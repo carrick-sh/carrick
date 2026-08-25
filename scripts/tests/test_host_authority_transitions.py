@@ -2482,7 +2482,7 @@ class ProductionInventoryTest(unittest.TestCase):
         return matches[0]
 
     def test_inventory_uses_compiler_resolved_schema_and_catalog_bindings(self):
-        self.assertEqual(len(self.rows), 682)
+        self.assertEqual(len(self.rows), 646)
         manifest = self.host_authority.load_catalog_manifest(CATALOG_MANIFEST)
         catalog = self.host_authority.load_production_catalog(
             CLIPPY_CONFIG, manifest
@@ -2515,16 +2515,16 @@ class ProductionInventoryTest(unittest.TestCase):
     def test_inventory_has_only_complete_unique_reviews(self):
         self.assertEqual(
             [row["review_id"] for row in self.rows],
-            [f"HA-{number:06d}" for number in range(1, 683)],
+            [f"HA-{number:06d}" for number in range(1, 647)],
         )
-        self.assertEqual(len({row["review_id"] for row in self.rows}), 682)
+        self.assertEqual(len({row["review_id"] for row in self.rows}), 646)
         self.assertEqual(
             Counter(row["classification"] for row in self.rows),
             Counter(
                 {
-                    "forbidden_semantic": 173,
-                    "declared_backing": 318,
-                    "declared_substrate": 191,
+                    "forbidden_semantic": 98,
+                    "declared_backing": 368,
+                    "declared_substrate": 180,
                 }
             ),
         )
@@ -2541,22 +2541,22 @@ class ProductionInventoryTest(unittest.TestCase):
             Counter(tuple(row["profiles"]) for row in self.rows),
             Counter(
                 {
-                    ("macos-cli-default",): 180,
-                    ("macos-cli-default", "macos-runtime-default"): 390,
+                    ("macos-cli-default",): 175,
+                    ("macos-cli-default", "macos-runtime-default"): 378,
                     (
                         "macos-cli-default",
                         "macos-hvf-default",
                         "macos-runtime-default",
-                    ): 112,
+                    ): 93,
                 }
             ),
         )
 
     def test_waitpid_openoptions_and_hvf_operations_are_bound(self):
         operation_counts = Counter(row["operation"] for row in self.rows)
-        self.assertEqual(operation_counts["libc::waitpid"], 7)
-        self.assertEqual(operation_counts["std::fs::OpenOptions::new"], 19)
-        self.assertEqual(operation_counts["std::fs::OpenOptions::open"], 19)
+        self.assertEqual(operation_counts["libc::waitpid"], 3)
+        self.assertEqual(operation_counts["std::fs::OpenOptions::new"], 22)
+        self.assertEqual(operation_counts["std::fs::OpenOptions::open"], 22)
         self.assertEqual(operation_counts["applevisor_sys::hv_vcpus_exit"], 1)
         self.assertEqual(
             {
@@ -2565,13 +2565,9 @@ class ProductionInventoryTest(unittest.TestCase):
                 if row["operation"] == "libc::waitpid"
             },
             {
-                ("crates/carrick-cli/src/commands.rs", 237),
-                ("crates/carrick-runtime/src/file_authority/ipc.rs", 102),
-                ("crates/carrick-runtime/src/interactive_supervisor.rs", 324),
-                ("crates/carrick-runtime/src/interactive_supervisor.rs", 340),
-                ("crates/carrick-runtime/src/interactive_supervisor.rs", 508),
-                ("crates/carrick-runtime/src/namespace/supervisor.rs", 269),
-                ("crates/carrick-runtime/src/namespace/supervisor.rs", 283),
+                ("crates/carrick-cli/src/commands.rs", 238),
+                ("crates/carrick-cli/src/lifecycle.rs", 326),
+                ("crates/carrick-cli/src/lifecycle.rs", 962),
             },
         )
         hvf_exit = self.row_at(
@@ -2589,90 +2585,51 @@ class ProductionInventoryTest(unittest.TestCase):
             ],
         )
 
-    def test_liveness_wait_and_permit_sites_have_strict_classifications(self):
-        forbidden = {
-            ("crates/carrick-runtime/src/container.rs", 392, "libc::kill"),
-            (
-                "crates/carrick-runtime/src/namespace/supervisor.rs",
-                179,
+    def test_retired_process_liveness_channels_are_absent(self):
+        retired_operations = {
+            "crates/carrick-runtime/src/cred_ipc.rs": {
+                "std::fs::metadata",
+                "std::fs::read",
+            },
+            "crates/carrick-runtime/src/exec_helpers.rs": {
+                "std::fs::read",
+                "std::fs::remove_file",
+            },
+            "crates/carrick-runtime/src/interactive_supervisor.rs": {"libc::waitpid"},
+            "crates/carrick-runtime/src/namespace/supervisor.rs": {
                 "libc::kill",
-            ),
-            (
-                "crates/carrick-runtime/src/namespace/supervisor.rs",
-                269,
                 "libc::waitpid",
-            ),
-            (
-                "crates/carrick-runtime/src/namespace/supervisor.rs",
-                283,
-                "libc::waitpid",
-            ),
-            ("crates/carrick-vmm-hvf/src/host_signal.rs", 488, "libc::waitid"),
-            ("crates/carrick-vmm-hvf/src/io_wait.rs", 168, "libc::waitid"),
-            ("crates/carrick-vmm-hvf/src/io_wait.rs", 188, "std::process::id"),
-            ("crates/carrick-vmm-hvf/src/io_wait.rs", 217, "std::process::id"),
-            ("crates/carrick-vmm-hvf/src/io_wait.rs", 229, "libc::waitid"),
-            ("crates/carrick-vmm-hvf/src/io_wait.rs", 906, "std::process::id"),
-            ("crates/carrick-vmm-hvf/src/io_wait.rs", 914, "std::process::id"),
-        }
-        for file, line, operation in forbidden:
-            with self.subTest(file=file, line=line, operation=operation):
-                self.assertEqual(
-                    self.row_at(file, line, operation)["classification"],
-                    "forbidden_semantic",
-                )
-
-        substrate = {
-            (
-                "crates/carrick-vmm-hvf/src/vcpu_permit_reaper.rs",
-                74,
+            },
+            "crates/carrick-vmm-hvf/src/host_signal.rs": {"libc::waitid"},
+            "crates/carrick-vmm-hvf/src/io_wait.rs": {
                 "libc::waitid",
-            ),
-            (
-                "crates/carrick-vmm-hvf/src/vcpu_permit_reaper.rs",
-                107,
+                "std::process::id",
+            },
+            "crates/carrick-vmm-hvf/src/vcpu_permit_reaper.rs": {
                 "libc::kill",
-            ),
-            (
-                "crates/carrick-vmm-hvf/src/vcpu_permit_reaper.rs",
-                346,
+                "libc::waitid",
                 "std::thread::Builder::new",
-            ),
-            (
-                "crates/carrick-runtime/src/interactive_supervisor.rs",
-                508,
-                "libc::waitpid",
-            ),
+            },
         }
-        for file, line, operation in substrate:
-            with self.subTest(file=file, line=line, operation=operation):
-                self.assertEqual(
-                    self.row_at(file, line, operation)["classification"],
-                    "declared_substrate",
-                )
+        self.assertFalse(
+            [
+                row
+                for row in self.rows
+                if row["operation"]
+                in retired_operations.get(row["source"]["file"], set())
+            ]
+        )
 
     def test_reviewer_identified_semantic_channels_are_classified_from_source(self):
         semantic = {
-            ("crates/carrick-runtime/src/exec_helpers.rs", 349, "std::fs::read"):
+            ("crates/carrick-runtime/src/exec_helpers.rs", 385, "std::fs::write"):
                 "guest child signal wait status",
-            ("crates/carrick-runtime/src/exec_helpers.rs", 350, "std::fs::remove_file"):
+            ("crates/carrick-runtime/src/exec_helpers.rs", 403, "std::fs::write"):
                 "guest child signal wait status",
-            ("crates/carrick-runtime/src/exec_helpers.rs", 412, "std::fs::write"):
+            ("crates/carrick-runtime/src/exec_helpers.rs", 385, "std::process::id"):
                 "guest child signal wait status",
-            ("crates/carrick-runtime/src/exec_helpers.rs", 430, "std::fs::write"):
+            ("crates/carrick-runtime/src/exec_helpers.rs", 403, "std::process::id"):
                 "guest child signal wait status",
-            ("crates/carrick-runtime/src/exec_helpers.rs", 412, "std::process::id"):
-                "guest child signal wait status",
-            ("crates/carrick-runtime/src/exec_helpers.rs", 430, "std::process::id"):
-                "guest child signal wait status",
-            ("crates/carrick-runtime/src/cred_ipc.rs", 91, "std::fs::metadata"):
-                "guest cross-process signal permission",
-            ("crates/carrick-runtime/src/cred_ipc.rs", 112, "std::fs::read"):
-                "guest cross-process signal permission",
-            ("crates/carrick-runtime/src/dispatch/mod.rs", 4703, "std::process::id"):
-                "guest PTY entry lifetime",
-            ("crates/carrick-runtime/src/dispatch/mod.rs", 4895, "std::process::id"):
-                "guest controlling PTY identity",
             ("crates/carrick-runtime/src/vfs/dev.rs", 150, "std::process::id"):
                 "guest PTY entry ownership",
             ("crates/carrick-runtime/src/vfs/devpts.rs", 263, "std::process::id"):
@@ -2704,7 +2661,7 @@ class ProductionInventoryTest(unittest.TestCase):
 
         rosetta = self.row_at(
             "crates/carrick-runtime/src/lib.rs",
-            364,
+            352,
             "std::fs::read_to_string",
         )
         self.assertEqual(rosetta["classification"], "declared_backing")
@@ -2712,21 +2669,25 @@ class ProductionInventoryTest(unittest.TestCase):
 
     def test_sysv_message_queue_fork_caches_are_carrier_substrate(self):
         expected = {
-            "HA-000034": "message-queue descriptor cache fork ownership",
-            "HA-000035": "inherited message-queue descriptors",
-            "HA-000036": "message-queue wait-word mapping cache fork ownership",
-            "HA-000037": "inherited message-queue wait-word mappings",
+            "message-queue descriptor cache fork ownership",
+            "inherited message-queue descriptors",
         }
-        for review_id, resource in expected.items():
-            with self.subTest(review_id=review_id):
-                row = next(row for row in self.rows if row["review_id"] == review_id)
+        for resource in expected:
+            with self.subTest(resource=resource):
+                row = next(
+                    row for row in self.rows if resource in row["evidence"]["resource"]
+                )
                 self.assertEqual(row["classification"], "declared_substrate")
                 self.assertEqual(row["evidence"]["authority"], "authenticated_carrier")
                 self.assertIn(resource, row["evidence"]["resource"])
 
-        for review_id in ("HA-000533", "HA-000534", "HA-000535"):
-            with self.subTest(sibling=review_id):
-                row = next(row for row in self.rows if row["review_id"] == review_id)
+        for function in ("private_name", "init_sysv_run_scope", "sysv_run_scope"):
+            with self.subTest(backing=function):
+                row = next(
+                    row
+                    for row in self.rows
+                    if f"used by `{function}`" in row["evidence"]["resource"]
+                )
                 self.assertEqual(row["classification"], "declared_backing")
                 self.assertEqual(row["evidence"]["authority"], "authorized_backing")
 
@@ -2870,7 +2831,7 @@ class IndependentAuthorityArtifactsTest(unittest.TestCase):
         receipt = load_receipt(MACOS_CAPTURE, matrix, catalog)
         inventory = self.host_authority.load_inventory(INVENTORY)
         validate_receipt(inventory, receipt)
-        self.assertEqual(len(receipt["rows"]), 682)
+        self.assertEqual(len(receipt["rows"]), 646)
         self.assertEqual(
             receipt["executed_profiles"],
             ["macos-cli-default", "macos-hvf-default", "macos-runtime-default"],
