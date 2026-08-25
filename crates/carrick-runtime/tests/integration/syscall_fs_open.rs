@@ -607,11 +607,35 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
-    let stdin_is_tty = carrick_runtime::host_tty::host_isatty(0);
-    let stderr_is_tty = carrick_runtime::host_tty::host_isatty(2);
+    let root = dispatcher.capture_one_task_context().unwrap();
+    let root_identity = root
+        .kernel()
+        .task_identity(root.task().key().id)
+        .expect("reference-model root task must be live");
+    assert_eq!(
+        dispatcher.register_controlling_pty("/dev/ttys-carrier-test".to_owned()),
+        0,
+    );
 
-    // TIOCGPGRP on stdio fd 0 either writes the bootstrap pgid for headless
-    // stdio or the real foreground pgrp for PTY-backed test runs.
+    // A bare dispatcher has no controlling terminal and correctly answers
+    // ENOTTY. Model a `run -t` launch explicitly, then acquire that terminal
+    // through the guest ioctl path so the assertions below exercise Carrick's
+    // kernel-owned session/process-group state rather than the test runner's
+    // host process group.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(29, SyscallArgs::from([1, LINUX_TIOCSCTTY, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    // TIOCGPGRP on the launch terminal reports the kernel bootstrap task's
+    // foreground process group, independent of the host test runner's tty.
     assert_eq!(
         dispatcher
             .dispatch(
@@ -623,16 +647,10 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
     );
-    let expected_pgrp = if stdin_is_tty {
-        let host_pgrp = carrick_runtime::host_tty::host_tty_tcgetpgrp(0)
-            .expect("stdio tty should have a foreground process group");
-        carrick_runtime::namespace::pid::host_to_ns_pgid(host_pgrp as u32) as i32
-    } else {
-        carrick_runtime::linux_abi::LINUX_BOOTSTRAP_PGID
-    };
+    let expected_pgrp = root_identity.process_group.raw();
     assert_eq!(read_i32_le(&memory, 0x4000), expected_pgrp);
 
-    // TIOCGSID on stdio fd 2 follows the same split.
+    // TIOCGSID is likewise Carrick's kernel session, not the host session.
     assert_eq!(
         dispatcher
             .dispatch(
@@ -644,12 +662,7 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
     );
-    let expected_sid = if stderr_is_tty {
-        carrick_runtime::host_tty::host_tty_tcgetsid(2)
-            .expect("stdio tty should have a controlling session")
-    } else {
-        carrick_runtime::linux_abi::LINUX_BOOTSTRAP_SID
-    };
+    let expected_sid = root_identity.session.raw();
     assert_eq!(read_i32_le(&memory, 0x4010), expected_sid);
 
     // TIOCGPGRP on unknown fd 99 → EBADF.
@@ -685,32 +698,28 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
     );
-    if !stdin_is_tty {
-        memory.write_bytes(0x4040, &99_i32.to_le_bytes()).unwrap();
-        assert_eq!(
-            dispatcher
-                .dispatch(
-                    &dispatcher.capture_one_task_context().unwrap(),
-                    SyscallRequest::new(
-                        29,
-                        SyscallArgs::from([0, LINUX_TIOCSPGRP, 0x4040, 0, 0, 0])
-                    ),
-                    &mut memory,
-                    &reporter,
-                )
-                .unwrap(),
-            DispatchOutcome::Errno {
-                errno: LinuxErrno::new(1)
-            }
-        );
-    }
-
-    // TIOCSCTTY / TIOCNOTTY on stdio → 0.
+    memory.write_bytes(0x4040, &99_i32.to_le_bytes()).unwrap();
     assert_eq!(
         dispatcher
             .dispatch(
                 &dispatcher.capture_one_task_context().unwrap(),
-                SyscallRequest::new(29, SyscallArgs::from([1, LINUX_TIOCSCTTY, 1, 0, 0, 0])),
+                SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TIOCSPGRP, 0x4040, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(1)
+        }
+    );
+
+    // Re-acquiring the same session's terminal is idempotent; TIOCNOTTY then
+    // removes the kernel association.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(29, SyscallArgs::from([1, LINUX_TIOCSCTTY, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
             )
@@ -727,6 +736,32 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TIOCGPGRP, 0x4050, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(25)
+        }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(29, SyscallArgs::from([2, LINUX_TIOCGSID, 0x4058, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(25)
+        }
     );
 
     // On a rootfs-backed file fd: TIOCGPGRP/TIOCGSID → ENOTTY.
