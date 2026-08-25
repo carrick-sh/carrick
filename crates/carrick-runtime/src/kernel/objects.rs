@@ -2488,10 +2488,30 @@ struct TaskJobControl {
     pending_stop_is_ptrace: bool,
     stopped_by_ptrace: bool,
     ptrace_tracer: Option<TaskKey>,
+    ptrace_stop_settled: bool,
+    ptrace_resume_command: Option<PtraceResumeCommand>,
     ptrace_resume_signal: Option<LinuxSignal>,
     pending_continue: bool,
     stop_invalidation_generation: u64,
     default_stop_generation: DefaultStopGeneration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PtraceResumeCommand {
+    signal: Option<LinuxSignal>,
+}
+
+fn clear_ptrace_transient_state(state: &mut TaskJobControl) {
+    state.ptrace_stop_settled = false;
+    state.ptrace_resume_command = None;
+    state.ptrace_resume_signal = None;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PtraceStopSettlement {
+    NotPtraceStopped,
+    Stopped,
+    Resumed { signal: Option<LinuxSignal> },
 }
 
 fn advance_job_control_stop_invalidation_generation(state: &mut TaskJobControl) {
@@ -3368,6 +3388,7 @@ impl Task {
         state.pending_stop = Some(signal);
         state.pending_stop_is_ptrace = true;
         state.stopped_by_ptrace = true;
+        clear_ptrace_transient_state(&mut state);
         true
     }
 
@@ -3379,7 +3400,10 @@ impl Task {
         }
         {
             let state = self.job_control.lock();
-            if state.ptrace_tracer != Some(tracer) || !state.stopped_by_ptrace {
+            if state.ptrace_tracer != Some(tracer)
+                || !state.stopped_by_ptrace
+                || state.ptrace_resume_command.is_some()
+            {
                 return false;
             }
         }
@@ -3396,13 +3420,45 @@ impl Task {
         {
             let mut state = self.job_control.lock();
             state.ptrace_resume_signal = signal;
-            state.stopped_by = None;
-            state.stopped_by_ptrace = false;
+            if state.ptrace_stop_settled {
+                state.stopped_by = None;
+                state.stopped_by_ptrace = false;
+                state.ptrace_stop_settled = false;
+            } else {
+                state.ptrace_resume_command = Some(PtraceResumeCommand { signal });
+            }
         }
         drop(lifecycle);
         drop(signal_generation);
         self.job_control_changed.notify_all();
         true
+    }
+
+    pub(super) fn settle_ptrace_stop(&self) -> PtraceStopSettlement {
+        let signal_generation = self.lock_signal_generation();
+        let lifecycle = self.lifecycle.lock();
+        if *lifecycle != TaskLifecycle::Live {
+            return PtraceStopSettlement::NotPtraceStopped;
+        }
+        let mut state = self.job_control.lock();
+        if !state.stopped_by_ptrace {
+            return PtraceStopSettlement::NotPtraceStopped;
+        }
+        state.ptrace_stop_settled = true;
+        let Some(command) = state.ptrace_resume_command.take() else {
+            return PtraceStopSettlement::Stopped;
+        };
+        state.stopped_by = None;
+        state.stopped_by_ptrace = false;
+        state.ptrace_stop_settled = false;
+        let settlement = PtraceStopSettlement::Resumed {
+            signal: command.signal,
+        };
+        drop(state);
+        drop(lifecycle);
+        drop(signal_generation);
+        self.job_control_changed.notify_all();
+        settlement
     }
 
     pub(super) fn detach_from_ptrace(&self, tracer: TaskKey) -> bool {
@@ -3415,10 +3471,15 @@ impl Task {
             return false;
         }
         state.ptrace_tracer = None;
-        state.ptrace_resume_signal = None;
-        if state.stopped_by_ptrace {
+        clear_ptrace_transient_state(&mut state);
+        let changed = state.stopped_by_ptrace;
+        if changed {
             state.stopped_by = None;
             state.stopped_by_ptrace = false;
+        }
+        drop(state);
+        drop(lifecycle);
+        if changed {
             self.job_control_changed.notify_all();
         }
         true
@@ -3564,6 +3625,7 @@ impl Task {
         state.pending_stop = Some(signal);
         state.pending_stop_is_ptrace = false;
         state.stopped_by_ptrace = false;
+        clear_ptrace_transient_state(&mut state);
         true
     }
 
@@ -3576,10 +3638,14 @@ impl Task {
         let changed = state.stopped_by.take().is_some();
         if changed {
             state.stopped_by_ptrace = false;
-            state.ptrace_resume_signal = None;
+            clear_ptrace_transient_state(&mut state);
             if publish_continued {
                 state.pending_continue = true;
             }
+        }
+        drop(state);
+        drop(lifecycle);
+        if changed {
             self.job_control_changed.notify_all();
         }
         changed
@@ -3625,7 +3691,7 @@ impl Task {
     }
 
     pub(super) fn begin_exit(&self) -> bool {
-        let _generation = self.signal_generation.lock();
+        let generation = self.signal_generation.lock();
         {
             let mut lifecycle = self.lifecycle.lock();
             if *lifecycle == TaskLifecycle::Exiting {
@@ -3637,7 +3703,9 @@ impl Task {
         job_control.stopped_by = None;
         job_control.stopped_by_ptrace = false;
         job_control.ptrace_tracer = None;
-        job_control.ptrace_resume_signal = None;
+        clear_ptrace_transient_state(&mut job_control);
+        drop(job_control);
+        drop(generation);
         self.job_control_changed.notify_all();
         true
     }
@@ -6922,6 +6990,53 @@ mod tests {
         assert_eq!(fixture.task.wake_generation(), 1);
         fixture.task.wake();
         assert_eq!(fixture.task.wake_generation(), 2);
+    }
+
+    #[test]
+    fn ptrace_transient_command_state_is_cleared_by_non_ptrace_transitions() {
+        let stop_signal =
+            LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGUSR2).expect("SIGUSR2");
+        let kill_signal =
+            LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGKILL).expect("SIGKILL");
+
+        let stage_early_resume = || {
+            let fixture = Fixture::new();
+            let tracer = fixture.task.key();
+            assert!(fixture.task.claim_ptrace_traceme(tracer));
+            assert!(fixture.task.stop_for_ptrace(stop_signal));
+            assert!(fixture.task.resume_from_ptrace(tracer, Some(kill_signal)));
+            fixture
+        };
+        let assert_transient_clear = |task: &Task| {
+            let state = task.job_control.lock();
+            assert!(!state.ptrace_stop_settled);
+            assert_eq!(state.ptrace_resume_command, None);
+            assert_eq!(state.ptrace_resume_signal, None);
+        };
+
+        let detached = stage_early_resume();
+        assert!(detached.task.detach_from_ptrace(detached.task.key()));
+        assert_transient_clear(&detached.task);
+
+        let continued = stage_early_resume();
+        assert!(continued.task.resume_from_job_control(false));
+        assert_transient_clear(&continued.task);
+
+        let exited = stage_early_resume();
+        assert!(exited.task.begin_exit());
+        assert_transient_clear(&exited.task);
+
+        let ordinary_stop = Fixture::new();
+        {
+            let mut state = ordinary_stop.task.job_control.lock();
+            state.ptrace_stop_settled = true;
+            state.ptrace_resume_command = Some(PtraceResumeCommand {
+                signal: Some(kill_signal),
+            });
+            state.ptrace_resume_signal = Some(kill_signal);
+        }
+        assert!(ordinary_stop.task.stop_for_job_control(stop_signal, None));
+        assert_transient_clear(&ordinary_stop.task);
     }
 
     #[test]
