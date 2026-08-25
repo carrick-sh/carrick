@@ -87,7 +87,13 @@ fn main() {
         match pid {
             0 => {
                 let ok = child_check((round as u8).wrapping_mul(29).wrapping_add(3));
-                std::process::exit(if ok { 0 } else { 42 });
+                // This process forked while sibling threads existed. POSIX only
+                // permits async-signal-safe functions before exec in that
+                // child; `exit(3)` runs libc/atexit cleanup and may acquire a
+                // lock inherited from a vanished sibling. Use the syscall-like
+                // `_exit(2)` edge so this probe measures stack COW rather than
+                // undefined post-fork runtime cleanup.
+                unsafe { libc::_exit(if ok { 0 } else { 42 }) };
             }
             -1 => {
                 wait_failures += 1;
