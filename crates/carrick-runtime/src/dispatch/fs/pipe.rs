@@ -257,6 +257,84 @@ pub(crate) fn restore_pipe_bytes(pipe: &PipeRef, bytes: &[u8]) {
     pipe.changed.notify_all();
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum InMemoryTeeOutcome {
+    SamePipe,
+    BrokenPipe,
+    Eof,
+    SourceWouldBlock,
+    DestWouldBlock,
+    Transferred(usize),
+}
+
+fn pipe_double_lock<'a>(
+    p1: &'a PipeInner,
+    p2: &'a PipeInner,
+) -> (
+    parking_lot::MutexGuard<'a, PipeState>,
+    parking_lot::MutexGuard<'a, PipeState>,
+) {
+    let ptr1 = p1 as *const PipeInner as usize;
+    let ptr2 = p2 as *const PipeInner as usize;
+    if ptr1 < ptr2 {
+        let g1 = p1.state.lock();
+        let g2 = p2.state.lock();
+        (g1, g2)
+    } else {
+        let g2 = p2.state.lock();
+        let g1 = p1.state.lock();
+        (g1, g2)
+    }
+}
+
+pub(crate) fn tee_in_memory_pipes(
+    in_pipe: &PipeRef,
+    out_pipe: &PipeRef,
+    count: usize,
+) -> InMemoryTeeOutcome {
+    if Arc::ptr_eq(in_pipe, out_pipe) || in_pipe.pipe_id() == out_pipe.pipe_id() {
+        return InMemoryTeeOutcome::SamePipe;
+    }
+    if count == 0 {
+        return InMemoryTeeOutcome::Transferred(0);
+    }
+    let (in_state, mut out_state) = pipe_double_lock(in_pipe, out_pipe);
+
+    // Linux link_pipe checks destination readers first; broken destination pipe
+    // takes precedence over empty source or full destination.
+    if out_state.readers == 0 {
+        return InMemoryTeeOutcome::BrokenPipe;
+    }
+
+    if in_state.buffer.is_empty() {
+        if in_state.writers == 0 {
+            return InMemoryTeeOutcome::Eof;
+        }
+        return InMemoryTeeOutcome::SourceWouldBlock;
+    }
+
+    let dest_room = out_state.capacity.saturating_sub(out_state.buffer.len());
+    if dest_room == 0 {
+        return InMemoryTeeOutcome::DestWouldBlock;
+    }
+
+    let copy_len = count.min(in_state.buffer.len()).min(dest_room);
+    let (s1, s2) = in_state.buffer.as_slices();
+    if copy_len <= s1.len() {
+        out_state.buffer.extend(&s1[..copy_len]);
+    } else {
+        out_state.buffer.extend(s1);
+        out_state.buffer.extend(&s2[..copy_len - s1.len()]);
+    }
+    out_pipe.update_readiness_locked(&out_state);
+
+    drop(in_state);
+    drop(out_state);
+    out_pipe.changed.notify_all();
+
+    InMemoryTeeOutcome::Transferred(copy_len)
+}
+
 pub(crate) fn write_pipe(
     bytes: &[u8],
     pipe: &PipeRef,

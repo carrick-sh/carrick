@@ -3012,3 +3012,285 @@ fn vmsplice_in_memory_pipe_writer_full_blocking_parks_on_write_readiness_pollin(
     );
     assert_ne!(poll_fd_struct.revents & libc::POLLIN, 0);
 }
+
+struct TestPipePair {
+    dispatcher: SyscallDispatcher,
+    in_pipe: PipeRef,
+    in_read_fd: i32,
+    #[allow(dead_code)]
+    in_write_fd: i32,
+    out_pipe: PipeRef,
+    #[allow(dead_code)]
+    out_read_fd: i32,
+    out_write_fd: i32,
+}
+
+impl TestPipePair {
+    fn new(in_cap: usize, out_cap: usize) -> Self {
+        Self::with_flags(in_cap, 0, out_cap, 0)
+    }
+
+    fn with_flags(in_cap: usize, in_flags: u64, out_cap: usize, out_flags: u64) -> Self {
+        let dispatcher = SyscallDispatcher::new();
+        let in_pipe = Arc::new(PipeInner::new_connected(2001, in_cap));
+        let out_pipe = Arc::new(PipeInner::new_connected(2002, out_cap));
+
+        let make_pair = |pipe: &PipeRef, r_flags, w_flags| {
+            let desc = |flags, is_reader| {
+                let mut base = OpenDescriptionBase::new(flags);
+                base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+                let d = if is_reader {
+                    OpenDescription::PipeReader {
+                        base,
+                        pipe: Arc::clone(pipe),
+                    }
+                } else {
+                    OpenDescription::PipeWriter {
+                        base,
+                        pipe: Arc::clone(pipe),
+                    }
+                };
+                OpenFile::from_open_description(Arc::new(RwLock::new(d)), 0)
+            };
+            dispatcher
+                .install_fd_pair_at_or_above(
+                    3,
+                    desc(LINUX_O_RDONLY | r_flags, true),
+                    desc(LINUX_O_WRONLY | w_flags, false),
+                )
+                .expect("install pipe")
+        };
+
+        let (in_read_fd, in_write_fd) = make_pair(&in_pipe, in_flags, 0);
+        let (out_read_fd, out_write_fd) = make_pair(&out_pipe, 0, out_flags);
+        Self {
+            dispatcher,
+            in_pipe,
+            in_read_fd,
+            in_write_fd,
+            out_pipe,
+            out_read_fd,
+            out_write_fd,
+        }
+    }
+
+    fn fill_in(&self, bytes: &[u8]) {
+        let mut s = self.in_pipe.state.lock();
+        s.buffer.extend(bytes);
+        self.in_pipe.update_readiness_locked(&s);
+    }
+
+    fn fill_out(&self, bytes: usize) {
+        let mut s = self.out_pipe.state.lock();
+        s.buffer.extend(vec![0x7f; bytes]);
+        self.out_pipe.update_readiness_locked(&s);
+    }
+
+    fn dispatch_tee(&self, in_fd: i32, out_fd: i32, len: u64, flags: u64) -> DispatchOutcome {
+        let mut mem = LinearMemory::new(0x1000, vec![0; 0x1000]);
+        let rep = CompatReporter::default();
+        let args = SyscallArgs::from([in_fd as u64, out_fd as u64, len, flags, 0, 0]);
+        self.dispatcher
+            .dispatch_normalized(
+                &self.dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(77, args),
+                &mut mem,
+                &rep,
+                None,
+            )
+            .expect("tee claimed")
+            .expect("tee outcome")
+    }
+}
+
+fn assert_wait_on(outcome: DispatchOutcome, expected_fd: i32, events: i16) {
+    match outcome {
+        DispatchOutcome::WaitOnFds {
+            fds,
+            timeout,
+            on_timeout,
+            sig_mask,
+        } => {
+            assert_eq!(timeout, None);
+            assert_eq!(on_timeout, LINUX_EAGAIN.guest_retval());
+            assert_eq!(sig_mask, carrick_abi::WaitSigMask::NONE);
+            assert_eq!(fds.first(), Some((expected_fd, events)));
+        }
+        other => panic!("expected WaitOnFds for fd {expected_fd}, got {other:?}"),
+    }
+}
+
+#[test]
+fn tee_in_memory_basic_non_consuming_copy() {
+    let pair = TestPipePair::new(65536, 65536);
+    let payload: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+    pair.fill_in(&payload);
+
+    assert_eq!(
+        pair.dispatch_tee(pair.in_read_fd, pair.out_write_fd, 1024, 0),
+        DispatchOutcome::Returned { value: 1024 }
+    );
+
+    let tid = crate::thread::ThreadId::synthetic_for_tests(10);
+    let mut dest_buf = vec![0u8; 1024];
+    assert_eq!(
+        read_pipe_bytes(&mut dest_buf, &pair.out_pipe, 0, tid),
+        Ok(1024)
+    );
+    assert_eq!(dest_buf, payload);
+
+    let mut src_buf = vec![0u8; 1024];
+    assert_eq!(
+        read_pipe_bytes(&mut src_buf, &pair.in_pipe, 0, tid),
+        Ok(1024)
+    );
+    assert_eq!(src_buf, payload);
+
+    // Zero-length returns 0
+    assert_eq!(
+        pair.dispatch_tee(pair.in_read_fd, pair.out_write_fd, 0, 0),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    // Short transfer bounded by available room
+    let small_pair = TestPipePair::new(65536, 4096);
+    small_pair.fill_in(&vec![0x33u8; 4096]);
+    small_pair.fill_out(3072);
+    assert_eq!(
+        small_pair.dispatch_tee(small_pair.in_read_fd, small_pair.out_write_fd, 4096, 0),
+        DispatchOutcome::Returned { value: 1024 }
+    );
+    assert_eq!(small_pair.out_pipe.buffered_bytes(), 4096);
+    assert_eq!(small_pair.in_pipe.buffered_bytes(), 4096);
+}
+
+#[test]
+fn tee_in_memory_validation_and_same_pipe_precedence() {
+    let pair = TestPipePair::new(65536, 65536);
+    pair.fill_in(&[0x11; 512]);
+
+    assert_eq!(
+        pipe::tee_in_memory_pipes(&pair.in_pipe, &pair.in_pipe, 1024),
+        pipe::InMemoryTeeOutcome::SamePipe
+    );
+    assert_eq!(
+        pair.dispatch_tee(pair.in_read_fd, pair.in_write_fd, 1024, 0),
+        DispatchOutcome::errno(LINUX_EINVAL)
+    );
+    assert_eq!(
+        pair.dispatch_tee(pair.in_read_fd, pair.in_read_fd, 1024, 0),
+        DispatchOutcome::errno(LINUX_EINVAL)
+    );
+    assert_eq!(
+        pair.dispatch_tee(pair.in_read_fd, pair.out_write_fd, 512, 0xdead_beef),
+        DispatchOutcome::errno(LINUX_EINVAL)
+    );
+    assert_eq!(
+        pair.dispatch_tee(pair.in_read_fd, pair.out_read_fd, 512, 0),
+        DispatchOutcome::errno(LINUX_EINVAL)
+    );
+    assert_eq!(
+        pair.dispatch_tee(pair.in_write_fd, pair.out_write_fd, 512, 0),
+        DispatchOutcome::errno(LINUX_EINVAL)
+    );
+}
+
+#[test]
+fn tee_in_memory_empty_source_backpressure_and_eof() {
+    let pair = TestPipePair::new(65536, 65536);
+    let in_poll_fd = pair.in_pipe.read_poll_fd().expect("poll fd").raw();
+    let nb_flags = carrick_abi::LinuxSpliceFlags::NONBLOCK.bits();
+
+    assert_eq!(
+        pair.dispatch_tee(pair.in_read_fd, pair.out_write_fd, 1024, nb_flags),
+        DispatchOutcome::errno(LINUX_EAGAIN)
+    );
+    assert_wait_on(
+        pair.dispatch_tee(pair.in_read_fd, pair.out_write_fd, 1024, 0),
+        in_poll_fd,
+        libc::POLLIN,
+    );
+
+    // O_NONBLOCK on descriptor
+    let nb_pair = TestPipePair::with_flags(65536, LINUX_O_NONBLOCK, 65536, 0);
+    assert_eq!(
+        nb_pair.dispatch_tee(nb_pair.in_read_fd, nb_pair.out_write_fd, 1024, 0),
+        DispatchOutcome::errno(LINUX_EAGAIN)
+    );
+
+    // EOF: writers = 0
+    pair.in_pipe.state.lock().writers = 0;
+    pair.in_pipe
+        .update_readiness_locked(&pair.in_pipe.state.lock());
+    assert_eq!(
+        pair.dispatch_tee(pair.in_read_fd, pair.out_write_fd, 1024, 0),
+        DispatchOutcome::Returned { value: 0 }
+    );
+}
+
+#[test]
+fn tee_in_memory_full_destination_backpressure() {
+    let pair = TestPipePair::new(65536, 65536);
+    pair.fill_in(&[0xaa; 1024]);
+    pair.fill_out(65536);
+    let out_poll_fd = pair.out_pipe.write_poll_fd().expect("poll fd").raw();
+    let nb_flags = carrick_abi::LinuxSpliceFlags::NONBLOCK.bits();
+
+    assert_eq!(
+        pair.dispatch_tee(pair.in_read_fd, pair.out_write_fd, 1024, nb_flags),
+        DispatchOutcome::errno(LINUX_EAGAIN)
+    );
+    assert_wait_on(
+        pair.dispatch_tee(pair.in_read_fd, pair.out_write_fd, 1024, 0),
+        out_poll_fd,
+        libc::POLLIN,
+    );
+
+    // O_NONBLOCK on destination writer
+    let nb_pair = TestPipePair::with_flags(65536, 0, 65536, LINUX_O_NONBLOCK);
+    nb_pair.fill_in(&[0xaa; 1024]);
+    nb_pair.fill_out(65536);
+    assert_eq!(
+        nb_pair.dispatch_tee(nb_pair.in_read_fd, nb_pair.out_write_fd, 1024, 0),
+        DispatchOutcome::errno(LINUX_EAGAIN)
+    );
+}
+
+#[test]
+fn tee_in_memory_destination_reader_closed_epipe_and_sigpipe() {
+    let pair = TestPipePair::new(65536, 65536);
+    // Destination readers = 0 wins even when source is empty (precedence)
+    pair.out_pipe.state.lock().readers = 0;
+    pair.out_pipe
+        .update_readiness_locked(&pair.out_pipe.state.lock());
+
+    let ctx = pair.dispatcher.capture_one_task_context().unwrap();
+    let outcome = pair.dispatch_tee(pair.in_read_fd, pair.out_write_fd, 1024, 0);
+    assert_eq!(outcome, DispatchOutcome::errno(LINUX_EPIPE));
+    assert!(
+        ctx.thread()
+            .signal_state()
+            .pending()
+            .contains(carrick_abi::LINUX_SIGPIPE),
+        "EPIPE must raise pending SIGPIPE"
+    );
+
+    // When SIGPIPE is ignored (SIG_IGN), EPIPE is still returned but no signal is queued
+    let mut ign = LinuxSigaction::empty();
+    ign.sa_handler = carrick_abi::LINUX_SIG_IGN;
+    let sigpipe =
+        crate::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGPIPE).unwrap();
+    ctx.shared().sighand().install_action(sigpipe, ign);
+    ctx.thread()
+        .update_signal_state(|s| s.replace_pending_entries(&[]));
+
+    let outcome_ign = pair.dispatch_tee(pair.in_read_fd, pair.out_write_fd, 1024, 0);
+    assert_eq!(outcome_ign, DispatchOutcome::errno(LINUX_EPIPE));
+    assert!(
+        !ctx.thread()
+            .signal_state()
+            .pending()
+            .contains(carrick_abi::LINUX_SIGPIPE),
+        "SIG_IGN must suppress queuing SIGPIPE"
+    );
+}

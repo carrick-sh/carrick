@@ -4568,6 +4568,60 @@ impl SyscallDispatcher {
         }
     }
 
+    /// tee(2) for in-memory anonymous pipes: duplicate up to `count` bytes from
+    /// the source pipe's buffer to the destination pipe WITHOUT consuming or
+    /// reordering the source.
+    #[allow(clippy::too_many_arguments)]
+    fn in_memory_tee(
+        &self,
+        in_fd: i32,
+        in_pipe: &PipeRef,
+        in_status_flags: u64,
+        out_fd: i32,
+        out_pipe: &PipeRef,
+        out_status_flags: u64,
+        count: usize,
+        splice_flags: LinuxSpliceFlags,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let in_nonblocking = splice_flags.contains(LinuxSpliceFlags::NONBLOCK)
+            || (in_status_flags & LINUX_O_NONBLOCK != 0);
+        let out_nonblocking = splice_flags.contains(LinuxSpliceFlags::NONBLOCK)
+            || (out_status_flags & LINUX_O_NONBLOCK != 0);
+
+        match pipe::tee_in_memory_pipes(in_pipe, out_pipe, count) {
+            pipe::InMemoryTeeOutcome::SamePipe => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+            pipe::InMemoryTeeOutcome::BrokenPipe => Ok(DispatchOutcome::errno(LINUX_EPIPE)),
+            pipe::InMemoryTeeOutcome::Eof => Ok(DispatchOutcome::Returned { value: 0 }),
+            pipe::InMemoryTeeOutcome::SourceWouldBlock => {
+                let Some(host_fd) = in_pipe.read_poll_fd() else {
+                    return Ok(DispatchOutcome::errno(linux_errno::EMFILE));
+                };
+                Ok(self.splice_host_output_wait(
+                    in_fd,
+                    host_fd.raw(),
+                    libc::POLLIN,
+                    Some(host_fd),
+                    in_nonblocking,
+                ))
+            }
+            pipe::InMemoryTeeOutcome::DestWouldBlock => {
+                let Some(host_fd) = out_pipe.write_poll_fd() else {
+                    return Ok(DispatchOutcome::errno(linux_errno::EMFILE));
+                };
+                Ok(self.splice_host_output_wait(
+                    out_fd,
+                    host_fd.raw(),
+                    libc::POLLIN,
+                    Some(host_fd),
+                    out_nonblocking,
+                ))
+            }
+            pipe::InMemoryTeeOutcome::Transferred(written) => Ok(DispatchOutcome::Returned {
+                value: written as i64,
+            }),
+        }
+    }
+
     /// tee(2): duplicate up to `count` bytes from the source pipe's read end to
     /// the destination pipe's write end WITHOUT consuming the source. On a Linux
     /// host the real `tee(2)` is exact; elsewhere (macOS/BSD lack `tee(2)`) fall
@@ -11256,33 +11310,57 @@ impl SyscallDispatcher {
         fn tee(this, cx, fd_in: Fd, fd_out: Fd, len: u64, flags: u64) {
 
             // tee(2) duplicates up to `len` bytes of pipe data from fd_in to
-            // fd_out WITHOUT consuming the source. carrick's pipes are real host
-            // kernel pipes (HostPipe), so on Linux we pass straight through to
-            // the host tee(2) — exact, fork-coherent semantics with no userspace
-            // ring to peek. macOS has no tee(2): it stays ENOSYS (as before).
+            // fd_out WITHOUT consuming the source.
             let _ = cx;
             // `from_bits` rejects exactly the historical `& !SUPPORTED` set:
             // the type's full set IS the supported set.
             let Some(splice_flags) = LinuxSpliceFlags::from_bits(flags) else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
-            // Both fds must be pipes — fd_in a READ end, fd_out a WRITE end —
-            // else EINVAL (tee01 setup). The read and write end of the SAME pipe
-            // object is also EINVAL (tee02), detected via the shared pipe_id.
-            let Some((in_fd, in_pipe)) = this.host_pipe_end(fd_in.0, true) else {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            };
-            let Some((out_fd, out_pipe)) = this.host_pipe_end(fd_out.0, false) else {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            };
-            if in_pipe != 0 && in_pipe == out_pipe {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+
+            // Check if both ends are HostPipe
+            if let Some((in_fd, in_pipe)) = this.host_pipe_end(fd_in.0, true) {
+                let Some((out_fd, out_pipe)) = this.host_pipe_end(fd_out.0, false) else {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                };
+                if in_pipe != 0 && in_pipe == out_pipe {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                let count = usize::try_from(len).map_err(|_| DispatchError::LengthTooLarge(len))?;
+                if count == 0 {
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
+                return this.host_tee(in_fd, in_pipe, out_fd, count, splice_flags);
             }
-            let count = usize::try_from(len).map_err(|_| DispatchError::LengthTooLarge(len))?;
-            if count == 0 {
-                return Ok(DispatchOutcome::Returned { value: 0 });
+
+
+            // Check if both ends are in-memory pipes
+            if let Some((in_pipe, in_status_flags)) = this.pipe_reader(fd_in.0) {
+                let Some((out_pipe, out_status_flags)) = this.pipe_writer(fd_out.0) else {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                };
+                if Arc::ptr_eq(&in_pipe, &out_pipe) || in_pipe.pipe_id() == out_pipe.pipe_id() {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                let count = usize::try_from(len).map_err(|_| DispatchError::LengthTooLarge(len))?;
+                if count == 0 {
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
+                let outcome = this.in_memory_tee(
+                    fd_in.0,
+                    &in_pipe,
+                    in_status_flags,
+                    fd_out.0,
+                    &out_pipe,
+                    out_status_flags,
+                    count,
+                    splice_flags,
+                )?;
+                return Ok(this.raise_sigpipe_on_epipe(cx, outcome));
             }
-            this.host_tee(in_fd, in_pipe, out_fd, count, splice_flags)
+
+            // Non-pipe fds, wrong pipe ends, or mixed pairs are rejected with EINVAL.
+            Ok(DispatchOutcome::errno(LINUX_EINVAL))
 
         }
 
