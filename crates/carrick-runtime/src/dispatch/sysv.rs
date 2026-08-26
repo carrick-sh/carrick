@@ -3168,6 +3168,9 @@ impl SyscallDispatcher {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             let mut state = this.sysv.state.lock();
+            if state.semaphores.len() >= LINUX_SEMMNI {
+                return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
+            }
             let Ok((guest_semid, scan_index)) = state.allocate_sem_id() else {
                 return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
             };
@@ -4713,6 +4716,47 @@ mod ipc_set_tests {
             self.set.values.lock()[semnum as usize] += 1;
             self.set.changed.notify_all();
         }
+    }
+
+    #[test]
+    fn semget_new_set_at_semmni_returns_enospc_without_inserting() {
+        let dispatcher = SyscallDispatcher::new();
+        let fixture = InMemSemFixture::new(1);
+        {
+            let mut state = dispatcher.sysv.state.lock();
+            for raw in 0..LINUX_SEMMNI {
+                let mut set = fixture.set.clone();
+                set.key = raw as i32 + 1;
+                set.scan_index = SemScanIndex(raw as u32);
+                state.semaphores.insert(GuestSemId(raw as i32), set);
+            }
+            state.next_sem_scan_index = LINUX_SEMMNI as u32;
+        }
+
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x1000]);
+        let outcome = dispatcher
+            .dispatch_normalized(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(
+                    190,
+                    SyscallArgs::from([0x5151_0001, 1, 0o1000 | 0o2000 | 0o600, 0, 0, 0]),
+                ),
+                &mut memory,
+                &CompatReporter::default(),
+                None,
+            )
+            .expect("semget must be claimed")
+            .expect("semget dispatch must not fault");
+
+        assert!(
+            matches!(outcome, DispatchOutcome::Errno { errno } if errno == LINUX_ENOSPC),
+            "a new semaphore set past SEMMNI must be ENOSPC, got {outcome:?}"
+        );
+        assert_eq!(
+            dispatcher.sysv.state.lock().semaphores.len(),
+            LINUX_SEMMNI,
+            "the failing semget must not insert a 32001st set"
+        );
     }
 
     fn sembuf_bytes(sops: &[LinuxSembuf]) -> Vec<u8> {
