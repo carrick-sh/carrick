@@ -2754,22 +2754,23 @@ mod hvpatch_guest_probe_abi {
     #[test]
     fn epoll_lookup_provider_and_stub_keep_file_authority_abi_stable() {
         let source = include_str!("probes.rs");
-        for declaration in [
-            "fn epoll__lookup(_: u64, _: i32, _: u64, _: u64, _: u32) {}",
-            "stub!(epoll_lookup(file_table_id: u64, epfd: i32, slot_generation: u64, file_description_id: u64, lookup_kind: u32));",
-        ] {
-            assert!(
-                source.matches(declaration).count() >= 2,
-                "missing epoll lookup ABI declaration {declaration}"
-            );
-        }
+        let declaration = "fn epoll__lookup(_: u64, _: i32, _: u64, _: u64, _: u32) {}";
+        assert!(
+            source.matches(declaration).count() >= 2,
+            "missing epoll lookup ABI declaration {declaration}"
+        );
+        let producer = "pub fn epoll_lookup(emit: impl FnOnce() -> (u64, i32, u64, u64, u32))";
+        assert!(
+            source.matches(producer).count() >= 3,
+            "the real and stub epoll lookup paths must share a lazy five-scalar producer ABI"
+        );
         let wrapper = source
             .split_once("pub fn epoll_lookup(")
             .expect("real epoll lookup wrapper")
             .1;
         assert!(
-            wrapper.contains("carrick_usdt::epoll__lookup!"),
-            "epoll lookup wrapper must fire the provider"
+            wrapper.contains("carrick_usdt::epoll__lookup!(|| emit())"),
+            "epoll lookup must evaluate its producer only within the enabled USDT closure"
         );
     }
 
@@ -6649,20 +6650,10 @@ mod real {
         carrick_usdt::epoll__result!(|| (epfd, ready_count, wait_count, timeout_ms, kind));
     }
 
-    pub fn epoll_lookup(
-        file_table_id: u64,
-        epfd: i32,
-        slot_generation: u64,
-        file_description_id: u64,
-        lookup_kind: u32,
-    ) {
-        carrick_usdt::epoll__lookup!(|| (
-            file_table_id,
-            epfd,
-            slot_generation,
-            file_description_id,
-            lookup_kind
-        ));
+    #[allow(clippy::redundant_closure)] // `usdt` requires a syntactic closure.
+    pub fn epoll_lookup(emit: impl FnOnce() -> (u64, i32, u64, u64, u32)) {
+        // `usdt` requires this syntactic closure and invokes it only when enabled.
+        carrick_usdt::epoll__lookup!(|| emit());
     }
 
     pub fn epoll_stale_edge(udata: u64, guest_fd: i32, generation: u32) {
@@ -7649,7 +7640,9 @@ mod stub {
     stub!(epoll_rebind(reason: u32, host_fd: i32, survivor_fd: i32, survivor_gen: u32, union_events: u32, effective: u32));
     stub!(epoll_wait_fd(epfd: i32, fd: i32, host_fd: i32, poll_events: i32, timeout_ms: i32));
     stub!(epoll_result(epfd: i32, ready_count: i32, wait_count: i32, timeout_ms: i32, kind: i32));
-    stub!(epoll_lookup(file_table_id: u64, epfd: i32, slot_generation: u64, file_description_id: u64, lookup_kind: u32));
+    pub fn epoll_lookup(emit: impl FnOnce() -> (u64, i32, u64, u64, u32)) {
+        let _ = emit;
+    }
     stub!(epoll_stale_edge(udata: u64, guest_fd: i32, generation: u32));
     stub!(io_wait_begin(tid: i32, fd_count: i32, timeout_ms: i64, fd0: i32, events0: i32, fd1: i32));
     stub!(io_wait_end(tid: i32, result: i32, fd_count: i32, fd0: i32, fd1: i32, fd2: i32));

@@ -180,6 +180,10 @@ pub struct DTraceRunReport {
     pub dynamic_dirty_drops: u64,
     pub other_drops: u64,
     pub interrupted: bool,
+    /// True once libdtrace has delivered the D script's terminal `exit(status)`.
+    pub dtrace_exit_observed: bool,
+    /// Terminal D-script status. An out-of-range status is fail-closed as 255.
+    pub exit_status: u8,
 }
 
 struct InterruptRegistrations(Vec<signal_hook::SigId>);
@@ -231,15 +235,21 @@ extern "C" fn chew(_data: *const c_void, _arg: *mut c_void) -> c_int {
     DTRACE_CONSUME_THIS
 }
 
-// OPEN QUESTION (chip b294eb82, 2026-08-07): the DTRACEACT_EXIT branch below discards the exit status entirely, which is why `carrick trace -s` can exit 0 on a self-truncated capture — see docs/perf-results/2026-08-06-build-lane-amplification-ledger.md §8.
-extern "C" fn chewrec(_data: *const c_void, rec: *const c_void, _arg: *mut c_void) -> c_int {
+extern "C" fn chewrec(_data: *const c_void, rec: *const c_void, arg: *mut c_void) -> c_int {
     // NULL rec marks the end of this probe's records — advance to the next.
     if rec.is_null() {
-        DTRACE_CONSUME_NEXT
-    } else if unsafe { &*rec.cast::<DtraceRecDesc>() }.action == DTRACEACT_EXIT {
+        return DTRACE_CONSUME_NEXT;
+    }
+    let rec = unsafe { &*rec.cast::<DtraceRecDesc>() };
+    if rec.action == DTRACEACT_EXIT {
         // `exit(status)` is a libdtrace control action, not trace output. Asking
         // libdtrace to format it prints the bare status (for example `0`) and
         // corrupts a machine protocol emitted by the following END clause.
+        if !arg.is_null() {
+            let report = unsafe { &mut *arg.cast::<DTraceRunReport>() };
+            report.dtrace_exit_observed = true;
+            report.exit_status = u8::try_from(rec.argument).unwrap_or(u8::MAX);
+        }
         DTRACE_CONSUME_NEXT
     } else {
         DTRACE_CONSUME_THIS
@@ -758,8 +768,15 @@ fn run_child_under_dtrace_impl<T>(
     let linger_past_child = opts.script.is_some();
     loop {
         unsafe { dtrace_sleep(hdl.as_ptr()) };
-        let status =
-            unsafe { dtrace_work(hdl.as_ptr(), out.fp(), chew, chewrec, std::ptr::null_mut()) };
+        let status = unsafe {
+            dtrace_work(
+                hdl.as_ptr(),
+                out.fp(),
+                chew,
+                chewrec,
+                (observation.report_mut() as *mut DTraceRunReport).cast(),
+            )
+        };
         // dtrace_work writes events into the C stdio buffer, which is
         // block-buffered when the sink is a pipe/file. Flush every cycle so the
         // live stream stays live even when the traced child never exits (e.g.
@@ -891,6 +908,8 @@ mod tests {
             dynamic_dirty_drops: 5,
             other_drops: 6,
             interrupted: true,
+            dtrace_exit_observed: true,
+            exit_status: 1,
         };
         let mut observation = DTraceObservation::default();
         *observation.report_mut() = report;
@@ -1020,6 +1039,8 @@ mod tests {
                 dynamic_dirty_drops: 5,
                 other_drops: 6,
                 interrupted: false,
+                dtrace_exit_observed: false,
+                exit_status: 0,
             }
         );
     }
@@ -1225,25 +1246,28 @@ mod tests {
     }
 
     #[test]
-    fn record_consumer_suppresses_exit_status_but_formats_protocol_records() {
+    fn record_consumer_receipts_exit_status_without_formatting_it() {
         let exit = DtraceRecDesc {
             action: DTRACEACT_EXIT,
             size: 0,
             offset: 0,
             alignment: 0,
             format: 0,
-            argument: 0,
+            argument: 1,
             user_argument: 0,
         };
         let printf = DtraceRecDesc { action: 3, ..exit };
+        let mut report = DTraceRunReport::default();
         assert_eq!(
             chewrec(
                 std::ptr::null(),
                 (&exit as *const DtraceRecDesc).cast(),
-                std::ptr::null_mut(),
+                (&mut report as *mut DTraceRunReport).cast(),
             ),
             DTRACE_CONSUME_NEXT
         );
+        assert!(report.dtrace_exit_observed);
+        assert_eq!(report.exit_status, 1);
         assert_eq!(
             chewrec(
                 std::ptr::null(),
