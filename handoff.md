@@ -59,7 +59,8 @@ push unless explicitly asked. Preserve unrelated worktree changes.
 
 ## Current checkpoint — Task 4.33 pipe-end authority closed
 
-The current accepted source is `2937db4aec3c01455ee7c9563456f6601dd12376`.
+The current accepted runtime source is
+`2937db4aec3c01455ee7c9563456f6601dd12376`.
 `ltp-pipe03` is exact MATCH 2/2 versus the cached native-arm64 Docker oracle,
 and the eight-suite pipe family is exact MATCH. The frozen true-differential
 ledger moves from 21/156 to 22/156 focused-closed; 134 remain before a fresh
@@ -90,6 +91,14 @@ bounded deterministic core-emulation reducer from the remaining 134. Keep the
 deferred `setsid01` timeout out of scope until a shared execution seam is
 measured; do not start final performance work or treat the 0.17x–0.38x
 sub-second cached-oracle pipe ratios as controlled performance evidence.
+
+Local `main` and `codex/conformance-core-roadmap` are fast-forwarded and 0/0
+aligned; no push occurred and the four unrelated Carrick-embed documents in
+the primary checkout remain untouched. Post-integration `RUST_TEST_THREADS=1
+just ci` passed frame pointers, formatting, workspace compile/Clippy, and
+domain lint, then exited 2 at the known broad host-authority inventory drift
+with `changed=[]`. Task 4.33 touches none of the listed catalog sites, so no
+inventory refresh is mixed into this reducer.
 
 ## Historical prerequisite objective — closed, retained for provenance
 
