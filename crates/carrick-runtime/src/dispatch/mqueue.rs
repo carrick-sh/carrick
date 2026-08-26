@@ -106,6 +106,10 @@ impl Drop for RetainedNetlinkDescription {
 
 #[derive(Debug)]
 pub enum MqueueNotify {
+    Silent {
+        registration: MqueueRegistration,
+        target: MqueueNotifyTarget,
+    },
     Signal {
         registration: MqueueRegistration,
         target: MqueueNotifyTarget,
@@ -131,13 +135,18 @@ pub(crate) struct MqueueRegistration {
 impl MqueueNotify {
     fn registration(&self) -> MqueueRegistration {
         match self {
-            Self::Signal { registration, .. } | Self::Thread { registration, .. } => *registration,
+            Self::Silent { registration, .. }
+            | Self::Signal { registration, .. }
+            | Self::Thread { registration, .. } => *registration,
         }
     }
 }
 
 #[derive(Debug)]
 enum MqueueNotifySpec {
+    Silent {
+        target: MqueueNotifyTarget,
+    },
     Signal {
         target: MqueueNotifyTarget,
         signo: i32,
@@ -152,6 +161,10 @@ enum MqueueNotifySpec {
 impl MqueueNotifySpec {
     fn bind(self, registration: MqueueRegistration) -> MqueueNotify {
         match self {
+            Self::Silent { target } => MqueueNotify::Silent {
+                registration,
+                target,
+            },
             Self::Signal {
                 target,
                 signo,
@@ -174,7 +187,7 @@ impl MqueueNotifySpec {
 impl MqueueNotify {
     fn kernel_owner(&self) -> Option<crate::kernel::TaskKey> {
         let target = match self {
-            Self::Signal { target, .. } => target,
+            Self::Silent { target, .. } | Self::Signal { target, .. } => target,
             Self::Thread { target, .. } => {
                 return match target {
                     MqueueNotifyTarget::Kernel(task, _) => Some(*task),
@@ -286,7 +299,8 @@ impl MqueueInner {
         }
         if let Some(successor) = successor {
             match notification {
-                MqueueNotify::Signal { registration, .. }
+                MqueueNotify::Silent { registration, .. }
+                | MqueueNotify::Signal { registration, .. }
                 | MqueueNotify::Thread { registration, .. } => {
                     registration.file_table = successor;
                 }
@@ -827,6 +841,10 @@ impl SyscallDispatcher {
                 };
                 let mut state = queue.state.lock();
                 let delivery = match state.notify.take() {
+                    Some(MqueueNotify::Silent {
+                        registration: owner,
+                        target,
+                    }) if owner == registration && target.same_owner(&caller) => None,
                     Some(MqueueNotify::Signal {
                         registration: owner,
                         target,
@@ -866,7 +884,9 @@ impl SyscallDispatcher {
             let sigev_notify = sev.sigev_notify;
             let sigev_value = sev.sigev_value;
             let notify_record = match sigev_notify {
-                crate::linux_abi::LINUX_SIGEV_NONE => None,
+                crate::linux_abi::LINUX_SIGEV_NONE => {
+                    Some(MqueueNotifySpec::Silent { target: caller })
+                }
                 crate::linux_abi::LINUX_SIGEV_SIGNAL => {
                     let s = sev.sigev_signo;
                     if !(1..=64).contains(&s) {
@@ -991,6 +1011,7 @@ fn deliver_notify(
     delivery: MqueueNotify,
 ) {
     match delivery {
+        MqueueNotify::Silent { .. } => {}
         MqueueNotify::Signal {
             target,
             signo,
@@ -1499,6 +1520,104 @@ mod tests {
                 ..
             }) if *pid == std::process::id() as libc::pid_t
         ));
+    }
+
+    /// `SIGEV_NONE` suppresses delivery; it does not suppress registration.
+    /// Linux therefore reserves the queue's single notification slot until the
+    /// next empty-to-nonempty transition, and a second registration is EBUSY.
+    #[test]
+    fn sigev_none_registration_blocks_a_second_registration() {
+        use zerocopy::IntoBytes as _;
+
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x5000]);
+        let mqd = open_test_queue(
+            &dispatcher,
+            &context,
+            &mut memory,
+            0x1000,
+            b"silent_notify\0",
+        );
+        let queue = dispatcher.mq_description(mqd).unwrap().queue;
+        let sigevent_address = 0x1100;
+        let sigevent = crate::linux_abi::LinuxSigevent {
+            sigev_value: 0,
+            sigev_signo: 0,
+            sigev_notify: crate::linux_abi::LINUX_SIGEV_NONE,
+            _sigev_un: [0; 48],
+        };
+        memory
+            .write_bytes(sigevent_address, sigevent.as_bytes())
+            .unwrap();
+
+        assert_eq!(
+            dispatch_call(
+                &dispatcher,
+                &context,
+                &mut memory,
+                184,
+                [mqd as u64, sigevent_address, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        assert_eq!(
+            dispatch_call(
+                &dispatcher,
+                &context,
+                &mut memory,
+                184,
+                [mqd as u64, sigevent_address, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::errno(crate::linux_abi::LINUX_EBUSY),
+        );
+
+        send_test_message(&dispatcher, &context, &mut memory, mqd, 0x1200);
+        assert!(
+            queue.state.lock().notify.is_none(),
+            "the empty-to-nonempty transition consumes the silent registration"
+        );
+
+        assert_eq!(
+            dispatch_call(
+                &dispatcher,
+                &context,
+                &mut memory,
+                184,
+                [mqd as u64, sigevent_address, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        assert_eq!(
+            dispatch_call(
+                &dispatcher,
+                &context,
+                &mut memory,
+                184,
+                [mqd as u64, 0, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        assert!(
+            queue.state.lock().notify.is_none(),
+            "explicit unregister removes the silent registration"
+        );
+
+        assert_eq!(
+            dispatch_call(
+                &dispatcher,
+                &context,
+                &mut memory,
+                184,
+                [mqd as u64, sigevent_address, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        close_test_fd(&dispatcher, &context, &mut memory, mqd);
+        assert!(
+            queue.state.lock().notify.is_none(),
+            "final close retires the silent registration"
+        );
     }
 
     #[test]
