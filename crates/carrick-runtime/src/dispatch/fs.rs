@@ -6979,27 +6979,28 @@ impl SyscallDispatcher {
     }
 
     /// Enforce RLIMIT_FSIZE for a regular-file write starting at `offset` that
-    /// would carry `len` bytes. Returns `Some(EFBIG)` (after queuing SIGXFSZ)
-    /// when the write STARTS at or beyond the soft cap — the case Linux errors
-    /// outright (a straddling write is truncated to the cap, not an error, and
-    /// is left to the backend). `None` means the write may proceed.
-    fn fsize_write_guard<M: GuestMemory>(
+    /// would carry `len` bytes. Returns the permitted prefix length, or EFBIG
+    /// (after queuing SIGXFSZ) when the write starts at or beyond the soft cap.
+    /// A straddling write is truncated to the cap, as Linux requires.
+    fn fsize_write_len<M: GuestMemory>(
         &self,
         cx: &SyscallCtx<M>,
         offset: u64,
         len: usize,
-    ) -> Option<LinuxErrno> {
+    ) -> Result<usize, LinuxErrno> {
         if len == 0 {
-            return None;
+            return Ok(0);
         }
-        let limit = self.fsize_soft_limit()?;
+        let Some(limit) = self.fsize_soft_limit() else {
+            return Ok(len);
+        };
         if offset >= limit {
             if !self.signal_is_ignored(cx.kernel, LINUX_SIGXFSZ) {
                 self.mark_signal_pending(cx.kernel, Self::ctx_tid(cx), LINUX_SIGXFSZ);
             }
-            return Some(LINUX_EFBIG);
+            return Err(LINUX_EFBIG);
         }
-        None
+        Ok(len.min((limit - offset) as usize))
     }
 
     /// Linux DAC: may the calling guest create/remove an entry in directory
@@ -12370,7 +12371,7 @@ impl SyscallDispatcher {
                 usize::try_from(count).map_err(|_| DispatchError::LengthTooLarge(count))?;
             // A zero-length write never accesses the buffer (write(fd, NULL, 0)
             // returns 0, not EFAULT) — only read guest memory when count > 0.
-            let bytes = if length == 0 {
+            let mut bytes = if length == 0 {
                 Vec::new()
             } else {
                 match (*cx.memory).read_bytes(address, length) {
@@ -12577,17 +12578,16 @@ impl SyscallDispatcher {
                             if base.is_append() {
                                 unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_END) };
                             }
-                            // RLIMIT_FSIZE: a write starting past the guest's
-                            // soft file-size cap is EFBIG + SIGXFSZ (llseek01).
                             // The offset lives in the host kernel; read it back
-                            // (post-append reposition) only when a cap is set.
+                            // (post-append reposition) before applying the
+                            // guest's RLIMIT_FSIZE cap.
                             if this.fsize_soft_limit().is_some() {
                                 let pos = unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_CUR) };
-                                if pos >= 0
-                                    && let Some(errno) =
-                                        this.fsize_write_guard(cx, pos as u64, bytes.len())
-                                {
-                                    return Ok(DispatchOutcome::errno(errno));
+                                if pos >= 0 {
+                                    match this.fsize_write_len(cx, pos as u64, bytes.len()) {
+                                        Ok(len) => bytes.truncate(len),
+                                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                                    }
                                 }
                             }
                             // libc::write to the real fd: advances the
@@ -12631,12 +12631,9 @@ impl SyscallDispatcher {
                             ) {
                                 return Ok(DispatchOutcome::errno(errno));
                             }
-                            // RLIMIT_FSIZE: a write starting past the guest's
-                            // soft file-size cap is EFBIG + SIGXFSZ (llseek01).
-                            if let Some(errno) =
-                                this.fsize_write_guard(cx, *offset as u64, bytes.len())
-                            {
-                                return Ok(DispatchOutcome::errno(errno));
+                            match this.fsize_write_len(cx, *offset as u64, bytes.len()) {
+                                Ok(len) => bytes.truncate(len),
+                                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                             }
                             let write_offset = *offset;
                             if let Err(errno) = write_into_file_contents(contents, offset, &bytes) {
