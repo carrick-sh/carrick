@@ -35,6 +35,7 @@
 dtrace:::BEGIN
 {
     secs = 0;
+    target_exited = 0;
     entries = 0;
     returns = 0;
     write_ebadf = 0;
@@ -104,27 +105,9 @@ carrick*:::host-pipe-io
 }
 
 proc:::exit
-/pid == $target && write_ebadf > 0 && read_ebadf > 0/
+/pid == $target/
 {
-    printf("PEA1|pass|entries=%d|returns=%d|write_ebadf=%d|read_ebadf=%d|host-pipe-ios=%d\n",
-        entries, returns, write_ebadf, read_ebadf, host_pipe_ios);
-    exit(0);
-}
-
-proc:::exit
-/pid == $target && write_ebadf == 0/
-{
-    printf("PEA1|error=missing-write-EBADF|entries=%d|returns=%d|write_ebadf=%d|read_ebadf=%d\n",
-        entries, returns, write_ebadf, read_ebadf);
-    exit(1);
-}
-
-proc:::exit
-/pid == $target && write_ebadf > 0 && read_ebadf == 0/
-{
-    printf("PEA1|error=missing-read-EBADF|entries=%d|returns=%d|write_ebadf=%d|read_ebadf=%d\n",
-        entries, returns, write_ebadf, read_ebadf);
-    exit(1);
+    target_exited = 1;
 }
 
 tick-1s
@@ -133,25 +116,26 @@ tick-1s
 }
 
 tick-1s
-/secs >= 20 && write_ebadf > 0 && read_ebadf > 0/
+/(target_exited || secs >= 20) && write_ebadf > 0 && read_ebadf > 0/
 {
-    printf("PEA1|pass|timeout-bound=1|entries=%d|returns=%d|write_ebadf=%d|read_ebadf=%d|host-pipe-ios=%d\n",
-        entries, returns, write_ebadf, read_ebadf, host_pipe_ios);
+    printf("PEA1|pass|target-exited=%d|timeout-bound=%d|entries=%d|returns=%d|write_ebadf=%d|read_ebadf=%d|host-pipe-ios=%d\n",
+        target_exited, secs >= 20, entries, returns, write_ebadf, read_ebadf,
+        host_pipe_ios);
     exit(0);
 }
 
 tick-1s
-/secs >= 20 && write_ebadf == 0/
+/(target_exited || secs >= 20) && write_ebadf == 0/
 {
-    printf("PEA1|error=timeout-missing-write-EBADF|entries=%d|returns=%d|write_ebadf=%d|read_ebadf=%d\n",
-        entries, returns, write_ebadf, read_ebadf);
+    printf("PEA1|error=missing-write-EBADF|target-exited=%d|timeout-bound=%d|entries=%d|returns=%d|write_ebadf=%d|read_ebadf=%d\n",
+        target_exited, secs >= 20, entries, returns, write_ebadf, read_ebadf);
     exit(1);
 }
 
 tick-1s
-/secs >= 20 && write_ebadf > 0 && read_ebadf == 0/
+/(target_exited || secs >= 20) && write_ebadf > 0 && read_ebadf == 0/
 {
-    printf("PEA1|error=timeout-missing-read-EBADF|entries=%d|returns=%d|write_ebadf=%d|read_ebadf=%d\n",
-        entries, returns, write_ebadf, read_ebadf);
+    printf("PEA1|error=missing-read-EBADF|target-exited=%d|timeout-bound=%d|entries=%d|returns=%d|write_ebadf=%d|read_ebadf=%d\n",
+        target_exited, secs >= 20, entries, returns, write_ebadf, read_ebadf);
     exit(1);
 }
