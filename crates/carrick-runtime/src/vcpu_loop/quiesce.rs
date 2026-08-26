@@ -1003,11 +1003,12 @@ where
             child_pid,
         );
 
-        let child_dispatcher = kernel.dispatcher.fork_clone_in_process(
+        let child_dispatcher = kernel.dispatcher.fork_clone_in_process_with_mm_mode(
             self.this_tid,
             child_tid,
             parent_process.pid() as u32,
             child_pid as u32,
+            clone_plan.mm(),
         );
         if external_exec.is_some() {
             child_dispatcher.set_stream_stdio(false);

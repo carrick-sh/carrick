@@ -1119,7 +1119,8 @@ where
         // dispatcher memory-authority generation. The historical MM
         // retains the pre-staging snapshot, but records this deliberate
         // source revision so commit can reject any later mutation.
-        apply_exec_image_proc_state(&kernel.dispatcher, &img);
+        let mut prepared_dispatch_mm_exec =
+            Some(apply_exec_image_proc_state(&kernel.dispatcher, &img));
         if let Err(error) = prepared_kernel_exec.acknowledge_staged_vma_revision() {
             return Self::exec_failed_past_no_return(
                 kernel,
@@ -1295,18 +1296,28 @@ where
                         .map(Some);
                     }
                 };
+                let replacement_vma_source = prepared_dispatch_mm_exec.as_ref().map_or_else(
+                    || kernel.dispatcher.vma_snapshot_source(),
+                    crate::dispatch::PreparedDispatchMmExec::vma_snapshot_source,
+                );
                 process
                     .commit_exec(
                         prepared,
                         stage1_root,
-                        kernel.dispatcher.vma_snapshot_source(),
+                        replacement_vma_source,
+                        prepared_dispatch_mm_exec.take(),
                     )
                     .map(|committed| (committed.context().retain_exact(), Some(committed)))
             }
-            (None, RuntimePreparedExec::Other(prepared)) => kernel
-                .dispatcher
-                .commit_one_task_kernel_exec(prepared)
-                .map(|context| (context, None)),
+            (None, RuntimePreparedExec::Other(prepared)) => {
+                let committed = kernel.dispatcher.commit_one_task_kernel_exec(prepared);
+                if committed.is_ok()
+                    && let Some(prepared) = prepared_dispatch_mm_exec.take()
+                {
+                    prepared.commit();
+                }
+                committed.map(|context| (context, None))
+            }
             _ => {
                 tracing::error!("exec preparation/backend authority mismatch");
                 std::process::abort();

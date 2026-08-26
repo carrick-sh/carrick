@@ -1025,11 +1025,13 @@ where
                         dispatcher.set_executable_identity(path.clone(), proc_argv, proc_env);
                         dispatcher.reset_signal_handlers_on_execve(&kernel_context);
                         // Reset and refresh memory proc state as one VMA generation.
-                        apply_exec_image_proc_state(&dispatcher, &new_image);
+                        let prepared_dispatch_mm_exec =
+                            apply_exec_image_proc_state(&dispatcher, &new_image);
                         runtime.execve_into(&new_image)?;
                         let exec_context = dispatcher
                             .commit_one_task_kernel_exec(prepared_kernel_exec)
                             .map_err(RuntimeError::Configuration)?;
+                        prepared_dispatch_mm_exec.commit();
                         crate::namespace::pid::mark_self_execed();
                         // execve_into rebuilt a fresh (zeroed) identity page;
                         // exec retains the caller's captured credential values.

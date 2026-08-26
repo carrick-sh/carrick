@@ -1337,6 +1337,7 @@ struct HostAliasTransactionId(u64);
 /// transaction aborts the matching pending/installing phase, if any, and wakes
 /// blocked sibling mapping syscalls.
 pub struct HostAliasTransaction {
+    authority: Arc<DispatchMmAuthority>,
     transactions: Arc<HostAliasTransactions>,
     id: HostAliasTransactionId,
     armed: bool,
@@ -1384,6 +1385,7 @@ impl HostAliasTransaction {
         };
         self.armed = false;
         Some(HostAliasInstallGuard {
+            authority: Arc::clone(&self.authority),
             transactions: Arc::clone(&self.transactions),
             id: self.id,
             armed: true,
@@ -1400,6 +1402,7 @@ impl Drop for HostAliasTransaction {
 }
 
 pub(crate) struct HostAliasInstallGuard {
+    authority: Arc<DispatchMmAuthority>,
     transactions: Arc<HostAliasTransactions>,
     id: HostAliasTransactionId,
     armed: bool,
@@ -2084,6 +2087,16 @@ pub(crate) struct HostAliasCommit {
 }
 
 impl HostAliasCommit {
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self {
+            mmap: None,
+            io_uring_mapping: None,
+            io_uring_mm: None,
+            shmat: None,
+        }
+    }
+
     pub(crate) fn mmap(mmap: mem::HostAliasMmapCommit) -> Self {
         Self {
             mmap: Some(mmap),
@@ -2168,6 +2181,7 @@ impl HostAliasTransactions {
         }
         *phase = HostAliasPhase::Dispatching;
         HostAliasDispatchGuard {
+            authority: None,
             transactions: Arc::clone(self),
             active: true,
             vma_revision: None,
@@ -2195,6 +2209,7 @@ impl HostAliasTransactions {
         }
         *phase = HostAliasPhase::Dispatching;
         Some(HostAliasDispatchGuard {
+            authority: None,
             transactions: Arc::clone(self),
             active: true,
             vma_revision: None,
@@ -2219,26 +2234,214 @@ impl HostAliasTransactions {
             self.idle.notify_all();
         }
     }
-}
 
-struct DispatcherVmaSnapshotSource {
-    mem: Arc<mem::MemAuthority>,
-    transactions: Arc<HostAliasTransactions>,
-}
-
-impl std::fmt::Debug for DispatcherVmaSnapshotSource {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("DispatcherVmaSnapshotSource")
+    fn with_non_dispatching_phase<R>(&self, publish: impl FnOnce() -> R) -> R {
+        let mut phase = self.phase.lock();
+        while matches!(*phase, HostAliasPhase::Dispatching) {
+            self.idle.wait(&mut phase);
+        }
+        // Retain the phase lock across publication. An Idle predecessor cannot
+        // admit a new dispatcher between the check and CAS, while Pending and
+        // Installing deliberately do not block exec promotion.
+        publish()
     }
 }
 
-impl crate::kernel::VmaSnapshotSource for DispatcherVmaSnapshotSource {
+/// Dispatcher-side authority for one Linux MM.
+///
+/// Every dispatcher still owns process-private signal, fd, proc, and control
+/// state. Only Linux memory metadata and the host-alias transaction boundary
+/// travel together here: `CLONE_VM` selects the same authority while a copied
+/// MM receives an exact fork-private authority.
+pub(crate) struct DispatchMmAuthority {
+    mem: Arc<mem::MemAuthority>,
+    host_alias_transactions: Arc<HostAliasTransactions>,
+}
+
+impl DispatchMmAuthority {
+    fn new() -> Self {
+        Self {
+            mem: Arc::new(mem::MemAuthority::new(mem::MemState::new())),
+            host_alias_transactions: Arc::new(HostAliasTransactions::new()),
+        }
+    }
+
+    fn fork_private(&self) -> Self {
+        Self {
+            mem: self.mem.fork_private(),
+            host_alias_transactions: Arc::new(HostAliasTransactions::new()),
+        }
+    }
+
+    fn lock(&self) -> parking_lot::MutexGuard<'_, mem::MemState> {
+        self.mem.lock()
+    }
+
+    fn revision_publisher(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.mem.revision_publisher()
+    }
+
+    #[cfg(test)]
+    fn vma_revision(&self) -> crate::kernel::VmaRevision {
+        self.mem.vma_revision()
+    }
+
+    #[cfg(test)]
+    fn snapshot_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<crate::kernel::OwnedVmaSnapshot, crate::kernel::SnapshotError> {
+        self.mem.snapshot_until(deadline)
+    }
+}
+
+struct DispatchMmBinding {
+    current: arc_swap::ArcSwap<DispatchMmAuthority>,
+    staged_exec: Mutex<Option<Arc<DispatchMmAuthority>>>,
+}
+
+impl DispatchMmBinding {
+    fn new(current: Arc<DispatchMmAuthority>) -> Arc<Self> {
+        Arc::new(Self {
+            current: arc_swap::ArcSwap::new(current),
+            staged_exec: Mutex::new(None),
+        })
+    }
+
+    fn stage_private_exec(self: &Arc<Self>) -> PreparedDispatchMmExec {
+        // Hold the dispatcher selection stable while joining that authority's
+        // alias exclusion, then copy the exact quiescent generation. Exec
+        // promotion takes the same binding lock exclusively.
+        let dispatch = self.begin_dispatch(false);
+        let current = Arc::clone(dispatch.authority.as_ref().unwrap_or_else(|| {
+            tracing::error!("exec staging guard lacks MM authority");
+            std::process::abort();
+        }));
+        let _dispatch = dispatch;
+        let staged = Arc::new(current.fork_private());
+        let mut slot = self.staged_exec.lock();
+        if slot.is_some() {
+            tracing::error!("dispatcher already has a staged exec MM authority");
+            std::process::abort();
+        }
+        *slot = Some(Arc::clone(&staged));
+        PreparedDispatchMmExec {
+            binding: Arc::clone(self),
+            predecessor: current,
+            staged,
+            committed: false,
+        }
+    }
+
+    fn begin_dispatch(&self, marks_vma: bool) -> HostAliasDispatchGuard {
+        loop {
+            let authority = self.current.load_full();
+            let guard = authority
+                .host_alias_transactions
+                .begin_dispatch()
+                .with_authority(Arc::clone(&authority));
+            if Arc::ptr_eq(&self.current.load_full(), &authority) {
+                return if marks_vma {
+                    guard.with_vma_revision(authority.mem.revision_publisher())
+                } else {
+                    guard
+                };
+            }
+            // Promotion won after selection but before exclusion. Releasing
+            // the stale guard and retrying prevents an old transaction from
+            // ever pairing with the new authority's memory.
+            drop(guard);
+        }
+    }
+
+    #[cfg(all(
+        any(target_os = "freebsd", target_os = "netbsd"),
+        target_arch = "x86_64"
+    ))]
+    fn begin_dispatch_until(&self, deadline: std::time::Instant) -> Option<HostAliasDispatchGuard> {
+        loop {
+            let authority = self.current.load_full();
+            let guard = authority
+                .host_alias_transactions
+                .begin_dispatch_until(deadline)?
+                .with_authority(Arc::clone(&authority));
+            if Arc::ptr_eq(&self.current.load_full(), &authority) {
+                return Some(guard);
+            }
+            drop(guard);
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+        }
+    }
+}
+
+pub(crate) struct PreparedDispatchMmExec {
+    binding: Arc<DispatchMmBinding>,
+    predecessor: Arc<DispatchMmAuthority>,
+    staged: Arc<DispatchMmAuthority>,
+    committed: bool,
+}
+
+impl PreparedDispatchMmExec {
+    pub(crate) fn vma_snapshot_source(&self) -> crate::kernel::SharedVmaSnapshotSource {
+        self.staged.clone()
+    }
+
+    pub(crate) fn commit(mut self) {
+        let mut staged = self.binding.staged_exec.lock();
+        if !staged
+            .as_ref()
+            .is_some_and(|candidate| Arc::ptr_eq(candidate, &self.staged))
+        {
+            tracing::error!("staged dispatcher exec MM authority changed before commit");
+            std::process::abort();
+        }
+        let predecessor = self
+            .predecessor
+            .host_alias_transactions
+            .with_non_dispatching_phase(|| {
+                self.binding
+                    .current
+                    .compare_and_swap(&self.predecessor, Arc::clone(&self.staged))
+            });
+        if !Arc::ptr_eq(&predecessor, &self.predecessor) {
+            tracing::error!("dispatcher exec MM predecessor changed before commit");
+            std::process::abort();
+        }
+        *staged = None;
+        self.committed = true;
+    }
+}
+
+impl Drop for PreparedDispatchMmExec {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut staged = self.binding.staged_exec.lock();
+        if staged
+            .as_ref()
+            .is_some_and(|candidate| Arc::ptr_eq(candidate, &self.staged))
+        {
+            *staged = None;
+        }
+    }
+}
+
+impl std::fmt::Debug for DispatchMmAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DispatchMmAuthority")
+    }
+}
+
+impl crate::kernel::VmaSnapshotSource for DispatchMmAuthority {
     fn snapshot(
         &self,
         deadline: std::time::Instant,
     ) -> Result<crate::kernel::OwnedVmaSnapshot, crate::kernel::SnapshotError> {
         let _dispatch = self
-            .transactions
+            .host_alias_transactions
             .begin_dispatch_until(deadline)
             .ok_or_else(|| {
                 if std::time::Instant::now() >= deadline {
@@ -2261,7 +2464,7 @@ impl crate::kernel::VmaSnapshotSource for DispatcherVmaSnapshotSource {
         publish: &mut dyn FnMut() -> Result<(), crate::kernel::SnapshotError>,
     ) -> Result<(), crate::kernel::SnapshotError> {
         let _dispatch = self
-            .transactions
+            .host_alias_transactions
             .begin_dispatch_until(deadline)
             .ok_or_else(|| {
                 if std::time::Instant::now() >= deadline {
@@ -2278,12 +2481,21 @@ impl crate::kernel::VmaSnapshotSource for DispatcherVmaSnapshotSource {
 }
 
 pub(crate) struct HostAliasDispatchGuard {
+    authority: Option<Arc<DispatchMmAuthority>>,
     transactions: Arc<HostAliasTransactions>,
     active: bool,
     vma_revision: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl HostAliasDispatchGuard {
+    fn with_authority(mut self, authority: Arc<DispatchMmAuthority>) -> Self {
+        if !Arc::ptr_eq(&authority.host_alias_transactions, &self.transactions) {
+            std::process::abort();
+        }
+        self.authority = Some(authority);
+        self
+    }
+
     fn with_vma_revision(mut self, revision: Arc<std::sync::atomic::AtomicU64>) -> Self {
         self.vma_revision = Some(revision);
         self
@@ -2322,8 +2534,14 @@ impl HostAliasDispatchGuard {
             id,
             commit: Some(commit),
         };
+        self.transactions.idle.notify_all();
         self.active = false;
+        let authority = self.authority.take().unwrap_or_else(|| {
+            tracing::error!("host-alias publication lacks MM authority");
+            std::process::abort();
+        });
         HostAliasTransaction {
+            authority,
             transactions: Arc::clone(&self.transactions),
             id,
             armed: true,
@@ -2368,10 +2586,10 @@ pub struct SyscallDispatcher {
     /// Process-local output buffering/streaming only. Linux descriptor state is
     /// owned exclusively by each captured Kernel [`crate::kernel::FileTable`].
     io: fs::RuntimeIo,
-    /// Owned memory subsystem state (brk, mmap arena, shared-file IPA
-    /// window + live maps, and the captured address-space regions for
-    /// `/proc/self/maps`). See [`mem::MemState`].
-    mem: Arc<mem::MemAuthority>,
+    /// Per-dispatcher selection of an MM-scoped authority. `CLONE_VM`
+    /// dispatchers begin on the same authority but retain separate bindings so
+    /// a successful exec can promote only the caller's staged replacement.
+    mm_binding: Arc<DispatchMmBinding>,
     /// Serializes mapping syscalls across the dispatcher/runtime split. A
     /// `MapHostAlias` remains `Pending` until its runtime consumer claims it,
     /// then `Installing` until exact metadata commit or abort, so no sibling
@@ -2387,7 +2605,6 @@ pub struct SyscallDispatcher {
     /// never deferred past its release. `HostAliasDispatchGuard::publish`
     /// fail-closes the one shape that breaks this (publishing from under a
     /// SHARED dispatch guard).
-    host_alias_transactions: Arc<HostAliasTransactions>,
     /// Owned process subsystem state (executable path, personality,
     /// dumpable flag, task comm name). See [`proc::ProcState`].
     proc: Mutex<proc::ProcState>,
@@ -3537,6 +3754,19 @@ impl Drop for HvpatchLaneScope {
 }
 
 impl SyscallDispatcher {
+    fn mm_authority(&self) -> arc_swap::Guard<Arc<DispatchMmAuthority>> {
+        self.mm_binding.current.load()
+    }
+
+    pub(crate) fn mem(&self) -> arc_swap::Guard<Arc<DispatchMmAuthority>> {
+        self.mm_authority()
+    }
+
+    #[cfg(test)]
+    fn host_alias_transactions(&self) -> Arc<HostAliasTransactions> {
+        Arc::clone(&self.mm_authority().host_alias_transactions)
+    }
+
     pub(in crate::dispatch) fn complete_wait_fd_authority(
         &self,
         outcome: DispatchOutcome,
@@ -3643,10 +3873,7 @@ impl SyscallDispatcher {
     }
 
     pub(crate) fn vma_snapshot_source(&self) -> crate::kernel::SharedVmaSnapshotSource {
-        Arc::new(DispatcherVmaSnapshotSource {
-            mem: Arc::clone(&self.mem),
-            transactions: Arc::clone(&self.host_alias_transactions),
-        })
+        self.mm_binding.current.load_full()
     }
 
     pub fn capture_kernel_context(
@@ -3964,6 +4191,7 @@ impl SyscallDispatcher {
     /// Shared kernel objects (open descriptions, filesystem namespace, network)
     /// stay shared; fd numbers, signals, credentials, memory metadata, and
     /// process controls become independent child state.
+    #[cfg(test)]
     pub(crate) fn fork_clone_in_process(
         &self,
         _parent_tid: crate::thread::ThreadId,
@@ -3971,7 +4199,35 @@ impl SyscallDispatcher {
         parent_guest_pid: u32,
         child_guest_pid: u32,
     ) -> Self {
-        let _vma_snapshot = self.begin_host_alias_dispatch();
+        self.fork_clone_in_process_with_mm_mode(
+            _parent_tid,
+            _child_tid,
+            parent_guest_pid,
+            child_guest_pid,
+            crate::kernel::CloneObjectMode::Copy,
+        )
+    }
+
+    pub(crate) fn fork_clone_in_process_with_mm_mode(
+        &self,
+        _parent_tid: crate::thread::ThreadId,
+        _child_tid: crate::thread::ThreadId,
+        parent_guest_pid: u32,
+        child_guest_pid: u32,
+        mm_mode: crate::kernel::CloneObjectMode,
+    ) -> Self {
+        // Select the binding and quiesce that exact authority as one operation
+        // relative to exec promotion.
+        let vma_snapshot = self.mm_binding.begin_dispatch(false);
+        let parent_mm = Arc::clone(vma_snapshot.authority.as_ref().unwrap_or_else(|| {
+            tracing::error!("fork guard lacks MM authority");
+            std::process::abort();
+        }));
+        let _vma_snapshot = vma_snapshot;
+        let child_mm = match mm_mode {
+            crate::kernel::CloneObjectMode::Share => parent_mm,
+            crate::kernel::CloneObjectMode::Copy => Arc::new(parent_mm.fork_private()),
+        };
         Self {
             kernel_binding: RwLock::new(self.kernel_binding.read().clone()),
             // Linux interval timers are not inherited across fork. The child
@@ -3980,8 +4236,7 @@ impl SyscallDispatcher {
             timer_delivery: RwLock::new(None),
             file_authority: RwLock::new(self.file_authority.read().clone()),
             io: self.io.fork_clone(),
-            mem: self.mem.fork_private(),
-            host_alias_transactions: Arc::new(HostAliasTransactions::new()),
+            mm_binding: DispatchMmBinding::new(child_mm),
             proc: Mutex::new(
                 self.proc
                     .lock()
@@ -4144,13 +4399,13 @@ impl SyscallDispatcher {
     }
 
     fn new_with_host_resolver(snapshot: Option<&crate::vfs::HostResolverSnapshot>) -> Self {
+        let mm_authority = Arc::new(DispatchMmAuthority::new());
         Self {
             kernel_binding: RwLock::new(bootstrap_one_task_binding()),
             timer_delivery: RwLock::new(None),
             file_authority: RwLock::new(None),
             io: fs::RuntimeIo::new(),
-            mem: Arc::new(mem::MemAuthority::new(mem::MemState::new())),
-            host_alias_transactions: Arc::new(HostAliasTransactions::new()),
+            mm_binding: DispatchMmBinding::new(mm_authority),
             proc: Mutex::new(proc::ProcState::new()),
             fs: fs::FsState::new_with_host_resolver(snapshot),
             seccomp: crate::seccomp::SeccompState::default(),
@@ -4176,24 +4431,23 @@ impl SyscallDispatcher {
     }
 
     pub(crate) fn begin_host_alias_dispatch(&self) -> HostAliasDispatchGuard {
-        self.host_alias_transactions.begin_dispatch()
+        self.mm_binding.begin_dispatch(false)
     }
 
     pub(crate) fn begin_vma_dispatch(&self) -> HostAliasDispatchGuard {
-        self.host_alias_transactions
-            .begin_dispatch()
-            .with_vma_revision(self.mem.revision_publisher())
+        self.mm_binding.begin_dispatch(true)
     }
 
     pub(crate) fn begin_conditional_vma_dispatch(&self) -> HostAliasDispatchGuard {
-        self.host_alias_transactions.begin_dispatch()
+        self.mm_binding.begin_dispatch(false)
     }
 
     pub(crate) fn mark_vma_dispatch(&self, guard: &mut HostAliasDispatchGuard) {
-        if !self.owns_host_alias_dispatch(guard) {
+        let authority = guard.authority.as_ref().unwrap_or_else(|| {
+            tracing::error!("VMA dispatch guard lacks MM authority");
             std::process::abort();
-        }
-        guard.mark_vma_revision(self.mem.revision_publisher());
+        });
+        guard.mark_vma_revision(authority.mem.revision_publisher());
     }
 
     #[cfg(all(
@@ -4204,11 +4458,13 @@ impl SyscallDispatcher {
         &self,
         deadline: std::time::Instant,
     ) -> Option<HostAliasDispatchGuard> {
-        self.host_alias_transactions.begin_dispatch_until(deadline)
+        self.mm_binding.begin_dispatch_until(deadline)
     }
 
     pub(super) fn owns_host_alias_dispatch(&self, guard: &HostAliasDispatchGuard) -> bool {
-        Arc::ptr_eq(&self.host_alias_transactions, &guard.transactions)
+        guard.authority.as_ref().is_some_and(|authority| {
+            Arc::ptr_eq(&authority.host_alias_transactions, &guard.transactions)
+        })
     }
 
     /// Publish exact range-owned metadata after the host alias and every
@@ -4217,10 +4473,12 @@ impl SyscallDispatcher {
         &self,
         mut install: HostAliasInstallGuard,
     ) -> Result<(), LinuxErrno> {
-        if !Arc::ptr_eq(&self.host_alias_transactions, &install.transactions) {
+        let authority = Arc::clone(&install.authority);
+        let transactions = Arc::clone(&authority.host_alias_transactions);
+        if !Arc::ptr_eq(&transactions, &install.transactions) {
             return Err(LINUX_ENOMEM);
         }
-        let mut phase = self.host_alias_transactions.phase.lock();
+        let mut phase = transactions.phase.lock();
         let HostAliasPhase::Installing {
             id: installing,
             commit,
@@ -4238,7 +4496,7 @@ impl SyscallDispatcher {
         if let Some(mmap) = commit.mmap {
             let start = mmap.start;
             let len = mmap.len;
-            self.commit_host_alias_mmap_observed(mmap);
+            self.commit_host_alias_mmap_observed(&authority, mmap);
             if let Some(mm) = commit.io_uring_mm {
                 mm.replace_io_uring_mappings(start, len, commit.io_uring_mapping);
             } else if commit.io_uring_mapping.is_some() {
@@ -4249,7 +4507,7 @@ impl SyscallDispatcher {
             self.commit_host_alias_shmat(shmat);
         }
         *phase = HostAliasPhase::Idle;
-        self.host_alias_transactions.idle.notify_all();
+        transactions.idle.notify_all();
         install.disarm();
         Ok(())
     }
@@ -4386,14 +4644,14 @@ impl SyscallDispatcher {
     /// succeeds.
     pub fn set_address_space_regions(&self, regions: Vec<ProcMapsEntry>) {
         let _vma_dispatch = self.begin_vma_dispatch();
-        self.mem.lock().address_space_regions = Some(regions);
+        self.mem().lock().address_space_regions = Some(regions);
     }
 
     pub(crate) fn set_address_space_file_mappings(
         &self,
         mappings: Vec<crate::core_dump::FileMapping>,
     ) {
-        self.mem.lock().core_file_mappings = mappings;
+        self.mem().lock().core_file_mappings = mappings;
     }
 
     /// Publish a replacement image's complete dispatcher memory generation.
@@ -4404,13 +4662,24 @@ impl SyscallDispatcher {
         regions: Vec<ProcMapsEntry>,
         auxv: Vec<u8>,
         file_mappings: Vec<crate::core_dump::FileMapping>,
-    ) {
-        let _vma_dispatch = self.begin_vma_dispatch();
-        let mut mem = self.mem.lock();
+    ) -> PreparedDispatchMmExec {
+        // Always stage the replacement privately. This avoids asking a
+        // racy owner-count question while another CLONE_VM dispatcher can be
+        // created or dropped, and keeps even a currently-private exec out of
+        // the live authority until the existing successful publication seam.
+        let prepared = self.mm_binding.stage_private_exec();
+        let authority = Arc::clone(&prepared.staged);
+        let _vma_dispatch = authority
+            .host_alias_transactions
+            .begin_dispatch()
+            .with_vma_revision(authority.mem.revision_publisher());
+        let mut mem = authority.mem.lock();
         mem.reset_for_execve();
         mem.address_space_regions = Some(regions);
         mem.linux_auxv_image = auxv;
         mem.core_file_mappings = file_mappings;
+        drop(mem);
+        prepared
     }
 
     /// Capture the guest's serialized ELF auxv image (from the loaded
@@ -4418,7 +4687,7 @@ impl SyscallDispatcher {
     /// guest received on its stack. Called alongside `set_address_space_regions`
     /// at boot and on each successful `execve`.
     pub fn set_auxv_image(&self, auxv: Vec<u8>) {
-        self.mem.lock().linux_auxv_image = auxv;
+        self.mem().lock().linux_auxv_image = auxv;
     }
 
     pub(crate) fn core_process_snapshot(
@@ -4430,7 +4699,8 @@ impl SyscallDispatcher {
             .task_identity(context.task().key().id)
             .map_err(|error| CorePublicationError::KernelIdentity(error.to_string()))?;
         let proc = self.proc.lock();
-        let mem = self.mem.lock();
+        let mem_authority_41 = self.mem();
+        let mem = mem_authority_41.lock();
         if !mem.linux_auxv_image.len().is_multiple_of(16) {
             return Err(CorePublicationError::MalformedAuxv);
         }
@@ -4619,7 +4889,7 @@ impl SyscallDispatcher {
     /// difference between a ~470 ms and a sub-millisecond fork for a guest that
     /// has mmap'd only a sliver (i.e. essentially every guest).
     pub fn mmap_arena_high_water(&self) -> u64 {
-        self.mem.lock().mmap_next
+        self.mem().lock().mmap_next
     }
 
     pub fn with_rootfs(rootfs: RootFs) -> Self {
@@ -7695,7 +7965,7 @@ impl SyscallDispatcher {
     }
 
     fn mem_snapshot(&self) -> mem::MemState {
-        self.mem.lock().clone()
+        self.mem().lock().clone()
     }
 
     fn synthetic_proc_context(

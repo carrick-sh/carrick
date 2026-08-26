@@ -710,7 +710,8 @@ fn shared_anon_deferred_setter_failure_rolls_back_before_commit() {
             .unmapped
             .range_unmapped(crate::memory::LINUX_SHARED_FILE_BASE, MAPPED_LENGTH)
     );
-    let mem = dispatcher.mem.lock();
+    let mem_authority_101 = dispatcher.mem();
+    let mem = mem_authority_101.lock();
     assert!(mem.shared.live().is_empty(), "allocation must not commit");
     assert!(mem.dynamic_maps.is_empty(), "VMA metadata must not commit");
 }
@@ -962,7 +963,7 @@ fn file_private_fixed_shared_aperture_repoints_snapshot_and_publishes_map_time_b
     assert!(replacement.execute);
     assert!(
         dispatcher
-            .mem
+            .mem()
             .lock()
             .resident_ranges
             .iter()
@@ -1637,7 +1638,7 @@ fn private_repoint_failure_preserves_prior_overlay_owner_and_vma() {
     )) as u64;
     assert_eq!(first, shared);
     let prior_overlay = dispatcher
-        .mem
+        .mem()
         .lock()
         .overlay
         .find_by_source(shared)
@@ -1669,7 +1670,8 @@ fn private_repoint_failure_preserves_prior_overlay_owner_and_vma() {
     assert_eq!(failed, DispatchOutcome::errno(LINUX_ENOMEM));
     assert_eq!(memory.inner.bytes[0], 0x5a);
     assert_eq!(dispatcher.dynamic_mapping_for_test(shared), Some(prior_map));
-    let mut mem = dispatcher.mem.lock();
+    let mem_authority_102 = dispatcher.mem();
+    let mut mem = mem_authority_102.lock();
     assert_eq!(mem.overlay.find_by_source(shared), Some(prior_overlay));
     assert_eq!(
         mem.overlay
@@ -1696,7 +1698,8 @@ fn indeterminate_repoint_policy_retains_old_and_candidate_storage() {
     let dispatcher = SyscallDispatcher::new();
     let source = crate::memory::LINUX_SHARED_FILE_BASE;
     let (old, candidate) = {
-        let mut mem = dispatcher.mem.lock();
+        let mem_authority_103 = dispatcher.mem();
+        let mut mem = mem_authority_103.lock();
         let old = mem
             .overlay
             .alloc_sourced(
@@ -1723,7 +1726,8 @@ fn indeterminate_repoint_policy_retains_old_and_candidate_storage() {
         )),
     );
     assert_eq!(action, PrivateRepointRecovery::FailStopRetainingOwners);
-    let mut mem = dispatcher.mem.lock();
+    let mem_authority_104 = dispatcher.mem();
+    let mut mem = mem_authority_104.lock();
     assert!(mem.overlay.live().iter().any(|slot| slot.guest_addr == old));
     assert!(
         mem.overlay
@@ -1866,7 +1870,7 @@ fn assert_partial_private_overlay_replacement(replace_offset: u64) {
     )) as u64;
     assert_eq!(first, source);
     let old_overlay = dispatcher
-        .mem
+        .mem()
         .lock()
         .overlay
         .translate_source_range(source, LENGTH)
@@ -1917,7 +1921,9 @@ fn assert_partial_private_overlay_replacement(replace_offset: u64) {
         );
     }
 
-    let mut mem = dispatcher.mem.lock();
+    let mem_authority_105 = dispatcher.mem();
+
+    let mut mem = mem_authority_105.lock();
     let replacement_overlay = mem
         .overlay
         .translate_source_range(source + replace_offset, GRANULE)
@@ -2035,7 +2041,8 @@ fn assert_shared_owner_survives_partial_private_replacement(replace_offset: u64)
         (source + replace_offset) as i64
     );
     {
-        let mem = dispatcher.mem.lock();
+        let mem_authority_106 = dispatcher.mem();
+        let mem = mem_authority_106.lock();
         if replace_offset != 0 {
             assert!(mem.shared.guest_range_has_owner(source, replace_offset));
         }
@@ -2184,7 +2191,7 @@ fn partial_shared_file_munmaps_write_exact_fragments_and_close_once() {
     let owned = unsafe { OwnedFd::from_raw_fd(dup) };
     let owned_raw = owned.as_raw_fd();
     let source = dispatcher
-        .mem
+        .mem()
         .lock()
         .shared
         .alloc(
@@ -2276,7 +2283,7 @@ fn clean_private_repoint_failure_does_not_commit_shared_file_writeback() {
     let owned = unsafe { OwnedFd::from_raw_fd(dup) };
     let owned_raw = owned.as_raw_fd();
     let source = dispatcher
-        .mem
+        .mem()
         .lock()
         .shared
         .alloc(
@@ -2321,7 +2328,7 @@ fn clean_private_repoint_failure_does_not_commit_shared_file_writeback() {
     assert_eq!(byte, [0], "clean failure must not commit writeback");
     assert!(
         dispatcher
-            .mem
+            .mem()
             .lock()
             .shared
             .guest_range_has_owner(source, LENGTH)
@@ -2409,7 +2416,7 @@ fn exact_partial_granule_replacement_splits_owner_without_reusing_live_storage()
     ));
     let prior_calls = memory.repoint_calls;
     let prior_overlay = dispatcher
-        .mem
+        .mem()
         .lock()
         .overlay
         .translate_source_range(source, LENGTH)
@@ -2440,7 +2447,8 @@ fn exact_partial_granule_replacement_splits_owner_without_reusing_live_storage()
         }
     );
     assert_eq!(memory.repoint_calls, prior_calls + 1);
-    let mut mem = dispatcher.mem.lock();
+    let mem_authority_107 = dispatcher.mem();
+    let mut mem = mem_authority_107.lock();
     let replacement = mem
         .overlay
         .translate_source_range(source, PARTIAL)
@@ -2582,7 +2590,7 @@ fn moving_shared_mremap_fails_before_private_copy_or_metadata_mutation() {
         "shared-code".into(),
     );
 
-    let mmap_next_before = dispatcher.mem.lock().mmap_next;
+    let mmap_next_before = dispatcher.mem().lock().mmap_next;
     let outcome = threaded_memory_call(
         &dispatcher,
         &mut memory,
@@ -2594,14 +2602,15 @@ fn moving_shared_mremap_fails_before_private_copy_or_metadata_mutation() {
         ),
     );
     assert_eq!(outcome, DispatchOutcome::errno(LINUX_ENOMEM));
-    assert_eq!(dispatcher.mem.lock().mmap_next, mmap_next_before);
+    assert_eq!(dispatcher.mem().lock().mmap_next, mmap_next_before);
     assert!(
         memory
             .protections
             .range_mutable_shared_backing(old, LENGTH as usize)
     );
     assert!(!memory.protections.range_unmapped(old, LENGTH as usize));
-    let mem = dispatcher.mem.lock();
+    let mem_authority_108 = dispatcher.mem();
+    let mem = mem_authority_108.lock();
     assert!(mem.dynamic_maps.iter().any(|map| {
         map.start == old
             && map.end == old + LENGTH
@@ -2659,8 +2668,8 @@ fn mixed_rx_and_r_mremap_source_is_rejected_without_broadening_permissions() {
         ),
         DispatchOutcome::Returned { value: 0 }
     );
-    let maps_before = dispatcher.mem.lock().dynamic_maps.clone();
-    let mmap_next_before = dispatcher.mem.lock().mmap_next;
+    let maps_before = dispatcher.mem().lock().dynamic_maps.clone();
+    let mmap_next_before = dispatcher.mem().lock().mmap_next;
 
     let outcome = threaded_memory_call(
         &dispatcher,
@@ -2680,8 +2689,8 @@ fn mixed_rx_and_r_mremap_source_is_rejected_without_broadening_permissions() {
         ),
     );
     assert_eq!(outcome, DispatchOutcome::errno(LINUX_EFAULT));
-    assert_eq!(dispatcher.mem.lock().dynamic_maps, maps_before);
-    assert_eq!(dispatcher.mem.lock().mmap_next, mmap_next_before);
+    assert_eq!(dispatcher.mem().lock().dynamic_maps, maps_before);
+    assert_eq!(dispatcher.mem().lock().mmap_next, mmap_next_before);
 }
 
 #[test]
@@ -2699,10 +2708,10 @@ fn mremap_shrink_unmap_failure_keeps_source_metadata_and_allocator() {
         ProcMapSharing::Private,
         "source".into(),
     );
-    dispatcher.mem.lock().mmap_next = source + 2 * LINUX_PAGE_SIZE;
+    dispatcher.mem().lock().mmap_next = source + 2 * LINUX_PAGE_SIZE;
     let mut memory =
         DeferredSetterFailureMemory::new(source, (2 * LINUX_PAGE_SIZE) as usize).fail_unmaps(1);
-    let maps_before = dispatcher.mem.lock().dynamic_maps.clone();
+    let maps_before = dispatcher.mem().lock().dynamic_maps.clone();
     let outcome = threaded_memory_call(
         &dispatcher,
         &mut memory,
@@ -2714,9 +2723,9 @@ fn mremap_shrink_unmap_failure_keeps_source_metadata_and_allocator() {
         ),
     );
     assert_eq!(outcome, DispatchOutcome::errno(LINUX_ENOMEM));
-    assert_eq!(dispatcher.mem.lock().dynamic_maps, maps_before);
+    assert_eq!(dispatcher.mem().lock().dynamic_maps, maps_before);
     assert_eq!(
-        dispatcher.mem.lock().mmap_next,
+        dispatcher.mem().lock().mmap_next,
         source + 2 * LINUX_PAGE_SIZE
     );
 }
@@ -2765,7 +2774,8 @@ fn shared_anonymous_mremap_shrink_retains_shared_prefix_metadata() {
             value: source as i64
         }
     );
-    let mem = dispatcher.mem.lock();
+    let mem_authority_109 = dispatcher.mem();
+    let mem = mem_authority_109.lock();
     assert!(mem.dynamic_maps.iter().any(|map| {
         map.start == source
             && map.end == source + crate::trap::HVF_PAGE_SIZE
@@ -2824,7 +2834,7 @@ fn private_overlay_mremap_shrink_carves_source_tail_and_reuses_only_storage() {
         source as i64
     );
     let old_overlay = dispatcher
-        .mem
+        .mem()
         .lock()
         .overlay
         .translate_source_range(source, LENGTH)
@@ -2845,7 +2855,9 @@ fn private_overlay_mremap_shrink_carves_source_tail_and_reuses_only_storage() {
         }
     );
 
-    let mut mem = dispatcher.mem.lock();
+    let mem_authority_110 = dispatcher.mem();
+
+    let mut mem = mem_authority_110.lock();
     assert_eq!(
         mem.overlay.translate_source_range(source, GRANULE),
         Some(old_overlay),
@@ -2999,7 +3011,8 @@ fn mremap_fixed_is_rejected_before_source_or_destination_mutation() {
             .protections
             .range_unmapped(source, LINUX_PAGE_SIZE as usize)
     );
-    let mem = dispatcher.mem.lock();
+    let mem_authority_111 = dispatcher.mem();
+    let mem = mem_authority_111.lock();
     assert!(mem.dynamic_maps.iter().any(|map| map.start == source));
     assert!(!mem.dynamic_maps.iter().any(|map| map.start == destination));
 }
@@ -3073,7 +3086,8 @@ fn mremap_dontunmap_is_rejected_before_source_or_allocator_mutation() {
     );
     assert_eq!(outcome, DispatchOutcome::errno(LINUX_EOPNOTSUPP));
     assert_eq!(memory.read_bytes(source, 4).unwrap(), b"keep");
-    let mem = dispatcher.mem.lock();
+    let mem_authority_112 = dispatcher.mem();
+    let mem = mem_authority_112.lock();
     assert_eq!(mem.dynamic_maps.len(), 1);
     assert_eq!(mem.dynamic_maps[0].start, source);
 }
@@ -3119,7 +3133,7 @@ fn shared_fixed_mremap_move_fails_before_source_mutation() {
         ProcMapSharing::Shared,
         "shared-fixed".into(),
     );
-    let before = dispatcher.mem.lock().dynamic_maps.clone();
+    let before = dispatcher.mem().lock().dynamic_maps.clone();
 
     let outcome = threaded_memory_call(
         &dispatcher,
@@ -3139,7 +3153,7 @@ fn shared_fixed_mremap_move_fails_before_source_mutation() {
         ),
     );
     assert_eq!(outcome, DispatchOutcome::errno(LINUX_EOPNOTSUPP));
-    assert_eq!(dispatcher.mem.lock().dynamic_maps, before);
+    assert_eq!(dispatcher.mem().lock().dynamic_maps, before);
     assert!(
         !memory
             .protections
@@ -3188,7 +3202,7 @@ fn shared_fixed_mremap_shrink_fails_before_source_tail_mutation() {
         ProcMapSharing::Shared,
         "shared-fixed-shrink".into(),
     );
-    let before = dispatcher.mem.lock().dynamic_maps.clone();
+    let before = dispatcher.mem().lock().dynamic_maps.clone();
 
     let outcome = threaded_memory_call(
         &dispatcher,
@@ -3209,7 +3223,7 @@ fn shared_fixed_mremap_shrink_fails_before_source_tail_mutation() {
     );
 
     assert_eq!(outcome, DispatchOutcome::errno(LINUX_EOPNOTSUPP));
-    assert_eq!(dispatcher.mem.lock().dynamic_maps, before);
+    assert_eq!(dispatcher.mem().lock().dynamic_maps, before);
     assert!(
         !memory
             .protections
@@ -3308,7 +3322,7 @@ fn mremap_rejects_boot_region_source_spanning_multiple_regions() {
         )
         .expect("mixed boot-span shrink dispatch");
     assert_eq!(outcome, DispatchOutcome::errno(LINUX_EFAULT));
-    assert!(dispatcher.mem.lock().dynamic_maps.is_empty());
+    assert!(dispatcher.mem().lock().dynamic_maps.is_empty());
 }
 
 #[test]
@@ -3337,7 +3351,7 @@ fn mremap_rejects_hidden_mmap_backing_boot_region() {
         )
         .expect("hidden backing mremap dispatch");
     assert_eq!(outcome, DispatchOutcome::errno(LINUX_EFAULT));
-    assert!(dispatcher.mem.lock().dynamic_maps.is_empty());
+    assert!(dispatcher.mem().lock().dynamic_maps.is_empty());
 }
 
 #[test]
@@ -3378,7 +3392,7 @@ fn mremap_rejects_hidden_shared_and_private_aperture_boot_regions() {
             )
             .expect("hidden aperture mremap dispatch");
         assert_eq!(outcome, DispatchOutcome::errno(LINUX_EFAULT), "{label}");
-        assert!(dispatcher.mem.lock().dynamic_maps.is_empty(), "{label}");
+        assert!(dispatcher.mem().lock().dynamic_maps.is_empty(), "{label}");
     }
 }
 
@@ -3386,7 +3400,7 @@ fn mremap_rejects_hidden_shared_and_private_aperture_boot_regions() {
 fn mremap_boot_heap_fallback_accepts_live_prefix_and_rejects_hidden_suffix() {
     const SYS_MREMAP: u64 = 216;
     let mut dispatcher = SyscallDispatcher::new();
-    let layout = dispatcher.mem.lock().layout;
+    let layout = dispatcher.mem().lock().layout;
     dispatcher.set_address_space_regions(vec![ProcMapsEntry {
         start: layout.heap_base,
         end: layout.heap_base + layout.heap_size,
@@ -3396,7 +3410,7 @@ fn mremap_boot_heap_fallback_accepts_live_prefix_and_rejects_hidden_suffix() {
         sharing: ProcMapSharing::Private,
         path: "hidden-heap-backing".into(),
     }]);
-    dispatcher.mem.lock().brk_current = layout.heap_base + (2 * LINUX_PAGE_SIZE);
+    dispatcher.mem().lock().brk_current = layout.heap_base + (2 * LINUX_PAGE_SIZE);
     let mut memory =
         ProtectionTrackingMemory::new(layout.heap_base, (4 * LINUX_PAGE_SIZE) as usize);
     let reporter = CompatReporter::default();
@@ -3511,7 +3525,7 @@ fn munmap_hole_cannot_fall_back_to_boot_metadata_during_mremap() {
         )
         .expect("mremap of munmap hole");
     assert_eq!(remapped, DispatchOutcome::errno(LINUX_EFAULT));
-    assert!(dispatcher.mem.lock().dynamic_maps.is_empty());
+    assert!(dispatcher.mem().lock().dynamic_maps.is_empty());
     assert!(
         memory
             .protections
@@ -3597,7 +3611,8 @@ fn shared_aperture_partial_and_shifted_sources_reject_before_backend_mutation() 
         ),
     );
     assert_eq!(shifted_outcome, DispatchOutcome::errno(LINUX_EFAULT));
-    let mem = dispatcher.mem.lock();
+    let mem_authority_113 = dispatcher.mem();
+    let mem = mem_authority_113.lock();
     let alloc = mem
         .shared
         .live()
@@ -3637,7 +3652,8 @@ fn odd_shared_mmap_tracks_logical_length_and_granule_reservation() {
             ]),
         ),
     )) as u64;
-    let mem = dispatcher.mem.lock();
+    let mem_authority_114 = dispatcher.mem();
+    let mem = mem_authority_114.lock();
     let alloc = mem
         .shared
         .live()
@@ -3698,7 +3714,8 @@ fn shared_mremap_shrink_unmap_failure_keeps_live_length_and_tail_accounting() {
     );
     assert_eq!(outcome, DispatchOutcome::errno(LINUX_ENOMEM));
     {
-        let mem = dispatcher.mem.lock();
+        let mem_authority_115 = dispatcher.mem();
+        let mem = mem_authority_115.lock();
         let alloc = mem
             .shared
             .live()
@@ -3709,7 +3726,8 @@ fn shared_mremap_shrink_unmap_failure_keeps_live_length_and_tail_accounting() {
         assert_eq!(alloc.len, map_len);
     }
     let next = {
-        let mut mem = dispatcher.mem.lock();
+        let mem_authority_116 = dispatcher.mem();
+        let mut mem = mem_authority_116.lock();
         mem.shared
             .alloc(
                 crate::trap::HVF_PAGE_SIZE,
@@ -3757,7 +3775,7 @@ fn demand_paged_shared_anon_keeps_best_effort_mapping_on_protection_failure() {
         memory.unmap_calls, 0,
         "demand-paged backend keeps reservation"
     );
-    assert_eq!(dispatcher.mem.lock().dynamic_maps.len(), 1);
+    assert_eq!(dispatcher.mem().lock().dynamic_maps.len(), 1);
 }
 
 #[test]
@@ -3794,7 +3812,7 @@ fn concurrent_exec_mmap_does_not_commit_consumed_protection_failure_outside_aren
         memory.protect_calls, 1,
         "deferred failure consumed exactly once"
     );
-    assert!(dispatcher.mem.lock().dynamic_maps.is_empty());
+    assert!(dispatcher.mem().lock().dynamic_maps.is_empty());
 }
 
 #[test]
@@ -4000,7 +4018,7 @@ fn native16k_shared_provenance_survives_partial_mprotect() {
         ),
     );
     assert_eq!(middle, DispatchOutcome::Returned { value: 0 });
-    let maps = dispatcher.mem.lock().dynamic_maps.clone();
+    let maps = dispatcher.mem().lock().dynamic_maps.clone();
     assert_eq!(
         maps.len(),
         3,
@@ -4475,7 +4493,7 @@ fn removing_a_fixed_range_splits_the_region_it_lands_inside() {
 #[test]
 fn guest_vma_occupancy_excludes_hidden_arenas_but_includes_live_ranges() {
     let dispatcher = SyscallDispatcher::new();
-    let layout = dispatcher.mem.lock().layout;
+    let layout = dispatcher.mem().lock().layout;
     const BOOT: u64 = 0x20_0000_0000;
     dispatcher.set_address_space_regions(vec![
         ProcMapsEntry {
@@ -4506,7 +4524,7 @@ fn guest_vma_occupancy_excludes_hidden_arenas_but_includes_live_ranges() {
             path: "boot-text".into(),
         },
     ]);
-    dispatcher.mem.lock().brk_current = layout.heap_base + LINUX_PAGE_SIZE;
+    dispatcher.mem().lock().brk_current = layout.heap_base + LINUX_PAGE_SIZE;
     dispatcher.record_dynamic_mapping(
         layout.mmap_base + (2 * LINUX_PAGE_SIZE),
         LINUX_PAGE_SIZE,
@@ -4524,7 +4542,7 @@ fn guest_vma_occupancy_excludes_hidden_arenas_but_includes_live_ranges() {
     assert!(dispatcher.guest_vma_overlaps(BOOT, LINUX_PAGE_SIZE));
 
     let snapshot = dispatcher
-        .mem
+        .mem()
         .snapshot_until(std::time::Instant::now() + std::time::Duration::from_secs(1))
         .expect("VMA authority snapshot");
     assert!(snapshot.vmas.contains(&crate::kernel::VmaSummary {
@@ -4554,7 +4572,7 @@ fn guest_vma_occupancy_excludes_hidden_arenas_but_includes_live_ranges() {
 #[test]
 fn core_vma_projection_subtracts_map_fixed_replacement_from_live_heap() {
     let dispatcher = SyscallDispatcher::new();
-    let layout = dispatcher.mem.lock().layout;
+    let layout = dispatcher.mem().lock().layout;
     dispatcher.set_address_space_regions(vec![ProcMapsEntry {
         start: layout.heap_base,
         end: layout.heap_base + layout.heap_size,
@@ -4564,7 +4582,7 @@ fn core_vma_projection_subtracts_map_fixed_replacement_from_live_heap() {
         sharing: ProcMapSharing::Private,
         path: "heap-backing".into(),
     }]);
-    dispatcher.mem.lock().brk_current = layout.heap_base + (2 * LINUX_PAGE_SIZE);
+    dispatcher.mem().lock().brk_current = layout.heap_base + (2 * LINUX_PAGE_SIZE);
     dispatcher.record_dynamic_mapping(
         layout.heap_base,
         LINUX_PAGE_SIZE,
@@ -4573,7 +4591,7 @@ fn core_vma_projection_subtracts_map_fixed_replacement_from_live_heap() {
         "fixed-replacement".into(),
     );
 
-    let maps = project_core_maps(&dispatcher.mem.lock());
+    let maps = project_core_maps(&dispatcher.mem().lock());
     assert_eq!(maps.len(), 2);
     assert_eq!(
         (
@@ -4630,7 +4648,7 @@ fn vma_projection_preserves_adjacency_and_removes_unmapped_boot_ranges() {
         },
     ]);
     let before = dispatcher
-        .mem
+        .mem()
         .snapshot_until(std::time::Instant::now() + std::time::Duration::from_secs(1))
         .expect("adjacent VMA snapshot");
     assert_eq!(before.vmas.len(), 2);
@@ -4639,7 +4657,7 @@ fn vma_projection_preserves_adjacency_and_removes_unmapped_boot_ranges() {
     dispatcher.remove_mapping_metadata(0x1000, 0x1000);
     drop(vma_dispatch);
     let after = dispatcher
-        .mem
+        .mem()
         .snapshot_until(std::time::Instant::now() + std::time::Duration::from_secs(1))
         .expect("trimmed VMA snapshot");
     assert_eq!(
@@ -4654,21 +4672,21 @@ fn vma_projection_preserves_adjacency_and_removes_unmapped_boot_ranges() {
 #[test]
 fn mem_authority_revises_once_per_published_vma_transaction() {
     let dispatcher = SyscallDispatcher::new();
-    let initial = dispatcher.mem.vma_revision();
+    let initial = dispatcher.mem().vma_revision();
 
-    let _layout = dispatcher.mem.lock().layout;
-    dispatcher.mem.lock().linux_auxv_image.push(1);
-    assert_eq!(dispatcher.mem.vma_revision(), initial);
+    let _layout = dispatcher.mem().lock().layout;
+    dispatcher.mem().lock().linux_auxv_image.push(1);
+    assert_eq!(dispatcher.mem().vma_revision(), initial);
 
     // Failed/no-op mapping paths take exclusion but never arm publication.
     drop(dispatcher.begin_conditional_vma_dispatch());
-    assert_eq!(dispatcher.mem.vma_revision(), initial);
+    assert_eq!(dispatcher.mem().vma_revision(), initial);
 
     let vma_dispatch = dispatcher.begin_vma_dispatch();
-    dispatcher.mem.lock().brk_current += LINUX_PAGE_SIZE;
+    dispatcher.mem().lock().brk_current += LINUX_PAGE_SIZE;
     drop(vma_dispatch);
     assert_eq!(
-        dispatcher.mem.vma_revision(),
+        dispatcher.mem().vma_revision(),
         initial.next().expect("revision")
     );
 
@@ -4676,7 +4694,7 @@ fn mem_authority_revises_once_per_published_vma_transaction() {
     dispatcher.mark_vma_dispatch(&mut conditional);
     drop(conditional);
     assert_eq!(
-        dispatcher.mem.vma_revision(),
+        dispatcher.mem().vma_revision(),
         initial
             .next()
             .and_then(crate::kernel::VmaRevision::next)
@@ -4712,7 +4730,7 @@ fn revision_checked_publication_excludes_concurrent_vma_mutation() {
                     .recv_timeout(std::time::Duration::from_secs(1))
                     .expect("mutation waiter reached acquisition");
                 let waiter_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-                while dispatcher.host_alias_transactions.waiting_dispatchers() == 0 {
+                while dispatcher.host_alias_transactions().waiting_dispatchers() == 0 {
                     assert!(
                         std::time::Instant::now() < waiter_deadline,
                         "mutation thread never blocked on VMA exclusion"
@@ -4791,11 +4809,11 @@ fn growdown_metadata_is_trimmed_with_mapping_teardown() {
 #[test]
 fn mem_authority_fork_is_independent_after_one_existing_state_clone() {
     let parent = SyscallDispatcher::new();
-    let layout = parent.mem.lock().layout;
+    let layout = parent.mem().lock().layout;
     let parent_vma_dispatch = parent.begin_vma_dispatch();
-    parent.mem.lock().brk_current = layout.heap_base + LINUX_PAGE_SIZE;
+    parent.mem().lock().brk_current = layout.heap_base + LINUX_PAGE_SIZE;
     drop(parent_vma_dispatch);
-    let parent_revision = parent.mem.vma_revision();
+    let parent_revision = parent.mem().vma_revision();
     let child = parent.fork_clone_in_process(
         crate::thread::ThreadId::synthetic_for_tests(71),
         crate::thread::ThreadId::synthetic_for_tests(72),
@@ -4803,18 +4821,18 @@ fn mem_authority_fork_is_independent_after_one_existing_state_clone() {
         72,
     );
 
-    assert!(!std::sync::Arc::ptr_eq(&parent.mem, &child.mem));
-    assert_eq!(child.mem.vma_revision(), parent_revision);
+    assert!(!std::sync::Arc::ptr_eq(&parent.mem(), &child.mem()));
+    assert_eq!(child.mem().vma_revision(), parent_revision);
     let child_vma_dispatch = child.begin_vma_dispatch();
-    child.mem.lock().brk_current += LINUX_PAGE_SIZE;
+    child.mem().lock().brk_current += LINUX_PAGE_SIZE;
     drop(child_vma_dispatch);
     assert_eq!(
-        parent.mem.lock().brk_current,
+        parent.mem().lock().brk_current,
         layout.heap_base + LINUX_PAGE_SIZE
     );
-    assert_eq!(parent.mem.vma_revision(), parent_revision);
+    assert_eq!(parent.mem().vma_revision(), parent_revision);
     assert_eq!(
-        child.mem.vma_revision(),
+        child.mem().vma_revision(),
         parent_revision.next().expect("child revision")
     );
 }
@@ -4882,7 +4900,7 @@ fn committed_vma_coverage_rejects_holes_and_accepts_adjacent_mappings() {
         );
     }
     assert!(!guest_vma_covers_locked(
-        &dispatcher.mem.lock(),
+        &dispatcher.mem().lock(),
         base,
         3 * LINUX_PAGE_SIZE,
     ));
@@ -4895,7 +4913,7 @@ fn committed_vma_coverage_rejects_holes_and_accepts_adjacent_mappings() {
         String::new(),
     );
     assert!(guest_vma_covers_locked(
-        &dispatcher.mem.lock(),
+        &dispatcher.mem().lock(),
         base,
         3 * LINUX_PAGE_SIZE,
     ));
@@ -4997,7 +5015,7 @@ fn mincore_onfault_lock_is_not_resident_until_page_is_touched() {
     let range =
         crate::vfs::GuestMemoryRange::new(GuestVa(base), GuestVa(base.saturating_add(length)))
             .expect("valid locked range");
-    locked_ranges_insert(&mut dispatcher.mem.lock().locked_ranges, range);
+    locked_ranges_insert(&mut dispatcher.mem().lock().locked_ranges, range);
     let memory = LinearMemory::new(base, vec![0; length as usize]);
 
     assert_eq!(
@@ -5229,7 +5247,8 @@ fn next_mmap_address_reuses_freed_arena_region() {
     let dispatcher = SyscallDispatcher::new();
     let freed = LINUX_MMAP_BASE + (4 * LINUX_PAGE_SIZE);
     {
-        let mut mem = dispatcher.mem.lock();
+        let mem_authority_117 = dispatcher.mem();
+        let mut mem = mem_authority_117.lock();
         free_regions_insert(&mut mem.free_regions, freed, 2 * LINUX_PAGE_SIZE);
     }
 
@@ -5239,7 +5258,7 @@ fn next_mmap_address_reuses_freed_arena_region() {
     let second = dispatcher.next_mmap_address(0, LINUX_PAGE_SIZE, 0, 0);
     assert_eq!(second, Some((freed + LINUX_PAGE_SIZE, true)));
 
-    assert!(dispatcher.mem.lock().free_regions.is_empty());
+    assert!(dispatcher.mem().lock().free_regions.is_empty());
 }
 
 /// A `PROT_NONE` reservation cannot hold a guest-written byte, so it must
@@ -5254,7 +5273,7 @@ fn next_mmap_address_reuses_freed_arena_region() {
 #[test]
 fn a_prot_none_reserve_does_not_raise_the_writable_watermark() {
     let dispatcher = SyscallDispatcher::new();
-    let base = dispatcher.mem.lock().mmap_writable_high;
+    let base = dispatcher.mem().lock().mmap_writable_high;
 
     // A large PROT_NONE reserve: allocated, never writable.
     let reserve = dispatcher
@@ -5262,14 +5281,14 @@ fn a_prot_none_reserve_does_not_raise_the_writable_watermark() {
         .expect("reserve");
     assert!(!reserve.1, "a fresh bump allocation is never reused");
     assert_eq!(
-        dispatcher.mem.lock().mmap_writable_high,
+        dispatcher.mem().lock().mmap_writable_high,
         base,
         "a PROT_NONE reservation must not move the writable watermark"
     );
 
     // Rewind the cursor the way `munmap` of the top region does, then take
     // the same span again. Nothing could have written it, so no scrub.
-    dispatcher.mem.lock().mmap_next = reserve.0;
+    dispatcher.mem().lock().mmap_next = reserve.0;
     let again = dispatcher
         .next_mmap_address(0, 16 * LINUX_PAGE_SIZE, 0, 0)
         .expect("re-allocate");
@@ -5293,11 +5312,11 @@ fn a_writable_mapping_raises_the_watermark_and_forces_a_later_scrub() {
         .expect("writable mapping");
     assert!(!writable.1, "a fresh bump allocation is never reused");
     assert!(
-        dispatcher.mem.lock().mmap_writable_high >= writable.0 + 16 * LINUX_PAGE_SIZE,
+        dispatcher.mem().lock().mmap_writable_high >= writable.0 + 16 * LINUX_PAGE_SIZE,
         "a writable hand-out must move the watermark past its end"
     );
 
-    dispatcher.mem.lock().mmap_next = writable.0;
+    dispatcher.mem().lock().mmap_next = writable.0;
     let again = dispatcher
         .next_mmap_address(0, 16 * LINUX_PAGE_SIZE, LINUX_PROT_WRITE, 0)
         .expect("re-allocate");
@@ -5313,7 +5332,8 @@ fn reset_memory_state_on_execve_resets_arenas_and_preserves_auxv_snapshot() {
     let dispatcher = SyscallDispatcher::new();
     dispatcher.set_auxv_image(vec![1, 2, 3, 4]);
     {
-        let mut mem = dispatcher.mem.lock();
+        let mem_authority_118 = dispatcher.mem();
+        let mut mem = mem_authority_118.lock();
         mem.brk_current = LINUX_HEAP_BASE + 0x21000;
         mem.mmap_next = LINUX_MMAP_BASE + 0x8000;
         mem.mmap_writable_high = LINUX_MMAP_BASE + 0x9000;
@@ -5323,7 +5343,8 @@ fn reset_memory_state_on_execve_resets_arenas_and_preserves_auxv_snapshot() {
     dispatcher.reset_memory_state_on_execve();
 
     {
-        let mem = dispatcher.mem.lock();
+        let mem_authority_119 = dispatcher.mem();
+        let mem = mem_authority_119.lock();
         assert_eq!(mem.brk_current, LINUX_HEAP_BASE);
         assert_eq!(mem.mmap_next, LINUX_MMAP_BASE);
         assert_eq!(mem.mmap_writable_high, LINUX_MMAP_BASE);
@@ -5342,9 +5363,9 @@ fn brk_shrink_scrubs_backing_before_regrowth() {
     const PAGES: u64 = 3;
 
     let mut dispatcher = SyscallDispatcher::new();
-    let initial = dispatcher.mem.lock().layout.heap_base;
+    let initial = dispatcher.mem().lock().layout.heap_base;
     let grown = initial + PAGES * LINUX_PAGE_SIZE;
-    dispatcher.mem.lock().brk_current = grown;
+    dispatcher.mem().lock().brk_current = grown;
 
     let mut memory = CountingMmapMemory::new(initial, (PAGES * LINUX_PAGE_SIZE) as usize);
     memory.bytes.fill(0xa5);
@@ -5417,7 +5438,8 @@ fn reused_private_anonymous_mmap_zeroes_backing_without_zero_write() {
 
     let mut dispatcher = SyscallDispatcher::new();
     {
-        let mut mem = dispatcher.mem.lock();
+        let mem_authority_120 = dispatcher.mem();
+        let mut mem = mem_authority_120.lock();
         free_regions_insert(&mut mem.free_regions, LINUX_MMAP_BASE, LINUX_PAGE_SIZE);
     }
     let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize);
@@ -5493,7 +5515,8 @@ fn range_owned_metadata_removal_clears_every_mmap_classification() {
         String::new(),
     );
     {
-        let mut mem = dispatcher.mem.lock();
+        let mem_authority_121 = dispatcher.mem();
+        let mut mem = mem_authority_121.lock();
         mem.remap_snapshots.insert(start, vec![0; len as usize]);
         mem.bus_fault_ranges.push((start, len));
         locked_ranges_insert(&mut mem.locked_ranges, range);
@@ -5538,7 +5561,8 @@ fn replacement_commit_trims_every_predecessor_classification_to_prefix_and_suffi
         "predecessor".into(),
     );
     {
-        let mut mem = dispatcher.mem.lock();
+        let mem_authority_122 = dispatcher.mem();
+        let mut mem = mem_authority_122.lock();
         let mut snapshot = vec![0x11; page as usize];
         snapshot.extend(std::iter::repeat_n(0x22, page as usize));
         snapshot.extend(std::iter::repeat_n(0x33, page as usize));
@@ -5573,7 +5597,9 @@ fn replacement_commit_trims_every_predecessor_classification_to_prefix_and_suffi
         shared_file_alias: None,
     });
 
-    let mem = dispatcher.mem.lock();
+    let mem_authority_123 = dispatcher.mem();
+
+    let mem = mem_authority_123.lock();
     assert_eq!(mem.dynamic_maps.len(), 3);
     assert_eq!(
         mem.dynamic_maps
@@ -5663,7 +5689,7 @@ fn core_file_provenance_keeps_mmap_offset_and_excludes_anonymous_exec() {
     });
 
     assert_eq!(
-        dispatcher.mem.lock().core_file_mappings,
+        dispatcher.mem().lock().core_file_mappings,
         vec![crate::core_dump::FileMapping {
             start: 0x7000_0000,
             end: 0x7000_2000,
@@ -5755,7 +5781,8 @@ fn host_alias_abort_preserves_replaced_vma_lock_residency_bus_and_seal_metadata(
         },
     )));
     {
-        let mut mem = dispatcher.mem.lock();
+        let mem_authority_124 = dispatcher.mem();
+        let mut mem = mem_authority_124.lock();
         locked_ranges_insert(&mut mem.locked_ranges, replacement);
         locked_ranges_insert(&mut mem.resident_ranges, replacement);
         locked_ranges_insert(&mut mem.write_sealed_shared_maps, replacement);
@@ -5764,7 +5791,7 @@ fn host_alias_abort_preserves_replaced_vma_lock_residency_bus_and_seal_metadata(
         mem.bus_fault_ranges
             .push((start + LINUX_PAGE_SIZE, LINUX_PAGE_SIZE));
     }
-    let before = dispatcher.mem.lock().clone();
+    let before = dispatcher.mem().lock().clone();
     assert!(!dispatcher.range_has_host_alias_backing(start, len));
     let vma_source = dispatcher.vma_snapshot_source();
     let guard = dispatcher.begin_host_alias_dispatch();
@@ -5789,7 +5816,7 @@ fn host_alias_abort_preserves_replaced_vma_lock_residency_bus_and_seal_metadata(
         vma_source.snapshot(std::time::Instant::now() + std::time::Duration::from_millis(5)),
         Err(crate::kernel::SnapshotError::TimedOut)
     );
-    let pending = dispatcher.mem.lock().clone();
+    let pending = dispatcher.mem().lock().clone();
     assert!(!dispatcher.range_has_host_alias_backing(start, len));
     assert_eq!(pending.dynamic_maps, before.dynamic_maps);
     assert_eq!(pending.locked_ranges, before.locked_ranges);
@@ -5809,7 +5836,7 @@ fn host_alias_abort_preserves_replaced_vma_lock_residency_bus_and_seal_metadata(
         .expect("claim pending host alias install");
     drop(install);
 
-    let after = dispatcher.mem.lock().clone();
+    let after = dispatcher.mem().lock().clone();
     assert!(
         !dispatcher.range_has_host_alias_backing(start, len),
         "an aborted backend install must not publish backing presence"

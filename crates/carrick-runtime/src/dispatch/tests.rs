@@ -810,8 +810,7 @@ mod overlay_dispatch_tests {
             };
             unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };
             let dispatcher = SyscallDispatcher::new();
-            dispatcher
-                .host_alias_transactions
+            dispatcher.host_alias_transactions()
                 .next_id
                 .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
             let guard = dispatcher.begin_host_alias_dispatch();
@@ -3578,7 +3577,7 @@ mod hvpatch_in_process_fork_tests {
         parent.mark_signal_pending(&parent_context, parent_tid, 15);
         parent.proc.lock().pdeathsig = 9;
         parent.proc.lock().membarrier_ready = u64::MAX;
-        parent.mem.lock().brk_current = 0x1234_0000;
+        parent.mem().lock().brk_current = 0x1234_0000;
 
         let (child, child_context) = fork_dispatcher(&parent, parent_tid, child_tid, 41, 42);
 
@@ -3597,17 +3596,17 @@ mod hvpatch_in_process_fork_tests {
         assert!(child_context.thread().signal_state().pending().is_empty());
         assert_eq!(child.proc.lock().pdeathsig, 0);
         assert_eq!(child.proc.lock().membarrier_ready, 0);
-        assert_eq!(child.mem.lock().brk_current, 0x1234_0000);
+        assert_eq!(child.mem().lock().brk_current, 0x1234_0000);
 
         child.captured_file_table().write_open_files().remove(&3);
-        child.mem.lock().brk_current = 0x5678_0000;
+        child.mem().lock().brk_current = 0x5678_0000;
         assert!(
             parent
                 .captured_file_table()
                 .read_open_files()
                 .contains_key(&3)
         );
-        assert_eq!(parent.mem.lock().brk_current, 0x1234_0000);
+        assert_eq!(parent.mem().lock().brk_current, 0x1234_0000);
     }
 
     #[test]

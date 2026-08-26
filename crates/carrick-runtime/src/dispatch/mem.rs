@@ -255,7 +255,7 @@ impl MemAuthority {
         Ok(crate::kernel::OwnedVmaSnapshot { revision, vmas })
     }
 
-    fn bump_revision(&self) {
+    pub(super) fn bump_revision(&self) {
         if self
             .revision
             .fetch_add(1, std::sync::atomic::Ordering::Release)
@@ -1544,7 +1544,7 @@ impl SyscallDispatcher {
     ) -> PrivateRepointRecovery {
         match failure {
             carrick_guest_mem::RepointPrivateError::Clean(_) => {
-                if self.mem.lock().overlay.free(candidate).is_none() {
+                if self.mem().lock().overlay.free(candidate).is_none() {
                     std::process::abort();
                 }
                 PrivateRepointRecovery::RecoveredCleanly
@@ -1555,16 +1555,28 @@ impl SyscallDispatcher {
         }
     }
 
-    pub(super) fn commit_host_alias_mmap_observed(&self, commit: HostAliasMmapCommit) {
+    pub(super) fn commit_host_alias_mmap_observed(
+        &self,
+        authority: &super::DispatchMmAuthority,
+        commit: HostAliasMmapCommit,
+    ) {
         // The matching install guard keeps HostAliasTransactions non-idle for
         // this complete state+revision publication. Snapshot and fork observers
         // acquire that same exclusion before MemState, so neither can enter the
         // narrow interval between the state unlock and release-ordered revision.
-        self.commit_host_alias_mmap(commit);
-        self.mem.bump_revision();
+        Self::commit_host_alias_mmap_on(authority, commit);
+        authority.mem.bump_revision();
     }
 
     pub(super) fn commit_host_alias_mmap(&self, commit: HostAliasMmapCommit) {
+        let authority = self.mm_authority();
+        Self::commit_host_alias_mmap_on(&authority, commit);
+    }
+
+    fn commit_host_alias_mmap_on(
+        authority: &super::DispatchMmAuthority,
+        commit: HostAliasMmapCommit,
+    ) {
         let Some(end) = commit.start.checked_add(commit.len) else {
             std::process::abort();
         };
@@ -1574,7 +1586,7 @@ impl SyscallDispatcher {
             std::process::abort();
         };
         let (read, write, execute) = prot_to_proc_perms(commit.prot);
-        let mut mem = self.mem.lock();
+        let mut mem = authority.mem.lock();
 
         // Remove only the replaced range from every classification. This is
         // the same cleanup used by munmap/shmdt; range-aware trimming preserves
@@ -1703,7 +1715,8 @@ impl SyscallDispatcher {
     /// a post-`munmap` hole in a file/anon VMA (removed from `dynamic_maps`)
     /// stays uncovered → ENOMEM.
     fn madvise_range_meta(&self, start: u64, end: u64) -> MadviseRangeMeta {
-        let mem = self.mem.lock();
+        let mem_authority_2 = self.mem();
+        let mem = mem_authority_2.lock();
         // (start, end, writable, shared) for every VMA overlapping [start, end).
         let mut intervals: Vec<(u64, u64, bool, bool)> = Vec::new();
         let mut push = |map: &ProcMapsEntry| {
@@ -1785,7 +1798,7 @@ impl SyscallDispatcher {
         allow(dead_code)
     )]
     fn dynamic_mapping_ranges(&self, sharing: ProcMapSharing) -> Vec<(u64, usize)> {
-        self.mem
+        self.mem()
             .lock()
             .dynamic_maps
             .iter()
@@ -1799,7 +1812,7 @@ impl SyscallDispatcher {
     }
 
     fn dynamic_mapping_overlaps(&self, start: u64, len: u64) -> bool {
-        dynamic_mapping_overlaps_sorted(&self.mem.lock().dynamic_maps, start, len)
+        dynamic_mapping_overlaps_sorted(&self.mem().lock().dynamic_maps, start, len)
     }
 
     /// Whether `[start, start + len)` overlaps a Linux-visible guest VMA.
@@ -1809,14 +1822,15 @@ impl SyscallDispatcher {
     /// either arena and the live `[heap_base, brk_current)` span are real VMAs and
     /// are checked separately before the hidden boot reservations are filtered.
     pub(super) fn guest_vma_overlaps(&self, start: u64, len: u64) -> bool {
-        guest_vma_overlaps_locked(&self.mem.lock(), start, len)
+        guest_vma_overlaps_locked(&self.mem().lock(), start, len)
     }
 
     fn range_intersects_shared_mapping(&self, start: u64, len: u64) -> bool {
         let Some(end) = start.checked_add(len) else {
             return false;
         };
-        let mem = self.mem.lock();
+        let mem_authority_3 = self.mem();
+        let mem = mem_authority_3.lock();
         mem.dynamic_maps
             .iter()
             .chain(mem.address_space_regions.iter().flatten())
@@ -1868,7 +1882,7 @@ impl SyscallDispatcher {
         if let Some(range) =
             crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
         {
-            locked_ranges_insert(&mut self.mem.lock().write_sealed_shared_maps, range);
+            locked_ranges_insert(&mut self.mem().lock().write_sealed_shared_maps, range);
         }
     }
 
@@ -1876,7 +1890,7 @@ impl SyscallDispatcher {
         if let Some(range) =
             crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
         {
-            locked_ranges_insert(&mut self.mem.lock().read_only_shared_file_maps, range);
+            locked_ranges_insert(&mut self.mem().lock().read_only_shared_file_maps, range);
         }
     }
 
@@ -1890,7 +1904,7 @@ impl SyscallDispatcher {
         len: u64,
     ) -> Option<Arc<crate::kernel::FileDescription>> {
         let end = start.checked_add(len)?;
-        self.mem
+        self.mem()
             .lock()
             .shared_file_alias_maps
             .iter()
@@ -1899,7 +1913,7 @@ impl SyscallDispatcher {
     }
 
     fn range_is_read_only_shared_file(&self, start: u64, len: u64) -> bool {
-        self.mem
+        self.mem()
             .lock()
             .read_only_shared_file_maps
             .iter()
@@ -1907,7 +1921,7 @@ impl SyscallDispatcher {
     }
 
     fn range_is_write_sealed_shared(&self, start: u64, len: u64) -> bool {
-        self.mem
+        self.mem()
             .lock()
             .write_sealed_shared_maps
             .iter()
@@ -1918,7 +1932,7 @@ impl SyscallDispatcher {
         if let Some(range) =
             crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
         {
-            self.mem.lock().secretmem_maps.push(range);
+            self.mem().lock().secretmem_maps.push(range);
         }
     }
 
@@ -1926,7 +1940,7 @@ impl SyscallDispatcher {
     /// by the `/proc/<pid>/mem` read path to fail with EIO (the kernel cannot
     /// GUP secret pages; memfdsecret probe `procmem_hidden`).
     pub(in crate::dispatch) fn range_touches_secretmem(&self, start: u64, len: u64) -> bool {
-        self.mem
+        self.mem()
             .lock()
             .secretmem_maps
             .iter()
@@ -1938,7 +1952,7 @@ impl SyscallDispatcher {
         if let Some(range) =
             crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
         {
-            locked_ranges_remove(&mut self.mem.lock().secretmem_maps, range);
+            locked_ranges_remove(&mut self.mem().lock().secretmem_maps, range);
         }
     }
 
@@ -1951,7 +1965,7 @@ impl SyscallDispatcher {
         if let Some(range) =
             crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
         {
-            self.mem
+            self.mem()
                 .lock()
                 .writable_memfd_maps
                 .push((range, description));
@@ -1966,7 +1980,7 @@ impl SyscallDispatcher {
     /// alias too and must retire the same VMA/residency/lock/fault/bus/seal/memfd
     /// state before it removes the attachment and decrements `nattch`.
     pub(super) fn remove_mapping_metadata(&self, start: u64, len: u64) {
-        remove_mapping_metadata_locked(&mut self.mem.lock(), start, len);
+        remove_mapping_metadata_locked(&mut self.mem().lock(), start, len);
         self.captured_mm()
             .replace_io_uring_mappings(start, len, None);
     }
@@ -1977,7 +1991,7 @@ impl SyscallDispatcher {
         &self,
         description: &Arc<crate::kernel::FileDescription>,
     ) -> bool {
-        self.mem
+        self.mem()
             .lock()
             .writable_memfd_maps
             .iter()
@@ -2009,7 +2023,8 @@ impl SyscallDispatcher {
             return;
         };
         let (read, write, execute) = prot_to_proc_perms(prot);
-        let mut mem = self.mem.lock();
+        let mem_authority_4 = self.mem();
+        let mut mem = mem_authority_4.lock();
         trim_core_file_mappings_for_range(&mut mem.core_file_mappings, start, len);
         if let Some(file_page_offset) = file_page_offset
             && !path.is_empty()
@@ -2052,7 +2067,7 @@ impl SyscallDispatcher {
         let Some(end) = start.checked_add(len) else {
             return false;
         };
-        self.mem
+        self.mem()
             .lock()
             .host_alias_backed_ranges
             .iter()
@@ -2063,7 +2078,7 @@ impl SyscallDispatcher {
         let Some(end) = start.checked_add(len) else {
             return false;
         };
-        self.mem
+        self.mem()
             .lock()
             .alias_vma_ranges
             .iter()
@@ -2077,7 +2092,7 @@ impl SyscallDispatcher {
         let Some(range) = crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)) else {
             std::process::abort();
         };
-        locked_ranges_insert(&mut self.mem.lock().alias_vma_ranges, range);
+        locked_ranges_insert(&mut self.mem().lock().alias_vma_ranges, range);
     }
 
     /// Recover the one source VMA `mremap` is allowed to transform. Combining
@@ -2093,7 +2108,8 @@ impl SyscallDispatcher {
         len: u64,
     ) -> Result<MremapMappingMetadata, LinuxErrno> {
         let end = start.checked_add(len).ok_or(LINUX_EFAULT)?;
-        let mem = self.mem.lock();
+        let mem_authority_5 = self.mem();
+        let mem = mem_authority_5.lock();
         let mut overlapping_dynamic = mem
             .dynamic_maps
             .iter()
@@ -2160,12 +2176,12 @@ impl SyscallDispatcher {
         if len == 0 {
             return;
         }
-        self.mem.lock().bus_fault_ranges.push((start, len));
+        self.mem().lock().bus_fault_ranges.push((start, len));
     }
 
     pub(crate) fn mmap_fault_is_sigbus(&self, addr: u64) -> bool {
         let _host_alias_dispatch = self.begin_host_alias_dispatch();
-        self.mem
+        self.mem()
             .lock()
             .bus_fault_ranges
             .iter()
@@ -2183,13 +2199,14 @@ impl SyscallDispatcher {
         let page_size = self.linux_page_size();
         let stack_span = 256 * page_size;
         let low = end.saturating_sub(stack_span);
-        self.mem.lock().growdown_ranges.push((low, start, end));
+        self.mem().lock().growdown_ranges.push((low, start, end));
     }
 
     pub(crate) fn mmap_growdown_fault_plan(&self, addr: u64) -> Option<MmapGrowdownFaultPlan> {
         let exclusion = self.begin_host_alias_dispatch();
         let page = page_floor(addr, self.linux_page_size());
-        let mem = self.mem.lock();
+        let mem_authority_6 = self.mem();
+        let mem = mem_authority_6.lock();
         for &(low, current, _end) in &mem.growdown_ranges {
             if page >= low && page < current {
                 let obstacle = mem
@@ -2203,7 +2220,7 @@ impl SyscallDispatcher {
                 return Some(MmapGrowdownFaultPlan {
                     start: page,
                     len,
-                    exclusion: exclusion.with_vma_revision(self.mem.revision_publisher()),
+                    exclusion: exclusion.with_vma_revision(self.mem().revision_publisher()),
                 });
             }
         }
@@ -2214,7 +2231,8 @@ impl SyscallDispatcher {
         if !self.owns_host_alias_dispatch(&plan.exclusion) {
             std::process::abort();
         }
-        let mut mem = self.mem.lock();
+        let mem_authority_7 = self.mem();
+        let mut mem = mem_authority_7.lock();
         for (_low, current, _end) in &mut mem.growdown_ranges {
             if plan.start < *current {
                 *current = plan.start;
@@ -2225,7 +2243,8 @@ impl SyscallDispatcher {
     }
 
     fn update_dynamic_mapping_prot(&self, start: u64, len: u64, prot: LinuxProtFlags) {
-        let mut mem = self.mem.lock();
+        let mem_authority_8 = self.mem();
+        let mut mem = mem_authority_8.lock();
         update_proc_map_prot(&mut mem.dynamic_maps, start, len, prot);
 
         let layout = mem.layout;
@@ -2256,7 +2275,7 @@ impl SyscallDispatcher {
     #[cfg(test)]
     pub(crate) fn reset_memory_state_on_execve(&self) {
         let _vma_dispatch = self.begin_vma_dispatch();
-        self.mem.lock().reset_for_execve();
+        self.mem().lock().reset_for_execve();
     }
 
     pub(in crate::dispatch) fn next_mmap_address(
@@ -2276,7 +2295,8 @@ impl SyscallDispatcher {
             && std::env::var_os("CARRICK_MMAP_GRANT_DEBUG").is_some()
             && let Some((address, _)) = granted
         {
-            let mem = self.mem.lock();
+            let mem_authority_9 = self.mem();
+            let mem = mem_authority_9.lock();
             let overlaps: Vec<_> = mem
                 .dynamic_maps
                 .iter()
@@ -2339,7 +2359,7 @@ impl SyscallDispatcher {
         // see `mmap_writable_high`.
         let writable = prot & LINUX_PROT_WRITE != 0;
         let page_size = self.linux_page_size();
-        let layout = self.mem.lock().layout;
+        let layout = self.mem().lock().layout;
         if flags & LINUX_MAP_FIXED != 0 {
             if requested == 0 || !requested.is_multiple_of(page_size) {
                 return None;
@@ -2357,7 +2377,8 @@ impl SyscallDispatcher {
             if range_within(requested, length, layout.mmap_base, layout.mmap_size)
                 && let Some(end) = requested.checked_add(length)
             {
-                let mut mem = self.mem.lock();
+                let mem_authority_10 = self.mem();
+                let mut mem = mem_authority_10.lock();
                 if prot & LINUX_PROT_WRITE != 0 {
                     mem.mmap_writable_high = mem.mmap_writable_high.max(end);
                 }
@@ -2391,7 +2412,8 @@ impl SyscallDispatcher {
             let arena_hint =
                 aligned_hint && range_within(requested, length, layout.mmap_base, layout.mmap_size);
             if arena_hint {
-                let mut mem = self.mem.lock();
+                let mem_authority_11 = self.mem();
+                let mut mem = mem_authority_11.lock();
                 let end = requested.checked_add(length)?;
                 if requested >= mem.mmap_next {
                     mem.mmap_next = end;
@@ -2413,7 +2435,9 @@ impl SyscallDispatcher {
             }
         }
 
-        let mut mem = self.mem.lock();
+        let mem_authority_12 = self.mem();
+
+        let mut mem = mem_authority_12.lock();
         if let Some(pos) = mem.free_regions.iter().position(|&(_, l)| l >= length) {
             let (s, l) = mem.free_regions[pos];
             if l == length {
@@ -2633,7 +2657,8 @@ impl SyscallDispatcher {
 
         fn brk(this, cx, requested: u64) {
             let mut host_alias_dispatch = this.begin_host_alias_dispatch();
-            let mut mem = this.mem.lock();
+            let mem_authority_13 = this.mem();
+            let mut mem = mem_authority_13.lock();
             let current = mem.brk_current;
             if requested == 0 {
                 return Ok(DispatchOutcome::Returned {
@@ -2677,7 +2702,7 @@ impl SyscallDispatcher {
                 }
                 if requested != current {
                     mem.brk_current = requested;
-                    host_alias_dispatch.mark_vma_revision(this.mem.revision_publisher());
+                    host_alias_dispatch.mark_vma_revision(this.mem().revision_publisher());
                 }
             }
             Ok(DispatchOutcome::Returned {
@@ -2999,7 +3024,7 @@ impl SyscallDispatcher {
             }
 
             let fixed_write_exec_alias = if map_flags.contains(LinuxMmapFlags::FIXED) {
-                let layout = this.mem.lock().layout;
+                let layout = this.mem().lock().layout;
                 !range_within(requested.0, length, layout.mmap_base, layout.mmap_size)
             } else {
                 false
@@ -3082,7 +3107,8 @@ impl SyscallDispatcher {
                 // Exact sub-granule fragments stay quarantined in the aperture
                 // free list until they coalesce into an aligned allocation.
                 let (overlay_va, displaced_shared_preview) = {
-                    let mut mem = this.mem.lock();
+                    let mem_authority_14 = this.mem();
+                    let mut mem = mem_authority_14.lock();
                     if !mem
                         .overlay
                         .source_range_is_carvable(requested.0, length, None)
@@ -3151,7 +3177,8 @@ impl SyscallDispatcher {
                     }
                 }
                 let displaced_shared = {
-                    let mut mem = this.mem.lock();
+                    let mem_authority_15 = this.mem();
+                    let mut mem = mem_authority_15.lock();
                     if mem
                         .overlay
                         .carve_source_range(requested.0, length, Some(overlay_va))
@@ -3423,11 +3450,12 @@ impl SyscallDispatcher {
                 // PROT_NONE -> writable commit can install the exact hinted VA
                 // while preserving the original MAP_SHARED provenance.
                 && (requested.0 == 0
-                    || !mmap_address_uses_alias(requested.0, length, this.mem.lock().layout))
+                    || !mmap_address_uses_alias(requested.0, length, this.mem().lock().layout))
             {
                 let map_len = align_up_u64(length, hvf_page).unwrap_or(length);
                 let alloc = {
-                    let mut mem = this.mem.lock();
+                    let mem_authority_16 = this.mem();
+                    let mut mem = mem_authority_16.lock();
                     mem.shared.alloc_sourced_with_reuse(
                         length,
                         crate::shared_aperture::BackingObject::SharedAnon,
@@ -3445,15 +3473,14 @@ impl SyscallDispatcher {
                             carrick_guest_mem::MappingSharing::Shared,
                         )
                     {
-                        this.mem.lock().shared.free(addr);
+                        this.mem().lock().shared.free(addr);
                         return Ok(request.refused_by(
                             MmapRefusal::Internal("anonymous-reuse scrub failed (shared aperture)"),
                             LINUX_ENOMEM,
                             format_args!("at {addr:#x}+{map_len:#x}: {error}"),
                         ));
                     }
-                    let needs_identity_restore = this
-                        .mem
+                    let needs_identity_restore = this.mem()
                         .lock()
                         .shared
                         .range_needs_identity_restore(addr, map_len);
@@ -3464,8 +3491,7 @@ impl SyscallDispatcher {
                             // this VA would publish unowned translation state.
                             std::process::abort();
                         }
-                        if this
-                            .mem
+                        if this.mem()
                             .lock()
                             .shared
                             .mark_identity_restored(addr, map_len)
@@ -3587,7 +3613,7 @@ impl SyscallDispatcher {
                     // CPython's `test_io` asks for 0x8000_0000_0000_1000 on
                     // purpose. Only a request that would have fitted, and did
                     // not, is carrick's own arena running out.
-                    let arena = this.mem.lock().layout.mmap_size;
+                    let arena = this.mem().lock().layout.mmap_size;
                     let refusal = if length > arena {
                         MmapRefusal::Spec("length exceeds the entire mmap address-space arena")
                     } else {
@@ -3599,7 +3625,7 @@ impl SyscallDispatcher {
 
             let fixed_anonymous = map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                 && map_flags.contains(LinuxMmapFlags::FIXED);
-            let layout = this.mem.lock().layout;
+            let layout = this.mem().lock().layout;
             let in_arena = range_within(address, length, layout.mmap_base, layout.mmap_size);
             let address_uses_alias = mmap_request_uses_alias(
                 map_flags.contains(LinuxMmapFlags::FIXED),
@@ -4258,7 +4284,7 @@ impl SyscallDispatcher {
             let Some(aligned_len) = align_up_u64(length, page_size) else {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             };
-            let had_vma = guest_vma_overlaps_locked(&this.mem.lock(), address.0, aligned_len);
+            let had_vma = guest_vma_overlaps_locked(&this.mem().lock(), address.0, aligned_len);
             let (
                 shared_owned,
                 shared_carvable,
@@ -4266,7 +4292,8 @@ impl SyscallDispatcher {
                 overlay_owned,
                 overlay_carvable,
             ) = {
-                let mem = this.mem.lock();
+                let mem_authority_17 = this.mem();
+                let mem = mem_authority_17.lock();
                 (
                     mem.shared.guest_range_has_owner(address.0, aligned_len),
                     mem.shared.guest_range_is_carvable(address.0, aligned_len),
@@ -4288,8 +4315,7 @@ impl SyscallDispatcher {
                 }
                 mark_range_unmapped(&mut *cx.memory, address.0, len_usize);
                 this.remove_mapping_metadata(address.0, aligned_len);
-                if this
-                    .mem
+                if this.mem()
                     .lock()
                     .overlay
                     .carve_source_range(address.0, aligned_len, None)
@@ -4324,7 +4350,8 @@ impl SyscallDispatcher {
                 mark_range_unmapped(&mut *cx.memory, address.0, len_usize);
                 this.remove_mapping_metadata(address.0, aligned_len);
                 let displaced_shared = {
-                    let mut mem = this.mem.lock();
+                    let mem_authority_18 = this.mem();
+                    let mut mem = mem_authority_18.lock();
                     if mem
                         .overlay
                         .carve_source_range(address.0, aligned_len, None)
@@ -4362,7 +4389,7 @@ impl SyscallDispatcher {
             // Misaligned addresses (e.g. RLIM_INFINITY, which LTP munmap03 passes
             // to assert EINVAL) are already rejected by the alignment gate above;
             // addresses >= 2^48 stay EINVAL via the range check below.
-            let layout = this.mem.lock().layout;
+            let layout = this.mem().lock().layout;
             if this.range_is_alias_vma(address.0, length)
                 || mmap_address_uses_alias(address.0, length, layout)
             {
@@ -4400,7 +4427,8 @@ impl SyscallDispatcher {
             }
             mark_range_unmapped(&mut *cx.memory, address.0, len_usize);
             this.remove_mapping_metadata(address.0, aligned_len);
-            let mut mem = this.mem.lock();
+            let mem_authority_19 = this.mem();
+            let mut mem = mem_authority_19.lock();
             if mem
                 .overlay
                 .carve_source_range(address.0, aligned_len, None)
@@ -4440,7 +4468,8 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
             let alloc = {
-                let mem = this.mem.lock();
+                let mem_authority_20 = this.mem();
+                let mem = mem_authority_20.lock();
                 mem.shared
                     .live()
                     .iter()
@@ -4465,7 +4494,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             };
             let committed_vma_covers_range = guest_vma_covers_locked(
-                &this.mem.lock(),
+                &this.mem().lock(),
                 range.start().raw(),
                 range.len() as u64,
             );
@@ -4488,7 +4517,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             };
             let committed_vma_covers_range = guest_vma_covers_locked(
-                &this.mem.lock(),
+                &this.mem().lock(),
                 range.start().raw(),
                 range.len() as u64,
             );
@@ -4527,7 +4556,7 @@ impl SyscallDispatcher {
 
         fn munlockall(this, cx) {
             let _host_alias_dispatch = this.begin_host_alias_dispatch();
-            this.mem.lock().locked_ranges.clear();
+            this.mem().lock().locked_ranges.clear();
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -4541,7 +4570,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             };
             let committed_vma_covers_range = guest_vma_covers_locked(
-                &this.mem.lock(),
+                &this.mem().lock(),
                 range.start().raw(),
                 range.len() as u64,
             );
@@ -4694,7 +4723,7 @@ impl SyscallDispatcher {
                 // not resurrecting dead branches.
                 return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
             }
-            let layout = this.mem.lock().layout;
+            let layout = this.mem().lock().layout;
             let source_in_arena =
                 range_within(old_address.0, old_size, layout.mmap_base, layout.mmap_size);
             if !source_in_arena && memory.read_bytes(old_address.0, 1).is_err() {
@@ -4704,8 +4733,7 @@ impl SyscallDispatcher {
                 Ok(metadata) => metadata,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
-            let shared_aperture_alloc = this
-                .mem
+            let shared_aperture_alloc = this.mem()
                 .lock()
                 .shared
                 .live()
@@ -4817,7 +4845,7 @@ impl SyscallDispatcher {
                 && old_size != 0)
             .then(|| {
                 let last = old_address.0.saturating_add(old_size) - 1;
-                this.mem
+                this.mem()
                     .lock()
                     .bus_fault_ranges
                     .iter()
@@ -5011,8 +5039,7 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     };
                     let old_end = old_address.0.saturating_add(old_size);
-                    let tail_occupied = this
-                        .mem
+                    let tail_occupied = this.mem()
                         .lock()
                         .dynamic_maps
                         .iter()
@@ -5048,7 +5075,7 @@ impl SyscallDispatcher {
                     // must keep its identity so every other mapper (a forked
                     // child, a second mmap of the same object) still sees this
                     // mapping's stores.
-                    let claimed = this.mem.lock().shared.grow(old_address.0, new_size);
+                    let claimed = this.mem().lock().shared.grow(old_address.0, new_size);
                     let Some((claim_start, claim_len)) = claimed else {
                         return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     };
@@ -5071,8 +5098,7 @@ impl SyscallDispatcher {
                         {
                             return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                         }
-                        if this
-                            .mem
+                        if this.mem()
                             .lock()
                             .shared
                             .range_needs_identity_restore(claim_start, claim_len)
@@ -5086,8 +5112,7 @@ impl SyscallDispatcher {
                                 // this VA would publish unowned translation.
                                 std::process::abort();
                             }
-                            if this
-                                .mem
+                            if this.mem()
                                 .lock()
                                 .shared
                                 .mark_identity_restored(claim_start, claim_len)
@@ -5138,7 +5163,8 @@ impl SyscallDispatcher {
                         };
                         let tracked_shared = shared_aperture_alloc.is_some();
                         let (tracked_overlay, overlay_tail_carvable) = {
-                            let mem = this.mem.lock();
+                            let mem_authority_21 = this.mem();
+                            let mem = mem_authority_21.lock();
                             (
                                 mem.overlay.source_range_has_owner(tail_start, tail_len),
                                 mem.overlay
@@ -5163,8 +5189,7 @@ impl SyscallDispatcher {
                         mark_range_unmapped(memory, tail_start, tail_len_usize);
                         this.remove_mapping_metadata(tail_start, tail_len);
                         if tracked_shared
-                            && this
-                                .mem
+                            && this.mem()
                                 .lock()
                                 .shared
                                 .shrink(old_address.0, new_size)
@@ -5176,8 +5201,7 @@ impl SyscallDispatcher {
                             std::process::abort();
                         }
                         if tracked_overlay
-                            && this
-                                .mem
+                            && this.mem()
                                 .lock()
                                 .overlay
                                 .carve_source_range(tail_start, tail_len, None)
@@ -5233,7 +5257,8 @@ impl SyscallDispatcher {
                     }
                     mark_range_unmapped(memory, tail_start, tl);
                     this.remove_mapping_metadata(tail_start, tail_len);
-                    let mut mem = this.mem.lock();
+                    let mem_authority_22 = this.mem();
+                    let mut mem = mem_authority_22.lock();
                     if tail_end == mem.mmap_next {
                         let mem = &mut *mem;
                         lower_mmap_next(&mut mem.mmap_next, &mut mem.free_regions, tail_start);
@@ -5273,7 +5298,7 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
                 let old_end = old_address.0.saturating_add(old_size);
-                let can_extend_in_place = old_end == this.mem.lock().mmap_next
+                let can_extend_in_place = old_end == this.mem().lock().mmap_next
                     && range_within(old_address.0, new_size, layout.mmap_base, layout.mmap_size);
                 if !can_extend_in_place {
                     // Something already owns the space directly above, so this
@@ -5373,7 +5398,8 @@ impl SyscallDispatcher {
                     {
                         mark_range_unmapped(memory, old_address.0, old_len);
                         this.remove_mapping_metadata(old_address.0, old_size);
-                        let mut mem = this.mem.lock();
+                        let mem_authority_23 = this.mem();
+                        let mut mem = mem_authority_23.lock();
                         if old_end == mem.mmap_next {
                             let mem = &mut *mem;
                             lower_mmap_next(
@@ -5399,7 +5425,8 @@ impl SyscallDispatcher {
                 // pointless anyway — reserving the VA and recording the bus
                 // range is the whole job.
                 {
-                    let mut mem = this.mem.lock();
+                    let mem_authority_24 = this.mem();
+                    let mut mem = mem_authority_24.lock();
                     mem.mmap_next = new_end;
                 }
                 this.record_mmap_bus_fault_range(old_end, grow_len_u64);
@@ -5416,7 +5443,7 @@ impl SyscallDispatcher {
                     value: old_address.0 as i64,
                 });
             }
-            if old_address.0.checked_add(old_size) == Some(this.mem.lock().mmap_next) {
+            if old_address.0.checked_add(old_size) == Some(this.mem().lock().mmap_next) {
                 let Some(old_end) = old_address.0.checked_add(old_size) else {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
@@ -5448,7 +5475,8 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     }
                     {
-                        let mut mem = this.mem.lock();
+                        let mem_authority_25 = this.mem();
+                        let mut mem = mem_authority_25.lock();
                         mem.mmap_next = new_end;
                         // The dirty high-water stays monotonic so a later
                         // munmap+rebump cannot expose bytes dirtied in this tail.
@@ -5585,7 +5613,8 @@ impl SyscallDispatcher {
                     }
                     mark_range_unmapped(memory, old_address.0, old_len);
                     this.remove_mapping_metadata(old_address.0, old_size);
-                    let mut mem = this.mem.lock();
+                    let mem_authority_26 = this.mem();
+                    let mut mem = mem_authority_26.lock();
                     if old_address.0.checked_add(old_size) == Some(mem.mmap_next) {
                         let mem = &mut *mem;
                         lower_mmap_next(
@@ -5640,7 +5669,7 @@ impl SyscallDispatcher {
                 .memory
                 .protections()
                 .is_some_and(|p| p.range_unmapped(address.0, len));
-            let layout = this.mem.lock().layout;
+            let layout = this.mem().lock().layout;
             let address_is_alias_vma = this.range_is_alias_vma(address.0, length)
                 || mmap_address_uses_alias(address.0, length, layout);
             // Complete VMA metadata answers whether the Linux address range is
@@ -5664,7 +5693,7 @@ impl SyscallDispatcher {
             // neither complete backend metadata nor committed VMA metadata
             // covers the request. Explicit post-munmap state still wins above.
             let committed_vma_covers_range =
-                guest_vma_covers_locked(&this.mem.lock(), address.0, length);
+                guest_vma_covers_locked(&this.mem().lock(), address.0, length);
             let incomplete_backend_says_unmapped = !committed_vma_covers_range
                 && !cx.memory.has_complete_mapping_metadata()
                 && cx.memory.read_bytes_raw(address.0, 1).is_err();
@@ -5755,7 +5784,7 @@ impl SyscallDispatcher {
             {
                 return Ok(DispatchOutcome::errno(LINUX_EACCES));
             }
-            let layout = this.mem.lock().layout;
+            let layout = this.mem().lock().layout;
             if prot_flags.contains(LinuxProtFlags::EXEC)
                 && let Some(reason) =
                     this.native16k_exec_transition_rejection(cx.memory, cx.thread)
@@ -5828,7 +5857,8 @@ impl SyscallDispatcher {
                 if prot_flags.contains(LinuxProtFlags::WRITE)
                     && let Some(end) = address.0.checked_add(length)
                 {
-                    let mut mem = this.mem.lock();
+                    let mem_authority_27 = this.mem();
+                    let mut mem = mem_authority_27.lock();
                     mem.mmap_writable_high = mem.mmap_writable_high.max(end);
                 }
             } else if mprotect_range_in_identity_image(address.0, length, layout) {
@@ -5958,7 +5988,7 @@ impl SyscallDispatcher {
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             }
             let shared_map = {
-                this.mem
+                this.mem()
                     .lock()
                     .dynamic_maps
                     .iter()
@@ -5968,7 +5998,8 @@ impl SyscallDispatcher {
             if let Some(map) = shared_map {
                 let map_len = map.end.saturating_sub(map.start);
                 let snapshot = {
-                    let mut mem = this.mem.lock();
+                    let mem_authority_28 = this.mem();
+                    let mut mem = mem_authority_28.lock();
                     if let Some(snapshot) = mem.remap_snapshots.get(&map.start) {
                         snapshot.clone()
                     } else {
@@ -6072,7 +6103,8 @@ impl SyscallDispatcher {
         ) else {
             return;
         };
-        let mut mem = self.mem.lock();
+        let mem_authority_29 = self.mem();
+        let mut mem = mem_authority_29.lock();
         locked_ranges_insert(&mut mem.resident_tracked_ranges, range);
         mem.resident_fault_ranges
             .push(ResidentFaultRange { range, prot });
@@ -6099,7 +6131,8 @@ impl SyscallDispatcher {
         page_size: u64,
     ) -> Option<Vec<u8>> {
         let live_residency = memory.resident_pages(GuestVa(address), pages, page_size);
-        let mem = self.mem.lock();
+        let mem_authority_30 = self.mem();
+        let mem = mem_authority_30.lock();
         let mut out = Vec::with_capacity(usize::try_from(pages).ok()?);
         for index in 0..pages {
             let page = address.checked_add(index.checked_mul(page_size)?)?;
@@ -6126,7 +6159,7 @@ impl SyscallDispatcher {
     /// reports those pages resident.
     #[cfg(test)]
     pub(crate) fn dynamic_mapping_for_test(&self, start: u64) -> Option<ProcMapsEntry> {
-        self.mem
+        self.mem()
             .lock()
             .dynamic_maps
             .iter()
@@ -6139,7 +6172,8 @@ impl SyscallDispatcher {
         let Some(end) = start.checked_add(len) else {
             return true;
         };
-        let mem = self.mem.lock();
+        let mem_authority_31 = self.mem();
+        let mem = mem_authority_31.lock();
         let overlaps = |range: &crate::vfs::GuestMemoryRange| {
             range.start().raw() < end && start < range.end().raw()
         };
@@ -6170,14 +6204,15 @@ impl SyscallDispatcher {
         if let Some(range) =
             crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
         {
-            locked_ranges_insert(&mut self.mem.lock().resident_ranges, range);
+            locked_ranges_insert(&mut self.mem().lock().resident_ranges, range);
         }
     }
 
     pub(crate) fn resident_fault_plan(&self, address: u64) -> Option<ResidentFaultPlan> {
         let exclusion = self.begin_host_alias_dispatch();
         let page = page_floor(address, self.linux_page_size());
-        let mem = self.mem.lock();
+        let mem_authority_32 = self.mem();
+        let mem = mem_authority_32.lock();
         let prot = mem
             .resident_fault_ranges
             .iter()
@@ -6202,7 +6237,8 @@ impl SyscallDispatcher {
         else {
             return;
         };
-        let mut mem = self.mem.lock();
+        let mem_authority_33 = self.mem();
+        let mut mem = mem_authority_33.lock();
         locked_ranges_insert(&mut mem.resident_ranges, range);
         remove_fault_range(&mut mem.resident_fault_ranges, range);
     }
@@ -6213,7 +6249,8 @@ impl SyscallDispatcher {
         range: crate::vfs::GuestMemoryRange,
     ) -> Result<(), LinuxErrno> {
         let faults = {
-            let mem = self.mem.lock();
+            let mem_authority_34 = self.mem();
+            let mem = mem_authority_34.lock();
             fault_range_intersections(&mem.resident_fault_ranges, range)
         };
         for fault in &faults {
@@ -6222,7 +6259,8 @@ impl SyscallDispatcher {
                 .protect_range(fault.range.start().raw(), len, fault.prot.bits())
                 .map_err(|_| LINUX_ENOMEM)?;
         }
-        let mut mem = self.mem.lock();
+        let mem_authority_35 = self.mem();
+        let mut mem = mem_authority_35.lock();
         locked_ranges_insert(&mut mem.resident_ranges, range);
         remove_fault_range(&mut mem.resident_fault_ranges, range);
         Ok(())
@@ -6230,7 +6268,7 @@ impl SyscallDispatcher {
 
     fn add_locked_range(&self, range: crate::vfs::GuestMemoryRange) -> Result<(), LinuxErrno> {
         self.check_locked_range_limit(range)?;
-        locked_ranges_insert(&mut self.mem.lock().locked_ranges, range);
+        locked_ranges_insert(&mut self.mem().lock().locked_ranges, range);
         Ok(())
     }
 
@@ -6268,7 +6306,7 @@ impl SyscallDispatcher {
         if limit == 0 {
             return Err(LINUX_EPERM);
         }
-        let locked = locked_ranges_total(&self.mem.lock().locked_ranges);
+        let locked = locked_ranges_total(&self.mem().lock().locked_ranges);
         if locked.checked_add(length).is_none_or(|total| total > limit) {
             return Err(LINUX_ENOMEM);
         }
@@ -6285,7 +6323,8 @@ impl SyscallDispatcher {
         } else {
             Some(self.effective_resource_limit(LINUX_RLIMIT_MEMLOCK).rlim_cur)
         };
-        let mem = self.mem.lock();
+        let mem_authority_36 = self.mem();
+        let mem = mem_authority_36.lock();
         let mut next = mem.locked_ranges.clone();
         locked_ranges_insert(&mut next, range);
         if let Some(limit) = memlock_limit {
@@ -6308,7 +6347,7 @@ impl SyscallDispatcher {
             return Ok(());
         };
         self.populate_resident_range(memory, range)?;
-        locked_ranges_insert(&mut self.mem.lock().locked_ranges, range);
+        locked_ranges_insert(&mut self.mem().lock().locked_ranges, range);
         Ok(())
     }
 
@@ -6318,7 +6357,8 @@ impl SyscallDispatcher {
         let Some(range) = range else {
             return;
         };
-        let mut mem = self.mem.lock();
+        let mem_authority_37 = self.mem();
+        let mut mem = mem_authority_37.lock();
         locked_ranges_insert(&mut mem.resident_ranges, range);
         locked_ranges_insert(&mut mem.locked_ranges, range);
     }
@@ -6356,7 +6396,8 @@ impl SyscallDispatcher {
             )));
         }
         memory.set_unmapped(address, mapped_length, true);
-        let mut mem = self.mem.lock();
+        let mem_authority_38 = self.mem();
+        let mut mem = mem_authority_38.lock();
         mem.shared.free(address);
         locked_ranges_remove(&mut mem.locked_ranges, range);
         locked_ranges_remove(&mut mem.resident_ranges, range);
@@ -6390,7 +6431,8 @@ impl SyscallDispatcher {
             )));
         }
         mark_range_unmapped(memory, address, len_usize);
-        let mut mem = self.mem.lock();
+        let mem_authority_39 = self.mem();
+        let mut mem = mem_authority_39.lock();
         if address.checked_add(len) == Some(mem.mmap_next) {
             let mem = &mut *mem;
             lower_mmap_next(&mut mem.mmap_next, &mut mem.free_regions, address);
@@ -6401,7 +6443,7 @@ impl SyscallDispatcher {
     }
 
     fn remove_locked_range(&self, range: crate::vfs::GuestMemoryRange) {
-        locked_ranges_remove(&mut self.mem.lock().locked_ranges, range);
+        locked_ranges_remove(&mut self.mem().lock().locked_ranges, range);
     }
 
     fn lock_current_mappings(
@@ -6409,7 +6451,8 @@ impl SyscallDispatcher {
         memory: &mut impl GuestMemory,
         onfault: bool,
     ) -> Result<(), LinuxErrno> {
-        let mem = self.mem.lock();
+        let mem_authority_40 = self.mem();
+        let mem = mem_authority_40.lock();
         let mut ranges = mem.locked_ranges.clone();
         if let Some(regions) = &mem.address_space_regions {
             for region in regions {
@@ -6444,7 +6487,7 @@ impl SyscallDispatcher {
                 self.populate_resident_range(memory, *range)?;
             }
         }
-        self.mem.lock().locked_ranges = ranges;
+        self.mem().lock().locked_ranges = ranges;
         Ok(())
     }
 }
