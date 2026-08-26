@@ -3294,3 +3294,453 @@ fn tee_in_memory_destination_reader_closed_epipe_and_sigpipe() {
         "SIG_IGN must suppress queuing SIGPIPE"
     );
 }
+
+#[test]
+fn pipe_end_direction_matrix_and_fd_lifecycle_closure() {
+    let pair = TestPipePair::new(65536, 65536);
+    let mut memory = LinearMemory::new(0x1000, vec![0; 0x10000]);
+    let reporter = CompatReporter::default();
+    let ctx = pair.dispatcher.capture_one_task_context().unwrap();
+
+    const BUF_ADDR: u64 = 0x2000;
+    const IOV_ADDR: u64 = 0x3000;
+    let iov = LinuxIovec {
+        iov_base: BUF_ADDR,
+        iov_len: 16,
+    };
+    write_kernel_struct_raw(&mut memory, IOV_ADDR, &iov).expect("write iov");
+    memory
+        .write_bytes(BUF_ADDR, b"0123456789abcdef")
+        .expect("write buf");
+
+    let dispatch_call =
+        |dispatcher: &SyscallDispatcher, nr: u64, args: [u64; 6], mem: &mut LinearMemory| {
+            dispatcher
+                .dispatch_normalized(
+                    &ctx,
+                    SyscallRequest::new(nr, SyscallArgs::from(args)),
+                    mem,
+                    &reporter,
+                    None,
+                )
+                .expect("claimed")
+                .expect("outcome")
+        };
+
+    // 1. Read-family operations on PipeWriter return EBADF
+    let w_fd = pair.in_write_fd as u64;
+    assert_eq!(
+        dispatch_call(
+            &pair.dispatcher,
+            63,
+            [w_fd, BUF_ADDR, 1, 0, 0, 0],
+            &mut memory
+        ),
+        DispatchOutcome::errno(LINUX_EBADF),
+        "read on pipe write end must return EBADF"
+    );
+    assert_eq!(
+        dispatch_call(
+            &pair.dispatcher,
+            65,
+            [w_fd, IOV_ADDR, 1, 0, 0, 0],
+            &mut memory
+        ),
+        DispatchOutcome::errno(LINUX_EBADF),
+        "readv on pipe write end must return EBADF"
+    );
+    assert_eq!(
+        dispatch_call(
+            &pair.dispatcher,
+            67,
+            [w_fd, BUF_ADDR, 1, 0, 0, 0],
+            &mut memory
+        ),
+        DispatchOutcome::errno(LINUX_EBADF),
+        "pread64 on pipe write end must return EBADF"
+    );
+    assert_eq!(
+        dispatch_call(
+            &pair.dispatcher,
+            69,
+            [w_fd, IOV_ADDR, 1, 0, 0, 0],
+            &mut memory
+        ),
+        DispatchOutcome::errno(LINUX_EBADF),
+        "preadv on pipe write end must return EBADF"
+    );
+
+    // 2. Write-family operations on PipeReader return EBADF
+    let r_fd = pair.in_read_fd as u64;
+    assert_eq!(
+        dispatch_call(
+            &pair.dispatcher,
+            64,
+            [r_fd, BUF_ADDR, 1, 0, 0, 0],
+            &mut memory
+        ),
+        DispatchOutcome::errno(LINUX_EBADF),
+        "write on pipe read end must return EBADF"
+    );
+    assert_eq!(
+        dispatch_call(
+            &pair.dispatcher,
+            66,
+            [r_fd, IOV_ADDR, 1, 0, 0, 0],
+            &mut memory
+        ),
+        DispatchOutcome::errno(LINUX_EBADF),
+        "writev on pipe read end must return EBADF"
+    );
+    assert_eq!(
+        dispatch_call(
+            &pair.dispatcher,
+            68,
+            [r_fd, BUF_ADDR, 1, 0, 0, 0],
+            &mut memory
+        ),
+        DispatchOutcome::errno(LINUX_EBADF),
+        "pwrite64 on pipe read end must return EBADF"
+    );
+    assert_eq!(
+        dispatch_call(
+            &pair.dispatcher,
+            70,
+            [r_fd, IOV_ADDR, 1, 0, 0, 0],
+            &mut memory
+        ),
+        DispatchOutcome::errno(LINUX_EBADF),
+        "pwritev on pipe read end must return EBADF"
+    );
+
+    // 3. Correct directions succeed
+    assert_eq!(
+        dispatch_call(
+            &pair.dispatcher,
+            64,
+            [w_fd, BUF_ADDR, 5, 0, 0, 0],
+            &mut memory
+        ),
+        DispatchOutcome::Returned { value: 5 }
+    );
+    assert_eq!(
+        dispatch_call(
+            &pair.dispatcher,
+            63,
+            [r_fd, BUF_ADDR, 5, 0, 0, 0],
+            &mut memory
+        ),
+        DispatchOutcome::Returned { value: 5 }
+    );
+
+    // 4. Dup preserves direction and descriptor identity
+    let dup_read = dispatch_call(&pair.dispatcher, 23, [r_fd, 0, 0, 0, 0, 0], &mut memory);
+    let dup_read_fd = match dup_read {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("expected dup read fd, got {other:?}"),
+    };
+    assert_eq!(
+        dispatch_call(
+            &pair.dispatcher,
+            64,
+            [dup_read_fd, BUF_ADDR, 1, 0, 0, 0],
+            &mut memory
+        ),
+        DispatchOutcome::errno(LINUX_EBADF),
+        "write on duplicated read end must return EBADF"
+    );
+
+    let dup_write = dispatch_call(&pair.dispatcher, 23, [w_fd, 0, 0, 0, 0, 0], &mut memory);
+    let dup_write_fd = match dup_write {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("expected dup write fd, got {other:?}"),
+    };
+    assert_eq!(
+        dispatch_call(
+            &pair.dispatcher,
+            63,
+            [dup_write_fd, BUF_ADDR, 1, 0, 0, 0],
+            &mut memory
+        ),
+        DispatchOutcome::errno(LINUX_EBADF),
+        "read on duplicated write end must return EBADF"
+    );
+
+    // 5. Bidirectional HostPipe (e.g. O_RDWR FIFO or pty) permits both directions
+    let mut host_fds = [-1; 2];
+    assert_eq!(unsafe { libc::pipe(host_fds.as_mut_ptr()) }, 0);
+    let pty_desc = OpenDescription::HostPipe {
+        base: OpenDescriptionBase::new(carrick_abi::LINUX_O_RDWR),
+        host_fd: HostFdRef::new(host_fds[0]),
+        is_read_end: false,
+        pipe_id: 9999,
+        pty: None,
+        bidirectional: true,
+        write_kind: HostWriteKind::PipeLike,
+    };
+    let bi_fd = pair
+        .dispatcher
+        .install_fd_at_or_above(
+            3,
+            OpenFile::from_open_description(Arc::new(RwLock::new(pty_desc)), 0),
+        )
+        .expect("install bidirectional pipe");
+    let bi_file = pair.dispatcher.open_file(bi_fd).expect("open file");
+    assert!(matches!(
+        &*bi_file.description.read(),
+        OpenDescription::HostPipe {
+            bidirectional: true,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn dispatch_threaded_pipe_reader_write_shared_ebadf_not_enosys() {
+    let pair = TestPipePair::new(65536, 65536);
+    let context = pair
+        .dispatcher
+        .capture_one_task_context()
+        .expect("task context");
+    let reporter = CompatReporter::default();
+    let registry =
+        crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(2300));
+    let futex = crate::thread::FutexTable::new();
+    let mut memory = LinearMemory::new(0x4000, vec![0u8; 0x1000]);
+
+    const PAYLOAD_ADDR: u64 = 0x4100;
+    const PAYLOAD: &[u8] = b"test payload";
+    memory.write_bytes(PAYLOAD_ADDR, PAYLOAD).unwrap();
+
+    // 1. write on PipeReader must be admitted to the shared path (via write_shared_supported)
+    //    and return EBADF directly, rather than falling through to unhandled syscall (ENOSYS).
+    let write_reader_outcome = pair
+        .dispatcher
+        .dispatch_threaded(
+            &context,
+            SyscallRequest::new(
+                64, // SYS_WRITE
+                SyscallArgs::from([
+                    pair.in_read_fd as u64,
+                    PAYLOAD_ADDR,
+                    PAYLOAD.len() as u64,
+                    0,
+                    0,
+                    0,
+                ]),
+            ),
+            &mut memory,
+            &reporter,
+            registry.main_tid(),
+            &registry,
+            &futex,
+        )
+        .expect("dispatch_threaded write on pipe read end");
+
+    assert_eq!(
+        write_reader_outcome,
+        DispatchOutcome::errno(LINUX_EBADF),
+        "write on pipe reader in dispatch_threaded must return EBADF"
+    );
+
+    // 2. read on PipeWriter via dispatch_threaded returns EBADF
+    let read_writer_outcome = pair
+        .dispatcher
+        .dispatch_threaded(
+            &context,
+            SyscallRequest::new(
+                63, // SYS_READ
+                SyscallArgs::from([
+                    pair.in_write_fd as u64,
+                    PAYLOAD_ADDR,
+                    PAYLOAD.len() as u64,
+                    0,
+                    0,
+                    0,
+                ]),
+            ),
+            &mut memory,
+            &reporter,
+            registry.main_tid(),
+            &registry,
+            &futex,
+        )
+        .expect("dispatch_threaded read on pipe write end");
+
+    assert_eq!(
+        read_writer_outcome,
+        DispatchOutcome::errno(LINUX_EBADF),
+        "read on pipe writer in dispatch_threaded must return EBADF"
+    );
+
+    // 3. Normal write on PipeWriter and read on PipeReader succeed
+    let write_writer_outcome = pair
+        .dispatcher
+        .dispatch_threaded(
+            &context,
+            SyscallRequest::new(
+                64, // SYS_WRITE
+                SyscallArgs::from([
+                    pair.in_write_fd as u64,
+                    PAYLOAD_ADDR,
+                    PAYLOAD.len() as u64,
+                    0,
+                    0,
+                    0,
+                ]),
+            ),
+            &mut memory,
+            &reporter,
+            registry.main_tid(),
+            &registry,
+            &futex,
+        )
+        .expect("dispatch_threaded write on pipe write end");
+
+    assert_eq!(
+        write_writer_outcome,
+        DispatchOutcome::Returned {
+            value: PAYLOAD.len() as i64,
+        }
+    );
+
+    let read_reader_outcome = pair
+        .dispatcher
+        .dispatch_threaded(
+            &context,
+            SyscallRequest::new(
+                63, // SYS_READ
+                SyscallArgs::from([
+                    pair.in_read_fd as u64,
+                    PAYLOAD_ADDR,
+                    PAYLOAD.len() as u64,
+                    0,
+                    0,
+                    0,
+                ]),
+            ),
+            &mut memory,
+            &reporter,
+            registry.main_tid(),
+            &registry,
+            &futex,
+        )
+        .expect("dispatch_threaded read on pipe read end");
+
+    assert_eq!(
+        read_reader_outcome,
+        DispatchOutcome::Returned {
+            value: PAYLOAD.len() as i64,
+        }
+    );
+
+    let report = reporter.finish();
+    assert!(
+        report.unhandled_syscalls.is_empty(),
+        "dispatch_threaded pipe read/write must not generate unhandled syscall events: {:?}",
+        report.unhandled_syscalls
+    );
+}
+
+#[test]
+fn non_pipe_access_mode_readv_writev_and_splice_precedence() {
+    let mut pair = TestPipePair::new(65536, 65536);
+    let ctx = pair
+        .dispatcher
+        .capture_one_task_context()
+        .expect("task context");
+    let reporter = CompatReporter::default();
+    let mut memory = LinearMemory::new(0x1000, vec![0; 0x10000]);
+
+    const BUF_ADDR: u64 = 0x2000;
+    const IOV_ADDR: u64 = 0x3000;
+    let iov = LinuxIovec {
+        iov_base: BUF_ADDR,
+        iov_len: 8,
+    };
+    write_kernel_struct_raw(&mut memory, IOV_ADDR, &iov).expect("write iov");
+    memory
+        .write_bytes(BUF_ADDR, b"01234567")
+        .expect("write buf");
+
+    // 1. In-memory SyntheticFile opened O_WRONLY: readv returns EBADF
+    let wr_file_desc = OpenDescription::SyntheticFile {
+        base: OpenDescriptionBase::new(carrick_abi::LINUX_O_WRONLY),
+        path: "/tmp/test-wronly".to_string(),
+        contents: vec![1, 2, 3, 4],
+        offset: 0,
+    };
+    let wr_fd = pair
+        .dispatcher
+        .install_fd_at_or_above(
+            3,
+            OpenFile::from_open_description(Arc::new(RwLock::new(wr_file_desc)), 0),
+        )
+        .expect("install wronly file");
+
+    assert_eq!(
+        pair.dispatcher
+            .dispatch(
+                &ctx,
+                SyscallRequest::new(65, SyscallArgs::from([wr_fd as u64, IOV_ADDR, 1, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::errno(LINUX_EBADF),
+        "readv on O_WRONLY in-memory file must return EBADF"
+    );
+
+    // 2. splice_source_not_readable returns true on O_WRONLY file and yields EBADF on splice(76)
+    assert!(pair.dispatcher.splice_source_not_readable(wr_fd));
+    assert_eq!(
+        pair.dispatcher
+            .dispatch(
+                &ctx,
+                SyscallRequest::new(
+                    76, // SYS_SPLICE
+                    SyscallArgs::from([wr_fd as u64, 0, pair.in_write_fd as u64, 0, 4, 0])
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::errno(LINUX_EBADF),
+        "splice with O_WRONLY source must return EBADF"
+    );
+
+    // 3. Directory description: writev returns EBADF (restoring base behavior)
+    let dir_desc = OpenDescription::Directory {
+        base: OpenDescriptionBase::new(carrick_abi::LINUX_O_RDONLY),
+        path: "/tmp/dir".to_string(),
+        metadata: RootFsMetadata {
+            path: std::path::PathBuf::from("/tmp/dir"),
+            kind: crate::rootfs::RootFsEntryKind::Directory,
+            mode: 0o755,
+            size: 0,
+        },
+        entries: vec![],
+        offset: 0,
+        trusted_host_dir: None,
+    };
+    let dir_fd = pair
+        .dispatcher
+        .install_fd_at_or_above(
+            3,
+            OpenFile::from_open_description(Arc::new(RwLock::new(dir_desc)), 0),
+        )
+        .expect("install directory fd");
+
+    assert_eq!(
+        pair.dispatcher
+            .dispatch(
+                &ctx,
+                SyscallRequest::new(66, SyscallArgs::from([dir_fd as u64, IOV_ADDR, 1, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::errno(LINUX_EBADF),
+        "writev on directory descriptor must return EBADF"
+    );
+}

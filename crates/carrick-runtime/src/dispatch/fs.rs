@@ -1512,6 +1512,9 @@ impl SyscallDispatcher {
             &*open,
             OpenDescription::EventFd { .. }
                 | OpenDescription::PipeWriter { .. }
+                // PipeReader is shared-safe: write dispatch on a pipe read end returns
+                // Linux EBADF immediately without performing mutable or legacy-only state transitions.
+                | OpenDescription::PipeReader { .. }
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::HostFile { .. }
@@ -10128,12 +10131,14 @@ impl SyscallDispatcher {
                 OpenDescription::FsContext { .. } => {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
+                OpenDescription::PipeWriter { .. } => {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                }
                 OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
                 | OpenDescription::Mqueue { .. }
                 | OpenDescription::BpfMap { .. }
-                | OpenDescription::BpfProg { .. }
-                | OpenDescription::PipeWriter { .. } => {
+                | OpenDescription::BpfProg { .. } => {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
                 OpenDescription::HostSocket { host_fd, .. } => {
@@ -10200,6 +10205,16 @@ impl SyscallDispatcher {
             };
             let nonblocking = this.io_is_nonblocking(fd.0, 0);
             let mut open = open_file.description.write();
+            // readv() on a regular file opened write-only (O_WRONLY) → EBADF.
+            if matches!(
+                &*open,
+                OpenDescription::File { .. }
+                    | OpenDescription::SyntheticFile { .. }
+                    | OpenDescription::HostFile { .. }
+            ) && open.status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY
+            {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            }
             // Real host file: readv via the kernel fd (advances the shared
             // offset). Fill each iovec sequentially.
             if let OpenDescription::HostFile { host_fd, .. } = &*open {
@@ -10373,6 +10388,9 @@ impl SyscallDispatcher {
                 OpenDescription::Directory { .. } => {
                     return Ok(DispatchOutcome::errno(LINUX_EISDIR));
                 }
+                OpenDescription::PipeWriter { .. } => {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                }
                 OpenDescription::EventFd { .. }
                 | OpenDescription::TimerFd { .. }
                 | OpenDescription::Epoll { .. }
@@ -10380,7 +10398,6 @@ impl SyscallDispatcher {
                 | OpenDescription::Inotify { .. }
                 | OpenDescription::Fanotify { .. }
                 | OpenDescription::PipeReader { .. }
-                | OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
@@ -10420,6 +10437,12 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
             let open = open_file.description.read();
+            // pread reads the fd, so a descriptor not open for reading
+            // (O_WRONLY) is EBADF (pread02 "not open for reading" case), exactly
+            // as the kernel rejects it before touching the data.
+            if open.status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            }
             // Real host file: positional read via libc::pread (doesn't
             // disturb the shared kernel offset).
             if let OpenDescription::HostFile { host_fd, .. } = &*open {
@@ -10475,6 +10498,17 @@ impl SyscallDispatcher {
                 OpenDescription::Directory { .. } => {
                     return Ok(DispatchOutcome::errno(LINUX_EISDIR));
                 }
+                OpenDescription::PipeWriter { .. } => {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                }
+                OpenDescription::HostPipe {
+                    is_read_end,
+                    pty,
+                    bidirectional,
+                    ..
+                } if !*is_read_end && pty.is_none() && !*bidirectional => {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                }
                 OpenDescription::EventFd { .. }
                 | OpenDescription::TimerFd { .. }
                 | OpenDescription::Epoll { .. }
@@ -10482,7 +10516,6 @@ impl SyscallDispatcher {
                 | OpenDescription::Inotify { .. }
                 | OpenDescription::Fanotify { .. }
                 | OpenDescription::PipeReader { .. }
-                | OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
@@ -10637,6 +10670,17 @@ impl SyscallDispatcher {
                 OpenDescription::Directory { .. } => {
                     return Ok(DispatchOutcome::errno(LINUX_EISDIR));
                 }
+                OpenDescription::PipeWriter { .. } => {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                }
+                OpenDescription::HostPipe {
+                    is_read_end,
+                    pty,
+                    bidirectional,
+                    ..
+                } if !*is_read_end && pty.is_none() && !*bidirectional => {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                }
                 OpenDescription::EventFd { .. }
                 | OpenDescription::TimerFd { .. }
                 | OpenDescription::Epoll { .. }
@@ -10644,7 +10688,6 @@ impl SyscallDispatcher {
                 | OpenDescription::Inotify { .. }
                 | OpenDescription::Fanotify { .. }
                 | OpenDescription::PipeReader { .. }
-                | OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
@@ -10812,11 +10855,18 @@ impl SyscallDispatcher {
             let errno = match &*open {
                 OpenDescription::Closed { .. }
                 | OpenDescription::File { .. }
-                | OpenDescription::SyntheticFile { .. } => LINUX_EBADF,
+                | OpenDescription::SyntheticFile { .. }
+                | OpenDescription::PipeReader { .. } => LINUX_EBADF,
+                OpenDescription::HostPipe {
+                    is_read_end,
+                    pty,
+                    bidirectional,
+                    ..
+                } if *is_read_end && pty.is_none() && !*bidirectional => LINUX_EBADF,
+                OpenDescription::HostFile { writable, .. } if !*writable => LINUX_EBADF,
                 OpenDescription::HostFile { .. } => LINUX_EINVAL,
                 OpenDescription::Directory { .. } => LINUX_EISDIR,
-                OpenDescription::PipeReader { .. }
-                | OpenDescription::PipeWriter { .. }
+                OpenDescription::PipeWriter { .. }
                 | OpenDescription::EventFd { .. }
                 | OpenDescription::TimerFd { .. }
                 | OpenDescription::HostPipe { .. }
@@ -10982,11 +11032,18 @@ impl SyscallDispatcher {
             let errno = match &*open {
                 OpenDescription::Closed { .. }
                 | OpenDescription::File { .. }
-                | OpenDescription::SyntheticFile { .. } => LINUX_EBADF,
+                | OpenDescription::SyntheticFile { .. }
+                | OpenDescription::PipeReader { .. } => LINUX_EBADF,
+                OpenDescription::HostPipe {
+                    is_read_end,
+                    pty,
+                    bidirectional,
+                    ..
+                } if *is_read_end && pty.is_none() && !*bidirectional => LINUX_EBADF,
+                OpenDescription::HostFile { writable, .. } if !*writable => LINUX_EBADF,
                 OpenDescription::HostFile { .. } => LINUX_EINVAL,
                 OpenDescription::Directory { .. } => LINUX_EISDIR,
-                OpenDescription::PipeReader { .. }
-                | OpenDescription::PipeWriter { .. }
+                OpenDescription::PipeWriter { .. }
                 | OpenDescription::EventFd { .. }
                 | OpenDescription::TimerFd { .. }
                 | OpenDescription::HostPipe { .. }

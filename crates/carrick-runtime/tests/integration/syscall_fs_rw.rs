@@ -1764,7 +1764,7 @@ fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
             )
             .unwrap(),
         DispatchOutcome::Errno {
-            errno: LinuxErrno::new(29)
+            errno: LinuxErrno::new(9)
         }
     );
 

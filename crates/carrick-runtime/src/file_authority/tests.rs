@@ -2636,3 +2636,299 @@ fn canonical_paths_reject_ambiguous_spellings() {
     }
     assert_eq!(CanonicalPath::absolute("/").expect("root").as_str(), "/");
 }
+
+#[test]
+fn pipe_authority_direction_and_stream_sharing_survives_fork_copy() {
+    let mut parent = Harness::new();
+    let mut child = parent.peer(2, 1202, 1);
+    let parent_table = parent.create_table();
+
+    let (pipe, read_fd, write_fd) = match parent.send(
+        Command::CreatePipeAndInstall {
+            table: parent_table,
+            descriptor_flags: DescriptorFlags::NONE,
+            minimum: fd(3),
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(16),
+            status_flags: StatusFlags::from_linux_bits(0),
+            capacity: PipeCapacity::bounded(64).expect("capacity"),
+        },
+        ObjectGeneration::INITIAL,
+    ) {
+        Outcome::PipeCreated {
+            pipe,
+            read_fd,
+            write_fd,
+            ..
+        } => (pipe, read_fd, write_fd),
+        other => panic!("unexpected pipe creation: {other:?}"),
+    };
+
+    let child_table = match parent.send(
+        Command::ForkCopy {
+            source: parent_table,
+            owner: child.client,
+        },
+        ObjectGeneration::INITIAL,
+    ) {
+        Outcome::ForkCopied { table, .. } => table,
+        other => panic!("unexpected fork copy outcome: {other:?}"),
+    };
+
+    // 1. Child wrong-direction operations are rejected before I/O
+    assert_eq!(
+        child.send(
+            Command::Read {
+                table: child_table,
+                fd: write_fd,
+                maximum: ByteCount::bounded(8).expect("count"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Rejected(AuthorityError::NotReadable)
+    );
+    assert_eq!(
+        child.send(
+            Command::Write {
+                table: child_table,
+                fd: read_fd,
+                bytes: b"child-write".to_vec(),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Rejected(AuthorityError::NotWritable)
+    );
+
+    // 2. Child writes to write_fd and data is visible to parent reading from read_fd
+    assert!(matches!(
+        child.send(
+            Command::Write {
+                table: child_table,
+                fd: write_fd,
+                bytes: b"child-data".to_vec(),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::StreamWritten { pipe: actual, count, .. }
+            if actual == pipe && count.raw() == 10
+    ));
+    assert!(matches!(
+        parent.send(
+            Command::Read {
+                table: parent_table,
+                fd: read_fd,
+                maximum: ByteCount::bounded(16).expect("count"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::StreamBytes { pipe: actual, bytes, .. }
+            if actual == pipe && bytes == b"child-data"
+    ));
+
+    // 3. Parent writes to write_fd and data is visible to child reading from read_fd
+    assert!(matches!(
+        parent.send(
+            Command::Write {
+                table: parent_table,
+                fd: write_fd,
+                bytes: b"parent-data".to_vec(),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::StreamWritten { pipe: actual, count, .. }
+            if actual == pipe && count.raw() == 11
+    ));
+    assert!(matches!(
+        child.send(
+            Command::Read {
+                table: child_table,
+                fd: read_fd,
+                maximum: ByteCount::bounded(16).expect("count"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::StreamBytes { pipe: actual, bytes, .. }
+            if actual == pipe && bytes == b"parent-data"
+    ));
+}
+
+#[test]
+fn pipe_authority_direction_and_stream_sharing_survives_share_table_and_exec() {
+    let mut first = Harness::new();
+    let mut second = first.peer(2, 1203, 1);
+    let table = first.create_table();
+
+    let (pipe, read_fd, write_fd) = match first.send(
+        Command::CreatePipeAndInstall {
+            table,
+            descriptor_flags: DescriptorFlags::NONE,
+            minimum: fd(3),
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(16),
+            status_flags: StatusFlags::from_linux_bits(0),
+            capacity: PipeCapacity::bounded(64).expect("capacity"),
+        },
+        ObjectGeneration::INITIAL,
+    ) {
+        Outcome::PipeCreated {
+            pipe,
+            read_fd,
+            write_fd,
+            ..
+        } => (pipe, read_fd, write_fd),
+        other => panic!("unexpected pipe creation: {other:?}"),
+    };
+
+    assert!(matches!(
+        first.send(
+            Command::ShareTable {
+                table,
+                owner: second.client,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::TableShared { .. }
+    ));
+
+    // 1. Shared peer wrong-direction operations are rejected before I/O
+    assert_eq!(
+        second.send(
+            Command::Read {
+                table,
+                fd: write_fd,
+                maximum: ByteCount::bounded(8).expect("count"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Rejected(AuthorityError::NotReadable)
+    );
+    assert_eq!(
+        second.send(
+            Command::Write {
+                table,
+                fd: read_fd,
+                bytes: b"peer-write".to_vec(),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Rejected(AuthorityError::NotWritable)
+    );
+
+    // 2. Shared peer writes and first peer reads
+    assert!(matches!(
+        second.send(
+            Command::Write {
+                table,
+                fd: write_fd,
+                bytes: b"peer-data".to_vec(),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::StreamWritten { pipe: actual, count, .. }
+            if actual == pipe && count.raw() == 9
+    ));
+    assert!(matches!(
+        first.send(
+            Command::Read {
+                table,
+                fd: read_fd,
+                maximum: ByteCount::bounded(16).expect("count"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::StreamBytes { pipe: actual, bytes, .. }
+            if actual == pipe && bytes == b"peer-data"
+    ));
+
+    // 3. Duplicate descriptor preserves description identity and direction
+    let dup_read = match first.send(
+        Command::Dup {
+            table,
+            source: read_fd,
+            minimum: fd(10),
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(32),
+            flags: DescriptorFlags::CLOSE_ON_EXEC,
+        },
+        ObjectGeneration::INITIAL,
+    ) {
+        Outcome::Duplicated { fd, .. } => fd,
+        other => panic!("unexpected dup outcome: {other:?}"),
+    };
+    let dup_write = match first.send(
+        Command::Dup {
+            table,
+            source: write_fd,
+            minimum: fd(11),
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(32),
+            flags: DescriptorFlags::NONE,
+        },
+        ObjectGeneration::INITIAL,
+    ) {
+        Outcome::Duplicated { fd, .. } => fd,
+        other => panic!("unexpected dup outcome: {other:?}"),
+    };
+
+    assert_eq!(
+        first.send(
+            Command::Read {
+                table,
+                fd: dup_write,
+                maximum: ByteCount::bounded(8).expect("count"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Rejected(AuthorityError::NotReadable)
+    );
+    assert_eq!(
+        first.send(
+            Command::Write {
+                table,
+                fd: dup_read,
+                bytes: b"test".to_vec(),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Rejected(AuthorityError::NotWritable)
+    );
+
+    // 4. ExecSuccessor drops CLOSE_ON_EXEC dup_read but retains non-CLOEXEC write_fd and dup_write
+    let exec_table = match first.send(
+        Command::ExecSuccessor { source: table },
+        ObjectGeneration::INITIAL,
+    ) {
+        Outcome::ExecSucceeded { table, .. } => table,
+        other => panic!("unexpected exec outcome: {other:?}"),
+    };
+    assert_eq!(
+        first.send(
+            Command::Read {
+                table: exec_table,
+                fd: dup_read,
+                maximum: ByteCount::bounded(8).expect("count"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Rejected(AuthorityError::SlotNotFound)
+    );
+    assert!(matches!(
+        first.send(
+            Command::Write {
+                table: exec_table,
+                fd: dup_write,
+                bytes: b"retained".to_vec(),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::StreamWritten { pipe: actual, .. } if actual == pipe
+    ));
+    assert!(matches!(
+        first.send(
+            Command::Read {
+                table: exec_table,
+                fd: read_fd,
+                maximum: ByteCount::bounded(16).expect("count"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::StreamBytes { pipe: actual, bytes, .. }
+            if actual == pipe && bytes == b"retained"
+    ));
+}
