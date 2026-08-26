@@ -1839,6 +1839,38 @@ fn bind_mount_setxattr_reports_unsupported_instead_of_missing() {
 }
 
 #[test]
+fn sync_file_range_rejects_synthetic_character_device_with_espipe() {
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    memory.write_bytes(0x4000, b"/dev/null\0").unwrap();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(56, SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                // sync_file_range(fd, 0, 1, SYNC_FILE_RANGE_WAIT_AFTER)
+                SyscallRequest::new(84, SyscallArgs::from([3, 0, 1, 4, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::errno(LINUX_ESPIPE)
+    );
+}
+
+#[test]
 fn memory_file_open_does_not_duplicate_path_record_for_proc_fd() {
     reset_fd_open_path_inserts();
 
