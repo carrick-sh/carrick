@@ -1866,7 +1866,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     && profile.is_none()
                     && custom_trace_report_is_lossy(report)
                 {
-                    bail!("custom DTrace capture was lossy or interrupted");
+                    bail!("custom DTrace capture was lossy, interrupted, or exited nonzero");
                 }
                 if let Some(requested_profile) = profile {
                     let raw_path = output_path
@@ -2123,6 +2123,8 @@ fn custom_trace_report_is_lossy(report: carrick_runtime::dtrace_consumer::DTrace
         || report.dynamic_dirty_drops != 0
         || report.other_drops != 0
         || report.interrupted
+        || !report.dtrace_exit_observed
+        || report.exit_status != 0
 }
 
 fn run_volume_command(command: VolumeCommand) -> anyhow::Result<()> {
@@ -3113,8 +3115,8 @@ mod tests {
     }
 
     #[test]
-    fn custom_trace_drop_or_interrupt_is_never_accepted() {
-        assert!(!custom_trace_report_is_lossy(
+    fn custom_trace_drop_interrupt_or_missing_or_nonzero_exit_is_never_accepted() {
+        assert!(custom_trace_report_is_lossy(
             carrick_runtime::dtrace_consumer::DTraceRunReport::default()
         ));
         assert!(custom_trace_report_is_lossy(
@@ -3126,6 +3128,20 @@ mod tests {
         assert!(custom_trace_report_is_lossy(
             carrick_runtime::dtrace_consumer::DTraceRunReport {
                 interrupted: true,
+                ..Default::default()
+            }
+        ));
+        assert!(!custom_trace_report_is_lossy(
+            carrick_runtime::dtrace_consumer::DTraceRunReport {
+                dtrace_exit_observed: true,
+                exit_status: 0,
+                ..Default::default()
+            }
+        ));
+        assert!(custom_trace_report_is_lossy(
+            carrick_runtime::dtrace_consumer::DTraceRunReport {
+                dtrace_exit_observed: true,
+                exit_status: 1,
                 ..Default::default()
             }
         ));

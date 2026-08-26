@@ -4795,21 +4795,23 @@ impl SyscallDispatcher {
 
             let files = this.captured_file_table();
             let open_file = files.read_open_files().get(&epfd).cloned();
-            let (slot_generation, file_description_id, lookup_kind) = match &open_file {
-                Some(open_file) => (
-                    open_file.generation(),
-                    open_file.description.id().raw(),
-                    if open_file.description.is_epoll() { 0 } else { 1 },
-                ),
-                None => (0, 0, 2),
-            };
-            crate::probes::epoll_lookup(
-                files.id().raw(),
-                epfd,
-                slot_generation,
-                file_description_id,
-                lookup_kind,
-            );
+            crate::probes::epoll_lookup(|| {
+                let (slot_generation, file_description_id, lookup_kind) = match &open_file {
+                    Some(open_file) => (
+                        open_file.generation(),
+                        open_file.description.id().raw(),
+                        if open_file.description.is_epoll() { 0 } else { 1 },
+                    ),
+                    None => (0, 0, 2),
+                };
+                (
+                    files.id().raw(),
+                    epfd,
+                    slot_generation,
+                    file_description_id,
+                    lookup_kind,
+                )
+            });
             let Some(open_file) = open_file else {
                 // A valid fd that simply isn't an epoll instance is EINVAL; only a
                 // genuinely bad fd is EBADF. (LTP epoll_wait03.)
@@ -4897,21 +4899,23 @@ impl SyscallDispatcher {
             };
             let files = this.captured_file_table();
             let open_file = files.read_open_files().get(&epfd).cloned();
-            let (slot_generation, file_description_id, lookup_kind) = match &open_file {
-                Some(open_file) => (
-                    open_file.generation(),
-                    open_file.description.id().raw(),
-                    if open_file.description.is_epoll() { 0 } else { 1 },
-                ),
-                None => (0, 0, 2),
-            };
-            crate::probes::epoll_lookup(
-                files.id().raw(),
-                epfd,
-                slot_generation,
-                file_description_id,
-                lookup_kind,
-            );
+            crate::probes::epoll_lookup(|| {
+                let (slot_generation, file_description_id, lookup_kind) = match &open_file {
+                    Some(open_file) => (
+                        open_file.generation(),
+                        open_file.description.id().raw(),
+                        if open_file.description.is_epoll() { 0 } else { 1 },
+                    ),
+                    None => (0, 0, 2),
+                };
+                (
+                    files.id().raw(),
+                    epfd,
+                    slot_generation,
+                    file_description_id,
+                    lookup_kind,
+                )
+            });
             let Some(open_file) = open_file else {
                 return Ok(DispatchOutcome::errno(if this.fd_is_valid(epfd) {
                     LINUX_EINVAL
