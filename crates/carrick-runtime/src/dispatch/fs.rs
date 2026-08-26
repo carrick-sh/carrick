@@ -9332,58 +9332,91 @@ impl SyscallDispatcher {
             if first > last {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let cloexec_only = flags.contains(carrick_abi::LinuxCloseRangeFlags::CLOEXEC);
-            // Drain matching fds out of the table so we don't iterate a
-            // gigantic [first, last] (callers commonly pass last=u32::MAX).
-            let fds: Vec<i32> = this
-                .captured_file_table()
-                .read_open_files()
-                .keys()
-                .copied()
-                .filter(|fd| (*fd as u64) >= first && (*fd as u64) <= last)
-                .collect();
-            if cloexec_only {
-                let files = this.captured_file_table();
-                let mut table = files.write_open_files();
-                for fd in fds {
-                    if let Some(open_file) = table.get_mut(&fd) {
-                        open_file.fd_flags |= LINUX_FD_CLOEXEC;
-                    }
-                }
-            } else {
-                // Detach BEFORE freeing each fd number — same ordering rule as
-                // `close` (a freed number is instantly reusable, and a
-                // detach-after-free would rip out a sibling's reused-fd interest;
-                // see `close`). Detach (read lock) and remove (write lock) are
-                // separate per fd, so the fd is still in the table — hence not
-                // reallocatable — across its own detach.
-                for fd in fds {
-                    this.discard_splice_pushback_if_final(fd);
-                    this.detach_fd_from_epolls(fd);
+            let close_selected = || {
+                let cloexec_only = flags.contains(carrick_abi::LinuxCloseRangeFlags::CLOEXEC);
+                // Drain matching fds out of the table so we don't iterate a
+                // gigantic [first, last] (callers commonly pass last=u32::MAX).
+                let fds: Vec<i32> = this
+                    .captured_file_table()
+                    .read_open_files()
+                    .keys()
+                    .copied()
+                    .filter(|fd| (*fd as u64) >= first && (*fd as u64) <= last)
+                    .collect();
+                if cloexec_only {
                     let files = this.captured_file_table();
-                    let removed = files.write_open_files().remove(&fd);
-                    if let Some(open_file) = removed {
-                        this.mqueue_owner_alias_closed(&files, &open_file);
-                        this.record_fd_close_owner(fd, cx.tid().raw(), &open_file);
-                        this.release_hvpatch_classic_record_locks(
-                            cx.kernel.task().key(),
-                            &open_file,
-                        );
-                        crate::event_ring::rec(
-                            crate::event_ring::FDCLOSE,
-                            fd,
-                            fd_helpers::event_ring_host_fd(&open_file),
-                            0,
-                        );
-                        // Centralised close so pty masters freed via close_range
-                        // also drop their /dev/pts/N entry. open_files and pty_table
-                        // are independent locks (no nesting), so deadlock-free.
-                        this.close_open_file_and_free_pty(&open_file);
-                        this.note_fd_closed(fd);
+                    let mut table = files.write_open_files();
+                    for fd in fds {
+                        if let Some(open_file) = table.get_mut(&fd) {
+                            open_file.fd_flags |= LINUX_FD_CLOEXEC;
+                        }
+                    }
+                } else {
+                    // Detach BEFORE freeing each fd number — same ordering rule as
+                    // `close` (a freed number is instantly reusable, and a
+                    // detach-after-free would rip out a sibling's reused-fd interest;
+                    // see `close`). Detach (read lock) and remove (write lock) are
+                    // separate per fd, so the fd is still in the table — hence not
+                    // reallocatable — across its own detach.
+                    for fd in fds {
+                        this.discard_splice_pushback_if_final(fd);
+                        this.detach_fd_from_epolls(fd);
+                        let files = this.captured_file_table();
+                        let removed = files.write_open_files().remove(&fd);
+                        if let Some(open_file) = removed {
+                            this.mqueue_owner_alias_closed(&files, &open_file);
+                            this.record_fd_close_owner(fd, cx.tid().raw(), &open_file);
+                            this.release_hvpatch_classic_record_locks(
+                                cx.kernel.task().key(),
+                                &open_file,
+                            );
+                            crate::event_ring::rec(
+                                crate::event_ring::FDCLOSE,
+                                fd,
+                                fd_helpers::event_ring_host_fd(&open_file),
+                                0,
+                            );
+                            // Centralised close so pty masters freed via close_range
+                            // also drop their /dev/pts/N entry. open_files and pty_table
+                            // are independent locks (no nesting), so deadlock-free.
+                            this.close_open_file_and_free_pty(&open_file);
+                            this.note_fd_closed(fd);
+                        }
                     }
                 }
+                Ok(DispatchOutcome::Returned { value: 0 })
+            };
+
+            if !flags.contains(carrick_abi::LinuxCloseRangeFlags::UNSHARE) {
+                return close_selected();
             }
-            Ok(DispatchOutcome::Returned { value: 0 })
+            let unshared: crate::kernel::CloseRangeUnshare = match cx
+                .kernel
+                .kernel()
+                .unshare_file_table_for_close_range(cx.kernel)
+            {
+                Ok(unshared) => unshared,
+                Err(
+                    crate::kernel::KernelOperationError::StaleContext
+                    | crate::kernel::KernelOperationError::ParentExited
+                    | crate::kernel::KernelOperationError::UnknownThread(_),
+                ) => return Ok(DispatchOutcome::errno(LINUX_EINTR)),
+                Err(crate::kernel::KernelOperationError::TaskBusy(_)) => {
+                    return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+                }
+                Err(error) => {
+                    tracing::error!(%error, "close_range unshare publication invariant failed");
+                    std::process::abort();
+                }
+            };
+            let successor = unshared.context().resources().files();
+            this.close_draining_file_table(
+                cx.kernel.kernel(),
+                unshared.old_file_table(),
+                Some(cx.kernel.task().key()),
+                Some(&successor),
+            );
+            this.with_kernel_resources(unshared.context(), close_selected)
 
         }
 

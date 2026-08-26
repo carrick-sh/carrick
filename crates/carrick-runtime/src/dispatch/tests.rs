@@ -3481,9 +3481,26 @@ mod hvpatch_in_process_fork_tests {
         parent_guest_pid: u32,
         child_guest_pid: u32,
     ) -> (SyscallDispatcher, crate::kernel::KernelContext) {
+        fork_dispatcher_with_clone_flags(
+            parent,
+            parent_tid,
+            child_tid,
+            parent_guest_pid,
+            child_guest_pid,
+            carrick_abi::LinuxCloneFlags::empty(),
+        )
+    }
+
+    fn fork_dispatcher_with_clone_flags(
+        parent: &SyscallDispatcher,
+        parent_tid: crate::thread::ThreadId,
+        child_tid: crate::thread::ThreadId,
+        parent_guest_pid: u32,
+        child_guest_pid: u32,
+        flags: carrick_abi::LinuxCloneFlags,
+    ) -> (SyscallDispatcher, crate::kernel::KernelContext) {
         let parent_context = parent.capture_one_task_context().unwrap();
-        let plan =
-            crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty()).unwrap();
+        let plan = crate::kernel::ClonePlan::from_flags(flags).unwrap();
         let child_context = parent_context
             .kernel()
             .reserve_fork(
@@ -3504,6 +3521,71 @@ mod hvpatch_in_process_fork_tests {
             parent.fork_clone_in_process(parent_tid, child_tid, parent_guest_pid, child_guest_pid);
         *child.kernel_binding.write() = child_context.task_binding();
         (child, child_context)
+    }
+
+    #[test]
+    fn hvpatch_close_range_unshare_splits_clone_files_before_closing_child_fd() {
+        let parent = SyscallDispatcher::new();
+        let parent_context = parent.capture_one_task_context().unwrap();
+        let parent_tid = parent_context.thread().registry_id();
+        let description =
+            kernel_file_description(Arc::new(RwLock::new(OpenDescription::SyntheticFile {
+                base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
+                path: "/close-range-unshare".to_owned(),
+                contents: b"payload".to_vec(),
+                offset: 0,
+            })));
+        parent.captured_file_table().write_open_files().insert(
+            3,
+            OpenFile::new(Arc::clone(&description), 0),
+        );
+        retain_open_file(&description);
+        let parent_files = parent.captured_file_table();
+        let parent_slot = parent_files
+            .read_open_files()
+            .get(&3)
+            .cloned()
+            .expect("parent fd 3");
+
+        let child_tid = crate::thread::ThreadId::synthetic_for_tests(4102);
+        let (mut child, child_context) = fork_dispatcher_with_clone_flags(
+            &parent,
+            parent_tid,
+            child_tid,
+            43,
+            44,
+            carrick_abi::LinuxCloneFlags::FILES,
+        );
+        assert!(Arc::ptr_eq(
+            &parent_files,
+            &child_context.resources().files()
+        ));
+
+        let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
+        let outcome = child
+            .dispatch(
+                &child_context,
+                SyscallRequest::new(
+                    436,
+                    SyscallArgs::from([3, 3, carrick_abi::LINUX_CLOSE_RANGE_UNSHARE as u64, 0, 0, 0]),
+                ),
+                &mut memory,
+                &CompatReporter::default(),
+            )
+            .expect("close_range dispatch");
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+
+        let child_successor = child.capture_one_task_context().unwrap().resources().files();
+        assert!(!Arc::ptr_eq(&parent_files, &child_successor));
+        assert!(!child_successor.read_open_files().contains_key(&3));
+        let parent_after = parent_files
+            .read_open_files()
+            .get(&3)
+            .cloned()
+            .expect("parent fd 3 retained");
+        assert!(Arc::ptr_eq(&parent_slot.description, &parent_after.description));
+        assert!(Arc::ptr_eq(&description, &parent_after.description));
+        assert_eq!(description.read().fd_ref_count(), 1);
     }
 
     #[test]

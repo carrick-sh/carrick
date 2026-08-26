@@ -85,7 +85,7 @@ pub use operations::{
     ThreadCloneReservation, ThreadPublicationReservationAttempt, WaitMode, WaitOutcome,
 };
 pub(crate) use operations::{
-    ExactSignalTargetAuthorization, ExactThreadSignalPost, TtyControlError,
+    CloseRangeUnshare, ExactSignalTargetAuthorization, ExactThreadSignalPost, TtyControlError,
 };
 pub use registry::{
     IdError, IdRegistry, IdRegistryCounts, ProcessGroupClaim, SessionClaim, TaskClaim,

@@ -65,6 +65,26 @@ pub enum WaitOutcome {
     NoChild,
 }
 
+/// Result of splitting one calling thread's `CLONE_FILES` file table for
+/// `close_range`. The caller must consume `old_file_table` through its exact
+/// dispatcher close path before using `context`: when this was the final table
+/// owner, the old slots are transferred to the successor rather than simply
+/// discarded.
+pub(crate) struct CloseRangeUnshare {
+    context: KernelContext,
+    old_files: Arc<FileTable>,
+}
+
+impl CloseRangeUnshare {
+    pub(crate) fn context(&self) -> &KernelContext {
+        &self.context
+    }
+
+    pub(crate) fn old_file_table(&self) -> &Arc<FileTable> {
+        &self.old_files
+    }
+}
+
 /// Result of resolving one Linux signal target against the authoritative
 /// kernel identity, credential, session, and sighand graph.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2851,6 +2871,70 @@ impl Kernel {
                 resources,
                 revision,
             ));
+        }
+    }
+
+    /// Perform the `close_range(CLOSE_RANGE_UNSHARE)` file-table split for
+    /// exactly the calling thread. This is intentionally not the host-fork
+    /// copy operation: it copies the current captured table, publishes the
+    /// replacement only to this thread, and preserves the old generation for
+    /// the dispatcher to retire with successor-aware close semantics.
+    pub(crate) fn unshare_file_table_for_close_range(
+        self: &Arc<Self>,
+        context: &KernelContext,
+    ) -> Result<CloseRangeUnshare, KernelOperationError> {
+        if !Arc::ptr_eq(self, &context.kernel) {
+            return Err(KernelOperationError::ForeignContext);
+        }
+        let task_id = context.task.key().id;
+        loop {
+            let observed = self.reservation_epoch();
+            let state = self.registry().state.write();
+            if let Err(KernelOperationError::TaskBusy(_)) = ensure_task_unreserved(&state, task_id)
+            {
+                drop(state);
+                self.wait_for_reservation_change(observed);
+                continue;
+            }
+            ensure_task_unreserved(&state, task_id)?;
+            let record = state
+                .tasks
+                .get(&task_id)
+                .ok_or(KernelOperationError::ParentExited)?;
+            let thread = record.task.thread(context.thread.key().tid).ok_or(
+                KernelOperationError::UnknownThread(context.thread.key().tid),
+            )?;
+            if record.task.key() != context.task.key()
+                || thread.key() != context.thread.key()
+                || !Arc::ptr_eq(&thread, &context.thread)
+                || !Arc::ptr_eq(&thread.resources(), &context.resources)
+            {
+                return Err(KernelOperationError::StaleContext);
+            }
+
+            let old_files = context.resources.files();
+            let files = Arc::new(FileTable::for_fork_copy(
+                self.object_ids().file_table_id()?,
+                &old_files,
+            ));
+            let resources = Arc::new(context.resources.with_files(Arc::clone(&files)));
+            let revision = record.revision;
+            let task = Arc::clone(&record.task);
+            thread.replace_resources(Arc::clone(&resources));
+            self.observe_thread_publication(&thread, &resources, revision);
+            drop(state);
+            self.retire_file_table_generation(&old_files, Some(&files));
+            return Ok(CloseRangeUnshare {
+                context: KernelContext::from_parts(
+                    self.clone(),
+                    task,
+                    thread,
+                    Arc::clone(&context.shared),
+                    resources,
+                    revision,
+                ),
+                old_files,
+            });
         }
     }
 
