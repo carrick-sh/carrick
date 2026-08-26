@@ -325,6 +325,34 @@ fn chroot_no_search_permission_precedes_capability_error() {
     );
 }
 
+#[test]
+fn truncate_follows_final_symlink_cycle_to_eloop() {
+    let scratch = tempfile::tempdir().unwrap();
+    let dir =
+        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
+    let backend = crate::fs_backend::HostFsBackend::from_existing_dir(dir);
+    backend.symlink("testsymlink2", "/testsymlink1").unwrap();
+    backend.symlink("testsymlink1", "/testsymlink2").unwrap();
+
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    let reporter = CompatReporter::default();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+    memory.write_bytes(0x4000, b"/testsymlink1\0").unwrap();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(45, SyscallArgs::from([0x4000, 256, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::errno(crate::linux_abi::LINUX_ELOOP)
+    );
+}
+
 // === Trusted-dirfd fast lane (`--fs host`) ===
 
 /// Host-backend dispatcher over a fixture walk tree:
