@@ -2733,3 +2733,108 @@ fn splice_block_captures_output_slot_and_rejects_same_number_reuse() {
         "input reuse invalidates the blocked splice while output stays stable"
     );
 }
+
+#[test]
+fn threaded_dispatch_synthetic_device_write_routes_without_unhandled_syscall() {
+    let mut dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().expect("task context");
+    let reporter = CompatReporter::default();
+    let registry =
+        crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(2200));
+    let futex = crate::thread::FutexTable::new();
+    let mut memory = LinearMemory::new(0x4000, vec![0u8; 0x1000]);
+
+    const PATH_NULL: u64 = 0x4000;
+    const PATH_FULL: u64 = 0x4020;
+    const PAYLOAD_ADDR: u64 = 0x4100;
+    const PAYLOAD: &[u8] = b"cpython cgi devnull write test";
+
+    memory.write_bytes(PATH_NULL, b"/dev/null\0").unwrap();
+    memory.write_bytes(PATH_FULL, b"/dev/full\0").unwrap();
+    memory.write_bytes(PAYLOAD_ADDR, PAYLOAD).unwrap();
+
+    let open_null = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(
+                56, // SYS_OPENAT
+                SyscallArgs::from([
+                    LINUX_AT_FDCWD,
+                    PATH_NULL,
+                    LINUX_O_WRONLY | LINUX_O_APPEND,
+                    0,
+                    0,
+                    0,
+                ]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .expect("openat /dev/null");
+    let null_fd = match open_null {
+        DispatchOutcome::Returned { value } => value,
+        other => panic!("expected openat /dev/null to return fd, got {other:?}"),
+    };
+
+    let write_null_outcome = dispatcher
+        .dispatch_threaded(
+            &context,
+            SyscallRequest::new(
+                64, // SYS_WRITE
+                SyscallArgs::from([null_fd as u64, PAYLOAD_ADDR, PAYLOAD.len() as u64, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+            registry.main_tid(),
+            &registry,
+            &futex,
+        )
+        .expect("dispatch_threaded write /dev/null");
+
+    assert_eq!(
+        write_null_outcome,
+        DispatchOutcome::Returned {
+            value: PAYLOAD.len() as i64,
+        }
+    );
+
+    let open_full = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(
+                56, // SYS_OPENAT
+                SyscallArgs::from([LINUX_AT_FDCWD, PATH_FULL, LINUX_O_WRONLY, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .expect("openat /dev/full");
+    let full_fd = match open_full {
+        DispatchOutcome::Returned { value } => value,
+        other => panic!("expected openat /dev/full to return fd, got {other:?}"),
+    };
+
+    let write_full_outcome = dispatcher
+        .dispatch_threaded(
+            &context,
+            SyscallRequest::new(
+                64, // SYS_WRITE
+                SyscallArgs::from([full_fd as u64, PAYLOAD_ADDR, PAYLOAD.len() as u64, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+            registry.main_tid(),
+            &registry,
+            &futex,
+        )
+        .expect("dispatch_threaded write /dev/full");
+
+    assert_eq!(write_full_outcome, DispatchOutcome::errno(LINUX_ENOSPC));
+
+    let report = reporter.finish();
+    assert!(
+        report.unhandled_syscalls.is_empty(),
+        "expected no unhandled syscalls, but found: {:?}",
+        report.unhandled_syscalls
+    );
+}
