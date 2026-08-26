@@ -2027,6 +2027,10 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::errno(LINUX_ENOENT));
         }
         let resolved = self.resolve_at_path(LINUX_AT_FDCWD, &path)?;
+        let resolved = match self.canonicalize_following(&resolved) {
+            Ok(resolved) => resolved,
+            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+        };
         if crate::vfs::is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context(context)) {
             return Ok(DispatchOutcome::errno(LINUX_EROFS));
         }
