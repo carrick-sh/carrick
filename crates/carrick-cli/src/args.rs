@@ -793,6 +793,11 @@ pub(crate) enum Commands {
         /// stream cost. The script sees the same carrick USDT providers.
         #[arg(short = 's', long = "script")]
         script: Option<std::path::PathBuf>,
+        /// Require a custom D script to terminate with `exit(0)`; missing or
+        /// nonzero terminal receipts fail the trace. Legacy custom scripts
+        /// retain their lossy/interruption-only acceptance unless opted in.
+        #[arg(long = "require-script-exit", requires = "script")]
+        require_script_exit: bool,
         /// Run one of Carrick's bounded, machine-readable DSR profiles.
         #[arg(long, value_enum, conflicts_with = "script")]
         profile: Option<TraceProfileKind>,
@@ -1362,6 +1367,39 @@ mod tests {
             panic!("expected trace command");
         };
         assert_eq!(profile, Some(TraceProfileKind::HvpatchK1Lifecycle));
+    }
+
+    #[test]
+    fn trace_strict_script_exit_is_explicit_and_requires_a_script() {
+        let cli = Cli::try_parse_from([
+            "carrick",
+            "trace",
+            "--script",
+            "/tmp/authority.d",
+            "--require-script-exit",
+            "--",
+            "run",
+            "fixture",
+        ])
+        .expect("strict custom script trace should parse");
+        let Commands::Trace {
+            script,
+            require_script_exit,
+            ..
+        } = cli.command
+        else {
+            panic!("expected trace command");
+        };
+        assert_eq!(
+            script.as_deref(),
+            Some(std::path::Path::new("/tmp/authority.d"))
+        );
+        assert!(require_script_exit);
+        assert!(
+            Cli::try_parse_from(["carrick", "trace", "--require-script-exit", "--", "run"])
+                .is_err(),
+            "the strict exit contract has no meaning without a custom script"
+        );
     }
 
     #[test]
