@@ -1,6 +1,6 @@
 # Carrick exact conformance closure handoff
 
-**Updated:** 2026-08-26 (session 9 — conformance closure with directed-swing execution)
+**Updated:** 2026-08-26 (session 10 — directed pipe-authority closure)
 
 **Canonical host/lane:** macOS, Apple Silicon, HVF/HVPatch, Linux arm64 guest
 
@@ -56,6 +56,40 @@ Execution is a directed-worker model:
 Complete only when fail-closed gate integrity, exact correctness, and the <=2x
 performance gate pass together on the final integrated signed artifact. Do not
 push unless explicitly asked. Preserve unrelated worktree changes.
+
+## Current checkpoint — Task 4.33 pipe-end authority closed
+
+The current accepted source is `2937db4aec3c01455ee7c9563456f6601dd12376`.
+`ltp-pipe03` is exact MATCH 2/2 versus the cached native-arm64 Docker oracle,
+and the eight-suite pipe family is exact MATCH. The frozen true-differential
+ledger moves from 21/156 to 22/156 focused-closed; 134 remain before a fresh
+exhaustive 2,127-suite refresh.
+
+The fix is at the shared execution seam, not a harness exception: in-memory
+`PipeReader` is admitted to threaded write dispatch so the existing handler can
+return `EBADF`, and wrong-end one-way pipe operations retain explicit Linux
+direction errors across scalar/vectored paths without changing pty,
+bidirectional FIFO, regular-file access-mode, or `tee` behavior. Fork-copy,
+shared-table, dup, and exec-successor authority tests preserve endpoint identity
+and shared stream lifetime.
+
+The durable trace is
+`scripts/dtrace/hvpatch-pipe-end-authority.d`. Its accepted final receipt is
+`target/conformance/task433-pipe-authority/final-2937db4a-trace.out`, with 36
+selected entries/returns, one wrong-end write `EBADF`, one wrong-end read
+`EBADF`, six host-pipe I/O events, natural target exit, and a required zero exit
+receipt. Exact signed artifact: SHA-256
+`6fbbe5ec7060870e513dedcfcfe2b013a551615a07555c0066c300423aa7f58a`,
+CDHash `e17b1c43cc97686b5a7dfdc6d995c65faa2408d0`, LC_UUID
+`35CC0219-BEBB-3DAD-A845-CEC35517BFEB`, entitlement and DOF present. Host
+verification is 1,825/1,825 runtime tests plus fmt and Clippy. Both stamped
+conformance runs cleaned to zero processes.
+
+Receipt: `.superpowers/sdd/handoff/task-4-33-report.md`. Next, re-rank one
+bounded deterministic core-emulation reducer from the remaining 134. Keep the
+deferred `setsid01` timeout out of scope until a shared execution seam is
+measured; do not start final performance work or treat the 0.17x–0.38x
+sub-second cached-oracle pipe ratios as controlled performance evidence.
 
 ## Historical prerequisite objective — closed, retained for provenance
 
