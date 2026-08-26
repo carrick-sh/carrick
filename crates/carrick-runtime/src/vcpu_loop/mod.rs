@@ -2909,11 +2909,7 @@ fn bootstrap_hvpatch_process_child<E: ThreadedEngine>(
     let context = state.service_kernel_context.as_ref().ok_or_else(|| {
         RuntimeError::Configuration("process child bootstrap lost Kernel context".to_owned())
     })?;
-    stamp_identity_page(engine, &kernel.dispatcher, context).map_err(|error| {
-        RuntimeError::Trap(TrapError::Hypervisor(format!(
-            "process child identity bootstrap: {error}"
-        )))
-    })?;
+    bootstrap_hvpatch_process_child_identity(engine, &kernel.dispatcher, context, shares_mm)?;
     stamp_guest_tid_checked(
         engine,
         state.this_tid,
@@ -2925,6 +2921,53 @@ fn bootstrap_hvpatch_process_child<E: ThreadedEngine>(
         bootstrap_hvpatch_process_child_tid(engine, address, tid)?;
     }
     Ok(())
+}
+
+fn bootstrap_hvpatch_process_child_identity(
+    memory: &mut impl GuestMemory,
+    dispatcher: &SyscallDispatcher,
+    kernel_context: &crate::kernel::KernelContext,
+    shares_mm: bool,
+) -> Result<(), RuntimeError> {
+    bootstrap_hvpatch_process_child_identity_with(
+        memory,
+        dispatcher,
+        kernel_context,
+        shares_mm,
+        crate::syscall_shim_enabled(),
+    )
+}
+
+fn bootstrap_hvpatch_process_child_identity_with(
+    memory: &mut impl GuestMemory,
+    dispatcher: &SyscallDispatcher,
+    kernel_context: &crate::kernel::KernelContext,
+    shares_mm: bool,
+    shim_enabled: bool,
+) -> Result<(), RuntimeError> {
+    if !shim_enabled {
+        return Ok(());
+    }
+    let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
+    let res = if shares_mm {
+        memory.write_bytes(
+            base + crate::memory::IDENTITY_OFF_SHIM_ENABLED,
+            &0_u32.to_le_bytes(),
+        )
+    } else {
+        let id = dispatcher.identity_snapshot(kernel_context);
+        stamp_identity_values(
+            memory,
+            base,
+            id.pid,
+            u32::from(dispatcher.identity_fast_path_enabled()),
+        )
+    };
+    res.map_err(|error| {
+        RuntimeError::Trap(TrapError::Hypervisor(format!(
+            "process child identity bootstrap: {error}"
+        )))
+    })
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -8686,6 +8729,78 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.to_string().contains("CONTEXTIDR"));
+    }
+
+    #[test]
+    fn hvpatch_process_child_identity_bootstrap_handles_shared_and_copied_mm() {
+        let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
+        let read_state = |m: &crate::dispatch::LinearMemory| {
+            let pid = u32::from_le_bytes(
+                m.read_bytes_raw(base + crate::memory::IDENTITY_OFF_PID, 4)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            );
+            let enabled = u32::from_le_bytes(
+                m.read_bytes_raw(base + crate::memory::IDENTITY_OFF_SHIM_ENABLED, 4)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            );
+            let syscalls = u64::from_le_bytes(
+                m.read_bytes_raw(base + crate::memory::IDENTITY_OFF_SHIM_SYSCALLS, 8)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            );
+            (pid, enabled, syscalls)
+        };
+
+        let mut memory = crate::dispatch::LinearMemory::new(base, vec![0; 4096]);
+        let (parent_pid, parent_counter): (u32, u64) = (70_301, 127);
+        stamp_identity_values(&mut memory, base, parent_pid, 1).unwrap();
+        memory
+            .write_bytes(
+                base + crate::memory::IDENTITY_OFF_SHIM_SYSCALLS,
+                &parent_counter.to_le_bytes(),
+            )
+            .unwrap();
+
+        let (_child_process, child_context) = crate::hvpatch::process_context_for_tests(70_302);
+        let dispatcher = SyscallDispatcher::new();
+        let child_pid = dispatcher.identity_snapshot(&child_context).pid;
+        assert_ne!(child_pid, parent_pid);
+
+        // 1. Shared-MM: preserves parent PID and counter, clears enabled word.
+        bootstrap_hvpatch_process_child_identity_with(
+            &mut memory,
+            &dispatcher,
+            &child_context,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(read_state(&memory), (parent_pid, 0, parent_counter));
+
+        // 2. Copied-MM: stamps child PID and enabled state, resets counter.
+        let mut child_memory = crate::dispatch::LinearMemory::new(base, vec![0; 4096]);
+        stamp_identity_values(&mut child_memory, base, parent_pid, 1).unwrap();
+        child_memory
+            .write_bytes(
+                base + crate::memory::IDENTITY_OFF_SHIM_SYSCALLS,
+                &parent_counter.to_le_bytes(),
+            )
+            .unwrap();
+
+        bootstrap_hvpatch_process_child_identity_with(
+            &mut child_memory,
+            &dispatcher,
+            &child_context,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(read_state(&child_memory), (child_pid, 1, 0));
     }
 
     fn alias_context(pid: i32) -> crate::kernel::KernelContext {
