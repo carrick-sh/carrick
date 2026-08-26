@@ -161,13 +161,23 @@ struct DtraceRecDesc {
     user_argument: u64,
 }
 
+// Prefix of libdtrace's `dtrace_eprobedesc_t`; `size` is the total raw ECB
+// record length and is all the consumer needs to authenticate a record slice.
+#[repr(C)]
+struct DtraceEnabledProbeDesc {
+    _enabled_probe_id: u32,
+    _probe_id: u32,
+    _user_argument: u64,
+    size: u32,
+}
+
 // libdtrace's `dtrace_probedata_t`. The consumer callback receives this as its
 // first argument; `data` points to the raw ECB record described by
 // `DtraceRecDesc::offset` and `DtraceRecDesc::size`.
 #[repr(C)]
 struct DtraceProbeData {
     _handle: *mut DtraceHdl,
-    _enabled_probe: *mut c_void,
+    enabled_probe: *const DtraceEnabledProbeDesc,
     _probe: *mut c_void,
     _cpu: c_int,
     data: *const u8,
@@ -255,7 +265,11 @@ fn dtrace_exit_status(data: *const c_void, rec: &DtraceRecDesc) -> Option<u8> {
         return None;
     }
     let probe = unsafe { &*data.cast::<DtraceProbeData>() };
-    if probe.data.is_null() {
+    if probe.enabled_probe.is_null() || probe.data.is_null() {
+        return None;
+    }
+    let enabled_probe = unsafe { &*probe.enabled_probe };
+    if rec.offset.checked_add(rec.size)? > enabled_probe.size {
         return None;
     }
     let offset = usize::try_from(rec.offset).ok()?;
@@ -1278,15 +1292,50 @@ mod tests {
     #[test]
     fn record_consumer_reads_exit_status_from_record_payload_without_formatting_it() {
         #[repr(C)]
+        struct TestDtraceEnabledProbeDesc {
+            _epid: u32,
+            _probeid: u32,
+            _user_argument: u64,
+            size: u32,
+        }
+
+        #[repr(C)]
         struct TestDtraceProbeData {
             _handle: *mut std::ffi::c_void,
-            _enabled_probe: *mut std::ffi::c_void,
+            enabled_probe: *const TestDtraceEnabledProbeDesc,
             _probe: *mut std::ffi::c_void,
             _cpu: i32,
             data: *const u8,
             _flow: i32,
             _prefix: *const std::ffi::c_char,
             _indent: i32,
+        }
+
+        fn exit_report(
+            record: &DtraceRecDesc,
+            enabled_probe: *const TestDtraceEnabledProbeDesc,
+            data: *const u8,
+        ) -> DTraceRunReport {
+            let probe = TestDtraceProbeData {
+                _handle: std::ptr::null_mut(),
+                enabled_probe,
+                _probe: std::ptr::null_mut(),
+                _cpu: 0,
+                data,
+                _flow: 0,
+                _prefix: std::ptr::null(),
+                _indent: 0,
+            };
+            let mut report = DTraceRunReport::default();
+            assert_eq!(
+                chewrec(
+                    (&probe as *const TestDtraceProbeData).cast(),
+                    (record as *const DtraceRecDesc).cast(),
+                    (&mut report as *mut DTraceRunReport).cast(),
+                ),
+                DTRACE_CONSUME_NEXT
+            );
+            report
         }
 
         let mut payload = [0u8; 16];
@@ -1301,27 +1350,57 @@ mod tests {
             user_argument: 0,
         };
         let printf = DtraceRecDesc { action: 3, ..exit };
-        let probe = TestDtraceProbeData {
-            _handle: std::ptr::null_mut(),
-            _enabled_probe: std::ptr::null_mut(),
-            _probe: std::ptr::null_mut(),
-            _cpu: 0,
-            data: payload.as_ptr(),
-            _flow: 0,
-            _prefix: std::ptr::null(),
-            _indent: 0,
+        let enabled_probe = TestDtraceEnabledProbeDesc {
+            _epid: 0,
+            _probeid: 0,
+            _user_argument: 0,
+            size: payload.len() as u32,
         };
-        let mut report = DTraceRunReport::default();
-        assert_eq!(
-            chewrec(
-                (&probe as *const TestDtraceProbeData).cast(),
-                (&exit as *const DtraceRecDesc).cast(),
-                (&mut report as *mut DTraceRunReport).cast(),
-            ),
-            DTRACE_CONSUME_NEXT
-        );
+        let report = exit_report(&exit, &enabled_probe, payload.as_ptr());
         assert!(report.dtrace_exit_observed);
         assert_eq!(report.exit_status, 1);
+
+        for malformed in [
+            exit_report(&exit, std::ptr::null(), payload.as_ptr()),
+            exit_report(&exit, &enabled_probe, std::ptr::null()),
+            exit_report(
+                &DtraceRecDesc { size: 8, ..exit },
+                &enabled_probe,
+                payload.as_ptr(),
+            ),
+            exit_report(
+                &DtraceRecDesc { offset: 13, ..exit },
+                &enabled_probe,
+                payload.as_ptr(),
+            ),
+            exit_report(
+                &DtraceRecDesc {
+                    offset: u32::MAX,
+                    ..exit
+                },
+                &enabled_probe,
+                payload.as_ptr(),
+            ),
+        ] {
+            assert!(
+                !malformed.dtrace_exit_observed,
+                "malformed exit record must leave the receipt absent"
+            );
+        }
+
+        let mut negative = payload;
+        negative[8..12].copy_from_slice(&(-1_i32).to_ne_bytes());
+        assert!(
+            !exit_report(&exit, &enabled_probe, negative.as_ptr()).dtrace_exit_observed,
+            "negative exit status must leave the receipt absent"
+        );
+        let mut oversized = payload;
+        oversized[8..12].copy_from_slice(&256_i32.to_ne_bytes());
+        assert!(
+            !exit_report(&exit, &enabled_probe, oversized.as_ptr()).dtrace_exit_observed,
+            "out-of-range exit status must leave the receipt absent"
+        );
+
         assert_eq!(
             chewrec(
                 std::ptr::null(),
