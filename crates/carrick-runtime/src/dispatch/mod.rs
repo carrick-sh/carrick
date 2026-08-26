@@ -935,12 +935,60 @@ impl WaitFds {
                 .collect::<Result<Vec<_>, _>>()
         };
         let strict = capture(strict_fds.into_iter().collect())?;
-        let watched = capture(watched_fds.into_iter().collect())?;
+        let watched = watched_fds
+            .into_iter()
+            .filter_map(|fd| crate::kernel::FileSlotNumber::for_open_fd(fd).ok())
+            .filter_map(|number| files.capture_slot_authority(number))
+            .collect();
         if strict.is_empty() {
             return Err(LINUX_EBADF);
         }
         self.authority = WaitFdAuthority::Logical { strict, watched };
         Ok(self)
+    }
+}
+
+#[cfg(test)]
+mod wait_fds_tests {
+    use super::*;
+
+    fn install_slot(
+        files: &crate::kernel::objects::FileTable,
+        ids: &crate::kernel::ObjectIdRegistry,
+        fd: i32,
+    ) -> crate::kernel::objects::FileSlotAuthority {
+        let number = crate::kernel::FileSlotNumber::for_open_fd(fd).expect("open fd");
+        files.install(
+            number,
+            Arc::new(crate::kernel::objects::FileDescription::regular(
+                ids.file_description_id().expect("file description ID"),
+            )),
+            false,
+        );
+        files
+            .capture_slot_authority(number)
+            .expect("installed file slot authority")
+    }
+
+    #[test]
+    fn redispatch_authority_omits_missing_watched_slots_but_requires_strict_slots() {
+        let ids = crate::kernel::ObjectIdRegistry::new();
+        let files =
+            crate::kernel::objects::FileTable::new(ids.file_table_id().expect("file table ID"));
+        let strict = install_slot(&files, &ids, 11);
+        let live_watched = install_slot(&files, &ids, 13);
+
+        let fds = WaitFds::raw_one(-1, 0)
+            .with_redispatch_and_watched_slots(&files, [11], [12, 13])
+            .expect("missing watched slot must be advisory");
+        assert_eq!(fds.logical_authorities_for_test(), [strict]);
+        assert_eq!(fds.watched_authorities_for_test(), [live_watched]);
+
+        assert_eq!(
+            WaitFds::raw_one(-1, 0).with_redispatch_and_watched_slots(&files, [10], [13]),
+            Err(LINUX_EBADF),
+            "missing strict epfd must remain fail-closed"
+        );
     }
 }
 
