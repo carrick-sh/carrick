@@ -129,6 +129,8 @@ fn rt_sigaction_sig_dfl_resets_host_disposition_for_job_control() {
 
 #[test]
 fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
+    use carrick_runtime::linux_abi::LinuxSiginfo;
+
     const LINUX_EINTR: LinuxErrno = LinuxErrno::new(4);
     const LINUX_EAGAIN: LinuxErrno = LinuxErrno::new(11);
     const LINUX_EFAULT: LinuxErrno = LinuxErrno::new(14);
@@ -139,6 +141,8 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
+    let queued_info = LinuxSiginfo::rt_queue(1, 1, 0, 0);
+    memory.write_bytes(0x4100, queued_info.as_bytes()).unwrap();
     let tid = dispatcher
         .capture_one_task_context()
         .unwrap()
@@ -271,12 +275,12 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
         }
     );
 
-    // rt_sigqueueinfo(1, 65, NULL) -> EINVAL (signum out of range).
+    // rt_sigqueueinfo(1, 65, info) -> EINVAL (signum out of range).
     assert_eq!(
         dispatcher
             .dispatch(
                 &dispatcher.capture_one_task_context().unwrap(),
-                SyscallRequest::new(138, SyscallArgs::from([1, 65, 0, 0, 0, 0])),
+                SyscallRequest::new(138, SyscallArgs::from([1, 65, 0x4100, 0, 0, 0])),
                 &mut memory,
                 &reporter,
             )
@@ -285,12 +289,12 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
             errno: LINUX_EINVAL
         }
     );
-    // rt_sigqueueinfo(99, 1, NULL) -> ESRCH (no such tgid).
+    // rt_sigqueueinfo(99, 1, info) -> ESRCH (no such tgid).
     assert_eq!(
         dispatcher
             .dispatch(
                 &dispatcher.capture_one_task_context().unwrap(),
-                SyscallRequest::new(138, SyscallArgs::from([99, 1, 0, 0, 0, 0])),
+                SyscallRequest::new(138, SyscallArgs::from([99, 1, 0x4100, 0, 0, 0])),
                 &mut memory,
                 &reporter,
             )
@@ -312,12 +316,12 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
     );
-    // rt_sigqueueinfo(1, 1, NULL) -> 0: queued to self (SIGHUP blocked).
+    // rt_sigqueueinfo(1, 1, info) -> 0: queued to self (SIGHUP blocked).
     assert_eq!(
         dispatcher
             .dispatch(
                 &dispatcher.capture_one_task_context().unwrap(),
-                SyscallRequest::new(138, SyscallArgs::from([1, 1, 0, 0, 0, 0])),
+                SyscallRequest::new(138, SyscallArgs::from([1, 1, 0x4100, 0, 0, 0])),
                 &mut memory,
                 &reporter,
             )
@@ -332,7 +336,7 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
                 &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     138,
-                    SyscallArgs::from([std::process::id() as u64, 1, 0, 0, 0, 0])
+                    SyscallArgs::from([std::process::id() as u64, 1, 0x4100, 0, 0, 0])
                 ),
                 &mut memory,
                 &reporter,
