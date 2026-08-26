@@ -2706,7 +2706,7 @@ fn splice_block_captures_output_slot_and_rejects_same_number_reuse() {
     );
     let outcome = super::super::resources::with_captured_resources(&context, || {
         dispatcher.complete_wait_fd_authority(
-            dispatcher.splice_host_output_wait(8, -1, None, false),
+            dispatcher.splice_host_output_wait(8, -1, libc::POLLOUT, None, false),
             &files,
             [7, 8],
         )
@@ -2837,4 +2837,178 @@ fn threaded_dispatch_synthetic_device_write_routes_without_unhandled_syscall() {
         "expected no unhandled syscalls, but found: {:?}",
         report.unhandled_syscalls
     );
+}
+
+struct TestInMemoryPipe {
+    dispatcher: SyscallDispatcher,
+    pipe: PipeRef,
+    write_fd: i32,
+    _read_fd: i32,
+}
+
+impl TestInMemoryPipe {
+    fn new(pipe_id: u64, capacity: usize) -> Self {
+        let dispatcher = SyscallDispatcher::new();
+        let pipe = Arc::new(PipeInner::new_connected(pipe_id, capacity));
+        let mut read_base = OpenDescriptionBase::new(LINUX_O_RDONLY);
+        read_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+        let mut write_base = OpenDescriptionBase::new(LINUX_O_WRONLY);
+        write_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+
+        let read_open = OpenFile::from_open_description(
+            Arc::new(RwLock::new(OpenDescription::PipeReader {
+                base: read_base,
+                pipe: Arc::clone(&pipe),
+            })),
+            0,
+        );
+        let write_open = OpenFile::from_open_description(
+            Arc::new(RwLock::new(OpenDescription::PipeWriter {
+                base: write_base,
+                pipe: Arc::clone(&pipe),
+            })),
+            0,
+        );
+        let (_read_fd, write_fd) = dispatcher
+            .install_fd_pair_at_or_above(3, read_open, write_open)
+            .expect("install in-memory pipe pair");
+        Self {
+            dispatcher,
+            pipe,
+            write_fd,
+            _read_fd,
+        }
+    }
+
+    fn fill(&self, bytes: usize) {
+        let mut state = self.pipe.state.lock();
+        state.buffer.extend(vec![0x7f; bytes]);
+        self.pipe.update_readiness_locked(&state);
+    }
+
+    fn dispatch_vmsplice(&self, payload_len: usize, flags: u64) -> DispatchOutcome {
+        const SYS_VMSPLICE: u64 = 75;
+        const IOV_ADDR: u64 = 0x1000;
+        const PAYLOAD_ADDR: u64 = 0x2000;
+
+        let mut memory = LinearMemory::new(0x1000, vec![0; PAYLOAD_ADDR as usize + payload_len]);
+        let iov = LinuxIovec {
+            iov_base: PAYLOAD_ADDR,
+            iov_len: payload_len as u64,
+        };
+        write_kernel_struct_raw(&mut memory, IOV_ADDR, &iov).expect("write iovec");
+        let payload = vec![0x5au8; payload_len];
+        memory
+            .write_bytes(PAYLOAD_ADDR, &payload)
+            .expect("write payload");
+
+        let reporter = CompatReporter::default();
+        self.dispatcher
+            .dispatch_normalized(
+                &self.dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(
+                    SYS_VMSPLICE,
+                    SyscallArgs::from([self.write_fd as u64, IOV_ADDR, 1, flags, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+                None,
+            )
+            .expect("vmsplice is a claimed syscall")
+            .expect("vmsplice must not be a fatal DispatchError")
+    }
+}
+
+#[test]
+fn vmsplice_in_memory_pipe_writer_is_bounded_by_available_capacity() {
+    let test_pipe = TestInMemoryPipe::new(1001, 65536);
+
+    // Exact room-selection seam check:
+    assert_eq!(
+        test_pipe
+            .dispatcher
+            .splice_pipe_write_room(test_pipe.write_fd),
+        Some(65536),
+        "in-memory pipe writer must report its available capacity as room"
+    );
+
+    // Gather 128 KiB into a 64 KiB pipe: transfers at most available room (64 KiB)
+    // and immediately returns a short count rather than blocking.
+    let outcome = test_pipe.dispatch_vmsplice(128 * 1024, 0);
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 65536 });
+    assert_eq!(test_pipe.pipe.buffered_bytes(), 65536);
+}
+
+#[test]
+fn vmsplice_in_memory_pipe_writer_full_nonblocking_returns_eagain() {
+    let test_pipe = TestInMemoryPipe::new(1002, 65536);
+    test_pipe.fill(65536);
+    assert_eq!(
+        test_pipe
+            .dispatcher
+            .splice_pipe_write_room(test_pipe.write_fd),
+        Some(0),
+        "full in-memory pipe must report zero room"
+    );
+
+    let outcome = test_pipe.dispatch_vmsplice(4096, carrick_abi::LinuxSpliceFlags::NONBLOCK.bits());
+    assert_eq!(outcome, DispatchOutcome::errno(LINUX_EAGAIN));
+}
+
+#[test]
+fn vmsplice_in_memory_pipe_writer_full_blocking_parks_on_write_readiness_pollin() {
+    let test_pipe = TestInMemoryPipe::new(1003, 65536);
+    test_pipe.fill(65536);
+    let write_poll_fd = test_pipe
+        .pipe
+        .write_poll_fd()
+        .expect("pipe must have write poll fd")
+        .raw();
+
+    assert_eq!(
+        test_pipe
+            .dispatcher
+            .splice_pipe_write_room(test_pipe.write_fd),
+        Some(0),
+        "full in-memory pipe must report zero room"
+    );
+
+    let outcome = test_pipe.dispatch_vmsplice(4096, 0);
+    let DispatchOutcome::WaitOnFds {
+        fds,
+        timeout,
+        on_timeout,
+        sig_mask,
+    } = outcome
+    else {
+        panic!("expected blocking vmsplice on full pipe to park on WaitOnFds, got {outcome:?}");
+    };
+
+    assert_eq!(timeout, None);
+    assert_eq!(on_timeout, LINUX_EAGAIN.guest_retval());
+    assert_eq!(sig_mask, carrick_abi::WaitSigMask::NONE);
+    assert_eq!(
+        fds.first(),
+        Some((write_poll_fd, libc::POLLIN)),
+        "full pipe must park on write_poll_fd with POLLIN"
+    );
+
+    // Verify readiness pipe state: full pipe is not readable (no byte in readiness pipe)
+    let mut poll_fd_struct = libc::pollfd {
+        fd: write_poll_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    assert_eq!(unsafe { libc::poll(&mut poll_fd_struct, 1, 0) }, 0);
+
+    // Free PIPE_BUF bytes from reader; readiness pipe must now be signaled
+    let drained = take_pipe_bytes(&test_pipe.pipe, PIPE_BUF, 0).expect("drain pipe bytes");
+    assert_eq!(drained.len(), PIPE_BUF);
+
+    let ready_after_drain = unsafe { libc::poll(&mut poll_fd_struct, 1, 0) };
+    assert_eq!(
+        ready_after_drain, 1,
+        "pipe must become write-ready after reader drains PIPE_BUF"
+    );
+    assert_ne!(poll_fd_struct.revents & libc::POLLIN, 0);
 }

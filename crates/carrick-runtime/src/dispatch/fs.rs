@@ -4711,34 +4711,39 @@ impl SyscallDispatcher {
         Some((read_fd, capacity.saturating_sub(queued)))
     }
 
-    /// Room in a host-pipe destination, in bytes — `None` when `fd` is not a
-    /// host pipe. Uses the same accounting the write path applies
-    /// ([`super::host_pipe_write_room`]), so a `splice(2)` that bounds its read
-    /// window by this value never hands the writer more than the pipe can take.
-    /// Unlike [`Self::host_pipe_splice_staging_target`] this accepts any host
-    /// pipe write end, including pty and bidirectional ends.
+    /// Room in a pipe destination, in bytes — `None` when `fd` is not a
+    /// pipe. Uses the same accounting the write path applies
+    /// ([`super::host_pipe_write_room`]), so a `splice(2)`/`vmsplice(2)` that bounds
+    /// its transfer window by this value never hands the writer more than the pipe can take.
+    /// Unlike [`Self::host_pipe_splice_staging_target`] this accepts any pipe
+    /// write end, including in-memory pipes, pty, and bidirectional ends.
     fn splice_pipe_write_room(&self, fd: i32) -> Option<usize> {
         let open_file = self.open_file(fd)?;
         let open = open_file.description.read();
-        let OpenDescription::HostPipe {
-            base,
-            pipe_id,
-            is_read_end,
-            bidirectional,
-            host_fd,
-            ..
-        } = &*open
-        else {
-            return None;
-        };
-        let (capacity, queued) = self.host_pipe_capacity_state(
-            base,
-            *pipe_id,
-            *is_read_end,
-            *bidirectional,
-            host_fd.raw(),
-        )?;
-        super::host_pipe_write_room(capacity, queued)
+        match &*open {
+            OpenDescription::PipeWriter { pipe, .. } => {
+                let state = pipe.state.lock();
+                Some(state.capacity.saturating_sub(state.buffer.len()))
+            }
+            OpenDescription::HostPipe {
+                base,
+                pipe_id,
+                is_read_end,
+                bidirectional,
+                host_fd,
+                ..
+            } => {
+                let (capacity, queued) = self.host_pipe_capacity_state(
+                    base,
+                    *pipe_id,
+                    *is_read_end,
+                    *bidirectional,
+                    host_fd.raw(),
+                )?;
+                super::host_pipe_write_room(capacity, queued)
+            }
+            _ => None,
+        }
     }
 
     pub(in crate::dispatch) fn host_pipe_capacity_state(
@@ -5508,15 +5513,21 @@ impl SyscallDispatcher {
             match &*open {
                 OpenDescription::HostPipe { host_fd, .. }
                 | OpenDescription::HostSocket { host_fd, .. } => {
-                    Some((host_fd.raw(), Some(host_fd.clone())))
+                    Some((host_fd.raw(), libc::POLLOUT, Some(host_fd.clone())))
+                }
+                OpenDescription::PipeWriter { pipe, .. } => {
+                    let host_fd = pipe.write_poll_fd()?;
+                    Some((host_fd.raw(), libc::POLLIN, Some(host_fd)))
                 }
                 _ => None,
             }
         });
         match target {
-            Some((host_fd, owner)) => self.splice_host_output_wait(fd, host_fd, owner, nonblocking),
-            // No host readiness source to park on (in-memory pipe destination):
-            // report the condition rather than parking on nothing.
+            Some((host_fd, events, owner)) => {
+                self.splice_host_output_wait(fd, host_fd, events, owner, nonblocking)
+            }
+            // No readiness source to park on: report the condition rather than
+            // parking on nothing.
             None => DispatchOutcome::errno(LINUX_EAGAIN),
         }
     }
@@ -5525,6 +5536,7 @@ impl SyscallDispatcher {
         &self,
         fd: i32,
         host_fd: i32,
+        events: i16,
         owner: Option<HostFdRef>,
         nonblocking: bool,
     ) -> DispatchOutcome {
@@ -5533,7 +5545,7 @@ impl SyscallDispatcher {
         };
         super::would_block_outcome(
             host_fd,
-            libc::POLLOUT,
+            events,
             nonblocking,
             owner,
             WaitFdAuthority::logical(authority),
@@ -5610,10 +5622,15 @@ impl SyscallDispatcher {
                 let mut open = open_file.description.write();
                 match &mut *open {
                     OpenDescription::PipeWriter { base, pipe } => {
+                        let flags = if nonblocking {
+                            base.status_flags() | LINUX_O_NONBLOCK
+                        } else {
+                            base.status_flags()
+                        };
                         return write_pipe(
                             bytes,
                             pipe,
-                            base.status_flags(),
+                            flags,
                             fd,
                             self.captured_slot_authority(fd)
                                 .map(WaitFdAuthority::logical)
