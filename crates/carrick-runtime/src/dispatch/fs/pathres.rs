@@ -194,15 +194,28 @@ impl SyscallDispatcher {
             let target = self
                 .readlink_layered(&cur)
                 .ok_or(crate::linux_abi::LINUX_ENOENT)?;
-            cur = if target.starts_with('/') {
+            let source = cur;
+            let next = if target.starts_with('/') {
                 join_rootfs_path("/", &target)
             } else {
-                let parent = Path::new(&cur)
+                let parent = Path::new(&source)
                     .parent()
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "/".to_string());
                 self.join_symlink_target(&parent, &target)?
             };
+            // A final symlink can expand to itself or below itself
+            // (`link -> link/inside`). The next host lstat then sees the link as
+            // an intermediate component and may collapse the cycle to ENOENT.
+            // Reject the recursive prefix before crossing that host boundary.
+            if next == source
+                || next
+                    .strip_prefix(&source)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+            {
+                return Err(crate::linux_abi::LINUX_ELOOP);
+            }
+            cur = next;
         }
         Err(crate::linux_abi::LINUX_ELOOP)
     }

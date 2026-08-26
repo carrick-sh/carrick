@@ -462,6 +462,52 @@ fn mknodat_special_node_in_setgid_parent_inherits_gid_without_setgid() {
     assert_eq!(stat.mode & 0o2000, 0, "do not add unrequested S_ISGID");
 }
 
+/// CPython pathlib strict resolution: both stat ABIs must propagate ELOOP for
+/// a final-component symlink cycle instead of misclassifying it as dangling.
+#[cfg(target_os = "macos")]
+#[test]
+fn stat_following_final_symlink_cycle_returns_eloop() {
+    let scratch = tempfile::tempdir().unwrap();
+    let dir =
+        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
+    let backend = crate::fs_backend::HostFsBackend::from_existing_dir(dir);
+    backend.symlink("loop/inside", "/loop").unwrap();
+
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+    memory.write_bytes(0x4000, b"/loop\0").unwrap();
+    let expected = -i64::from(crate::linux_abi::LINUX_ELOOP.get());
+
+    assert_eq!(
+        lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            79,
+            [LINUX_AT_FDCWD, 0x4000, 0x4100, 0, 0, 0],
+        ),
+        expected,
+        "newfstatat must preserve final-cycle ELOOP"
+    );
+    assert_eq!(
+        lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            291,
+            [
+                LINUX_AT_FDCWD,
+                0x4000,
+                0,
+                LINUX_STATX_BASIC_STATS as u64,
+                0x4200,
+                0,
+            ],
+        ),
+        expected,
+        "statx must preserve final-cycle ELOOP"
+    );
+}
+
 /// Cached-lower form of the walk fixture: the immutable image tree is a
 /// real host directory and the writable host overlay starts sparse.
 #[cfg(target_os = "macos")]
