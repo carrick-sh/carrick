@@ -1691,6 +1691,178 @@ fn splice_host_file_to_pipe_returns_short_and_advances_offset() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Linux exposes splice-write support on the null and zero character devices:
+/// a readable pipe may be drained directly into either writable device. LTP
+/// splice09 exercises both paths; rejecting the synthetic descriptions before
+/// the write route returns EINVAL and leaves both assertions red.
+#[test]
+fn splice_pipe_to_writable_null_and_zero_devices_consumes_bytes() {
+    const SYS_OPENAT: u64 = 56;
+    const SYS_CLOSE: u64 = 57;
+    const SYS_PIPE2: u64 = 59;
+    const SYS_READ: u64 = 63;
+    const SYS_WRITE: u64 = 64;
+    const SYS_SPLICE: u64 = 76;
+    const PATH: u64 = 0x4000;
+    const PAYLOAD: u64 = 0x4100;
+    const PIPE_FDS: u64 = 0x4200;
+    const BYTES: &[u8] = b"splice09";
+
+    for device in [b"/dev/null\0".as_slice(), b"/dev/zero\0".as_slice()] {
+        let reporter = CompatReporter::default();
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+        memory.write_bytes(PATH, device).unwrap();
+        memory.write_bytes(PAYLOAD, BYTES).unwrap();
+
+        let run = |dispatcher: &mut SyscallDispatcher,
+                   memory: &mut LinearMemory,
+                   nr: u64,
+                   args: [u64; 6]| {
+            dispatcher
+                .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
+                    SyscallRequest::new(nr, SyscallArgs::from(args)),
+                    memory,
+                    &reporter,
+                )
+                .expect("dispatch")
+        };
+
+        assert_eq!(
+            run(
+                &mut dispatcher,
+                &mut memory,
+                SYS_PIPE2,
+                [PIPE_FDS, 0, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        let pair = memory.read_bytes(PIPE_FDS, 8).unwrap();
+        let read_fd = i32::from_ne_bytes(pair[0..4].try_into().unwrap()) as u64;
+        let write_fd = i32::from_ne_bytes(pair[4..8].try_into().unwrap()) as u64;
+
+        assert_eq!(
+            run(
+                &mut dispatcher,
+                &mut memory,
+                SYS_WRITE,
+                [write_fd, PAYLOAD, BYTES.len() as u64, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned {
+                value: BYTES.len() as i64,
+            },
+        );
+        let device_fd = match run(
+            &mut dispatcher,
+            &mut memory,
+            SYS_OPENAT,
+            [LINUX_AT_FDCWD, PATH, LINUX_O_WRONLY, 0, 0, 0],
+        ) {
+            DispatchOutcome::Returned { value } => value as u64,
+            other => panic!("open writable device failed: {other:?}"),
+        };
+
+        assert_eq!(
+            run(
+                &mut dispatcher,
+                &mut memory,
+                SYS_SPLICE,
+                [read_fd, 0, device_fd, 0, BYTES.len() as u64, 0],
+            ),
+            DispatchOutcome::Returned {
+                value: BYTES.len() as i64,
+            },
+        );
+        assert_eq!(
+            run(
+                &mut dispatcher,
+                &mut memory,
+                SYS_CLOSE,
+                [write_fd, 0, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        assert_eq!(
+            run(
+                &mut dispatcher,
+                &mut memory,
+                SYS_READ,
+                [read_fd, PAYLOAD, BYTES.len() as u64, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
+
+        assert_eq!(
+            run(
+                &mut dispatcher,
+                &mut memory,
+                SYS_PIPE2,
+                [PIPE_FDS, 0, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        let pair = memory.read_bytes(PIPE_FDS, 8).unwrap();
+        let read_fd = i32::from_ne_bytes(pair[0..4].try_into().unwrap()) as u64;
+        let write_fd = i32::from_ne_bytes(pair[4..8].try_into().unwrap()) as u64;
+        assert_eq!(
+            run(
+                &mut dispatcher,
+                &mut memory,
+                SYS_WRITE,
+                [write_fd, PAYLOAD, BYTES.len() as u64, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned {
+                value: BYTES.len() as i64,
+            },
+        );
+        let append_fd = match run(
+            &mut dispatcher,
+            &mut memory,
+            SYS_OPENAT,
+            [
+                LINUX_AT_FDCWD,
+                PATH,
+                LINUX_O_WRONLY | LINUX_O_APPEND,
+                0,
+                0,
+                0,
+            ],
+        ) {
+            DispatchOutcome::Returned { value } => value as u64,
+            other => panic!("open append device failed: {other:?}"),
+        };
+        assert_eq!(
+            run(
+                &mut dispatcher,
+                &mut memory,
+                SYS_SPLICE,
+                [read_fd, 0, append_fd, 0, BYTES.len() as u64, 0],
+            ),
+            DispatchOutcome::errno(LINUX_EINVAL),
+        );
+
+        let read_only_fd = match run(
+            &mut dispatcher,
+            &mut memory,
+            SYS_OPENAT,
+            [LINUX_AT_FDCWD, PATH, LINUX_O_RDONLY, 0, 0, 0],
+        ) {
+            DispatchOutcome::Returned { value } => value as u64,
+            other => panic!("open read-only device failed: {other:?}"),
+        };
+        assert_eq!(
+            run(
+                &mut dispatcher,
+                &mut memory,
+                SYS_SPLICE,
+                [read_fd, 0, read_only_fd, 0, BYTES.len() as u64, 0],
+            ),
+            DispatchOutcome::errno(LINUX_EBADF),
+        );
+    }
+}
+
 #[test]
 fn splice_pushback_keeps_large_stages_chunked() {
     let mut pushback = fs::SplicePushback::default();
