@@ -1526,6 +1526,7 @@ impl SyscallDispatcher {
                 // only under multithreading, surfacing as 58 ERRORs in test_csv.
                 | OpenDescription::File { .. }
                 | OpenDescription::SyntheticFile { .. }
+                | OpenDescription::SyntheticDevice { .. }
         )
     }
 
