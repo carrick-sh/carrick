@@ -65,6 +65,27 @@ struct ExecBackendPublicationGate {
     engine_replaced: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExecDispositionRouting {
+    predecessor_shared: bool,
+    retirement_inventory: bool,
+}
+
+fn route_exec_disposition(
+    disposition: crate::hvpatch::ExecMmDispositionKind,
+) -> ExecDispositionRouting {
+    match disposition {
+        crate::hvpatch::ExecMmDispositionKind::RetainOldMm => ExecDispositionRouting {
+            predecessor_shared: true,
+            retirement_inventory: false,
+        },
+        crate::hvpatch::ExecMmDispositionKind::RetireOldMm => ExecDispositionRouting {
+            predecessor_shared: false,
+            retirement_inventory: true,
+        },
+    }
+}
+
 impl ExecBackendPublicationGate {
     fn record_engine_replaced(&mut self) {
         self.engine_replaced = true;
@@ -76,7 +97,12 @@ impl ExecBackendPublicationGate {
 }
 
 enum RuntimePreparedExec {
-    Hvpatch(crate::hvpatch::PreparedProcessExec),
+    Hvpatch(Box<crate::hvpatch::PreparedProcessExec>),
+    Other(Box<crate::kernel::PreparedExec>),
+}
+
+enum RuntimePublishedExec {
+    Hvpatch(crate::hvpatch::PublishedProcessExec),
     Other(crate::kernel::PreparedExec),
 }
 
@@ -117,6 +143,13 @@ impl RuntimePreparedExec {
         match self {
             Self::Hvpatch(prepared) => prepared.replacement_mm_id(),
             Self::Other(prepared) => prepared.replacement_mm_id(),
+        }
+    }
+
+    fn hvpatch_disposition(&self) -> Option<crate::hvpatch::ExecMmDispositionKind> {
+        match self {
+            Self::Hvpatch(prepared) => Some(prepared.disposition()),
+            Self::Other(_) => None,
         }
     }
 
@@ -273,10 +306,11 @@ fn verify_published_exec_image<E: ThreadedEngine>(
 #[cfg(test)]
 mod exec_image_verification_tests {
     use super::{
-        ExecBackendPublicationGate, HvpatchExecInventoryFailureInjection, apply_exec_inventory,
-        exec_regions_to_verify_with_mappings, first_byte_mismatch,
+        ExecBackendPublicationGate, ExecDispositionRouting, HvpatchExecInventoryFailureInjection,
+        apply_exec_inventory, exec_regions_to_verify_with_mappings, first_byte_mismatch,
         parse_hvpatch_exec_inventory_failure_injection, publish_execution_authority_after_exec,
-        retire_execution_authority_for_exec, should_update_host_process_title,
+        retire_execution_authority_for_exec, route_exec_disposition,
+        should_update_host_process_title,
     };
 
     fn cpu_state_for_exec_test(mm_generation: u64) -> carrick_hal::threaded::Aarch64TaskCpuStateV1 {
@@ -694,6 +728,58 @@ mod exec_image_verification_tests {
         );
         assert_eq!(calls.get(), 1);
     }
+
+    #[test]
+    fn pinned_exec_disposition_drives_engine_sharing_and_inventory_presence() {
+        assert_eq!(
+            route_exec_disposition(crate::hvpatch::ExecMmDispositionKind::RetainOldMm),
+            ExecDispositionRouting {
+                predecessor_shared: true,
+                retirement_inventory: false,
+            },
+        );
+        assert_eq!(
+            route_exec_disposition(crate::hvpatch::ExecMmDispositionKind::RetireOldMm),
+            ExecDispositionRouting {
+                predecessor_shared: false,
+                retirement_inventory: true,
+            },
+        );
+
+        let source = include_str!("exec.rs");
+        let runtime_path = source
+            .rsplit("impl<E: ThreadedEngine + 'static> ThreadRuntimeState<E>")
+            .next()
+            .expect("runtime exec implementation");
+        assert!(
+            !runtime_path.contains(".observe_exec_owners("),
+            "production exec must never recount owners after reservation",
+        );
+    }
+
+    #[test]
+    fn mm_publication_is_the_no_return_cut_and_precedes_destructive_work() {
+        let source = include_str!("exec.rs");
+        let publish = source
+            .rfind("process.publish_exec_mm(*prepared")
+            .expect("MM publication cut");
+        let retire = source
+            .rfind("retire_execution_authority_for_exec(&retiring_thread")
+            .expect("predecessor retirement");
+        let replace = source
+            .rfind("engine.execve_into(&img)")
+            .expect("destructive engine replacement");
+        assert!(publish < retire && retire < replace);
+        assert!(
+            !source[publish..].contains("get_sys_reg(carrick_hal::SysReg::Ttbr0)"),
+            "post-publication engine TTBR reads must not select MM authority",
+        );
+        let retirement_failure = &source[retire..replace];
+        assert!(
+            retirement_failure.contains("Self::exec_failed_past_no_return("),
+            "every failure after MM publication must be terminal",
+        );
+    }
 }
 
 impl<E: ThreadedEngine + 'static> ThreadRuntimeState<E>
@@ -891,13 +977,20 @@ where
         // From here, the prepared exec transaction is the sole owner of
         // nonleader promotion and replacement Mm state.
         let prepared_kernel_exec = match kernel.hvpatch_process.as_ref() {
-            Some(process) => process
-                .prepare_exec_for_linux_tid(self.linux_tid)
-                .map(|(prepared, context)| (RuntimePreparedExec::Hvpatch(prepared), Some(context))),
+            Some(process) => {
+                process
+                    .prepare_exec_for_linux_tid(self.linux_tid)
+                    .map(|(prepared, context)| {
+                        (
+                            RuntimePreparedExec::Hvpatch(Box::new(prepared)),
+                            Some(context),
+                        )
+                    })
+            }
             None => kernel
                 .dispatcher
                 .prepare_one_task_kernel_exec(kernel_context)
-                .map(|prepared| (RuntimePreparedExec::Other(prepared), None)),
+                .map(|prepared| (RuntimePreparedExec::Other(Box::new(prepared)), None)),
         };
         let (mut prepared_kernel_exec, refreshed_hvpatch_context) = match prepared_kernel_exec {
             Ok(prepared) => prepared,
@@ -919,22 +1012,14 @@ where
         // any pre-replacement failure abandons both runtime records and
         // dropping `prepared_kernel_exec` rolls back Kernel preparation.
         let _inventory_abandon = if let Some(process) = kernel.hvpatch_process.as_ref() {
-            // Answer "is the predecessor mm shared with a live sharer?" from
-            // the AUTHORITY (MmResources lease sharing), freshly per exec,
-            // and hand it to the backend BEFORE the sizing below reads
-            // `exec_retires_old_mm`. The backend flag was never set in
-            // production, so every vfork-shared exec retired the shared mm
-            // out from under the surviving child (vforkexecthread: the
-            // child's load-barrier fetch walked all-zero descriptors).
-            let predecessor_owners = process
-                .mm_resources()
-                .observe_exec_owners(process.task_key(), exec_kernel_context.thread().key())
-                .map_err(|error| {
-                    RuntimeError::Configuration(format!(
-                        "resolve exec predecessor mm sharing: {error}"
-                    ))
-                })?;
-            let predecessor_shared = !predecessor_owners.final_owner();
+            // The reservation pinned this topology decision under MM-resource
+            // authority before any later topology mutation. Never recount it.
+            let disposition = prepared_kernel_exec
+                .hvpatch_disposition()
+                .unwrap_or_else(|| std::process::abort());
+            let routing = route_exec_disposition(disposition);
+            let retires_old_mm = routing.retirement_inventory;
+            let predecessor_shared = routing.predecessor_shared;
             let predecessor_binding = process.mm_binding().ok_or_else(|| {
                 RuntimeError::Configuration(
                     "HVPatch exec predecessor has no exact MM binding".to_owned(),
@@ -999,13 +1084,12 @@ where
                 replacement_mm = ?replacement_mm_id,
                 old_extent_count,
                 replacement_extent_count,
-                retires_old_mm = old_extent_count != 0,
+                retires_old_mm,
                 "HVPatch exec inventory sizing",
             );
-            // Zero old extents means the exec retires nothing from the old mm
-            // (a live sharer still owns it). `FrameEventCapacity` is non-zero by
-            // construction, so that case has no capacity and no transaction.
-            let old_capacity = if old_extent_count == 0 {
+            // A retained pinned disposition has no retirement reservation at
+            // all; an observed zero is not allowed to redefine ownership.
+            let old_capacity = if !retires_old_mm {
                 None
             } else {
                 match carrick_hal::FrameEventCapacity::for_event_count(
@@ -1178,12 +1262,37 @@ where
                     .map(Some);
                 }
             };
+        let old_files = prepared_kernel_exec.old_file_table();
+        let published_kernel_exec = match (kernel.hvpatch_process.as_ref(), prepared_kernel_exec) {
+            (Some(process), RuntimePreparedExec::Hvpatch(prepared)) => {
+                let replacement_vma_source = prepared_dispatch_mm_exec.as_ref().map_or_else(
+                    || kernel.dispatcher.vma_snapshot_source(),
+                    crate::dispatch::PreparedDispatchMmExec::vma_snapshot_source,
+                );
+                match process.publish_exec_mm(*prepared, replacement_vma_source) {
+                    Ok(published) => RuntimePublishedExec::Hvpatch(published),
+                    Err(error) => {
+                        return Err(RuntimeError::Configuration(format!(
+                            "reject exec before MM publication: {error}"
+                        )));
+                    }
+                }
+            }
+            (None, RuntimePreparedExec::Other(prepared)) => RuntimePublishedExec::Other(*prepared),
+            _ => {
+                tracing::error!("exec preparation/backend authority mismatch");
+                std::process::abort();
+            }
+        };
         if let Err(error) =
             retire_execution_authority_for_exec(&retiring_thread, &self.execution_lease)
         {
-            return Err(RuntimeError::Configuration(format!(
-                "reject exec before backend replacement: {error}"
-            )));
+            return Self::exec_failed_past_no_return(
+                kernel,
+                engine,
+                &format!("retire predecessor after MM publication: {error}"),
+            )
+            .map(Some);
         }
         if let Some(identity) = exec_predecessor_identity
             && let Err(error) = engine.bind_exec_predecessor_identity(identity)
@@ -1281,35 +1390,11 @@ where
                 }
             }
         }
-        let old_files = prepared_kernel_exec.old_file_table();
-        let committed = match (kernel.hvpatch_process.as_ref(), prepared_kernel_exec) {
-            (Some(process), RuntimePreparedExec::Hvpatch(prepared)) => {
-                const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
-                let stage1_root = match engine.get_sys_reg(carrick_hal::SysReg::Ttbr0) {
-                    Ok(root) => root & TTBR_ROOT_MASK,
-                    Err(error) => {
-                        return Self::exec_failed_past_no_return(
-                            kernel,
-                            engine,
-                            &format!("read HVPatch stage-1 root after destructive exec: {error}"),
-                        )
-                        .map(Some);
-                    }
-                };
-                let replacement_vma_source = prepared_dispatch_mm_exec.as_ref().map_or_else(
-                    || kernel.dispatcher.vma_snapshot_source(),
-                    crate::dispatch::PreparedDispatchMmExec::vma_snapshot_source,
-                );
-                process
-                    .commit_exec(
-                        prepared,
-                        stage1_root,
-                        replacement_vma_source,
-                        prepared_dispatch_mm_exec.take(),
-                    )
-                    .map(|committed| (committed.context().retain_exact(), Some(committed)))
-            }
-            (None, RuntimePreparedExec::Other(prepared)) => {
+        let committed = match (kernel.hvpatch_process.as_ref(), published_kernel_exec) {
+            (Some(process), RuntimePublishedExec::Hvpatch(published)) => process
+                .complete_exec(published, prepared_dispatch_mm_exec.take())
+                .map(|committed| (committed.context().retain_exact(), Some(committed))),
+            (None, RuntimePublishedExec::Other(prepared)) => {
                 let committed = kernel.dispatcher.commit_one_task_kernel_exec(prepared);
                 if committed.is_ok()
                     && let Some(prepared) = prepared_dispatch_mm_exec.take()

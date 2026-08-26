@@ -35,7 +35,7 @@ pub(crate) use stage1_mm::Stage1MmPool;
 pub(crate) use stage1_mm::{PreparedStage1Mm, Stage1MmLease, Stage1MmRetirement};
 
 use mm_resources::MmResources;
-pub(crate) use mm_resources::RetiredStage1Mm;
+pub(crate) use mm_resources::{ExecMmDispositionKind, RetiredStage1Mm};
 
 #[derive(Clone, Debug)]
 pub(crate) struct ProcessContext {
@@ -287,8 +287,9 @@ impl carrick_hal::TimerDelivery for ProcessTimerDelivery {
 pub(crate) struct PreparedProcessExec {
     kernel: crate::kernel::PreparedExec,
     backend: std::sync::Arc<stage1_mm::Stage1MmBackend>,
-    replacement_mm: stage1_mm::PreparedStage1Mm,
-    old_vmas: stage1_mm::PreparedVmaFreeze,
+    predecessor_backend: std::sync::Arc<stage1_mm::Stage1MmBackend>,
+    reservation: mm_resources::ExecMmReservation,
+    old_vmas: Option<stage1_mm::PreparedVmaFreeze>,
 }
 
 impl PreparedProcessExec {
@@ -305,29 +306,44 @@ impl PreparedProcessExec {
     }
 
     pub(crate) fn acknowledge_staged_vma_revision(&mut self) -> Result<(), String> {
-        self.old_vmas
-            .acknowledge_staged_revision(
-                std::time::Instant::now() + std::time::Duration::from_secs(1),
-            )
-            .map_err(|error| error.to_string())
+        match self.old_vmas.as_mut() {
+            Some(old_vmas) => old_vmas
+                .acknowledge_staged_revision(
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                )
+                .map_err(|error| error.to_string()),
+            None => Ok(()),
+        }
     }
 
     pub(crate) fn replacement_root_slot(&self) -> Option<stage1_mm::Stage1RootSlot> {
-        self.replacement_mm.root_slot()
+        self.reservation.replacement_root_slot()
     }
 
     pub(crate) fn replacement_asid_generation(&self) -> AsidGeneration {
-        self.replacement_mm.asid_generation()
+        self.reservation.replacement_asid_generation()
+    }
+
+    pub(crate) fn disposition(&self) -> mm_resources::ExecMmDispositionKind {
+        self.reservation.disposition()
     }
 
     pub(crate) fn begin_replacement_load(
         &self,
         executor: crate::kernel::objects::ExecutorId,
     ) -> Result<AsidLoad, String> {
-        self.replacement_mm
-            .begin_asid_load(executor)
+        self.reservation
+            .begin_replacement_asid_load(executor)
             .map_err(|error| error.to_string())
     }
+}
+
+/// MM publication is the HVPatch exec no-return cut. This non-cloneable token
+/// carries the still-prepared Kernel transition and exact pinned MM receipt
+/// forward to post-engine publication.
+pub(crate) struct PublishedProcessExec {
+    kernel: crate::kernel::PreparedExec,
+    receipt: mm_resources::ExecMmCommitReceipt,
 }
 
 pub(crate) struct CommittedProcessExec {
@@ -704,79 +720,151 @@ impl ProcessContext {
         &self,
         tid: crate::kernel::LinuxTid,
     ) -> Result<(PreparedProcessExec, crate::kernel::KernelContext), String> {
-        let current_backend = std::sync::Arc::clone(&self.mm_backend.read());
-        let replacement_mm = self
+        let reservation = self
             .resources
-            .prepare_exec(self.task_key())
+            .reserve_exec(self.task_key())
             .map_err(|error| error.to_string())?;
-        let backend = replacement_mm.backend();
+        let predecessor_backend = reservation.predecessor_backend();
+        let backend = reservation.replacement_backend();
         let kernel_backend: std::sync::Arc<dyn crate::kernel::MmBackend> = backend.clone();
-        let (kernel, context) = self
+        let (kernel, context) = match self
             .kernel_graph()
             .prepare_exec_for_binding_with_mm_backend(&self.binding, tid, kernel_backend, None)
-            .map_err(|error| error.to_string())?;
-        let old_vmas = current_backend
-            .prepare_vma_freeze(std::time::Instant::now() + std::time::Duration::from_secs(1))
-            .map_err(|error| error.to_string())?;
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let error = error.to_string();
+                reservation.abort().unwrap_or_else(|abort_error| {
+                    tracing::error!(%abort_error, "failed to abort exec MM after Kernel preparation failure");
+                    std::process::abort();
+                });
+                return Err(error);
+            }
+        };
+        let old_vmas = match reservation.disposition() {
+            mm_resources::ExecMmDispositionKind::RetainOldMm => None,
+            mm_resources::ExecMmDispositionKind::RetireOldMm => {
+                match predecessor_backend.prepare_vma_freeze(
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                ) {
+                    Ok(freeze) => Some(freeze),
+                    Err(error) => {
+                        let error = error.to_string();
+                        reservation.abort().unwrap_or_else(|abort_error| {
+                            tracing::error!(%abort_error, "failed to abort exec MM after VMA freeze preparation failure");
+                            std::process::abort();
+                        });
+                        return Err(error);
+                    }
+                }
+            }
+        };
         Ok((
             PreparedProcessExec {
                 kernel,
                 backend,
-                replacement_mm,
+                predecessor_backend,
+                reservation,
                 old_vmas,
             },
             context,
         ))
     }
 
-    pub(crate) fn commit_exec(
+    /// Publish the exact pinned MM disposition. Success is the bounded exec
+    /// no-return cut: callers must fail-stop rather than restore the old image.
+    pub(crate) fn publish_exec_mm(
         &self,
         prepared: PreparedProcessExec,
-        stage1_root: u64,
         vma_source: crate::kernel::SharedVmaSnapshotSource,
-        dispatch_mm: Option<crate::dispatch::PreparedDispatchMmExec>,
-    ) -> Result<CommittedProcessExec, String> {
+    ) -> Result<PublishedProcessExec, String> {
         let PreparedProcessExec {
-            kernel,
+            mut kernel,
             backend,
-            replacement_mm: prepared_mm,
+            predecessor_backend,
+            reservation,
             old_vmas,
         } = prepared;
         let current_backend = std::sync::Arc::clone(&self.mm_backend.read());
-        old_vmas
-            .validate(
+        if !std::sync::Arc::ptr_eq(&current_backend, &predecessor_backend) {
+            reservation.abort().unwrap_or_else(|abort_error| {
+                tracing::error!(%abort_error, "failed to abort exec MM after predecessor backend mismatch");
+                std::process::abort();
+            });
+            return Err("exec predecessor backend changed after MM reservation".to_owned());
+        }
+        if let Some(old_vmas) = old_vmas {
+            if let Err(error) = old_vmas.validate(
                 &current_backend,
                 std::time::Instant::now() + std::time::Duration::from_secs(1),
-            )
-            .map_err(|error| error.to_string())?;
-        let (replacement_lease, retired_mm) = self
-            .resources
-            .commit_exec(self.task_key(), prepared_mm, stage1_root)
-            .map_err(|error| error.to_string())?;
-        let binding = replacement_lease.binding();
+            ) {
+                let error = error.to_string();
+                reservation.abort().unwrap_or_else(|abort_error| {
+                    tracing::error!(%abort_error, "failed to abort exec MM after predecessor VMA validation failure");
+                    std::process::abort();
+                });
+                return Err(error);
+            }
+            if let Err(error) = old_vmas.commit(
+                &current_backend,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            ) {
+                let error = error.to_string();
+                reservation.abort().unwrap_or_else(|abort_error| {
+                    tracing::error!(%abort_error, "failed to abort exec MM after predecessor VMA freeze failure");
+                    std::process::abort();
+                });
+                return Err(error);
+            }
+        }
+        let stage1_root = reservation
+            .replacement_root_slot()
+            .unwrap_or_else(|| {
+                tracing::error!("exec MM reservation lost its replacement root slot");
+                std::process::abort();
+            })
+            .base();
+        let receipt = reservation.commit(stage1_root).unwrap_or_else(|error| {
+            // A final-owner VMA freeze may already be published. There is no
+            // safe predecessor resume beyond this exact point.
+            tracing::error!(%error, "exec MM reservation commit failed after predecessor freeze");
+            std::process::abort();
+        });
+        let replacement_lease = match &receipt {
+            mm_resources::ExecMmCommitReceipt::Retained { replacement, .. }
+            | mm_resources::ExecMmCommitReceipt::Retired { replacement, .. } => replacement,
+        };
         let replacement_mm = kernel.replacement_mm_id();
-        backend.publish_binding(binding);
+        debug_assert_eq!(backend.binding(), replacement_lease.binding());
         backend.bind_inventory(self.kernel_graph(), replacement_mm);
         backend.bind_vma_source(vma_source);
+        *self.mm_backend.write() = backend;
+        kernel.enter_no_return();
+        Ok(PublishedProcessExec { kernel, receipt })
+    }
+
+    pub(crate) fn complete_exec(
+        &self,
+        published: PublishedProcessExec,
+        dispatch_mm: Option<crate::dispatch::PreparedDispatchMmExec>,
+    ) -> Result<CommittedProcessExec, String> {
+        let PublishedProcessExec { kernel, receipt } = published;
+        let replacement_mm = kernel.replacement_mm_id();
         let transition = self
             .kernel_graph()
             .commit_exec_transition(kernel, None)
             .map_err(|error| error.to_string())?;
-        // The caller invokes this method only after destructive engine
-        // replacement. Freeze the detached historical observer after Kernel
-        // publication so no recoverable pre-publication error can strand the
-        // still-live old image on an owned snapshot.
-        old_vmas
-            .commit(
-                &current_backend,
-                std::time::Instant::now() + std::time::Duration::from_secs(1),
-            )
-            .map_err(|error| error.to_string())?;
-        *self.mm_backend.write() = backend;
+        let (replacement_lease, retired_mm) = match receipt {
+            mm_resources::ExecMmCommitReceipt::Retained { replacement, .. } => (replacement, None),
+            mm_resources::ExecMmCommitReceipt::Retired {
+                retirement,
+                replacement,
+            } => (replacement, Some(retirement)),
+        };
         let transition = transition
             .attach_successor_asid_generation(
                 replacement_mm,
-                self.mm_backend.read().asid_generation().generation(),
+                replacement_lease.asid_generation().generation(),
             )
             .map_err(|error| error.to_string())?;
         if let Some(dispatch_mm) = dispatch_mm {
@@ -787,6 +875,18 @@ impl ProcessContext {
             replacement_mm: replacement_lease,
             retired_mm,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit_exec(
+        &self,
+        prepared: PreparedProcessExec,
+        _stage1_root: u64,
+        vma_source: crate::kernel::SharedVmaSnapshotSource,
+        dispatch_mm: Option<crate::dispatch::PreparedDispatchMmExec>,
+    ) -> Result<CommittedProcessExec, String> {
+        let published = self.publish_exec_mm(prepared, vma_source)?;
+        self.complete_exec(published, dispatch_mm)
     }
 
     pub(crate) fn record_process_exit_begin(
@@ -1546,6 +1646,65 @@ mod tests {
         SyscallDispatcher::new().vma_snapshot_source()
     }
 
+    #[derive(Debug)]
+    struct ChangeAfterExecValidationVmaSource {
+        revision: std::sync::atomic::AtomicU64,
+        publish_calls: std::sync::atomic::AtomicUsize,
+        vmas: Vec<crate::kernel::VmaSummary>,
+    }
+
+    impl ChangeAfterExecValidationVmaSource {
+        fn new(vmas: Vec<crate::kernel::VmaSummary>) -> Self {
+            Self {
+                revision: std::sync::atomic::AtomicU64::new(
+                    crate::kernel::VmaRevision::INITIAL.raw(),
+                ),
+                publish_calls: std::sync::atomic::AtomicUsize::new(0),
+                vmas,
+            }
+        }
+    }
+
+    impl crate::kernel::VmaSnapshotSource for ChangeAfterExecValidationVmaSource {
+        fn snapshot(
+            &self,
+            _deadline: std::time::Instant,
+        ) -> Result<crate::kernel::OwnedVmaSnapshot, crate::kernel::SnapshotError> {
+            Ok(crate::kernel::OwnedVmaSnapshot {
+                revision: self.revision(),
+                vmas: self.vmas.clone(),
+            })
+        }
+
+        fn revision(&self) -> crate::kernel::VmaRevision {
+            crate::kernel::VmaRevision::from_authority_raw(
+                self.revision.load(std::sync::atomic::Ordering::Acquire),
+            )
+        }
+
+        fn publish_if_revision(
+            &self,
+            expected: crate::kernel::VmaRevision,
+            _deadline: std::time::Instant,
+            publish: &mut dyn FnMut() -> Result<(), crate::kernel::SnapshotError>,
+        ) -> Result<(), crate::kernel::SnapshotError> {
+            if self.revision() != expected {
+                return Err(crate::kernel::SnapshotError::ChangedDuringObservation);
+            }
+            let result = publish();
+            if result.is_ok()
+                && self
+                    .publish_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                    == 0
+            {
+                self.revision
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
+            result
+        }
+    }
+
     fn siginfo_i32(bytes: &[u8; crate::linux_abi::LINUX_SIGINFO_SIZE], offset: usize) -> i32 {
         i32::from_ne_bytes(bytes[offset..offset + 4].try_into().expect("siginfo i32"))
     }
@@ -1593,6 +1752,37 @@ mod tests {
                 .is_none_or(|r| r.pending().is_empty())
         );
         retirement.complete().unwrap();
+    }
+
+    fn production_shared_child(
+        parent: &ProcessContext,
+        parent_context: &crate::kernel::KernelContext,
+        diagnostic_name: &str,
+        child_tid: crate::thread::ThreadId,
+    ) -> (ProcessContext, crate::kernel::KernelContext) {
+        let published = parent
+            .kernel_graph()
+            .reserve_fork(
+                parent_context,
+                crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::VM).unwrap(),
+                diagnostic_name.to_owned(),
+                None,
+            )
+            .unwrap()
+            .prepare_shared_mm(child_tid)
+            .unwrap()
+            .commit()
+            .unwrap();
+        let (child_context, wait) = published.into_parts().unwrap();
+        assert!(wait.is_none());
+        let backend = parent
+            .mm_resources()
+            .publish_shared_child(parent_context.task().key(), child_context.task().key())
+            .unwrap();
+        (
+            parent.published_child_context(&child_context, backend),
+            child_context,
+        )
     }
 
     /// A wait that overlaps a child's mid-flight exit reservation must NOT
@@ -1748,6 +1938,896 @@ mod tests {
                 .expect("child VMA source")
                 .vma_revision
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn active_exec_reservation_rejects_later_shared_child_bind() {
+        let (parent, root) = authoritative_root();
+        let parent_dispatcher = SyscallDispatcher::new();
+        parent_dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+            start: 0x1000,
+            end: 0x2000,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: crate::vfs::ProcMapSharing::Private,
+            path: "shared-old-image".to_owned(),
+        }]);
+        parent_dispatcher.bind_hvpatch_process(parent.clone());
+
+        let exec_tid = crate::thread::ThreadId::synthetic_for_tests(10_001);
+        let (exec_child, exec_context) =
+            production_shared_child(&parent, &root, "shared-exec-child", exec_tid);
+        let exec_dispatcher = parent_dispatcher.fork_clone_in_process_with_mm_mode(
+            root.thread().registry_id(),
+            exec_context.thread().registry_id(),
+            parent.pid() as u32,
+            exec_child.pid() as u32,
+            crate::kernel::CloneObjectMode::Share,
+        );
+        exec_dispatcher.bind_hvpatch_process(exec_child.clone());
+
+        let mut prepared = exec_child
+            .prepare_exec(&exec_context)
+            .expect("prepare shared-child exec");
+        exec_dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+            start: 0x5000,
+            end: 0x6000,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: crate::vfs::ProcMapSharing::Private,
+            path: "staged-exec-image".to_owned(),
+        }]);
+        prepared
+            .acknowledge_staged_vma_revision()
+            .expect("acknowledge staged shared-child image");
+
+        let sibling_tid = crate::thread::ThreadId::synthetic_for_tests(10_002);
+        let published = parent
+            .kernel_graph()
+            .reserve_fork(
+                &root,
+                crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::VM).unwrap(),
+                "second-shared-child".to_owned(),
+                None,
+            )
+            .unwrap()
+            .prepare_shared_mm(sibling_tid)
+            .unwrap()
+            .commit()
+            .unwrap();
+        let (sibling_context, wait) = published.into_parts().unwrap();
+        assert!(wait.is_none());
+        assert!(matches!(
+            parent
+                .mm_resources()
+                .publish_shared_child(root.task().key(), sibling_context.task().key(),),
+            Err(mm_resources::MmResourcesError::ExecReservationConflict(_))
+        ));
+
+        let replacement_root = prepared
+            .replacement_root_slot()
+            .expect("replacement root slot")
+            .base();
+        exec_child
+            .commit_exec(prepared, replacement_root, test_vma_source(), None)
+            .expect("a rejected shared-child bind must not invalidate exec preparation");
+    }
+
+    #[test]
+    fn shared_mm_exec_never_freezes_retained_parent_backend() {
+        let (parent, root) = authoritative_root();
+        let parent_dispatcher = SyscallDispatcher::new();
+        parent_dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+            start: 0x1000,
+            end: 0x2000,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: crate::vfs::ProcMapSharing::Private,
+            path: "shared-parent-before-exec".to_owned(),
+        }]);
+        parent_dispatcher.bind_hvpatch_process(parent.clone());
+        let retained_parent_backend = std::sync::Arc::clone(&parent.mm_backend.read());
+
+        let exec_tid = crate::thread::ThreadId::synthetic_for_tests(10_001);
+        let (exec_child, exec_context) =
+            production_shared_child(&parent, &root, "shared-retained-exec-child", exec_tid);
+        let prepared = exec_child
+            .prepare_exec(&exec_context)
+            .expect("prepare shared-child exec");
+        let replacement_root = prepared
+            .replacement_root_slot()
+            .expect("replacement root slot")
+            .base();
+        let replacement_dispatcher = SyscallDispatcher::new();
+        replacement_dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+            start: 0x9000,
+            end: 0xa000,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: crate::vfs::ProcMapSharing::Private,
+            path: "exec-replacement".to_owned(),
+        }]);
+        let committed = exec_child
+            .commit_exec(
+                prepared,
+                replacement_root,
+                replacement_dispatcher.vma_snapshot_source(),
+                None,
+            )
+            .expect("commit shared-child exec");
+        let (_, _, retired_mm) = committed.into_parts();
+        assert!(
+            retired_mm.is_none(),
+            "the surviving parent still owns the predecessor MM",
+        );
+
+        let replacement_backend = std::sync::Arc::clone(&exec_child.mm_backend.read());
+        let replacement = crate::kernel::MmBackend::snapshot(
+            replacement_backend.as_ref(),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .expect("replacement MM observer");
+        assert_eq!(
+            replacement.vmas,
+            vec![crate::kernel::VmaSummary {
+                start: carrick_guest_mem::GuestVa(0x9000),
+                end: carrick_guest_mem::GuestVa(0xa000),
+            }],
+        );
+
+        parent_dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+            start: 0x7000,
+            end: 0x8000,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: crate::vfs::ProcMapSharing::Private,
+            path: "surviving-parent-after-child-exec".to_owned(),
+        }]);
+        let replacement_after_parent_mutation = crate::kernel::MmBackend::snapshot(
+            replacement_backend.as_ref(),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .expect("replacement MM remains isolated");
+        assert_eq!(
+            replacement_after_parent_mutation.vmas, replacement.vmas,
+            "the replacement backend must observe only its replacement VMA source",
+        );
+
+        let retained_parent = crate::kernel::MmBackend::snapshot(
+            retained_parent_backend.as_ref(),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .expect("retained shared parent MM observer");
+        assert_eq!(
+            retained_parent.vmas,
+            vec![crate::kernel::VmaSummary {
+                start: carrick_guest_mem::GuestVa(0x7000),
+                end: carrick_guest_mem::GuestVa(0x8000),
+            }],
+            "shared-child exec must not freeze the backend retained by the surviving parent",
+        );
+    }
+
+    #[test]
+    fn failed_final_owner_freeze_rolls_back_every_mm_authority() {
+        let (process, root) = authoritative_root();
+        let old_backend = std::sync::Arc::clone(&process.mm_backend.read());
+        let old_lease = process
+            .mm_resources()
+            .lease(process.task_key())
+            .expect("old MM lease");
+        let old_mm = root.shared().mm().id();
+        let source: crate::kernel::SharedVmaSnapshotSource =
+            std::sync::Arc::new(ChangeAfterExecValidationVmaSource::new(vec![
+                crate::kernel::VmaSummary {
+                    start: carrick_guest_mem::GuestVa(0x1000),
+                    end: carrick_guest_mem::GuestVa(0x2000),
+                },
+            ]));
+        process.bind_vma_source(source);
+
+        let prepared = process
+            .prepare_exec(&root)
+            .expect("prepare final-owner exec");
+        let replacement_root = prepared
+            .replacement_root_slot()
+            .expect("replacement root slot");
+        let error =
+            match process.commit_exec(prepared, replacement_root.base(), test_vma_source(), None) {
+                Ok(_) => panic!("the post-validation revision change must fail closed"),
+                Err(error) => error,
+            };
+        assert!(
+            error.contains("backend snapshot changed while it was being observed"),
+            "unexpected freeze failure: {error}",
+        );
+
+        assert!(
+            std::sync::Arc::ptr_eq(&process.mm_backend.read(), &old_backend),
+            "a failed exec must preserve the ProcessContext backend",
+        );
+        let table_lease = process
+            .mm_resources()
+            .lease(process.task_key())
+            .expect("MM table remains populated after rollback");
+        assert!(
+            std::sync::Arc::ptr_eq(&table_lease, &old_lease),
+            "a failed exec must restore the exact predecessor MM lease",
+        );
+        let kernel_retained_old_mm = process
+            .context_for_linux_tid(root.thread().key().tid)
+            .is_ok_and(|context| context.shared().mm().id() == old_mm);
+        assert!(
+            kernel_retained_old_mm,
+            "a failed exec must leave Kernel on the predecessor MM",
+        );
+
+        let executor = crate::kernel::objects::ExecutorId::for_transitional_thread(
+            crate::thread::ThreadId::synthetic_for_tests(19_999),
+        )
+        .expect("test executor");
+        let predecessor_load = old_lease.begin_asid_load(executor);
+        assert!(
+            predecessor_load.is_ok(),
+            "rollback must leave predecessor residency open and non-retired",
+        );
+        drop(predecessor_load);
+
+        let reusable = process
+            .mm_resources()
+            .prepare_child()
+            .expect("failed replacement reservation must be recoverable");
+        assert_eq!(reusable.root_slot(), Some(replacement_root));
+    }
+
+    #[test]
+    fn exec_publication_rejects_process_backend_drift_before_freeze() {
+        let (process, root) = authoritative_root();
+        let predecessor_backend = std::sync::Arc::clone(&process.mm_backend.read());
+        let predecessor_lease = process
+            .mm_resources()
+            .lease(process.task_key())
+            .expect("predecessor lease");
+        let prepared = process.prepare_exec(&root).expect("prepare exec");
+        let replacement_root = prepared
+            .replacement_root_slot()
+            .expect("replacement root slot");
+
+        let (unrelated, _) = authoritative_root();
+        *process.mm_backend.write() = std::sync::Arc::clone(&unrelated.mm_backend.read());
+        let error = match process.publish_exec_mm(prepared, test_vma_source()) {
+            Ok(_) => panic!("backend drift must reject before MM publication"),
+            Err(error) => error,
+        };
+        assert!(error.contains("predecessor backend changed"));
+        assert!(std::sync::Arc::ptr_eq(
+            &process.mm_resources().lease(process.task_key()).unwrap(),
+            &predecessor_lease,
+        ));
+
+        *process.mm_backend.write() = predecessor_backend;
+        let retry = process
+            .prepare_exec(&root)
+            .expect("exact retry after abort");
+        assert_eq!(retry.replacement_root_slot(), Some(replacement_root));
+        drop(retry);
+    }
+
+    #[test]
+    fn dropping_mm_published_exec_terminates_parked_predecessor_siblings() {
+        let (process, root) = authoritative_root();
+        let plan = crate::kernel::ClonePlan::from_flags(
+            carrick_abi::LinuxCloneFlags::THREAD
+                | carrick_abi::LinuxCloneFlags::SIGHAND
+                | carrick_abi::LinuxCloneFlags::VM,
+        )
+        .unwrap();
+        let sibling = process
+            .kernel_graph()
+            .reserve_thread_clone_eventually(&root, plan)
+            .unwrap()
+            .prepare(crate::thread::ThreadId::synthetic_for_tests(10_001))
+            .unwrap()
+            .commit()
+            .unwrap()
+            .into_context()
+            .unwrap();
+        let sibling_thread = std::sync::Arc::clone(sibling.thread());
+        let runner = sibling_thread.bind_runner().expect("bind sibling runner");
+        let runner_thread = std::thread::spawn(move || {
+            loop {
+                match runner.checkpoint() {
+                    crate::kernel::RunnerDirective::Continue => std::thread::yield_now(),
+                    directive => break directive,
+                }
+            }
+        });
+
+        let prepared = process.prepare_exec(&root).expect("prepare drained exec");
+        let published = process
+            .publish_exec_mm(prepared, test_vma_source())
+            .expect("publish MM no-return cut");
+        drop(published);
+
+        assert_eq!(
+            runner_thread.join().expect("join predecessor sibling"),
+            crate::kernel::RunnerDirective::Terminate,
+            "forward-only drop must never resume a predecessor sibling",
+        );
+        assert!(matches!(
+            sibling_thread.bind_runner(),
+            Err(crate::kernel::ObjectGraphError::RunnerDraining(_)),
+        ));
+    }
+
+    #[test]
+    fn shared_child_private_exec_accepts_later_dispatcher_vma_binding() {
+        let (parent, root) = authoritative_root();
+        let parent_dispatcher = SyscallDispatcher::new();
+        parent_dispatcher.bind_hvpatch_process(parent.clone());
+        let child_tid = crate::thread::ThreadId::synthetic_for_tests(10_001);
+        let (child, child_context) =
+            production_shared_child(&parent, &root, "shared-rebind-child", child_tid);
+        let child_dispatcher = parent_dispatcher.fork_clone_in_process_with_mm_mode(
+            root.thread().registry_id(),
+            child_context.thread().registry_id(),
+            parent.pid() as u32,
+            child.pid() as u32,
+            crate::kernel::CloneObjectMode::Share,
+        );
+        child_dispatcher.bind_hvpatch_process(child.clone());
+
+        let prepared = child
+            .prepare_exec(&child_context)
+            .expect("prepare shared-child exec");
+        let replacement_root = prepared
+            .replacement_root_slot()
+            .expect("replacement root slot")
+            .base();
+        child
+            .commit_exec(prepared, replacement_root, test_vma_source(), None)
+            .expect("commit shared-child private replacement");
+
+        let rebound = SyscallDispatcher::new();
+        rebound.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+            start: 0x9000,
+            end: 0xa000,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: crate::vfs::ProcMapSharing::Private,
+            path: "post-exec-rebind".to_owned(),
+        }]);
+        rebound.bind_hvpatch_process(child.clone());
+        let observed = crate::kernel::MmBackend::snapshot(
+            child.mm_backend.read().as_ref(),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .expect("replacement MM observer");
+        assert_eq!(
+            observed.vmas,
+            vec![crate::kernel::VmaSummary {
+                start: carrick_guest_mem::GuestVa(0x9000),
+                end: carrick_guest_mem::GuestVa(0xa000),
+            }],
+            "a private exec replacement must accept its later dispatcher authority",
+        );
+    }
+
+    #[test]
+    fn clone_vm_dispatchers_share_vma_mutations_bidirectionally_before_exec() {
+        let parent = SyscallDispatcher::new();
+        parent.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+            start: 0x1000,
+            end: 0x2000,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: crate::vfs::ProcMapSharing::Private,
+            path: "shared-initial".to_owned(),
+        }]);
+        let child = parent.fork_clone_in_process_with_mm_mode(
+            crate::thread::ThreadId::synthetic_for_tests(10_000),
+            crate::thread::ThreadId::synthetic_for_tests(10_001),
+            10_000,
+            10_001,
+            crate::kernel::CloneObjectMode::Share,
+        );
+
+        child.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+            start: 0x3000,
+            end: 0x4000,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: crate::vfs::ProcMapSharing::Private,
+            path: "child-mutation".to_owned(),
+        }]);
+        let parent_after_child = parent
+            .vma_snapshot_source()
+            .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .expect("parent source after child mutation");
+
+        parent.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+            start: 0x5000,
+            end: 0x6000,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: crate::vfs::ProcMapSharing::Private,
+            path: "parent-mutation".to_owned(),
+        }]);
+        let child_after_parent = child
+            .vma_snapshot_source()
+            .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .expect("child source after parent mutation");
+
+        assert_eq!(
+            (parent_after_child.vmas, child_after_parent.vmas),
+            (
+                vec![crate::kernel::VmaSummary {
+                    start: carrick_guest_mem::GuestVa(0x3000),
+                    end: carrick_guest_mem::GuestVa(0x4000),
+                }],
+                vec![crate::kernel::VmaSummary {
+                    start: carrick_guest_mem::GuestVa(0x5000),
+                    end: carrick_guest_mem::GuestVa(0x6000),
+                }],
+            ),
+        );
+    }
+
+    #[test]
+    fn copied_mm_dispatchers_keep_vma_mutations_private() {
+        let parent = SyscallDispatcher::new();
+        parent.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+            start: 0x1000,
+            end: 0x2000,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: crate::vfs::ProcMapSharing::Private,
+            path: "private-parent".to_owned(),
+        }]);
+        let child = parent.fork_clone_in_process(
+            crate::thread::ThreadId::synthetic_for_tests(10_000),
+            crate::thread::ThreadId::synthetic_for_tests(10_001),
+            10_000,
+            10_001,
+        );
+        child.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+            start: 0x3000,
+            end: 0x4000,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: crate::vfs::ProcMapSharing::Private,
+            path: "private-child".to_owned(),
+        }]);
+
+        let parent_observed = parent
+            .vma_snapshot_source()
+            .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .expect("private parent source");
+        let child_observed = child
+            .vma_snapshot_source()
+            .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .expect("private child source");
+        assert_eq!(
+            (parent_observed.vmas, child_observed.vmas),
+            (
+                vec![crate::kernel::VmaSummary {
+                    start: carrick_guest_mem::GuestVa(0x1000),
+                    end: carrick_guest_mem::GuestVa(0x2000),
+                }],
+                vec![crate::kernel::VmaSummary {
+                    start: carrick_guest_mem::GuestVa(0x3000),
+                    end: carrick_guest_mem::GuestVa(0x4000),
+                }],
+            ),
+        );
+    }
+
+    #[test]
+    fn exec_mm_authority_is_private_until_commit_and_drop_abandons_it() {
+        let parent = SyscallDispatcher::new();
+        parent.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+            start: 0x1000,
+            end: 0x2000,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: crate::vfs::ProcMapSharing::Private,
+            path: "live-shared".to_owned(),
+        }]);
+        let child = parent.fork_clone_in_process_with_mm_mode(
+            crate::thread::ThreadId::synthetic_for_tests(10_000),
+            crate::thread::ThreadId::synthetic_for_tests(10_001),
+            10_000,
+            10_001,
+            crate::kernel::CloneObjectMode::Share,
+        );
+
+        let abandoned = child.publish_exec_image_state(
+            vec![crate::vfs::ProcMapsEntry {
+                start: 0x3000,
+                end: 0x4000,
+                read: true,
+                write: false,
+                execute: true,
+                sharing: crate::vfs::ProcMapSharing::Private,
+                path: "abandoned-replacement".to_owned(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(
+            parent
+                .vma_snapshot_source()
+                .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
+                .expect("live parent while exec is staged")
+                .vmas,
+            vec![crate::kernel::VmaSummary {
+                start: carrick_guest_mem::GuestVa(0x1000),
+                end: carrick_guest_mem::GuestVa(0x2000),
+            }],
+        );
+        assert_eq!(
+            abandoned
+                .vma_snapshot_source()
+                .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
+                .expect("private staged source")
+                .vmas,
+            vec![crate::kernel::VmaSummary {
+                start: carrick_guest_mem::GuestVa(0x3000),
+                end: carrick_guest_mem::GuestVa(0x4000),
+            }],
+        );
+        drop(abandoned);
+        assert_eq!(
+            child
+                .vma_snapshot_source()
+                .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
+                .expect("child remains on live shared source after abandon")
+                .vmas,
+            vec![crate::kernel::VmaSummary {
+                start: carrick_guest_mem::GuestVa(0x1000),
+                end: carrick_guest_mem::GuestVa(0x2000),
+            }],
+        );
+    }
+
+    #[test]
+    fn exec_mm_authority_commit_promotes_only_calling_dispatcher() {
+        let parent = SyscallDispatcher::new();
+        parent.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+            start: 0x1000,
+            end: 0x2000,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: crate::vfs::ProcMapSharing::Private,
+            path: "live-shared".to_owned(),
+        }]);
+        let child = parent.fork_clone_in_process_with_mm_mode(
+            crate::thread::ThreadId::synthetic_for_tests(10_000),
+            crate::thread::ThreadId::synthetic_for_tests(10_001),
+            10_000,
+            10_001,
+            crate::kernel::CloneObjectMode::Share,
+        );
+        let prepared = child.publish_exec_image_state(
+            vec![crate::vfs::ProcMapsEntry {
+                start: 0x3000,
+                end: 0x4000,
+                read: true,
+                write: false,
+                execute: true,
+                sharing: crate::vfs::ProcMapSharing::Private,
+                path: "committed-replacement".to_owned(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        prepared.commit();
+
+        parent.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+            start: 0x5000,
+            end: 0x6000,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: crate::vfs::ProcMapSharing::Private,
+            path: "parent-after-commit".to_owned(),
+        }]);
+        assert_eq!(
+            child
+                .vma_snapshot_source()
+                .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
+                .expect("promoted child source")
+                .vmas,
+            vec![crate::kernel::VmaSummary {
+                start: carrick_guest_mem::GuestVa(0x3000),
+                end: carrick_guest_mem::GuestVa(0x4000),
+            }],
+        );
+        assert_eq!(
+            parent
+                .vma_snapshot_source()
+                .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
+                .expect("retained parent source")
+                .vmas,
+            vec![crate::kernel::VmaSummary {
+                start: carrick_guest_mem::GuestVa(0x5000),
+                end: carrick_guest_mem::GuestVa(0x6000),
+            }],
+        );
+    }
+
+    #[test]
+    fn exec_mm_authority_promotion_does_not_wait_for_shared_parent_alias_transaction() {
+        let parent = SyscallDispatcher::new();
+        parent.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+            start: 0x1000,
+            end: 0x2000,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: crate::vfs::ProcMapSharing::Private,
+            path: "live-shared".to_owned(),
+        }]);
+        let child = parent.fork_clone_in_process_with_mm_mode(
+            crate::thread::ThreadId::synthetic_for_tests(10_000),
+            crate::thread::ThreadId::synthetic_for_tests(10_001),
+            10_000,
+            10_001,
+            crate::kernel::CloneObjectMode::Share,
+        );
+        let prepared = child.publish_exec_image_state(
+            vec![crate::vfs::ProcMapsEntry {
+                start: 0x3000,
+                end: 0x4000,
+                read: true,
+                write: false,
+                execute: true,
+                sharing: crate::vfs::ProcMapSharing::Private,
+                path: "committed-replacement".to_owned(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let parent_transaction = parent
+            .begin_host_alias_dispatch()
+            .publish(crate::dispatch::HostAliasCommit::empty_for_test());
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let promotion = std::thread::spawn(move || {
+            prepared.commit();
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("child promotion must not join the shared predecessor transaction queue");
+        promotion.join().expect("promotion thread");
+
+        let parent_install = parent_transaction
+            .claim()
+            .expect("the parent's predecessor transaction remains valid");
+        assert_eq!(parent_install.bus_fault_range(), None);
+        drop(parent_install);
+        assert_eq!(
+            child
+                .vma_snapshot_source()
+                .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
+                .expect("promoted child source")
+                .vmas,
+            vec![crate::kernel::VmaSummary {
+                start: carrick_guest_mem::GuestVa(0x3000),
+                end: carrick_guest_mem::GuestVa(0x4000),
+            }],
+        );
+        assert_eq!(
+            parent
+                .vma_snapshot_source()
+                .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
+                .expect("retained parent source")
+                .vmas,
+            vec![crate::kernel::VmaSummary {
+                start: carrick_guest_mem::GuestVa(0x1000),
+                end: carrick_guest_mem::GuestVa(0x2000),
+            }],
+        );
+    }
+
+    #[test]
+    fn exec_mm_authority_promotion_waits_for_active_predecessor_dispatch() {
+        let parent = SyscallDispatcher::new();
+        parent.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+            start: 0x1000,
+            end: 0x2000,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: crate::vfs::ProcMapSharing::Private,
+            path: "live-shared".to_owned(),
+        }]);
+        let child = parent.fork_clone_in_process_with_mm_mode(
+            crate::thread::ThreadId::synthetic_for_tests(10_000),
+            crate::thread::ThreadId::synthetic_for_tests(10_001),
+            10_000,
+            10_001,
+            crate::kernel::CloneObjectMode::Share,
+        );
+        let prepared = child.publish_exec_image_state(
+            vec![crate::vfs::ProcMapsEntry {
+                start: 0x3000,
+                end: 0x4000,
+                read: true,
+                write: false,
+                execute: true,
+                sharing: crate::vfs::ProcMapSharing::Private,
+                path: "committed-replacement".to_owned(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let predecessor_dispatch = child.begin_host_alias_dispatch();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let thread_start = std::sync::Arc::clone(&start);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let promotion = std::thread::spawn(move || {
+            thread_start.wait();
+            prepared.commit();
+            let _ = done_tx.send(());
+        });
+        start.wait();
+        assert_eq!(
+            done_rx.recv_timeout(std::time::Duration::from_millis(250)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "promotion completed while predecessor authority was actively Dispatching",
+        );
+
+        drop(predecessor_dispatch);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("promotion completes after predecessor dispatch releases");
+        promotion.join().expect("promotion thread");
+    }
+
+    #[test]
+    fn clone_vm_dispatchers_share_before_exec_and_isolate_after() {
+        let (parent, root) = authoritative_root();
+        let parent_dispatcher = SyscallDispatcher::new();
+        parent_dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+            start: 0x1000,
+            end: 0x2000,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: crate::vfs::ProcMapSharing::Private,
+            path: "shared-initial".to_owned(),
+        }]);
+        parent_dispatcher.bind_hvpatch_process(parent.clone());
+        let retained_parent_backend = std::sync::Arc::clone(&parent.mm_backend.read());
+        let child_tid = crate::thread::ThreadId::synthetic_for_tests(10_001);
+        let (child, child_context) =
+            production_shared_child(&parent, &root, "shared-vma-authority", child_tid);
+        let child_dispatcher = parent_dispatcher.fork_clone_in_process_with_mm_mode(
+            root.thread().registry_id(),
+            child_context.thread().registry_id(),
+            parent.pid() as u32,
+            child.pid() as u32,
+            crate::kernel::CloneObjectMode::Share,
+        );
+        child_dispatcher.bind_hvpatch_process(child.clone());
+
+        child_dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+            start: 0x3000,
+            end: 0x4000,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: crate::vfs::ProcMapSharing::Private,
+            path: "child-mutation".to_owned(),
+        }]);
+        let parent_after_child = parent_dispatcher
+            .vma_snapshot_source()
+            .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .expect("parent source after child mutation");
+
+        parent_dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+            start: 0x5000,
+            end: 0x6000,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: crate::vfs::ProcMapSharing::Private,
+            path: "parent-mutation".to_owned(),
+        }]);
+        let child_after_parent = child_dispatcher
+            .vma_snapshot_source()
+            .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .expect("child source after parent mutation");
+
+        let prepared = child
+            .prepare_exec(&child_context)
+            .expect("prepare CLONE_VM child exec");
+        let replacement_root = prepared
+            .replacement_root_slot()
+            .expect("replacement root slot")
+            .base();
+        let replacement_dispatcher = SyscallDispatcher::new();
+        child
+            .commit_exec(
+                prepared,
+                replacement_root,
+                replacement_dispatcher.vma_snapshot_source(),
+                None,
+            )
+            .expect("commit CLONE_VM child private exec");
+
+        parent_dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+            start: 0x7000,
+            end: 0x8000,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: crate::vfs::ProcMapSharing::Private,
+            path: "parent-after-child-exec".to_owned(),
+        }]);
+        replacement_dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+            start: 0x9000,
+            end: 0xa000,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: crate::vfs::ProcMapSharing::Private,
+            path: "child-after-private-exec".to_owned(),
+        }]);
+        let retained_parent_after_exec = crate::kernel::MmBackend::snapshot(
+            retained_parent_backend.as_ref(),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .expect("retained parent MM after child exec");
+        let replacement_after_exec = crate::kernel::MmBackend::snapshot(
+            child.mm_backend.read().as_ref(),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .expect("private child MM after exec");
+
+        assert_eq!(
+            (
+                parent_after_child.vmas,
+                child_after_parent.vmas,
+                retained_parent_after_exec.vmas,
+                replacement_after_exec.vmas,
+            ),
+            (
+                vec![crate::kernel::VmaSummary {
+                    start: carrick_guest_mem::GuestVa(0x3000),
+                    end: carrick_guest_mem::GuestVa(0x4000),
+                }],
+                vec![crate::kernel::VmaSummary {
+                    start: carrick_guest_mem::GuestVa(0x5000),
+                    end: carrick_guest_mem::GuestVa(0x6000),
+                }],
+                vec![crate::kernel::VmaSummary {
+                    start: carrick_guest_mem::GuestVa(0x7000),
+                    end: carrick_guest_mem::GuestVa(0x8000),
+                }],
+                vec![crate::kernel::VmaSummary {
+                    start: carrick_guest_mem::GuestVa(0x9000),
+                    end: carrick_guest_mem::GuestVa(0xa000),
+                }],
+            ),
+            "CLONE_VM VMA authority must be shared before exec and isolated afterward",
         );
     }
 
@@ -2071,6 +3151,10 @@ mod tests {
         let mut prepared = process.prepare_exec(&root).expect("prepare exec observer");
         let replacement_mm = prepared.replacement_mm_id();
         assert_ne!(old_mm, replacement_mm);
+        let reserved_stage1_root = prepared
+            .replacement_root_slot()
+            .expect("reserved replacement root")
+            .base();
         let stage1_root = old_snapshot.binding.stage1_root.gpa().raw() + 0x4000;
 
         // Runtime stages the replacement image in the same dispatcher after
@@ -2126,7 +3210,15 @@ mod tests {
             std::time::Instant::now() + std::time::Duration::from_secs(1),
         )
         .expect("replacement backend snapshot");
-        assert_eq!(replacement.binding.stage1_root.gpa().raw(), stage1_root);
+        assert_ne!(
+            stage1_root, reserved_stage1_root,
+            "test must supply a wrong TTBR"
+        );
+        assert_eq!(
+            replacement.binding.stage1_root.gpa().raw(),
+            reserved_stage1_root,
+            "caller/engine-reported TTBR must not select authoritative exec root",
+        );
         assert_eq!(
             replacement.vmas,
             vec![crate::kernel::VmaSummary {
@@ -2163,7 +3255,7 @@ mod tests {
             path: "unexpected-change".to_owned(),
         }]);
         assert_eq!(
-            prepared.old_vmas.commit(
+            prepared.old_vmas.expect("final-owner VMA freeze").commit(
                 backend.as_ref(),
                 std::time::Instant::now() + std::time::Duration::from_secs(1),
             ),
