@@ -161,6 +161,21 @@ struct DtraceRecDesc {
     user_argument: u64,
 }
 
+// libdtrace's `dtrace_probedata_t`. The consumer callback receives this as its
+// first argument; `data` points to the raw ECB record described by
+// `DtraceRecDesc::offset` and `DtraceRecDesc::size`.
+#[repr(C)]
+struct DtraceProbeData {
+    _handle: *mut DtraceHdl,
+    _enabled_probe: *mut c_void,
+    _probe: *mut c_void,
+    _cpu: c_int,
+    data: *const u8,
+    _flow: c_int,
+    _prefix: *const c_char,
+    _indent: c_int,
+}
+
 #[repr(C)]
 struct DtraceDropData {
     handle: *mut DtraceHdl,
@@ -235,7 +250,20 @@ extern "C" fn chew(_data: *const c_void, _arg: *mut c_void) -> c_int {
     DTRACE_CONSUME_THIS
 }
 
-extern "C" fn chewrec(_data: *const c_void, rec: *const c_void, arg: *mut c_void) -> c_int {
+fn dtrace_exit_status(data: *const c_void, rec: &DtraceRecDesc) -> Option<u8> {
+    if data.is_null() || rec.size != std::mem::size_of::<i32>() as u32 {
+        return None;
+    }
+    let probe = unsafe { &*data.cast::<DtraceProbeData>() };
+    if probe.data.is_null() {
+        return None;
+    }
+    let offset = usize::try_from(rec.offset).ok()?;
+    let raw = unsafe { std::ptr::read_unaligned(probe.data.add(offset).cast::<[u8; 4]>()) };
+    u8::try_from(i32::from_ne_bytes(raw)).ok()
+}
+
+extern "C" fn chewrec(data: *const c_void, rec: *const c_void, arg: *mut c_void) -> c_int {
     // NULL rec marks the end of this probe's records — advance to the next.
     if rec.is_null() {
         return DTRACE_CONSUME_NEXT;
@@ -247,8 +275,10 @@ extern "C" fn chewrec(_data: *const c_void, rec: *const c_void, arg: *mut c_void
         // corrupts a machine protocol emitted by the following END clause.
         if !arg.is_null() {
             let report = unsafe { &mut *arg.cast::<DTraceRunReport>() };
-            report.dtrace_exit_observed = true;
-            report.exit_status = u8::try_from(rec.argument).unwrap_or(u8::MAX);
+            if let Some(status) = dtrace_exit_status(data, rec) {
+                report.dtrace_exit_observed = true;
+                report.exit_status = status;
+            }
         }
         DTRACE_CONSUME_NEXT
     } else {
@@ -1246,21 +1276,45 @@ mod tests {
     }
 
     #[test]
-    fn record_consumer_receipts_exit_status_without_formatting_it() {
+    fn record_consumer_reads_exit_status_from_record_payload_without_formatting_it() {
+        #[repr(C)]
+        struct TestDtraceProbeData {
+            _handle: *mut std::ffi::c_void,
+            _enabled_probe: *mut std::ffi::c_void,
+            _probe: *mut std::ffi::c_void,
+            _cpu: i32,
+            data: *const u8,
+            _flow: i32,
+            _prefix: *const std::ffi::c_char,
+            _indent: i32,
+        }
+
+        let mut payload = [0u8; 16];
+        payload[8..12].copy_from_slice(&1_i32.to_ne_bytes());
         let exit = DtraceRecDesc {
             action: DTRACEACT_EXIT,
-            size: 0,
-            offset: 0,
+            size: std::mem::size_of::<i32>() as u32,
+            offset: 8,
             alignment: 0,
             format: 0,
-            argument: 1,
+            argument: 0,
             user_argument: 0,
         };
         let printf = DtraceRecDesc { action: 3, ..exit };
+        let probe = TestDtraceProbeData {
+            _handle: std::ptr::null_mut(),
+            _enabled_probe: std::ptr::null_mut(),
+            _probe: std::ptr::null_mut(),
+            _cpu: 0,
+            data: payload.as_ptr(),
+            _flow: 0,
+            _prefix: std::ptr::null(),
+            _indent: 0,
+        };
         let mut report = DTraceRunReport::default();
         assert_eq!(
             chewrec(
-                std::ptr::null(),
+                (&probe as *const TestDtraceProbeData).cast(),
                 (&exit as *const DtraceRecDesc).cast(),
                 (&mut report as *mut DTraceRunReport).cast(),
             ),
