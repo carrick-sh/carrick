@@ -1,6 +1,6 @@
 # Carrick exact conformance closure handoff
 
-**Updated:** 2026-08-26 (session 12 — sparse-file swing rejected; memfd fallback next)
+**Updated:** 2026-08-26 (session 12 — two guided swings reviewed and rejected)
 
 **Canonical host/lane:** macOS, Apple Silicon, HVF/HVPatch, Linux arm64 guest
 
@@ -154,18 +154,39 @@ validation to an explicit virtual-kernel hugepage capability and carry the
 selected hugepage size into memfd/mmap/truncate semantics, or stop partial if
 that honest backing contract cannot be closed in one bounded swing.
 
-## Active swing — Task 4.37 typed huge-memfd capability
+## Rejected swing — Task 4.37 typed huge-memfd capability
 
-The clean worker branch/worktree is `agy/memfd-huge-t437` at
+The worker branch/worktree is `agy/memfd-huge-t437` at
 `.worktrees/memfd-huge-t437`, based exactly on the accepted `fc640c3f` source.
-Antigravity run `core-roadmap-t437` has a 20-minute bounded turn. Its contract
-requires signed red-first proof, nine exact memfd flag/result Trace events,
-serialized Docker bpftrace, a typed guest-architecture hugepage capability,
-propagation of the chosen size into shared memfd authority, and adjacent
-truncate/mmap/seal controls. A creation-only allowlist is explicitly forbidden;
-the worker must return partial if it cannot preserve the hugetlb property beyond
-`memfd_create` honestly. Codex will inspect the actual diff and rerun decisive
-gates before any integration.
+Antigravity run `core-roadmap-t437` completed signed red-first proof and
+serialized native-arm64 bpftrace, then a Codex correction round removed an
+unrelated attempted weakening of the HVPatch frame-inventory test. The measured
+Linux contract is useful and exact: the registered AArch64 hstates are 64 KiB,
+2 MiB, 32 MiB, and 1 GiB with zero pool/free/reserved counts; the nine frozen
+flags yield exactly three successes (64 KiB, 2 MiB, 1 GiB) and six `ENODEV`;
+a 2 MiB huge memfd reports `st_blksize=2097152`, aligned `ftruncate` changes
+logical size with zero allocated blocks, one-byte `pwrite` returns `EINVAL`,
+one-byte `pread` returns a zero byte, and `mmap` returns `ENOMEM` with the zero
+pool.
+
+Codex and an independent read-only review nevertheless reject the corrected
+dirty diff wholesale. It hard-codes hstates in `carrick-abi` while Carrick's
+guest-visible `/sys/kernel/mm/hugepages` remains empty; stores a page-size marker
+on an ordinary open-description base instead of a typed hugetlb inode/backing;
+does not carry hstate/backing authority into VMA/fault/unmap lifetime; and makes
+all huge mmap fail before any reservation transaction. Its trace checks the
+exact syscall multiset but not guest exit status, sysfs capability consistency,
+or DTrace drops. No Task 4.37 source is integrated; keep the dirty worktree
+quarantined as evidence only. The frozen ledger remains **23/156
+focused-closed; 133 remain**.
+
+The reusable architecture result is now explicit: a future hugetlb swing must
+start with one kernel-owned `HugeTlbRegistry` containing hstates, default size,
+pool/free/reserved counts, and reservation authority. Both sysfs/proc rendering
+and memfd/MAP_HUGETLB decode must consume that registry. A typed hugetlb inode
+must own logical size plus backing/reservations, and VMA authority must retain
+the hstate/backing reference through fault, fork, unmap, mprotect, and mremap.
+Do not revive the current runtime diff or land the syntax parser by itself.
 
 ## Historical prerequisite objective — closed, retained for provenance
 
