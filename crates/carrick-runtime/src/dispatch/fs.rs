@@ -6842,9 +6842,11 @@ impl SyscallDispatcher {
     /// created special node (mknod FIFO/device/socket), mirroring mkdirat's
     /// rule: a new inode's group is the creator's egid, UNLESS the parent
     /// directory is setgid (S_ISGID), in which case it inherits the parent's
-    /// group and the node itself becomes setgid. Without this the host assigns
-    /// its own gid and a later stat reports the wrong st_gid (LTP mknod08
-    /// expects st_gid == the process egid because the parent isn't setgid).
+    /// group but preserves its requested mode. Unlike a newly created directory,
+    /// a non-directory node does not acquire S_ISGID from its parent. Without
+    /// this the host assigns its own gid and a later stat reports the wrong
+    /// st_gid (LTP mknod08 expects st_gid == the process egid because the parent
+    /// isn't setgid).
     /// Record the creating process as the owner of a just-created node, with
     /// Linux's setgid-parent gid inheritance. Called by every path that
     /// materialises a new node — `openat(O_CREAT)`, `mknod`, and `bind(2)` on an
@@ -6862,11 +6864,7 @@ impl SyscallDispatcher {
             {
                 owner_gid = pgid;
                 inherited_gid = true;
-                let _ = self
-                    .fs
-                    .rootfs_vfs
-                    .overlay
-                    .set_mode(path, node_mode | S_ISGID);
+                let _ = self.fs.rootfs_vfs.overlay.set_mode(path, node_mode);
             }
         }
         if !creds.euid.is_root() || !owner_gid.is_root() || inherited_gid {
