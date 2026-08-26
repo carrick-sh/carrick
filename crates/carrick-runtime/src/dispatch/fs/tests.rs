@@ -2002,6 +2002,84 @@ fn memory_file_open_does_not_duplicate_path_record_for_proc_fd() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
+#[test]
+fn rlimit_fsize_straddling_regular_write_returns_only_the_limit_prefix() {
+    let backend = crate::fs_backend::MemoryBackend::new();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    memory.write_bytes(0x4000, b"/fsize-limit\0").unwrap();
+    memory
+        .write_bytes(
+            0x4100,
+            &[10_u64.to_le_bytes(), 10_u64.to_le_bytes()].concat(),
+        )
+        .unwrap();
+    memory
+        .write_bytes(0x4200, b"abcdefghijklmnopqrstuvwxyz")
+        .unwrap();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    261,
+                    SyscallArgs::from([0, carrick_abi::LINUX_RLIMIT_FSIZE, 0x4100, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let fd = match dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(
+                56,
+                SyscallArgs::from([
+                    LINUX_AT_FDCWD,
+                    0x4000,
+                    LINUX_O_CREAT | LINUX_O_WRONLY,
+                    0o644,
+                    0,
+                    0,
+                ]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap()
+    {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("open regular file failed: {other:?}"),
+    };
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(64, SyscallArgs::from([fd as u64, 0x4200, 26, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 10 }
+    );
+    let open = dispatcher
+        .open_file(fd)
+        .expect("created regular file remains open");
+    let description = open.description.read();
+    let OpenDescription::File { contents, .. } = &*description else {
+        panic!("expected in-memory regular-file description");
+    };
+    assert_eq!(contents.len(), 10);
+    assert_eq!(contents.to_vec(), b"abcdefghij");
+}
+
 /// `close(2)` must retire the descriptor's `fd_open_paths` entry.
 ///
 /// Only one close path used to clear it, so a path-opened descriptor left
