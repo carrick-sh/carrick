@@ -656,6 +656,17 @@ impl SyscallDispatcher {
         }
     }
 
+    pub(in crate::dispatch) fn pipe_writer(&self, fd: i32) -> Option<(PipeRef, u64)> {
+        let open_file = self.open_file(fd)?;
+        let open = open_file.description.read();
+        match &*open {
+            OpenDescription::PipeWriter { base, pipe } => {
+                Some((Arc::clone(pipe), base.status_flags()))
+            }
+            _ => None,
+        }
+    }
+
     pub(in crate::dispatch) fn fd_is_pipe_writer(&self, fd: i32) -> Result<bool, LinuxErrno> {
         let Some(open_file) = self.open_file(fd) else {
             return if is_stdio_fd(fd) {
