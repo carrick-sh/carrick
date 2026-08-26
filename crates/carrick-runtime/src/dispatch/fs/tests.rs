@@ -383,6 +383,85 @@ fn trusted_lane_fixture() -> (tempfile::TempDir, SyscallDispatcher) {
     (scratch, dispatcher)
 }
 
+/// LTP mknod04 semantics: a non-directory created in a setgid parent inherits
+/// that parent's gid, but must not acquire S_ISGID unless the caller requested
+/// it. Use Carrick's socket-node marker so the mode is deterministic even when
+/// macOS refuses an unprivileged S_ISGID chmod on a real FIFO.
+#[cfg(target_os = "macos")]
+#[test]
+fn mknodat_special_node_in_setgid_parent_inherits_gid_without_setgid() {
+    let scratch = tempfile::tempdir().unwrap();
+    let dir =
+        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
+    let backend = crate::fs_backend::HostFsBackend::from_existing_dir(dir);
+    backend.make_dir("/setgid-parent").unwrap();
+    backend
+        .set_owner(
+            "/setgid-parent",
+            Some(carrick_abi::NsUid::new(1234)),
+            Some(carrick_abi::NsGid::new(11)),
+        )
+        .unwrap();
+    // Force the guest-visible mode through the backend's metadata xattr: macOS
+    // may clear a native directory S_ISGID bit when its real host gid differs.
+    // The creator is not the guest owner and retains traversal via other+rwx.
+    backend.set_mode("/setgid-parent", 0o2677).unwrap();
+
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    dispatcher.set_credentials(
+        carrick_abi::NsUid::new(65534),
+        carrick_abi::NsGid::new(65534),
+    );
+    let parent = dispatcher
+        .layered_metadata("/setgid-parent")
+        .expect("setgid parent metadata");
+    assert_ne!(parent.mode & 0o2000, 0, "fixture parent must be setgid");
+    assert_eq!(
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .get_owner("/setgid-parent")
+            .map(|(_, gid)| gid),
+        Some(carrick_abi::NsGid::new(11)),
+        "fixture parent must carry gid 11"
+    );
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+    memory
+        .write_bytes(0x4000, b"/setgid-parent/socket-node\0")
+        .unwrap();
+
+    assert_eq!(
+        lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            33,
+            [
+                LINUX_AT_FDCWD,
+                0x4000,
+                (LINUX_S_IFSOCK | 0o400) as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        0,
+        "mknodat socket node"
+    );
+
+    let stat = dispatcher
+        .path_stat_record(
+            &dispatcher.exact_signal_context_for_test(),
+            LINUX_AT_FDCWD,
+            "/setgid-parent/socket-node",
+            LINUX_AT_SYMLINK_NOFOLLOW,
+        )
+        .unwrap();
+    assert_eq!(stat.gid, carrick_abi::NsGid::new(11), "inherit parent gid");
+    assert_eq!(stat.mode & 0o2000, 0, "do not add unrequested S_ISGID");
+}
+
 /// Cached-lower form of the walk fixture: the immutable image tree is a
 /// real host directory and the writable host overlay starts sparse.
 #[cfg(target_os = "macos")]
