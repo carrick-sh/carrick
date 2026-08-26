@@ -1755,12 +1755,15 @@ pub(crate) fn apply_image_proc_state(dispatcher: &SyscallDispatcher, image: &Add
 }
 
 /// Publish a successful exec image as one dispatcher VMA generation.
-pub(crate) fn apply_exec_image_proc_state(dispatcher: &SyscallDispatcher, image: &AddressSpace) {
+pub(crate) fn apply_exec_image_proc_state(
+    dispatcher: &SyscallDispatcher,
+    image: &AddressSpace,
+) -> crate::dispatch::PreparedDispatchMmExec {
     dispatcher.publish_exec_image_state(
         proc_maps_from_address_space(image),
         image.linux_auxv_image().to_vec(),
         core_file_mappings_from_address_space(image),
-    );
+    )
 }
 
 fn core_file_mappings_from_address_space(

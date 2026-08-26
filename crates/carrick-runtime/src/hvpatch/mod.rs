@@ -734,6 +734,7 @@ impl ProcessContext {
         prepared: PreparedProcessExec,
         stage1_root: u64,
         vma_source: crate::kernel::SharedVmaSnapshotSource,
+        dispatch_mm: Option<crate::dispatch::PreparedDispatchMmExec>,
     ) -> Result<CommittedProcessExec, String> {
         let PreparedProcessExec {
             kernel,
@@ -778,6 +779,9 @@ impl ProcessContext {
                 self.mm_backend.read().asid_generation().generation(),
             )
             .map_err(|error| error.to_string())?;
+        if let Some(dispatch_mm) = dispatch_mm {
+            dispatch_mm.commit();
+        }
         Ok(CommittedProcessExec {
             transition,
             replacement_mm: replacement_lease,
@@ -2100,6 +2104,7 @@ mod tests {
                 prepared,
                 stage1_root,
                 replacement_dispatcher.vma_snapshot_source(),
+                None,
             )
             .expect("commit exec observer");
         let replacement_backend = process.mm_backend.read().clone();
@@ -2292,7 +2297,7 @@ mod tests {
         let leader_tid = crate::kernel::LinuxTid::for_task_leader(child_id);
         let prepared_exec = child.prepare_exec(&child_context).unwrap();
         let committed = child
-            .commit_exec(prepared_exec, stage1_root, test_vma_source())
+            .commit_exec(prepared_exec, stage1_root, test_vma_source(), None)
             .unwrap();
         assert_eq!(committed.thread().key().tid, leader_tid);
         assert_eq!(wait.released_reason(), None);
@@ -2331,7 +2336,7 @@ mod tests {
 
         let prepared = process.prepare_exec(sibling.context()).unwrap();
         let committed = process
-            .commit_exec(prepared, stage1_root, test_vma_source())
+            .commit_exec(prepared, stage1_root, test_vma_source(), None)
             .unwrap();
 
         assert_eq!(
