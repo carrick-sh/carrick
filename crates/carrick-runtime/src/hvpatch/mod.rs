@@ -35,7 +35,7 @@ pub(crate) use stage1_mm::Stage1MmPool;
 pub(crate) use stage1_mm::{PreparedStage1Mm, Stage1MmLease, Stage1MmRetirement};
 
 use mm_resources::MmResources;
-pub(crate) use mm_resources::{ExecMmDispositionKind, RetiredStage1Mm};
+pub(crate) use mm_resources::{ExecMmDispositionKind, ExecMmReservation, RetiredStage1Mm};
 
 #[derive(Clone, Debug)]
 pub(crate) struct ProcessContext {
@@ -716,6 +716,7 @@ impl ProcessContext {
             .map(|(prepared, _context)| prepared)
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare_exec_for_linux_tid(
         &self,
         tid: crate::kernel::LinuxTid,
@@ -724,6 +725,22 @@ impl ProcessContext {
             .resources
             .reserve_exec(self.task_key())
             .map_err(|error| error.to_string())?;
+        self.prepare_exec_for_linux_tid_with_mm_reservation(tid, reservation)
+    }
+
+    pub(crate) fn reserve_exec_mm_eventual(
+        &self,
+    ) -> Result<mm_resources::ExecMmReservation, String> {
+        self.resources
+            .reserve_exec_eventual(self.task_key())
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn prepare_exec_for_linux_tid_with_mm_reservation(
+        &self,
+        tid: crate::kernel::LinuxTid,
+        reservation: mm_resources::ExecMmReservation,
+    ) -> Result<(PreparedProcessExec, crate::kernel::KernelContext), String> {
         let predecessor_backend = reservation.predecessor_backend();
         let backend = reservation.replacement_backend();
         let kernel_backend: std::sync::Arc<dyn crate::kernel::MmBackend> = backend.clone();
