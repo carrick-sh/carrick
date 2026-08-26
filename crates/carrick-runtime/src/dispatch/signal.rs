@@ -2205,36 +2205,45 @@ impl SyscallDispatcher {
         info_ptr: GuestPtr,
         tid_directed: bool,
     ) -> DispatchOutcome {
-        if !is_valid_signum(signum) {
-            return DispatchOutcome::errno(LINUX_EINVAL);
-        }
-        // rt_sigqueueinfo/rt_tgsigqueueinfo name one thread group. Unlike
-        // kill(2), zero and negative pid encodings never mean a group/broadcast.
-        if ns_target <= 0 {
-            return DispatchOutcome::errno(LINUX_EINVAL);
-        }
         let s = signum as i32;
 
         // Read the caller's siginfo once; the kernel re-stamps si_signo.
-        let mut user_info: Option<LinuxSiginfo> = None;
-        if info_ptr.0 != 0 {
-            let memory = &*ctx.memory;
-            if let Ok(bytes) = memory.read_bytes(info_ptr.0, core::mem::size_of::<LinuxSiginfo>())
-                && let Ok(mut info) = LinuxSiginfo::read_from_bytes(&bytes)
-            {
-                // rt_sigqueueinfo(2): "EPERM ... or `info->si_code` is invalid:
-                // it must be negative (i.e. not one of the codes the kernel
-                // generates) unless the signal is being sent to the caller's
-                // own thread group." Without this a guest can forge a
-                // kernel-origin si_code such as SI_USER into ANOTHER thread
-                // group's siginfo, which is a real cross-process spoof and not
-                // merely a missing assertion (LTP rt_sigqueueinfo02).
-                if info.si_code >= 0 && ns_target != i64::from(self.identity_pid()) {
-                    return DispatchOutcome::errno(LINUX_EPERM);
-                }
-                info.si_signo = s;
-                user_info = Some(info);
+        if info_ptr.0 == 0 {
+            return DispatchOutcome::errno(LINUX_EFAULT);
+        }
+        let memory = &*ctx.memory;
+        let Ok(bytes) = memory.read_bytes(info_ptr.0, core::mem::size_of::<LinuxSiginfo>()) else {
+            return DispatchOutcome::errno(LINUX_EFAULT);
+        };
+        let Ok(mut info) = LinuxSiginfo::read_from_bytes(&bytes) else {
+            return DispatchOutcome::errno(LINUX_EFAULT);
+        };
+        info.si_signo = s;
+        let user_info = Some(info);
+
+        // rt_tgsigqueueinfo requires positive tgid/tid identifiers. Plain
+        // rt_sigqueueinfo instead treats a nonpositive literal target as a
+        // missing thread group (ESRCH), after validating the caller's siginfo.
+        if tid_directed {
+            if !is_valid_signum(signum) || ns_target <= 0 || route_target <= 0 {
+                return DispatchOutcome::errno(LINUX_EINVAL);
             }
+        }
+        // rt_sigqueueinfo(2): "EPERM ... or `info->si_code` is invalid:
+        // it must be negative (i.e. not one of the codes the kernel
+        // generates) unless the signal is being sent to the caller's
+        // own thread group." Without this a guest can forge a
+        // kernel-origin si_code such as SI_USER into ANOTHER thread
+        // group's siginfo, which is a real cross-process spoof and not
+        // merely a missing assertion (LTP rt_sigqueueinfo02).
+        if user_info.is_some_and(|info| info.si_code >= 0)
+            && ns_target != i64::from(self.identity_pid())
+        {
+            return DispatchOutcome::errno(LINUX_EPERM);
+        }
+
+        if !tid_directed && ns_target <= 0 {
+            return DispatchOutcome::errno(LINUX_ESRCH);
         }
 
         // Every HVPatch target, including this task and its sibling threads,
@@ -2258,6 +2267,10 @@ impl SyscallDispatcher {
                 self.hvpatch_specific_process_signal(ctx, ns_target as i32, signum, user_info)
                     .unwrap_or_else(|| DispatchOutcome::errno(LINUX_ESRCH))
             };
+        }
+
+        if !is_valid_signum(signum) {
+            return DispatchOutcome::errno(LINUX_EINVAL);
         }
 
         // Sibling-thread route: deliver directly so the SA_SIGINFO frame carries
@@ -3110,9 +3123,15 @@ mod tests {
     }
 
     #[test]
-    fn rt_sigqueueinfo_rejects_nonpositive_tgid_with_einval() {
+    fn queued_signal_nonpositive_target_errno_depends_on_syscall_shape() {
+        use zerocopy::IntoBytes;
+
+        let _lane = crate::dispatch::HvpatchLaneScope::force(true);
         let d = SyscallDispatcher::new();
         let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
+        let usr1 = crate::linux_abi::LINUX_SIGUSR1;
+        let siginfo = LinuxSiginfo::rt_queue(usr1, std::process::id() as i32, 0, 0x5eed_cafe);
+        memory.write_bytes(0x400, siginfo.as_bytes()).unwrap();
         let reporter = crate::compat::CompatReporter::default();
         let kernel = d.capture_one_task_context().unwrap();
         let cx = crate::dispatch::SyscallCtx {
@@ -3128,11 +3147,89 @@ mod tests {
 
         for tgid in [0, -1, -2] {
             assert_eq!(
-                d.sigqueueinfo_common(&cx, tgid, tgid, 0, GuestPtr(0), false),
-                DispatchOutcome::errno(LINUX_EINVAL),
-                "rt_sigqueueinfo tgid {tgid} must not use kill-style target semantics"
+                d.sigqueueinfo_common(&cx, tgid, tgid, usr1 as u64, GuestPtr(0x400), false,),
+                DispatchOutcome::errno(LINUX_ESRCH),
+                "rt_sigqueueinfo tgid {tgid} names no thread group"
             );
         }
+
+        assert_eq!(
+            d.sigqueueinfo_common(&cx, -1, -1, 65, GuestPtr(0x400), false,),
+            DispatchOutcome::errno(LINUX_ESRCH),
+            "missing rt_sigqueueinfo target must precede signal validation"
+        );
+        let absent_positive = i64::from(i32::MAX - 1);
+        assert_eq!(
+            d.sigqueueinfo_common(
+                &cx,
+                absent_positive,
+                absent_positive,
+                65,
+                GuestPtr(0x400),
+                false,
+            ),
+            DispatchOutcome::errno(LINUX_ESRCH),
+            "absent positive rt_sigqueueinfo target must precede signal validation"
+        );
+
+        let valid_id = i64::from(d.identity_pid());
+        assert_eq!(
+            d.sigqueueinfo_common(&cx, valid_id, valid_id, 65, GuestPtr(0x400), false,),
+            DispatchOutcome::errno(LINUX_EINVAL),
+            "a live rt_sigqueueinfo target must validate the signal"
+        );
+        assert_eq!(
+            d.sigqueueinfo_common(&cx, valid_id, 0, usr1 as u64, GuestPtr(0x400), true,),
+            DispatchOutcome::errno(LINUX_EINVAL),
+            "rt_tgsigqueueinfo must reject an invalid tgid independently"
+        );
+        assert_eq!(
+            d.sigqueueinfo_common(&cx, 0, valid_id, usr1 as u64, GuestPtr(0x400), true,),
+            DispatchOutcome::errno(LINUX_EINVAL),
+            "rt_tgsigqueueinfo must reject an invalid tid independently"
+        );
+    }
+
+    #[test]
+    fn queued_signal_copies_siginfo_before_validating_selector() {
+        let _lane = crate::dispatch::HvpatchLaneScope::force(true);
+        let d = SyscallDispatcher::new();
+        let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
+        let reporter = crate::compat::CompatReporter::default();
+        let kernel = d.capture_one_task_context().unwrap();
+        let cx = crate::dispatch::SyscallCtx {
+            kernel: &kernel,
+            request: crate::dispatch::SyscallRequest::new(
+                138,
+                crate::dispatch::SyscallArgs::from([0, 0, 0, 0, 0, 0]),
+            ),
+            memory: &mut memory,
+            reporter: &reporter,
+            thread: None,
+        };
+        let bad_info = GuestPtr(0x4000);
+        let usr1 = crate::linux_abi::LINUX_SIGUSR1 as u64;
+
+        assert_eq!(
+            d.sigqueueinfo_common(&cx, -1, -1, usr1, bad_info, false),
+            DispatchOutcome::errno(LINUX_EFAULT)
+        );
+        assert_eq!(
+            d.sigqueueinfo_common(&cx, 0, 0, usr1, bad_info, true),
+            DispatchOutcome::errno(LINUX_EFAULT)
+        );
+        assert_eq!(
+            d.sigqueueinfo_common(&cx, 1, 1, 65, bad_info, false),
+            DispatchOutcome::errno(LINUX_EFAULT)
+        );
+        assert_eq!(
+            d.sigqueueinfo_common(&cx, -1, -1, usr1, GuestPtr(0), false),
+            DispatchOutcome::errno(LINUX_EFAULT)
+        );
+        assert_eq!(
+            d.sigqueueinfo_common(&cx, 0, 0, usr1, GuestPtr(0), true),
+            DispatchOutcome::errno(LINUX_EFAULT)
+        );
     }
 
     #[test]
@@ -3316,6 +3413,7 @@ mod tests {
     #[test]
     fn cross_process_sigqueue_signal_zero_checks_guest_credentials() {
         use std::os::unix::fs::PermissionsExt as _;
+        use zerocopy::IntoBytes;
 
         // `bootstrap_signal_send_as` is the subject here, and
         // `sigqueueinfo_common` only reaches it while no HVPatch process is
@@ -3349,6 +3447,8 @@ mod tests {
         let d = SyscallDispatcher::new();
         d.set_credentials(carrick_abi::NsUid::new(1000), carrick_abi::NsGid::new(1000));
         let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
+        let siginfo = LinuxSiginfo::rt_queue(0, std::process::id() as i32, 1000, 0);
+        memory.write_bytes(0x400, siginfo.as_bytes()).unwrap();
         let reporter = crate::compat::CompatReporter::default();
         let kernel = d.capture_one_task_context().unwrap();
         let cx = crate::dispatch::SyscallCtx {
@@ -3361,7 +3461,7 @@ mod tests {
             reporter: &reporter,
             thread: None,
         };
-        let outcome = d.sigqueueinfo_common(&cx, child_pid, child_pid, 0, GuestPtr(0), false);
+        let outcome = d.sigqueueinfo_common(&cx, child_pid, child_pid, 0, GuestPtr(0x400), false);
 
         let _ = std::fs::remove_file(cred_path);
         assert_eq!(published_euid, Some(target_euid));
