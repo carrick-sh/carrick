@@ -1903,7 +1903,11 @@ impl SyscallDispatcher {
                 .is_some_and(|link| link.kind == RootFsEntryKind::Symlink);
 
         let path = if follow {
-            self.canonicalize_following(&path).unwrap_or(path)
+            match self.canonicalize_following(&path) {
+                Ok(resolved) => resolved,
+                Err(errno) if errno == crate::linux_abi::LINUX_ELOOP => return Err(errno),
+                Err(_) => path,
+            }
         } else {
             path
         };
@@ -14666,7 +14670,13 @@ impl SyscallDispatcher {
                     .real_stat(&path, false)
                     .is_some_and(|link| link.kind == RootFsEntryKind::Symlink);
             let path = if follow {
-                this.canonicalize_following(&path).unwrap_or(path)
+                match this.canonicalize_following(&path) {
+                    Ok(resolved) => resolved,
+                    Err(errno) if errno == crate::linux_abi::LINUX_ELOOP => {
+                        return Ok(DispatchOutcome::errno(errno));
+                    }
+                    Err(_) => path,
+                }
             } else {
                 path
             };
