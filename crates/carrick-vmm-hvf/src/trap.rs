@@ -1348,23 +1348,54 @@ mod task_only_carrier_directory_tests {
                 )
                 .unwrap()
         };
-        let root_vfork_child = publish(101, 101, 1);
+        let mut root_vfork_child = publish(101, 101, 1);
         let nested_vfork_child = publish(202, 202, 1);
-        let first_mm = root_vfork_child
+        let first_mm = Arc::clone(
+            root_vfork_child
+                .registration
+                .as_ref()
+                .unwrap()
+                .task_mm
+                .as_ref()
+                .unwrap(),
+        );
+        let second_mm = Arc::clone(
+            nested_vfork_child
+                .registration
+                .as_ref()
+                .unwrap()
+                .task_mm
+                .as_ref()
+                .unwrap(),
+        );
+        assert!(Arc::ptr_eq(&first_mm, &second_mm));
+
+        let replacement = Arc::new(HvpatchTaskMmAuthority {
+            mappings: Vec::new(),
+            mm_root_slot: Some((0x1000_0000, 0x20_0000)),
+            inventory: parking_lot::Mutex::new(HvpatchTaskInventoryAuthority::SharedProcess {
+                ledger: Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
+            }),
+            kernel_mm: parking_lot::Mutex::new(None),
+            cow_armed: None,
+            cow_deferred_publications: None,
+            pending_publication_receipts: parking_lot::Mutex::new(Vec::new()),
+            pending_receipts: Vec::new(),
+            alias_receipts: parking_lot::Mutex::new(Vec::new()),
+            last_holder: parking_lot::Mutex::new(HvpatchTaskMmHolder::Test),
+            drop_order: None,
+        });
+        root_vfork_child
             .registration
-            .as_ref()
+            .as_mut()
             .unwrap()
-            .task_mm
-            .as_ref()
+            .rebind_exec_authority(replacement, (0x1000_0000, 0x20_0000), Vec::new(), true)
             .unwrap();
-        let second_mm = nested_vfork_child
-            .registration
-            .as_ref()
-            .unwrap()
-            .task_mm
-            .as_ref()
-            .unwrap();
-        assert!(Arc::ptr_eq(first_mm, second_mm));
+        let inventory = second_mm.inventory.lock();
+        assert_eq!(inventory.phase_name(), "shared_process");
+        assert!(inventory.shared_runtime_ledger().is_some());
+        drop(inventory);
+
         drop(root_vfork_child);
         drop(nested_vfork_child);
         assert_eq!(rollbacks.load(Ordering::SeqCst), 2);
@@ -8866,6 +8897,7 @@ impl HvpatchTaskRegistration {
         new_task_mm: std::sync::Arc<HvpatchTaskMmAuthority>,
         replacement_mm_root_slot: (u64, u64),
         stage2_lease_keys: Vec<(u64, u64)>,
+        retain_shared_predecessor_authority: bool,
     ) -> Result<(), TrapError> {
         let new_mm_key = HvpatchMmAuthorityKey {
             task_serial: 0,
@@ -8880,7 +8912,9 @@ impl HvpatchTaskRegistration {
         )?;
         if let Some(old_task_mm) = self.task_mm.take() {
             old_task_mm.record_holder(HvpatchTaskMmHolder::ExecRebind);
-            old_task_mm.retire_exec_predecessor();
+            if !retain_shared_predecessor_authority {
+                old_task_mm.retire_exec_predecessor();
+            }
         }
         self.task_mm = Some(new_task_mm);
         Ok(())
@@ -18073,6 +18107,7 @@ impl HvfVmState {
         // own JSON report to stdout (interleaved with the parent's), making the
         // user-visible output unreadable.
         let was_forked_child = self.is_forked_child;
+        let shared_projection = self.shared_process_mm;
         let address_space_teardown_started = std::time::Instant::now();
         let retired_physical_extents = if self.persistent_vm_lifecycle {
             // The vCPU is stopped at the execve syscall exit and every sibling
@@ -18266,7 +18301,6 @@ impl HvfVmState {
             })?;
             let predecessor_identity =
                 self.take_exec_predecessor_identity(predecessor_cow_identity)?;
-            let shared_projection = self.shared_process_mm;
             let predecessor_classification =
                 carrick_observability::probes::HvpatchExecPredecessorClassification::new(
                     carrick_observability::probes::HvpatchExecPredecessorClassificationPhase::BackendCaptured,
@@ -18536,6 +18570,7 @@ impl HvfVmState {
                     new_task_mm,
                     replacement_mm_root_slot,
                     stage2_lease_keys,
+                    shared_projection,
                 ) {
                     eprintln!("carrick: FATAL: rebind HVPatch exec MM authority: {error}");
                     std::process::abort();
