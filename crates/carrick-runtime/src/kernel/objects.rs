@@ -807,6 +807,10 @@ impl FileSlot {
         Arc::clone(&self.description)
     }
 
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub fn close_on_exec(&self) -> bool {
         carrick_abi::LinuxFdFlags::from_bits_truncate(self.fd_flags)
             .contains(carrick_abi::LinuxFdFlags::CLOEXEC)

@@ -2752,6 +2752,28 @@ mod hvpatch_guest_probe_abi {
     }
 
     #[test]
+    fn epoll_lookup_provider_and_stub_keep_file_authority_abi_stable() {
+        let source = include_str!("probes.rs");
+        for declaration in [
+            "fn epoll__lookup(_: u64, _: i32, _: u64, _: u64, _: u32) {}",
+            "stub!(epoll_lookup(file_table_id: u64, epfd: i32, slot_generation: u64, file_description_id: u64, lookup_kind: u32));",
+        ] {
+            assert!(
+                source.matches(declaration).count() >= 2,
+                "missing epoll lookup ABI declaration {declaration}"
+            );
+        }
+        let wrapper = source
+            .split_once("pub fn epoll_lookup(")
+            .expect("real epoll lookup wrapper")
+            .1;
+        assert!(
+            wrapper.contains("carrick_usdt::epoll__lookup!"),
+            "epoll lookup wrapper must fire the provider"
+        );
+    }
+
+    #[test]
     fn mn_clone_outcome_provider_keeps_failure_stages_typed() {
         assert_eq!(HvpatchCloneThreadPhase::AdmissionClosed.raw(), 0);
         assert_eq!(HvpatchCloneThreadPhase::AdmissionCancelled.raw(), 1);
@@ -5036,6 +5058,10 @@ mod real {
         /// epoll_pwait result decision. `kind` is 0 for immediate guest return and
         /// 1 for WaitOnFds handoff.
         fn epoll__result(_: i32, _: i32, _: i32, _: i32, _: i32) {}
+        /// Exact table-scoped pre-core epoll descriptor lookup. Args:
+        /// file-table ID, epfd, cloned slot generation, cloned file-description
+        /// ID, and kind (0=live epoll, 1=live non-epoll, 2=absent slot).
+        fn epoll__lookup(_: u64, _: i32, _: u64, _: u64, _: u32) {}
         /// A drained multiplexer edge whose `(guest_fd, generation)` udata handle no
         /// longer matches any live interest — a stale edge for a recycled fd (the
         /// ABA hazard). Dropped, not mis-delivered; fires here so the recycle race is
@@ -6623,6 +6649,22 @@ mod real {
         carrick_usdt::epoll__result!(|| (epfd, ready_count, wait_count, timeout_ms, kind));
     }
 
+    pub fn epoll_lookup(
+        file_table_id: u64,
+        epfd: i32,
+        slot_generation: u64,
+        file_description_id: u64,
+        lookup_kind: u32,
+    ) {
+        carrick_usdt::epoll__lookup!(|| (
+            file_table_id,
+            epfd,
+            slot_generation,
+            file_description_id,
+            lookup_kind
+        ));
+    }
+
     pub fn epoll_stale_edge(udata: u64, guest_fd: i32, generation: u32) {
         carrick_usdt::epoll__stale__edge!(|| (udata, guest_fd, generation));
     }
@@ -7607,6 +7649,7 @@ mod stub {
     stub!(epoll_rebind(reason: u32, host_fd: i32, survivor_fd: i32, survivor_gen: u32, union_events: u32, effective: u32));
     stub!(epoll_wait_fd(epfd: i32, fd: i32, host_fd: i32, poll_events: i32, timeout_ms: i32));
     stub!(epoll_result(epfd: i32, ready_count: i32, wait_count: i32, timeout_ms: i32, kind: i32));
+    stub!(epoll_lookup(file_table_id: u64, epfd: i32, slot_generation: u64, file_description_id: u64, lookup_kind: u32));
     stub!(epoll_stale_edge(udata: u64, guest_fd: i32, generation: u32));
     stub!(io_wait_begin(tid: i32, fd_count: i32, timeout_ms: i64, fd0: i32, events0: i32, fd1: i32));
     stub!(io_wait_end(tid: i32, result: i32, fd_count: i32, fd0: i32, fd1: i32, fd2: i32));
