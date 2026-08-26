@@ -3982,6 +3982,97 @@ fn native16k_rejects_write_exec_alias_mprotect() {
 }
 
 #[test]
+fn committed_high_alias_mprotect_readonly_edits_guest_page_tables() {
+    const SYS_MPROTECT: u64 = 226;
+    const PAGE_SIZE: u64 = 4 * 1024;
+    let address = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+
+    let dispatcher = SyscallDispatcher::new();
+    dispatcher.commit_host_alias_mmap(HostAliasMmapCommit {
+        start: address,
+        len: PAGE_SIZE,
+        prot: LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+        sharing: ProcMapSharing::Shared,
+        path: "/tmp/mprotect03".to_owned(),
+        file_page_offset: Some(0),
+        locked: None,
+        resident: true,
+        bus_fault: None,
+        write_sealed_shared: false,
+        read_only_shared_file: false,
+        secretmem: false,
+        writable_memfd: None,
+        shared_file_alias: None,
+    });
+    let registry =
+        crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1161));
+    let reporter = CompatReporter::default();
+    let mut memory = CountingMmapMemory::new(address, PAGE_SIZE as usize);
+
+    let outcome = threaded_memory_call(
+        &dispatcher,
+        &mut memory,
+        &registry,
+        &reporter,
+        SyscallRequest::new(
+            SYS_MPROTECT,
+            SyscallArgs([address, PAGE_SIZE, LINUX_PROT_READ, 0, 0, 0]),
+        ),
+    );
+
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+    assert_eq!(
+        memory.protect_calls.get(),
+        1,
+        "a committed high alias must publish its read-only stage-1 permission"
+    );
+}
+
+#[test]
+fn committed_high_alias_mprotect_reports_backend_edit_failure() {
+    const SYS_MPROTECT: u64 = 226;
+    const PAGE_SIZE: u64 = 4 * 1024;
+    let address = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+
+    let dispatcher = SyscallDispatcher::new();
+    dispatcher.commit_host_alias_mmap(HostAliasMmapCommit {
+        start: address,
+        len: PAGE_SIZE,
+        prot: LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+        sharing: ProcMapSharing::Shared,
+        path: "/tmp/mprotect03-failure".to_owned(),
+        file_page_offset: Some(0),
+        locked: None,
+        resident: true,
+        bus_fault: None,
+        write_sealed_shared: false,
+        read_only_shared_file: false,
+        secretmem: false,
+        writable_memfd: None,
+        shared_file_alias: None,
+    });
+    let registry =
+        crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1162));
+    let reporter = CompatReporter::default();
+    let mut memory = FailingProtectMemory {
+        inner: CountingMmapMemory::new(address, PAGE_SIZE as usize),
+    };
+
+    let outcome = threaded_memory_call(
+        &dispatcher,
+        &mut memory,
+        &registry,
+        &reporter,
+        SyscallRequest::new(
+            SYS_MPROTECT,
+            SyscallArgs([address, PAGE_SIZE, LINUX_PROT_READ, 0, 0, 0]),
+        ),
+    );
+
+    assert_eq!(outcome, DispatchOutcome::errno(LINUX_ENOMEM));
+}
+
+#[test]
 fn native16k_shared_provenance_survives_partial_mprotect() {
     const SYS_MPROTECT: u64 = 226;
     const PAGE_SIZE: u64 = 16 * 1024;

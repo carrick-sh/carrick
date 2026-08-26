@@ -5834,8 +5834,9 @@ impl SyscallDispatcher {
             // must actually flip the leaves — but a hole inside the
             // range (unmapped identity VA on x86) degrades to the
             // historical host-side-only behaviour instead of failing.
-            // The shared/overlay apertures and high-VA aliases keep
-            // host-side checks only (unchanged).
+            // Unbacked shared/overlay apertures keep host-side checks only.
+            // A committed high-VA alias has a live stage-1 translation, so its
+            // protection must be edited just like the mmap arena below.
             if range_within(address.0, length, layout.mmap_base, layout.mmap_size) {
                 if let Err(error) = cx.memory.protect_range(address.0, len, prot) {
                     tracing::error!(
@@ -5874,13 +5875,14 @@ impl SyscallDispatcher {
                     ));
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
-            } else if cx.memory.supports_concurrent_exec_protection()
+            } else if (this.range_has_host_alias_backing(address.0, length)
+                || cx.memory.supports_concurrent_exec_protection())
                 && cx.memory.protect_range(address.0, len, prot).is_err()
             {
-                // DSR-backed native aliases are real host mappings and keep
-                // executable bytes non-executable. Apply the protection so a
-                // write to an RWX page faults through generation invalidation;
-                // legacy VMM aliases retain their host-side-only behavior.
+                // HVPatch reaches this branch under the syscall's stage-1
+                // exclusivity/pause; DSR-backed native aliases use their
+                // concurrent host-mapping path. Either backend must fail the
+                // syscall when it cannot publish the guest-visible permission.
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
             // A backend protection call above may have made the whole VMA
