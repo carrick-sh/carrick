@@ -3677,6 +3677,9 @@ where
                     executor_id,
                     ExecutorPoolEvent::OrdinarySyscall { thread, generation },
                 );
+                if scheduler.need_resched() {
+                    break ExecutorExit::Preempted;
+                }
                 continue;
             }
             break exit;
@@ -7383,6 +7386,48 @@ pub(crate) mod tests {
             0,
             "ordinary syscalls never settle"
         );
+    }
+
+    #[test]
+    fn queued_task_preempts_resident_syscall_loop_at_boundary() {
+        let (kernel, first) = bootstrap(14_025);
+        let second = sibling(&kernel, &first, 24_025);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let factory = Arc::new(FakeFactory::default());
+
+        let first_entered = Arc::new(Barrier::new(2));
+        let first_resume = Arc::new(Barrier::new(2));
+        let first_binding = FakeBinding::new(31, [Step::Syscalls(10_000), Step::Exit]);
+        *first_binding.entered.lock() = Some(Arc::clone(&first_entered));
+        *first_binding.resume.lock() = Some(Arc::clone(&first_resume));
+
+        let second_entered = Arc::new(Barrier::new(2));
+        let second_binding = FakeBinding::new(32, [Step::Exit]);
+        *second_binding.entered.lock() = Some(Arc::clone(&second_entered));
+
+        factory.install(&first, Arc::clone(&first_binding));
+        factory.install(&second, Arc::clone(&second_binding));
+
+        let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+        let first_authority = enqueue_root(&scheduler, &first, publish(&first, 31));
+
+        first_entered.wait();
+        let second_authority = enqueue_root(&scheduler, &second, publish(&second, 32));
+        first_resume.wait();
+
+        second_entered.wait();
+        let progress_when_b_entered = first_binding.progress.load(Ordering::SeqCst);
+        assert!(
+            progress_when_b_entered < 10_000,
+            "task B must enter before task A exhausts its syscalls (progress: {progress_when_b_entered})"
+        );
+
+        drop((first_authority, second_authority));
+        let report = pool.shutdown().expect("clean shutdown");
+        assert_eq!(first_binding.progress.load(Ordering::SeqCst), 10_001);
+        assert_eq!(second_binding.progress.load(Ordering::SeqCst), 1);
+        assert_eq!(report.created(), 1);
+        assert_eq!(report.destroyed(), 1);
     }
 
     #[test]
