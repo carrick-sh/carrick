@@ -12235,11 +12235,13 @@ impl SyscallDispatcher {
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            // A pipe/socket/eventfd/timerfd/epoll/pidfd/inotify/signalfd/netlink
-            // fd has no page-cache range to sync → ESPIPE.
+            // A character device/pipe/socket/eventfd/timerfd/epoll/pidfd/
+            // inotify/signalfd/netlink fd has no page-cache range to sync →
+            // ESPIPE.
             let is_special = matches!(
                 &*open_file.description.read(),
-                OpenDescription::HostPipe { .. }
+                OpenDescription::SyntheticDevice { .. }
+                    | OpenDescription::HostPipe { .. }
                     | OpenDescription::HostSocket { .. }
                     | OpenDescription::PipeReader { .. }
                     | OpenDescription::PipeWriter { .. }
