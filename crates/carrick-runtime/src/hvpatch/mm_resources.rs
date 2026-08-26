@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
-use super::asid::{AsidError, AsidResidencyError};
+use super::asid::{AsidError, AsidGeneration, AsidLoad, AsidResidencyError};
 use super::stage1_mm::{
-    PreparedStage1Mm, Stage1MmBackend, Stage1MmError, Stage1MmLease, Stage1MmPool,
-    Stage1MmRetirement,
+    PreparedStage1Mm, PreparedStage1MmAbort, PreparedStage1MmRetirement, Stage1MmBackend,
+    Stage1MmError, Stage1MmLease, Stage1MmPool, Stage1MmRetirement,
 };
 use crate::kernel::{Stage1RootError, TaskKey, ThreadKey};
 
@@ -29,6 +30,410 @@ impl ExecOwnerObservation {
 #[derive(Debug)]
 pub(crate) struct RetiredStage1Mm {
     retirement: Option<Stage1MmRetirement>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error(
+    "hvpatch exec reservation for task {reserving_task:?} already owns MM generation {generation:?}"
+)]
+pub(crate) struct ExecReservationConflict {
+    pub(crate) reserving_task: TaskKey,
+    pub(crate) generation: AsidGeneration,
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct ExecReservationId(u64);
+
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct ActiveExecReservation {
+    id: Arc<ExecReservationId>,
+    task: TaskKey,
+    generation: AsidGeneration,
+    predecessor: Arc<Stage1MmLease>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum ExecReservationConstructionFailpoint {
+    #[error("exec reservation construction failpoint is disabled")]
+    Disabled,
+    #[error("injected exec reservation failure after marker insertion")]
+    AfterMarker,
+    #[error("injected exec reservation failure after replacement allocation")]
+    AfterReplacement,
+    #[error("injected exec reservation failure after predecessor retirement preparation")]
+    AfterFinalRetirement,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct MmStateLinearizationHook {
+    entered: Arc<std::sync::Barrier>,
+    release: Arc<std::sync::Barrier>,
+}
+
+#[cfg(test)]
+impl MmStateLinearizationHook {
+    fn run(self) {
+        self.entered.wait();
+        self.release.wait();
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExecConstructionRollbackStep {
+    ReplacementSettled,
+    PredecessorRestored,
+    MarkerCleared,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+struct ExecConstructionRollbackTrace {
+    steps: Arc<Mutex<Vec<ExecConstructionRollbackStep>>>,
+}
+
+#[cfg(test)]
+impl ExecConstructionRollbackTrace {
+    fn record(&self, step: ExecConstructionRollbackStep) {
+        self.steps.lock().push(step);
+    }
+
+    fn snapshot(&self) -> Vec<ExecConstructionRollbackStep> {
+        self.steps.lock().clone()
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExecDispositionSettlementStep {
+    ReplacementSettled,
+    PredecessorRestored,
+    MarkerCleared,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+struct ExecDispositionSettlementTrace {
+    steps: Arc<Mutex<Vec<ExecDispositionSettlementStep>>>,
+}
+
+#[cfg(test)]
+impl ExecDispositionSettlementTrace {
+    fn record(&self, step: ExecDispositionSettlementStep) {
+        self.steps.lock().push(step);
+    }
+
+    fn snapshot(&self) -> Vec<ExecDispositionSettlementStep> {
+        self.steps.lock().clone()
+    }
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum ExecMmDisposition {
+    RetainOldMm,
+    RetireOldMm(PreparedStage1MmRetirement),
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum ExecMmDispositionPlan {
+    RetainOldMm,
+    RetireOldMm,
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum ExecMmReservationState {
+    Active {
+        replacement: PreparedStage1Mm,
+        disposition: ExecMmDisposition,
+    },
+    FailClosed {
+        disposition: ExecMmDisposition,
+    },
+    Settled,
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum ExecMmAbortReceipt {
+    Retained {
+        predecessor: Arc<Stage1MmLease>,
+        replacement: AsidGeneration,
+        settlement: PreparedStage1MmAbort,
+    },
+    RestoredFinal {
+        predecessor: Arc<Stage1MmLease>,
+        replacement: AsidGeneration,
+        settlement: PreparedStage1MmAbort,
+    },
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum ExecMmCommitReceipt {
+    Retained {
+        predecessor: Arc<Stage1MmLease>,
+        replacement: Arc<Stage1MmLease>,
+    },
+    Retired {
+        retirement: Stage1MmRetirement,
+        replacement: Arc<Stage1MmLease>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum ExecReservationMismatch {
+    #[error("exec MM reservation marker is missing")]
+    MarkerMissing,
+    #[error("exec MM reservation ID does not match its active marker")]
+    ReservationId,
+    #[error("exec MM reservation task does not match its active marker")]
+    Task,
+    #[error("exec MM reservation generation does not match its active marker")]
+    Generation,
+    #[error("exec MM reservation predecessor does not match its active marker")]
+    Predecessor,
+    #[error("exec MM reservation task edge no longer owns its exact predecessor")]
+    TaskEdge,
+    #[error("exec MM replacement lease and backend bindings disagree")]
+    ReplacementBinding,
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct ExecMmReservation {
+    resources: Arc<MmResources>,
+    id: Arc<ExecReservationId>,
+    task: TaskKey,
+    predecessor: Arc<Stage1MmLease>,
+    generation: AsidGeneration,
+    state: ExecMmReservationState,
+    #[cfg(test)]
+    settlement_trace: Option<ExecDispositionSettlementTrace>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl ExecMmReservation {
+    #[cfg(test)]
+    fn record_settlement(&self, step: ExecDispositionSettlementStep) {
+        if let Some(trace) = self.settlement_trace.as_ref() {
+            trace.record(step);
+        }
+    }
+
+    fn validate(&self, state: &MmResourceState) -> Result<(), MmResourcesError> {
+        let marker = state
+            .exec_reservations
+            .get(&self.generation)
+            .ok_or(ExecReservationMismatch::MarkerMissing)?;
+        if !Arc::ptr_eq(&marker.id, &self.id) {
+            return Err(ExecReservationMismatch::ReservationId.into());
+        }
+        if marker.task != self.task {
+            return Err(ExecReservationMismatch::Task.into());
+        }
+        if marker.generation != self.generation {
+            return Err(ExecReservationMismatch::Generation.into());
+        }
+        if !Arc::ptr_eq(&marker.predecessor, &self.predecessor) {
+            return Err(ExecReservationMismatch::Predecessor.into());
+        }
+        if !state
+            .leases
+            .get(&self.task)
+            .is_some_and(|lease| Arc::ptr_eq(lease, &self.predecessor))
+        {
+            return Err(ExecReservationMismatch::TaskEdge.into());
+        }
+        Ok(())
+    }
+
+    fn active(&self) -> (&PreparedStage1Mm, &ExecMmDisposition) {
+        match &self.state {
+            ExecMmReservationState::Active {
+                replacement,
+                disposition,
+            } => (replacement, disposition),
+            ExecMmReservationState::FailClosed { .. } | ExecMmReservationState::Settled => {
+                std::process::abort()
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn disposition_for_tests(&self) -> &ExecMmDisposition {
+        self.active().1
+    }
+
+    pub(crate) fn replacement_asid_generation(&self) -> AsidGeneration {
+        self.active().0.asid_generation()
+    }
+
+    pub(crate) fn replacement_root_slot(&self) -> Option<super::stage1_mm::Stage1RootSlot> {
+        self.active().0.root_slot()
+    }
+
+    pub(crate) fn begin_replacement_asid_load(
+        &self,
+        executor: crate::kernel::objects::ExecutorId,
+    ) -> Result<AsidLoad, AsidResidencyError> {
+        self.active().0.begin_asid_load(executor)
+    }
+
+    pub(crate) fn abort(mut self) -> Result<ExecMmAbortReceipt, MmResourcesError> {
+        let mut resources_state = self.resources.state.lock();
+        self.validate(&resources_state)?;
+        let state = std::mem::replace(&mut self.state, ExecMmReservationState::Settled);
+        let ExecMmReservationState::Active {
+            replacement,
+            disposition,
+        } = state
+        else {
+            std::process::abort();
+        };
+        let replacement_generation = replacement.asid_generation();
+        let settlement = match replacement.abort() {
+            Ok(settlement) => settlement,
+            Err(error) => {
+                self.state = ExecMmReservationState::FailClosed { disposition };
+                return Err(error.into());
+            }
+        };
+        #[cfg(test)]
+        self.record_settlement(ExecDispositionSettlementStep::ReplacementSettled);
+        let receipt = match disposition {
+            ExecMmDisposition::RetainOldMm => ExecMmAbortReceipt::Retained {
+                predecessor: Arc::clone(&self.predecessor),
+                replacement: replacement_generation,
+                settlement,
+            },
+            ExecMmDisposition::RetireOldMm(retirement) => {
+                drop(retirement);
+                #[cfg(test)]
+                self.record_settlement(ExecDispositionSettlementStep::PredecessorRestored);
+                ExecMmAbortReceipt::RestoredFinal {
+                    predecessor: Arc::clone(&self.predecessor),
+                    replacement: replacement_generation,
+                    settlement,
+                }
+            }
+        };
+        let removed = resources_state.exec_reservations.remove(&self.generation);
+        assert!(
+            removed.is_some(),
+            "validated exec reservation marker vanished"
+        );
+        #[cfg(test)]
+        self.record_settlement(ExecDispositionSettlementStep::MarkerCleared);
+        drop(resources_state);
+        Ok(receipt)
+    }
+
+    pub(crate) fn commit(
+        mut self,
+        stage1_root: u64,
+    ) -> Result<ExecMmCommitReceipt, MmResourcesError> {
+        let mut resources_state = self.resources.state.lock();
+        self.validate(&resources_state)?;
+        let replacement_binding = self.active().0.publish_stage1_root(stage1_root)?;
+        let replacement_backend = self.active().0.backend();
+        replacement_backend.publish_binding(replacement_binding);
+        if replacement_backend.binding() != replacement_binding {
+            return Err(ExecReservationMismatch::ReplacementBinding.into());
+        }
+
+        let state = std::mem::replace(&mut self.state, ExecMmReservationState::Settled);
+        let ExecMmReservationState::Active {
+            replacement,
+            disposition,
+        } = state
+        else {
+            std::process::abort();
+        };
+        let replacement = replacement.commit();
+        let receipt = match disposition {
+            ExecMmDisposition::RetainOldMm => ExecMmCommitReceipt::Retained {
+                predecessor: Arc::clone(&self.predecessor),
+                replacement: Arc::clone(&replacement),
+            },
+            ExecMmDisposition::RetireOldMm(retirement) => ExecMmCommitReceipt::Retired {
+                retirement: retirement.commit(),
+                replacement: Arc::clone(&replacement),
+            },
+        };
+        let predecessor = resources_state.leases.insert(self.task, replacement);
+        assert!(
+            predecessor
+                .as_ref()
+                .is_some_and(|lease| Arc::ptr_eq(lease, &self.predecessor)),
+            "validated exec reservation task edge changed under state authority"
+        );
+        let removed = resources_state.exec_reservations.remove(&self.generation);
+        assert!(
+            removed.is_some(),
+            "validated exec reservation marker vanished"
+        );
+        drop(resources_state);
+        Ok(receipt)
+    }
+}
+
+impl Drop for ExecMmReservation {
+    fn drop(&mut self) {
+        let reservation_state = std::mem::replace(&mut self.state, ExecMmReservationState::Settled);
+        match reservation_state {
+            ExecMmReservationState::Settled => {}
+            ExecMmReservationState::FailClosed { disposition } => {
+                drop(disposition);
+            }
+            ExecMmReservationState::Active {
+                replacement,
+                disposition,
+            } => {
+                let mut resources_state = self.resources.state.lock();
+                let marker_matches = self.validate(&resources_state).is_ok();
+                match replacement.abort() {
+                    Ok(PreparedStage1MmAbort::Unpublished { .. }) => {}
+                    Ok(PreparedStage1MmAbort::Retirement(retirement)) => {
+                        std::mem::forget(retirement);
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "failed to settle dropped exec MM replacement");
+                        drop(disposition);
+                        return;
+                    }
+                }
+                #[cfg(test)]
+                self.record_settlement(ExecDispositionSettlementStep::ReplacementSettled);
+                #[cfg(test)]
+                let final_disposition = matches!(disposition, ExecMmDisposition::RetireOldMm(_));
+                drop(disposition);
+                #[cfg(test)]
+                if final_disposition {
+                    self.record_settlement(ExecDispositionSettlementStep::PredecessorRestored);
+                }
+                if marker_matches {
+                    resources_state.exec_reservations.remove(&self.generation);
+                    #[cfg(test)]
+                    self.record_settlement(ExecDispositionSettlementStep::MarkerCleared);
+                } else {
+                    tracing::error!(
+                        task = ?self.task,
+                        generation = ?self.generation,
+                        reservation_id = self.id.0,
+                        "exec MM reservation identity mismatch during drop; leaving marker fail-closed"
+                    );
+                }
+            }
+        }
+    }
 }
 
 impl RetiredStage1Mm {
@@ -63,6 +468,13 @@ pub(crate) enum MmResourcesError {
     #[error("hvpatch stage-1 mm retirement still awaits executor invalidation")]
     RetirementIncomplete,
     #[error(transparent)]
+    ExecReservationConflict(#[from] ExecReservationConflict),
+    #[error(transparent)]
+    ExecReservationMismatch(#[from] ExecReservationMismatch),
+    #[error(transparent)]
+    #[cfg(test)]
+    InjectedExecReservationFailure(ExecReservationConstructionFailpoint),
+    #[error(transparent)]
     Residency(#[from] AsidResidencyError),
 }
 
@@ -96,6 +508,7 @@ impl From<Stage1MmError> for MmResourcesError {
 #[derive(Debug, Default)]
 struct MmResourceState {
     leases: BTreeMap<TaskKey, Arc<Stage1MmLease>>,
+    exec_reservations: BTreeMap<AsidGeneration, ActiveExecReservation>,
     /// Permanent within one runtime: exact-generation tombstones make delayed
     /// duplicate cleanup idempotent without permitting a reused numeric PID to
     /// target its successor's root-slot/ASID lease.
@@ -107,6 +520,8 @@ pub(crate) struct MmResources {
     state: Mutex<MmResourceState>,
     pending_root: Mutex<Option<Arc<Stage1MmLease>>>,
     mm_pool: Stage1MmPool,
+    #[cfg_attr(not(test), allow(dead_code))]
+    next_exec_reservation: AtomicU64,
 }
 
 impl MmResources {
@@ -119,6 +534,34 @@ impl MmResources {
                 .count(),
         )
         .unwrap_or_else(|_| std::process::abort())
+    }
+
+    fn exec_conflict(
+        state: &MmResourceState,
+        lease: &Arc<Stage1MmLease>,
+    ) -> Option<ExecReservationConflict> {
+        state
+            .exec_reservations
+            .get(&lease.asid_generation())
+            .map(|marker| ExecReservationConflict {
+                reserving_task: marker.task,
+                generation: marker.generation,
+            })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn settle_failed_exec_replacement(
+        replacement: PreparedStage1Mm,
+    ) -> Result<(), MmResourcesError> {
+        match replacement.abort()? {
+            PreparedStage1MmAbort::Unpublished { .. } => Ok(()),
+            PreparedStage1MmAbort::Retirement(retirement) => {
+                // Construction has no receipt owner able to acknowledge a
+                // hardware-exposed replacement. Quarantine it permanently.
+                std::mem::forget(retirement);
+                Ok(())
+            }
+        }
     }
 
     fn publish_lifecycle(
@@ -164,6 +607,7 @@ impl MmResources {
                 state: Mutex::new(MmResourceState::default()),
                 pending_root: Mutex::new(Some(root_mm)),
                 mm_pool,
+                next_exec_reservation: AtomicU64::new(1),
             },
             backend,
         ))
@@ -195,6 +639,7 @@ impl MmResources {
                 state: Mutex::new(MmResourceState::default()),
                 pending_root: Mutex::new(Some(root_mm)),
                 mm_pool,
+                next_exec_reservation: AtomicU64::new(1),
             },
             backend,
         ))
@@ -227,6 +672,27 @@ impl MmResources {
         child: TaskKey,
     ) -> Result<Arc<Stage1MmBackend>, MmResourcesError> {
         let mut state = self.state.lock();
+        self.publish_shared_child_locked(&mut state, parent, child)
+    }
+
+    #[cfg(test)]
+    fn publish_shared_child_with_state_hook_for_tests(
+        &self,
+        parent: TaskKey,
+        child: TaskKey,
+        hook: MmStateLinearizationHook,
+    ) -> Result<Arc<Stage1MmBackend>, MmResourcesError> {
+        let mut state = self.state.lock();
+        hook.run();
+        self.publish_shared_child_locked(&mut state, parent, child)
+    }
+
+    fn publish_shared_child_locked(
+        &self,
+        state: &mut MmResourceState,
+        parent: TaskKey,
+        child: TaskKey,
+    ) -> Result<Arc<Stage1MmBackend>, MmResourcesError> {
         if state.leases.contains_key(&child) || state.retired.contains(&child) {
             return Err(MmResourcesError::DuplicateTask(child));
         }
@@ -235,9 +701,12 @@ impl MmResources {
             .get(&parent)
             .cloned()
             .ok_or(MmResourcesError::UnknownTask(parent))?;
+        if let Some(conflict) = Self::exec_conflict(state, &lease) {
+            return Err(conflict.into());
+        }
         let backend = lease.backend();
         state.leases.insert(child, Arc::clone(&lease));
-        let owner_count = Self::owner_count(&state, &lease);
+        let owner_count = Self::owner_count(state, &lease);
         Self::publish_relation(
             carrick_observability::probes::HvpatchMmLeasePhase::SharedChildPublished,
             child,
@@ -309,10 +778,219 @@ impl MmResources {
     }
 
     pub(crate) fn prepare_exec(&self, task: TaskKey) -> Result<PreparedStage1Mm, MmResourcesError> {
-        if !self.state.lock().leases.contains_key(&task) {
-            return Err(MmResourcesError::UnknownTask(task));
+        let state = self.state.lock();
+        let predecessor = state
+            .leases
+            .get(&task)
+            .ok_or(MmResourcesError::UnknownTask(task))?;
+        if let Some(conflict) = Self::exec_conflict(&state, predecessor) {
+            return Err(conflict.into());
         }
+        drop(state);
         self.mm_pool.prepare_child().map_err(Into::into)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn reserve_exec(
+        self: &Arc<Self>,
+        task: TaskKey,
+    ) -> Result<ExecMmReservation, MmResourcesError> {
+        #[cfg(not(test))]
+        {
+            self.reserve_exec_inner(task)
+        }
+        #[cfg(test)]
+        {
+            self.reserve_exec_inner(
+                task,
+                ExecReservationConstructionFailpoint::Disabled,
+                None,
+                None,
+            )
+        }
+    }
+
+    #[cfg(test)]
+    fn reserve_exec_with_failpoint_for_tests(
+        self: &Arc<Self>,
+        task: TaskKey,
+        failpoint: ExecReservationConstructionFailpoint,
+    ) -> Result<ExecMmReservation, MmResourcesError> {
+        self.reserve_exec_inner(task, failpoint, None, None)
+    }
+
+    #[cfg(test)]
+    fn reserve_exec_with_failpoint_and_trace_for_tests(
+        self: &Arc<Self>,
+        task: TaskKey,
+        failpoint: ExecReservationConstructionFailpoint,
+        trace: ExecConstructionRollbackTrace,
+    ) -> Result<ExecMmReservation, MmResourcesError> {
+        self.reserve_exec_inner(task, failpoint, None, Some(trace))
+    }
+
+    #[cfg(test)]
+    fn reserve_exec_with_state_hook_for_tests(
+        self: &Arc<Self>,
+        task: TaskKey,
+        hook: MmStateLinearizationHook,
+    ) -> Result<ExecMmReservation, MmResourcesError> {
+        self.reserve_exec_inner(
+            task,
+            ExecReservationConstructionFailpoint::Disabled,
+            Some(hook),
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    fn reserve_exec_with_settlement_trace_for_tests(
+        self: &Arc<Self>,
+        task: TaskKey,
+        trace: ExecDispositionSettlementTrace,
+    ) -> Result<ExecMmReservation, MmResourcesError> {
+        let mut reservation = self.reserve_exec(task)?;
+        reservation.settlement_trace = Some(trace);
+        Ok(reservation)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn reserve_exec_inner(
+        self: &Arc<Self>,
+        task: TaskKey,
+        #[cfg(test)] failpoint: ExecReservationConstructionFailpoint,
+        #[cfg(test)] hook: Option<MmStateLinearizationHook>,
+        #[cfg(test)] rollback_trace: Option<ExecConstructionRollbackTrace>,
+    ) -> Result<ExecMmReservation, MmResourcesError> {
+        let mut state = self.state.lock();
+        #[cfg(test)]
+        if let Some(hook) = hook {
+            hook.run();
+        }
+        let predecessor = state
+            .leases
+            .get(&task)
+            .cloned()
+            .ok_or(MmResourcesError::UnknownTask(task))?;
+        let generation = predecessor.asid_generation();
+        if let Some(marker) = state.exec_reservations.get(&generation) {
+            return Err(ExecReservationConflict {
+                reserving_task: marker.task,
+                generation,
+            }
+            .into());
+        }
+
+        let reservation_id = self
+            .next_exec_reservation
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .unwrap_or_else(|_| std::process::abort());
+        let id = Arc::new(ExecReservationId(reservation_id));
+        let inserted = state.exec_reservations.insert(
+            generation,
+            ActiveExecReservation {
+                id: Arc::clone(&id),
+                task,
+                generation,
+                predecessor: Arc::clone(&predecessor),
+            },
+        );
+        assert!(inserted.is_none(), "exec MM reservation marker replaced");
+        #[cfg(test)]
+        if failpoint == ExecReservationConstructionFailpoint::AfterMarker {
+            state.exec_reservations.remove(&generation);
+            if let Some(trace) = rollback_trace.as_ref() {
+                trace.record(ExecConstructionRollbackStep::MarkerCleared);
+            }
+            return Err(MmResourcesError::InjectedExecReservationFailure(failpoint));
+        }
+
+        let disposition_plan = if Self::owner_count(&state, &predecessor) == 1 {
+            ExecMmDispositionPlan::RetireOldMm
+        } else {
+            ExecMmDispositionPlan::RetainOldMm
+        };
+        let replacement = match self.mm_pool.prepare_child() {
+            Ok(replacement) => replacement,
+            Err(error) => {
+                state.exec_reservations.remove(&generation);
+                return Err(error.into());
+            }
+        };
+        #[cfg(test)]
+        if failpoint == ExecReservationConstructionFailpoint::AfterReplacement {
+            Self::settle_failed_exec_replacement(replacement)?;
+            if let Some(trace) = rollback_trace.as_ref() {
+                trace.record(ExecConstructionRollbackStep::ReplacementSettled);
+            }
+            state.exec_reservations.remove(&generation);
+            if let Some(trace) = rollback_trace.as_ref() {
+                trace.record(ExecConstructionRollbackStep::MarkerCleared);
+            }
+            return Err(MmResourcesError::InjectedExecReservationFailure(failpoint));
+        }
+        let disposition = match disposition_plan {
+            ExecMmDispositionPlan::RetireOldMm => {
+                match self.mm_pool.prepare_retirement(&predecessor) {
+                    Ok(retirement) => {
+                        #[cfg(test)]
+                        if failpoint == ExecReservationConstructionFailpoint::AfterFinalRetirement {
+                            let replacement_settlement =
+                                Self::settle_failed_exec_replacement(replacement);
+                            if replacement_settlement.is_ok()
+                                && let Some(trace) = rollback_trace.as_ref()
+                            {
+                                trace.record(ExecConstructionRollbackStep::ReplacementSettled);
+                            }
+                            drop(retirement);
+                            if let Some(trace) = rollback_trace.as_ref() {
+                                trace.record(ExecConstructionRollbackStep::PredecessorRestored);
+                            }
+                            replacement_settlement?;
+                            state.exec_reservations.remove(&generation);
+                            if let Some(trace) = rollback_trace.as_ref() {
+                                trace.record(ExecConstructionRollbackStep::MarkerCleared);
+                            }
+                            return Err(MmResourcesError::InjectedExecReservationFailure(
+                                failpoint,
+                            ));
+                        }
+                        ExecMmDisposition::RetireOldMm(retirement)
+                    }
+                    Err(error) => {
+                        Self::settle_failed_exec_replacement(replacement)?;
+                        #[cfg(test)]
+                        if let Some(trace) = rollback_trace.as_ref() {
+                            trace.record(ExecConstructionRollbackStep::ReplacementSettled);
+                        }
+                        state.exec_reservations.remove(&generation);
+                        #[cfg(test)]
+                        if let Some(trace) = rollback_trace.as_ref() {
+                            trace.record(ExecConstructionRollbackStep::MarkerCleared);
+                        }
+                        return Err(error.into());
+                    }
+                }
+            }
+            ExecMmDispositionPlan::RetainOldMm => ExecMmDisposition::RetainOldMm,
+        };
+
+        drop(state);
+        Ok(ExecMmReservation {
+            resources: Arc::clone(self),
+            id,
+            task,
+            predecessor,
+            generation,
+            state: ExecMmReservationState::Active {
+                replacement,
+                disposition,
+            },
+            #[cfg(test)]
+            settlement_trace: None,
+        })
     }
 
     pub(crate) fn commit_exec(
@@ -327,6 +1005,9 @@ impl MmResources {
             .get(&task)
             .cloned()
             .ok_or(MmResourcesError::UnknownTask(task))?;
+        if let Some(conflict) = Self::exec_conflict(&state, &predecessor) {
+            return Err(conflict.into());
+        }
         prepared.publish_stage1_root(stage1_root)?;
         let shared = state
             .leases
@@ -358,6 +1039,25 @@ impl MmResources {
     /// A repeated cleanup for the same retired generation is idempotent.
     pub(crate) fn retire(&self, task: TaskKey) -> Result<RetiredStage1Mm, MmResourcesError> {
         let mut state = self.state.lock();
+        self.retire_locked(&mut state, task)
+    }
+
+    #[cfg(test)]
+    fn retire_with_state_hook_for_tests(
+        &self,
+        task: TaskKey,
+        hook: MmStateLinearizationHook,
+    ) -> Result<RetiredStage1Mm, MmResourcesError> {
+        let mut state = self.state.lock();
+        hook.run();
+        self.retire_locked(&mut state, task)
+    }
+
+    fn retire_locked(
+        &self,
+        state: &mut MmResourceState,
+        task: TaskKey,
+    ) -> Result<RetiredStage1Mm, MmResourcesError> {
         if state.retired.contains(&task) {
             return Ok(RetiredStage1Mm { retirement: None });
         }
@@ -366,6 +1066,9 @@ impl MmResources {
             .get(&task)
             .cloned()
             .ok_or(MmResourcesError::UnknownTask(task))?;
+        if let Some(conflict) = Self::exec_conflict(state, &lease) {
+            return Err(conflict.into());
+        }
         let shared = state
             .leases
             .iter()
@@ -380,7 +1083,7 @@ impl MmResources {
         };
         state.leases.remove(&task);
         state.retired.insert(task);
-        let remaining_owner_count = Self::owner_count(&state, &lease);
+        let remaining_owner_count = Self::owner_count(state, &lease);
         Self::publish_lifecycle(
             if shared {
                 carrick_observability::probes::HvpatchMmLeasePhase::TaskEdgeRetiredShared
@@ -414,6 +1117,13 @@ mod tests {
             tid: LinuxTid::from_abi_positive(raw).unwrap(),
             serial: ThreadSerial::from_registry_allocation(NonZeroU64::new(serial).unwrap()),
         }
+    }
+
+    fn executor(raw: i32) -> crate::kernel::objects::ExecutorId {
+        crate::kernel::objects::ExecutorId::for_transitional_thread(
+            crate::thread::ThreadId::synthetic_for_tests(raw),
+        )
+        .unwrap()
     }
 
     fn resources(root: TaskKey, asid_limit: u16) -> (MmResources, Arc<Stage1MmBackend>) {
@@ -563,6 +1273,943 @@ mod tests {
         assert_eq!(
             resources.prepare_child().unwrap().binding(),
             duplicate_binding
+        );
+    }
+
+    #[test]
+    fn exec_reservation_pins_shared_and_final_predecessor_dispositions() {
+        let shared_parent = task(100, 1);
+        let shared_child = task(101, 2);
+        let (shared_resources, _) = resources(shared_parent, 2);
+        let shared_resources = Arc::new(shared_resources);
+        shared_resources
+            .publish_shared_child(shared_parent, shared_child)
+            .unwrap();
+
+        let shared = shared_resources.reserve_exec(shared_child).unwrap();
+        assert!(matches!(
+            shared.disposition_for_tests(),
+            ExecMmDisposition::RetainOldMm
+        ));
+        drop(shared);
+        let shared_retry = shared_resources.reserve_exec(shared_child).unwrap();
+        assert!(matches!(
+            shared_retry.disposition_for_tests(),
+            ExecMmDisposition::RetainOldMm
+        ));
+        drop(shared_retry);
+
+        let final_task = task(102, 3);
+        let (final_resources, _) = resources(final_task, 2);
+        let final_resources = Arc::new(final_resources);
+        let final_reservation = final_resources.reserve_exec(final_task).unwrap();
+        assert!(matches!(
+            final_reservation.disposition_for_tests(),
+            ExecMmDisposition::RetireOldMm(_)
+        ));
+        drop(final_reservation);
+        let final_retry = final_resources.reserve_exec(final_task).unwrap();
+        assert!(matches!(
+            final_retry.disposition_for_tests(),
+            ExecMmDisposition::RetireOldMm(_)
+        ));
+    }
+
+    #[test]
+    fn explicit_exec_abort_restores_retained_and_final_topology_for_exact_retry() {
+        let shared_parent = task(110, 1);
+        let shared_child = task(111, 2);
+        let (shared_resources, _) = resources(shared_parent, 2);
+        let shared_resources = Arc::new(shared_resources);
+        shared_resources
+            .publish_shared_child(shared_parent, shared_child)
+            .unwrap();
+        let shared_predecessor = shared_resources.lease(shared_child).unwrap();
+        let shared_reservation = shared_resources.reserve_exec(shared_child).unwrap();
+        let shared_replacement = shared_reservation.replacement_asid_generation();
+        let shared_root = shared_reservation.replacement_root_slot().unwrap();
+        let shared_abort = shared_reservation.abort().unwrap();
+        match shared_abort {
+            ExecMmAbortReceipt::Retained {
+                predecessor,
+                replacement,
+                settlement: PreparedStage1MmAbort::Unpublished { .. },
+            } => {
+                assert!(Arc::ptr_eq(&predecessor, &shared_predecessor));
+                assert_eq!(replacement, shared_replacement);
+            }
+            other => panic!("unexpected shared abort receipt: {other:?}"),
+        }
+        assert!(Arc::ptr_eq(
+            &shared_resources.lease(shared_child).unwrap(),
+            &shared_predecessor
+        ));
+        let shared_retry = shared_resources.reserve_exec(shared_child).unwrap();
+        assert_eq!(shared_retry.replacement_root_slot(), Some(shared_root));
+        assert_eq!(
+            shared_retry.replacement_asid_generation().asid(),
+            shared_replacement.asid()
+        );
+        drop(shared_retry);
+
+        let final_task = task(112, 3);
+        let (final_resources, _) = resources(final_task, 2);
+        let final_resources = Arc::new(final_resources);
+        let final_predecessor = final_resources.lease(final_task).unwrap();
+        let final_reservation = final_resources.reserve_exec(final_task).unwrap();
+        let final_replacement = final_reservation.replacement_asid_generation();
+        let final_root = final_reservation.replacement_root_slot().unwrap();
+        let final_abort = final_reservation.abort().unwrap();
+        match final_abort {
+            ExecMmAbortReceipt::RestoredFinal {
+                predecessor,
+                replacement,
+                settlement: PreparedStage1MmAbort::Unpublished { .. },
+            } => {
+                assert!(Arc::ptr_eq(&predecessor, &final_predecessor));
+                assert_eq!(replacement, final_replacement);
+            }
+            other => panic!("unexpected final abort receipt: {other:?}"),
+        }
+        assert!(Arc::ptr_eq(
+            &final_resources.lease(final_task).unwrap(),
+            &final_predecessor
+        ));
+        let final_retry = final_resources.reserve_exec(final_task).unwrap();
+        assert_eq!(final_retry.replacement_root_slot(), Some(final_root));
+        assert_eq!(
+            final_retry.replacement_asid_generation().asid(),
+            final_replacement.asid()
+        );
+    }
+
+    #[test]
+    fn active_exec_marker_rejects_every_same_mm_mutator_before_topology_changes() {
+        let parent = task(120, 1);
+        let exec_child = task(121, 2);
+        let rejected_child = task(122, 3);
+        let (resources, _) = resources(parent, 3);
+        let resources = Arc::new(resources);
+        resources.publish_shared_child(parent, exec_child).unwrap();
+        let predecessor = resources.lease(parent).unwrap();
+        let legacy_prepared = resources.prepare_exec(parent).unwrap();
+        let reservation = resources.reserve_exec(exec_child).unwrap();
+        let generation = predecessor.asid_generation();
+
+        assert!(matches!(
+            resources.reserve_exec(parent),
+            Err(MmResourcesError::ExecReservationConflict(conflict))
+                if conflict.reserving_task == exec_child && conflict.generation == generation
+        ));
+        assert!(matches!(
+            resources.publish_shared_child(parent, rejected_child),
+            Err(MmResourcesError::ExecReservationConflict(conflict))
+                if conflict.reserving_task == exec_child && conflict.generation == generation
+        ));
+        assert!(matches!(
+            resources.retire(parent),
+            Err(MmResourcesError::ExecReservationConflict(conflict))
+                if conflict.reserving_task == exec_child && conflict.generation == generation
+        ));
+        assert!(matches!(
+            resources.prepare_exec(parent),
+            Err(MmResourcesError::ExecReservationConflict(conflict))
+                if conflict.reserving_task == exec_child && conflict.generation == generation
+        ));
+        assert!(matches!(
+            resources.commit_exec(
+                parent,
+                legacy_prepared,
+                carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE + 0x1000,
+            ),
+            Err(MmResourcesError::ExecReservationConflict(conflict))
+                if conflict.reserving_task == exec_child && conflict.generation == generation
+        ));
+
+        assert!(Arc::ptr_eq(&resources.lease(parent).unwrap(), &predecessor));
+        assert!(Arc::ptr_eq(
+            &resources.lease(exec_child).unwrap(),
+            &predecessor
+        ));
+        assert!(matches!(
+            resources.lease(rejected_child),
+            Err(MmResourcesError::UnknownTask(key)) if key == rejected_child
+        ));
+        reservation.abort().unwrap();
+        resources
+            .publish_shared_child(parent, rejected_child)
+            .expect("exact-MM publication retries after abort");
+    }
+
+    #[test]
+    fn exec_commit_consumes_pinned_disposition_and_publishes_one_coherent_replacement() {
+        let retained_parent = task(130, 1);
+        let exec_child = task(131, 2);
+        let (retained_resources, _) = resources(retained_parent, 2);
+        let retained_resources = Arc::new(retained_resources);
+        retained_resources
+            .publish_shared_child(retained_parent, exec_child)
+            .unwrap();
+        let retained_reservation = retained_resources.reserve_exec(exec_child).unwrap();
+        let retained_root = retained_reservation.replacement_root_slot().unwrap();
+        let predecessor = retained_resources.lease(exec_child).unwrap();
+        let removed = retained_resources
+            .state
+            .lock()
+            .leases
+            .remove(&retained_parent);
+        assert!(removed.is_some(), "test removes the only surviving alias");
+
+        let retained_published_root = retained_root.base() + 0x1000;
+        let retained = retained_reservation
+            .commit(retained_published_root)
+            .unwrap();
+        let retained_replacement = match retained {
+            ExecMmCommitReceipt::Retained {
+                predecessor: receipt_predecessor,
+                replacement,
+            } => {
+                assert!(Arc::ptr_eq(&receipt_predecessor, &predecessor));
+                replacement
+            }
+            other => panic!("commit re-counted the pinned retained disposition: {other:?}"),
+        };
+        assert!(Arc::ptr_eq(
+            &retained_resources.lease(exec_child).unwrap(),
+            &retained_replacement
+        ));
+        assert_eq!(
+            retained_replacement.binding().stage1_root.gpa().raw(),
+            retained_published_root
+        );
+        retained_resources
+            .mm_pool
+            .retire(&predecessor)
+            .unwrap()
+            .complete()
+            .unwrap();
+
+        let final_task = task(132, 3);
+        let committed_child = task(133, 4);
+        let (final_resources, _) = resources(final_task, 2);
+        let final_resources = Arc::new(final_resources);
+        let final_reservation = final_resources.reserve_exec(final_task).unwrap();
+        let final_root = final_reservation.replacement_root_slot().unwrap();
+        let final_published_root = final_root.base() + 0x1000;
+        let retired = final_reservation.commit(final_published_root).unwrap();
+        let (replacement, retirement) = match retired {
+            ExecMmCommitReceipt::Retired {
+                retirement,
+                replacement,
+            } => (replacement, retirement),
+            other => panic!("final-owner reservation changed disposition: {other:?}"),
+        };
+        assert_eq!(replacement.binding(), replacement.backend().binding());
+        assert_eq!(
+            replacement.binding().stage1_root.gpa().raw(),
+            final_published_root
+        );
+        assert!(Arc::ptr_eq(
+            &final_resources.lease(final_task).unwrap(),
+            &replacement
+        ));
+        let shared_backend = final_resources
+            .publish_shared_child(final_task, committed_child)
+            .unwrap();
+        assert_eq!(shared_backend.binding(), replacement.binding());
+        assert!(Arc::ptr_eq(
+            &final_resources.lease(committed_child).unwrap(),
+            &replacement
+        ));
+        retirement.complete().unwrap();
+    }
+
+    #[test]
+    fn explicit_exec_abort_returns_dirty_replacement_quarantine_for_both_dispositions() {
+        let retained_parent = task(140, 1);
+        let retained_child = task(141, 2);
+        let retained_executor = executor(14_001);
+        let (retained_resources, _) = resources(retained_parent, 2);
+        let retained_resources = Arc::new(retained_resources);
+        retained_resources
+            .publish_shared_child(retained_parent, retained_child)
+            .unwrap();
+        let retained_predecessor = retained_resources.lease(retained_child).unwrap();
+        let retained_reservation = retained_resources.reserve_exec(retained_child).unwrap();
+        let mut retained_load = retained_reservation
+            .begin_replacement_asid_load(retained_executor)
+            .unwrap();
+        retained_load.arm_hardware_dirty().unwrap();
+        retained_load.mark_resident().unwrap();
+        let retained_abort = retained_reservation.abort().unwrap();
+        let retained_retirement = match retained_abort {
+            ExecMmAbortReceipt::Retained {
+                predecessor,
+                replacement,
+                settlement: PreparedStage1MmAbort::Retirement(retirement),
+            } => {
+                assert!(Arc::ptr_eq(&predecessor, &retained_predecessor));
+                assert_eq!(replacement, retirement.asid_generation());
+                retirement
+            }
+            other => panic!("dirty retained abort was not quarantined: {other:?}"),
+        };
+        retained_retirement
+            .acknowledge(super::super::asid::InvalidationAck::new(
+                retained_executor,
+                retained_retirement.asid_generation(),
+            ))
+            .unwrap();
+        retained_retirement.complete().unwrap();
+        drop(retained_resources.reserve_exec(retained_child).unwrap());
+
+        let final_task = task(142, 3);
+        let final_executor = executor(14_002);
+        let (final_resources, _) = resources(final_task, 2);
+        let final_resources = Arc::new(final_resources);
+        let final_predecessor = final_resources.lease(final_task).unwrap();
+        let final_reservation = final_resources.reserve_exec(final_task).unwrap();
+        let mut final_load = final_reservation
+            .begin_replacement_asid_load(final_executor)
+            .unwrap();
+        final_load.arm_hardware_dirty().unwrap();
+        final_load.mark_resident().unwrap();
+        let final_abort = final_reservation.abort().unwrap();
+        let final_retirement = match final_abort {
+            ExecMmAbortReceipt::RestoredFinal {
+                predecessor,
+                replacement,
+                settlement: PreparedStage1MmAbort::Retirement(retirement),
+            } => {
+                assert!(Arc::ptr_eq(&predecessor, &final_predecessor));
+                assert_eq!(replacement, retirement.asid_generation());
+                retirement
+            }
+            other => panic!("dirty final abort was not quarantined: {other:?}"),
+        };
+        assert!(final_predecessor.begin_asid_load(executor(14_003)).is_ok());
+        final_retirement
+            .acknowledge(super::super::asid::InvalidationAck::new(
+                final_executor,
+                final_retirement.asid_generation(),
+            ))
+            .unwrap();
+        final_retirement.complete().unwrap();
+        drop(final_resources.reserve_exec(final_task).unwrap());
+    }
+
+    #[test]
+    fn active_exec_reservation_leaves_unrelated_mm_operations_independent() {
+        let reserved_task = task(150, 1);
+        let unrelated_owner = task(151, 2);
+        let unrelated_alias = task(152, 3);
+        let unrelated_final = task(153, 4);
+        let (resources, _) = resources(reserved_task, 4);
+        let resources = Arc::new(resources);
+        resources
+            .publish_child(unrelated_owner, resources.prepare_child().unwrap())
+            .unwrap();
+        resources
+            .publish_child(unrelated_final, resources.prepare_child().unwrap())
+            .unwrap();
+        let held = resources.reserve_exec(reserved_task).unwrap();
+
+        let worker_resources = Arc::clone(&resources);
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            worker_resources
+                .publish_shared_child(unrelated_owner, unrelated_alias)
+                .unwrap();
+            worker_resources
+                .retire(unrelated_alias)
+                .unwrap()
+                .complete()
+                .unwrap();
+            worker_resources
+                .retire(unrelated_final)
+                .unwrap()
+                .complete()
+                .unwrap();
+            worker_resources
+                .reserve_exec(unrelated_owner)
+                .unwrap()
+                .abort()
+                .unwrap();
+            completed_tx.send(()).unwrap();
+        });
+        completed_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("unrelated MM operations must not wait on a held reservation");
+        worker.join().unwrap();
+        held.abort().unwrap();
+    }
+
+    #[test]
+    fn failure_after_exec_marker_insertion_clears_marker_and_permits_exact_retry() {
+        let root = task(160, 1);
+        let (resources, _) = resources(root, 2);
+        let resources = Arc::new(resources);
+        let predecessor = resources.lease(root).unwrap();
+
+        assert!(matches!(
+            resources.reserve_exec_with_failpoint_for_tests(
+                root,
+                ExecReservationConstructionFailpoint::AfterMarker,
+            ),
+            Err(MmResourcesError::InjectedExecReservationFailure(
+                ExecReservationConstructionFailpoint::AfterMarker,
+            ))
+        ));
+        assert!(Arc::ptr_eq(&resources.lease(root).unwrap(), &predecessor));
+        assert!(predecessor.begin_asid_load(executor(16_001)).is_ok());
+        drop(resources.reserve_exec(root).unwrap());
+    }
+
+    #[test]
+    fn failure_after_replacement_allocation_settles_replacement_before_marker_clear() {
+        let root = task(161, 1);
+        let (resources, _) = resources(root, 2);
+        let resources = Arc::new(resources);
+        let predecessor = resources.lease(root).unwrap();
+        let probe = resources.prepare_child().unwrap();
+        let expected_asid = probe.asid_generation().asid();
+        let expected_root = probe.root_slot();
+        drop(probe);
+
+        assert!(matches!(
+            resources.reserve_exec_with_failpoint_for_tests(
+                root,
+                ExecReservationConstructionFailpoint::AfterReplacement,
+            ),
+            Err(MmResourcesError::InjectedExecReservationFailure(
+                ExecReservationConstructionFailpoint::AfterReplacement,
+            ))
+        ));
+        assert!(Arc::ptr_eq(&resources.lease(root).unwrap(), &predecessor));
+        assert!(predecessor.begin_asid_load(executor(16_002)).is_ok());
+        let retry = resources.reserve_exec(root).unwrap();
+        assert_eq!(retry.replacement_asid_generation().asid(), expected_asid);
+        assert_eq!(retry.replacement_root_slot(), expected_root);
+    }
+
+    #[test]
+    fn failure_after_final_retirement_preparation_restores_every_layer_before_retry() {
+        let root = task(162, 1);
+        let (resources, _) = resources(root, 2);
+        let resources = Arc::new(resources);
+        let predecessor = resources.lease(root).unwrap();
+        let probe = resources.prepare_child().unwrap();
+        let expected_asid = probe.asid_generation().asid();
+        let expected_root = probe.root_slot();
+        drop(probe);
+
+        assert!(matches!(
+            resources.reserve_exec_with_failpoint_for_tests(
+                root,
+                ExecReservationConstructionFailpoint::AfterFinalRetirement,
+            ),
+            Err(MmResourcesError::InjectedExecReservationFailure(
+                ExecReservationConstructionFailpoint::AfterFinalRetirement,
+            ))
+        ));
+        assert!(Arc::ptr_eq(&resources.lease(root).unwrap(), &predecessor));
+        assert!(predecessor.begin_asid_load(executor(16_003)).is_ok());
+        let retry = resources.reserve_exec(root).unwrap();
+        assert!(matches!(
+            retry.disposition_for_tests(),
+            ExecMmDisposition::RetireOldMm(_)
+        ));
+        assert_eq!(retry.replacement_asid_generation().asid(), expected_asid);
+        assert_eq!(retry.replacement_root_slot(), expected_root);
+    }
+
+    #[test]
+    fn reserve_vs_shared_publish_barriers_cover_both_linearization_orders() {
+        let reserve_first_root = task(170, 1);
+        let reserve_first_child = task(171, 2);
+        let (reserve_first_resources, _) = resources(reserve_first_root, 2);
+        let reserve_first_resources = Arc::new(reserve_first_resources);
+        let reserve_entered = Arc::new(std::sync::Barrier::new(2));
+        let reserve_release = Arc::new(std::sync::Barrier::new(2));
+        let reserve_worker_resources = Arc::clone(&reserve_first_resources);
+        let reserve_worker_entered = Arc::clone(&reserve_entered);
+        let reserve_worker_release = Arc::clone(&reserve_release);
+        let reserve_worker = std::thread::spawn(move || {
+            reserve_worker_resources.reserve_exec_with_state_hook_for_tests(
+                reserve_first_root,
+                MmStateLinearizationHook {
+                    entered: reserve_worker_entered,
+                    release: reserve_worker_release,
+                },
+            )
+        });
+        reserve_entered.wait();
+        let publish_worker_resources = Arc::clone(&reserve_first_resources);
+        let (publish_tx, publish_rx) = std::sync::mpsc::channel();
+        let publish_worker = std::thread::spawn(move || {
+            publish_tx
+                .send(
+                    publish_worker_resources
+                        .publish_shared_child(reserve_first_root, reserve_first_child),
+                )
+                .unwrap();
+        });
+        assert!(matches!(
+            publish_rx.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        reserve_release.wait();
+        let reserve_first = reserve_worker.join().unwrap().unwrap();
+        assert!(matches!(
+            reserve_first.disposition_for_tests(),
+            ExecMmDisposition::RetireOldMm(_)
+        ));
+        assert!(matches!(
+            publish_rx.recv_timeout(std::time::Duration::from_secs(2)),
+            Ok(Err(MmResourcesError::ExecReservationConflict(_)))
+        ));
+        publish_worker.join().unwrap();
+        reserve_first.abort().unwrap();
+
+        let publish_first_root = task(172, 3);
+        let publish_first_child = task(173, 4);
+        let (publish_first_resources, _) = resources(publish_first_root, 2);
+        let publish_first_resources = Arc::new(publish_first_resources);
+        let publish_entered = Arc::new(std::sync::Barrier::new(2));
+        let publish_release = Arc::new(std::sync::Barrier::new(2));
+        let publish_owner_resources = Arc::clone(&publish_first_resources);
+        let publish_owner_entered = Arc::clone(&publish_entered);
+        let publish_owner_release = Arc::clone(&publish_release);
+        let publish_owner = std::thread::spawn(move || {
+            publish_owner_resources.publish_shared_child_with_state_hook_for_tests(
+                publish_first_root,
+                publish_first_child,
+                MmStateLinearizationHook {
+                    entered: publish_owner_entered,
+                    release: publish_owner_release,
+                },
+            )
+        });
+        publish_entered.wait();
+        let reserve_after_publish_resources = Arc::clone(&publish_first_resources);
+        let (reserve_tx, reserve_rx) = std::sync::mpsc::channel();
+        let reserve_after_publish = std::thread::spawn(move || {
+            reserve_tx
+                .send(reserve_after_publish_resources.reserve_exec(publish_first_root))
+                .unwrap();
+        });
+        assert!(matches!(
+            reserve_rx.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        publish_release.wait();
+        publish_owner.join().unwrap().unwrap();
+        let publish_first = reserve_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        reserve_after_publish.join().unwrap();
+        assert!(matches!(
+            publish_first.disposition_for_tests(),
+            ExecMmDisposition::RetainOldMm
+        ));
+        publish_first.abort().unwrap();
+    }
+
+    #[test]
+    fn reserve_vs_shared_retire_barriers_cover_both_linearization_orders() {
+        let reserve_first_root = task(180, 1);
+        let reserve_first_alias = task(181, 2);
+        let (reserve_first_resources, _) = resources(reserve_first_root, 2);
+        let reserve_first_resources = Arc::new(reserve_first_resources);
+        reserve_first_resources
+            .publish_shared_child(reserve_first_root, reserve_first_alias)
+            .unwrap();
+        let reserve_entered = Arc::new(std::sync::Barrier::new(2));
+        let reserve_release = Arc::new(std::sync::Barrier::new(2));
+        let reserve_worker_resources = Arc::clone(&reserve_first_resources);
+        let reserve_worker_entered = Arc::clone(&reserve_entered);
+        let reserve_worker_release = Arc::clone(&reserve_release);
+        let reserve_worker = std::thread::spawn(move || {
+            reserve_worker_resources.reserve_exec_with_state_hook_for_tests(
+                reserve_first_root,
+                MmStateLinearizationHook {
+                    entered: reserve_worker_entered,
+                    release: reserve_worker_release,
+                },
+            )
+        });
+        reserve_entered.wait();
+        let retire_worker_resources = Arc::clone(&reserve_first_resources);
+        let (retire_tx, retire_rx) = std::sync::mpsc::channel();
+        let retire_worker = std::thread::spawn(move || {
+            retire_tx
+                .send(retire_worker_resources.retire(reserve_first_alias))
+                .unwrap();
+        });
+        assert!(matches!(
+            retire_rx.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        reserve_release.wait();
+        let reserve_first = reserve_worker.join().unwrap().unwrap();
+        assert!(matches!(
+            reserve_first.disposition_for_tests(),
+            ExecMmDisposition::RetainOldMm
+        ));
+        assert!(matches!(
+            retire_rx.recv_timeout(std::time::Duration::from_secs(2)),
+            Ok(Err(MmResourcesError::ExecReservationConflict(_)))
+        ));
+        retire_worker.join().unwrap();
+        reserve_first.abort().unwrap();
+        reserve_first_resources
+            .retire(reserve_first_alias)
+            .unwrap()
+            .complete()
+            .unwrap();
+
+        let retire_first_root = task(182, 3);
+        let retire_first_alias = task(183, 4);
+        let (retire_first_resources, _) = resources(retire_first_root, 2);
+        let retire_first_resources = Arc::new(retire_first_resources);
+        retire_first_resources
+            .publish_shared_child(retire_first_root, retire_first_alias)
+            .unwrap();
+        let retire_entered = Arc::new(std::sync::Barrier::new(2));
+        let retire_release = Arc::new(std::sync::Barrier::new(2));
+        let retire_owner_resources = Arc::clone(&retire_first_resources);
+        let retire_owner_entered = Arc::clone(&retire_entered);
+        let retire_owner_release = Arc::clone(&retire_release);
+        let retire_owner = std::thread::spawn(move || {
+            retire_owner_resources.retire_with_state_hook_for_tests(
+                retire_first_alias,
+                MmStateLinearizationHook {
+                    entered: retire_owner_entered,
+                    release: retire_owner_release,
+                },
+            )
+        });
+        retire_entered.wait();
+        let reserve_after_retire_resources = Arc::clone(&retire_first_resources);
+        let (reserve_tx, reserve_rx) = std::sync::mpsc::channel();
+        let reserve_after_retire = std::thread::spawn(move || {
+            reserve_tx
+                .send(reserve_after_retire_resources.reserve_exec(retire_first_root))
+                .unwrap();
+        });
+        assert!(matches!(
+            reserve_rx.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        retire_release.wait();
+        retire_owner.join().unwrap().unwrap().complete().unwrap();
+        let retire_first = reserve_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        reserve_after_retire.join().unwrap();
+        assert!(matches!(
+            retire_first.disposition_for_tests(),
+            ExecMmDisposition::RetireOldMm(_)
+        ));
+        retire_first.abort().unwrap();
+    }
+
+    #[test]
+    fn exec_commit_rejects_task_generation_id_and_predecessor_mismatches_fail_closed() {
+        let task_mismatch_root = task(190, 1);
+        let (task_mismatch_resources, _) = resources(task_mismatch_root, 2);
+        let task_mismatch_resources = Arc::new(task_mismatch_resources);
+        let task_mismatch = task_mismatch_resources
+            .reserve_exec(task_mismatch_root)
+            .unwrap();
+        let task_generation = task_mismatch.generation;
+        let task_replacement_root = task_mismatch.replacement_root_slot().unwrap().base();
+        task_mismatch_resources
+            .state
+            .lock()
+            .exec_reservations
+            .get_mut(&task_generation)
+            .unwrap()
+            .task = task(191, 2);
+        assert!(matches!(
+            task_mismatch.commit(task_replacement_root),
+            Err(MmResourcesError::ExecReservationMismatch(
+                ExecReservationMismatch::Task,
+            ))
+        ));
+
+        let generation_mismatch_root = task(192, 3);
+        let (generation_mismatch_resources, _) = resources(generation_mismatch_root, 2);
+        let generation_mismatch_resources = Arc::new(generation_mismatch_resources);
+        let generation_mismatch = generation_mismatch_resources
+            .reserve_exec(generation_mismatch_root)
+            .unwrap();
+        let predecessor_generation = generation_mismatch.generation;
+        let replacement_generation = generation_mismatch.replacement_asid_generation();
+        let generation_replacement_root =
+            generation_mismatch.replacement_root_slot().unwrap().base();
+        generation_mismatch_resources
+            .state
+            .lock()
+            .exec_reservations
+            .get_mut(&predecessor_generation)
+            .unwrap()
+            .generation = replacement_generation;
+        assert!(matches!(
+            generation_mismatch.commit(generation_replacement_root),
+            Err(MmResourcesError::ExecReservationMismatch(
+                ExecReservationMismatch::Generation,
+            ))
+        ));
+
+        let id_mismatch_root = task(193, 4);
+        let (id_mismatch_resources, _) = resources(id_mismatch_root, 2);
+        let id_mismatch_resources = Arc::new(id_mismatch_resources);
+        let id_mismatch = id_mismatch_resources
+            .reserve_exec(id_mismatch_root)
+            .unwrap();
+        let id_generation = id_mismatch.generation;
+        let id_replacement_root = id_mismatch.replacement_root_slot().unwrap().base();
+        id_mismatch_resources
+            .state
+            .lock()
+            .exec_reservations
+            .get_mut(&id_generation)
+            .unwrap()
+            .id = Arc::new(ExecReservationId(u64::MAX));
+        assert!(matches!(
+            id_mismatch.commit(id_replacement_root),
+            Err(MmResourcesError::ExecReservationMismatch(
+                ExecReservationMismatch::ReservationId,
+            ))
+        ));
+
+        let predecessor_mismatch_root = task(194, 5);
+        let unrelated_task = task(195, 6);
+        let (predecessor_mismatch_resources, _) = resources(predecessor_mismatch_root, 3);
+        let predecessor_mismatch_resources = Arc::new(predecessor_mismatch_resources);
+        predecessor_mismatch_resources
+            .publish_child(
+                unrelated_task,
+                predecessor_mismatch_resources.prepare_child().unwrap(),
+            )
+            .unwrap();
+        let unrelated_lease = predecessor_mismatch_resources
+            .lease(unrelated_task)
+            .unwrap();
+        let predecessor_mismatch = predecessor_mismatch_resources
+            .reserve_exec(predecessor_mismatch_root)
+            .unwrap();
+        let predecessor_generation = predecessor_mismatch.generation;
+        let predecessor_replacement_root =
+            predecessor_mismatch.replacement_root_slot().unwrap().base();
+        predecessor_mismatch_resources
+            .state
+            .lock()
+            .exec_reservations
+            .get_mut(&predecessor_generation)
+            .unwrap()
+            .predecessor = Arc::clone(&unrelated_lease);
+        assert!(matches!(
+            predecessor_mismatch.commit(predecessor_replacement_root),
+            Err(MmResourcesError::ExecReservationMismatch(
+                ExecReservationMismatch::Predecessor,
+            ))
+        ));
+
+        let edge_mismatch_root = task(196, 7);
+        let edge_unrelated = task(197, 8);
+        let (edge_mismatch_resources, _) = resources(edge_mismatch_root, 3);
+        let edge_mismatch_resources = Arc::new(edge_mismatch_resources);
+        edge_mismatch_resources
+            .publish_child(
+                edge_unrelated,
+                edge_mismatch_resources.prepare_child().unwrap(),
+            )
+            .unwrap();
+        let edge_unrelated_lease = edge_mismatch_resources.lease(edge_unrelated).unwrap();
+        let edge_mismatch = edge_mismatch_resources
+            .reserve_exec(edge_mismatch_root)
+            .unwrap();
+        let edge_replacement_root = edge_mismatch.replacement_root_slot().unwrap().base();
+        edge_mismatch_resources
+            .state
+            .lock()
+            .leases
+            .insert(edge_mismatch_root, edge_unrelated_lease);
+        assert!(matches!(
+            edge_mismatch.commit(edge_replacement_root),
+            Err(MmResourcesError::ExecReservationMismatch(
+                ExecReservationMismatch::TaskEdge,
+            ))
+        ));
+    }
+
+    #[test]
+    fn exec_abort_uses_the_same_exact_marker_validation_as_commit() {
+        let root = task(198, 1);
+        let (resources, _) = resources(root, 2);
+        let resources = Arc::new(resources);
+        let reservation = resources.reserve_exec(root).unwrap();
+        let generation = reservation.generation;
+        resources
+            .state
+            .lock()
+            .exec_reservations
+            .get_mut(&generation)
+            .unwrap()
+            .id = Arc::new(ExecReservationId(u64::MAX));
+        assert!(matches!(
+            reservation.abort(),
+            Err(MmResourcesError::ExecReservationMismatch(
+                ExecReservationMismatch::ReservationId,
+            ))
+        ));
+    }
+
+    #[test]
+    fn explicit_dirty_final_abort_orders_replacement_predecessor_marker_settlement() {
+        let root = task(199, 1);
+        let alias = task(200, 2);
+        let dirty_executor = executor(19_901);
+        let (resources, _) = resources(root, 2);
+        let resources = Arc::new(resources);
+        let predecessor = resources.lease(root).unwrap();
+        let trace = ExecDispositionSettlementTrace::default();
+        let reservation = resources
+            .reserve_exec_with_settlement_trace_for_tests(root, trace.clone())
+            .unwrap();
+        let mut load = reservation
+            .begin_replacement_asid_load(dirty_executor)
+            .unwrap();
+        load.arm_hardware_dirty().unwrap();
+        load.mark_resident().unwrap();
+
+        assert!(matches!(
+            reservation.abort().unwrap(),
+            ExecMmAbortReceipt::RestoredFinal {
+                settlement: PreparedStage1MmAbort::Retirement(_),
+                ..
+            }
+        ));
+        assert_eq!(
+            trace.snapshot(),
+            vec![
+                ExecDispositionSettlementStep::ReplacementSettled,
+                ExecDispositionSettlementStep::PredecessorRestored,
+                ExecDispositionSettlementStep::MarkerCleared,
+            ]
+        );
+        assert!(Arc::ptr_eq(&resources.lease(root).unwrap(), &predecessor));
+        resources.publish_shared_child(root, alias).unwrap();
+    }
+
+    #[test]
+    fn dropping_dirty_final_reservation_restores_predecessor_and_quarantines_replacement() {
+        let root = task(201, 1);
+        let alias = task(202, 2);
+        let dirty_executor = executor(20_101);
+        let (resources, _) = resources(root, 2);
+        let resources = Arc::new(resources);
+        let predecessor = resources.lease(root).unwrap();
+        let trace = ExecDispositionSettlementTrace::default();
+        let reservation = resources
+            .reserve_exec_with_settlement_trace_for_tests(root, trace.clone())
+            .unwrap();
+        let mut load = reservation
+            .begin_replacement_asid_load(dirty_executor)
+            .unwrap();
+        load.arm_hardware_dirty().unwrap();
+        load.mark_resident().unwrap();
+        drop(reservation);
+
+        assert_eq!(
+            trace.snapshot(),
+            vec![
+                ExecDispositionSettlementStep::ReplacementSettled,
+                ExecDispositionSettlementStep::PredecessorRestored,
+                ExecDispositionSettlementStep::MarkerCleared,
+            ]
+        );
+        assert!(Arc::ptr_eq(&resources.lease(root).unwrap(), &predecessor));
+        assert!(predecessor.begin_asid_load(executor(20_102)).is_ok());
+        resources.publish_shared_child(root, alias).unwrap();
+        assert!(matches!(
+            resources.prepare_child(),
+            Err(MmResourcesError::AsidExhausted)
+        ));
+    }
+
+    #[test]
+    fn dropping_dirty_retained_reservation_quarantines_replacement_and_clears_marker() {
+        let root = task(203, 1);
+        let exec_child = task(204, 2);
+        let post_drop_alias = task(205, 3);
+        let dirty_executor = executor(20_301);
+        let (resources, _) = resources(root, 2);
+        let resources = Arc::new(resources);
+        resources.publish_shared_child(root, exec_child).unwrap();
+        let predecessor = resources.lease(exec_child).unwrap();
+        let trace = ExecDispositionSettlementTrace::default();
+        let reservation = resources
+            .reserve_exec_with_settlement_trace_for_tests(exec_child, trace.clone())
+            .unwrap();
+        assert!(matches!(
+            reservation.disposition_for_tests(),
+            ExecMmDisposition::RetainOldMm
+        ));
+        let mut load = reservation
+            .begin_replacement_asid_load(dirty_executor)
+            .unwrap();
+        load.arm_hardware_dirty().unwrap();
+        load.mark_resident().unwrap();
+        drop(reservation);
+
+        assert_eq!(
+            trace.snapshot(),
+            vec![
+                ExecDispositionSettlementStep::ReplacementSettled,
+                ExecDispositionSettlementStep::MarkerCleared,
+            ]
+        );
+        assert!(Arc::ptr_eq(
+            &resources.lease(exec_child).unwrap(),
+            &predecessor
+        ));
+        resources
+            .publish_shared_child(root, post_drop_alias)
+            .unwrap();
+        assert!(matches!(
+            resources.prepare_child(),
+            Err(MmResourcesError::AsidExhausted)
+        ));
+    }
+
+    #[test]
+    fn final_construction_failure_records_replacement_predecessor_marker_rollback_order() {
+        let root = task(206, 1);
+        let (resources, _) = resources(root, 2);
+        let resources = Arc::new(resources);
+        let trace = ExecConstructionRollbackTrace::default();
+        assert!(matches!(
+            resources.reserve_exec_with_failpoint_and_trace_for_tests(
+                root,
+                ExecReservationConstructionFailpoint::AfterFinalRetirement,
+                trace.clone(),
+            ),
+            Err(MmResourcesError::InjectedExecReservationFailure(
+                ExecReservationConstructionFailpoint::AfterFinalRetirement,
+            ))
+        ));
+        assert_eq!(
+            trace.snapshot(),
+            vec![
+                ExecConstructionRollbackStep::ReplacementSettled,
+                ExecConstructionRollbackStep::PredecessorRestored,
+                ExecConstructionRollbackStep::MarkerCleared,
+            ]
         );
     }
 }
