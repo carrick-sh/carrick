@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use super::asid::{AsidError, AsidGeneration, AsidLoad, AsidResidencyError};
 use super::stage1_mm::{
@@ -353,7 +353,9 @@ impl ExecMmReservation {
                 }
             }
         };
-        let removed = resources_state.exec_reservations.remove(&self.generation);
+        let removed = self
+            .resources
+            .clear_exec_reservation(&mut resources_state, self.generation);
         assert!(
             removed.is_some(),
             "validated exec reservation marker vanished"
@@ -403,7 +405,9 @@ impl ExecMmReservation {
                 .is_some_and(|lease| Arc::ptr_eq(lease, &self.predecessor)),
             "validated exec reservation task edge changed under state authority"
         );
-        let removed = resources_state.exec_reservations.remove(&self.generation);
+        let removed = self
+            .resources
+            .clear_exec_reservation(&mut resources_state, self.generation);
         assert!(
             removed.is_some(),
             "validated exec reservation marker vanished"
@@ -448,7 +452,8 @@ impl Drop for ExecMmReservation {
                     self.record_settlement(ExecDispositionSettlementStep::PredecessorRestored);
                 }
                 if marker_matches {
-                    resources_state.exec_reservations.remove(&self.generation);
+                    self.resources
+                        .clear_exec_reservation(&mut resources_state, self.generation);
                     #[cfg(test)]
                     self.record_settlement(ExecDispositionSettlementStep::MarkerCleared);
                 } else {
@@ -546,6 +551,7 @@ struct MmResourceState {
 #[derive(Debug)]
 pub(crate) struct MmResources {
     state: Mutex<MmResourceState>,
+    exec_reservation_settled: Condvar,
     pending_root: Mutex<Option<Arc<Stage1MmLease>>>,
     mm_pool: Stage1MmPool,
     #[cfg_attr(not(test), allow(dead_code))]
@@ -553,6 +559,18 @@ pub(crate) struct MmResources {
 }
 
 impl MmResources {
+    fn clear_exec_reservation(
+        &self,
+        state: &mut MmResourceState,
+        generation: AsidGeneration,
+    ) -> Option<ActiveExecReservation> {
+        let removed = state.exec_reservations.remove(&generation);
+        if removed.is_some() {
+            self.exec_reservation_settled.notify_all();
+        }
+        removed
+    }
+
     fn owner_count(state: &MmResourceState, lease: &Arc<Stage1MmLease>) -> u32 {
         u32::try_from(
             state
@@ -633,6 +651,7 @@ impl MmResources {
         Ok((
             Self {
                 state: Mutex::new(MmResourceState::default()),
+                exec_reservation_settled: Condvar::new(),
                 pending_root: Mutex::new(Some(root_mm)),
                 mm_pool,
                 next_exec_reservation: AtomicU64::new(1),
@@ -665,6 +684,7 @@ impl MmResources {
         Ok((
             Self {
                 state: Mutex::new(MmResourceState::default()),
+                exec_reservation_settled: Condvar::new(),
                 pending_root: Mutex::new(Some(root_mm)),
                 mm_pool,
                 next_exec_reservation: AtomicU64::new(1),
@@ -827,12 +847,39 @@ impl MmResources {
     ) -> Result<ExecMmReservation, MmResourcesError> {
         #[cfg(not(test))]
         {
-            self.reserve_exec_inner(task)
+            self.reserve_exec_inner(task, false)
         }
         #[cfg(test)]
         {
             self.reserve_exec_inner(
                 task,
+                false,
+                ExecReservationConstructionFailpoint::Disabled,
+                None,
+                None,
+            )
+        }
+    }
+
+    /// Acquire the exact MM-generation exec reservation, waiting for a
+    /// distinct task's in-flight exec on the same shared MM to settle.
+    ///
+    /// The task edge and owner disposition are recomputed after every wake
+    /// while holding MM-resource authority. The returned reservation remains
+    /// the sole marker owner until its abort, commit, or drop settlement.
+    pub(crate) fn reserve_exec_eventual(
+        self: &Arc<Self>,
+        task: TaskKey,
+    ) -> Result<ExecMmReservation, MmResourcesError> {
+        #[cfg(not(test))]
+        {
+            self.reserve_exec_inner(task, true)
+        }
+        #[cfg(test)]
+        {
+            self.reserve_exec_inner(
+                task,
+                true,
                 ExecReservationConstructionFailpoint::Disabled,
                 None,
                 None,
@@ -846,7 +893,7 @@ impl MmResources {
         task: TaskKey,
         failpoint: ExecReservationConstructionFailpoint,
     ) -> Result<ExecMmReservation, MmResourcesError> {
-        self.reserve_exec_inner(task, failpoint, None, None)
+        self.reserve_exec_inner(task, false, failpoint, None, None)
     }
 
     #[cfg(test)]
@@ -856,7 +903,7 @@ impl MmResources {
         failpoint: ExecReservationConstructionFailpoint,
         trace: ExecConstructionRollbackTrace,
     ) -> Result<ExecMmReservation, MmResourcesError> {
-        self.reserve_exec_inner(task, failpoint, None, Some(trace))
+        self.reserve_exec_inner(task, false, failpoint, None, Some(trace))
     }
 
     #[cfg(test)]
@@ -867,6 +914,7 @@ impl MmResources {
     ) -> Result<ExecMmReservation, MmResourcesError> {
         self.reserve_exec_inner(
             task,
+            false,
             ExecReservationConstructionFailpoint::Disabled,
             Some(hook),
             None,
@@ -888,6 +936,7 @@ impl MmResources {
     fn reserve_exec_inner(
         self: &Arc<Self>,
         task: TaskKey,
+        wait_for_conflict: bool,
         #[cfg(test)] failpoint: ExecReservationConstructionFailpoint,
         #[cfg(test)] hook: Option<MmStateLinearizationHook>,
         #[cfg(test)] rollback_trace: Option<ExecConstructionRollbackTrace>,
@@ -897,19 +946,26 @@ impl MmResources {
         if let Some(hook) = hook {
             hook.run();
         }
-        let predecessor = state
-            .leases
-            .get(&task)
-            .cloned()
-            .ok_or(MmResourcesError::UnknownTask(task))?;
-        let generation = predecessor.asid_generation();
-        if let Some(marker) = state.exec_reservations.get(&generation) {
-            return Err(ExecReservationConflict {
-                reserving_task: marker.task,
-                generation,
+        let predecessor = loop {
+            let predecessor = state
+                .leases
+                .get(&task)
+                .cloned()
+                .ok_or(MmResourcesError::UnknownTask(task))?;
+            let generation = predecessor.asid_generation();
+            let Some(marker) = state.exec_reservations.get(&generation) else {
+                break predecessor;
+            };
+            if !wait_for_conflict || marker.task == task {
+                return Err(ExecReservationConflict {
+                    reserving_task: marker.task,
+                    generation,
+                }
+                .into());
             }
-            .into());
-        }
+            self.exec_reservation_settled.wait(&mut state);
+        };
+        let generation = predecessor.asid_generation();
 
         let reservation_id = self
             .next_exec_reservation
@@ -930,7 +986,7 @@ impl MmResources {
         assert!(inserted.is_none(), "exec MM reservation marker replaced");
         #[cfg(test)]
         if failpoint == ExecReservationConstructionFailpoint::AfterMarker {
-            state.exec_reservations.remove(&generation);
+            self.clear_exec_reservation(&mut state, generation);
             if let Some(trace) = rollback_trace.as_ref() {
                 trace.record(ExecConstructionRollbackStep::MarkerCleared);
             }
@@ -945,7 +1001,7 @@ impl MmResources {
         let replacement = match self.mm_pool.prepare_child() {
             Ok(replacement) => replacement,
             Err(error) => {
-                state.exec_reservations.remove(&generation);
+                self.clear_exec_reservation(&mut state, generation);
                 return Err(error.into());
             }
         };
@@ -955,7 +1011,7 @@ impl MmResources {
             if let Some(trace) = rollback_trace.as_ref() {
                 trace.record(ExecConstructionRollbackStep::ReplacementSettled);
             }
-            state.exec_reservations.remove(&generation);
+            self.clear_exec_reservation(&mut state, generation);
             if let Some(trace) = rollback_trace.as_ref() {
                 trace.record(ExecConstructionRollbackStep::MarkerCleared);
             }
@@ -979,7 +1035,7 @@ impl MmResources {
                                 trace.record(ExecConstructionRollbackStep::PredecessorRestored);
                             }
                             replacement_settlement?;
-                            state.exec_reservations.remove(&generation);
+                            self.clear_exec_reservation(&mut state, generation);
                             if let Some(trace) = rollback_trace.as_ref() {
                                 trace.record(ExecConstructionRollbackStep::MarkerCleared);
                             }
@@ -995,7 +1051,7 @@ impl MmResources {
                         if let Some(trace) = rollback_trace.as_ref() {
                             trace.record(ExecConstructionRollbackStep::ReplacementSettled);
                         }
-                        state.exec_reservations.remove(&generation);
+                        self.clear_exec_reservation(&mut state, generation);
                         #[cfg(test)]
                         if let Some(trace) = rollback_trace.as_ref() {
                             trace.record(ExecConstructionRollbackStep::MarkerCleared);
@@ -1344,6 +1400,69 @@ mod tests {
             final_retry.disposition_for_tests(),
             ExecMmDisposition::RetireOldMm(_)
         ));
+    }
+
+    #[test]
+    fn eventual_exec_reservation_waits_then_recomputes_final_owner_disposition() {
+        let first = task(105, 1);
+        let waiter = task(106, 2);
+        let (resources, _) = resources(first, 3);
+        let resources = Arc::new(resources);
+        resources.publish_shared_child(first, waiter).unwrap();
+
+        let first_reservation = resources.reserve_exec(first).unwrap();
+        assert_eq!(
+            first_reservation.disposition(),
+            ExecMmDispositionKind::RetainOldMm,
+        );
+        let first_root = first_reservation.replacement_root_slot().unwrap();
+        assert!(matches!(
+            resources.reserve_exec_eventual(first),
+            Err(MmResourcesError::ExecReservationConflict(conflict))
+                if conflict.reserving_task == first
+                    && conflict.generation
+                        == resources.lease(first).unwrap().asid_generation()
+        ));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter_resources = Arc::clone(&resources);
+        let waiter_thread = std::thread::spawn(move || {
+            tx.send(waiter_resources.reserve_exec_eventual(waiter))
+                .unwrap();
+        });
+
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "distinct-task exec acquired the shared generation concurrently",
+        );
+
+        let first_receipt = first_reservation
+            .commit(first_root.base() + 0x1000)
+            .unwrap();
+        assert!(matches!(
+            first_receipt,
+            ExecMmCommitReceipt::Retained { .. }
+        ));
+
+        let waiter_reservation = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("waiter was not notified when the first reservation settled")
+            .unwrap();
+        assert_eq!(
+            waiter_reservation.disposition(),
+            ExecMmDispositionKind::RetireOldMm,
+            "waiter reused the pre-wait owner count instead of recomputing after wake",
+        );
+        let waiter_root = waiter_reservation.replacement_root_slot().unwrap();
+        let waiter_receipt = waiter_reservation
+            .commit(waiter_root.base() + 0x1000)
+            .unwrap();
+        let ExecMmCommitReceipt::Retired { retirement, .. } = waiter_receipt else {
+            panic!("final waiter did not retire its exact predecessor");
+        };
+        retirement.complete().unwrap();
+        waiter_thread.join().unwrap();
     }
 
     #[test]

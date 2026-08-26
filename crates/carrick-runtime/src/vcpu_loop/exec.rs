@@ -113,6 +113,7 @@ pub(super) struct PreparedExecve {
     proc_env: Vec<Vec<u8>>,
     command_line: String,
     inventory_failure_injection: Option<HvpatchExecInventoryFailureInjection>,
+    hvpatch_mm_reservation: Option<crate::hvpatch::ExecMmReservation>,
     _clone_admission: ExecCloneAdmission,
     runtime_region_count: u64,
     runtime_mapped_bytes: u64,
@@ -888,6 +889,25 @@ where
             .hvpatch_process
             .as_ref()
             .and_then(|_| hvpatch_exec_inventory_failure_injection(&path));
+        // Shared-MM tasks serialize their exec replacement before closing
+        // clone admission or draining siblings. A waiter carries this exact,
+        // non-cloneable reservation through the persistent-executor handoff;
+        // dropping any pre-no-return preparation path settles and wakes the
+        // next owner.
+        let hvpatch_mm_reservation = match kernel.hvpatch_process.as_ref() {
+            Some(process) => match process.reserve_exec_mm_eventual() {
+                Ok(reservation) => Some(reservation),
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        "execve MM-generation admission failed before the point of no return"
+                    );
+                    return Self::exec_failed_with_errno(engine, crate::linux_abi::LINUX_EAGAIN)
+                        .map(ExecvePreparation::Complete);
+                }
+            },
+            None => None,
+        };
         let clone_admission = match kernel.close_clone_admission_for_exec(self.this_tid) {
             Ok(admission) => admission,
             Err(error) => {
@@ -920,6 +940,7 @@ where
             proc_env,
             command_line,
             inventory_failure_injection,
+            hvpatch_mm_reservation,
             _clone_admission: clone_admission,
             runtime_region_count,
             runtime_mapped_bytes,
@@ -944,6 +965,7 @@ where
             proc_env,
             command_line: cmdline,
             inventory_failure_injection,
+            mut hvpatch_mm_reservation,
             _clone_admission,
             runtime_region_count,
             runtime_mapped_bytes,
@@ -978,8 +1000,12 @@ where
         // nonleader promotion and replacement Mm state.
         let prepared_kernel_exec = match kernel.hvpatch_process.as_ref() {
             Some(process) => {
+                let reservation = hvpatch_mm_reservation.take().unwrap_or_else(|| {
+                    tracing::error!("prepared HVPatch exec lost MM-generation admission");
+                    std::process::abort();
+                });
                 process
-                    .prepare_exec_for_linux_tid(self.linux_tid)
+                    .prepare_exec_for_linux_tid_with_mm_reservation(self.linux_tid, reservation)
                     .map(|(prepared, context)| {
                         (
                             RuntimePreparedExec::Hvpatch(Box::new(prepared)),
