@@ -1,6 +1,6 @@
 # Carrick exact conformance closure handoff
 
-**Updated:** 2026-08-25 (session 8 — host-subprocess retirement closed; core roadmap restored)
+**Updated:** 2026-08-26 (session 9 — conformance closure with directed-swing execution)
 
 **Canonical host/lane:** macOS, Apple Silicon, HVF/HVPatch, Linux arm64 guest
 
@@ -8,7 +8,56 @@ This file is the live controller for the next session. It supersedes the old
 native/Tier-D handoff that previously occupied this path. Do not resume the
 retired native campaign or restart the completed closure-harness work.
 
-## Objective — preserve verbatim
+## Current objective and operating contract — preserve verbatim
+
+On the canonical macOS / Apple Silicon / HVF / HVPatch arm64 lane, close the
+frozen 2,127-suite core-emulation denominator to 100% executed assertion-level
+parity with native-arm64 Linux. Accept no Carrick-specific gap, excuse, false
+match, skip, crash, timeout, empty result, oracle failure, or retry-recovered
+pass. After correctness closes, bring the Go, CPython, Node, and LTP aggregates
+plus cold go-build to no more than 2.0x native-arm64 Docker. A valid completing
+suite at or above 10x remains a correctness-pathology lead, not a tuning result.
+
+Execution is a directed-worker model:
+
+1. **Codex owns the architecture.** Codex maintains this controller, the frozen
+   ledger, subsystem boundaries, invariants, denominator, oracle policy,
+   acceptance criteria, signed-artifact provenance, and integration order.
+   Architectural judgment and any decision that could weaken the gate remain
+   here; they are never delegated by implication.
+2. **Antigravity takes substantial guided swings.** Prefer delegating a cohesive
+   subsystem or differential cluster large enough to include diagnosis, durable
+   tracing, rearchitecture where evidence requires it, implementation,
+   adjacent regression coverage, focused gates, signed reproduction, and a
+   narrow commit. Do not fragment work into single-errno microtasks merely to
+   make delegation look bounded. The brief supplies the architecture fence,
+   invariants, exact evidence, required commands, forbidden shortcuts, and a
+   clean isolated worktree; within that fence, trust the worker to execute and
+   iterate aggressively.
+3. **Codex reviews reality, not the report.** Every worker result is a claim
+   until Codex reads the actual diff and commit, checks it against Carrick's
+   ownership/lifetime model, reruns the decisive host and signed conformance
+   gates, verifies receipts and scoped cleanup, and reviews performance impact.
+   Concrete findings go back to the same worker for correction. Codex alone
+   integrates accepted work and advances the controller.
+4. **Instrumentation precedes architecture changes.** Lead guest diagnosis with
+   `carrick trace` and durable fail-closed D scripts. Use `carrick debug`, LLDB,
+   and real carrier cores when tracing perturbs or cannot observe the failure.
+   Run `sudo -nl` before privileged tracing/debugging and use run-ID-scoped
+   cleanup. Docker bpftrace remains the Linux syscall-shape authority. Carrick
+   and Docker phases are always serialized.
+5. **Take the biggest evidence-supported next bite.** Rank current deterministic
+   Carrick-specific failures by shared core-emulation cause and closure value.
+   Prefer one architectural correction that retires an honest cluster over a
+   sequence of local patches. Avoid broad speculative migrations and timeout
+   rabbit holes: expand scope only when a reducer or trace proves the shared
+   seam.
+
+Complete only when fail-closed gate integrity, exact correctness, and the <=2x
+performance gate pass together on the final integrated signed artifact. Do not
+push unless explicitly asked. Preserve unrelated worktree changes.
+
+## Historical prerequisite objective — closed, retained for provenance
 
 On the canonical macOS / Apple Silicon / HVF / HVPatch arm64 lane, make the
 HVPatch kernel's process lifecycle correct on one honest code path. Complete
