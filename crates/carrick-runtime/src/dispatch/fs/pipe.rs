@@ -41,6 +41,10 @@ pub(crate) struct PipeInner {
 
 pub(crate) type PipeRef = Arc<PipeInner>;
 
+pub(crate) fn pipe_writer_is_writable(state: &PipeState) -> bool {
+    state.capacity.saturating_sub(state.buffer.len()) >= PIPE_BUF
+}
+
 impl PipeInner {
     pub(crate) fn new(pipe_id: u64, capacity: usize) -> Self {
         let capacity = capacity.clamp(PIPE_BUF, MAX_PIPE_CAPACITY);
@@ -90,7 +94,7 @@ impl PipeInner {
             }
         }
 
-        let write_ready = state.readers == 0 || state.buffer.len() < state.capacity;
+        let write_ready = state.readers == 0 || pipe_writer_is_writable(state);
         if let Some((r, w)) = &self.write_pipe_ready {
             if write_ready {
                 if !self.write_notified.swap(true, Ordering::SeqCst) {
@@ -343,6 +347,16 @@ mod tests {
     use super::*;
     use crate::dispatch::{InternalWaitKind, WaitFdAuthority};
 
+    fn write_readiness_is_signaled(pipe: &PipeInner) -> bool {
+        let fd = pipe.write_poll_fd().expect("write readiness fd");
+        let mut pollfd = libc::pollfd {
+            fd: fd.raw(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        unsafe { libc::poll(&mut pollfd, 1, 0) > 0 && pollfd.revents & libc::POLLIN != 0 }
+    }
+
     #[test]
     fn in_memory_pipe_basic_read_write() {
         let pipe = Arc::new(PipeInner::new_connected(1, 65536));
@@ -368,6 +382,42 @@ mod tests {
         let read_n = read_pipe_bytes(&mut buf, &pipe, 0, tid).expect("read");
         assert_eq!(read_n, data.len());
         assert_eq!(&buf[..], data);
+    }
+
+    #[test]
+    fn in_memory_pipe_write_readiness_requires_pipe_buf_room() {
+        let pipe = Arc::new(PipeInner::new_connected(5, PIPE_BUF));
+        let authority = WaitFdAuthority::internal(InternalWaitKind::CarrierControl);
+        let tid = crate::thread::ThreadId::synthetic_for_tests(5);
+        let payload = vec![0x55; PIPE_BUF];
+
+        assert!(write_readiness_is_signaled(&pipe));
+        assert_eq!(
+            write_pipe(&payload, &pipe, LINUX_O_NONBLOCK, 4, authority, || false),
+            DispatchOutcome::Returned {
+                value: PIPE_BUF as i64
+            }
+        );
+        assert!(!write_readiness_is_signaled(&pipe));
+
+        let mut half = vec![0; PIPE_BUF / 2];
+        assert_eq!(
+            read_pipe_bytes(&mut half, &pipe, LINUX_O_NONBLOCK, tid),
+            Ok(PIPE_BUF / 2)
+        );
+        assert!(
+            !write_readiness_is_signaled(&pipe),
+            "free space below PIPE_BUF must not be writable"
+        );
+
+        assert_eq!(
+            read_pipe_bytes(&mut half, &pipe, LINUX_O_NONBLOCK, tid),
+            Ok(PIPE_BUF / 2)
+        );
+        assert!(
+            write_readiness_is_signaled(&pipe),
+            "PIPE_BUF free bytes must be writable"
+        );
     }
 
     #[test]

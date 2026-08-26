@@ -908,7 +908,7 @@ impl SyscallDispatcher {
                 if state.readers == 0 {
                     ready |= LINUX_EPOLLERR | LINUX_EPOLLHUP;
                 } else if requested_events & LINUX_EPOLLOUT != 0
-                    && state.buffer.len() < state.capacity
+                    && crate::dispatch::fs::pipe::pipe_writer_is_writable(&state)
                 {
                     ready |= LINUX_EPOLLOUT;
                 }
@@ -1880,7 +1880,7 @@ impl SyscallDispatcher {
                 if state.readers == 0 {
                     ready |= LINUX_POLLERR;
                 } else if requested_events & LINUX_POLLOUT != 0
-                    && state.buffer.len() < state.capacity
+                    && crate::dispatch::fs::pipe::pipe_writer_is_writable(&state)
                 {
                     ready |= LINUX_POLLOUT;
                 }
