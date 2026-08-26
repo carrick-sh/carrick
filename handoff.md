@@ -1,6 +1,6 @@
 # Carrick exact conformance closure handoff
 
-**Updated:** 2026-08-26 (session 11 — synthetic-device splice closure)
+**Updated:** 2026-08-26 (session 12 — sparse-file swing rejected; memfd fallback next)
 
 **Canonical host/lane:** macOS, Apple Silicon, HVF/HVPatch, Linux arm64 guest
 
@@ -114,6 +114,58 @@ format check, and workspace compile/Clippy, then exited 2 at the pre-existing
 broad `lint-domains` host-authority escape scan (`checked Rust token helper
 exited 2: no diagnostic`). Task 4.35 changes no host-authority catalog site; do
 not mix an inventory/tooling repair into this accepted reducer.
+
+## Rejected swing — Task 4.36 sparse-file semantics
+
+Codex re-ranked the 133 remaining frozen assertion gaps and selected
+`ltp-lseek11` (16 rows) as the next substantial deterministic core-emulation
+cluster, with `ltp-memfd_create04` (12 rows) as the bounded fallback. The
+accepted base remains `fc640c3f499aa1b048703f1bf23abff7738ed078`; the clean
+worker branch/worktree is `agy/sparse-file-t436` at
+`.worktrees/sparse-file-t436`.
+
+The architecture fence treats sparse layout as inode/backing authority, never
+fd-local offset state and never a scan for zero bytes. The canonical host-file
+path must derive Linux SEEK_DATA/SEEK_HOLE from authenticated APFS allocation
+extents, preserve EOF/ENXIO/shared-offset/error-precedence semantics, and make
+`FALLOC_FL_PUNCH_HOLE` create a real hole instead of returning silent success.
+Any in-memory extent model must remain coherent across aliases, writes,
+truncation, and fallocate; if that expands into an unbounded VFS-wide migration,
+the worker must stop after a fail-closed trace and Codex will take the memfd
+fallback rather than accept a local shortcut.
+
+The Antigravity worker proved the frozen signed red and produced useful APFS
+reducers plus a fail-closed trace, but Codex stopped and rejected the
+implementation before commit. The dirty diff added an `fsync` and block-by-block
+extent scan to each sparse seek, hard-coded 4 KiB/16 KiB allocation behavior,
+silently discarded punch-hole failures, punched holes as a side effect of
+ordinary seeks and writes, and zero-filled the in-memory path while claiming
+hole semantics. Those violate the performance, authority, and honesty fences.
+Nothing from `.worktrees/sparse-file-t436` is integrated; keep it quarantined as
+diagnostic evidence only. The frozen ledger remains **23/156 focused-closed;
+133 remain**.
+
+The next bounded fallback is `ltp-memfd_create04` (12 assertion-pair identity
+gaps). The visible symptom is exact: Carrick accepts all nine encoded hugepage
+sizes while Linux accepts 64 KiB, 2 MiB, and 1 GiB and rejects the other six.
+Do not fix this with a six-value allowlist that leaves a dense ordinary memfd
+pretending to be hugetlb-backed. The next architecture brief must bind flag
+validation to an explicit virtual-kernel hugepage capability and carry the
+selected hugepage size into memfd/mmap/truncate semantics, or stop partial if
+that honest backing contract cannot be closed in one bounded swing.
+
+## Active swing — Task 4.37 typed huge-memfd capability
+
+The clean worker branch/worktree is `agy/memfd-huge-t437` at
+`.worktrees/memfd-huge-t437`, based exactly on the accepted `fc640c3f` source.
+Antigravity run `core-roadmap-t437` has a 20-minute bounded turn. Its contract
+requires signed red-first proof, nine exact memfd flag/result Trace events,
+serialized Docker bpftrace, a typed guest-architecture hugepage capability,
+propagation of the chosen size into shared memfd authority, and adjacent
+truncate/mmap/seal controls. A creation-only allowlist is explicitly forbidden;
+the worker must return partial if it cannot preserve the hugetlb property beyond
+`memfd_create` honestly. Codex will inspect the actual diff and rerun decisive
+gates before any integration.
 
 ## Historical prerequisite objective — closed, retained for provenance
 
