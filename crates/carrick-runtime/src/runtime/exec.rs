@@ -239,7 +239,6 @@ mod tests {
             .expect("exec stage-1 table region");
         for va in [
             0x0040_0000,
-            carrick_mem::memory::LINUX_HEAP_BASE,
             carrick_mem::memory::LINUX_MMAP_BASE,
             carrick_mem::memory::LINUX_SHARED_FILE_BASE,
             carrick_mem::memory::LINUX_STACK_TOP - 0x4000,

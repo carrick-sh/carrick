@@ -2666,41 +2666,60 @@ impl SyscallDispatcher {
                 });
             }
             if range_within(requested, 0, mem.layout.heap_base, mem.layout.heap_size) {
-                if requested < current {
-                    let page_size = this.linux_page_size();
-                    let Some(clear_start) = align_up_u64(requested, page_size) else {
-                        return Ok(DispatchOutcome::Returned {
-                            value: current as i64,
-                        });
-                    };
-                    let Some(clear_end) = align_up_u64(current, page_size) else {
-                        return Ok(DispatchOutcome::Returned {
-                            value: current as i64,
-                        });
-                    };
-                    let Some(clear_len) = clear_end
-                        .checked_sub(clear_start)
+                let page_size = this.linux_page_size();
+                let Some(old_page_end) = align_up_u64(current, page_size) else {
+                    return Ok(DispatchOutcome::Returned {
+                        value: current as i64,
+                    });
+                };
+                let Some(new_page_end) = align_up_u64(requested, page_size) else {
+                    return Ok(DispatchOutcome::Returned {
+                        value: current as i64,
+                    });
+                };
+
+                if new_page_end > old_page_end {
+                    // Grow: revalidate old-page-end..new-page-end identity leaves as RW,
+                    // then publish RW in MemoryProtections (clearing unmapped atomically), then commit.
+                    let grow_start = old_page_end;
+                    let Some(grow_len) = new_page_end
+                        .checked_sub(old_page_end)
                         .and_then(|len| usize::try_from(len).ok())
                     else {
                         return Ok(DispatchOutcome::Returned {
                             value: current as i64,
                         });
                     };
-                    if clear_len != 0
-                        && let Err(error) = cx.memory.zero_backing(clear_start, clear_len)
-                    {
-                        if std::env::var_os("CARRICK_FORK_DEBUG_VA").is_some() {
-                            eprintln!(
-                                "[BRKDBG] shrink {current:#x} -> {requested:#x} REFUSED: \
-                                 zero_backing({clear_start:#x}, {clear_len:#x}) = {error:?}"
-                            );
-                        }
+                    let rw = crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE;
+                    if cx.memory.protect_range(grow_start, grow_len, rw).is_err() {
+                        std::process::abort();
+                    }
+                    cx.memory.set_mapping_protection(grow_start, grow_len, false, false);
+                    mem.brk_current = requested;
+                    host_alias_dispatch.mark_vma_revision(this.mem().revision_publisher());
+                } else if new_page_end < old_page_end {
+                    // Shrink: first make removed page tail stage-1-invalid, then publish
+                    // unmapped, then zero raw backing for safe reuse, then commit.
+                    let shrink_start = new_page_end;
+                    let Some(shrink_len) = old_page_end
+                        .checked_sub(new_page_end)
+                        .and_then(|len| usize::try_from(len).ok())
+                    else {
                         return Ok(DispatchOutcome::Returned {
                             value: current as i64,
                         });
+                    };
+                    if cx.memory.protect_range(shrink_start, shrink_len, 0).is_err() {
+                        std::process::abort();
                     }
-                }
-                if requested != current {
+                    cx.memory.set_unmapped(shrink_start, shrink_len, true);
+                    if cx.memory.zero_backing(shrink_start, shrink_len).is_err() {
+                        std::process::abort();
+                    }
+                    mem.brk_current = requested;
+                    host_alias_dispatch.mark_vma_revision(this.mem().revision_publisher());
+                } else if requested != current {
+                    // Same-page movement: only update byte-precise break.
                     mem.brk_current = requested;
                     host_alias_dispatch.mark_vma_revision(this.mem().revision_publisher());
                 }

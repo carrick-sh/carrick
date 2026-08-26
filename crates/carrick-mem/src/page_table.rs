@@ -1634,7 +1634,7 @@ impl PageTableManager {
 mod tests {
     use super::*;
     use crate::memory::{
-        LINUX_ALIAS_IPA_BASE, LINUX_HEAP_BASE, LINUX_HIGH_VA_THRESHOLD,
+        LINUX_ALIAS_IPA_BASE, LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_HIGH_VA_THRESHOLD,
         LINUX_HVPATCH_GLOBAL_FRAME_BASE, LINUX_MMAP_BASE, LINUX_PAGE_TABLES_BASE,
         LINUX_PRIVATE_OVERLAY_BASE, LINUX_SHARED_FILE_BASE, mmap_arena_size,
         stage1_hvpatch_page_tables, stage1_identity_page_tables,
@@ -2713,5 +2713,138 @@ mod tests {
         let (after, _, _) = rebuilt.pool_stats();
         assert!(after > rebuilt_used, "fresh table allocated");
         assert_eq!(rebuilt.ap_bits(ro_va), AP_RO, "boot edit survives");
+    }
+
+    #[test]
+    fn stage1_heap_starts_invalid_and_preserves_neighbors() {
+        for (image_name, bytes, expect_ng) in [
+            ("compatibility", stage1_identity_page_tables(), false),
+            ("hvpatch", stage1_hvpatch_page_tables(), true),
+        ] {
+            let walk_leaf =
+                |va| terminal_descriptor(walk_descriptors(&bytes, LINUX_PAGE_TABLES_BASE, va));
+
+            // Heap base must start invalid.
+            let heap_base_leaf = walk_leaf(LINUX_HEAP_BASE);
+            assert_eq!(
+                heap_base_leaf & VALID,
+                0,
+                "{image_name}: heap base {:#x} must start invalid",
+                LINUX_HEAP_BASE
+            );
+
+            // Last page of the 128 MiB heap reservation must start invalid.
+            let last_heap_page = LINUX_HEAP_BASE + LINUX_HEAP_SIZE - 0x1000;
+            let last_heap_leaf = walk_leaf(last_heap_page);
+            assert_eq!(
+                last_heap_leaf & VALID,
+                0,
+                "{image_name}: last heap page {:#x} must start invalid",
+                last_heap_page
+            );
+
+            // First address past heap reservation must retain validity.
+            let past_heap = LINUX_HEAP_BASE + LINUX_HEAP_SIZE;
+            let past_heap_leaf = walk_leaf(past_heap);
+            assert_ne!(
+                past_heap_leaf & VALID,
+                0,
+                "{image_name}: past heap {:#x} must be valid",
+                past_heap
+            );
+            if expect_ng {
+                assert_ne!(
+                    past_heap_leaf & NON_GLOBAL,
+                    0,
+                    "{image_name}: past heap {:#x} must be nG",
+                    past_heap
+                );
+            }
+
+            // Neighboring/non-heap mappings retain prior validity and ASID scoping.
+            for (name, va) in [
+                ("user text", 0x0040_0000),
+                ("mmap", LINUX_MMAP_BASE),
+                ("shared aperture", LINUX_SHARED_FILE_BASE),
+            ] {
+                let leaf = walk_leaf(va);
+                assert_ne!(
+                    leaf & VALID,
+                    0,
+                    "{image_name}: {name} at {va:#x} must be valid"
+                );
+                if expect_ng {
+                    assert_ne!(
+                        leaf & NON_GLOBAL,
+                        0,
+                        "{image_name}: {name} at {va:#x} must be nG"
+                    );
+                } else {
+                    assert_eq!(
+                        leaf & NON_GLOBAL,
+                        0,
+                        "{image_name}: {name} at {va:#x} must be global"
+                    );
+                }
+            }
+        }
+
+        // HVPatch live heap transition in multi-vCPU mode:
+        let hvpatch_bytes = stage1_hvpatch_page_tables();
+        let mut mgr = PageTableManager::new(hvpatch_bytes, LINUX_PAGE_TABLES_BASE);
+        mgr.set_multi_vcpu(true);
+
+        // 1. Grow: make first heap page (0x1000) RW.
+        mgr.set_rw(LINUX_HEAP_BASE, 0x1000, false)
+            .expect("grow heap page to RW");
+        let bytes_after_grow = mgr.into_bytes();
+        let walk_grow = |va| {
+            terminal_descriptor(walk_descriptors(
+                &bytes_after_grow,
+                LINUX_PAGE_TABLES_BASE,
+                va,
+            ))
+        };
+
+        let grown_leaf = walk_grow(LINUX_HEAP_BASE);
+        assert_ne!(grown_leaf & VALID, 0, "grown heap page must be valid");
+        assert_eq!(
+            grown_leaf & AP_MASK,
+            AP_RW,
+            "grown heap page must be writable (RW)"
+        );
+        assert_ne!(
+            grown_leaf & NON_GLOBAL,
+            0,
+            "grown heap page must be nG (ASID-scoped)"
+        );
+
+        let next_heap_leaf = walk_grow(LINUX_HEAP_BASE + 0x1000);
+        assert_eq!(
+            next_heap_leaf & VALID,
+            0,
+            "next heap page must remain invalid"
+        );
+
+        // 2. Shrink: make first heap page PROT_NONE again.
+        let mut mgr2 = PageTableManager::new(bytes_after_grow, LINUX_PAGE_TABLES_BASE);
+        mgr2.set_multi_vcpu(true);
+        mgr2.set_prot_none(LINUX_HEAP_BASE, 0x1000)
+            .expect("shrink heap page to PROT_NONE");
+        let bytes_after_shrink = mgr2.into_bytes();
+        let walk_shrink = |va| {
+            terminal_descriptor(walk_descriptors(
+                &bytes_after_shrink,
+                LINUX_PAGE_TABLES_BASE,
+                va,
+            ))
+        };
+
+        let shrunk_leaf = walk_shrink(LINUX_HEAP_BASE);
+        assert_eq!(
+            shrunk_leaf & VALID,
+            0,
+            "shrunk heap page must return to invalid"
+        );
     }
 }

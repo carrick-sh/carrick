@@ -2760,7 +2760,13 @@ pub fn stage1_identity_page_tables() -> Vec<u8> {
     let rosetta_block = (LINUX_ROSETTA_IPA_BASE & PA_MASK_2MIB) | USER_BLOCK_FLAGS;
     bytes[0x7000..0x7008].copy_from_slice(&rosetta_block.to_le_bytes());
 
-    bytes
+    let mut mgr = crate::page_table::PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE);
+    mgr.set_multi_vcpu(true);
+    let heap_size = usize::try_from(LINUX_HEAP_SIZE).unwrap_or_else(|_| std::process::abort());
+    if mgr.set_prot_none(LINUX_HEAP_BASE, heap_size).is_err() {
+        std::process::abort();
+    }
+    mgr.into_bytes()
 }
 
 /// Build the per-mm HVPatch stage-1 image.
@@ -4641,8 +4647,10 @@ mod stage1_tests {
         );
 
         // L1A[1..511] are USER 1 GiB BLOCK descriptors (AP=01, PXN=1, UXN=0),
-        // EXCEPT the entry covering the kernel hole, which is a TABLE → L2_B.
+        // EXCEPT the entry covering the kernel hole, which is a TABLE → L2_B,
+        // and the entry covering the heap, which is split into an L2 table.
         let kernel_l1_index = (LINUX_KERNEL_REGION_BASE >> 30) as usize;
+        let heap_l1_index = (LINUX_HEAP_BASE >> 30) as usize;
         for index in 1..512usize {
             let d = read_u64_le(&bytes, 0x1000 + index * 8);
             if index == kernel_l1_index {
@@ -4655,6 +4663,14 @@ mod stage1_tests {
                     d & 0x0000_FFFF_FFFF_F000,
                     LINUX_PAGE_TABLES_BASE + 0x4000,
                     "L1A[{}] must point at L2_B",
+                    index
+                );
+                continue;
+            }
+            if index == heap_l1_index {
+                assert!(
+                    valid_table(d),
+                    "L1A[{}] (heap split) must be a table",
                     index
                 );
                 continue;
@@ -4790,7 +4806,6 @@ mod stage1_tests {
         let bytes = stage1_hvpatch_page_tables();
         for (name, va) in [
             ("user text", 0x0040_0000),
-            ("heap", LINUX_HEAP_BASE),
             ("mmap", LINUX_MMAP_BASE),
             ("shared aperture", LINUX_SHARED_FILE_BASE),
             ("stack", LINUX_STACK_TOP - 0x4000),
@@ -4920,15 +4935,15 @@ mod stage1_tests {
     fn page_tables_reserve_spare_pool_within_kernel_block() {
         let bytes = stage1_identity_page_tables();
         assert_eq!(bytes.len() as u64, LINUX_PAGE_TABLES_SIZE);
-        // Eight boot tables (0..0x8000: six identity + two Rosetta alias); the
-        // rest is a spare pool of >=8 pages.
-        let spare_pages = (LINUX_PAGE_TABLES_SIZE - 0x8000) / 0x1000;
+        // Nine boot tables (0..0x9000: six identity + two Rosetta alias + one heap L2);
+        // the rest is a spare pool of >=7 pages.
+        let spare_pages = (LINUX_PAGE_TABLES_SIZE - 0x9000) / 0x1000;
         assert!(
-            spare_pages >= 8,
+            spare_pages >= 7,
             "need a spare-table pool, got {spare_pages}"
         );
         // Spare tail is zero-filled (invalid descriptors).
-        assert!(bytes[0x8000..].iter().all(|&b| b == 0));
+        assert!(bytes[0x9000..].iter().all(|&b| b == 0));
         // Whole table region stays inside the kernel hole's first 2 MiB block,
         // so it remains kernel-only (EL1) after the size bump.
         let region_end_off =
