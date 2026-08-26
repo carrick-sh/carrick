@@ -1863,6 +1863,327 @@ fn splice_pipe_to_writable_null_and_zero_devices_consumes_bytes() {
     }
 }
 
+struct SpliceTestRig {
+    dispatcher: SyscallDispatcher,
+    memory: LinearMemory,
+    reporter: CompatReporter,
+}
+
+impl SpliceTestRig {
+    const SYS_OPENAT: u64 = 56;
+    const SYS_CLOSE: u64 = 57;
+    const SYS_PIPE2: u64 = 59;
+    const SYS_READ: u64 = 63;
+    const SYS_WRITE: u64 = 64;
+    const SYS_SENDFILE: u64 = 71;
+    const SYS_SPLICE: u64 = 76;
+    const SYS_COPY_FILE_RANGE: u64 = 285;
+
+    fn new(mem_size: usize) -> Self {
+        Self {
+            dispatcher: SyscallDispatcher::new(),
+            memory: LinearMemory::new(0x4000, vec![0; mem_size]),
+            reporter: CompatReporter::default(),
+        }
+    }
+
+    fn run(&mut self, nr: u64, args: [u64; 6]) -> DispatchOutcome {
+        self.dispatcher
+            .dispatch(
+                &self.dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(nr, SyscallArgs::from(args)),
+                &mut self.memory,
+                &self.reporter,
+            )
+            .expect("dispatch")
+    }
+
+    fn pipe2(&mut self, fds_addr: u64) -> (u64, u64) {
+        assert_eq!(
+            self.run(Self::SYS_PIPE2, [fds_addr, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        let pair = self.memory.read_bytes(fds_addr, 8).unwrap();
+        let rfd = i32::from_ne_bytes(pair[0..4].try_into().unwrap()) as u64;
+        let wfd = i32::from_ne_bytes(pair[4..8].try_into().unwrap()) as u64;
+        (rfd, wfd)
+    }
+
+    fn open(&mut self, path_addr: u64, path: &[u8], flags: u64) -> u64 {
+        self.memory.write_bytes(path_addr, path).unwrap();
+        match self.run(
+            Self::SYS_OPENAT,
+            [LINUX_AT_FDCWD, path_addr, flags, 0, 0, 0],
+        ) {
+            DispatchOutcome::Returned { value } => value as u64,
+            other => panic!("open {path:?} failed: {other:?}"),
+        }
+    }
+
+    fn close(&mut self, fd: u64) {
+        assert_eq!(
+            self.run(Self::SYS_CLOSE, [fd, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 },
+        );
+    }
+}
+
+/// Splicing FROM readable synthetic character devices into a pipe write end:
+/// - /dev/zero and /dev/full yield requested zero bytes (LTP splice08).
+/// - /dev/null yields EOF (returns 0).
+/// - /dev/random and /dev/urandom yield pseudo-random bytes of requested length.
+#[test]
+fn splice_synthetic_devices_to_pipe_transfers_bytes_or_eof() {
+    let cases: &[(&[u8], usize, bool)] = &[
+        (b"/dev/zero\0", 1009, true),
+        (b"/dev/full\0", 2018, true),
+        (b"/dev/null\0", 1009, false),
+        (b"/dev/urandom\0", 64, false),
+        (b"/dev/random\0", 64, false),
+    ];
+
+    for &(device_path, count, expect_zeroes) in cases {
+        let mut rig = SpliceTestRig::new(0x10000);
+        let (read_fd, write_fd) = rig.pipe2(0x4200);
+        let dev_fd = rig.open(0x4000, device_path, LINUX_O_RDONLY);
+
+        // 0-byte splice always returns 0 without consuming.
+        assert_eq!(
+            rig.run(SpliceTestRig::SYS_SPLICE, [dev_fd, 0, write_fd, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 },
+        );
+
+        // Nonzero splice from synthetic device to pipe.
+        let expected_return = if device_path == b"/dev/null\0" {
+            0
+        } else {
+            count as i64
+        };
+        assert_eq!(
+            rig.run(
+                SpliceTestRig::SYS_SPLICE,
+                [dev_fd, 0, write_fd, 0, count as u64, 0]
+            ),
+            DispatchOutcome::Returned {
+                value: expected_return
+            },
+        );
+
+        // Read transferred bytes from the pipe to verify.
+        if expected_return > 0 {
+            assert_eq!(
+                rig.run(
+                    SpliceTestRig::SYS_READ,
+                    [read_fd, 0x5000, count as u64, 0, 0, 0]
+                ),
+                DispatchOutcome::Returned {
+                    value: count as i64
+                },
+            );
+            let read_bytes = rig.memory.read_bytes(0x5000, count).unwrap();
+            if expect_zeroes {
+                assert!(read_bytes.iter().all(|&b| b == 0));
+            }
+        }
+
+        rig.close(dev_fd);
+        rig.close(read_fd);
+        rig.close(write_fd);
+    }
+}
+
+/// Splicing synthetic devices enforces open access mode, offset rules, and genuine pipe requirement:
+/// - O_WRONLY synthetic device returns EBADF.
+/// - Valid off_in pointer succeeds without altering offset in memory.
+/// - Unmapped off_in pointer returns EFAULT.
+/// - Splicing between two synthetic devices (no pipe) returns EINVAL.
+#[test]
+fn splice_synthetic_devices_access_mode_and_offset_rules() {
+    let mut rig = SpliceTestRig::new(0x10000);
+    let (_read_fd, write_fd) = rig.pipe2(0x4200);
+    rig.memory
+        .write_bytes(0x4300, &42u64.to_ne_bytes())
+        .unwrap();
+
+    // O_WRONLY device as source -> EBADF.
+    let dev_wo = rig.open(0x4000, b"/dev/zero\0", LINUX_O_WRONLY);
+    assert_eq!(
+        rig.run(SpliceTestRig::SYS_SPLICE, [dev_wo, 0, write_fd, 0, 100, 0]),
+        DispatchOutcome::errno(LINUX_EBADF),
+    );
+
+    // O_RDONLY device as source.
+    let dev_ro = rig.open(0x4000, b"/dev/zero\0", LINUX_O_RDONLY);
+
+    // Valid non-NULL off_in succeeds and does not modify the memory offset.
+    assert_eq!(
+        rig.run(
+            SpliceTestRig::SYS_SPLICE,
+            [dev_ro, 0x4300, write_fd, 0, 100, 0]
+        ),
+        DispatchOutcome::Returned { value: 100 },
+    );
+    let off_after = u64::from_ne_bytes(
+        rig.memory
+            .read_bytes(0x4300, 8)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(off_after, 42);
+
+    // Unmapped/faulty off_in returns EFAULT.
+    assert_eq!(
+        rig.run(
+            SpliceTestRig::SYS_SPLICE,
+            [dev_ro, 0xdeadbeef0000, write_fd, 0, 100, 0]
+        ),
+        DispatchOutcome::errno(LINUX_EFAULT),
+    );
+
+    // Splice between two synthetic devices (neither end is a pipe) returns EINVAL.
+    let null_rw = rig.open(0x4020, b"/dev/null\0", LINUX_O_RDWR);
+    assert_eq!(
+        rig.run(SpliceTestRig::SYS_SPLICE, [dev_ro, 0, null_rw, 0, 100, 0]),
+        DispatchOutcome::errno(LINUX_EINVAL),
+    );
+}
+
+/// Splicing synthetic devices into a pipe respects pipe write room:
+/// - Transfers only up to available room.
+/// - Full pipe returns WaitOnFds under blocking mode, parking on pipe readiness and carrying slot authorities.
+/// - Full pipe returns EAGAIN under nonblocking mode.
+#[test]
+fn splice_synthetic_devices_pipe_capacity_and_nonblocking() {
+    let mut rig = SpliceTestRig::new(0x20000);
+    let (_read_fd, write_fd) = rig.pipe2(0x4200);
+    let dev_fd = rig.open(0x4000, b"/dev/zero\0", LINUX_O_RDONLY);
+
+    // Splice 100 bytes into empty pipe.
+    assert_eq!(
+        rig.run(SpliceTestRig::SYS_SPLICE, [dev_fd, 0, write_fd, 0, 100, 0]),
+        DispatchOutcome::Returned { value: 100 },
+    );
+
+    // Fill the pipe to capacity.
+    let room = rig
+        .dispatcher
+        .splice_pipe_write_room(write_fd as i32)
+        .unwrap_or(0);
+    if room > 0 {
+        assert_eq!(
+            rig.run(
+                SpliceTestRig::SYS_WRITE,
+                [write_fd, 0x5000, room as u64, 0, 0, 0]
+            ),
+            DispatchOutcome::Returned { value: room as i64 },
+        );
+    }
+    assert_eq!(
+        rig.dispatcher.splice_pipe_write_room(write_fd as i32),
+        Some(0),
+        "full in-memory pipe must report zero room"
+    );
+
+    let (write_poll_fd, poll_events) = match &*rig
+        .dispatcher
+        .open_file(write_fd as i32)
+        .expect("write file")
+        .description
+        .read()
+    {
+        OpenDescription::PipeWriter { pipe, .. } => (
+            pipe.write_poll_fd()
+                .expect("pipe must have write poll fd")
+                .raw(),
+            libc::POLLIN,
+        ),
+        OpenDescription::HostPipe { host_fd, .. } => (host_fd.raw(), libc::POLLOUT),
+        other => panic!("unexpected open description: {other:?}"),
+    };
+
+    let dev_authority = rig
+        .dispatcher
+        .captured_slot_authority(dev_fd as i32)
+        .expect("dev authority");
+    let pipe_authority = rig
+        .dispatcher
+        .captured_slot_authority(write_fd as i32)
+        .expect("pipe authority");
+
+    // Blocking splice on full pipe must return WaitOnFds parking on pipe readiness
+    // and carrying both in and out slot authorities.
+    let outcome = rig.run(SpliceTestRig::SYS_SPLICE, [dev_fd, 0, write_fd, 0, 100, 0]);
+    let DispatchOutcome::WaitOnFds {
+        fds,
+        timeout,
+        on_timeout,
+        sig_mask,
+    } = outcome
+    else {
+        panic!("expected blocking splice on full pipe to return WaitOnFds, got {outcome:?}");
+    };
+    assert_eq!(timeout, None);
+    assert_eq!(on_timeout, LINUX_EAGAIN.guest_retval());
+    assert_eq!(sig_mask, carrick_abi::WaitSigMask::NONE);
+    assert_eq!(
+        fds.first(),
+        Some((write_poll_fd, poll_events)),
+        "full pipe must park on pipe readiness fd"
+    );
+    let auths = fds.logical_authorities_for_test();
+    assert!(
+        auths.contains(&dev_authority),
+        "WaitOnFds must contain input slot authority"
+    );
+    assert!(
+        auths.contains(&pipe_authority),
+        "WaitOnFds must contain output slot authority"
+    );
+
+    // Splicing with SPLICE_F_NONBLOCK into full pipe returns EAGAIN.
+    assert_eq!(
+        rig.run(
+            SpliceTestRig::SYS_SPLICE,
+            [
+                dev_fd,
+                0,
+                write_fd,
+                0,
+                100,
+                carrick_abi::LINUX_SPLICE_F_NONBLOCK
+            ],
+        ),
+        DispatchOutcome::errno(LINUX_EAGAIN),
+    );
+}
+
+/// sendfile and copy_file_range reject synthetic devices with EINVAL (no widening).
+#[test]
+fn sendfile_and_copy_file_range_reject_synthetic_device() {
+    let mut rig = SpliceTestRig::new(0x10000);
+    let (_read_fd, write_fd) = rig.pipe2(0x4200);
+    let dev_fd = rig.open(0x4000, b"/dev/zero\0", LINUX_O_RDONLY);
+
+    // copy_file_range rejects SyntheticDevice with EINVAL.
+    assert_eq!(
+        rig.run(
+            SpliceTestRig::SYS_COPY_FILE_RANGE,
+            [dev_fd, 0, write_fd, 0, 100, 0]
+        ),
+        DispatchOutcome::errno(LINUX_EINVAL),
+    );
+
+    // sendfile rejects SyntheticDevice with EINVAL.
+    assert_eq!(
+        rig.run(
+            SpliceTestRig::SYS_SENDFILE,
+            [write_fd, dev_fd, 0, 100, 0, 0]
+        ),
+        DispatchOutcome::errno(LINUX_EINVAL),
+    );
+}
+
 #[test]
 fn splice_pushback_keeps_large_stages_chunked() {
     let mut pushback = fs::SplicePushback::default();
