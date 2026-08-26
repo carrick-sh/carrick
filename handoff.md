@@ -1,6 +1,6 @@
 # Carrick exact conformance closure handoff
 
-**Updated:** 2026-08-26 (session 10 — directed pipe-authority closure)
+**Updated:** 2026-08-26 (session 11 — synthetic-device splice closure)
 
 **Canonical host/lane:** macOS, Apple Silicon, HVF/HVPatch, Linux arm64 guest
 
@@ -57,48 +57,57 @@ Complete only when fail-closed gate integrity, exact correctness, and the <=2x
 performance gate pass together on the final integrated signed artifact. Do not
 push unless explicitly asked. Preserve unrelated worktree changes.
 
-## Current checkpoint — Task 4.33 pipe-end authority closed
+## Current checkpoint — Task 4.35 synthetic-device splice source closed
 
 The current accepted runtime source is
-`2937db4aec3c01455ee7c9563456f6601dd12376`.
-`ltp-pipe03` is exact MATCH 2/2 versus the cached native-arm64 Docker oracle,
-and the eight-suite pipe family is exact MATCH. The frozen true-differential
-ledger moves from 21/156 to 22/156 focused-closed; 134 remain before a fresh
-exhaustive 2,127-suite refresh.
+`6d0b8c7bbcfa21ca1383306e19076a3fdb74e6c7`. `ltp-splice08` is exact
+assertion-level MATCH 36/36 against a fresh native-arm64 Docker closure-v3
+oracle. This retires all 32 frozen assertion gaps in the suite and moves the
+true-differential ledger from 22/156 to **23/156 focused-closed; 133 remain**
+before a fresh exhaustive 2,127-suite refresh.
 
-The fix is at the shared execution seam, not a harness exception: in-memory
-`PipeReader` is admitted to threaded write dispatch so the existing handler can
-return `EBADF`, and wrong-end one-way pipe operations retain explicit Linux
-direction errors across scalar/vectored paths without changing pty,
-bidirectional FIFO, regular-file access-mode, or `tee` behavior. Fork-copy,
-shared-table, dup, and exec-successor authority tests preserve endpoint identity
-and shared stream lifetime.
+The fix is a splice-local typed source path for readable in-memory synthetic
+character devices. `/dev/null` produces EOF, `/dev/zero` and `/dev/full`
+produce bounded zero-filled chunks, and `/dev/random`/`/dev/urandom` produce
+bounded random bytes. Existing pipe-room short-transfer, blocking/nonblocking,
+slot-authority, access-mode, offset/error-precedence, and genuine-pipe rules
+remain authoritative. `sendfile` and `copy_file_range` still reject synthetic
+devices; they were not widened. Focused regression coverage includes full-pipe
+`WaitOnFds` authorities, nonblocking `EAGAIN`, valid and unmapped `off_in`,
+wrong access mode, device contents/EOF, and the non-widening boundary.
 
-The durable trace is
-`scripts/dtrace/hvpatch-pipe-end-authority.d`. Its accepted final receipt is
-`target/conformance/task433-pipe-authority/final-2937db4a-trace.out`, with 36
-selected entries/returns, one wrong-end write `EBADF`, one wrong-end read
-`EBADF`, six host-pipe I/O events, natural target exit, and a required zero exit
-receipt. Exact signed artifact: SHA-256
-`6fbbe5ec7060870e513dedcfcfe2b013a551615a07555c0066c300423aa7f58a`,
-CDHash `e17b1c43cc97686b5a7dfdc6d995c65faa2408d0`, LC_UUID
-`35CC0219-BEBB-3DAD-A845-CEC35517BFEB`, entitlement and DOF present. Host
-verification is 1,825/1,825 runtime tests plus fmt and Clippy. Both stamped
-conformance runs cleaned to zero processes.
+The durable fail-closed trace is
+`scripts/dtrace/hvpatch-splice08-synthetic-device.d`. On the exact accepted
+artifact it exited zero with `target-exited=1`, `timeout-bound=0`, 18 splice
+entries, 18 returns, 18 successful returns, two zero-length calls, zero
+`EINVAL`, and six host-pipe I/O events. Codex independently refreshed the
+closure-v3 Docker row (36 pass, zero fail/broken/skip), then compared all 36
+raw Carrick TPASS lines byte-for-byte with that fresh stream. Final signed
+artifact: SHA-256
+`a78cff33e5d0ffb62a752a6af71259c74c989642bc68c91d2cb732ec2006d080`,
+CDHash `74d102751225ab7720e7b79570c7e88c78bc9d33`, LC_UUID
+`8C6AFCBB-D821-32D2-8500-0B5BD79C937F`, hypervisor entitlement and
+`__dof_carrick` present. The full serialized runtime suite is 1,829/1,829;
+format and diff checks pass. All accepted trace/conformance run IDs clean to
+zero processes.
 
-Receipt: `.superpowers/sdd/handoff/task-4-33-report.md`. Next, re-rank one
-bounded deterministic core-emulation reducer from the remaining 134. Keep the
-deferred `setsid01` timeout out of scope until a shared execution seam is
-measured; do not start final performance work or treat the 0.17x–0.38x
-sub-second cached-oracle pipe ratios as controlled performance evidence.
+The final focused Carrick run was 390 ms versus the 209 ms regression oracle
+(1.87x); the fresh closure-v3 Docker row was 205 ms (1.90x by direct division).
+That is an encouraging sub-second row inside the eventual 2x bar, not aggregate
+performance closure. Do not extrapolate it to Go, CPython, Node, LTP overall,
+or cold go-build.
 
-Local `main` and `codex/conformance-core-roadmap` are fast-forwarded and 0/0
-aligned; no push occurred and the four unrelated Carrick-embed documents in
-the primary checkout remain untouched. Post-integration `RUST_TEST_THREADS=1
-just ci` passed frame pointers, formatting, workspace compile/Clippy, and
-domain lint, then exited 2 at the known broad host-authority inventory drift
-with `changed=[]`. Task 4.33 touches none of the listed catalog sites, so no
-inventory refresh is mixed into this reducer.
+Task 4.34 remains explicitly rejected and quarantined in
+`.worktrees/process-vm-authority-t434`: the attempted foreign-MM design did not
+provide typed pinned MM/backing-generation authority and was not integrated.
+Do not revive its diff. Re-rank one substantial deterministic core-emulation
+cluster from the remaining 133; keep `setsid01` and speculative subprocess or
+timeout work out of scope until a reducer proves a shared execution seam.
+
+Receipt: `.superpowers/sdd/handoff/task-4-35-report.md`. Local `main` and
+`codex/conformance-core-roadmap` are fast-forwarded and must remain 0/0 aligned;
+no push occurred and the four unrelated Carrick-embed documents in the primary
+checkout remain untouched.
 
 ## Historical prerequisite objective — closed, retained for provenance
 
