@@ -109,6 +109,12 @@ Receipt: `.superpowers/sdd/handoff/task-4-35-report.md`. Local `main` and
 no push occurred and the four unrelated Carrick-embed documents in the primary
 checkout remain untouched.
 
+Post-integration `RUST_TEST_THREADS=1 just ci` passed the frame-pointer gate,
+format check, and workspace compile/Clippy, then exited 2 at the pre-existing
+broad `lint-domains` host-authority escape scan (`checked Rust token helper
+exited 2: no diagnostic`). Task 4.35 changes no host-authority catalog site; do
+not mix an inventory/tooling repair into this accepted reducer.
+
 ## Historical prerequisite objective — closed, retained for provenance
 
 On the canonical macOS / Apple Silicon / HVF / HVPatch arm64 lane, make the
