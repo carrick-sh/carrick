@@ -14,7 +14,8 @@
  *     arg3=file_description_id (u64), arg4=lookup_kind (u32):
  *     0=live epoll, 1=live non-epoll replacement, 2=absent slot.
  * The consumer pairs both probes through self->epoll_syscall on the same host
- * thread. Use through `carrick trace --script ...` so $target is the carrier.
+ * thread. Use through `carrick trace --script ... --require-script-exit -- ...`
+ * so $target is the carrier and this script's terminal receipt is strict.
  *
  * The script self-exits after 12 seconds and fails closed unless it sees an
  * epoll syscall-service begin, a live fd-11 epoll lookup, and an fd-11 absent

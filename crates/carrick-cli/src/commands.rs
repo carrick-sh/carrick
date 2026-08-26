@@ -1426,6 +1426,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::Trace {
             flowindent,
             script,
+            require_script_exit,
             profile,
             summary_jsonl,
             core_artifact,
@@ -1574,6 +1575,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         store: store_path.as_deref(),
                         flowindent,
                         script: script.as_deref(),
+                        require_script_exit,
                         profile,
                         summary_jsonl: summary_jsonl.as_deref(),
                         core_artifact: core_artifact.as_deref(),
@@ -1864,9 +1866,11 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         .map_err(|error| anyhow::anyhow!("trace failed: {error}"))?;
                 if opts.script.is_some()
                     && profile.is_none()
-                    && custom_trace_report_is_lossy(report)
+                    && custom_trace_report_is_rejected(report, require_script_exit)
                 {
-                    bail!("custom DTrace capture was lossy, interrupted, or exited nonzero");
+                    bail!(
+                        "custom DTrace capture was lossy, interrupted, or violated its required exit receipt"
+                    );
                 }
                 if let Some(requested_profile) = profile {
                     let raw_path = output_path
@@ -2115,7 +2119,10 @@ fn build_source_marker_json() -> serde_json::Value {
     })
 }
 
-fn custom_trace_report_is_lossy(report: carrick_runtime::dtrace_consumer::DTraceRunReport) -> bool {
+fn custom_trace_report_is_rejected(
+    report: carrick_runtime::dtrace_consumer::DTraceRunReport,
+    require_script_exit: bool,
+) -> bool {
     report.principal_drops != 0
         || report.aggregation_drops != 0
         || report.dynamic_drops != 0
@@ -2123,8 +2130,7 @@ fn custom_trace_report_is_lossy(report: carrick_runtime::dtrace_consumer::DTrace
         || report.dynamic_dirty_drops != 0
         || report.other_drops != 0
         || report.interrupted
-        || !report.dtrace_exit_observed
-        || report.exit_status != 0
+        || (require_script_exit && (!report.dtrace_exit_observed || report.exit_status != 0))
 }
 
 fn run_volume_command(command: VolumeCommand) -> anyhow::Result<()> {
@@ -3115,35 +3121,48 @@ mod tests {
     }
 
     #[test]
-    fn custom_trace_drop_interrupt_or_missing_or_nonzero_exit_is_never_accepted() {
-        assert!(custom_trace_report_is_lossy(
-            carrick_runtime::dtrace_consumer::DTraceRunReport::default()
+    fn legacy_custom_trace_allows_missing_exit_but_rejects_loss_or_interruption() {
+        assert!(!custom_trace_report_is_rejected(
+            carrick_runtime::dtrace_consumer::DTraceRunReport::default(),
+            false,
         ));
-        assert!(custom_trace_report_is_lossy(
+        assert!(custom_trace_report_is_rejected(
             carrick_runtime::dtrace_consumer::DTraceRunReport {
                 principal_drops: 1,
                 ..Default::default()
-            }
+            },
+            false,
         ));
-        assert!(custom_trace_report_is_lossy(
+        assert!(custom_trace_report_is_rejected(
             carrick_runtime::dtrace_consumer::DTraceRunReport {
                 interrupted: true,
                 ..Default::default()
-            }
+            },
+            false,
         ));
-        assert!(!custom_trace_report_is_lossy(
+    }
+
+    #[test]
+    fn strict_custom_trace_requires_a_zero_exit_receipt() {
+        assert!(custom_trace_report_is_rejected(
+            carrick_runtime::dtrace_consumer::DTraceRunReport::default(),
+            true,
+        ));
+        assert!(!custom_trace_report_is_rejected(
             carrick_runtime::dtrace_consumer::DTraceRunReport {
                 dtrace_exit_observed: true,
                 exit_status: 0,
                 ..Default::default()
-            }
+            },
+            true,
         ));
-        assert!(custom_trace_report_is_lossy(
+        assert!(custom_trace_report_is_rejected(
             carrick_runtime::dtrace_consumer::DTraceRunReport {
                 dtrace_exit_observed: true,
                 exit_status: 1,
                 ..Default::default()
-            }
+            },
+            true,
         ));
     }
 

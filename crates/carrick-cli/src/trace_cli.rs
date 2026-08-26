@@ -68,6 +68,8 @@ pub(crate) struct TraceSudoInvocation<'a> {
     pub(crate) store: Option<&'a Path>,
     pub(crate) flowindent: bool,
     pub(crate) script: Option<&'a Path>,
+    /// Explicit strict terminal-receipt contract for one custom script.
+    pub(crate) require_script_exit: bool,
     pub(crate) profile: Option<TraceProfileKind>,
     pub(crate) summary_jsonl: Option<&'a Path>,
     pub(crate) core_artifact: Option<&'a Path>,
@@ -99,6 +101,9 @@ pub(crate) fn trace_sudo_argv(invocation: &TraceSudoInvocation<'_>) -> Vec<OsStr
     if let Some(script) = invocation.script {
         argv.push(OsString::from("--script"));
         argv.push(script.as_os_str().to_owned());
+    }
+    if invocation.require_script_exit {
+        argv.push(OsString::from("--require-script-exit"));
     }
     if let Some(profile) = invocation.profile {
         argv.push(OsString::from("--profile"));
@@ -296,6 +301,7 @@ mod tests {
             store: None,
             flowindent: false,
             script: None,
+            require_script_exit: false,
             profile: Some(TraceProfileKind::DsrIndirect),
             summary_jsonl: Some(Path::new("/tmp/summary.jsonl")),
             core_artifact: None,
@@ -340,6 +346,40 @@ mod tests {
     }
 
     #[test]
+    fn strict_script_exit_contract_survives_sudo_argv_reconstruction() {
+        let command = ["run".to_owned(), "fixture".to_owned()];
+        let argv = trace_sudo_argv(&TraceSudoInvocation {
+            executable: Path::new("/tmp/carrick"),
+            store: None,
+            flowindent: false,
+            script: Some(Path::new("/tmp/authority.d")),
+            require_script_exit: true,
+            profile: None,
+            summary_jsonl: None,
+            core_artifact: None,
+            profile_bound_seconds: None,
+            trace_out: None,
+            native_shape_snapshots: None,
+            preflight_quiet_host: false,
+            uid: 501,
+            gid: 20,
+            groups: &[],
+            forwarded_env: &[],
+            command: &command,
+        });
+        let strings: Vec<_> = argv
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            strings
+                .windows(2)
+                .any(|pair| pair == ["--script", "/tmp/authority.d"])
+        );
+        assert!(strings.contains(&"--require-script-exit".to_owned()));
+    }
+
+    #[test]
     fn core_artifact_survives_sudo_argv_reconstruction() {
         let command = ["run-elf".to_owned(), "/tmp/probe".to_owned()];
         let argv = trace_sudo_argv(&TraceSudoInvocation {
@@ -347,6 +387,7 @@ mod tests {
             store: None,
             flowindent: false,
             script: None,
+            require_script_exit: false,
             profile: Some(TraceProfileKind::HvpatchCoreLifecycle),
             summary_jsonl: None,
             core_artifact: Some(Path::new("/tmp/coredumpfile/core")),
@@ -388,6 +429,7 @@ mod tests {
             store: None,
             flowindent: false,
             script: None,
+            require_script_exit: false,
             profile: Some(TraceProfileKind::NativeWall),
             summary_jsonl: None,
             core_artifact: None,
@@ -440,6 +482,7 @@ mod tests {
             store: Some(Path::new("/tmp/store")),
             flowindent: false,
             script: None,
+            require_script_exit: false,
             profile: Some(TraceProfileKind::NativeWall),
             summary_jsonl: None,
             core_artifact: None,
@@ -483,6 +526,7 @@ mod tests {
             store: None,
             flowindent: false,
             script: None,
+            require_script_exit: false,
             profile: Some(TraceProfileKind::NativeFault),
             summary_jsonl: None,
             core_artifact: None,
@@ -532,6 +576,7 @@ mod tests {
             store: None,
             flowindent: false,
             script: None,
+            require_script_exit: false,
             profile: Some(TraceProfileKind::NativeShape),
             summary_jsonl: Some(Path::new("/tmp/native-shape.jsonl")),
             core_artifact: None,
