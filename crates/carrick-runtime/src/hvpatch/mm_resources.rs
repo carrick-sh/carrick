@@ -9,15 +9,18 @@ use super::stage1_mm::{
     PreparedStage1Mm, PreparedStage1MmAbort, PreparedStage1MmRetirement, Stage1MmBackend,
     Stage1MmError, Stage1MmLease, Stage1MmPool, Stage1MmRetirement,
 };
-use crate::kernel::{Stage1RootError, TaskKey, ThreadKey};
+#[cfg(test)]
+use crate::kernel::ThreadKey;
+use crate::kernel::{Stage1RootError, TaskKey};
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ExecOwnerObservation {
     owner_count: u32,
 }
 
+#[cfg(test)]
 impl ExecOwnerObservation {
-    #[cfg(test)]
     pub(crate) const fn owner_count(self) -> u32 {
         self.owner_count
     }
@@ -137,6 +140,16 @@ impl ExecDispositionSettlementTrace {
 pub(crate) enum ExecMmDisposition {
     RetainOldMm,
     RetireOldMm(PreparedStage1MmRetirement),
+}
+
+/// Read-only view of the topology decision pinned by an exec reservation.
+///
+/// This is deliberately exhaustive: consumers must route backend sharing and
+/// retirement inventory from the reservation, never from a later owner count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExecMmDispositionKind {
+    RetainOldMm,
+    RetireOldMm,
 }
 
 #[derive(Debug)]
@@ -274,6 +287,21 @@ impl ExecMmReservation {
 
     pub(crate) fn replacement_asid_generation(&self) -> AsidGeneration {
         self.active().0.asid_generation()
+    }
+
+    pub(crate) fn disposition(&self) -> ExecMmDispositionKind {
+        match self.active().1 {
+            ExecMmDisposition::RetainOldMm => ExecMmDispositionKind::RetainOldMm,
+            ExecMmDisposition::RetireOldMm(_) => ExecMmDispositionKind::RetireOldMm,
+        }
+    }
+
+    pub(crate) fn replacement_backend(&self) -> Arc<Stage1MmBackend> {
+        self.active().0.backend()
+    }
+
+    pub(crate) fn predecessor_backend(&self) -> Arc<Stage1MmBackend> {
+        self.predecessor.backend()
     }
 
     pub(crate) fn replacement_root_slot(&self) -> Option<super::stage1_mm::Stage1RootSlot> {
@@ -751,6 +779,7 @@ impl MmResources {
             .any(|(other, candidate)| *other != task && Arc::ptr_eq(candidate, lease)))
     }
 
+    #[cfg(test)]
     pub(crate) fn observe_exec_owners(
         &self,
         task: TaskKey,
@@ -777,6 +806,7 @@ impl MmResources {
         Ok(ExecOwnerObservation { owner_count })
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare_exec(&self, task: TaskKey) -> Result<PreparedStage1Mm, MmResourcesError> {
         let state = self.state.lock();
         let predecessor = state
@@ -993,6 +1023,7 @@ impl MmResources {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn commit_exec(
         &self,
         task: TaskKey,
@@ -1451,6 +1482,10 @@ mod tests {
             .publish_shared_child(retained_parent, exec_child)
             .unwrap();
         let retained_reservation = retained_resources.reserve_exec(exec_child).unwrap();
+        assert_eq!(
+            retained_reservation.disposition(),
+            ExecMmDispositionKind::RetainOldMm,
+        );
         let retained_root = retained_reservation.replacement_root_slot().unwrap();
         let predecessor = retained_resources.lease(exec_child).unwrap();
         let removed = retained_resources
@@ -1459,6 +1494,11 @@ mod tests {
             .leases
             .remove(&retained_parent);
         assert!(removed.is_some(), "test removes the only surviving alias");
+        assert_eq!(
+            retained_reservation.disposition(),
+            ExecMmDispositionKind::RetainOldMm,
+            "later topology cannot change the pinned exec disposition",
+        );
 
         let retained_published_root = retained_root.base() + 0x1000;
         let retained = retained_reservation

@@ -41,6 +41,7 @@ impl Drop for ExecReservation {
 struct ExecOperationGuard {
     reservation: Option<ExecReservation>,
     drain: Option<ExecDrain>,
+    no_return: bool,
 }
 
 impl ExecOperationGuard {
@@ -56,6 +57,10 @@ impl ExecOperationGuard {
         }
     }
 
+    fn enter_no_return(&mut self) {
+        self.no_return = true;
+    }
+
     fn transaction(&self) -> Option<KernelTransactionId> {
         self.reservation
             .as_ref()
@@ -65,6 +70,14 @@ impl ExecOperationGuard {
 
 impl Drop for ExecOperationGuard {
     fn drop(&mut self) {
+        if self.no_return {
+            // MM authority has already moved forward. Resuming a parked
+            // predecessor sibling would run it against an authority graph
+            // that no longer belongs to the old image.
+            self.terminate_siblings();
+            drop(self.reservation.take());
+            return;
+        }
         // Rollback order is load-bearing: runners resume and acknowledge that
         // they left the park before another task mutator may acquire the ID.
         if let Some(drain) = self.drain.take() {
@@ -182,6 +195,13 @@ impl PreparedExec {
 
     pub(crate) fn old_file_table(&self) -> Arc<FileTable> {
         self.old_caller.resources().files()
+    }
+
+    /// Cross the external backend's no-return cut. Dropping this preparation
+    /// after this point terminates predecessor siblings instead of resuming
+    /// them into an authority graph that has already moved forward.
+    pub(crate) fn enter_no_return(&mut self) {
+        self.guard.enter_no_return();
     }
 
     /// Exact unpublished replacement address-space identity allocated by the
@@ -362,6 +382,7 @@ impl Kernel {
         let mut guard = ExecOperationGuard {
             reservation: Some(reservation),
             drain: None,
+            no_return: false,
         };
         check_exec_failpoint(failpoint, KernelFailpoint::AfterReserve)?;
 
