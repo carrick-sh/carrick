@@ -1360,6 +1360,13 @@ mod tests {
         assert!(report.dtrace_exit_observed);
         assert_eq!(report.exit_status, 1);
 
+        let mut boundary_payload = payload;
+        boundary_payload[12..16].copy_from_slice(&42_i32.to_ne_bytes());
+        let boundary = DtraceRecDesc { offset: 12, ..exit };
+        let boundary_report = exit_report(&boundary, &enabled_probe, boundary_payload.as_ptr());
+        assert!(boundary_report.dtrace_exit_observed);
+        assert_eq!(boundary_report.exit_status, 42);
+
         for malformed in [
             exit_report(&exit, std::ptr::null(), payload.as_ptr()),
             exit_report(&exit, &enabled_probe, std::ptr::null()),
