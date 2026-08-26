@@ -568,6 +568,12 @@ pub fn restore_aarch64_task_state(
     Ok(restored)
 }
 
+fn seed_heap_unmapped(protections: &MemoryProtections) {
+    if let Ok(heap_size) = usize::try_from(carrick_mem::memory::LINUX_HEAP_SIZE) {
+        protections.set_unmapped(carrick_mem::memory::LINUX_HEAP_BASE, heap_size, true);
+    }
+}
+
 impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     fn validate_task_metadata(&self, state: &Aarch64TaskCpuStateV1) -> Result<(), TrapError> {
         if state.mm_generation != self.mm_generation
@@ -617,6 +623,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         let protections = vm
             .exec_protections()
             .unwrap_or_else(|| Arc::new(MemoryProtections::default()));
+        seed_heap_unmapped(&protections);
         Self {
             vm,
             vcpu,
@@ -2096,6 +2103,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         if let Some(protections) = self.vm.exec_protections() {
             self.protections = protections;
         }
+        seed_heap_unmapped(&self.protections);
         if let Some(asid) = self.process_asid {
             <Self as ThreadedEngine>::configure_process_asid(self, asid)?;
         }
@@ -4012,6 +4020,70 @@ mod tests {
             resolved.raw(),
             guest_va + 4,
             "the semantic high VA is not a cross-process physical futex key"
+        );
+    }
+
+    #[test]
+    fn fresh_root_engine_and_exec_heap_lifecycle() {
+        use carrick_mem::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE};
+
+        // 1. Fresh root / exec seeding: heap starts unmapped.
+        let protections = Arc::new(MemoryProtections::default());
+        seed_heap_unmapped(&protections);
+
+        assert!(
+            protections.range_no_access(LINUX_HEAP_BASE, 0x1000),
+            "heap base must start unmapped / no-access"
+        );
+        assert!(
+            protections.range_unmapped(LINUX_HEAP_BASE, 0x1000),
+            "heap base must start unmapped"
+        );
+        assert!(
+            protections.range_no_access(LINUX_HEAP_BASE + LINUX_HEAP_SIZE - 0x1000, 0x1000),
+            "last heap page must start unmapped"
+        );
+
+        // 2. Grow 1 page (0x1000): clearing unmapped makes only the live prefix accessible.
+        protections.set_mapping_protection(LINUX_HEAP_BASE, 0x1000, false, false);
+        assert!(
+            !protections.range_no_access(LINUX_HEAP_BASE, 0x1000),
+            "grown page must be accessible"
+        );
+        assert!(
+            protections.range_unmapped(LINUX_HEAP_BASE + 0x1000, 0x1000),
+            "ungrown tail must remain unmapped"
+        );
+
+        // 3. Copied-mm fork inherits live grown prefix snapshot.
+        let child_protections =
+            Arc::new(MemoryProtections::from_snapshot(protections.snapshot_all()));
+        assert!(
+            !child_protections.range_no_access(LINUX_HEAP_BASE, 0x1000),
+            "forked child must inherit grown prefix as accessible"
+        );
+        assert!(
+            child_protections.range_unmapped(LINUX_HEAP_BASE + 0x1000, 0x1000),
+            "forked child must inherit ungrown tail as unmapped"
+        );
+
+        // 4. CLONE_VM sibling shares the exact same Arc.
+        let sibling_protections = Arc::clone(&protections);
+        assert!(
+            Arc::ptr_eq(&protections, &sibling_protections),
+            "CLONE_VM sibling must share the same Arc<MemoryProtections>"
+        );
+
+        // 5. Exec replacement resets heap on fresh mm.
+        let exec_protections = Arc::new(MemoryProtections::default());
+        seed_heap_unmapped(&exec_protections);
+        assert!(
+            exec_protections.range_unmapped(LINUX_HEAP_BASE, 0x1000),
+            "execve must seed fresh mm heap as unmapped"
+        );
+        assert!(
+            exec_protections.range_unmapped(LINUX_HEAP_BASE + LINUX_HEAP_SIZE - 0x1000, 0x1000),
+            "execve must seed full heap as unmapped"
         );
     }
 }
