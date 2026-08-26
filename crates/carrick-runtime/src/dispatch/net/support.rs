@@ -3342,6 +3342,39 @@ mod tests {
         }
     }
 
+    /// Linux validates the protocol required by an INET raw socket before it
+    /// rejects INET as an unsupported socketpair domain. Darwin reports only
+    /// EOPNOTSUPP for this tuple, but Linux (and LTP socketpair01) require
+    /// EPROTONOSUPPORT for protocol zero.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn socketpair_inet_raw_protocol_zero_returns_eprotonosupport() {
+        use crate::dispatch::{LinearMemory, SyscallArgs, SyscallRequest};
+
+        const SYS_SOCKETPAIR: u64 = 199;
+        let reporter = CompatReporter::default();
+        let mut dispatcher = SyscallDispatcher::new();
+        let sv = 0x1_0000_u64;
+        let mut memory = LinearMemory::new(sv, vec![0u8; 0x1000]);
+
+        let outcome = dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(
+                    SYS_SOCKETPAIR,
+                    SyscallArgs::from([LINUX_AF_INET as u64, LINUX_SOCK_RAW as u64, 0, sv, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("socketpair dispatch");
+
+        assert_eq!(
+            outcome,
+            DispatchOutcome::errno(crate::linux_abi::LINUX_EPROTONOSUPPORT),
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn host_socket_install_forces_host_nonblocking_even_for_blocking_guest_fd() {
