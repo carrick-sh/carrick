@@ -5299,6 +5299,25 @@ impl SyscallDispatcher {
         nonblocking: bool,
     ) -> DispatchOutcome {
         if off_out_addr == 0 {
+            if let Some(open_file) = self.open_file(out_fd) {
+                let open = open_file.description.read();
+                if let OpenDescription::SyntheticDevice {
+                    base,
+                    kind:
+                        crate::vfs::SyntheticDeviceKind::Null | crate::vfs::SyntheticDeviceKind::Zero,
+                } = &*open
+                {
+                    return if base.is_read_only() {
+                        DispatchOutcome::errno(LINUX_EBADF)
+                    } else if base.is_append() {
+                        DispatchOutcome::errno(LINUX_EINVAL)
+                    } else {
+                        DispatchOutcome::Returned {
+                            value: bytes.len() as i64,
+                        }
+                    };
+                }
+            }
             return match self.write_output_fd_partial(out_fd, bytes, tid) {
                 // The destination could not take a single byte. A blocking
                 // `splice(2)` waits for room; the partial write path reports

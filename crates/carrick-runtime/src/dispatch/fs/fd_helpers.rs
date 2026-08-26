@@ -761,6 +761,21 @@ impl SyscallDispatcher {
                 }
             }
             OpenDescription::HostFile { .. } | OpenDescription::File { .. } => Some(LINUX_EBADF),
+            // Linux's null and zero character devices expose a splice-write
+            // sink when opened writable (LTP splice09). They are synthetic in
+            // Carrick, so the host cannot supply that file operation for us.
+            OpenDescription::SyntheticDevice {
+                base,
+                kind: crate::vfs::SyntheticDeviceKind::Null | crate::vfs::SyntheticDeviceKind::Zero,
+            } => {
+                if base.is_read_only() {
+                    Some(LINUX_EBADF)
+                } else if base.is_append() {
+                    Some(LINUX_EINVAL)
+                } else {
+                    None
+                }
+            }
             // Everything else: splice(2) distinguishes "this fd cannot be
             // written at all" from "this pairing cannot splice". EBADF is the
             // answer whenever fd_out is not open for writing ("do not have
