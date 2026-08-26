@@ -2088,6 +2088,7 @@ pub(crate) struct HostAliasCommit {
 
 impl HostAliasCommit {
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn empty_for_test() -> Self {
         Self {
             mmap: None,
