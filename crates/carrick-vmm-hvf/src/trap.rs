@@ -1322,6 +1322,69 @@ mod task_only_carrier_directory_tests {
     }
 
     #[test]
+    fn exclusive_rebind_retires_predecessor_authority() {
+        let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        let receipt = test_kernel_apply(
+            empty_inventory_commit(103),
+            103,
+            std::num::NonZeroU64::new(103).unwrap(),
+            1,
+            Vec::new(),
+        );
+        let mut state = directory
+            .publish(
+                identity(103),
+                test_state(&rollbacks),
+                HvpatchPreparedTaskAuthority {
+                    mm_root_slot: Some((0x1100_0000, 0x20_0000)),
+                    inventory: HvpatchTaskInventoryAuthority::Active {
+                        ledger: Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
+                        receipt,
+                        retirement: None,
+                    },
+                    ..HvpatchPreparedTaskAuthority::default()
+                },
+            )
+            .unwrap();
+        let old_task_mm = Arc::clone(
+            state
+                .registration
+                .as_ref()
+                .unwrap()
+                .task_mm
+                .as_ref()
+                .unwrap(),
+        );
+        let replacement = Arc::new(HvpatchTaskMmAuthority {
+            mappings: Vec::new(),
+            mm_root_slot: Some((0x1200_0000, 0x20_0000)),
+            inventory: parking_lot::Mutex::new(HvpatchTaskInventoryAuthority::SharedProcess {
+                ledger: Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
+            }),
+            kernel_mm: parking_lot::Mutex::new(None),
+            cow_armed: None,
+            cow_deferred_publications: None,
+            pending_publication_receipts: parking_lot::Mutex::new(Vec::new()),
+            pending_receipts: Vec::new(),
+            alias_receipts: parking_lot::Mutex::new(Vec::new()),
+            last_holder: parking_lot::Mutex::new(HvpatchTaskMmHolder::Test),
+            drop_order: None,
+        });
+        state
+            .registration
+            .as_mut()
+            .unwrap()
+            .rebind_exec_authority(replacement, (0x1200_0000, 0x20_0000), Vec::new(), false)
+            .unwrap();
+
+        assert_eq!(old_task_mm.inventory.lock().phase_name(), "retired");
+        drop(state);
+        drop(old_task_mm);
+        assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn root_parent_shared_process_interns_by_exact_kernel_mm_without_parent_row() {
         let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
         let rollbacks = Arc::new(AtomicUsize::new(0));
