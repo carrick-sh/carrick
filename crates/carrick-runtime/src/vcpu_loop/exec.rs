@@ -120,6 +120,14 @@ pub(super) struct PreparedExecve {
     sibling_drain_started: std::time::Instant,
 }
 
+fn close_clone_admission_then<T>(
+    close: impl FnOnce() -> Result<ExecCloneAdmission, RuntimeError>,
+    after_close: impl FnOnce() -> T,
+) -> Result<(ExecCloneAdmission, T), RuntimeError> {
+    let admission = close()?;
+    Ok((admission, after_close()))
+}
+
 pub(super) enum ExecvePreparation {
     Complete(Option<VcpuLoopOutcome>),
     Prepared(Box<PreparedExecve>),
@@ -308,10 +316,10 @@ fn verify_published_exec_image<E: ThreadedEngine>(
 mod exec_image_verification_tests {
     use super::{
         ExecBackendPublicationGate, ExecDispositionRouting, HvpatchExecInventoryFailureInjection,
-        apply_exec_inventory, exec_regions_to_verify_with_mappings, first_byte_mismatch,
-        parse_hvpatch_exec_inventory_failure_injection, publish_execution_authority_after_exec,
-        retire_execution_authority_for_exec, route_exec_disposition,
-        should_update_host_process_title,
+        apply_exec_inventory, close_clone_admission_then, exec_regions_to_verify_with_mappings,
+        first_byte_mismatch, parse_hvpatch_exec_inventory_failure_injection,
+        publish_execution_authority_after_exec, retire_execution_authority_for_exec,
+        route_exec_disposition, should_update_host_process_title,
     };
 
     fn cpu_state_for_exec_test(mm_generation: u64) -> carrick_hal::threaded::Aarch64TaskCpuStateV1 {
@@ -364,6 +372,46 @@ mod exec_image_verification_tests {
             })
             .expect("production exec suffix");
         assert!(!production.contains(concat!("ExecutorId::for_transitional_", "thread")));
+    }
+
+    #[test]
+    fn exec_mm_admission_runs_only_after_in_flight_process_fork_drains() {
+        let gate = std::sync::Arc::new(super::super::CloneAdmissionGate::default());
+        let owner = carrick_hal::ThreadId::synthetic_for_tests(19_100);
+        let process_fork = gate
+            .try_enroll_process_fork(owner)
+            .expect("process fork admission");
+        let (after_close_tx, after_close_rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let close_gate = std::sync::Arc::clone(&gate);
+            let exec = scope.spawn(move || {
+                close_clone_admission_then(
+                    || close_gate.close_for_exec(owner),
+                    || after_close_tx.send(()).unwrap(),
+                )
+            });
+
+            while !process_fork.is_cancelled() {
+                std::thread::yield_now();
+            }
+            assert!(
+                after_close_rx
+                    .recv_timeout(std::time::Duration::from_millis(50))
+                    .is_err(),
+                "post-close MM admission ran while a process fork was still admitted",
+            );
+
+            drop(process_fork);
+            after_close_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("post-close MM admission did not run after fork settlement");
+            let (admission, ()) = exec
+                .join()
+                .expect("exec admission worker")
+                .expect("clone-admission drain");
+            drop(admission);
+        });
     }
 
     #[test]
@@ -889,27 +937,32 @@ where
             .hvpatch_process
             .as_ref()
             .and_then(|_| hvpatch_exec_inventory_failure_injection(&path));
-        // Shared-MM tasks serialize their exec replacement before closing
-        // clone admission or draining siblings. A waiter carries this exact,
-        // non-cloneable reservation through the persistent-executor handoff;
-        // dropping any pre-no-return preparation path settles and wakes the
-        // next owner.
-        let hvpatch_mm_reservation = match kernel.hvpatch_process.as_ref() {
-            Some(process) => match process.reserve_exec_mm_eventual() {
-                Ok(reservation) => Some(reservation),
-                Err(error) => {
-                    tracing::error!(
-                        %error,
-                        "execve MM-generation admission failed before the point of no return"
-                    );
-                    return Self::exec_failed_with_errno(engine, crate::linux_abi::LINUX_EAGAIN)
-                        .map(ExecvePreparation::Complete);
-                }
+        // First close clone admission and wait for every already-admitted fork
+        // to publish or cancel. Only then may this exec mark the shared MM
+        // generation reserved: an in-flight fork publishes a shared-child edge
+        // under the same authority and must never collide with that marker.
+        // The exact, non-cloneable reservation then crosses the persistent-
+        // executor handoff before sibling drain/no-return work begins.
+        let admissions = close_clone_admission_then(
+            || kernel.close_clone_admission_for_exec(self.this_tid),
+            || {
+                kernel
+                    .hvpatch_process
+                    .as_ref()
+                    .map(|process| process.reserve_exec_mm_eventual())
             },
-            None => None,
-        };
-        let clone_admission = match kernel.close_clone_admission_for_exec(self.this_tid) {
-            Ok(admission) => admission,
+        );
+        let (clone_admission, hvpatch_mm_reservation) = match admissions {
+            Ok((admission, Some(Ok(reservation)))) => (admission, Some(reservation)),
+            Ok((admission, None)) => (admission, None),
+            Ok((_admission, Some(Err(error)))) => {
+                tracing::error!(
+                    %error,
+                    "execve MM-generation admission failed before the point of no return"
+                );
+                return Self::exec_failed_with_errno(engine, crate::linux_abi::LINUX_EAGAIN)
+                    .map(ExecvePreparation::Complete);
+            }
             Err(error) => {
                 tracing::error!(
                     %error,
