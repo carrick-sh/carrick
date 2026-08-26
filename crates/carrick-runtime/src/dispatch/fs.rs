@@ -4557,7 +4557,8 @@ impl SyscallDispatcher {
         match &*open {
             OpenDescription::File { .. }
             | OpenDescription::SyntheticFile { .. }
-            | OpenDescription::HostFile { .. } => {
+            | OpenDescription::HostFile { .. }
+            | OpenDescription::SyntheticDevice { .. } => {
                 open.status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY
             }
             OpenDescription::PipeWriter { .. } => true,
@@ -11751,6 +11752,54 @@ impl SyscallDispatcher {
             // fd_out IS a pipe here, so a non-NULL off_out is ESPIPE.
             if off_out_address != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
+            }
+
+            if let Some(open_file) = this.open_file(in_fd.0) {
+                let open = open_file.description.read();
+                if let OpenDescription::SyntheticDevice { kind, .. } = &*open {
+                    let kind = *kind;
+                    drop(open);
+
+                    if off_in_address != 0 {
+                        // Character devices have no seek position, so off_in is not
+                        // used or updated, but guest pointer validity is checked.
+                        if read_u64(memory, off_in_address).is_err() {
+                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                        }
+                    }
+
+                    // Bound production by a fixed chunk ceiling (global pipe-room
+                    // bounds and full-pipe wait policy already applied above).
+                    const SYNTHETIC_SPLICE_CHUNK: usize = 1 << 16; // 64 KiB
+                    let count = count.min(SYNTHETIC_SPLICE_CHUNK);
+
+                    let bytes = match kind {
+                        crate::vfs::SyntheticDeviceKind::Null => Vec::new(),
+                        crate::vfs::SyntheticDeviceKind::Zero
+                        | crate::vfs::SyntheticDeviceKind::Full => vec![0u8; count],
+                        crate::vfs::SyntheticDeviceKind::Random
+                        | crate::vfs::SyntheticDeviceKind::Urandom => {
+                            let mut buf = vec![0u8; count];
+                            unsafe {
+                                libc::arc4random_buf(buf.as_mut_ptr().cast(), count);
+                            }
+                            buf
+                        }
+                    };
+
+                    if bytes.is_empty() {
+                        return Ok(DispatchOutcome::Returned { value: 0 });
+                    }
+
+                    let outcome = this.write_output_fd_partial(out_fd.0, &bytes, tid);
+                    let DispatchOutcome::Returned { value } = outcome else {
+                        return Ok(complete_wait(outcome));
+                    };
+                    let written = usize::try_from(value).unwrap_or(0).min(bytes.len());
+                    return Ok(DispatchOutcome::Returned {
+                        value: written as i64,
+                    });
+                }
             }
 
             // splice(2) into a pipe moves at most what the pipe can hold and
