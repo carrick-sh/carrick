@@ -1,13 +1,14 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use parking_lot::{Mutex, RwLock};
 
 use super::asid::{
     AsidAllocator, AsidError, AsidGeneration, AsidLoad, AsidResidency, AsidResidencyError,
-    AsidRetirement, InvalidationAck, RetiredAsid,
+    AsidRetirement, InvalidationAck, PreparedAsidAllocatorRetirement,
+    PreparedAsidResidencyRetirement, RetiredAsid,
 };
 use crate::kernel::{
     MmBackend, MmBackendSnapshot, MmBinding, SharedVmaSnapshotSource, SnapshotError, SnapshotTable,
@@ -63,7 +64,23 @@ pub(crate) struct Stage1MmLease {
     asid: AsidGeneration,
     residency: AsidResidency,
     root_slot: Option<Stage1RootSlot>,
-    retired: AtomicBool,
+    lifecycle: Mutex<Stage1MmLeaseLifecycle>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Stage1MmLeaseLifecycle {
+    Live,
+    RetirementPrepared,
+    Retired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum Stage1RetirementPreparationFailpoint {
+    Disabled,
+    AfterLeaseGate,
+    AfterResidency,
+    AfterAllocator,
 }
 
 impl Stage1MmLease {
@@ -87,7 +104,7 @@ impl Stage1MmLease {
             asid,
             residency: AsidResidency::new(asid),
             root_slot,
-            retired: AtomicBool::new(false),
+            lifecycle: Mutex::new(Stage1MmLeaseLifecycle::Live),
         }
     }
 
@@ -111,11 +128,16 @@ impl Stage1MmLease {
         &self,
         executor: crate::kernel::objects::ExecutorId,
     ) -> Result<AsidLoad, AsidResidencyError> {
+        let lifecycle = self.lifecycle.lock();
+        if *lifecycle != Stage1MmLeaseLifecycle::Live {
+            return Err(AsidResidencyError::Retiring);
+        }
         self.residency.begin_load(executor)
     }
 
     pub(crate) fn publish_stage1_root(&self, stage1_root: u64) -> Result<MmBinding, Stage1MmError> {
-        if self.retired.load(Ordering::Acquire) {
+        let lifecycle = self.lifecycle.lock();
+        if *lifecycle != Stage1MmLeaseLifecycle::Live {
             return Err(Stage1MmError::Retired);
         }
         let stage1_root = Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa(stage1_root))?;
@@ -155,7 +177,7 @@ impl Stage1MmPool {
 
     fn with_allocator(
         stage1_root: u64,
-        mut asids: AsidAllocator,
+        asids: AsidAllocator,
     ) -> Result<(Self, Arc<Stage1MmLease>), Stage1MmError> {
         let asid = asids.allocate()?;
         let stage1_root = Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa(stage1_root))?;
@@ -198,6 +220,8 @@ impl Stage1MmPool {
             pool: self.clone(),
             lease,
             committed: false,
+            #[cfg(test)]
+            abort_classification_hook: None,
         })
     }
 
@@ -212,26 +236,188 @@ impl Stage1MmPool {
 
     pub(crate) fn retire(
         &self,
-        lease: &Stage1MmLease,
+        lease: &Arc<Stage1MmLease>,
     ) -> Result<Stage1MmRetirement, Stage1MmError> {
-        lease
-            .retired
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| Stage1MmError::Retired)?;
-        let residency = lease.residency.begin_retirement()?;
-        let mut inner = self.inner.lock();
-        let asid = match inner.asids.retire(lease.asid) {
-            Ok(asid) => asid,
+        Ok(self.prepare_retirement(lease)?.commit())
+    }
+
+    /// Reserve every layer of one exact live MM for retirement without yet
+    /// publishing retirement. Lock order is lease lifecycle -> residency ->
+    /// pool inventory -> ASID allocator. Commit and rollback keep the lease
+    /// gate closed while visiting the same lower layers in that order, so load
+    /// admission and root publication cannot observe a partially transitioned
+    /// predecessor.
+    pub(crate) fn prepare_retirement(
+        &self,
+        lease: &Arc<Stage1MmLease>,
+    ) -> Result<PreparedStage1MmRetirement, Stage1MmError> {
+        self.prepare_retirement_inner(lease, Stage1RetirementPreparationFailpoint::Disabled)
+    }
+
+    #[cfg(test)]
+    fn prepare_retirement_with_failpoint_for_tests(
+        &self,
+        lease: &Arc<Stage1MmLease>,
+        failpoint: Stage1RetirementPreparationFailpoint,
+    ) -> Result<PreparedStage1MmRetirement, Stage1MmError> {
+        self.prepare_retirement_inner(lease, failpoint)
+    }
+
+    fn prepare_retirement_inner(
+        &self,
+        lease: &Arc<Stage1MmLease>,
+        failpoint: Stage1RetirementPreparationFailpoint,
+    ) -> Result<PreparedStage1MmRetirement, Stage1MmError> {
+        let mut lifecycle = lease.lifecycle.lock();
+        if *lifecycle != Stage1MmLeaseLifecycle::Live {
+            return Err(Stage1MmError::Retired);
+        }
+        *lifecycle = Stage1MmLeaseLifecycle::RetirementPrepared;
+        if failpoint == Stage1RetirementPreparationFailpoint::AfterLeaseGate {
+            *lifecycle = Stage1MmLeaseLifecycle::Live;
+            return Err(Stage1MmError::Retired);
+        }
+
+        let residency = match lease.residency.prepare_retirement() {
+            Ok(residency) => residency,
             Err(error) => {
+                *lifecycle = Stage1MmLeaseLifecycle::Live;
                 return Err(error.into());
             }
         };
-        Ok(Stage1MmRetirement {
+        if failpoint == Stage1RetirementPreparationFailpoint::AfterResidency {
+            drop(residency);
+            *lifecycle = Stage1MmLeaseLifecycle::Live;
+            return Err(Stage1MmError::Retired);
+        }
+        let asid = {
+            let inner = self.inner.lock();
+            inner.asids.prepare_retirement(lease.asid)
+        };
+        let asid = match asid {
+            Ok(asid) => asid,
+            Err(error) => {
+                drop(residency);
+                *lifecycle = Stage1MmLeaseLifecycle::Live;
+                return Err(error.into());
+            }
+        };
+        if failpoint == Stage1RetirementPreparationFailpoint::AfterAllocator {
+            drop(asid);
+            drop(residency);
+            *lifecycle = Stage1MmLeaseLifecycle::Live;
+            return Err(Stage1MmError::Retired);
+        }
+        drop(lifecycle);
+
+        Ok(PreparedStage1MmRetirement {
             pool: self.clone(),
+            lease: Arc::clone(lease),
+            residency: Some(residency),
+            asid: Some(asid),
+            root_slot: lease.root_slot,
+            finished: false,
+            #[cfg(test)]
+            rollback_hook: None,
+        })
+    }
+}
+
+/// Owned, non-cloneable reservation of the lease gate, executor residency,
+/// exact allocator generation, and root slot for one stage-1 MM retirement.
+#[derive(Debug)]
+pub(crate) struct PreparedStage1MmRetirement {
+    pool: Stage1MmPool,
+    lease: Arc<Stage1MmLease>,
+    residency: Option<PreparedAsidResidencyRetirement>,
+    asid: Option<PreparedAsidAllocatorRetirement>,
+    root_slot: Option<Stage1RootSlot>,
+    finished: bool,
+    #[cfg(test)]
+    rollback_hook: Option<RollbackOrderHook>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct RollbackOrderHook {
+    after_allocator: Arc<std::sync::Barrier>,
+    resume_after_allocator: Arc<std::sync::Barrier>,
+    after_residency: Arc<std::sync::Barrier>,
+    resume_after_residency: Arc<std::sync::Barrier>,
+}
+
+impl PreparedStage1MmRetirement {
+    #[cfg(test)]
+    fn install_rollback_hook_for_tests(&mut self, hook: RollbackOrderHook) {
+        self.rollback_hook = Some(hook);
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn pending(&self) -> Vec<crate::kernel::objects::ExecutorId> {
+        let Some(residency) = self.residency.as_ref() else {
+            std::process::abort();
+        };
+        residency.pending()
+    }
+
+    fn requires_quarantine(&self) -> bool {
+        let Some(residency) = self.residency.as_ref() else {
+            std::process::abort();
+        };
+        residency.requires_quarantine()
+    }
+
+    pub(crate) fn commit(mut self) -> Stage1MmRetirement {
+        let mut lifecycle = self.lease.lifecycle.lock();
+        assert_eq!(
+            *lifecycle,
+            Stage1MmLeaseLifecycle::RetirementPrepared,
+            "prepared stage-1 retirement lost its lease-gate reservation"
+        );
+        let Some(residency) = self.residency.take() else {
+            std::process::abort();
+        };
+        let residency = residency.commit();
+        let Some(asid) = self.asid.take() else {
+            std::process::abort();
+        };
+        let asid = asid.commit();
+        *lifecycle = Stage1MmLeaseLifecycle::Retired;
+        drop(lifecycle);
+        self.finished = true;
+        Stage1MmRetirement {
+            pool: self.pool.clone(),
             asid,
             residency,
-            root_slot: lease.root_slot,
-        })
+            root_slot: self.root_slot,
+        }
+    }
+}
+
+impl Drop for PreparedStage1MmRetirement {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let mut lifecycle = self.lease.lifecycle.lock();
+        assert_eq!(
+            *lifecycle,
+            Stage1MmLeaseLifecycle::RetirementPrepared,
+            "prepared stage-1 retirement lost its lease-gate reservation"
+        );
+        drop(self.asid.take());
+        #[cfg(test)]
+        if let Some(hook) = self.rollback_hook.as_ref() {
+            hook.after_allocator.wait();
+            hook.resume_after_allocator.wait();
+        }
+        drop(self.residency.take());
+        #[cfg(test)]
+        if let Some(hook) = self.rollback_hook.as_ref() {
+            hook.after_residency.wait();
+            hook.resume_after_residency.wait();
+        }
+        *lifecycle = Stage1MmLeaseLifecycle::Live;
     }
 }
 
@@ -240,9 +426,44 @@ pub(crate) struct PreparedStage1Mm {
     pool: Stage1MmPool,
     lease: Arc<Stage1MmLease>,
     committed: bool,
+    #[cfg(test)]
+    abort_classification_hook: Option<AbortClassificationHook>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct AbortClassificationHook {
+    reached_classification: Arc<std::sync::Barrier>,
+    resume_classification: Arc<std::sync::Barrier>,
+}
+
+#[cfg(test)]
+impl AbortClassificationHook {
+    fn run(self) {
+        self.reached_classification.wait();
+        self.resume_classification.wait();
+    }
+}
+
+/// Exhaustive settlement of an explicitly aborted unpublished replacement.
+/// The retirement arm is deliberately non-cloneable because it owns the only
+/// route from hardware-exposed quarantine back to numeric ASID/root reuse.
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum PreparedStage1MmAbort {
+    Unpublished {
+        binding: MmBinding,
+        root_slot: Option<Stage1RootSlot>,
+    },
+    Retirement(Stage1MmRetirement),
 }
 
 impl PreparedStage1Mm {
+    #[cfg(test)]
+    fn install_abort_classification_hook_for_tests(&mut self, hook: AbortClassificationHook) {
+        self.abort_classification_hook = Some(hook);
+    }
+
     pub(crate) fn binding(&self) -> MmBinding {
         self.lease.binding()
     }
@@ -274,6 +495,31 @@ impl PreparedStage1Mm {
         self.committed = true;
         Arc::clone(&self.lease)
     }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn abort(mut self) -> Result<PreparedStage1MmAbort, Stage1MmError> {
+        let root_slot = self.lease.root_slot;
+        let retirement = self.pool.prepare_retirement(&self.lease)?;
+        let binding = self.lease.binding();
+        #[cfg(test)]
+        if let Some(hook) = self.abort_classification_hook.take() {
+            hook.run();
+        }
+        if retirement.requires_quarantine() {
+            let retirement = retirement.commit();
+            self.committed = true;
+            return Ok(PreparedStage1MmAbort::Retirement(retirement));
+        }
+
+        // Admission was closed and residency proved that no load ever crossed
+        // the hardware-dirty boundary and none remains capable of crossing it.
+        // Roll back the retirement reservation before returning the unpublished
+        // ASID/root pair to their immediate reuse pools.
+        drop(retirement);
+        self.pool.release_unpublished(&self.lease)?;
+        self.committed = true;
+        Ok(PreparedStage1MmAbort::Unpublished { binding, root_slot })
+    }
 }
 
 impl Drop for PreparedStage1Mm {
@@ -281,6 +527,24 @@ impl Drop for PreparedStage1Mm {
         if self.committed {
             return;
         }
+        let Ok(retirement) = self.pool.prepare_retirement(&self.lease) else {
+            tracing::error!(
+                "failed to quarantine or release dropped unpublished hvpatch mm root slot"
+            );
+            return;
+        };
+        #[cfg(test)]
+        if let Some(hook) = self.abort_classification_hook.take() {
+            hook.run();
+        }
+        if retirement.requires_quarantine() {
+            // No owner remains to drive acknowledgements. Permanently leak the
+            // exact retirement receipt: this is fail-closed quarantine, never
+            // an unpublished release of hardware-exposed identity.
+            std::mem::forget(retirement.commit());
+            return;
+        }
+        drop(retirement);
         if let Err(error) = self.pool.release_unpublished(&self.lease) {
             tracing::error!(%error, "failed to release unpublished hvpatch mm root slot");
         }
@@ -710,6 +974,487 @@ mod tests {
             replacement.asid_generation(),
             lease.asid_generation(),
             "numeric reuse must mint a new strong generation"
+        );
+    }
+
+    #[test]
+    fn quarantined_root_slot_is_skipped_then_reused_exactly_after_completion() {
+        let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 3).expect("root pool");
+        let first = pool.prepare_child().expect("first child");
+        let first_binding = first.binding();
+        let first_generation = first.asid_generation();
+        let first_root = first.root_slot().expect("first root slot");
+        let first = first.commit();
+        let resident = executor(47);
+        first
+            .begin_asid_load(resident)
+            .expect("resident load")
+            .mark_resident()
+            .expect("resident commit");
+        let retirement = pool.retire(&first).expect("first retirement");
+
+        let other = pool.prepare_child().expect("other live ASID/root");
+        assert_ne!(other.root_slot(), Some(first_root));
+        let _other = other.commit();
+        assert_eq!(
+            pool.prepare_child().unwrap_err(),
+            Stage1MmError::AsidExhausted
+        );
+
+        retirement
+            .acknowledge(InvalidationAck::new(resident, first_generation))
+            .expect("exact first invalidation acknowledgement");
+        retirement.complete().expect("complete first retirement");
+        let reused = pool.prepare_child().expect("reuse completed root slot");
+        assert_eq!(reused.binding().asid, first_binding.asid);
+        assert_eq!(reused.root_slot(), Some(first_root));
+        assert_ne!(reused.asid_generation(), first_generation);
+    }
+
+    #[test]
+    fn dropped_retirement_preparation_reopens_the_exact_live_predecessor() {
+        let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 2).expect("root pool");
+        let lease = pool.prepare_child().expect("child preparation").commit();
+        let binding = lease.binding();
+        let generation = lease.asid_generation();
+        let first = executor(30);
+        let second = executor(31);
+        lease
+            .begin_asid_load(first)
+            .expect("first load")
+            .mark_resident()
+            .expect("first resident");
+
+        let prepared = pool.prepare_retirement(&lease).expect("prepare retirement");
+        assert_eq!(
+            lease.begin_asid_load(second).unwrap_err(),
+            AsidResidencyError::Retiring
+        );
+        assert_eq!(prepared.pending(), vec![first]);
+
+        drop(prepared);
+
+        assert_eq!(lease.binding(), binding);
+        assert_eq!(lease.asid_generation(), generation);
+        assert_eq!(lease.residency.residents(), vec![first]);
+        lease
+            .begin_asid_load(second)
+            .expect("rollback reopens exact predecessor")
+            .mark_resident()
+            .expect("second resident");
+        assert_eq!(lease.residency.residents(), vec![first, second]);
+    }
+
+    #[test]
+    fn failure_after_lease_gate_transition_restores_an_exact_retry() {
+        let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 2).expect("root pool");
+        let lease = pool.prepare_child().expect("child preparation").commit();
+        let binding = lease.binding();
+        let generation = lease.asid_generation();
+        let resident = executor(32);
+        lease
+            .begin_asid_load(resident)
+            .expect("resident load")
+            .mark_resident()
+            .expect("resident commit");
+
+        pool.prepare_retirement_with_failpoint_for_tests(
+            &lease,
+            Stage1RetirementPreparationFailpoint::AfterLeaseGate,
+        )
+        .expect_err("failure after lease gate transition");
+
+        assert_eq!(lease.binding(), binding);
+        assert_eq!(lease.asid_generation(), generation);
+        assert_eq!(lease.residency.residents(), vec![resident]);
+        let retry = pool.prepare_retirement(&lease).expect("exact retry");
+        assert_eq!(retry.pending(), vec![resident]);
+    }
+
+    #[test]
+    fn failure_after_residency_preparation_restores_every_earlier_layer() {
+        let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 2).expect("root pool");
+        let lease = pool.prepare_child().expect("child preparation").commit();
+        let binding = lease.binding();
+        let generation = lease.asid_generation();
+        let resident = executor(33);
+        let retry_executor = executor(34);
+        lease
+            .begin_asid_load(resident)
+            .expect("resident load")
+            .mark_resident()
+            .expect("resident commit");
+
+        pool.prepare_retirement_with_failpoint_for_tests(
+            &lease,
+            Stage1RetirementPreparationFailpoint::AfterResidency,
+        )
+        .expect_err("failure after residency preparation");
+
+        assert_eq!(lease.binding(), binding);
+        assert_eq!(lease.asid_generation(), generation);
+        assert_eq!(lease.residency.residents(), vec![resident]);
+        let retry_load = lease
+            .begin_asid_load(retry_executor)
+            .expect("lease and residency admission both reopen");
+        let retry = pool.prepare_retirement(&lease).expect("exact retry");
+        assert_eq!(retry.pending(), vec![resident, retry_executor]);
+        drop(retry);
+        drop(retry_load);
+    }
+
+    #[test]
+    fn failure_after_allocator_preparation_restores_exact_generation_and_retry() {
+        let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 2).expect("root pool");
+        let lease = pool.prepare_child().expect("child preparation").commit();
+        let binding = lease.binding();
+        let generation = lease.asid_generation();
+        let root_slot = lease.root_slot();
+        let resident = executor(35);
+        lease
+            .begin_asid_load(resident)
+            .expect("resident load")
+            .mark_resident()
+            .expect("resident commit");
+
+        pool.prepare_retirement_with_failpoint_for_tests(
+            &lease,
+            Stage1RetirementPreparationFailpoint::AfterAllocator,
+        )
+        .expect_err("failure after allocator preparation");
+
+        assert_eq!(lease.binding(), binding);
+        assert_eq!(lease.asid_generation(), generation);
+        assert_eq!(lease.residency.residents(), vec![resident]);
+        let retirement = pool
+            .prepare_retirement(&lease)
+            .expect("exact retry after every layer rollback")
+            .commit();
+        assert_eq!(retirement.pending(), vec![resident]);
+        assert_eq!(
+            pool.prepare_child().unwrap_err(),
+            Stage1MmError::AsidExhausted,
+            "prepared generation commits into TLB quarantine"
+        );
+        retirement
+            .acknowledge(InvalidationAck::new(resident, generation))
+            .expect("exact invalidation acknowledgement");
+        retirement.complete().expect("complete exact retirement");
+
+        let replacement = pool.prepare_child().expect("reuse after exact ack");
+        assert_eq!(replacement.binding().asid, binding.asid);
+        assert_eq!(replacement.root_slot(), root_slot);
+        assert_ne!(replacement.asid_generation(), generation);
+    }
+
+    #[test]
+    fn rollback_keeps_load_and_root_publication_blocked_until_every_layer_restores() {
+        let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 2).expect("root pool");
+        let lease = pool.prepare_child().expect("child preparation").commit();
+        let mut prepared = pool.prepare_retirement(&lease).expect("prepare retirement");
+        let after_allocator = Arc::new(std::sync::Barrier::new(2));
+        let resume_after_allocator = Arc::new(std::sync::Barrier::new(2));
+        let after_residency = Arc::new(std::sync::Barrier::new(2));
+        let resume_after_residency = Arc::new(std::sync::Barrier::new(2));
+        prepared.install_rollback_hook_for_tests(RollbackOrderHook {
+            after_allocator: Arc::clone(&after_allocator),
+            resume_after_allocator: Arc::clone(&resume_after_allocator),
+            after_residency: Arc::clone(&after_residency),
+            resume_after_residency: Arc::clone(&resume_after_residency),
+        });
+
+        let rollback = std::thread::spawn(move || drop(prepared));
+        after_allocator.wait();
+
+        let (load_started_tx, load_started_rx) = std::sync::mpsc::channel();
+        let (load_done_tx, load_done_rx) = std::sync::mpsc::channel();
+        let load_lease = Arc::clone(&lease);
+        let load = std::thread::spawn(move || {
+            load_started_tx.send(()).unwrap();
+            let result = load_lease.begin_asid_load(executor(46)).map(drop);
+            load_done_tx.send(result).unwrap();
+        });
+        let (publish_started_tx, publish_started_rx) = std::sync::mpsc::channel();
+        let (publish_done_tx, publish_done_rx) = std::sync::mpsc::channel();
+        let publish_lease = Arc::clone(&lease);
+        let root = lease.root_slot().expect("child root slot").base();
+        let publish = std::thread::spawn(move || {
+            publish_started_tx.send(()).unwrap();
+            let result = publish_lease.publish_stage1_root(root).map(drop);
+            publish_done_tx.send(result).unwrap();
+        });
+        load_started_rx.recv().unwrap();
+        publish_started_rx.recv().unwrap();
+        assert!(lease.lifecycle.try_lock().is_none());
+        assert!(load_done_rx.try_recv().is_err());
+        assert!(publish_done_rx.try_recv().is_err());
+
+        resume_after_allocator.wait();
+        after_residency.wait();
+        assert!(lease.lifecycle.try_lock().is_none());
+        assert!(load_done_rx.try_recv().is_err());
+        assert!(publish_done_rx.try_recv().is_err());
+
+        resume_after_residency.wait();
+        rollback.join().unwrap();
+        load_done_rx
+            .recv()
+            .unwrap()
+            .expect("load admitted only after complete rollback");
+        publish_done_rx
+            .recv()
+            .unwrap()
+            .expect("root publication admitted only after complete rollback");
+        load.join().unwrap();
+        publish.join().unwrap();
+    }
+
+    #[test]
+    fn clean_inflight_load_cancellation_stays_cancelled_across_retirement_rollback() {
+        let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 2).expect("root pool");
+        let lease = pool.prepare_child().expect("child preparation").commit();
+        let loading = executor(36);
+        let later = executor(37);
+        let load = lease.begin_asid_load(loading).expect("in-flight load");
+        let prepared = pool
+            .prepare_retirement(&lease)
+            .expect("prepare around in-flight load");
+        assert_eq!(prepared.pending(), vec![loading]);
+
+        drop(load);
+        assert!(prepared.pending().is_empty());
+        drop(prepared);
+
+        assert!(lease.residency.residents().is_empty());
+        lease
+            .begin_asid_load(later)
+            .expect("rollback reopens admission after clean cancellation");
+    }
+
+    #[test]
+    fn dirty_inflight_load_cancellation_survives_retirement_rollback_as_resident() {
+        let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 2).expect("root pool");
+        let lease = pool.prepare_child().expect("child preparation").commit();
+        let executor = executor(38);
+        let mut load = lease.begin_asid_load(executor).expect("in-flight load");
+        load.arm_hardware_dirty().expect("real dirty boundary");
+        let prepared = pool
+            .prepare_retirement(&lease)
+            .expect("prepare around dirty in-flight load");
+        assert_eq!(prepared.pending(), vec![executor]);
+
+        drop(load);
+        assert_eq!(prepared.pending(), vec![executor]);
+        drop(prepared);
+
+        assert_eq!(lease.residency.residents(), vec![executor]);
+        let retry = pool.prepare_retirement(&lease).expect("exact retry");
+        assert_eq!(retry.pending(), vec![executor]);
+    }
+
+    #[test]
+    fn clean_replacement_abort_releases_exact_unpublished_asid_and_root() {
+        let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 2).expect("root pool");
+        let prepared = pool.prepare_child().expect("replacement preparation");
+        let binding = prepared.binding();
+        let root_slot = prepared.root_slot();
+        let clean_load = prepared
+            .begin_asid_load(executor(39))
+            .expect("clean replacement load");
+        drop(clean_load);
+
+        let settlement = prepared.abort().expect("settle clean abort");
+        match settlement {
+            PreparedStage1MmAbort::Unpublished {
+                binding: released_binding,
+                root_slot: released_root_slot,
+            } => {
+                assert_eq!(released_binding, binding);
+                assert_eq!(released_root_slot, root_slot);
+            }
+            PreparedStage1MmAbort::Retirement(_) => {
+                panic!("a never-hardware-dirty replacement must not enter quarantine")
+            }
+        }
+
+        let replacement = pool.prepare_child().expect("immediate exact reuse");
+        assert_eq!(replacement.binding(), binding);
+        assert_eq!(replacement.root_slot(), root_slot);
+    }
+
+    #[test]
+    fn dirty_replacement_abort_quarantines_until_exact_invalidation_completes() {
+        let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 2).expect("root pool");
+        let prepared = pool.prepare_child().expect("replacement preparation");
+        let binding = prepared.binding();
+        let generation = prepared.asid_generation();
+        let root_slot = prepared.root_slot();
+        let dirty_executor = executor(40);
+        let mut load = prepared
+            .begin_asid_load(dirty_executor)
+            .expect("replacement load");
+        load.arm_hardware_dirty().expect("real dirty boundary");
+        drop(load);
+
+        let settlement = prepared.abort().expect("settle dirty abort");
+        let PreparedStage1MmAbort::Retirement(retirement) = settlement else {
+            panic!("hardware-dirty replacement must enter retirement quarantine");
+        };
+        assert_eq!(retirement.asid_generation(), generation);
+        assert_eq!(retirement.pending(), vec![dirty_executor]);
+        assert_eq!(
+            pool.prepare_child().unwrap_err(),
+            Stage1MmError::AsidExhausted,
+            "dirty ASID/root stay unavailable before exact acknowledgement"
+        );
+        retirement
+            .acknowledge(InvalidationAck::new(dirty_executor, generation))
+            .expect("exact dirty invalidation acknowledgement");
+        retirement.complete().expect("complete dirty quarantine");
+
+        let replacement = pool.prepare_child().expect("reuse after dirty ack");
+        assert_eq!(replacement.binding().asid, binding.asid);
+        assert_eq!(replacement.root_slot(), root_slot);
+        assert_ne!(replacement.asid_generation(), generation);
+    }
+
+    #[test]
+    fn explicit_abort_classifies_hardware_exposure_atomically() {
+        let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 2).expect("root pool");
+        let mut prepared = pool.prepare_child().expect("replacement preparation");
+        let generation = prepared.asid_generation();
+        let dirty_executor = executor(44);
+        let mut load = prepared
+            .begin_asid_load(dirty_executor)
+            .expect("replacement load");
+        let reached_classification = Arc::new(std::sync::Barrier::new(2));
+        let resume_classification = Arc::new(std::sync::Barrier::new(2));
+        prepared.install_abort_classification_hook_for_tests(AbortClassificationHook {
+            reached_classification: Arc::clone(&reached_classification),
+            resume_classification: Arc::clone(&resume_classification),
+        });
+
+        let abort = std::thread::spawn(move || prepared.abort().expect("explicit abort"));
+        reached_classification.wait();
+        load.arm_hardware_dirty()
+            .expect("race crosses dirty boundary");
+        load.mark_resident().expect("race settles as resident");
+        resume_classification.wait();
+
+        let settlement = abort.join().expect("abort thread");
+        let PreparedStage1MmAbort::Retirement(retirement) = settlement else {
+            panic!("atomic classification must quarantine the raced dirty load");
+        };
+        assert_eq!(retirement.pending(), vec![dirty_executor]);
+        retirement
+            .acknowledge(InvalidationAck::new(dirty_executor, generation))
+            .expect("exact raced invalidation acknowledgement");
+        retirement.complete().expect("complete raced quarantine");
+    }
+
+    #[test]
+    fn clean_inflight_abort_retirement_completes_after_the_load_cancels() {
+        let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 2).expect("root pool");
+        let prepared = pool.prepare_child().expect("replacement preparation");
+        let binding = prepared.binding();
+        let root_slot = prepared.root_slot();
+        let loading_executor = executor(41);
+        let load = prepared
+            .begin_asid_load(loading_executor)
+            .expect("clean in-flight replacement load");
+
+        let settlement = prepared.abort().expect("settle in-flight abort");
+        let PreparedStage1MmAbort::Retirement(retirement) = settlement else {
+            panic!("an in-flight load must be quarantined until it settles");
+        };
+        assert_eq!(retirement.pending(), vec![loading_executor]);
+
+        drop(load);
+
+        assert!(retirement.pending().is_empty());
+        retirement
+            .complete()
+            .expect("clean cancellation discharges retirement");
+        let replacement = pool.prepare_child().expect("reuse after cancellation");
+        assert_eq!(replacement.binding(), binding);
+        assert_eq!(replacement.root_slot(), root_slot);
+    }
+
+    #[test]
+    fn dirty_resident_replacement_abort_has_the_same_quarantine_requirement() {
+        let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 2).expect("root pool");
+        let prepared = pool.prepare_child().expect("replacement preparation");
+        let generation = prepared.asid_generation();
+        let resident_executor = executor(42);
+        let mut load = prepared
+            .begin_asid_load(resident_executor)
+            .expect("replacement load");
+        load.arm_hardware_dirty().expect("real dirty boundary");
+        load.mark_resident().expect("dirty load becomes resident");
+
+        let settlement = prepared.abort().expect("settle dirty resident abort");
+        let PreparedStage1MmAbort::Retirement(retirement) = settlement else {
+            panic!("resident hardware-dirty replacement must enter quarantine");
+        };
+        assert_eq!(retirement.pending(), vec![resident_executor]);
+        assert_eq!(
+            pool.prepare_child().unwrap_err(),
+            Stage1MmError::AsidExhausted
+        );
+        retirement
+            .acknowledge(InvalidationAck::new(resident_executor, generation))
+            .expect("exact resident invalidation acknowledgement");
+        retirement.complete().expect("complete resident quarantine");
+        assert!(pool.prepare_child().is_ok());
+    }
+
+    #[test]
+    fn dropping_dirty_replacement_without_settlement_quarantines_permanently() {
+        let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 2).expect("root pool");
+        let prepared = pool.prepare_child().expect("replacement preparation");
+        let dirty_executor = executor(43);
+        let mut load = prepared
+            .begin_asid_load(dirty_executor)
+            .expect("replacement load");
+        load.arm_hardware_dirty().expect("real dirty boundary");
+        drop(load);
+
+        drop(prepared);
+
+        assert_eq!(
+            pool.prepare_child().unwrap_err(),
+            Stage1MmError::AsidExhausted,
+            "implicit dirty drop must never release unpublished identity"
+        );
+    }
+
+    #[test]
+    fn implicit_drop_classifies_hardware_exposure_atomically() {
+        let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 2).expect("root pool");
+        let mut prepared = pool.prepare_child().expect("replacement preparation");
+        let dirty_executor = executor(45);
+        let mut load = prepared
+            .begin_asid_load(dirty_executor)
+            .expect("replacement load");
+        let reached_classification = Arc::new(std::sync::Barrier::new(2));
+        let resume_classification = Arc::new(std::sync::Barrier::new(2));
+        prepared.install_abort_classification_hook_for_tests(AbortClassificationHook {
+            reached_classification: Arc::clone(&reached_classification),
+            resume_classification: Arc::clone(&resume_classification),
+        });
+
+        let dropped = std::thread::spawn(move || drop(prepared));
+        reached_classification.wait();
+        load.arm_hardware_dirty()
+            .expect("race crosses dirty boundary");
+        load.mark_resident().expect("race settles as resident");
+        resume_classification.wait();
+        dropped.join().expect("drop thread");
+
+        assert_eq!(
+            pool.prepare_child().unwrap_err(),
+            Stage1MmError::AsidExhausted,
+            "atomic implicit-drop classification must quarantine the raced dirty load"
         );
     }
 
