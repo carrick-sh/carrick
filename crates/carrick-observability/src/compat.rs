@@ -236,6 +236,7 @@ pub struct CompatReporter {
     sys_read_unimplemented: Mutex<HashMap<String, u64>>,
     unsupported_signals: Mutex<HashMap<(i32, String), u64>>,
     unknown_syscall_flags: Mutex<HashMap<(u64, String, u32, u64), u64>>,
+    fast_path_blind_spots: Mutex<Vec<String>>,
 }
 
 impl Default for CompatReporter {
@@ -251,6 +252,7 @@ impl Default for CompatReporter {
             sys_read_unimplemented: Mutex::new(HashMap::new()),
             unsupported_signals: Mutex::new(HashMap::new()),
             unknown_syscall_flags: Mutex::new(HashMap::new()),
+            fast_path_blind_spots: Mutex::new(Vec::new()),
         }
     }
 }
@@ -374,6 +376,8 @@ impl CompatReporter {
         let unknown_flag_invocations = unknown_syscall_flags.values().sum::<u64>();
         let unknown_syscall_flags = sorted_unknown_flags(unknown_syscall_flags);
 
+        let fast_path_blind_spots = self.fast_path_blind_spots.lock().clone();
+
         let summary = CompatSummary {
             syscall_invocations: syscall_entries,
             syscall_returns_ok,
@@ -391,6 +395,7 @@ impl CompatReporter {
             distinct_unsupported_signals: unsupported_signals.len() as u64,
             distinct_unknown_syscall_flags: unknown_syscall_flags.len() as u64,
             unknown_syscall_flag_invocations: unknown_flag_invocations,
+            fast_path_blind_spots: fast_path_blind_spots.len() as u64,
         };
 
         CompatReport {
@@ -403,7 +408,12 @@ impl CompatReporter {
             sys_read_unimplemented,
             unsupported_signals,
             unknown_syscall_flags,
+            fast_path_blind_spots,
         }
+    }
+
+    pub fn set_fast_path_blind_spots(&self, spots: Vec<String>) {
+        *self.fast_path_blind_spots.lock() = spots;
     }
 
     pub fn finish(self) -> CompatReport {
@@ -427,6 +437,8 @@ pub struct CompatReport {
     pub sys_read_unimplemented: Vec<PathCount>,
     pub unsupported_signals: Vec<SignalCount>,
     pub unknown_syscall_flags: Vec<UnknownFlagsCount>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fast_path_blind_spots: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -484,6 +496,8 @@ pub struct CompatSummary {
     pub distinct_unsupported_signals: u64,
     pub distinct_unknown_syscall_flags: u64,
     pub unknown_syscall_flag_invocations: u64,
+    #[serde(default)]
+    pub fast_path_blind_spots: u64,
 }
 
 impl CompatReport {
@@ -531,6 +545,12 @@ impl CompatReport {
             "  unsupported signals: {} distinct\n",
             s.distinct_unsupported_signals,
         ));
+        if !self.fast_path_blind_spots.is_empty() {
+            out.push_str(&format!(
+                "  fast-path blind spots: {}\n",
+                self.fast_path_blind_spots.join(", ")
+            ));
+        }
         render_section(&mut out, "Unhandled syscalls", &self.unhandled_syscalls);
         render_section(
             &mut out,

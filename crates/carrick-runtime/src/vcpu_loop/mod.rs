@@ -2065,6 +2065,8 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// Exact authority captured at the current syscall boundary. Lifecycle
     /// outcomes consume it rather than recapturing a newer registry generation.
     service_kernel_context: Option<crate::kernel::KernelContext>,
+    current_syscall_request: Option<crate::dispatch::SyscallRequest>,
+    observers: Option<Arc<crate::observe::ObserverChain>>,
     continuation_restart: Option<continuation::RestartDecision>,
     /// Consecutive identical (FAR, ESR) COW faults "successfully" resolved.
     /// A resolution that does not change the faulting translation refaults
@@ -3688,6 +3690,12 @@ where
                 self.kernel.notify_hvpatch_parent_exit(parent);
             }
         });
+        if publish_result.is_ok() {
+            if let Some(chain) = self.kernel.dispatcher.observers() {
+                let p = crate::observe::ProcessInfo::new(&terminal_context);
+                chain.on_process_exit(&p, crate::observe::ExitStatus::from_wait_status(status));
+            }
+        }
         if let Err(failure) = publish_result {
             if let Some(publ) = &core_publication {
                 let _ = self.kernel.dispatcher.rollback_core_publication(publ);
@@ -6557,6 +6565,8 @@ where
             linux_tid,
             fatal_image_generation,
             service_kernel_context: None,
+            current_syscall_request: None,
+            observers: None,
             continuation_restart: None,
             cow_refault_watch: None,
             reserved_signal: None,
@@ -7468,6 +7478,7 @@ where
         // consume this slot through `take_service_kernel_context`; ordinary
         // outcomes leave it available to signal delivery below.
         self.service_kernel_context = Some(kernel_context.retain_exact());
+        self.observers = kernel.dispatcher.observers().cloned();
         let _syscall_guard = kernel.hvpatch_process.as_ref().and_then(|proc| {
             let (pid, asid) = proc.syscall_trace_identity()?;
             HvpatchSyscallServiceGuard::begin(
@@ -7486,6 +7497,7 @@ where
             let request = SyscallRequest::from_raw(frame)
                 .with_guest_abi(<E::Arch as carrick_hal::GuestArch>::linux_guest_abi())
                 .with_current_guest_sp(engine.get_reg(carrick_hal::Reg::Sp).ok());
+            self.current_syscall_request = Some(request);
             let outcome =
                 dispatch_with_panic_backstop(request.number.raw(), self.this_tid, || {
                     kernel.dispatcher.dispatch_threaded(
@@ -7677,6 +7689,16 @@ where
         value: i64,
     ) -> Result<i64, RuntimeError> {
         engine.complete_syscall(value)?;
+        if let (Some(context), Some(request), Some(chain)) = (
+            &self.service_kernel_context,
+            &self.current_syscall_request,
+            &self.observers,
+        ) {
+            let p = crate::observe::ProcessInfo::new(context);
+            let s = crate::observe::SyscallInfo::new(request);
+            let o = crate::observe::SyscallOutcome::from_retval(value);
+            chain.on_syscall_return(&p, &s, &o);
+        }
         Ok(value)
     }
 

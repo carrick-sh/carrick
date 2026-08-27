@@ -1182,6 +1182,10 @@ where
             .unwrap_or_else(|| std::process::abort())
             .retain_exact();
         let child_key = child_context.task().key();
+        if let Some(chain) = kernel.dispatcher.observers() {
+            let p = crate::observe::ProcessInfo::new(parent_context);
+            chain.on_process_create(&p, child_key);
+        }
         let child_backend_result = match prepared_mm {
             PreparedHvpatchProcessMm::Copied(prepared) => parent_process
                 .mm_resources()

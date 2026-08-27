@@ -102,6 +102,7 @@ pub fn resolve_plan(spec: &RunSpec, launch: LaunchContext) -> Result<ExecutionPl
 pub struct RuntimeExtensions {
     vfs_mounts: Vec<(Utf8PathBuf, Box<dyn Vfs>)>,
     stdio: Option<StdioSink>,
+    observers: Vec<Arc<dyn crate::observe::SyscallObserver>>,
 }
 
 impl RuntimeExtensions {
@@ -118,6 +119,21 @@ impl RuntimeExtensions {
     /// `resolve_stdio`) — never a silent override of the spec.
     pub fn stdio(mut self, sink: StdioSink) -> Self {
         self.stdio = Some(sink);
+        self
+    }
+
+    /// Register a syscall observer to receive lifecycle and syscall events.
+    pub fn observer(mut self, observer: Arc<dyn crate::observe::SyscallObserver>) -> Self {
+        self.observers.push(observer);
+        self
+    }
+
+    /// Register multiple syscall observers.
+    pub fn observers<I>(mut self, observers: I) -> Self
+    where
+        I: IntoIterator<Item = Arc<dyn crate::observe::SyscallObserver>>,
+    {
+        self.observers.extend(observers);
         self
     }
 }
@@ -348,7 +364,11 @@ impl Runtime {
             crate::fs_resolve_cache::init();
         });
 
-        let RuntimeExtensions { vfs_mounts, stdio } = ext;
+        let RuntimeExtensions {
+            vfs_mounts,
+            stdio,
+            observers,
+        } = ext;
         let sink = resolve_stdio(spec, stdio)?;
         if spec.platform == Platform::Amd64 {
             rosetta_license_notice();
@@ -393,6 +413,9 @@ impl Runtime {
         // embedder's mount at the same point shadows them (re-mount replaces).
         for (target, vfs) in vfs_mounts {
             dispatcher.register_mount(PathBuf::from(target.as_std_path()), vfs);
+        }
+        for observer in observers {
+            dispatcher.install_observer(observer);
         }
         dispatcher.set_stdio_sink(sink);
         let interactive_session = if spec.tty {
