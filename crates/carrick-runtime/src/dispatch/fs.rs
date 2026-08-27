@@ -188,6 +188,7 @@ mod stat;
 mod state;
 mod xattr;
 pub(crate) use pipe::*;
+pub use state::StdioSink;
 use state::*;
 pub(super) use state::{FsState, RuntimeIo, host_fd_offset};
 pub(crate) use state::{LegacyAioContextId, SplicePushback};

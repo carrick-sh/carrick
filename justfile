@@ -238,6 +238,9 @@ test-integration:
     if [ "{{os()}}" = "macos" ]; then
         cargo test -p carrick-runtime --test integration
         cargo test -p carrick-runtime --test syscall_process
+        # `PreparedRun::execute(self)` single-use contract is a compile_fail
+        # doctest; `just test`'s `--lib --bins` never runs doctests.
+        cargo test -p carrick-runtime --doc prepare
         # `carrick-cli`'s trace_profile suite: the D-program contracts and the
         # DSRPROF1/DSRPROF2 stream parsers. It ran in NO gate until 2026-08-06
         # -- `just test`'s `--lib --bins` reaches carrick-cli's in-file tests

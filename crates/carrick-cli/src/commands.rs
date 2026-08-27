@@ -549,13 +549,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     unsafe { std::env::set_var(k, v) };
                 }
             }
-            // Carrier-wide alias-IPA counter, before any logical guest task is
-            // created (see the Run handler / alloc_alias_ipa — prevents
-            // cross-task alias-IPA reuse in the shared stage-2 TLB).
-            carrick_runtime::memory::init_alias_ipa_allocator();
-            // Same reason: force the carrier-wide fs-resolve generation word
-            // into existence before any logical guest task is created.
-            carrick_runtime::fs_resolve_cache::init();
             let mut dispatcher = if rootfs_layers.is_empty() {
                 SyscallDispatcher::new()
             } else {
@@ -947,15 +940,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 stop_timeout,
                 volumes_from,
             };
-
-            // Stand up the carrier-wide alias-IPA counter before any logical guest
-            // task is created. Every task allocates from this one counter so no two
-            // address spaces ever reuse an alias IPA in the shared hv_vm (a latent
-            // cross-task stage-2 coherence hazard). See alloc_alias_ipa.
-            carrick_runtime::memory::init_alias_ipa_allocator();
-            // Same reason: force the carrier-wide fs-resolve generation word into
-            // existence before any logical guest task is created.
-            carrick_runtime::fs_resolve_cache::init();
 
             // Detached (`carrick run -d`): fork one VM carrier into the
             // background, print the id, and return. Manage it with `carrick
@@ -2798,8 +2782,6 @@ pub(crate) fn run_build(
         stdio: carrick_spec::StdioMode::Inherit,
         ..carrick_engine::RunRequest::default()
     };
-    carrick_runtime::memory::init_alias_ipa_allocator();
-    carrick_runtime::fs_resolve_cache::init();
     let engine = carrick_engine::Engine::new(store.clone());
     let resolved = block_on_oci(engine.resolve(request)).context("resolve kaniko build carrier")?;
     crate::runtime_util::emit_resolve_warnings(&resolved.warnings);

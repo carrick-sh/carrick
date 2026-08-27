@@ -707,6 +707,7 @@ pub(crate) mod ioring;
 mod fs;
 #[cfg(test)]
 pub(crate) use fs::RecordLockContentionFixture;
+pub use fs::StdioSink;
 mod keys;
 pub(crate) use fs::{LegacyAioContextId, SplicePushback};
 #[macro_use]
