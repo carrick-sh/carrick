@@ -38,11 +38,35 @@ fn set_nproc(cur: u64, max: u64) -> bool {
 }
 
 /// Fork a child that blocks on a 1-byte pipe read and exits 0 when released.
-fn fork_blocked() -> (libc::pid_t, i32) {
+///
+/// `inherited` lists the release write-ends of children forked EARLIER that
+/// this parent still holds. The new child must close them, because `fork`
+/// copies the whole descriptor table: a later child holding an earlier
+/// child's write end keeps that pipe open, so closing the PARENT's copy never
+/// delivers EOF, the earlier child never exits, and `waitpid` on it blocks
+/// forever while the child that could release it is itself still blocked.
+/// That is a deadlock in the probe, not a runtime divergence, and it strands
+/// both children — which then count against this uid's RLIMIT_NPROC and make
+/// every later run fail.
+///
+/// A failed fork returns a negative pid; the caller must not treat that as a
+/// child, because `waitpid(-1, ...)` means "any child" and would block on an
+/// unrelated one that has not been released yet.
+fn fork_blocked(inherited: &[i32]) -> (libc::pid_t, i32) {
     let (r, w) = pipe2();
     let pid = unsafe { libc::fork() };
     if pid == 0 {
         unsafe {
+            for fd in inherited {
+                libc::close(*fd);
+            }
+            // If the harness kills the probe while this child is blocked, the
+            // child must not survive: an orphaned PROBE_UID process counts
+            // against RLIMIT_NPROC for that uid forever and makes every later
+            // run of this probe fail with EAGAIN. Best-effort — an unsupported
+            // prctl is ignored, and nothing is printed either way, so the
+            // line-exact output is unaffected on both sides of the oracle.
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
             libc::close(w);
             let mut byte = 0u8;
             libc::read(r, &mut byte as *mut u8 as *mut c_void, 1);
@@ -53,10 +77,23 @@ fn fork_blocked() -> (libc::pid_t, i32) {
     (pid, w)
 }
 
+/// Release a blocked child and reap exactly it.
+///
+/// The `pid > 0` guard is load-bearing, not defensive: `waitpid` treats a
+/// non-positive pid as a wildcard (`-1` = any child, `0` = the process group),
+/// so reaping a fork that FAILED would block on whichever other child is still
+/// blocked on its own release pipe — a deadlock that leaks both children. The
+/// leak is not confined to the run that hangs, because `RLIMIT_NPROC` counts
+/// live processes per REAL uid across the whole user namespace: a leaked
+/// `PROBE_UID` process makes the NEXT run's forks fail with EAGAIN and hang in
+/// turn. One unchecked fork therefore poisons every later run on the machine.
 fn release_and_reap(pid: libc::pid_t, w: i32) -> bool {
     let mut status = 0i32;
     unsafe {
         libc::close(w);
+        if pid <= 0 {
+            return false;
+        }
         libc::waitpid(pid, &mut status, 0) == pid
             && libc::WIFEXITED(status)
             && libc::WEXITSTATUS(status) == 0
@@ -90,16 +127,16 @@ fn main() {
         return;
     }
 
-    let (a, a_release) = fork_blocked();
+    let (a, a_release) = fork_blocked(&[]);
     println!("fork_a_ok={}", a > 0);
     println!("fork_b_eagain={}", fork_expect_eagain());
     println!("reap_a_ok={}", release_and_reap(a, a_release));
 
-    let (c, c_release) = fork_blocked();
+    let (c, c_release) = fork_blocked(&[]);
     println!("fork_c_after_reap_ok={}", c > 0);
 
     println!("setrlimit_nproc_3={}", set_nproc(3, 3));
-    let (d, d_release) = fork_blocked();
+    let (d, d_release) = fork_blocked(&[c_release]);
     println!("fork_d_ok={}", d > 0);
 
     println!("reap_c_ok={}", release_and_reap(c, c_release));
