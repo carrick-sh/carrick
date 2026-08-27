@@ -382,6 +382,24 @@ gate-containers: build
     CARRICK_PROBE_SCENARIO_LIBC=musl cargo test -p carrick-cli --test conformance \
       conformance_container_gate -- --exact --nocapture
 
+# Guest-running tests of the embedding crate, from SIGNED cargo test
+# executables. A cargo test binary is the process that calls hv_vm_create, so
+# it needs the hypervisor entitlement ITSELF — `just build` signs only
+# target/release/carrick, and a bare `cargo test -p carrick-embed` dies
+# HV_DENIED (0xfae94007). scripts/test-signed.sh builds the crate's test
+# executables with --no-run, signs each through the shipped binary's post-link
+# path (scripts/lib/post-link-sign.sh), proves the entitlement, runs them under
+# RUST_TEST_THREADS=1 (one VM per process), then runs an UNENTITLED negative
+# control that must classify HV_DENIED as EmbedError::Entitlement. HV_DENIED
+# is a failure here, never a skip. ARGS go straight to the libtest executables
+# (`just test-embed captured_ --nocapture`; no `--` separator). Depends on
+# `build`: the CLI-parity test compares the library against
+# target/release/carrick. Needs HVF + the docker.io/library/ubuntu:24.04
+# image, so it is an opt-in guest lane like conformance-quick — deliberately
+# NOT part of `just ci`.
+test-embed *ARGS: build
+    ./scripts/test-signed.sh carrick-embed {{ARGS}}
+
 # Re-sign an already-built release binary (rarely needed on its own).
 sign:
     codesign --force --sign - --entitlements scripts/entitlements.plist target/release/carrick

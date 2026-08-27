@@ -15,6 +15,9 @@
 # RUN/test phase fan out (see parallel_conformance_gate).
 set -e
 cd "$(dirname "$0")/.."
+# The vtool + codesign post-link path is shared with scripts/test-signed.sh
+# (cargo test executables that boot guests need the identical treatment).
+. scripts/lib/post-link-sign.sh
 
 # Entitlements selection.
 #
@@ -71,21 +74,12 @@ if [ ! -x "$built" ]; then
     echo "build-signed: expected binary not found at $built" >&2
     exit 1
 fi
-# XNU's arm64 exception-return policy preserves physical x18 for binaries
-# linked against the pre-macOS-13 ABI. Tier D proves that behavior again at
-# runtime before using x18; if Apple changes it, Carrick refuses dynamic code
-# rather than trusting this metadata. The private custom-x18 entitlement is
-# intentionally NOT used: ad-hoc signed binaries carrying it are killed by
-# AMFI on current macOS.
-#
-# Always materialise ATOMICALLY — vtool requires distinct input/output paths,
-# and rename(2) means a concurrent exec sees the complete old or new binary.
+# vtool build-version stamp (x18 ABI) + ad-hoc codesign + atomic rename, in
+# scripts/lib/post-link-sign.sh — the rationale lives there. The temporaries
+# are <signed>.raw.$$ / <signed>.tmp.$$; clean them up if a step fails.
 mkdir -p target/release
 raw="$signed.raw.$$"
 tmp="$signed.tmp.$$"
 trap 'rm -f "$raw" "$tmp"' EXIT
-cp -f "$built" "$raw"
-/usr/bin/vtool -set-build-version macos 11.0 12.0 -replace -output "$tmp" "$raw"
-codesign --force --sign - --entitlements "$entitlements" "$tmp"
-mv -f "$tmp" "$signed"
+carrick_post_link_sign "$built" "$signed" "$entitlements"
 echo "built + signed: $signed (from $built, entitlements=$entitlements)"

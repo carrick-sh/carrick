@@ -550,6 +550,7 @@ dependencies = [
  "carrick-runtime",
  "carrick-spec",
  "flate2",
+ "libc",
  "serde_json",
  "tar",
  "tempfile",
