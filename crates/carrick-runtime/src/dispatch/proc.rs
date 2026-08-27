@@ -1443,6 +1443,8 @@ impl SyscallDispatcher {
                     }
                     this.proc.lock().task_name = task_name;
                     set_host_process_name(&task_name);
+                    let name_str = linux_task_name_to_string(&task_name);
+                    cx.kernel.kernel().set_diagnostic_name(cx.kernel.task().key().id, name_str);
                     DispatchOutcome::Returned { value: 0 }
                 }
                 LINUX_PR_GET_NAME => {

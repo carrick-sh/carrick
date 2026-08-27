@@ -999,6 +999,10 @@ impl Kernel {
         &self.registry
     }
 
+    pub fn set_diagnostic_name(&self, id: TaskId, name: String) -> bool {
+        self.registry.set_diagnostic_name(id, name)
+    }
+
     pub const fn ids(&self) -> &IdRegistry {
         &self.ids
     }
@@ -1467,6 +1471,19 @@ impl Registry {
         match state.tasks.get(&task_id) {
             Some(record) => {
                 record.task.set_nice(nice);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Apply a diagnostic/comm name update to live process `id`. `false` means
+    /// no such live process.
+    pub(crate) fn set_diagnostic_name(&self, id: TaskId, name: String) -> bool {
+        let mut state = self.state.write();
+        match state.tasks.get_mut(&id) {
+            Some(record) => {
+                record.diagnostic_name = name;
                 true
             }
             None => false,
