@@ -572,7 +572,8 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 &security_opt,
             )
             .map_err(anyhow::Error::msg)?;
-            dispatcher.apply_launch_privileges(seccomp_policy, &[]);
+            let container = carrick_runtime::kernel::Container::for_reference_model();
+            dispatcher.apply_launch_privileges(seccomp_policy, &container);
             install_fs_backend(&mut dispatcher, fs)?;
             // Bind-mount host paths into the guest. `--fs host` is a sandboxed
             // scratch (NOT the real host FS), so this is the only way to expose a

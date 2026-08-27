@@ -194,7 +194,8 @@ impl Runtime {
         // `install_pid_ns`, B4's `admit_container`/`retire_container` and the
         // dispatcher all hold the one `Arc`.
         let launch = crate::kernel::LaunchContext::from_process_env()?;
-        let container = Arc::new(crate::kernel::Container::new(launch));
+        let container =
+            Arc::new(crate::kernel::Container::new(launch).with_launch_capabilities(&spec.cap_add));
         if spec.platform == Platform::Amd64 {
             rosetta_license_notice();
         }
@@ -339,7 +340,7 @@ impl Runtime {
                 // Launch-time container syscall policy (the Docker default-
                 // seccomp model, or unconfined) — before boot, inherited by the
                 // whole guest process tree. See crate::container_policy.
-                dispatcher.apply_launch_privileges(spec.seccomp_policy, &spec.cap_add);
+                dispatcher.apply_launch_privileges(spec.seccomp_policy, &container);
 
                 let hosts_entries = runtime_network.guest_hosts_entries().map_err(|e| {
                     RuntimeError::Unsupported(format!("network hosts setup failed: {e}"))
@@ -439,7 +440,7 @@ impl Runtime {
                 }
                 dispatcher.set_credentials(spec.uid, spec.gid);
                 // Same launch-time policy application as the Host branch.
-                dispatcher.apply_launch_privileges(spec.seccomp_policy, &spec.cap_add);
+                dispatcher.apply_launch_privileges(spec.seccomp_policy, &container);
 
                 install_fs_backend(
                     &mut dispatcher,
