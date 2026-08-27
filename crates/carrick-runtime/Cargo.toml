@@ -136,7 +136,6 @@ socket2.workspace = true
 tar.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 # NOTE: no `usdt` edge here. This crate names no `usdt` type — the provider (and
@@ -182,6 +181,7 @@ bad64.workspace = true
 dynasmrt.workspace = true
 carrick-test-support = { path = "../carrick-test-support" }
 tempfile.workspace = true
+tokio.workspace = true
 carrick-image = { path = "../carrick-image" }
 proptest.workspace = true
 static_assertions = "1"

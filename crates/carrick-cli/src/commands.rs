@@ -41,16 +41,6 @@
 //!    (stdio already streamed live by the engine; the CLI just flushes residual
 //!    bytes and adopts the code); `--json` opts into the legacy compat-report
 //!    envelope; `--raw` is now a no-op alias for the default.
-//!
-//! ## Fork-safety on the engine error path
-//!
-//! An interactive run may cross the separately-scoped TTY supervisor boundary
-//! inside `Runtime::execute`, so an HVF/setup failure can surface in the `Err`
-//! arm while already in a forked runtime child. That child uses
-//! `libc::_exit(125)` because normal atexit/Drop cleanup after fork can
-//! double-close an inherited fd and trip an IO-safety abort. The ordinary/raw
-//! carrier uses `std::process::exit(125)` and retains normal cleanup.
-//!
 //! ## `trace`: the auto-sudo re-exec
 //!
 //! `Commands::Trace` is the one arm with real control-flow weight, because
@@ -1003,13 +993,12 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             // start — image resolve/pull, an invalid reference, no command, or
             // VM setup. (The container's OWN exit code is the Ok path below;
             // 126/127 for a bad entrypoint are produced inside the runtime.)
-            // Resolve (pull + build the spec) under the tokio runtime, then DROP
-            // the runtime before executing — so no tokio thread is alive across
-            // the fork in Runtime::execute. (Forking with a live tokio runtime
-            // deadlocks the child in BlockingPool::shutdown.)
+            // Resolve (pull + build the spec) on a short-lived current-thread
+            // tokio runtime; `block_on_oci` drops it before `Runtime::execute`
+            // runs the guest synchronously in this carrier.
             let spec = match block_on_oci(engine.resolve(req.clone())) {
                 Ok(s) => s,
-                // resolve runs in the PARENT (no fork yet) → normal exit is safe.
+                // No guest has started yet → normal exit is safe.
                 Err(e) => {
                     eprintln!("carrick: {e:#}");
                     std::process::exit(125);
@@ -1019,15 +1008,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("carrick: {e:#}");
-                    if tty {
-                        // The separately-scoped interactive TTY supervisor may
-                        // put this error arm in its forked runtime child. Do not
-                        // unwind fd-owning state there.
-                        // SAFETY: `_exit` skips atexit/Drop; stderr is unbuffered.
-                        unsafe { libc::_exit(125) };
-                    }
-                    // Ordinary/raw HVPatch execution is the original carrier,
-                    // so normal process cleanup and terminal receipts are safe.
                     std::process::exit(125);
                 }
             };

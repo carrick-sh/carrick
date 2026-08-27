@@ -1011,10 +1011,10 @@ impl GuestVmBackend for HvfAarch64Vmm {
     }
 
     fn process_exit_cleanup(&mut self) -> Result<(), TrapError> {
-        // Called on the exiting fork-child's OWN thread (vcpu_loop/mod.rs:1469/
-        // 1500/1884 — the child-exit / signal-death paths, gated by
-        // `is_forked_child() || is_forked_guest_process()`, so it NEVER runs on
-        // the parent), BEFORE `_exit` skips Rust drops.
+        // Called on the exiting task's OWN thread from the vcpu_loop
+        // child-exit / signal-death paths (`vcpu_loop/exec.rs` and
+        // `vcpu_loop/mod.rs`, behind `requires_no_unwind_host_exit`), before
+        // any host-process exit would skip Rust drops.
         //
         // ATOMIC PERMIT PATH (the default): cooperatively free the permit slots
         // THIS process registered so occupancy returns to baseline immediately,

@@ -1,9 +1,8 @@
-//! execve image loading + forked-child exit paths, split out of runtime.rs
-//! (WS-F3): load_execve_image (rootfs/overlay ELF + shebang + Rosetta
-//! redirect) and the no-unwind forked_child_exit / forked_child_die_by_signal
-//! helpers. The shebang helpers (resolve_shebang, parse_shebang) and
-//! forked-child exit functions now live in `crate::exec_helpers` (cross-
-//! platform); they are re-exported here for existing call sites.
+//! execve image loading, split out of runtime.rs (WS-F3): load_execve_image
+//! (rootfs/overlay ELF + shebang + Rosetta redirect). The shebang helpers
+//! (resolve_shebang, parse_shebang) and the signal-death / stop helpers live
+//! in `crate::exec_helpers` (cross-platform); they are re-exported here for
+//! existing call sites.
 //! Free functions reached via `use super::*`.
 use super::*;
 use crate::linux_abi::LinuxErrno;
@@ -160,13 +159,13 @@ pub(crate) fn load_execve_image(
     Ok(image)
 }
 
-// Shebang resolution and forked-child exit helpers are now in the
-// cross-platform `exec_helpers` module. Re-export them here so the existing
-// call sites in `runtime.rs` (`use exec::{…}`) and the vcpu_loop macOS import
-// (`use crate::runtime::exec::{…}`) continue to resolve without change.
+// Shebang resolution and the signal-death / stop helpers live in the
+// cross-platform `exec_helpers` module. Re-export them here so the call sites
+// in `runtime.rs` (`use exec::{…}`) and the vcpu_loop macOS import
+// (`use crate::runtime::exec::{…}`) resolve without change.
 pub(super) use crate::exec_helpers::resolve_shebang;
 pub(crate) use crate::exec_helpers::{
-    forked_child_die_by_signal, forked_child_exit, stop_after_traced_exec, stop_by_signal,
+    forked_child_die_by_signal, stop_after_traced_exec, stop_by_signal,
 };
 
 #[cfg(test)]

@@ -511,7 +511,7 @@ mod macos_helper_stubs {
     // so the `use macos_helper_stubs::{…}` import at the bottom of this module
     // (line ~281) continues to resolve without change.
     pub(super) use crate::exec_helpers::{
-        forked_child_die_by_signal, forked_child_exit, stop_after_traced_exec, stop_by_signal,
+        forked_child_die_by_signal, stop_after_traced_exec, stop_by_signal,
     };
 
     pub(super) fn hardware_tso_for_debug(_requested: bool) -> bool {
@@ -524,8 +524,8 @@ mod macos_helper_stubs {
     feature = "platform-netbsd"
 ))]
 use macos_helper_stubs::{
-    forked_child_die_by_signal, forked_child_exit, hardware_tso_for_debug, load_execve_image,
-    stop_after_traced_exec, stop_by_signal,
+    forked_child_die_by_signal, hardware_tso_for_debug, load_execve_image, stop_after_traced_exec,
+    stop_by_signal,
 };
 
 // ===================================================================
