@@ -74,7 +74,21 @@ fn main() {
     let my_comm = format!("gate-{role}");
     let peer_comm = format!("gate-{peer}");
 
+    // Sampled twice, plus /proc, to tell a STARTUP WINDOW from a persistent
+    // wrong answer. `getpid=0` has been seen intermittently under load, and a
+    // single sample cannot distinguish "the first call raced something" from
+    // "this container's pid is wrong for its whole life". These extra fields
+    // are diagnostic; `getpid` remains the asserted one.
     let pid = unsafe { libc::getpid() };
+    let pid_again = unsafe { libc::getpid() };
+    let proc_status_pid = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("Pid:"))
+                .and_then(|l| l.split_whitespace().nth(1).map(str::to_owned))
+        })
+        .unwrap_or_else(|| "ERR".to_owned());
     let mut host = [0 as libc::c_char; 256];
     unsafe { libc::gethostname(host.as_mut_ptr(), host.len() - 1) };
     let hostname = unsafe { std::ffi::CStr::from_ptr(host.as_ptr()) }
@@ -120,7 +134,8 @@ fn main() {
         "role={role}\ngetpid={pid}\nhostname={hostname}\nown_marker_written={own_marker_written}\n\
          foreign_marker_visible={foreign_marker_visible}\nchild_comm_visible={child_comm_visible}\n\
          foreign_proc_visible={foreign_proc_visible}\npeer_ready={peer_ready}\n\
-         mmap_arena_ok={mmap_arena_ok}\n"
+         mmap_arena_ok={mmap_arena_ok}\ngetpid_again={pid_again}\n\
+         proc_status_pid={proc_status_pid}\n"
     );
     print!("{lines}");
     if let Ok(mut file) = std::fs::File::create(format!("/gate/{role}.report")) {
