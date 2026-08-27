@@ -1,0 +1,651 @@
+//! In-process conformance probe test suite for generic probe shard 0.
+//!
+//! Migrates shard 0 of generic conformance probes from
+//! `crates/carrick-cli/tests/conformance.rs` into an in-process integration test
+//! using `carrick-embed`'s `TestContainer` without invoking `carrick run` or `std::process::Command`.
+//!
+//! Run host-only verification via:
+//!   cargo test -p carrick-conformance-next --test probes_shard_0
+//!
+//! Run signed guest verification via:
+//!   just test-conformance-next generic_probe_shard_0 --nocapture
+//! or:
+//!   ./scripts/test-signed.sh carrick-conformance-next generic_probe_shard_0 --nocapture
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+mod common;
+
+use std::collections::BTreeSet;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+
+use carrick_conformance_next::{PullPolicy, TestContainer};
+
+/// Exact materialized list of 142 sorted unique probe names for generic shard 0.
+///
+/// Conceptually defined as:
+/// - class: "conformance"
+/// - excluded: false
+/// - runner: "generic"
+/// - sorted lexicographically
+/// - enumerated from index 0
+/// - retained where index % 3 == 0
+pub const SHARD_0_PROBES: &[&str] = &[
+    "abortdeath",
+    "accounting",
+    "aliassize",
+    "bigread",
+    "brkheapgrow",
+    "cachestatpages",
+    "chmodfollowsymlink",
+    "clockgetres",
+    "clone3args",
+    "clone3signalflight",
+    "cloneexitsig",
+    "clonefsumask",
+    "cluster10errno",
+    "coredumpfile",
+    "ctrel0",
+    "dirfdnotdir",
+    "dnotify",
+    "epollclosenodel",
+    "epolletchildhup",
+    "epollexclusive",
+    "epolloutrearm",
+    "epollpwait",
+    "execfailsurvive",
+    "execpermitchurn",
+    "execsocket",
+    "execvereset",
+    "exitstatus127",
+    "faultaddr",
+    "fcntllease",
+    "fcntlowner",
+    "fdio",
+    "fexecveprobe",
+    "fifoforkeof",
+    "forkaltstack",
+    "forkfault",
+    "forkfpregs",
+    "forkshared",
+    "forksnapshot",
+    "fsescapeguard",
+    "fstatatflags",
+    "futexextra",
+    "futexghost",
+    "futexprivatewakeexact",
+    "futexshare",
+    "futexwaiterstates",
+    "getrandomflags",
+    "getrandomvdsoloop",
+    "icmp",
+    "iouring",
+    "iovecedge",
+    "itimer",
+    "keydeny",
+    "killgroup",
+    "killtarget",
+    "legacyaio",
+    "linkstat",
+    "ltpcheckpoint",
+    "lxattr",
+    "mapfixed",
+    "mcastjoingroup",
+    "memfdsecret",
+    "mkdirsetgid",
+    "mmapcage",
+    "mmapexecshared",
+    "mmapfileshare_mt",
+    "mmaprecl",
+    "mmapv8align",
+    "mprotectexec",
+    "mremapgrow",
+    "mremapshrink",
+    "msyncalign",
+    "mtsigrelease",
+    "nativeetexecfork",
+    "netifmcast",
+    "newmountapi",
+    "nsfsioctl",
+    "oomscoreadj",
+    "openat2valid",
+    "openempty",
+    "overlaysymlink",
+    "pauseeintr",
+    "pidfdprocdir",
+    "pidnsorphanreap",
+    "pipeextra",
+    "pollevent",
+    "ppollsig",
+    "prctlerrors",
+    "preadv2flags",
+    "procconfigloop",
+    "procladder_epollmgr",
+    "proclife",
+    "procprctlview",
+    "procselfstatleader",
+    "procstat",
+    "protnonesyscall",
+    "ptraceinvaliderrno",
+    "ptracesigdeath",
+    "ptracetraceme",
+    "ptyforkreopen",
+    "readwronly",
+    "recvmsgtrunc",
+    "rlimitasdata",
+    "rlimitresource",
+    "roprotect",
+    "rtsigqueueinfo",
+    "saresethand",
+    "schedparam",
+    "scmrightsfds",
+    "seekholedata",
+    "selfhostnameresolve",
+    "semgetnsems",
+    "setfsid",
+    "setpgidparentgroup",
+    "shmlinkat",
+    "sigactionresetinfo",
+    "siginfo",
+    "signalfd4",
+    "sigpairrace",
+    "sigreenter",
+    "sigtimedwaitintr",
+    "sigwaitblock",
+    "sockoptdomainproto",
+    "splicepipe",
+    "symlinkfollow",
+    "syscallregpreserve",
+    "sysvmsgwake",
+    "sysvshm",
+    "termiosflow",
+    "threadcommname",
+    "threadstatstate",
+    "timeextra",
+    "tlsswitch",
+    "traceexecstop",
+    "udplitesock",
+    "unicodenorm",
+    "usernsmap",
+    "vdsosymbols",
+    "vforkvmshare",
+    "waitexitstorm",
+    "waitidspec",
+    "waitsiblingsigchld",
+    "xsignal",
+];
+
+/// Complete baseline expected gaps for musl on arm64.
+pub const MUSL_BASELINE_GAPS: &[&str] = &[
+    "budget_two_proc",
+    "childsubreaper",
+    "cluster10errno",
+    "coredumpfile",
+    "execfromthread",
+    "execthreads",
+    "futexforkwakegroups",
+    "mprotectexec",
+    "mqnotifycrossproc",
+    "pidfdprocdir",
+    "pidnsroot",
+    "ppid",
+    "proclife",
+    "procpeerdir",
+    "procpeermem",
+    "rlimitnproc",
+    "shmnestedfork",
+    "siginfo",
+    "sigpairrace",
+    "sigtimedwaitintr",
+    "sigwaitblock",
+    "sysinfo",
+    "telemetrymap",
+    "vforkexecthread",
+    "vfs_mount_rw",
+];
+
+/// Complete baseline expected gaps for gnu on arm64.
+pub const GNU_BASELINE_GAPS: &[&str] = &[
+    "budget_two_proc",
+    "childsubreaper",
+    "clonefsumask",
+    "cluster10errno",
+    "coredumpfile",
+    "execfromthread",
+    "execthreads",
+    "killchld",
+    "mmapfileshare_mt",
+    "pidfdprocdir",
+    "pidnsroot",
+    "ppid",
+    "proclife",
+    "procpeerdir",
+    "procpeermem",
+    "ptraceattach",
+    "rlimitnproc",
+    "setidthreadchurn",
+    "shmnestedfork",
+    "siginfo",
+    "sigpairrace",
+    "sigwaitblock",
+    "sysinfo",
+    "telemetrymap",
+    "vforkexecthread",
+    "vfs_mount_rw",
+];
+
+/// Derive the shard 0 subset from a complete baseline set.
+pub fn expected_shard_gaps(baseline: &[&'static str]) -> BTreeSet<&'static str> {
+    let shard_set: BTreeSet<&str> = SHARD_0_PROBES.iter().copied().collect();
+    baseline
+        .iter()
+        .copied()
+        .filter(|probe| shard_set.contains(probe))
+        .collect()
+}
+
+/// Drop carrick's scratch warning so output lines up with Docker's.
+/// Exact match of the old normalize function in `crates/carrick-cli/tests/conformance.rs`.
+pub fn normalize(s: &str) -> String {
+    s.lines()
+        .filter(|l| !l.contains("case-insensitive; defaulting") && !l.contains("Pass `--fs host`"))
+        .map(|l| l.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim_end()
+        .to_string()
+}
+
+/// Stable content fingerprint of a probe's source using DefaultHasher.
+/// Matches `probe_src_hash` in `crates/carrick-cli/tests/conformance.rs`.
+pub fn probe_src_hash(repo_root: &Path, name: &str) -> String {
+    match std::fs::read(repo_root.join(format!("conformance-probes/src/bin/{name}.rs"))) {
+        Ok(bytes) => {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            bytes.hash(&mut h);
+            format!("{:016x}", h.finish())
+        }
+        Err(_) => "nosrc".to_string(),
+    }
+}
+
+/// Read and validate a cached Docker oracle output for a probe.
+/// Fails with a descriptive error if missing or if the source hash has drifted.
+pub fn cached_probe_oracle(
+    repo_root: &Path,
+    lane_label: &str,
+    libc: &str,
+    name: &str,
+) -> Result<String, String> {
+    let rel_path = format!("crates/carrick-cli/tests/probe-oracle/{lane_label}-{libc}/{name}");
+    let path = repo_root.join(&rel_path);
+    let raw = std::fs::read_to_string(&path).map_err(|e| {
+        format!(
+            "missing oracle cache for probe {name:?} ({lane_label}-{libc}) at {}: {e}. \
+             Bless it on a Docker host.",
+            path.display()
+        )
+    })?;
+    let (hash_line, body) = raw.split_once('\n').ok_or_else(|| {
+        format!(
+            "corrupt oracle cache for probe {name:?} at {}: missing first-line source hash separator",
+            path.display()
+        )
+    })?;
+    let expected_hash = probe_src_hash(repo_root, name);
+    if hash_line != expected_hash {
+        return Err(format!(
+            "stale oracle cache for probe {name:?} at {}: \
+             source hash mismatch (cache has {hash_line:?}, current source has {expected_hash:?}). \
+             Re-bless on a Docker host.",
+            path.display()
+        ));
+    }
+    Ok(normalize(body))
+}
+
+/// Formats a line-by-line diff between carrick output and oracle output.
+pub fn diff_lines(carrick: &str, oracle: &str) -> Option<String> {
+    if carrick == oracle {
+        return None;
+    }
+    let c: Vec<&str> = carrick.lines().collect();
+    let o: Vec<&str> = oracle.lines().collect();
+    let mut buf = String::new();
+    for i in 0..c.len().max(o.len()) {
+        let cl = c.get(i).copied();
+        let ol = o.get(i).copied();
+        if cl == ol {
+            continue;
+        }
+        buf.push_str(&format!("  line {}:\n", i + 1));
+        match cl {
+            Some(s) => buf.push_str(&format!("    - carrick: {s}\n")),
+            None => buf.push_str("    - carrick: <missing>\n"),
+        }
+        match ol {
+            Some(s) => buf.push_str(&format!("    + oracle:  {s}\n")),
+            None => buf.push_str("    + oracle:  <missing>\n"),
+        }
+    }
+    Some(buf)
+}
+
+/// Locate probe directory for a target triple.
+pub fn find_probe_binary_dir(repo_root: &Path, target: &str) -> Option<PathBuf> {
+    let candidate1 = repo_root
+        .join("conformance-probes/target")
+        .join(target)
+        .join("release");
+    if candidate1.is_dir() {
+        return Some(candidate1);
+    }
+    let candidate2 = repo_root.join("target").join(target).join("release");
+    if candidate2.is_dir() {
+        return Some(candidate2);
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Host-only verification tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_shard_0_inventory() {
+    // Hard-assert exactly 142 sorted unique names.
+    assert_eq!(
+        SHARD_0_PROBES.len(),
+        142,
+        "shard 0 must have exactly 142 probes"
+    );
+
+    let mut sorted_probes = SHARD_0_PROBES.to_vec();
+    sorted_probes.sort_unstable();
+    assert_eq!(
+        SHARD_0_PROBES,
+        sorted_probes.as_slice(),
+        "SHARD_0_PROBES must be strictly sorted"
+    );
+
+    let unique_probes: BTreeSet<_> = SHARD_0_PROBES.iter().copied().collect();
+    assert_eq!(
+        unique_probes.len(),
+        142,
+        "SHARD_0_PROBES must contain 142 unique names"
+    );
+
+    // Verify against conformance-probes/probe-inventory.json
+    let repo_root = common::repo_root();
+    let inv_path = repo_root.join("conformance-probes/probe-inventory.json");
+    let inv_raw = std::fs::read_to_string(&inv_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", inv_path.display()));
+
+    // Custom lightweight parser for probe-inventory.json to avoid extra dependencies.
+    // Format is:
+    // "name": {
+    //   "class": "conformance",
+    //   "excluded": false,
+    //   "runner": "generic"
+    // }
+    let mut selected_names = Vec::new();
+    let mut cur_name: Option<String> = None;
+    let mut cur_class: Option<String> = None;
+    let mut cur_excluded = false;
+    let mut cur_runner: Option<String> = None;
+
+    for line in inv_raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('"') && trimmed.ends_with('{') {
+            if let Some(name) = cur_name.take()
+                && cur_class.as_deref() == Some("conformance")
+                && !cur_excluded
+                && cur_runner.as_deref() == Some("generic")
+            {
+                selected_names.push(name);
+            }
+            cur_class = None;
+            cur_excluded = false;
+            cur_runner = None;
+            if let Some(end_idx) = trimmed[1..].find('"') {
+                cur_name = Some(trimmed[1..=end_idx].to_string());
+            }
+        } else if trimmed.starts_with("\"class\":") && trimmed.contains("\"conformance\"") {
+            cur_class = Some("conformance".to_string());
+        } else if trimmed.starts_with("\"excluded\":") && trimmed.contains("true") {
+            cur_excluded = true;
+        } else if trimmed.starts_with("\"runner\":") && trimmed.contains("\"generic\"") {
+            cur_runner = Some("generic".to_string());
+        }
+    }
+    if let Some(name) = cur_name.take()
+        && cur_class.as_deref() == Some("conformance")
+        && !cur_excluded
+        && cur_runner.as_deref() == Some("generic")
+    {
+        selected_names.push(name);
+    }
+
+    selected_names.sort();
+    assert_eq!(
+        selected_names.len(),
+        426,
+        "expected exactly 426 conformance generic probes in inventory"
+    );
+
+    let derived_shard_0: Vec<&str> = selected_names
+        .iter()
+        .enumerate()
+        .filter_map(|(i, name)| (i % 3 == 0).then_some(name.as_str()))
+        .collect();
+
+    assert_eq!(
+        derived_shard_0.len(),
+        142,
+        "derived shard 0 must have exactly 142 items"
+    );
+    assert_eq!(
+        SHARD_0_PROBES,
+        derived_shard_0.as_slice(),
+        "SHARD_0_PROBES must match the derived shard 0 from probe-inventory.json"
+    );
+}
+
+#[test]
+fn test_shard_0_expected_gaps_derivation() {
+    let musl_shard_gaps = expected_shard_gaps(MUSL_BASELINE_GAPS);
+    let gnu_shard_gaps = expected_shard_gaps(GNU_BASELINE_GAPS);
+
+    let expected_musl_set: BTreeSet<&str> = [
+        "cluster10errno",
+        "coredumpfile",
+        "mprotectexec",
+        "pidfdprocdir",
+        "proclife",
+        "siginfo",
+        "sigpairrace",
+        "sigtimedwaitintr",
+        "sigwaitblock",
+    ]
+    .into_iter()
+    .collect();
+
+    let expected_gnu_set: BTreeSet<&str> = [
+        "clonefsumask",
+        "cluster10errno",
+        "coredumpfile",
+        "mmapfileshare_mt",
+        "pidfdprocdir",
+        "proclife",
+        "siginfo",
+        "sigpairrace",
+        "sigwaitblock",
+    ]
+    .into_iter()
+    .collect();
+
+    assert_eq!(
+        musl_shard_gaps, expected_musl_set,
+        "musl shard 0 gaps must match derived intersection"
+    );
+    assert_eq!(
+        gnu_shard_gaps, expected_gnu_set,
+        "gnu shard 0 gaps must match derived intersection"
+    );
+}
+
+#[test]
+fn test_normalization() {
+    let input = "line 1\ncase-insensitive; defaulting to memory fs\nline 2   \nPass `--fs host` to use host fs\nline 3\n\n";
+    let normalized = normalize(input);
+    assert_eq!(normalized, "line 1\nline 2\nline 3");
+
+    let clean = "clean\noutput\n";
+    assert_eq!(normalize(clean), "clean\noutput");
+
+    let empty = "";
+    assert_eq!(normalize(empty), "");
+}
+
+#[test]
+fn test_cache_freshness_and_hashing() {
+    let repo_root = common::repo_root();
+
+    // Fingerprint of a non-existent probe source is sentinel "nosrc".
+    assert_eq!(
+        probe_src_hash(&repo_root, "__definitely_nonexistent_probe__"),
+        "nosrc"
+    );
+
+    // Any probe source that exists must have a 16-hex-digit fingerprint.
+    let abortdeath_hash = probe_src_hash(&repo_root, "abortdeath");
+    assert_eq!(abortdeath_hash.len(), 16);
+    assert!(abortdeath_hash.chars().all(|c| c.is_ascii_hexdigit()));
+
+    // Verify shard 0 cached entries under arm64-musl match their source hashes.
+    for probe_name in [
+        "fifoforkeof",
+        "futexshare",
+        "ptyforkreopen",
+        "syscallregpreserve",
+    ] {
+        let cached = cached_probe_oracle(&repo_root, "arm64", "musl", probe_name);
+        assert!(
+            cached.is_ok(),
+            "cached oracle for arm64-musl/{probe_name} must be fresh: {:?}",
+            cached.err()
+        );
+        let content = cached.unwrap();
+        assert_eq!(content, normalize(&content));
+    }
+
+    // Verify that a file without a valid matching source hash is rejected as stale.
+    let stale_err = cached_probe_oracle(&repo_root, "arm64", "musl", "dsrconstantpool")
+        .expect_err("dsrconstantpool without valid hash header must fail validation");
+    assert!(stale_err.contains("source hash mismatch"));
+
+    // Verify error messages on missing cache queries.
+    let missing_err = cached_probe_oracle(&repo_root, "arm64", "musl", "__nonexistent__")
+        .expect_err("missing cache entry must return Err");
+    assert!(
+        missing_err.contains("missing oracle cache for probe \"__nonexistent__\""),
+        "error message must clearly state missing oracle cache: {missing_err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Signed guest execution test
+// ---------------------------------------------------------------------------
+
+#[test]
+fn generic_probe_shard_0() {
+    let _guard = common::guest_lock();
+    let root = common::repo_root();
+
+    let targets = [
+        ("aarch64-unknown-linux-musl", "musl"),
+        ("aarch64-unknown-linux-gnu", "gnu"),
+    ];
+
+    for (target, libc) in targets {
+        let expected_gaps = match libc {
+            "musl" => expected_shard_gaps(MUSL_BASELINE_GAPS),
+            "gnu" => expected_shard_gaps(GNU_BASELINE_GAPS),
+            _ => unreachable!(),
+        };
+
+        let probe_dir = match find_probe_binary_dir(&root, target) {
+            Some(dir) => dir,
+            None => {
+                eprintln!(
+                    "SKIP generic_probe_shard_0[{target}]: probe binaries not built \
+                     (looked in conformance-probes/target/{target}/release and target/{target}/release)"
+                );
+                continue;
+            }
+        };
+
+        let init_path = probe_dir.join("probeinit");
+        assert!(
+            init_path.is_file(),
+            "probeinit transport helper missing at {} — run scripts/build-probes.sh",
+            init_path.display()
+        );
+
+        let mut observed_mismatches = BTreeSet::new();
+        let mut missing_binaries = Vec::new();
+        let mut diff_details = Vec::new();
+
+        for probe_name in SHARD_0_PROBES {
+            let probe_path = probe_dir.join(probe_name);
+            if !probe_path.is_file() {
+                missing_binaries.push(probe_name);
+                continue;
+            }
+
+            let cached_oracle = match cached_probe_oracle(&root, "arm64", libc, probe_name) {
+                Ok(out) => out,
+                Err(err) => panic!("{err}"),
+            };
+
+            let container = TestContainer::new(common::SMOKE_IMAGE)
+                .pull_policy(PullPolicy::Missing)
+                .mount_readonly(probe_path.display().to_string(), "/tmp/p")
+                .mount_readonly(init_path.display().to_string(), "/tmp/carrick-init");
+
+            let result = common::run_or_fail(container.run(["/tmp/carrick-init"]));
+
+            let mut combined = String::from_utf8_lossy(&result.stdout).into_owned();
+            combined.push_str(&String::from_utf8_lossy(&result.stderr));
+            let normalized_carrick = normalize(&combined);
+
+            if let Some(diff) = diff_lines(&normalized_carrick, &cached_oracle) {
+                observed_mismatches.insert(*probe_name);
+                diff_details.push(format!("{probe_name}:\n{diff}"));
+            }
+        }
+
+        assert!(
+            missing_binaries.is_empty(),
+            "missing probe binaries for target {target}: {missing_binaries:?}"
+        );
+
+        let unexpected_failures: BTreeSet<_> = observed_mismatches
+            .difference(&expected_gaps)
+            .copied()
+            .collect();
+        let unexpected_passes: BTreeSet<_> = expected_gaps
+            .difference(&observed_mismatches)
+            .copied()
+            .collect();
+
+        assert!(
+            unexpected_failures.is_empty() && unexpected_passes.is_empty(),
+            "probe shard 0 verdict mismatch for {target}:\n\
+             unexpected failures (new regressions): {unexpected_failures:?}\n\
+             unexpected passes (fixed gaps — update baseline): {unexpected_passes:?}\n\
+             diffs:\n{}",
+            diff_details.join("\n")
+        );
+    }
+}
