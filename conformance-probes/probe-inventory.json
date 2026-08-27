@@ -69,6 +69,11 @@
     "excluded": false,
     "runner": "conformance_bridge_compose_pair"
   },
+  "bridge_dns_epoll_wake": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "conformance_bridge_dns_epoll_wake"
+  },
   "bridge_loopback_isolation": {
     "class": "conformance",
     "excluded": false,
