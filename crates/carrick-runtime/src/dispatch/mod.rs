@@ -2359,6 +2359,10 @@ impl DispatchMmAuthority {
             Self {
                 mem: Arc::new(forked_mem),
                 host_alias_transactions: Arc::new(HostAliasTransactions::new()),
+                // Never stamped: the child inherits the parent's vvar content
+                // through the COW split, and re-stamps on its next syscall
+                // only once a `clock_settime` has moved the global epoch.
+                vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
             },
             revision,
             ranges,
@@ -2397,6 +2401,7 @@ impl DispatchMmAuthority {
                 revision,
             )),
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
+            vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
 
