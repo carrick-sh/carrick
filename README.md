@@ -101,7 +101,7 @@ on macOS/Apple Silicon through `carrick-vmm-hvf`. It includes:
   behavior over host event mechanisms.
 - **Interactive terminals:** `carrick run -t` bridges a host terminal to guest
   `/dev/pts` with job-control and resize propagation.
-- **Diagnostics:** `carrick trace`, static USDT probes, `compat-report`, and the
+- **Diagnostics:** `carrick trace`, static USDT probes, the `run --json` compat report, and the
   always-on event ring for post-mortem debugging.
 
 The cross-platform work is source-visible and partially live:

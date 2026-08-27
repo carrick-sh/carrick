@@ -48,7 +48,7 @@
 //! - **Diagnostic surface** (carrick-specific, no docker analogue): `trace`
 //!   (in-process DTrace, auto-sudo — see [`trace_cli`] and [`commands`]),
 //!   `debug` (ESR decode, lldb-plugin path, debug-state inspect — see
-//!   the `debug` module), `syscalls` / `trap-capabilities` / `compat-report`
+//!   the `debug` module), `syscalls` / `trap-capabilities`
 //!   (introspection of the emulation tables), `inspect-elf` / `plan-elf-load` /
 //!   `load-elf` / `run-elf` / `dispatch-syscall` (ELF + syscall fixtures), and
 //!   `volume` (the APFS scratch subvolume — see [`args`]).

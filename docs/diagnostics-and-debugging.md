@@ -3,8 +3,8 @@
 Carrick is a syscall-translation layer, so almost every bug is "the guest asked
 the macOS host for something and got the wrong answer." The tools below let you
 watch that translation boundary from the host side without touching the guest
-binary. Three of them are first-class subcommands of the `carrick` CLI
-(`carrick trace`, `carrick debug …`, `carrick compat-report`); the rest are
+binary. Two of them are first-class subcommands of the `carrick` CLI
+(`carrick trace`, `carrick debug …`) plus the `carrick run --json` envelope; the rest are
 compile-time debug-trace Cargo features, a few runtime env-var tunables, and an
 lldb plugin.
 
@@ -516,15 +516,13 @@ with and without, compare):
 
 ---
 
-## 4. `carrick compat-report` — what did the guest need that we don't handle?
+## 4. The compat report (`carrick run --json`) — what did the guest need that we don't handle?
 
 ```sh
-carrick compat-report [--format json|text] -- <cmd>
-# or, on a container run, the same envelope as a flag:
-carrick run --json <image> -- <cmd>
+carrick run --json <image> <cmd…>
 ```
 
-`compat-report` runs the guest and, on exit, emits a USDT-backed aggregation of
+`carrick run --json` runs the guest and, on exit, emits a USDT-backed aggregation of
 everything carrick could **not** fully service: unhandled syscalls (by number +
 name, with invocation counts), partially-implemented syscalls, unhandled
 `ioctl(2)` requests, unimplemented `/proc` and `/sys` read paths, unsupported
@@ -533,14 +531,12 @@ signals, and unknown syscall-flag bits (`crates/carrick-observability/src/compat
 that we don't handle yet"** tool — point it at a new binary and the report is
 your gap list, sorted by frequency.
 
-The report is emitted as pretty JSON by default (`--format json`) or as a human
-summary (`--format text`). The same envelope (exit code + traps + report) is
-available on a normal container run via `carrick run --json …` (off by default;
-`run` otherwise behaves like `docker run`, streaming guest stdio and matching the
-guest's exit code). Internally each gap is a `CompatEvent` recorded through the
-carrick USDT provider, so the same data is visible live under `carrick trace`
-(`carrick*:::unhandled-syscall`, etc.) — `compat-report` is the batch
-aggregation, `carrick trace` is the live stream.
+The envelope (exit code + traps + report) is pretty JSON on stdout; it is off
+by default (`run` otherwise behaves like `docker run`, streaming guest stdio
+and matching the guest's exit code). Internally each gap is a `CompatEvent`
+recorded through the carrick USDT provider, so the same data is visible live
+under `carrick trace` (`carrick*:::unhandled-syscall`, etc.) — `--json` is the
+batch aggregation, `carrick trace` is the live stream.
 
 ---
 
@@ -555,7 +551,7 @@ aggregation, `carrick trace` is the live stream.
 - [hal.md](hal.md) — KVM, bhyve, NVMM, host-primitive crates, and the shared
   x86_64 engine.
 - [syscalls-emulation-map.md](syscalls-emulation-map.md) — the per-syscall
-  translation map a `compat-report` gap points back into.
+  translation map a `run --json` compat-report gap points back into.
 - [../README.md](../README.md) — quickstart, the `ld64`-vs-`lld` `__dof_carrick`
   warning, and the codesigning requirement.
 - Skills: [`.agents/skills/carrick-trace/SKILL.md`](../.agents/skills/carrick-trace/SKILL.md)
