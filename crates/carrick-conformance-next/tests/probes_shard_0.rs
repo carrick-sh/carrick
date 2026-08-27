@@ -181,25 +181,16 @@ const CACHED_SHARD_0_PROBE_COUNT: usize = 130;
 pub const MUSL_BASELINE_GAPS: &[&str] = &[
     "budget_two_proc",
     "childsubreaper",
-    "cluster10errno",
-    "coredumpfile",
     "execfromthread",
     "execthreads",
     "futexforkwakegroups",
-    "mprotectexec",
     "mqnotifycrossproc",
-    "pidfdprocdir",
     "pidnsroot",
     "ppid",
-    "proclife",
     "procpeerdir",
     "procpeermem",
     "rlimitnproc",
     "shmnestedfork",
-    "siginfo",
-    "sigpairrace",
-    "sigtimedwaitintr",
-    "sigwaitblock",
     "sysinfo",
     "telemetrymap",
     "vforkexecthread",
@@ -465,19 +456,7 @@ fn test_shard_0_expected_gaps_derivation() {
     let musl_shard_gaps = expected_shard_gaps(MUSL_BASELINE_GAPS);
     let gnu_shard_gaps = expected_shard_gaps(GNU_BASELINE_GAPS);
 
-    let expected_musl_set: BTreeSet<&str> = [
-        "cluster10errno",
-        "coredumpfile",
-        "mprotectexec",
-        "pidfdprocdir",
-        "proclife",
-        "siginfo",
-        "sigpairrace",
-        "sigtimedwaitintr",
-        "sigwaitblock",
-    ]
-    .into_iter()
-    .collect();
+    let expected_musl_set = BTreeSet::new();
 
     let expected_gnu_set: BTreeSet<&str> = [
         "clonefsumask",
