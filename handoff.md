@@ -60,7 +60,8 @@ push unless explicitly asked. Preserve unrelated worktree changes.
 ## SESSION 11 — 2026-08-27: conformance-next migration and legacy carve
 
 The mechanical migration requested for this session is integrated on `main`
-through `790a04d4e4d6e71b4cd8930190200f71a0e1ef6b`. Antigravity ran three
+through `790a04d4e4d6e71b4cd8930190200f71a0e1ef6b`, with its closing aggregate
+receipt recorded at `9256b0b3664190b8fa24840b0956d291ff6880da`. Antigravity ran three
 parallel generic-probe shards and a second three-agent suite/dedicated audit;
 Codex reviewed every diff, rejected false-green blocker stubs, reran the signed
 acceptance surfaces, and integrated only reviewed commits.
@@ -106,10 +107,10 @@ acceptance surfaces, and integrated only reviewed commits.
 
 | field | value |
 |---|---|
-| source HEAD | `790a04d4e4d6e71b4cd8930190200f71a0e1ef6b` |
-| binary SHA-256 | `21c7b92153bdd617fd1565643ce36dc9710d948b50022ac1c1c3bbb60517acbb` |
-| CDHash | `68c416c9739b1ff12db1d8ab03e9ca385cc9c0b4` |
-| LC_UUID | `5E476509-A811-39DB-AE79-0C0B72910E95` |
+| source HEAD | `9256b0b3664190b8fa24840b0956d291ff6880da` |
+| binary SHA-256 | `01374bd0b18e0f71933f6ab45181b4f1c9440eb24bd070537f35a4f353cda742` |
+| CDHash | `46f372aa60e20a080bb19bb6a0586bced61ea5e1` |
+| LC_UUID | `9AA3BC24-C91D-3EED-A752-F712B061F89D` |
 | hypervisor entitlement | present |
 | `__dof_carrick` | present |
 
@@ -117,19 +118,20 @@ acceptance surfaces, and integrated only reviewed commits.
 |---|---|
 | cached shard 1 | **green**, 264 executions, expected `vfs_mount_rw` gap only |
 | cached shard 2 | **green**, 262 executions, expected `budget_two_proc` gap only |
-| cached shard 0 | **flaky process abort**: aggregate run aborted; isolated samples were green, red, green (260 executions on each completed sample). `fea51e1c3` adds the missing pre-probe marker; the marked sample completed all probes. No runtime rabbit hole was opened. |
+| cached shard 0 | **green in the closing aggregate run**, 260 executions. The earlier isolated samples were green, red, green; `fea51e1c3` added a pre-probe marker, and the quiet-host aggregate completed every marked probe. The lifecycle flake did not recur and no runtime rabbit hole was opened. |
 | 24 in-process core cases | **green**, signed, entitlement negative control green |
 | in-process Go fixture | **green**, signed, entitlement negative control green |
 | CLI boundary contract | **green**, 5/5, no Docker contacted |
 | retained legacy phase | **green**, 46 passed / 1 explicit bless ignored; the three MM-authority failures are fail-closed XFAILs and unexpected passes fail the gate (`790a04d4e`) |
+| aggregate `just conformance-probes` | **green**, exit 0 at `9256b0b36` under scoped run ID `confnext-aggregate-20260827-9256b0b`; all cached shards, 24 core cases, CLI contract, dedicated retained runners, retained live probes, and entitlement controls completed in one invocation |
 | full `just conformance full` | **red / incomplete**: fail-fast after 51 gating verdicts; 1,092/2,127 rows emitted (`1022 match`, `12 diff`, `7 new`, `45 regression`, `6 timeout`). Receipt: `target/conformance/results.hvf.full.jsonl`. Do not call this a refreshed 93% result. |
 | `RUST_TEST_THREADS=1 just ci` | **green**, exit 0 at documentation HEAD `aeec834a9`; fmt, clippy, typed-domain lint, deny, matrix drift, build, docs, serialized host tests, and host integration tests all passed. This host-only gate did not relink the signed artifact recorded above. |
 
-The first aggregate `just conformance-probes` attempt is not green because the
-shard-0 test executable aborted before its phase completed. The same revision's
-components were then run serially as described above. A future closing receipt
-still needs one aggregate green run; do not hide the lifecycle flake or infer a
-probe identity from an unmarked abort.
+The first aggregate `just conformance-probes` attempt was not green because the
+shard-0 test executable aborted before its phase completed. The later quiet-host
+aggregate passed end to end with every shard-0 probe named before execution.
+Retain the markers: a future abort must be attributed to its last named probe,
+not treated as an anonymous lane failure.
 
 ### Scope fences and next work
 
@@ -139,14 +141,11 @@ the migration changes test harnesses, not Carrick runtime semantics. The full
 suite failed before all rows were scheduled, so no coverage percentage refresh
 is valid. The bounded next steps are:
 
-1. rerun aggregate `just conformance-probes` on a quiet host and require shard 0
-   to complete; if it aborts again, capture the marked last probe and classify
-   only a repeatedly identified process-poisoning case;
-2. compare `target/conformance/results.hvf.full.jsonl` against an unmodified
+1. compare `target/conformance/results.hvf.full.jsonl` against an unmodified
    base run before filing any of its 51 gating verdicts as migration regressions;
-3. migrate dedicated tests only after the corresponding public embed topology
+2. migrate dedicated tests only after the corresponding public embed topology
    APIs exist; do not replace them with passing blocker stubs;
-4. after any code change, rerun `RUST_TEST_THREADS=1 just ci`; the current
+3. after any code change, rerun `RUST_TEST_THREADS=1 just ci`; the current
    documentation HEAD `aeec834a9` is green. Rebuild and restamp the signed
    artifact only when a later guest-running checkpoint actually changes code.
 
