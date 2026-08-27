@@ -12049,11 +12049,25 @@ impl HvfVmState {
         // exec placement); first-boot lane: the identity `map_region_raw`
         // placement. `plan` is rebound so the register programming below reads
         // the relocated stage-1 table root (guest VAs are unchanged).
-        let plan: &GuestMappingPlan = match global_plan.as_mut() {
+        let (root_slot, plan): (Option<(u64, u64)>, &GuestMappingPlan) = match global_plan.as_mut()
+        {
             Some(GlobalExecPlan {
                 plan: relocated,
                 stage2_leases,
             }) => {
+                let table_root = relocated.stage1_page_tables_base.ok_or_else(|| {
+                    TrapError::Hypervisor("relocated plan has no stage-1 table base".to_owned())
+                })?;
+                let table_size = relocated
+                    .mappings
+                    .iter()
+                    .find(|mapping| {
+                        mapping.guest_start == carrick_mem::memory::LINUX_PAGE_TABLES_BASE
+                            || Some(mapping.ipa_start) == relocated.stage1_page_tables_base
+                    })
+                    .map_or(carrick_mem::memory::LINUX_PAGE_TABLES_SIZE, |mapping| {
+                        mapping.mapped_size
+                    });
                 for mapping in relocated.mappings.iter().filter(|mapping| {
                     !is_sparse_hvpatch_mmap_mapping(mapping)
                         && !is_persistent_executor_carrier_guest_mapping(mapping)
@@ -12091,9 +12105,19 @@ impl HvfVmState {
                         stage2_leases.len()
                     )));
                 }
-                relocated
+                (Some((table_root, table_size)), relocated)
             }
             None => {
+                let table_root = plan
+                    .stage1_page_tables_base
+                    .unwrap_or(carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
+                let table_size = plan
+                    .mappings
+                    .iter()
+                    .find(|mapping| mapping.guest_start == table_root)
+                    .map_or(carrick_mem::memory::LINUX_PAGE_TABLES_SIZE, |mapping| {
+                        mapping.mapped_size
+                    });
                 for mapping in plan
                     .mappings
                     .iter()
@@ -12112,9 +12136,10 @@ impl HvfVmState {
                     let region = map_region_raw(mapping, false)?;
                     state.mappings.push(region);
                 }
-                plan
+                (Some((table_root, table_size)), plan)
             }
         };
+        state.task.mm_root_slot = root_slot;
 
         // Start PC: if an EL0 entry trampoline is installed, the vCPU begins
         // at the trampoline page (in EL1h) and executes the single `eret`
@@ -26067,10 +26092,10 @@ mod tag_strip_tests {
     use super::{
         AliasBacking, AliasOwnershipScope, CowArmedSpan, GuestMappingPlan, GuestMappingSharing,
         HVF_PAGE_SIZE, HvfMappedRegion, InventoryBackingIdentity, ThreadMappingDesc,
-        alias_is_owned_by_process, alias_matches_process_scope, alias_registry,
-        current_dynamic_alias_ipas, forget_replay_extent, inherited_fork_inventory_extents,
-        lookup_shared_alias, mapping_is_current_for_process_fork_indexed, missing_process_aliases,
-        process_alias_index,
+        alias_is_owned_by_process, alias_matches_process_scope, alias_ownership_scope,
+        alias_registry, current_dynamic_alias_ipas, forget_replay_extent,
+        inherited_fork_inventory_extents, lookup_shared_alias,
+        mapping_is_current_for_process_fork_indexed, missing_process_aliases, process_alias_index,
     };
     /// Test adapter preserving the retired linear signature over the index.
     fn mapping_is_current_for_process_fork_test(
@@ -26350,6 +26375,67 @@ mod tag_strip_tests {
             AliasOwnershipScope::Global,
             Some(root_slot)
         ));
+    }
+
+    #[test]
+    fn concurrent_carrier_containers_have_isolated_alias_scopes() {
+        let container_alpha_slot = (
+            carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::LINUX_PAGE_TABLES_SIZE,
+        );
+        let container_beta_slot = (
+            carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x20_0000,
+            0x20_0000,
+        );
+        assert_ne!(container_alpha_slot, container_beta_slot);
+
+        let alpha_alias = AliasBacking {
+            start: carrick_mem::memory::LINUX_MMAP_BASE,
+            ipa: carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x40_0000,
+            host_addr: 0x2000,
+            size: 0x1_0000,
+            physical_ipa: carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x40_0000,
+            physical_host_addr: 0x2000,
+            physical_size: 0x1_0000,
+            perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+            guest_writable: true,
+            sharing: GuestMappingSharing::Private,
+            ownership_scope: alias_ownership_scope(
+                GuestMappingSharing::Private,
+                Some(container_alpha_slot),
+            ),
+            inventory_backing: InventoryBackingIdentity::Private(1),
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: 1,
+        };
+
+        assert!(alias_matches_process_scope(
+            alpha_alias.ownership_scope,
+            Some(container_alpha_slot)
+        ));
+        assert!(alias_is_owned_by_process(
+            alpha_alias.ownership_scope,
+            Some(container_alpha_slot)
+        ));
+
+        assert!(!alias_matches_process_scope(
+            alpha_alias.ownership_scope,
+            Some(container_beta_slot)
+        ));
+        assert!(!alias_is_owned_by_process(
+            alpha_alias.ownership_scope,
+            Some(container_beta_slot)
+        ));
+
+        assert!(
+            missing_process_aliases(
+                &std::collections::HashSet::new(),
+                &[alpha_alias],
+                Some(container_beta_slot)
+            )
+            .is_empty()
+        );
     }
 
     #[test]
