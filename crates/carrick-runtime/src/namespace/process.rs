@@ -89,6 +89,7 @@ pub fn capability_by_name(name: &str) -> Option<u32> {
         "SYS_PTRACE" => CAP_SYS_PTRACE,
         "SYS_NICE" => CAP_SYS_NICE,
         "SYS_RESOURCE" => CAP_SYS_RESOURCE,
+        "SYS_TIME" => CAP_SYS_TIME,
         "MKNOD" => CAP_MKNOD,
         "MAC_OVERRIDE" => CAP_MAC_OVERRIDE,
         "WAKE_ALARM" => CAP_WAKE_ALARM,
@@ -363,5 +364,50 @@ mod tests {
         let c = CapabilitySet::full();
         assert!(c.effective & (1 << 6) != 0);
         assert!(c.effective & (1 << 7) != 0);
+    }
+
+    /// Every capability carrick models must be reachable by its docker
+    /// `--cap-add` name. `capability_mask_for_names` only WARNS on a name it
+    /// does not know ("ignoring unknown --cap-add name"), so a missing row
+    /// here silently runs the guest without the capability it was granted —
+    /// which is exactly how `--cap-add SYS_TIME` was dropped and made the
+    /// `clocksettimevdso` conformance probe report `clock_settime` EPERM
+    /// against a Linux oracle that returned 0. Fail on the table, not on a
+    /// guest divergence hours later.
+    #[test]
+    fn every_modelled_capability_has_a_docker_name() {
+        // (name, bit) for every CAP_* this module models. CAP_LAST_CAP is a
+        // bound, not a capability, so it is deliberately absent.
+        let modelled: &[(&str, u32)] = &[
+            ("CHOWN", CAP_CHOWN),
+            ("DAC_OVERRIDE", CAP_DAC_OVERRIDE),
+            ("DAC_READ_SEARCH", CAP_DAC_READ_SEARCH),
+            ("FOWNER", CAP_FOWNER),
+            ("FSETID", CAP_FSETID),
+            ("SETPCAP", CAP_SETPCAP),
+            ("LINUX_IMMUTABLE", CAP_LINUX_IMMUTABLE),
+            ("NET_RAW", CAP_NET_RAW),
+            ("SYS_ADMIN", CAP_SYS_ADMIN),
+            ("SYS_PTRACE", CAP_SYS_PTRACE),
+            ("SYS_NICE", CAP_SYS_NICE),
+            ("SYS_RESOURCE", CAP_SYS_RESOURCE),
+            ("SYS_TIME", CAP_SYS_TIME),
+            ("MKNOD", CAP_MKNOD),
+            ("MAC_OVERRIDE", CAP_MAC_OVERRIDE),
+            ("WAKE_ALARM", CAP_WAKE_ALARM),
+        ];
+        for (name, bit) in modelled {
+            assert_eq!(
+                capability_by_name(name),
+                Some(*bit),
+                "--cap-add {name} must map to bit {bit}"
+            );
+            // Docker accepts the `CAP_` prefix and lower case too.
+            assert_eq!(capability_by_name(&format!("CAP_{name}")), Some(*bit));
+            assert_eq!(capability_by_name(&name.to_ascii_lowercase()), Some(*bit));
+        }
+        let (mask, unknown) = capability_mask_for_names(&["SYS_TIME".to_owned()]);
+        assert!(unknown.is_empty(), "SYS_TIME must not be reported unknown");
+        assert_eq!(mask, 1u64 << CAP_SYS_TIME);
     }
 }
