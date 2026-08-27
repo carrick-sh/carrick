@@ -1030,3 +1030,128 @@ fn madvise_accepts_common_advice_for_mapped_ranges() {
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
+
+#[test]
+fn concurrent_containers_file_backed_mmap_and_touch_isolated() {
+    let layer_alpha = LayerSource::TarGz(gzip_tar([(
+        "lib/libalpha.so",
+        b"ALPHA_BYTES_1234".as_slice(),
+    )]));
+    let layer_beta = LayerSource::TarGz(gzip_tar([(
+        "lib/libbeta.so",
+        b"BETA_BYTES_56789".as_slice(),
+    )]));
+
+    let rootfs_alpha = RootFs::from_layers([layer_alpha]).unwrap();
+    let rootfs_beta = RootFs::from_layers([layer_beta]).unwrap();
+
+    let mut dispatcher_alpha = SyscallDispatcher::with_rootfs(rootfs_alpha);
+    let mut dispatcher_beta = SyscallDispatcher::with_rootfs(rootfs_beta);
+
+    let handle_alpha = std::thread::spawn(move || {
+        let mut memory = AddressSpace::from_segments(
+            0,
+            [
+                (0x4000, rw_perms(), b"/lib/libalpha.so\0".to_vec(), 0x100),
+                (LINUX_MMAP_BASE, rwx_perms(), Vec::new(), 0x10_0000),
+            ],
+        )
+        .unwrap();
+        let reporter = CompatReporter::default();
+        let fd_outcome = dispatcher_alpha
+            .dispatch(
+                &dispatcher_alpha.capture_one_task_context().unwrap(),
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        let fd = match fd_outcome {
+            DispatchOutcome::Returned { value } => value as u64,
+            other => panic!("expected open fd, got {other:?}"),
+        };
+        let mmap_outcome = dispatcher_alpha
+            .dispatch(
+                &dispatcher_alpha.capture_one_task_context().unwrap(),
+                SyscallRequest::new(222, SyscallArgs::from([0, 16, 1, 0x02, fd, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(
+            mmap_outcome,
+            DispatchOutcome::Returned {
+                value: LINUX_MMAP_BASE as i64
+            }
+        );
+        assert_eq!(
+            memory.read_bytes(LINUX_MMAP_BASE, 16).unwrap(),
+            b"ALPHA_BYTES_1234"
+        );
+        memory
+            .write_bytes(LINUX_MMAP_BASE + 8, b"MODIFIED")
+            .unwrap();
+        assert_eq!(
+            memory.read_bytes(LINUX_MMAP_BASE, 16).unwrap(),
+            b"ALPHA_BYMODIFIED"
+        );
+    });
+
+    let handle_beta = std::thread::spawn(move || {
+        let mut memory = AddressSpace::from_segments(
+            0,
+            [
+                (0x4000, rw_perms(), b"/lib/libbeta.so\0".to_vec(), 0x100),
+                (LINUX_MMAP_BASE, rwx_perms(), Vec::new(), 0x10_0000),
+            ],
+        )
+        .unwrap();
+        let reporter = CompatReporter::default();
+        let fd_outcome = dispatcher_beta
+            .dispatch(
+                &dispatcher_beta.capture_one_task_context().unwrap(),
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        let fd = match fd_outcome {
+            DispatchOutcome::Returned { value } => value as u64,
+            other => panic!("expected open fd, got {other:?}"),
+        };
+        let mmap_outcome = dispatcher_beta
+            .dispatch(
+                &dispatcher_beta.capture_one_task_context().unwrap(),
+                SyscallRequest::new(222, SyscallArgs::from([0, 16, 1, 0x02, fd, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(
+            mmap_outcome,
+            DispatchOutcome::Returned {
+                value: LINUX_MMAP_BASE as i64
+            }
+        );
+        assert_eq!(
+            memory.read_bytes(LINUX_MMAP_BASE, 16).unwrap(),
+            b"BETA_BYTES_56789"
+        );
+        memory
+            .write_bytes(LINUX_MMAP_BASE + 8, b"TOUCHED!")
+            .unwrap();
+        assert_eq!(
+            memory.read_bytes(LINUX_MMAP_BASE, 16).unwrap(),
+            b"BETA_BYTTOUCHED!"
+        );
+    });
+
+    handle_alpha.join().unwrap();
+    handle_beta.join().unwrap();
+}
