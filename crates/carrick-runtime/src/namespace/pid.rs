@@ -343,7 +343,8 @@ pub fn ns_to_host_or_self(ns_pid: u32) -> Option<u32> {
 pub fn self_ns_pid() -> u32 {
     if let Some(pid) = crate::dispatch::resources::with_active_context(|context| {
         let task_id = u32::try_from(context.task().key().id.raw()).unwrap_or(0);
-        host_to_ns_or_self_for(context, task_id)
+        // SELF's pid — never zero. See `ns_self_pid_for`.
+        ns_self_pid_for(context, task_id)
     }) {
         return pid;
     }
@@ -602,9 +603,36 @@ pub fn mark_self_execed_for(context: &crate::kernel::KernelContext) {
 
 /// [`host_to_ns_or_self`] for a caller outside the dispatch scope that holds
 /// the exact task (signal delivery in the vCPU loop).
+/// Translate a host pid for `context`'s namespace, or `0` when it is not a
+/// member.
+///
+/// The zero is deliberate and matches `pid_namespaces(7)`: a process whose
+/// PARENT lives outside the namespace sees `getppid() == 0`. That is what
+/// `self_ns_ppid` needs.
+///
+/// It is NOT what a process's OWN pid needs — `getpid()` never returns 0 on
+/// Linux — so callers asking "what is my pid here?" must use
+/// [`ns_self_pid_for`] instead. Reporting a missing translation as 0 through
+/// this function was how a container's init came to report `getpid=0` while
+/// synthetic `/proc/self/status` correctly said `Pid: 1`.
 pub fn host_to_ns_or_self_for(context: &crate::kernel::KernelContext, host_pid: u32) -> u32 {
     match region_for(context) {
         Some(r) => r.host_to_ns(host_pid).unwrap_or(0),
+        None => host_pid,
+    }
+}
+
+/// The pid `host_pid` sees for ITSELF in `context`'s namespace — never zero.
+///
+/// A miss means the task is not registered in the region, not that its
+/// ns-local pid is 0. `getpid()` never returns 0 on Linux, and this value
+/// reaches the guest both through the trapped handler and through the EL1
+/// identity page's no-exit fast path, so a zero here is a pid no process can
+/// have. Falls back to the untranslated pid, which is exactly what this
+/// namespace layer returns when there is no namespace at all.
+pub fn ns_self_pid_for(context: &crate::kernel::KernelContext, host_pid: u32) -> u32 {
+    match region_for(context) {
+        Some(r) => r.host_to_ns(host_pid).unwrap_or(host_pid),
         None => host_pid,
     }
 }
