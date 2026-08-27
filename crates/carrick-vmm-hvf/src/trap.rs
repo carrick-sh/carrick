@@ -2218,6 +2218,21 @@ fn carrier_published() -> &'static parking_lot::Condvar {
     &PUBLISHED
 }
 
+/// Whether this carrier has already retired the boot loader's eager mmap arena.
+///
+/// The retirement is a VM-wide `hv_vm_unmap` performed during a container's
+/// root bring-up, so it must happen exactly once for the carrier's VM rather
+/// than once per container: a second unmap would remove sparse arena pages a
+/// sibling container has already faulted in. Carrier scope is the correct
+/// scope here — the arena belongs to the VM, not to a Linux process — and is
+/// cleared with the VM in `record_vm_released` so a rebuilt VM retires its own
+/// fresh eager mapping.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn carrier_initial_arena_retired() -> &'static std::sync::atomic::AtomicBool {
+    static RETIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    &RETIRED
+}
+
 /// Serializes the "does this carrier own a VM yet?" decision across roots
 /// booting at the same time. Held across the FIRST root's `hv_vm_create`, so
 /// a second root arriving mid-create observes `carrier_vm_live()` and waits
@@ -4183,6 +4198,10 @@ fn record_vm_resident() {
 fn record_vm_released() {
     crate::probes::vm_lifecycle(3, -1);
     CARRIER_VM_LIVE.store(false, std::sync::atomic::Ordering::Release);
+    // The eager mmap arena belonged to the VM that just died. A VM rebuilt
+    // after this point gets a fresh eager mapping and must retire it once of
+    // its own accord, so the carrier's once-flag is released with the VM.
+    carrier_initial_arena_retired().store(false, std::sync::atomic::Ordering::Release);
     if !atomic_permit_enabled() {
         return;
     }
@@ -5881,13 +5900,28 @@ impl HvfTaskState {
     /// Mature VMM never enables the persistent lifecycle and keeps its existing
     /// eager identity mapping unchanged.
     ///
-    /// When the carrier VM persists across containers, subsequent containers
-    /// boot via global exec plans that omit the eager 32 GiB mapping from stage 2
-    /// and prepare sparse page tables upfront. Retirement is therefore idempotent:
-    /// if the eager mapping is present, it is validated and unmapped; if absent,
-    /// the arena is already sparsely backed on demand.
+    /// **Once per carrier VM, not once per container.** The unmap below is
+    /// `inventory_hv_vm_unmap` over the WHOLE arena extent, which is VM-wide
+    /// state, while this runs during each container's root bring-up. With one
+    /// VM per container that distinction did not exist. With a carrier VM
+    /// shared by several containers it is the difference between retiring an
+    /// eager mapping nobody is using yet and tearing out the sparse per-page
+    /// backing a SIBLING container has already faulted in inside that same
+    /// range — the sibling's next access then takes a level-1 translation
+    /// fault on an address it was legitimately handed, and its guest dies of
+    /// SIGSEGV within a few traps.
+    ///
+    /// The carrier's root boot gate serializes VM ownership and the first root
+    /// publishes the carrier bundle before any guest instruction runs, so the
+    /// first caller retires while no guest can yet hold sparse pages, and
+    /// every later container skips it. Absence remains tolerated for the same
+    /// reason it always was: a later container's plan omits the eager mapping.
+    /// What is NOT tolerated is a second unmap.
     pub(crate) fn retire_initial_mmap_arena(&mut self) -> Result<(), TrapError> {
         if !self.persistent_vm_lifecycle {
+            return Ok(());
+        }
+        if carrier_initial_arena_retired().swap(true, std::sync::atomic::Ordering::AcqRel) {
             return Ok(());
         }
         let Some(index) = self
@@ -21468,6 +21502,10 @@ mod frame_inventory_backend_tests {
 
     #[test]
     fn retire_initial_mmap_arena_is_idempotent_when_sparse_mapping_absent() {
+        // The retirement flag is carrier-scoped, so it outlives any one test in
+        // this process. Each of these tests owns it explicitly rather than
+        // inheriting whatever a sibling left behind.
+        carrier_initial_arena_retired().store(false, std::sync::atomic::Ordering::Release);
         let mut state = HvfTaskState::neutral();
         state.persistent_vm_lifecycle = true;
         // Under persistent VM lifecycle, if the initial eager mmap arena was not mapped
@@ -21476,7 +21514,65 @@ mod frame_inventory_backend_tests {
     }
 
     #[test]
+    fn second_container_never_unmaps_the_carrier_arena_again() {
+        // The unmap inside retirement is VM-wide, but retirement runs during
+        // each CONTAINER's root bring-up. A second container reaching it must
+        // not unmap again: a sibling container may already have faulted sparse
+        // pages into that same arena range, and tearing the range out from
+        // under it makes its next access a level-1 translation fault on an
+        // address it was legitimately handed.
+        //
+        // This binds the carrier once-guard. Delete the guard and the second
+        // call below walks into the shape validation and unmap path instead of
+        // returning early.
+        carrier_initial_arena_retired().store(false, std::sync::atomic::Ordering::Release);
+
+        let mut first = HvfTaskState::neutral();
+        first.persistent_vm_lifecycle = true;
+        assert!(
+            first.retire_initial_mmap_arena().is_ok(),
+            "first container retires the eager arena"
+        );
+        assert!(
+            carrier_initial_arena_retired().load(std::sync::atomic::Ordering::Acquire),
+            "retirement must be recorded at carrier scope, not per container"
+        );
+
+        // A second container whose mappings still describe an arena extent: if
+        // the guard were absent this would be validated and unmapped a second
+        // time. With the guard it returns before touching `mappings` at all.
+        let mut second = HvfTaskState::neutral();
+        second.persistent_vm_lifecycle = true;
+        let mut region = thread_sibling_tests::mapped_region(
+            crate::memory::LINUX_MMAP_BASE,
+            crate::memory::LINUX_MMAP_BASE + 0x4000,
+            crate::memory::LINUX_MMAP_BASE,
+        );
+        region.physical_size = 0x4000;
+        second.mappings.push(region);
+        assert!(
+            second.retire_initial_mmap_arena().is_ok(),
+            "a later container must skip retirement entirely"
+        );
+        assert_eq!(
+            second.mappings.len(),
+            1,
+            "the later container's arena mapping must be left untouched"
+        );
+
+        carrier_initial_arena_retired().store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    #[test]
     fn retire_initial_mmap_arena_rejects_corrupted_shape() {
+        // Shape validation applies to the FIRST retirement only: it exists to
+        // catch a carrier eager mapping that is present but malformed, and only
+        // the first container ever sees that mapping. A later container's arena
+        // entries are its own sparse ones and must not be judged against the
+        // eager shape — which is why the carrier guard returns before this
+        // check for them. Reset the carrier flag so this test is that first
+        // caller regardless of sibling test order.
+        carrier_initial_arena_retired().store(false, std::sync::atomic::Ordering::Release);
         let mut state = HvfTaskState::neutral();
         state.persistent_vm_lifecycle = true;
         let mut region = thread_sibling_tests::mapped_region(
