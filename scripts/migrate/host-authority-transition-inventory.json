@@ -65,18 +65,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/commands.rs:1531 in `run_cli`, `libc::geteuid` acts only on the current CLI trace privilege state used by `run_cli`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-cli/src/commands.rs:1517 in `run_cli`, `libc::geteuid` acts only on the current CLI trace privilege state used by `run_cli`; no guest identity selects its host target.",
     "review_id": "HA-000003",
     "source": {
-      "byte_end": 66435,
-      "byte_start": 66422,
+      "byte_end": 65564,
+      "byte_start": 65551,
       "column": 29,
       "column_end": 42,
       "column_start": 29,
       "file": "crates/carrick-cli/src/commands.rs",
-      "line": 1531,
-      "line_end": 1531,
-      "line_start": 1531
+      "line": 1517,
+      "line_end": 1517,
+      "line_start": 1517
     }
   },
   {
@@ -388,18 +388,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3773 in `synthetic_proc_pid_file`, the host result from `libc::getpgrp` determines the guest-visible /proc process entry used by `synthetic_proc_pid_file`.",
+    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3774 in `synthetic_proc_pid_file`, the host result from `libc::getpgrp` determines the guest-visible /proc process entry used by `synthetic_proc_pid_file`.",
     "review_id": "HA-000015",
     "source": {
-      "byte_end": 156627,
-      "byte_start": 156614,
+      "byte_end": 156670,
+      "byte_start": 156657,
       "column": 34,
       "column_end": 47,
       "column_start": 34,
       "file": "crates/carrick-runtime/src/vfs/proc.rs",
-      "line": 3773,
-      "line_end": 3773,
-      "line_start": 3773
+      "line": 3774,
+      "line_end": 3774,
+      "line_start": 3774
     }
   },
   {
@@ -737,18 +737,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1346 in `MsgQueueFdCache::new`, `libc::getpid` authenticates only the current carrier that owns the message-queue descriptor cache fork ownership sentinel; no guest identity selects a host target.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1348 in `MsgQueueFdCache::new`, `libc::getpid` authenticates only the current carrier that owns the message-queue descriptor cache fork ownership sentinel; no guest identity selects a host target.",
     "review_id": "HA-000028",
     "source": {
-      "byte_end": 43668,
-      "byte_start": 43656,
+      "byte_end": 43729,
+      "byte_start": 43717,
       "column": 32,
       "column_end": 44,
       "column_start": 32,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 1346,
-      "line_end": 1346,
-      "line_start": 1346
+      "line": 1348,
+      "line_end": 1348,
+      "line_start": 1348
     }
   },
   {
@@ -764,18 +764,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1352 in `MsgQueueFdCache::refresh_for_current_process`, `libc::getpid` authenticates the current carrier so inherited message-queue descriptors are drained after a host fork; it does not answer guest process identity.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1354 in `MsgQueueFdCache::refresh_for_current_process`, `libc::getpid` authenticates the current carrier so inherited message-queue descriptors are drained after a host fork; it does not answer guest process identity.",
     "review_id": "HA-000029",
     "source": {
-      "byte_end": 43820,
-      "byte_start": 43808,
+      "byte_end": 43881,
+      "byte_start": 43869,
       "column": 33,
       "column_end": 45,
       "column_start": 33,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 1352,
-      "line_end": 1352,
-      "line_start": 1352
+      "line": 1354,
+      "line_end": 1354,
+      "line_start": 1354
     }
   },
   {
@@ -1452,18 +1452,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3251 in `synthetic_proc_self_stat`, the host result from `libc::getppid` determines the guest-visible /proc process entry used by `synthetic_proc_self_stat`.",
+    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3252 in `synthetic_proc_self_stat`, the host result from `libc::getppid` determines the guest-visible /proc process entry used by `synthetic_proc_self_stat`.",
     "review_id": "HA-000054",
     "source": {
-      "byte_end": 137224,
-      "byte_start": 137211,
+      "byte_end": 137267,
+      "byte_start": 137254,
       "column": 21,
       "column_end": 34,
       "column_start": 21,
       "file": "crates/carrick-runtime/src/vfs/proc.rs",
-      "line": 3251,
-      "line_end": 3251,
-      "line_start": 3251
+      "line": 3252,
+      "line_end": 3252,
+      "line_start": 3252
     }
   },
   {
@@ -1479,18 +1479,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3652 in `synthetic_proc_pid_file`, the host result from `libc::getppid` determines the guest-visible /proc process entry used by `synthetic_proc_pid_file`.",
+    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3653 in `synthetic_proc_pid_file`, the host result from `libc::getppid` determines the guest-visible /proc process entry used by `synthetic_proc_pid_file`.",
     "review_id": "HA-000055",
     "source": {
-      "byte_end": 151437,
-      "byte_start": 151424,
+      "byte_end": 151480,
+      "byte_start": 151467,
       "column": 29,
       "column_end": 42,
       "column_start": 29,
       "file": "crates/carrick-runtime/src/vfs/proc.rs",
-      "line": 3652,
-      "line_end": 3652,
-      "line_start": 3652
+      "line": 3653,
+      "line_end": 3653,
+      "line_start": 3653
     }
   },
   {
@@ -1506,18 +1506,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3704 in `synthetic_proc_pid_file`, the host result from `libc::getppid` determines the guest-visible /proc process entry used by `synthetic_proc_pid_file`.",
+    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3705 in `synthetic_proc_pid_file`, the host result from `libc::getppid` determines the guest-visible /proc process entry used by `synthetic_proc_pid_file`.",
     "review_id": "HA-000056",
     "source": {
-      "byte_end": 153502,
-      "byte_start": 153489,
+      "byte_end": 153545,
+      "byte_start": 153532,
       "column": 29,
       "column_end": 42,
       "column_start": 29,
       "file": "crates/carrick-runtime/src/vfs/proc.rs",
-      "line": 3704,
-      "line_end": 3704,
-      "line_start": 3704
+      "line": 3705,
+      "line_end": 3705,
+      "line_start": 3705
     }
   },
   {
@@ -1587,18 +1587,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/time.rs:1038 in `raise_host_nofile_backing`, `libc::getrlimit` acts only on the current runtime internal-FD capacity used by `raise_host_nofile_backing`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/time.rs:1078 in `raise_host_nofile_backing`, `libc::getrlimit` acts only on the current runtime internal-FD capacity used by `raise_host_nofile_backing`; no guest identity selects its host target.",
     "review_id": "HA-000059",
     "source": {
-      "byte_end": 51918,
-      "byte_start": 51903,
+      "byte_end": 53992,
+      "byte_start": 53977,
       "column": 17,
       "column_end": 32,
       "column_start": 17,
       "file": "crates/carrick-runtime/src/dispatch/time.rs",
-      "line": 1038,
-      "line_end": 1038,
-      "line_start": 1038
+      "line": 1078,
+      "line_end": 1078,
+      "line_start": 1078
     }
   },
   {
@@ -1667,18 +1667,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/commands.rs:1567 in `run_cli`, `libc::getuid` acts only on the CLI trace credential handoff used by `run_cli`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-cli/src/commands.rs:1553 in `run_cli`, `libc::getuid` acts only on the CLI trace credential handoff used by `run_cli`; no guest identity selects its host target.",
     "review_id": "HA-000062",
     "source": {
-      "byte_end": 68675,
-      "byte_start": 68663,
+      "byte_end": 67804,
+      "byte_start": 67792,
       "column": 39,
       "column_end": 51,
       "column_start": 39,
       "file": "crates/carrick-cli/src/commands.rs",
-      "line": 1567,
-      "line_end": 1567,
-      "line_start": 1567
+      "line": 1553,
+      "line_end": 1553,
+      "line_start": 1553
     }
   },
   {
@@ -1693,18 +1693,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/commands.rs:1589 in `run_cli`, `libc::getuid` acts only on the CLI trace credential handoff used by `run_cli`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-cli/src/commands.rs:1575 in `run_cli`, `libc::getuid` acts only on the CLI trace credential handoff used by `run_cli`; no guest identity selects its host target.",
     "review_id": "HA-000063",
     "source": {
-      "byte_end": 69877,
-      "byte_start": 69865,
+      "byte_end": 69006,
+      "byte_start": 68994,
       "column": 54,
       "column_end": 66,
       "column_start": 54,
       "file": "crates/carrick-cli/src/commands.rs",
-      "line": 1589,
-      "line_end": 1589,
-      "line_start": 1589
+      "line": 1575,
+      "line_end": 1575,
+      "line_start": 1575
     }
   },
   {
@@ -1985,18 +1985,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/time.rs:1061 in `raise_host_nofile_backing`, `libc::setrlimit` acts only on the current runtime internal-FD capacity used by `raise_host_nofile_backing`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/time.rs:1101 in `raise_host_nofile_backing`, `libc::setrlimit` acts only on the current runtime internal-FD capacity used by `raise_host_nofile_backing`; no guest identity selects its host target.",
     "review_id": "HA-000074",
     "source": {
-      "byte_end": 52695,
-      "byte_start": 52680,
+      "byte_end": 54769,
+      "byte_start": 54754,
       "column": 9,
       "column_end": 24,
       "column_start": 9,
       "file": "crates/carrick-runtime/src/dispatch/time.rs",
-      "line": 1061,
-      "line_end": 1061,
-      "line_start": 1061
+      "line": 1101,
+      "line_end": 1101,
+      "line_start": 1101
     }
   },
   {
@@ -2221,18 +2221,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/commands.rs:2883 in `preserve_build_archive`, `std::fs::File::open` accesses only the build archive source and preserved destination selected by the CLI request.",
+    "rationale": "At crates/carrick-cli/src/commands.rs:2867 in `preserve_build_archive`, `std::fs::File::open` accesses only the build archive source and preserved destination selected by the CLI request.",
     "review_id": "HA-000083",
     "source": {
-      "byte_end": 127236,
-      "byte_start": 127217,
+      "byte_end": 126261,
+      "byte_start": 126242,
       "column": 25,
       "column_end": 44,
       "column_start": 25,
       "file": "crates/carrick-cli/src/commands.rs",
-      "line": 2883,
-      "line_end": 2883,
-      "line_start": 2883
+      "line": 2867,
+      "line_end": 2867,
+      "line_start": 2867
     }
   },
   {
@@ -2568,18 +2568,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/commands.rs:2885 in `preserve_build_archive`, `std::fs::OpenOptions::new` accesses only the build archive source and preserved destination selected by the CLI request.",
+    "rationale": "At crates/carrick-cli/src/commands.rs:2869 in `preserve_build_archive`, `std::fs::OpenOptions::new` accesses only the build archive source and preserved destination selected by the CLI request.",
     "review_id": "HA-000096",
     "source": {
-      "byte_end": 127388,
-      "byte_start": 127363,
+      "byte_end": 126413,
+      "byte_start": 126388,
       "column": 26,
       "column_end": 51,
       "column_start": 26,
       "file": "crates/carrick-cli/src/commands.rs",
-      "line": 2885,
-      "line_end": 2885,
-      "line_start": 2885
+      "line": 2869,
+      "line_end": 2869,
+      "line_start": 2869
     }
   },
   {
@@ -2833,18 +2833,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1954 in `with_shm_nattch_file`, `std::fs::OpenOptions::new` accesses only the run-scoped SysV IPC backing object used by `with_shm_nattch_file`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1956 in `with_shm_nattch_file`, `std::fs::OpenOptions::new` accesses only the run-scoped SysV IPC backing object used by `with_shm_nattch_file`.",
     "review_id": "HA-000106",
     "source": {
-      "byte_end": 64439,
-      "byte_start": 64414,
+      "byte_end": 64500,
+      "byte_start": 64475,
       "column": 20,
       "column_end": 45,
       "column_start": 20,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 1954,
-      "line_end": 1954,
-      "line_start": 1954
+      "line": 1956,
+      "line_end": 1956,
+      "line_start": 1956
     }
   },
   {
@@ -3182,18 +3182,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/commands.rs:2888 in `preserve_build_archive`, `std::fs::OpenOptions::open` accesses only the build archive source and preserved destination selected by the CLI request.",
+    "rationale": "At crates/carrick-cli/src/commands.rs:2872 in `preserve_build_archive`, `std::fs::OpenOptions::open` accesses only the build archive source and preserved destination selected by the CLI request.",
     "review_id": "HA-000119",
     "source": {
-      "byte_end": 127463,
-      "byte_start": 127459,
+      "byte_end": 126488,
+      "byte_start": 126484,
       "column": 14,
       "column_end": 18,
       "column_start": 14,
       "file": "crates/carrick-cli/src/commands.rs",
-      "line": 2888,
-      "line_end": 2888,
-      "line_start": 2888
+      "line": 2872,
+      "line_end": 2872,
+      "line_start": 2872
     }
   },
   {
@@ -3447,18 +3447,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1959 in `with_shm_nattch_file`, `std::fs::OpenOptions::open` accesses only the run-scoped SysV IPC backing object used by `with_shm_nattch_file`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1961 in `with_shm_nattch_file`, `std::fs::OpenOptions::open` accesses only the run-scoped SysV IPC backing object used by `with_shm_nattch_file`.",
     "review_id": "HA-000129",
     "source": {
-      "byte_end": 64543,
-      "byte_start": 64539,
+      "byte_end": 64604,
+      "byte_start": 64600,
       "column": 10,
       "column_end": 14,
       "column_start": 10,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 1959,
-      "line_end": 1959,
-      "line_start": 1959
+      "line": 1961,
+      "line_end": 1961,
+      "line_start": 1961
     }
   },
   {
@@ -3744,18 +3744,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/commands.rs:2955 in `copy_dir_recursive`, `std::fs::copy` accesses only the container-copy filesystem tree selected by the CLI request.",
+    "rationale": "At crates/carrick-cli/src/commands.rs:2939 in `copy_dir_recursive`, `std::fs::copy` accesses only the container-copy filesystem tree selected by the CLI request.",
     "review_id": "HA-000140",
     "source": {
-      "byte_end": 130646,
-      "byte_start": 130633,
+      "byte_end": 129671,
+      "byte_start": 129658,
       "column": 13,
       "column_end": 26,
       "column_start": 13,
       "file": "crates/carrick-cli/src/commands.rs",
-      "line": 2955,
-      "line_end": 2955,
-      "line_start": 2955
+      "line": 2939,
+      "line_end": 2939,
+      "line_start": 2939
     }
   },
   {
@@ -3903,18 +3903,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/commands.rs:2921 in `copy_dir_recursive`, `std::fs::create_dir_all` accesses only the container-copy filesystem tree selected by the CLI request.",
+    "rationale": "At crates/carrick-cli/src/commands.rs:2905 in `copy_dir_recursive`, `std::fs::create_dir_all` accesses only the container-copy filesystem tree selected by the CLI request.",
     "review_id": "HA-000146",
     "source": {
-      "byte_end": 128936,
-      "byte_start": 128913,
+      "byte_end": 127961,
+      "byte_start": 127938,
       "column": 5,
       "column_end": 28,
       "column_start": 5,
       "file": "crates/carrick-cli/src/commands.rs",
-      "line": 2921,
-      "line_end": 2921,
-      "line_start": 2921
+      "line": 2905,
+      "line_end": 2905,
+      "line_start": 2905
     }
   },
   {
@@ -4505,18 +4505,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/fs/state.rs:398 in `new`, `std::fs::create_dir_all` accesses only the run-scoped host shared-memory directory used by `new`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/fs/state.rs:463 in `new`, `std::fs::create_dir_all` accesses only the run-scoped host shared-memory directory used by `new`.",
     "review_id": "HA-000169",
     "source": {
-      "byte_end": 16463,
-      "byte_start": 16440,
+      "byte_end": 19011,
+      "byte_start": 18988,
       "column": 25,
       "column_end": 48,
       "column_start": 25,
       "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
-      "line": 398,
-      "line_end": 398,
-      "line_start": 398
+      "line": 463,
+      "line_end": 463,
+      "line_start": 463
     }
   },
   {
@@ -4882,18 +4882,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/commands.rs:2874 in `preserve_build_archive`, `std::fs::hard_link` accesses only the build archive source and preserved destination selected by the CLI request.",
+    "rationale": "At crates/carrick-cli/src/commands.rs:2858 in `preserve_build_archive`, `std::fs::hard_link` accesses only the build archive source and preserved destination selected by the CLI request.",
     "review_id": "HA-000183",
     "source": {
-      "byte_end": 126894,
-      "byte_start": 126876,
+      "byte_end": 125919,
+      "byte_start": 125901,
       "column": 11,
       "column_end": 29,
       "column_start": 11,
       "file": "crates/carrick-cli/src/commands.rs",
-      "line": 2874,
-      "line_end": 2874,
-      "line_start": 2874
+      "line": 2858,
+      "line_end": 2858,
+      "line_start": 2858
     }
   },
   {
@@ -4935,18 +4935,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/commands.rs:2870 in `preserve_build_archive`, `std::fs::metadata` accesses only the build archive source and preserved destination selected by the CLI request.",
+    "rationale": "At crates/carrick-cli/src/commands.rs:2854 in `preserve_build_archive`, `std::fs::metadata` accesses only the build archive source and preserved destination selected by the CLI request.",
     "review_id": "HA-000185",
     "source": {
-      "byte_end": 126711,
-      "byte_start": 126694,
+      "byte_end": 125736,
+      "byte_start": 125719,
       "column": 5,
       "column_end": 22,
       "column_start": 5,
       "file": "crates/carrick-cli/src/commands.rs",
-      "line": 2870,
-      "line_end": 2870,
-      "line_start": 2870
+      "line": 2854,
+      "line_end": 2854,
+      "line_start": 2854
     }
   },
   {
@@ -6451,18 +6451,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/commands.rs:2928 in `copy_dir_recursive`, `std::fs::read_dir` accesses only the container-copy filesystem tree selected by the CLI request.",
+    "rationale": "At crates/carrick-cli/src/commands.rs:2912 in `copy_dir_recursive`, `std::fs::read_dir` accesses only the container-copy filesystem tree selected by the CLI request.",
     "review_id": "HA-000242",
     "source": {
-      "byte_end": 129339,
-      "byte_start": 129322,
+      "byte_end": 128364,
+      "byte_start": 128347,
       "column": 18,
       "column_end": 35,
       "column_start": 18,
       "file": "crates/carrick-cli/src/commands.rs",
-      "line": 2928,
-      "line_end": 2928,
-      "line_start": 2928
+      "line": 2912,
+      "line_end": 2912,
+      "line_start": 2912
     }
   },
   {
@@ -6713,18 +6713,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1293 in `lookup_msg_queue_path`, `std::fs::read_dir` accesses only the run-scoped SysV IPC backing object used by `lookup_msg_queue_path`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1295 in `lookup_msg_queue_path`, `std::fs::read_dir` accesses only the run-scoped SysV IPC backing object used by `lookup_msg_queue_path`.",
     "review_id": "HA-000252",
     "source": {
-      "byte_end": 42296,
-      "byte_start": 42279,
+      "byte_end": 42357,
+      "byte_start": 42340,
       "column": 19,
       "column_end": 36,
       "column_start": 19,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 1293,
-      "line_end": 1293,
-      "line_start": 1293
+      "line": 1295,
+      "line_end": 1295,
+      "line_start": 1295
     }
   },
   {
@@ -6740,18 +6740,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1315 in `cleanup_msg_queue_files_for_scope`, `std::fs::read_dir` accesses only the run-scoped SysV IPC backing object used by `cleanup_msg_queue_files_for_scope`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1317 in `cleanup_msg_queue_files_for_scope`, `std::fs::read_dir` accesses only the run-scoped SysV IPC backing object used by `cleanup_msg_queue_files_for_scope`.",
     "review_id": "HA-000253",
     "source": {
-      "byte_end": 42996,
-      "byte_start": 42979,
+      "byte_end": 43057,
+      "byte_start": 43040,
       "column": 26,
       "column_end": 43,
       "column_start": 26,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 1315,
-      "line_end": 1315,
-      "line_start": 1315
+      "line": 1317,
+      "line_end": 1317,
+      "line_start": 1317
     }
   },
   {
@@ -6767,18 +6767,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:3438 in `sorted_msg_queue_ids`, `std::fs::read_dir` accesses only the run-scoped SysV IPC backing object used by `sorted_msg_queue_ids`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:3440 in `sorted_msg_queue_ids`, `std::fs::read_dir` accesses only the run-scoped SysV IPC backing object used by `sorted_msg_queue_ids`.",
     "review_id": "HA-000254",
     "source": {
-      "byte_end": 129214,
-      "byte_start": 129197,
+      "byte_end": 129275,
+      "byte_start": 129258,
       "column": 26,
       "column_end": 43,
       "column_start": 26,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 3438,
-      "line_end": 3438,
-      "line_start": 3438
+      "line": 3440,
+      "line_end": 3440,
+      "line_start": 3440
     }
   },
   {
@@ -7198,18 +7198,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/commands.rs:2941 in `copy_dir_recursive`, `std::fs::read_link` accesses only the container-copy filesystem tree selected by the CLI request.",
+    "rationale": "At crates/carrick-cli/src/commands.rs:2925 in `copy_dir_recursive`, `std::fs::read_link` accesses only the container-copy filesystem tree selected by the CLI request.",
     "review_id": "HA-000270",
     "source": {
-      "byte_end": 129977,
-      "byte_start": 129959,
+      "byte_end": 129002,
+      "byte_start": 128984,
       "column": 26,
       "column_end": 44,
       "column_start": 26,
       "file": "crates/carrick-cli/src/commands.rs",
-      "line": 2941,
-      "line_end": 2941,
-      "line_start": 2941
+      "line": 2925,
+      "line_end": 2925,
+      "line_start": 2925
     }
   },
   {
@@ -7303,18 +7303,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/commands.rs:1602 in `run_cli`, `std::fs::read_to_string` accesses only the user-selected DTrace script.",
+    "rationale": "At crates/carrick-cli/src/commands.rs:1588 in `run_cli`, `std::fs::read_to_string` accesses only the user-selected DTrace script.",
     "review_id": "HA-000274",
     "source": {
-      "byte_end": 70554,
-      "byte_start": 70531,
+      "byte_end": 69683,
+      "byte_start": 69660,
       "column": 30,
       "column_end": 53,
       "column_start": 30,
       "file": "crates/carrick-cli/src/commands.rs",
-      "line": 1602,
-      "line_end": 1602,
-      "line_start": 1602
+      "line": 1588,
+      "line_end": 1588,
+      "line_start": 1588
     }
   },
   {
@@ -7772,18 +7772,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/lib.rs:353 in `rosetta_interpreter_path`, `std::fs::read_to_string` accesses only the fixed binfmt_misc Rosetta registration object at /proc/sys/fs/binfmt_misc/rosetta.",
+    "rationale": "At crates/carrick-runtime/src/lib.rs:355 in `rosetta_interpreter_path`, `std::fs::read_to_string` accesses only the fixed binfmt_misc Rosetta registration object at /proc/sys/fs/binfmt_misc/rosetta.",
     "review_id": "HA-000292",
     "source": {
-      "byte_end": 18820,
-      "byte_start": 18797,
+      "byte_end": 18883,
+      "byte_start": 18860,
       "column": 22,
       "column_end": 45,
       "column_start": 22,
       "file": "crates/carrick-runtime/src/lib.rs",
-      "line": 353,
-      "line_end": 353,
-      "line_start": 353
+      "line": 355,
+      "line_end": 355,
+      "line_start": 355
     }
   },
   {
@@ -8416,18 +8416,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/commands.rs:2903 in `preserve_build_archive`, `std::fs::remove_file` accesses only the build archive source and preserved destination selected by the CLI request.",
+    "rationale": "At crates/carrick-cli/src/commands.rs:2887 in `preserve_build_archive`, `std::fs::remove_file` accesses only the build archive source and preserved destination selected by the CLI request.",
     "review_id": "HA-000316",
     "source": {
-      "byte_end": 128045,
-      "byte_start": 128025,
+      "byte_end": 127070,
+      "byte_start": 127050,
       "column": 17,
       "column_end": 37,
       "column_start": 17,
       "file": "crates/carrick-cli/src/commands.rs",
-      "line": 2903,
-      "line_end": 2903,
-      "line_start": 2903
+      "line": 2887,
+      "line_end": 2887,
+      "line_start": 2887
     }
   },
   {
@@ -8683,18 +8683,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:6037 in `bind`, `std::fs::remove_file` accesses only the registered AF_UNIX backing path used by `bind`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:6055 in `bind`, `std::fs::remove_file` accesses only the registered AF_UNIX backing path used by `bind`.",
     "review_id": "HA-000326",
     "source": {
-      "byte_end": 279740,
-      "byte_start": 279720,
+      "byte_end": 281091,
+      "byte_start": 281071,
       "column": 33,
       "column_end": 53,
       "column_start": 33,
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 6037,
-      "line_end": 6037,
-      "line_start": 6037
+      "line": 6055,
+      "line_end": 6055,
+      "line_start": 6055
     }
   },
   {
@@ -8710,18 +8710,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:6138 in `bind`, `std::fs::remove_file` accesses only the registered AF_UNIX backing path used by `bind`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:6156 in `bind`, `std::fs::remove_file` accesses only the registered AF_UNIX backing path used by `bind`.",
     "review_id": "HA-000327",
     "source": {
-      "byte_end": 285074,
-      "byte_start": 285054,
+      "byte_end": 286425,
+      "byte_start": 286405,
       "column": 33,
       "column_end": 53,
       "column_start": 33,
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 6138,
-      "line_end": 6138,
-      "line_start": 6138
+      "line": 6156,
+      "line_end": 6156,
+      "line_start": 6156
     }
   },
   {
@@ -8764,18 +8764,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1319 in `cleanup_msg_queue_files_for_scope`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `cleanup_msg_queue_files_for_scope`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1321 in `cleanup_msg_queue_files_for_scope`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `cleanup_msg_queue_files_for_scope`.",
     "review_id": "HA-000329",
     "source": {
-      "byte_end": 43181,
-      "byte_start": 43161,
+      "byte_end": 43242,
+      "byte_start": 43222,
       "column": 25,
       "column_end": 45,
       "column_start": 25,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 1319,
-      "line_end": 1319,
-      "line_start": 1319
+      "line": 1321,
+      "line_end": 1321,
+      "line_start": 1321
     }
   },
   {
@@ -8791,18 +8791,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:2021 in `decrement_shm_attachment`, `std::fs::remove_file` accesses only the run-scoped SysV IPC attachment-count backing object used by `decrement_shm_attachment`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:2023 in `decrement_shm_attachment`, `std::fs::remove_file` accesses only the run-scoped SysV IPC attachment-count backing object used by `decrement_shm_attachment`.",
     "review_id": "HA-000330",
     "source": {
-      "byte_end": 66538,
-      "byte_start": 66518,
+      "byte_end": 66599,
+      "byte_start": 66579,
       "column": 17,
       "column_end": 37,
       "column_start": 17,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 2021,
-      "line_end": 2021,
-      "line_start": 2021
+      "line": 2023,
+      "line_end": 2023,
+      "line_start": 2023
     }
   },
   {
@@ -8818,18 +8818,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:2210 in `shmctl_rmid`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `shmctl_rmid`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:2212 in `shmctl_rmid`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `shmctl_rmid`.",
     "review_id": "HA-000331",
     "source": {
-      "byte_end": 74141,
-      "byte_start": 74121,
+      "byte_end": 74202,
+      "byte_start": 74182,
       "column": 21,
       "column_end": 41,
       "column_start": 21,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 2210,
-      "line_end": 2210,
-      "line_start": 2210
+      "line": 2212,
+      "line_end": 2212,
+      "line_start": 2212
     }
   },
   {
@@ -8845,18 +8845,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:2472 in `cleanup_sysv_ipc_on_process_exit`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `cleanup_sysv_ipc_on_process_exit`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:2474 in `cleanup_sysv_ipc_on_process_exit`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `cleanup_sysv_ipc_on_process_exit`.",
     "review_id": "HA-000332",
     "source": {
-      "byte_end": 83951,
-      "byte_start": 83931,
+      "byte_end": 84012,
+      "byte_start": 83992,
       "column": 21,
       "column_end": 41,
       "column_start": 21,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 2472,
-      "line_end": 2472,
-      "line_start": 2472
+      "line": 2474,
+      "line_end": 2474,
+      "line_start": 2474
     }
   },
   {
@@ -8872,18 +8872,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:2473 in `cleanup_sysv_ipc_on_process_exit`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `cleanup_sysv_ipc_on_process_exit`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:2475 in `cleanup_sysv_ipc_on_process_exit`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `cleanup_sysv_ipc_on_process_exit`.",
     "review_id": "HA-000333",
     "source": {
-      "byte_end": 84008,
-      "byte_start": 83988,
+      "byte_end": 84069,
+      "byte_start": 84049,
       "column": 21,
       "column_end": 41,
       "column_start": 21,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 2473,
-      "line_end": 2473,
-      "line_start": 2473
+      "line": 2475,
+      "line_end": 2475,
+      "line_start": 2475
     }
   },
   {
@@ -8899,18 +8899,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:3577 in `sysv_msgctl`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `sysv_msgctl`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:3579 in `sysv_msgctl`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `sysv_msgctl`.",
     "review_id": "HA-000334",
     "source": {
-      "byte_end": 133635,
-      "byte_start": 133615,
+      "byte_end": 133696,
+      "byte_start": 133676,
       "column": 21,
       "column_end": 41,
       "column_start": 21,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 3577,
-      "line_end": 3577,
-      "line_start": 3577
+      "line": 3579,
+      "line_end": 3579,
+      "line_start": 3579
     }
   },
   {
@@ -8926,18 +8926,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:3578 in `sysv_msgctl`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `sysv_msgctl`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:3580 in `sysv_msgctl`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `sysv_msgctl`.",
     "review_id": "HA-000335",
     "source": {
-      "byte_end": 133684,
-      "byte_start": 133664,
+      "byte_end": 133745,
+      "byte_start": 133725,
       "column": 21,
       "column_end": 41,
       "column_start": 21,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 3578,
-      "line_end": 3578,
-      "line_start": 3578
+      "line": 3580,
+      "line_end": 3580,
+      "line_start": 3580
     }
   },
   {
@@ -9386,18 +9386,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:3257 in `msgget_open`, `std::fs::rename` accesses only the run-scoped SysV IPC backing object used by `msgget_open`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:3259 in `msgget_open`, `std::fs::rename` accesses only the run-scoped SysV IPC backing object used by `msgget_open`.",
     "review_id": "HA-000352",
     "source": {
-      "byte_end": 123388,
-      "byte_start": 123373,
+      "byte_end": 123449,
+      "byte_start": 123434,
       "column": 13,
       "column_end": 28,
       "column_start": 13,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 3257,
-      "line_end": 3257,
-      "line_start": 3257
+      "line": 3259,
+      "line_end": 3259,
+      "line_start": 3259
     }
   },
   {
@@ -9791,18 +9791,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/fs/state.rs:406 in `new`, `std::fs::set_permissions` accesses only the run-scoped host shared-memory directory used by `new`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/fs/state.rs:471 in `new`, `std::fs::set_permissions` accesses only the run-scoped host shared-memory directory used by `new`.",
     "review_id": "HA-000367",
     "source": {
-      "byte_end": 16993,
-      "byte_start": 16969,
+      "byte_end": 19541,
+      "byte_start": 19517,
       "column": 21,
       "column_end": 45,
       "column_start": 21,
       "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
-      "line": 406,
-      "line_end": 406,
-      "line_start": 406
+      "line": 471,
+      "line_end": 471,
+      "line_start": 471
     }
   },
   {
@@ -10352,18 +10352,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:6034 in `bind`, `std::fs::symlink_metadata` accesses only the registered AF_UNIX backing path used by `bind`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:6052 in `bind`, `std::fs::symlink_metadata` accesses only the registered AF_UNIX backing path used by `bind`.",
     "review_id": "HA-000388",
     "source": {
-      "byte_end": 279572,
-      "byte_start": 279547,
+      "byte_end": 280923,
+      "byte_start": 280898,
       "column": 33,
       "column_end": 58,
       "column_start": 33,
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 6034,
-      "line_end": 6034,
-      "line_start": 6034
+      "line": 6052,
+      "line_end": 6052,
+      "line_start": 6052
     }
   },
   {
@@ -10379,18 +10379,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:6134 in `bind`, `std::fs::symlink_metadata` accesses only the registered AF_UNIX backing path used by `bind`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:6152 in `bind`, `std::fs::symlink_metadata` accesses only the registered AF_UNIX backing path used by `bind`.",
     "review_id": "HA-000389",
     "source": {
-      "byte_end": 284889,
-      "byte_start": 284864,
+      "byte_end": 286240,
+      "byte_start": 286215,
       "column": 37,
       "column_end": 62,
       "column_start": 37,
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 6134,
-      "line_end": 6134,
-      "line_start": 6134
+      "line": 6152,
+      "line_end": 6152,
+      "line_start": 6152
     }
   },
   {
@@ -11312,18 +11312,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/commands.rs:989 in `run_cli`, the host result from `std::process::id` determines the container identifier returned by the CLI run operation used by `run_cli`.",
+    "rationale": "At crates/carrick-cli/src/commands.rs:974 in `run_cli`, the host result from `std::process::id` determines the container identifier returned by the CLI run operation used by `run_cli`.",
     "review_id": "HA-000424",
     "source": {
-      "byte_end": 42404,
-      "byte_start": 42388,
+      "byte_end": 41444,
+      "byte_start": 41428,
       "column": 61,
       "column_end": 77,
       "column_start": 61,
       "file": "crates/carrick-cli/src/commands.rs",
-      "line": 989,
-      "line_end": 989,
-      "line_start": 989
+      "line": 974,
+      "line_end": 974,
+      "line_start": 974
     }
   },
   {
@@ -13070,18 +13070,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/fs.rs:1253 in `proc_self_magic_link`, the host result from `std::process::id` determines the guest /proc/self magic-link result used by `proc_self_magic_link`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/fs.rs:1254 in `proc_self_magic_link`, the host result from `std::process::id` determines the guest /proc/self magic-link result used by `proc_self_magic_link`.",
     "review_id": "HA-000488",
     "source": {
-      "byte_end": 45067,
-      "byte_start": 45051,
+      "byte_end": 45093,
+      "byte_start": 45077,
       "column": 33,
       "column_end": 49,
       "column_start": 33,
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1253,
-      "line_end": 1253,
-      "line_start": 1253
+      "line": 1254,
+      "line_end": 1254,
+      "line_start": 1254
     }
   },
   {
@@ -13097,18 +13097,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/fs.rs:1305 in `proc_self_fdinfo_number`, the host result from `std::process::id` determines the guest /proc/self magic-link result used by `proc_self_fdinfo_number`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/fs.rs:1306 in `proc_self_fdinfo_number`, the host result from `std::process::id` determines the guest /proc/self magic-link result used by `proc_self_fdinfo_number`.",
     "review_id": "HA-000489",
     "source": {
-      "byte_end": 47268,
-      "byte_start": 47252,
+      "byte_end": 47294,
+      "byte_start": 47278,
       "column": 33,
       "column_end": 49,
       "column_start": 33,
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1305,
-      "line_end": 1305,
-      "line_start": 1305
+      "line": 1306,
+      "line_end": 1306,
+      "line_start": 1306
     }
   },
   {
@@ -13124,18 +13124,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/fs.rs:4977 in `send_async_owner_signal`, the host result from `std::process::id` determines the guest self-thread signal-target decision used by `send_async_owner_signal`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/fs.rs:4978 in `send_async_owner_signal`, the host result from `std::process::id` determines the guest self-thread signal-target decision used by `send_async_owner_signal`.",
     "review_id": "HA-000490",
     "source": {
-      "byte_end": 218898,
-      "byte_start": 218882,
+      "byte_end": 218924,
+      "byte_start": 218908,
       "column": 97,
       "column_end": 113,
       "column_start": 97,
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4977,
-      "line_end": 4977,
-      "line_start": 4977
+      "line": 4978,
+      "line_end": 4978,
+      "line_start": 4978
     }
   },
   {
@@ -13151,18 +13151,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/fs.rs:4978 in `send_async_owner_signal`, the host result from `std::process::id` determines the guest self-process signal-target decision used by `send_async_owner_signal`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/fs.rs:4979 in `send_async_owner_signal`, the host result from `std::process::id` determines the guest self-process signal-target decision used by `send_async_owner_signal`.",
     "review_id": "HA-000491",
     "source": {
-      "byte_end": 219017,
-      "byte_start": 219001,
+      "byte_end": 219043,
+      "byte_start": 219027,
       "column": 100,
       "column_end": 116,
       "column_start": 100,
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4978,
-      "line_end": 4978,
-      "line_start": 4978
+      "line": 4979,
+      "line_end": 4979,
+      "line_start": 4979
     }
   },
   {
@@ -13178,18 +13178,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/fs/state.rs:397 in `new`, `std::process::id` accesses only the run-scoped host shared-memory directory used by `new`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/fs/state.rs:462 in `new`, `std::process::id` accesses only the run-scoped host shared-memory directory used by `new`.",
     "review_id": "HA-000492",
     "source": {
-      "byte_end": 16410,
-      "byte_start": 16394,
+      "byte_end": 18958,
+      "byte_start": 18942,
       "column": 73,
       "column_end": 89,
       "column_start": 73,
       "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
-      "line": 397,
-      "line_end": 397,
-      "line_start": 397
+      "line": 462,
+      "line_end": 462,
+      "line_start": 462
     }
   },
   {
@@ -13205,18 +13205,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:3033 in `bootstrap_one_task_binding`, the host result from `std::process::id` determines the guest root-process identity in the one-task adapter used by `bootstrap_one_task_binding`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:3034 in `bootstrap_one_task_binding`, the host result from `std::process::id` determines the guest root-process identity in the one-task adapter used by `bootstrap_one_task_binding`.",
     "review_id": "HA-000493",
     "source": {
-      "byte_end": 114863,
-      "byte_start": 114847,
+      "byte_end": 114860,
+      "byte_start": 114844,
       "column": 38,
       "column_end": 54,
       "column_start": 38,
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 3033,
-      "line_end": 3033,
-      "line_start": 3033
+      "line": 3034,
+      "line_end": 3034,
+      "line_start": 3034
     }
   },
   {
@@ -13232,18 +13232,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:4146 in `event_ring_guest_pid`, `std::process::id` acts only on the current carrier event-ring diagnostic fallback used by `event_ring_guest_pid`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:4147 in `event_ring_guest_pid`, `std::process::id` acts only on the current carrier event-ring diagnostic fallback used by `event_ring_guest_pid`; no guest identity selects its host target.",
     "review_id": "HA-000494",
     "source": {
-      "byte_end": 158147,
-      "byte_start": 158131,
+      "byte_end": 158144,
+      "byte_start": 158128,
       "column": 42,
       "column_end": 58,
       "column_start": 42,
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 4146,
-      "line_end": 4146,
-      "line_start": 4146
+      "line": 4147,
+      "line_end": 4147,
+      "line_start": 4147
     }
   },
   {
@@ -13259,18 +13259,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:4548 in `close_open_file_and_free_pty`, the host result from `std::process::id` determines the guest PTY entry lifetime decided by the host-process owner PID.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:4549 in `close_open_file_and_free_pty`, the host result from `std::process::id` determines the guest PTY entry lifetime decided by the host-process owner PID.",
     "review_id": "HA-000495",
     "source": {
-      "byte_end": 176183,
-      "byte_start": 176167,
+      "byte_end": 176180,
+      "byte_start": 176164,
       "column": 32,
       "column_end": 48,
       "column_start": 32,
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 4548,
-      "line_end": 4548,
-      "line_start": 4548
+      "line": 4549,
+      "line_end": 4549,
+      "line_start": 4549
     }
   },
   {
@@ -13286,18 +13286,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:5903 in `register_controlling_pty`, the host result from `std::process::id` determines the guest controlling PTY identity assigned to the host-process owner PID.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:5905 in `register_controlling_pty`, the host result from `std::process::id` determines the guest controlling PTY identity assigned to the host-process owner PID.",
     "review_id": "HA-000496",
     "source": {
-      "byte_end": 235623,
-      "byte_start": 235607,
+      "byte_end": 235673,
+      "byte_start": 235657,
       "column": 39,
       "column_end": 55,
       "column_start": 39,
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 5903,
-      "line_end": 5903,
-      "line_start": 5903
+      "line": 5905,
+      "line_end": 5905,
+      "line_start": 5905
     }
   },
   {
@@ -13313,18 +13313,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:6103 in `reset_one_task_kernel_binding_for_current_process`, the host result from `std::process::id` determines the guest fork-child identity in the one-task adapter used by `reset_one_task_kernel_binding_for_current_process`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:6105 in `reset_one_task_kernel_binding_for_current_process`, the host result from `std::process::id` determines the guest fork-child identity in the one-task adapter used by `reset_one_task_kernel_binding_for_current_process`.",
     "review_id": "HA-000497",
     "source": {
-      "byte_end": 243570,
-      "byte_start": 243554,
+      "byte_end": 243620,
+      "byte_start": 243604,
       "column": 47,
       "column_end": 63,
       "column_start": 47,
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 6103,
-      "line_end": 6103,
-      "line_start": 6103
+      "line": 6105,
+      "line_end": 6105,
+      "line_start": 6105
     }
   },
   {
@@ -13370,8 +13370,8 @@
     "rationale": "At crates/carrick-runtime/src/dispatch/mqueue.rs:1045 in `deliver_notify`, the host result from `std::process::id` determines the legacy host-fallback message-queue thread recipient used by `deliver_notify`.",
     "review_id": "HA-000499",
     "source": {
-      "byte_end": 40908,
-      "byte_start": 40892,
+      "byte_end": 40984,
+      "byte_start": 40968,
       "column": 40,
       "column_end": 56,
       "column_start": 40,
@@ -13397,8 +13397,8 @@
     "rationale": "At crates/carrick-runtime/src/dispatch/mqueue.rs:1073 in `deliver_notify`, the host result from `std::process::id` determines the legacy host-fallback message-queue signal recipient used by `deliver_notify`.",
     "review_id": "HA-000500",
     "source": {
-      "byte_end": 42157,
-      "byte_start": 42141,
+      "byte_end": 42233,
+      "byte_start": 42217,
       "column": 40,
       "column_end": 56,
       "column_start": 40,
@@ -13448,18 +13448,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:6010 in `bind`, the host result from `std::process::id` determines the guest-visible synthetic netlink bind PID used by `bind`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:6028 in `bind`, the host result from `std::process::id` determines the guest-visible synthetic netlink bind PID used by `bind`.",
     "review_id": "HA-000502",
     "source": {
-      "byte_end": 278191,
-      "byte_start": 278175,
+      "byte_end": 279542,
+      "byte_start": 279526,
       "column": 21,
       "column_end": 37,
       "column_start": 21,
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 6010,
-      "line_end": 6010,
-      "line_start": 6010
+      "line": 6028,
+      "line_end": 6028,
+      "line_start": 6028
     }
   },
   {
@@ -13475,18 +13475,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:6768 in `sendto`, `std::process::id` acts only on the current carrier network-debug event used by `sendto`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:6786 in `sendto`, `std::process::id` acts only on the current carrier network-debug event used by `sendto`; no guest identity selects its host target.",
     "review_id": "HA-000503",
     "source": {
-      "byte_end": 316420,
-      "byte_start": 316404,
+      "byte_end": 317771,
+      "byte_start": 317755,
       "column": 21,
       "column_end": 37,
       "column_start": 21,
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 6768,
-      "line_end": 6768,
-      "line_start": 6768
+      "line": 6786,
+      "line_end": 6786,
+      "line_start": 6786
     }
   },
   {
@@ -13610,18 +13610,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/signal.rs:2306 in `sigqueueinfo_common`, the host result from `std::process::id` determines the guest signal sender and recipient identity used by `sigqueueinfo_common`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/signal.rs:2308 in `sigqueueinfo_common`, the host result from `std::process::id` determines the guest signal sender and recipient identity used by `sigqueueinfo_common`.",
     "review_id": "HA-000508",
     "source": {
-      "byte_end": 105437,
-      "byte_start": 105421,
+      "byte_end": 105575,
+      "byte_start": 105559,
       "column": 24,
       "column_end": 40,
       "column_start": 24,
       "file": "crates/carrick-runtime/src/dispatch/signal.rs",
-      "line": 2306,
-      "line_end": 2306,
-      "line_start": 2306
+      "line": 2308,
+      "line_end": 2308,
+      "line_start": 2308
     }
   },
   {
@@ -13637,18 +13637,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/signal.rs:2573 in `hvpatch_process_signal_target`, the host result from `std::process::id` determines the transitional guest process-signal target bridge used by `hvpatch_process_signal_target`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/signal.rs:2575 in `hvpatch_process_signal_target`, the host result from `std::process::id` determines the transitional guest process-signal target bridge used by `hvpatch_process_signal_target`.",
     "review_id": "HA-000509",
     "source": {
-      "byte_end": 118057,
-      "byte_start": 118041,
+      "byte_end": 118195,
+      "byte_start": 118179,
       "column": 59,
       "column_end": 75,
       "column_start": 59,
       "file": "crates/carrick-runtime/src/dispatch/signal.rs",
-      "line": 2573,
-      "line_end": 2573,
-      "line_start": 2573
+      "line": 2575,
+      "line_end": 2575,
+      "line_start": 2575
     }
   },
   {
@@ -13664,18 +13664,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/signal.rs:2636 in `bootstrap_signal_send_as`, the host result from `std::process::id` determines the guest signal recipient identity used by `bootstrap_signal_send_as`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/signal.rs:2638 in `bootstrap_signal_send_as`, the host result from `std::process::id` determines the guest signal recipient identity used by `bootstrap_signal_send_as`.",
     "review_id": "HA-000510",
     "source": {
-      "byte_end": 121004,
-      "byte_start": 120988,
+      "byte_end": 121142,
+      "byte_start": 121126,
       "column": 20,
       "column_end": 36,
       "column_start": 20,
       "file": "crates/carrick-runtime/src/dispatch/signal.rs",
-      "line": 2636,
-      "line_end": 2636,
-      "line_start": 2636
+      "line": 2638,
+      "line_end": 2638,
+      "line_start": 2638
     }
   },
   {
@@ -13842,33 +13842,6 @@
   },
   {
     "catalog_id": "HA-CATALOG-PROCESS-ID",
-    "classification": "declared_backing",
-    "evidence": {
-      "authority": "authorized_backing",
-      "resource": "carrier process PID registered as root init host PID for container PID namespace"
-    },
-    "expansion": null,
-    "operation": "std::process::id",
-    "profiles": [
-      "macos-cli-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-runtime/src/execute.rs:228 in `Runtime::execute`, `std::process::id` registers the carrier host process PID with the container's NsSharedRegion root slot; no guest identity selects its host target.",
-    "review_id": "HA-000517",
-    "source": {
-      "byte_end": 9869,
-      "byte_start": 9853,
-      "column": 33,
-      "column_end": 49,
-      "column_start": 33,
-      "file": "crates/carrick-runtime/src/execute.rs",
-      "line": 228,
-      "line_end": 228,
-      "line_start": 228
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-PROCESS-ID",
     "classification": "declared_substrate",
     "evidence": {
       "authority": "authenticated_carrier",
@@ -14015,18 +13988,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/kernel/container.rs:208 in `from_process_env`, the host result from `std::process::id` determines the run-scoped fallback run identifier returned by `from_process_env`.",
+    "rationale": "At crates/carrick-runtime/src/kernel/container.rs:211 in `from_process_env`, the host result from `std::process::id` determines the run-scoped fallback run identifier returned by `from_process_env`.",
     "review_id": "HA-000523",
     "source": {
-      "byte_end": 8898,
-      "byte_start": 8882,
+      "byte_end": 9091,
+      "byte_start": 9075,
       "column": 61,
       "column_end": 77,
       "column_start": 61,
       "file": "crates/carrick-runtime/src/kernel/container.rs",
-      "line": 208,
-      "line_end": 208,
-      "line_start": 208
+      "line": 211,
+      "line_end": 211,
+      "line_start": 211
     }
   },
   {
@@ -14706,6 +14679,33 @@
   },
   {
     "catalog_id": "HA-CATALOG-PROCESS-ID",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "carrier process PID registered as root init host PID for container PID namespace"
+    },
+    "expansion": null,
+    "operation": "std::process::id",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-runtime/src/prepare.rs:387 in `Runtime::prepare`, `std::process::id` registers the carrier host process PID with the container's NsSharedRegion root slot; no guest identity selects its host target.",
+    "review_id": "HA-000517",
+    "source": {
+      "byte_end": 15601,
+      "byte_start": 15585,
+      "column": 33,
+      "column_end": 49,
+      "column_start": 33,
+      "file": "crates/carrick-runtime/src/prepare.rs",
+      "line": 387,
+      "line_end": 387,
+      "line_start": 387
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-PROCESS-ID",
     "classification": "forbidden_semantic",
     "evidence": {
       "authority": "guest_answer",
@@ -15095,18 +15095,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3249 in `synthetic_proc_self_stat`, the host result from `std::process::id` determines the guest /proc process metadata identity used by `synthetic_proc_self_stat`.",
+    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3250 in `synthetic_proc_self_stat`, the host result from `std::process::id` determines the guest /proc process metadata identity used by `synthetic_proc_self_stat`.",
     "review_id": "HA-000563",
     "source": {
-      "byte_end": 137126,
-      "byte_start": 137110,
+      "byte_end": 137169,
+      "byte_start": 137153,
       "column": 36,
       "column_end": 52,
       "column_start": 36,
       "file": "crates/carrick-runtime/src/vfs/proc.rs",
-      "line": 3249,
-      "line_end": 3249,
-      "line_start": 3249
+      "line": 3250,
+      "line_end": 3250,
+      "line_start": 3250
     }
   },
   {
@@ -15122,18 +15122,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3653 in `synthetic_proc_pid_file`, the host result from `std::process::id` determines the guest /proc process metadata identity used by `synthetic_proc_pid_file`.",
+    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3654 in `synthetic_proc_pid_file`, the host result from `std::process::id` determines the guest /proc process metadata identity used by `synthetic_proc_pid_file`.",
     "review_id": "HA-000564",
     "source": {
-      "byte_end": 151483,
-      "byte_start": 151467,
+      "byte_end": 151526,
+      "byte_start": 151510,
       "column": 18,
       "column_end": 34,
       "column_start": 18,
       "file": "crates/carrick-runtime/src/vfs/proc.rs",
-      "line": 3653,
-      "line_end": 3653,
-      "line_start": 3653
+      "line": 3654,
+      "line_end": 3654,
+      "line_start": 3654
     }
   },
   {
@@ -15149,18 +15149,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3705 in `synthetic_proc_pid_file`, the host result from `std::process::id` determines the guest /proc process metadata identity used by `synthetic_proc_pid_file`.",
+    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3706 in `synthetic_proc_pid_file`, the host result from `std::process::id` determines the guest /proc process metadata identity used by `synthetic_proc_pid_file`.",
     "review_id": "HA-000565",
     "source": {
-      "byte_end": 153548,
-      "byte_start": 153532,
+      "byte_end": 153591,
+      "byte_start": 153575,
       "column": 18,
       "column_end": 34,
       "column_start": 18,
       "file": "crates/carrick-runtime/src/vfs/proc.rs",
-      "line": 3705,
-      "line_end": 3705,
-      "line_start": 3705
+      "line": 3706,
+      "line_end": 3706,
+      "line_start": 3706
     }
   },
   {
@@ -15176,18 +15176,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3772 in `synthetic_proc_pid_file`, the host result from `std::process::id` determines the guest /proc parent-process metadata used by `synthetic_proc_pid_file`.",
+    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3773 in `synthetic_proc_pid_file`, the host result from `std::process::id` determines the guest /proc parent-process metadata used by `synthetic_proc_pid_file`.",
     "review_id": "HA-000566",
     "source": {
-      "byte_end": 156577,
-      "byte_start": 156561,
+      "byte_end": 156620,
+      "byte_start": 156604,
       "column": 25,
       "column_end": 41,
       "column_start": 25,
       "file": "crates/carrick-runtime/src/vfs/proc.rs",
-      "line": 3772,
-      "line_end": 3772,
-      "line_start": 3772
+      "line": 3773,
+      "line_end": 3773,
+      "line_start": 3773
     }
   },
   {
@@ -15203,18 +15203,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3844 in `parse_proc_pid_path`, the host result from `std::process::id` determines the guest /proc self-directory identity used by `parse_proc_pid_path`.",
+    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3845 in `parse_proc_pid_path`, the host result from `std::process::id` determines the guest /proc self-directory identity used by `parse_proc_pid_path`.",
     "review_id": "HA-000567",
     "source": {
-      "byte_end": 159231,
-      "byte_start": 159215,
+      "byte_end": 159274,
+      "byte_start": 159258,
       "column": 35,
       "column_end": 51,
       "column_start": 35,
       "file": "crates/carrick-runtime/src/vfs/proc.rs",
-      "line": 3844,
-      "line_end": 3844,
-      "line_start": 3844
+      "line": 3845,
+      "line_end": 3845,
+      "line_start": 3845
     }
   },
   {
@@ -15477,18 +15477,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/time.rs:1141 in `arm_rlimit_cpu`, `std::thread::Builder::new` acts only on the current carrier timer and nanosleep helper used by `arm_rlimit_cpu`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/time.rs:1181 in `arm_rlimit_cpu`, `std::thread::Builder::new` acts only on the current carrier timer and nanosleep helper used by `arm_rlimit_cpu`; no guest identity selects its host target.",
     "review_id": "HA-000577",
     "source": {
-      "byte_end": 55216,
-      "byte_start": 55191,
+      "byte_end": 57290,
+      "byte_start": 57265,
       "column": 5,
       "column_end": 30,
       "column_start": 5,
       "file": "crates/carrick-runtime/src/dispatch/time.rs",
-      "line": 1141,
-      "line_end": 1141,
-      "line_start": 1141
+      "line": 1181,
+      "line_end": 1181,
+      "line_start": 1181
     }
   },
   {
@@ -16251,18 +16251,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/time.rs:1194 in `enforce_rlimit_cpu`, `std::thread::sleep` acts only on the current carrier timer and nanosleep helper used by `enforce_rlimit_cpu`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/time.rs:1234 in `enforce_rlimit_cpu`, `std::thread::sleep` acts only on the current carrier timer and nanosleep helper used by `enforce_rlimit_cpu`; no guest identity selects its host target.",
     "review_id": "HA-000606",
     "source": {
-      "byte_end": 57356,
-      "byte_start": 57338,
+      "byte_end": 59430,
+      "byte_start": 59412,
       "column": 9,
       "column_end": 27,
       "column_start": 9,
       "file": "crates/carrick-runtime/src/dispatch/time.rs",
-      "line": 1194,
-      "line_end": 1194,
-      "line_start": 1194
+      "line": 1234,
+      "line_end": 1234,
+      "line_start": 1234
     }
   },
   {
@@ -16992,18 +16992,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:2977 in `msgsnd`, `std::thread::yield_now` acts only on the current SysV dispatch retry worker used by `msgsnd`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:2979 in `msgsnd`, `std::thread::yield_now` acts only on the current SysV dispatch retry worker used by `msgsnd`; no guest identity selects its host target.",
     "review_id": "HA-000633",
     "source": {
-      "byte_end": 110019,
-      "byte_start": 109997,
+      "byte_end": 110080,
+      "byte_start": 110058,
       "column": 29,
       "column_end": 51,
       "column_start": 29,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 2977,
-      "line_end": 2977,
-      "line_start": 2977
+      "line": 2979,
+      "line_end": 2979,
+      "line_start": 2979
     }
   },
   {
@@ -17019,18 +17019,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:3052 in `msgrcv`, `std::thread::yield_now` acts only on the current SysV dispatch retry worker used by `msgrcv`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:3054 in `msgrcv`, `std::thread::yield_now` acts only on the current SysV dispatch retry worker used by `msgrcv`; no guest identity selects its host target.",
     "review_id": "HA-000634",
     "source": {
-      "byte_end": 113995,
-      "byte_start": 113973,
+      "byte_end": 114056,
+      "byte_start": 114034,
       "column": 29,
       "column_end": 51,
       "column_start": 29,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 3052,
-      "line_end": 3052,
-      "line_start": 3052
+      "line": 3054,
+      "line_end": 3054,
+      "line_start": 3054
     }
   },
   {
@@ -17046,18 +17046,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/time.rs:1108 in `try_hold_rlimit_cpu_for_fork_until`, `std::thread::yield_now` acts only on the current carrier timer and nanosleep helper used by `try_hold_rlimit_cpu_for_fork_until`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/time.rs:1148 in `try_hold_rlimit_cpu_for_fork_until`, `std::thread::yield_now` acts only on the current carrier timer and nanosleep helper used by `try_hold_rlimit_cpu_for_fork_until`; no guest identity selects its host target.",
     "review_id": "HA-000635",
     "source": {
-      "byte_end": 54249,
-      "byte_start": 54227,
+      "byte_end": 56323,
+      "byte_start": 56301,
       "column": 9,
       "column_end": 31,
       "column_start": 9,
       "file": "crates/carrick-runtime/src/dispatch/time.rs",
-      "line": 1108,
-      "line_end": 1108,
-      "line_start": 1108
+      "line": 1148,
+      "line_end": 1148,
+      "line_start": 1148
     }
   },
   {
