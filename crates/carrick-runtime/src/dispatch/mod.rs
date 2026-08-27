@@ -2313,11 +2313,16 @@ pub(crate) struct DispatchMmAuthority {
     /// `VVAR_OFF_REALTIME_OFF_NS` word was last stamped by the dispatcher
     /// (`SyscallDispatcher::sync_vvar_realtime_offset`). The vvar page is per
     /// MM (it also carries the per-process RNG generation), so the stamp state
-    /// is MM state. `u64::MAX` = never: a fresh or forked MM re-stamps once on
-    /// its first syscall (or at the post-exec identity stamp), an idempotent
-    /// 8-byte write of the word the VMM stamper already published when the
-    /// delta is 0 (a fork child's vvar frame is already COW-split by the
-    /// HVPatch RNG-generation re-stamp, `trap.rs:11281`).
+    /// is MM state. `u64::MAX` = never.
+    ///
+    /// While the global epoch is still 0 — no guest has moved the clock in
+    /// this carrier — an MM is left at `u64::MAX` and never stamped, because
+    /// the VMM stamper's boot-time word is already correct and a re-stamp
+    /// would write the same bytes. The first `clock_settime` advances the
+    /// epoch past 0, and each MM then re-stamps once on its next syscall (or
+    /// at the post-exec identity stamp): a single 8-byte write (a fork child's
+    /// vvar frame is already COW-split by the HVPatch RNG-generation
+    /// re-stamp, `trap.rs:11281`).
     vvar_realtime_epoch: std::sync::atomic::AtomicU64,
 }
 
@@ -4712,6 +4717,18 @@ impl SyscallDispatcher {
         memory: &mut impl GuestMemory,
     ) -> Result<(), MemoryError> {
         let epoch = guest_realtime_epoch();
+        // Epoch 0 means no guest has ever moved the clock in this carrier, so
+        // every MM's vvar still holds exactly what the VMM stamper published
+        // for it at boot (a fork child inherits that content, an exec'd MM is
+        // stamped fresh) and no re-stamp can change a byte. Answering that
+        // from ONE load of a static keeps the ArcSwap `mm_binding` load — the
+        // expensive half of this check — off the syscall path entirely until
+        // a `clock_settime` actually happens. This function runs on every
+        // dispatched syscall, so the untaken case is the one that has to be
+        // cheap.
+        if epoch == 0 {
+            return Ok(());
+        }
         let authority = self.mm_binding.current.load();
         if authority
             .vvar_realtime_epoch
