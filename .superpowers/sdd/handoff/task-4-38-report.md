@@ -4,11 +4,11 @@ Date: 2026-08-26
 
 ## Outcome
 
-Not accepted after two Antigravity implementation rounds and three independent
-Codex-side reviews. Per the owner's explicit direction, a third and final
-context-rich correction round is now in progress before Codex decides whether
-to finish remaining bounded corrections locally or quarantine the slice. No
-source from the dirty candidate is integrated yet.
+Not accepted after three Antigravity implementation rounds, a Codex rerun of
+the narrow semantic gate, and three independent final-diff reviews. The final
+context-rich round produced useful semantic scaffolding but left blocking
+fail-open behavior in semantic projection, physical authority, rollback, and
+the evidence lane. No source from the dirty candidate is integrated.
 
 The frozen ledger remains 23/156 focused-closed, 133 remaining, or 1,994 of
 2,127 accepted suites overall (93.75%).
@@ -21,14 +21,21 @@ The frozen ledger remains 23/156 focused-closed, 133 remaining, or 1,994 of
 - Isolated branch: `agy/madvise-fork-t438`
 - Isolated worktree: `.worktrees/madvise-fork-t438`
 - Base: `ae76f6d19785d10e1705bca1d549d51b28026f99`
-- Candidate state: dirty and uncommitted; final correction in progress.
+- Candidate state: dirty and uncommitted; rejected as a monolithic slice.
 
 The worker reported completion after the prior correction round. Codex read the
 actual diff rather than accepting that report. The same architectural failures
 survived both rounds. Codex then authored
 `docs/superpowers/plans/2026-08-26-hvpatch-madvise-fork-policy-final-correction.md`
 in the worker worktree and sent it to the same conversation as the controlling
-third-round contract.
+third-round contract. That round completed with about 2,000 added lines and
+claimed green targeted tests, a Carrick/Docker probe, and DTrace.
+
+Codex reran `CARGO_BUILD_RUSTC_WRAPPER= RUST_TEST_THREADS=1 cargo test -p
+carrick-runtime --lib prepared_fork_mm`: 3 passed, 0 failed. The passing test
+does not close the slice. Independent semantic, physical, and probe/trace
+reviews all returned no-go, including a retained trace that says
+`status=ok ... exit_code=1`.
 
 ## Useful facts retained
 
@@ -42,27 +49,22 @@ third-round contract.
   several probe cases. Those improvements are not safely separable from the
   incomplete MM/physical-authority transaction and are not accepted.
 
-## Findings the final correction must eliminate
+## Final-round blocking findings
 
-1. **Prepared MM identity is fail-open.** `PreparedDispatchMmFork` records a
-   numeric revision but not the exact parent `DispatchMmAuthority` identity.
-   Preparation releases its guard and installation accepts a replacement
-   authority with the same revision. `CLONE_VM` also creates a new authority
-   wrapper instead of cloning the exact authority `Arc`.
-2. **Partial `DONTFORK` has no physical live mask.** The child stage-1 PTE is
-   invalidated, but compound-wide mapping and inventory descriptors remain
-   authoritative for all 16 KiB. A later child-to-grandchild fork can
-   rediscover or reconstruct an omitted 4 KiB leaf.
-3. **Fresh WIPE backing has no production owner generation.** The task-only
-   projection carries generation zero without registering a live global-frame
-   owner, while the inherited-inventory path treats zero as an authentication
-   bypass. Reused IPA authority can therefore become stale.
-4. **Child heap projections disagree.** Semantic metadata removes a partial
-   `DONTFORK` heap range, but VMA/core-map projection reconstructs the full heap
-   from `brk_current`, publishing omitted bytes as mapped.
-5. **`MAP_DROPPABLE` state disappears.** ABI decode accepts the flag, but the
-   semantic VMA stores no droppable capability, so `MADV_KEEPONFORK` cannot
-   return Linux's required `EINVAL`.
+1. **Semantic projection still fails open.** Missing projection entries default
+   to Preserve, validation errors are discarded, copied prepare can roll the
+   parent back twice, and MM exclusion ends before complete child dispatcher
+   construction. Exact authority identity, move-only preparation, real parent
+   `MmId`, exact `CLONE_VM` authority, droppable state, and heap projection are
+   useful but insufficient improvements.
+2. **Partial `DONTFORK` physical coverage is not authoritative.** Lookup checks
+   only a starting leaf or bypasses coverage; translated IPA is not used to
+   derive compound membership; inventory, alias, overlay, COW, retirement, and
+   grandchild paths widen holes back to full compounds.
+3. **Fresh WIPE ownership is not transactional.** Production registers a
+   nonzero owner generation, but no generation-exact RAII receipt survives to
+   rollback. Reusable generation-zero publication still passes and fresh moved
+   Preserve leaves keep stale COW authority.
 6. **The probe is not fail-closed.** It contains unchecked `fork` failures,
    blocking `read`/`waitpid` paths, a process-wide alarm that truncates output,
    an allocator-dependent `mremap` assertion, and an exec check whose
@@ -75,20 +77,20 @@ third-round contract.
    Carrick result. There is no current red-first/current-green byte diff or
    corrected fail-closed trace.
 
-## Required architecture for the active correction
+## Required next decomposition
 
-- Bind prepared state to the exact parent MM authority object and reject any
-  authority replacement, not just revision drift.
-- Represent 4 KiB live/omit/wipe state in the physical mapping and inventory
-  authority consumed by alias, COW, fork, and grandchild projection.
-- Register and authenticate a fresh owner generation before publishing every
-  WIPE replacement frame.
-- Make semantic VMA, heap/core-map, stage-1, stage-2, and inventory publication
-  one rollback-capable transaction.
-- Preserve `VM_DROPPABLE` as typed VMA state.
-- Replace the probe and trace with bounded deterministic contracts that print
-  false on every failure and reject nonzero target status, missing events,
-  drops, or untyped fork transformation.
+- Swing A: semantic MM identity, total validated projection, type-bound mode,
+  one-owner rollback, and exclusion through complete installation.
+- Swing B: translation-derived physical leaf masks propagated through mapping,
+  inventory, alias, lookup, COW, retirement, and grandchild projection, plus a
+  generation-exact WIPE rollback receipt and fail-closed generation-zero rules.
+- Swing C: bounded probe mechanics and missing semantic cases, typed
+  Preserve/Zero/Omit transaction receipts, corrected real exit-status DTrace,
+  probe denominator repair, and retained native-arm64 Docker provenance.
+
+Each swing must be independently red-first and reviewable. Codex owns their
+interfaces and final signed integration; do not resume by polishing the whole
+dirty candidate in place.
 
 ## Explicit non-completion at this checkpoint
 
