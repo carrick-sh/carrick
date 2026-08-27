@@ -302,6 +302,28 @@ impl ContainerPolicy {
     }
 }
 
+impl crate::observe::SyscallObserver for ContainerPolicy {
+    fn on_syscall(
+        &self,
+        _p: &crate::observe::ProcessInfo<'_>,
+        s: &crate::observe::SyscallInfo<'_>,
+    ) -> crate::observe::SyscallAction {
+        if let Some(errno) = self.denied_errno_for_args(s.number(), s.raw_args().0[0]) {
+            crate::observe::SyscallAction::Deny(errno)
+        } else {
+            crate::observe::SyscallAction::Allow
+        }
+    }
+
+    fn wants_fast_path_visibility(&self) -> crate::observe::FastPathVisibility {
+        if self.denies_any(IDENTITY_FAST_PATH_SYSCALLS) {
+            crate::observe::FastPathVisibility::Required
+        } else {
+            crate::observe::FastPathVisibility::Blind
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

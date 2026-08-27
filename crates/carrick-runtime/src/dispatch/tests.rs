@@ -5216,8 +5216,7 @@ mod container_caps_tests {
         );
         assert_eq!(
             plain
-                .container_policy
-                .as_ref()
+                .container_policy()
                 .expect("plain policy")
                 .denied_errno_for_args(SYS_UNSHARE, 0),
             Some(LINUX_EPERM),
@@ -5225,8 +5224,7 @@ mod container_caps_tests {
         );
         assert_eq!(
             admin
-                .container_policy
-                .as_ref()
+                .container_policy()
                 .expect("admin policy")
                 .denied_errno_for_args(SYS_UNSHARE, 0),
             None,
