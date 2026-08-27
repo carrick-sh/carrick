@@ -1502,14 +1502,12 @@ mod rlimit_tests {
 
     #[test]
     fn guest_realtime_offset_virtual_clock() {
-        use crate::dispatch::{get_guest_realtime_offset_ns, set_guest_realtime_offset_ns};
-
-        set_guest_realtime_offset_ns(0);
-        assert_eq!(get_guest_realtime_offset_ns(), 0);
-
-        set_guest_realtime_offset_ns(1_000_000_000);
-        assert_eq!(get_guest_realtime_offset_ns(), 1_000_000_000);
-
-        set_guest_realtime_offset_ns(0);
+        crate::dispatch::realtime_test_support::with_guest_realtime_offset(1_000_000_000, || {
+            assert_eq!(
+                crate::dispatch::get_guest_realtime_offset_ns(),
+                1_000_000_000
+            );
+        });
+        assert_eq!(crate::dispatch::get_guest_realtime_offset_ns(), 0);
     }
 }

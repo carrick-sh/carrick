@@ -1103,15 +1103,14 @@ fn read_abs_deadline(
     Ok(Some((ts.tv_sec, ts.tv_nsec)))
 }
 
+/// Whether an absolute CLOCK_REALTIME deadline has passed on the GUEST's clock
+/// (`crate::dispatch::realtime_duration`, the single realtime authority).
 fn deadline_expired(deadline: Option<(i64, i64)>) -> bool {
     let Some((sec, nsec)) = deadline else {
         return false;
     };
-    let mut now: libc::timespec = unsafe { core::mem::zeroed() };
-    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut now) };
-    let now_sec = now.tv_sec as i64;
-    let now_nsec = now.tv_nsec as i64;
-    (now_sec, now_nsec) >= (sec, nsec)
+    let now = crate::dispatch::realtime_duration();
+    (now.as_secs() as i64, i64::from(now.subsec_nanos())) >= (sec, nsec)
 }
 
 #[cfg(test)]
@@ -2577,5 +2576,32 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(unlink_res, DispatchOutcome::Returned { value: 0 });
+    }
+
+    /// `mq_timedsend`/`mq_timedreceive` deadlines are absolute CLOCK_REALTIME
+    /// values the guest built on ITS clock; expiry must be judged on the same
+    /// clock, not the host's.
+    #[test]
+    fn mq_deadline_expiry_is_measured_on_the_guest_clock() {
+        crate::dispatch::realtime_test_support::with_guest_realtime_offset(
+            3_600 * 1_000_000_000,
+            || {
+                let host_now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                // 30 minutes past the HOST clock is already 30 minutes in the
+                // guest's past.
+                assert!(deadline_expired(Some((
+                    (host_now.as_secs() + 1_800) as i64,
+                    0
+                ))));
+                // 30 minutes past the GUEST clock is still in the future.
+                let guest_now = crate::dispatch::realtime_duration();
+                assert!(!deadline_expired(Some((
+                    (guest_now.as_secs() + 1_800) as i64,
+                    0
+                ))));
+            },
+        );
     }
 }

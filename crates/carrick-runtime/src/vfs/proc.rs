@@ -60,7 +60,7 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use carrick_abi::{NsGid, NsUid};
 
@@ -2861,13 +2861,14 @@ fn synthetic_proc_uptime() -> String {
 }
 
 /// Boot time in seconds since the Epoch, for `/proc/stat`'s `btime` line:
-/// now - uptime. Non-zero so `start_epoch = btime + starttime/HZ` math works.
+/// guest now - uptime, both from the dispatch clock authorities
+/// (`realtime_duration` / `boottime_duration`) so `btime` moves with
+/// `clock_settime` like Linux's. Non-zero so `start_epoch = btime +
+/// starttime/HZ` math works.
 fn boot_epoch_secs() -> u64 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    now.saturating_sub(boot_elapsed().as_secs())
+    crate::dispatch::realtime_duration()
+        .as_secs()
+        .saturating_sub(boot_elapsed().as_secs())
 }
 
 fn synthetic_proc_meminfo() -> &'static [u8] {
@@ -5803,6 +5804,26 @@ mod tests {
         assert!(
             stat.starts_with("2147418113 (logical-child) Z 41 40 39 "),
             "logical zombie identity/state was not preserved: {stat:?}"
+        );
+    }
+
+    /// `btime` is `now - uptime` on the GUEST's wall clock; it moves with
+    /// `clock_settime` exactly as Linux's does.
+    #[test]
+    fn proc_stat_btime_follows_the_guest_clock() {
+        crate::dispatch::realtime_test_support::with_guest_realtime_offset(
+            3_600 * 1_000_000_000,
+            || {
+                let host_now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let btime = boot_epoch_secs();
+                assert!(
+                    btime + boot_elapsed().as_secs() >= host_now + 3_599,
+                    "btime {btime} must be derived from the guest clock"
+                );
+            },
         );
     }
 }
