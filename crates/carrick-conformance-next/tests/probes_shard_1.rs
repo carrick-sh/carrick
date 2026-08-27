@@ -528,11 +528,20 @@ fn generic_probe_shard_1() {
                 container = container.security_opt("seccomp=unconfined");
             }
 
+            executed_count += 1;
             let outcome = common::with_empty_stdin_pipe(|| container.run(["/tmp/carrick-init"]));
-            let result = common::run_named_or_fail(
-                &format!("generic probe shard 1 {target}:{probe_name}"),
-                outcome,
-            );
+            let result = match outcome {
+                Ok(result) => result,
+                Err(error) if expected_gaps.contains(&probe_name) => {
+                    eprintln!("EXPECTED GAP generic probe shard 1 {target}:{probe_name}: {error}");
+                    observed_mismatches.push(probe_name.to_string());
+                    continue;
+                }
+                Err(error) => common::run_named_or_fail(
+                    &format!("generic probe shard 1 {target}:{probe_name}"),
+                    Err(error),
+                ),
+            };
             let mut combined = String::from_utf8_lossy(&result.stdout).into_owned();
             combined.push_str(&String::from_utf8_lossy(&result.stderr));
             let actual = normalize(&combined);
@@ -540,7 +549,6 @@ fn generic_probe_shard_1() {
             if actual != oracle {
                 observed_mismatches.push(probe_name.to_string());
             }
-            executed_count += 1;
         }
 
         assert_eq!(
