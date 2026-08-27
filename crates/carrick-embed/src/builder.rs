@@ -9,6 +9,7 @@ use carrick_engine::{Engine, RunRequest};
 use carrick_image::{ImageStore, PullPolicy};
 use carrick_runtime::prepare::{RuntimeExtensions, StdioSink};
 use carrick_runtime::runtime::DEFAULT_MAX_TRAPS;
+use carrick_runtime::vfs::Vfs;
 use carrick_spec::{Mount, Platform, StdioMode};
 
 use crate::result::{CaptureBuffer, CapturedStreams};
@@ -115,6 +116,7 @@ pub struct ContainerBuilder {
     user: Option<String>,
     hostname: Option<String>,
     mounts: Vec<Mount>,
+    vfs_mounts: Vec<(Utf8PathBuf, Box<dyn Vfs>)>,
     stdout: StdioConfig,
     stderr: StdioConfig,
     max_traps: usize,
@@ -135,6 +137,7 @@ impl ContainerBuilder {
             user: None,
             hostname: None,
             mounts: Vec::new(),
+            vfs_mounts: Vec::new(),
             stdout: StdioConfig::Captured,
             stderr: StdioConfig::Captured,
             max_traps: DEFAULT_MAX_TRAPS,
@@ -193,6 +196,12 @@ impl ContainerBuilder {
     /// Bind-mount an absolute host path at an absolute guest path, read-only.
     pub fn mount_readonly(self, host: impl Into<String>, guest: impl Into<String>) -> Self {
         self.push_mount(host, guest, true)
+    }
+
+    /// Mount a custom [`Vfs`] decorator or in-memory filesystem at an absolute guest path.
+    pub fn vfs_mount(mut self, guest: impl Into<String>, vfs: Box<dyn Vfs>) -> Self {
+        self.vfs_mounts.push((Utf8PathBuf::from(guest.into()), vfs));
+        self
     }
 
     fn push_mount(
@@ -275,6 +284,13 @@ impl ContainerBuilder {
                 )));
             }
         }
+        for (target, _) in &self.vfs_mounts {
+            if !target.is_absolute() {
+                return Err(EmbedError::Config(format!(
+                    "vfs_mount {target} must use an absolute guest path"
+                )));
+            }
+        }
         Ok(RunRequest {
             image_ref: self.image.clone(),
             platform: self
@@ -315,6 +331,9 @@ impl ContainerBuilder {
         let mut extensions = RuntimeExtensions::default();
         if let StdioSink::Piped { .. } = plan.sink {
             extensions = extensions.stdio(plan.sink);
+        }
+        for (target, vfs) in self.vfs_mounts {
+            extensions = extensions.vfs_mount(target, vfs);
         }
         Ok(PreparedContainer::new(
             spec,
@@ -746,5 +765,38 @@ mod tests {
             panic!("an absent image under PullPolicy::Never must not resolve");
         };
         assert!(matches!(error, EmbedError::Image(_)), "{error}");
+    }
+
+    #[test]
+    fn vfs_mount_relative_path_is_config_error() {
+        let inmem = crate::vfs::InMemoryFileVfs::new();
+        let error = ContainerBuilder::from_image("alpine")
+            .vfs_mount("data", Box::new(inmem))
+            .to_run_request()
+            .unwrap_err();
+        assert!(matches!(error, EmbedError::Config(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn vfs_mount_wires_into_prepared_container() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path());
+        seed_local_image(
+            &store,
+            "vfs-test:latest",
+            r#"{"architecture":"arm64","os":"linux","config":{"Cmd":["/bin/true"]}}"#,
+        );
+        let inmem = crate::vfs::InMemoryFileVfs::new();
+        inmem.add_file("/injected.txt", b"custom data").unwrap();
+
+        let prepared = ContainerBuilder::from_image("vfs-test:latest")
+            .image_store(store)
+            .pull_policy(PullPolicy::Never)
+            .vfs_mount("/data", Box::new(inmem))
+            .prepare()
+            .await
+            .expect("prepares container with vfs mount");
+
+        assert_eq!(prepared.run_spec().argv, strings(&["/bin/true"]));
     }
 }
