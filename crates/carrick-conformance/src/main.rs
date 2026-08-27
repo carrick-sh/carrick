@@ -96,6 +96,11 @@ struct Args {
         env = "CARRICK_CONFORMANCE_LOCAL_TIMEOUT_SCALE"
     )]
     local_timeout_scale: f64,
+    /// Maximum wall-clock seconds for each Carrick run. This is a diagnostic
+    /// cap only: Docker oracle keys and declared suite budgets are unchanged.
+    /// Set to 0 only for a deliberate targeted long-run investigation.
+    #[arg(long, default_value_t = 60, env = "CARRICK_CONFORMANCE_TIMEOUT_CAP_S")]
+    carrick_timeout_cap_s: u64,
     /// Filter to these ecosystems (repeatable): cpython|go|node|ltp.
     #[arg(long)]
     ecosystem: Vec<String>,
@@ -401,6 +406,7 @@ fn run() -> anyhow::Result<ExitCode> {
                 &args.carrick_bin.to_string_lossy(),
                 &format!("conf-{}-cN", std::process::id()),
                 &lane,
+                args.carrick_timeout_cap_s,
             );
             let d = engine::docker_dry_run(
                 s,
@@ -617,7 +623,10 @@ fn run() -> anyhow::Result<ExitCode> {
     let phase1_gating = AtomicUsize::new(0);
 
     // ---- Phase 1: ALL carrick (weight-aware; never overlapping docker). ----
-    eprintln!("phase 1/3: {n} carrick runs (workers={workers}, cpython-workers={cpython_workers})");
+    eprintln!(
+        "phase 1/3: {n} carrick runs (workers={workers}, cpython-workers={cpython_workers}, timeout-cap={}s)",
+        args.carrick_timeout_cap_s
+    );
     let all_indices: Vec<usize> = (0..n).collect();
     let carrick_outs = fan_out_scheduled_with_stop(
         &all_indices,
@@ -631,7 +640,8 @@ fn run() -> anyhow::Result<ExitCode> {
             // kill.sh anchors on the proctitle "carrick:<id>:" delimiter too, but a
             // collision-free id is defense in depth against any unanchored grep.
             let run_id = format!("conf-{pid}-c{i:02}");
-            let out = engine::run_carrick(s, &carrick_bin, &run_id, &lane);
+            let out =
+                engine::run_carrick(s, &carrick_bin, &run_id, &lane, args.carrick_timeout_cap_s);
             eprintln!("  [carrick] {}", s.name);
             // Stream this suite's report NOW if its oracle is cached (the common
             // case). Un-cached suites still need docker (Phase 2) and are emitted
@@ -830,7 +840,14 @@ fn run() -> anyhow::Result<ExitCode> {
             |i, attempt| {
                 let s = &selected[i];
                 let run_id = format!("conf-{pid}-r{i:02}-a{attempt}");
-                let cout = engine::run_carrick(s, &carrick_bin, &run_id, &lane).ok();
+                let cout = engine::run_carrick(
+                    s,
+                    &carrick_bin,
+                    &run_id,
+                    &lane,
+                    args.carrick_timeout_cap_s,
+                )
+                .ok();
                 let rep = build_report(s, cout.as_ref(), &docker_sides[i], classification);
                 eprintln!(
                     "  [retry] {} attempt {attempt}/{retries} -> {}{}",
@@ -2806,6 +2823,15 @@ mod tests {
 
         let explicit = Args::parse_from(["carrick-conformance", "--flake-retries", "2"]);
         assert_eq!(explicit.flake_retries, 2);
+    }
+
+    #[test]
+    fn carrick_timeout_cap_is_tight_by_default_and_explicitly_disableable() {
+        let default = Args::parse_from(["carrick-conformance"]);
+        assert_eq!(default.carrick_timeout_cap_s, 60);
+
+        let uncapped = Args::parse_from(["carrick-conformance", "--carrick-timeout-cap-s", "0"]);
+        assert_eq!(uncapped.carrick_timeout_cap_s, 0);
     }
 
     #[test]
