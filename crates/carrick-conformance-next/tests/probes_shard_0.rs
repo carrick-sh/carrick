@@ -553,6 +553,31 @@ fn test_cache_freshness_and_hashing() {
     );
 }
 
+#[test]
+fn test_probe_binary_locator_and_gap_counts() {
+    let repo_root = common::repo_root();
+
+    // A non-existent target should return None.
+    assert_eq!(
+        find_probe_binary_dir(&repo_root, "__nonexistent_target_arch__"),
+        None
+    );
+
+    // Hard-assert the exact number of derived shard 0 baseline gaps.
+    let musl_shard_gaps = expected_shard_gaps(MUSL_BASELINE_GAPS);
+    let gnu_shard_gaps = expected_shard_gaps(GNU_BASELINE_GAPS);
+    assert_eq!(
+        musl_shard_gaps.len(),
+        9,
+        "musl shard 0 must contain exactly 9 baseline gaps"
+    );
+    assert_eq!(
+        gnu_shard_gaps.len(),
+        9,
+        "gnu shard 0 must contain exactly 9 baseline gaps"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Signed guest execution test
 // ---------------------------------------------------------------------------
@@ -574,16 +599,13 @@ fn generic_probe_shard_0() {
             _ => unreachable!(),
         };
 
-        let probe_dir = match find_probe_binary_dir(&root, target) {
-            Some(dir) => dir,
-            None => {
-                eprintln!(
-                    "SKIP generic_probe_shard_0[{target}]: probe binaries not built \
-                     (looked in conformance-probes/target/{target}/release and target/{target}/release)"
-                );
-                continue;
-            }
-        };
+        let probe_dir = find_probe_binary_dir(&root, target).unwrap_or_else(|| {
+            panic!(
+                "missing probe binaries directory for target {target}; \
+                 expected either conformance-probes/target/{target}/release or target/{target}/release — \
+                 run scripts/build-probes.sh"
+            )
+        });
 
         let init_path = probe_dir.join("probeinit");
         assert!(
@@ -593,15 +615,17 @@ fn generic_probe_shard_0() {
         );
 
         let mut observed_mismatches = BTreeSet::new();
-        let mut missing_binaries = Vec::new();
         let mut diff_details = Vec::new();
+        let mut executed_count = 0usize;
 
         for probe_name in SHARD_0_PROBES {
             let probe_path = probe_dir.join(probe_name);
-            if !probe_path.is_file() {
-                missing_binaries.push(probe_name);
-                continue;
-            }
+            assert!(
+                probe_path.is_file(),
+                "probe binary {probe_name:?} missing for target {target} at {} — \
+                 run scripts/build-probes.sh",
+                probe_path.display()
+            );
 
             let cached_oracle = match cached_probe_oracle(&root, "arm64", libc, probe_name) {
                 Ok(out) => out,
@@ -614,6 +638,7 @@ fn generic_probe_shard_0() {
                 .mount_readonly(init_path.display().to_string(), "/tmp/carrick-init");
 
             let result = common::run_or_fail(container.run(["/tmp/carrick-init"]));
+            executed_count += 1;
 
             let mut combined = String::from_utf8_lossy(&result.stdout).into_owned();
             combined.push_str(&String::from_utf8_lossy(&result.stderr));
@@ -625,9 +650,9 @@ fn generic_probe_shard_0() {
             }
         }
 
-        assert!(
-            missing_binaries.is_empty(),
-            "missing probe binaries for target {target}: {missing_binaries:?}"
+        assert_eq!(
+            executed_count, 142,
+            "must execute exactly 142 shard 0 probes for target {target}, executed {executed_count}"
         );
 
         let unexpected_failures: BTreeSet<_> = observed_mismatches
