@@ -1,6 +1,6 @@
 # Carrick exact conformance closure handoff
 
-**Updated:** 2026-08-27 (session 14 — bounded clock discipline validation closes clock_adjtime02; stateful clock_adjtime01 remains honestly red)
+**Updated:** 2026-08-27 (session 15 — pathflagmatrix closes 64/64 on both libc lanes; both renameat2 LTP suites now MATCH)
 
 **Canonical host/lane:** macOS, Apple Silicon, HVF/HVPatch, Linux arm64 guest
 
@@ -56,6 +56,64 @@ Execution is a directed-worker model:
 Complete only when fail-closed gate integrity, exact correctness, and the <=2x
 performance gate pass together on the final integrated signed artifact. Do not
 push unless explicitly asked. Preserve unrelated worktree changes.
+
+## SESSION 15 — 2026-08-27: atomic path-flag cluster closed
+
+`387f1f363` closes every current `pathflagmatrix` difference without changing
+the probe, oracle, or expected-gap sets. The embedded matrix now matches all 64
+atomic assertions for both arm64 musl and arm64 glibc; guest execution took
+0.46 seconds and the unsigned entitlement negative control passed. Docker was
+not started.
+
+The runtime corrections are grouped by their actual ownership seams:
+
+- `openat2` rejects unknown flag bits and the Linux-invalid `O_PATH` mixtures,
+  and `RESOLVE_IN_ROOT` rebases absolute paths plus lexically clamps repeated
+  `..` at the dirfd root;
+- `statx` rejects mutually exclusive FORCE_SYNC/DONT_SYNC flags;
+- layered rename reports Linux's `EISDIR`, `ENOTDIR`, and `ENOTEMPTY` before a
+  backend can collapse them to success or `EINVAL`; and
+- `faccessat2` follows the default path, preserves a no-follow check on the
+  symlink itself, and returns `ENOENT` for a dangling followed target.
+
+Every correction was red first in a focused unit or integration reducer. The
+adjacent gates pass: seven openat2 unit tests, seven layered-rename unit tests,
+three faccessat2 integration tests, formatting, diff checks, and focused
+warnings-denied clippy. One stale test incorrectly expected
+`AT_SYMLINK_NOFOLLOW` to inspect its target's execute bits; it now asserts the
+Linux link-self contract.
+
+Eight signed cached-only LTP suites ran serially with a 20-second cap and zero
+Docker runs. `ltp-renameat201` is now MATCH 6/6 and `ltp-renameat202` MATCH 1/1.
+The openat2, faccessat2, and statx rows still TBROK before their syscall
+assertions because the LTP framework cannot find `/proc/2/oom_score_adj`; their
+0/1 results are the pre-existing proc/PID blocker, not path evidence.
+
+Exact signed release artifact used for that LTP pass:
+
+| field | value |
+|---|---|
+| source tree committed as | `387f1f363` |
+| binary SHA-256 | `1ee6ea4e610a7fcc1012b3fb1bef2c2866d2ee27c13f72e97a31cef20af6fcae` |
+| CDHash | `db3d7ac23ef0b7cd40e9ad516fc4c7a99788c059` |
+| LC_UUID | `D31A3567-000F-3812-87AF-5E462C2B13E5` |
+| hypervisor entitlement | present |
+| `__dof_carrick` | present |
+
+Three concurrent Antigravity workers performed source-only audits of the path,
+network, and archive matrices in about 2.25 minutes each. Their first launch was
+immediately reaped when the briefs were found to permit concurrent guest runs;
+the corrected launch explicitly prohibited guest/build/Docker execution, and
+Codex alone ran reducers serially. The path audit's five root-cause groups were
+checked against the actual code before implementation. The next ranked atomic
+clusters are network (MSG_TRUNC plus shared POLLRDHUP/EPOLLRDHUP EOF readiness)
+and archive (regular-file getdents64 errno, no-follow symlink xattr, and
+linkat-follow canonicalization).
+
+Coverage follow-up: the current `RESOLVE_IN_ROOT` probe proves absolute rebasing
+and lexical parent clamping, but does not yet exercise a symlink whose target is
+absolute or contains `..`. Add that exact cached-oracle case before claiming a
+general root-barrier implementation; do not infer it from this matrix MATCH.
 
 ## SESSION 14 — 2026-08-27: bounded clock discipline validation
 
