@@ -246,10 +246,10 @@ unsafe fn test_clone_matrix() {
         core::ptr::null_mut(),
         core::ptr::null_mut(),
     );
+    let r1_er = if r1 < 0 { errno() } else { 0 };
     if r1 == 0 {
         libc::_exit(0);
     }
-    let r1_einval = r1 == -1 && errno() == libc::EINVAL;
     if r1 > 0 {
         let _ = waitpid_bounded(r1 as i32, deadline);
         cleanup_child_bounded(r1 as i32);
@@ -261,10 +261,10 @@ unsafe fn test_clone_matrix() {
         core::ptr::null_mut(),
         core::ptr::null_mut(),
     );
+    let r2_er = if r2 < 0 { errno() } else { 0 };
     if r2 == 0 {
         libc::_exit(0);
     }
-    let r2_einval = r2 == -1 && errno() == libc::EINVAL;
     if r2 > 0 {
         let _ = waitpid_bounded(r2 as i32, deadline);
         cleanup_child_bounded(r2 as i32);
@@ -276,10 +276,10 @@ unsafe fn test_clone_matrix() {
         core::ptr::null_mut(),
         core::ptr::null_mut(),
     );
+    let r4_er = if r4 < 0 { errno() } else { 0 };
     if r4 == 0 {
         libc::_exit(0);
     }
-    let r4_einval = r4 == -1 && errno() == libc::EINVAL;
     if r4 > 0 {
         let _ = waitpid_bounded(r4 as i32, deadline);
         cleanup_child_bounded(r4 as i32);
@@ -291,10 +291,10 @@ unsafe fn test_clone_matrix() {
         core::ptr::null_mut(),
         core::ptr::null_mut(),
     );
+    let r5_er = if r5 < 0 { errno() } else { 0 };
     if r5 == 0 {
         libc::_exit(0);
     }
-    let r5_einval = r5 == -1 && errno() == libc::EINVAL;
     if r5 > 0 {
         let _ = waitpid_bounded(r5 as i32, deadline);
         cleanup_child_bounded(r5 as i32);
@@ -307,16 +307,18 @@ unsafe fn test_clone_matrix() {
         &mut ptid,
         core::ptr::null_mut(),
     );
-    let r6_ok = if r6 == 0 {
+    let r6_fork_ok = r6 > 0;
+    let mut r6_ptid_matches = false;
+    let mut r6_child_exit_zero = false;
+    if r6 == 0 {
         libc::_exit(0);
     } else if r6 > 0 {
         let wait_res = waitpid_bounded(r6 as i32, deadline);
         cleanup_child_bounded(r6 as i32);
-        ptid == r6 as i32
-            && matches!(wait_res, Some(st) if libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0)
-    } else {
-        false
-    };
+        r6_ptid_matches = ptid == r6 as i32;
+        r6_child_exit_zero =
+            matches!(wait_res, Some(st) if libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0);
+    }
 
     // 1.6 clone3 argument validation (Linux exact error: EINVAL)
     let mut cargs = CloneArgs {
@@ -325,8 +327,14 @@ unsafe fn test_clone_matrix() {
         ..CloneArgs::default()
     };
     let c3_small = libc::syscall(SYS_CLONE3, &mut cargs, 8usize) as i64;
-    let c3_small_er = errno();
-    let c3_small_ok = c3_small == -1 && c3_small_er == libc::EINVAL;
+    let c3_small_er = if c3_small < 0 { errno() } else { 0 };
+    if c3_small == 0 {
+        libc::_exit(0);
+    }
+    if c3_small > 0 {
+        let _ = waitpid_bounded(c3_small as i32, deadline);
+        cleanup_child_bounded(c3_small as i32);
+    }
 
     let mut cargs_bad_flags = CloneArgs {
         flags: 1 << 63,
@@ -335,8 +343,14 @@ unsafe fn test_clone_matrix() {
     };
     let c3_bad_flags =
         libc::syscall(SYS_CLONE3, &mut cargs_bad_flags, size_of::<CloneArgs>()) as i64;
-    let c3_bad_flags_er = errno();
-    let c3_bad_flags_ok = c3_bad_flags == -1 && c3_bad_flags_er == libc::EINVAL;
+    let c3_bad_flags_er = if c3_bad_flags < 0 { errno() } else { 0 };
+    if c3_bad_flags == 0 {
+        libc::_exit(0);
+    }
+    if c3_bad_flags > 0 {
+        let _ = waitpid_bounded(c3_bad_flags as i32, deadline);
+        cleanup_child_bounded(c3_bad_flags as i32);
+    }
 
     let mut cargs_bad_stack = CloneArgs {
         flags: 0,
@@ -347,8 +361,14 @@ unsafe fn test_clone_matrix() {
     };
     let c3_bad_stack =
         libc::syscall(SYS_CLONE3, &mut cargs_bad_stack, size_of::<CloneArgs>()) as i64;
-    let c3_bad_stack_er = errno();
-    let c3_bad_stack_ok = c3_bad_stack == -1 && c3_bad_stack_er == libc::EINVAL;
+    let c3_bad_stack_er = if c3_bad_stack < 0 { errno() } else { 0 };
+    if c3_bad_stack == 0 {
+        libc::_exit(0);
+    }
+    if c3_bad_stack > 0 {
+        let _ = waitpid_bounded(c3_bad_stack as i32, deadline);
+        cleanup_child_bounded(c3_bad_stack as i32);
+    }
 
     let mut cargs_bad_sig = CloneArgs {
         flags: 0,
@@ -356,19 +376,27 @@ unsafe fn test_clone_matrix() {
         ..CloneArgs::default()
     };
     let c3_bad_sig = libc::syscall(SYS_CLONE3, &mut cargs_bad_sig, size_of::<CloneArgs>()) as i64;
-    let c3_bad_sig_er = errno();
-    let c3_bad_sig_ok = c3_bad_sig == -1 && c3_bad_sig_er == libc::EINVAL;
+    let c3_bad_sig_er = if c3_bad_sig < 0 { errno() } else { 0 };
+    if c3_bad_sig == 0 {
+        libc::_exit(0);
+    }
+    if c3_bad_sig > 0 {
+        let _ = waitpid_bounded(c3_bad_sig as i32, deadline);
+        cleanup_child_bounded(c3_bad_sig as i32);
+    }
 
     report!(
-        clone_thread_no_sighand_einval = r1_einval,
-        clone_sighand_no_vm_einval = r2_einval,
-        clone_invalid_exit_signal_einval = r4_einval,
-        clone_fs_with_newns_einval = r5_einval,
-        clone_parent_settid_ok = r6_ok,
-        clone3_size_truncated_einval = c3_small_ok,
-        clone3_reserved_flags_einval = c3_bad_flags_ok,
-        clone3_bad_stack_einval = c3_bad_stack_ok,
-        clone3_bad_signal_einval = c3_bad_sig_ok,
+        clone_thread_no_sighand_einval = r1 == -1 && r1_er == libc::EINVAL,
+        clone_sighand_no_vm_einval = r2 == -1 && r2_er == libc::EINVAL,
+        clone_invalid_exit_signal_einval = r4 == -1 && r4_er == libc::EINVAL,
+        clone_fs_with_newns_einval = r5 == -1 && r5_er == libc::EINVAL,
+        clone_parent_settid_fork_ok = r6_fork_ok,
+        clone_parent_settid_ptid_matches = r6_ptid_matches,
+        clone_parent_settid_child_exit_zero = r6_child_exit_zero,
+        clone3_size_truncated_einval = c3_small == -1 && c3_small_er == libc::EINVAL,
+        clone3_reserved_flags_einval = c3_bad_flags == -1 && c3_bad_flags_er == libc::EINVAL,
+        clone3_bad_stack_einval = c3_bad_stack == -1 && c3_bad_stack_er == libc::EINVAL,
+        clone3_bad_signal_einval = c3_bad_sig == -1 && c3_bad_sig_er == libc::EINVAL,
     );
 }
 
@@ -381,17 +409,17 @@ extern "C" fn custom_usr1_handler(_sig: libc::c_int) {}
 unsafe fn test_fork_matrix() {
     let deadline = Instant::now() + DEFAULT_DEADLINE;
 
-    // 2.1 Basic fork return value
+    // 2.1 Basic fork return value & child exit
     let pid1 = libc::fork();
-    let fork_basic_ok = if pid1 == 0 {
+    let fork_pid1_positive = pid1 > 0;
+    let mut fork_pid1_exit_zero = false;
+    if pid1 == 0 {
         libc::_exit(0);
     } else if pid1 > 0 {
         let wait_res = waitpid_bounded(pid1, deadline);
         cleanup_child_bounded(pid1);
-        matches!(wait_res, Some(status) if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0)
-    } else {
-        false
-    };
+        fork_pid1_exit_zero = matches!(wait_res, Some(status) if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+    }
 
     // 2.2 Signal inheritance across fork:
     // - Custom handler for SIGUSR1
@@ -441,9 +469,11 @@ unsafe fn test_fork_matrix() {
     let mut sig_res = [0u8; 3];
     let sig_read_ok = read_exact_bounded(pipe_sig[0], &mut sig_res, deadline);
     libc::close(pipe_sig[0]);
+    let mut sig_child_exit_zero = false;
     if pid2 > 0 {
-        let _ = waitpid_bounded(pid2, deadline);
+        let wait_res = waitpid_bounded(pid2, deadline);
         cleanup_child_bounded(pid2);
+        sig_child_exit_zero = matches!(wait_res, Some(status) if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
     }
 
     // Clean up parent signal state
@@ -468,8 +498,11 @@ unsafe fn test_fork_matrix() {
         libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
         0o644,
     );
+    let mut fd_file_created = false;
     let mut fd_offset_shared = false;
+    let mut fd_child_exit_zero = false;
     if fd_file >= 0 {
+        fd_file_created = true;
         let dummy = [0u8; 128];
         let _ = libc::write(fd_file, dummy.as_ptr().cast(), dummy.len());
         libc::lseek(fd_file, 10, libc::SEEK_SET);
@@ -481,8 +514,9 @@ unsafe fn test_fork_matrix() {
             libc::_exit(0);
         }
         if pid3 > 0 {
-            let _ = waitpid_bounded(pid3, deadline);
+            let wait_res = waitpid_bounded(pid3, deadline);
             cleanup_child_bounded(pid3);
+            fd_child_exit_zero = matches!(wait_res, Some(status) if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
         }
         let cur_off = libc::lseek(fd_file, 0, libc::SEEK_CUR);
         fd_offset_shared = cur_off == 40;
@@ -515,9 +549,11 @@ unsafe fn test_fork_matrix() {
     libc::close(pipe_clo_out[0]);
     libc::close(pipe_clo[0]);
     libc::close(pipe_clo[1]);
+    let mut clo_child_exit_zero = false;
     if pid4 > 0 {
-        let _ = waitpid_bounded(pid4, deadline);
+        let wait_res = waitpid_bounded(pid4, deadline);
         cleanup_child_bounded(pid4);
+        clo_child_exit_zero = matches!(wait_res, Some(status) if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
     }
 
     // 2.5 Memory isolation (COW)
@@ -529,8 +565,11 @@ unsafe fn test_fork_matrix() {
         -1,
         0,
     ) as *mut u8;
-    let mut cow_isolated = false;
+    let mut cow_mmap_ok = false;
+    let mut cow_child_exit_zero = false;
+    let mut cow_parent_intact = false;
     if page != libc::MAP_FAILED as *mut u8 {
+        cow_mmap_ok = true;
         *page = 0x42;
         let pid5 = libc::fork();
         if pid5 == 0 {
@@ -538,25 +577,31 @@ unsafe fn test_fork_matrix() {
             let child_read = *page == 0x99;
             libc::_exit(if child_read { 0 } else { 1 });
         }
-        let mut child_ok = false;
         if pid5 > 0 {
             let wait_res = waitpid_bounded(pid5, deadline);
             cleanup_child_bounded(pid5);
-            child_ok = matches!(wait_res, Some(status) if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+            cow_child_exit_zero = matches!(wait_res, Some(status) if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
         }
-        let parent_still_42 = *page == 0x42;
-        cow_isolated = child_ok && parent_still_42;
+        cow_parent_intact = *page == 0x42;
         libc::munmap(page as *mut libc::c_void, 4096);
     }
 
     report!(
-        fork_basic_rc_positive = fork_basic_ok,
+        fork_child_pid_positive = fork_pid1_positive,
+        fork_child_exit_zero = fork_pid1_exit_zero,
         fork_sig_handler_inherited = sig_read_ok && sig_res[0] == 1,
         fork_sig_mask_inherited = sig_read_ok && sig_res[1] == 1,
         fork_sig_pending_cleared = sig_read_ok && sig_res[2] == 1,
+        fork_sig_child_exit_zero = sig_child_exit_zero,
+        fork_fd_file_open_ok = fd_file_created,
         fork_fd_offset_shared = fd_offset_shared,
-        fork_cloexec_inherited = clo_read_ok && clo_res[0] == 1,
-        fork_cow_isolated = cow_isolated,
+        fork_fd_offset_child_exit_zero = fd_child_exit_zero,
+        fork_cloexec_pipe_read_ok = clo_read_ok,
+        fork_cloexec_inherited = clo_res[0] == 1,
+        fork_cloexec_child_exit_zero = clo_child_exit_zero,
+        fork_cow_mmap_ok = cow_mmap_ok,
+        fork_cow_child_exit_zero = cow_child_exit_zero,
+        fork_cow_parent_val_intact = cow_parent_intact,
     );
 }
 
@@ -599,9 +644,12 @@ unsafe fn test_identity_matrix() {
     let mut child_ppid_bytes = [0u8; 4];
     let ppid_read_ok = read_exact_bounded(pipe_ppid[0], &mut child_ppid_bytes, deadline);
     libc::close(pipe_ppid[0]);
+    let mut child_exit_zero = false;
     if pid_child > 0 {
-        let _ = waitpid_bounded(pid_child, deadline);
+        let wait_res = waitpid_bounded(pid_child, deadline);
         cleanup_child_bounded(pid_child);
+        child_exit_zero =
+            matches!(wait_res, Some(st) if libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0);
     }
     let child_ppid = i32::from_ne_bytes(child_ppid_bytes);
     let child_ppid_matches = ppid_read_ok && child_ppid == pid1;
@@ -628,9 +676,12 @@ unsafe fn test_identity_matrix() {
     let mut child_tid_bytes = [0u8; 8];
     let tid_read_ok = read_exact_bounded(pipe_tid[0], &mut child_tid_bytes, deadline);
     libc::close(pipe_tid[0]);
+    let mut child2_exit_zero = false;
     if pid_child2 > 0 {
-        let _ = waitpid_bounded(pid_child2, deadline);
+        let wait_res = waitpid_bounded(pid_child2, deadline);
         cleanup_child_bounded(pid_child2);
+        child2_exit_zero =
+            matches!(wait_res, Some(st) if libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0);
     }
     let c_tid = i32::from_ne_bytes([
         child_tid_bytes[0],
@@ -644,7 +695,8 @@ unsafe fn test_identity_matrix() {
         child_tid_bytes[6],
         child_tid_bytes[7],
     ]);
-    let child_tid_eq_pid = tid_read_ok && c_tid == c_pid && c_tid == pid_child2;
+    let child_tid_matches_child_pid = tid_read_ok && c_tid == c_pid;
+    let child_pid_matches_fork_return = tid_read_ok && c_pid == pid_child2;
 
     let mut thread_info = [0i32; 2];
     let mut th: libc::pthread_t = MaybeUninit::zeroed().assume_init();
@@ -657,23 +709,25 @@ unsafe fn test_identity_matrix() {
     if th_created {
         libc::pthread_join(th, core::ptr::null_mut());
     }
-    let thread_tid_differs_pid = th_created
-        && thread_info[1] == pid1
-        && thread_info[0] != pid1
-        && thread_info[0] > 0;
+    let thread_pid_matches_main = th_created && thread_info[1] == pid1;
+    let thread_tid_differs_main = th_created && thread_info[0] != pid1 && thread_info[0] > 0;
 
     // 3.4 getppid in orphaned grandchild reparented to init / subreaper
     let mut pipe_orphan = [0i32; 2];
     libc::pipe(pipe_orphan.as_mut_ptr());
     let mut pipe_sync = [0i32; 2];
     libc::pipe(pipe_sync.as_mut_ptr());
+    let mut pipe_gpid = [0i32; 2];
+    libc::pipe(pipe_gpid.as_mut_ptr());
 
     let child_a = libc::fork();
     if child_a == 0 {
         libc::close(pipe_orphan[0]);
         libc::close(pipe_sync[1]);
+        libc::close(pipe_gpid[0]);
         let grandchild = libc::fork();
         if grandchild == 0 {
+            libc::close(pipe_gpid[1]);
             // Grandchild waits until child A exits and parent signals
             let mut b = [0u8; 1];
             let _ = read_exact_bounded(pipe_sync[0], &mut b, deadline);
@@ -684,16 +738,28 @@ unsafe fn test_identity_matrix() {
             libc::_exit(0);
         }
         libc::close(pipe_sync[0]);
+        let _ = write_exact_bounded(pipe_gpid[1], &grandchild.to_ne_bytes(), deadline);
+        libc::close(pipe_gpid[1]);
         // Child A exits immediately to orphan grandchild
         libc::_exit(0);
     }
     libc::close(pipe_sync[0]);
     libc::close(pipe_orphan[1]);
+    libc::close(pipe_gpid[1]);
+
+    let mut grandchild_pid_bytes = [0u8; 4];
+    let gpid_read_ok = read_exact_bounded(pipe_gpid[0], &mut grandchild_pid_bytes, deadline);
+    libc::close(pipe_gpid[0]);
+    let grandchild_pid = i32::from_ne_bytes(grandchild_pid_bytes);
+
+    let mut child_a_exit_zero = false;
     if child_a > 0 {
-        let _ = waitpid_bounded(child_a, deadline);
+        let wait_res = waitpid_bounded(child_a, deadline);
         cleanup_child_bounded(child_a);
+        child_a_exit_zero =
+            matches!(wait_res, Some(st) if libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0);
     }
-    // Now tell grandchild parent is reaped
+    // Now tell grandchild child A has exited and been reaped
     let _ = write_exact_bounded(pipe_sync[1], b"k", deadline);
     libc::close(pipe_sync[1]);
 
@@ -701,16 +767,27 @@ unsafe fn test_identity_matrix() {
     let orphan_read_ok = read_exact_bounded(pipe_orphan[0], &mut orphan_ppid_bytes, deadline);
     libc::close(pipe_orphan[0]);
     let orphan_ppid = i32::from_ne_bytes(orphan_ppid_bytes);
-    let orphan_reparent_ok = orphan_read_ok && orphan_ppid >= 1 && orphan_ppid != pid1;
+    let orphan_reparent_ppid_valid = orphan_read_ok && orphan_ppid >= 1 && orphan_ppid != pid1;
+
+    if gpid_read_ok && grandchild_pid > 0 {
+        let _ = waitpid_bounded(grandchild_pid, deadline);
+        cleanup_child_bounded(grandchild_pid);
+    }
 
     report!(
         getpid_positive = pid_positive,
         getpid_repeated_match = pid_repeat_match,
         child_getppid_matches_parent_pid = child_ppid_matches,
+        child_getppid_exit_zero = child_exit_zero,
         main_gettid_eq_getpid = main_tid_eq_pid,
-        child_gettid_eq_getpid = child_tid_eq_pid,
-        thread_gettid_differs_getpid = thread_tid_differs_pid,
-        orphan_reparent_ppid_is_init_or_subreaper = orphan_reparent_ok,
+        child_gettid_eq_child_getpid = child_tid_matches_child_pid,
+        child_getpid_eq_fork_rc = child_pid_matches_fork_return,
+        child_gettid_exit_zero = child2_exit_zero,
+        thread_pthread_create_ok = th_created,
+        thread_getpid_matches_main_pid = thread_pid_matches_main,
+        thread_gettid_differs_main_pid = thread_tid_differs_main,
+        orphan_child_a_exit_zero = child_a_exit_zero,
+        orphan_reparent_ppid_is_init_or_subreaper = orphan_reparent_ppid_valid,
     );
 }
 
@@ -722,25 +799,30 @@ unsafe fn test_pidfd_matrix() {
     let deadline = Instant::now() + DEFAULT_DEADLINE;
 
     // 4.1 pidfd_open error paths
-    let r_bad_flags = libc::syscall(
-        SYS_PIDFD_OPEN,
-        libc::getpid() as libc::c_long,
-        1i64 << 31,
-    ) as i32;
-    let er_bad_flags = errno();
-    let pfd_flags_einval = r_bad_flags == -1 && er_bad_flags == libc::EINVAL;
+    let r_bad_flags =
+        libc::syscall(SYS_PIDFD_OPEN, libc::getpid() as libc::c_long, 1i64 << 31) as i32;
+    let er_bad_flags = if r_bad_flags < 0 { errno() } else { 0 };
+    if r_bad_flags >= 0 {
+        libc::close(r_bad_flags);
+    }
 
     let r_zero = libc::syscall(SYS_PIDFD_OPEN, 0i64, 0i64) as i32;
-    let er_zero = errno();
-    let pfd_zero_einval = r_zero == -1 && er_zero == libc::EINVAL;
+    let er_zero = if r_zero < 0 { errno() } else { 0 };
+    if r_zero >= 0 {
+        libc::close(r_zero);
+    }
 
     let r_neg = libc::syscall(SYS_PIDFD_OPEN, -1i64, 0i64) as i32;
-    let er_neg = errno();
-    let pfd_neg_einval = r_neg == -1 && er_neg == libc::EINVAL;
+    let er_neg = if r_neg < 0 { errno() } else { 0 };
+    if r_neg >= 0 {
+        libc::close(r_neg);
+    }
 
     let r_nonexist = libc::syscall(SYS_PIDFD_OPEN, 999999i64, 0i64) as i32;
-    let er_nonexist = errno();
-    let pfd_nonexist_esrch = r_nonexist == -1 && er_nonexist == libc::ESRCH;
+    let er_nonexist = if r_nonexist < 0 { errno() } else { 0 };
+    if r_nonexist >= 0 {
+        libc::close(r_nonexist);
+    }
 
     // 4.2 pidfd_open valid child and self
     let mut pipe_wait = [0i32; 2];
@@ -766,9 +848,12 @@ unsafe fn test_pidfd_matrix() {
 
     // 4.3 pidfd_send_signal error matrix
     let mut pfd_sig_bad_flags = false;
+    let mut pfd_sig_bad_flags_er = 0;
     let mut pfd_sig_bad_sig = false;
-    let mut pfd_sig_null_sig = false;
+    let mut pfd_sig_bad_sig_er = 0;
+    let mut pfd_sig_null_sig_rc = -1;
     let mut pfd_sig_mismatch = false;
+    let mut pfd_sig_mismatch_er = 0;
     if pfd_child >= 0 {
         let r = libc::syscall(
             SYS_PIDFD_SEND_SIGNAL,
@@ -777,7 +862,8 @@ unsafe fn test_pidfd_matrix() {
             0i64,
             1i64 << 31,
         ) as i32;
-        pfd_sig_bad_flags = r == -1 && errno() == libc::EINVAL;
+        pfd_sig_bad_flags = r == -1;
+        pfd_sig_bad_flags_er = if r < 0 { errno() } else { 0 };
 
         let r = libc::syscall(
             SYS_PIDFD_SEND_SIGNAL,
@@ -786,7 +872,8 @@ unsafe fn test_pidfd_matrix() {
             0i64,
             0i64,
         ) as i32;
-        pfd_sig_bad_sig = r == -1 && errno() == libc::EINVAL;
+        pfd_sig_bad_sig = r == -1;
+        pfd_sig_bad_sig_er = if r < 0 { errno() } else { 0 };
 
         let r = libc::syscall(
             SYS_PIDFD_SEND_SIGNAL,
@@ -795,7 +882,7 @@ unsafe fn test_pidfd_matrix() {
             0i64,
             0i64,
         ) as i32;
-        pfd_sig_null_sig = r == 0;
+        pfd_sig_null_sig_rc = r;
 
         let mut si_bad: libc::siginfo_t = MaybeUninit::zeroed().assume_init();
         si_bad.si_signo = libc::SIGUSR2;
@@ -806,7 +893,8 @@ unsafe fn test_pidfd_matrix() {
             &si_bad as *const libc::siginfo_t,
             0i64,
         ) as i32;
-        pfd_sig_mismatch = r == -1 && errno() == libc::EINVAL;
+        pfd_sig_mismatch = r == -1;
+        pfd_sig_mismatch_er = if r < 0 { errno() } else { 0 };
     }
 
     let mut pipe_non_pfd = [0i32; 2];
@@ -818,30 +906,36 @@ unsafe fn test_pidfd_matrix() {
         0i64,
         0i64,
     ) as i32;
-    let er_non_pfd = errno();
-    let pfd_non_pidfd_einval = r_non_pfd == -1 && er_non_pfd == libc::EINVAL;
+    let er_non_pfd = if r_non_pfd < 0 { errno() } else { 0 };
     libc::close(pipe_non_pfd[0]);
     libc::close(pipe_non_pfd[1]);
 
     let r_bad_fd = libc::syscall(SYS_PIDFD_SEND_SIGNAL, -1i64, 0i64, 0i64, 0i64) as i32;
-    let er_bad_fd = errno();
-    let pfd_bad_fd_ebadf = r_bad_fd == -1 && er_bad_fd == libc::EBADF;
+    let er_bad_fd = if r_bad_fd < 0 { errno() } else { 0 };
 
     // Release child to exit(42)
     let _ = write_exact_bounded(pipe_wait[1], b"x", deadline);
     libc::close(pipe_wait[1]);
 
     // 4.4 waitid(P_PIDFD, pfd_child, ...) with bounded loop
-    let mut waitid_pfd_ok = false;
-    let mut pfd_sig_reaped_esrch = false;
-    let mut pfd_open_reaped_esrch = false;
+    let mut waitid_pfd_rc = -1;
+    let mut waitid_pfd_pid_match = false;
+    let mut waitid_pfd_code_exited = false;
+    let mut waitid_pfd_status_matches = false;
+    let mut pfd_sig_reaped_rc = 0;
+    let mut pfd_sig_reaped_er = 0;
+    let mut pfd_open_reaped_rc = 0;
+    let mut pfd_open_reaped_er = 0;
     if pfd_child >= 0 {
         let reap_deadline = Instant::now() + DEFAULT_DEADLINE;
         loop {
             let mut si: libc::siginfo_t = MaybeUninit::zeroed().assume_init();
             let rc = libc::waitid(P_PIDFD, pfd_child as libc::id_t, &mut si, WEXITED | WNOHANG);
             if rc == 0 && si.si_pid() == child_pid {
-                waitid_pfd_ok = si.si_code == CLD_EXITED && si.si_status() == 42;
+                waitid_pfd_rc = 0;
+                waitid_pfd_pid_match = true;
+                waitid_pfd_code_exited = si.si_code == CLD_EXITED;
+                waitid_pfd_status_matches = si.si_status() == 42;
                 break;
             }
             if rc == -1 && errno() != libc::EINTR {
@@ -861,14 +955,13 @@ unsafe fn test_pidfd_matrix() {
             0i64,
             0i64,
         ) as i32;
-        let er_reaped = errno();
-        pfd_sig_reaped_esrch = r_reaped == -1 && er_reaped == libc::ESRCH;
+        pfd_sig_reaped_rc = r_reaped;
+        pfd_sig_reaped_er = if r_reaped < 0 { errno() } else { 0 };
 
         // pidfd_open on reaped child -> ESRCH
-        let r_open_reaped =
-            libc::syscall(SYS_PIDFD_OPEN, child_pid as libc::c_long, 0i64) as i32;
-        let er_open_reaped = errno();
-        pfd_open_reaped_esrch = r_open_reaped == -1 && er_open_reaped == libc::ESRCH;
+        let r_open_reaped = libc::syscall(SYS_PIDFD_OPEN, child_pid as libc::c_long, 0i64) as i32;
+        pfd_open_reaped_rc = r_open_reaped;
+        pfd_open_reaped_er = if r_open_reaped < 0 { errno() } else { 0 };
 
         libc::close(pfd_child);
     }
@@ -877,21 +970,28 @@ unsafe fn test_pidfd_matrix() {
     }
 
     report!(
-        pidfd_open_invalid_flags_einval = pfd_flags_einval,
-        pidfd_open_pid_zero_einval = pfd_zero_einval,
-        pidfd_open_pid_neg_einval = pfd_neg_einval,
-        pidfd_open_nonexistent_esrch = pfd_nonexist_esrch,
+        pidfd_open_invalid_flags_einval = r_bad_flags == -1 && er_bad_flags == libc::EINVAL,
+        pidfd_open_pid_zero_einval = r_zero == -1 && er_zero == libc::EINVAL,
+        pidfd_open_pid_neg_einval = r_neg == -1 && er_neg == libc::EINVAL,
+        pidfd_open_nonexistent_esrch = r_nonexist == -1 && er_nonexist == libc::ESRCH,
         pidfd_open_child_ok = pfd_child_ok,
         pidfd_open_self_ok = pfd_self_ok,
-        pidfd_send_signal_invalid_flags_einval = pfd_sig_bad_flags,
-        pidfd_send_signal_invalid_sig_einval = pfd_sig_bad_sig,
-        pidfd_send_signal_null_sig_zero = pfd_sig_null_sig,
-        pidfd_send_signal_siginfo_mismatch_einval = pfd_sig_mismatch,
-        pidfd_send_signal_non_pidfd_einval = pfd_non_pidfd_einval,
-        pidfd_send_signal_bad_fd_ebadf = pfd_bad_fd_ebadf,
-        waitid_pidfd_reap_ok = waitid_pfd_ok,
-        pidfd_send_signal_reaped_esrch = pfd_sig_reaped_esrch,
-        pidfd_open_reaped_esrch = pfd_open_reaped_esrch,
+        pidfd_send_signal_invalid_flags_einval =
+            pfd_sig_bad_flags && pfd_sig_bad_flags_er == libc::EINVAL,
+        pidfd_send_signal_invalid_sig_einval =
+            pfd_sig_bad_sig && pfd_sig_bad_sig_er == libc::EINVAL,
+        pidfd_send_signal_null_sig_zero = pfd_sig_null_sig_rc == 0,
+        pidfd_send_signal_siginfo_mismatch_einval =
+            pfd_sig_mismatch && pfd_sig_mismatch_er == libc::EINVAL,
+        pidfd_send_signal_non_pidfd_einval = r_non_pfd == -1 && er_non_pfd == libc::EINVAL,
+        pidfd_send_signal_bad_fd_ebadf = r_bad_fd == -1 && er_bad_fd == libc::EBADF,
+        waitid_pidfd_reap_rc_zero = waitid_pfd_rc == 0,
+        waitid_pidfd_reap_pid_matches = waitid_pfd_pid_match,
+        waitid_pidfd_reap_code_exited = waitid_pfd_code_exited,
+        waitid_pidfd_reap_status_matches = waitid_pfd_status_matches,
+        pidfd_send_signal_reaped_esrch =
+            pfd_sig_reaped_rc == -1 && pfd_sig_reaped_er == libc::ESRCH,
+        pidfd_open_reaped_esrch = pfd_open_reaped_rc == -1 && pfd_open_reaped_er == libc::ESRCH,
     );
 }
 
@@ -923,7 +1023,7 @@ unsafe fn test_process_vm_matrix() {
         1i64,
         1i64,
     ) as i32;
-    let pvm_bad_flags_einval = r_bad_flags == -1 && errno() == libc::EINVAL;
+    let er_bad_flags = if r_bad_flags < 0 { errno() } else { 0 };
 
     let r_bad_liov = libc::syscall(
         SYS_PROCESS_VM_READV,
@@ -934,7 +1034,7 @@ unsafe fn test_process_vm_matrix() {
         1i64,
         0i64,
     ) as i32;
-    let pvm_bad_liov_einval = r_bad_liov == -1 && errno() == libc::EINVAL;
+    let er_bad_liov = if r_bad_liov < 0 { errno() } else { 0 };
 
     let r_bad_riov = libc::syscall(
         SYS_PROCESS_VM_READV,
@@ -945,7 +1045,7 @@ unsafe fn test_process_vm_matrix() {
         -1i64,
         0i64,
     ) as i32;
-    let pvm_bad_riov_einval = r_bad_riov == -1 && errno() == libc::EINVAL;
+    let er_bad_riov = if r_bad_riov < 0 { errno() } else { 0 };
 
     let r_max_iov = libc::syscall(
         SYS_PROCESS_VM_READV,
@@ -956,7 +1056,7 @@ unsafe fn test_process_vm_matrix() {
         1i64,
         0i64,
     ) as i32;
-    let pvm_max_iov_einval = r_max_iov == -1 && errno() == libc::EINVAL;
+    let er_max_iov = if r_max_iov < 0 { errno() } else { 0 };
 
     let r_zero_iov = libc::syscall(
         SYS_PROCESS_VM_READV,
@@ -967,7 +1067,6 @@ unsafe fn test_process_vm_matrix() {
         0i64,
         0i64,
     ) as isize;
-    let pvm_zero_iov_zero = r_zero_iov == 0;
 
     let r_bad_pid = libc::syscall(
         SYS_PROCESS_VM_READV,
@@ -978,7 +1077,7 @@ unsafe fn test_process_vm_matrix() {
         1i64,
         0i64,
     ) as i32;
-    let pvm_nonexist_esrch = r_bad_pid == -1 && errno() == libc::ESRCH;
+    let er_bad_pid = if r_bad_pid < 0 { errno() } else { 0 };
 
     // 5.2 Self-process read & write
     let r_self_read = libc::syscall(
@@ -990,7 +1089,8 @@ unsafe fn test_process_vm_matrix() {
         1i64,
         0i64,
     ) as isize;
-    let pvm_self_read_ok = r_self_read == 16 && buf_b == buf_a;
+    let pvm_self_read_bytes = r_self_read == 16;
+    let pvm_self_read_match = buf_b == buf_a;
 
     let mut buf_c = *b"WORLD_PROCESS_VM";
     let liov_write = libc::iovec {
@@ -1010,7 +1110,8 @@ unsafe fn test_process_vm_matrix() {
         1i64,
         0i64,
     ) as isize;
-    let pvm_self_write_ok = r_self_write == 16 && buf_b == buf_c;
+    let pvm_self_write_bytes = r_self_write == 16;
+    let pvm_self_write_match = buf_b == buf_c;
 
     // 5.3 Cross-process child read & write
     let mut pipe_pvm_addr = [0i32; 2];
@@ -1064,8 +1165,8 @@ unsafe fn test_process_vm_matrix() {
     } else {
         -1
     };
-    let pvm_read_child_ok =
-        r_pvm_read_child == 16 && &child_read_out == b"CHILD_DATA_12345";
+    let pvm_read_child_bytes = r_pvm_read_child == 16;
+    let pvm_read_child_match = &child_read_out == b"CHILD_DATA_12345";
 
     let mut parent_write_data = *b"PARENT_OVERWRITE";
     let liov_to_child = libc::iovec {
@@ -1085,7 +1186,7 @@ unsafe fn test_process_vm_matrix() {
     } else {
         -1
     };
-    let pvm_write_child_ok = r_pvm_write_child == 16;
+    let pvm_write_child_bytes = r_pvm_write_child == 16;
 
     let _ = write_exact_bounded(pipe_pvm_ack[1], b"w", deadline);
     libc::close(pipe_pvm_ack[1]);
@@ -1111,7 +1212,7 @@ unsafe fn test_process_vm_matrix() {
         1i64,
         0i64,
     ) as i32;
-    let pvm_bad_remote_efault = r_bad_rem == -1 && errno() == libc::EFAULT;
+    let er_bad_rem = if r_bad_rem < 0 { errno() } else { 0 };
 
     let bad_liov = libc::iovec {
         iov_base: 0x1000 as *mut libc::c_void,
@@ -1126,21 +1227,25 @@ unsafe fn test_process_vm_matrix() {
         1i64,
         0i64,
     ) as i32;
-    let pvm_bad_local_efault = r_bad_loc == -1 && errno() == libc::EFAULT;
+    let er_bad_loc = if r_bad_loc < 0 { errno() } else { 0 };
 
     report!(
-        process_vm_readv_bad_flags_einval = pvm_bad_flags_einval,
-        process_vm_readv_bad_liovcnt_einval = pvm_bad_liov_einval,
-        process_vm_readv_bad_riovcnt_einval = pvm_bad_riov_einval,
-        process_vm_readv_max_iovcnt_einval = pvm_max_iov_einval,
-        process_vm_readv_zero_iovcnt_zero = pvm_zero_iov_zero,
-        process_vm_readv_nonexistent_esrch = pvm_nonexist_esrch,
-        process_vm_readv_self_ok = pvm_self_read_ok,
-        process_vm_writev_self_ok = pvm_self_write_ok,
-        process_vm_readv_child_ok = pvm_read_child_ok,
-        process_vm_writev_child_ok = pvm_write_child_ok && child_exit_ok,
-        process_vm_readv_bad_remote_efault = pvm_bad_remote_efault,
-        process_vm_readv_bad_local_efault = pvm_bad_local_efault,
+        process_vm_readv_bad_flags_einval = r_bad_flags == -1 && er_bad_flags == libc::EINVAL,
+        process_vm_readv_bad_liovcnt_einval = r_bad_liov == -1 && er_bad_liov == libc::EINVAL,
+        process_vm_readv_bad_riovcnt_einval = r_bad_riov == -1 && er_bad_riov == libc::EINVAL,
+        process_vm_readv_max_iovcnt_einval = r_max_iov == -1 && er_max_iov == libc::EINVAL,
+        process_vm_readv_zero_iovcnt_zero = r_zero_iov == 0,
+        process_vm_readv_nonexistent_esrch = r_bad_pid == -1 && er_bad_pid == libc::ESRCH,
+        process_vm_readv_self_bytes_match = pvm_self_read_bytes,
+        process_vm_readv_self_data_match = pvm_self_read_match,
+        process_vm_writev_self_bytes_match = pvm_self_write_bytes,
+        process_vm_writev_self_data_match = pvm_self_write_match,
+        process_vm_readv_child_bytes_match = pvm_read_child_bytes,
+        process_vm_readv_child_data_match = pvm_read_child_match,
+        process_vm_writev_child_bytes_match = pvm_write_child_bytes,
+        process_vm_writev_child_verified_data = child_exit_ok,
+        process_vm_readv_bad_remote_efault = r_bad_rem == -1 && er_bad_rem == libc::EFAULT,
+        process_vm_readv_bad_local_efault = r_bad_loc == -1 && er_bad_loc == libc::EFAULT,
     );
 }
 
@@ -1158,7 +1263,7 @@ unsafe fn test_ptrace_matrix() {
         core::ptr::null_mut::<libc::c_void>(),
         0,
     );
-    let pt_attach_self_eperm = r_self == -1 && errno() == libc::EPERM;
+    let er_self = if r_self < 0 { errno() } else { 0 };
 
     let r_init = libc::ptrace(
         libc::PTRACE_ATTACH,
@@ -1166,7 +1271,7 @@ unsafe fn test_ptrace_matrix() {
         core::ptr::null_mut::<libc::c_void>(),
         0,
     );
-    let pt_attach_init_eperm = r_init == -1 && errno() == libc::EPERM;
+    let er_init = if r_init < 0 { errno() } else { 0 };
 
     let r_zero = libc::ptrace(
         libc::PTRACE_ATTACH,
@@ -1174,8 +1279,7 @@ unsafe fn test_ptrace_matrix() {
         core::ptr::null_mut::<libc::c_void>(),
         0,
     );
-    let er_zero = errno();
-    let pt_attach_zero_esrch = r_zero == -1 && er_zero == libc::ESRCH;
+    let er_zero = if r_zero < 0 { errno() } else { 0 };
 
     let r_neg = libc::ptrace(
         libc::PTRACE_ATTACH,
@@ -1183,7 +1287,7 @@ unsafe fn test_ptrace_matrix() {
         core::ptr::null_mut::<libc::c_void>(),
         0,
     );
-    let pt_attach_neg_esrch = r_neg == -1 && errno() == libc::ESRCH;
+    let er_neg = if r_neg < 0 { errno() } else { 0 };
 
     let r_nonexist = libc::ptrace(
         libc::PTRACE_ATTACH,
@@ -1191,7 +1295,7 @@ unsafe fn test_ptrace_matrix() {
         core::ptr::null_mut::<libc::c_void>(),
         0,
     );
-    let pt_attach_nonexist_esrch = r_nonexist == -1 && errno() == libc::ESRCH;
+    let er_nonexist = if r_nonexist < 0 { errno() } else { 0 };
 
     // 6.2 Invalid request codes & untraced detach/cont
     let mut pipe_pt = [0i32; 2];
@@ -1212,8 +1316,7 @@ unsafe fn test_ptrace_matrix() {
         core::ptr::null_mut::<libc::c_void>(),
         0,
     );
-    let er_inv_req = errno();
-    let pt_inv_req_eio = r_inv_req == -1 && er_inv_req == libc::EIO;
+    let er_inv_req = if r_inv_req < 0 { errno() } else { 0 };
 
     let r_detach_unattached = libc::ptrace(
         libc::PTRACE_DETACH,
@@ -1221,8 +1324,7 @@ unsafe fn test_ptrace_matrix() {
         core::ptr::null_mut::<libc::c_void>(),
         0,
     );
-    let er_detach = errno();
-    let pt_detach_unattached_esrch = r_detach_unattached == -1 && er_detach == libc::ESRCH;
+    let er_detach = if r_detach_unattached < 0 { errno() } else { 0 };
 
     let r_cont_unattached = libc::ptrace(
         libc::PTRACE_CONT,
@@ -1230,13 +1332,16 @@ unsafe fn test_ptrace_matrix() {
         core::ptr::null_mut::<libc::c_void>(),
         0,
     );
-    let pt_cont_unattached_esrch = r_cont_unattached == -1 && errno() == libc::ESRCH;
+    let er_cont = if r_cont_unattached < 0 { errno() } else { 0 };
 
     let _ = write_exact_bounded(pipe_pt[1], b"q", deadline);
     libc::close(pipe_pt[1]);
+    let mut child_pt_exit_zero = false;
     if child_pt > 0 {
-        let _ = waitpid_bounded(child_pt, deadline);
+        let wait_res = waitpid_bounded(child_pt, deadline);
         cleanup_child_bounded(child_pt);
+        child_pt_exit_zero =
+            matches!(wait_res, Some(st) if libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0);
     }
 
     // 6.3 Traceme duplicate error
@@ -1257,31 +1362,37 @@ unsafe fn test_ptrace_matrix() {
             core::ptr::null_mut::<libc::c_void>(),
             0,
         );
-        let r2_er = errno();
-        let tm_dup_eperm = r1 == 0 && r2 == -1 && r2_er == libc::EPERM;
-        let _ = write_exact_bounded(pipe_tm[1], &[tm_dup_eperm as u8], deadline);
+        let r2_er = if r2 < 0 { errno() } else { 0 };
+        let res = [(r1 == 0) as u8, (r2 == -1 && r2_er == libc::EPERM) as u8];
+        let _ = write_exact_bounded(pipe_tm[1], &res, deadline);
         libc::close(pipe_tm[1]);
         libc::_exit(0);
     }
     libc::close(pipe_tm[1]);
-    let mut tm_res = [0u8; 1];
+    let mut tm_res = [0u8; 2];
     let tm_read_ok = read_exact_bounded(pipe_tm[0], &mut tm_res, deadline);
     libc::close(pipe_tm[0]);
+    let mut child_tm_exit_zero = false;
     if child_tm > 0 {
-        let _ = waitpid_bounded(child_tm, deadline);
+        let wait_res = waitpid_bounded(child_tm, deadline);
         cleanup_child_bounded(child_tm);
+        child_tm_exit_zero =
+            matches!(wait_res, Some(st) if libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0);
     }
 
     report!(
-        ptrace_attach_self_eperm = pt_attach_self_eperm,
-        ptrace_attach_init_eperm = pt_attach_init_eperm,
-        ptrace_attach_zero_esrch = pt_attach_zero_esrch,
-        ptrace_attach_neg_esrch = pt_attach_neg_esrch,
-        ptrace_attach_nonexistent_esrch = pt_attach_nonexist_esrch,
-        ptrace_invalid_request_eio = pt_inv_req_eio,
-        ptrace_detach_unattached_esrch = pt_detach_unattached_esrch,
-        ptrace_cont_unattached_esrch = pt_cont_unattached_esrch,
-        ptrace_traceme_duplicate_eperm = tm_read_ok && tm_res[0] == 1,
+        ptrace_attach_self_eperm = r_self == -1 && er_self == libc::EPERM,
+        ptrace_attach_init_eperm = r_init == -1 && er_init == libc::EPERM,
+        ptrace_attach_zero_esrch = r_zero == -1 && er_zero == libc::ESRCH,
+        ptrace_attach_neg_esrch = r_neg == -1 && er_neg == libc::ESRCH,
+        ptrace_attach_nonexistent_esrch = r_nonexist == -1 && er_nonexist == libc::ESRCH,
+        ptrace_invalid_request_eio = r_inv_req == -1 && er_inv_req == libc::EIO,
+        ptrace_detach_unattached_esrch = r_detach_unattached == -1 && er_detach == libc::ESRCH,
+        ptrace_cont_unattached_esrch = r_cont_unattached == -1 && er_cont == libc::ESRCH,
+        ptrace_unattached_child_exit_zero = child_pt_exit_zero,
+        ptrace_traceme_first_ok = tm_read_ok && tm_res[0] == 1,
+        ptrace_traceme_duplicate_eperm = tm_read_ok && tm_res[1] == 1,
+        ptrace_traceme_child_exit_zero = child_tm_exit_zero,
     );
 }
 
@@ -1292,12 +1403,12 @@ unsafe fn test_ptrace_matrix() {
 unsafe fn test_setns_matrix() {
     // 7.1 setns error paths
     let r_bad_fd = libc::syscall(SYS_SETNS, -1i64, 0i64) as i32;
-    let setns_bad_fd_ebadf = r_bad_fd == -1 && errno() == libc::EBADF;
+    let er_bad_fd = if r_bad_fd < 0 { errno() } else { 0 };
 
     let mut pipe_ns = [0i32; 2];
     libc::pipe(pipe_ns.as_mut_ptr());
     let r_non_ns = libc::syscall(SYS_SETNS, pipe_ns[0] as libc::c_long, 0i64) as i32;
-    let setns_non_ns_einval = r_non_ns == -1 && errno() == libc::EINVAL;
+    let er_non_ns = if r_non_ns < 0 { errno() } else { 0 };
     libc::close(pipe_ns[0]);
     libc::close(pipe_ns[1]);
 
@@ -1308,16 +1419,17 @@ unsafe fn test_setns_matrix() {
     let mut setns_zero_rc_zero = false;
     let mut setns_zero_errno = 0i32;
     if fd_uts >= 0 {
-        let r_bad_nstype =
-            libc::syscall(SYS_SETNS, fd_uts as libc::c_long, 0x1000_0000i64) as i32;
-        setns_bad_nstype_einval = r_bad_nstype == -1 && errno() == libc::EINVAL;
+        let r_bad_nstype = libc::syscall(SYS_SETNS, fd_uts as libc::c_long, 0x1000_0000i64) as i32;
+        let er_bad_nstype = if r_bad_nstype < 0 { errno() } else { 0 };
+        setns_bad_nstype_einval = r_bad_nstype == -1 && er_bad_nstype == libc::EINVAL;
 
         let r_mismatch = libc::syscall(
             SYS_SETNS,
             fd_uts as libc::c_long,
             CLONE_NEWIPC as libc::c_long,
         ) as i32;
-        setns_mismatched_einval = r_mismatch == -1 && errno() == libc::EINVAL;
+        let er_mismatch = if r_mismatch < 0 { errno() } else { 0 };
+        setns_mismatched_einval = r_mismatch == -1 && er_mismatch == libc::EINVAL;
 
         let r_zero_nstype = libc::syscall(SYS_SETNS, fd_uts as libc::c_long, 0i64) as i32;
         let er_zero = if r_zero_nstype < 0 { errno() } else { 0 };
@@ -1328,8 +1440,9 @@ unsafe fn test_setns_matrix() {
     }
 
     report!(
-        setns_bad_fd_ebadf = setns_bad_fd_ebadf,
-        setns_non_ns_fd_einval = setns_non_ns_einval,
+        setns_bad_fd_ebadf = r_bad_fd == -1 && er_bad_fd == libc::EBADF,
+        setns_non_ns_fd_einval = r_non_ns == -1 && er_non_ns == libc::EINVAL,
+        setns_proc_self_ns_uts_open_ok = fd_uts >= 0,
         setns_bad_nstype_einval = setns_bad_nstype_einval,
         setns_mismatched_nstype_einval = setns_mismatched_einval,
         setns_zero_nstype_rc_zero = setns_zero_rc_zero,
@@ -1377,28 +1490,32 @@ unsafe fn test_session_pgid_matrix() {
     let mut sid_res = [0u8; 4];
     let sid_read_ok = read_exact_bounded(pipe_sid[0], &mut sid_res, deadline);
     libc::close(pipe_sid[0]);
+    let mut child_sid_exit_zero = false;
     if child_sid_pid > 0 {
-        let _ = waitpid_bounded(child_sid_pid, deadline);
+        let wait_res = waitpid_bounded(child_sid_pid, deadline);
         cleanup_child_bounded(child_sid_pid);
+        child_sid_exit_zero =
+            matches!(wait_res, Some(st) if libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0);
     }
 
     // 8.2 getsid query
     let self_sid = libc::getsid(0);
-    let getsid_self_ok = self_sid > 0 && self_sid == libc::getsid(libc::getpid());
+    let getsid_self_positive = self_sid > 0;
+    let getsid_zero_matches_self = self_sid == libc::getsid(libc::getpid());
     let getsid_neg = libc::getsid(-1);
-    let getsid_neg_einval = getsid_neg == -1 && errno() == libc::EINVAL;
+    let er_getsid_neg = if getsid_neg < 0 { errno() } else { 0 };
     let getsid_nonexist = libc::getsid(999999);
-    let getsid_nonexist_esrch = getsid_nonexist == -1 && errno() == libc::ESRCH;
+    let er_getsid_nonexist = if getsid_nonexist < 0 { errno() } else { 0 };
 
     // 8.3 setpgid error & lifecycle paths
     let setpgid_neg_pid = libc::setpgid(-1, 0);
-    let setpgid_neg_pid_einval = setpgid_neg_pid == -1 && errno() == libc::EINVAL;
+    let er_setpgid_neg_pid = if setpgid_neg_pid < 0 { errno() } else { 0 };
 
     let setpgid_neg_pgid = libc::setpgid(0, -1);
-    let setpgid_neg_pgid_einval = setpgid_neg_pgid == -1 && errno() == libc::EINVAL;
+    let er_setpgid_neg_pgid = if setpgid_neg_pgid < 0 { errno() } else { 0 };
 
     let setpgid_nonexist = libc::setpgid(999999, 0);
-    let setpgid_nonexist_esrch = setpgid_nonexist == -1 && errno() == libc::ESRCH;
+    let er_setpgid_nonexist = if setpgid_nonexist < 0 { errno() } else { 0 };
 
     let mut pipe_pgid = [0i32; 2];
     libc::pipe(pipe_pgid.as_mut_ptr());
@@ -1408,7 +1525,8 @@ unsafe fn test_session_pgid_matrix() {
         let c_pid = libc::getpid();
         // setpgid(0, 0) sets pgid to child pid
         let r0 = libc::setpgid(0, 0);
-        let pgrp_is_cpid = r0 == 0 && libc::getpgrp() == c_pid;
+        let r0_zero = r0 == 0;
+        let pgrp_is_cpid = libc::getpgrp() == c_pid;
 
         // setpgid(0, 999999) -> EPERM (not in same session)
         let r_bad_pgid = libc::setpgid(0, 999999);
@@ -1417,11 +1535,14 @@ unsafe fn test_session_pgid_matrix() {
 
         // setpgid(0, parent_pgrp) -> joins parent group
         let r_parent = libc::setpgid(0, parent_pgrp);
-        let joined_parent = r_parent == 0 && libc::getpgrp() == parent_pgrp;
+        let r_parent_zero = r_parent == 0;
+        let joined_parent = libc::getpgrp() == parent_pgrp;
 
         let res = [
+            r0_zero as u8,
             pgrp_is_cpid as u8,
             bad_pgid_eperm as u8,
+            r_parent_zero as u8,
             joined_parent as u8,
         ];
         let _ = write_exact_bounded(pipe_pgid[1], &res, deadline);
@@ -1429,12 +1550,15 @@ unsafe fn test_session_pgid_matrix() {
         libc::_exit(0);
     }
     libc::close(pipe_pgid[1]);
-    let mut pgid_res = [0u8; 3];
+    let mut pgid_res = [0u8; 5];
     let pgid_read_ok = read_exact_bounded(pipe_pgid[0], &mut pgid_res, deadline);
     libc::close(pipe_pgid[0]);
+    let mut child_pgid_exit_zero = false;
     if child_pgid_pid > 0 {
-        let _ = waitpid_bounded(child_pgid_pid, deadline);
+        let wait_res = waitpid_bounded(child_pgid_pid, deadline);
         cleanup_child_bounded(child_pgid_pid);
+        child_pgid_exit_zero =
+            matches!(wait_res, Some(st) if libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0);
     }
 
     // 8.4 getpgid query
@@ -1442,27 +1566,34 @@ unsafe fn test_session_pgid_matrix() {
     let getpgid_zero_ok = libc::getpgid(0) == self_pgrp;
     let getpgid_self_ok = libc::getpgid(libc::getpid()) == self_pgrp;
     let getpgid_neg = libc::getpgid(-1);
-    let getpgid_neg_einval = getpgid_neg == -1 && errno() == libc::EINVAL;
+    let er_getpgid_neg = if getpgid_neg < 0 { errno() } else { 0 };
     let getpgid_nonexist = libc::getpgid(999999);
-    let getpgid_nonexist_esrch = getpgid_nonexist == -1 && errno() == libc::ESRCH;
+    let er_getpgid_nonexist = if getpgid_nonexist < 0 { errno() } else { 0 };
 
     report!(
-        setsid_in_child_ok = sid_read_ok && sid_res[0] == 1,
-        setsid_pgrp_updated = sid_read_ok && sid_res[1] == 1,
-        setsid_getsid_updated = sid_read_ok && sid_res[2] == 1,
+        setsid_in_child_sid_matches_pid = sid_read_ok && sid_res[0] == 1,
+        setsid_in_child_pgrp_updated = sid_read_ok && sid_res[1] == 1,
+        setsid_in_child_getsid_updated = sid_read_ok && sid_res[2] == 1,
         setsid_leader_eperm = sid_read_ok && sid_res[3] == 1,
-        getsid_zero_eq_self = getsid_self_ok,
-        getsid_neg_einval = getsid_neg_einval,
-        getsid_nonexistent_esrch = getsid_nonexist_esrch,
-        setpgid_neg_pid_einval = setpgid_neg_pid_einval,
-        setpgid_neg_pgid_einval = setpgid_neg_pgid_einval,
-        setpgid_nonexistent_pid_esrch = setpgid_nonexist_esrch,
-        setpgid_zero_zero_sets_pgrp = pgid_read_ok && pgid_res[0] == 1,
-        setpgid_invalid_pgrp_eperm = pgid_read_ok && pgid_res[1] == 1,
-        setpgid_join_parent_ok = pgid_read_ok && pgid_res[2] == 1,
-        getpgid_zero_eq_pgrp = getpgid_zero_ok && getpgid_self_ok,
-        getpgid_neg_einval = getpgid_neg_einval,
-        getpgid_nonexistent_esrch = getpgid_nonexist_esrch,
+        setsid_child_exit_zero = child_sid_exit_zero,
+        getsid_self_positive = getsid_self_positive,
+        getsid_zero_eq_self = getsid_zero_matches_self,
+        getsid_neg_einval = getsid_neg == -1 && er_getsid_neg == libc::EINVAL,
+        getsid_nonexistent_esrch = getsid_nonexist == -1 && er_getsid_nonexist == libc::ESRCH,
+        setpgid_neg_pid_einval = setpgid_neg_pid == -1 && er_setpgid_neg_pid == libc::EINVAL,
+        setpgid_neg_pgid_einval = setpgid_neg_pgid == -1 && er_setpgid_neg_pgid == libc::EINVAL,
+        setpgid_nonexistent_pid_esrch =
+            setpgid_nonexist == -1 && er_setpgid_nonexist == libc::ESRCH,
+        setpgid_zero_zero_rc_zero = pgid_read_ok && pgid_res[0] == 1,
+        setpgid_zero_zero_sets_pgrp = pgid_read_ok && pgid_res[1] == 1,
+        setpgid_invalid_pgrp_eperm = pgid_read_ok && pgid_res[2] == 1,
+        setpgid_join_parent_rc_zero = pgid_read_ok && pgid_res[3] == 1,
+        setpgid_join_parent_pgrp_matches = pgid_read_ok && pgid_res[4] == 1,
+        setpgid_child_exit_zero = child_pgid_exit_zero,
+        getpgid_zero_eq_pgrp = getpgid_zero_ok,
+        getpgid_self_eq_pgrp = getpgid_self_ok,
+        getpgid_neg_einval = getpgid_neg == -1 && er_getpgid_neg == libc::EINVAL,
+        getpgid_nonexistent_esrch = getpgid_nonexist == -1 && er_getpgid_nonexist == libc::ESRCH,
     );
 }
 
@@ -1475,48 +1606,39 @@ unsafe fn test_process_control_waitid_matrix() {
 
     // 9.1 prctl(PR_SET_PDEATHSIG)
     let r_pdeath_neg = libc::prctl(PR_SET_PDEATHSIG, -1, 0, 0, 0);
-    let pdeath_neg_einval = r_pdeath_neg == -1 && errno() == libc::EINVAL;
+    let er_pdeath_neg = if r_pdeath_neg < 0 { errno() } else { 0 };
 
     let r_pdeath_large = libc::prctl(PR_SET_PDEATHSIG, 1000, 0, 0, 0);
-    let pdeath_large_einval = r_pdeath_large == -1 && errno() == libc::EINVAL;
+    let er_pdeath_large = if r_pdeath_large < 0 { errno() } else { 0 };
 
     let r_pdeath_set = libc::prctl(PR_SET_PDEATHSIG, libc::SIGUSR1, 0, 0, 0);
     let mut sig_got = 0i32;
-    let r_pdeath_get = libc::prctl(
-        PR_GET_PDEATHSIG,
-        &mut sig_got as *mut i32 as usize,
-        0,
-        0,
-        0,
-    );
-    let pdeath_roundtrip_usr1 =
-        r_pdeath_set == 0 && r_pdeath_get == 0 && sig_got == libc::SIGUSR1;
+    let r_pdeath_get = libc::prctl(PR_GET_PDEATHSIG, &mut sig_got as *mut i32 as usize, 0, 0, 0);
 
     let r_pdeath_clear = libc::prctl(PR_SET_PDEATHSIG, 0, 0, 0, 0);
+    let mut sig_got_zero = -1i32;
     let r_pdeath_get_zero = libc::prctl(
         PR_GET_PDEATHSIG,
-        &mut sig_got as *mut i32 as usize,
+        &mut sig_got_zero as *mut i32 as usize,
         0,
         0,
         0,
     );
-    let pdeath_clear_zero = r_pdeath_clear == 0 && r_pdeath_get_zero == 0 && sig_got == 0;
 
     // 9.2 prctl(PR_SET_NAME) & PR_GET_NAME
     let target_name = b"lifecycle_probe\0";
     let r_name_set = libc::prctl(PR_SET_NAME, target_name.as_ptr() as usize, 0, 0, 0);
     let mut name_buf = [0u8; 16];
     let r_name_get = libc::prctl(PR_GET_NAME, name_buf.as_mut_ptr() as usize, 0, 0, 0);
-    let name_ok =
-        r_name_set == 0 && r_name_get == 0 && &name_buf[..15] == b"lifecycle_probe";
+    let name_matches = &name_buf[..15] == b"lifecycle_probe";
 
     // 9.3 waitid argument validation & options
     let mut si: libc::siginfo_t = MaybeUninit::zeroed().assume_init();
     let r_bad_idtype = libc::waitid(99, 0, &mut si, WEXITED);
-    let waitid_bad_idtype_einval = r_bad_idtype == -1 && errno() == libc::EINVAL;
+    let er_bad_idtype = if r_bad_idtype < 0 { errno() } else { 0 };
 
     let r_bad_opts = libc::waitid(P_ALL, 0, &mut si, 0);
-    let waitid_bad_opts_einval = r_bad_opts == -1 && errno() == libc::EINVAL;
+    let er_bad_opts = if r_bad_opts < 0 { errno() } else { 0 };
 
     // waitid with WNOWAIT then reap
     let mut pipe_wait = [0i32; 2];
@@ -1533,13 +1655,9 @@ unsafe fn test_process_control_waitid_matrix() {
 
     // Running child + WNOHANG -> returns 0 with si_pid == 0
     let mut si_run: libc::siginfo_t = MaybeUninit::zeroed().assume_init();
-    let r_run = libc::waitid(
-        P_PID,
-        child_w as libc::id_t,
-        &mut si_run,
-        WEXITED | WNOHANG,
-    );
-    let running_nohang_zero = r_run == 0 && si_run.si_pid() == 0;
+    let r_run = libc::waitid(P_PID, child_w as libc::id_t, &mut si_run, WEXITED | WNOHANG);
+    let running_nohang_rc_zero = r_run == 0;
+    let running_nohang_si_pid_zero = si_run.si_pid() == 0;
 
     // Release child
     let _ = write_exact_bounded(pipe_wait[1], b"g", deadline);
@@ -1547,7 +1665,10 @@ unsafe fn test_process_control_waitid_matrix() {
 
     // Inspect exit code with WNOWAIT (without reaping) in bounded loop
     let peek_deadline = Instant::now() + DEFAULT_DEADLINE;
-    let mut peek_ok = false;
+    let mut peek_rc_zero = false;
+    let mut peek_si_pid_matches = false;
+    let mut peek_si_code_exited = false;
+    let mut peek_si_status_matches = false;
     loop {
         let mut si_peek: libc::siginfo_t = MaybeUninit::zeroed().assume_init();
         let r_peek = libc::waitid(
@@ -1557,7 +1678,10 @@ unsafe fn test_process_control_waitid_matrix() {
             WEXITED | WNOWAIT | WNOHANG,
         );
         if r_peek == 0 && si_peek.si_pid() == child_w {
-            peek_ok = si_peek.si_code == CLD_EXITED && si_peek.si_status() == 33;
+            peek_rc_zero = true;
+            peek_si_pid_matches = true;
+            peek_si_code_exited = si_peek.si_code == CLD_EXITED;
+            peek_si_status_matches = si_peek.si_status() == 33;
             break;
         }
         if r_peek == -1 && errno() != libc::EINTR {
@@ -1571,13 +1695,14 @@ unsafe fn test_process_control_waitid_matrix() {
 
     // Follow-up waitpid must successfully reap the child
     let reap_res = waitpid_bounded(child_w, deadline);
-    let reap_ok = matches!(reap_res, Some(st) if libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 33);
+    let reap_ok =
+        matches!(reap_res, Some(st) if libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 33);
     cleanup_child_bounded(child_w);
 
     // All children reaped -> P_ALL + WNOHANG -> ECHILD
     let mut si_none: libc::siginfo_t = MaybeUninit::zeroed().assume_init();
     let r_none = libc::waitid(P_ALL, 0, &mut si_none, WEXITED | WNOHANG);
-    let no_children_echild = r_none == -1 && errno() == libc::ECHILD;
+    let er_none = if r_none < 0 { errno() } else { 0 };
 
     // 9.4 waitid(P_PGID)
     let child_pgid = libc::fork();
@@ -1586,7 +1711,10 @@ unsafe fn test_process_control_waitid_matrix() {
         libc::_exit(55);
     }
     let pgid_deadline = Instant::now() + DEFAULT_DEADLINE;
-    let mut waitid_p_pgid_ok = false;
+    let mut waitid_p_pgid_rc_zero = false;
+    let mut waitid_p_pgid_pid_matches = false;
+    let mut waitid_p_pgid_code_exited = false;
+    let mut waitid_p_pgid_status_matches = false;
     loop {
         let mut si_pgid: libc::siginfo_t = MaybeUninit::zeroed().assume_init();
         let r_pgid = libc::waitid(
@@ -1596,7 +1724,10 @@ unsafe fn test_process_control_waitid_matrix() {
             WEXITED | WNOHANG,
         );
         if r_pgid == 0 && si_pgid.si_pid() == child_pgid {
-            waitid_p_pgid_ok = si_pgid.si_status() == 55;
+            waitid_p_pgid_rc_zero = true;
+            waitid_p_pgid_pid_matches = true;
+            waitid_p_pgid_code_exited = si_pgid.si_code == CLD_EXITED;
+            waitid_p_pgid_status_matches = si_pgid.si_status() == 55;
             break;
         }
         if r_pgid == -1 && errno() != libc::EINTR {
@@ -1610,18 +1741,31 @@ unsafe fn test_process_control_waitid_matrix() {
     cleanup_child_bounded(child_pgid);
 
     report!(
-        prctl_pdeathsig_bad_neg_einval = pdeath_neg_einval,
-        prctl_pdeathsig_bad_large_einval = pdeath_large_einval,
-        prctl_pdeathsig_roundtrip_usr1 = pdeath_roundtrip_usr1,
-        prctl_pdeathsig_clear_zero = pdeath_clear_zero,
-        prctl_thread_name_roundtrip = name_ok,
-        waitid_bad_idtype_einval = waitid_bad_idtype_einval,
-        waitid_bad_options_einval = waitid_bad_opts_einval,
-        waitid_running_child_nohang_zero = running_nohang_zero,
-        waitid_wnowait_inspects_without_reap = peek_ok,
+        prctl_pdeathsig_bad_neg_einval = r_pdeath_neg == -1 && er_pdeath_neg == libc::EINVAL,
+        prctl_pdeathsig_bad_large_einval = r_pdeath_large == -1 && er_pdeath_large == libc::EINVAL,
+        prctl_pdeathsig_set_usr1_rc_zero = r_pdeath_set == 0,
+        prctl_pdeathsig_get_usr1_rc_zero = r_pdeath_get == 0,
+        prctl_pdeathsig_get_usr1_matches = sig_got == libc::SIGUSR1,
+        prctl_pdeathsig_clear_rc_zero = r_pdeath_clear == 0,
+        prctl_pdeathsig_get_clear_rc_zero = r_pdeath_get_zero == 0,
+        prctl_pdeathsig_get_clear_matches = sig_got_zero == 0,
+        prctl_set_name_rc_zero = r_name_set == 0,
+        prctl_get_name_rc_zero = r_name_get == 0,
+        prctl_get_name_matches = name_matches,
+        waitid_bad_idtype_einval = r_bad_idtype == -1 && er_bad_idtype == libc::EINVAL,
+        waitid_bad_options_einval = r_bad_opts == -1 && er_bad_opts == libc::EINVAL,
+        waitid_running_child_nohang_rc_zero = running_nohang_rc_zero,
+        waitid_running_child_nohang_si_pid_zero = running_nohang_si_pid_zero,
+        waitid_wnowait_peek_rc_zero = peek_rc_zero,
+        waitid_wnowait_peek_si_pid_matches = peek_si_pid_matches,
+        waitid_wnowait_peek_si_code_exited = peek_si_code_exited,
+        waitid_wnowait_peek_si_status_matches = peek_si_status_matches,
         waitid_after_wnowait_reap_clean = reap_ok,
-        waitid_no_children_echild = no_children_echild,
-        waitid_p_pgid_reap_ok = waitid_p_pgid_ok,
+        waitid_no_children_echild = r_none == -1 && er_none == libc::ECHILD,
+        waitid_p_pgid_rc_zero = waitid_p_pgid_rc_zero,
+        waitid_p_pgid_si_pid_matches = waitid_p_pgid_pid_matches,
+        waitid_p_pgid_si_code_exited = waitid_p_pgid_code_exited,
+        waitid_p_pgid_status_matches = waitid_p_pgid_status_matches,
     );
 }
 
