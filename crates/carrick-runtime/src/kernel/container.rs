@@ -1334,4 +1334,79 @@ mod clock_domain_tests {
         let from_std: SignedDuration = Duration::from_secs(5).into();
         assert_eq!(from_std.as_nanos_i64(), Some(5_000_000_000));
     }
+
+    #[test]
+    fn guest_observed_monotonic_under_deterministic_and_scaled() {
+        use crate::vdso_policy::with_optional_vdso_for_clock;
+        use carrick_hal::aarch64_arch::Aarch64GuestArch;
+        use carrick_mem::memory::AddressSpace;
+
+        // 1. Deterministic container
+        let det_clock = ClockDomain::deterministic(UNIX_EPOCH);
+        // Ensure vDSO routes to syscalls
+        let det_space = with_optional_vdso_for_clock::<Aarch64GuestArch>(
+            AddressSpace::from_regions(0, Vec::new()).unwrap(),
+            &det_clock,
+        )
+        .unwrap();
+        let det_vdso = det_space
+            .regions()
+            .iter()
+            .find(|r| r.start == carrick_mem::vdso::LINUX_VDSO_BASE)
+            .unwrap()
+            .bytes()
+            .to_vec();
+        let syscall_bytes = carrick_mem::vdso::vdso_image_bytes_with_clock_syscalls();
+        assert_eq!(
+            &det_vdso[..syscall_bytes.len()],
+            syscall_bytes.as_slice(),
+            "deterministic mode must map syscall-stub vDSO to prevent unscaled hardware counter reads"
+        );
+
+        // Guest reads CLOCK_MONOTONIC via syscall
+        let t0 = det_clock.monotonic_now();
+        assert_eq!(t0, Duration::ZERO);
+        // Sleep on host - monotonic time must not advance
+        std::thread::sleep(Duration::from_millis(5));
+        let t1 = det_clock.monotonic_now();
+        assert_eq!(
+            t1,
+            Duration::ZERO,
+            "deterministic monotonic time must not drift on host time"
+        );
+
+        // Advance virtual time by 500ms
+        det_clock.advance(Duration::from_millis(500)).unwrap();
+        let t2 = det_clock.monotonic_now();
+        assert_eq!(
+            t2,
+            Duration::from_millis(500),
+            "deterministic monotonic time must step by exact advance delta"
+        );
+
+        // 2. Scaled container (10x speedup)
+        let scaled_clock = ClockDomain::scaled(UNIX_EPOCH, 10, 1).unwrap();
+        let scaled_space = with_optional_vdso_for_clock::<Aarch64GuestArch>(
+            AddressSpace::from_regions(0, Vec::new()).unwrap(),
+            &scaled_clock,
+        )
+        .unwrap();
+        let scaled_vdso = scaled_space
+            .regions()
+            .iter()
+            .find(|r| r.start == carrick_mem::vdso::LINUX_VDSO_BASE)
+            .unwrap()
+            .bytes()
+            .to_vec();
+        assert_eq!(
+            &scaled_vdso[..syscall_bytes.len()],
+            syscall_bytes.as_slice(),
+            "scaled mode must map syscall-stub vDSO to prevent unscaled hardware counter reads"
+        );
+        // Timeouts are compressed by 10x
+        assert_eq!(
+            scaled_clock.scale_timeout(Duration::from_secs(10)),
+            Duration::from_secs(1)
+        );
+    }
 }
