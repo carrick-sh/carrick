@@ -8,18 +8,18 @@
 //! (ordered layer blobs + the OCI config). `carrick-runtime` answers *how do I
 //! run this exact process* (it consumes a fully resolved [`RunSpec`] and knows
 //! nothing about images, registries, or docker flags). This crate is the seam
-//! between them: it takes a [`CliRunRequest`] — the loosely-typed, docker-CLI-
+//! between them: it takes a [`RunRequest`] — the loosely-typed, docker-CLI-
 //! shaped bundle of flags and overrides the user typed — resolves the image,
 //! and *merges* the two into a single, fully-specified `RunSpec`. The runtime
-//! never sees a `CliRunRequest`; the CLI never builds a `RunSpec`. All
+//! never sees a `RunRequest`; the CLI never builds a `RunSpec`. All
 //! docker-compatibility merge semantics — the rules for which of image-config
 //! vs. command-line wins — live in exactly one place: [`resolve_run_spec`].
 //!
 //! ## The merge is the whole job, and order matters
 //!
-//! [`resolve_run_spec`] is a deterministic, side-effect-light function (its only
-//! reads of ambient state are `std::env` for bare-`-e KEY` import and the APFS
-//! case-sensitivity probe). It reproduces docker's precedence rules:
+//! [`resolve_run_spec`] is a deterministic, pure function without reads of ambient state
+//! (`host_env` snapshot for bare-`-e KEY` import is explicitly passed).
+//! It reproduces docker's precedence rules:
 //!
 //! * **argv** = effective entrypoint ++ effective command. `--entrypoint`
 //!   overrides the image `Entrypoint` (and `--entrypoint ""`, lowered by the CLI
@@ -31,15 +31,14 @@
 //! * **env** is layered lowest-to-highest: image `Env`, then carrick's baseline
 //!   defaults (`PATH`, `HOME`, `TERM`, `LANG`/`LC_ALL`, `DEBIAN_FRONTEND`,
 //!   `PAGER`) added only where the image left a key *unset*, then `--env`
-//!   overrides last-wins. A bare `-e KEY` (no `=`) imports `KEY` from the *host*
-//!   environment and contributes nothing if the host has it unset — matching
-//!   docker's `-e KEY` / env-file passthrough. The result is sorted for a
+//!   overrides last-wins. A bare `-e KEY` (no `=`) imports `KEY` from the supplied
+//!   `host_env` snapshot and contributes nothing if unset. The result is sorted for a
 //!   stable, reproducible `envp`.
 //! * **cwd** = `--workdir`, else image `WorkingDir`, else `/`.
 //! * **user** = `--user`, else image `User`. Only *numeric* `uid[:gid]` is
 //!   honored; a user/group **name** would require reading the in-image
 //!   `/etc/passwd` (which this layer cannot do — the rootfs is not mounted yet),
-//!   so a name resolves to root with a warning rather than a silent
+//!   so a name resolves to root with a [`ResolveWarning`] rather than a silent
 //!   mis-mapping. `gid` defaults to `0` when only a uid is given, per docker.
 //!
 //! ## Filesystem backend: explicit, else probed
@@ -50,8 +49,7 @@
 //! [`resolve_run_spec`] probes the preferred scratch root for case sensitivity
 //! and picks [`FsBackendKind::Host`] only if the probe passes, falling back to
 //! the in-memory backend (only when the default-off `fs-memory` feature is
-//! compiled in; otherwise host is the only choice). This is the one place the
-//! function touches the filesystem.
+//! compiled in; otherwise host is the only choice).
 //!
 //! ## Platform and the image read-through
 //!
@@ -60,19 +58,15 @@
 //! [`carrick_image::PlatformTarget`] and calls `resolve_with_platform`, so an
 //! amd64 (Rosetta) run pulls and caches the amd64 manifest without disturbing
 //! the native arm64 cache (see the `carrick-image` BTS), then returns the merged
-//! [`RunSpec`] to the caller. Resolving the spec is deliberately kept separate
+//! [`Resolved`] to the caller. Resolving the spec is deliberately kept separate
 //! from executing it: the CLI calls [`carrick_runtime::Runtime::execute`] only
 //! after `resolve` has returned and the async (tokio) image-pull machinery has
 //! been torn down, so no tokio runtime is ever live across the `execute` fork.
 //!
 //! ## What this layer does *not* own
 //!
-//! Several `CliRunRequest` fields are carried but not consumed here. `rm`,
-//! `name`, `stop_signal`, and `stop_timeout` are container-lifecycle concerns
-//! resolved and persisted by the CLI/registry at create time, not run-merge
-//! inputs — they are part of the request shape for a single source of truth, but
-//! [`resolve_run_spec`] ignores them. `interactive`/`tty`/`pid`/`mounts` flow
-//! straight through into the `RunSpec` unchanged. Keeping the merge function
+//! Lifecycle concerns (`rm`, `stop_signal`, `stop_timeout`, `volumes_from`) are
+//! kept outside `RunRequest` in the CLI's `LaunchRequest`. Keeping the merge function
 //! pure of lifecycle bookkeeping is what makes it exhaustively unit-testable
 //! (see the `tests` module: argv/env/workdir/user precedence are pinned there).
 
@@ -94,30 +88,54 @@ pub struct CliNetworkAttachment {
     pub ipv4: Option<String>,
 }
 
+/// One run's inputs, docker-shaped, as every frontend lowers them: the
+/// `carrick` CLI (clap flags), the Docker API server (`carrick serve`) and a
+/// library embedder (`carrick-embed`). [`resolve_run_spec`] merges it over the
+/// resolved image into a [`RunSpec`]; nothing else reads it. `Default` is a
+/// runnable baseline — host network, private pid namespace, HvPatch, `Missing`
+/// pull, no trap limit, docker-shaped streamed stdio — so a caller names only
+/// what it overrides.
+///
+/// Container-lifecycle inputs (`--rm`, `--stop-signal`, `--stop-timeout`,
+/// `--volumes-from`, `-i`) are NOT here: the engine never consumed them, and
+/// the CLI keeps them beside this struct (`LaunchRequest` in `carrick-cli`).
 #[derive(Debug, Clone)]
-pub struct CliRunRequest {
+pub struct RunRequest {
     pub image_ref: String,
-    /// Raw OCI platform string from the CLI (`--platform linux/amd64`), or
-    /// `None` to default to the host-native architecture (see
-    /// [`Platform::host_native`]).
+    /// Raw OCI platform string (`--platform linux/amd64`), or `None` for the
+    /// host-native architecture (see [`Platform::host_native`]).
     pub platform: Option<String>,
+    /// Command override — docker's positional args after the image.
     pub args: Vec<String>,
+    /// `-e KEY=VALUE` / `-e KEY` entries, last-wins. A bare `KEY` imports from
+    /// [`RunRequest::host_env`].
     pub env_overrides: Vec<String>,
+    /// The environment a bare `-e KEY` imports from. The CLI passes a snapshot
+    /// of its own process environment (docker's `-e KEY` semantics); `None`
+    /// imports nothing, so a library host never leaks its environment into a
+    /// guest by accident. The engine never reads `std::env` itself.
+    pub host_env: Option<Vec<(String, String)>>,
     pub mounts: Vec<Mount>,
     pub workdir: Option<String>,
     pub user: Option<String>,
     /// Docker-compatible container hostname / UTS identity.
     pub hostname: Option<String>,
     pub entrypoint_override: Option<Vec<String>>,
+    /// Allocate a pty (`-t`). A pty run streams through the pty and ignores
+    /// `stdio`.
     pub tty: bool,
-    pub interactive: bool,
-    pub rm: bool,
+    /// Where guest fd 1/2 bytes go — see [`StdioMode`]. `Inherit` is the CLI's
+    /// docker-shaped default; library callers typically choose `Captured`.
+    pub stdio: StdioMode,
+    /// Container name. Consumed only in bridge mode, where it becomes the
+    /// container's DNS name and the fallback network-namespace id.
     pub name: Option<String>,
+    /// Guest trap budget; `DEFAULT_MAX_TRAPS` (`usize::MAX`) means unbounded.
     pub max_traps: usize,
     pub debug_state_path: Option<String>,
+    /// Writable-layer backend; `None` probes the shared default.
     pub fs: Option<FsBackendKind>,
-    /// Docker `--pull` policy for image resolution (`always`/`missing`/`never`).
-    /// Defaults to `Missing` (pull only when the image is absent locally).
+    /// Docker `--pull` policy for image resolution. Defaults to `Missing`.
     pub pull: carrick_image::PullPolicy,
     pub exec_backend: carrick_spec::ExecBackendRequest,
     /// PID namespace mode (`docker run --pid`). Defaults to `Private`.
@@ -126,6 +144,13 @@ pub struct CliRunRequest {
     pub network_bridge: Option<String>,
     pub network_container: Option<String>,
     pub network_namespace_id: Option<String>,
+    /// The namespace id a bridge-mode container falls back to when it has no
+    /// `network_namespace_id`, `network_container` or `name`. The CLI mints
+    /// `anon-<pid>` here — once per carrier process, so fork children share
+    /// it. The engine never asks for the host pid itself: an embedder running
+    /// several unnamed bridge containers in one process must give each its
+    /// own id, and a bridge request with no id source at all is an error.
+    pub bridge_namespace_id: Option<String>,
     pub network_attachments: Vec<CliNetworkAttachment>,
     pub network_ipv4: Option<String>,
     pub network_aliases: Vec<String>,
@@ -133,25 +158,77 @@ pub struct CliRunRequest {
     pub dns_servers: Vec<String>,
     pub dns_search: Vec<String>,
     pub dns_options: Vec<String>,
-    pub volumes_from: Vec<String>,
     pub published_ports: Vec<PortMapping>,
-    /// Raw `--stop-signal` value (e.g. `SIGQUIT`/`9`), or `None` to fall back to
-    /// the image's OCI `STOPSIGNAL`. Resolved to a host signum at create time
-    /// and persisted in the container's `RunConfig`; the engine itself does not
-    /// consume it (stop/restart read it from the registry).
-    pub stop_signal: Option<String>,
-    /// `--stop-timeout` in seconds (graceful-stop window before SIGKILL), or
-    /// `None` for the default. Persisted in the container's `RunConfig`.
-    pub stop_timeout: Option<u64>,
     /// Raw `--security-opt` values (docker syntax). Resolved by
     /// [`resolve_seccomp_policy`] over the `carrick run` default
-    /// ([`SeccompPolicy::ContainerDefault`], docker's own default); persisted
-    /// in the container's `RunConfig` so start/restart/exec keep the policy.
+    /// ([`SeccompPolicy::ContainerDefault`], docker's own default).
     pub security_opts: Vec<String>,
-    /// Docker-compatible `--cap-add` names (no `CAP_` prefix). Persisted with
-    /// the container's `RunConfig` so start/restart/exec keep the grant, the
-    /// same lifetime rule as `security_opts`.
+    /// Docker-compatible `--cap-add` names (no `CAP_` prefix), the same
+    /// lifetime rule as `security_opts`.
     pub cap_add: Vec<String>,
+}
+
+/// Hand-written rather than derived: a derived `Default` would set
+/// `max_traps` to `0`, which trips the trap limit on the first syscall.
+impl Default for RunRequest {
+    fn default() -> Self {
+        Self {
+            image_ref: String::new(),
+            platform: None,
+            args: Vec::new(),
+            env_overrides: Vec::new(),
+            host_env: None,
+            mounts: Vec::new(),
+            workdir: None,
+            user: None,
+            hostname: None,
+            entrypoint_override: None,
+            tty: false,
+            stdio: StdioMode::default(),
+            name: None,
+            max_traps: carrick_runtime::runtime::DEFAULT_MAX_TRAPS,
+            debug_state_path: None,
+            fs: None,
+            pull: carrick_image::PullPolicy::default(),
+            exec_backend: carrick_spec::ExecBackendRequest::default(),
+            pid: PidMode::default(),
+            network: NetworkMode::default(),
+            network_bridge: None,
+            network_container: None,
+            network_namespace_id: None,
+            bridge_namespace_id: None,
+            network_attachments: Vec::new(),
+            network_ipv4: None,
+            network_aliases: Vec::new(),
+            extra_hosts: Vec::new(),
+            dns_servers: Vec::new(),
+            dns_search: Vec::new(),
+            dns_options: Vec::new(),
+            published_ports: Vec::new(),
+            security_opts: Vec::new(),
+            cap_add: Vec::new(),
+        }
+    }
+}
+
+/// A merge decision the caller should surface but that does not fail the
+/// run — today only "named `--user` fell back to root". The engine never
+/// prints; the CLI writes these to stderr, a library caller inspects them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveWarning(pub String);
+
+impl std::fmt::Display for ResolveWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// [`resolve_run_spec`]'s result: the fully merged spec plus the warnings the
+/// merge produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolved {
+    pub spec: RunSpec,
+    pub warnings: Vec<ResolveWarning>,
 }
 
 /// Resolve docker-syntax `--security-opt` values (last-wins) onto a
@@ -196,7 +273,7 @@ pub fn resolve_seccomp_policy(
 /// absent or unrecognised — so `carrick run <image>` with no `--platform`
 /// targets the ISA this host runs without translation (arm64 on Apple Silicon,
 /// amd64 on the x86_64 lanes).
-pub fn request_platform(req: &CliRunRequest) -> Platform {
+pub fn request_platform(req: &RunRequest) -> Platform {
     req.platform
         .as_deref()
         .and_then(Platform::from_oci_str)
@@ -239,7 +316,7 @@ pub fn check_platform_runnable(platform: Platform) -> Result<(), String> {
     }
 }
 
-pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunSpec, String> {
+pub fn resolve_run_spec(req: RunRequest, image: ResolvedImage) -> Result<Resolved, String> {
     let platform = request_platform(&req);
 
     // 1. Resolve argv (entrypoint + cmd overrides)
@@ -294,15 +371,23 @@ pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunS
     }
 
     // Add env overrides (last-wins). A bare `KEY` (no `=`) imports the value
-    // from the HOST environment, matching docker's `-e KEY` / env-file semantics;
-    // an unset host var contributes nothing (docker drops it too).
+    // from the caller-supplied host-environment snapshot, matching docker's
+    // `-e KEY` / env-file semantics; a key absent there — or no snapshot at
+    // all — contributes nothing (docker drops it too). The engine never reads
+    // `std::env`: the frontend decides what, if anything, leaks in.
     for entry in &req.env_overrides {
         match entry.split_once('=') {
             Some((k, v)) => {
                 env_map.insert(k.to_string(), v.to_string());
             }
             None => {
-                if let Ok(v) = std::env::var(entry) {
+                let imported = req
+                    .host_env
+                    .iter()
+                    .flatten()
+                    .find(|(key, _)| key == entry)
+                    .map(|(_, value)| value.clone());
+                if let Some(v) = imported {
                     env_map.insert(entry.to_string(), v);
                 }
             }
@@ -340,16 +425,19 @@ pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunS
 
     // 4. Resolve user (`--user` overrides image USER). Numeric `uid[:gid]` only;
     // a user/group NAME needs in-image /etc/passwd resolution (not yet
-    // supported), so warn and run as root rather than silently mis-mapping.
+    // supported), so record a warning and run as root rather than silently
+    // mis-mapping. The warning is returned, never printed: the CLI relays it
+    // to stderr, a library caller reads `Resolved::warnings`.
+    let mut warnings = Vec::new();
     let (uid, gid) = match req.user.clone().or_else(|| image.config.user.clone()) {
         None => (carrick_abi::NsUid::ROOT, carrick_abi::NsGid::ROOT),
         Some(s) if s.is_empty() => (carrick_abi::NsUid::ROOT, carrick_abi::NsGid::ROOT),
         Some(s) => match parse_numeric_user(&s) {
             Some((u, g)) => (u, g),
             None => {
-                eprintln!(
-                    "carrick: --user {s:?}: name resolution is not yet supported; running as root (use a numeric uid[:gid])"
-                );
+                warnings.push(ResolveWarning(format!(
+                    "--user {s:?}: name resolution is not yet supported; running as root (use a numeric uid[:gid])"
+                )));
                 (carrick_abi::NsUid::ROOT, carrick_abi::NsGid::ROOT)
             }
         },
@@ -400,12 +488,22 @@ pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunS
                 }
                 spec.attachments = attachments;
             }
+            // The engine never samples the host pid: an unnamed container's
+            // fallback id is an explicit input (`anon-<pid>` from the CLI, a
+            // per-container id from an embedder). No source at all is an error
+            // rather than a silently shared namespace.
             let namespace_id = req
                 .network_namespace_id
                 .clone()
                 .or_else(|| req.network_container.clone())
                 .or_else(|| req.name.clone())
-                .unwrap_or_else(|| format!("anon-{}", std::process::id()));
+                .or_else(|| req.bridge_namespace_id.clone())
+                .ok_or_else(|| {
+                    "bridge networking needs a namespace id: name the container, set \
+                     `network_namespace_id`/`network_container`, or supply \
+                     `bridge_namespace_id`"
+                        .to_string()
+                })?;
             spec.namespace_id = Some(NetworkNamespaceId::new(namespace_id));
             spec
         }
@@ -436,7 +534,7 @@ pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunS
     let seccomp_policy =
         resolve_seccomp_policy(SeccompPolicy::ContainerDefault, &req.security_opts)?;
 
-    Ok(RunSpec {
+    let spec = RunSpec {
         cap_add: req.cap_add.clone(),
         executable,
         argv,
@@ -446,8 +544,7 @@ pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunS
         fs_backend,
         mounts: req.mounts,
         tty: req.tty,
-        // Docker-shaped streaming until `RunRequest.stdio` lands (next commit).
-        stdio: StdioMode::Inherit,
+        stdio: req.stdio,
         max_traps: req.max_traps,
         debug_state_path,
         platform,
@@ -459,7 +556,8 @@ pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunS
         uid,
         gid,
         seccomp_policy,
-    })
+    };
+    Ok(Resolved { spec, warnings })
 }
 
 /// Parse a user-supplied bridge address (`--ip`, or a per-attachment
@@ -513,14 +611,13 @@ impl Engine {
         Self { store }
     }
 
-    /// Resolve a run request to a `RunSpec`: parse the image ref, pull/resolve
-    /// the image for the target platform, and merge into a fully-specified spec.
-    /// This is the ONLY async part of a run — it does NOT execute, so no fork
-    /// happens here and it is safe to drive inside a tokio runtime. The caller
-    /// drops the runtime (joining its blocking pool in the parent) BEFORE
-    /// calling `carrick_runtime::Runtime::execute`, so tokio is never alive
-    /// across a fork.
-    pub async fn resolve(&self, req: CliRunRequest) -> Result<RunSpec, anyhow::Error> {
+    /// Resolve a run request: parse the image ref, pull/resolve the image for
+    /// the target platform, and merge into a fully-specified [`Resolved`]
+    /// (spec + warnings). This is the ONLY async part of a run — the image
+    /// store awaits `tokio::fs` and the registry client — and it does NOT
+    /// execute. The CLI drives it on a throwaway current-thread runtime that it
+    /// drops before `carrick_runtime::Runtime::execute` (`block_on_oci`).
+    pub async fn resolve(&self, req: RunRequest) -> Result<Resolved, anyhow::Error> {
         let image_ref = carrick_spec::ImageReference::parse(&req.image_ref)
             .map_err(|e| anyhow::anyhow!("invalid image reference: {}", e))?;
 
@@ -573,45 +670,107 @@ mod tests {
         }
     }
 
-    fn base_req(user: Option<&str>) -> CliRunRequest {
-        CliRunRequest {
-            cap_add: Vec::new(),
+    fn base_req(user: Option<&str>) -> RunRequest {
+        RunRequest {
             image_ref: "alpine".to_string(),
-            platform: None,
             args: vec!["/bin/ls".to_string()],
-            env_overrides: vec![],
-            mounts: vec![],
-            workdir: None,
             user: user.map(|s| s.to_string()),
-            hostname: None,
-            entrypoint_override: None,
-            tty: false,
-            interactive: false,
-            rm: false,
-            name: None,
             max_traps: 100,
-            debug_state_path: None,
             fs: Some(FsBackendKind::Host),
-            pull: carrick_image::PullPolicy::Missing,
-            exec_backend: carrick_spec::ExecBackendRequest::HvPatch,
-            pid: PidMode::default(),
-            network: NetworkMode::Host,
-            network_bridge: None,
-            network_container: None,
-            network_namespace_id: None,
-            network_attachments: Vec::new(),
-            network_ipv4: None,
-            network_aliases: Vec::new(),
-            extra_hosts: Vec::new(),
-            dns_servers: Vec::new(),
-            dns_search: Vec::new(),
-            dns_options: Vec::new(),
-            volumes_from: Vec::new(),
-            published_ports: Vec::new(),
-            stop_signal: None,
-            stop_timeout: None,
-            security_opts: Vec::new(),
+            // What the CLI always supplies; the bridge tests rely on it.
+            bridge_namespace_id: Some("anon-test".to_string()),
+            ..RunRequest::default()
         }
+    }
+
+    /// The merged spec alone, for tests that pin precedence rules and do not
+    /// care about warnings.
+    fn spec_of(req: RunRequest, image: ResolvedImage) -> Result<RunSpec, String> {
+        super::resolve_run_spec(req, image).map(|resolved| resolved.spec)
+    }
+
+    /// The request the parity pin merges. Every field that reaches the spec is
+    /// set to a non-default value except the network mode (bridge lowering
+    /// derives addresses from a name hash and is pinned by its own tests).
+    fn parity_request() -> RunRequest {
+        RunRequest {
+            image_ref: "alpine".to_string(),
+            args: vec!["/bin/ls".to_string(), "-l".to_string()],
+            env_overrides: vec!["CUSTOM=2".to_string()],
+            mounts: vec![Mount {
+                source: Utf8PathBuf::from("/h"),
+                target: Utf8PathBuf::from("/g"),
+                readonly: true,
+            }],
+            workdir: Some("/app".to_string()),
+            user: Some("1000:2000".to_string()),
+            hostname: Some("api-host".to_string()),
+            max_traps: 100,
+            debug_state_path: Some("/tmp/state".to_string()),
+            fs: Some(FsBackendKind::Host),
+            extra_hosts: vec!["db.local:10.12.0.7".to_string()],
+            dns_servers: vec!["1.1.1.1".to_string()],
+            dns_search: vec!["example.test".to_string()],
+            dns_options: vec!["ndots:2".to_string()],
+            security_opts: vec!["seccomp=unconfined".to_string()],
+            cap_add: vec!["SYS_PTRACE".to_string()],
+            ..RunRequest::default()
+        }
+    }
+
+    /// Hand-derived from `resolve_run_spec` at the pre-rename revision: args
+    /// override the image cmd, baseline env plus the override sorted, absolute
+    /// workdir verbatim, numeric uid:gid, dns fields set on the host-mode
+    /// namespace spec, `seccomp=unconfined` opting out.
+    fn parity_expected() -> RunSpec {
+        RunSpec {
+            executable: "/bin/ls".to_string(),
+            argv: vec!["/bin/ls".to_string(), "-l".to_string()],
+            envp: vec![
+                "CUSTOM=2".to_string(),
+                "DEBIAN_FRONTEND=noninteractive".to_string(),
+                "HOME=/root".to_string(),
+                "LANG=C.UTF-8".to_string(),
+                "LC_ALL=C.UTF-8".to_string(),
+                "PAGER=cat".to_string(),
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+                "TERM=xterm-256color".to_string(),
+            ],
+            cwd: Some(Utf8PathBuf::from("/app")),
+            rootfs_layers: vec![Utf8PathBuf::from("/layer1")],
+            fs_backend: FsBackendKind::Host,
+            mounts: vec![Mount {
+                source: Utf8PathBuf::from("/h"),
+                target: Utf8PathBuf::from("/g"),
+                readonly: true,
+            }],
+            tty: false,
+            stdio: StdioMode::Inherit,
+            max_traps: 100,
+            debug_state_path: Some(Utf8PathBuf::from("/tmp/state")),
+            platform: Platform::host_native(),
+            exec_backend: carrick_spec::ExecBackendRequest::HvPatch,
+            pid: PidMode::Private,
+            hostname: Some("api-host".to_string()),
+            network: NetworkNamespaceSpec {
+                dns_servers: vec!["1.1.1.1".parse::<std::net::IpAddr>().expect("ip")],
+                dns_search: vec!["example.test".to_string()],
+                dns_options: vec!["ndots:2".to_string()],
+                ..NetworkNamespaceSpec::default()
+            },
+            extra_hosts: vec!["db.local:10.12.0.7".to_string()],
+            uid: carrick_abi::NsUid::new(1000),
+            gid: carrick_abi::NsGid::new(2000),
+            seccomp_policy: SeccompPolicy::Unconfined,
+            cap_add: vec!["SYS_PTRACE".to_string()],
+        }
+    }
+
+    #[test]
+    fn resolve_run_spec_parity_pin() {
+        let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
+        let resolved = resolve_run_spec(parity_request(), image).expect("resolve");
+        assert_eq!(resolved.spec, parity_expected());
     }
 
     #[test]
@@ -620,7 +779,7 @@ mod tests {
         req.exec_backend = carrick_spec::ExecBackendRequest::HvPatch;
 
         let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
-        let spec = resolve_run_spec(req, image).expect("resolve run spec");
+        let spec = spec_of(req, image).expect("resolve run spec");
 
         assert_eq!(spec.exec_backend, carrick_spec::ExecBackendRequest::HvPatch);
     }
@@ -639,7 +798,7 @@ mod tests {
             protocol: carrick_spec::PortProtocol::Tcp,
         }];
 
-        let spec = resolve_run_spec(req, image).expect("resolve run spec");
+        let spec = spec_of(req, image).expect("resolve run spec");
         assert_eq!(spec.network.mode, NetworkMode::Bridge);
         assert_eq!(spec.network.container_name.as_deref(), Some("web"));
         assert_eq!(spec.network.aliases, vec!["api"]);
@@ -654,7 +813,7 @@ mod tests {
         req.network = NetworkMode::Bridge;
         req.network_ipv4 = Some("172.31.44.10".to_string());
 
-        let spec = resolve_run_spec(req, image).expect("resolve run spec");
+        let spec = spec_of(req, image).expect("resolve run spec");
 
         assert_eq!(spec.network.mode, NetworkMode::Bridge);
         assert_eq!(spec.network.ipv4.to_string(), "172.31.44.10");
@@ -673,7 +832,7 @@ mod tests {
             req.network = NetworkMode::Bridge;
             req.network_ipv4 = Some(pinned.to_string());
 
-            let error = resolve_run_spec(req, image).expect_err("must reject the reserved /24");
+            let error = spec_of(req, image).expect_err("must reject the reserved /24");
             assert!(
                 error.contains("172.31.0.0/24"),
                 "error must name the reserved range: {error}"
@@ -687,7 +846,7 @@ mod tests {
         req.network = NetworkMode::Bridge;
         req.network_ipv4 = Some("172.31.1.2".to_string());
         assert_eq!(
-            resolve_run_spec(req, image)
+            spec_of(req, image)
                 .expect("172.31.1.2 is allocatable")
                 .network
                 .ipv4
@@ -700,7 +859,7 @@ mod tests {
         req.network = NetworkMode::Bridge;
         req.network_ipv4 = Some("not-an-address".to_string());
         assert!(
-            resolve_run_spec(req, image)
+            spec_of(req, image)
                 .expect_err("invalid address")
                 .contains("invalid IPv4 address")
         );
@@ -712,7 +871,7 @@ mod tests {
         let mut req = base_req(None);
         req.extra_hosts = vec!["db.local:10.12.0.7".to_string()];
 
-        let spec = resolve_run_spec(req, image).expect("resolve run spec");
+        let spec = spec_of(req, image).expect("resolve run spec");
         assert_eq!(spec.extra_hosts, vec!["db.local:10.12.0.7"]);
     }
 
@@ -722,7 +881,7 @@ mod tests {
         let mut req = base_req(None);
         req.hostname = Some("api-host".to_string());
 
-        let spec = resolve_run_spec(req, image).expect("resolve run spec");
+        let spec = spec_of(req, image).expect("resolve run spec");
         assert_eq!(spec.hostname.as_deref(), Some("api-host"));
     }
 
@@ -734,7 +893,7 @@ mod tests {
         req.dns_search = vec!["example.test".to_string()];
         req.dns_options = vec!["ndots:2".to_string()];
 
-        let spec = resolve_run_spec(req, image).expect("resolve run spec");
+        let spec = spec_of(req, image).expect("resolve run spec");
         assert_eq!(
             spec.network.dns_servers,
             vec![
@@ -749,7 +908,7 @@ mod tests {
     #[test]
     fn user_numeric_uid_and_gid() {
         let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
-        let spec = resolve_run_spec(base_req(Some("1000:2000")), image).unwrap();
+        let spec = spec_of(base_req(Some("1000:2000")), image).unwrap();
         assert_eq!(
             (spec.uid, spec.gid),
             (carrick_abi::NsUid::new(1000), carrick_abi::NsGid::new(2000))
@@ -760,7 +919,7 @@ mod tests {
     fn user_numeric_uid_defaults_gid_zero() {
         // docker: `--user 1000` with no group → gid 0.
         let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
-        let spec = resolve_run_spec(base_req(Some("1000")), image).unwrap();
+        let spec = spec_of(base_req(Some("1000")), image).unwrap();
         assert_eq!(
             (spec.uid, spec.gid),
             (carrick_abi::NsUid::new(1000), carrick_abi::NsGid::ROOT)
@@ -771,28 +930,10 @@ mod tests {
     fn user_absent_defaults_root() {
         // No --user; the test image's USER is the name "root" (unresolved) → root.
         let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
-        let spec = resolve_run_spec(base_req(None), image).unwrap();
+        let spec = spec_of(base_req(None), image).unwrap();
         assert_eq!(
             (spec.uid, spec.gid),
             (carrick_abi::NsUid::ROOT, carrick_abi::NsGid::ROOT)
-        );
-    }
-
-    #[test]
-    fn bare_env_key_imports_host_value() {
-        // SAFETY: test setup; the unique key avoids racing other tests' env.
-        unsafe { std::env::set_var("CARRICK_TEST_IMPORT_XYZ", "from-host") };
-        let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
-        let mut req = base_req(None);
-        req.env_overrides = vec!["CARRICK_TEST_IMPORT_XYZ".to_string()];
-        let spec = resolve_run_spec(req, image).unwrap();
-        unsafe { std::env::remove_var("CARRICK_TEST_IMPORT_XYZ") };
-        assert!(
-            spec.envp
-                .iter()
-                .any(|e| e == "CARRICK_TEST_IMPORT_XYZ=from-host"),
-            "bare `-e KEY` should import the host value; envp={:?}",
-            spec.envp
         );
     }
 
@@ -809,7 +950,7 @@ mod tests {
         let mut req = base_req(None);
         req.entrypoint_override = Some(vec![]);
         req.args = vec![];
-        let spec = resolve_run_spec(req, image).unwrap();
+        let spec = spec_of(req, image).unwrap();
         assert_eq!(spec.argv, vec!["echo", "hi"]);
     }
 
@@ -821,45 +962,9 @@ mod tests {
             vec![],
             None,
         );
-        let req = CliRunRequest {
-            cap_add: Vec::new(),
-            image_ref: "alpine".to_string(),
-            platform: None,
-            args: vec![],
-            env_overrides: vec![],
-            mounts: vec![],
-            workdir: None,
-            user: None,
-            hostname: None,
-            entrypoint_override: None,
-            tty: false,
-            interactive: false,
-            rm: false,
-            name: None,
-            max_traps: 100,
-            debug_state_path: None,
-            fs: Some(FsBackendKind::Host),
-            pull: carrick_image::PullPolicy::Missing,
-            exec_backend: carrick_spec::ExecBackendRequest::HvPatch,
-            pid: PidMode::default(),
-            network: NetworkMode::Host,
-            network_bridge: None,
-            network_container: None,
-            network_namespace_id: None,
-            network_attachments: Vec::new(),
-            network_ipv4: None,
-            network_aliases: Vec::new(),
-            extra_hosts: Vec::new(),
-            dns_servers: Vec::new(),
-            dns_search: Vec::new(),
-            dns_options: Vec::new(),
-            volumes_from: Vec::new(),
-            published_ports: Vec::new(),
-            stop_signal: None,
-            stop_timeout: None,
-            security_opts: Vec::new(),
-        };
-        let spec = resolve_run_spec(req, image).unwrap();
+        let mut req = base_req(None);
+        req.args = vec![];
+        let spec = spec_of(req, image).unwrap();
         assert_eq!(spec.executable, "/bin/sh");
         assert_eq!(spec.argv, vec!["/bin/sh", "-c", "echo hi"]);
     }
@@ -872,45 +977,8 @@ mod tests {
             vec![],
             None,
         );
-        let req = CliRunRequest {
-            cap_add: Vec::new(),
-            image_ref: "alpine".to_string(),
-            platform: None,
-            args: vec!["/bin/ls".to_string()],
-            env_overrides: vec![],
-            mounts: vec![],
-            workdir: None,
-            user: None,
-            hostname: None,
-            entrypoint_override: None,
-            tty: false,
-            interactive: false,
-            rm: false,
-            name: None,
-            max_traps: 100,
-            debug_state_path: None,
-            fs: Some(FsBackendKind::Host),
-            pull: carrick_image::PullPolicy::Missing,
-            exec_backend: carrick_spec::ExecBackendRequest::HvPatch,
-            pid: PidMode::default(),
-            network: NetworkMode::Host,
-            network_bridge: None,
-            network_container: None,
-            network_namespace_id: None,
-            network_attachments: Vec::new(),
-            network_ipv4: None,
-            network_aliases: Vec::new(),
-            extra_hosts: Vec::new(),
-            dns_servers: Vec::new(),
-            dns_search: Vec::new(),
-            dns_options: Vec::new(),
-            volumes_from: Vec::new(),
-            published_ports: Vec::new(),
-            stop_signal: None,
-            stop_timeout: None,
-            security_opts: Vec::new(),
-        };
-        let spec = resolve_run_spec(req, image).unwrap();
+        let req = base_req(None);
+        let spec = spec_of(req, image).unwrap();
         assert_eq!(spec.argv, vec!["/bin/sh", "/bin/ls"]);
     }
 
@@ -922,45 +990,10 @@ mod tests {
             vec![],
             None,
         );
-        let req = CliRunRequest {
-            cap_add: Vec::new(),
-            image_ref: "alpine".to_string(),
-            platform: None,
-            args: vec![],
-            env_overrides: vec![],
-            mounts: vec![],
-            workdir: None,
-            user: None,
-            hostname: None,
-            entrypoint_override: Some(vec!["/bin/bash".to_string()]),
-            tty: false,
-            interactive: false,
-            rm: false,
-            name: None,
-            max_traps: 100,
-            debug_state_path: None,
-            fs: Some(FsBackendKind::Host),
-            pull: carrick_image::PullPolicy::Missing,
-            exec_backend: carrick_spec::ExecBackendRequest::HvPatch,
-            pid: PidMode::default(),
-            network: NetworkMode::Host,
-            network_bridge: None,
-            network_container: None,
-            network_namespace_id: None,
-            network_attachments: Vec::new(),
-            network_ipv4: None,
-            network_aliases: Vec::new(),
-            extra_hosts: Vec::new(),
-            dns_servers: Vec::new(),
-            dns_search: Vec::new(),
-            dns_options: Vec::new(),
-            volumes_from: Vec::new(),
-            published_ports: Vec::new(),
-            stop_signal: None,
-            stop_timeout: None,
-            security_opts: Vec::new(),
-        };
-        let spec = resolve_run_spec(req, image).unwrap();
+        let mut req = base_req(None);
+        req.args = vec![];
+        req.entrypoint_override = Some(vec!["/bin/bash".to_string()]);
+        let spec = spec_of(req, image).unwrap();
         assert_eq!(spec.argv, vec!["/bin/bash", "-c", "echo hi"]);
     }
 
@@ -972,45 +1005,9 @@ mod tests {
             vec!["PATH=/image/bin".to_string(), "CUSTOM=1".to_string()],
             None,
         );
-        let req = CliRunRequest {
-            cap_add: Vec::new(),
-            image_ref: "alpine".to_string(),
-            platform: None,
-            args: vec!["/bin/ls".to_string()],
-            env_overrides: vec!["CUSTOM=2".to_string(), "USER_VAR=yes".to_string()],
-            mounts: vec![],
-            workdir: None,
-            user: None,
-            hostname: None,
-            entrypoint_override: None,
-            tty: false,
-            interactive: false,
-            rm: false,
-            name: None,
-            max_traps: 100,
-            debug_state_path: None,
-            fs: Some(FsBackendKind::Host),
-            pull: carrick_image::PullPolicy::Missing,
-            exec_backend: carrick_spec::ExecBackendRequest::HvPatch,
-            pid: PidMode::default(),
-            network: NetworkMode::Host,
-            network_bridge: None,
-            network_container: None,
-            network_namespace_id: None,
-            network_attachments: Vec::new(),
-            network_ipv4: None,
-            network_aliases: Vec::new(),
-            extra_hosts: Vec::new(),
-            dns_servers: Vec::new(),
-            dns_search: Vec::new(),
-            dns_options: Vec::new(),
-            volumes_from: Vec::new(),
-            published_ports: Vec::new(),
-            stop_signal: None,
-            stop_timeout: None,
-            security_opts: Vec::new(),
-        };
-        let spec = resolve_run_spec(req, image).unwrap();
+        let mut req = base_req(None);
+        req.env_overrides = vec!["CUSTOM=2".to_string(), "USER_VAR=yes".to_string()];
+        let spec = spec_of(req, image).unwrap();
 
         let env_map: HashMap<String, String> = spec
             .envp
@@ -1031,45 +1028,9 @@ mod tests {
     #[test]
     fn test_merge_workdir() {
         let image = make_test_image(None, None, vec![], Some(Utf8PathBuf::from("/image/app")));
-        let req = CliRunRequest {
-            cap_add: Vec::new(),
-            image_ref: "alpine".to_string(),
-            platform: None,
-            args: vec!["/bin/ls".to_string()],
-            env_overrides: vec![],
-            mounts: vec![],
-            workdir: Some("/user/app".to_string()),
-            user: None,
-            hostname: None,
-            entrypoint_override: None,
-            tty: false,
-            interactive: false,
-            rm: false,
-            name: None,
-            max_traps: 100,
-            debug_state_path: None,
-            fs: Some(FsBackendKind::Host),
-            pull: carrick_image::PullPolicy::Missing,
-            exec_backend: carrick_spec::ExecBackendRequest::HvPatch,
-            pid: PidMode::default(),
-            network: NetworkMode::Host,
-            network_bridge: None,
-            network_container: None,
-            network_namespace_id: None,
-            network_attachments: Vec::new(),
-            network_ipv4: None,
-            network_aliases: Vec::new(),
-            extra_hosts: Vec::new(),
-            dns_servers: Vec::new(),
-            dns_search: Vec::new(),
-            dns_options: Vec::new(),
-            volumes_from: Vec::new(),
-            published_ports: Vec::new(),
-            stop_signal: None,
-            stop_timeout: None,
-            security_opts: Vec::new(),
-        };
-        let spec = resolve_run_spec(req, image).unwrap();
+        let mut req = base_req(None);
+        req.workdir = Some("/user/app".to_string());
+        let spec = spec_of(req, image).unwrap();
         assert_eq!(spec.cwd.unwrap().as_str(), "/user/app");
     }
 
@@ -1079,49 +1040,9 @@ mod tests {
         // semantics), not `/`; an absolute one still wins verbatim.
         let mk = |img_wd: Option<&str>, wd: Option<&str>| {
             let image = make_test_image(None, None, vec![], img_wd.map(Utf8PathBuf::from));
-            let req = CliRunRequest {
-                cap_add: Vec::new(),
-                image_ref: "alpine".to_string(),
-                platform: None,
-                args: vec!["/bin/ls".to_string()],
-                env_overrides: vec![],
-                mounts: vec![],
-                workdir: wd.map(|s| s.to_string()),
-                user: None,
-                hostname: None,
-                entrypoint_override: None,
-                tty: false,
-                interactive: false,
-                rm: false,
-                name: None,
-                max_traps: 100,
-                debug_state_path: None,
-                fs: Some(FsBackendKind::Host),
-                pull: carrick_image::PullPolicy::Missing,
-                exec_backend: carrick_spec::ExecBackendRequest::HvPatch,
-                pid: PidMode::default(),
-                network: NetworkMode::Host,
-                network_bridge: None,
-                network_container: None,
-                network_namespace_id: None,
-                network_attachments: Vec::new(),
-                network_ipv4: None,
-                network_aliases: Vec::new(),
-                extra_hosts: Vec::new(),
-                dns_servers: Vec::new(),
-                dns_search: Vec::new(),
-                dns_options: Vec::new(),
-                volumes_from: Vec::new(),
-                published_ports: Vec::new(),
-                stop_signal: None,
-                stop_timeout: None,
-                security_opts: Vec::new(),
-            };
-            resolve_run_spec(req, image)
-                .unwrap()
-                .cwd
-                .unwrap()
-                .to_string()
+            let mut req = base_req(None);
+            req.workdir = wd.map(|s| s.to_string());
+            spec_of(req, image).unwrap().cwd.unwrap().to_string()
         };
         // relative joins onto the image WorkingDir (the go-conformance case)
         assert_eq!(
@@ -1139,7 +1060,7 @@ mod tests {
         // `carrick run` with no --security-opt models docker's default
         // launch-time seccomp profile.
         let image = make_test_image(None, None, vec![], None);
-        let spec = resolve_run_spec(base_req(None), image).unwrap();
+        let spec = spec_of(base_req(None), image).unwrap();
         assert_eq!(spec.seccomp_policy, SeccompPolicy::ContainerDefault);
     }
 
@@ -1148,7 +1069,7 @@ mod tests {
         let image = make_test_image(None, None, vec![], None);
         let mut req = base_req(None);
         req.security_opts = vec!["seccomp=unconfined".to_string()];
-        let spec = resolve_run_spec(req, image).unwrap();
+        let spec = spec_of(req, image).unwrap();
         assert_eq!(spec.seccomp_policy, SeccompPolicy::Unconfined);
     }
 
@@ -1228,5 +1149,124 @@ mod tests {
         let err = check_platform_runnable(Platform::Aarch64)
             .expect_err("arm64 guest on x86_64 host must be rejected");
         assert!(err.contains("not supported"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn run_request_default_is_a_runnable_docker_shaped_baseline() {
+        let d = RunRequest::default();
+        assert_eq!(d.max_traps, carrick_runtime::runtime::DEFAULT_MAX_TRAPS);
+        assert_eq!(d.pull, carrick_image::PullPolicy::Missing);
+        assert_eq!(d.exec_backend, carrick_spec::ExecBackendRequest::HvPatch);
+        assert_eq!(d.pid, PidMode::Private);
+        assert_eq!(d.network, NetworkMode::Host);
+        assert_eq!(d.stdio, StdioMode::Inherit);
+        assert!(d.fs.is_none(), "fs is probed when unset");
+        assert!(
+            d.host_env.is_none(),
+            "a library host imports nothing by default"
+        );
+        assert!(d.bridge_namespace_id.is_none());
+        assert!(d.image_ref.is_empty() && d.args.is_empty());
+    }
+
+    #[test]
+    fn stdio_mode_flows_from_request_into_run_spec() {
+        let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
+        let mut req = base_req(None);
+        req.stdio = StdioMode::Captured;
+        assert_eq!(
+            spec_of(req, image).expect("resolve").stdio,
+            StdioMode::Captured
+        );
+    }
+
+    #[test]
+    fn bare_env_key_imports_from_the_host_env_snapshot() {
+        let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
+        let mut req = base_req(None);
+        req.env_overrides = vec!["CARRICK_TEST_IMPORT_XYZ".to_string()];
+        req.host_env = Some(vec![(
+            "CARRICK_TEST_IMPORT_XYZ".to_string(),
+            "from-host".to_string(),
+        )]);
+        let spec = spec_of(req, image).expect("resolve");
+        assert!(
+            spec.envp
+                .iter()
+                .any(|e| e == "CARRICK_TEST_IMPORT_XYZ=from-host"),
+            "bare `-e KEY` imports from the snapshot; envp={:?}",
+            spec.envp
+        );
+    }
+
+    #[test]
+    fn bare_env_key_without_a_host_env_imports_nothing() {
+        // The process env is set ON PURPOSE: the engine must not read it when
+        // no snapshot is supplied.
+        // SAFETY: test setup; unique key so no other test races it.
+        unsafe { std::env::set_var("CARRICK_TEST_NO_IMPORT_XYZ", "leaked") };
+        let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
+        let mut req = base_req(None);
+        req.env_overrides = vec!["CARRICK_TEST_NO_IMPORT_XYZ".to_string()];
+        req.host_env = None;
+        let spec = spec_of(req, image).expect("resolve");
+        // SAFETY: test teardown of the key set above.
+        unsafe { std::env::remove_var("CARRICK_TEST_NO_IMPORT_XYZ") };
+        assert!(
+            !spec
+                .envp
+                .iter()
+                .any(|e| e.starts_with("CARRICK_TEST_NO_IMPORT_XYZ=")),
+            "engine read std::env; envp={:?}",
+            spec.envp
+        );
+    }
+
+    #[test]
+    fn unnamed_bridge_container_needs_an_explicit_bridge_namespace_id() {
+        let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
+        let mut req = base_req(None);
+        req.network = NetworkMode::Bridge;
+        req.bridge_namespace_id = None;
+        let err = resolve_run_spec(req, image).expect_err("no namespace-id source");
+        assert!(err.contains("bridge_namespace_id"), "{err}");
+
+        let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
+        let mut req = base_req(None);
+        req.network = NetworkMode::Bridge;
+        req.bridge_namespace_id = Some("anon-4242".to_string());
+        let spec = spec_of(req, image).expect("explicit id");
+        assert_eq!(
+            spec.network
+                .namespace_id
+                .as_ref()
+                .map(NetworkNamespaceId::as_str),
+            Some("anon-4242")
+        );
+    }
+
+    #[test]
+    fn named_user_becomes_a_typed_warning_not_stderr() {
+        let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
+        let resolved = resolve_run_spec(base_req(Some("nobody")), image).expect("resolve");
+        assert_eq!(
+            (resolved.spec.uid, resolved.spec.gid),
+            (carrick_abi::NsUid::ROOT, carrick_abi::NsGid::ROOT)
+        );
+        assert_eq!(
+            resolved.warnings,
+            vec![ResolveWarning(
+                "--user \"nobody\": name resolution is not yet supported; running as root (use a numeric uid[:gid])"
+                    .to_string()
+            )]
+        );
+        assert_eq!(resolved.warnings[0].to_string(), resolved.warnings[0].0);
+    }
+
+    #[test]
+    fn numeric_user_produces_no_warning() {
+        let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
+        let resolved = resolve_run_spec(parity_request(), image).expect("resolve");
+        assert!(resolved.warnings.is_empty(), "{:?}", resolved.warnings);
     }
 }

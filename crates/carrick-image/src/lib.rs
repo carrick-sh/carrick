@@ -407,9 +407,11 @@ pub async fn resolve_registry_tag_digest(
 /// Docker `--pull` semantics for a `run`. `Missing` is docker's default (pull
 /// only when the image is absent locally); `Always` re-checks the registry every
 /// run and re-pulls a moved tag; `Never` uses only the local cache.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PullPolicy {
     Always,
+    /// Docker's default: pull only when the image is absent locally.
+    #[default]
     Missing,
     Never,
 }
