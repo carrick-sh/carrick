@@ -486,6 +486,7 @@ dependencies = [
  "carrick-embed",
  "carrick-guest-mem",
  "carrick-spec",
+ "libc",
  "parking_lot",
  "tempfile",
  "thiserror",

@@ -47,7 +47,7 @@ pub const LIVE_ORACLE_PROBES: &[&str] = &[
 
 /// Probes that cannot share an embedded test process after they fail. Keep
 /// these on the old out-of-process lane until the runtime teardown is fixed.
-pub const OUT_OF_PROCESS_PROBES: &[&str] = &["execthreads"];
+pub const OUT_OF_PROCESS_PROBES: &[&str] = &["execthreads", "vforkexecthread"];
 
 pub fn needs_live_oracle(probe: &str) -> bool {
     LIVE_ORACLE_PROBES.contains(&probe)

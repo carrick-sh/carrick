@@ -166,31 +166,13 @@ pub const SHARD_1_PROBES: &[&str] = &[
     "xthreadsig",
 ];
 
-const CACHED_SHARD_1_PROBE_COUNT: usize = 133;
+const CACHED_SHARD_1_PROBE_COUNT: usize = 132;
 
 /// Shard 1 subset of baseline expected oracle mismatches for musl.
-pub const MUSL_SHARD_1_EXPECTED_GAPS: &[&str] = &[
-    "mqnotifycrossproc",
-    "pidnsroot",
-    "procpeerdir",
-    "shmnestedfork",
-    "sysinfo",
-    "telemetrymap",
-    "vforkexecthread",
-    "vfs_mount_rw",
-];
+pub const MUSL_SHARD_1_EXPECTED_GAPS: &[&str] = &["vfs_mount_rw"];
 
 /// Shard 1 subset of baseline expected oracle mismatches for gnu.
-pub const GNU_SHARD_1_EXPECTED_GAPS: &[&str] = &[
-    "killchld",
-    "pidnsroot",
-    "procpeerdir",
-    "shmnestedfork",
-    "sysinfo",
-    "telemetrymap",
-    "vforkexecthread",
-    "vfs_mount_rw",
-];
+pub const GNU_SHARD_1_EXPECTED_GAPS: &[&str] = &["vfs_mount_rw"];
 
 /// Drop carrick's scratch warning so output lines up with Docker's.
 pub fn normalize(s: &str) -> String {
@@ -455,7 +437,9 @@ fn test_shard_1_security_policy_mapping() {
 
     assert!(SHARD_1_PROBES.contains(&"clonefilesexec"));
     assert!(common::OUT_OF_PROCESS_PROBES.contains(&"execthreads"));
+    assert!(common::OUT_OF_PROCESS_PROBES.contains(&"vforkexecthread"));
     assert!(SHARD_1_PROBES.contains(&"execthreads"));
+    assert!(SHARD_1_PROBES.contains(&"vforkexecthread"));
 }
 
 // ---------------------------------------------------------------------------
@@ -528,6 +512,7 @@ fn generic_probe_shard_1() {
                 container = container.security_opt("seccomp=unconfined");
             }
 
+            eprintln!("RUN generic probe shard 1 {target}:{probe_name}");
             executed_count += 1;
             let outcome = common::with_empty_stdin_pipe(|| container.run(["/tmp/carrick-init"]));
             let result = match outcome {
