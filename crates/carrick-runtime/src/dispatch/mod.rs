@@ -5756,12 +5756,8 @@ impl SyscallDispatcher {
         self.io.set_sink(sink);
     }
 
-    pub(crate) fn enable_external_exec_capture(&self) {
-        self.io.enable_external_exec_capture();
-    }
-
-    pub(crate) fn external_exec_capture_enabled(&self) -> bool {
-        self.io.external_exec_capture_enabled()
+    pub(crate) fn init_external_exec_stdio(&mut self) {
+        self.io = fs::RuntimeIo::new();
     }
 
     /// Close `open_file`'s backing host fd AND, if it was the last reference
