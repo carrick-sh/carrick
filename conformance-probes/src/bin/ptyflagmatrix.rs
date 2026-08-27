@@ -313,11 +313,14 @@ unsafe fn test_pgrp_ctty_matrix() {
         None => return,
     };
 
-    // 5.1 TIOCGPGRP on slave when not the controlling terminal -> ENOTTY
+    // 5.1 TIOCGPGRP on slave when not the controlling terminal
     let mut pgrp: libc::pid_t = 0;
     let r_gpgrp = libc::ioctl(pty.slave, TIOCGPGRP as _, &mut pgrp);
-    let gpgrp_enotty_or_ok = (r_gpgrp == -1 && errno() == libc::ENOTTY) || (r_gpgrp == 0);
-    report!(pgrp_tiocgpgrp_slave_enotty_or_ok = gpgrp_enotty_or_ok);
+    let err_gpgrp = if r_gpgrp == -1 { errno() } else { 0 };
+    report!(
+        pgrp_tiocgpgrp_slave_rc = r_gpgrp,
+        pgrp_tiocgpgrp_slave_errno = err_gpgrp,
+    );
 
     // 5.2 TIOCSPGRP on pipe -> ENOTTY
     let mut pipefd = [0i32; 2];
@@ -328,13 +331,19 @@ unsafe fn test_pgrp_ctty_matrix() {
 
     // 5.3 TIOCSCTTY on slave: attempt to set controlling terminal
     let r_sctty = libc::ioctl(pty.slave, TIOCSCTTY as _, 0);
-    let sctty_ok_or_err = (r_sctty == 0) || (r_sctty == -1 && errno() == libc::EPERM);
-    report!(ctty_tiocsctty_ok_or_eperm = sctty_ok_or_err);
+    let err_sctty = if r_sctty == -1 { errno() } else { 0 };
+    report!(
+        ctty_tiocsctty_rc = r_sctty,
+        ctty_tiocsctty_errno = err_sctty,
+    );
 
-    // 5.4 TIOCNOTTY on slave when not controlling terminal -> ENOTTY or 0
+    // 5.4 TIOCNOTTY on slave when not controlling terminal
     let r_notty = libc::ioctl(pty.slave, TIOCNOTTY as _);
-    let notty_enotty_or_ok = (r_notty == -1 && errno() == libc::ENOTTY) || (r_notty == 0);
-    report!(ctty_tiocnotty_enotty_or_ok = notty_enotty_or_ok);
+    let err_notty = if r_notty == -1 { errno() } else { 0 };
+    report!(
+        ctty_tiocnotty_rc = r_notty,
+        ctty_tiocnotty_errno = err_notty,
+    );
 
     // Verify ptn field
     let _ = pty.ptn;
