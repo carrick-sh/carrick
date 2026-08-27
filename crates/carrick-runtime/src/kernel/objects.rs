@@ -511,8 +511,6 @@ pub(crate) trait FileDescriptionBacking: Any + Send + Sync {
         deadline: std::time::Instant,
     ) -> Option<FileDescriptionBackingSnapshot>;
 
-    fn epoll_wake_fd(&self) -> Option<i32>;
-
     fn retain_fd_ref(&self);
 
     fn release_fd_ref(&self);
@@ -671,13 +669,6 @@ impl FileDescription {
 
     pub(crate) fn publish_mutation(&self) {
         self.revision.publish();
-    }
-
-    pub(crate) fn epoll_wake_fd(&self) -> Option<i32> {
-        let FileDescriptionKind::Concrete(backing) = &self.kind else {
-            return None;
-        };
-        backing.0.epoll_wake_fd()
     }
 
     pub(crate) fn retain_fd_ref(&self) {
@@ -1091,12 +1082,7 @@ impl FileTable {
         for slot in open_files.values() {
             slot.description.retain_fd_ref();
         }
-        let epoll_wake_registry = crate::dispatch::new_epoll_wake_registry();
-        for slot in open_files.values() {
-            if let Some(wake_fd) = slot.description.epoll_wake_fd() {
-                crate::dispatch::register_epoll_kqueue(&epoll_wake_registry, wake_fd);
-            }
-        }
+        let epoll_wake_registry = Arc::clone(&parent.epoll_wake_registry);
         Self {
             id,
             open_files: RwLock::new(open_files),
@@ -1135,12 +1121,7 @@ impl FileTable {
         {
             *closed |= *close_on_exec;
         }
-        let epoll_wake_registry = crate::dispatch::new_epoll_wake_registry();
-        for slot in open_files.values() {
-            if let Some(wake_fd) = slot.description.epoll_wake_fd() {
-                crate::dispatch::register_epoll_kqueue(&epoll_wake_registry, wake_fd);
-            }
-        }
+        let epoll_wake_registry = Arc::clone(&caller.epoll_wake_registry);
         let next_fd = *caller.next_fd.lock();
         let fd_open_paths = caller
             .fd_open_paths

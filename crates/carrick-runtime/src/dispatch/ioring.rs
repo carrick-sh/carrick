@@ -576,9 +576,6 @@ impl crate::kernel::FileDescriptionBacking for IoUringBacking {
         ))
     }
 
-    fn epoll_wake_fd(&self) -> Option<i32> {
-        None
-    }
     fn retain_fd_ref(&self) {
         self.open_metadata.read().retain_fd_ref();
     }
