@@ -1,15 +1,22 @@
 //! Observer pipeline for syscalls, lifecycle events, and process accounting.
 
 pub mod audit;
+pub mod budget;
+pub mod fault;
 pub mod policy;
 pub mod sandbox;
 
 pub use audit::{AuditEvent, AuditObserver};
+pub use budget::{BudgetCounters, BudgetResource, BudgetSnapshot, ExceedAction, ResourceBudget};
+pub use fault::{
+    FaultAction, FaultCondition, FaultInjector, FaultPredicate, FaultRule, FaultRuleBuilder,
+    SyscallBitset,
+};
 pub use policy::{ArgFilter, PolicyObserver, PolicyRule};
 pub use sandbox::{SandboxObserver, SandboxPreset};
 
 use crate::dispatch::Signal;
-use carrick_abi::LinuxErrno;
+use carrick_abi::{CanonicalNr, LinuxErrno};
 use std::sync::Arc;
 
 use crate::kernel::{LinuxWaitStatus, TaskKey, ThreadKey};
@@ -21,6 +28,16 @@ pub enum SyscallAction {
     Allow,
     Deny(LinuxErrno),
     Kill(Signal),
+    /// Short I/O: clamp requested read/write/send/recv count to `n` bytes.
+    Short(usize),
+}
+
+/// Returns true if `nr` is a read/write/send/recv syscall whose byte count can be clamped.
+pub fn is_shortable_syscall(nr: CanonicalNr) -> bool {
+    matches!(
+        nr.raw(),
+        63 | 64 | 65 | 66 | 67 | 68 | 206 | 207 | 211 | 212
+    )
 }
 
 /// Requested fast-path visibility for an observer.

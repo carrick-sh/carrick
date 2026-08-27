@@ -885,6 +885,10 @@ impl PreparedFork {
         }
         .publish();
 
+        if let Some(budget) = child.container().budget() {
+            let _ = budget.check_process_creation();
+        }
+
         Ok(PublishedFork {
             started: Some(StartedFork {
                 context: KernelContext::from_parts(
@@ -4224,6 +4228,18 @@ fn enforce_rlimit_nproc(
     caller: &KernelContext,
 ) -> Result<(), KernelOperationError> {
     let ruid = caller.resources.credentials().ruid();
+    if let Some(budget) = caller.task().container().budget() {
+        if let Some(max_proc) = budget.max_processes_limit() {
+            let current = budget.raw_counters().processes();
+            if current >= max_proc {
+                return Err(KernelOperationError::ProcessLimitExceeded {
+                    uid: ruid,
+                    count: current as usize,
+                    limit: max_proc,
+                });
+            }
+        }
+    }
     if ruid == NsUid::ROOT {
         return Ok(());
     }

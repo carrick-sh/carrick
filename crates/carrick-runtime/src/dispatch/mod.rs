@@ -2116,6 +2116,7 @@ pub(crate) enum AsyncSignalWakeOwner {
 }
 
 impl AsyncSignalWakeOwner {
+    #[allow(dead_code)]
     pub(crate) fn publish_process_signal(self, signum: i32) {
         #[cfg(feature = "platform-macos")]
         match self {
@@ -4976,6 +4977,7 @@ impl SyscallDispatcher {
             .map(|authority| authority.binding())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn async_signal_wake_owner(&self) -> AsyncSignalWakeOwner {
         self.async_signal_wake_owner
     }
@@ -4983,7 +4985,7 @@ impl SyscallDispatcher {
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn publish_rlimit_cpu_signal_for_test(&self, signum: i32) {
-        time::publish_rlimit_cpu_signal(self.async_signal_wake_owner(), signum);
+        self.async_signal_wake_owner.publish_process_signal(signum);
     }
 
     pub fn page_geometry(&self) -> crate::page_profile::PageGeometry {
@@ -6291,23 +6293,26 @@ impl SyscallDispatcher {
     pub fn dispatch_threaded(
         &self,
         kernel: &crate::kernel::KernelContext,
-        request: SyscallRequest,
+        mut request: SyscallRequest,
         memory: &mut impl GuestMemory,
         reporter: &CompatReporter,
         tid: crate::thread::ThreadId,
         registry: &crate::thread::ThreadRegistry,
         futex: &crate::thread::FutexTable,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let s = crate::observe::SyscallInfo::new(&request);
         let p = crate::observe::ProcessInfo::new(kernel);
 
         // 1. Policy observer precheck (first built-in observer in the chain)
         if let Some(ref chain) = self.observers {
-            if let Some(action) = chain.check_policy(&p, &s) {
+            let action = {
+                let s = crate::observe::SyscallInfo::new(&request);
+                chain.check_policy(&p, &s)
+            };
+            if let Some(action) = action {
                 match action {
                     crate::observe::SyscallAction::Allow => {}
                     crate::observe::SyscallAction::Deny(errno) => {
-                        let name = s.name();
+                        let name = crate::observe::SyscallInfo::new(&request).name();
                         reporter.record(CompatEvent::partial_syscall(
                             request.number.raw(),
                             name,
@@ -6318,6 +6323,11 @@ impl SyscallDispatcher {
                     }
                     crate::observe::SyscallAction::Kill(sig) => {
                         return Ok(DispatchOutcome::SignalDeath { signum: sig.0 });
+                    }
+                    crate::observe::SyscallAction::Short(n) => {
+                        if crate::observe::is_shortable_syscall(request.number) {
+                            request.args.0[2] = (request.args.0[2] as usize).min(n) as u64;
+                        }
                     }
                 }
             }
@@ -6331,7 +6341,11 @@ impl SyscallDispatcher {
         // 3. User observers
         if let Some(ref chain) = self.observers {
             if chain.has_user_observers() {
-                match chain.on_user_syscall(&p, &s) {
+                let action = {
+                    let s = crate::observe::SyscallInfo::new(&request);
+                    chain.on_user_syscall(&p, &s)
+                };
+                match action {
                     crate::observe::SyscallAction::Allow => {}
                     crate::observe::SyscallAction::Deny(errno) => {
                         return Ok(DispatchOutcome::Errno { errno });
@@ -6339,8 +6353,18 @@ impl SyscallDispatcher {
                     crate::observe::SyscallAction::Kill(sig) => {
                         return Ok(DispatchOutcome::SignalDeath { signum: sig.0 });
                     }
+                    crate::observe::SyscallAction::Short(n) => {
+                        if crate::observe::is_shortable_syscall(request.number) {
+                            request.args.0[2] = (request.args.0[2] as usize).min(n) as u64;
+                        }
+                    }
                 }
             }
+        }
+
+        // 4. CPU limits and budget check
+        if let Err(outcome) = time::check_cpu_limits(kernel) {
+            return Ok(outcome);
         }
 
         // The calling MM's vDSO realtime word follows a guest `clock_settime`
@@ -6660,7 +6684,7 @@ impl SyscallDispatcher {
     fn dispatch_inner(
         &mut self,
         kernel: &crate::kernel::KernelContext,
-        request: SyscallRequest,
+        mut request: SyscallRequest,
         memory: &mut impl GuestMemory,
         reporter: &CompatReporter,
         thread: Option<ThreadCtx>,
@@ -6674,16 +6698,19 @@ impl SyscallDispatcher {
             args: request.args,
         });
 
-        let s = crate::observe::SyscallInfo::new(&request);
         let p = crate::observe::ProcessInfo::new(kernel);
 
         // 1. Policy observer precheck (first built-in observer in the chain)
         if let Some(ref chain) = self.observers {
-            if let Some(action) = chain.check_policy(&p, &s) {
+            let action = {
+                let s = crate::observe::SyscallInfo::new(&request);
+                chain.check_policy(&p, &s)
+            };
+            if let Some(action) = action {
                 match action {
                     crate::observe::SyscallAction::Allow => {}
                     crate::observe::SyscallAction::Deny(errno) => {
-                        let name = s.name();
+                        let name = crate::observe::SyscallInfo::new(&request).name();
                         reporter.record(CompatEvent::partial_syscall(
                             request.number.raw(),
                             name,
@@ -6701,6 +6728,11 @@ impl SyscallDispatcher {
                     }
                     crate::observe::SyscallAction::Kill(sig) => {
                         return Ok(DispatchOutcome::SignalDeath { signum: sig.0 });
+                    }
+                    crate::observe::SyscallAction::Short(n) => {
+                        if crate::observe::is_shortable_syscall(request.number) {
+                            request.args.0[2] = (request.args.0[2] as usize).min(n) as u64;
+                        }
                     }
                 }
             }
@@ -6722,7 +6754,11 @@ impl SyscallDispatcher {
         // 3. User observers
         if let Some(ref chain) = self.observers {
             if chain.has_user_observers() {
-                match chain.on_user_syscall(&p, &s) {
+                let action = {
+                    let s = crate::observe::SyscallInfo::new(&request);
+                    chain.on_user_syscall(&p, &s)
+                };
+                match action {
                     crate::observe::SyscallAction::Allow => {}
                     crate::observe::SyscallAction::Deny(errno) => {
                         let (retval, errno_val) = (errno.guest_retval(), Some(errno.get()));
@@ -6737,9 +6773,20 @@ impl SyscallDispatcher {
                     crate::observe::SyscallAction::Kill(sig) => {
                         return Ok(DispatchOutcome::SignalDeath { signum: sig.0 });
                     }
+                    crate::observe::SyscallAction::Short(n) => {
+                        if crate::observe::is_shortable_syscall(request.number) {
+                            request.args.0[2] = (request.args.0[2] as usize).min(n) as u64;
+                        }
+                    }
                 }
             }
         }
+
+        // 4. CPU limits and budget check
+        if let Err(outcome) = time::check_cpu_limits(kernel) {
+            return Ok(outcome);
+        }
+
         // The calling MM's vDSO realtime word follows a guest `clock_settime`
         // made by any process (see `dispatch_threaded`).
         if let Err(error) =

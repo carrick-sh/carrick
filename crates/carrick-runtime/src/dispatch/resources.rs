@@ -246,6 +246,10 @@ pub(super) fn rlimits() -> Option<crate::kernel::RlimitSet> {
     })
 }
 
+pub(super) fn task() -> Option<crate::kernel::TaskRef> {
+    CAPTURED_RESOURCES.with(|stack| stack.borrow().last().map(CapturedResources::task))
+}
+
 pub(super) fn credentials() -> Option<Arc<crate::kernel::Credentials>> {
     CAPTURED_RESOURCES.with(|stack| stack.borrow().last().map(CapturedResources::credentials))
 }

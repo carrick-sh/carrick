@@ -8462,6 +8462,11 @@ pub(crate) fn assemble_run_result(
     crate::probes::guest_exit(exit_code);
     kernel.dispatcher.cleanup_sysv_ipc_on_process_exit();
     let report = kernel.reporter.snapshot();
+    let terminal_reason = if trap_limit_hit {
+        Some(crate::runtime::TerminalReason::TrapLimit)
+    } else {
+        None
+    };
     RunResult {
         exit_code,
         terminating_signal,
@@ -8470,6 +8475,7 @@ pub(crate) fn assemble_run_result(
         traps,
         report,
         trap_limit_hit,
+        terminal_reason,
     }
 }
 

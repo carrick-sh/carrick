@@ -55,9 +55,11 @@ pub use carrick_runtime::compat::CompatReport;
 pub use carrick_runtime::dispatch::Signal;
 pub use carrick_runtime::kernel::{ClockDomain, SignedDuration, TimeControl, TimeError};
 pub use carrick_runtime::observe::{
-    ArgFilter, AuditEvent, AuditObserver, ExitStatus, FastPathVisibility, PolicyObserver,
-    PolicyRule, ProcessInfo, SandboxObserver, SandboxPreset, SyscallAction, SyscallInfo,
-    SyscallObserver, SyscallOutcome,
+    ArgFilter, AuditEvent, AuditObserver, BudgetCounters, BudgetResource, BudgetSnapshot,
+    ExceedAction, ExitStatus, FastPathVisibility, FaultAction, FaultCondition, FaultInjector,
+    FaultPredicate, FaultRule, FaultRuleBuilder, PolicyObserver, PolicyRule, ProcessInfo,
+    ResourceBudget, SandboxObserver, SandboxPreset, SyscallAction, SyscallBitset, SyscallInfo,
+    SyscallObserver, SyscallOutcome, is_shortable_syscall,
 };
-pub use carrick_runtime::runtime::{RunResult, RuntimeError};
+pub use carrick_runtime::runtime::{RunResult, RuntimeError, TerminalReason};
 pub use carrick_spec::{Mount, Platform, RunSpec, StdioMode};

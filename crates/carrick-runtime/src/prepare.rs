@@ -104,6 +104,7 @@ pub struct RuntimeExtensions {
     stdio: Option<StdioSink>,
     observers: Vec<Arc<dyn crate::observe::SyscallObserver>>,
     time: Option<crate::kernel::container::TimeControl>,
+    budget: Option<Arc<crate::observe::ResourceBudget>>,
 }
 
 impl RuntimeExtensions {
@@ -138,9 +139,20 @@ impl RuntimeExtensions {
         self
     }
 
+    /// Attach a fault injector to simulate syscall and I/O failures.
+    pub fn fault_injector(self, injector: crate::observe::FaultInjector) -> Self {
+        self.observer(Arc::new(injector))
+    }
+
     /// Time control for the container.
     pub fn time(mut self, control: crate::kernel::container::TimeControl) -> Self {
         self.time = Some(control);
+        self
+    }
+
+    /// Attach a resource budget quota to the container.
+    pub fn resource_budget(mut self, budget: crate::observe::ResourceBudget) -> Self {
+        self.budget = Some(Arc::new(budget));
         self
     }
 }
@@ -376,6 +388,7 @@ impl Runtime {
             stdio,
             observers,
             time,
+            budget,
         } = ext;
         let sink = resolve_stdio(spec, stdio)?;
         if spec.platform == Platform::Amd64 {
@@ -387,6 +400,9 @@ impl Runtime {
             .with_launch_capabilities(&spec.cap_add);
         if let Some(control) = time {
             container = container.with_time_control(control);
+        }
+        if let Some(ref b) = budget {
+            container = container.with_resource_budget(Arc::clone(b));
         }
         let container = Arc::new(container);
 
@@ -423,6 +439,9 @@ impl Runtime {
         // embedder's mount at the same point shadows them (re-mount replaces).
         for (target, vfs) in vfs_mounts {
             dispatcher.register_mount(PathBuf::from(target.as_std_path()), vfs);
+        }
+        if let Some(b) = budget {
+            dispatcher.install_observer(b);
         }
         for observer in observers {
             dispatcher.install_observer(observer);
