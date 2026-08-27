@@ -2,7 +2,6 @@
 
 use super::super::*;
 use crate::linux_abi::{LinuxDnotifyMask, LinuxErrno};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Guest-visible fd allocation pressure caused by host-backed path opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -266,7 +265,6 @@ pub(in crate::dispatch) struct RuntimeIo {
     /// Where bare fd 1/2 writes go. `Captured` (the default) appends to
     /// `stdout`/`stderr` above.
     route: Mutex<StdioRoute>,
-    external_exec_capture: AtomicBool,
 }
 
 impl RuntimeIo {
@@ -275,7 +273,6 @@ impl RuntimeIo {
             stdout: Arc::new(Mutex::new(Vec::new())),
             stderr: Arc::new(Mutex::new(Vec::new())),
             route: Mutex::new(StdioRoute::Captured),
-            external_exec_capture: AtomicBool::new(false),
         }
     }
 
@@ -295,56 +292,29 @@ impl RuntimeIo {
     }
 
     pub(in crate::dispatch) fn fork_clone(&self) -> Self {
-        let external_exec_capture = self.external_exec_capture.load(Ordering::Acquire);
         Self {
-            // The host-fork child clears inherited buffered output before it
-            // resumes. An in-process child starts with the same clean boundary.
-            stdout: if external_exec_capture {
-                Arc::clone(&self.stdout)
-            } else {
-                Arc::new(Mutex::new(Vec::new()))
-            },
-            stderr: if external_exec_capture {
-                Arc::clone(&self.stderr)
-            } else {
-                Arc::new(Mutex::new(Vec::new()))
-            },
+            // A guest fork's children write into the same output buffers as their
+            // parent, streaming each write into the shared destination as it happens.
+            stdout: Arc::clone(&self.stdout),
+            stderr: Arc::clone(&self.stderr),
             // Same route object: a piped tree shares ONE caller writer.
             route: Mutex::new(self.route()),
-            external_exec_capture: AtomicBool::new(external_exec_capture),
         }
-    }
-
-    pub(in crate::dispatch) fn enable_external_exec_capture(&self) {
-        self.external_exec_capture.store(true, Ordering::Release);
-    }
-
-    pub(in crate::dispatch) fn external_exec_capture_enabled(&self) -> bool {
-        self.external_exec_capture.load(Ordering::Acquire)
     }
 }
 
 #[cfg(test)]
-mod external_exec_capture_tests {
+mod forked_descendants_capture_tests {
     use super::*;
 
     #[test]
-    fn external_exec_descendants_share_one_capture_sink() {
+    fn forked_descendants_share_one_capture_sink() {
         let root = RuntimeIo::new();
-        root.enable_external_exec_capture();
         let child = root.fork_clone();
         child.stdout.lock().extend_from_slice(b"child");
         child.stderr.lock().extend_from_slice(b"error");
         assert_eq!(&*root.stdout.lock(), b"child");
         assert_eq!(&*root.stderr.lock(), b"error");
-    }
-
-    #[test]
-    fn ordinary_fork_keeps_process_local_capture() {
-        let root = RuntimeIo::new();
-        let child = root.fork_clone();
-        child.stdout.lock().extend_from_slice(b"child");
-        assert!(root.stdout.lock().is_empty());
     }
 }
 
@@ -507,14 +477,14 @@ mod fork_clone_tests {
     use super::*;
 
     #[test]
-    fn forked_runtime_io_starts_with_clean_output_and_preserves_sink() {
+    fn forked_runtime_io_shares_output_buffers_and_preserves_sink() {
         let parent = RuntimeIo::new();
         parent.stdout.lock().extend_from_slice(b"parent");
         parent.set_sink(StdioSink::Inherit);
 
         let child = parent.fork_clone();
 
-        assert!(child.stdout.lock().is_empty());
+        assert_eq!(&*child.stdout.lock(), b"parent");
         assert!(child.stderr.lock().is_empty());
         assert!(matches!(child.route(), StdioRoute::Inherit));
         assert_eq!(&*parent.stdout.lock(), b"parent");
@@ -637,5 +607,109 @@ mod stdio_sink_tests {
         // `dispatch` glob), and a trait import just for one call is noise.
         std::io::Write::write_all(&mut *stdout.lock(), b"child").unwrap();
         assert_eq!(&*out.lock(), b"child");
+    }
+
+    #[test]
+    fn forked_child_output_captured_into_parent_buffers() {
+        let parent = SyscallDispatcher::new();
+        parent.set_stdio_sink(StdioSink::Captured);
+        let parent_context = parent.capture_one_task_context().unwrap();
+        let parent_tid = parent_context.thread().registry_id();
+        let child_tid = crate::thread::ThreadId::from_guest_supplied_tid(2);
+        let mut child = parent.fork_clone_in_process(parent_tid, child_tid, 10, 11);
+        *child.kernel_binding.write() = parent_context.task_binding();
+
+        assert_eq!(
+            write_fd(&mut child, 1, b"hello\n"),
+            DispatchOutcome::Returned { value: 6 }
+        );
+        assert_eq!(parent.stdout(), b"hello\n");
+    }
+
+    #[test]
+    fn forked_child_output_streamed_to_piped_sink() {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let err = Arc::new(Mutex::new(Vec::new()));
+        let parent = SyscallDispatcher::new();
+        parent.set_stdio_sink(StdioSink::Piped {
+            stdout: Box::new(Recorder(Arc::clone(&out))),
+            stderr: Box::new(Recorder(Arc::clone(&err))),
+        });
+        let parent_context = parent.capture_one_task_context().unwrap();
+        let parent_tid = parent_context.thread().registry_id();
+        let child_tid = crate::thread::ThreadId::from_guest_supplied_tid(2);
+        let mut child = parent.fork_clone_in_process(parent_tid, child_tid, 10, 11);
+        *child.kernel_binding.write() = parent_context.task_binding();
+
+        assert_eq!(
+            write_fd(&mut child, 1, b"hello from child\n"),
+            DispatchOutcome::Returned { value: 17 }
+        );
+        assert_eq!(&*out.lock(), b"hello from child\n");
+        assert!(parent.stdout().is_empty());
+    }
+
+    #[test]
+    fn interleaved_parent_and_child_writes_preserve_pipeline_order() {
+        let mut parent = SyscallDispatcher::new();
+        parent.set_stdio_sink(StdioSink::Captured);
+        let parent_context = parent.capture_one_task_context().unwrap();
+        let parent_tid = parent_context.thread().registry_id();
+        let child_tid = crate::thread::ThreadId::from_guest_supplied_tid(2);
+        let mut child = parent.fork_clone_in_process(parent_tid, child_tid, 10, 11);
+        *child.kernel_binding.write() = parent_context.task_binding();
+
+        assert_eq!(
+            write_fd(&mut parent, 1, b"parent first\n"),
+            DispatchOutcome::Returned { value: 13 }
+        );
+        assert_eq!(
+            write_fd(&mut child, 1, b"child second\n"),
+            DispatchOutcome::Returned { value: 13 }
+        );
+        assert_eq!(
+            write_fd(&mut parent, 1, b"parent third\n"),
+            DispatchOutcome::Returned { value: 13 }
+        );
+        assert_eq!(
+            write_fd(&mut child, 1, b"child fourth\n"),
+            DispatchOutcome::Returned { value: 13 }
+        );
+
+        assert_eq!(
+            parent.stdout(),
+            b"parent first\nchild second\nparent third\nchild fourth\n"
+        );
+    }
+
+    #[test]
+    fn stderr_kept_separate_from_stdout_across_fork() {
+        let mut parent = SyscallDispatcher::new();
+        parent.set_stdio_sink(StdioSink::Captured);
+        let parent_context = parent.capture_one_task_context().unwrap();
+        let parent_tid = parent_context.thread().registry_id();
+        let child_tid = crate::thread::ThreadId::from_guest_supplied_tid(2);
+        let mut child = parent.fork_clone_in_process(parent_tid, child_tid, 10, 11);
+        *child.kernel_binding.write() = parent_context.task_binding();
+
+        assert_eq!(
+            write_fd(&mut parent, 1, b"parent out\n"),
+            DispatchOutcome::Returned { value: 11 }
+        );
+        assert_eq!(
+            write_fd(&mut child, 2, b"child err\n"),
+            DispatchOutcome::Returned { value: 10 }
+        );
+        assert_eq!(
+            write_fd(&mut child, 1, b"child out\n"),
+            DispatchOutcome::Returned { value: 10 }
+        );
+        assert_eq!(
+            write_fd(&mut parent, 2, b"parent err\n"),
+            DispatchOutcome::Returned { value: 11 }
+        );
+
+        assert_eq!(parent.stdout(), b"parent out\nchild out\n");
+        assert_eq!(parent.stderr(), b"child err\nparent err\n");
     }
 }

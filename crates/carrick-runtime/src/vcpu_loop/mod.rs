@@ -3652,9 +3652,9 @@ where
         };
         let process_exit_event = process.record_process_exit_begin(exit_code, self.state.this_tid);
         let child = process.is_child();
-        let out = self.kernel.dispatcher.stdout();
-        let err = self.kernel.dispatcher.stderr();
         if let Some(work) = self.external_exec.take() {
+            let out = self.kernel.dispatcher.stdout();
+            let err = self.kernel.dispatcher.stderr();
             let terminating_signal = match &terminal {
                 PersistentTerminal::Outcome {
                     outcome: VcpuLoopOutcome::ProcessExit(run) | VcpuLoopOutcome::TrapLimit(run),
@@ -3669,16 +3669,13 @@ where
             if let Err(error) = work.complete(crate::kernel::control::ExecResult {
                 exit_code,
                 terminating_signal,
-                stdout: out.clone(),
-                stderr: err.clone(),
+                stdout: out,
+                stderr: err,
                 output_truncated: false,
             }) {
                 tracing::error!(%error, "publish logical exec terminal result failed");
                 std::process::abort();
             }
-        } else if child && !self.kernel.dispatcher.external_exec_capture_enabled() {
-            let _ = write_hvpatch_child_output(1, &out);
-            let _ = write_hvpatch_child_output(2, &err);
         }
         let status = crate::kernel::LinuxWaitStatus::from_wait_encoding(wait_encoding);
         let orphan_adopter = self.kernel.dispatcher.hvpatch_orphan_adopter();
@@ -8428,6 +8425,7 @@ fn trap_watchdog_decision(
     }
 }
 
+#[cfg(test)]
 fn write_hvpatch_child_output(fd: i32, mut bytes: &[u8]) -> std::io::Result<()> {
     while !bytes.is_empty() {
         let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
