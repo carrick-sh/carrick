@@ -94,18 +94,6 @@
 //! to the Linux `(signum, si_code)` the kernel would deliver (SIGSEGV/SIGBUS/
 //! SIGTRAP) and injects it into the guest, so Go's `sigpanic`/`recover`, glibc
 //! backtraces, and any installed handler run exactly as on Linux.
-//!
-//! # The forked-child `_exit` rule (do not break this)
-//!
-//! A `libc::fork`ed child shares the parent's fd table. Unwinding through an
-//! fd-owning `Drop` (the dispatcher's buffers, an `applevisor::Vcpu`) in the
-//! child double-closes an inherited fd — tripping std's IO-safety abort — or
-//! runs the no-VM `Vcpu` Drop and panics. So on **every** exit path the loops
-//! check `is_forked_child()` / `is_forked_guest_process()` and route through the
-//! `_exit`-based [`exec`] helpers (`forked_child_exit` flushes buffered stdio to
-//! the inherited host fds then `_exit`s; `forked_child_die_by_signal` re-raises
-//! the signal so the parent's `wait4` reports `WIFSIGNALED`).
-//!
 //! [`AddressSpace`]: crate::memory::AddressSpace
 
 use std::os::fd::IntoRawFd;
@@ -133,10 +121,7 @@ use crate::vcpu_loop::{
     dispatch_with_panic_backstop, partial_write_interrupt_outcome,
     raise_sigpipe_for_blocking_write, signal_wait_expired, signal_wait_slice, stamp_identity_page,
 };
-use exec::{
-    forked_child_die_by_signal, forked_child_exit, load_execve_image, stop_after_traced_exec,
-    stop_by_signal,
-};
+use exec::{load_execve_image, stop_after_traced_exec, stop_by_signal};
 
 use crate::trap::{HvfTrapEngine, TrapError};
 // `SyscallTrap`/`TrapError` live in the carrick-hal leaf crate
@@ -840,8 +825,7 @@ where
     let _termios_guard = crate::host_tty::TermiosRestoreGuard::new();
 
     let this_tid = ThreadId::main_from_host_pid();
-    // Per-thread blocking-I/O waiter (owns this thread's kqueue). Recreated in
-    // a forked child below (kqueue is not inherited across fork).
+    // Per-thread blocking-I/O waiter (owns this thread's kqueue).
     let mut waiter = crate::io_wait::ThreadWaiter::new(this_tid);
     for traps in 1..=max_traps {
         let frame = match runtime.next_syscall()? {
@@ -868,13 +852,6 @@ where
                         continue;
                     }
                     if let Some(signum) = action.term_signal {
-                        if runtime.is_forked_child() || dispatcher.is_forked_guest_process() {
-                            forked_child_die_by_signal(
-                                signum,
-                                dispatcher.stdout(),
-                                dispatcher.stderr(),
-                            );
-                        }
                         return Ok(RunResult {
                             exit_code: 128 + signum,
                             terminating_signal: Some(signum),
@@ -941,10 +918,6 @@ where
             }
             DispatchOutcome::Exit { code } => {
                 crate::probes::guest_exit(code);
-                if runtime.is_forked_child() || dispatcher.is_forked_guest_process() {
-                    dispatcher.cleanup_sysv_ipc_on_process_exit();
-                    forked_child_exit(code, dispatcher.stdout(), dispatcher.stderr());
-                }
                 dispatcher.cleanup_sysv_ipc_on_process_exit();
                 return Ok(RunResult {
                     exit_code: code,
@@ -957,10 +930,6 @@ where
                 });
             }
             DispatchOutcome::SignalDeath { signum } => {
-                if runtime.is_forked_child() || dispatcher.is_forked_guest_process() {
-                    dispatcher.cleanup_sysv_ipc_on_process_exit();
-                    forked_child_die_by_signal(signum, dispatcher.stdout(), dispatcher.stderr());
-                }
                 dispatcher.cleanup_sysv_ipc_on_process_exit();
                 return Ok(RunResult {
                     exit_code: 128 + signum,
@@ -1348,10 +1317,6 @@ where
                 continue;
             }
             if let Some(signum) = action.term_signal {
-                if runtime.is_forked_child() || dispatcher.is_forked_guest_process() {
-                    dispatcher.cleanup_sysv_ipc_on_process_exit();
-                    forked_child_die_by_signal(signum, dispatcher.stdout(), dispatcher.stderr());
-                }
                 dispatcher.cleanup_sysv_ipc_on_process_exit();
                 return Ok(RunResult {
                     exit_code: 128 + signum,

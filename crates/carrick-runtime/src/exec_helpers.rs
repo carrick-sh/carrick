@@ -1,4 +1,4 @@
-//! Cross-platform forked-child exit helpers and shebang resolution.
+//! Cross-platform signal-death / stop helpers and shebang resolution.
 //!
 //! Six helpers that were previously duplicated byte-for-byte between
 //! `runtime/exec.rs` (macOS, `pub(crate)`) and `vcpu_loop`'s
@@ -279,56 +279,6 @@ fn flush_fork_child_fd(fd: libc::c_int, mut bytes: &[u8]) {
     }
 }
 
-/// Called from a forked child when the guest hits `exit_group`. Flushes any
-/// buffered guest stdout/stderr to the host's fd 1/fd 2 (inherited from the
-/// parent process) and then calls `_exit(2)` to bypass Rust's normal Drop
-/// chain. Without this, the rebuilt HVF/KVM context in the child would trigger
-/// Drop panics during shutdown.
-///
-/// Also publishes guest CPU time so the parent's `wait4` can roll it into its
-/// child-time totals (RUSAGE_CHILDREN).
-pub(crate) fn forked_child_exit(
-    code: i32,
-    stdout_buf: impl AsRef<[u8]>,
-    stderr_buf: impl AsRef<[u8]>,
-) -> ! {
-    let pid = std::process::id();
-    crate::guest_cpu::adopt_children_of(pid);
-    let adopted_parent = crate::guest_cpu::adopted_parent_for(pid);
-    // Enqueue the subreaper's SIGCHLD BEFORE publishing the reapable exit
-    // record: the parent's wait4 observes `exit_ready` (Acquire) and then
-    // drains the xsig ring so the exit signal is pending by the time wait4
-    // returns, matching Linux's "the child-exit signal is observable when
-    // waitpid returns". Enqueued after the record, the parent could reap and
-    // return between the two and read a not-yet-delivered SIGCHLD
-    // (childsubreaper sigchld_from_orphan=false, load-coupled).
-    if let Some(parent) = adopted_parent {
-        let _ = crate::host_signal::xsig_enqueue(
-            parent as i32,
-            crate::linux_abi::LINUX_SIGCHLD,
-            0,
-            pid as i32,
-            0,
-            0,
-            0,
-        );
-        crate::host_signal::xsig_nudge(parent as i32);
-    }
-    crate::guest_cpu::record_child_exit_status(
-        pid,
-        crate::guest_cpu::total_ns(),
-        (code & 0xff) << 8,
-        adopted_parent.is_some(),
-    );
-    flush_fork_child_fd(1, stdout_buf.as_ref());
-    flush_fork_child_fd(2, stderr_buf.as_ref());
-    // Untraced lifecycle gauge: last stamp this image can write; the delta to
-    // the parent's `WaitReaped` is host kernel address-space teardown plus
-    // parent wake latency.
-    crate::exec_stamps::stamp(crate::exec_stamps::ExecStampPhase::PreHostExit);
-    unsafe { libc::_exit(code) };
-}
-
 /// Host-fs marker path for a forked-child signal death the BSD host kernel could
 /// not represent as WIFSIGNALED. Keyed by the globally-unique host pid (so it
 /// never collides across concurrent guests or carrick instances).
@@ -355,7 +305,7 @@ pub(crate) fn forked_child_die_by_signal(
     let pid = std::process::id();
     crate::guest_cpu::adopt_children_of(pid);
     let adopted_parent = crate::guest_cpu::adopted_parent_for(pid);
-    // Enqueue-before-record, as in `forked_child_exit`: the reaping wait4
+    // Enqueue-before-record: the reaping wait4
     // drains the ring on an adopted reap, so the ring entry must exist by the
     // time the exit record is observable.
     if let Some(parent) = adopted_parent {

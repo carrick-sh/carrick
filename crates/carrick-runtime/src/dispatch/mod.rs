@@ -5727,24 +5727,6 @@ impl SyscallDispatcher {
         *self.io.stream_stdio.lock()
     }
 
-    /// Called after `libc::fork(2)` returns into a child: the child
-    /// inherited the parent's buffered stdout/stderr, but we don't
-    /// want to re-print those bytes when the child eventually exits
-    /// via the `forked_child_exit` path. The parent's full buffer
-    /// goes out through its own JSON report.
-    pub fn clear_output_buffers(&self) {
-        self.io.stdout.lock().clear();
-        self.io.stderr.lock().clear();
-        // Interval timers are NOT inherited across fork(2) (setitimer(2)). The
-        // child inherited the parent's armed interval timers through the copied
-        // address space; clear them so the child's alarm()/getitimer() see
-        // disarmed timers (LTP runs each test in a forked child whose alarm()
-        // must return 0, not the framework's residual watchdog timeout).
-        // Interval timers are NOT inherited across fork(2); the parent's timer
-        // threads don't survive fork either, so just clear the state.
-        self.proc.lock().itimers = [None, None, None];
-    }
-
     /// Close `open_file`'s backing host fd AND, if it was the last reference
     /// to a pty master this process owns, drop its `/dev/pts` entry. Use this
     /// on every fd-close path (including exec generation retirement) so the

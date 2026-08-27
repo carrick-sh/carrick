@@ -189,16 +189,6 @@ pub struct Runtime;
 
 impl Runtime {
     pub fn execute(spec: &RunSpec) -> Result<RunResult, RuntimeError> {
-        // Guardrail: execute() may still enter the separately-scoped
-        // interactive-session boundary. A live tokio runtime must NOT survive
-        // into here — its blocking-pool threads do not survive that host fork,
-        // so the interactive child would deadlock in BlockingPool::shutdown.
-        // Callers resolve the image under tokio, DROP the runtime, then execute.
-        debug_assert!(
-            tokio::runtime::Handle::try_current().is_err(),
-            "tokio runtime must not be live when Runtime::execute is called \
-             (tokio-fork-isolation invariant)"
-        );
         if spec.platform == Platform::Amd64 {
             rosetta_license_notice();
         }
