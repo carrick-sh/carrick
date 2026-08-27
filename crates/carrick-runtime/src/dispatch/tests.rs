@@ -4847,7 +4847,10 @@ mod container_policy_dispatch_tests {
         }];
         assert_eq!(
             validate_fork_projection(&unaligned_va),
-            Err(ForkProjectionError::Unaligned)
+            Err(ForkProjectionError::Unaligned {
+                va: 0x1001,
+                len: 0x1000
+            })
         );
 
         // Unaligned length
@@ -4858,7 +4861,10 @@ mod container_policy_dispatch_tests {
         }];
         assert_eq!(
             validate_fork_projection(&unaligned_len),
-            Err(ForkProjectionError::Unaligned)
+            Err(ForkProjectionError::Unaligned {
+                va: 0x1000,
+                len: 0x1001
+            })
         );
 
         // Overflow
@@ -4957,7 +4963,7 @@ mod container_policy_dispatch_tests {
                 crate::kernel::CloneObjectMode::Copy,
             ),
             Err(PrepareDispatchMmForkError::Projection(
-                carrick_hal::ForkProjectionError::Unaligned
+                carrick_hal::ForkProjectionError::Unaligned { .. }
             ))
         ));
     }

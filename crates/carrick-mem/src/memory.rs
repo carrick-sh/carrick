@@ -2468,17 +2468,23 @@ fn region_from_load_segment_page_aligned(
     })
 }
 
+/// The guest page size every Linux-visible VMA boundary is expressed in. The
+/// host mapping granularity (`HVF_MAPPING_PAGE_SIZE`, 16 KiB) is a separate
+/// concern: rounding VMAs to it would publish a coarser `/proc/self/maps` than
+/// Linux shows for a 4 KiB-page guest.
+const GUEST_VMA_PAGE_SIZE: u64 = 0x1000;
+
 fn region_from_load_segments(
     file: &[u8],
     segments: &[&LoadSegment],
 ) -> Result<MemoryRegion, AddressSpaceError> {
     #[allow(clippy::expect_used)]
-    let start = segments
+    let raw_start = segments
         .iter()
         .map(|segment| segment.virtual_address)
         .min()
         .expect("non-empty load segment group");
-    let mut end = start;
+    let mut raw_end = raw_start;
     for segment in segments {
         let segment_end = segment
             .virtual_address
@@ -2487,8 +2493,25 @@ fn region_from_load_segments(
                 start: segment.virtual_address,
                 size: segment.memory_size,
             })?;
-        end = end.max(segment_end);
+        raw_end = raw_end.max(segment_end);
     }
+    // Linux maps a PT_LOAD over WHOLE PAGES —
+    // `[align_down(p_vaddr), align_up(p_vaddr + p_memsz)]` — and this region
+    // becomes a guest VMA verbatim (`proc_maps_from_address_space` ->
+    // `ProcMapsEntry` -> `semantic_vmas_from_boot_regions` -> `SemanticVma`).
+    // Recording the raw ELF extent instead published a VMA ending mid-page,
+    // which `validate_fork_projection` rejects, so a guest whose last PT_LOAD
+    // group is not a page multiple could not fork at all. The grouping loop
+    // above already reasons in page-aligned bounds; only the region it builds
+    // did not. Aligning start DOWN keeps the copy offsets below correct (they
+    // are relative to `start`) and aligning end UP zero-fills the page tail,
+    // which is what Linux leaves there.
+    let start = align_down_u64(raw_start, GUEST_VMA_PAGE_SIZE);
+    let end =
+        align_up_u64(raw_end, GUEST_VMA_PAGE_SIZE).ok_or(AddressSpaceError::RegionOverflow {
+            start: raw_start,
+            size: raw_end.saturating_sub(raw_start),
+        })?;
     let total_size_u64 = end
         .checked_sub(start)
         .ok_or(AddressSpaceError::RegionOverflow { start, size: 0 })?;
@@ -4511,6 +4534,72 @@ mod loader_tests {
             }),
             "native loader should omit pre-mapped HVF runtime regions"
         );
+    }
+
+    /// The HVF/HVPatch lane's merged load regions ARE the guest's initial
+    /// VMAs: `proc_maps_from_address_space` copies `region.start`/`region.end`
+    /// straight into `ProcMapsEntry`, and `semantic_vmas_from_boot_regions`
+    /// copies those into `SemanticVma`. Linux maps a `PT_LOAD` over whole
+    /// pages — `[align_down(p_vaddr), align_up(p_vaddr + p_memsz)]` — so these
+    /// bounds must be page-aligned too.
+    ///
+    /// They were not: the region took the RAW segment extent. Nothing checked
+    /// until fork projection began validating that every semantic range is
+    /// 4 KiB aligned, at which point a guest whose last PT_LOAD group is not a
+    /// page multiple could not `fork(2)` AT ALL — `ubuntu:24.04`'s `/bin/sh`
+    /// yielded `va=0x8800030000 len=0x2e88` and every fork returned EAGAIN.
+    /// A binary whose segments happened to end on a page boundary was fine,
+    /// which is why the failure looked image-specific rather than universal.
+    #[test]
+    fn hvf_merged_load_regions_are_page_aligned() {
+        let mut file = vec![0_u8; 0x3000];
+        file[0x1000..0x1004].copy_from_slice(&[1, 2, 3, 4]);
+        // One PT_LOAD whose memsz (0x2e88) is not a page multiple, at a
+        // page-aligned vaddr — the exact shape observed in the guest.
+        let plan = LoadPlan {
+            entry: 0x0088_0003_0000,
+            interpreter: None,
+            program_header_address: None,
+            program_header_entry_size: 56,
+            program_header_count: 1,
+            load_bias: 0,
+            e_type: ElfType::Dyn,
+            segments: vec![LoadSegment {
+                file_offset: 0x1000,
+                virtual_address: 0x88_0003_0000,
+                file_size: 4,
+                memory_size: 0x2e88,
+                alignment: 0x1000,
+                perms: SegmentPerms {
+                    read: true,
+                    write: false,
+                    execute: true,
+                },
+            }],
+        };
+
+        let regions = regions_from_load_plan(&file, &plan).expect("hvf merged regions");
+        assert_eq!(regions.len(), 1);
+        let region = &regions[0];
+        assert_eq!(
+            region.start & 0xFFF,
+            0,
+            "region start {:#x} must be page aligned",
+            region.start
+        );
+        assert_eq!(
+            region.end & 0xFFF,
+            0,
+            "region end {:#x} must be page aligned (memsz {:#x} is not a page multiple)",
+            region.end,
+            0x2e88
+        );
+        // Linux rounds the extent UP: the segment's bytes stay at their
+        // in-region offset and the page tail is zero.
+        assert_eq!(region.start, 0x88_0003_0000);
+        assert_eq!(region.end, 0x88_0003_3000);
+        assert_eq!(&region.bytes()[0..4], &[1, 2, 3, 4]);
+        assert_eq!(region.bytes()[0x2e88], 0, "page tail is zero-filled");
     }
 
     #[test]

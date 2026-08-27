@@ -918,7 +918,14 @@ pub fn lookup_fork_projection(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ForkProjectionError {
     ZeroLength,
-    Unaligned,
+    /// A range whose `va` or `len` is not 4 KiB aligned. Carries the exact
+    /// offending pair: the rejection is otherwise indistinguishable from any
+    /// other unaligned VMA in the address space, and the guest only sees
+    /// `fork(2) = EAGAIN`.
+    Unaligned {
+        va: u64,
+        len: u64,
+    },
     Overflow,
     OverlappingOrUnsorted,
     IncompleteCoverage,
@@ -928,7 +935,13 @@ impl std::fmt::Display for ForkProjectionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ZeroLength => write!(f, "zero length projection range"),
-            Self::Unaligned => write!(f, "unaligned projection range"),
+            Self::Unaligned { va, len } => write!(
+                f,
+                "unaligned projection range va={va:#x} len={len:#x} \
+                 (va&0xfff={:#x}, len&0xfff={:#x})",
+                va & 0xFFF,
+                len & 0xFFF
+            ),
             Self::Overflow => write!(f, "projection range overflow"),
             Self::OverlappingOrUnsorted => write!(f, "overlapping or unsorted projection ranges"),
             Self::IncompleteCoverage => write!(f, "projection does not exactly cover live VMAs"),
@@ -970,7 +983,10 @@ pub fn validate_fork_projection(ranges: &[ForkProjectionRange]) -> Result<(), Fo
             return Err(ForkProjectionError::ZeroLength);
         }
         if r.va & 0xFFF != 0 || r.len & 0xFFF != 0 {
-            return Err(ForkProjectionError::Unaligned);
+            return Err(ForkProjectionError::Unaligned {
+                va: r.va,
+                len: r.len,
+            });
         }
         let end =
             r.va.checked_add(r.len)
