@@ -1809,12 +1809,36 @@ fn stamp_identity_page_at<M: GuestMemory>(
         return Ok(());
     }
     let id = dispatcher.identity_snapshot(kernel_context);
-    stamp_identity_values(
-        memory,
-        base,
-        id.pid,
-        u32::from(dispatcher.identity_fast_path_enabled()),
-    )
+    // FAIL CLOSED on an unpublishable identity.
+    //
+    // `getpid()` never returns 0 on Linux, so a zero here means the identity
+    // is not knowable yet rather than that it is zero — a pid-namespace
+    // translation that has not been registered resolves to 0 through the
+    // `unwrap_or(0)` in `identity_pid`. Opening the fast-path gate over that
+    // publishes a pid no Linux process has, and the guest reads it in
+    // userspace with NO vm exit, so nothing ever re-checks it. Observed as a
+    // container's init reporting `getpid=0`.
+    //
+    // Leaving the gate SHUT costs only speed: the guest traps and the
+    // dispatcher answers correctly. A later stamp re-opens it once the
+    // identity is real.
+    let shim_enabled = identity_gate_word(dispatcher.identity_fast_path_enabled(), id.pid);
+    stamp_identity_values(memory, base, id.pid, shim_enabled)
+}
+
+/// The value to publish in the identity page's shim gate.
+///
+/// Non-zero opens the userspace fast path, so it must only ever be opened over
+/// a pid a guest could legitimately observe. `getpid()` never returns 0 on
+/// Linux: a zero here means the identity is not knowable YET — an unregistered
+/// pid-namespace translation resolves to 0 through the `unwrap_or(0)` in
+/// `identity_pid` — not that the pid is zero. Publishing it would let a guest
+/// read a pid no process has, with no vm exit and nothing to re-check it.
+///
+/// Shutting the gate costs only speed: the guest traps and the dispatcher
+/// answers correctly, and a later stamp opens it once the identity is real.
+fn identity_gate_word(fast_path_enabled: bool, pid: u32) -> u32 {
+    u32::from(fast_path_enabled && pid != 0)
 }
 
 fn stamp_identity_values<M: GuestMemory>(
@@ -8993,6 +9017,33 @@ mod tests {
         assert!(
             stack.start > crate::memory::LINUX_STACK_TOP - crate::memory::LINUX_STACK_SIZE,
             "the full RLIMIT-sized backing is not the initially grown Linux VMA"
+        );
+    }
+
+    #[test]
+    fn identity_gate_stays_shut_over_an_unpublishable_pid() {
+        // `getpid()` never returns 0 on Linux, so a zero identity means "not
+        // knowable yet", not "zero" — an unregistered pid-namespace
+        // translation resolves to 0 via `unwrap_or(0)` in `identity_pid`.
+        // Opening the fast path over it publishes a pid no process has, and
+        // the guest reads it with NO vm exit, so nothing re-checks it. Seen as
+        // a container's init reporting `getpid=0`.
+        //
+        // Drop the `pid != 0` term and the first assertion fails.
+        assert_eq!(
+            identity_gate_word(true, 0),
+            0,
+            "an unpublishable identity must leave the fast path SHUT"
+        );
+        assert_eq!(
+            identity_gate_word(true, 1),
+            1,
+            "a real pid still opens the fast path"
+        );
+        assert_eq!(
+            identity_gate_word(false, 1),
+            0,
+            "a caller that disabled the fast path still wins"
         );
     }
 
