@@ -7282,11 +7282,8 @@ EOF
 <!-- cluster C5-docs-handoff -->
 ## Cluster C5-docs-handoff
 
-> **Status: RECONCILIATION PENDING.** Verifier-corrected against `39426141`; task headings were renumbered mechanically (headings renumbered 27..28 -> 33..34), but by-number cross-references inside the text still use the DRAFT numbering (see the renumber table in the index) and the cross-cluster fixes below have NOT been applied. A future session must apply each item, then remove this block.
->
-> - [ ] TASK-NUMBER COLLISIONS (5) + one unnumbered cluster: A3 Task 6 (syscall-map doc row) vs A4 Task 6 (net.rs test module); A4 Task 7/8 vs A5 Task 7/8; B2 Task 14/15 vs B3 Task 14/15; C1 Task 21 (host-authority census reconcile, added in review) vs C2 Task 21 (prepare.rs). A2 carries no task number at all. FIX: renumber globally in dependency order and rewrite every cross-reference ('Task 11', 'Task 18', 'Task 19', 'Task 21/22', 'Task 23', 'Task 25/26') to the new numbers: A1=1-3, A2=4, A3=5-7, A4=8-10, A5=11-13, B1=14-15, B2=16-19, B3=20-21, B4=22-23, C1=24-27, C2=28-29, C3=30-31, C4=32-33, C5=34-35. (All consumers below are stated with the ORIGINAL numbers; the renumbering must be applied on top.)
-> - [ ] C5's Gate C parity input and C3's `to_run_request` disagree on the comparison surface: C5 consumes 'Gate C parity test in crates/carrick-embed/tests/ comparing ContainerResult to the CLI RunResult for the same image/command (embed cluster)', C3 produces `to_run_request(&self)` for 'Gate C's CLI/embed RunSpec parity tests' (RunSpec equality, no guest), and C4's `just test-embed` depends on `build` because 'the CLI-parity test needs a signed target/release/carrick' (guest-running result parity). FIX: C3 records that the guest-running parity case (`carrick run --json` envelope exit_code/trap_limit_hit/stdout vs ContainerResult) lives in the signed smoke file owned by C4 Task 26, and C5 links that test by name; the RunSpec parity test stays in C3's no-HVF lib tests.
->
+> **Status:** verifier-corrected and cross-cluster reconciled.
+
 ### Task 33: Make `carrick-embed` the active workstream in the controller and docs
 
 **Files:**
@@ -7304,7 +7301,7 @@ EOF
 
 - [ ] **Step 0: Precondition — the Phase A–C plan document exists at the path the spec names**
 
-This task (and Task 28's receipt) link `docs/superpowers/plans/2026-08-25-carrick-embed-phase-a-c-plan.md`. That file is THIS plan; it does not exist in the tree at HEAD `ea0dac4c`. Save the plan there before running Step 1, otherwise the handoff link dangles and Step 7's add is a no-op for it:
+This task (and Task 34's receipt) link `docs/superpowers/plans/2026-08-25-carrick-embed-phase-a-c-plan.md`. That file is THIS plan; it does not exist in the tree at HEAD `ea0dac4c`. Save the plan there before running Step 1, otherwise the handoff link dangles and Step 7's add is a no-op for it:
 
 ```bash
 test -e docs/superpowers/plans/2026-08-25-carrick-embed-phase-a-c-plan.md && echo plan-present
@@ -7637,12 +7634,12 @@ EOF
 
 **Files:**
 - Create: `docs/perf-results/${DATE}-embed-phase-c-checkpoint.md` where `DATE=$(date +%F)` on the day the gates run (the 2026-08-22 precedent is `docs/perf-results/2026-08-22-fork-closure-baseline.md`, whose `## Exact signed artifact` header at lines 12-21 this receipt mirrors)
-- Modify: `handoff.md` "Current direction" section (added by Task 27) — one bullet linking the receipt
+- Modify: `handoff.md` "Current direction" section (added by Task 33) — one bullet linking the receipt
 - Read-only inputs: `justfile:267-284` (`ci`), `justfile:347-364` (`conformance-probes-closure`, comment 347-349, recipe 350-364), `justfile:35-41` (`build` execs `scripts/build-signed.sh` on macOS), `scripts/build-signed.sh:53-66` (source stamping; the three `CARRICK_BUILD_SOURCE_*` env lines are 63-65) and `:82-88` (the re-sign: `cp` to `carrick.tmp.$$`, `vtool`, `codesign --force --sign -`, `mv`), `scripts/conformance/carrier-topology-gate.py:277-287` (`validate_source_binding`) and `:309-356` (`source_identity`/`artifact_receipt` — the tree's definition of the receipt fields; `dwarfdump --uuid` at 345), `handoff.md:175-211` (session 8's file-backed gate pattern and its artifact-identity note), `scripts/perf/native_go_build_abba.py:2195-2228` (`prepare-arm`/`run` argparse), `:1770-1791` (`_publish_receipt` writes `arm.json`), `:225-258` (`validate_arm_mode`, two-binary mode rules), `:1811-1935` (`prepare_arm`: runs `just build` in the source repo, requires `git status --porcelain` EMPTY including untracked files, copies the binary and records `binary_sha256`/`macho_uuid`), `:948-1012` and `:1148-1190` (`run_campaign`: `--quads` ≥ 8, output must not exist, campaign artifact keys), `:880-915` (`_campaign_decision` — an IMPROVEMENT test), `scripts/perf/native_go_build.py:26` (`DEFAULT_IMAGE`), `:37` (`VARIANT_DEFAULT`), `:58-83` (`PERFORMANCE_CONTROL_KEYS`), `:93-100` (`VARIANT_OVERLAYS`), `:355-360` (`fixed_variant_overlay`), `scripts/perf/evidence/native-go-build-abba-control-control-v1.json` (the instrument's control/control resolution: `statistics.metrics.cpu_s.median_quad_ratio` 1.0053, `bootstrap.two_sided_lower` 0.9734, `two_sided_upper` 1.0564, `decision.statistical_pass` false, `accepted` true)
 - Test: the receipt-existence and status-file assertions below (red before the gates run, green after)
 
 **Interfaces:**
-- Consumes: `just test-embed` (Phase C signing cluster: `cargo test -p carrick-embed --no-run --message-format=json`, codesign each test executable with `scripts/entitlements.plist`, run with `RUST_TEST_THREADS=1`); the Gate C CLI-vs-library parity test inside `crates/carrick-embed/tests/` (embed cluster); `carrick __build-source-marker` (hidden subcommand declared at `crates/carrick-cli/src/args.rs:118`, JSON built by `build_source_marker_json` at `crates/carrick-cli/src/commands.rs:2113-2120`, emitting `{"head","schema":"carrick-build-source-v1","state","tree"}` — serde_json without `preserve_order`, so keys are alphabetical); `scripts/sudo/kill.sh <run-id>`.
+- Consumes: `just test-embed` (Phase C signing cluster: `cargo test -p carrick-embed --no-run --message-format=json`, codesign each test executable with `scripts/entitlements.plist`, run with `RUST_TEST_THREADS=1`); the Gate C CLI-vs-library parity test inside `crates/carrick-embed/tests/` (signed smoke file owned by C4 Task 32); `carrick __build-source-marker` (hidden subcommand declared at `crates/carrick-cli/src/args.rs:118`, JSON built by `build_source_marker_json` at `crates/carrick-cli/src/commands.rs:2113-2120`, emitting `{"head","schema":"carrick-build-source-v1","state","tree"}` — serde_json without `preserve_order`, so keys are alphabetical); `scripts/sudo/kill.sh <run-id>`.
 - Produces: `docs/perf-results/${DATE}-embed-phase-c-checkpoint.md` — the artifact-bound receipt later phases cite as "Phase C closed on <HEAD>".
 
 **Artifact identity — read this before Step 2.** `just build` always re-signs: `scripts/build-signed.sh:82-88` copies the linked binary to `target/release/carrick.tmp.$$`, rewrites the build version with `vtool`, ad-hoc signs THAT file (so the codesign identifier is `carrick.tmp.<pid>` — the live binary reports `Identifier=carrick.tmp.2298`, the 2026-08-22 receipt `carrick.tmp.49125`), and renames it into place. Consequently every `just build` — including the one `conformance-probes-closure: build` triggers and the one `prepare-arm` runs — changes the codesign identifier, CDHash and SHA-256 even when cargo did not relink. What identifies the LINK is the LC_UUID (set by `ld64`, untouched by `vtool`/`codesign`) plus the `__build-source-marker` head/tree. This task therefore stamps LC_UUID + marker + SHA-256 after every gate, requires LC_UUID and marker to be identical at every stamp, and records the final signing's SHA-256/CDHash/identifier as the receipt's exact artifact. (Session 8 obtained byte-identity only because its closure build was the last re-sign and its later controls did not rebuild — `handoff.md:198-211`.)
@@ -7656,7 +7653,7 @@ git status --porcelain | wc -l
 git log -1 --format='%H %s'
 ```
 
-Expected: receipt count `0` (the red), tracked-tree count `0` (if it is not 0, commit or discard first: a receipt taken on a dirty tree is invalid, and `validate_source_binding` in `carrier-topology-gate.py:277-287` refuses one), the untracked count also `0` (Step 7's `prepare-arm` uses plain `git status --porcelain` and refuses ANY untracked path — commit the plan/spec documents via Task 27 first, and do not create the receipt file until Step 9), and the HEAD line names the last Phase C commit.
+Expected: receipt count `0` (the red), tracked-tree count `0` (if it is not 0, commit or discard first: a receipt taken on a dirty tree is invalid, and `validate_source_binding` in `carrier-topology-gate.py:277-287` refuses one), the untracked count also `0` (Step 7's `prepare-arm` uses plain `git status --porcelain` and refuses ANY untracked path — commit the plan/spec documents via Task 33 first, and do not create the receipt file until Step 9), and the HEAD line names the last Phase C commit.
 
 - [ ] **Step 2: Build the signed artifact on exactly this HEAD, prove the binding, take the first stamp**
 
@@ -7918,7 +7915,7 @@ Expected: the file renders with every field populated (no `unstamped`, no empty 
 
 - [ ] **Step 10: Link the receipt from the controller**
 
-In `handoff.md`, inside the "Current direction" section from Task 27, directly after the bullet list that ends with the source-proposal path (`docs/superpowers/plans/2026-08-23-carrick-embed-source-implementation-plan.md`), add:
+In `handoff.md`, inside the "Current direction" section from Task 33, directly after the bullet list that ends with the source-proposal path (`docs/superpowers/plans/2026-08-23-carrick-embed-source-implementation-plan.md`), add:
 
 ```markdown
 - Phase C receipt (signed artifact, all gates file-backed):

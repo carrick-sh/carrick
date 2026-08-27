@@ -1,6 +1,6 @@
 # Carrick exact conformance closure handoff
 
-**Updated:** 2026-08-26 (session 15 — Task 4.38A semantic transaction integrated)
+**Updated:** 2026-08-26 (session 9 — `carrick-embed` is the active workstream; owner decision 2026-08-25)
 
 **Canonical host/lane:** macOS, Apple Silicon, HVF/HVPatch, Linux arm64 guest
 
@@ -313,9 +313,13 @@ and were being silently skipped, so the frozen surface was not being measured.
 Session 8 has now closed all five prerequisite criteria on one signed artifact:
 the file-backed CI status is `0`, the fail-closed probe closure is **838/838
 generic + 40/40 dedicated**, the 40-run fork-lifecycle stress and shell controls
-are green, and scoped cleanup is empty. The objective below is therefore active
-again. Do not divert into retired API cleanup; resume the 2,127-suite core
-emulation roadmap, correctness first and performance only after exact parity.
+are green, and scoped cleanup is empty. The objective below therefore stands as
+the standing correctness-then-performance goal. It is NOT the active
+workstream: on 2026-08-25 the owner decided that `carrick-embed` is (see
+"Current direction" below and
+`docs/superpowers/specs/2026-08-25-carrick-embed-program-design.md`, Decisions
+table, row "Sequencing"). Retired-API cleanup stays out of scope except for the
+specific deletions the embed plan's Phase A names.
 
 Restored verbatim after the three final reducers closed:
 
@@ -487,16 +491,39 @@ Acceptance is closed. Any future change to source or binary invalidates this
 artifact-specific receipt and must rerun both exhaustive gates and controls;
 do not reuse these counts for a later link.
 
-### Current direction — core emulation roadmap resumed
+### Current direction — `carrick-embed` is the active workstream (owner decision 2026-08-25)
 
-The retirement receipts are green, so return to the restored core-emulation
-roadmap above: freeze and execute the declared 2,127-suite surface, close exact
-assertion-level parity with no skips/excuses/retry acceptance, and only then
-attack the <=2x performance gate. Continue to lead diagnosis with `carrick
-trace`; use `carrick debug lldb-snapshot`/cores when tracing perturbs or misses
-the failure.
-The retired API and legacy subprocess architecture are no longer the active
-workstream.
+The retirement receipts are green. The owner ruled on 2026-08-25 that the next
+work is `carrick-embed`: the Rust library surface that runs a containerized
+Linux workload from a host application and exposes what follows from Carrick
+being the kernel — VFS injection, syscall observation, time control, fault
+injection, zero-copy shared memory, in-process network mocking, resource
+budgets and a self-hosted conformance framework. Carrick's own tests are the
+first consumer (dog-food first), and the carrier's process statics are
+de-globalized before any multi-container claim is made.
+
+Governing documents (the two 2026-08-23 review documents are superseded and
+carry a banner saying so):
+
+- Spec: `docs/superpowers/specs/2026-08-25-carrick-embed-program-design.md`
+- Plan (Phases A–C): `docs/superpowers/plans/2026-08-25-carrick-embed-phase-a-c-plan.md`
+- Source proposal (purpose and spirit):
+  `docs/superpowers/plans/2026-08-23-carrick-embed-source-implementation-plan.md`
+
+Sequencing: Phase A (narrow red-first defect commits, independent of embed) →
+Phase B (`Container` as a kernel-graph object; two containers sequentially and
+concurrently in ONE carrier) → Phase C (`RunRequest`, `prepare.rs`,
+`carrick-embed` v1, signed `just test-embed`). Each phase closes on a dated
+receipt under `docs/perf-results/` bound to one signed artifact, exactly as
+session 8 did. The 2,127-suite core-emulation roadmap above remains the
+standing objective and is served by Phase J (`carrick-conformance-next`); it
+becomes the active workstream again when the owner says so, not by inference.
+
+Unchanged and binding: red-first deterministic reducers, Docker bpftrace
+ground truth, `carrick trace` first and `carrick debug lldb-snapshot`/cores
+when tracing perturbs, guest runs never parallelized, no probe blessed, no
+excuse row, no default-off mechanism, `just ci` status read from a FILE. The
+retired API and legacy subprocess architecture are not a workstream.
 
 ## SESSION 7 — 2026-08-24: the churn tail is ONE bug, and it is cornered
 

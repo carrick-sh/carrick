@@ -285,6 +285,42 @@ so the guest's slave observes the resize and the guest is delivered its own `SIG
 
 ---
 
+## 5. Embedding
+
+Carrick is also a library. `carrick-embed` — governed by
+[superpowers/specs/2026-08-25-carrick-embed-program-design.md](superpowers/specs/2026-08-25-carrick-embed-program-design.md)
+— runs a containerized Linux workload from a host Rust application through the
+same seam the CLI uses:
+
+```text
+host application
+  -> carrick_embed::ContainerBuilder
+  -> carrick_engine::RunRequest  ->  Engine::resolve (async; tokio) -> RunSpec
+  -> Runtime::prepare(&RunSpec, LaunchContext, RuntimeExtensions) -> PreparedRun
+  -> PreparedRun::execute() -> RunResult          (sync; spawn_blocking for async)
+  -> HVPatch kernel: ONE carrier / ONE VM / ONE kernel graph
+       `- Container objects on the kernel graph (namespace trees)
+```
+
+The CLI and the library both lower into `RunRequest` and both call
+`Runtime::prepare`, so there is one merge path and one execution path. A
+`Container` (`crates/carrick-runtime/src/kernel/container.rs`) is a kernel-graph
+object owning its PID-namespace root, rootfs and mount table, hostname, clock
+domain, granted capabilities and stdio sink — and, in later phases, its observer
+chain and quotas. Carrier-lifetime state (the HVF VM, the `KernelArena`, host
+signal dispositions, the SIGWINCH self-pipe of §4, vCPU leases) stays
+process-scoped and is never aliased to one container; every `KernelContext`
+reaches its container through its task, never through a static. Extensions —
+VFS mounts, observers, time control, fault injection, budgets, network
+interposition, shared buffers — are installed at `prepare` time and sealed at
+`execute`. Guest-running library tests are codesigned test executables run
+serially by `just test-embed`; `HV_DENIED` there is a failure, never a skip.
+
+Status: experimental, like the rest of Carrick. Phase status, gates and
+non-goals live in the spec; nothing here claims a hardened trust boundary.
+
+---
+
 ## See also
 
 * [../README.md](../README.md) — quickstart, the crate workspace, and the build/codesign gate.
@@ -297,3 +333,6 @@ so the guest's slave observes the resize and the guest is delivered its own `SIG
   Docker-oracle suites and the compile-time no-panic gate.
 * [conformance-coverage.md](conformance-coverage.md) — the active probe-gate map: every
   syscall-ABI invariant and its owning deterministic probe.
+* [superpowers/specs/2026-08-25-carrick-embed-program-design.md](superpowers/specs/2026-08-25-carrick-embed-program-design.md) — the
+  `carrick-embed` program: library surface, `Container` on the kernel graph, and the
+  per-phase gates (§5).
