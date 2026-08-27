@@ -345,7 +345,7 @@ impl SyscallDispatcher {
     ) -> IdentitySnapshot {
         let task_id = u32::try_from(kernel.task().key().id.raw()).unwrap_or(0);
         IdentitySnapshot {
-            pid: crate::namespace::pid::host_to_ns_or_self_for(kernel, task_id),
+            pid: crate::namespace::pid::ns_self_pid_for(kernel, task_id),
         }
     }
 
@@ -356,7 +356,7 @@ impl SyscallDispatcher {
     pub(crate) fn identity_pid(&self) -> u32 {
         if let Some(pid) = crate::dispatch::resources::with_active_context(|context| {
             let task_id = u32::try_from(context.task().key().id.raw()).unwrap_or(0);
-            crate::namespace::pid::host_to_ns_or_self_for(context, task_id)
+            crate::namespace::pid::ns_self_pid_for(context, task_id)
         }) {
             return pid;
         }
