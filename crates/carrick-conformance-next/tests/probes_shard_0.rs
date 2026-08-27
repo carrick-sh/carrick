@@ -604,6 +604,7 @@ fn generic_probe_shard_0() {
             if !common::runs_in_cached_lane(probe_name) {
                 continue;
             }
+            eprintln!("RUN generic probe shard 0 {target}:{probe_name}");
             let probe_path = probe_dir.join(probe_name);
             assert!(
                 probe_path.is_file(),
