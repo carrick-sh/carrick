@@ -290,6 +290,7 @@ mod overlay_dispatch_tests {
                 pty: None,
                 bidirectional: false,
                 write_kind: HostWriteKind::PipeLike,
+                stdio_stream: None,
             })),
             0,
         );
@@ -499,6 +500,7 @@ mod overlay_dispatch_tests {
             pty: None,
             bidirectional: false,
             write_kind: HostWriteKind::PipeLike,
+            stdio_stream: None,
         })));
         let writer_fd = dispatcher
             .install_fd_at_or_above(3, OpenFile::new(Arc::clone(&writer), LINUX_FD_CLOEXEC))
@@ -3790,6 +3792,7 @@ mod hvpatch_in_process_fork_tests {
                     pty: None,
                     bidirectional: false,
                     write_kind: HostWriteKind::PipeLike,
+                    stdio_stream: None,
                 })),
                 0,
             ),
@@ -3805,6 +3808,7 @@ mod hvpatch_in_process_fork_tests {
                     pty: None,
                     bidirectional: false,
                     write_kind: HostWriteKind::PipeLike,
+                    stdio_stream: None,
                 })),
                 0,
             ),
