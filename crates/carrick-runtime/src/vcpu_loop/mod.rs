@@ -1842,6 +1842,10 @@ fn stamp_identity_values<M: GuestMemory>(
         base + crate::memory::IDENTITY_OFF_SHIM_ENABLED,
         &0_u32.to_le_bytes(),
     )?;
+    // Pair for the release below: the CLOSE must be observable before the
+    // identity it protects starts changing, or a guest can see the old gate
+    // open over a half-written pid.
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
     memory.write_bytes(base + crate::memory::IDENTITY_OFF_PID, &pid.to_le_bytes())?;
     // A fresh stamp starts a fresh serviced-syscall ledger: a forked child
     // COWs its parent's identity page and must not inherit the parent's
@@ -1852,7 +1856,19 @@ fn stamp_identity_values<M: GuestMemory>(
         base + crate::memory::IDENTITY_OFF_SHIM_SYSCALLS,
         &0_u64.to_le_bytes(),
     )?;
-    // Open the gate last, once pid and the ledger are both published.
+    // RELEASE the identity before opening the gate.
+    //
+    // Ordering the stores in program order is necessary but NOT sufficient.
+    // The guest reads this page from another vCPU, and AArch64 lets plain
+    // stores be observed out of order: without a barrier a guest can see the
+    // gate word already non-zero while the pid store is not yet visible, and
+    // report pid 0 through a fast path that never traps. That is the whole
+    // failure — intermittent, wider under load, and closed by anything that
+    // slows the writer down (which is why logging or a debug build hides it).
+    //
+    // The gate is a publication flag, so it needs release semantics: every
+    // store above must be observable before the store that opens it.
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
     memory.write_bytes(
         base + crate::memory::IDENTITY_OFF_SHIM_ENABLED,
         &shim_enabled.to_le_bytes(),
