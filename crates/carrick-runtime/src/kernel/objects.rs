@@ -3353,7 +3353,7 @@ impl Task {
         self.identity.lock().process_group
     }
 
-    pub(super) fn session(&self) -> SessionId {
+    pub fn session(&self) -> SessionId {
         self.identity.lock().session
     }
 
@@ -3370,7 +3370,7 @@ impl Task {
         *self.lifecycle.lock()
     }
 
-    pub(super) fn process_credentials(&self) -> Arc<Credentials> {
+    pub fn process_credentials(&self) -> Arc<Credentials> {
         self.process_credentials.load_full()
     }
 

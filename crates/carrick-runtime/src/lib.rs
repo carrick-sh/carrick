@@ -141,6 +141,7 @@ pub mod interactive_supervisor;
 pub(crate) mod keyring;
 pub mod layer_cache;
 pub mod namespace;
+pub mod observe;
 
 pub mod network;
 pub mod page_profile;

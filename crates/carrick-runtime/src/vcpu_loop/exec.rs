@@ -908,6 +908,21 @@ where
                 self.this_tid
             );
         }
+        if let Some(chain) = kernel.dispatcher.observers() {
+            let p = crate::observe::ProcessInfo::new(kernel_context);
+            let argv_slices: Vec<&[u8]> = argv.iter().map(|arg| arg.as_slice()).collect();
+            match chain.on_exec(&p, path.as_bytes(), &argv_slices) {
+                crate::observe::SyscallAction::Allow => {}
+                crate::observe::SyscallAction::Deny(errno) => {
+                    return Self::exec_failed_with_errno(engine, errno)
+                        .map(ExecvePreparation::Complete);
+                }
+                crate::observe::SyscallAction::Kill(_sig) => {
+                    return Self::exec_failed_with_errno(engine, crate::linux_abi::LINUX_EACCES)
+                        .map(ExecvePreparation::Complete);
+                }
+            }
+        }
         let proc_argv: Vec<String> = argv
             .iter()
             .map(|argument| String::from_utf8_lossy(argument).into_owned())

@@ -108,6 +108,10 @@ impl KernelContext {
         )
     }
 
+    pub fn parent_at_capture(&self) -> Option<TaskKey> {
+        self.parent_at_capture
+    }
+
     /// Retain this exact captured generation for a lifecycle handoff. This is
     /// deliberately distinct from registry capture: every Arc and revision is
     /// preserved byte-for-byte, so no newer association can be substituted.

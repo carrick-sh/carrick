@@ -79,6 +79,10 @@ pub fn lookup_aarch64(number: u64) -> Option<&'static Syscall> {
         .map(|index| &AARCH64_SYSCALLS[index])
 }
 
+pub fn lookup_aarch64_by_name(name: &str) -> Option<&'static Syscall> {
+    AARCH64_SYSCALLS.iter().find(|syscall| syscall.name == name)
+}
+
 pub fn aarch64_table() -> &'static [Syscall] {
     AARCH64_SYSCALLS
 }
