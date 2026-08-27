@@ -746,9 +746,13 @@ impl SyscallDispatcher {
             OpenDescription::HostPipe {
                 is_read_end: false, ..
             } => None,
-            // A host socket is a valid splice destination (pipe->socket, the
-            // io.Copy(conn, pipe) direction); the host send enforces its own
-            // errors. Without this the `_` arm below rejected it with EINVAL.
+            OpenDescription::Stdio { stream, .. } => {
+                if *stream == 0 {
+                    Some(LINUX_EBADF)
+                } else {
+                    None
+                }
+            }
             OpenDescription::HostSocket { .. } => None,
             // Splicing FROM a pipe INTO a regular file is valid on Linux (only
             // ONE end must be a pipe). The write + offset advance is handled by
