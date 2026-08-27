@@ -2264,15 +2264,6 @@ impl SyscallDispatcher {
                 snapshot_private_host_file(host_fd.raw(), offset, &mut bytes)?;
                 shared_file_bus_offset(file_len, offset, length_u64, page_size)
             }
-            OpenDescription::Stdio { stream, .. } => {
-                let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                let is_chardev = unsafe { libc::fstat(*stream, &mut st) } == 0
-                    && (st.st_mode as u32 & libc::S_IFMT as u32) == libc::S_IFCHR as u32;
-                if !is_chardev {
-                    return Err(linux_errno::ENODEV);
-                }
-                None
-            }
             OpenDescription::HostPipe { host_fd, .. } => {
                 let mut st: libc::stat = unsafe { core::mem::zeroed() };
                 let is_chardev = unsafe { libc::fstat(host_fd.raw(), &mut st) } == 0
@@ -3313,13 +3304,6 @@ impl SyscallDispatcher {
             if let Some(open_file) = this.open_file(fd.0) {
                 let is_fifo = match &*open_file.description.read() {
                     OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => true,
-                    OpenDescription::Stdio { stream, .. } => {
-                        let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                        let fstat_ok = unsafe { libc::fstat(*stream, &mut st) } == 0;
-                        fstat_ok
-                            && (st.st_mode as u32 & libc::S_IFMT as u32)
-                                == libc::S_IFIFO as u32
-                    }
                     OpenDescription::HostPipe { host_fd, .. } => {
                         let mut st: libc::stat = unsafe { core::mem::zeroed() };
                         let fstat_ok = unsafe { libc::fstat(host_fd.raw(), &mut st) } == 0;

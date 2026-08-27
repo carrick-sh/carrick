@@ -1471,13 +1471,6 @@ impl SyscallDispatcher {
                     fd if fd >= 0 => Some(HostFd(fd)),
                     _ => None,
                 },
-                OpenDescription::Stdio { stream, .. } => {
-                    if is_stdio_fd(*stream) {
-                        Some(HostFd(*stream))
-                    } else {
-                        None
-                    }
-                }
                 _ => None,
             };
         }
@@ -1811,29 +1804,6 @@ impl SyscallDispatcher {
                 LINUX_POLLNVAL
             };
         };
-        let open = open_file.description.read();
-        if let OpenDescription::Stdio { stream, .. } = &*open {
-            let stream = *stream;
-            drop(open);
-            let mut revents = requested_events & LINUX_POLLOUT;
-            if stream == 0 && (requested_events & LINUX_POLLIN) != 0 {
-                let mut pfd = libc::pollfd {
-                    fd: 0,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                let n = unsafe { libc::poll(&mut pfd as *mut _, 1, 0) };
-                if n > 0 {
-                    if pfd.revents & libc::POLLIN != 0 {
-                        revents |= LINUX_POLLIN;
-                    }
-                    if pfd.revents & libc::POLLHUP != 0 {
-                        revents |= LINUX_POLLHUP;
-                    }
-                }
-            }
-            return revents;
-        }
         if let Some(ring) = open_file
             .description
             .concrete_backing::<crate::dispatch::ioring::IoUringBacking>()
@@ -2121,7 +2091,6 @@ impl SyscallDispatcher {
                     ready |= LINUX_POLLOUT;
                 }
             }
-            OpenDescription::Stdio { .. } => {}
         }
         ready
     }
@@ -5770,9 +5739,6 @@ impl SyscallDispatcher {
                                 fd if fd >= 0 => Some((fd, p.events, false)),
                                 _ => None,
                             },
-                            OpenDescription::Stdio { stream, .. } => {
-                                Some((*stream, p.events, false))
-                            }
                             _ => None,
                         }
                     } else if is_stdio_fd(p.fd) || p.fd < 0 {

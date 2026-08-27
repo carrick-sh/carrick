@@ -3792,16 +3792,32 @@ impl SyscallDispatcher {
                 return DispatchOutcome::errno(LINUX_EBADF);
             }
             None if is_stdio_fd(old_fd) => {
-                let pty = self.dup_stdio_pty_role(old_fd);
-                let flags = if old_fd == 0 {
-                    LINUX_O_RDONLY
-                } else {
-                    LINUX_O_WRONLY
+                // dup/fcntl(F_DUPFD) of the process's bare stdio fds:
+                // mirror what dup3 does and grab the host fd into a
+                // HostPipe so future reads/writes still hit the right
+                // host endpoint (this is what dpkg-query needs at
+                // startup to redirect its diagnostic fd, and what most
+                // glibc fork+exec helpers expect to succeed).
+                let duped = match (unsafe { libc::dup(old_fd) }).host_syscall_errno() {
+                    Ok(duped) => duped,
+                    Err(errno) => return DispatchOutcome::errno(errno),
                 };
-                kernel_file_description(Arc::new(RwLock::new(OpenDescription::Stdio {
-                    base: OpenDescriptionBase::new(flags),
-                    stream: old_fd,
+                crate::dispatch::net::set_host_nonblocking(duped);
+                let write_kind = HostWriteKind::for_host_fd(duped);
+                let pty = self.dup_stdio_pty_role(old_fd);
+                kernel_file_description(Arc::new(RwLock::new(OpenDescription::HostPipe {
+                    // A duped stdio fd has no separate pipe peer to coordinate
+                    // a FASYNC arm/trigger with; the host inode is still a
+                    // unique id (FASYNC is not exercised on bare stdio).
+                    pipe_id: host_inode_pipe_id(duped),
+                    // `duped` is a genuinely NEW host fd, so this fresh owned
+                    // handle is its one owner.
+                    host_fd: HostFdRef::new(duped),
+                    is_read_end: old_fd == 0,
+                    base: OpenDescriptionBase::new(0),
                     pty,
+                    bidirectional: false,
+                    write_kind,
                 })))
             }
             None => return DispatchOutcome::errno(LINUX_EBADF),
@@ -3851,16 +3867,26 @@ impl SyscallDispatcher {
                 return DispatchOutcome::errno(LINUX_EBADF);
             }
             None if is_stdio_fd(old_fd) => {
-                let pty = self.dup_stdio_pty_role(old_fd);
-                let flags = if old_fd == 0 {
-                    LINUX_O_RDONLY
-                } else {
-                    LINUX_O_WRONLY
+                let duped = match (unsafe { libc::dup(old_fd) }).host_syscall_errno() {
+                    Ok(duped) => duped,
+                    Err(errno) => return DispatchOutcome::errno(errno),
                 };
-                kernel_file_description(Arc::new(RwLock::new(OpenDescription::Stdio {
-                    base: OpenDescriptionBase::new(flags),
-                    stream: old_fd,
+                crate::dispatch::net::set_host_nonblocking(duped);
+                let write_kind = HostWriteKind::for_host_fd(duped);
+                let pty = self.dup_stdio_pty_role(old_fd);
+                kernel_file_description(Arc::new(RwLock::new(OpenDescription::HostPipe {
+                    // A duped stdio fd has no separate pipe peer to coordinate
+                    // a FASYNC arm/trigger with; the host inode is still a
+                    // unique id (FASYNC is not exercised on bare stdio).
+                    pipe_id: host_inode_pipe_id(duped),
+                    // `duped` is a genuinely NEW host fd, so this fresh owned
+                    // handle is its one owner.
+                    host_fd: HostFdRef::new(duped),
+                    is_read_end: old_fd == 0,
+                    base: OpenDescriptionBase::new(0),
                     pty,
+                    bidirectional: false,
+                    write_kind,
                 })))
             }
             None => return DispatchOutcome::errno(LINUX_EBADF),
@@ -5795,12 +5821,6 @@ impl SyscallDispatcher {
                             || false,
                         );
                     }
-                    OpenDescription::Stdio { stream, .. } => {
-                        if *stream == 0 {
-                            return DispatchOutcome::errno(LINUX_EBADF);
-                        }
-                        return self.write_stdio_sink(*stream, bytes);
-                    }
                     OpenDescription::HostPipe {
                         base,
                         host_fd,
@@ -7459,7 +7479,6 @@ impl SyscallDispatcher {
                 | OpenDescription::Fanotify { .. }
                 | OpenDescription::PipeReader { .. }
                 | OpenDescription::PipeWriter { .. }
-                | OpenDescription::Stdio { .. }
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::InMemorySocket { .. }
@@ -9787,26 +9806,6 @@ impl SyscallDispatcher {
             // Python's io.open("/dev/null","r+") requires seekable(). Delegate to
             // the host lseek when the backing fd is a char device; genuine
             // pipes/fifos (S_IFIFO) fall through to the ESPIPE branch below.
-            if let OpenDescription::Stdio { stream, .. } = &*open {
-                let mut st: libc::stat = unsafe { std::mem::zeroed() };
-                if unsafe { libc::fstat(*stream, &mut st) } == 0
-                    && (st.st_mode & libc::S_IFMT) == libc::S_IFCHR
-                {
-                    let host_whence = match whence {
-                        LINUX_SEEK_SET => libc::SEEK_SET,
-                        LINUX_SEEK_CUR => libc::SEEK_CUR,
-                        LINUX_SEEK_END => libc::SEEK_END,
-                        _ => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
-                    };
-                    let r = (unsafe {
-                        libc::lseek(*stream, offset as libc::off_t, host_whence)
-                    })
-                    .host_syscall_errno()?;
-                    return Ok(DispatchOutcome::Returned { value: r as i64 });
-                }
-                return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
-            }
-
             if let OpenDescription::HostPipe { host_fd, .. } = &*open {
                 let mut st: libc::stat = unsafe { std::mem::zeroed() };
                 if unsafe { libc::fstat(host_fd.raw(), &mut st) } == 0
@@ -9876,7 +9875,6 @@ impl SyscallDispatcher {
                 // ESPIPE means "give up, it's a stream".
                 OpenDescription::PipeReader { .. }
                 | OpenDescription::PipeWriter { .. }
-                | OpenDescription::Stdio { .. }
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::InMemorySocket { .. }
@@ -9935,7 +9933,6 @@ impl SyscallDispatcher {
                 | OpenDescription::Fanotify { .. }
                 | OpenDescription::PipeReader { .. }
                 | OpenDescription::PipeWriter { .. }
-                | OpenDescription::Stdio { .. }
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::InMemorySocket { .. }
@@ -10247,22 +10244,6 @@ impl SyscallDispatcher {
                         this.captured_slot_authority(fd.0)
                             .map(WaitFdAuthority::logical)
                             .unwrap_or_else(|| std::process::abort()),
-                    ));
-                }
-                OpenDescription::Stdio { stream, .. } => {
-                    if *stream != 0 {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                    }
-                    crate::dispatch::net::set_host_nonblocking(0);
-                    drop(open);
-                    return Ok(read_host_pipe(
-                        memory,
-                        address,
-                        length,
-                        0,
-                        None,
-                        nonblocking,
-                        WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
                     ));
                 }
                 OpenDescription::HostPipe {
@@ -10645,9 +10626,6 @@ impl SyscallDispatcher {
                 OpenDescription::PipeWriter { .. } => {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 }
-                OpenDescription::Stdio { stream, .. } if *stream != 0 => {
-                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                }
                 OpenDescription::EventFd { .. }
                 | OpenDescription::TimerFd { .. }
                 | OpenDescription::Epoll { .. }
@@ -10655,7 +10633,6 @@ impl SyscallDispatcher {
                 | OpenDescription::Inotify { .. }
                 | OpenDescription::Fanotify { .. }
                 | OpenDescription::PipeReader { .. }
-                | OpenDescription::Stdio { .. }
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::InMemorySocket { .. }
@@ -10768,9 +10745,6 @@ impl SyscallDispatcher {
                 OpenDescription::PipeWriter { .. } => {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 }
-                OpenDescription::Stdio { stream, .. } if *stream != 0 => {
-                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                }
                 OpenDescription::HostPipe {
                     is_read_end,
                     pty,
@@ -10786,7 +10760,6 @@ impl SyscallDispatcher {
                 | OpenDescription::Inotify { .. }
                 | OpenDescription::Fanotify { .. }
                 | OpenDescription::PipeReader { .. }
-                | OpenDescription::Stdio { .. }
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
@@ -10949,9 +10922,6 @@ impl SyscallDispatcher {
                 OpenDescription::PipeWriter { .. } => {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 }
-                OpenDescription::Stdio { stream, .. } if *stream != 0 => {
-                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                }
                 OpenDescription::HostPipe {
                     is_read_end,
                     pty,
@@ -10967,7 +10937,6 @@ impl SyscallDispatcher {
                 | OpenDescription::Inotify { .. }
                 | OpenDescription::Fanotify { .. }
                 | OpenDescription::PipeReader { .. }
-                | OpenDescription::Stdio { .. }
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
@@ -11170,7 +11139,6 @@ impl SyscallDispatcher {
                 | OpenDescription::InMemoryFile { .. }
                 | OpenDescription::SyntheticFile { .. }
                 | OpenDescription::PipeReader { .. } => LINUX_EBADF,
-                OpenDescription::Stdio { stream, .. } if *stream == 0 => LINUX_EBADF,
                 OpenDescription::HostPipe {
                     is_read_end,
                     pty,
@@ -11181,7 +11149,6 @@ impl SyscallDispatcher {
                 OpenDescription::HostFile { .. } => LINUX_EINVAL,
                 OpenDescription::Directory { .. } => LINUX_EISDIR,
                 OpenDescription::PipeWriter { .. }
-                | OpenDescription::Stdio { .. }
                 | OpenDescription::EventFd { .. }
                 | OpenDescription::TimerFd { .. }
                 | OpenDescription::HostPipe { .. }
@@ -11429,7 +11396,6 @@ impl SyscallDispatcher {
                 | OpenDescription::InMemoryFile { .. }
                 | OpenDescription::SyntheticFile { .. }
                 | OpenDescription::PipeReader { .. } => LINUX_EBADF,
-                OpenDescription::Stdio { stream, .. } if *stream == 0 => LINUX_EBADF,
                 OpenDescription::HostPipe {
                     is_read_end,
                     pty,
@@ -11440,7 +11406,6 @@ impl SyscallDispatcher {
                 OpenDescription::HostFile { .. } => LINUX_EINVAL,
                 OpenDescription::Directory { .. } => LINUX_EISDIR,
                 OpenDescription::PipeWriter { .. }
-                | OpenDescription::Stdio { .. }
                 | OpenDescription::EventFd { .. }
                 | OpenDescription::TimerFd { .. }
                 | OpenDescription::HostPipe { .. }
@@ -13092,14 +13057,6 @@ impl SyscallDispatcher {
                             }
                             return Ok(this.raise_sigpipe_on_epipe(cx, outcome));
                         }
-                        OpenDescription::Stdio { stream, .. } => {
-                            if *stream == 0 {
-                                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                            }
-                            let stream = *stream;
-                            drop(open);
-                            return Ok(this.write_stdio_sink(stream, &bytes));
-                        }
                         OpenDescription::HostPipe {
                             base,
                             host_fd,
@@ -13657,13 +13614,6 @@ impl SyscallDispatcher {
                                         )
                                     },
                                 );
-                                writeback = None;
-                            }
-                            OpenDescription::Stdio { stream, .. } => {
-                                if *stream == 0 {
-                                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                                }
-                                outcome = this.write_stdio_sink(*stream, &bytes);
                                 writeback = None;
                             }
                             OpenDescription::HostPipe {

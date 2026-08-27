@@ -5836,9 +5836,6 @@ impl SyscallDispatcher {
             let closing_slave = match &*open_file.description.read() {
                 OpenDescription::HostPipe {
                     pty: Some(role), ..
-                }
-                | OpenDescription::Stdio {
-                    pty: Some(role), ..
                 } if !role.is_master => Some(role.index),
                 _ => None,
             };
@@ -5853,11 +5850,6 @@ impl SyscallDispatcher {
                     {
                         pty_master_index = Some(role.index);
                     }
-                }
-                OpenDescription::Stdio {
-                    pty: Some(role), ..
-                } if role.is_master => {
-                    pty_master_index = Some(role.index);
                 }
                 // The inotify fd is closing for good: drop every dispatch-registry
                 // entry it owned so stale watches don't keep firing (and so the
@@ -7791,16 +7783,10 @@ fn is_stdio_fd(fd: i32) -> bool {
 /// Darwin-native ground truth and also fixes the interactive `-t` pty case
 /// (the slave IS a tty) and the redirected case (a pipe/file is NOT).
 fn fd_is_tty(open_files: &HashMap<i32, OpenFile>, fd: i32) -> bool {
-    if let Some(of) = open_files.get(&fd) {
-        if let OpenDescription::Stdio { stream, .. } = &*of.description.read() {
-            return is_stdio_fd(*stream) && crate::host_tty::host_isatty(*stream);
-        }
-        return false;
-    }
     if !is_stdio_fd(fd) {
         return false;
     }
-    crate::host_tty::host_isatty(fd)
+    !open_files.contains_key(&fd) && crate::host_tty::host_isatty(fd)
 }
 
 fn retain_open_file(description: &Arc<crate::kernel::FileDescription>) {
