@@ -133,19 +133,66 @@ aggregate passed end to end with every shard-0 probe named before execution.
 Retain the markers: a future abort must be attributed to its last named probe,
 not treated as an anonymous lane failure.
 
+### Full-suite migration fidelity and cache closure
+
+The earlier 1,092-row migrated run was compared against a new quiet-host run of
+the exact pre-migration source `1174dd6c2bd7cfa76a43e7771fdf87ea04885267`
+in an isolated worktree. The base reproduced the same failure mode: it stopped
+during Carrick phase 1 after the fail-fast threshold, emitting 1,079 rows with
+52 gating verdicts (`1008 match`, `12 diff`, `7 new`, `47 regression`,
+`5 timeout`). All 1,079 base rows were present in the migrated partial run;
+46 gating suite names were common, and ten common-name verdicts flipped in
+both directions. This attributes the broad partial-run red state to the
+load-sensitive existing runtime/baseline surface, not to the test migration.
+
+A quiet-host exhaustive migrated run then used `just conformance full --force`
+on the signed binary built from `e8f2ec37`. It emitted all **2,127/2,127** rows:
+
+| verdict | count |
+|---|---:|
+| `MATCH` | 2,004 |
+| known `DIFF` | 14 |
+| `NEW` | 7 |
+| `REGRESSION` | 82 |
+| `TIMEOUT` | 16 |
+| `CARRICK_CRASH` | 4 |
+
+That is **94.22% `MATCH`**, above the requested existing approximately 93%
+migration-fidelity bar. It is not a claim that runtime conformance is closed:
+102 verdicts remain gating. The authoritative receipt is
+`target/conformance/results.hvf.full.jsonl` (8,509,266 bytes, completed
+2026-08-27 11:20 PDT), whose first Carrick run ID is `conf-48617-c00`.
+
+The exhaustive run hit 2,111 committed Docker-oracle rows and ran 16 misses in
+the later, serialized Docker-only phase. Those canonical arm64 results produced
+15 unique cache keys (one `ioctl02` result serves two declarations), committed
+as `92f030cf1`. A follow-up selection of all 16 declarations with
+`--require-cached-oracle --no-image-refresh` proved up front that every key was
+present and reported `phase 2/3: 0 docker run(s), 16 cached oracle(s)`. Its
+runtime verdict was red for eight existing Carrick gaps; the cache/Docker-less
+contract itself passed fail-closed.
+
+The exhaustive-suite signed artifact was:
+
+| field | value |
+|---|---|
+| source HEAD at build | `e8f2ec37` |
+| binary SHA-256 | `88909052683abaf3f95ff6de9638c498bd8a3b7f405f9bda1b3096a2cdcd3c55` |
+| CDHash | `51ddf8132ae166d15dac150787c588e741d74be4` |
+| LC_UUID | `2A963A21-5A3C-31E1-9D55-FE02943926A1` |
+| hypervisor entitlement | present |
+| `__dof_carrick` | present |
+
 ### Scope fences and next work
 
-Do not chase the 45 suite regressions or six timeouts as part of this mechanical
-migration without first reproducing them on an unmodified base / quiet host;
-the migration changes test harnesses, not Carrick runtime semantics. The full
-suite failed before all rows were scheduled, so no coverage percentage refresh
-is valid. The bounded next steps are:
+Do not chase the exhaustive run's 102 gating verdicts as part of this mechanical
+migration: the exact pre-migration source reproduced the broad red state, and
+the migration changes test harnesses rather than Carrick runtime semantics. The
+bounded next steps are:
 
-1. compare `target/conformance/results.hvf.full.jsonl` against an unmodified
-   base run before filing any of its 51 gating verdicts as migration regressions;
-2. migrate dedicated tests only after the corresponding public embed topology
+1. migrate dedicated tests only after the corresponding public embed topology
    APIs exist; do not replace them with passing blocker stubs;
-3. after any code change, rerun `RUST_TEST_THREADS=1 just ci`; the current
+2. after any code change, rerun `RUST_TEST_THREADS=1 just ci`; the current
    documentation HEAD `aeec834a9` is green. Rebuild and restamp the signed
    artifact only when a later guest-running checkpoint actually changes code.
 
