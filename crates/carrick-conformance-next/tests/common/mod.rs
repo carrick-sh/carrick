@@ -49,6 +49,46 @@ pub fn needs_live_oracle(probe: &str) -> bool {
     LIVE_ORACLE_PROBES.contains(&probe)
 }
 
+/// Run one embedded container while host fd 0 is an already-EOF pipe, matching
+/// the old direct-probe transport and Docker's `-i` pipe after payload upload.
+/// Callers must hold [`guest_lock`] because fd 0 is process-global.
+pub fn with_empty_stdin_pipe<T>(run: impl FnOnce() -> T) -> T {
+    struct RestoreStdin(i32);
+
+    impl Drop for RestoreStdin {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is a live duplicate of fd 0 owned by this guard.
+            unsafe {
+                libc::dup2(self.0, libc::STDIN_FILENO);
+                libc::close(self.0);
+            }
+        }
+    }
+
+    // SAFETY: all returned fds are checked, uniquely owned here, and closed.
+    unsafe {
+        let saved = libc::dup(libc::STDIN_FILENO);
+        assert!(saved >= 0, "failed to duplicate host stdin");
+        let restore = RestoreStdin(saved);
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(
+            libc::pipe(pipe_fds.as_mut_ptr()),
+            0,
+            "failed to create stdin pipe"
+        );
+        libc::close(pipe_fds[1]);
+        assert_eq!(
+            libc::dup2(pipe_fds[0], libc::STDIN_FILENO),
+            libc::STDIN_FILENO,
+            "failed to install stdin pipe"
+        );
+        libc::close(pipe_fds[0]);
+        let outcome = run();
+        drop(restore);
+        outcome
+    }
+}
+
 static GUEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// Serialize guest-running tests inside one process.
@@ -56,6 +96,28 @@ pub fn guest_lock() -> MutexGuard<'static, ()> {
     GUEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[test]
+fn empty_stdin_transport_is_an_eof_fifo() {
+    let _guard = guest_lock();
+    with_empty_stdin_pipe(|| {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `stat` is a valid output pointer and fd 0 is installed above.
+        assert_eq!(
+            unsafe { libc::fstat(libc::STDIN_FILENO, stat.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: fstat succeeded and initialized the structure.
+        let stat = unsafe { stat.assume_init() };
+        assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFIFO);
+        let mut byte = 0u8;
+        // SAFETY: the one-byte destination is valid; the pipe's writer is closed.
+        assert_eq!(
+            unsafe { libc::read(libc::STDIN_FILENO, (&mut byte as *mut u8).cast(), 1) },
+            0
+        );
+    });
 }
 
 /// The repository root (`crates/carrick-conformance-next` is two levels down).

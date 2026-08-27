@@ -584,7 +584,9 @@ fn generic_probe_shard_2() {
                 container = container.cap_add(cap);
             }
 
-            let result = common::run_or_fail(container.run(["/tmp/carrick-init"]));
+            let result = common::with_empty_stdin_pipe(|| {
+                common::run_or_fail(container.run(["/tmp/carrick-init"]))
+            });
 
             let mut combined = result.stdout_utf8();
             combined.push_str(&result.stderr_utf8());
