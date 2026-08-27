@@ -753,7 +753,16 @@ impl SyscallDispatcher {
 
         fn adjtimex(this, cx, address: GuestPtr) {
             let clock = Arc::clone(cx.kernel.task().container().clock());
-            Ok(adjtimex_bootstrap(&clock, &mut *cx.memory, address.0))
+            let can_adjust = super::creds::has_effective_capability(
+                cx.kernel,
+                crate::namespace::process::CAP_SYS_TIME,
+            );
+            Ok(adjtimex_bootstrap(
+                &clock,
+                &mut *cx.memory,
+                address.0,
+                can_adjust,
+            ))
         }
 
         fn clock_adjtime(this, cx, clock_id: u64, address: GuestPtr) {
@@ -762,7 +771,11 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let clock = Arc::clone(cx.kernel.task().container().clock());
-            Ok(adjtimex_bootstrap(&clock, memory, address.0))
+            let can_adjust = super::creds::has_effective_capability(
+                cx.kernel,
+                crate::namespace::process::CAP_SYS_TIME,
+            );
+            Ok(adjtimex_bootstrap(&clock, memory, address.0, can_adjust))
         }
 
         fn x86_time(this, cx, result: GuestPtr) {
