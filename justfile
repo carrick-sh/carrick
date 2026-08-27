@@ -374,6 +374,9 @@ conformance-probes: build
         # oracles. Only live-oracle and process-poisoning exceptions retain the
         # old signed-binary harness while their embed blockers remain open.
         ./scripts/test-signed.sh carrick-conformance-next generic_probe_shard_ --nocapture
+        ./scripts/test-signed.sh carrick-conformance-next case_ --nocapture
+        cargo test -p carrick-cli --test conformance_cli_contract \
+          conformance_default_run_contract -- --exact --nocapture
         retained_filter="$(paste -sd, scripts/conformance/retained-generic-probes.txt)"
         CARRICK_PROBE_LANE=arm64 CARRICK_PROBE_FILTER="$retained_filter" \
           cargo test -p carrick-cli --test conformance {{_platform_features}} -- --nocapture
