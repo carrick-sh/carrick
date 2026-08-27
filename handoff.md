@@ -1,6 +1,6 @@
 # Carrick exact conformance closure handoff
 
-**Updated:** 2026-08-27 (session 10 — carrick-embed phases A-J landed on `main` at `7e537da48`; Gate B green, no phase receipt yet)
+**Updated:** 2026-08-27 (session 11 — conformance-next mechanical migration landed through `790a04d4e`; probe components green with one shard lifecycle flake; full suite still red)
 
 **Canonical host/lane:** macOS, Apple Silicon, HVF/HVPatch, Linux arm64 guest
 
@@ -56,6 +56,99 @@ Execution is a directed-worker model:
 Complete only when fail-closed gate integrity, exact correctness, and the <=2x
 performance gate pass together on the final integrated signed artifact. Do not
 push unless explicitly asked. Preserve unrelated worktree changes.
+
+## SESSION 11 — 2026-08-27: conformance-next migration and legacy carve
+
+The mechanical migration requested for this session is integrated on `main`
+through `790a04d4e4d6e71b4cd8930190200f71a0e1ef6b`. Antigravity ran three
+parallel generic-probe shards and a second three-agent suite/dedicated audit;
+Codex reviewed every diff, rejected false-green blocker stubs, reran the signed
+acceptance surfaces, and integrated only reviewed commits.
+
+### What moved and what remains
+
+* The 426 generic probes are exactly partitioned across three in-process
+  `carrick-conformance-next` shards. 393 per libc run against 798 committed
+  Docker-oracle cache entries without contacting Docker: 130 in shard 0, 132 in
+  shard 1, and 131 in shard 2. The cached lane executes 786 guest cases total.
+* 33 generic probes remain in
+  `scripts/conformance/retained-generic-probes.txt`: 30 require a live oracle
+  or are intentionally non-deterministic, and three (`execthreads`,
+  `execfromthread`, `vforkexecthread`) must remain out of process because their
+  HVPatch MM-authority abort poisons a shared embedded test process.
+* All 18 old `CASES`, all five `EXIT_CASES`, and the PID1 invariant are mapped
+  to 24 distinct in-process tests. Signed acceptance is 24/24 with exact
+  stdout/stderr and structural audit assertions.
+* `conformance_go_fixture` is in-process and signed, with an exact four-line
+  contract plus socket/bind/listen/connect and process-exit observations. It
+  passed. Its ignored prebuilt Go ELF remains an explicit prerequisite so the
+  routine cached probe gate does not acquire a Docker build dependency.
+* The only retained `carrick run` contract is
+  `conformance_default_run_contract`: five shipped CLI host-boundary cases for
+  exit status, stdout/stderr separation, and envelope suppression. Routine runs
+  use committed Linux expectations; live Docker is explicit opt-in and fails
+  closed if requested but unavailable. All five passed.
+* The retired native cross-boundary network test and retired `vmm` transport
+  test were deleted rather than perpetuating retired backends.
+* All 22 dedicated probe sources / 16 dedicated runner functions were audited.
+  None can move honestly yet: public embed APIs do not expose bridge networking,
+  published ports, container naming/DNS, inter-container routing, shared
+  network namespaces, host gateway, or the container-gate live carrier census.
+  Their old runners remain authoritative. The new audit tests name every
+  missing capability and prevent denominator drift.
+* The accepted legacy carve is `bb51fa5cc`: 907 old lines removed for 29 lines
+  of replacement audit/gate wiring. The surviving old file compiles without
+  warnings. `just conformance-probes` now runs cached generic shards, the 24
+  core cases, the one justified CLI boundary contract, then only the retained
+  generic manifest on Darwin/arm64.
+
+### Exact artifact and receipts
+
+| field | value |
+|---|---|
+| source HEAD | `790a04d4e4d6e71b4cd8930190200f71a0e1ef6b` |
+| binary SHA-256 | `21c7b92153bdd617fd1565643ce36dc9710d948b50022ac1c1c3bbb60517acbb` |
+| CDHash | `68c416c9739b1ff12db1d8ab03e9ca385cc9c0b4` |
+| LC_UUID | `5E476509-A811-39DB-AE79-0C0B72910E95` |
+| hypervisor entitlement | present |
+| `__dof_carrick` | present |
+
+| gate | verdict |
+|---|---|
+| cached shard 1 | **green**, 264 executions, expected `vfs_mount_rw` gap only |
+| cached shard 2 | **green**, 262 executions, expected `budget_two_proc` gap only |
+| cached shard 0 | **flaky process abort**: aggregate run aborted; isolated samples were green, red, green (260 executions on each completed sample). `fea51e1c3` adds the missing pre-probe marker; the marked sample completed all probes. No runtime rabbit hole was opened. |
+| 24 in-process core cases | **green**, signed, entitlement negative control green |
+| in-process Go fixture | **green**, signed, entitlement negative control green |
+| CLI boundary contract | **green**, 5/5, no Docker contacted |
+| retained legacy phase | **green**, 46 passed / 1 explicit bless ignored; the three MM-authority failures are fail-closed XFAILs and unexpected passes fail the gate (`790a04d4e`) |
+| full `just conformance full` | **red / incomplete**: fail-fast after 51 gating verdicts; 1,092/2,127 rows emitted (`1022 match`, `12 diff`, `7 new`, `45 regression`, `6 timeout`). Receipt: `target/conformance/results.hvf.full.jsonl`. Do not call this a refreshed 93% result. |
+
+The first aggregate `just conformance-probes` attempt is not green because the
+shard-0 test executable aborted before its phase completed. The same revision's
+components were then run serially as described above. A future closing receipt
+still needs one aggregate green run; do not hide the lifecycle flake or infer a
+probe identity from an unmarked abort.
+
+### Scope fences and next work
+
+Do not chase the 45 suite regressions or six timeouts as part of this mechanical
+migration without first reproducing them on an unmodified base / quiet host;
+the migration changes test harnesses, not Carrick runtime semantics. The full
+suite failed before all rows were scheduled, so no coverage percentage refresh
+is valid. The bounded next steps are:
+
+1. rerun aggregate `just conformance-probes` on a quiet host and require shard 0
+   to complete; if it aborts again, capture the marked last probe and classify
+   only a repeatedly identified process-poisoning case;
+2. compare `target/conformance/results.hvf.full.jsonl` against an unmodified
+   base run before filing any of its 51 gating verdicts as migration regressions;
+3. migrate dedicated tests only after the corresponding public embed topology
+   APIs exist; do not replace them with passing blocker stubs;
+4. run final `just ci` after the guest machine is quiet, then record the exact
+   final artifact again.
+
+There is no phase-completion receipt yet.
 
 ## SESSION 10 — 2026-08-27: carrick-embed phases A–J landed; Gate B GREEN
 
