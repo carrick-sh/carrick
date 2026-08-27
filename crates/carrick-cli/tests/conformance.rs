@@ -3467,7 +3467,10 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// `vfs_mount_rw` (VFS injection read/write/readdir and cross-mount boundary semantics;
 /// generic runner) moves the denominator from 470 to 471 and the gating rows from
 /// 888 to 890 — 445 conformance sources (423 generic, 22 dedicated).
-const PROBE_SOURCE_COUNT: usize = 471;
+///
+/// `mock_network_socket` (network mocking socket semantics; generic runner) moves
+/// the denominator from 471 to 472 — 446 conformance sources (424 generic, 22 dedicated).
+const PROBE_SOURCE_COUNT: usize = 472;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping

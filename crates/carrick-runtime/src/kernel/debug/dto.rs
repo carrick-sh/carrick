@@ -1293,6 +1293,7 @@ fn backing_kind_name(backing: &FileDescriptionBackingSnapshot) -> &'static str {
         Kind::PerfEvent => "perf-event",
         Kind::IoUring => "io-uring",
         Kind::FsContext => "fscontext",
+        Kind::InMemorySocket => "in-memory-socket",
     }
 }
 
