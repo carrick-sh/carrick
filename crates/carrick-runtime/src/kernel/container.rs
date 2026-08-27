@@ -222,30 +222,113 @@ impl LaunchContext {
     }
 }
 
-/// The container's time authority. Phase B carries `System` mode only and the
-/// realtime offset `clock_settime` moves; Phase F adds the mode word,
-/// `Frozen`/`Scaled`/`Deterministic`, and the virtual-time scheduler.
+use carrick_guest_mem::{GuestMemory, MemoryError};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// The container's time authority. Phase B ships `System` mode only: the
+/// host clock plus a per-container CLOCK_REALTIME offset that guest
+/// `clock_settime`/`settimeofday` move. It replaces the carrier-wide
+/// static realtime offset, which let one Linux process's
+/// `clock_settime` shift every process in the carrier.
 ///
-/// B1 introduces the object as a skeleton nothing reads yet. B3 (Tasks 20–21)
-/// adds the vvar `epoch` (bumped by `set_realtime_offset_ns`), `system()`,
-/// `realtime_base_now`/`realtime_now` and `publish_vvar_realtime_offset`, and
-/// rewires the carrier-wide `GUEST_REALTIME_OFFSET_NS` static
-/// (`dispatch/mod.rs`, kept there by A1) to this cell. It is held in an `Arc`
-/// on the container because B3's `TimerFdState` keeps the domain with no
-/// `KernelContext` to reach it through.
+/// The host-derived base (`carrick_mem::vdso::REALTIME_OFF_NS`,
+/// `unix_ns - uptime_ns` published by the VMM's `populate_vdso_data_page`
+/// at vCPU construction and at every exec image replace) is a carrier
+/// calibration value shared by every domain; only the offset is container
+/// state.
 #[derive(Debug, Default)]
 pub struct ClockDomain {
     /// Guest `CLOCK_REALTIME` minus host realtime, in nanoseconds.
     realtime_offset_ns: AtomicI64,
+    /// Bumped (Release) on every offset change, AFTER the new delta is stored,
+    /// so a reader that observes the new epoch (Acquire) also observes the new
+    /// delta. Each Linux MM records the epoch its vvar word was stamped under
+    /// and re-stamps itself when it falls behind.
+    epoch: AtomicU64,
+}
+
+/// The vvar `VVAR_OFF_REALTIME_OFF_NS` word for a domain: the vDSO computes
+/// `realtime_ns = CNTVCT/freq + word` with u64 wrapping arithmetic, so a
+/// negative offset is published as its two's complement.
+pub fn vvar_realtime_word(base_off_ns: u64, offset_ns: i64) -> u64 {
+    crate::vdso::vvar_realtime_off_ns(base_off_ns, offset_ns)
 }
 
 impl ClockDomain {
+    /// The host clock, unshifted.
+    pub fn system() -> Self {
+        Self {
+            realtime_offset_ns: AtomicI64::new(0),
+            epoch: AtomicU64::new(0),
+        }
+    }
+
     pub fn realtime_offset_ns(&self) -> i64 {
         self.realtime_offset_ns.load(Ordering::SeqCst)
     }
 
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
     pub fn set_realtime_offset_ns(&self, delta_ns: i64) {
         self.realtime_offset_ns.store(delta_ns, Ordering::SeqCst);
+        self.epoch.fetch_add(1, Ordering::Release);
+    }
+
+    /// CLOCK_REALTIME before this domain's offset: `uptime + vvar base` when
+    /// the VMM has calibrated the vvar (so the syscall path and the vDSO agree
+    /// to the nanosecond, clock_gettime04), else a live wall-clock read.
+    pub fn realtime_base_now(&self) -> Duration {
+        #[cfg(not(target_os = "linux"))]
+        {
+            if let Some(off_ns) = crate::vdso::realtime_off_ns()
+                && let Some(uptime) =
+                    crate::dispatch::host_clock_duration(carrick_portable::CLOCK_UPTIME_RAW)
+            {
+                return Duration::from_nanos((uptime.as_nanos() as u64).wrapping_add(off_ns));
+            }
+        }
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// CLOCK_REALTIME as this container sees it.
+    pub fn realtime_now(&self) -> Duration {
+        let offset_ns = self.realtime_offset_ns();
+        let base = self.realtime_base_now();
+        if offset_ns >= 0 {
+            base.saturating_add(Duration::from_nanos(offset_ns as u64))
+        } else {
+            base.saturating_sub(Duration::from_nanos(offset_ns.unsigned_abs()))
+        }
+    }
+
+    /// The vvar realtime word this domain wants published, or `None` before
+    /// the VMM has calibrated the base (no vDSO in this lane / unit tests).
+    pub fn vvar_realtime_off_ns(&self) -> Option<u64> {
+        crate::vdso::realtime_off_ns()
+            .map(|base| vvar_realtime_word(base, self.realtime_offset_ns()))
+    }
+
+    /// Publish this domain's realtime word into the calling process's vvar
+    /// page so the userspace vDSO fast path and the syscall path agree. The
+    /// vvar is guest-read-only, hence the carrick-internal unchecked writer.
+    pub fn publish_vvar_realtime_offset(
+        &self,
+        memory: &mut impl GuestMemory,
+    ) -> Result<(), MemoryError> {
+        let Some(word) = self.vvar_realtime_off_ns() else {
+            return Ok(());
+        };
+        match memory.write_bytes_unchecked(
+            crate::vdso::LINUX_VVAR_BASE + crate::vdso::VVAR_OFF_REALTIME_OFF_NS as u64,
+            &word.to_le_bytes(),
+        ) {
+            Ok(()) | Err(MemoryError::OutOfBounds { .. }) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -530,5 +613,53 @@ mod tests {
                 ));
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod clock_domain_tests {
+    use super::{ClockDomain, vvar_realtime_word};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn wall_now() -> Duration {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+    }
+
+    #[test]
+    fn system_domain_starts_unshifted() {
+        let clock = ClockDomain::system();
+        assert_eq!(clock.realtime_offset_ns(), 0);
+        assert!(
+            clock.realtime_now().abs_diff(wall_now()) < Duration::from_secs(5),
+            "an unshifted System domain reports the host wall clock"
+        );
+    }
+
+    #[test]
+    fn two_domains_hold_independent_offsets() {
+        let a = ClockDomain::system();
+        let b = ClockDomain::system();
+        a.set_realtime_offset_ns(600_000_000_000);
+        b.set_realtime_offset_ns(-600_000_000_000);
+        assert_eq!(a.realtime_offset_ns(), 600_000_000_000);
+        assert_eq!(b.realtime_offset_ns(), -600_000_000_000);
+        let gap = a.realtime_now() - b.realtime_now();
+        assert!(
+            (Duration::from_secs(1199)..=Duration::from_secs(1201)).contains(&gap),
+            "domains are 20 minutes apart, got {gap:?}"
+        );
+        // The base (host calibration) is shared; only the offset is per domain.
+        assert!(a.realtime_base_now().abs_diff(b.realtime_base_now()) < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn vvar_word_adds_the_signed_offset_with_wrapping() {
+        // The vDSO computes realtime_ns = CNTVCT/freq + word (u64 wrapping),
+        // so a negative offset must be published as two's complement.
+        assert_eq!(vvar_realtime_word(1_000, 5), 1_005);
+        assert_eq!(vvar_realtime_word(1_000, -400), 600);
+        assert_eq!(vvar_realtime_word(u64::MAX, 1), 0);
     }
 }

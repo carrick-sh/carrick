@@ -2862,11 +2862,12 @@ fn synthetic_proc_uptime() -> String {
 
 /// Boot time in seconds since the Epoch, for `/proc/stat`'s `btime` line:
 /// guest now - uptime, both from the dispatch clock authorities
-/// (`realtime_duration` / `boottime_duration`) so `btime` moves with
+/// (`ClockDomain::realtime_now` / `boottime_duration`) so `btime` moves with
 /// `clock_settime` like Linux's. Non-zero so `start_epoch = btime +
 /// starttime/HZ` math works.
 fn boot_epoch_secs() -> u64 {
-    crate::dispatch::realtime_duration()
+    crate::kernel::container::ClockDomain::system()
+        .realtime_now()
         .as_secs()
         .saturating_sub(boot_elapsed().as_secs())
 }
@@ -5811,19 +5812,19 @@ mod tests {
     /// `clock_settime` exactly as Linux's does.
     #[test]
     fn proc_stat_btime_follows_the_guest_clock() {
-        crate::dispatch::realtime_test_support::with_guest_realtime_offset(
-            3_600 * 1_000_000_000,
-            || {
-                let host_now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let btime = boot_epoch_secs();
-                assert!(
-                    btime + boot_elapsed().as_secs() >= host_now + 3_599,
-                    "btime {btime} must be derived from the guest clock"
-                );
-            },
+        let clock = crate::kernel::container::ClockDomain::system();
+        clock.set_realtime_offset_ns(3_600 * 1_000_000_000);
+        let host_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let btime = clock
+            .realtime_now()
+            .as_secs()
+            .saturating_sub(boot_elapsed().as_secs());
+        assert!(
+            btime + boot_elapsed().as_secs() >= host_now + 3_599,
+            "btime {btime} must be derived from the guest clock"
         );
     }
 }

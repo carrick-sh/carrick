@@ -739,7 +739,7 @@ impl SyscallDispatcher {
                     if nonblock {
                         return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
                     }
-                    if deadline_expired(deadline) {
+                    if deadline_expired(cx.kernel.task().container().clock(), deadline) {
                         return Ok(DispatchOutcome::errno(LINUX_ETIMEDOUT));
                     }
                     mq.queue
@@ -801,7 +801,7 @@ impl SyscallDispatcher {
                     if nonblock {
                         return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
                     }
-                    if deadline_expired(deadline) {
+                    if deadline_expired(cx.kernel.task().container().clock(), deadline) {
                         return Ok(DispatchOutcome::errno(LINUX_ETIMEDOUT));
                     }
                     mq.queue
@@ -1104,12 +1104,15 @@ fn read_abs_deadline(
 }
 
 /// Whether an absolute CLOCK_REALTIME deadline has passed on the GUEST's clock
-/// (`crate::dispatch::realtime_duration`, the single realtime authority).
-fn deadline_expired(deadline: Option<(i64, i64)>) -> bool {
+/// (`clock.realtime_now()`).
+fn deadline_expired(
+    clock: &crate::kernel::container::ClockDomain,
+    deadline: Option<(i64, i64)>,
+) -> bool {
     let Some((sec, nsec)) = deadline else {
         return false;
     };
-    let now = crate::dispatch::realtime_duration();
+    let now = clock.realtime_now();
     (now.as_secs() as i64, i64::from(now.subsec_nanos())) >= (sec, nsec)
 }
 
@@ -2583,25 +2586,22 @@ mod tests {
     /// clock, not the host's.
     #[test]
     fn mq_deadline_expiry_is_measured_on_the_guest_clock() {
-        crate::dispatch::realtime_test_support::with_guest_realtime_offset(
-            3_600 * 1_000_000_000,
-            || {
-                let host_now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
-                // 30 minutes past the HOST clock is already 30 minutes in the
-                // guest's past.
-                assert!(deadline_expired(Some((
-                    (host_now.as_secs() + 1_800) as i64,
-                    0
-                ))));
-                // 30 minutes past the GUEST clock is still in the future.
-                let guest_now = crate::dispatch::realtime_duration();
-                assert!(!deadline_expired(Some((
-                    (guest_now.as_secs() + 1_800) as i64,
-                    0
-                ))));
-            },
-        );
+        let clock = crate::kernel::container::ClockDomain::system();
+        clock.set_realtime_offset_ns(3_600 * 1_000_000_000);
+        let host_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        // 30 minutes past the HOST clock is already 30 minutes in the
+        // guest's past.
+        assert!(deadline_expired(
+            &clock,
+            Some(((host_now.as_secs() + 1_800) as i64, 0))
+        ));
+        // 30 minutes past the GUEST clock is still in the future.
+        let guest_now = clock.realtime_now();
+        assert!(!deadline_expired(
+            &clock,
+            Some(((guest_now.as_secs() + 1_800) as i64, 0))
+        ));
     }
 }
