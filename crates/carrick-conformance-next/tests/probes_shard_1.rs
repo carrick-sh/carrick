@@ -166,11 +166,10 @@ pub const SHARD_1_PROBES: &[&str] = &[
     "xthreadsig",
 ];
 
-const CACHED_SHARD_1_PROBE_COUNT: usize = 134;
+const CACHED_SHARD_1_PROBE_COUNT: usize = 133;
 
 /// Shard 1 subset of baseline expected oracle mismatches for musl.
 pub const MUSL_SHARD_1_EXPECTED_GAPS: &[&str] = &[
-    "execthreads",
     "mqnotifycrossproc",
     "pidnsroot",
     "procpeerdir",
@@ -183,7 +182,6 @@ pub const MUSL_SHARD_1_EXPECTED_GAPS: &[&str] = &[
 
 /// Shard 1 subset of baseline expected oracle mismatches for gnu.
 pub const GNU_SHARD_1_EXPECTED_GAPS: &[&str] = &[
-    "execthreads",
     "killchld",
     "pidnsroot",
     "procpeerdir",
@@ -288,7 +286,7 @@ fn test_shard_1_inventory_count_and_sorted() {
     assert_eq!(
         SHARD_1_PROBES
             .iter()
-            .filter(|name| !common::needs_live_oracle(name))
+            .filter(|name| common::runs_in_cached_lane(name))
             .count(),
         CACHED_SHARD_1_PROBE_COUNT
     );
@@ -434,7 +432,7 @@ fn test_shard_1_cached_oracles_are_complete() {
         for probe in SHARD_1_PROBES
             .iter()
             .copied()
-            .filter(|name| !common::needs_live_oracle(name))
+            .filter(|name| common::runs_in_cached_lane(name))
         {
             cached_probe_oracle(&root, "arm64", libc, probe).unwrap_or_else(|error| {
                 panic!("arm64-{libc}/{probe} must have a fresh committed oracle: {error}")
@@ -456,6 +454,8 @@ fn test_shard_1_security_policy_mapping() {
     assert!(!probe_needs_unconfined("forkfiletable"));
 
     assert!(SHARD_1_PROBES.contains(&"clonefilesexec"));
+    assert!(common::OUT_OF_PROCESS_PROBES.contains(&"execthreads"));
+    assert!(SHARD_1_PROBES.contains(&"execthreads"));
 }
 
 // ---------------------------------------------------------------------------
@@ -501,7 +501,7 @@ fn generic_probe_shard_1() {
         let mut executed_count = 0;
 
         for &probe_name in SHARD_1_PROBES {
-            if common::needs_live_oracle(probe_name) {
+            if !common::runs_in_cached_lane(probe_name) {
                 continue;
             }
             let probe_bin = dir.join(probe_name);
