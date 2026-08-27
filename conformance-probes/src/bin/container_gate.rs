@@ -115,14 +115,64 @@ fn main() {
             let _ = reap(child);
         }
     }
+    let mmap_arena_ok = exercise_mmap_arena();
     let lines = format!(
         "role={role}\ngetpid={pid}\nhostname={hostname}\nown_marker_written={own_marker_written}\n\
          foreign_marker_visible={foreign_marker_visible}\nchild_comm_visible={child_comm_visible}\n\
-         foreign_proc_visible={foreign_proc_visible}\npeer_ready={peer_ready}\n"
+         foreign_proc_visible={foreign_proc_visible}\npeer_ready={peer_ready}\n\
+         mmap_arena_ok={mmap_arena_ok}\n"
     );
     print!("{lines}");
     if let Ok(mut file) = std::fs::File::create(format!("/gate/{role}.report")) {
         let _ = file.write_all(lines.as_bytes());
     }
     std::process::exit(role_code(role));
+}
+
+/// Exercise the guest mmap arena end to end.
+///
+/// This exists because the SECOND container in a carrier does not get the boot
+/// loader's eager 32 GiB arena mapping — that one is retired by the first
+/// container, and later containers are meant to be backed sparsely on demand.
+/// Without this check the gate cannot tell a correctly sparse arena from an
+/// absent one: every other line here passes with no arena at all, so a
+/// regression that leaves container two's arena unbacked would be invisible.
+///
+/// The mapping is large enough that it cannot be served incidentally, and the
+/// pages are checked for the zero fill Linux guarantees for anonymous memory
+/// (AGENTS.md treats that guarantee as immovable) before being written and read
+/// back at three widely separated offsets.
+fn exercise_mmap_arena() -> bool {
+    const LEN: usize = 16 * 1024 * 1024;
+    const PAGE: usize = 4096;
+    unsafe {
+        let addr = libc::mmap(
+            std::ptr::null_mut(),
+            LEN,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        if addr == libc::MAP_FAILED {
+            return false;
+        }
+        let base = addr as *mut u8;
+        let offsets = [0usize, LEN / 2, LEN - PAGE];
+        for (i, off) in offsets.iter().enumerate() {
+            // Anonymous pages must arrive zeroed.
+            if std::ptr::read_volatile(base.add(*off)) != 0 {
+                libc::munmap(addr, LEN);
+                return false;
+            }
+            std::ptr::write_volatile(base.add(*off), (i as u8) + 1);
+        }
+        for (i, off) in offsets.iter().enumerate() {
+            if std::ptr::read_volatile(base.add(*off)) != (i as u8) + 1 {
+                libc::munmap(addr, LEN);
+                return false;
+            }
+        }
+        libc::munmap(addr, LEN) == 0
+    }
 }

@@ -2016,6 +2016,12 @@ fn conformance_container_gate() {
             "child_comm_visible=true".to_string(),
             "foreign_proc_visible=false".to_string(),
             "peer_ready=true".to_string(),
+            // Proves the container's mmap arena is genuinely backed. The second
+            // container in a carrier is backed sparsely on demand rather than by
+            // the boot loader's eager arena, and every other line above passes
+            // with no arena at all — so without this one an unbacked arena is
+            // indistinguishable from a correctly sparse one.
+            "mmap_arena_ok=true".to_string(),
         ];
         for line in expected {
             assert!(
