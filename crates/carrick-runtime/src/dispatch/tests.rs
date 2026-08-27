@@ -5170,6 +5170,32 @@ mod container_clock_tests {
         );
     }
 
+    #[test]
+    fn clock_settime_rejects_realtime_before_monotonic_uptime() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
+        let reporter = CompatReporter::default();
+        let context = dispatcher.capture_one_task_context().expect("task context");
+        context
+            .task()
+            .with_caps(|caps| *caps = crate::namespace::process::CapabilitySet::full());
+
+        write_timespec(&mut memory, TIMESPEC_ADDR, Duration::from_secs(2));
+        let outcome = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    SYS_CLOCK_SETTIME,
+                    SyscallArgs([LINUX_CLOCK_REALTIME, TIMESPEC_ADDR, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("dispatch clock_settime");
+
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EINVAL));
+    }
+
     fn armed_absolute_timerfd(
         dispatcher: &mut SyscallDispatcher,
         memory: &mut LinearMemory,
@@ -5317,5 +5343,4 @@ mod container_caps_tests {
         assert_eq!(container_with(&[]).granted_caps().effective & bit, 0);
     }
 }
-
 
