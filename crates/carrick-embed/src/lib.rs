@@ -38,11 +38,16 @@ mod error;
 mod prepared;
 mod result;
 pub mod testing;
+pub mod vfs;
 
 pub use builder::{ContainerBuilder, StdioConfig};
 pub use error::EmbedError;
 pub use prepared::PreparedContainer;
 pub use result::ContainerResult;
+pub use vfs::{
+    DirEnt, EntryKind, FilterVfs, InMemoryFileVfs, LayeredVfs, MAX_IN_MEMORY_FILE_SIZE, Metadata,
+    OpenContext, OpenFlags, RecordingVfs, Vfs, VfsError, VfsEvent, VfsHandle, VfsOp, VfsOpOutcome,
+};
 
 pub use carrick_engine::{ResolveWarning, RunRequest};
 pub use carrick_image::{ImageStore, PullPolicy};
