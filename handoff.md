@@ -1,6 +1,6 @@
 # Carrick exact conformance closure handoff
 
-**Updated:** 2026-08-26 (session 14 — Task 4.38 final guided correction rejected)
+**Updated:** 2026-08-26 (session 15 — Task 4.38A semantic transaction integrated)
 
 **Canonical host/lane:** macOS, Apple Silicon, HVF/HVPatch, Linux arm64 guest
 
@@ -244,9 +244,23 @@ gate, and denominator/provenance repair. Each swing must carry red tests for its
 own invariant before the next starts. Codex owns the interfaces between these
 swings and the final signed acceptance.
 
-Nothing from Task 4.38 is integrated yet. The frozen ledger remains **23/156
-focused-closed; 133 remain**, equivalent to **1,994/2,127 accepted suites
-(93.75%)**. The final rejection checkpoint is recorded in
+Swing A is now integrated as `16ebcefc` after Codex repaired the delegated
+candidate and two independent re-reviews returned GO. It supplies the exact
+semantic-MM transaction: move-only exact parent/child MM identity and authority,
+total validated Preserve/Zero/Omit projection, canonical heap/droppable/mremap
+policy, pre-mutation backend plan validation, exclusion through complete child
+dispatcher construction, and cleanup that attempts child abort plus copied
+parent rollback before fail-stop. Final local gates were fmt/diff clean,
+warning-denied package Clippy green, and **1,850/1,850** serial
+`carrick-runtime` library tests green.
+
+This is prerequisite integration, not Task 4.38 closure. Swing B must still
+apply the projection through translation-derived physical coverage,
+inventory/alias/COW/grandchild authority, and generation-exact WIPE rollback;
+Swing C must still close the bounded probe, typed trace, Docker provenance, and
+signed differential evidence. Therefore `ltp-madvise10` remains open and the
+frozen ledger remains **23/156 focused-closed; 133 remain**, equivalent to
+**1,994/2,127 accepted suites (93.75%)**. Detailed evidence is recorded in
 `.superpowers/sdd/handoff/task-4-38-report.md`.
 
 ## Historical prerequisite objective — closed, retained for provenance
