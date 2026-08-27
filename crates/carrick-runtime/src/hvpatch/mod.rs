@@ -1350,6 +1350,14 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
         .map_err(|error| {
             RuntimeError::Configuration(format!("initialize controlling tty authority: {error}"))
         })?;
+    let root_context = dispatcher.capture_one_task_context().map_err(|error| {
+        RuntimeError::Configuration(format!(
+            "capture HVPatch root identity Kernel context: {error}"
+        ))
+    })?;
+    crate::vcpu_loop::stamp_identity_page(engine, dispatcher, &root_context).map_err(|error| {
+        RuntimeError::Configuration(format!("stamp HVPatch root identity page: {error}"))
+    })?;
     Ok(Some(context))
 }
 
