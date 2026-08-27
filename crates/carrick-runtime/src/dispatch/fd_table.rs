@@ -1078,6 +1078,12 @@ pub(super) enum OpenDescription {
         /// Write behavior classified once when adopting the host fd. Only real
         /// host FIFOs/pipes need Linux's blocking large-write completion loop.
         write_kind: HostWriteKind,
+        /// When this `HostPipe` was created by duplicating an initial stdio
+        /// stream (0 for stdin, 1 for stdout, 2 for stderr), this records which
+        /// standard stream it names so captured/piped stdio routing can direct
+        /// writes to the appropriate runtime sink instead of leaking straight to
+        /// the carrier host process.
+        stdio_stream: Option<i32>,
     },
     /// Host BSD socket backed by a real macOS file descriptor.
     /// Survives `libc::fork(2)`; the `family`/`type_` fields capture

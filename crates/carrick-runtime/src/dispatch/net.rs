@@ -2293,6 +2293,7 @@ impl SyscallDispatcher {
                 bidirectional: true,
                 write_kind: HostWriteKind::PipeLike,
                 base: OpenDescriptionBase::new(0),
+                stdio_stream: None,
             }
         } else {
             // Regular file / chardev / anything else: a host file with a real fd.
@@ -3758,6 +3759,7 @@ mod staged_splice_readiness_tests {
                 pty: None,
                 bidirectional: false,
                 write_kind: HostWriteKind::PipeLike,
+                stdio_stream: None,
             })),
             0,
         );
@@ -3770,6 +3772,7 @@ mod staged_splice_readiness_tests {
                 pty: None,
                 bidirectional: false,
                 write_kind: HostWriteKind::PipeLike,
+                stdio_stream: None,
             })),
             0,
         );

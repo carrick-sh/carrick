@@ -1485,6 +1485,7 @@ fn staged_splice_pipe_bytes_preserve_fifo_order() {
             pty: None,
             bidirectional: false,
             write_kind: HostWriteKind::PipeLike,
+            stdio_stream: None,
         })),
         0,
     );
@@ -1497,6 +1498,7 @@ fn staged_splice_pipe_bytes_preserve_fifo_order() {
             pty: None,
             bidirectional: false,
             write_kind: HostWriteKind::PipeLike,
+            stdio_stream: None,
         })),
         0,
     );
@@ -1538,6 +1540,7 @@ fn staged_splice_pipe_bytes_are_visible_to_read() {
             pty: None,
             bidirectional: false,
             write_kind: HostWriteKind::PipeLike,
+            stdio_stream: None,
         })),
         0,
     );
@@ -1550,6 +1553,7 @@ fn staged_splice_pipe_bytes_are_visible_to_read() {
             pty: None,
             bidirectional: false,
             write_kind: HostWriteKind::PipeLike,
+            stdio_stream: None,
         })),
         0,
     );
@@ -1623,6 +1627,7 @@ fn splice_host_file_to_pipe_returns_short_and_advances_offset() {
             pty: None,
             bidirectional: false,
             write_kind: HostWriteKind::PipeLike,
+            stdio_stream: None,
         })),
         0,
     );
@@ -1635,6 +1640,7 @@ fn splice_host_file_to_pipe_returns_short_and_advances_offset() {
             pty: None,
             bidirectional: false,
             write_kind: HostWriteKind::PipeLike,
+            stdio_stream: None,
         })),
         0,
     );
@@ -3798,6 +3804,7 @@ fn pipe_end_direction_matrix_and_fd_lifecycle_closure() {
         pty: None,
         bidirectional: true,
         write_kind: HostWriteKind::PipeLike,
+        stdio_stream: None,
     };
     let bi_fd = pair
         .dispatcher
