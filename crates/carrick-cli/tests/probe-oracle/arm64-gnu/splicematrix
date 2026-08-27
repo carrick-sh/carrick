@@ -1,0 +1,17 @@
+a636c0dd55b011d2
+pipe2_invalid_flags_einval=true
+pipe2_nonblock_cloexec_flags=true
+pipe_wrong_direction_ebadf=true
+pipe_lseek_espipe=true
+pipe_empty_nonblock_read_eagain=true
+splice_invalid_fd_ebadf=true
+splice_non_pipe_targets_einval=true
+splice_access_mode_mismatch_ebadf=true
+splice_pipe_offset_espipe=true
+splice_negative_file_offset_einval=true
+splice_append_target_einval=true
+splice_invalid_flags_einval=true
+splice_zero_length_success=true
+vmsplice_error_matrix=false
+tee_error_matrix=true
+splice_pipe_to_pipe_nonblock_and_eagain=true

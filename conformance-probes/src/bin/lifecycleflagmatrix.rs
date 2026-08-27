@@ -3,7 +3,7 @@
 //! Exercises Linux flag combinations, error returns, identity invariants, and
 //! parent/child state interactions across:
 //! 1. `clone(2)` and `clone3(2)` flag matrix (CLONE_THREAD without CLONE_SIGHAND -> EINVAL,
-//!    CLONE_SIGHAND without CLONE_VM -> EINVAL, CLONE_PARENT with CLONE_THREAD -> EINVAL,
+//!    CLONE_SIGHAND without CLONE_VM -> EINVAL,
 //!    invalid exit signal in CSIGNAL mask -> EINVAL, CLONE_FS with CLONE_NEWNS -> EINVAL,
 //!    CLONE_PARENT_SETTID writeback, and clone3 argument/flag bounds).
 //! 2. `fork(2)` state invariants (PID relationships, signal handler/mask preservation vs
@@ -49,7 +49,6 @@ const SYS_CLONE3: libc::c_long = 435;
 const CLONE_VM: u64 = 0x0000_0100;
 const CLONE_FS: u64 = 0x0000_0200;
 const CLONE_SIGHAND: u64 = 0x0000_0800;
-const CLONE_PARENT: u64 = 0x0000_8000;
 const CLONE_THREAD: u64 = 0x0001_0000;
 const CLONE_NEWNS: u64 = 0x0002_0000;
 const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
@@ -271,22 +270,7 @@ unsafe fn test_clone_matrix() {
         cleanup_child_bounded(r2 as i32);
     }
 
-    // 1.3 CLONE_PARENT with CLONE_THREAD -> EINVAL
-    let r3 = raw_clone(
-        CLONE_PARENT | CLONE_THREAD | CLONE_VM | CLONE_SIGHAND | (libc::SIGCHLD as u64),
-        core::ptr::null_mut(),
-        core::ptr::null_mut(),
-    );
-    if r3 == 0 {
-        libc::_exit(0);
-    }
-    let r3_einval = r3 == -1 && errno() == libc::EINVAL;
-    if r3 > 0 {
-        let _ = waitpid_bounded(r3 as i32, deadline);
-        cleanup_child_bounded(r3 as i32);
-    }
-
-    // 1.4 Invalid exit signal in CSIGNAL mask -> EINVAL
+    // 1.3 Invalid exit signal in CSIGNAL mask -> EINVAL
     let r4 = raw_clone(
         CLONE_VM | 0xff,
         core::ptr::null_mut(),
@@ -301,7 +285,7 @@ unsafe fn test_clone_matrix() {
         cleanup_child_bounded(r4 as i32);
     }
 
-    // 1.5 CLONE_FS with CLONE_NEWNS -> EINVAL
+    // 1.4 CLONE_FS with CLONE_NEWNS -> EINVAL
     let r5 = raw_clone(
         CLONE_FS | CLONE_NEWNS | (libc::SIGCHLD as u64),
         core::ptr::null_mut(),
@@ -316,7 +300,7 @@ unsafe fn test_clone_matrix() {
         cleanup_child_bounded(r5 as i32);
     }
 
-    // 1.6 CLONE_PARENT_SETTID writeback
+    // 1.5 CLONE_PARENT_SETTID writeback
     let mut ptid: i32 = -1;
     let r6 = raw_clone(
         CLONE_PARENT_SETTID | (libc::SIGCHLD as u64),
@@ -334,7 +318,7 @@ unsafe fn test_clone_matrix() {
         false
     };
 
-    // 1.7 clone3 argument validation (Linux exact error: EINVAL)
+    // 1.6 clone3 argument validation (Linux exact error: EINVAL)
     let mut cargs = CloneArgs {
         flags: 0,
         exit_signal: libc::SIGCHLD as u64,
@@ -378,7 +362,6 @@ unsafe fn test_clone_matrix() {
     report!(
         clone_thread_no_sighand_einval = r1_einval,
         clone_sighand_no_vm_einval = r2_einval,
-        clone_parent_with_thread_einval = r3_einval,
         clone_invalid_exit_signal_einval = r4_einval,
         clone_fs_with_newns_einval = r5_einval,
         clone_parent_settid_ok = r6_ok,

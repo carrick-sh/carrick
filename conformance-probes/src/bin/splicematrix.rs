@@ -144,7 +144,7 @@ unsafe fn test_splice_matrix() {
         wr,
         std::ptr::null_mut::<libc::loff_t>(),
         1usize,
-        0u32,
+        SPLICE_F_NONBLOCK,
     );
     let sp_bad_in_ebadf = sp_bad_in == -1 && errno() == libc::EBADF;
 
@@ -155,7 +155,7 @@ unsafe fn test_splice_matrix() {
         -1,
         std::ptr::null_mut::<libc::loff_t>(),
         1usize,
-        0u32,
+        SPLICE_F_NONBLOCK,
     );
     let sp_bad_out_ebadf = sp_bad_out == -1 && errno() == libc::EBADF;
 
@@ -169,7 +169,7 @@ unsafe fn test_splice_matrix() {
         f2,
         &mut off_out as *mut _,
         1usize,
-        0u32,
+        SPLICE_F_NONBLOCK,
     );
     let sp_file_file_einval = sp_file_file == -1 && errno() == libc::EINVAL;
 
@@ -182,7 +182,7 @@ unsafe fn test_splice_matrix() {
         sv[1],
         std::ptr::null_mut::<libc::loff_t>(),
         1usize,
-        0u32,
+        SPLICE_F_NONBLOCK,
     );
     let sp_sock_sock_einval = sp_sock_sock == -1 && errno() == libc::EINVAL;
     libc::close(sv[0]);
@@ -197,7 +197,7 @@ unsafe fn test_splice_matrix() {
         f_ro,
         &mut off_out as *mut _,
         1usize,
-        0u32,
+        SPLICE_F_NONBLOCK,
     );
     let sp_wr_ro_ebadf = sp_wr_ro == -1 && errno() == libc::EBADF;
     libc::close(f_ro);
@@ -210,7 +210,7 @@ unsafe fn test_splice_matrix() {
         wr,
         std::ptr::null_mut::<libc::loff_t>(),
         1usize,
-        0u32,
+        SPLICE_F_NONBLOCK,
     );
     let sp_rd_wo_ebadf = sp_rd_wo == -1 && errno() == libc::EBADF;
     libc::close(f_wo);
@@ -224,7 +224,7 @@ unsafe fn test_splice_matrix() {
         f2,
         &mut off_out as *mut _,
         1usize,
-        0u32,
+        SPLICE_F_NONBLOCK,
     );
     let sp_pipe_off_in_espipe = sp_pipe_off_in == -1 && errno() == libc::ESPIPE;
 
@@ -235,7 +235,7 @@ unsafe fn test_splice_matrix() {
         wr,
         &mut pipe_off as *mut _,
         1usize,
-        0u32,
+        SPLICE_F_NONBLOCK,
     );
     let sp_pipe_off_out_espipe = sp_pipe_off_out == -1 && errno() == libc::ESPIPE;
 
@@ -248,7 +248,7 @@ unsafe fn test_splice_matrix() {
         wr,
         std::ptr::null_mut::<libc::loff_t>(),
         1usize,
-        0u32,
+        SPLICE_F_NONBLOCK,
     );
     let sp_neg_off_einval = sp_neg_off == -1 && errno() == libc::EINVAL;
 
@@ -260,7 +260,7 @@ unsafe fn test_splice_matrix() {
         f_app,
         std::ptr::null_mut::<libc::loff_t>(),
         1usize,
-        0u32,
+        SPLICE_F_NONBLOCK,
     );
     let sp_append_einval = sp_append == -1 && errno() == libc::EINVAL;
 
@@ -272,7 +272,7 @@ unsafe fn test_splice_matrix() {
         f2,
         &mut off_out as *mut _,
         1usize,
-        0x1000_0000u32,
+        0x1000_0000u32 | SPLICE_F_NONBLOCK,
     );
     let sp_bad_fl_einval = sp_bad_fl == -1 && errno() == libc::EINVAL;
 
@@ -284,7 +284,7 @@ unsafe fn test_splice_matrix() {
         wr,
         std::ptr::null_mut::<libc::loff_t>(),
         0usize,
-        SPLICE_F_MOVE | SPLICE_F_MORE | SPLICE_F_GIFT,
+        SPLICE_F_MOVE | SPLICE_F_MORE | SPLICE_F_GIFT | SPLICE_F_NONBLOCK,
     );
     let sp_zero_ok = sp_zero == 0;
 
@@ -334,11 +334,17 @@ unsafe fn test_vmsplice_and_tee_matrix() {
 
     // 3.1 vmsplice error conditions
     // vmsplice on regular file -> EBADF
-    let vm_file = libc::syscall(SYS_VMSPLICE, f, &iov as *const _, 1usize, 0u32);
+    let vm_file = libc::syscall(SYS_VMSPLICE, f, &iov as *const _, 1usize, SPLICE_F_NONBLOCK);
     let vm_file_ebadf = vm_file == -1 && errno() == libc::EBADF;
 
     // vmsplice on bad fd -> EBADF
-    let vm_badf = libc::syscall(SYS_VMSPLICE, -1, &iov as *const _, 1usize, 0u32);
+    let vm_badf = libc::syscall(
+        SYS_VMSPLICE,
+        -1,
+        &iov as *const _,
+        1usize,
+        SPLICE_F_NONBLOCK,
+    );
     let vm_badf_ebadf = vm_badf == -1 && errno() == libc::EBADF;
 
     // vmsplice with nr_segs = 0 returns 0
@@ -347,40 +353,64 @@ unsafe fn test_vmsplice_and_tee_matrix() {
         a_wr,
         std::ptr::null::<libc::iovec>(),
         0usize,
-        0u32,
+        SPLICE_F_NONBLOCK,
     );
     let vm_zero_segs_ok = vm_zero_segs == 0;
 
     // vmsplice with nr_segs > UIO_MAXIOV (1024) -> EINVAL
-    let vm_maxiov = libc::syscall(SYS_VMSPLICE, a_wr, &iov as *const _, 1025usize, 0u32);
+    let vm_maxiov = libc::syscall(
+        SYS_VMSPLICE,
+        a_wr,
+        &iov as *const _,
+        1025usize,
+        SPLICE_F_NONBLOCK,
+    );
     let vm_maxiov_einval = vm_maxiov == -1 && errno() == libc::EINVAL;
 
     // vmsplice with invalid flags -> EINVAL
-    let vm_bad_fl = libc::syscall(SYS_VMSPLICE, a_wr, &iov as *const _, 1usize, 0x1000_0000u32);
+    let vm_bad_fl = libc::syscall(
+        SYS_VMSPLICE,
+        a_wr,
+        &iov as *const _,
+        1usize,
+        0x1000_0000u32 | SPLICE_F_NONBLOCK,
+    );
     let vm_bad_fl_einval = vm_bad_fl == -1 && errno() == libc::EINVAL;
 
     // vmsplice to read-end of pipe -> EBADF
-    let vm_rd_end = libc::syscall(SYS_VMSPLICE, a_rd, &iov as *const _, 1usize, 0u32);
+    let vm_rd_end = libc::syscall(
+        SYS_VMSPLICE,
+        a_rd,
+        &iov as *const _,
+        1usize,
+        SPLICE_F_NONBLOCK,
+    );
     let vm_rd_end_ebadf = vm_rd_end == -1 && errno() == libc::EBADF;
 
     // 3.2 tee error conditions
     // tee on non-pipe fds -> EINVAL
-    let tee_files = libc::syscall(SYS_TEE, f, f, 1usize, 0u32);
+    let tee_files = libc::syscall(SYS_TEE, f, f, 1usize, SPLICE_F_NONBLOCK);
     let tee_files_einval = tee_files == -1 && errno() == libc::EINVAL;
 
-    let tee_one_file = libc::syscall(SYS_TEE, f, b_wr, 1usize, 0u32);
+    let tee_one_file = libc::syscall(SYS_TEE, f, b_wr, 1usize, SPLICE_F_NONBLOCK);
     let tee_one_file_einval = tee_one_file == -1 && errno() == libc::EINVAL;
 
     // tee with same pipe (a_rd to a_wr) -> EINVAL
-    let tee_same = libc::syscall(SYS_TEE, a_rd, a_wr, 1usize, 0u32);
+    let tee_same = libc::syscall(SYS_TEE, a_rd, a_wr, 1usize, SPLICE_F_NONBLOCK);
     let tee_same_einval = tee_same == -1 && errno() == libc::EINVAL;
 
     // tee with invalid flags -> EINVAL
-    let tee_bad_fl = libc::syscall(SYS_TEE, a_rd, b_wr, 1usize, 0x1000_0000u32);
+    let tee_bad_fl = libc::syscall(
+        SYS_TEE,
+        a_rd,
+        b_wr,
+        1usize,
+        0x1000_0000u32 | SPLICE_F_NONBLOCK,
+    );
     let tee_bad_fl_einval = tee_bad_fl == -1 && errno() == libc::EINVAL;
 
     // tee zero length returns 0
-    let tee_zero = libc::syscall(SYS_TEE, a_rd, b_wr, 0usize, 0u32);
+    let tee_zero = libc::syscall(SYS_TEE, a_rd, b_wr, 0usize, SPLICE_F_NONBLOCK);
     let tee_zero_ok = tee_zero == 0;
 
     // 3.3 Non-blocking pipe-to-pipe splice and drain validation

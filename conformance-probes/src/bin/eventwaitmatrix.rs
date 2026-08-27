@@ -87,27 +87,43 @@ unsafe fn test_clock_and_timerfd_matrix() {
         tv_sec: 1000,
         tv_nsec: 0,
     };
-    let set_mono = libc::clock_settime(libc::CLOCK_MONOTONIC, &valid_ts);
+    let set_mono = libc::syscall(
+        libc::SYS_clock_settime,
+        libc::CLOCK_MONOTONIC,
+        &valid_ts as *const _,
+    );
     let set_mono_einval = set_mono == -1 && errno() == libc::EINVAL;
 
-    let set_bad = libc::clock_settime(99999, &valid_ts);
+    let set_bad = libc::syscall(libc::SYS_clock_settime, 99999i32, &valid_ts as *const _);
     let set_bad_einval = set_bad == -1 && errno() == libc::EINVAL;
 
     let bad_ts_neg = libc::timespec {
         tv_sec: 1000,
         tv_nsec: -1,
     };
-    let set_nsec_neg = libc::clock_settime(libc::CLOCK_REALTIME, &bad_ts_neg);
+    let set_nsec_neg = libc::syscall(
+        libc::SYS_clock_settime,
+        libc::CLOCK_REALTIME,
+        &bad_ts_neg as *const _,
+    );
     let set_nsec_neg_einval = set_nsec_neg == -1 && errno() == libc::EINVAL;
 
     let bad_ts_over = libc::timespec {
         tv_sec: 1000,
         tv_nsec: 1_000_000_000,
     };
-    let set_nsec_over = libc::clock_settime(libc::CLOCK_REALTIME, &bad_ts_over);
+    let set_nsec_over = libc::syscall(
+        libc::SYS_clock_settime,
+        libc::CLOCK_REALTIME,
+        &bad_ts_over as *const _,
+    );
     let set_nsec_over_einval = set_nsec_over == -1 && errno() == libc::EINVAL;
 
-    let set_null = libc::clock_settime(libc::CLOCK_REALTIME, std::ptr::null());
+    let set_null = libc::syscall(
+        libc::SYS_clock_settime,
+        libc::CLOCK_REALTIME,
+        std::ptr::null::<libc::timespec>(),
+    );
     let set_null_efault = set_null == -1 && errno() == libc::EFAULT;
 
     // 1.3 timerfd_create flags and clockids
@@ -317,18 +333,30 @@ unsafe fn test_clock_and_timerfd_matrix() {
     libc::close(pipe_fds[0]);
     libc::close(pipe_fds[1]);
 
-    // 1.5 timer_settime invalid timer_t errors
-    let bad_timer_id: libc::timer_t = 0xdead_beef as libc::timer_t;
-    let t_set_bad = libc::timer_settime(bad_timer_id, 0, &valid_spec, std::ptr::null_mut());
+    // 1.5 Raw timer syscalls with an invalid kernel timer ID. glibc's public
+    // timer_t is an implementation pointer, so passing a fabricated timer_t to
+    // its wrapper dereferences userspace garbage instead of testing Linux.
+    let bad_timer_id = -1i32;
+    let t_set_bad = libc::syscall(
+        libc::SYS_timer_settime,
+        bad_timer_id,
+        0,
+        &valid_spec as *const _,
+        std::ptr::null_mut::<libc::itimerspec>(),
+    );
     let t_set_bad_einval = t_set_bad == -1 && errno() == libc::EINVAL;
 
-    let t_get_bad = libc::timer_gettime(bad_timer_id, &mut cur_spec);
+    let t_get_bad = libc::syscall(
+        libc::SYS_timer_gettime,
+        bad_timer_id,
+        &mut cur_spec as *mut _,
+    );
     let t_get_bad_einval = t_get_bad == -1 && errno() == libc::EINVAL;
 
-    let t_del_bad = libc::timer_delete(bad_timer_id);
+    let t_del_bad = libc::syscall(libc::SYS_timer_delete, bad_timer_id);
     let t_del_bad_einval = t_del_bad == -1 && errno() == libc::EINVAL;
 
-    let t_ovr_bad = libc::timer_getoverrun(bad_timer_id);
+    let t_ovr_bad = libc::syscall(libc::SYS_timer_getoverrun, bad_timer_id);
     let t_ovr_bad_einval = t_ovr_bad == -1 && errno() == libc::EINVAL;
 
     report!(
@@ -403,6 +431,14 @@ unsafe fn test_futex_wait_matrix() {
     );
     let wait_ts_over_einval = rc_over == -1 && errno() == libc::EINVAL;
 
+    // Every case below that should reject before waiting still carries a zero
+    // deadline. If Carrick fails to validate the earlier argument, the probe
+    // must report a fast mismatch instead of hanging the conformance process.
+    let zero_ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+
     // 2.2 Unaligned futex address -> EINVAL
     let raw_buf = [0u8; 8];
     let unaligned_ptr = raw_buf.as_ptr().add(1) as *mut u32;
@@ -411,17 +447,13 @@ unsafe fn test_futex_wait_matrix() {
         unaligned_ptr,
         FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
         0i64,
-        std::ptr::null::<libc::timespec>(),
+        &zero_ts as *const _,
         std::ptr::null::<u32>(),
         0i64,
     );
     let unaligned_einval = rc_unaligned == -1 && errno() == libc::EINVAL;
 
     // 2.3 Zero-timeout FUTEX_WAIT with matching value -> immediate ETIMEDOUT
-    let zero_ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
     let rc_zero = libc::syscall(
         SYS_FUTEX,
         &mut word as *mut u32,
@@ -439,7 +471,7 @@ unsafe fn test_futex_wait_matrix() {
         &mut word as *mut u32,
         FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG,
         42i64,
-        std::ptr::null::<libc::timespec>(),
+        &zero_ts as *const _,
         std::ptr::null::<u32>(),
         0u32 as i64, // bitset 0 is invalid
     );
