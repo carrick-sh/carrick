@@ -690,10 +690,20 @@ unsafe fn test_mremap_matrix(page: usize) {
 
         fixed_reloc_ok = dst_updated && src_unmapped;
         libc::munmap(dst, page);
+        if !src_unmapped {
+            libc::munmap(src, page);
+        }
+    } else {
+        if src != libc::MAP_FAILED {
+            libc::munmap(src, page);
+        }
+        if dst != libc::MAP_FAILED {
+            libc::munmap(dst, page);
+        }
     }
 
-    // 9. MREMAP_DONTUNMAP (Linux 5.7+): if supported, moves data to new address
-    // and keeps source address mapped as fresh zero-filled anonymous memory.
+    // 9. MREMAP_DONTUNMAP (Linux 5.7+): moves data to new address and retains
+    // the source address mapped as fresh zero-filled anonymous memory.
     let du_src = libc::mmap(
         core::ptr::null_mut(),
         page,
@@ -713,9 +723,6 @@ unsafe fn test_mremap_matrix(page: usize) {
             let src_still_mapped_zeroed = *sub == 0;
             dontunmap_semantics = q != du_src && q_has_data && src_still_mapped_zeroed;
             libc::munmap(q, page);
-        } else if errno() == libc::EINVAL {
-            // Older kernels or backends lacking MREMAP_DONTUNMAP reject with EINVAL
-            dontunmap_semantics = true;
         }
         libc::munmap(du_src, page);
     }
