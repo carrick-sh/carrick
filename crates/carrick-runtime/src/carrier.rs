@@ -210,4 +210,34 @@ mod tests {
         assert_ne!(alpha_teardown.id, beta_teardown.id);
         shutdown().expect("carrier shutdown after container retirement should succeed");
     }
+
+    #[test]
+    fn concurrent_containers_admit_and_retire_in_one_carrier() {
+        assert_eq!(live_container_count(), 0);
+        let start_barrier = Arc::new(std::sync::Barrier::new(3));
+        let alpha_barrier = Arc::clone(&start_barrier);
+        let beta_barrier = Arc::clone(&start_barrier);
+
+        let alpha_handle = std::thread::spawn(move || {
+            alpha_barrier.wait();
+            let alpha = Arc::new(Container::for_reference_model());
+            let alpha_admission = admit_container(alpha.id());
+            retire_container(alpha, alpha_admission).expect("alpha container retire must succeed")
+        });
+
+        let beta_handle = std::thread::spawn(move || {
+            beta_barrier.wait();
+            let beta = Arc::new(Container::for_reference_model());
+            let beta_admission = admit_container(beta.id());
+            retire_container(beta, beta_admission).expect("beta container retire must succeed")
+        });
+
+        start_barrier.wait();
+        let alpha_teardown = alpha_handle.join().expect("alpha thread join");
+        let beta_teardown = beta_handle.join().expect("beta thread join");
+
+        assert_ne!(alpha_teardown.id, beta_teardown.id);
+        assert_eq!(live_container_count(), 0);
+        shutdown().expect("carrier shutdown after concurrent container retirement should succeed");
+    }
 }
