@@ -3468,14 +3468,16 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// generic runner) moves the denominator from 470 to 471 and the gating rows from
 /// 888 to 890 — 445 conformance sources (423 generic, 22 dedicated).
 ///
-/// Two probes land together: `budget_two_proc` (Phase G fault injection and
-/// resource budget two-process differential invariants) and
-/// `mock_network_socket` (Phase H network mocking socket semantics), both
-/// generic runners. Each was written against a 471 denominator in its own
-/// branch; both exist after the merge, so the denominator moves 471 -> 473 and
-/// the gating rows 890 -> 894 — 447 conformance sources (425 generic, 22
-/// dedicated). Counted from the tree, not from either branch's arithmetic.
-const PROBE_SOURCE_COUNT: usize = 473;
+/// Three probes then land together, each written against a 471 denominator in
+/// its own branch because the branches were cut from the same base:
+/// `budget_two_proc` (Phase G fault injection and resource budget two-process
+/// differential invariants), `mock_network_socket` (Phase H network mocking
+/// socket semantics) and `shared_buffer_mmap` (Phase I shared-memory zero-copy
+/// and cross-task futex), all generic runners. All three exist after the
+/// merges, so the denominator moves 471 -> 474 and the gating rows 890 -> 896
+/// — 448 conformance sources (426 generic, 22 dedicated). Counted from the
+/// tree, never from any one branch's arithmetic.
+const PROBE_SOURCE_COUNT: usize = 474;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
@@ -5266,9 +5268,9 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
     let generic = validate_closure_probe_rows(&inventory(), &sources)
         .expect("checked-in closure probe inventory must match the source denominator");
-    assert_eq!(generic.len(), 425);
-    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 447);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 894);
+    assert_eq!(generic.len(), 426);
+    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 448);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 896);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")

@@ -30,20 +30,24 @@ fs-memory = ["carrick-spec/fs-memory", "carrick-engine/fs-memory", "carrick-runt
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }
 carrick-engine = { path = "../carrick-engine", default-features = false }
+carrick-guest-mem = { path = "../carrick-guest-mem" }
+carrick-hal = { path = "../carrick-hal" }
+carrick-host = { path = "../carrick-host" }
 carrick-runtime = { path = "../carrick-runtime", default-features = false }
+carrick-thread = { path = "../carrick-thread" }
 # The engine re-exports neither PullPolicy nor the spec's StdioMode; take the
 # two leaf crates directly rather than widening the engine's re-export list.
 carrick-image = { path = "../carrick-image" }
 carrick-spec = { path = "../carrick-spec" }
 anyhow.workspace = true
 camino.workspace = true
+libc.workspace = true
 parking_lot.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
 flate2.workspace = true
-libc.workspace = true
 serde_json.workspace = true
 tar.workspace = true
-tempfile.workspace = true

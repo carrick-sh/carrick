@@ -4,12 +4,14 @@
 //! filtering, and bounded execution tracing for embedded container runs.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use carrick_abi::{
-    LINUX_EBUSY, LINUX_EEXIST, LINUX_EFBIG, LINUX_EINVAL, LINUX_EISDIR, LINUX_ELOOP, LINUX_ENOENT,
-    LINUX_ENOSYS, LINUX_ENOTDIR, LINUX_ENOTEMPTY, LINUX_EROFS, LinuxErrno, NsGid, NsUid,
+    LINUX_EBUSY, LINUX_EEXIST, LINUX_EFBIG, LINUX_EINVAL, LINUX_EIO, LINUX_EISDIR, LINUX_ELOOP,
+    LINUX_EMFILE, LINUX_ENOENT, LINUX_ENOSYS, LINUX_ENOTDIR, LINUX_ENOTEMPTY, LINUX_EROFS,
+    LinuxErrno, NsGid, NsUid,
 };
 pub use carrick_runtime::vfs::{
     DirEnt, EntryKind, MAX_IN_MEMORY_FILE_SIZE, Metadata, OpenContext, OpenFlags, Vfs, VfsError,
@@ -63,6 +65,14 @@ enum InMemNode {
         gid: NsGid,
         mtime_secs: i64,
     },
+    HostFd {
+        fd: RawFd,
+        size: u64,
+        mode: u32,
+        uid: NsUid,
+        gid: NsGid,
+        mtime_secs: i64,
+    },
 }
 
 impl InMemNode {
@@ -78,6 +88,22 @@ impl InMemNode {
                 kind: EntryKind::File,
                 mode: *mode,
                 size: contents.read().len() as u64,
+                mtime_secs: *mtime_secs,
+                mtime_nanos: 0,
+                uid: uid.raw(),
+                gid: gid.raw(),
+            },
+            Self::HostFd {
+                size,
+                mode,
+                uid,
+                gid,
+                mtime_secs,
+                ..
+            } => Metadata {
+                kind: EntryKind::File,
+                mode: *mode,
+                size: *size,
                 mtime_secs: *mtime_secs,
                 mtime_nanos: 0,
                 uid: uid.raw(),
@@ -289,12 +315,66 @@ impl InMemoryFileVfs {
         Ok(())
     }
 
+    /// Add a host-fd-backed file with default permissions (`0o666`, owned by root).
+    pub fn add_host_file(
+        &self,
+        path: impl AsRef<Path>,
+        fd: RawFd,
+        size: u64,
+    ) -> Result<(), VfsError> {
+        self.add_host_file_with_metadata(path, fd, size, 0o666, NsUid::ROOT, NsGid::ROOT, 0)
+    }
+
+    /// Add a host-fd-backed file with explicit metadata.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_host_file_with_metadata(
+        &self,
+        path: impl AsRef<Path>,
+        fd: RawFd,
+        size: u64,
+        mode: u32,
+        uid: NsUid,
+        gid: NsGid,
+        mtime_secs: i64,
+    ) -> Result<(), VfsError> {
+        let path_str = normalize_path(&path.as_ref().to_string_lossy());
+        if path_str == "/" {
+            return Err(LINUX_EISDIR);
+        }
+        let mut nodes = self.nodes.write();
+        let parent = parent_path(&path_str);
+        Self::ensure_dirs_locked(&mut nodes, &parent)?;
+        nodes.insert(
+            path_str,
+            InMemNode::HostFd {
+                fd,
+                size,
+                mode,
+                uid,
+                gid,
+                mtime_secs,
+            },
+        );
+        Ok(())
+    }
+
     /// Read the full byte contents of a file in the in-memory filesystem.
     pub fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, VfsError> {
         let nodes = self.nodes.read();
         let target_path = Self::resolve_symlinks_locked(&nodes, path, 32)?;
         match nodes.get(&target_path) {
             Some(InMemNode::File { contents, .. }) => Ok(contents.read().clone()),
+            Some(InMemNode::HostFd { fd, size, .. }) => {
+                let len = *size as usize;
+                let mut buf = vec![0u8; len];
+                let n = unsafe { libc::pread(*fd, buf.as_mut_ptr() as *mut libc::c_void, len, 0) };
+                if n >= 0 {
+                    buf.truncate(n as usize);
+                    Ok(buf)
+                } else {
+                    Err(LINUX_EIO)
+                }
+            }
             Some(InMemNode::Directory { .. }) => Err(LINUX_EISDIR),
             Some(InMemNode::Symlink { .. }) => unreachable!(),
             None => Err(LINUX_ENOENT),
@@ -314,6 +394,18 @@ impl InMemoryFileVfs {
             .iter()
             .filter_map(|(path, node)| match node {
                 InMemNode::File { contents, .. } => Some((path.clone(), contents.read().clone())),
+                InMemNode::HostFd { fd, size, .. } => {
+                    let len = *size as usize;
+                    let mut buf = vec![0u8; len];
+                    let n =
+                        unsafe { libc::pread(*fd, buf.as_mut_ptr() as *mut libc::c_void, len, 0) };
+                    if n >= 0 {
+                        buf.truncate(n as usize);
+                        Some((path.clone(), buf))
+                    } else {
+                        None
+                    }
+                }
                 _ => None,
             })
             .collect()
@@ -487,6 +579,20 @@ impl Vfs for InMemoryFileVfs {
                         status_flags: 0,
                         writable: flags.write && !self.readonly,
                         max_size: self.max_file_size,
+                    });
+                }
+                InMemNode::HostFd { fd, .. } => {
+                    if flags.directory {
+                        return Err(LINUX_ENOTDIR);
+                    }
+                    let dup_fd = unsafe { libc::dup(*fd) };
+                    if dup_fd < 0 {
+                        return Err(LINUX_EMFILE);
+                    }
+                    return Ok(VfsHandle::HostFd {
+                        host_fd: dup_fd,
+                        is_read_end: !flags.write,
+                        status_flags: 0,
                     });
                 }
             }
@@ -667,6 +773,7 @@ impl Vfs for InMemoryFileVfs {
         let node = nodes.get_mut(&norm).ok_or(LINUX_ENOENT)?;
         match node {
             InMemNode::File { mode: m, .. }
+            | InMemNode::HostFd { mode: m, .. }
             | InMemNode::Directory { mode: m, .. }
             | InMemNode::Symlink { mode: m, .. } => *m = mode,
         }
@@ -688,6 +795,7 @@ impl Vfs for InMemoryFileVfs {
         let node = nodes.get_mut(&norm).ok_or(LINUX_ENOENT)?;
         match node {
             InMemNode::File { uid: u, gid: g, .. }
+            | InMemNode::HostFd { uid: u, gid: g, .. }
             | InMemNode::Directory { uid: u, gid: g, .. }
             | InMemNode::Symlink { uid: u, gid: g, .. } => {
                 if let Some(uid) = uid {
@@ -717,6 +825,7 @@ impl Vfs for InMemoryFileVfs {
         if let Some((secs, _)) = mtime {
             match node {
                 InMemNode::File { mtime_secs: m, .. }
+                | InMemNode::HostFd { mtime_secs: m, .. }
                 | InMemNode::Directory { mtime_secs: m, .. }
                 | InMemNode::Symlink { mtime_secs: m, .. } => *m = secs,
             }
@@ -743,6 +852,10 @@ impl Vfs for InMemoryFileVfs {
                     data.truncate(len);
                 }
                 Ok(())
+            }
+            Some(InMemNode::HostFd { fd, size: _, .. }) => {
+                let rc = unsafe { libc::ftruncate(*fd, len as i64) };
+                if rc == 0 { Ok(()) } else { Err(LINUX_EINVAL) }
             }
             Some(InMemNode::Directory { .. }) => Err(LINUX_EISDIR),
             Some(InMemNode::Symlink { .. }) => Err(LINUX_EINVAL),

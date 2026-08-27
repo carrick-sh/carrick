@@ -16,7 +16,7 @@
 //! UTS/net namespaces. Every task reaches its container through its
 //! `NsProxy`, never through a static.
 
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -816,6 +816,8 @@ pub struct Container {
     /// constant — set once through `with_launch_capabilities` before the
     /// root task is bootstrapped, then read-only; forks copy it per task.
     granted_caps: CapabilitySet,
+    generation: u64,
+    retired: Arc<AtomicBool>,
 }
 
 impl Container {
@@ -831,6 +833,8 @@ impl Container {
             clock: Arc::new(ClockDomain::default()),
             budget: None,
             granted_caps: CapabilitySet::docker_default(),
+            generation: 1,
+            retired: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -937,6 +941,21 @@ impl Container {
         &self.clock
     }
 
+    /// The execution and lifecycle generation of this container.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Whether this container has completed execution and been retired.
+    pub fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::Acquire)
+    }
+
+    /// A shared token observing this container's retirement status.
+    pub fn retirement_token(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.retired)
+    }
+
     /// Retire this container after its run loop returned. Precondition: the
     /// run loop joined every executor of this container (`join_hvpatch_process_threads`
     /// and `take_process_terminal` in `threaded_loop::run_threaded_loop_inner`),
@@ -945,6 +964,7 @@ impl Container {
     pub(crate) fn retire(
         self: std::sync::Arc<Self>,
     ) -> Result<crate::carrier::ContainerTeardown, crate::run_result::RuntimeError> {
+        self.retired.store(true, Ordering::Release);
         let id = self.id();
         let pid_region_released = self
             .pid_region()

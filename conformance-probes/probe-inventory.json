@@ -1904,6 +1904,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "shared_buffer_mmap": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "shmlinkat": {
     "class": "conformance",
     "excluded": false,
