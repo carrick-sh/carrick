@@ -189,4 +189,25 @@ mod tests {
         // Idempotent.
         shutdown().expect("second shutdown is a no-op");
     }
+
+    #[test]
+    fn sequential_containers_admit_and_retire_in_one_carrier() {
+        assert_eq!(live_container_count(), 0);
+        let alpha = Arc::new(Container::for_reference_model());
+        let alpha_admission = admit_container(alpha.id());
+        assert_eq!(live_container_count(), 1);
+        let alpha_teardown =
+            retire_container(alpha, alpha_admission).expect("alpha container retire must succeed");
+        assert_eq!(live_container_count(), 0);
+
+        let beta = Arc::new(Container::for_reference_model());
+        let beta_admission = admit_container(beta.id());
+        assert_eq!(live_container_count(), 1);
+        let beta_teardown =
+            retire_container(beta, beta_admission).expect("beta container retire must succeed");
+        assert_eq!(live_container_count(), 0);
+
+        assert_ne!(alpha_teardown.id, beta_teardown.id);
+        shutdown().expect("carrier shutdown after container retirement should succeed");
+    }
 }
