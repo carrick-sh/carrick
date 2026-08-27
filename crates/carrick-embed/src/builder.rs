@@ -116,6 +116,8 @@ pub struct ContainerBuilder {
     user: Option<String>,
     hostname: Option<String>,
     mounts: Vec<Mount>,
+    security_opts: Vec<String>,
+    cap_add: Vec<String>,
     vfs_mounts: Vec<(Utf8PathBuf, Box<dyn Vfs>)>,
     stdout: StdioConfig,
     stderr: StdioConfig,
@@ -142,6 +144,8 @@ impl ContainerBuilder {
             user: None,
             hostname: None,
             mounts: Vec::new(),
+            security_opts: Vec::new(),
+            cap_add: Vec::new(),
             vfs_mounts: Vec::new(),
             stdout: StdioConfig::Captured,
             stderr: StdioConfig::Captured,
@@ -195,6 +199,19 @@ impl ContainerBuilder {
     /// Container hostname / UTS identity.
     pub fn hostname(mut self, hostname: impl Into<String>) -> Self {
         self.hostname = Some(hostname.into());
+        self
+    }
+
+    /// Set one Docker-compatible launch security option, such as
+    /// `seccomp=unconfined` (later options follow the engine's last-wins rule).
+    pub fn security_opt(mut self, option: impl Into<String>) -> Self {
+        self.security_opts.push(option.into());
+        self
+    }
+
+    /// Grant one Docker-compatible Linux capability name without the `CAP_` prefix.
+    pub fn cap_add(mut self, capability: impl Into<String>) -> Self {
+        self.cap_add.push(capability.into());
         self
     }
 
@@ -360,6 +377,8 @@ impl ContainerBuilder {
             workdir: self.workdir.clone(),
             user: self.user.clone(),
             hostname: self.hostname.clone(),
+            security_opts: self.security_opts.clone(),
+            cap_add: self.cap_add.clone(),
             max_traps: self.max_traps,
             pull: self.pull,
             stdio: stdio_mode(&self.stdout, &self.stderr),
@@ -691,6 +710,18 @@ mod tests {
             .unwrap();
         assert_eq!(request.host_env, None);
         assert_eq!(request.bridge_namespace_id, None);
+    }
+
+    #[test]
+    fn launch_policy_lowers_to_the_engine_request() {
+        let request = ContainerBuilder::from_image("alpine")
+            .security_opt("seccomp=unconfined")
+            .cap_add("SYS_TIME")
+            .to_run_request()
+            .unwrap();
+
+        assert_eq!(request.security_opts, ["seccomp=unconfined"]);
+        assert_eq!(request.cap_add, ["SYS_TIME"]);
     }
 
     #[test]

@@ -21,6 +21,8 @@ pub struct TestContainer {
     user: Option<String>,
     hostname: Option<String>,
     mounts: Vec<(String, String, bool)>,
+    security_opts: Vec<String>,
+    cap_add: Vec<String>,
     max_traps: Option<usize>,
     store: Option<ImageStore>,
     pull: Option<PullPolicy>,
@@ -53,6 +55,8 @@ impl TestContainer {
             user: None,
             hostname: None,
             mounts: Vec::new(),
+            security_opts: Vec::new(),
+            cap_add: Vec::new(),
             max_traps: None,
             store: None,
             pull: None,
@@ -77,6 +81,16 @@ impl TestContainer {
 
     pub fn hostname(mut self, hostname: impl Into<String>) -> Self {
         self.hostname = Some(hostname.into());
+        self
+    }
+
+    pub fn security_opt(mut self, option: impl Into<String>) -> Self {
+        self.security_opts.push(option.into());
+        self
+    }
+
+    pub fn cap_add(mut self, capability: impl Into<String>) -> Self {
+        self.cap_add.push(capability.into());
         self
     }
 
@@ -129,6 +143,12 @@ impl TestContainer {
         }
         if let Some(hostname) = &self.hostname {
             builder = builder.hostname(hostname.clone());
+        }
+        for option in &self.security_opts {
+            builder = builder.security_opt(option.clone());
+        }
+        for capability in &self.cap_add {
+            builder = builder.cap_add(capability.clone());
         }
         for (host, guest, readonly) in &self.mounts {
             if *readonly {
@@ -280,11 +300,15 @@ mod tests {
     fn test_container_builds_a_captured_request_per_run() {
         let container = TestContainer::new("ubuntu:24.04")
             .env("K", "v")
+            .security_opt("seccomp=unconfined")
+            .cap_add("SYS_TIME")
             .max_traps(9);
         let request = container.builder(["/bin/true"]).to_run_request().unwrap();
         assert_eq!(request.image_ref, "ubuntu:24.04");
         assert_eq!(request.args, vec!["/bin/true".to_string()]);
         assert_eq!(request.env_overrides, vec!["K=v".to_string()]);
+        assert_eq!(request.security_opts, ["seccomp=unconfined"]);
+        assert_eq!(request.cap_add, ["SYS_TIME"]);
         assert_eq!(request.max_traps, 9);
         assert_eq!(request.stdio, crate::StdioMode::Captured);
     }
