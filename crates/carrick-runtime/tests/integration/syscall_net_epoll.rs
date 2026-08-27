@@ -20,7 +20,8 @@ use carrick_runtime::linux_abi::{
 };
 #[cfg(target_os = "macos")]
 use carrick_runtime::linux_abi::{
-    LINUX_EINTR, LINUX_EPOLLOUT, LINUX_SOCK_CLOEXEC, LINUX_SOCK_NONBLOCK, LINUX_SOL_TCP,
+    LINUX_EINTR, LINUX_EPOLLHUP, LINUX_EPOLLOUT, LINUX_SOCK_CLOEXEC, LINUX_SOCK_NONBLOCK,
+    LINUX_SOL_TCP,
 };
 #[cfg(target_os = "macos")]
 use carrick_runtime::thread::{FutexTable, ThreadRegistry};
@@ -2245,6 +2246,136 @@ fn epoll_wakes_accepted_socket_after_peer_write() {
             panic!("expected timed epoll wait handoff after latched accepted socket, got {other:?}")
         }
     }
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn epoll_latched_eof_hup_disarms_kqueue_and_leaves_fd_not_readable() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    // Create a non-blocking pipe.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(
+                    59,
+                    SyscallArgs::from([0x4000, LINUX_O_NONBLOCK, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let pair = read_fd_pair(&memory, 0x4000);
+    let read_fd = pair.read_fd as u64;
+    let write_fd = pair.write_fd as u64;
+
+    // Create an epoll instance.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(20, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 5 }
+    );
+
+    // Register read_fd with EPOLLET | EPOLLIN.
+    let wanted = LinuxEpollEvent {
+        events: LINUX_EPOLLIN | LINUX_EPOLLET,
+        _pad: 0,
+        data: 0xcafe,
+    };
+    memory.write_bytes(0x4040, wanted.as_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(
+                    21,
+                    SyscallArgs::from([5, LINUX_EPOLL_CTL_ADD, read_fd, 0x4040, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    // Close write_fd to cause EOF / HUP on read_fd.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(57, SyscallArgs::from([write_fd, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    // Drain the EOF / HUP edge via epoll_wait.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(22, SyscallArgs::from([5, 0x4100, 4, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 1 }
+    );
+    let event = read_epoll_event(&memory, 0x4100);
+    let event_data = event.data;
+    let event_events = event.events;
+    assert_eq!(event_data, 0xcafe);
+    assert_ne!(event_events & (LINUX_EPOLLIN | LINUX_EPOLLHUP), 0);
+
+    // Subsequent epoll_wait should park on kqueue without leaving the kqueue fd readable.
+    let outcome = dispatcher
+        .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
+            SyscallRequest::new(22, SyscallArgs::from([5, 0x4100, 4, 25, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    let DispatchOutcome::WaitOnPollFds {
+        fds,
+        timeout,
+        on_timeout,
+        sig_mask,
+    } = outcome
+    else {
+        panic!("expected timed epoll wait handoff after latched EOF, got {outcome:?}");
+    };
+    assert_eq!(fds.len(), 1);
+    assert_eq!(fds[0].events() & libc::POLLIN, libc::POLLIN);
+    assert_eq!(timeout, Some(std::time::Duration::from_millis(25)));
+    assert_eq!(on_timeout, 0);
+    assert_eq!(sig_mask.raw_block_bits(), 0);
+
+    let mut host_pollfd = libc::pollfd {
+        fd: fds[0].fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let host_ready = unsafe { libc::poll(&mut host_pollfd, 1, 0) };
+    assert_eq!(
+        host_ready, 0,
+        "latched EOF/HUP ET readiness must not leave the epoll kqueue fd readable"
+    );
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
