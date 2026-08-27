@@ -1023,7 +1023,7 @@ where
             child_pid,
         );
 
-        let child_dispatcher = match kernel.dispatcher.fork_clone_with_prepared_mm(
+        let mut child_dispatcher = match kernel.dispatcher.fork_clone_with_prepared_mm(
             parent_context.shared().mm().id(),
             child_mm_id,
             parent_process.pid() as u32,
@@ -1052,8 +1052,7 @@ where
             }
         };
         if external_exec.is_some() {
-            child_dispatcher.set_stdio_sink(crate::dispatch::StdioSink::Captured);
-            child_dispatcher.enable_external_exec_capture();
+            child_dispatcher.init_external_exec_stdio();
         }
         let child_exit_signal = i32::try_from(request.exit_signal)
             .ok()
