@@ -8,5 +8,6 @@
 pub mod arena;
 pub mod domains;
 pub mod lock;
+pub mod pidns;
 pub mod process;
 pub mod wait;

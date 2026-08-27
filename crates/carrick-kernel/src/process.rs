@@ -181,6 +181,12 @@ pub struct ProcessRecord {
     pub exit_status: AtomicU64,
     pub ptrace_control: AtomicU64,
     pub exit_ready: AtomicU32,
+    /// The PID namespace this record is a member of (`PidNamespaceRef::ns_id`),
+    /// or 0 while it carries no namespace identity (run-state/guest-CPU only).
+    /// Placed in the padding after `exit_ready`, so the `#[repr(C)]` record
+    /// stays 88 bytes (10×u32 + 4×u64 = 72, `exit_ready` at 72, this at 76,
+    /// `guest_ns` at 80).
+    pub pid_ns: AtomicU32,
     pub guest_ns: AtomicU64,
 }
 
@@ -422,6 +428,7 @@ impl ProcessRecord {
         self.ptrace_control
             .store(VirtualPtraceControl::untraced().raw(), Ordering::Relaxed);
         self.exit_ready.store(0, Ordering::Relaxed);
+        self.pid_ns.store(0, Ordering::Relaxed);
         self.guest_ns.store(0, Ordering::Relaxed);
     }
 }
@@ -552,5 +559,31 @@ mod tests {
                 capacity: PROCESS_RECORDS
             })
         ));
+    }
+
+    #[test]
+    fn claim_clears_the_namespace_tag() {
+        let arena = KernelArena::create().unwrap();
+        let s = &arena.layout().processes;
+        let r = s
+            .claim(
+                Some(HostPid::new(700)),
+                arena.allocate_generation(),
+                |rec| {
+                    rec.pid_ns.store(9, Ordering::Relaxed);
+                },
+            )
+            .unwrap();
+        assert_eq!(s.records[r.index].pid_ns.load(Ordering::Acquire), 9);
+        assert!(s.release(r));
+        let again = s
+            .claim(Some(HostPid::new(700)), arena.allocate_generation(), |_| {})
+            .unwrap();
+        assert_eq!(again.index, r.index);
+        assert_eq!(
+            s.records[again.index].pid_ns.load(Ordering::Acquire),
+            0,
+            "a reused record must not inherit a namespace tag"
+        );
     }
 }
