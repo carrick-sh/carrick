@@ -448,6 +448,27 @@ impl Container {
     pub fn clock(&self) -> &Arc<ClockDomain> {
         &self.clock
     }
+
+    /// Retire this container after its run loop returned. Precondition: the
+    /// run loop joined every executor of this container (`join_hvpatch_process_threads`
+    /// and `take_process_terminal` in `threaded_loop::run_threaded_loop_inner`),
+    /// so no task of this pid namespace can still be running. Releases the pid
+    /// region back to the carrier arena.
+    pub(crate) fn retire(
+        self: std::sync::Arc<Self>,
+    ) -> Result<crate::carrier::ContainerTeardown, crate::run_result::RuntimeError> {
+        let id = self.id();
+        let pid_region_released = self
+            .pid_region()
+            .map(|region| region.retire())
+            .unwrap_or(false);
+        Ok(crate::carrier::ContainerTeardown {
+            id,
+            tasks_reaped: 0,
+            mounts_dropped: 0,
+            pid_region_released,
+        })
+    }
 }
 
 #[cfg(test)]

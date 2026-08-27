@@ -625,10 +625,10 @@ fn run_detached_carrier(
     // stderr is the container log here; the notice lands with the run.
     crate::runtime_util::emit_resolve_warnings(&resolved.warnings);
     match carrick_runtime::Runtime::execute(&resolved.spec) {
-        Ok(r) => std::process::exit(r.exit_code),
+        Ok(r) => carrick_runtime::carrier::exit_carrier(r.exit_code),
         Err(_) => {
             container::mark_exited(id, 1);
-            std::process::exit(1);
+            carrick_runtime::carrier::exit_carrier(1);
         }
     }
 }

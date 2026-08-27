@@ -312,6 +312,7 @@ pub mod kernel;
 // below).
 pub mod run_result;
 
+pub mod carrier;
 pub(crate) mod container_policy;
 pub mod threaded_loop;
 pub mod vcpu_loop;

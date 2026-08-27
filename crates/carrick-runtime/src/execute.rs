@@ -943,13 +943,28 @@ mod exit_code_tests {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
-    fn hvpatch_uses_container_entrypoint_resolution() {
-        let result = Runtime::execute(&hvpatch_run_spec())
-            .expect("hvpatch container setup should classify a missing entrypoint");
-
-        assert_eq!(result.exit_code, 127);
-        assert!(result.stdout.is_empty());
-        assert!(result.stderr.is_empty());
+    fn hvpatch_uses_container_entrypoint_resolution_for_every_container_in_one_carrier() {
+        // Two sequential containers in ONE carrier process: each resolves its
+        // entrypoint independently (127 both times) and leaves no live
+        // container behind, and carrier shutdown afterwards is a no-op. A 127
+        // run never boots a VM (it fails in `run_elf_from_dispatcher_debug`,
+        // before `run_address_space_with_hvf_and_dispatcher`), so this proves
+        // the carrier module's idempotency without HVF; the live two-container
+        // proof is Gate B (`conformance_container_gate`, Task 17).
+        for round in 0..2 {
+            let result = Runtime::execute(&hvpatch_run_spec())
+                .expect("hvpatch container setup should classify a missing entrypoint");
+            assert_eq!(result.exit_code, 127, "round {round}");
+            assert!(result.stdout.is_empty());
+            assert!(result.stderr.is_empty());
+            assert_eq!(
+                crate::carrier::live_container_count(),
+                0,
+                "round {round}: container must be retired at run end"
+            );
+        }
+        crate::carrier::shutdown().expect("carrier shutdown without a VM is a no-op");
+        assert!(crate::vm_lifecycle::process_snapshot().terminal.is_none());
     }
 
     #[test]
