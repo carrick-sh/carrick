@@ -540,6 +540,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-embed"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "camino",
+ "carrick-engine",
+ "carrick-image",
+ "carrick-runtime",
+ "carrick-spec",
+ "flate2",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "carrick-engine"
 version = "0.1.0"
 dependencies = [
