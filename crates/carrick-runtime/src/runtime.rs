@@ -593,14 +593,9 @@ fn run_address_space_with_hvf_and_dispatcher(
     max_traps: usize,
 ) -> Result<RunResult, RuntimeError> {
     let _ = crate::ulock::preinit_waiter_table();
-    ensure_kernel_arena_path_env()?;
-    // The carrier owns the kernel arena and PID-namespace placement directly.
-    // Guest fork/clone creates logical Carrick-kernel tasks, never a host
-    // namespace-supervisor process.
-    let _ = carrick_kernel::arena::KernelArena::init_global();
-    if crate::namespace::pid::requested() && !crate::namespace::pid::enabled() {
-        let _ = crate::namespace::pid::init(std::process::id());
-    }
+    // The carrier owns the kernel arena directly (in-memory singleton; B2
+    // deletes the path-based constructor).
+    let _ = carrick_kernel::arena::KernelArena::global();
     let container_id = std::env::var("CARRICK_CONTAINER_ID").ok();
     let mut exact_control_installed = false;
     let run = (|| -> Result<RunResult, RuntimeError> {
@@ -667,48 +662,6 @@ fn run_address_space_with_hvf_and_dispatcher(
         crate::container::mark_exited(id, exit_code);
     }
     run
-}
-
-fn ensure_kernel_arena_path_env() -> Result<(), RuntimeError> {
-    if std::env::var_os(carrick_kernel::arena::ARENA_PATH_ENV).is_some() {
-        return Ok(());
-    }
-
-    let dir = std::env::temp_dir()
-        .join("carrick-kernel")
-        .join(kernel_arena_run_scope());
-    std::fs::create_dir_all(&dir).map_err(|err| {
-        RuntimeError::AddressSpace(AddressSpaceError::Io(std::io::Error::new(
-            err.kind(),
-            format!(
-                "failed to create kernel arena directory {}: {err}",
-                dir.display()
-            ),
-        )))
-    })?;
-    let path = dir.join("arena");
-    // SAFETY: this runs during runtime preinit, before Carrick starts guest
-    // threads. Fork descendants and late exec attachers inherit the path.
-    unsafe {
-        std::env::set_var(carrick_kernel::arena::ARENA_PATH_ENV, &path);
-    }
-    Ok(())
-}
-
-fn kernel_arena_run_scope() -> String {
-    let raw = std::env::var("CARRICK_RUN_ID").unwrap_or_else(|_| {
-        std::env::var("CARRICK_CONTAINER_ID")
-            .unwrap_or_else(|_| format!("pid-{}", std::process::id()))
-    });
-    raw.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 /// Install the macOS/HVF AArch64 syscall transport in a freshly loaded image.
@@ -996,7 +949,7 @@ where
                             .commit_one_task_kernel_exec(prepared_kernel_exec)
                             .map_err(RuntimeError::Configuration)?;
                         prepared_dispatch_mm_exec.commit();
-                        crate::namespace::pid::mark_self_execed();
+                        crate::namespace::pid::mark_self_execed_for(&exec_context);
                         // execve_into rebuilt a fresh (zeroed) identity page;
                         // exec retains the caller's captured credential values.
                         let _ = stamp_identity_page(runtime, &dispatcher, &exec_context);
@@ -2353,7 +2306,10 @@ mod tests {
         let launch_source = runtime_source
             .split("fn run_address_space_with_hvf_and_dispatcher")
             .nth(1)
-            .and_then(|tail| tail.split("fn ensure_kernel_arena_path_env").next())
+            .and_then(|tail| {
+                tail.split("/// Install the macOS/HVF AArch64 syscall transport")
+                    .next()
+            })
             .expect("HVPatch runtime launch source");
         assert!(
             !launch_source.contains(&["libc::", "fork"].concat()),

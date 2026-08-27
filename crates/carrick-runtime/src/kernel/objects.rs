@@ -3030,6 +3030,14 @@ impl Task {
         Arc::clone(self.nsproxy.load().net())
     }
 
+    /// The PID namespace region of this process's container, or `None` when
+    /// the container shares the host pid namespace (`--pid host`). This is the
+    /// ONLY path from a task to pid translation: `namespace::pid::region()`
+    /// resolves the calling task through it, never through a static.
+    pub fn pid_ns_region(&self) -> Option<Arc<crate::namespace::pid::NsSharedRegion>> {
+        self.container().pid_region()
+    }
+
     /// The UTS namespace this process belongs to — the nodename `uname(2)` and
     /// `/proc/sys/kernel/hostname` report.
     pub fn uts_ns(&self) -> Arc<UtsNs> {

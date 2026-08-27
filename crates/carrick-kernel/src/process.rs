@@ -154,13 +154,10 @@ impl VirtualPtraceControl {
     }
 }
 
+/// The carrier's ONE process-record table. Namespace numbering words live per
+/// namespace in `crate::pidns`; a record's `pid_ns` tag names its owner.
 #[repr(C)]
 pub struct ProcessSection {
-    pub next_ns_pid: AtomicU32,
-    pub init_host_pid: AtomicU32,
-    pub init_host_pgid: AtomicU32,
-    pub init_host_sid: AtomicU32,
-    pub init_sig_handlers: AtomicU64,
     pub records: [ProcessRecord; PROCESS_RECORDS],
 }
 
@@ -260,10 +257,6 @@ impl ProcessSection {
             }
         }
         None
-    }
-
-    pub fn allocate_ns_pid(&self) -> u32 {
-        self.next_ns_pid.fetch_add(1, Ordering::AcqRel)
     }
 
     pub fn publish_host_pid(&self, r: ProcessRecordRef, pid: HostPid) {
@@ -530,14 +523,6 @@ mod tests {
         record.ns_pid.store(0, Ordering::Release);
         assert!(s.release_if_namespace_unowned(r, HostPid::new(601)));
         assert!(s.find(HostPid::new(601)).is_none());
-    }
-
-    #[test]
-    fn ns_pids_are_monotonic_from_2() {
-        let arena = KernelArena::create().unwrap();
-        let s = &arena.layout().processes;
-        assert_eq!(s.allocate_ns_pid(), 2);
-        assert_eq!(s.allocate_ns_pid(), 3);
     }
 
     #[test]

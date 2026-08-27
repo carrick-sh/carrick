@@ -372,7 +372,7 @@ static PENDING_CHILD_RECORD: AtomicU64 = AtomicU64::new(REF_NONE);
 /// Ensure the arena exists before any `fork`, so every descendant inherits the
 /// same process section. Idempotent.
 pub fn init_child_table() {
-    let _ = KernelArena::init_global();
+    let _ = KernelArena::global();
 }
 
 fn process_section() -> &'static ProcessSection {

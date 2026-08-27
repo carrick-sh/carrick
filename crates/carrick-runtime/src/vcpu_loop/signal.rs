@@ -611,9 +611,10 @@ where
                         crate::host_signal::take_child_exit_siginfo(tid.raw(), pending).map(
                             |info| {
                                 const CLD_EXITED: i32 = 1;
-                                let ns_pid =
-                                    crate::namespace::pid::host_to_ns_or_self(info.host_pid as u32)
-                                        as i32;
+                                let ns_pid = crate::namespace::pid::host_to_ns_or_self_for(
+                                    context,
+                                    info.host_pid as u32,
+                                ) as i32;
                                 let linux_status = if info.si_code == CLD_EXITED {
                                     info.host_status
                                 } else {
@@ -633,8 +634,10 @@ where
                 let queued_siginfo = queued_siginfo.or_else(|| {
                     let sender_host = crate::host_signal::last_sender_for(pending);
                     (sender_host > 0).then(|| {
-                        let ns_pid =
-                            crate::namespace::pid::host_to_ns_or_self(sender_host as u32) as i32;
+                        let ns_pid = crate::namespace::pid::host_to_ns_or_self_for(
+                            context,
+                            sender_host as u32,
+                        ) as i32;
                         let uid = crate::cred_ipc::read_target(sender_host)
                             .unwrap_or(carrick_abi::NsUid::ROOT);
                         crate::linux_abi::LinuxSiginfo::kill(
