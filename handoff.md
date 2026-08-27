@@ -1,6 +1,6 @@
 # Carrick exact conformance closure handoff
 
-**Updated:** 2026-08-26 (session 13 — Task 4.38 final guided correction in progress)
+**Updated:** 2026-08-26 (session 14 — Task 4.38 final guided correction rejected)
 
 **Canonical host/lane:** macOS, Apple Silicon, HVF/HVPatch, Linux arm64 guest
 
@@ -188,7 +188,7 @@ must own logical size plus backing/reservations, and VMA authority must retain
 the hstate/backing reference through fault, fork, unmap, mprotect, and mremap.
 Do not revive the current runtime diff or land the syntax parser by itself.
 
-## Correction in progress — Task 4.38 HVPatch madvise fork policy
+## Rejected candidate — Task 4.38 HVPatch madvise fork policy
 
 Codex re-ranked the frozen gaps and gave Antigravity a larger architectural
 swing around `ltp-madvise10` (13 assertion identities), including
@@ -200,52 +200,54 @@ inventory authority, a bounded probe, and a fail-closed trace. The worker is
 uncommitted branch/worktree is `agy/madvise-fork-t438` at
 `.worktrees/madvise-fork-t438`, based on accepted controller HEAD `ae76f6d1`.
 
-The worker completed two implementation rounds and reported its tests green.
-Codex reviewed the actual diff after each round, and three independent reviews
-agreed that the same architectural blockers remained. Per the owner's explicit
-direction, Codex did not discard the candidate at that point: it authored a
-much more concrete final-correction architecture and acceptance packet and sent
-it back to the same stateful worker first. That final guided round is now in
-progress. Do not integrate the slice until Codex reviews the resulting diff and
-reruns the decisive gates; if bounded corrections still remain, Codex may
-finish them here rather than automatically abandoning useful work.
+The worker completed three guided implementation rounds and reported its
+targeted tests, probe, Docker comparison, and trace green. Codex reviewed the
+actual final diff, reran the narrow semantic gate (3/3 passed), and split the
+2,000-line candidate across three independent read-only reviews. All three
+domains are no-go. The candidate remains dirty and uncommitted as evidence;
+none of it is integrated. Its useful pieces may be recovered only through new
+architecture-bounded changes, not by accepting or polishing the monolith.
 
-The decisive review findings are authority-level, not cosmetic. Prepared fork state
-is guarded only by a numeric revision instead of the exact parent MM authority,
-so an exec-time authority replacement at the same revision can accept a stale
-snapshot. Partial 4 KiB `DONTFORK` holes invalidate a child PTE but remain
-present in compound-wide physical mapping/inventory authority, allowing alias,
-COW, or grandchild reconstruction to resurrect omitted bytes. Fresh WIPE frames
-are published in the production task-only path with owner generation zero and
-without live-owner registration. Heap semantic metadata removes omitted ranges
-while heap/core-map projection reconstructs the full `[heap_base, brk_current)`
-authority. `MAP_DROPPABLE` is accepted but not retained as VMA state, so
-`MADV_KEEPONFORK` cannot enforce Linux's required rejection.
+The final round did fix several semantic prerequisites: prepared state now
+retains the exact parent authority, is move-only, uses the real parent `MmId`,
+and `CLONE_VM` clones the exact authority `Arc`. It also retains droppable state
+and improves semantic heap projection. Those improvements do not close the
+transaction. Missing projection entries still default to Preserve; invalid
+plans are detected and accepted; copied prepare can double-roll back; and MM
+exclusion ends before child dispatcher construction completes.
 
-The acceptance instruments also remain fail-open. The probe has unchecked
-failed forks, blocking reads/reaps, process-wide alarm truncation, an
-allocator-dependent `mremap` assertion, and an exec test whose `MAP_FIXED`
-remap can erase stale policy before it is observed. The DTrace script treats
-Darwin `proc:::exit` `arg0` as an exit code, does not prove typed Omit/Wipe
-transformation, and retained `status=ok` beside `exit_code=1`. The current
-all-true oracle file is Docker data; there is no current green Carrick receipt
-for the expanded probe contract.
+Physical authority remains incomplete. Coverage is checked only for a starting
+leaf or bypassed entirely by alias lookup, geometry still comes from semantic
+VA/descriptor arithmetic instead of live stage-1 translation, and coverage is
+not carried through inventory, grandchild inheritance, overlay authentication,
+or COW publication. Fresh WIPE registration is present, but has no
+generation-exact rollback receipt, generation-zero reusable extents still pass,
+and moved Preserve leaves remain armed against an owner they no longer use.
 
-The controlling third-round plan is
+The acceptance instruments remain fail-open. The probe still has unchecked
+failed forks, blocking reads/reaps, alarm truncation, allocator-dependent
+`mremap`, `MAP_FIXED` exec masking, and missing shared-file, DONT+WIPE
+`CLONE_VM`, and `PROT_NONE` behavior. The DTrace script still treats Darwin
+`proc:::exit` `arg0` as an exit code, has no typed Omit/Wipe receipts, and
+actually recorded `status=ok ... exit_code=1`. Probe inventory denominators
+also drifted (466 source entries versus stale Rust/Python closure counts). The
+current all-true oracle fixture has no retained native-arm64 Docker provenance.
+
+The rejected third-round plan is
 `docs/superpowers/plans/2026-08-26-hvpatch-madvise-fork-policy-final-correction.md`
-inside the worker worktree. It binds prepared state to the exact parent
-authority object; replaces sparse policy defaults with a total typed 4 KiB
-Preserve/Zero/Omit projection; carries translated-IPA-derived physical leaf
-coverage through mapping/inventory/task/alias/COW authority; registers fresh
-WIPE owner generations in the production task-only path with rollback; retains
-`VM_DROPPABLE`; stops reconstructing omitted heap authority; and replaces the
-probe/trace with bounded, typed, fail-closed contracts.
+inside the worker worktree. Resume Task 4.38 as three separately reviewable
+swings: (A) semantic MM identity plus total validated projection and exact
+rollback ownership; (B) translation-derived physical coverage plus
+generation-exact WIPE rollback through inventory/alias/COW/grandchild; and (C)
+the bounded probe, typed observability receipts, corrected DTrace exit-status
+gate, and denominator/provenance repair. Each swing must carry red tests for its
+own invariant before the next starts. Codex owns the interfaces between these
+swings and the final signed acceptance.
 
 Nothing from Task 4.38 is integrated yet. The frozen ledger remains **23/156
 focused-closed; 133 remain**, equivalent to **1,994/2,127 accepted suites
-(93.75%)**. The current review checkpoint is recorded in
-`.superpowers/sdd/handoff/task-4-38-report.md`; update its outcome after the
-final round is reviewed.
+(93.75%)**. The final rejection checkpoint is recorded in
+`.superpowers/sdd/handoff/task-4-38-report.md`.
 
 ## Historical prerequisite objective — closed, retained for provenance
 
