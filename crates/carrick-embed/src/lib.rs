@@ -30,13 +30,12 @@
 //! injection, observers, time control or tty support is exposed in this
 //! version — those arrive with later phases of the embed program
 //! (`docs/superpowers/specs/2026-08-25-carrick-embed-program-design.md`).
-#![forbid(unsafe_code)]
-
 mod builder;
 pub(crate) mod entitlement;
 mod error;
 mod prepared;
 mod result;
+pub mod shared_buffer;
 pub mod testing;
 pub mod vfs;
 
@@ -44,12 +43,14 @@ pub use builder::{ContainerBuilder, StdioConfig};
 pub use error::EmbedError;
 pub use prepared::PreparedContainer;
 pub use result::ContainerResult;
+pub use shared_buffer::{SharedBuffer, SharedBufferError, SharedBufferLease};
 pub use vfs::{
     DirEnt, EntryKind, FilterVfs, InMemoryFileVfs, LayeredVfs, MAX_IN_MEMORY_FILE_SIZE, Metadata,
     OpenContext, OpenFlags, RecordingVfs, Vfs, VfsError, VfsEvent, VfsHandle, VfsOp, VfsOpOutcome,
 };
 
 pub use carrick_engine::{ResolveWarning, RunRequest};
+pub use carrick_guest_mem::{Gpa, GuestMemory, GuestVa, HostVa, MemoryError, SharedFutexLocation};
 pub use carrick_image::{ImageStore, PullPolicy};
 pub use carrick_runtime::compat::CompatReport;
 pub use carrick_runtime::dispatch::Signal;
