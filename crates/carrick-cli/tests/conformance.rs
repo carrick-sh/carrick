@@ -5036,6 +5036,8 @@ fn bless_probe_oracle() {
     let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     use base64::Engine as _;
     let engine = base64::engine::general_purpose::STANDARD;
+    let requested_lane = std::env::var("CARRICK_PROBE_LANE").ok();
+    let requested_libc = std::env::var("CARRICK_PROBE_LIBC").ok();
 
     let docker_available = Command::new("docker")
         .arg("version")
@@ -5051,7 +5053,19 @@ fn bless_probe_oracle() {
 
     let mut blessed = 0usize;
     for lane in LANES {
+        if requested_lane
+            .as_deref()
+            .is_some_and(|label| label != lane.label)
+        {
+            continue;
+        }
         for set in lane.probe_sets {
+            if requested_libc
+                .as_deref()
+                .is_some_and(|libc| libc != set.libc)
+            {
+                continue;
+            }
             if !probes_dir(set.target).exists() {
                 continue;
             }
