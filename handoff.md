@@ -1,6 +1,6 @@
 # Carrick exact conformance closure handoff
 
-**Updated:** 2026-08-26 (session 9 — `carrick-embed` is the active workstream; owner decision 2026-08-25)
+**Updated:** 2026-08-27 (session 10 — carrick-embed phases A-J landed on `main` at `7e537da48`; Gate B green, no phase receipt yet)
 
 **Canonical host/lane:** macOS, Apple Silicon, HVF/HVPatch, Linux arm64 guest
 
@@ -56,6 +56,138 @@ Execution is a directed-worker model:
 Complete only when fail-closed gate integrity, exact correctness, and the <=2x
 performance gate pass together on the final integrated signed artifact. Do not
 push unless explicitly asked. Preserve unrelated worktree changes.
+
+## SESSION 10 — 2026-08-27: carrick-embed phases A–J landed; Gate B GREEN
+
+**Merged to `main` as a fast-forward: `d306db9af` → `7e537da48`, 120 commits,
+linear history, clean tree.** The `feat/carrick-embed` branch and its worktrees
+are now redundant with `main`.
+
+### State on ONE exact signed artifact
+
+| field | value |
+|---|---|
+| source HEAD | `7e537da487d0021a1a6d65d738f93da81524f756` |
+| binary SHA-256 | `2eb80e838894f206c9dbc29ad6030fdfa4db9551e2670d58edec2f6f9c80ebad` |
+| hypervisor entitlement | present |
+| `__dof_carrick` | present |
+
+| gate | verdict |
+|---|---|
+| `just ci` | **0 (green)** — SHA identical before and after |
+| `conformance_container_gate` (Gate B, sequential AND concurrent) | **0 (green)** — SHA identical before and after |
+| `conformance_probes` | RED: 27 `arm64:musl` gaps, status vs a `main` baseline NOT established |
+| ABBA receipt (disabled paths) | **not started** — needs a quiet machine |
+
+**There is therefore NO phase receipt.** Two of the four criteria are met on one
+artifact; the probe gate and ABBA are open. Do not describe any phase as done.
+
+To reproduce the two green gates without letting the artifact change under you:
+`just gate-containers` depends on `build` and WILL rebuild, silently giving a
+different binary than `just ci` passed on. Run the inner commands instead:
+
+```
+just build                       # once; record SHA
+just ci
+./scripts/build-probes.sh --closure-arm64
+CARRICK_PROBE_MODE=closure CARRICK_PROBE_LANE=arm64 CARRICK_EXEC_BACKEND=hvpatch \
+  CARRICK_PROBE_SCENARIO_LIBC=musl \
+  cargo test -p carrick-cli --test conformance conformance_container_gate -- --exact --nocapture
+```
+
+`just ci` does not touch `target/release/carrick`, so the SHA survives it.
+
+### What shipped
+
+Phases A–J of `docs/superpowers/specs/2026-08-25-carrick-embed-program-design.md`:
+observer pipeline, VFS injection, clock domains + virtual-time scheduler, fault
+injection + quotas, network mocking, SharedBuffer, and
+`carrick-conformance-next`. Evidence: `docs/2026-08-27-carrick-embed-gate-b-evidence.md`
+and `docs/2026-08-27-carrick-embed-defect-closure-evidence.md`.
+
+`carrick-conformance-next` runs guests **in-process** through `carrick-embed`
+(zero `Command::new`), unlike `crates/carrick-cli/tests/conformance.rs` which
+still shells out to the signed binary in 38 places. Its 12 ported cases went
+4/12 → 12/12; eight were fixed by the RUNTIME, not by adjusting tests.
+
+### The one finding that should shape the next session
+
+**Every defect this program closed reduces to one sentence: state that was
+correct when one host process served one guest, and wrong once a carrier hosts
+several containers.**
+
+1. `retire_initial_mmap_arena` — a VM-wide `hv_vm_unmap` driven per container.
+2. `AliasOwnershipScope::Root` — documented as "the root address space in this
+   host process"; both containers collapsed into it whenever `mm_root_slot` was
+   `None`, which is the default in `neutral()` and what the `new_with_plan`
+   carrier REUSE lane leaves. Deterministic SIGSEGV at `LINUX_MMAP_BASE + 8`.
+   Fixed with a `ContainerRootToken`, NOT by borrowing the stage-1 root slot
+   (that was tried, and it disturbs identity-page publication).
+3. `host_to_ns_or_self_for` — returned `0` on a lookup miss despite its name.
+   Split into two functions, because `self_ns_ppid` NEEDS the zero:
+   `pid_namespaces(7)` specifies `getppid() == 0` for a parent outside the ns,
+   and returning a host pid there would leak host identity.
+4. `GLOBAL_EPOLL_WAKE_FDS` — a process-wide static causing cross-test
+   `EVFILT_USER(0)` wake pollution. Also: Darwin `filt_piperead` IGNORES
+   `NOTE_LOWAT` and fires level readiness unconditionally, so a lowat threshold
+   on a pipe is silently inert.
+
+**Census taken 2026-08-27: 182 process-global mutable statics** — 89
+`carrick-runtime`, 56 `carrick-vmm-hvf`, 19 `carrick-host`, 14 `carrick-thread`,
+4 `carrick-mem`. Many legitimately describe the CARRIER. Two of the bugs above
+lived in that population. `docs/identity-and-scope-domains.md` classified 42
+sites statically; the population is ~4x that. Proposed but NOT started, and it
+needs an owner decision because it is a program in its own right:
+
+* classify all 182 as carrier-legitimate / container-scoped / unclear, committed;
+* fix the container-scoped ones, each with a two-container test that fails without it;
+* add a `lint-domains` rule so a new bare `static` in these crates declares its scope.
+
+### Method notes that cost real time
+
+* **Gate B is worth its cost.** Every defect above was invisible to unit tests
+  and to the single-container smoke lane, and visible the moment two live
+  containers existed.
+* **Instrumenting the RUNTIME perturbed the bug away every time** — 10/10 and
+  6/6 passes under per-write logging and under a debug-profile build. What
+  cracked `getpid=0` was making the PROBE report more (`getpid`, `getpid_again`,
+  `proc_status_pid`), which separated a startup race from a persistent wrong
+  answer in one run.
+* **`just build-debug` is NOT a debug build** — it runs `cargo build --release`
+  and only swaps the entitlements plist, so NO signed lane has `debug_assert!`
+  enabled and every boot-path `debug_assert!` is decoration. Added
+  `just build-debug-profile` for the real thing.
+* **A single green proves nothing on an intermittent failure.** The epoll defect
+  needed `just test ; just test-integration` BACK TO BACK (1-in-3); five runs of
+  `just test-integration` alone passed and were meaningless.
+* **Three hypotheses were falsified by measurement** on the `getpid=0` bug alone
+  (recycled page, missing release ordering, the wrong `unwrap_or(0)`). Each is
+  recorded in its commit so it is not re-derived.
+
+### Open defects (named, with evidence, in memory)
+
+* `rlimitnproc` — **CLOSED**. Pipe-fd inheritance deadlock IN THE PROBE, not the
+  runtime; line-exact oracle MATCH, zero leaked processes.
+* veneer readback returning 0 — unreproducible (0/30 + 126/126), leading
+  hypothesis refuted (`force_dynamic_shadow` is per-`DirectLoadGroup`, not
+  process-global), assertion made self-diagnosing. NOT claimed fixed.
+* `epoll_wakes_accepted_socket_after_peer_write` — fixed this session.
+* `/dev` readdir omits entries that lookup resolves (`/dev/shm`, `fd`,
+  `stdin/stdout/stderr` all work but are unlisted), and `/dev/shm` is owned by
+  host uid 501 — oracle-verified, dispatched, NOT landed.
+
+### Immediate next steps
+
+1. Establish the probe-gate baseline: run `conformance_probes` on `main` before
+   these 120 commits and diff the gap sets. Three of the 27 gaps are OURS and
+   must MATCH: `budget_two_proc`, `container_gate`, `vfs_mount_rw`.
+   (`procselfpid` moved from gap to MATCH over this work.)
+2. Full `just conformance` against the blessed baseline — the real
+   "did we regress" answer, and NOT yet run. Prefer the ecosystem rows
+   (go/cpython/node); LTP parity is not workload coverage.
+3. ABBA receipts for the disabled paths (observer-off, clock `System`, fault
+   injection off) on a QUIET machine — no agy workers, no Docker.
+4. Then, and only then, a consolidated phase receipt.
 
 ## Current checkpoint — Task 4.35 synthetic-device splice source closed
 
