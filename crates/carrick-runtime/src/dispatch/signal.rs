@@ -1941,16 +1941,18 @@ impl SyscallDispatcher {
             if sigset_size != LINUX_RT_SIGSET_SIZE {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
+            if set_ptr == 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            }
             // Pending = this exact Kernel thread queue UNION the shared task
             // queue (Linux sigpending reports both).
             let pending = Self::required_signal_thread(cx.kernel, tid)
                 .signal_state()
                 .pending()
                 .union(cx.kernel.shared().pending_signals().present());
-            if set_ptr != 0
-                && memory
-                    .write_bytes(set_ptr, &pending.raw().to_le_bytes())
-                    .is_err()
+            if memory
+                .write_bytes(set_ptr, &pending.raw().to_le_bytes())
+                .is_err()
             {
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
