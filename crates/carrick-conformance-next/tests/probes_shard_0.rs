@@ -664,7 +664,9 @@ fn generic_probe_shard_0() {
                 .mount_readonly(probe_path.display().to_string(), "/tmp/p")
                 .mount_readonly(init_path.display().to_string(), "/tmp/carrick-init");
 
-            let result = common::run_or_fail(container.run(["/tmp/carrick-init"]));
+            let result = common::with_empty_stdin_pipe(|| {
+                common::run_or_fail(container.run(["/tmp/carrick-init"]))
+            });
             executed_count += 1;
 
             let mut combined = String::from_utf8_lossy(&result.stdout).into_owned();
