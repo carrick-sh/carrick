@@ -340,11 +340,19 @@ impl SyscallDispatcher {
                 let target_secs = timespec.tv_sec.max(0) as u64;
                 let target_nanos = (timespec.tv_nsec as u32).min(999_999_999);
                 let clock = Arc::clone(cx.kernel.task().container().clock());
+                let target = Duration::new(target_secs, target_nanos);
+                // Linux refuses to move CLOCK_REALTIME behind the current
+                // CLOCK_MONOTONIC value (timekeeping_inject_offset_valid): the
+                // wall clock must not become earlier than boot. This check is
+                // capability-ordered after CAP_SYS_TIME, like the kernel.
+                if target < clock.monotonic_now() {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
                 // Moves the container's guest wall clock and re-stamps THIS
                 // MM's vvar so a vDSO read right after the syscall agrees;
                 // other MMs re-stamp at their next syscall entry
                 // (`sync_vvar_realtime_offset`). Probe: clocksettimevdso.
-                this.set_guest_realtime(&clock, &mut *cx.memory, Duration::new(target_secs, target_nanos))?;
+                this.set_guest_realtime(&clock, &mut *cx.memory, target)?;
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
             Ok(DispatchOutcome::errno(LINUX_EPERM))
