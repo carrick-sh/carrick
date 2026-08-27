@@ -80,7 +80,6 @@ def main() -> int:
         "run",
         "--max-traps",
         "100000000",
-        "--raw",
         "--fs",
         "host",
         "--entrypoint",

@@ -79,7 +79,7 @@ while read t; do
   cut -f1 "$OUT/carrick.tsv" | grep -qx "$t" && continue   # resume
   sudo -n "$KILL" "$RUN_ID" >/dev/null 2>&1
   : > "$OUT/c.out"
-  timeout -s KILL "$TC" "$CARRICK" run "$IMAGE" --raw --fs host /bin/sh -c "/opt/ltp/testcases/bin/$t" > "$OUT/c.out" 2>&1
+  timeout -s KILL "$TC" "$CARRICK" run "$IMAGE" --fs host /bin/sh -c "/opt/ltp/testcases/bin/$t" > "$OUT/c.out" 2>&1
   rc=$?
   sudo -n "$KILL" "$RUN_ID" >/dev/null 2>&1
   grep -vE "case-insensitive|Pass .--fs" "$OUT/c.out" > "$OUT/c.clean"

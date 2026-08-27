@@ -197,7 +197,7 @@ for p in "${pkgs[@]}"; do
   test_args=(-test.run Test -test.skip "$SKIP" -test.short -test.v -test.timeout "${TEST_TIMEOUT}s")
   case " $ROOTFS_PKGS " in
     *" $p "*)
-      carrick_args=(run --raw --forward-env CARRICK_EXPOSED_CPUS=10
+      carrick_args=(run --forward-env CARRICK_EXPOSED_CPUS=10
         -v "$cache/bin:/b" -v "$cache/run:/run" -v "$cache/zoneinfo:/usr/share/zoneinfo:ro"
         -w "/run/src/$p" "$ROOTFS_IMAGE" "/b/$n.test" "${test_args[@]}") ;;
     *)

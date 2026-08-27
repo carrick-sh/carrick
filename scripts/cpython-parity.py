@@ -82,7 +82,7 @@ def run_carrick(module, carrick, image, testroot, timeout, run_id, bundled=False
     _kill(run_id)
     mount = [] if bundled else ["-v", f"{testroot}:{MOUNT_DEST}:ro", "-e", f"PYTHONPATH={MOUNT_DEST}"]
     cmd = [carrick, "run", *mount,
-           image, "--raw", "--fs", "host",
+           image, "--fs", "host",
            "/usr/local/bin/python3", "-m", "test", "-v", "--randseed", "0", module]
     out, rc, dur, timed = _run(cmd, timeout, env=env)
     _kill(run_id)

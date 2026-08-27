@@ -438,7 +438,7 @@ mod tests {
             weight: Weight::Heavy,
             timeout_s: 60,
             known_gaps: vec![],
-            carrick_flags: vec!["--raw".into(), "--fs".into(), "host".into()],
+            carrick_flags: vec!["--fs".into(), "host".into()],
             docker_flags: vec![],
             bind_mounts: vec![],
             env: vec![],

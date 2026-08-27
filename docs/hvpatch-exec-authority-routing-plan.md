@@ -11,7 +11,7 @@ hvpatch-kernel` refuses on any such guest:
 
 Reducer, deterministic:
 
-    carrick run ubuntu:24.04 --raw --fs host /bin/sh -c '/bin/true; sleep 12'
+    carrick run ubuntu:24.04 --fs host /bin/sh -c '/bin/true; sleep 12'
     # while it sleeps, in another shell:
     carrick debug hvpatch-kernel --run-id <RID> --table mapping
 

@@ -30,7 +30,7 @@
  *
  * USAGE:
  *   sudo dtrace -s scripts/guest_stack.d -c \
- *     '/path/to/carrick run docker.io/library/ubuntu:24.04 --raw /usr/bin/true'
+ *     '/path/to/carrick run docker.io/library/ubuntu:24.04 /usr/bin/true'
  *
  * Output: one block per trap — guest PC + syscall number, then the
  * unwound return addresses (guest VAs). Feed those to

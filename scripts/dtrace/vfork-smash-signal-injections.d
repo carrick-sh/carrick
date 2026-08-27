@@ -74,7 +74,7 @@
  *
  * Usage (traced lane; load lanes run separately):
  *   carrick trace --script scripts/dtrace/vfork-smash-signal-injections.d \
- *     --trace-out <out> -- run --raw --fs host ubuntu:24.04 /bin/sh -c '...'
+ *     --trace-out <out> -- run --fs host ubuntu:24.04 /bin/sh -c '...'
  */
 #pragma D option quiet
 #pragma D option strsize=512

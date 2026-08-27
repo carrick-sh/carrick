@@ -97,7 +97,6 @@ fn start_server(
                     "run",
                     "--platform",
                     PLATFORM,
-                    "--raw",
                     "--fs",
                     "host",
                     IMAGE,

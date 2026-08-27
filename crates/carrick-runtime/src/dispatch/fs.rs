@@ -7747,7 +7747,7 @@ impl SyscallDispatcher {
                         // _exit(100)'d, failing `apt install` ("Sub-process dpkg
                         // returned an error code (100)"). Accept it, propagating
                         // O_NONBLOCK to the real host stdio fd when the guest's
-                        // stdio is wired to our host fds (stream_stdio / --raw),
+                        // stdio is wired to our host fds (stream_stdio),
                         // mirroring the F_GETFD/F_SETFD/F_GETFL stdio special-cases.
                         if is_stdio_fd(fd.0) {
                             if *this.io.stream_stdio.lock() {

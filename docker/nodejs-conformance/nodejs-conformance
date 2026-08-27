@@ -135,7 +135,7 @@ run_carrick_host() {
   [[ -n "$carrick_bin" && -x "$carrick_bin" ]] || die "carrick binary not found; set CARRICK_BIN or build target/release/carrick"
 
   local run_id="${CARRICK_RUN_ID:-nodejs-conf-$$}"
-  local args=(run --raw --entrypoint /bin/bash -e NODEJS_CONFORMANCE_IN_IMAGE=1 -e NODEJS_CONFORMANCE_EFFECTIVE_RUNNER=carrick)
+  local args=(run --entrypoint /bin/bash -e NODEJS_CONFORMANCE_IN_IMAGE=1 -e NODEJS_CONFORMANCE_EFFECTIVE_RUNNER=carrick)
   local inner_jsonl="$jsonl"
   if path="$(jsonl_abs)"; then
     mkdir -p "$(dirname "$path")"

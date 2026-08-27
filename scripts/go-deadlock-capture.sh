@@ -100,7 +100,7 @@ CPU_ENV=""
 # shellcheck disable=SC2086
 nice -n 20 taskpolicy -b \
   env CARRICK_INSECURE_REGISTRIES=localhost:5005 CARRICK_DEADLOCK_WATCHDOG_MS="$WD_MS" $CPU_ENV \
-  "$CARRICK" run --name "$RUN" --raw --fs host -w /tmp \
+  "$CARRICK" run --name "$RUN" --fs host -w /tmp \
   "$IMG" /bin/sh -c "echo $B64 | base64 -d | sh" \
   >"$OUT" 2>"$ERR" &
 RUNPID=$!

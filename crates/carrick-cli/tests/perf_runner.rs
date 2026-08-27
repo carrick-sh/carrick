@@ -123,7 +123,6 @@ fn v8_backend_args(backend: CarrickBackend, immutable_image: &str) -> Vec<String
         "run".to_owned(),
         "--max-traps".to_owned(),
         V8_MAX_TRAPS.to_owned(),
-        "--raw".to_owned(),
         "--fs".to_owned(),
         "host".to_owned(),
         "--entrypoint".to_owned(),
@@ -314,7 +313,6 @@ fn v8_backend_commands_share_the_workload_contract() {
     for required in [
         "--max-traps",
         "18446744073709551615",
-        "--raw",
         "--fs",
         "host",
         "--entrypoint",

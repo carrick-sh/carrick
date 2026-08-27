@@ -280,7 +280,7 @@ only when all five hold together on one clean-tree signed artifact:
    invariant mismatch, a duplicate retirement, a stale dormant binding, or an
    ASID-maintenance fault.
 3. **The shell reducer exits 0.**
-   `carrick run ubuntu:24.04 --raw --fs host /bin/sh -c '/bin/echo hi'` exits 0,
+   `carrick run ubuntu:24.04 --fs host /bin/sh -c '/bin/echo hi'` exits 0,
    ten runs in a row, with `/bin/bash -c` clean as the fork-not-vfork control.
 4. **`just ci` green end to end**, status read from a FILE and never from a
    pipe, including `lint-domains` with the host-authority census reconciled by
@@ -963,7 +963,7 @@ The hunt for hunt-family (A) ran four instrumented rounds deep after gate
 15 and is CLEANLY PARKED: full diagnosis below, WIP at
 `target/perf/execfromthread-abba-wip.patch` (693 lines, compiles, NOT
 mergeable — read the edges first). Reducer: the GATE transport exactly —
-`base64 < probe | carrick run --raw --fs host ubuntu:24.04 /bin/sh -c
+`base64 < probe | carrick run --fs host ubuntu:24.04 /bin/sh -c
 'base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p'` (my earlier
 `-v dir:/p` transport exits 0 silently and does NOT reproduce — transport
 matters).
@@ -2416,7 +2416,7 @@ Also open, separate from the above: after a vfork+exec the guest output is
 correct but persistent-executor pool shutdown fails in two timing-dependent
 shapes — a stale dormant binding (`fail_blocked_exact` → `UnknownThread` for a
 binding whose Thread was already reaped) and an `EL0Fault during scoped EL1 ASID
-maintenance`. `carrick run ubuntu:24.04 --raw --fs host /bin/sh -c '/bin/echo hi'`
+maintenance`. `carrick run ubuntu:24.04 --fs host /bin/sh -c '/bin/echo hi'`
 prints `hi` and exits 125.
 
 ### `just ci` was RED and gating NOTHING — now peeled three layers

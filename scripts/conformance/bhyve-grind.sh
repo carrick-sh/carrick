@@ -62,7 +62,7 @@ case "$cmd" in
     for t in "$@"; do
       # shellcheck disable=SC2029
       $SSH "$BOX" "cd $DIR && $REAP; \
-        $ENVV timeout 40 ./target/release/carrick run --name grind --platform linux/amd64 --raw \
+        $ENVV timeout 40 ./target/release/carrick run --name grind --platform linux/amd64 \
           --fs host $IMG /bin/sh -c /opt/ltp/testcases/bin/$t 2>&1 \
         | grep -iE 'TFAIL|TBROK|TRIPLEFAULT|trap engine|panic' | head -2 | sed \"s|^|$t :: |\""
     done

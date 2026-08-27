@@ -77,7 +77,7 @@ target/release/carrick debug lldb-run \
   --deadline-seconds 35 \
   --out-dir target/conformance/logs/lldb-runs \
   --run-id <run-id> -- \
-  --max-traps 18446744073709551615 --raw --fs host \
+  --max-traps 18446744073709551615 --fs host \
   <image> <guest-command> ...
 ```
 

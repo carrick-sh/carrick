@@ -57,7 +57,7 @@ fallback scoped pkill issued"
 }
 
 kill_guests; sleep 0.3
-c=$(base64 -i "$bin" | timeout 60 "$carrick" run "$image" --raw --fs host /bin/sh -c "$snippet" 2>/dev/null \
+c=$(base64 -i "$bin" | timeout 60 "$carrick" run "$image" --fs host /bin/sh -c "$snippet" 2>/dev/null \
     | grep -vE 'case-insensitive|Pass .--fs')
 cleanup_with_receipt || exit 3
 d=$(base64 -i "$bin" | docker run --rm -i --platform linux/arm64 "$image" /bin/sh -c "$snippet" 2>/dev/null)

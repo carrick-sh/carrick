@@ -19,7 +19,7 @@
 # Run a package's tests under carrick (cwd = the package source dir so the
 # test's relative file reads resolve):
 #   CARRICK_INSECURE_REGISTRIES=localhost:5005 \
-#   carrick run --raw -w /usr/local/go/src/sync \
+#   carrick run -w /usr/local/go/src/sync \
 #     localhost:5005/carrick-go-conformance:1.24 \
 #     /conformance/sync.test -test.run Test -test.short -test.v
 FROM golang:1.24-bookworm

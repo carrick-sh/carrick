@@ -26,7 +26,7 @@
  *
  * Usage:
  *   carrick trace --script scripts/dtrace/hvpatch-clone08-control-flow.d \
- *     --trace-out <out> -- run --raw --fs host localhost:5050/ltp:arm64 \
+ *     --trace-out <out> -- run --fs host localhost:5050/ltp:arm64 \
  *     /bin/sh -c /opt/ltp/testcases/bin/clone08
  */
 #pragma D option quiet

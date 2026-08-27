@@ -152,7 +152,7 @@ pub const ROSETTA_ACCEPT_ENV: &str = "CARRICK_ACCEPT_ROSETTA_TERMS";
 /// Rosetta 2 — which carrick does not bundle or redistribute — and that its use
 /// is governed by Apple's macOS Software License Agreement. Suppressed once the
 /// operator accepts the terms via [`ROSETTA_ACCEPT_ENV`] (or the legacy
-/// `CARRICK_NO_ROSETTA_NOTICE`). Goes to stderr so it never corrupts a `--raw`
+/// `CARRICK_NO_ROSETTA_NOTICE`). Goes to stderr so it never corrupts a streaming
 /// guest's stdout.
 fn rosetta_license_notice() {
     use std::sync::atomic::{AtomicBool, Ordering};

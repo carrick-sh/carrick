@@ -11,8 +11,8 @@ export CARRICK_INSECURE_REGISTRIES="${CARRICK_INSECURE_REGISTRIES:-localhost:505
 
 alive() { ps -axo args | grep "carrick:$1" | grep -v grep | grep -c . ; }
 
-CARRICK_RUN_ID=cr-AAA "$CARRICK" run "$IMG" --raw --fs host /bin/sleep 25 >/dev/null 2>&1 &
-CARRICK_RUN_ID=cr-BBB "$CARRICK" run "$IMG" --raw --fs host /bin/sleep 25 >/dev/null 2>&1 &
+CARRICK_RUN_ID=cr-AAA "$CARRICK" run "$IMG" --fs host /bin/sleep 25 >/dev/null 2>&1 &
+CARRICK_RUN_ID=cr-BBB "$CARRICK" run "$IMG" --fs host /bin/sleep 25 >/dev/null 2>&1 &
 sleep 7  # boot + title rename
 
 echo "=== running guests ==="; ps -axo pid,args | grep -E 'carrick:cr-(AAA|BBB)' | grep -v grep

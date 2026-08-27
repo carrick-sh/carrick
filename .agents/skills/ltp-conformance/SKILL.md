@@ -109,7 +109,7 @@ logic is the subtle part):
 ```
 
 Each test runs under Docker (the oracle) and under
-`carrick run … --raw --fs host /bin/sh -c /opt/ltp/testcases/bin/<t>`, with a
+`carrick run … --fs host /bin/sh -c /opt/ltp/testcases/bin/<t>`, with a
 `timeout` and a `scripts/sudo/kill.sh "$CARRICK_RUN_ID"` between runs — ALWAYS
 SCOPED to this run's id (the bundled scripts export a unique `CARRICK_RUN_ID`;
 `kill.sh` now REQUIRES a run-id and refuses the global reap, so concurrent
