@@ -23,7 +23,8 @@
 //!        └──▶  carrick-spec     (FsBackendKind, PidMode, Mount — shared request types)
 //! ```
 //!
-//! For a docker `run`, the CLI builds a [`carrick_engine::CliRunRequest`] and
+//! For a docker `run`, the CLI builds a [`carrick_engine::RunRequest`] (inside
+//! its own `lifecycle::LaunchRequest`, which adds the lifecycle-only flags) and
 //! hands it to `Engine::resolve`, which resolves+pulls the image and merges
 //! entrypoint+cmd+env into a `RunSpec`. The CLI *then* — after the async image
 //! pull has been torn down, so no tokio runtime is live across the fork — calls

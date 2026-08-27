@@ -17,7 +17,8 @@
 //!
 //! 2. **The two run pipelines.** There are deliberately two entry points to a
 //!    guest, and they share almost nothing:
-//!    - `Run`/`Create`/`Exec` build a [`carrick_engine::CliRunRequest`] and go
+//!    - `Run`/`Create` lower their flags into a `lifecycle::LaunchRequest` (the
+//!      engine's [`carrick_engine::RunRequest`] plus lifecycle fields) and go
 //!      through `carrick_engine::Engine::resolve` — i.e. resolve+pull an OCI
 //!      image and compose its rootfs — then call `Runtime::execute` separately,
 //!      once the async pull is torn down (no tokio runtime live across the
@@ -900,43 +901,50 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             let entrypoint_override =
                 entrypoint.map(|ep| if ep.is_empty() { Vec::new() } else { vec![ep] });
 
-            let req = carrick_engine::CliRunRequest {
-                image_ref: image,
-                pull: pull.into(),
-                platform,
-                args: command,
-                env_overrides,
-                mounts,
-                workdir,
-                user,
-                hostname: None,
-                entrypoint_override,
-                tty,
+            let req = crate::lifecycle::LaunchRequest {
+                run: carrick_engine::RunRequest {
+                    image_ref: image,
+                    pull: pull.into(),
+                    platform,
+                    args: command,
+                    env_overrides,
+                    // docker `-e KEY`: import from the user's shell environment.
+                    host_env: Some(crate::runtime_util::host_env_snapshot()),
+                    mounts,
+                    workdir,
+                    user,
+                    hostname: None,
+                    entrypoint_override,
+                    tty,
+                    // docker-shaped: guest stdout/stderr stream to this terminal.
+                    stdio: carrick_spec::StdioMode::Inherit,
+                    name,
+                    max_traps,
+                    debug_state_path: debug_state_path.map(|p| p.to_string_lossy().into_owned()),
+                    fs,
+                    exec_backend,
+                    pid,
+                    network: parsed_network.mode,
+                    network_bridge: parsed_network.bridge,
+                    network_container: parsed_network.container,
+                    network_namespace_id: None,
+                    bridge_namespace_id: Some(crate::runtime_util::anon_bridge_namespace_id()),
+                    network_attachments: Vec::new(),
+                    network_ipv4: ip,
+                    network_aliases: network_alias,
+                    extra_hosts: add_host,
+                    dns_servers: dns,
+                    dns_search,
+                    dns_options: dns_option,
+                    published_ports,
+                    security_opts: security_opt,
+                    cap_add,
+                },
                 interactive,
                 rm,
-                name,
-                max_traps,
-                debug_state_path: debug_state_path.map(|p| p.to_string_lossy().into_owned()),
-                fs,
-                exec_backend,
-                pid,
-                network: parsed_network.mode,
-                network_bridge: parsed_network.bridge,
-                network_container: parsed_network.container,
-                network_namespace_id: None,
-                network_attachments: Vec::new(),
-                network_ipv4: ip,
-                network_aliases: network_alias,
-                extra_hosts: add_host,
-                dns_servers: dns,
-                dns_search,
-                dns_options: dns_option,
-                volumes_from,
-                published_ports,
                 stop_signal,
                 stop_timeout,
-                security_opts: security_opt,
-                cap_add,
+                volumes_from,
             };
 
             // Stand up the carrier-wide alias-IPA counter before any logical guest
@@ -955,7 +963,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             // terminal (not the detached log) and the effective stop signal is
             // baked into the persisted config.
             if detach {
-                let name_for_state = req.name.clone();
+                let name_for_state = req.run.name.clone();
                 return crate::lifecycle::run_detached(req, store.clone(), name_for_state);
             }
 
@@ -972,7 +980,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             // random 12-hex, never a prefix of one another). `proctitle.rs` reads
             // CARRICK_RUN_ID; we resolve the default here and stamp it.
             if std::env::var_os("CARRICK_RUN_ID").is_none() {
-                let scope = req.name.clone().unwrap_or_else(|| {
+                let scope = req.run.name.clone().unwrap_or_else(|| {
                     let entropy = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_nanos() as u64)
@@ -994,14 +1002,16 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             // Resolve (pull + build the spec) on a short-lived current-thread
             // tokio runtime; `block_on_oci` drops it before `Runtime::execute`
             // runs the guest synchronously in this carrier.
-            let spec = match block_on_oci(engine.resolve(req.clone())) {
-                Ok(s) => s,
+            let resolved = match block_on_oci(engine.resolve(req.run.clone())) {
+                Ok(resolved) => resolved,
                 // No guest has started yet → normal exit is safe.
                 Err(e) => {
                     eprintln!("carrick: {e:#}");
                     std::process::exit(125);
                 }
             };
+            crate::runtime_util::emit_resolve_warnings(&resolved.warnings);
+            let spec = resolved.spec;
             let result = match carrick_runtime::Runtime::execute(&spec) {
                 Ok(r) => r,
                 Err(e) => {
@@ -1043,8 +1053,8 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
-                        "image": req.image_ref,
-                        "command": req.args,
+                        "image": req.run.image_ref,
+                        "command": req.run.args,
                         "store": store.root(),
                         "exit_code": result.exit_code,
                         "stdout": String::from_utf8_lossy(&result.stdout),
@@ -1139,43 +1149,48 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             let entrypoint_override =
                 entrypoint.map(|ep| if ep.is_empty() { Vec::new() } else { vec![ep] });
             let parsed_network = parse_network_mode_arg(&network)?;
-            let req = carrick_engine::CliRunRequest {
-                image_ref: image,
-                pull: pull.into(),
-                platform,
-                args: command,
-                env_overrides,
-                mounts,
-                workdir,
-                user,
-                hostname: None,
-                entrypoint_override,
-                tty,
+            let req = crate::lifecycle::LaunchRequest {
+                run: carrick_engine::RunRequest {
+                    image_ref: image,
+                    pull: pull.into(),
+                    platform,
+                    args: command,
+                    env_overrides,
+                    host_env: Some(crate::runtime_util::host_env_snapshot()),
+                    mounts,
+                    workdir,
+                    user,
+                    hostname: None,
+                    entrypoint_override,
+                    tty,
+                    stdio: carrick_spec::StdioMode::Inherit,
+                    name: None,
+                    max_traps: DEFAULT_MAX_TRAPS,
+                    debug_state_path: None,
+                    fs,
+                    exec_backend,
+                    pid,
+                    network: parsed_network.mode,
+                    network_bridge: parsed_network.bridge,
+                    network_container: parsed_network.container,
+                    network_namespace_id: None,
+                    bridge_namespace_id: Some(crate::runtime_util::anon_bridge_namespace_id()),
+                    network_attachments: Vec::new(),
+                    network_ipv4: ip,
+                    network_aliases: network_alias,
+                    extra_hosts: add_host,
+                    dns_servers: dns,
+                    dns_search,
+                    dns_options: dns_option,
+                    published_ports: parse_publish_specs(parsed_network.mode, &publish)?,
+                    security_opts: security_opt,
+                    cap_add,
+                },
                 interactive,
                 rm,
-                name: None,
-                max_traps: DEFAULT_MAX_TRAPS,
-                debug_state_path: None,
-                fs,
-                exec_backend,
-                pid,
-                network: parsed_network.mode,
-                network_bridge: parsed_network.bridge,
-                network_container: parsed_network.container,
-                network_namespace_id: None,
-                network_attachments: Vec::new(),
-                network_ipv4: ip,
-                network_aliases: network_alias,
-                extra_hosts: add_host,
-                dns_servers: dns,
-                dns_search,
-                dns_options: dns_option,
-                volumes_from,
-                published_ports: parse_publish_specs(parsed_network.mode, &publish)?,
                 stop_signal,
                 stop_timeout,
-                security_opts: security_opt,
-                cap_add,
+                volumes_from,
             };
             crate::lifecycle::create(req, store.clone(), name)?;
         }
@@ -2767,49 +2782,26 @@ pub(crate) fn run_build(
     if let Some(out) = out_path.as_deref() {
         mounts.push(parse_volume_mount(&format!("{}:/out", out.display()))?);
     }
-    let request = carrick_engine::CliRunRequest {
+    // Everything not named here is the `RunRequest` baseline: `Missing` pull,
+    // HvPatch, private pid ns, host network, unbounded traps. No env overrides
+    // means there is no bare KEY to import, and host networking never needs a
+    // bridge namespace id, so both stay `None`.
+    let request = carrick_engine::RunRequest {
         image_ref: KANIKO_IMAGE.to_owned(),
-        platform: None,
         args: argv[image_index + 1..].to_vec(),
-        env_overrides: Vec::new(),
         mounts,
-        workdir: None,
-        user: None,
-        hostname: None,
-        entrypoint_override: None,
-        tty: false,
-        interactive: false,
-        rm: false,
-        name: None,
-        max_traps: usize::MAX,
-        debug_state_path: None,
         fs: Some(carrick_spec::FsBackendKind::Host),
-        pull: carrick_image::PullPolicy::Missing,
-        exec_backend: carrick_spec::ExecBackendRequest::HvPatch,
-        pid: carrick_spec::PidMode::Private,
-        network: carrick_spec::NetworkMode::Host,
-        network_bridge: None,
-        network_container: None,
-        network_namespace_id: None,
-        network_attachments: Vec::new(),
-        network_ipv4: None,
-        network_aliases: Vec::new(),
-        extra_hosts: Vec::new(),
-        dns_servers: Vec::new(),
-        dns_search: Vec::new(),
-        dns_options: Vec::new(),
-        volumes_from: Vec::new(),
-        published_ports: Vec::new(),
-        stop_signal: None,
-        stop_timeout: None,
-        security_opts: Vec::new(),
-        cap_add: Vec::new(),
+        // kaniko's build log streams to this terminal, docker-shaped.
+        stdio: carrick_spec::StdioMode::Inherit,
+        ..carrick_engine::RunRequest::default()
     };
     carrick_runtime::memory::init_alias_ipa_allocator();
     carrick_runtime::fs_resolve_cache::init();
     let engine = carrick_engine::Engine::new(store.clone());
-    let spec = block_on_oci(engine.resolve(request)).context("resolve kaniko build carrier")?;
-    let result = carrick_runtime::Runtime::execute(&spec).context("run kaniko build carrier")?;
+    let resolved = block_on_oci(engine.resolve(request)).context("resolve kaniko build carrier")?;
+    crate::runtime_util::emit_resolve_warnings(&resolved.warnings);
+    let result =
+        carrick_runtime::Runtime::execute(&resolved.spec).context("run kaniko build carrier")?;
     emit_raw(&result);
     let status = if result.trap_limit_hit {
         1
