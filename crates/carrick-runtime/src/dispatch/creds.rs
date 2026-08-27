@@ -364,7 +364,23 @@ impl SyscallDispatcher {
             let container = self.installed_container();
             if let Some(container) = container {
                 if let Some(region) = container.pid_region() {
-                    return region.host_to_ns(pid).unwrap_or(0);
+                    // Fall back to the UNTRANSLATED pid, never to zero.
+                    //
+                    // A miss here means this pid is not registered in the
+                    // container's namespace region YET — not that its ns-local
+                    // pid is zero. `getpid()` never returns 0 on Linux, so
+                    // publishing 0 hands the guest a pid no process can have,
+                    // and it reached both the trap path and (through the
+                    // identity page) the no-exit fast path. A container's init
+                    // reported `getpid=0` intermittently for exactly this
+                    // reason, depending on whether registration had run.
+                    //
+                    // Falling back to `pid` gives the same answer this function
+                    // returns one line below when the container has no pid
+                    // namespace at all, which is a coherent degradation rather
+                    // than an impossible value. The `or_self` branch above
+                    // already works this way.
+                    return region.host_to_ns(pid).unwrap_or(pid);
                 }
             }
             return pid;
