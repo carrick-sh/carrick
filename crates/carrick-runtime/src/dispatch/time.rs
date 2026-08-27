@@ -328,17 +328,11 @@ impl SyscallDispatcher {
             if clock_id == LINUX_CLOCK_REALTIME {
                 let target_secs = timespec.tv_sec.max(0) as u64;
                 let target_nanos = (timespec.tv_nsec as u32).min(999_999_999);
-                let target_duration = Duration::new(target_secs, target_nanos);
-                let raw_now = {
-                    set_guest_realtime_offset_ns(0);
-                    realtime_duration()
-                };
-                let delta_ns = if target_duration >= raw_now {
-                    (target_duration - raw_now).as_nanos() as i64
-                } else {
-                    -((raw_now - target_duration).as_nanos() as i64)
-                };
-                set_guest_realtime_offset_ns(delta_ns);
+                // Moves the carrier-wide guest wall clock and re-stamps THIS
+                // MM's vvar so a vDSO read right after the syscall agrees;
+                // other MMs re-stamp at their next syscall entry
+                // (`sync_vvar_realtime_offset`). Probe: clocksettimevdso.
+                this.set_guest_realtime(&mut *cx.memory, Duration::new(target_secs, target_nanos))?;
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
             Ok(DispatchOutcome::errno(LINUX_EPERM))
@@ -801,17 +795,7 @@ impl SyscallDispatcher {
             }
             let target_secs = tv_sec.max(0) as u64;
             let target_nanos = (tv_usec as u32) * 1000;
-            let target_duration = Duration::new(target_secs, target_nanos);
-            let raw_now = {
-                set_guest_realtime_offset_ns(0);
-                realtime_duration()
-            };
-            let delta_ns = if target_duration >= raw_now {
-                (target_duration - raw_now).as_nanos() as i64
-            } else {
-                -((raw_now - target_duration).as_nanos() as i64)
-            };
-            set_guest_realtime_offset_ns(delta_ns);
+            this.set_guest_realtime(&mut *cx.memory, Duration::new(target_secs, target_nanos))?;
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -1509,5 +1493,185 @@ mod rlimit_tests {
             );
         });
         assert_eq!(crate::dispatch::get_guest_realtime_offset_ns(), 0);
+    }
+}
+
+#[cfg(test)]
+mod realtime_vvar_tests {
+    use super::*;
+    use crate::dispatch::realtime_test_support::with_guest_realtime_offset;
+    use crate::vdso::{LINUX_VVAR_BASE, VVAR_OFF_REALTIME_OFF_NS};
+
+    /// A plausible `unix_ns - uptime_ns` host calibration.
+    const HOST_OFF_NS: u64 = 1_700_000_000_000_000_000;
+    const TIMESPEC_ADDR: u64 = LINUX_VVAR_BASE + 0x800;
+    const VVAR_WORD_ADDR: u64 = LINUX_VVAR_BASE + VVAR_OFF_REALTIME_OFF_NS as u64;
+
+    /// Install the fake host calibration for one test and clear it again on
+    /// drop (also on panic), so a failing test cannot leak `HOST_OFF_NS` into
+    /// every later carrick-runtime test in the same serial process.
+    /// (`with_guest_realtime_offset` resets only the guest delta.)
+    struct HostCalibration;
+
+    impl HostCalibration {
+        fn install() -> Self {
+            crate::vdso::set_realtime_off_ns(HOST_OFF_NS);
+            Self
+        }
+    }
+
+    impl Drop for HostCalibration {
+        fn drop(&mut self) {
+            // 0 = "not calibrated": `realtime_off_ns()` reads back `None`.
+            crate::vdso::set_realtime_off_ns(0);
+        }
+    }
+
+    /// One guest page standing in for the vvar page, counting the
+    /// carrick-internal (permission-bypassing) writes the dispatcher makes.
+    struct VvarPage {
+        page: LinearMemory,
+        internal_writes: usize,
+    }
+
+    impl VvarPage {
+        fn new() -> Self {
+            Self {
+                page: LinearMemory::new(LINUX_VVAR_BASE, vec![0u8; 0x1000]),
+                internal_writes: 0,
+            }
+        }
+
+        fn realtime_word(&self) -> u64 {
+            let bytes = self.read_bytes(VVAR_WORD_ADDR, 8).expect("vvar word");
+            u64::from_le_bytes(bytes.try_into().expect("8 bytes"))
+        }
+    }
+
+    impl GuestMemory for VvarPage {
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            self.page.read_bytes_raw(address, length)
+        }
+
+        fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+            self.page.write_bytes_raw(address, bytes)
+        }
+
+        fn write_bytes_unchecked(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+            self.internal_writes += 1;
+            self.page.write_bytes_unchecked(address, bytes)
+        }
+    }
+
+    fn grant_sys_time(context: &crate::kernel::KernelContext) {
+        context.task().with_caps(|caps| {
+            caps.effective |= 1u64 << crate::namespace::process::CAP_SYS_TIME;
+        });
+    }
+
+    /// Dispatch `clock_settime(CLOCK_REALTIME, guest_now + 1h)` on `dispatcher`.
+    fn step_clock_one_hour(
+        dispatcher: &mut SyscallDispatcher,
+        context: &crate::kernel::KernelContext,
+        memory: &mut VvarPage,
+    ) {
+        let target = realtime_duration() + Duration::from_secs(3_600);
+        memory
+            .write_bytes(
+                TIMESPEC_ADDR,
+                LinuxTimespec::new(target.as_secs() as i64, i64::from(target.subsec_nanos()))
+                    .as_bytes(),
+            )
+            .expect("timespec fits the page");
+        let outcome = dispatcher
+            .dispatch(
+                context,
+                SyscallRequest::new(
+                    112,
+                    SyscallArgs([LINUX_CLOCK_REALTIME, TIMESPEC_ADDR, 0, 0, 0, 0]),
+                ),
+                memory,
+                &CompatReporter::default(),
+            )
+            .expect("clock_settime dispatches");
+        assert!(
+            matches!(outcome, DispatchOutcome::Returned { value: 0 }),
+            "clock_settime under CAP_SYS_TIME: {outcome:?}"
+        );
+    }
+
+    fn expected_word() -> u64 {
+        crate::vdso::vvar_realtime_off_ns(
+            HOST_OFF_NS,
+            crate::dispatch::get_guest_realtime_offset_ns(),
+        )
+    }
+
+    /// After `clock_settime` the CALLER's vvar word already carries the new
+    /// delta — a vDSO read issued right after the syscall returns agrees with
+    /// the syscall path.
+    #[test]
+    fn clock_settime_restamps_the_callers_vvar_word() {
+        with_guest_realtime_offset(0, || {
+            let _calibration = HostCalibration::install();
+            let mut dispatcher = SyscallDispatcher::new();
+            let context = dispatcher.capture_one_task_context().expect("task context");
+            grant_sys_time(&context);
+            let mut memory = VvarPage::new();
+
+            step_clock_one_hour(&mut dispatcher, &context, &mut memory);
+
+            let delta = crate::dispatch::get_guest_realtime_offset_ns();
+            assert!(
+                (3_599_000_000_000..=3_601_000_000_000).contains(&delta),
+                "delta {delta}"
+            );
+            assert_eq!(memory.realtime_word(), expected_word());
+        });
+    }
+
+    /// A DIFFERENT MM (another dispatcher, i.e. another Linux process) has its
+    /// own vvar page. It re-stamps itself on its next syscall entry — once —
+    /// and not again while the offset is unchanged.
+    #[test]
+    fn a_sibling_mm_restamps_its_vvar_on_its_next_syscall() {
+        with_guest_realtime_offset(0, || {
+            let _calibration = HostCalibration::install();
+            let mut setter = SyscallDispatcher::new();
+            let setter_context = setter.capture_one_task_context().expect("task context");
+            grant_sys_time(&setter_context);
+            let mut setter_memory = VvarPage::new();
+            step_clock_one_hour(&mut setter, &setter_context, &mut setter_memory);
+
+            let mut sibling = SyscallDispatcher::new();
+            let sibling_context = sibling.capture_one_task_context().expect("task context");
+            let mut sibling_memory = VvarPage::new();
+            let read_clock = |sibling: &mut SyscallDispatcher, memory: &mut VvarPage| {
+                sibling
+                    .dispatch(
+                        &sibling_context,
+                        SyscallRequest::new(
+                            113,
+                            SyscallArgs([LINUX_CLOCK_REALTIME, TIMESPEC_ADDR, 0, 0, 0, 0]),
+                        ),
+                        memory,
+                        &CompatReporter::default(),
+                    )
+                    .expect("clock_gettime dispatches");
+            };
+
+            read_clock(&mut sibling, &mut sibling_memory);
+            assert_eq!(sibling_memory.realtime_word(), expected_word());
+            assert_eq!(
+                sibling_memory.internal_writes, 1,
+                "one re-stamp on the first entry"
+            );
+
+            read_clock(&mut sibling, &mut sibling_memory);
+            assert_eq!(
+                sibling_memory.internal_writes, 1,
+                "no re-stamp while the epoch is unchanged"
+            );
+        });
     }
 }

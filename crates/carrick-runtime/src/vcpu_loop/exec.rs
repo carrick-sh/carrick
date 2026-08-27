@@ -1683,6 +1683,19 @@ where
             )
             .map(Some);
         }
+        // The new image's vvar was published with the host calibration only;
+        // fold in the guest CLOCK_REALTIME delta before the image runs its
+        // first instruction, so a vDSO read before any syscall already agrees
+        // with the syscall path (`sync_vvar_realtime_offset`; probe
+        // clocksettimevdso, `date -s` followed by an exec'd `date`).
+        if let Err(error) = kernel.dispatcher.sync_vvar_realtime_offset(engine) {
+            return Self::exec_failed_past_no_return(
+                kernel,
+                engine,
+                &format!("stamp HVPatch exec vvar realtime word: {error}"),
+            )
+            .map(Some);
+        }
         if let Err(error) = engine.set_guest_thread_id(self.linux_tid.raw() as u64) {
             return Self::exec_failed_past_no_return(
                 kernel,
