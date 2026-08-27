@@ -7006,3 +7006,142 @@ fn host_alias_map_droppable_reaches_keeponfork_rejection_metadata() {
     assert!(metadata.fully_mapped);
     assert!(metadata.any_droppable);
 }
+
+/// `RLIMIT_DATA` (proc(5) `VmData`) charges the brk heap and private
+/// writable mappings only; `RLIMIT_AS` charges the union of every VMA.
+#[test]
+fn data_va_bytes_counts_only_private_writable_mappings_and_the_heap() {
+    let mut mem = MemState::new();
+    let entry = |start: u64, end: u64, write: bool, sharing: ProcMapSharing| ProcMapsEntry {
+        start,
+        end,
+        read: true,
+        write,
+        execute: false,
+        sharing,
+        path: String::new(),
+    };
+    mem.dynamic_maps.push(entry(
+        LINUX_MMAP_BASE,
+        LINUX_MMAP_BASE + 3 * LINUX_PAGE_SIZE,
+        true,
+        ProcMapSharing::Private,
+    ));
+    mem.dynamic_maps.push(entry(
+        LINUX_MMAP_BASE + 0x10_0000,
+        LINUX_MMAP_BASE + 0x10_0000 + LINUX_PAGE_SIZE,
+        true,
+        ProcMapSharing::Shared,
+    ));
+    mem.dynamic_maps.push(entry(
+        LINUX_MMAP_BASE + 0x20_0000,
+        LINUX_MMAP_BASE + 0x20_0000 + LINUX_PAGE_SIZE,
+        false,
+        ProcMapSharing::Private,
+    ));
+    mem.brk_current = mem.layout.heap_base + 2 * LINUX_PAGE_SIZE;
+
+    assert_eq!(data_va_bytes(&mem), 5 * LINUX_PAGE_SIZE);
+    assert_eq!(committed_va_bytes(&mem), 7 * LINUX_PAGE_SIZE);
+    assert_eq!(
+        mapped_overlap_bytes(&mem, LINUX_MMAP_BASE + LINUX_PAGE_SIZE, 4 * LINUX_PAGE_SIZE),
+        2 * LINUX_PAGE_SIZE
+    );
+}
+
+/// `mmap` past the `RLIMIT_AS` soft limit is ENOMEM before any allocator or
+/// VMA mutation: the arena cursor must not move.
+#[test]
+fn mmap_refuses_growth_past_rlimit_as_with_enomem() {
+    const SYS_MMAP: u64 = 222;
+    let mut dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let baseline = committed_va_bytes(&dispatcher.mem().lock());
+    context
+        .task()
+        .replace_rlimit(carrick_abi::LinuxResource::As, |_| {
+            Ok::<_, std::convert::Infallible>(carrick_abi::LinuxRlimit::new(
+                baseline + 2 * LINUX_PAGE_SIZE,
+                LINUX_RLIM_INFINITY,
+            ))
+        })
+        .expect("set RLIMIT_AS");
+    let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, (4 * LINUX_PAGE_SIZE) as usize);
+    let reporter = CompatReporter::default();
+    let map = |len: u64| {
+        SyscallRequest::new(
+            SYS_MMAP,
+            SyscallArgs([
+                0,
+                len,
+                LINUX_PROT_READ | LINUX_PROT_WRITE,
+                LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                u64::MAX,
+                0,
+            ]),
+        )
+    };
+
+    let first = dispatcher
+        .dispatch(&context, map(2 * LINUX_PAGE_SIZE), &mut memory, &reporter)
+        .expect("mmap dispatch");
+    assert_eq!(returned(first), LINUX_MMAP_BASE as i64);
+
+    let cursor = dispatcher.mem().lock().mmap_next;
+    let second = dispatcher
+        .dispatch(&context, map(LINUX_PAGE_SIZE), &mut memory, &reporter)
+        .expect("mmap dispatch");
+    assert_eq!(second, DispatchOutcome::errno(LINUX_ENOMEM));
+    assert_eq!(dispatcher.mem().lock().mmap_next, cursor);
+}
+
+/// `brk` past the `RLIMIT_DATA` soft limit reports ENOMEM the way Linux does:
+/// by returning the UNCHANGED break.
+#[test]
+fn brk_growth_past_rlimit_data_returns_the_unchanged_break() {
+    const SYS_BRK: u64 = 214;
+    let mut dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let initial = dispatcher.mem().lock().layout.heap_base;
+    let data_now = data_va_bytes(&dispatcher.mem().lock());
+    context
+        .task()
+        .replace_rlimit(carrick_abi::LinuxResource::Data, |_| {
+            Ok::<_, std::convert::Infallible>(carrick_abi::LinuxRlimit::new(
+                data_now + LINUX_PAGE_SIZE,
+                LINUX_RLIM_INFINITY,
+            ))
+        })
+        .expect("set RLIMIT_DATA");
+    let mut memory = CountingMmapMemory::new(initial, (2 * LINUX_PAGE_SIZE) as usize);
+    let reporter = CompatReporter::default();
+    let grow = |to: u64| SyscallRequest::new(SYS_BRK, SyscallArgs([to, 0, 0, 0, 0, 0]));
+
+    let one = dispatcher
+        .dispatch(
+            &context,
+            grow(initial + LINUX_PAGE_SIZE),
+            &mut memory,
+            &reporter,
+        )
+        .expect("brk dispatch");
+    assert_eq!(returned(one), (initial + LINUX_PAGE_SIZE) as i64);
+
+    let two = dispatcher
+        .dispatch(
+            &context,
+            grow(initial + 2 * LINUX_PAGE_SIZE),
+            &mut memory,
+            &reporter,
+        )
+        .expect("brk dispatch");
+    assert_eq!(
+        returned(two),
+        (initial + LINUX_PAGE_SIZE) as i64,
+        "brk past RLIMIT_DATA must report the unchanged break"
+    );
+    assert_eq!(
+        dispatcher.mem().lock().brk_current,
+        initial + LINUX_PAGE_SIZE
+    );
+}

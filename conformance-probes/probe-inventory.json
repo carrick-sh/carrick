@@ -1709,6 +1709,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "rlimitasdata": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "rlimitnofile": {
     "class": "conformance",
     "excluded": false,

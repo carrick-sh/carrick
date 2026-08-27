@@ -1079,6 +1079,65 @@ fn project_vma_summaries(mem: &MemState) -> Vec<crate::kernel::VmaSummary> {
         .collect()
 }
 
+/// Linux-visible virtual size of this mm in bytes — the `VmSize` that
+/// `RLIMIT_AS` is measured against — as the union of the projected VMAs. Same
+/// authority as `/proc/<pid>/maps` and the core publisher, so the limit and
+/// the reported size cannot disagree.
+fn committed_va_bytes(mem: &MemState) -> u64 {
+    project_vma_summaries(mem)
+        .iter()
+        .map(|vma| vma.end.0.saturating_sub(vma.start.0))
+        .sum()
+}
+
+/// Bytes of `[start, start + len)` that are already mapped. A `MAP_FIXED`
+/// replacement is charged only for the remainder, as Linux charges it after
+/// unmapping the overlap.
+fn mapped_overlap_bytes(mem: &MemState, start: u64, len: u64) -> u64 {
+    let end = start.saturating_add(len);
+    project_vma_summaries(mem)
+        .iter()
+        .map(|vma| vma.end.0.min(end).saturating_sub(vma.start.0.max(start)))
+        .sum()
+}
+
+/// Whether a mapping counts toward `RLIMIT_DATA` (proc(5) `VmData`): private,
+/// writable, and not a grow-down stack VMA — anonymous or file-backed alike.
+/// `PROT_NONE` reservations and `MAP_SHARED` mappings are address space, not
+/// data.
+fn mapping_is_data(write: bool, private: bool, growsdown: bool) -> bool {
+    write && private && !growsdown
+}
+
+/// Bytes charged to `RLIMIT_DATA`: the brk heap span plus every private
+/// writable mapping in the visible boot image (`.data`/`.bss`) and the dynamic
+/// VMAs. A dynamic map overlapping a grow-down range is stack, not data.
+fn data_va_bytes(mem: &MemState) -> u64 {
+    let heap = mem.brk_current.saturating_sub(mem.layout.heap_base);
+    let is_growdown = |map: &ProcMapsEntry| {
+        mem.growdown_ranges
+            .iter()
+            .any(|(low, _, end)| map.start < *end && map.end > *low)
+    };
+    let maps: u64 = mem
+        .address_space_regions
+        .iter()
+        .flatten()
+        .filter(|map| !boot_region_is_hidden_reservation(map, mem.layout))
+        .chain(mem.dynamic_maps.iter())
+        .filter(|map| map.start < map.end)
+        .filter(|map| {
+            mapping_is_data(
+                map.write,
+                map.sharing == ProcMapSharing::Private,
+                is_growdown(map),
+            )
+        })
+        .map(|map| map.end - map.start)
+        .sum();
+    heap.saturating_add(maps)
+}
+
 /// Exact Linux-visible mapping metadata used by the live core publisher.
 /// Hidden reservation apertures and carrick's own EL1-only kernel hole are
 /// implementation backing, not VMAs; the heap is clamped to `brk`, and dynamic
@@ -3278,6 +3337,21 @@ impl SyscallDispatcher {
                     });
                 };
 
+                if requested > current {
+                    // RLIMIT_AS / RLIMIT_DATA on the page-rounded growth; the
+                    // heap is data by definition. brk(2) reports ENOMEM by
+                    // returning the unchanged break.
+                    let page_size = this.linux_page_size();
+                    let grow = align_up_u64(requested, page_size)
+                        .zip(align_up_u64(current, page_size))
+                        .map_or(u64::MAX, |(new_end, old_end)| new_end.saturating_sub(old_end));
+                    if this.check_address_space_limits(&mem, grow, true).is_err() {
+                        return Ok(DispatchOutcome::Returned {
+                            value: current as i64,
+                        });
+                    }
+                }
+
                 if new_page_end > old_page_end {
                     // Grow: revalidate old-page-end..new-page-end identity leaves as RW,
                     // then publish RW in MemoryProtections (clearing unmapped atomically), then commit.
@@ -3472,6 +3546,30 @@ impl SyscallDispatcher {
             };
             let length_usize =
                 usize::try_from(length).map_err(|_| DispatchError::LengthTooLarge(length))?;
+
+            // RLIMIT_AS / RLIMIT_DATA admission before any allocator, backing
+            // or VMA mutation. A MAP_FIXED replacement is charged only for the
+            // bytes not already mapped.
+            {
+                let mem_authority_rlimit = this.mem();
+                let mem = mem_authority_rlimit.lock();
+                let grow = if map_flags.contains(LinuxMmapFlags::FIXED) {
+                    length.saturating_sub(mapped_overlap_bytes(&mem, requested.0, length))
+                } else {
+                    length
+                };
+                let data = mapping_is_data(
+                    prot_flags.contains(LinuxProtFlags::WRITE),
+                    map_sharing == MmapSharing::Private,
+                    map_flags.contains(LinuxMmapFlags::GROWSDOWN),
+                );
+                if let Err(errno) = this.check_address_space_limits(&mem, grow, data) {
+                    return Ok(request.refused(
+                        MmapRefusal::Spec("RLIMIT_AS or RLIMIT_DATA soft limit reached"),
+                        errno,
+                    ));
+                }
+            }
 
             // io_uring mappings are ordinary MAP_SHARED host aliases. The file
             // description owns the persistent bytes; this mm receives only an
@@ -5378,6 +5476,24 @@ impl SyscallDispatcher {
                 Ok(metadata) => metadata,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
+            if new_size > old_size {
+                // RLIMIT_AS / RLIMIT_DATA on the growth, before any page-table,
+                // allocator or VMA mutation. A move is charged like an in-place
+                // grow (`new_size - old_size`): the source is unmapped again.
+                let mem_authority_rlimit = this.mem();
+                let mem = mem_authority_rlimit.lock();
+                let data = mapping_is_data(
+                    source_metadata.prot.contains(LinuxProtFlags::WRITE),
+                    source_metadata.sharing == ProcMapSharing::Private,
+                    false,
+                );
+                if this
+                    .check_address_space_limits(&mem, new_size - old_size, data)
+                    .is_err()
+                {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                }
+            }
             let shared_aperture_alloc = this.mem()
                 .lock()
                 .shared
@@ -6945,6 +7061,40 @@ impl SyscallDispatcher {
         };
         self.check_locked_range_limit(range)?;
         Ok(Some(range))
+    }
+
+    /// `RLIMIT_AS` / `RLIMIT_DATA` admission for a mapping change that grows
+    /// this mm by `grow` page-rounded bytes; `data` says whether the grown
+    /// bytes are data (`mapping_is_data`). setrlimit(2): both limits fail
+    /// brk(2)/mmap(2)/mremap(2) with ENOMEM at the SOFT limit. Zero cost
+    /// while both limits are infinite (carrick's defaults): two `ArcSwap`
+    /// loads and no VMA walk. The caller holds the `MemState` lock so the
+    /// population it reads is the one it is about to mutate.
+    fn check_address_space_limits(
+        &self,
+        mem: &MemState,
+        grow: u64,
+        data: bool,
+    ) -> Result<(), LinuxErrno> {
+        let as_limit = self.effective_resource_limit(LINUX_RLIMIT_AS).rlim_cur;
+        if as_limit != LINUX_RLIM_INFINITY
+            && committed_va_bytes(mem)
+                .checked_add(grow)
+                .is_none_or(|total| total > as_limit)
+        {
+            return Err(LINUX_ENOMEM);
+        }
+        if data {
+            let data_limit = self.effective_resource_limit(LINUX_RLIMIT_DATA).rlim_cur;
+            if data_limit != LINUX_RLIM_INFINITY
+                && data_va_bytes(mem)
+                    .checked_add(grow)
+                    .is_none_or(|total| total > data_limit)
+            {
+                return Err(LINUX_ENOMEM);
+            }
+        }
+        Ok(())
     }
 
     fn prepare_fresh_mmap_locked_length(
