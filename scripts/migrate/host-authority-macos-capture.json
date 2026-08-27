@@ -6484,15 +6484,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 281955,
-        "byte_start": 281935,
+        "byte_end": 282397,
+        "byte_start": 282377,
         "column": 33,
         "column_end": 53,
         "column_start": 33,
         "file": "crates/carrick-runtime/src/dispatch/net.rs",
-        "line": 6075,
-        "line_end": 6075,
-        "line_start": 6075
+        "line": 6084,
+        "line_end": 6084,
+        "line_start": 6084
       }
     },
     {
@@ -6504,15 +6504,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 287289,
-        "byte_start": 287269,
+        "byte_end": 287731,
+        "byte_start": 287711,
         "column": 33,
         "column_end": 53,
         "column_start": 33,
         "file": "crates/carrick-runtime/src/dispatch/net.rs",
-        "line": 6176,
-        "line_end": 6176,
-        "line_start": 6176
+        "line": 6185,
+        "line_end": 6185,
+        "line_start": 6185
       }
     },
     {
@@ -7719,15 +7719,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 281787,
-        "byte_start": 281762,
+        "byte_end": 282229,
+        "byte_start": 282204,
         "column": 33,
         "column_end": 58,
         "column_start": 33,
         "file": "crates/carrick-runtime/src/dispatch/net.rs",
-        "line": 6072,
-        "line_end": 6072,
-        "line_start": 6072
+        "line": 6081,
+        "line_end": 6081,
+        "line_start": 6081
       }
     },
     {
@@ -7739,15 +7739,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 287104,
-        "byte_start": 287079,
+        "byte_end": 287546,
+        "byte_start": 287521,
         "column": 37,
         "column_end": 62,
         "column_start": 37,
         "file": "crates/carrick-runtime/src/dispatch/net.rs",
-        "line": 6172,
-        "line_end": 6172,
-        "line_start": 6172
+        "line": 6181,
+        "line_end": 6181,
+        "line_start": 6181
       }
     },
     {
@@ -9997,15 +9997,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 118759,
-        "byte_start": 118743,
+        "byte_end": 119003,
+        "byte_start": 118987,
         "column": 57,
         "column_end": 73,
         "column_start": 57,
         "file": "crates/carrick-runtime/src/dispatch/net.rs",
-        "line": 2639,
-        "line_end": 2639,
-        "line_start": 2639
+        "line": 2643,
+        "line_end": 2643,
+        "line_start": 2643
       }
     },
     {
@@ -10017,15 +10017,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 280406,
-        "byte_start": 280390,
+        "byte_end": 280848,
+        "byte_start": 280832,
         "column": 21,
         "column_end": 37,
         "column_start": 21,
         "file": "crates/carrick-runtime/src/dispatch/net.rs",
-        "line": 6048,
-        "line_end": 6048,
-        "line_start": 6048
+        "line": 6057,
+        "line_end": 6057,
+        "line_start": 6057
       }
     },
     {
@@ -10037,15 +10037,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 323566,
-        "byte_start": 323550,
+        "byte_end": 324008,
+        "byte_start": 323992,
         "column": 21,
         "column_end": 37,
         "column_start": 21,
         "file": "crates/carrick-runtime/src/dispatch/net.rs",
-        "line": 6900,
-        "line_end": 6900,
-        "line_start": 6900
+        "line": 6909,
+        "line_end": 6909,
+        "line_start": 6909
       }
     },
     {
@@ -12796,9 +12796,9 @@
       }
     }
   ],
-  "rows_sha256": "2a6b0e58443bcd9ed89e9befa6edd81918fb7230da26ae69de11a9ca1dcb7068",
+  "rows_sha256": "ebc33d8a3cbf12ec289bec1c8fdc59e296b6768925abe821a6b5523bd9599ba7",
   "schema": 1,
-  "source_head": "97d2fa4091884fe28cdce05081d85c40f387ef1f",
+  "source_head": "d5d8dd9702a0b81102859255cc696b3556e54c71",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
