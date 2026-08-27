@@ -25,6 +25,9 @@ pub const LIVE_ORACLE_PROBES: &[&str] = &[
     "iouring",
     "iouringenterflag",
     "itimer",
+    // The committed Docker result is only `Terminated`, so the old lane's
+    // apparent match is not assertion-level evidence.
+    "kernelidentity",
     "manythreads",
     "mmapfileforkwriteback",
     "mmaprecl",
@@ -47,7 +50,7 @@ pub const LIVE_ORACLE_PROBES: &[&str] = &[
 
 /// Probes that cannot share an embedded test process after they fail. Keep
 /// these on the old out-of-process lane until the runtime teardown is fixed.
-pub const OUT_OF_PROCESS_PROBES: &[&str] = &["execthreads", "vforkexecthread"];
+pub const OUT_OF_PROCESS_PROBES: &[&str] = &["execthreads", "execfromthread", "vforkexecthread"];
 
 pub fn needs_live_oracle(probe: &str) -> bool {
     LIVE_ORACLE_PROBES.contains(&probe)
@@ -55,6 +58,15 @@ pub fn needs_live_oracle(probe: &str) -> bool {
 
 pub fn runs_in_cached_lane(probe: &str) -> bool {
     !needs_live_oracle(probe) && !OUT_OF_PROCESS_PROBES.contains(&probe)
+}
+
+pub fn probe_filter_allows(probe: &str) -> bool {
+    std::env::var("CARRICK_PROBE_FILTER").map_or(true, |requested| {
+        requested
+            .split(',')
+            .map(str::trim)
+            .any(|name| name == probe)
+    })
 }
 
 /// Run one embedded container while host fd 0 is an already-EOF pipe, matching
