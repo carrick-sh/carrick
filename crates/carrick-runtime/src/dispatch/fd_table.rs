@@ -205,10 +205,18 @@ pub(crate) fn make_readiness_pipe() -> Option<(HostFdRef, HostFdRef)> {
 pub(super) struct TimerFdState {
     pub(super) inner: Mutex<TimerFdInner>,
     pub(super) changed: Condvar,
+    /// The time authority of the container that created this timerfd. Linux
+    /// binds a timerfd to its creator's time namespace; readiness is
+    /// re-evaluated from poll/epoll paths that carry no `KernelContext`, so
+    /// the domain is captured here rather than looked up per evaluation.
+    pub(super) clock: std::sync::Arc<crate::kernel::container::ClockDomain>,
 }
 
 impl TimerFdState {
-    pub(super) fn new(clock_id: u64) -> Self {
+    pub(super) fn new(
+        clock: std::sync::Arc<crate::kernel::container::ClockDomain>,
+        clock_id: u64,
+    ) -> Self {
         Self {
             inner: Mutex::new(TimerFdInner {
                 clock_id,
@@ -217,6 +225,7 @@ impl TimerFdState {
                 expirations: 0,
             }),
             changed: Condvar::new(),
+            clock,
         }
     }
 }

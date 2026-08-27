@@ -137,7 +137,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use std::path::{Component, Path};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 // LOCK ORDERING: dispatch handlers must not hold subsystem locks while entering
 // guest-memory callbacks or blocking host waits. When multiple dispatcher
@@ -4728,14 +4728,15 @@ impl SyscallDispatcher {
     /// unmapped VA as `OutOfBounds`) and is not an error. Any other failure is.
     pub(crate) fn sync_vvar_realtime_offset(
         &self,
+        clock: &crate::kernel::container::ClockDomain,
         memory: &mut impl GuestMemory,
     ) -> Result<(), MemoryError> {
-        let epoch = guest_realtime_epoch();
-        // Epoch 0 means no guest has ever moved the clock in this carrier, so
+        let epoch = clock.epoch();
+        // Epoch 0 means no guest has ever moved the clock in this container, so
         // every MM's vvar still holds exactly what the VMM stamper published
         // for it at boot (a fork child inherits that content, an exec'd MM is
         // stamped fresh) and no re-stamp can change a byte. Answering that
-        // from ONE load of a static keeps the ArcSwap `mm_binding` load — the
+        // from ONE load of a domain atomic keeps the ArcSwap `mm_binding` load — the
         // expensive half of this check — off the syscall path entirely until
         // a `clock_settime` actually happens. This function runs on every
         // dispatched syscall, so the untaken case is the one that has to be
@@ -4752,8 +4753,7 @@ impl SyscallDispatcher {
             return Ok(());
         }
         if let Some(host_off_ns) = crate::vdso::realtime_off_ns() {
-            let word =
-                crate::vdso::vvar_realtime_off_ns(host_off_ns, get_guest_realtime_offset_ns());
+            let word = crate::vdso::vvar_realtime_off_ns(host_off_ns, clock.realtime_offset_ns());
             match memory.write_bytes_unchecked(
                 crate::vdso::LINUX_VVAR_BASE + crate::vdso::VVAR_OFF_REALTIME_OFF_NS as u64,
                 &word.to_le_bytes(),
@@ -4775,10 +4775,11 @@ impl SyscallDispatcher {
     /// momentary jump back to host time.
     pub(crate) fn set_guest_realtime(
         &self,
+        clock: &crate::kernel::container::ClockDomain,
         memory: &mut impl GuestMemory,
         target: Duration,
     ) -> Result<(), MemoryError> {
-        let base = realtime_base_duration();
+        let base = clock.realtime_base_now();
         let delta_ns = if target >= base {
             i64::try_from((target - base).as_nanos()).unwrap_or(i64::MAX)
         } else {
@@ -4786,8 +4787,8 @@ impl SyscallDispatcher {
                 .map(|n| -n)
                 .unwrap_or(i64::MIN)
         };
-        set_guest_realtime_offset_ns(delta_ns);
-        self.sync_vvar_realtime_offset(memory)
+        clock.set_realtime_offset_ns(delta_ns);
+        self.sync_vvar_realtime_offset(clock, memory)
     }
 
     pub(crate) fn begin_host_alias_dispatch(&self) -> HostAliasDispatchGuard {
@@ -6296,7 +6297,9 @@ impl SyscallDispatcher {
         }
         // The calling MM's vDSO realtime word follows a guest `clock_settime`
         // made by any process (one atomic compare when nothing changed).
-        if let Err(error) = self.sync_vvar_realtime_offset(memory) {
+        if let Err(error) =
+            self.sync_vvar_realtime_offset(kernel.task().container().clock(), memory)
+        {
             tracing::error!("vvar realtime re-stamp failed: {error}");
             return Err(DispatchError::from(error));
         }
@@ -6645,7 +6648,9 @@ impl SyscallDispatcher {
         }
         // The calling MM's vDSO realtime word follows a guest `clock_settime`
         // made by any process (see `dispatch_threaded`).
-        if let Err(error) = self.sync_vvar_realtime_offset(memory) {
+        if let Err(error) =
+            self.sync_vvar_realtime_offset(kernel.task().container().clock(), memory)
+        {
             tracing::error!("vvar realtime re-stamp failed: {error}");
             return Err(DispatchError::from(error));
         }
@@ -6987,7 +6992,9 @@ fn relative_from_absolute_timespec(tv_sec: i64, tv_nsec: i64, realtime: bool) ->
     // its clock with `clock_settime`: every absolute deadline was then computed
     // against a "now" one step behind. Probe: futexrealtime.
     let now_ns: i128 = if realtime {
-        realtime_duration().as_nanos() as i128
+        crate::kernel::container::ClockDomain::system()
+            .realtime_now()
+            .as_nanos() as i128
     } else {
         monotonic_duration().as_nanos() as i128
     };
@@ -7697,12 +7704,15 @@ fn dynamic_cpu_clock(clock_id: u64) -> Option<DynamicCpuClock> {
     }
 }
 
-fn linux_clock_duration(clock_id: u64) -> Option<Duration> {
+fn linux_clock_duration(
+    clock: &crate::kernel::container::ClockDomain,
+    clock_id: u64,
+) -> Option<Duration> {
     match clock_id {
         LINUX_CLOCK_REALTIME
         | LINUX_CLOCK_REALTIME_COARSE
         | LINUX_CLOCK_REALTIME_ALARM
-        | LINUX_CLOCK_TAI => Some(realtime_duration()),
+        | LINUX_CLOCK_TAI => Some(clock.realtime_now()),
         LINUX_CLOCK_MONOTONIC | LINUX_CLOCK_MONOTONIC_RAW | LINUX_CLOCK_MONOTONIC_COARSE => {
             Some(monotonic_duration())
         }
@@ -7734,7 +7744,10 @@ fn linux_clock_duration(clock_id: u64) -> Option<Duration> {
     }
 }
 
-fn linux_clock_nanosleep_now(clock_id: u64) -> Result<Duration, LinuxErrno> {
+fn linux_clock_nanosleep_now(
+    clock: &crate::kernel::container::ClockDomain,
+    clock_id: u64,
+) -> Result<Duration, LinuxErrno> {
     if matches!(
         clock_id,
         LINUX_CLOCK_PROCESS_CPUTIME_ID | LINUX_CLOCK_THREAD_CPUTIME_ID
@@ -7742,7 +7755,7 @@ fn linux_clock_nanosleep_now(clock_id: u64) -> Result<Duration, LinuxErrno> {
     {
         return Err(LINUX_EOPNOTSUPP);
     }
-    linux_clock_duration(clock_id).ok_or(LINUX_EINVAL)
+    linux_clock_duration(clock, clock_id).ok_or(LINUX_EINVAL)
 }
 
 /// Linux clock_getres resolution in nanoseconds, selected per clock id.
@@ -7817,13 +7830,17 @@ fn linux_timeval_usec_is_valid(tv: LinuxTimeval) -> bool {
     (0..1_000_000).contains(&usec)
 }
 
-fn adjtimex_bootstrap(memory: &mut impl GuestMemory, address: u64) -> DispatchOutcome {
+fn adjtimex_bootstrap(
+    clock: &crate::kernel::container::ClockDomain,
+    memory: &mut impl GuestMemory,
+    address: u64,
+) -> DispatchOutcome {
     let timex = match read_kernel_struct::<LinuxTimex>(memory, address) {
         Ok(timex) => timex,
         Err(errno) => return DispatchOutcome::Errno { errno },
     };
     if timex.modes == 0 {
-        let current = LinuxTimex::new_read_state(linux_timeval_from_duration(realtime_duration()));
+        let current = LinuxTimex::new_read_state(linux_timeval_from_duration(clock.realtime_now()));
         return match write_kernel_struct(memory, address, &current) {
             DispatchOutcome::Returned { value: 0 } => DispatchOutcome::Returned {
                 value: LINUX_TIME_ERROR,
@@ -7876,85 +7893,10 @@ fn linux_access_flags_are_supported(flags: u64) -> bool {
     flags & !SUPPORTED == 0
 }
 
-/// The guest-settable CLOCK_REALTIME delta (`clock_settime`/`settimeofday`
-/// under CAP_SYS_TIME), in nanoseconds, applied on top of the host
-/// calibration published in `carrick_mem::vdso::realtime_off_ns`.
-/// Carrier-wide: every Linux process in the carrier shares one wall clock, as
-/// processes under one Linux kernel do. Phase B moves it (with its epoch)
-/// into the container's `ClockDomain`. Two consumers must agree on it — the
-/// syscall path (`realtime_duration`) and each MM's vvar word, which the
-/// dispatcher re-stamps through `carrick_mem::vdso::vvar_realtime_off_ns`
-/// (`SyscallDispatcher::sync_vvar_realtime_offset`).
-static GUEST_REALTIME_OFFSET_NS: std::sync::atomic::AtomicI64 =
-    std::sync::atomic::AtomicI64::new(0);
-
-/// Bumped (Release) on every offset change, AFTER the new delta is stored, so
-/// a reader that observes the new epoch (Acquire) also observes the new delta.
-/// Each Linux MM records the epoch its vvar word was stamped under
-/// (`DispatchMmAuthority::vvar_realtime_epoch`) and re-stamps itself when it
-/// falls behind.
-static GUEST_REALTIME_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-pub(crate) fn get_guest_realtime_offset_ns() -> i64 {
-    GUEST_REALTIME_OFFSET_NS.load(std::sync::atomic::Ordering::SeqCst)
-}
-
-/// Publish a new guest CLOCK_REALTIME delta and advance the epoch.
-pub(crate) fn set_guest_realtime_offset_ns(delta_ns: i64) {
-    GUEST_REALTIME_OFFSET_NS.store(delta_ns, std::sync::atomic::Ordering::SeqCst);
-    GUEST_REALTIME_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
-}
-
-/// The current offset epoch (see [`set_guest_realtime_offset_ns`]). Read on
-/// every syscall entry by every MM: one Acquire load.
-pub(crate) fn guest_realtime_epoch() -> u64 {
-    GUEST_REALTIME_EPOCH.load(std::sync::atomic::Ordering::Acquire)
-}
-
-/// The guest's CLOCK_REALTIME WITHOUT the guest-settable delta: host
-/// calibration only (`uptime + vvar host offset`, the same base the vDSO adds
-/// its word to; the live wall clock when no vvar was ever stamped).
-fn realtime_base_duration() -> Duration {
-    #[cfg(not(target_os = "linux"))]
-    {
-        if let Some(off_ns) = crate::vdso::realtime_off_ns()
-            && let Some(uptime) = host_clock_duration(carrick_portable::CLOCK_UPTIME_RAW)
-        {
-            Duration::from_nanos((uptime.as_nanos() as u64).wrapping_add(off_ns))
-        } else {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or(Duration::ZERO)
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-    }
-}
-
-/// The guest's `CLOCK_REALTIME`: THE wall-clock authority for every realtime
-/// consumer in the runtime (clock reads, absolute deadlines, file and IPC
-/// stamps, `/proc` epochs). Nothing else in the runtime may read the host wall
-/// clock for a guest-visible value. `realtime_base_duration` plus the guest
-/// delta — the same delta the dispatcher folds into every MM's vvar word, so
-/// the vDSO fast path and the trapping syscall agree.
-pub(crate) fn realtime_duration() -> Duration {
-    let offset_ns = get_guest_realtime_offset_ns();
-    let base = realtime_base_duration();
-    if offset_ns >= 0 {
-        base.saturating_add(Duration::from_nanos(offset_ns as u64))
-    } else {
-        base.saturating_sub(Duration::from_nanos(offset_ns.unsigned_abs()))
-    }
-}
-
 /// Read a host (macOS) POSIX clock via `libc::clock_gettime`. `clock_id`
 /// MUST be a host symbolic `libc::CLOCK_*` constant (Linux numbering
 /// differs and is mapped by callers). Returns `None` only on failure.
-fn host_clock_duration(clock_id: libc::clockid_t) -> Option<Duration> {
+pub(crate) fn host_clock_duration(clock_id: libc::clockid_t) -> Option<Duration> {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -8647,7 +8589,7 @@ fn read_timerfd(
 
     let mut timer = state.inner.lock();
     loop {
-        let ready = refresh_timerfd_locked(&mut timer);
+        let ready = refresh_timerfd_locked(&state.clock, &mut timer);
         if ready > 0 {
             let value = LinuxTimerfdExpirations {
                 expirations: timer.expirations,
@@ -8673,7 +8615,7 @@ fn read_timerfd(
             state.changed.wait(&mut timer);
             continue;
         };
-        let Some(now) = linux_clock_duration(timer.clock_id) else {
+        let Some(now) = linux_clock_duration(&state.clock, timer.clock_id) else {
             state.changed.wait(&mut timer);
             continue;
         };
@@ -8685,8 +8627,12 @@ fn read_timerfd(
     }
 }
 
-fn refresh_timerfd_locked(timer: &mut TimerFdInner) -> u64 {
+fn refresh_timerfd_locked(
+    clock: &crate::kernel::container::ClockDomain,
+    timer: &mut TimerFdInner,
+) -> u64 {
     let (ready, next_deadline) = timerfd_expirations(
+        clock,
         timer.clock_id,
         timer.interval,
         timer.deadline,
@@ -8699,15 +8645,16 @@ fn refresh_timerfd_locked(timer: &mut TimerFdInner) -> u64 {
 
 fn timerfd_ready_count(state: &TimerFdState) -> u64 {
     let mut timer = state.inner.lock();
-    refresh_timerfd_locked(&mut timer)
+    refresh_timerfd_locked(&state.clock, &mut timer)
 }
 
 fn timerfd_itimerspec(
+    clock: &crate::kernel::container::ClockDomain,
     clock_id: u64,
     interval: Option<Duration>,
     deadline: Option<Duration>,
 ) -> LinuxItimerspec {
-    let now = linux_clock_duration(clock_id).unwrap_or(Duration::ZERO);
+    let now = linux_clock_duration(clock, clock_id).unwrap_or(Duration::ZERO);
     let remaining = deadline.map(|deadline| deadline.saturating_sub(now));
     LinuxItimerspec::new(
         linux_timespec_from_optional_duration(interval),
@@ -8716,6 +8663,7 @@ fn timerfd_itimerspec(
 }
 
 fn timerfd_expirations(
+    clock: &crate::kernel::container::ClockDomain,
     clock_id: u64,
     interval: Option<Duration>,
     deadline: Option<Duration>,
@@ -8724,7 +8672,7 @@ fn timerfd_expirations(
     let Some(deadline) = deadline else {
         return (expirations, None);
     };
-    let Some(now) = linux_clock_duration(clock_id) else {
+    let Some(now) = linux_clock_duration(clock, clock_id) else {
         return (expirations, Some(deadline));
     };
     if now < deadline {
@@ -9304,7 +9252,7 @@ fn resolve_utimensat_timespec(timespec: LinuxTimespec) -> Option<(i64, i64)> {
 /// The guest's current CLOCK_REALTIME as a (sec, nsec) pair, for UTIME_NOW /
 /// NULL times.
 fn now_realtime_timespec() -> (i64, i64) {
-    let now = realtime_duration();
+    let now = crate::kernel::container::ClockDomain::system().realtime_now();
     (now.as_secs() as i64, i64::from(now.subsec_nanos()))
 }
 
@@ -9367,111 +9315,6 @@ mod exec_vector_tests {
 
         let oversized = vec![vec![b'x'; crate::linux_abi::LINUX_ARG_MAX]];
         assert_eq!(validate_exec_vector_size(&oversized, &[]), Err(LINUX_E2BIG));
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod realtime_test_support {
-    use std::sync::{Mutex, MutexGuard};
-
-    static GUEST_REALTIME_OFFSET_LOCK: Mutex<()> = Mutex::new(());
-
-    struct ResetOnDrop {
-        _guard: MutexGuard<'static, ()>,
-    }
-
-    impl Drop for ResetOnDrop {
-        fn drop(&mut self) {
-            super::set_guest_realtime_offset_ns(0);
-        }
-    }
-
-    /// Run `f` with the guest CLOCK_REALTIME delta set to `delta_ns`,
-    /// serialized against every other offset-moving test, and reset to 0
-    /// afterwards (also on panic). `just test` already runs carrick-runtime
-    /// under RUST_TEST_THREADS=1; the lock keeps a focused parallel
-    /// `cargo test -p carrick-runtime` honest too.
-    pub(crate) fn with_guest_realtime_offset<R>(delta_ns: i64, f: impl FnOnce() -> R) -> R {
-        let guard = GUEST_REALTIME_OFFSET_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _reset = ResetOnDrop { _guard: guard };
-        super::set_guest_realtime_offset_ns(delta_ns);
-        f()
-    }
-}
-
-#[cfg(test)]
-mod realtime_authority_tests {
-    use super::realtime_test_support::with_guest_realtime_offset;
-    use super::*;
-
-    const HOUR_NS: i64 = 3_600 * 1_000_000_000;
-
-    fn host_wall_secs() -> i64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0)
-    }
-
-    /// FUTEX_WAIT_BITSET|FUTEX_CLOCK_REALTIME: the guest built its absolute
-    /// deadline on ITS CLOCK_REALTIME, so "now" must be read from the same
-    /// authority. Reading the host wall clock instead put every deadline one
-    /// hour in the future once the guest had moved its clock forward.
-    #[test]
-    fn futex_realtime_deadline_is_measured_on_the_guest_clock() {
-        with_guest_realtime_offset(HOUR_NS, || {
-            let deadline = realtime_duration() + Duration::from_millis(200);
-            let remaining = relative_from_absolute_timespec(
-                deadline.as_secs() as i64,
-                i64::from(deadline.subsec_nanos()),
-                true,
-            );
-            assert!(
-                remaining <= Duration::from_millis(200),
-                "deadline 200ms past the guest clock must not wait longer: {remaining:?}"
-            );
-            assert!(
-                remaining >= Duration::from_millis(100),
-                "deadline 200ms past the guest clock must not be already past: {remaining:?}"
-            );
-        });
-    }
-
-    /// `utimensat(UTIME_NOW)` and the NULL-times form stamp the file with the
-    /// GUEST's wall clock, like every other realtime read.
-    #[test]
-    fn utimensat_utime_now_stamps_the_guest_clock() {
-        with_guest_realtime_offset(HOUR_NS, || {
-            let (sec, nsec) = now_realtime_timespec();
-            assert!((0..1_000_000_000).contains(&nsec));
-            assert!(
-                sec - host_wall_secs() >= 3_599,
-                "NULL-times stamp must carry the guest offset: sec={sec}"
-            );
-            let resolved = resolve_utimensat_timespec(LinuxTimespec::new(0, LINUX_UTIME_NOW))
-                .expect("UTIME_NOW resolves to a concrete stamp");
-            assert!(
-                resolved.0 - host_wall_secs() >= 3_599,
-                "UTIME_NOW must carry the guest offset: sec={}",
-                resolved.0
-            );
-        });
-    }
-
-    /// Every offset change advances the epoch each MM compares against, so a
-    /// sibling MM can tell "the clock moved since I last stamped my vvar"
-    /// with one atomic load.
-    #[test]
-    fn every_offset_change_advances_the_epoch() {
-        with_guest_realtime_offset(0, || {
-            let start = guest_realtime_epoch();
-            set_guest_realtime_offset_ns(5);
-            set_guest_realtime_offset_ns(0);
-            assert_eq!(guest_realtime_epoch(), start + 2);
-            assert_eq!(get_guest_realtime_offset_ns(), 0);
-        });
     }
 }
 

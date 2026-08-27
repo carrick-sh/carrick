@@ -1688,7 +1688,10 @@ where
         // first instruction, so a vDSO read before any syscall already agrees
         // with the syscall path (`sync_vvar_realtime_offset`; probe
         // clocksettimevdso, `date -s` followed by an exec'd `date`).
-        if let Err(error) = kernel.dispatcher.sync_vvar_realtime_offset(engine) {
+        if let Err(error) = kernel
+            .dispatcher
+            .sync_vvar_realtime_offset(committed_context.task().container().clock(), engine)
+        {
             return Self::exec_failed_past_no_return(
                 kernel,
                 engine,

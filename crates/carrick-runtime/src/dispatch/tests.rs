@@ -4968,3 +4968,193 @@ mod container_policy_dispatch_tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod container_clock_tests {
+    //! Two containers in one carrier keep independent CLOCK_REALTIME
+    //! authorities. Each `SyscallDispatcher::new()` bootstraps its own root
+    //! task and therefore its own `Container`; the clock a handler reads must
+    //! be that container's `ClockDomain`, never a process static.
+    use super::*;
+    use crate::compat::CompatReporter;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    const SYS_TIMERFD_CREATE: u64 = 85;
+    const SYS_TIMERFD_SETTIME: u64 = 86;
+    const SYS_CLOCK_SETTIME: u64 = 112;
+    const SYS_CLOCK_GETTIME: u64 = 113;
+    const MEM_BASE: u64 = 0x4000_0000;
+    const MEM_LEN: usize = 4096;
+    const TIMESPEC_ADDR: u64 = MEM_BASE + 0x100;
+    const ITIMERSPEC_ADDR: u64 = MEM_BASE + 0x200;
+    const SLACK: Duration = Duration::from_secs(5);
+
+    fn wall_now() -> Duration {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+    }
+
+    fn assert_within(actual: Duration, expected: Duration, what: &str) {
+        let delta = actual.abs_diff(expected);
+        assert!(
+            delta <= SLACK,
+            "{what}: actual {actual:?}, expected {expected:?} (delta {delta:?})"
+        );
+    }
+
+    fn realtime_via_syscall(dispatcher: &mut SyscallDispatcher, memory: &mut LinearMemory) -> Duration {
+        let reporter = CompatReporter::default();
+        let outcome = dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().expect("task context"),
+                SyscallRequest::new(
+                    SYS_CLOCK_GETTIME,
+                    SyscallArgs([LINUX_CLOCK_REALTIME, TIMESPEC_ADDR, 0, 0, 0, 0]),
+                ),
+                memory,
+                &reporter,
+            )
+            .expect("dispatch clock_gettime");
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+        let bytes = memory.read_bytes(TIMESPEC_ADDR, 16).expect("timespec bytes");
+        let secs = i64::from_le_bytes(bytes[0..8].try_into().expect("tv_sec"));
+        let nanos = i64::from_le_bytes(bytes[8..16].try_into().expect("tv_nsec"));
+        Duration::new(secs as u64, nanos as u32)
+    }
+
+    fn write_timespec(memory: &mut LinearMemory, address: u64, value: Duration) {
+        let mut bytes = [0u8; 16];
+        bytes[0..8].copy_from_slice(&(value.as_secs() as i64).to_le_bytes());
+        bytes[8..16].copy_from_slice(&i64::from(value.subsec_nanos()).to_le_bytes());
+        memory.write_bytes(address, &bytes).expect("write timespec");
+    }
+
+    #[test]
+    fn clock_gettime_realtime_reads_the_callers_container_domain() {
+        let mut a = SyscallDispatcher::new();
+        let mut b = SyscallDispatcher::new();
+        let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
+        const OFFSET: Duration = Duration::from_secs(3600);
+        b.capture_one_task_context()
+            .expect("b context")
+            .task()
+            .container()
+            .clock()
+            .set_realtime_offset_ns(OFFSET.as_nanos() as i64);
+
+        assert_within(realtime_via_syscall(&mut a, &mut memory), wall_now(), "A follows the wall clock");
+        assert_within(realtime_via_syscall(&mut b, &mut memory), wall_now() + OFFSET, "B is shifted by its own domain");
+        assert_within(realtime_via_syscall(&mut a, &mut memory), wall_now(), "A is untouched by B's offset");
+    }
+
+    #[test]
+    fn clock_settime_moves_only_the_callers_container() {
+        let mut a = SyscallDispatcher::new();
+        let mut b = SyscallDispatcher::new();
+        let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
+        let reporter = CompatReporter::default();
+        // clock_settime is CAP_SYS_TIME-gated and the Docker default set lacks it.
+        let a_context = a.capture_one_task_context().expect("a context");
+        a_context
+            .task()
+            .with_caps(|caps| *caps = crate::namespace::process::CapabilitySet::full());
+        const AHEAD: Duration = Duration::from_secs(7200);
+        write_timespec(&mut memory, TIMESPEC_ADDR, wall_now() + AHEAD);
+        let outcome = a
+            .dispatch(
+                &a_context,
+                SyscallRequest::new(
+                    SYS_CLOCK_SETTIME,
+                    SyscallArgs([LINUX_CLOCK_REALTIME, TIMESPEC_ADDR, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("dispatch clock_settime");
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+
+        assert_within(realtime_via_syscall(&mut a, &mut memory), wall_now() + AHEAD, "A moved");
+        assert_within(realtime_via_syscall(&mut b, &mut memory), wall_now(), "B did not move");
+        assert_eq!(
+            b.capture_one_task_context()
+                .expect("b context")
+                .task()
+                .container()
+                .clock()
+                .realtime_offset_ns(),
+            0,
+            "B's domain never observed A's clock_settime"
+        );
+    }
+
+    fn armed_absolute_timerfd(
+        dispatcher: &mut SyscallDispatcher,
+        memory: &mut LinearMemory,
+        deadline: Duration,
+    ) -> Arc<TimerFdState> {
+        let reporter = CompatReporter::default();
+        let context = dispatcher.capture_one_task_context().expect("task context");
+        let fd = match dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(SYS_TIMERFD_CREATE, SyscallArgs([LINUX_CLOCK_REALTIME, 0, 0, 0, 0, 0])),
+                memory,
+                &reporter,
+            )
+            .expect("dispatch timerfd_create")
+        {
+            DispatchOutcome::Returned { value } => value as u64,
+            other => panic!("timerfd_create failed: {other:?}"),
+        };
+        // struct itimerspec { it_interval (zero); it_value = deadline }
+        let mut spec = [0u8; 32];
+        spec[16..24].copy_from_slice(&(deadline.as_secs() as i64).to_le_bytes());
+        spec[24..32].copy_from_slice(&i64::from(deadline.subsec_nanos()).to_le_bytes());
+        memory.write_bytes(ITIMERSPEC_ADDR, &spec).expect("write itimerspec");
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        SYS_TIMERFD_SETTIME,
+                        SyscallArgs([fd, LinuxTfdFlags::TIMER_ABSTIME.bits(), ITIMERSPEC_ADDR, 0, 0, 0]),
+                    ),
+                    memory,
+                    &reporter,
+                )
+                .expect("dispatch timerfd_settime"),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let open_file = dispatcher.open_file(fd as i32).expect("timerfd open file");
+        let open = open_file.description.read();
+        let OpenDescription::TimerFd { state, .. } = &*open else {
+            panic!("fd {fd} is not a timerfd");
+        };
+        Arc::clone(state)
+    }
+
+    #[test]
+    fn timerfd_deadline_is_bound_to_the_creating_containers_clock() {
+        let mut a = SyscallDispatcher::new();
+        let mut b = SyscallDispatcher::new();
+        let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
+        let deadline = wall_now() + Duration::from_secs(3600);
+        let timer_a = armed_absolute_timerfd(&mut a, &mut memory, deadline);
+        let timer_b = armed_absolute_timerfd(&mut b, &mut memory, deadline);
+        assert_eq!(timerfd_ready_count(&timer_a), 0);
+        assert_eq!(timerfd_ready_count(&timer_b), 0);
+
+        // Move only A's clock past the deadline.
+        a.capture_one_task_context()
+            .expect("a context")
+            .task()
+            .container()
+            .clock()
+            .set_realtime_offset_ns(Duration::from_secs(7200).as_nanos() as i64);
+
+        assert_eq!(timerfd_ready_count(&timer_a), 1, "A's timerfd follows A's clock");
+        assert_eq!(timerfd_ready_count(&timer_b), 0, "B's timerfd is bound to B's clock");
+    }
+}
+

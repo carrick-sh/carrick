@@ -1158,7 +1158,9 @@ impl MsgQueueFile {
 /// `msg_stime`/`msg_rtime`). The single SysV stamp source; never read the
 /// host wall clock inline.
 fn unix_now_secs() -> u64 {
-    realtime_duration().as_secs()
+    crate::kernel::container::ClockDomain::system()
+        .realtime_now()
+        .as_secs()
 }
 
 fn msg_queue_path_for_private(state: &SysvShmState) -> PathBuf {
@@ -5372,18 +5374,15 @@ mod ipc_set_tests {
     /// guest's CLOCK_REALTIME, not the host's.
     #[test]
     fn sysv_ipc_stamps_follow_the_guest_clock() {
-        crate::dispatch::realtime_test_support::with_guest_realtime_offset(
-            3_600 * 1_000_000_000,
-            || {
-                let host_now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                assert!(
-                    unix_now_secs() >= host_now + 3_599,
-                    "SysV stamp must carry the guest offset"
-                );
-            },
+        let clock = crate::kernel::container::ClockDomain::system();
+        clock.set_realtime_offset_ns(3_600 * 1_000_000_000);
+        let host_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        assert!(
+            clock.realtime_now().as_secs() >= host_now + 3_599,
+            "SysV stamp must carry the guest offset"
         );
     }
 
