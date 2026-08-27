@@ -13,12 +13,12 @@
 //!    grandchild orphan reparenting, gettid in main vs child vs cloned subthread).
 //! 4. `pidfd_open(2)` & `pidfd_send_signal(2)` matrix (invalid flags -> EINVAL, invalid
 //!    PIDs -> EINVAL/ESRCH, dead process ESRCH, signal delivery, siginfo mismatch -> EINVAL,
-//!    non-pidfd descriptors -> EBADF, and waitid(P_PIDFD)).
+//!    non-pidfd descriptors -> EINVAL, bad fd -> EBADF, and waitid(P_PIDFD)).
 //! 5. `process_vm_readv(2)` & `process_vm_writev(2)` matrix (invalid flags/iovcnt/pids ->
 //!    EINVAL/ESRCH, zero-length transfers, self read/write, cross-process child read/write,
 //!    and unmapped/read-only memory fault handling -> EFAULT).
 //! 6. `ptrace(2)` error & access matrix (PTRACE_ATTACH to self/init/negative -> EPERM/ESRCH,
-//!    invalid request -> EIO/EINVAL, detach/cont on untraced process -> ESRCH/EPERM, and
+//!    invalid request -> EIO, detach/cont on untraced process -> ESRCH, and
 //!    duplicate PTRACE_TRACEME -> EPERM).
 //! 7. `setns(2)` error matrix (invalid fd -> EBADF, non-ns fd -> EINVAL, invalid nstype ->
 //!    EINVAL, mismatched nstype vs fd -> EINVAL, and nstype=0 wildcards).
@@ -29,7 +29,7 @@
 //!    roundtrip, PR_SET_NAME/PR_GET_NAME, waitid invalid idtype/options -> EINVAL, WNOWAIT
 //!    non-destructive inspection + clean reap, WNOHANG empty poll, and P_PGID waits).
 //!
-//! Deterministic boolean/key-value output only.
+//! Deterministic boolean/key-value output only. Exact assertions on Linux/aarch64 defined errnos.
 //! All parent-child operations use bounded monotonic timeouts and scoped SIGKILL cleanup.
 //! Filesystem paths use per-process unique names with explicit unlink cleanup before and after use.
 
@@ -334,7 +334,7 @@ unsafe fn test_clone_matrix() {
         false
     };
 
-    // 1.7 clone3 argument validation
+    // 1.7 clone3 argument validation (Linux exact error: EINVAL)
     let mut cargs = CloneArgs {
         flags: 0,
         exit_signal: libc::SIGCHLD as u64,
@@ -342,8 +342,7 @@ unsafe fn test_clone_matrix() {
     };
     let c3_small = libc::syscall(SYS_CLONE3, &mut cargs, 8usize) as i64;
     let c3_small_er = errno();
-    let c3_small_ok =
-        c3_small == -1 && (c3_small_er == libc::EINVAL || c3_small_er == libc::ENOSYS);
+    let c3_small_ok = c3_small == -1 && c3_small_er == libc::EINVAL;
 
     let mut cargs_bad_flags = CloneArgs {
         flags: 1 << 63,
@@ -353,8 +352,7 @@ unsafe fn test_clone_matrix() {
     let c3_bad_flags =
         libc::syscall(SYS_CLONE3, &mut cargs_bad_flags, size_of::<CloneArgs>()) as i64;
     let c3_bad_flags_er = errno();
-    let c3_bad_flags_ok = c3_bad_flags == -1
-        && (c3_bad_flags_er == libc::EINVAL || c3_bad_flags_er == libc::ENOSYS);
+    let c3_bad_flags_ok = c3_bad_flags == -1 && c3_bad_flags_er == libc::EINVAL;
 
     let mut cargs_bad_stack = CloneArgs {
         flags: 0,
@@ -366,8 +364,7 @@ unsafe fn test_clone_matrix() {
     let c3_bad_stack =
         libc::syscall(SYS_CLONE3, &mut cargs_bad_stack, size_of::<CloneArgs>()) as i64;
     let c3_bad_stack_er = errno();
-    let c3_bad_stack_ok = c3_bad_stack == -1
-        && (c3_bad_stack_er == libc::EINVAL || c3_bad_stack_er == libc::ENOSYS);
+    let c3_bad_stack_ok = c3_bad_stack == -1 && c3_bad_stack_er == libc::EINVAL;
 
     let mut cargs_bad_sig = CloneArgs {
         flags: 0,
@@ -376,8 +373,7 @@ unsafe fn test_clone_matrix() {
     };
     let c3_bad_sig = libc::syscall(SYS_CLONE3, &mut cargs_bad_sig, size_of::<CloneArgs>()) as i64;
     let c3_bad_sig_er = errno();
-    let c3_bad_sig_ok =
-        c3_bad_sig == -1 && (c3_bad_sig_er == libc::EINVAL || c3_bad_sig_er == libc::ENOSYS);
+    let c3_bad_sig_ok = c3_bad_sig == -1 && c3_bad_sig_er == libc::EINVAL;
 
     report!(
         clone_thread_no_sighand_einval = r1_einval,
@@ -386,10 +382,10 @@ unsafe fn test_clone_matrix() {
         clone_invalid_exit_signal_einval = r4_einval,
         clone_fs_with_newns_einval = r5_einval,
         clone_parent_settid_ok = r6_ok,
-        clone3_size_truncated_rejected = c3_small_ok,
-        clone3_reserved_flags_rejected = c3_bad_flags_ok,
-        clone3_bad_stack_rejected = c3_bad_stack_ok,
-        clone3_bad_signal_rejected = c3_bad_sig_ok,
+        clone3_size_truncated_einval = c3_small_ok,
+        clone3_reserved_flags_einval = c3_bad_flags_ok,
+        clone3_bad_stack_einval = c3_bad_stack_ok,
+        clone3_bad_signal_einval = c3_bad_sig_ok,
     );
 }
 
@@ -840,10 +836,13 @@ unsafe fn test_pidfd_matrix() {
         0i64,
     ) as i32;
     let er_non_pfd = errno();
-    let pfd_non_pidfd_ebadf =
-        r_non_pfd == -1 && (er_non_pfd == libc::EBADF || er_non_pfd == libc::EINVAL);
+    let pfd_non_pidfd_einval = r_non_pfd == -1 && er_non_pfd == libc::EINVAL;
     libc::close(pipe_non_pfd[0]);
     libc::close(pipe_non_pfd[1]);
+
+    let r_bad_fd = libc::syscall(SYS_PIDFD_SEND_SIGNAL, -1i64, 0i64, 0i64, 0i64) as i32;
+    let er_bad_fd = errno();
+    let pfd_bad_fd_ebadf = r_bad_fd == -1 && er_bad_fd == libc::EBADF;
 
     // Release child to exit(42)
     let _ = write_exact_bounded(pipe_wait[1], b"x", deadline);
@@ -905,7 +904,8 @@ unsafe fn test_pidfd_matrix() {
         pidfd_send_signal_invalid_sig_einval = pfd_sig_bad_sig,
         pidfd_send_signal_null_sig_zero = pfd_sig_null_sig,
         pidfd_send_signal_siginfo_mismatch_einval = pfd_sig_mismatch,
-        pidfd_send_signal_non_pidfd_ebadf = pfd_non_pidfd_ebadf,
+        pidfd_send_signal_non_pidfd_einval = pfd_non_pidfd_einval,
+        pidfd_send_signal_bad_fd_ebadf = pfd_bad_fd_ebadf,
         waitid_pidfd_reap_ok = waitid_pfd_ok,
         pidfd_send_signal_reaped_esrch = pfd_sig_reaped_esrch,
         pidfd_open_reaped_esrch = pfd_open_reaped_esrch,
@@ -1192,7 +1192,7 @@ unsafe fn test_ptrace_matrix() {
         0,
     );
     let er_zero = errno();
-    let pt_attach_zero_err = r_zero == -1 && (er_zero == libc::ESRCH || er_zero == libc::EPERM);
+    let pt_attach_zero_esrch = r_zero == -1 && er_zero == libc::ESRCH;
 
     let r_neg = libc::ptrace(
         libc::PTRACE_ATTACH,
@@ -1230,8 +1230,7 @@ unsafe fn test_ptrace_matrix() {
         0,
     );
     let er_inv_req = errno();
-    let pt_inv_req_err =
-        r_inv_req == -1 && (er_inv_req == libc::EIO || er_inv_req == libc::EINVAL);
+    let pt_inv_req_eio = r_inv_req == -1 && er_inv_req == libc::EIO;
 
     let r_detach_unattached = libc::ptrace(
         libc::PTRACE_DETACH,
@@ -1240,8 +1239,7 @@ unsafe fn test_ptrace_matrix() {
         0,
     );
     let er_detach = errno();
-    let pt_detach_unattached_err =
-        r_detach_unattached == -1 && (er_detach == libc::ESRCH || er_detach == libc::EPERM);
+    let pt_detach_unattached_esrch = r_detach_unattached == -1 && er_detach == libc::ESRCH;
 
     let r_cont_unattached = libc::ptrace(
         libc::PTRACE_CONT,
@@ -1294,11 +1292,11 @@ unsafe fn test_ptrace_matrix() {
     report!(
         ptrace_attach_self_eperm = pt_attach_self_eperm,
         ptrace_attach_init_eperm = pt_attach_init_eperm,
-        ptrace_attach_zero_esrch_or_eperm = pt_attach_zero_err,
+        ptrace_attach_zero_esrch = pt_attach_zero_esrch,
         ptrace_attach_neg_esrch = pt_attach_neg_esrch,
         ptrace_attach_nonexistent_esrch = pt_attach_nonexist_esrch,
-        ptrace_invalid_request_eio_or_einval = pt_inv_req_err,
-        ptrace_detach_unattached_esrch_or_eperm = pt_detach_unattached_err,
+        ptrace_invalid_request_eio = pt_inv_req_eio,
+        ptrace_detach_unattached_esrch = pt_detach_unattached_esrch,
         ptrace_cont_unattached_esrch = pt_cont_unattached_esrch,
         ptrace_traceme_duplicate_eperm = tm_read_ok && tm_res[0] == 1,
     );
@@ -1324,7 +1322,8 @@ unsafe fn test_setns_matrix() {
     let fd_uts = libc::open(c_uts.as_ptr(), libc::O_RDONLY);
     let mut setns_bad_nstype_einval = false;
     let mut setns_mismatched_einval = false;
-    let mut setns_zero_type_valid = false;
+    let mut setns_zero_rc_zero = false;
+    let mut setns_zero_errno = 0i32;
     if fd_uts >= 0 {
         let r_bad_nstype =
             libc::syscall(SYS_SETNS, fd_uts as libc::c_long, 0x1000_0000i64) as i32;
@@ -1338,9 +1337,9 @@ unsafe fn test_setns_matrix() {
         setns_mismatched_einval = r_mismatch == -1 && errno() == libc::EINVAL;
 
         let r_zero_nstype = libc::syscall(SYS_SETNS, fd_uts as libc::c_long, 0i64) as i32;
-        let er_zero = errno();
-        setns_zero_type_valid =
-            r_zero_nstype == 0 || (r_zero_nstype == -1 && er_zero == libc::EPERM);
+        let er_zero = if r_zero_nstype < 0 { errno() } else { 0 };
+        setns_zero_rc_zero = r_zero_nstype == 0;
+        setns_zero_errno = er_zero;
 
         libc::close(fd_uts);
     }
@@ -1350,7 +1349,8 @@ unsafe fn test_setns_matrix() {
         setns_non_ns_fd_einval = setns_non_ns_einval,
         setns_bad_nstype_einval = setns_bad_nstype_einval,
         setns_mismatched_nstype_einval = setns_mismatched_einval,
-        setns_zero_nstype_valid = setns_zero_type_valid,
+        setns_zero_nstype_rc_zero = setns_zero_rc_zero,
+        setns_zero_nstype_errno = setns_zero_errno,
     );
 }
 
@@ -1403,8 +1403,7 @@ unsafe fn test_session_pgid_matrix() {
     let self_sid = libc::getsid(0);
     let getsid_self_ok = self_sid > 0 && self_sid == libc::getsid(libc::getpid());
     let getsid_neg = libc::getsid(-1);
-    let getsid_neg_esrch =
-        getsid_neg == -1 && (errno() == libc::ESRCH || errno() == libc::EINVAL);
+    let getsid_neg_einval = getsid_neg == -1 && errno() == libc::EINVAL;
     let getsid_nonexist = libc::getsid(999999);
     let getsid_nonexist_esrch = getsid_nonexist == -1 && errno() == libc::ESRCH;
 
@@ -1460,8 +1459,7 @@ unsafe fn test_session_pgid_matrix() {
     let getpgid_zero_ok = libc::getpgid(0) == self_pgrp;
     let getpgid_self_ok = libc::getpgid(libc::getpid()) == self_pgrp;
     let getpgid_neg = libc::getpgid(-1);
-    let getpgid_neg_esrch =
-        getpgid_neg == -1 && (errno() == libc::ESRCH || errno() == libc::EINVAL);
+    let getpgid_neg_einval = getpgid_neg == -1 && errno() == libc::EINVAL;
     let getpgid_nonexist = libc::getpgid(999999);
     let getpgid_nonexist_esrch = getpgid_nonexist == -1 && errno() == libc::ESRCH;
 
@@ -1471,7 +1469,7 @@ unsafe fn test_session_pgid_matrix() {
         setsid_getsid_updated = sid_read_ok && sid_res[2] == 1,
         setsid_leader_eperm = sid_read_ok && sid_res[3] == 1,
         getsid_zero_eq_self = getsid_self_ok,
-        getsid_neg_esrch_or_einval = getsid_neg_esrch,
+        getsid_neg_einval = getsid_neg_einval,
         getsid_nonexistent_esrch = getsid_nonexist_esrch,
         setpgid_neg_pid_einval = setpgid_neg_pid_einval,
         setpgid_neg_pgid_einval = setpgid_neg_pgid_einval,
@@ -1480,7 +1478,7 @@ unsafe fn test_session_pgid_matrix() {
         setpgid_invalid_pgrp_eperm = pgid_read_ok && pgid_res[1] == 1,
         setpgid_join_parent_ok = pgid_read_ok && pgid_res[2] == 1,
         getpgid_zero_eq_pgrp = getpgid_zero_ok && getpgid_self_ok,
-        getpgid_neg_esrch_or_einval = getpgid_neg_esrch,
+        getpgid_neg_einval = getpgid_neg_einval,
         getpgid_nonexistent_esrch = getpgid_nonexist_esrch,
     );
 }
