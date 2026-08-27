@@ -26,15 +26,6 @@ pub const PERMIT_MAX_SLOTS: usize = 128;
 static ARENA_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static GLOBAL: OnceLock<KernelArena> = OnceLock::new();
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KernelArenaReexecAuthority {
-    pub fd: libc::c_int,
-    pub original_fd_flags: libc::c_int,
-    pub device: u64,
-    pub inode: u64,
-    pub size: u64,
-}
-
 #[repr(C)]
 pub struct ArenaHeader {
     pub magic: AtomicU32,
@@ -132,71 +123,7 @@ impl KernelArena {
             "carrick-kernel-arena-{}-{serial}",
             std::process::id()
         ));
-        Self::create_with_path(&path, true)
-    }
-
-    /// Create the arena at a stable path so later `carrick exec` processes can
-    /// attach to the same run-scoped region. The file is left linked on
-    /// success and created with `O_EXCL` so callers never attach stale state by
-    /// accident.
-    pub fn create_at(path: &Path) -> std::io::Result<KernelArena> {
-        Self::create_with_path(path, false)
-    }
-
-    /// Attach to an existing arena and fail closed on layout mismatch.
-    pub fn attach(path: &Path) -> std::io::Result<KernelArena> {
-        let size = std::mem::size_of::<ArenaLayout>();
-        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| std::io::Error::other("arena path contains NUL"))?;
-
-        let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
-            let err = std::io::Error::last_os_error();
-            unsafe {
-                libc::close(fd);
-            }
-            return Err(err);
-        }
-        let stat = unsafe { stat.assume_init() };
-        if stat.st_size < size as libc::off_t {
-            unsafe {
-                libc::close(fd);
-            }
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "kernel arena file is too small",
-            ));
-        }
-
-        let base = match Self::map_file(fd, size) {
-            Ok(base) => base,
-            Err(err) => {
-                unsafe {
-                    libc::close(fd);
-                }
-                return Err(err);
-            }
-        };
-        let arena = KernelArena { base, _fd: fd };
-        let layout = arena.layout();
-        let magic = layout.header.magic.load(Ordering::Acquire);
-        let version = layout.header.version.load(Ordering::Acquire);
-        if magic != ARENA_MAGIC || version != ARENA_VERSION {
-            unsafe {
-                libc::munmap(base as *mut libc::c_void, size);
-                libc::close(fd);
-            }
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "kernel arena magic/version mismatch",
-            ));
-        }
-        Ok(arena)
+        Self::create_with_path(&path)
     }
 
     /// Process-wide singleton. Always created fresh in memory for the carrier;
@@ -215,165 +142,11 @@ impl KernelArena {
         Self::init_global()
     }
 
-    pub fn reexec_authority(&self) -> std::io::Result<KernelArenaReexecAuthority> {
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        if unsafe { libc::fstat(self._fd, stat.as_mut_ptr()) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let flags = unsafe { libc::fcntl(self._fd, libc::F_GETFD) };
-        if flags < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let stat = unsafe { stat.assume_init() };
-        Ok(KernelArenaReexecAuthority {
-            fd: self._fd,
-            original_fd_flags: flags,
-            // `st_dev` is i32 on Darwin and u64 on FreeBSD; the widening cast
-            // is load-bearing on some targets and an identity on others.
-            #[allow(clippy::unnecessary_cast)]
-            device: stat.st_dev as u64,
-            inode: stat.st_ino,
-            size: stat.st_size as u64,
-        })
-    }
-
-    pub fn init_global_from_reexec(
-        authority: KernelArenaReexecAuthority,
-    ) -> std::io::Result<&'static KernelArena> {
-        if let Some(existing) = GLOBAL.get() {
-            let existing_authority = existing.reexec_authority()?;
-            if existing_authority.device != authority.device
-                || existing_authority.inode != authority.inode
-                || existing_authority.size != authority.size
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "kernel arena singleton already names different backing",
-                ));
-            }
-            return Ok(existing);
-        }
-
-        let arena = match Self::attach_reexec(authority) {
-            Ok(arena) => arena,
-            Err(error) => {
-                unsafe {
-                    libc::close(authority.fd);
-                }
-                return Err(error);
-            }
-        };
-        // The arena owns a duplicate; the inherited transport descriptor has
-        // served its only purpose and must not leak in the resumed process.
-        unsafe {
-            libc::close(authority.fd);
-        }
-        if let Err(arena) = GLOBAL.set(arena) {
-            unsafe {
-                libc::munmap(
-                    arena.base as *mut libc::c_void,
-                    std::mem::size_of::<ArenaLayout>(),
-                );
-                libc::close(arena._fd);
-            }
-            return Err(std::io::Error::other(
-                "kernel arena singleton raced during reexec attach",
-            ));
-        }
-        GLOBAL
-            .get()
-            .ok_or_else(|| std::io::Error::other("kernel arena reexec attach was not published"))
-    }
-
-    fn attach_reexec(authority: KernelArenaReexecAuthority) -> std::io::Result<KernelArena> {
-        if authority.fd < 0 || authority.size != std::mem::size_of::<ArenaLayout>() as u64 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "kernel arena reexec authority has invalid fd or size",
-            ));
-        }
-        let flags = unsafe { libc::fcntl(authority.fd, libc::F_GETFD) };
-        if flags < 0 || flags != (authority.original_fd_flags & !libc::FD_CLOEXEC) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "kernel arena reexec fd flags changed",
-            ));
-        }
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        if unsafe { libc::fstat(authority.fd, stat.as_mut_ptr()) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let stat = unsafe { stat.assume_init() };
-        // Per-OS `st_dev` width (i32 on Darwin, u64 on FreeBSD) makes the
-        // cast conditional — load-bearing there, an identity here.
-        #[allow(clippy::unnecessary_cast)]
-        if stat.st_dev as u64 != authority.device
-            || stat.st_ino != authority.inode
-            || stat.st_size as u64 != authority.size
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "kernel arena reexec fd identity changed",
-            ));
-        }
-        let owned_fd = unsafe { libc::fcntl(authority.fd, libc::F_DUPFD_CLOEXEC, 0) };
-        if owned_fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        if unsafe { libc::fcntl(owned_fd, libc::F_SETFD, authority.original_fd_flags) } != 0 {
-            let error = std::io::Error::last_os_error();
-            unsafe {
-                libc::close(owned_fd);
-            }
-            return Err(error);
-        }
-        let base = match Self::map_file(owned_fd, std::mem::size_of::<ArenaLayout>()) {
-            Ok(base) => base,
-            Err(error) => {
-                unsafe {
-                    libc::close(owned_fd);
-                }
-                return Err(error);
-            }
-        };
-        let arena = KernelArena {
-            base,
-            _fd: owned_fd,
-        };
-        let layout = arena.layout();
-        if layout.header.magic.load(Ordering::Acquire) != ARENA_MAGIC
-            || layout.header.version.load(Ordering::Acquire) != ARENA_VERSION
-        {
-            unsafe {
-                libc::munmap(
-                    base as *mut libc::c_void,
-                    std::mem::size_of::<ArenaLayout>(),
-                );
-                libc::close(owned_fd);
-            }
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "kernel arena reexec magic/version mismatch",
-            ));
-        }
-        if unsafe { libc::fcntl(authority.fd, libc::F_SETFD, authority.original_fd_flags) } != 0 {
-            unsafe {
-                libc::munmap(
-                    base as *mut libc::c_void,
-                    std::mem::size_of::<ArenaLayout>(),
-                );
-                libc::close(owned_fd);
-            }
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(arena)
-    }
-
     pub fn layout(&self) -> &ArenaLayout {
         unsafe { &*(self.base as *const ArenaLayout) }
     }
 
-    fn create_with_path(path: &Path, unlink_on_success: bool) -> std::io::Result<KernelArena> {
+    fn create_with_path(path: &Path) -> std::io::Result<KernelArena> {
         let size = std::mem::size_of::<ArenaLayout>();
         let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
             .map_err(|_| std::io::Error::other("arena path contains NUL"))?;
@@ -408,10 +181,9 @@ impl KernelArena {
                 return Err(err);
             }
         };
-        if unlink_on_success {
-            unsafe {
-                libc::unlink(cpath.as_ptr());
-            }
+        // Nothing attaches by path: the mapping is the only handle.
+        unsafe {
+            libc::unlink(cpath.as_ptr());
         }
 
         let arena = KernelArena { base, _fd: fd };
@@ -569,59 +341,6 @@ mod tests {
             }
             other => panic!("expected loud exhaustion, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn attach_joins_an_existing_arena() {
-        let dir = std::env::temp_dir().join(format!("cka-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("arena");
-        let a = KernelArena::create_at(&path).unwrap();
-        a.layout()
-            .header
-            .run_token
-            .store(77, std::sync::atomic::Ordering::Release);
-        let b = KernelArena::attach(&path).unwrap();
-        assert_eq!(
-            b.layout()
-                .header
-                .run_token
-                .load(std::sync::atomic::Ordering::Acquire),
-            77
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn attach_rejects_wrong_magic() {
-        let dir = std::env::temp_dir().join(format!("cka-badmagic-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("arena");
-        std::fs::write(&path, vec![0u8; std::mem::size_of::<ArenaLayout>()]).unwrap();
-        let e = KernelArena::attach(&path).err().unwrap();
-        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn reexec_authority_reattaches_exact_unlinked_arena_and_rejects_identity_change() {
-        let arena = KernelArena::create().unwrap();
-        arena
-            .layout()
-            .header
-            .run_token
-            .store(0xfeed, Ordering::Release);
-        let authority = arena.reexec_authority().unwrap();
-        let attached = KernelArena::attach_reexec(authority).unwrap();
-        assert_eq!(
-            attached.layout().header.run_token.load(Ordering::Acquire),
-            0xfeed
-        );
-
-        let mut wrong = authority;
-        wrong.inode = wrong.inode.wrapping_add(1);
-        let error = KernelArena::attach_reexec(wrong).err().unwrap();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]

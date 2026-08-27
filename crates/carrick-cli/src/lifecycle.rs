@@ -50,10 +50,9 @@
 //! args, config.entrypoint = the override) so the engine re-merges
 //! entrypoint+cmd on relaunch rather than double-applying the image's
 //! entrypoint. `reset_for_relaunch` clears volatile state (status/pids and the
-//! stale `exit_code` and `region_path`) while preserving the overlay path and
-//! the stop config. A relaunch creates a *fresh* carrier + compatibility region
-//! over the *same* overlay, which is why the stale region file is unlinked first (a
-//! reused region keeps dead members).
+//! stale `exit_code`) while preserving the overlay path and the stop config. A
+//! relaunch creates a *fresh* carrier, whose kernel arena and pid-namespace
+//! region are private to it, over the *same* overlay.
 //!
 //! ## Logical `exec` topology
 //!
@@ -443,8 +442,8 @@ fn resolve_name(name: Option<String>, id: &str) -> anyhow::Result<Option<String>
 }
 
 /// Build the `Created` registry entry for a detached run, persisting the full
-/// relaunch inputs into RunConfig. scratch_path/region_path are filled in by the
-/// runtime once the launched child sets up its overlay + region.
+/// relaunch inputs into RunConfig. `scratch_path` is filled in by the runtime
+/// once the launched carrier sets up its overlay.
 fn build_created_state(
     req: &carrick_engine::CliRunRequest,
     id: &str,
@@ -497,7 +496,6 @@ fn build_created_state(
             volumes_from: req.volumes_from.clone(),
             published_ports: req.published_ports.clone(),
             scratch_path: None,
-            region_path: None,
             entrypoint: req.entrypoint_override.clone(),
             mounts: req.mounts.clone(),
             fs: req.fs,
@@ -902,11 +900,6 @@ fn start_one_locked(store: &carrick_image::ImageStore, id: &str) -> anyhow::Resu
     // If a prior run populated the overlay (scratch_path set), attach it (skip
     // re-extraction, preserving the container's writes); otherwise this is the
     // first start and the runtime extracts the rootfs.
-    // A relaunch creates a FRESH carrier + region; unlink the stale region file
-    // so alloc_region maps a clean, seeded one (a reused file keeps dead members).
-    if let Some(region) = &state.config.region_path {
-        let _ = std::fs::remove_file(region);
-    }
     reset_for_relaunch(&mut state);
     container::clear_terminal_receipt(id)?;
     state.persist()?;
@@ -1026,8 +1019,7 @@ fn published_control_for_child(
 
 /// Reset a container's volatile state for a relaunch. The carrier overwrites
 /// status and both compatibility pid fields on takeover but NOT exit_code, so a stale
-/// `Some(code)` would otherwise persist into the new Running entry; region_path
-/// is cleared because the relaunch maps a fresh region.
+/// `Some(code)` would otherwise persist into the new Running entry.
 fn reset_for_relaunch(state: &mut ContainerState) {
     state.status = ContainerStatus::Created;
     state.exit_code = None;
@@ -1036,7 +1028,6 @@ fn reset_for_relaunch(state: &mut ContainerState) {
     state.control = None;
     state.terminal_control = None;
     state.launch_ticket = None;
-    state.config.region_path = None;
 }
 
 fn validate_published_port_availability(config: &RunConfig) -> anyhow::Result<()> {
@@ -2554,7 +2545,6 @@ mod tests {
                 volumes_from: Vec::new(),
                 published_ports: Vec::new(),
                 scratch_path: Some("/s".into()),
-                region_path: Some("/r".into()),
                 entrypoint: Some(vec!["/bin/sh".into(), "-c".into()]),
                 mounts: vec![carrick_spec::Mount {
                     source: "/h".into(),
@@ -3047,7 +3037,6 @@ mod tests {
         assert_eq!(s.exit_code, None); // D5: stale exit code MUST be cleared
         assert_eq!(s.init_pid, 0);
         assert_eq!(s.supervisor_pid, 0);
-        assert_eq!(s.config.region_path, None);
         // The overlay path is preserved (the relaunch reuses it).
         assert_eq!(s.config.scratch_path.as_deref(), Some("/s"));
         // The container's stop config survives a relaunch (docker keeps the
