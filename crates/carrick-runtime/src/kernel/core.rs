@@ -6,6 +6,7 @@ use carrick_hal::{FrameEventCapacity, FrameInventoryReservation, ThreadId};
 use parking_lot::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::address::MmBackend;
+use super::container::{Container, ContainerId};
 use super::frame_inventory::{FrameInventoryAuthority, FrameInventoryReserveError};
 use super::ids::{
     FileTableId, LinuxTid, ObjectIdError, ObjectIdRegistry, ProcessGroupId, SessionId, TaskId,
@@ -86,6 +87,12 @@ impl KernelContext {
 
     pub fn resources(&self) -> &Arc<ThreadResources> {
         &self.resources
+    }
+
+    /// The container the captured task belongs to, read through the task so
+    /// the answer can never be a carrier-wide one.
+    pub fn container(&self) -> Arc<Container> {
+        self.task.container()
     }
 
     pub const fn revision(&self) -> TaskRevision {
@@ -271,6 +278,8 @@ pub struct RootBootstrap {
     registry_id: ThreadId,
     mm_backend: Option<Arc<dyn MmBackend>>,
     diagnostic_name: String,
+    /// The container this kernel boots its root task into.
+    container: Arc<Container>,
 }
 
 impl RootBootstrap {
@@ -299,12 +308,22 @@ impl RootBootstrap {
         mm_backend: Option<Arc<dyn MmBackend>>,
         diagnostic_name: String,
     ) -> Result<Self, KernelError> {
+        // A reference-model kernel boots into the reference-model container.
+        // Product bootstraps override this with `with_container`.
         Ok(Self {
             task_id: TaskId::for_root_bootstrap(observed_pid)?,
             registry_id,
             mm_backend,
             diagnostic_name,
+            container: Arc::new(Container::for_reference_model()),
         })
+    }
+
+    /// Boot the root task inside `container` (the `Arc` `Runtime::execute`
+    /// built from the CLI's `LaunchContext` and installed on the dispatcher).
+    pub fn with_container(mut self, container: Arc<Container>) -> Self {
+        self.container = container;
+        self
     }
 }
 
@@ -334,6 +353,11 @@ pub struct Kernel {
     keyrings: crate::keyring::KeyringService,
     pub(super) debug_aux_provider: Mutex<Option<Weak<dyn super::debug::KernelDebugAuxProvider>>>,
     pub(super) controlling_tty: Mutex<Option<ControllingTtyState>>,
+    /// Every live container on this kernel, by id. The root task's container
+    /// is registered by `bootstrap_root`; later ones by `create_container`.
+    containers: Mutex<BTreeMap<ContainerId, Arc<Container>>>,
+    /// The container the root task was booted into.
+    root_container: Arc<Container>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -820,6 +844,8 @@ impl Kernel {
             id: bootstrap.task_id,
             serial: object_ids.task_serial()?,
         };
+        let container = bootstrap.container;
+        container.publish_pid_root(task_key)?;
         let task = Arc::new(Task::new(
             task_key,
             None,
@@ -827,6 +853,7 @@ impl Kernel {
             session_id,
             Arc::clone(&shared),
             resources.credentials(),
+            Arc::clone(&container),
         ));
         let leader_tid = LinuxTid::for_task_leader(bootstrap.task_id);
         let leader_key = ThreadKey {
@@ -901,9 +928,38 @@ impl Kernel {
             keyrings: crate::keyring::KeyringService::new(),
             debug_aux_provider: Mutex::new(None),
             controlling_tty: Mutex::new(None),
+            containers: Mutex::new(BTreeMap::from([(container.id(), Arc::clone(&container))])),
+            root_container: container,
         });
         let context = KernelContext::capture(kernel.clone(), task, leader, TaskRevision::INITIAL);
         Ok((kernel, context))
+    }
+
+    /// The container the root task was booted into.
+    pub fn root_container(&self) -> &Arc<Container> {
+        &self.root_container
+    }
+
+    pub fn container(&self, id: ContainerId) -> Option<Arc<Container>> {
+        self.containers.lock().get(&id).map(Arc::clone)
+    }
+
+    pub fn container_count(&self) -> usize {
+        self.containers.lock().len()
+    }
+
+    /// Register another container on this kernel. The caller built the
+    /// `Arc` (so the same allocation is what its dispatcher, pid region and
+    /// root bootstrap hold). Phase B1 records identity; B2 hands it a pid
+    /// region and B3 its namespaces and granted caps, at which point a second
+    /// `PreparedRun` boots its init here.
+    pub fn create_container(&self, container: Arc<Container>) -> Result<(), KernelError> {
+        let mut containers = self.containers.lock();
+        if containers.contains_key(&container.id()) {
+            return Err(KernelError::DuplicateContainer(container.id()));
+        }
+        containers.insert(container.id(), container);
+        Ok(())
     }
 
     pub fn register_debug_aux_provider(
@@ -1605,6 +1661,10 @@ pub enum KernelError {
     StaleTaskBinding(TaskId),
     #[error("kernel thread {0:?} is not live")]
     UnknownThread(LinuxTid),
+    #[error("container {0:?} is already registered on this kernel")]
+    DuplicateContainer(ContainerId),
+    #[error("container {0:?} already has an init task")]
+    ContainerRootAlreadyPublished(ContainerId),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -1646,6 +1706,7 @@ mod tests {
     use carrick_abi::LinuxCloneFlags;
 
     use super::*;
+    use crate::kernel::container::{LaunchContext, RunId};
     use crate::kernel::{
         ClonePlan, Credentials, FileTable, FsContext, LinuxWaitStatus, Mm, Sighand,
     };
@@ -1919,5 +1980,62 @@ mod tests {
                 .process_group_prio_targets(unknown_pgid)
                 .is_empty()
         );
+    }
+
+    /// Two containers on ONE kernel. With one container every id in the
+    /// carrier coincides and aliasing is invisible; the second one is what
+    /// makes `ContainerId` a real domain.
+    #[test]
+    fn containers_in_one_kernel_have_distinct_ids() {
+        let (kernel, _context) = bootstrap(4400);
+        let first = Arc::new(Container::new(LaunchContext::unmanaged(RunId::new(
+            "first",
+        ))));
+        let second = Arc::new(Container::new(LaunchContext::unmanaged(RunId::new(
+            "second",
+        ))));
+        kernel
+            .create_container(Arc::clone(&first))
+            .expect("first container");
+        kernel
+            .create_container(Arc::clone(&second))
+            .expect("second container");
+
+        assert_ne!(first.id(), second.id());
+        assert_ne!(first.id(), kernel.root_container().id());
+        assert_ne!(second.id(), kernel.root_container().id());
+        assert_eq!(kernel.container_count(), 3);
+        assert!(Arc::ptr_eq(
+            &kernel.container(first.id()).expect("registered"),
+            &first
+        ));
+        assert!(matches!(
+            kernel.create_container(Arc::clone(&first)),
+            Err(KernelError::DuplicateContainer(id)) if id == first.id()
+        ));
+    }
+
+    /// A captured syscall context reaches its container THROUGH its task —
+    /// there is no static to consult, so a second container cannot alias it.
+    #[test]
+    fn kernel_context_resolves_its_own_container() {
+        let container = Arc::new(Container::new(LaunchContext::unmanaged(RunId::new(
+            "root-run",
+        ))));
+        let bootstrap = RootBootstrap::for_reference_model(
+            4401,
+            ThreadId::synthetic_for_tests(4401),
+            "root".to_string(),
+        )
+        .expect("root bootstrap input")
+        .with_container(Arc::clone(&container));
+        let (kernel, context) = Kernel::bootstrap_root(bootstrap).expect("root kernel");
+
+        let resolved = context.container();
+        assert!(Arc::ptr_eq(&resolved, kernel.root_container()));
+        assert!(Arc::ptr_eq(&resolved, &container));
+        assert_eq!(resolved.run_id().as_str(), "root-run");
+        assert_eq!(resolved.pid_root(), Some(context.task().key()));
+        assert_eq!(kernel.container_count(), 1);
     }
 }

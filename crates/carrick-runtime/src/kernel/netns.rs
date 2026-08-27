@@ -27,6 +27,8 @@
 
 use std::sync::{Arc, OnceLock};
 
+use super::container::Container;
+
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 
@@ -145,9 +147,30 @@ impl UtsNs {
 pub(crate) struct NsProxy {
     net: Arc<NetNs>,
     uts: Arc<UtsNs>,
+    /// The container this task is a member of — the slot Linux's `nsproxy`
+    /// reserves for `pid_ns_for_children`/`mnt_ns`, generalized to the
+    /// kernel-graph object that owns this task's pid-namespace root, rootfs,
+    /// clock domain and run identity. Reached only through the task: there is
+    /// no static naming "the" container, because a carrier may hold several.
+    container: Arc<Container>,
 }
 
 impl NsProxy {
+    /// The proxy a fresh task holds: the ROOT network and UTS namespaces (what
+    /// Linux gives everything descended from init) as a member of `container`.
+    ///
+    /// Phase B1 still takes the root net/UTS objects from the carrier-wide
+    /// cells below; B3 (Tasks 20–21) moves them onto the container
+    /// (`Container::{uts_ns, net_ns}`) and deletes the cells, so this becomes
+    /// a pure read of `container`.
+    pub(crate) fn for_container(container: Arc<Container>) -> Self {
+        Self {
+            net: Arc::clone(root_net_ns()),
+            uts: Arc::clone(root_uts_ns()),
+            container,
+        }
+    }
+
     pub(crate) fn net(&self) -> &Arc<NetNs> {
         &self.net
     }
@@ -156,12 +179,17 @@ impl NsProxy {
         &self.uts
     }
 
+    pub(crate) fn container(&self) -> &Arc<Container> {
+        &self.container
+    }
+
     /// The proxy a task holds after moving into `uts`, keeping every other
     /// namespace it was already in.
     pub(crate) fn entering_uts(&self, uts: Arc<UtsNs>) -> Self {
         Self {
             net: Arc::clone(&self.net),
             uts,
+            container: Arc::clone(&self.container),
         }
     }
 
@@ -171,18 +199,7 @@ impl NsProxy {
         Self {
             net,
             uts: Arc::clone(&self.uts),
-        }
-    }
-}
-
-impl Default for NsProxy {
-    /// A fresh task starts in the ROOT namespaces, which is what Linux does for
-    /// everything descended from init and what carrick needs for the root task —
-    /// it is created before the run spec has been applied.
-    fn default() -> Self {
-        Self {
-            net: Arc::clone(root_net_ns()),
-            uts: Arc::clone(root_uts_ns()),
+            container: Arc::clone(&self.container),
         }
     }
 }

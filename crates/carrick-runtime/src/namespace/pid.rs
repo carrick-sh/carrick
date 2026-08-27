@@ -99,22 +99,6 @@ pub fn alloc_region() -> bool {
     activate_global_arena()
 }
 
-/// Attach an EXISTING file-backed arena (for `carrick exec`) as a new member.
-/// Does NOT seed the pid allocator — the arena already holds the container's
-/// live state. Returns `false` on any failure (the caller must not run outside
-/// the namespace).
-pub fn attach_region(path: &std::path::Path) -> bool {
-    if !REGION.load(Ordering::Acquire).is_null() {
-        return true;
-    }
-    // SAFETY: exec join happens in the single-threaded CLI/runtime setup before
-    // guest threads or forks; it tells the arena singleton to attach this file.
-    unsafe {
-        std::env::set_var(ARENA_PATH_ENV, path);
-    }
-    activate_global_arena()
-}
-
 fn activate_global_arena() -> bool {
     let section = &KernelArena::init_global().layout().processes;
     REGION.store(std::ptr::from_ref(section).cast_mut(), Ordering::Release);
@@ -599,21 +583,6 @@ pub fn is_execed_child_of_current(target_ns_pid: u32) -> bool {
         return false;
     };
     r.is_execed_child_of(target_host_pid, std::process::id())
-}
-
-/// `carrick exec`: attach the running container's file-backed region and join it
-/// as a new member — a fresh ns-pid, parented OUTSIDE the namespace (the
-/// `carrick exec` CLI, so the exec'd guest's ns-ppid is 0, matching docker exec).
-/// Enables pid translation while the original VM carrier remains namespace
-/// init. Returns `false` if the region cannot be mapped — the caller must then
-/// refuse to run, rather than silently execute outside the namespace.
-pub fn join_existing(path: &std::path::Path) -> bool {
-    if !attach_region(path) {
-        return false;
-    }
-    REQUESTED.store(true, Ordering::Relaxed);
-    register_child(std::process::id(), 0);
-    true
 }
 
 impl NsSharedRegion {

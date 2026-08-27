@@ -2727,6 +2727,12 @@ pub struct SyscallDispatcher {
     /// context at each backend dispatch boundary. HVPatch replaces the initial
     /// one-task binding when its root/child task is published.
     kernel_binding: RwLock<crate::kernel::KernelTaskBinding>,
+    /// The container `Runtime::execute` built for this run (the same `Arc`
+    /// B2 hands a pid region and B4 admits/retires), handed to the HVPatch
+    /// root bootstrap so the root task is created inside it. `None` until
+    /// execute installs it; C2 Task 28 (`Runtime::prepare`) makes it
+    /// mandatory.
+    container: RwLock<Option<Arc<crate::kernel::Container>>>,
     /// Process-scoped timer delivery for lanes that multiplex multiple Linux
     /// processes inside one host process. HVPatch binds an exact-task delivery
     /// here; VMM/native leave it empty and use their established run-global
@@ -4452,6 +4458,7 @@ impl SyscallDispatcher {
         let child_binding = DispatchMmBinding::new(prepared_mm.child_mm);
         let child_dispatcher = Self {
             kernel_binding: RwLock::new(self.kernel_binding.read().clone()),
+            container: RwLock::new(self.container.read().clone()),
             timer_delivery: RwLock::new(None),
             file_authority: RwLock::new(self.file_authority.read().clone()),
             io: self.io.fork_clone(),
@@ -4664,6 +4671,7 @@ impl SyscallDispatcher {
         let mm_authority = Arc::new(DispatchMmAuthority::new());
         Self {
             kernel_binding: RwLock::new(bootstrap_one_task_binding()),
+            container: RwLock::new(None),
             timer_delivery: RwLock::new(None),
             file_authority: RwLock::new(None),
             io: fs::RuntimeIo::new(),
@@ -4896,6 +4904,32 @@ impl SyscallDispatcher {
         }
         dispatcher.network = network;
         dispatcher
+    }
+
+    /// Install the container the root bootstrap boots into.
+    pub fn set_container(&self, container: Arc<crate::kernel::Container>) {
+        *self.container.write() = Some(container);
+    }
+
+    /// The container installed by `Runtime::execute`, if any. The HVPatch
+    /// root bootstrap uses this to decide whether to fall back to the process
+    /// environment (`run-elf`, in-crate fixtures).
+    pub(crate) fn installed_container(&self) -> Option<Arc<crate::kernel::Container>> {
+        self.container.read().clone()
+    }
+
+    /// The container this dispatcher serves. Every product entry installs
+    /// one before the first syscall; a dispatcher that reaches this without
+    /// one (a bare in-crate fixture) is given the reference-model container
+    /// so callers never see a carrier-wide answer.
+    pub fn container(&self) -> Arc<crate::kernel::Container> {
+        if let Some(container) = self.installed_container() {
+            return container;
+        }
+        let mut slot = self.container.write();
+        Arc::clone(
+            slot.get_or_insert_with(|| Arc::new(crate::kernel::Container::for_reference_model())),
+        )
     }
 
     pub fn set_host_resolver_snapshot(&mut self, snapshot: &crate::vfs::HostResolverSnapshot) {

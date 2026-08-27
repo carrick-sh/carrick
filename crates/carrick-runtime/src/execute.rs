@@ -15,6 +15,7 @@ use anyhow::{Context, Result};
 use carrick_spec::{FsBackendKind, NetworkNamespaceSpec, PidMode, Platform, RunSpec};
 use std::borrow::Cow;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// True when a runtime error means the ENTRYPOINT executable (or its loader)
 /// could not be found/read. The runc/shell convention is to exit 127 for that —
@@ -78,13 +79,10 @@ fn entrypoint_not_executable_result() -> RunResult {
 /// `carrick exec` can attach the same filesystem. `None` for a foreground run
 /// (which uses an ephemeral per-run scratch). Best-effort registry write — a
 /// failure just means `exec` can't find the overlay later, not a run failure.
-fn detached_stable_scratch() -> Option<PathBuf> {
-    let id = std::env::var("CARRICK_CONTAINER_ID").ok()?;
-    if !crate::container::is_safe_id(&id) {
-        return None;
-    }
-    let scratch = crate::container::container_dir(&id).join("scratch");
-    if let Ok(mut state) = crate::container::ContainerState::load(&id) {
+fn detached_stable_scratch(registry_id: Option<&str>) -> Option<PathBuf> {
+    let id = registry_id?;
+    let scratch = crate::container::container_dir(id).join("scratch");
+    if let Ok(mut state) = crate::container::ContainerState::load(id) {
         state.config.scratch_path = Some(scratch.to_string_lossy().into_owned());
         let _ = state.persist();
     }
@@ -189,6 +187,14 @@ pub struct Runtime;
 
 impl Runtime {
     pub fn execute(spec: &RunSpec) -> Result<RunResult, RuntimeError> {
+        // The run's identity, read from the process environment ONCE, here,
+        // and carried as a typed value from now on. C2 Task 28 moves this
+        // read to the CLI and passes the context into `Runtime::prepare`.
+        // The container is built BEFORE the dispatcher so that B2's
+        // `install_pid_ns`, B4's `admit_container`/`retire_container` and the
+        // dispatcher all hold the one `Arc`.
+        let launch = crate::kernel::LaunchContext::from_process_env()?;
+        let container = Arc::new(crate::kernel::Container::new(launch));
         if spec.platform == Platform::Amd64 {
             rosetta_license_notice();
         }
@@ -210,19 +216,7 @@ impl Runtime {
         // mode never creates a host namespace-supervisor process.
         match spec.pid {
             PidMode::Host => {} // share the host pid ns — no placement.
-            PidMode::Private => {
-                if let Ok(region) = std::env::var("CARRICK_JOIN_REGION") {
-                    // `carrick exec`: join the running container's namespace as a
-                    // member — do NOT fork our own supervisor (it already has one).
-                    if !crate::namespace::pid::join_existing(std::path::Path::new(&region)) {
-                        return Err(RuntimeError::FsBackend(anyhow::anyhow!(
-                            "failed to join container namespace at {region}"
-                        )));
-                    }
-                } else {
-                    crate::namespace::pid::request();
-                }
-            }
+            PidMode::Private => crate::namespace::pid::request(),
         }
         // Name the host process `carrick: <argv>` up front so
         // it's identifiable in ps/Activity Monitor even before the
@@ -252,14 +246,16 @@ impl Runtime {
                 // skips extraction. A DETACHED container gets a STABLE overlay
                 // under its registry dir (persisted + shared with `exec`, cleaned
                 // up by `rm`); a foreground run gets an ephemeral per-run TempDir.
-                let exec_overlay = std::env::var("CARRICK_EXEC_OVERLAY").ok();
-                let mut host = if let Some(scratch) = &exec_overlay {
-                    HostFsBackend::attach(std::path::Path::new(scratch)).map_err(|e| {
+                let exec_overlay = container.launch().exec_overlay.as_deref();
+                let mut host = if let Some(scratch) = exec_overlay {
+                    HostFsBackend::attach(scratch.as_std_path()).map_err(|e| {
                         RuntimeError::FsBackend(anyhow::anyhow!(
                             "failed to attach container overlay {scratch}: {e}"
                         ))
                     })?
-                } else if let Some(scratch) = detached_stable_scratch() {
+                } else if let Some(scratch) =
+                    detached_stable_scratch(container.launch().registry_id())
+                {
                     HostFsBackend::attach_or_create(&scratch).map_err(|e| {
                         RuntimeError::FsBackend(anyhow::anyhow!(
                             "failed to create container overlay: {}",
@@ -310,6 +306,7 @@ impl Runtime {
                     runtime_network.clone(),
                     host_resolver_snapshot.as_ref(),
                 );
+                dispatcher.set_container(Arc::clone(&container));
                 if let HostRootLayout::CachedLower(rootfs) = root_layout {
                     dispatcher.set_rootfs_layer(rootfs);
                 }
@@ -415,6 +412,7 @@ impl Runtime {
                     rootfs.clone(),
                     spec.executable.clone(),
                 );
+                dispatcher.set_container(Arc::clone(&container));
                 if let Some(snapshot) = host_resolver_snapshot.as_ref() {
                     dispatcher.set_host_resolver_snapshot(snapshot);
                 }
