@@ -131,14 +131,18 @@ pub fn repo_root() -> PathBuf {
 
 /// Unwrap a container run, converting `EmbedError::Entitlement` into a loud failure.
 pub fn run_or_fail<T>(outcome: Result<T, EmbedError>) -> T {
+    run_named_or_fail("container", outcome)
+}
+
+pub fn run_named_or_fail<T>(case: &str, outcome: Result<T, EmbedError>) -> T {
     match outcome {
         Ok(result) => result,
         Err(EmbedError::Entitlement) => panic!(
-            "HV_DENIED (0xfae94007): this test executable lacks \
+            "{case}: HV_DENIED (0xfae94007): this test executable lacks \
              com.apple.security.hypervisor. Run it through `just test-conformance-next` \
              or `scripts/test-signed.sh carrick-conformance-next`."
         ),
-        Err(err) => panic!("container run failed: {err}"),
+        Err(err) => panic!("{case}: container run failed: {err}"),
     }
 }
 

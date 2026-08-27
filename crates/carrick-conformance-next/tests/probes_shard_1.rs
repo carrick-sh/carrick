@@ -528,9 +528,11 @@ fn generic_probe_shard_1() {
                 container = container.security_opt("seccomp=unconfined");
             }
 
-            let result = common::with_empty_stdin_pipe(|| {
-                common::run_or_fail(container.run(["/tmp/carrick-init"]))
-            });
+            let outcome = common::with_empty_stdin_pipe(|| container.run(["/tmp/carrick-init"]));
+            let result = common::run_named_or_fail(
+                &format!("generic probe shard 1 {target}:{probe_name}"),
+                outcome,
+            );
             let mut combined = String::from_utf8_lossy(&result.stdout).into_owned();
             combined.push_str(&String::from_utf8_lossy(&result.stderr));
             let actual = normalize(&combined);
