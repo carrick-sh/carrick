@@ -488,12 +488,10 @@ unsafe fn test_archive_meta_matrix(base: &str) {
     let r_dir_link = libc::linkat(AT_FDCWD, c_dir.as_ptr(), AT_FDCWD, dummy_link.as_ptr(), 0);
     report!(linkat_directory_eperm = r_dir_link == -1 && errno() == libc::EPERM);
 
-    // 4.4 fchmodat with AT_SYMLINK_NOFOLLOW -> EOPNOTSUPP / ENOTSUP on Linux
+    // 4.4 fchmodat with AT_SYMLINK_NOFOLLOW -> EOPNOTSUPP on Linux
     let r_chmod_sym = libc::fchmodat(AT_FDCWD, c_symlink.as_ptr(), 0o644, AT_SYMLINK_NOFOLLOW);
-    let chmod_err = errno();
     report!(
-        fchmodat_symlink_nofollow_eopnotsupp =
-            r_chmod_sym == -1 && (chmod_err == libc::EOPNOTSUPP || chmod_err == libc::ENOTSUP)
+        fchmodat_symlink_nofollow_eopnotsupp = r_chmod_sym == -1 && errno() == libc::EOPNOTSUPP
     );
 
     // 4.5 utimensat with UTIME_NOW and UTIME_OMIT combinations
