@@ -920,6 +920,14 @@ pub(super) enum OpenDescription {
         contents: Vec<u8>,
         offset: usize,
     },
+    InMemoryFile {
+        base: OpenDescriptionBase,
+        path: String,
+        contents: Arc<parking_lot::RwLock<Vec<u8>>>,
+        offset: usize,
+        writable: bool,
+        max_size: usize,
+    },
     SyntheticDevice {
         base: OpenDescriptionBase,
         kind: crate::vfs::SyntheticDeviceKind,
@@ -1233,6 +1241,7 @@ impl OpenDescription {
         match self {
             Self::Closed { .. } => "closed",
             Self::File { .. } => "file",
+            Self::InMemoryFile { .. } => "in_memory_file",
             Self::Directory { .. } => "directory",
             Self::SyntheticFile { .. } => "synthetic_file",
             Self::SyntheticDevice { .. } => "synthetic_device",
@@ -1264,7 +1273,8 @@ impl OpenDescription {
         match self {
             OpenDescription::File { path, .. }
             | OpenDescription::Directory { path, .. }
-            | OpenDescription::SyntheticFile { path, .. } => Some(path.as_str()),
+            | OpenDescription::SyntheticFile { path, .. }
+            | OpenDescription::InMemoryFile { path, .. } => Some(path.as_str()),
             OpenDescription::SyntheticDevice { kind, .. } => Some(kind.as_str()),
             // A host-fd-backed regular file (e.g. `--fs host`) carries the guest
             // path it was opened at in its metadata — surface it so
@@ -1289,6 +1299,7 @@ impl OpenDescription {
             OpenDescription::File { .. }
             | OpenDescription::Directory { .. }
             | OpenDescription::SyntheticFile { .. }
+            | OpenDescription::InMemoryFile { .. }
             | OpenDescription::SyntheticDevice { .. }
             | OpenDescription::HostFile { .. } => return None,
             OpenDescription::EventFd { .. } => "anon_inode:[eventfd]".to_owned(),
@@ -1351,7 +1362,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
         let description = self.try_read_until(deadline)?;
         let kind = match &*description {
             OpenDescription::Closed { .. } => Kind::Closed,
-            OpenDescription::File { .. } => Kind::File,
+            OpenDescription::File { .. } | OpenDescription::InMemoryFile { .. } => Kind::File,
             OpenDescription::Directory { .. } => Kind::Directory,
             OpenDescription::SyntheticFile { .. } => Kind::SyntheticFile,
             OpenDescription::SyntheticDevice { .. } => Kind::SyntheticDevice,
@@ -1379,7 +1390,8 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
         let offset = match &*description {
             OpenDescription::File { offset, .. }
             | OpenDescription::Directory { offset, .. }
-            | OpenDescription::SyntheticFile { offset, .. } => u64::try_from(*offset).ok(),
+            | OpenDescription::SyntheticFile { offset, .. }
+            | OpenDescription::InMemoryFile { offset, .. } => u64::try_from(*offset).ok(),
             OpenDescription::HostFile { host_fd, .. } => super::fs::host_fd_offset(host_fd.view()),
             _ => None,
         };
@@ -1392,7 +1404,8 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
         let path = match &*description {
             OpenDescription::File { path, .. }
             | OpenDescription::Directory { path, .. }
-            | OpenDescription::SyntheticFile { path, .. } => Some(path.clone()),
+            | OpenDescription::SyntheticFile { path, .. }
+            | OpenDescription::InMemoryFile { path, .. } => Some(path.clone()),
             OpenDescription::SyntheticDevice { kind, .. } => Some(kind.as_str().to_string()),
             OpenDescription::HostFile { metadata, .. } => {
                 Some(metadata.path.to_string_lossy().into_owned())
@@ -1727,6 +1740,7 @@ impl OpenDescription {
             OpenDescription::File { base, .. }
             | OpenDescription::Directory { base, .. }
             | OpenDescription::SyntheticFile { base, .. }
+            | OpenDescription::InMemoryFile { base, .. }
             | OpenDescription::SyntheticDevice { base, .. }
             | OpenDescription::EventFd { base, .. }
             | OpenDescription::TimerFd { base, .. }
@@ -1758,6 +1772,7 @@ impl OpenDescription {
             OpenDescription::File { base, .. }
             | OpenDescription::Directory { base, .. }
             | OpenDescription::SyntheticFile { base, .. }
+            | OpenDescription::InMemoryFile { base, .. }
             | OpenDescription::SyntheticDevice { base, .. }
             | OpenDescription::EventFd { base, .. }
             | OpenDescription::TimerFd { base, .. }
@@ -1935,6 +1950,10 @@ impl OpenDescription {
                     record.ino = ino;
                 }
                 OpenStatSource::Record(record)
+            }
+            OpenDescription::InMemoryFile { path, contents, .. } => {
+                let len = contents.read().len();
+                OpenStatSource::Record(StatRecord::synthetic(path, len, LINUX_S_IFREG | 0o644))
             }
             OpenDescription::SyntheticDevice { kind, .. } => {
                 let mut record = StatRecord::synthetic(kind.as_str(), 0, LINUX_S_IFCHR | 0o666);

@@ -75,6 +75,11 @@ impl SyscallDispatcher {
         if path == "/" || path.is_empty() {
             return true;
         }
+        if let Some(m) = self.fs.vfs_mounts.resolve(path)
+            && let Ok(md) = m.vfs.lookup(&m.full_path)
+        {
+            return md.kind == crate::vfs::EntryKind::Directory;
+        }
         match self.fs.rootfs_vfs.overlay.lookup(path) {
             Some(OverlayEntry::Dir) => return true,
             Some(OverlayEntry::Deleted) | Some(OverlayEntry::File(_)) => return false,
