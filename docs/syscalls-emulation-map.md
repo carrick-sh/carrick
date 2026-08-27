@@ -14,7 +14,7 @@ table `AARCH64_SYSCALLS` in
 every assigned aarch64 number `0..=462` is listed (gaps `244..=259`,
 `295..=402`, `415` are unassigned on aarch64 and intentionally absent), so
 `lookup_aarch64()` can name *any* syscall a guest issues. The table is the input
-to the `compat-report` reporter and to the per-syscall handler grouping.
+to the `CompatReporter` behind `carrick run --json` and to the per-syscall handler grouping.
 
 ## Support levels → quality
 
@@ -333,11 +333,11 @@ remaining unassigned/reserved numbers.
   ```
 
 - To see what a *specific workload* actually exercises (and which calls fell
-  through to `ENOSYS`), run the compat reporter, which aggregates the USDT
-  probes at the dispatch boundary:
+  through to `ENOSYS`), run it with the JSON envelope, which aggregates the
+  USDT probes at the dispatch boundary:
 
   ```sh
-  carrick compat-report -- /path/to/guest-binary args…
+  carrick run --json <image> /path/to/guest-binary args…
   ```
 
 > [!IMPORTANT]

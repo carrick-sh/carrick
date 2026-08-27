@@ -1208,18 +1208,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             workdir,
             env,
         )?,
-        #[cfg(feature = "platform-macos")]
-        Commands::CompatReport { format, command } => {
-            if command.is_empty() {
-                bail!("compat-report needs a command after --");
-            }
-            tracing::warn!(
-                "compat-report runtime hooks are scaffolded; returning an empty report for {:?}",
-                command
-            );
-            let report = CompatReporter::default().finish();
-            println!("{}", report.render(format)?);
-        }
         Commands::DispatchSyscall {
             number,
             args,

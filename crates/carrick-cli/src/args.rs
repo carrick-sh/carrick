@@ -32,10 +32,6 @@
 
 use std::path::PathBuf;
 
-// `compat-report --format` uses the HVF report renderer (`CompatReportFormat`),
-// which is macOS-only; the subcommand is gated off on platform-linux.
-#[cfg(feature = "platform-macos")]
-use carrick_runtime::compat::CompatReportFormat;
 use carrick_runtime::runtime::DEFAULT_MAX_TRAPS;
 use carrick_spec::{ExecBackendRequest, FsBackendKind, PidMode};
 use clap::{Parser, Subcommand};
@@ -738,17 +734,6 @@ pub(crate) enum Commands {
         /// Container id or name.
         container: String,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
-        command: Vec<String>,
-    },
-    /// `compat-report` renders the HVF syscall-coverage report; macOS-only.
-    #[cfg(feature = "platform-macos")]
-    CompatReport {
-        // `CompatReportFormat` parses via `FromStr`/`Display` (not a clap
-        // `ValueEnum` derive) so its home crate carrick-observability does not
-        // pull `clap` into every backend's compile closure.
-        #[arg(long, default_value_t = CompatReportFormat::Json)]
-        format: CompatReportFormat,
-        #[arg(last = true)]
         command: Vec<String>,
     },
     DispatchSyscall {
