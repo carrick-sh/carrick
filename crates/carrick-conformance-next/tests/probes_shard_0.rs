@@ -562,6 +562,22 @@ fn test_cache_freshness_and_hashing() {
 }
 
 #[test]
+fn test_shard_0_cached_oracles_are_complete() {
+    let repo_root = common::repo_root();
+    for libc in ["musl", "gnu"] {
+        for probe in SHARD_0_PROBES
+            .iter()
+            .copied()
+            .filter(|name| !common::needs_live_oracle(name))
+        {
+            cached_probe_oracle(&repo_root, "arm64", libc, probe).unwrap_or_else(|error| {
+                panic!("arm64-{libc}/{probe} must have a fresh committed oracle: {error}")
+            });
+        }
+    }
+}
+
+#[test]
 fn test_probe_binary_locator_and_gap_counts() {
     let repo_root = common::repo_root();
 
