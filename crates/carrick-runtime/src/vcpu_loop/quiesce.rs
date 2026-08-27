@@ -1052,7 +1052,7 @@ where
             }
         };
         if external_exec.is_some() {
-            child_dispatcher.set_stream_stdio(false);
+            child_dispatcher.set_stdio_sink(crate::dispatch::StdioSink::Captured);
             child_dispatcher.enable_external_exec_capture();
         }
         let child_exit_signal = i32::try_from(request.exit_signal)

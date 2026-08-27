@@ -112,7 +112,7 @@ impl RuntimeExtensions {
         self
     }
 
-    /// The caller-owned sink for a `StdioMode::Piped` run (Task 22). For
+    /// The caller-owned sink for a `StdioMode::Piped` run. For
     /// `Inherit`/`Captured` the `RunSpec::stdio` mode alone is authoritative
     /// and supplying a sink here is a `RuntimeError::Configuration` (see
     /// `resolve_stdio`) — never a silent override of the spec.
@@ -135,8 +135,9 @@ fn resolve_stdio(spec: &RunSpec, ext: Option<StdioSink>) -> Result<StdioSink, Ru
     match (spec.stdio, ext) {
         (StdioMode::Inherit, None) => Ok(StdioSink::Inherit),
         (StdioMode::Captured, None) => Ok(StdioSink::Captured),
+        (StdioMode::Piped, Some(sink @ StdioSink::Piped { .. })) => Ok(sink),
         (StdioMode::Piped, _) => Err(RuntimeError::Configuration(
-            "StdioMode::Piped: the dispatcher has no caller-owned sink; use Inherit or Captured"
+            "StdioMode::Piped requires RuntimeExtensions::stdio(StdioSink::Piped { .. })"
                 .to_owned(),
         )),
         (mode, Some(_)) => Err(RuntimeError::Configuration(format!(
@@ -394,7 +395,7 @@ impl Runtime {
         for (target, vfs) in vfs_mounts {
             dispatcher.register_mount(PathBuf::from(target.as_std_path()), vfs);
         }
-        dispatcher.set_stream_stdio(matches!(sink, StdioSink::Inherit));
+        dispatcher.set_stdio_sink(sink);
         let interactive_session = if spec.tty {
             Some(InteractiveSession::start(&mut dispatcher).map_err(|e| {
                 RuntimeError::FsBackend(anyhow::anyhow!(
@@ -589,6 +590,25 @@ mod tests {
         assert!(matches!(
             resolve_stdio(&spec, Some(StdioSink::Captured)),
             Err(RuntimeError::Configuration(_))
+        ));
+        spec.stdio = StdioMode::Piped;
+        assert!(matches!(
+            resolve_stdio(&spec, None),
+            Err(RuntimeError::Configuration(_))
+        ));
+        assert!(matches!(
+            resolve_stdio(&spec, Some(StdioSink::Captured)),
+            Err(RuntimeError::Configuration(_))
+        ));
+        assert!(matches!(
+            resolve_stdio(
+                &spec,
+                Some(StdioSink::Piped {
+                    stdout: Box::new(std::io::sink()),
+                    stderr: Box::new(std::io::sink()),
+                })
+            ),
+            Ok(StdioSink::Piped { .. })
         ));
         spec.tty = true;
         spec.stdio = StdioMode::Captured;

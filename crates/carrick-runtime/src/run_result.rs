@@ -69,10 +69,11 @@ impl From<carrick_dsr::native_error::NativeMemoryError> for RuntimeError {
     }
 }
 
-/// What a finished guest run produced. The dispatcher buffers the guest's
-/// stdout/stderr (fd 1/2); the driver flushes them to the host after the loop
-/// returns. `report` / `trap_limit_hit` are the macOS compat-reporting fields;
-/// the KVM loop fills `report` from its (stub) reporter and leaves
+/// What a finished guest run produced. `stdout`/`stderr` hold the guest's fd
+/// 1/2 bytes ONLY for a `StdioSink::Captured` run; under `Inherit` they went
+/// to the carrier's own fds and under `Piped` to the caller's writers, so both
+/// are empty here. `report` / `trap_limit_hit` are the macOS compat-reporting
+/// fields; the KVM loop fills `report` from its (stub) reporter and leaves
 /// `trap_limit_hit` false (it surfaces the limit as `RuntimeError` instead).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RunResult {

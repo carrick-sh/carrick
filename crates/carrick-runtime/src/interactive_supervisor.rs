@@ -54,7 +54,7 @@ impl InteractiveSession {
                 return Err(io::Error::last_os_error());
             }
         }
-        dispatcher.set_stream_stdio(true);
+        dispatcher.set_stdio_sink(crate::dispatch::StdioSink::Inherit);
         dispatcher.register_controlling_pty(slave_name);
         setup.committed = true;
         Ok(Self {
