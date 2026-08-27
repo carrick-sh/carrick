@@ -1458,14 +1458,6 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
         ))
     }
 
-    fn epoll_wake_fd(&self) -> Option<i32> {
-        let description = self.read();
-        match &*description {
-            OpenDescription::Epoll { kqueue, .. } => Some(kqueue.wake_fd),
-            _ => None,
-        }
-    }
-
     fn retain_fd_ref(&self) {
         let description = self.read();
         description.retain_fd_ref();
