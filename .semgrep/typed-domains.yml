@@ -257,3 +257,29 @@ rules:
         - "**/*_test.rs"
         - "**/test_*.rs"
         - "crates/carrick-abi/**"
+
+  # Forbid raw SYS_* / LINUX_* integer constant declarations outside carrick-abi.
+  - id: carrick-no-private-abi-constants
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "crates/carrick-runtime/src/observe/**/*.rs"
+        - "crates/carrick-embed/**/*.rs"
+      exclude:
+        - "**/tests/**"
+        - "**/*_test.rs"
+        - "**/test_*.rs"
+        - "**/tests.rs"
+    patterns:
+      - pattern-either:
+          - pattern: "const $NAME: $TY = $VAL;"
+      - metavariable-regex:
+          metavariable: $NAME
+          regex: '^(SYS_|LINUX_).*'
+    message: |
+      ABI constants and syscall numbers live in carrick-abi. Do not declare
+      private const SYS_* or LINUX_* constants outside of carrick-abi. Look up
+      syscalls by name or use the typed constants provided by carrick-abi.
+
+

@@ -9,6 +9,10 @@ use crate::dispatch::Signal;
 use carrick_abi::{CanonicalNr, LinuxErrno};
 use std::sync::Arc;
 
+fn syscall_nr(name: &'static str) -> Option<CanonicalNr> {
+    carrick_abi::syscall::lookup_aarch64_by_name(name).map(|entry| CanonicalNr(entry.number))
+}
+
 /// High-level preset security profiles composed by [`SandboxObserver`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxPreset {
@@ -25,73 +29,43 @@ impl SandboxPreset {
     pub fn apply_to(&self, policy: &mut PolicyObserver) {
         match self {
             Self::NoNetwork => {
-                // Deny socket operations
-                const SYS_SOCKET: u64 = 198;
-                const SYS_SOCKETPAIR: u64 = 199;
-                const SYS_BIND: u64 = 200;
-                const SYS_LISTEN: u64 = 201;
-                const SYS_ACCEPT: u64 = 202;
-                const SYS_CONNECT: u64 = 203;
-                const SYS_SENDTO: u64 = 206;
-                const SYS_RECVFROM: u64 = 207;
-                const SYS_ACCEPT4: u64 = 242;
-
-                for nr in [
-                    SYS_SOCKET,
-                    SYS_SOCKETPAIR,
-                    SYS_BIND,
-                    SYS_LISTEN,
-                    SYS_ACCEPT,
-                    SYS_CONNECT,
-                    SYS_SENDTO,
-                    SYS_RECVFROM,
-                    SYS_ACCEPT4,
+                for name in [
+                    "socket",
+                    "socketpair",
+                    "bind",
+                    "listen",
+                    "accept",
+                    "connect",
+                    "sendto",
+                    "recvfrom",
+                    "accept4",
                 ] {
-                    policy.add_rule(PolicyRule::deny(CanonicalNr(nr), carrick_abi::LINUX_EPERM));
+                    if let Some(nr) = syscall_nr(name) {
+                        policy.add_rule(PolicyRule::deny(nr, carrick_abi::LINUX_EPERM));
+                    }
                 }
             }
             Self::ReadOnlyFs => {
-                // Deny mutating FS operations
-                const SYS_MKDIRAT: u64 = 34;
-                const SYS_UNLINKAT: u64 = 35;
-                const SYS_RENAMEAT: u64 = 38;
-                const SYS_TRUNCATE: u64 = 45;
-                const SYS_FTRUNCATE: u64 = 46;
-                const SYS_FCHMODAT: u64 = 53;
-                const SYS_FCHOWNAT: u64 = 54;
-                const SYS_RENAMEAT2: u64 = 276;
-
-                for nr in [
-                    SYS_MKDIRAT,
-                    SYS_UNLINKAT,
-                    SYS_RENAMEAT,
-                    SYS_TRUNCATE,
-                    SYS_FTRUNCATE,
-                    SYS_FCHMODAT,
-                    SYS_FCHOWNAT,
-                    SYS_RENAMEAT2,
+                for name in [
+                    "mkdirat",
+                    "unlinkat",
+                    "renameat",
+                    "truncate",
+                    "ftruncate",
+                    "fchmodat",
+                    "fchownat",
+                    "renameat2",
                 ] {
-                    policy.add_rule(PolicyRule::deny(CanonicalNr(nr), carrick_abi::LINUX_EROFS));
+                    if let Some(nr) = syscall_nr(name) {
+                        policy.add_rule(PolicyRule::deny(nr, carrick_abi::LINUX_EROFS));
+                    }
                 }
             }
             Self::NoNewProcesses => {
-                // Deny process spawning and namespace changes
-                const SYS_UNSHARE: u64 = 97;
-                const SYS_CLONE: u64 = 220;
-                const SYS_EXECVE: u64 = 221;
-                const SYS_SETNS: u64 = 268;
-                const SYS_EXECVEAT: u64 = 281;
-                const SYS_CLONE3: u64 = 435;
-
-                for nr in [
-                    SYS_UNSHARE,
-                    SYS_CLONE,
-                    SYS_EXECVE,
-                    SYS_SETNS,
-                    SYS_EXECVEAT,
-                    SYS_CLONE3,
-                ] {
-                    policy.add_rule(PolicyRule::deny(CanonicalNr(nr), carrick_abi::LINUX_EPERM));
+                for name in ["unshare", "clone", "execve", "setns", "execveat", "clone3"] {
+                    if let Some(nr) = syscall_nr(name) {
+                        policy.add_rule(PolicyRule::deny(nr, carrick_abi::LINUX_EPERM));
+                    }
                 }
             }
         }
@@ -103,7 +77,7 @@ impl SandboxPreset {
 pub struct SandboxObserver {
     policy: PolicyObserver,
     sub_observers: Vec<Arc<dyn SyscallObserver>>,
-    fast_path_visibility: FastPathVisibility,
+    blind_spot_accepted: bool,
 }
 
 impl SandboxObserver {
@@ -111,7 +85,7 @@ impl SandboxObserver {
         Self {
             policy: PolicyObserver::new(),
             sub_observers: Vec::new(),
-            fast_path_visibility: FastPathVisibility::Blind,
+            blind_spot_accepted: false,
         }
     }
 
@@ -132,9 +106,6 @@ impl SandboxObserver {
     }
 
     pub fn add_observer(&mut self, observer: Arc<dyn SyscallObserver>) -> &mut Self {
-        if observer.wants_fast_path_visibility() == FastPathVisibility::Required {
-            self.fast_path_visibility = FastPathVisibility::Required;
-        }
         self.sub_observers.push(observer);
         self
     }
@@ -154,9 +125,9 @@ impl SandboxObserver {
         self
     }
 
-    pub fn require_fast_path_visibility(mut self) -> Self {
-        self.fast_path_visibility = FastPathVisibility::Required;
-        self.policy = self.policy.require_fast_path_visibility();
+    pub fn accept_fast_path_blind_spot(mut self) -> Self {
+        self.blind_spot_accepted = true;
+        self.policy = self.policy.accept_fast_path_blind_spot();
         self
     }
 
@@ -220,6 +191,17 @@ impl SyscallObserver for SandboxObserver {
     }
 
     fn wants_fast_path_visibility(&self) -> FastPathVisibility {
-        self.fast_path_visibility
+        if self.blind_spot_accepted {
+            return FastPathVisibility::Blind;
+        }
+        if self.policy.wants_fast_path_visibility() == FastPathVisibility::Required {
+            return FastPathVisibility::Required;
+        }
+        for obs in &self.sub_observers {
+            if obs.wants_fast_path_visibility() == FastPathVisibility::Required {
+                return FastPathVisibility::Required;
+            }
+        }
+        FastPathVisibility::Blind
     }
 }

@@ -4,7 +4,7 @@ use carrick_observability::compat::{CompatReporter, SyscallArgs};
 use carrick_spec::SeccompPolicy;
 
 use super::*;
-use crate::dispatch::{LinearMemory, SyscallDispatcher, SyscallRequest};
+use crate::dispatch::{DispatchOutcome, LinearMemory, SyscallDispatcher, SyscallRequest};
 use crate::kernel::{
     CloneObjectMode, Kernel, KernelContext, LinuxWaitStatus, RootBootstrap, TaskKey,
 };
@@ -12,6 +12,23 @@ use crate::linux_abi::{LINUX_EACCES, LINUX_EPERM, LINUX_SIGKILL, LinuxErrno};
 
 const SYS_GETPID: u64 = 172;
 const SYS_UNSHARE: u64 = 97;
+
+fn dispatch_req(
+    dispatcher: &mut SyscallDispatcher,
+    number: u64,
+    args: [u64; 6],
+) -> DispatchOutcome {
+    let ctx = test_kernel_context();
+    let reporter = CompatReporter::default();
+    let mut mem = LinearMemory::new(0, vec![0u8; 4096]);
+    let tid = crate::thread::ThreadId::from_guest_supplied_tid(1);
+    let registry = crate::thread::ThreadRegistry::new(tid);
+    let futex = crate::thread::FutexTable::new();
+    let req = SyscallRequest::new(number, SyscallArgs(args));
+    dispatcher
+        .dispatch_threaded(&ctx, req, &mut mem, &reporter, tid, &registry, &futex)
+        .expect("dispatch")
+}
 
 #[derive(Default)]
 struct RecordingObserver {
@@ -365,4 +382,111 @@ fn test_compat_reporter_as_observer_on_return() {
 
     let report = reporter.snapshot();
     assert_eq!(report.summary.syscall_returns_ok, 1);
+}
+
+#[test]
+fn test_deny_all_policy_derives_fast_path_visibility() {
+    // Deny-all policy automatically requires fast-path visibility
+    let policy = PolicyObserver::with_default_action(SyscallAction::Deny(LINUX_EPERM));
+    assert_eq!(
+        policy.wants_fast_path_visibility(),
+        FastPathVisibility::Required
+    );
+
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.install_observer(Arc::new(policy));
+    assert!(!dispatcher.identity_fast_path_enabled());
+    assert!(dispatcher.identity_fast_path_word().is_none());
+
+    // Dispatching getpid through dispatcher is observed and denied
+    let outcome = dispatch_req(&mut dispatcher, SYS_GETPID, [0; 6]);
+    assert_eq!(outcome, DispatchOutcome::Errno { errno: LINUX_EPERM });
+
+    // Opt-out explicitly accepts the blind spot
+    let policy_opt_out = PolicyObserver::with_default_action(SyscallAction::Deny(LINUX_EPERM))
+        .accept_fast_path_blind_spot();
+    assert_eq!(
+        policy_opt_out.wants_fast_path_visibility(),
+        FastPathVisibility::Blind
+    );
+}
+
+#[test]
+fn test_deny_getpid_rule_derives_fast_path_visibility() {
+    use carrick_abi::CanonicalNr;
+
+    let policy = PolicyObserver::new().deny(CanonicalNr(SYS_GETPID), LINUX_EACCES);
+    assert_eq!(
+        policy.wants_fast_path_visibility(),
+        FastPathVisibility::Required
+    );
+
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.install_observer(Arc::new(policy));
+    assert!(!dispatcher.identity_fast_path_enabled());
+
+    let outcome = dispatch_req(&mut dispatcher, SYS_GETPID, [0; 6]);
+    assert_eq!(
+        outcome,
+        DispatchOutcome::Errno {
+            errno: LINUX_EACCES
+        }
+    );
+}
+
+#[test]
+fn test_sandbox_observer_propagates_derived_fast_path_visibility() {
+    use carrick_abi::CanonicalNr;
+
+    let sandbox = SandboxObserver::new().deny(CanonicalNr(SYS_GETPID), LINUX_EACCES);
+    assert_eq!(
+        sandbox.wants_fast_path_visibility(),
+        FastPathVisibility::Required
+    );
+
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.install_observer(Arc::new(sandbox));
+    assert!(!dispatcher.identity_fast_path_enabled());
+
+    let outcome = dispatch_req(&mut dispatcher, SYS_GETPID, [0; 6]);
+    assert_eq!(
+        outcome,
+        DispatchOutcome::Errno {
+            errno: LINUX_EACCES
+        }
+    );
+}
+
+#[test]
+fn test_all_sandbox_preset_syscalls_exist_in_abi_table() {
+    for name in [
+        "socket",
+        "socketpair",
+        "bind",
+        "listen",
+        "accept",
+        "connect",
+        "sendto",
+        "recvfrom",
+        "accept4",
+        "mkdirat",
+        "unlinkat",
+        "renameat",
+        "truncate",
+        "ftruncate",
+        "fchmodat",
+        "fchownat",
+        "renameat2",
+        "unshare",
+        "clone",
+        "execve",
+        "setns",
+        "execveat",
+        "clone3",
+    ] {
+        assert!(
+            carrick_abi::syscall::lookup_aarch64_by_name(name).is_some(),
+            "syscall {name} must exist in canonical ABI table"
+        );
+    }
 }
