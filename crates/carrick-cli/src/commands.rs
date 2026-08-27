@@ -591,7 +591,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 dispatcher.set_cwd(dir);
             }
             if raw {
-                dispatcher.set_stream_stdio(true);
+                dispatcher.set_stdio_sink(carrick_runtime::dispatch::StdioSink::Inherit);
             }
             let executable_path = path
                 .canonicalize()
@@ -1032,10 +1032,11 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 carrick_runtime::carrier::exit_carrier(status);
             }
 
-            // `--json`: opt into the legacy compat-report envelope on stdout.
-            // Output already streamed live during the run (the engine runs every
-            // container with raw/streaming stdio), so the envelope's stdout/
-            // stderr fields are informational only.
+            // `--json`: the compat-report envelope on stdout. The CLI runs the
+            // container with `StdioMode::Inherit`, so the guest's bytes already
+            // went straight to this process's fds 1/2 during the run and the
+            // envelope's `stdout`/`stderr` fields are EMPTY; only a
+            // `StdioMode::Captured` run (carrick-embed) populates them.
             if json {
                 println!(
                     "{}",

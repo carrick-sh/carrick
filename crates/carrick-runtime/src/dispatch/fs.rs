@@ -5248,7 +5248,59 @@ impl SyscallDispatcher {
         })
     }
 
-    /// Write ALL of `bytes` to an inherited stdio host fd (the user's tty/pipe),
+    /// Deliver a bare-stdio write (fd 1/2 with no `OpenDescription`) to the
+    /// run's [`StdioSink`]. Reads the route once so no dispatcher lock is held
+    /// across the blocking host or caller write.
+    fn write_stdio_sink(&self, fd: i32, bytes: &[u8]) -> DispatchOutcome {
+        #[cfg(feature = "trace-io")]
+        if !bytes.is_empty() {
+            eprintln!(
+                "[IODBG] SINKWRITE fd={fd} n={} bytes={:02x?}",
+                bytes.len(),
+                &bytes[..bytes.len().min(64)]
+            );
+        }
+        match self.io.route() {
+            StdioRoute::Captured => {
+                match fd {
+                    1 => self.io.stdout.lock().extend_from_slice(bytes),
+                    2 => self.io.stderr.lock().extend_from_slice(bytes),
+                    _ => return DispatchOutcome::errno(LINUX_EBADF),
+                }
+                DispatchOutcome::Returned {
+                    value: bytes.len() as i64,
+                }
+            }
+            // BLOCKING-IO-OK: the inherited stdout/stderr (the user's
+            // tty/pipe); blocking here is the correct backpressure.
+            StdioRoute::Inherit => match fd {
+                1 | 2 => Self::write_all_stdio(fd, bytes),
+                _ => DispatchOutcome::errno(LINUX_EBADF),
+            },
+            // BLOCKING-IO-OK: the embedder's writer runs on this vCPU thread;
+            // a blocking writer blocks this guest write, like a full pipe.
+            StdioRoute::Piped { stdout, stderr } => {
+                let writer = match fd {
+                    1 => stdout,
+                    2 => stderr,
+                    _ => return DispatchOutcome::errno(LINUX_EBADF),
+                };
+                let mut writer = writer.lock();
+                // UFCS: `std::io::Write` is not imported anywhere in this file
+                // (no `use std::io` at all) and one call does not earn one.
+                match std::io::Write::write_all(&mut *writer, bytes) {
+                    Ok(()) => DispatchOutcome::Returned {
+                        value: bytes.len() as i64,
+                    },
+                    Err(error) => DispatchOutcome::errno(crate::host_to_linux_errno(
+                        error.raw_os_error().unwrap_or(libc::EIO),
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Write ALL of `bytes` to an inherited stdio host fd (`StdioSink::Inherit`: the user's tty/pipe),
     /// looping until the whole buffer is queued. The dup2'd stdio pty slave can
     /// be O_NONBLOCK — a line editor that sets stdin non-blocking flips the
     /// SHARED slave description, so stdout/stderr go non-blocking too — and then
@@ -5262,7 +5314,7 @@ impl SyscallDispatcher {
         while off < bytes.len() {
             // BLOCKING-IO-OK: a write to the inherited controlling tty/pipe
             // (stdout/stderr); blocking on backpressure is correct, and callers
-            // release the stream_stdio lock before getting here (no dispatcher
+            // release the route lock before getting here (no dispatcher
             // lock is held across this write).
             // SAFETY: fd is a live inherited stdio fd; we write a sub-slice of `bytes`.
             let n = unsafe {
@@ -5846,28 +5898,7 @@ impl SyscallDispatcher {
             }
             return outcome;
         }
-        if *self.io.stream_stdio.lock() && (fd == 1 || fd == 2) {
-            // BLOCKING-IO-OK: streamed write to the inherited stdout/stderr
-            // (the user's tty/pipe). Blocking here is the correct backpressure
-            // and isn't a guest socket on the server path.
-            #[cfg(feature = "trace-io")]
-            if !bytes.is_empty() {
-                eprintln!(
-                    "[IODBG] STREAMWRITE fd={fd} n={} bytes={:02x?}",
-                    bytes.len(),
-                    &bytes[..bytes.len().min(64)]
-                );
-            }
-            return Self::write_all_stdio(fd, bytes);
-        }
-        match fd {
-            1 => self.io.stdout.lock().extend_from_slice(bytes),
-            2 => self.io.stderr.lock().extend_from_slice(bytes),
-            _ => return DispatchOutcome::errno(LINUX_EBADF),
-        }
-        DispatchOutcome::Returned {
-            value: bytes.len() as i64,
-        }
+        self.write_stdio_sink(fd, bytes)
     }
 
     /// If `path` is `/proc/self/fd/{0,1,2}` (or `/proc/<pid>/fd/...`) and the
@@ -7748,10 +7779,10 @@ impl SyscallDispatcher {
                         // _exit(100)'d, failing `apt install` ("Sub-process dpkg
                         // returned an error code (100)"). Accept it, propagating
                         // O_NONBLOCK to the real host stdio fd when the guest's
-                        // stdio is wired to our host fds (stream_stdio),
+                        // stdio is wired to our host fds (StdioSink::Inherit),
                         // mirroring the F_GETFD/F_SETFD/F_GETFL stdio special-cases.
                         if is_stdio_fd(fd.0) {
-                            if *this.io.stream_stdio.lock() {
+                            if this.io.inherits_host_stdio() {
                                 let want_nonblock = arg & LINUX_O_NONBLOCK != 0;
                                 unsafe {
                                     let cur = libc::fcntl(fd.0, libc::F_GETFL, 0);
@@ -9415,7 +9446,7 @@ impl SyscallDispatcher {
                     DispatchOutcome::Returned { value: 0 }
                 } else if is_stdio_fd(fd.0) {
                     // Guest closing its own stdio at exit: there's nothing for
-                    // us to do (host fd stays open under stream_stdio so
+                    // us to do (host fd stays open under StdioSink::Inherit so
                     // sibling processes keep working), but reporting EBADF
                     // here makes glibc print "write error: Bad file descriptor"
                     // after the program's real output. Return success.
@@ -12983,23 +13014,11 @@ impl SyscallDispatcher {
             if this.stdio_is_closed(fd) {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
-            if *this.io.stream_stdio.lock() && (fd == 1 || fd == 2) {
-                // Stream bare stdio to the inherited stdout/stderr (the user's
-                // tty/pipe) exactly like writev does — do NOT buffer it. Buffering
-                // delays interactive output until process exit: busybox ash writes
-                // its post-Enter newline to fd 2 via write(2), so buffering left the
-                // newline stuck and the next command's output ran onto the prompt.
-                return Ok(Self::write_all_stdio(fd, &bytes));
-            }
-            match fd {
-                1 => this.io.stdout.lock().extend_from_slice(&bytes),
-                2 => this.io.stderr.lock().extend_from_slice(&bytes),
-                _ => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
-            }
-
-            Ok(DispatchOutcome::Returned {
-                value: length as i64,
-            })
+            // Bare stdio goes to the run's sink exactly like writev does —
+            // never buffered when the sink is live: busybox ash writes its
+            // post-Enter newline to fd 2 via write(2), and buffering it left
+            // the newline stuck until exit.
+            Ok(this.write_stdio_sink(fd, &bytes))
 
         }
 
@@ -13392,28 +13411,16 @@ impl SyscallDispatcher {
                     }
                     continue;
                 }
-                if *this.io.stream_stdio.lock() && (fd == 1 || fd == 2) {
-                    // BLOCKING-IO-OK: streamed writev to the inherited stdout/
-                    // stderr (the user's tty/pipe); blocking is correct backpressure.
-                    // Full write loop — never drop the tail on an O_NONBLOCK slave.
-                    match Self::write_all_stdio(fd, &bytes) {
-                        DispatchOutcome::Returned { value } => {
-                            total = total
-                                .checked_add(value as usize)
-                                .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
-                            continue;
-                        }
-                        other => return Ok(other),
+                // Full write loop per iovec — never drop the tail on an
+                // O_NONBLOCK slave; a hard error ends the writev.
+                match this.write_stdio_sink(fd, &bytes) {
+                    DispatchOutcome::Returned { value } => {
+                        total = total
+                            .checked_add(value as usize)
+                            .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
                     }
+                    other => return Ok(other),
                 }
-                match fd {
-                    1 => this.io.stdout.lock().extend_from_slice(&bytes),
-                    2 => this.io.stderr.lock().extend_from_slice(&bytes),
-                    _ => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
-                }
-                total = total
-                    .checked_add(bytes.len())
-                    .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
             }
 
             Ok(DispatchOutcome::Returned {

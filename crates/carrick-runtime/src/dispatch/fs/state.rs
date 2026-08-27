@@ -217,6 +217,45 @@ pub enum StdioSink {
     /// Write through to the carrier's own host fds 1/2 — `docker run` shape,
     /// the CLI default (`StdioMode::Inherit`).
     Inherit,
+    /// The caller's writers. Each guest write(2)/writev(2) to fd 1/2 runs the
+    /// matching writer on the guest's own vCPU thread under a mutex: a writer
+    /// that blocks blocks THAT guest write (and any sibling writing the same
+    /// stream), exactly as a full pipe would. Writer errors come back to the
+    /// guest as the host errno translated to Linux (EPIPE stays EPIPE).
+    Piped {
+        stdout: Box<dyn std::io::Write + Send>,
+        stderr: Box<dyn std::io::Write + Send>,
+    },
+}
+
+/// Shared writer for one piped stream: the same `Arc` is cloned into every
+/// logical child so the whole process tree drains into one caller writer.
+pub(in crate::dispatch) type SharedWriter = Arc<Mutex<Box<dyn std::io::Write + Send>>>;
+
+/// The dispatcher-side form of [`StdioSink`]: cheap to clone (only `Arc`s), so
+/// a write reads the route once and drops the lock BEFORE the possibly
+/// blocking host/caller write.
+#[derive(Clone)]
+pub(in crate::dispatch) enum StdioRoute {
+    Captured,
+    Inherit,
+    Piped {
+        stdout: SharedWriter,
+        stderr: SharedWriter,
+    },
+}
+
+impl From<StdioSink> for StdioRoute {
+    fn from(sink: StdioSink) -> Self {
+        match sink {
+            StdioSink::Captured => StdioRoute::Captured,
+            StdioSink::Inherit => StdioRoute::Inherit,
+            StdioSink::Piped { stdout, stderr } => StdioRoute::Piped {
+                stdout: Arc::new(Mutex::new(stdout)),
+                stderr: Arc::new(Mutex::new(stderr)),
+            },
+        }
+    }
 }
 
 /// Process-local output transport. Linux fd-table authority lives exclusively
@@ -224,9 +263,9 @@ pub enum StdioSink {
 pub(in crate::dispatch) struct RuntimeIo {
     pub stdout: Arc<Mutex<Vec<u8>>>,
     pub stderr: Arc<Mutex<Vec<u8>>>,
-    /// When true, writes to fd 1/2 stream directly to host fds 1/2 instead of
-    /// buffering into `stdout`/`stderr`.
-    pub stream_stdio: Mutex<bool>,
+    /// Where bare fd 1/2 writes go. `Captured` (the default) appends to
+    /// `stdout`/`stderr` above.
+    route: Mutex<StdioRoute>,
     external_exec_capture: AtomicBool,
 }
 
@@ -235,9 +274,24 @@ impl RuntimeIo {
         Self {
             stdout: Arc::new(Mutex::new(Vec::new())),
             stderr: Arc::new(Mutex::new(Vec::new())),
-            stream_stdio: Mutex::new(false),
+            route: Mutex::new(StdioRoute::Captured),
             external_exec_capture: AtomicBool::new(false),
         }
+    }
+
+    pub(in crate::dispatch) fn set_sink(&self, sink: StdioSink) {
+        *self.route.lock() = StdioRoute::from(sink);
+    }
+
+    /// A snapshot of the route; the lock is released before the caller writes.
+    pub(in crate::dispatch) fn route(&self) -> StdioRoute {
+        self.route.lock().clone()
+    }
+
+    /// Whether fd 1/2 are the carrier's real host fds (the only mode in which
+    /// a guest `F_SETFL` on stdio must reach the host descriptor).
+    pub(in crate::dispatch) fn inherits_host_stdio(&self) -> bool {
+        matches!(*self.route.lock(), StdioRoute::Inherit)
     }
 
     pub(in crate::dispatch) fn fork_clone(&self) -> Self {
@@ -255,7 +309,8 @@ impl RuntimeIo {
             } else {
                 Arc::new(Mutex::new(Vec::new()))
             },
-            stream_stdio: Mutex::new(*self.stream_stdio.lock()),
+            // Same route object: a piped tree shares ONE caller writer.
+            route: Mutex::new(self.route()),
             external_exec_capture: AtomicBool::new(external_exec_capture),
         }
     }
@@ -452,16 +507,135 @@ mod fork_clone_tests {
     use super::*;
 
     #[test]
-    fn forked_runtime_io_starts_with_clean_output_and_preserves_stream_mode() {
+    fn forked_runtime_io_starts_with_clean_output_and_preserves_sink() {
         let parent = RuntimeIo::new();
         parent.stdout.lock().extend_from_slice(b"parent");
-        *parent.stream_stdio.lock() = true;
+        parent.set_sink(StdioSink::Inherit);
 
         let child = parent.fork_clone();
 
         assert!(child.stdout.lock().is_empty());
         assert!(child.stderr.lock().is_empty());
-        assert!(*child.stream_stdio.lock());
+        assert!(matches!(child.route(), StdioRoute::Inherit));
         assert_eq!(&*parent.stdout.lock(), b"parent");
+    }
+}
+
+#[cfg(test)]
+mod stdio_sink_tests {
+    use super::*;
+    use crate::compat::{CompatReporter, SyscallArgs};
+    use std::sync::Arc;
+
+    /// A `Write` that records into a shared buffer so the test can read back
+    /// what the guest's write(2) delivered.
+    struct Recorder(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Recorder {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn write_fd(dispatcher: &mut SyscallDispatcher, fd: u64, bytes: &[u8]) -> DispatchOutcome {
+        const BUF: u64 = 0x4000;
+        let mut memory = LinearMemory::new(BUF, vec![0u8; 0x1000]);
+        memory.write_bytes(BUF, bytes).unwrap();
+        let reporter = CompatReporter::default();
+        // Same two-phase-borrow idiom as tests/integration/address_space.rs:236.
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(
+                    64,
+                    SyscallArgs::from([fd, BUF, bytes.len() as u64, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn write_to_fd1_and_fd2_lands_in_the_piped_sink_not_the_capture_buffer() {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let err = Arc::new(Mutex::new(Vec::new()));
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_stdio_sink(StdioSink::Piped {
+            stdout: Box::new(Recorder(Arc::clone(&out))),
+            stderr: Box::new(Recorder(Arc::clone(&err))),
+        });
+
+        assert_eq!(
+            write_fd(&mut dispatcher, 1, b"hello"),
+            DispatchOutcome::Returned { value: 5 }
+        );
+        assert_eq!(
+            write_fd(&mut dispatcher, 2, b"oops\n"),
+            DispatchOutcome::Returned { value: 5 }
+        );
+
+        assert_eq!(&*out.lock(), b"hello");
+        assert_eq!(&*err.lock(), b"oops\n");
+        assert!(
+            dispatcher.stdout().is_empty(),
+            "piped bytes must not also be captured"
+        );
+        assert!(dispatcher.stderr().is_empty());
+    }
+
+    #[test]
+    fn captured_sink_fills_the_run_result_buffers() {
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_stdio_sink(StdioSink::Captured);
+        assert_eq!(
+            write_fd(&mut dispatcher, 1, b"kept"),
+            DispatchOutcome::Returned { value: 4 }
+        );
+        assert_eq!(dispatcher.stdout(), b"kept");
+    }
+
+    #[test]
+    fn piped_writer_errors_surface_as_the_guest_write_errno() {
+        struct Broken;
+        impl std::io::Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from_raw_os_error(libc::EPIPE))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_stdio_sink(StdioSink::Piped {
+            stdout: Box::new(Broken),
+            stderr: Box::new(std::io::sink()),
+        });
+        assert_eq!(
+            write_fd(&mut dispatcher, 1, b"x"),
+            DispatchOutcome::errno(crate::linux_abi::LINUX_EPIPE)
+        );
+    }
+
+    #[test]
+    fn forked_runtime_io_shares_the_piped_writer() {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let parent = RuntimeIo::new();
+        parent.set_sink(StdioSink::Piped {
+            stdout: Box::new(Recorder(Arc::clone(&out))),
+            stderr: Box::new(std::io::sink()),
+        });
+        let child = parent.fork_clone();
+        let StdioRoute::Piped { stdout, .. } = child.route() else {
+            panic!("a forked child must inherit the parent's piped route");
+        };
+        // UFCS: `std::io::Write` is not in scope in this module (nor via the
+        // `dispatch` glob), and a trait import just for one call is noise.
+        std::io::Write::write_all(&mut *stdout.lock(), b"child").unwrap();
+        assert_eq!(&*out.lock(), b"child");
     }
 }

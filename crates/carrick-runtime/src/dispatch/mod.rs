@@ -5746,13 +5746,13 @@ impl SyscallDispatcher {
         self.io.stdout.lock().clone()
     }
 
-    /// Enable live passthrough for fd 1/2. After this, `write`/`writev`
-    /// to the stdio fds go straight to host fd 1/2 via `libc::write`
-    /// instead of accumulating in the in-memory buffers — required for
-    /// interactive prompts (`/ # `, cursor-position queries, etc.) to
-    /// reach the user's terminal before the guest exits.
-    pub fn set_stream_stdio(&self, on: bool) {
-        *self.io.stream_stdio.lock() = on;
+    /// Choose where bare fd 1/2 writes go for this run (and every logical
+    /// child forked from it). `Inherit` is required for interactive prompts
+    /// (`/ # `, cursor-position queries) to reach the terminal before exit;
+    /// `Captured` (the construction default) fills `RunResult`; `Piped` hands
+    /// bytes to the embedder's writers. Set before boot.
+    pub fn set_stdio_sink(&self, sink: StdioSink) {
+        self.io.set_sink(sink);
     }
 
     pub(crate) fn enable_external_exec_capture(&self) {
@@ -5761,12 +5761,6 @@ impl SyscallDispatcher {
 
     pub(crate) fn external_exec_capture_enabled(&self) -> bool {
         self.io.external_exec_capture_enabled()
-    }
-
-    /// Whether guest stdout/stderr are live inherited host descriptors. Native
-    /// host self-reexec restores this execution-mode bit in the fresh dispatcher.
-    pub fn stream_stdio_enabled(&self) -> bool {
-        *self.io.stream_stdio.lock()
     }
 
     /// Close `open_file`'s backing host fd AND, if it was the last reference
