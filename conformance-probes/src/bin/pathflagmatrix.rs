@@ -171,10 +171,23 @@ fn make_symlink(target: &str, link: &str) {
     }
 }
 
+struct CleanGuard<'a>(&'a str);
+impl<'a> Drop for CleanGuard<'a> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(self.0);
+    }
+}
+
 fn main() {
-    let base = "/tmp/pathflagmatrix";
+    let pid = unsafe { libc::getpid() };
+    let base = format!("/tmp/pathflagmatrix_{pid}");
+
+    // Wipe any existing residue for this PID before starting setup.
+    let _ = std::fs::remove_dir_all(&base);
+    let _guard = CleanGuard(&base);
+
     make_dir("/tmp");
-    make_dir(base);
+    make_dir(&base);
 
     let regfile_path = format!("{base}/regfile");
     let missing_path = format!("{base}/missing");
@@ -203,7 +216,7 @@ fn main() {
     let reg_fd = unsafe { libc::open(reg_c.as_ptr(), libc::O_RDONLY) };
     let base_dir_fd = unsafe {
         libc::open(
-            CString::new(base).unwrap().as_ptr(),
+            CString::new(base.as_str()).unwrap().as_ptr(),
             libc::O_RDONLY | libc::O_DIRECTORY,
         )
     };
@@ -519,10 +532,9 @@ fn main() {
         nonempty_dir_c.as_ptr(),
         0,
     );
-    let enotempty_or_eexist = errno() == libc::ENOTEMPTY || errno() == libc::EEXIST;
     println!(
         "renameat2_dir_to_nonempty_dir_enotempty={}",
-        r == -1 && enotempty_or_eexist
+        r == -1 && errno() == libc::ENOTEMPTY
     );
 
     let dir_a = format!("{base}/dir_a");
@@ -592,10 +604,9 @@ fn main() {
     );
 
     let r = unsafe { libc::unlinkat(AT_FDCWD, empty_dir_c.as_ptr(), 0) };
-    let eisdir_or_eperm = errno() == libc::EISDIR || errno() == libc::EPERM;
     println!(
         "unlinkat_dir_without_removedir_eisdir={}",
-        r == -1 && eisdir_or_eperm
+        r == -1 && errno() == libc::EISDIR
     );
 
     let unl_symlink_dir = format!("{base}/unl_symlink_dir");
@@ -612,10 +623,9 @@ fn main() {
     println!("unlinkat_symlink_to_dir_without_removedir_ok={}", r == 0);
 
     let r = unsafe { libc::unlinkat(AT_FDCWD, nonempty_dir_c.as_ptr(), AT_REMOVEDIR) };
-    let enotempty_or_eexist = errno() == libc::ENOTEMPTY || errno() == libc::EEXIST;
     println!(
         "unlinkat_nonempty_dir_enotempty={}",
-        r == -1 && enotempty_or_eexist
+        r == -1 && errno() == libc::ENOTEMPTY
     );
 
     let r = unsafe { libc::unlinkat(AT_FDCWD, empty_c.as_ptr(), 0) };
