@@ -2853,7 +2853,12 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// merges, so the denominator moves 471 -> 474 and the gating rows 890 -> 896
 /// — 448 conformance sources (426 generic, 22 dedicated). Counted from the
 /// tree, never from any one branch's arithmetic.
-const PROBE_SOURCE_COUNT: usize = 474;
+///
+/// `pathflagmatrix`, `memflagmatrix`, and `netflagmatrix` add table-driven,
+/// exact-oracle coverage for path, memory, and socket flag/error interactions.
+/// The denominator moves 474 -> 477 and the gating rows 896 -> 902 — 451
+/// conformance sources (429 generic, 22 dedicated).
+const PROBE_SOURCE_COUNT: usize = 477;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
@@ -4344,6 +4349,7 @@ fn conformance_probes() {
 /// HVF guest churn of a full gate. `#[ignore]` — run deliberately:
 ///   cargo test -p carrick-cli --test conformance <platform features> -- \
 ///       --ignored bless_probe_oracle --nocapture
+/// Set `CARRICK_PROBE_FILTER=name[,name...]` to refresh only selected probes.
 /// then `git add crates/carrick-cli/tests/probe-oracle && git commit`.
 #[test]
 #[ignore = "bless step: writes the committed probe-oracle cache from live Docker"]
@@ -4353,6 +4359,7 @@ fn bless_probe_oracle() {
     let engine = base64::engine::general_purpose::STANDARD;
     let requested_lane = std::env::var("CARRICK_PROBE_LANE").ok();
     let requested_libc = std::env::var("CARRICK_PROBE_LIBC").ok();
+    let requested_probe_names = std::env::var("CARRICK_PROBE_FILTER").ok();
 
     let docker_available = Command::new("docker")
         .arg("version")
@@ -4392,6 +4399,9 @@ fn bless_probe_oracle() {
                 else {
                     continue;
                 };
+                if !probe_name_allowed(&name, requested_probe_names.as_deref()) {
+                    continue;
+                }
                 // Non-deterministic probes can't be cached.
                 if GATE_SKIP_PROBES.contains(&name.as_str())
                     || name.starts_with("perf_")
@@ -4559,9 +4569,9 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
     let generic = validate_closure_probe_rows(&inventory(), &sources)
         .expect("checked-in closure probe inventory must match the source denominator");
-    assert_eq!(generic.len(), 426);
-    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 448);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 896);
+    assert_eq!(generic.len(), 429);
+    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 451);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 902);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")

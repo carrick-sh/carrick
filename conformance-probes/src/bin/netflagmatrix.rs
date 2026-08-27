@@ -143,6 +143,14 @@ unsafe fn test_socket_creation_matrix() {
     let bind_ok = libc::bind(lfd, &sun as *const _ as *const libc::sockaddr, sun_len) == 0;
     let listen_ok = libc::listen(lfd, 2) == 0;
 
+    // Keep the reducer fail-fast if an implementation incorrectly consumes the
+    // pending connection while rejecting the invalid accept4 flags below. The
+    // valid accept still succeeds on Linux; a consumed queue becomes EAGAIN
+    // instead of hanging the entire in-process conformance lane.
+    let listener_flags = libc::fcntl(lfd, libc::F_GETFL);
+    let listener_nonblock =
+        listener_flags >= 0 && libc::fcntl(lfd, libc::F_SETFL, listener_flags | libc::O_NONBLOCK) == 0;
+
     let cfd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
     let conn_ok = libc::connect(cfd, &sun as *const _ as *const libc::sockaddr, sun_len) == 0;
 
@@ -198,7 +206,7 @@ unsafe fn test_socket_creation_matrix() {
             s_bad_fam == -1 && s_bad_fam_errno == libc::EAFNOSUPPORT,
         sockpair_dgram_nonblock_cloexec = sp_ok && sp0_nb && sp0_clo && sp1_nb && sp1_clo,
         sockpair_inet_eopnotsupp = sp_bad == -1 && sp_bad_errno == libc::EOPNOTSUPP,
-        accept4_setup_ok = bind_ok && listen_ok && conn_ok,
+        accept4_setup_ok = bind_ok && listen_ok && listener_nonblock && conn_ok,
         accept4_invalid_flags_einval = acc_inv == -1 && acc_inv_errno == libc::EINVAL,
         accept4_not_socket_enotsock = acc_pipe == -1 && acc_pipe_errno == libc::ENOTSOCK,
         accept4_nonblock_cloexec = afd_ok && afd_nonblock && afd_cloexec,

@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use carrick_conformance_next::{PullPolicy, TestContainer};
 
-/// Exact materialized list of 142 sorted unique probe names for generic shard 0.
+/// Exact materialized list of 143 sorted unique probe names for generic shard 0.
 ///
 /// Conceptually defined as:
 /// - class: "conformance"
@@ -92,25 +92,26 @@ pub const SHARD_0_PROBES: &[&str] = &[
     "mapfixed",
     "mcastjoingroup",
     "memfdsecret",
-    "mkdirsetgid",
-    "mmapcage",
-    "mmapexecshared",
-    "mmapfileshare_mt",
-    "mmaprecl",
-    "mmapv8align",
-    "mprotectexec",
-    "mremapgrow",
-    "mremapshrink",
-    "msyncalign",
-    "mtsigrelease",
-    "nativeetexecfork",
-    "netifmcast",
-    "newmountapi",
-    "nsfsioctl",
-    "oomscoreadj",
-    "openat2valid",
-    "openempty",
-    "overlaysymlink",
+    "mincoreedge",
+    "mlock2",
+    "mmapdevzero",
+    "mmapfileforkwriteback",
+    "mmapprivfile",
+    "mmaptrimprotect",
+    "mock_network_socket",
+    "mqueue",
+    "mremapsharedshrink",
+    "msgoverflow",
+    "mtidlesleep",
+    "nativebrk",
+    "net",
+    "netlink_route",
+    "nicepriority",
+    "oappendroundtrip",
+    "opathfd",
+    "openbrokensymlinkcreate",
+    "openexcldir",
+    "patherrno",
     "pauseeintr",
     "pidfdprocdir",
     "pidnsorphanreap",
@@ -175,7 +176,7 @@ pub const SHARD_0_PROBES: &[&str] = &[
     "xsignal",
 ];
 
-const CACHED_SHARD_0_PROBE_COUNT: usize = 130;
+const CACHED_SHARD_0_PROBE_COUNT: usize = 131;
 
 /// Complete baseline expected gaps for musl on arm64.
 pub const MUSL_BASELINE_GAPS: &[&str] = &[
@@ -337,11 +338,11 @@ pub fn find_probe_binary_dir(repo_root: &Path, target: &str) -> Option<PathBuf> 
 
 #[test]
 fn test_shard_0_inventory() {
-    // Hard-assert exactly 142 sorted unique names.
+    // Hard-assert exactly 143 sorted unique names.
     assert_eq!(
         SHARD_0_PROBES.len(),
-        142,
-        "shard 0 must have exactly 142 probes"
+        143,
+        "shard 0 must have exactly 143 probes"
     );
 
     let mut sorted_probes = SHARD_0_PROBES.to_vec();
@@ -355,8 +356,8 @@ fn test_shard_0_inventory() {
     let unique_probes: BTreeSet<_> = SHARD_0_PROBES.iter().copied().collect();
     assert_eq!(
         unique_probes.len(),
-        142,
-        "SHARD_0_PROBES must contain 142 unique names"
+        143,
+        "SHARD_0_PROBES must contain 143 unique names"
     );
     assert_eq!(
         SHARD_0_PROBES
@@ -420,8 +421,8 @@ fn test_shard_0_inventory() {
     selected_names.sort();
     assert_eq!(
         selected_names.len(),
-        426,
-        "expected exactly 426 conformance generic probes in inventory"
+        429,
+        "expected exactly 429 conformance generic probes in inventory"
     );
 
     let derived_shard_0: Vec<&str> = selected_names
@@ -432,8 +433,8 @@ fn test_shard_0_inventory() {
 
     assert_eq!(
         derived_shard_0.len(),
-        142,
-        "derived shard 0 must have exactly 142 items"
+        143,
+        "derived shard 0 must have exactly 143 items"
     );
     assert_eq!(
         SHARD_0_PROBES,

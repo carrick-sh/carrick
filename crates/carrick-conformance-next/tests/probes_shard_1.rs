@@ -82,26 +82,27 @@ pub const SHARD_1_PROBES: &[&str] = &[
     "mailboxregs",
     "mapfixedfork",
     "mem",
-    "memmap",
-    "mknoddevnode",
-    "mmapcluster",
-    "mmapfile",
-    "mmapmunmap",
-    "mmapreuse",
-    "mmapzerofill",
-    "mqnotifycrossproc",
-    "mremapmove",
-    "msgctlstat",
-    "mtforkcorrupt",
-    "nanosleeprem",
-    "nativex18",
-    "netlink_route",
-    "nicepriority",
-    "oappendroundtrip",
-    "opathfd",
-    "openbrokensymlinkcreate",
-    "openexcldir",
-    "patherrno",
+    "memflagmatrix",
+    "mkdirsetgid",
+    "mmapcage",
+    "mmapexecshared",
+    "mmapfileshare_mt",
+    "mmaprecl",
+    "mmapv8align",
+    "mprotectexec",
+    "mremapgrow",
+    "mremapshrink",
+    "msyncalign",
+    "mtsigrelease",
+    "nativeetexecfork",
+    "netflagmatrix",
+    "netpoll",
+    "nofiledefault",
+    "odirectory",
+    "openat2resolve",
+    "openeloop",
+    "otmpfileforkexec",
+    "pathflagmatrix",
     "pauseinterrupt2",
     "pidnsinitreap",
     "pidnsroot",
@@ -252,8 +253,8 @@ pub fn probe_campaign_dir(root: &Path, target: &str) -> PathBuf {
 fn test_shard_1_inventory_count_and_sorted() {
     assert_eq!(
         SHARD_1_PROBES.len(),
-        142,
-        "shard 1 must contain exactly 142 generic probes"
+        143,
+        "shard 1 must contain exactly 143 generic probes"
     );
 
     // Hard assert uniqueness and strictly ascending sort order.
@@ -329,8 +330,8 @@ fn test_shard_1_inventory_count_and_sorted() {
 
         assert_eq!(
             computed_shard_1.len(),
-            142,
-            "computed shard 1 from probe-inventory.json must have 142 items"
+            143,
+            "computed shard 1 from probe-inventory.json must have 143 items"
         );
         assert_eq!(
             SHARD_1_PROBES,
@@ -531,6 +532,9 @@ fn generic_probe_shard_1() {
             let actual = normalize(&combined);
 
             if actual != oracle {
+                eprintln!(
+                    "DIFF generic probe shard 1 {target}:{probe_name}\n--- observed ---\n{actual}\n--- oracle ---\n{oracle}"
+                );
                 observed_mismatches.push(probe_name.to_string());
             }
         }
