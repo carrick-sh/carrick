@@ -479,6 +479,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-conformance-next"
+version = "0.1.0"
+dependencies = [
+ "carrick-abi",
+ "carrick-embed",
+ "carrick-guest-mem",
+ "carrick-spec",
+ "parking_lot",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "carrick-dsr"
 version = "0.1.0"
 dependencies = [

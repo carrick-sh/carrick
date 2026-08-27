@@ -400,6 +400,10 @@ gate-containers: build
 test-embed *ARGS: build
     ./scripts/test-signed.sh carrick-embed {{ARGS}}
 
+# Guest-running tests of carrick-conformance-next from SIGNED cargo test executables.
+test-conformance-next *ARGS: build
+    ./scripts/test-signed.sh carrick-conformance-next {{ARGS}}
+
 # Re-sign an already-built release binary (rarely needed on its own).
 sign:
     codesign --force --sign - --entitlements scripts/entitlements.plist target/release/carrick

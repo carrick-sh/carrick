@@ -1,0 +1,35 @@
+[package]
+name = "carrick-conformance-next"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Self-hosted conformance framework for Carrick using carrick-embed."
+
+[lib]
+name = "carrick_conformance_next"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[features]
+# Matches carrick-embed: forward platform features and syscall-shim.
+default = ["platform-macos", "syscall-shim"]
+syscall-shim = ["carrick-embed/syscall-shim"]
+platform-macos = ["carrick-embed/platform-macos"]
+platform-linux = ["carrick-embed/platform-linux"]
+platform-freebsd = ["carrick-embed/platform-freebsd"]
+platform-netbsd = ["carrick-embed/platform-netbsd"]
+fs-memory = ["carrick-embed/fs-memory"]
+
+[dependencies]
+carrick-abi = { path = "../carrick-abi" }
+carrick-embed = { path = "../carrick-embed", default-features = false }
+carrick-guest-mem = { path = "../carrick-guest-mem" }
+carrick-spec = { path = "../carrick-spec" }
+parking_lot.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
