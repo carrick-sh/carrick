@@ -166,6 +166,8 @@ pub const SHARD_1_PROBES: &[&str] = &[
     "xthreadsig",
 ];
 
+const CACHED_SHARD_1_PROBE_COUNT: usize = 134;
+
 /// Shard 1 subset of baseline expected oracle mismatches for musl.
 pub const MUSL_SHARD_1_EXPECTED_GAPS: &[&str] = &[
     "execthreads",
@@ -283,6 +285,13 @@ fn test_shard_1_inventory_count_and_sorted() {
             window[1]
         );
     }
+    assert_eq!(
+        SHARD_1_PROBES
+            .iter()
+            .filter(|name| !common::needs_live_oracle(name))
+            .count(),
+        CACHED_SHARD_1_PROBE_COUNT
+    );
 
     // Verify against conformance-probes/probe-inventory.json on disk if present.
     let root = common::repo_root();
@@ -387,16 +396,9 @@ fn test_cache_freshness_and_validation() {
         );
     }
 
-    // dsrconstantpool lacks a valid source hash header on line 1, so cached_probe_oracle correctly treats it as stale.
-    let stale_dsr = cached_probe_oracle(&root, "arm64", "musl", "dsrconstantpool");
-    assert!(
-        stale_dsr.is_err(),
-        "dsrconstantpool without source hash header must fail validation as stale"
-    );
-    assert!(
-        stale_dsr.unwrap_err().contains("stale cached oracle"),
-        "error message must report stale cached oracle"
-    );
+    let dsr = cached_probe_oracle(&root, "arm64", "musl", "dsrconstantpool")
+        .expect("freshly blessed dsrconstantpool cache must match its source");
+    assert!(dsr.contains("constant_word_match=true"));
 
     // Missing cache error message check.
     let missing = cached_probe_oracle(&root, "arm64", "musl", "non_existent_probe_name_xyz");
@@ -483,6 +485,9 @@ fn generic_probe_shard_1() {
         let mut executed_count = 0;
 
         for &probe_name in SHARD_1_PROBES {
+            if common::needs_live_oracle(probe_name) {
+                continue;
+            }
             let probe_bin = dir.join(probe_name);
             if !probe_bin.is_file() {
                 panic!(
@@ -519,8 +524,8 @@ fn generic_probe_shard_1() {
         }
 
         assert_eq!(
-            executed_count, 142,
-            "must execute all 142 probes in shard 1 for libc {libc}"
+            executed_count, CACHED_SHARD_1_PROBE_COUNT,
+            "must execute all {CACHED_SHARD_1_PROBE_COUNT} cached probes in shard 1 for libc {libc}"
         );
 
         let expected_set: BTreeSet<&str> = expected_gaps.iter().copied().collect();

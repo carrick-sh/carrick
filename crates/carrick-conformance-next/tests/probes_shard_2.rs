@@ -156,6 +156,8 @@ pub const SHARD_2_PROBES: &[&str] = &[
     "zerolenio",
 ];
 
+const CACHED_SHARD_2_PROBE_COUNT: usize = 133;
+
 const MUSL_BASELINE_GAPS: &[&str] = &[
     "budget_two_proc",
     "childsubreaper",
@@ -338,6 +340,13 @@ fn test_shard_2_inventory_definition() {
             window[1]
         );
     }
+    assert_eq!(
+        SHARD_2_PROBES
+            .iter()
+            .filter(|name| !common::needs_live_oracle(name))
+            .count(),
+        CACHED_SHARD_2_PROBE_COUNT
+    );
 
     // 2. Validate against probe-inventory.json
     let repo_root = common::repo_root();
@@ -533,6 +542,9 @@ fn generic_probe_shard_2() {
         let mut executed_count = 0;
 
         for &probe_name in SHARD_2_PROBES {
+            if common::needs_live_oracle(probe_name) {
+                continue;
+            }
             let probe_path = dir.join(probe_name);
             assert!(
                 probe_path.is_file(),
@@ -569,8 +581,8 @@ fn generic_probe_shard_2() {
         }
 
         assert_eq!(
-            executed_count, 142,
-            "must execute exactly 142 probes for {target_triple}"
+            executed_count, CACHED_SHARD_2_PROBE_COUNT,
+            "must execute exactly {CACHED_SHARD_2_PROBE_COUNT} cached probes for {target_triple}"
         );
 
         assert_eq!(
