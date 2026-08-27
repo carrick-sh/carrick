@@ -45,8 +45,16 @@ pub const LIVE_ORACLE_PROBES: &[&str] = &[
     "waitsiblingsigchld",
 ];
 
+/// Probes that cannot share an embedded test process after they fail. Keep
+/// these on the old out-of-process lane until the runtime teardown is fixed.
+pub const OUT_OF_PROCESS_PROBES: &[&str] = &["execthreads"];
+
 pub fn needs_live_oracle(probe: &str) -> bool {
     LIVE_ORACLE_PROBES.contains(&probe)
+}
+
+pub fn runs_in_cached_lane(probe: &str) -> bool {
+    !needs_live_oracle(probe) && !OUT_OF_PROCESS_PROBES.contains(&probe)
 }
 
 /// Run one embedded container while host fd 0 is an already-EOF pipe, matching

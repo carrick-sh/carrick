@@ -343,7 +343,7 @@ fn test_shard_2_inventory_definition() {
     assert_eq!(
         SHARD_2_PROBES
             .iter()
-            .filter(|name| !common::needs_live_oracle(name))
+            .filter(|name| common::runs_in_cached_lane(name))
             .count(),
         CACHED_SHARD_2_PROBE_COUNT
     );
@@ -501,7 +501,7 @@ fn test_shard_2_cached_oracles_are_complete() {
         for probe in SHARD_2_PROBES
             .iter()
             .copied()
-            .filter(|name| !common::needs_live_oracle(name))
+            .filter(|name| common::runs_in_cached_lane(name))
         {
             cached_probe_oracle(&repo_root, libc, probe).unwrap_or_else(|error| {
                 panic!("arm64-{libc}/{probe} must have a fresh committed oracle: {error}")
@@ -558,7 +558,7 @@ fn generic_probe_shard_2() {
         let mut executed_count = 0;
 
         for &probe_name in SHARD_2_PROBES {
-            if common::needs_live_oracle(probe_name) {
+            if !common::runs_in_cached_lane(probe_name) {
                 continue;
             }
             let probe_path = dir.join(probe_name);
