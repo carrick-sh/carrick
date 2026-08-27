@@ -12082,7 +12082,7 @@ impl HvfVmState {
                         )));
                     }
                     lease.mark_mapped();
-                    region.stage2_lease = Some(lease);
+                    publish_exec_region_host_owner(&mut region, lease)?;
                     state.mappings.push(region);
                 }
                 if !stage2_leases.is_empty() {
@@ -18001,7 +18001,27 @@ impl HvfVmState {
                     rebind_inherited_alias_to_process(alias, spec.mm_root_slot)
                 });
             }
-            if let Some(stage2_lease) = mapping.stage2_lease.take() {
+            let host_mapping = mapping.host.into_owned();
+            let (host_mapping, stage2_lease, owner_generation) = if is_reusable_global_frame_extent(
+                mapping.physical_ipa,
+                mapping.physical_size as u64,
+            ) {
+                if let (Some(lease), Some(host_mapping)) =
+                    (mapping.stage2_lease.take(), host_mapping)
+                {
+                    let owner_generation = register_global_frame_host_owner(
+                        lease,
+                        host_mapping,
+                        u64::from(mapping.perms),
+                    )?;
+                    (None, None, owner_generation)
+                } else {
+                    (None, mapping.stage2_lease, mapping.owner_generation)
+                }
+            } else {
+                (host_mapping, mapping.stage2_lease, mapping.owner_generation)
+            };
+            if let Some(stage2_lease) = stage2_lease {
                 stage2_leases.push(stage2_lease);
             }
             mapped.push(HvpatchTaskMappingState {
@@ -18015,12 +18035,12 @@ impl HvfVmState {
                 physical_size: mapping.physical_size,
                 perms: mapping.perms,
                 guest_writable: mapping.guest_writable,
-                host_mapping: mapping.host.into_owned(),
+                host_mapping,
                 is_dynamic_alias: mapping.is_dynamic_alias,
                 sharing: mapping.sharing,
                 shared_key_base: mapping.shared_key_base,
                 shared_key_offset: mapping.shared_key_offset,
-                owner_generation: mapping.owner_generation,
+                owner_generation,
             });
         }
         let mut process_reservation = spec
@@ -18039,6 +18059,20 @@ impl HvfVmState {
         {
             let mut inventory = spec.frame_inventory.lock();
             for mapping in inventory_mappings {
+                let stage2_owner = if is_reusable_global_frame_extent(mapping.gpa, mapping.length) {
+                    let generation =
+                        global_frame_host_owner_generation(mapping.gpa, mapping.length);
+                    InventoryStage2OwnerIdentity {
+                        host_addr: mapping.stage2_owner.host_addr,
+                        generation: if generation != 0 {
+                            generation
+                        } else {
+                            mapping.stage2_owner.generation
+                        },
+                    }
+                } else {
+                    mapping.stage2_owner
+                };
                 let staged = match Self::stage_mapping(
                     &mut inventory,
                     &mut process_reservation,
@@ -18049,7 +18083,7 @@ impl HvfVmState {
                         backing: mapping.backing,
                         inherited_frame: mapping.inherited_frame,
                         stage2_lease: Some(mapping.stage2_lease),
-                        stage2_owner: mapping.stage2_owner,
+                        stage2_owner,
                     },
                 ) {
                     Ok(staged) => staged,
@@ -18194,6 +18228,26 @@ impl HvfVmState {
                     rebind_inherited_alias_to_process(alias, spec.mm_root_slot)
                 });
             }
+            let host_mapping = mapping.host.into_owned();
+            let (host_mapping, stage2_lease, owner_generation) = if is_reusable_global_frame_extent(
+                mapping.physical_ipa,
+                mapping.physical_size as u64,
+            ) {
+                if let (Some(lease), Some(host_mapping)) =
+                    (mapping.stage2_lease.take(), host_mapping)
+                {
+                    let owner_generation = register_global_frame_host_owner(
+                        lease,
+                        host_mapping,
+                        u64::from(mapping.perms),
+                    )?;
+                    (None, None, owner_generation)
+                } else {
+                    (None, mapping.stage2_lease, mapping.owner_generation)
+                }
+            } else {
+                (host_mapping, mapping.stage2_lease, mapping.owner_generation)
+            };
             mapped.push(HvfMappedRegion {
                 start: mapping.start,
                 ipa: mapping.ipa,
@@ -18205,13 +18259,13 @@ impl HvfVmState {
                 perms: mapping.perms,
                 guest_writable: mapping.guest_writable,
                 memory: None,
-                host_mapping: mapping.host.into_owned(),
-                stage2_lease: mapping.stage2_lease,
+                host_mapping,
+                stage2_lease,
                 is_dynamic_alias: mapping.is_dynamic_alias,
                 sharing: mapping.sharing,
                 shared_key_base: mapping.shared_key_base,
                 shared_key_offset: mapping.shared_key_offset,
-                owner_generation: mapping.owner_generation,
+                owner_generation,
             });
         }
         let mut process_reservation = spec
@@ -18277,6 +18331,20 @@ impl HvfVmState {
             let mut inventory = state.frame_inventory.lock();
             let mut staged_mappings = Vec::with_capacity(inventory_mappings.len());
             for mapping in inventory_mappings {
+                let stage2_owner = if is_reusable_global_frame_extent(mapping.gpa, mapping.length) {
+                    let generation =
+                        global_frame_host_owner_generation(mapping.gpa, mapping.length);
+                    InventoryStage2OwnerIdentity {
+                        host_addr: mapping.stage2_owner.host_addr,
+                        generation: if generation != 0 {
+                            generation
+                        } else {
+                            mapping.stage2_owner.generation
+                        },
+                    }
+                } else {
+                    mapping.stage2_owner
+                };
                 let staged = match Self::stage_mapping(
                     &mut inventory,
                     &mut process_reservation,
@@ -18287,7 +18355,7 @@ impl HvfVmState {
                         backing: mapping.backing,
                         inherited_frame: mapping.inherited_frame,
                         stage2_lease: Some(mapping.stage2_lease),
-                        stage2_owner: mapping.stage2_owner,
+                        stage2_owner,
                     },
                 ) {
                     Ok(staged) => staged,
@@ -23139,6 +23207,141 @@ mod frame_inventory_backend_tests {
         lease2.mark_mapped();
         let gen2 = publish_exec_region_host_owner(&mut region2, lease2)
             .expect("must register successor owner without collision");
+        assert_ne!(gen2, owner_generation);
+        disarm_test_owner_stage2_unmap(key2, gen2);
+        assert!(retire_global_frame_host_owner(key2.0, key2.1));
+    }
+
+    #[test]
+    fn fork_independent_kernel_state_publication_registers_global_frame_owner_and_retires_cleanly()
+    {
+        let _allocator_test_guard = global_frame_allocator_test_lock().lock();
+        let mut lease =
+            GlobalFrameStage2Lease::reserve(0x4000, 0x4000).expect("reserve global frame IPA");
+        let key = lease.key();
+        assert!(
+            global_frame_ipa_allocator().lock().is_live(key.0, key.1),
+            "allocator must report reserved IPA as live"
+        );
+        let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            0x4000,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate kernel state host mapping");
+        let host_addr = host.as_ptr() as usize;
+
+        // Register the reusable global frame lease as would happen during fork commit
+        lease.mark_test_mapped_without_backend();
+        let owner_generation = register_global_frame_host_owner(
+            lease,
+            host,
+            u64::from(applevisor::memory::MemPerms::ReadWrite),
+        )
+        .expect("register global frame host owner");
+        assert!(owner_generation > 0);
+        assert_eq!(
+            global_frame_host_owner_generation(key.0, key.1),
+            owner_generation
+        );
+        disarm_test_owner_stage2_unmap(key, owner_generation);
+
+        // Build a task state with unowned runtime region holding the stamped owner_generation
+        let mut task = hvpatch_task_state_test_fixture(21, key.0, 21);
+        task.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::Exact(1)));
+        task.mappings = vec![HvfMappedRegion {
+            start: 0x7fff_0000,
+            ipa: key.0,
+            physical_ipa: key.0,
+            end: 0x7fff_4000,
+            host_addr: host_addr as *mut u8,
+            size: 0x4000,
+            physical_size: 0x4000,
+            perms: applevisor::memory::MemPerms::ReadWrite,
+            memory: None,
+            host_mapping: None,
+            stage2_lease: None,
+            is_dynamic_alias: false,
+            sharing: GuestMappingSharing::Private,
+            guest_writable: true,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation,
+        }];
+
+        let frame = carrick_hal::FrameId::from_kernel_allocation(id(201));
+        let mapping = carrick_hal::MappingId::from_kernel_allocation(id(202));
+        {
+            let mut inventory = task.frame_inventory.lock();
+            inventory.initialized = true;
+            inventory.extents.insert(
+                key,
+                InventoryExtent {
+                    frame,
+                    mapping,
+                    backing: InventoryBackingIdentity::Private(201),
+                    stage2_base: key.0,
+                    stage2_length: key.1,
+                    stage2_owner: InventoryStage2OwnerIdentity {
+                        host_addr,
+                        generation: owner_generation,
+                    },
+                },
+            );
+            {
+                let mut frames = inventory.frames.lock();
+                frames.references.insert(frame, 1);
+                frames.extent_references.insert((frame, key.0, key.1), 1);
+                frames.stage2_references.insert(key, 1);
+            }
+            let capacity = carrick_hal::FrameEventCapacity::for_event_count(2).unwrap();
+            inventory.retirement_reservation = Some(
+                carrick_hal::FrameInventoryReservation::from_kernel_candidates(
+                    carrick_hal::FrameInventoryProvenance::from_kernel_entropy([94; 32]),
+                    carrick_hal::FrameInventoryBatch::prepare(
+                        carrick_hal::KernelTransactionId::from_kernel_allocation(id(94)),
+                        capacity,
+                    )
+                    .unwrap(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            );
+        }
+
+        HvfVmState::retire_task_state_process_mappings(&mut task)
+            .expect("detached child retirement with registered global frame owner should succeed");
+
+        assert_eq!(
+            global_frame_host_owner_generation(key.0, key.1),
+            0,
+            "exact owner must be absent after terminal retirement"
+        );
+        assert!(
+            !global_frame_host_owners().lock().contains_key(&key),
+            "owner entry must be removed from global owners map"
+        );
+        assert!(
+            !global_frame_ipa_allocator().lock().is_live(key.0, key.1),
+            "allocator-reserved IPA must be freed after terminal retirement"
+        );
+
+        // Prove second container can reuse this exact lease without collision or error
+        let mut lease2 = GlobalFrameStage2Lease::reserve(0x4000, 0x4000)
+            .expect("reserve global frame IPA for second container");
+        let key2 = lease2.key();
+        assert_eq!(key2, key);
+        let host2 = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            0x4000,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate second container kernel state host mapping");
+        lease2.mark_test_mapped_without_backend();
+        let gen2 = register_global_frame_host_owner(
+            lease2,
+            host2,
+            u64::from(applevisor::memory::MemPerms::ReadWrite),
+        )
+        .expect("register second container global frame host owner");
         assert_ne!(gen2, owner_generation);
         disarm_test_owner_stage2_unmap(key2, gen2);
         assert!(retire_global_frame_host_owner(key2.0, key2.1));
