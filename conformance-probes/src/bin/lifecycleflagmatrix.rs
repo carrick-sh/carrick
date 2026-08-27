@@ -30,11 +30,13 @@
 //!    non-destructive inspection + clean reap, WNOHANG empty poll, and P_PGID waits).
 //!
 //! Deterministic boolean/key-value output only.
+//! All parent-child operations use bounded monotonic timeouts and scoped SIGKILL cleanup.
 //! Filesystem paths use per-process unique names with explicit unlink cleanup before and after use.
 
 use conformance_probes::{errno, report};
 use std::ffi::CString;
 use std::mem::{size_of, MaybeUninit};
+use std::time::{Duration, Instant};
 
 const SYS_GETTID: libc::c_long = 178;
 const SYS_SETNS: libc::c_long = 268;
@@ -69,6 +71,9 @@ const WNOWAIT: libc::c_int = 0x0100_0000;
 
 const CLD_EXITED: libc::c_int = 1;
 
+const DEFAULT_DEADLINE: Duration = Duration::from_millis(500);
+const CLEANUP_DEADLINE: Duration = Duration::from_millis(200);
+
 #[repr(C)]
 #[derive(Copy, Clone, Default)]
 struct CloneArgs {
@@ -96,11 +101,146 @@ unsafe fn raw_clone(flags: u64, ptid: *mut i32, ctid: *mut i32) -> i64 {
     ) as i64
 }
 
+fn poll_readable(fd: i32, deadline: Instant) -> bool {
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let remaining_ms = (deadline - now).as_millis().min(i32::MAX as u128) as i32;
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, remaining_ms.max(1)) };
+        if rc > 0 {
+            return pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0;
+        }
+        if rc == -1 && errno() == libc::EINTR {
+            continue;
+        }
+        return false;
+    }
+}
+
+fn poll_writable(fd: i32, deadline: Instant) -> bool {
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let remaining_ms = (deadline - now).as_millis().min(i32::MAX as u128) as i32;
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, remaining_ms.max(1)) };
+        if rc > 0 {
+            return pfd.revents & libc::POLLOUT != 0;
+        }
+        if rc == -1 && errno() == libc::EINTR {
+            continue;
+        }
+        return false;
+    }
+}
+
+fn read_exact_bounded(fd: i32, bytes: &mut [u8], deadline: Instant) -> bool {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if !poll_readable(fd, deadline) {
+            return false;
+        }
+        let rc = unsafe {
+            libc::read(
+                fd,
+                bytes[offset..].as_mut_ptr().cast::<libc::c_void>(),
+                bytes.len() - offset,
+            )
+        };
+        if rc > 0 {
+            offset += rc as usize;
+        } else if rc == 0 || (rc == -1 && errno() != libc::EINTR) {
+            return false;
+        }
+    }
+    true
+}
+
+fn write_exact_bounded(fd: i32, bytes: &[u8], deadline: Instant) -> bool {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if !poll_writable(fd, deadline) {
+            return false;
+        }
+        let rc = unsafe {
+            libc::write(
+                fd,
+                bytes[offset..].as_ptr().cast::<libc::c_void>(),
+                bytes.len() - offset,
+            )
+        };
+        if rc > 0 {
+            offset += rc as usize;
+        } else if rc == -1 && errno() != libc::EINTR {
+            return false;
+        }
+    }
+    true
+}
+
+unsafe fn waitpid_bounded(pid: libc::pid_t, deadline: Instant) -> Option<i32> {
+    if pid <= 0 {
+        return None;
+    }
+    let mut status = 0;
+    loop {
+        let rc = libc::waitpid(pid, &mut status, libc::WNOHANG);
+        if rc == pid {
+            return Some(status);
+        }
+        if rc == -1 {
+            if errno() == libc::EINTR {
+                continue;
+            }
+            return None;
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        libc::usleep(500);
+    }
+}
+
+unsafe fn cleanup_child_bounded(pid: libc::pid_t) {
+    if pid <= 0 {
+        return;
+    }
+    let mut status = 0;
+    let rc = libc::waitpid(pid, &mut status, libc::WNOHANG);
+    if rc == pid || (rc == -1 && errno() == libc::ECHILD) {
+        return;
+    }
+    let _ = libc::kill(pid, libc::SIGKILL);
+    let deadline = Instant::now() + CLEANUP_DEADLINE;
+    loop {
+        let rc = libc::waitpid(pid, &mut status, libc::WNOHANG);
+        if rc == pid || (rc == -1 && errno() != libc::EINTR) || Instant::now() >= deadline {
+            return;
+        }
+        libc::usleep(500);
+    }
+}
+
 // -----------------------------------------------------------------------------
 // 1. Clone & Clone3 Flag Matrix
 // -----------------------------------------------------------------------------
 
 unsafe fn test_clone_matrix() {
+    let deadline = Instant::now() + DEFAULT_DEADLINE;
+
     // 1.1 CLONE_THREAD without CLONE_SIGHAND -> EINVAL
     let r1 = raw_clone(
         CLONE_THREAD | (libc::SIGCHLD as u64),
@@ -112,8 +252,8 @@ unsafe fn test_clone_matrix() {
     }
     let r1_einval = r1 == -1 && errno() == libc::EINVAL;
     if r1 > 0 {
-        let mut status = 0;
-        libc::waitpid(r1 as i32, &mut status, 0);
+        let _ = waitpid_bounded(r1 as i32, deadline);
+        cleanup_child_bounded(r1 as i32);
     }
 
     // 1.2 CLONE_SIGHAND without CLONE_VM -> EINVAL
@@ -127,8 +267,8 @@ unsafe fn test_clone_matrix() {
     }
     let r2_einval = r2 == -1 && errno() == libc::EINVAL;
     if r2 > 0 {
-        let mut status = 0;
-        libc::waitpid(r2 as i32, &mut status, 0);
+        let _ = waitpid_bounded(r2 as i32, deadline);
+        cleanup_child_bounded(r2 as i32);
     }
 
     // 1.3 CLONE_PARENT with CLONE_THREAD -> EINVAL
@@ -142,8 +282,8 @@ unsafe fn test_clone_matrix() {
     }
     let r3_einval = r3 == -1 && errno() == libc::EINVAL;
     if r3 > 0 {
-        let mut status = 0;
-        libc::waitpid(r3 as i32, &mut status, 0);
+        let _ = waitpid_bounded(r3 as i32, deadline);
+        cleanup_child_bounded(r3 as i32);
     }
 
     // 1.4 Invalid exit signal in CSIGNAL mask -> EINVAL
@@ -157,8 +297,8 @@ unsafe fn test_clone_matrix() {
     }
     let r4_einval = r4 == -1 && errno() == libc::EINVAL;
     if r4 > 0 {
-        let mut status = 0;
-        libc::waitpid(r4 as i32, &mut status, 0);
+        let _ = waitpid_bounded(r4 as i32, deadline);
+        cleanup_child_bounded(r4 as i32);
     }
 
     // 1.5 CLONE_FS with CLONE_NEWNS -> EINVAL
@@ -172,8 +312,8 @@ unsafe fn test_clone_matrix() {
     }
     let r5_einval = r5 == -1 && errno() == libc::EINVAL;
     if r5 > 0 {
-        let mut status = 0;
-        libc::waitpid(r5 as i32, &mut status, 0);
+        let _ = waitpid_bounded(r5 as i32, deadline);
+        cleanup_child_bounded(r5 as i32);
     }
 
     // 1.6 CLONE_PARENT_SETTID writeback
@@ -186,9 +326,10 @@ unsafe fn test_clone_matrix() {
     let r6_ok = if r6 == 0 {
         libc::_exit(0);
     } else if r6 > 0 {
-        let mut status = 0;
-        libc::waitpid(r6 as i32, &mut status, 0);
+        let wait_res = waitpid_bounded(r6 as i32, deadline);
+        cleanup_child_bounded(r6 as i32);
         ptid == r6 as i32
+            && matches!(wait_res, Some(st) if libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0)
     } else {
         false
     };
@@ -259,14 +400,16 @@ unsafe fn test_clone_matrix() {
 extern "C" fn custom_usr1_handler(_sig: libc::c_int) {}
 
 unsafe fn test_fork_matrix() {
+    let deadline = Instant::now() + DEFAULT_DEADLINE;
+
     // 2.1 Basic fork return value
     let pid1 = libc::fork();
     let fork_basic_ok = if pid1 == 0 {
         libc::_exit(0);
     } else if pid1 > 0 {
-        let mut status = 0;
-        let wr = libc::waitpid(pid1, &mut status, 0);
-        wr == pid1 && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+        let wait_res = waitpid_bounded(pid1, deadline);
+        cleanup_child_bounded(pid1);
+        matches!(wait_res, Some(status) if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0)
     } else {
         false
     };
@@ -311,24 +454,23 @@ unsafe fn test_fork_matrix() {
             mask_blocked as u8,
             pending_cleared as u8,
         ];
-        let _ = libc::write(pipe_sig[1], result.as_ptr().cast(), 3);
+        let _ = write_exact_bounded(pipe_sig[1], &result, deadline);
         libc::close(pipe_sig[1]);
         libc::_exit(0);
     }
     libc::close(pipe_sig[1]);
     let mut sig_res = [0u8; 3];
-    let _ = libc::read(pipe_sig[0], sig_res.as_mut_ptr().cast(), 3);
+    let sig_read_ok = read_exact_bounded(pipe_sig[0], &mut sig_res, deadline);
     libc::close(pipe_sig[0]);
     if pid2 > 0 {
-        let mut status = 0;
-        libc::waitpid(pid2, &mut status, 0);
+        let _ = waitpid_bounded(pid2, deadline);
+        cleanup_child_bounded(pid2);
     }
 
     // Clean up parent signal state
     let mut unblock_set: libc::sigset_t = MaybeUninit::zeroed().assume_init();
     libc::sigemptyset(&mut unblock_set);
     libc::sigaddset(&mut unblock_set, libc::SIGUSR2);
-    // Ignore before unblocking so we don't terminate
     let mut ign_sa: libc::sigaction = MaybeUninit::zeroed().assume_init();
     ign_sa.sa_sigaction = libc::SIG_IGN;
     libc::sigaction(libc::SIGUSR2, &ign_sa, core::ptr::null_mut());
@@ -360,8 +502,8 @@ unsafe fn test_fork_matrix() {
             libc::_exit(0);
         }
         if pid3 > 0 {
-            let mut status = 0;
-            libc::waitpid(pid3, &mut status, 0);
+            let _ = waitpid_bounded(pid3, deadline);
+            cleanup_child_bounded(pid3);
         }
         let cur_off = libc::lseek(fd_file, 0, libc::SEEK_CUR);
         fd_offset_shared = cur_off == 40;
@@ -382,7 +524,7 @@ unsafe fn test_fork_matrix() {
         libc::close(pipe_clo_out[0]);
         let fl = libc::fcntl(pipe_clo[0], libc::F_GETFD);
         let is_clo = (fl & libc::FD_CLOEXEC) != 0;
-        let _ = libc::write(pipe_clo_out[1], [is_clo as u8].as_ptr().cast(), 1);
+        let _ = write_exact_bounded(pipe_clo_out[1], &[is_clo as u8], deadline);
         libc::close(pipe_clo_out[1]);
         libc::close(pipe_clo[0]);
         libc::close(pipe_clo[1]);
@@ -390,13 +532,13 @@ unsafe fn test_fork_matrix() {
     }
     libc::close(pipe_clo_out[1]);
     let mut clo_res = [0u8; 1];
-    let _ = libc::read(pipe_clo_out[0], clo_res.as_mut_ptr().cast(), 1);
+    let clo_read_ok = read_exact_bounded(pipe_clo_out[0], &mut clo_res, deadline);
     libc::close(pipe_clo_out[0]);
     libc::close(pipe_clo[0]);
     libc::close(pipe_clo[1]);
     if pid4 > 0 {
-        let mut status = 0;
-        libc::waitpid(pid4, &mut status, 0);
+        let _ = waitpid_bounded(pid4, deadline);
+        cleanup_child_bounded(pid4);
     }
 
     // 2.5 Memory isolation (COW)
@@ -417,11 +559,12 @@ unsafe fn test_fork_matrix() {
             let child_read = *page == 0x99;
             libc::_exit(if child_read { 0 } else { 1 });
         }
-        let mut status = 0;
+        let mut child_ok = false;
         if pid5 > 0 {
-            libc::waitpid(pid5, &mut status, 0);
+            let wait_res = waitpid_bounded(pid5, deadline);
+            cleanup_child_bounded(pid5);
+            child_ok = matches!(wait_res, Some(status) if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
         }
-        let child_ok = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
         let parent_still_42 = *page == 0x42;
         cow_isolated = child_ok && parent_still_42;
         libc::munmap(page as *mut libc::c_void, 4096);
@@ -429,11 +572,11 @@ unsafe fn test_fork_matrix() {
 
     report!(
         fork_basic_rc_positive = fork_basic_ok,
-        fork_sig_handler_inherited = sig_res[0] == 1,
-        fork_sig_mask_inherited = sig_res[1] == 1,
-        fork_sig_pending_cleared = sig_res[2] == 1,
+        fork_sig_handler_inherited = sig_read_ok && sig_res[0] == 1,
+        fork_sig_mask_inherited = sig_read_ok && sig_res[1] == 1,
+        fork_sig_pending_cleared = sig_read_ok && sig_res[2] == 1,
         fork_fd_offset_shared = fd_offset_shared,
-        fork_cloexec_inherited = clo_res[0] == 1,
+        fork_cloexec_inherited = clo_read_ok && clo_res[0] == 1,
         fork_cow_isolated = cow_isolated,
     );
 }
@@ -454,6 +597,8 @@ extern "C" fn subthread_fn(arg: *mut libc::c_void) -> *mut libc::c_void {
 }
 
 unsafe fn test_identity_matrix() {
+    let deadline = Instant::now() + DEFAULT_DEADLINE;
+
     // 3.1 getpid positive and repeat consistency
     let pid1 = libc::getpid();
     let pid2 = libc::getpid();
@@ -467,27 +612,20 @@ unsafe fn test_identity_matrix() {
     if pid_child == 0 {
         libc::close(pipe_ppid[0]);
         let ppid = libc::getppid();
-        let _ = libc::write(
-            pipe_ppid[1],
-            &ppid as *const i32 as *const libc::c_void,
-            4,
-        );
+        let _ = write_exact_bounded(pipe_ppid[1], &ppid.to_ne_bytes(), deadline);
         libc::close(pipe_ppid[1]);
         libc::_exit(0);
     }
     libc::close(pipe_ppid[1]);
-    let mut child_ppid: i32 = -1;
-    let _ = libc::read(
-        pipe_ppid[0],
-        &mut child_ppid as *mut i32 as *mut libc::c_void,
-        4,
-    );
+    let mut child_ppid_bytes = [0u8; 4];
+    let ppid_read_ok = read_exact_bounded(pipe_ppid[0], &mut child_ppid_bytes, deadline);
     libc::close(pipe_ppid[0]);
     if pid_child > 0 {
-        let mut status = 0;
-        libc::waitpid(pid_child, &mut status, 0);
+        let _ = waitpid_bounded(pid_child, deadline);
+        cleanup_child_bounded(pid_child);
     }
-    let child_ppid_matches = child_ppid == pid1;
+    let child_ppid = i32::from_ne_bytes(child_ppid_bytes);
+    let child_ppid_matches = ppid_read_ok && child_ppid == pid1;
 
     // 3.3 gettid in main thread vs child vs pthread
     let main_tid = libc::syscall(SYS_GETTID) as i32;
@@ -500,21 +638,34 @@ unsafe fn test_identity_matrix() {
         libc::close(pipe_tid[0]);
         let c_tid = libc::syscall(SYS_GETTID) as i32;
         let c_pid = libc::getpid();
-        let res = [c_tid, c_pid];
-        let _ = libc::write(pipe_tid[1], res.as_ptr().cast(), 8);
+        let mut res = [0u8; 8];
+        res[..4].copy_from_slice(&c_tid.to_ne_bytes());
+        res[4..].copy_from_slice(&c_pid.to_ne_bytes());
+        let _ = write_exact_bounded(pipe_tid[1], &res, deadline);
         libc::close(pipe_tid[1]);
         libc::_exit(0);
     }
     libc::close(pipe_tid[1]);
-    let mut child_tid_res = [0i32; 2];
-    let _ = libc::read(pipe_tid[0], child_tid_res.as_mut_ptr().cast(), 8);
+    let mut child_tid_bytes = [0u8; 8];
+    let tid_read_ok = read_exact_bounded(pipe_tid[0], &mut child_tid_bytes, deadline);
     libc::close(pipe_tid[0]);
     if pid_child2 > 0 {
-        let mut status = 0;
-        libc::waitpid(pid_child2, &mut status, 0);
+        let _ = waitpid_bounded(pid_child2, deadline);
+        cleanup_child_bounded(pid_child2);
     }
-    let child_tid_eq_pid =
-        child_tid_res[0] == child_tid_res[1] && child_tid_res[0] == pid_child2;
+    let c_tid = i32::from_ne_bytes([
+        child_tid_bytes[0],
+        child_tid_bytes[1],
+        child_tid_bytes[2],
+        child_tid_bytes[3],
+    ]);
+    let c_pid = i32::from_ne_bytes([
+        child_tid_bytes[4],
+        child_tid_bytes[5],
+        child_tid_bytes[6],
+        child_tid_bytes[7],
+    ]);
+    let child_tid_eq_pid = tid_read_ok && c_tid == c_pid && c_tid == pid_child2;
 
     let mut thread_info = [0i32; 2];
     let mut th: libc::pthread_t = MaybeUninit::zeroed().assume_init();
@@ -544,16 +695,12 @@ unsafe fn test_identity_matrix() {
         libc::close(pipe_sync[1]);
         let grandchild = libc::fork();
         if grandchild == 0 {
-            // Grandchild waits until child A exits and is reaped
-            let mut b = 0u8;
-            let _ = libc::read(pipe_sync[0], &mut b as *mut u8 as *mut libc::c_void, 1);
+            // Grandchild waits until child A exits and parent signals
+            let mut b = [0u8; 1];
+            let _ = read_exact_bounded(pipe_sync[0], &mut b, deadline);
             libc::close(pipe_sync[0]);
             let ppid = libc::getppid();
-            let _ = libc::write(
-                pipe_orphan[1],
-                &ppid as *const i32 as *const libc::c_void,
-                4,
-            );
+            let _ = write_exact_bounded(pipe_orphan[1], &ppid.to_ne_bytes(), deadline);
             libc::close(pipe_orphan[1]);
             libc::_exit(0);
         }
@@ -564,21 +711,18 @@ unsafe fn test_identity_matrix() {
     libc::close(pipe_sync[0]);
     libc::close(pipe_orphan[1]);
     if child_a > 0 {
-        let mut status = 0;
-        libc::waitpid(child_a, &mut status, 0);
+        let _ = waitpid_bounded(child_a, deadline);
+        cleanup_child_bounded(child_a);
     }
     // Now tell grandchild parent is reaped
-    let _ = libc::write(pipe_sync[1], b"k".as_ptr().cast(), 1);
+    let _ = write_exact_bounded(pipe_sync[1], b"k", deadline);
     libc::close(pipe_sync[1]);
 
-    let mut orphan_ppid = 0i32;
-    let _ = libc::read(
-        pipe_orphan[0],
-        &mut orphan_ppid as *mut i32 as *mut libc::c_void,
-        4,
-    );
+    let mut orphan_ppid_bytes = [0u8; 4];
+    let orphan_read_ok = read_exact_bounded(pipe_orphan[0], &mut orphan_ppid_bytes, deadline);
     libc::close(pipe_orphan[0]);
-    let orphan_reparent_ok = orphan_ppid >= 1 && orphan_ppid != pid1;
+    let orphan_ppid = i32::from_ne_bytes(orphan_ppid_bytes);
+    let orphan_reparent_ok = orphan_read_ok && orphan_ppid >= 1 && orphan_ppid != pid1;
 
     report!(
         getpid_positive = pid_positive,
@@ -596,6 +740,8 @@ unsafe fn test_identity_matrix() {
 // -----------------------------------------------------------------------------
 
 unsafe fn test_pidfd_matrix() {
+    let deadline = Instant::now() + DEFAULT_DEADLINE;
+
     // 4.1 pidfd_open error paths
     let r_bad_flags = libc::syscall(
         SYS_PIDFD_OPEN,
@@ -623,8 +769,8 @@ unsafe fn test_pidfd_matrix() {
     let child_pid = libc::fork();
     if child_pid == 0 {
         libc::close(pipe_wait[1]);
-        let mut b = 0u8;
-        let _ = libc::read(pipe_wait[0], &mut b as *mut u8 as *mut libc::c_void, 1);
+        let mut b = [0u8; 1];
+        let _ = read_exact_bounded(pipe_wait[0], &mut b, deadline);
         libc::close(pipe_wait[0]);
         libc::_exit(42);
     }
@@ -700,19 +846,30 @@ unsafe fn test_pidfd_matrix() {
     libc::close(pipe_non_pfd[1]);
 
     // Release child to exit(42)
-    let _ = libc::write(pipe_wait[1], b"x".as_ptr().cast(), 1);
+    let _ = write_exact_bounded(pipe_wait[1], b"x", deadline);
     libc::close(pipe_wait[1]);
 
-    // 4.4 waitid(P_PIDFD, pfd_child, ...)
+    // 4.4 waitid(P_PIDFD, pfd_child, ...) with bounded loop
     let mut waitid_pfd_ok = false;
     let mut pfd_sig_reaped_esrch = false;
     let mut pfd_open_reaped_esrch = false;
     if pfd_child >= 0 {
-        let mut si: libc::siginfo_t = MaybeUninit::zeroed().assume_init();
-        let rc = libc::waitid(P_PIDFD, pfd_child as libc::id_t, &mut si, WEXITED);
-        let si_code = si.si_code;
-        let si_status = si.si_status();
-        waitid_pfd_ok = rc == 0 && si_code == CLD_EXITED && si_status == 42;
+        let reap_deadline = Instant::now() + DEFAULT_DEADLINE;
+        loop {
+            let mut si: libc::siginfo_t = MaybeUninit::zeroed().assume_init();
+            let rc = libc::waitid(P_PIDFD, pfd_child as libc::id_t, &mut si, WEXITED | WNOHANG);
+            if rc == 0 && si.si_pid() == child_pid {
+                waitid_pfd_ok = si.si_code == CLD_EXITED && si.si_status() == 42;
+                break;
+            }
+            if rc == -1 && errno() != libc::EINTR {
+                break;
+            }
+            if Instant::now() >= reap_deadline {
+                break;
+            }
+            libc::usleep(500);
+        }
 
         // pidfd_send_signal after child reaped -> ESRCH
         let r_reaped = libc::syscall(
@@ -732,6 +889,9 @@ unsafe fn test_pidfd_matrix() {
         pfd_open_reaped_esrch = r_open_reaped == -1 && er_open_reaped == libc::ESRCH;
 
         libc::close(pfd_child);
+    }
+    if child_pid > 0 {
+        cleanup_child_bounded(child_pid);
     }
 
     report!(
@@ -757,6 +917,8 @@ unsafe fn test_pidfd_matrix() {
 // -----------------------------------------------------------------------------
 
 unsafe fn test_process_vm_matrix() {
+    let deadline = Instant::now() + DEFAULT_DEADLINE;
+
     let mut buf_a = *b"HELLO_PROCESS_VM";
     let mut buf_b = [0u8; 16];
     let liov = libc::iovec {
@@ -879,15 +1041,11 @@ unsafe fn test_process_vm_matrix() {
         libc::close(pipe_pvm_ack[1]);
         let mut child_buf = *b"CHILD_DATA_12345";
         let addr = child_buf.as_mut_ptr() as usize;
-        let _ = libc::write(
-            pipe_pvm_addr[1],
-            &addr as *const usize as *const libc::c_void,
-            size_of::<usize>(),
-        );
+        let _ = write_exact_bounded(pipe_pvm_addr[1], &addr.to_ne_bytes(), deadline);
         libc::close(pipe_pvm_addr[1]);
 
-        let mut b = 0u8;
-        let _ = libc::read(pipe_pvm_ack[0], &mut b as *mut u8 as *mut libc::c_void, 1);
+        let mut b = [0u8; 1];
+        let _ = read_exact_bounded(pipe_pvm_ack[0], &mut b, deadline);
         libc::close(pipe_pvm_ack[0]);
 
         let updated_ok = &child_buf == b"PARENT_OVERWRITE";
@@ -896,13 +1054,10 @@ unsafe fn test_process_vm_matrix() {
     libc::close(pipe_pvm_addr[1]);
     libc::close(pipe_pvm_ack[0]);
 
-    let mut remote_addr: usize = 0;
-    let _ = libc::read(
-        pipe_pvm_addr[0],
-        &mut remote_addr as *mut usize as *mut libc::c_void,
-        size_of::<usize>(),
-    );
+    let mut remote_addr_bytes = [0u8; size_of::<usize>()];
+    let addr_read_ok = read_exact_bounded(pipe_pvm_addr[0], &mut remote_addr_bytes, deadline);
     libc::close(pipe_pvm_addr[0]);
+    let remote_addr = usize::from_ne_bytes(remote_addr_bytes);
 
     let mut child_read_out = [0u8; 16];
     let liov_from_child = libc::iovec {
@@ -913,15 +1068,19 @@ unsafe fn test_process_vm_matrix() {
         iov_base: remote_addr as *mut libc::c_void,
         iov_len: 16,
     };
-    let r_pvm_read_child = libc::syscall(
-        SYS_PROCESS_VM_READV,
-        child_pvm as libc::c_long,
-        &liov_from_child as *const libc::iovec,
-        1i64,
-        &riov_in_child as *const libc::iovec,
-        1i64,
-        0i64,
-    ) as isize;
+    let r_pvm_read_child = if addr_read_ok && remote_addr != 0 {
+        libc::syscall(
+            SYS_PROCESS_VM_READV,
+            child_pvm as libc::c_long,
+            &liov_from_child as *const libc::iovec,
+            1i64,
+            &riov_in_child as *const libc::iovec,
+            1i64,
+            0i64,
+        ) as isize
+    } else {
+        -1
+    };
     let pvm_read_child_ok =
         r_pvm_read_child == 16 && &child_read_out == b"CHILD_DATA_12345";
 
@@ -930,25 +1089,30 @@ unsafe fn test_process_vm_matrix() {
         iov_base: parent_write_data.as_mut_ptr().cast(),
         iov_len: parent_write_data.len(),
     };
-    let r_pvm_write_child = libc::syscall(
-        SYS_PROCESS_VM_WRITEV,
-        child_pvm as libc::c_long,
-        &liov_to_child as *const libc::iovec,
-        1i64,
-        &riov_in_child as *const libc::iovec,
-        1i64,
-        0i64,
-    ) as isize;
+    let r_pvm_write_child = if addr_read_ok && remote_addr != 0 {
+        libc::syscall(
+            SYS_PROCESS_VM_WRITEV,
+            child_pvm as libc::c_long,
+            &liov_to_child as *const libc::iovec,
+            1i64,
+            &riov_in_child as *const libc::iovec,
+            1i64,
+            0i64,
+        ) as isize
+    } else {
+        -1
+    };
     let pvm_write_child_ok = r_pvm_write_child == 16;
 
-    let _ = libc::write(pipe_pvm_ack[1], b"w".as_ptr().cast(), 1);
+    let _ = write_exact_bounded(pipe_pvm_ack[1], b"w", deadline);
     libc::close(pipe_pvm_ack[1]);
 
-    let mut status = 0;
+    let mut child_exit_ok = false;
     if child_pvm > 0 {
-        libc::waitpid(child_pvm, &mut status, 0);
+        let wait_res = waitpid_bounded(child_pvm, deadline);
+        cleanup_child_bounded(child_pvm);
+        child_exit_ok = matches!(wait_res, Some(status) if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
     }
-    let child_exit_ok = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
 
     // 5.4 Memory fault handling
     let bad_riov = libc::iovec {
@@ -1002,6 +1166,8 @@ unsafe fn test_process_vm_matrix() {
 // -----------------------------------------------------------------------------
 
 unsafe fn test_ptrace_matrix() {
+    let deadline = Instant::now() + DEFAULT_DEADLINE;
+
     // 6.1 Attachment errors
     let r_self = libc::ptrace(
         libc::PTRACE_ATTACH,
@@ -1050,8 +1216,8 @@ unsafe fn test_ptrace_matrix() {
     let child_pt = libc::fork();
     if child_pt == 0 {
         libc::close(pipe_pt[1]);
-        let mut b = 0u8;
-        let _ = libc::read(pipe_pt[0], &mut b as *mut u8 as *mut libc::c_void, 1);
+        let mut b = [0u8; 1];
+        let _ = read_exact_bounded(pipe_pt[0], &mut b, deadline);
         libc::close(pipe_pt[0]);
         libc::_exit(0);
     }
@@ -1085,11 +1251,11 @@ unsafe fn test_ptrace_matrix() {
     );
     let pt_cont_unattached_esrch = r_cont_unattached == -1 && errno() == libc::ESRCH;
 
-    let _ = libc::write(pipe_pt[1], b"q".as_ptr().cast(), 1);
+    let _ = write_exact_bounded(pipe_pt[1], b"q", deadline);
     libc::close(pipe_pt[1]);
     if child_pt > 0 {
-        let mut status = 0;
-        libc::waitpid(child_pt, &mut status, 0);
+        let _ = waitpid_bounded(child_pt, deadline);
+        cleanup_child_bounded(child_pt);
     }
 
     // 6.3 Traceme duplicate error
@@ -1112,17 +1278,17 @@ unsafe fn test_ptrace_matrix() {
         );
         let r2_er = errno();
         let tm_dup_eperm = r1 == 0 && r2 == -1 && r2_er == libc::EPERM;
-        let _ = libc::write(pipe_tm[1], [tm_dup_eperm as u8].as_ptr().cast(), 1);
+        let _ = write_exact_bounded(pipe_tm[1], &[tm_dup_eperm as u8], deadline);
         libc::close(pipe_tm[1]);
         libc::_exit(0);
     }
     libc::close(pipe_tm[1]);
     let mut tm_res = [0u8; 1];
-    let _ = libc::read(pipe_tm[0], tm_res.as_mut_ptr().cast(), 1);
+    let tm_read_ok = read_exact_bounded(pipe_tm[0], &mut tm_res, deadline);
     libc::close(pipe_tm[0]);
     if child_tm > 0 {
-        let mut status = 0;
-        libc::waitpid(child_tm, &mut status, 0);
+        let _ = waitpid_bounded(child_tm, deadline);
+        cleanup_child_bounded(child_tm);
     }
 
     report!(
@@ -1134,7 +1300,7 @@ unsafe fn test_ptrace_matrix() {
         ptrace_invalid_request_eio_or_einval = pt_inv_req_err,
         ptrace_detach_unattached_esrch_or_eperm = pt_detach_unattached_err,
         ptrace_cont_unattached_esrch = pt_cont_unattached_esrch,
-        ptrace_traceme_duplicate_eperm = tm_res[0] == 1,
+        ptrace_traceme_duplicate_eperm = tm_read_ok && tm_res[0] == 1,
     );
 }
 
@@ -1173,7 +1339,6 @@ unsafe fn test_setns_matrix() {
 
         let r_zero_nstype = libc::syscall(SYS_SETNS, fd_uts as libc::c_long, 0i64) as i32;
         let er_zero = errno();
-        // nstype 0 matches any namespace: accepts arg validation (returns 0 or EPERM if permission restricted, but not EINVAL/EBADF)
         setns_zero_type_valid =
             r_zero_nstype == 0 || (r_zero_nstype == -1 && er_zero == libc::EPERM);
 
@@ -1194,6 +1359,8 @@ unsafe fn test_setns_matrix() {
 // -----------------------------------------------------------------------------
 
 unsafe fn test_session_pgid_matrix() {
+    let deadline = Instant::now() + DEFAULT_DEADLINE;
+
     // 8.1 setsid in child vs session leader
     let mut pipe_sid = [0i32; 2];
     libc::pipe(pipe_sid.as_mut_ptr());
@@ -1219,17 +1386,17 @@ unsafe fn test_session_pgid_matrix() {
             getsid_ok as u8,
             sid2_eperm as u8,
         ];
-        let _ = libc::write(pipe_sid[1], res.as_ptr().cast(), 4);
+        let _ = write_exact_bounded(pipe_sid[1], &res, deadline);
         libc::close(pipe_sid[1]);
         libc::_exit(0);
     }
     libc::close(pipe_sid[1]);
     let mut sid_res = [0u8; 4];
-    let _ = libc::read(pipe_sid[0], sid_res.as_mut_ptr().cast(), 4);
+    let sid_read_ok = read_exact_bounded(pipe_sid[0], &mut sid_res, deadline);
     libc::close(pipe_sid[0]);
     if child_sid_pid > 0 {
-        let mut status = 0;
-        libc::waitpid(child_sid_pid, &mut status, 0);
+        let _ = waitpid_bounded(child_sid_pid, deadline);
+        cleanup_child_bounded(child_sid_pid);
     }
 
     // 8.2 getsid query
@@ -1275,17 +1442,17 @@ unsafe fn test_session_pgid_matrix() {
             bad_pgid_eperm as u8,
             joined_parent as u8,
         ];
-        let _ = libc::write(pipe_pgid[1], res.as_ptr().cast(), 3);
+        let _ = write_exact_bounded(pipe_pgid[1], &res, deadline);
         libc::close(pipe_pgid[1]);
         libc::_exit(0);
     }
     libc::close(pipe_pgid[1]);
     let mut pgid_res = [0u8; 3];
-    let _ = libc::read(pipe_pgid[0], pgid_res.as_mut_ptr().cast(), 3);
+    let pgid_read_ok = read_exact_bounded(pipe_pgid[0], &mut pgid_res, deadline);
     libc::close(pipe_pgid[0]);
     if child_pgid_pid > 0 {
-        let mut status = 0;
-        libc::waitpid(child_pgid_pid, &mut status, 0);
+        let _ = waitpid_bounded(child_pgid_pid, deadline);
+        cleanup_child_bounded(child_pgid_pid);
     }
 
     // 8.4 getpgid query
@@ -1299,19 +1466,19 @@ unsafe fn test_session_pgid_matrix() {
     let getpgid_nonexist_esrch = getpgid_nonexist == -1 && errno() == libc::ESRCH;
 
     report!(
-        setsid_in_child_ok = sid_res[0] == 1,
-        setsid_pgrp_updated = sid_res[1] == 1,
-        setsid_getsid_updated = sid_res[2] == 1,
-        setsid_leader_eperm = sid_res[3] == 1,
+        setsid_in_child_ok = sid_read_ok && sid_res[0] == 1,
+        setsid_pgrp_updated = sid_read_ok && sid_res[1] == 1,
+        setsid_getsid_updated = sid_read_ok && sid_res[2] == 1,
+        setsid_leader_eperm = sid_read_ok && sid_res[3] == 1,
         getsid_zero_eq_self = getsid_self_ok,
         getsid_neg_esrch_or_einval = getsid_neg_esrch,
         getsid_nonexistent_esrch = getsid_nonexist_esrch,
         setpgid_neg_pid_einval = setpgid_neg_pid_einval,
         setpgid_neg_pgid_einval = setpgid_neg_pgid_einval,
         setpgid_nonexistent_pid_esrch = setpgid_nonexist_esrch,
-        setpgid_zero_zero_sets_pgrp = pgid_res[0] == 1,
-        setpgid_invalid_pgrp_eperm = pgid_res[1] == 1,
-        setpgid_join_parent_ok = pgid_res[2] == 1,
+        setpgid_zero_zero_sets_pgrp = pgid_read_ok && pgid_res[0] == 1,
+        setpgid_invalid_pgrp_eperm = pgid_read_ok && pgid_res[1] == 1,
+        setpgid_join_parent_ok = pgid_read_ok && pgid_res[2] == 1,
         getpgid_zero_eq_pgrp = getpgid_zero_ok && getpgid_self_ok,
         getpgid_neg_esrch_or_einval = getpgid_neg_esrch,
         getpgid_nonexistent_esrch = getpgid_nonexist_esrch,
@@ -1323,6 +1490,8 @@ unsafe fn test_session_pgid_matrix() {
 // -----------------------------------------------------------------------------
 
 unsafe fn test_process_control_waitid_matrix() {
+    let deadline = Instant::now() + DEFAULT_DEADLINE;
+
     // 9.1 prctl(PR_SET_PDEATHSIG)
     let r_pdeath_neg = libc::prctl(PR_SET_PDEATHSIG, -1, 0, 0, 0);
     let pdeath_neg_einval = r_pdeath_neg == -1 && errno() == libc::EINVAL;
@@ -1374,8 +1543,8 @@ unsafe fn test_process_control_waitid_matrix() {
     let child_w = libc::fork();
     if child_w == 0 {
         libc::close(pipe_wait[1]);
-        let mut b = 0u8;
-        let _ = libc::read(pipe_wait[0], &mut b as *mut u8 as *mut libc::c_void, 1);
+        let mut b = [0u8; 1];
+        let _ = read_exact_bounded(pipe_wait[0], &mut b, deadline);
         libc::close(pipe_wait[0]);
         libc::_exit(33);
     }
@@ -1392,28 +1561,37 @@ unsafe fn test_process_control_waitid_matrix() {
     let running_nohang_zero = r_run == 0 && si_run.si_pid() == 0;
 
     // Release child
-    let _ = libc::write(pipe_wait[1], b"g".as_ptr().cast(), 1);
+    let _ = write_exact_bounded(pipe_wait[1], b"g", deadline);
     libc::close(pipe_wait[1]);
 
-    // Inspect exit code with WNOWAIT (without reaping)
-    let mut si_peek: libc::siginfo_t = MaybeUninit::zeroed().assume_init();
-    let r_peek = libc::waitid(
-        P_PID,
-        child_w as libc::id_t,
-        &mut si_peek,
-        WEXITED | WNOWAIT,
-    );
-    let peek_ok = r_peek == 0
-        && si_peek.si_pid() == child_w
-        && si_peek.si_code == CLD_EXITED
-        && si_peek.si_status() == 33;
+    // Inspect exit code with WNOWAIT (without reaping) in bounded loop
+    let peek_deadline = Instant::now() + DEFAULT_DEADLINE;
+    let mut peek_ok = false;
+    loop {
+        let mut si_peek: libc::siginfo_t = MaybeUninit::zeroed().assume_init();
+        let r_peek = libc::waitid(
+            P_PID,
+            child_w as libc::id_t,
+            &mut si_peek,
+            WEXITED | WNOWAIT | WNOHANG,
+        );
+        if r_peek == 0 && si_peek.si_pid() == child_w {
+            peek_ok = si_peek.si_code == CLD_EXITED && si_peek.si_status() == 33;
+            break;
+        }
+        if r_peek == -1 && errno() != libc::EINTR {
+            break;
+        }
+        if Instant::now() >= peek_deadline {
+            break;
+        }
+        libc::usleep(500);
+    }
 
     // Follow-up waitpid must successfully reap the child
-    let mut reap_status = 0;
-    let r_reap = libc::waitpid(child_w, &mut reap_status, 0);
-    let reap_ok = r_reap == child_w
-        && libc::WIFEXITED(reap_status)
-        && libc::WEXITSTATUS(reap_status) == 33;
+    let reap_res = waitpid_bounded(child_w, deadline);
+    let reap_ok = matches!(reap_res, Some(st) if libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 33);
+    cleanup_child_bounded(child_w);
 
     // All children reaped -> P_ALL + WNOHANG -> ECHILD
     let mut si_none: libc::siginfo_t = MaybeUninit::zeroed().assume_init();
@@ -1426,15 +1604,29 @@ unsafe fn test_process_control_waitid_matrix() {
         libc::setpgid(0, 0);
         libc::_exit(55);
     }
-    let mut si_pgid: libc::siginfo_t = MaybeUninit::zeroed().assume_init();
-    let r_pgid = libc::waitid(
-        P_PGID,
-        child_pgid as libc::id_t,
-        &mut si_pgid,
-        WEXITED,
-    );
-    let waitid_p_pgid_ok =
-        r_pgid == 0 && si_pgid.si_pid() == child_pgid && si_pgid.si_status() == 55;
+    let pgid_deadline = Instant::now() + DEFAULT_DEADLINE;
+    let mut waitid_p_pgid_ok = false;
+    loop {
+        let mut si_pgid: libc::siginfo_t = MaybeUninit::zeroed().assume_init();
+        let r_pgid = libc::waitid(
+            P_PGID,
+            child_pgid as libc::id_t,
+            &mut si_pgid,
+            WEXITED | WNOHANG,
+        );
+        if r_pgid == 0 && si_pgid.si_pid() == child_pgid {
+            waitid_p_pgid_ok = si_pgid.si_status() == 55;
+            break;
+        }
+        if r_pgid == -1 && errno() != libc::EINTR {
+            break;
+        }
+        if Instant::now() >= pgid_deadline {
+            break;
+        }
+        libc::usleep(500);
+    }
+    cleanup_child_bounded(child_pgid);
 
     report!(
         prctl_pdeathsig_bad_neg_einval = pdeath_neg_einval,
