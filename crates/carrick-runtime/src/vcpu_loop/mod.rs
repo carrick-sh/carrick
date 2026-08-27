@@ -7508,7 +7508,18 @@ where
                 Err(quiesce::PtPauseError::TimedOut) => {
                     // No dispatcher/backend mapping call has started yet. Return
                     // a clean Linux allocation failure after pt_pause rolled the
-                    // request back and resumed already-parked siblings.
+                    // request back and resumed already-parked siblings. This is
+                    // still a completed syscall boundary, so retain the exact
+                    // context required by errno completion and signal service.
+                    let kernel_context = kernel
+                        .dispatcher
+                        .capture_kernel_context(self.linux_tid)
+                        .map_err(|error| {
+                        RuntimeError::Configuration(format!(
+                            "capture timed-out page-table pause kernel context: {error}"
+                        ))
+                    })?;
+                    self.service_kernel_context = Some(kernel_context.retain_exact());
                     return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ENOMEM));
                 }
             }
