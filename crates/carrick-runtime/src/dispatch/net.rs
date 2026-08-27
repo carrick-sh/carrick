@@ -332,6 +332,14 @@ fn host_socket_addr(host_fd: i32, _family: i32, peer: bool) -> Option<std::net::
     let used = (sa_len as usize).min(sa.len());
     host_sockaddr_to_socket_addr(&sa[..used])
 }
+
+fn host_socket_is_connected(host_fd: i32) -> bool {
+    let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
+    let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
+    let rc =
+        unsafe { libc::getpeername(host_fd, sa.as_mut_ptr() as *mut _, &mut sa_len as *mut _) };
+    rc == 0
+}
 mod recverr;
 mod sctp;
 
@@ -662,6 +670,27 @@ mod accept4_flag_tests {
         );
         assert_eq!(decode_accept4_flags(0x1234_5678), None);
         assert_eq!(decode_accept4_flags(-1), None);
+    }
+
+    #[test]
+    fn detects_connected_stream_without_consuming_data() {
+        let mut connected = [-1; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, connected.as_mut_ptr())
+            },
+            0
+        );
+        assert!(host_socket_is_connected(connected[0]));
+        unsafe {
+            libc::close(connected[0]);
+            libc::close(connected[1]);
+        }
+
+        let unconnected = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        assert!(unconnected >= 0);
+        assert!(!host_socket_is_connected(unconnected));
+        unsafe { libc::close(unconnected) };
     }
 }
 
@@ -7081,6 +7110,9 @@ impl SyscallDispatcher {
             };
             let is_stream = guest_type == Some(libc::SOCK_STREAM);
             let is_sctp_stream = is_stream && guest_protocol == Some(LINUX_IPPROTO_SCTP);
+            if is_stream && dest_addr != 0 && host_socket_is_connected(host_fd.get()) {
+                return Ok(DispatchOutcome::errno(LINUX_EISCONN));
+            }
             let nonblocking = this.io_is_nonblocking(fd, flags);
             let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;
             let connected_send = dest_addr == 0;
@@ -7231,6 +7263,11 @@ impl SyscallDispatcher {
                 }
             }
             let (host_fd, family) = this.host_socket_lookup(fd)?;
+            if family == LINUX_AF_UNIX
+                && LinuxMsgFlags::from_bits_retain(flags).contains(LinuxMsgFlags::OOB)
+            {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
             // MSG_ERRQUEUE reads the socket's error queue. carrick keeps no
             // error queue, so it's always empty → EAGAIN (recv01/recvfrom01),
             // matching Linux when no error is queued. Checked after the socket
@@ -7866,6 +7903,7 @@ impl SyscallDispatcher {
                     || optname == LINUX_SO_REUSEPORT
                     || optname == LINUX_SO_RCVBUF
                     || optname == LINUX_SO_SNDBUF
+                    || optname == LINUX_SO_ACCEPTCONN
                     || optname == crate::linux_abi::LINUX_SO_PASSCRED)
             {
                 const LINUX_DEFAULT_SOCKBUF: i32 = 212_992;
@@ -7881,6 +7919,8 @@ impl SyscallDispatcher {
                             i32::from(base.so_reuseport())
                         } else if optname == crate::linux_abi::LINUX_SO_PASSCRED {
                             i32::from(base.so_passcred())
+                        } else if optname == LINUX_SO_ACCEPTCONN {
+                            i32::from(base.listening())
                         } else if optname == LINUX_SO_RCVBUF {
                             base.so_rcvbuf()
                                 .map_or(LINUX_DEFAULT_SOCKBUF, |v| v.saturating_mul(2))
