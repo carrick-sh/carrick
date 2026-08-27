@@ -242,7 +242,7 @@ the interval timers ride a kqueue `EVFILT_TIMER`.
 | `nanosleep` | 101 | Emulated (Full) | interruptible host sleep | SIGALRM EINTRs the wait. |
 | `times` | 153 | Emulated (Full) | Darwin process-time accounting | |
 | `timerfd_create`/`settime`/`gettime` | 85,86,87 | Emulated (Full) | kqueue `EVFILT_TIMER`, pollable as an fd | |
-| `clock_settime`, `settimeofday`, `clock_adjtime`, `adjtimex` | 112,170,266,171 | Emulated (Partial) | EPERM (no CAP_SYS_TIME) | Unprivileged set → EPERM, matching Linux. |
+| `clock_settime`, `settimeofday`, `clock_adjtime`, `adjtimex` | 112,170,266,171 | Emulated (Partial) | carrier-wide CLOCK_REALTIME delta (`dispatch/mod.rs`), re-stamped into each MM's vvar word by the dispatcher | Needs `CAP_SYS_TIME` (`--cap-add SYS_TIME`), else EPERM like Linux. vDSO and syscall reads agree after a step (probe `clocksettimevdso`); `adjtimex`/`clock_adjtime` are read-state only. |
 | `timer_create`/`gettime`/`settime`/`delete`/`getoverrun` | 107–111 | Emulated (Partial) | per-process timer registry + fallback delivery thread | SIGEV_SIGNAL only; SIGEV_THREAD → ENOTSUP. (Table marks these `Deferred`; the `posixtimers` probe owns the emulated path.) |
 
 **Deferred:** every `*_time64` clock/timer variant (#403–411) — unreachable from

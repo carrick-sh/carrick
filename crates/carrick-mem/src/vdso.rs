@@ -71,6 +71,21 @@ pub fn realtime_off_ns() -> Option<u64> {
     }
 }
 
+/// The exact `u64` the vvar must carry at `VVAR_OFF_REALTIME_OFF_NS` for a host
+/// calibration of `host_off_ns` (`unix_ns - counter_ns`) and a guest-settable
+/// CLOCK_REALTIME delta of `delta_ns` (`clock_settime`/`settimeofday` under
+/// CAP_SYS_TIME): the vDSO computes `realtime = counter_ns + word`, so the
+/// guest delta rides inside the word (two's-complement wrapping add, so a
+/// negative delta works). This is the ONLY place the word is computed; the
+/// VMM stampers publish it with `delta_ns = 0` at vCPU construction (host
+/// calibration only) and the runtime dispatcher re-stamps it per MM with the
+/// live delta (`SyscallDispatcher::sync_vvar_realtime_offset`). The delta
+/// itself is runtime state (carrier-wide today, the container's `ClockDomain`
+/// in Phase B) and deliberately does not live in this crate.
+pub fn vvar_realtime_off_ns(host_off_ns: u64, delta_ns: i64) -> u64 {
+    host_off_ns.wrapping_add(delta_ns as u64)
+}
+
 /// The assembled clock functions (aarch64). Offsets within this blob:
 /// `__kernel_clock_gettime` @ 0x00, `__kernel_gettimeofday` @ 0x84,
 /// `__kernel_clock_getres` @ 0xdc, `__kernel_rt_sigreturn` @ 0x104,
@@ -1063,6 +1078,22 @@ mod tests {
                 .iter()
                 .any(|s| elf.dynstrtab.get_at(s.st_name) == Some("__kernel_getrandom")),
             "__kernel_getrandom should remain exported in clock-syscalls mode"
+        );
+    }
+
+    /// The vvar word is `host calibration + guest delta` in two's complement,
+    /// so the vDSO's `counter_ns + word` yields the shifted wall clock. Pure:
+    /// the delta is an argument, never a static in this crate.
+    #[test]
+    fn vvar_realtime_word_carries_the_guest_offset() {
+        assert_eq!(vvar_realtime_off_ns(1_000, 0), 1_000);
+        assert_eq!(
+            vvar_realtime_off_ns(1_000, 3_600_000_000_000),
+            3_600_000_001_000
+        );
+        assert_eq!(
+            vvar_realtime_off_ns(1_000, -2_000),
+            1_000u64.wrapping_sub(2_000)
         );
     }
 }

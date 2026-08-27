@@ -60,8 +60,7 @@ const KNOWN_PROBE_GAPS: &[&str] = &[
     // iouringenterflag FIXED in M4 (flag/arg validation + to_submit bound) — now PASSES.
     // sotimeo FIXED in M3 (SO_RCVTIMEO/SO_SNDTIMEO stored per-OFD + threaded into blocking_io) — now PASSES.
     // epollstaledel FIXED in M3 (pending_ready keyed by fd) — now PASSES.
-    // clocksettimevdso — Task 3 lands the vvar sync fix; excused during Task 2.
-    "clocksettimevdso",
+    // clocksettimevdso FIXED (embed Phase A: per-MM vvar realtime re-stamp) — now PASSES.
 ];
 
 /// Probes kept as standalone REDUCERS but NOT run by the gate, for one of two

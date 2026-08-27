@@ -2309,6 +2309,16 @@ impl HostAliasTransactions {
 pub(crate) struct DispatchMmAuthority {
     mem: Arc<mem::MemAuthority>,
     host_alias_transactions: Arc<HostAliasTransactions>,
+    /// The `guest_realtime_epoch()` under which THIS MM's vvar
+    /// `VVAR_OFF_REALTIME_OFF_NS` word was last stamped by the dispatcher
+    /// (`SyscallDispatcher::sync_vvar_realtime_offset`). The vvar page is per
+    /// MM (it also carries the per-process RNG generation), so the stamp state
+    /// is MM state. `u64::MAX` = never: a fresh or forked MM re-stamps once on
+    /// its first syscall (or at the post-exec identity stamp), an idempotent
+    /// 8-byte write of the word the VMM stamper already published when the
+    /// delta is 0 (a fork child's vvar frame is already COW-split by the
+    /// HVPatch RNG-generation re-stamp, `trap.rs:11281`).
+    vvar_realtime_epoch: std::sync::atomic::AtomicU64,
 }
 
 impl DispatchMmAuthority {
@@ -2316,6 +2326,7 @@ impl DispatchMmAuthority {
         Self {
             mem: Arc::new(mem::MemAuthority::new(mem::MemState::new())),
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
+            vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
 
@@ -2323,6 +2334,7 @@ impl DispatchMmAuthority {
         Self {
             mem: self.mem.fork_private(),
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
+            vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
 
@@ -4669,6 +4681,84 @@ impl SyscallDispatcher {
         }
     }
 
+    /// Keep the CALLING MM's vvar `VVAR_OFF_REALTIME_OFF_NS` word coherent with
+    /// the guest realtime offset, so the userspace vDSO `clock_gettime` and the
+    /// trapping syscall agree after `clock_settime` / `settimeofday`.
+    ///
+    /// The vvar page is per MM, and a foreign MM has no stage-1 walker bound to
+    /// it, so a change cannot be broadcast from the setter. Instead every MM
+    /// re-stamps ITSELF at its next syscall entry when the global epoch has
+    /// moved (and at the post-exec identity stamp, so an exec'd image reads
+    /// the moved clock before its first syscall). Per-syscall cost when
+    /// nothing changed: one Acquire load of the epoch, one `ArcSwap::load` of
+    /// the current MM authority and one Acquire load — no write, no lock. One
+    /// 8-byte carrick-internal write per MM per change. The setter's own MM is
+    /// stamped inline by [`Self::set_guest_realtime`] before the syscall
+    /// returns, so a vDSO read issued right after it already agrees.
+    ///
+    /// The VMM stampers publish the host calibration only; the guest delta
+    /// enters the word here, through the single
+    /// `carrick_mem::vdso::vvar_realtime_off_ns` computation.
+    ///
+    /// `write_bytes_unchecked` bypasses the guest-visible read-only permission
+    /// of the vvar and splits a fork-shared frame (`PrivilegedInternal`), like
+    /// the RNG-generation re-stamp. An MM with no vvar mapped at
+    /// `LINUX_VVAR_BASE` (`CARRICK_DISABLE_VDSO=1`, the relocated native-lane
+    /// vvar) has nothing to keep coherent: `OutOfBounds` at that fixed VA means
+    /// exactly that (the aarch64 engine's `syscall_buffer_chunk` reports an
+    /// unmapped VA as `OutOfBounds`) and is not an error. Any other failure is.
+    pub(crate) fn sync_vvar_realtime_offset(
+        &self,
+        memory: &mut impl GuestMemory,
+    ) -> Result<(), MemoryError> {
+        let epoch = guest_realtime_epoch();
+        let authority = self.mm_binding.current.load();
+        if authority
+            .vvar_realtime_epoch
+            .load(std::sync::atomic::Ordering::Acquire)
+            == epoch
+        {
+            return Ok(());
+        }
+        if let Some(host_off_ns) = crate::vdso::realtime_off_ns() {
+            let word =
+                crate::vdso::vvar_realtime_off_ns(host_off_ns, get_guest_realtime_offset_ns());
+            match memory.write_bytes_unchecked(
+                crate::vdso::LINUX_VVAR_BASE + crate::vdso::VVAR_OFF_REALTIME_OFF_NS as u64,
+                &word.to_le_bytes(),
+            ) {
+                Ok(()) | Err(MemoryError::OutOfBounds { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        authority
+            .vvar_realtime_epoch
+            .store(epoch, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// `clock_settime(CLOCK_REALTIME)` / `settimeofday`: move the guest wall
+    /// clock so that "now" reads `target`, then stamp the caller's vvar at once.
+    /// The delta is measured against the host-calibrated base, never against a
+    /// transiently-zeroed offset, so concurrent readers never observe a
+    /// momentary jump back to host time.
+    pub(crate) fn set_guest_realtime(
+        &self,
+        memory: &mut impl GuestMemory,
+        target: Duration,
+    ) -> Result<(), MemoryError> {
+        let base = realtime_base_duration();
+        let delta_ns = if target >= base {
+            i64::try_from((target - base).as_nanos()).unwrap_or(i64::MAX)
+        } else {
+            i64::try_from((base - target).as_nanos())
+                .map(|n| -n)
+                .unwrap_or(i64::MIN)
+        };
+        set_guest_realtime_offset_ns(delta_ns);
+        self.sync_vvar_realtime_offset(memory)
+    }
+
     pub(crate) fn begin_host_alias_dispatch(&self) -> HostAliasDispatchGuard {
         self.mm_binding.begin_dispatch(false)
     }
@@ -6165,6 +6255,12 @@ impl SyscallDispatcher {
         if let Some(outcome) = self.seccomp_precheck(&request) {
             return Ok(outcome);
         }
+        // The calling MM's vDSO realtime word follows a guest `clock_settime`
+        // made by any process (one atomic compare when nothing changed).
+        if let Err(error) = self.sync_vvar_realtime_offset(memory) {
+            tracing::error!("vvar realtime re-stamp failed: {error}");
+            return Err(DispatchError::from(error));
+        }
         if let Some(result) = self
             .dispatch_threaded_independent(kernel, request, memory, reporter, tid, registry, futex)
         {
@@ -6507,6 +6603,12 @@ impl SyscallDispatcher {
                 errno,
             });
             return Ok(outcome);
+        }
+        // The calling MM's vDSO realtime word follows a guest `clock_settime`
+        // made by any process (see `dispatch_threaded`).
+        if let Err(error) = self.sync_vvar_realtime_offset(memory) {
+            tracing::error!("vvar realtime re-stamp failed: {error}");
+            return Err(DispatchError::from(error));
         }
 
         // Reusable guest-memory watchpoint (`watchpoint` feature +
@@ -7735,47 +7837,78 @@ fn linux_access_flags_are_supported(flags: u64) -> bool {
     flags & !SUPPORTED == 0
 }
 
+/// The guest-settable CLOCK_REALTIME delta (`clock_settime`/`settimeofday`
+/// under CAP_SYS_TIME), in nanoseconds, applied on top of the host
+/// calibration published in `carrick_mem::vdso::realtime_off_ns`.
+/// Carrier-wide: every Linux process in the carrier shares one wall clock, as
+/// processes under one Linux kernel do. Phase B moves it (with its epoch)
+/// into the container's `ClockDomain`. Two consumers must agree on it — the
+/// syscall path (`realtime_duration`) and each MM's vvar word, which the
+/// dispatcher re-stamps through `carrick_mem::vdso::vvar_realtime_off_ns`
+/// (`SyscallDispatcher::sync_vvar_realtime_offset`).
 static GUEST_REALTIME_OFFSET_NS: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(0);
+
+/// Bumped (Release) on every offset change, AFTER the new delta is stored, so
+/// a reader that observes the new epoch (Acquire) also observes the new delta.
+/// Each Linux MM records the epoch its vvar word was stamped under
+/// (`DispatchMmAuthority::vvar_realtime_epoch`) and re-stamps itself when it
+/// falls behind.
+static GUEST_REALTIME_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub(crate) fn get_guest_realtime_offset_ns() -> i64 {
     GUEST_REALTIME_OFFSET_NS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Publish a new guest CLOCK_REALTIME delta and advance the epoch.
 pub(crate) fn set_guest_realtime_offset_ns(delta_ns: i64) {
     GUEST_REALTIME_OFFSET_NS.store(delta_ns, std::sync::atomic::Ordering::SeqCst);
+    GUEST_REALTIME_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+/// The current offset epoch (see [`set_guest_realtime_offset_ns`]). Read on
+/// every syscall entry by every MM: one Acquire load.
+pub(crate) fn guest_realtime_epoch() -> u64 {
+    GUEST_REALTIME_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The guest's CLOCK_REALTIME WITHOUT the guest-settable delta: host
+/// calibration only (`uptime + vvar host offset`, the same base the vDSO adds
+/// its word to; the live wall clock when no vvar was ever stamped).
+fn realtime_base_duration() -> Duration {
+    #[cfg(not(target_os = "linux"))]
+    {
+        if let Some(off_ns) = crate::vdso::realtime_off_ns()
+            && let Some(uptime) = host_clock_duration(carrick_portable::CLOCK_UPTIME_RAW)
+        {
+            Duration::from_nanos((uptime.as_nanos() as u64).wrapping_add(off_ns))
+        } else {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+    }
 }
 
 /// The guest's `CLOCK_REALTIME`: THE wall-clock authority for every realtime
 /// consumer in the runtime (clock reads, absolute deadlines, file and IPC
 /// stamps, `/proc` epochs). Nothing else in the runtime may read the host wall
-/// clock for a guest-visible value.
+/// clock for a guest-visible value. `realtime_base_duration` plus the guest
+/// delta — the same delta the dispatcher folds into every MM's vvar word, so
+/// the vDSO fast path and the trapping syscall agree.
 pub(crate) fn realtime_duration() -> Duration {
     let offset_ns = get_guest_realtime_offset_ns();
-    let base = {
-        #[cfg(not(target_os = "linux"))]
-        {
-            if let Some(off_ns) = crate::vdso::realtime_off_ns()
-                && let Some(uptime) = host_clock_duration(carrick_portable::CLOCK_UPTIME_RAW)
-            {
-                Duration::from_nanos((uptime.as_nanos() as u64).wrapping_add(off_ns))
-            } else {
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or(Duration::ZERO)
-            }
-        }
-        #[cfg(target_os = "linux")]
-        {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or(Duration::ZERO)
-        }
-    };
+    let base = realtime_base_duration();
     if offset_ns >= 0 {
         base.saturating_add(Duration::from_nanos(offset_ns as u64))
     } else {
-        base.saturating_sub(Duration::from_nanos((-offset_ns) as u64))
+        base.saturating_sub(Duration::from_nanos(offset_ns.unsigned_abs()))
     }
 }
 
@@ -9285,6 +9418,20 @@ mod realtime_authority_tests {
                 "UTIME_NOW must carry the guest offset: sec={}",
                 resolved.0
             );
+        });
+    }
+
+    /// Every offset change advances the epoch each MM compares against, so a
+    /// sibling MM can tell "the clock moved since I last stamped my vvar"
+    /// with one atomic load.
+    #[test]
+    fn every_offset_change_advances_the_epoch() {
+        with_guest_realtime_offset(0, || {
+            let start = guest_realtime_epoch();
+            set_guest_realtime_offset_ns(5);
+            set_guest_realtime_offset_ns(0);
+            assert_eq!(guest_realtime_epoch(), start + 2);
+            assert_eq!(get_guest_realtime_offset_ns(), 0);
         });
     }
 }
