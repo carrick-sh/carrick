@@ -1525,6 +1525,72 @@ fn conformance_bridge_udp_sendto_unreachable() {
 }
 
 #[test]
+fn conformance_bridge_dns_epoll_wake() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Some(bin) = carrick_bin() else {
+        eprintln!("SKIP conformance_bridge_dns_epoll_wake: target/release/carrick not built");
+        return;
+    };
+    let lane = ARM64;
+    if !lane_runnable_here(&lane) {
+        eprintln!(
+            "SKIP conformance_bridge_dns_epoll_wake: host ({}) cannot run {} guests",
+            std::env::consts::ARCH,
+            lane.platform
+        );
+        return;
+    }
+    let docker_ok = Command::new("docker")
+        .arg("version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !docker_ok {
+        eprintln!("SKIP conformance_bridge_dns_epoll_wake: Docker not reachable");
+        return;
+    }
+    let probe = probes_dir(
+        selected_dedicated_probe_target(&lane).expect("select dedicated probe artifact"),
+    )
+    .join("bridge_dns_epoll_wake");
+    if !probe.exists() {
+        eprintln!(
+            "SKIP conformance_bridge_dns_epoll_wake: probe not built ({})",
+            probe.display()
+        );
+        return;
+    }
+
+    ensure_signed(&bin);
+    let raw = std::fs::read(&probe).expect("read bridge_dns_epoll_wake probe");
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD
+        .encode(raw)
+        .into_bytes();
+    let carrick_out = run_bridge_probe(&bin, lane, &encoded);
+    // The invariant is Linux's, not the oracle's: a datagram the gateway
+    // answered must wake epoll. Assert it on carrick's output BEFORE the diff
+    // so an oracle-side resolver outage (both sides `false`) cannot pass as a
+    // MATCH.
+    for line in [
+        "dns_epoll_ready_after_send=true",
+        "dns_epoll_wake_while_parked=true",
+    ] {
+        assert!(
+            carrick_out.contains(line),
+            "bridge dns epoll wake: carrick did not report {line}:\n{carrick_out}"
+        );
+    }
+    let docker_out = run_docker_probe(lane, &encoded).expect("docker bridge dns epoll wake probe");
+    if let Some(diff) = diff_lines(&carrick_out, &docker_out) {
+        panic!("bridge dns epoll wake conformance mismatch:\n{diff}");
+    }
+}
+
+#[test]
 fn conformance_bridge_reuse_sockopts() {
     let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -3248,7 +3314,13 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// for the migrating stack-smash family) move the denominator from 463 to 465
 /// and the gating rows from 874 to 878 — 439 conformance sources under both
 /// variants.
-const PROBE_SOURCE_COUNT: usize = 465;
+/// `bridge_dns_epoll_wake` (a datagram the bridge DNS gateway answers
+/// in-process must make the socket EPOLLIN-ready and wake a thread already
+/// parked in `epoll_wait`) moves the denominator from 465 to 466 and the
+/// gating rows from 878 to 880 — 440 conformance sources under both
+/// variants; it runs under the dedicated `conformance_bridge_dns_epoll_wake`
+/// runner, so the generic set stays at 419.
+const PROBE_SOURCE_COUNT: usize = 466;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
@@ -3256,6 +3328,7 @@ const PROBE_SOURCE_COUNT: usize = 465;
 const DEDICATED_PROBE_RUNNERS: &[(&str, &str)] = &[
     ("bridge_compose_client", "conformance_bridge_compose_pair"),
     ("bridge_compose_server", "conformance_bridge_compose_pair"),
+    ("bridge_dns_epoll_wake", "conformance_bridge_dns_epoll_wake"),
     (
         "bridge_loopback_isolation",
         "conformance_bridge_loopback_isolation",
@@ -4993,13 +5066,13 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     }
 
     let sources = all_probe_source_names();
-    assert_eq!(DEDICATED_PROBE_RUNNERS.len(), 20);
+    assert_eq!(DEDICATED_PROBE_RUNNERS.len(), 21);
     assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
     let generic = validate_closure_probe_rows(&inventory(), &sources)
         .expect("checked-in closure probe inventory must match the source denominator");
     assert_eq!(generic.len(), 419);
-    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 439);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 878);
+    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 440);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 880);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")
