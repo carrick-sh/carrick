@@ -50,3 +50,17 @@ pub fn run_or_fail(outcome: Result<ContainerResult, EmbedError>) -> ContainerRes
         Err(err) => panic!("container run failed: {err}"),
     }
 }
+
+/// The run id `scripts/test-signed.sh` exported. Every guest this process
+/// launches is titled `carrick:<run-id>:`, and the CLI-parity test derives
+/// `<run-id>-cli` for the child it spawns, so `scripts/sudo/kill.sh` can reap
+/// exactly this run. Fail closed: without the stamp nothing can clean up.
+pub fn run_id() -> String {
+    std::env::var("CARRICK_RUN_ID")
+        .ok()
+        .filter(|id| !id.is_empty())
+        .expect(
+            "CARRICK_RUN_ID must be set: scripts/test-signed.sh exports it so \
+             scripts/sudo/kill.sh can reap this run's guests",
+        )
+}

@@ -64,6 +64,16 @@ path. A guest on that path only runs from a **codesigned** binary: a bare
   Building the runtime lib alone does **not** relink `target/release/carrick`, so
   you'll test a stale binary. Confirm the new code is in the binary:
   `strings target/release/carrick | grep <your-marker>`.
+- **A cargo test executable is unsigned too.** The entitlement has to be on
+  the process that calls `hv_vm_create`; for an in-process guest test that is
+  `target/debug/deps/<crate>-<hash>`, which `just build` never touches. Guest
+  tests in `carrick-embed` therefore run only through `just test-embed` →
+  [`scripts/test-signed.sh`](scripts/test-signed.sh), which signs each test
+  executable on the shipped binary's post-link path
+  ([`scripts/lib/post-link-sign.sh`](scripts/lib/post-link-sign.sh)), runs
+  them serially, and runs an unentitled negative control. `HV_DENIED` there is
+  a FAILURE (`EmbedError::Entitlement`), never a self-skip — the
+  `trap_hvf.rs` skip pattern is not to be copied.
 - **Never swap in a faster linker (`lld`).** It strips the `__DATA,__dof_carrick`
   section → USDT probes register empty → `carrick trace` silently fires zero
   events. Keep Apple `ld64`. Verify: `otool -l target/release/carrick | grep dof`.
@@ -95,6 +105,7 @@ compile/lint/test only.
 | `just conformance-quick` 🔏 | Fast smoke regression vs the Docker oracle. |
 | `just conformance [TIER]` 🔏 | Language/LTP conformance vs Docker (default tier `full`). |
 | `just conformance-probes` 🔏 | Line-exact ABI probe gate vs Docker. |
+| `just test-embed [ARGS]` 🔏 | Signed guest tests for `carrick-embed`: `cargo test --no-run`, sign each test executable with the hypervisor entitlement through the shipped post-link path (`scripts/test-signed.sh`), run under `RUST_TEST_THREADS=1`, then an unentitled negative control that must yield `EmbedError::Entitlement`. `HV_DENIED` is a failure, never a skip. Opt-in (HVF + `ubuntu:24.04`); deliberately **not** in `just ci`. |
 | `just matrix` | Re-render [`docs/support-matrix.md`](docs/support-matrix.md) from a run's results. |
 | `just check-matrix` | Drift gate (in `just ci`): assert `docs/support-matrix.md` equals a fresh render of the checked-in `baseline.jsonl` (deterministic, no run). |
 | `just kvm-smoke` / `just kvm-smoke-lima` | KVM backend smoke (real `/dev/kvm`, via lima from macOS). |
