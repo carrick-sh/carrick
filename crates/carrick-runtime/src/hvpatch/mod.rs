@@ -7,6 +7,8 @@
 ))]
 use std::path::{Path, PathBuf};
 
+use std::sync::Arc;
+
 use crate::dispatch::SyscallDispatcher;
 use crate::memory::{AddressSpace, AddressSpaceError};
 #[cfg(all(
@@ -1293,13 +1295,29 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
     let table = std::sync::Arc::new(table);
     let root_tid = identity.tid;
+    let container = match dispatcher.installed_container() {
+        Some(container) => container,
+        // `run-elf` and the in-crate fixtures reach this loop without passing
+        // through `Runtime::execute`; until C2 Task 28 makes `prepare` the
+        // only entry they take the CLI's process environment as their
+        // identity (which succeeds with no identity env at all, and refuses
+        // only an unsafe CARRICK_CONTAINER_ID).
+        None => {
+            let container = Arc::new(crate::kernel::Container::new(
+                crate::kernel::LaunchContext::from_process_env()?,
+            ));
+            dispatcher.set_container(Arc::clone(&container));
+            container
+        }
+    };
     let bootstrap = crate::kernel::RootBootstrap::with_mm_backend(
         pid,
         root_tid,
         mm_backend.clone(),
         "hvpatch-root".to_owned(),
     )
-    .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+    .map_err(|error| RuntimeError::Configuration(error.to_string()))?
+    .with_container(container);
     let (kernel, root) = crate::kernel::Kernel::bootstrap_root(bootstrap)
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
     crate::kernel::tty::install(&kernel);

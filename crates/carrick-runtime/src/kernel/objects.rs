@@ -21,6 +21,7 @@ use crate::namespace::user::UserNs;
 
 use super::address::MmBackend;
 use super::clone_plan::{CloneObjectMode, ClonePlan, CloneTaskMode};
+use super::container::Container;
 use super::crash_capture::{CrashCaptureGeneration, CrashRegisterVote};
 use super::ids::{
     CredentialsId, FileDescriptionId, FileSlotNumber, FileTableId, FsContextId, LinuxSignal,
@@ -2817,6 +2818,7 @@ impl Task {
         session: SessionId,
         shared: Arc<TaskShared>,
         process_credentials: Arc<Credentials>,
+        container: Arc<Container>,
     ) -> Self {
         Self {
             key,
@@ -2846,7 +2848,7 @@ impl Task {
             creds_ns: Mutex::new(ProcessCredsNs::default()),
             rlimits: ArcSwap::new(Arc::new(RlimitSet::carrick_defaults())),
             rlimit_write: Mutex::new(()),
-            nsproxy: ArcSwap::new(Arc::new(NsProxy::default())),
+            nsproxy: ArcSwap::new(Arc::new(NsProxy::for_container(container))),
             nsproxy_write: Mutex::new(()),
         }
     }
@@ -3032,6 +3034,15 @@ impl Task {
     /// `/proc/sys/kernel/hostname` report.
     pub fn uts_ns(&self) -> Arc<UtsNs> {
         Arc::clone(self.nsproxy.load().uts())
+    }
+
+    /// The container this process belongs to, read through the task's
+    /// `nsproxy` — never a static — so two containers in one carrier cannot
+    /// alias. Inherited across `fork` as a share by
+    /// [`Self::inherit_fork_attributes_from`] (its `inherit_ns_from` stores
+    /// the parent's whole proxy `Arc`).
+    pub fn container(&self) -> Arc<Container> {
+        Arc::clone(self.nsproxy.load().container())
     }
 
     /// `unshare(CLONE_NEWUTS)`: put THIS process in a fresh UTS namespace
@@ -6692,6 +6703,7 @@ mod tests {
     use carrick_abi::LinuxCloneFlags;
 
     use super::*;
+    use crate::kernel::container::{LaunchContext, RunId};
     use crate::kernel::{ClonePlan, IdRegistry};
 
     struct Fixture {
@@ -6718,6 +6730,9 @@ mod tests {
                     ids.credentials_id().expect("credentials ID"),
                 )),
             ));
+            let container = Arc::new(Container::new(LaunchContext::unmanaged(RunId::new(
+                "objects-fixture",
+            ))));
             let task = Arc::new(Task::new(
                 key,
                 None,
@@ -6725,6 +6740,7 @@ mod tests {
                 SessionId::from_leader(task_id),
                 shared,
                 resources.credentials(),
+                container,
             ));
             let leader = task
                 .attach_thread(
@@ -6891,6 +6907,26 @@ mod tests {
             root,
             parent.task.uts_ns().id(),
             "neither task disturbed the namespace it started in"
+        );
+    }
+
+    /// Container membership is inherited across fork as a SHARE, exactly like
+    /// the network and UTS namespaces: the child holds the parent's `Arc`.
+    #[test]
+    fn fork_child_inherits_parent_container() {
+        let parent = Fixture::new();
+        let child = Fixture::new();
+        assert_ne!(
+            child.task.container().id(),
+            parent.task.container().id(),
+            "two fresh fixtures are two containers"
+        );
+
+        child.task.inherit_fork_attributes_from(&parent.task);
+
+        assert!(
+            Arc::ptr_eq(&child.task.container(), &parent.task.container()),
+            "a fork child is IN its parent's container, not holding a copy"
         );
     }
 

@@ -643,6 +643,7 @@ impl ForkReservation {
             self.caller_task.session(),
             Arc::clone(&child_shared),
             child_resources.credentials(),
+            self.caller_task.container(),
         ));
         // oom_score_adj, nice, the inherited keyrings and the capability/userns
         // copy — see `Task::inherit_fork_attributes_from`, which the host-fork

@@ -5,6 +5,7 @@
 
 pub mod address;
 pub mod clone_plan;
+pub mod container;
 pub mod control;
 pub mod core;
 pub mod crash_capture;
@@ -34,6 +35,10 @@ pub use address::{
 pub use clone_plan::{
     CloneObjectMode, ClonePlan, ClonePlanError, CloneTaskMode, ForkParentMode, ForkPidfdMode,
     VforkMode,
+};
+pub use container::{
+    ClockDomain, Container, ContainerId, LaunchAuthorization, LaunchContext, RegistryContainerId,
+    RunId,
 };
 pub use crash_capture::{
     CrashCaptureAuthority, CrashCaptureGeneration, CrashGenerationExhausted, CrashQuorum,
