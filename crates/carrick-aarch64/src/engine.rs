@@ -2780,19 +2780,22 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             ));
         }
         let total_started = std::time::Instant::now();
-        let emit_stage =
-            |phase: HvpatchForkProcessSpecStagePhase, started: std::time::Instant, units: u64| {
-                let elapsed_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-                carrick_observability::probes::hvpatch_fork_process_spec_stage(
-                    HvpatchForkProcessSpecStage::new(
-                        phase,
-                        request.child_tid.raw(),
-                        request.forking_tid.raw(),
-                        elapsed_ns,
-                        units,
-                    ),
-                );
-            };
+        let child_tid_raw = request.child_tid.raw();
+        let forking_tid_raw = request.forking_tid.raw();
+        let emit_stage = move |phase: HvpatchForkProcessSpecStagePhase,
+                               started: std::time::Instant,
+                               units: u64| {
+            let elapsed_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+            carrick_observability::probes::hvpatch_fork_process_spec_stage(
+                HvpatchForkProcessSpecStage::new(
+                    phase,
+                    child_tid_raw,
+                    forking_tid_raw,
+                    elapsed_ns,
+                    units,
+                ),
+            );
+        };
 
         // Persistent-VM exec leaves the software editor absent until it is
         // needed. A process fork needs a complete manager immediately so it can
@@ -2821,7 +2824,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // gives the child a private stage-1 root and per-process EL1 state, but
         // its user mappings must retain the same writable frames rather than
         // entering the ordinary fork-COW protocol.
-        let cow_ranges = if request.shares_mm {
+        let cow_ranges = if request.shares_mm() {
             Vec::new()
         } else {
             self.vm.fork_cow_ranges()

@@ -2516,6 +2516,70 @@ enum HvpatchProcessInventoryPreparation<'a> {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn validate_hvpatch_process_prepare_boundary(
+    inventory: &HvpatchProcessInventoryPreparation<'_>,
+    request: &carrick_hal::ProcessForkRequest,
+    mm_generation: u64,
+) -> Result<(), RuntimeError> {
+    carrick_hal::validate_fork_projection(request.plan.ranges()).map_err(|error| {
+        RuntimeError::Configuration(format!("invalid HVPatch fork projection: {error}"))
+    })?;
+    match (inventory, &request.plan) {
+        (
+            HvpatchProcessInventoryPreparation::Copied(_),
+            carrick_hal::ForkProjectionPlan::Copied {
+                parent_mm,
+                child_mm,
+                ..
+            },
+        ) if *child_mm == mm_generation && parent_mm != child_mm => Ok(()),
+        (
+            HvpatchProcessInventoryPreparation::SharedMm { kernel_mm },
+            carrick_hal::ForkProjectionPlan::Shared { parent_mm, .. },
+        ) if *parent_mm == *kernel_mm
+            && request.plan.child_mm() == *kernel_mm
+            && mm_generation == *kernel_mm =>
+        {
+            Ok(())
+        }
+        (HvpatchProcessInventoryPreparation::Copied(_), _) => Err(RuntimeError::Configuration(
+            "copied HVPatch inventory requires a distinct-parent Copied projection bound to the child MM generation"
+                .to_owned(),
+        )),
+        (HvpatchProcessInventoryPreparation::SharedMm { .. }, _) => {
+            Err(RuntimeError::Configuration(
+                "shared HVPatch inventory requires a Shared projection bound to the kernel MM"
+                    .to_owned(),
+            ))
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn cleanup_failed_hvpatch_initial_cpu<T>(
+    abort: impl FnOnce() -> Result<(), RuntimeError>,
+    context: &mut T,
+    cancel_inventory: impl FnOnce(&mut T) -> Result<(), RuntimeError>,
+    rollback_parent: impl FnOnce(&mut T) -> Result<(), RuntimeError>,
+) -> Result<(), RuntimeError> {
+    let abort_error = abort().err();
+    let _cancel_error = cancel_inventory(context).err();
+    let rollback_error = rollback_parent(context).err();
+    match (abort_error, rollback_error) {
+        (None, None) => Ok(()),
+        (Some(abort), None) => Err(RuntimeError::Configuration(format!(
+            "HVPatch initial CPU cleanup failed to abort child: {abort}"
+        ))),
+        (None, Some(rollback)) => Err(RuntimeError::Configuration(format!(
+            "HVPatch initial CPU cleanup failed to rollback parent: {rollback}"
+        ))),
+        (Some(abort), Some(rollback)) => Err(RuntimeError::Configuration(format!(
+            "HVPatch initial CPU cleanup failed to abort child ({abort}) and rollback parent ({rollback})"
+        ))),
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 trait HvpatchProcessBackendOps<E: ThreadedEngine, M: GuestMemory> {
     type Prepared;
     type Backend;
@@ -2532,6 +2596,29 @@ trait HvpatchProcessBackendOps<E: ThreadedEngine, M: GuestMemory> {
     fn abort(&mut self, prepared: Self::Prepared) -> Result<(), RuntimeError>;
     fn commit_parent(&mut self, memory: &mut M) -> Result<(), RuntimeError>;
     fn rollback_parent(&mut self, memory: &mut M) -> Result<(), RuntimeError>;
+    fn abort_and_rollback_prepared(
+        &mut self,
+        prepared: Self::Prepared,
+        memory: &mut M,
+        rollback_parent: bool,
+    ) -> Result<(), RuntimeError> {
+        let abort_error = self.abort(prepared).err();
+        let rollback_error = rollback_parent
+            .then(|| self.rollback_parent(memory).err())
+            .flatten();
+        match (abort_error, rollback_error) {
+            (None, None) => Ok(()),
+            (Some(abort), None) => Err(RuntimeError::Configuration(format!(
+                "HVPatch prepared unwind failed to abort child: {abort}"
+            ))),
+            (None, Some(rollback)) => Err(RuntimeError::Configuration(format!(
+                "HVPatch prepared unwind failed to rollback parent: {rollback}"
+            ))),
+            (Some(abort), Some(rollback)) => Err(RuntimeError::Configuration(format!(
+                "HVPatch prepared unwind failed to abort child ({abort}) and rollback parent ({rollback})"
+            ))),
+        }
+    }
     fn commit(
         &mut self,
         prepared: Self::Prepared,
@@ -2579,6 +2666,7 @@ where
         asid_generation: u64,
     ) -> Result<HvpatchProcessPreparation<Self::Prepared>, RuntimeError> {
         type HvfEngine = carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Engine;
+        validate_hvpatch_process_prepare_boundary(&inventory, &request, mm_generation)?;
         let prepared = match inventory {
             HvpatchProcessInventoryPreparation::Copied(reserve) => {
                 let spec = match memory.build_process_spec(request) {
@@ -2618,7 +2706,7 @@ where
                 }
             }
             HvpatchProcessInventoryPreparation::SharedMm { kernel_mm } => {
-                if !request.shares_mm {
+                if !request.shares_mm() {
                     return Err(RuntimeError::Configuration(
                         "shared HVPatch process preparation requires CLONE_VM".to_owned(),
                     ));
@@ -2643,9 +2731,20 @@ where
         let cpu = match prepared.initial_cpu_state(mm_generation, asid_generation) {
             Ok(cpu) => cpu,
             Err(error) => {
-                prepared.abort().map_err(RuntimeError::Trap)?;
-                let _ = memory.cancel_process_inventory();
-                memory.rollback_process_fork().map_err(RuntimeError::Trap)?;
+                if let Err(cleanup_error) = cleanup_failed_hvpatch_initial_cpu(
+                    || prepared.abort().map_err(RuntimeError::Trap),
+                    memory,
+                    |memory| {
+                        let _cancelled = memory.cancel_process_inventory();
+                        Ok(())
+                    },
+                    |memory| memory.rollback_process_fork().map_err(RuntimeError::Trap),
+                ) {
+                    return Err(<Self as HvpatchProcessBackendOps<E, E>>::fail_stop(
+                        self,
+                        cleanup_error,
+                    ));
+                }
                 return Err(RuntimeError::Trap(error));
             }
         };
@@ -8584,8 +8683,138 @@ mod tests {
     use super::signal::{lower_el0_fault, upgrade_protection_si_code};
     use super::*;
     use crate::vcpu_loop::executor::TaskBindingResolver;
+    use std::cell::RefCell;
     use std::num::NonZeroU64;
     use std::time::Duration;
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn fork_request(plan: carrick_hal::ForkProjectionPlan) -> carrick_hal::ProcessForkRequest {
+        carrick_hal::ProcessForkRequest {
+            entry: carrick_hal::GuestEntryRegs::default(),
+            child_ttbr0: 0,
+            root_slot_base: 0,
+            root_slot_size: 0,
+            plan,
+            child_tid: carrick_hal::ThreadId::NONE,
+            forking_tid: carrick_hal::ThreadId::NONE,
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn projection_ranges() -> Arc<[carrick_hal::ForkProjectionRange]> {
+        Arc::from([carrick_hal::ForkProjectionRange {
+            va: 0x1000,
+            len: 0x1000,
+            disposition: carrick_hal::ForkLeafDisposition::Preserve,
+        }])
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn backend_fork_boundary_rejects_wrong_inventory_mode_and_mm_identity() {
+        let mut reserve = |_, _, _| {
+            Err(RuntimeError::Configuration(
+                "validation test must not reserve inventory".to_owned(),
+            ))
+        };
+        let copied_inventory = HvpatchProcessInventoryPreparation::Copied(&mut reserve);
+        let shared = fork_request(carrick_hal::ForkProjectionPlan::Shared {
+            parent_mm: 7,
+            ranges: projection_ranges(),
+        });
+        assert!(validate_hvpatch_process_prepare_boundary(&copied_inventory, &shared, 8).is_err());
+
+        let wrong_child = fork_request(carrick_hal::ForkProjectionPlan::Copied {
+            parent_mm: 7,
+            child_mm: 9,
+            ranges: projection_ranges(),
+        });
+        assert!(
+            validate_hvpatch_process_prepare_boundary(&copied_inventory, &wrong_child, 8).is_err()
+        );
+
+        let shared_inventory = HvpatchProcessInventoryPreparation::SharedMm { kernel_mm: 7 };
+        let copied = fork_request(carrick_hal::ForkProjectionPlan::Copied {
+            parent_mm: 7,
+            child_mm: 8,
+            ranges: projection_ranges(),
+        });
+        assert!(validate_hvpatch_process_prepare_boundary(&shared_inventory, &copied, 8).is_err());
+        let wrong_shared_mm = fork_request(carrick_hal::ForkProjectionPlan::Shared {
+            parent_mm: 8,
+            ranges: projection_ranges(),
+        });
+        assert!(
+            validate_hvpatch_process_prepare_boundary(&shared_inventory, &wrong_shared_mm, 8)
+                .is_err()
+        );
+        let right_shared_mm_wrong_generation =
+            fork_request(carrick_hal::ForkProjectionPlan::Shared {
+                parent_mm: 7,
+                ranges: projection_ranges(),
+            });
+        assert!(
+            validate_hvpatch_process_prepare_boundary(
+                &shared_inventory,
+                &right_shared_mm_wrong_generation,
+                8,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn backend_fork_boundary_rejects_invalid_projection_before_prepare() {
+        let inventory = HvpatchProcessInventoryPreparation::SharedMm { kernel_mm: 7 };
+        let request = fork_request(carrick_hal::ForkProjectionPlan::Shared {
+            parent_mm: 7,
+            ranges: Arc::from([carrick_hal::ForkProjectionRange {
+                va: 0x1001,
+                len: 0x1000,
+                disposition: carrick_hal::ForkLeafDisposition::Preserve,
+            }]),
+        });
+        assert!(validate_hvpatch_process_prepare_boundary(&inventory, &request, 7).is_err());
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn initial_cpu_cleanup_attempts_cancel_and_rollback_after_abort_failure() {
+        let calls = RefCell::new(Vec::new());
+        let result = cleanup_failed_hvpatch_initial_cpu(
+            || {
+                calls.borrow_mut().push("abort");
+                Err(RuntimeError::Configuration("abort failed".to_owned()))
+            },
+            &mut (),
+            |_| {
+                calls.borrow_mut().push("cancel");
+                Err(RuntimeError::Configuration("cancel failed".to_owned()))
+            },
+            |_| {
+                calls.borrow_mut().push("rollback");
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(*calls.borrow(), ["abort", "cancel", "rollback"]);
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn prepared_unwind_attempts_parent_rollback_after_abort_failure() {
+        let mut ops = FakeBackendOps {
+            abort_fails: true,
+            ..Default::default()
+        };
+        let mut memory = Memory::default();
+        let result = ops.abort_and_rollback_prepared((), &mut memory, true);
+        assert!(result.is_err());
+        assert_eq!(ops.aborts, 1);
+        assert_eq!(ops.parent_rollbacks, 1);
+    }
 
     #[test]
     fn guest_run_accounting_uses_non_aliasing_engine_receipts() {
@@ -9470,226 +9699,302 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct Memory(std::collections::BTreeMap<u64, Vec<u8>>);
+    impl GuestMemory for Memory {
+        fn read_bytes_raw(
+            &self,
+            address: u64,
+            length: usize,
+        ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
+            self.0
+                .get(&address)
+                .filter(|bytes| bytes.len() == length)
+                .cloned()
+                .ok_or(carrick_guest_mem::MemoryError::OutOfBounds { address, length })
+        }
+
+        fn write_bytes_raw(
+            &mut self,
+            address: u64,
+            bytes: &[u8],
+        ) -> Result<(), carrick_guest_mem::MemoryError> {
+            self.0.insert(address, bytes.to_vec());
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeBackendOps {
+        parent_commits: usize,
+        parent_rollbacks: usize,
+        backend_prepare_rollbacks: usize,
+        aborts: usize,
+        fail_stops: usize,
+        child_kernel_bound: bool,
+        copied_preparations: usize,
+        shared_preparations: usize,
+        inventory_applies: usize,
+        prepare_fails: bool,
+        abort_fails: bool,
+        on_prepare: Option<Arc<dyn Fn() + Send + Sync>>,
+        request_parent_mm: Option<u64>,
+        request_child_mm: Option<u64>,
+    }
+
+    impl HvpatchProcessBackendOps<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Engine, Memory>
+        for FakeBackendOps
+    {
+        type Prepared = ();
+        type Backend = ();
+
+        fn prepare(
+            &mut self,
+            _memory: &mut Memory,
+            inventory: HvpatchProcessInventoryPreparation<'_>,
+            request: carrick_hal::ProcessForkRequest,
+            _identity: carrick_vmm_hvf::hvf_aarch64_engine::HvpatchCarrierTaskIdentity,
+            mm_generation: u64,
+            asid_generation: u64,
+        ) -> Result<
+            (
+                Self::Prepared,
+                carrick_hal::threaded::GuestCpuState,
+                Arc<dyn VcpuRegistry>,
+            ),
+            RuntimeError,
+        > {
+            self.request_parent_mm = Some(request.plan.parent_mm());
+            self.request_child_mm = Some(request.plan.child_mm());
+            if self.prepare_fails {
+                self.backend_prepare_rollbacks += 1;
+                return Err(RuntimeError::Trap(
+                    carrick_vmm_hvf::trap::TrapError::Hypervisor(
+                        "simulated backend prepare error".to_owned(),
+                    ),
+                ));
+            }
+            if let Some(hook) = &self.on_prepare {
+                hook();
+            }
+            match inventory {
+                HvpatchProcessInventoryPreparation::Copied(_) => {
+                    self.copied_preparations += 1;
+                }
+                HvpatchProcessInventoryPreparation::SharedMm { .. } => {
+                    self.shared_preparations += 1;
+                }
+            }
+            Ok((
+                (),
+                carrick_hal::threaded::GuestCpuState::from_aarch64_v1(
+                    carrick_hal::threaded::Aarch64TaskCpuStateV1 {
+                        gprs: [0; 31],
+                        pc: 0x1000,
+                        pstate: 0,
+                        trap_pc: 0,
+                        trap_pstate: 0,
+                        sp_el0: 0x8000,
+                        elr_el1: 0,
+                        spsr_el1: 0,
+                        ttbr0: 0,
+                        ttbr1: 0,
+                        tcr: 0,
+                        sctlr_el1: 0,
+                        mair_el1: 0,
+                        vbar_el1: 0,
+                        cpacr_el1: 0,
+                        cntkctl_el1: 0,
+                        tpidr_el1: 0,
+                        actlr_el1: 0,
+                        tpidr_el0: 0,
+                        tpidrro_el0: 0,
+                        contextidr_el1: 0,
+                        vregs: [0; 32],
+                        fpsr: 0,
+                        fpcr: 0,
+                        pending_resume_pc: None,
+                        last_syscall_nr: None,
+                        last_syscall_orig_x0: 0,
+                        last_fault_esr: 0,
+                        last_exit_class: 0,
+                        is_forked_child: true,
+                        syscall_continuation: None,
+                        mm_generation,
+                        asid_generation,
+                    },
+                ),
+                Arc::new(carrick_hal::GenericVcpuRegistry::new()),
+            ))
+        }
+
+        fn abort(&mut self, _prepared: Self::Prepared) -> Result<(), RuntimeError> {
+            self.aborts += 1;
+            if self.abort_fails {
+                return Err(RuntimeError::Configuration(
+                    "simulated backend abort failure".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+
+        fn commit_parent(&mut self, _memory: &mut Memory) -> Result<(), RuntimeError> {
+            self.parent_commits += 1;
+            Ok(())
+        }
+
+        fn rollback_parent(&mut self, _memory: &mut Memory) -> Result<(), RuntimeError> {
+            self.parent_rollbacks += 1;
+            Ok(())
+        }
+
+        fn commit(
+            &mut self,
+            _prepared: Self::Prepared,
+            _directory: Arc<carrick_vmm_hvf::hvf_aarch64_engine::HvpatchCarrierTaskStateDirectory>,
+        ) -> Result<Self::Backend, RuntimeError> {
+            Ok(())
+        }
+
+        fn apply_inventory(
+            &mut self,
+            _backend: &Self::Backend,
+            _kernel: &Arc<crate::kernel::Kernel>,
+            _mm: crate::kernel::MmId,
+        ) -> Result<(), RuntimeError> {
+            assert!(
+                self.child_kernel_bound,
+                "inventory must follow exact child Kernel/MM binding"
+            );
+            self.inventory_applies += 1;
+            Ok(())
+        }
+
+        fn bind_child_kernel(
+            &mut self,
+            _backend: &mut Self::Backend,
+            _token: carrick_vmm_hvf::hvf_aarch64_engine::HvpatchChildKernelBinding,
+        ) -> Result<(), RuntimeError> {
+            self.child_kernel_bound = true;
+            Ok(())
+        }
+
+        fn activate_child(&mut self, _backend: &mut Self::Backend) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        fn make_binding_state(
+            &mut self,
+            _backend: Self::Backend,
+        ) -> executor::HvpatchTaskEngineBindingState {
+            executor::HvpatchTaskEngineBindingState::test_only()
+        }
+
+        fn guest_sp(&self, _memory: &Memory) -> Option<u64> {
+            Some(0x8000)
+        }
+
+        fn fail_stop(&mut self, error: RuntimeError) -> RuntimeError {
+            self.fail_stops += 1;
+            error
+        }
+    }
+
+    struct NoopPlatformFutex;
+    impl PlatformFutex for NoopPlatformFutex {
+        fn private_wait(
+            &self,
+            _addr: u64,
+            _val: u32,
+            _tid: ThreadId,
+            _timeout: Option<Duration>,
+            _interrupted: &dyn Fn() -> bool,
+        ) -> carrick_hal::FutexOutcome {
+            carrick_hal::FutexOutcome::Interrupted
+        }
+        fn private_wake(&self, _addr: u64, _n: u32) -> u32 {
+            0
+        }
+        fn shared_wait(
+            &self,
+            _location: carrick_guest_mem::SharedFutexLocation,
+            _val: u32,
+            _tid: ThreadId,
+            _timeout: Option<Duration>,
+            _interrupted: &dyn Fn() -> bool,
+            _wait_enrolled: &dyn Fn(),
+        ) -> i64 {
+            -1
+        }
+        fn shared_wake(
+            &self,
+            _location: carrick_guest_mem::SharedFutexLocation,
+            _waiter_key: usize,
+            _n: u32,
+        ) -> i64 {
+            0
+        }
+        fn requeue(&self, _from: u64, _to: u64, _wake: u32, _requeue: u32) -> (u32, u32) {
+            (0, 0)
+        }
+        fn notify_signal_pending(&self) {}
+        fn notify_signal_pending_for(&self, _tid: ThreadId) {}
+    }
+
+    macro_rules! test_carrier_graph_with_dispatcher {
+        ($pid:expr, $dispatcher:expr) => {{
+            let (process, root) = crate::hvpatch::process_context_for_tests($pid);
+            $dispatcher.bind_hvpatch_process(process.clone());
+            let kernel = Arc::new(KernelState::new(
+                $dispatcher,
+                Arc::new(EndpointTestSignalPump),
+                Arc::new(EndpointTestSignalArrival),
+                Some(process.clone()),
+                None,
+                None,
+            ));
+            let runtime = Arc::clone(kernel.hvpatch_runtime.as_ref().unwrap());
+            let (scheduler, _) = runtime.continuation_services(root.kernel());
+            runtime
+                .persistent_bindings()
+                .install_scheduler(&scheduler)
+                .unwrap();
+            let mut root_state = executor::tests::task_state(&root, 500);
+            root_state.asid_generation = process.asid_generation();
+            let carrick_hal::threaded::GuestCpuState::Aarch64V1(cpu) = &mut root_state.cpu else {
+                unreachable!()
+            };
+            Arc::make_mut(cpu).asid_generation = process.asid_generation();
+            let root_generation = root
+                .thread()
+                .publish_initial_task_state(root_state.clone())
+                .unwrap();
+            let root_binding = executor::tests::hvpatch_test_binding(&root, &root_state, 600);
+            let dormant = runtime
+                .persistent_bindings()
+                .prepare_submission(
+                    &scheduler,
+                    executor::HvpatchSubmissionShape::Root,
+                    None,
+                    Arc::clone(root.thread()),
+                    root_generation,
+                    Arc::clone(&root_binding),
+                )
+                .unwrap();
+            executor::tests::activate_hvpatch_test_submission(
+                dormant,
+                &scheduler,
+                &root,
+                &root_state,
+                root_generation,
+                root_binding.as_ref(),
+            );
+            (runtime, scheduler, kernel, root, process, root_generation)
+        }};
+    }
+
     #[test]
     fn production_process_failpoints_run_the_real_kernel_copyout_and_publication_body() {
-        #[derive(Default)]
-        struct Memory(std::collections::BTreeMap<u64, Vec<u8>>);
-        impl GuestMemory for Memory {
-            fn read_bytes_raw(
-                &self,
-                address: u64,
-                length: usize,
-            ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
-                self.0
-                    .get(&address)
-                    .filter(|bytes| bytes.len() == length)
-                    .cloned()
-                    .ok_or(carrick_guest_mem::MemoryError::OutOfBounds { address, length })
-            }
-
-            fn write_bytes_raw(
-                &mut self,
-                address: u64,
-                bytes: &[u8],
-            ) -> Result<(), carrick_guest_mem::MemoryError> {
-                self.0.insert(address, bytes.to_vec());
-                Ok(())
-            }
-        }
-
-        #[derive(Default)]
-        struct FakeBackendOps {
-            parent_commits: usize,
-            parent_rollbacks: usize,
-            fail_stops: usize,
-            child_kernel_bound: bool,
-            copied_preparations: usize,
-            shared_preparations: usize,
-            inventory_applies: usize,
-        }
-
-        impl HvpatchProcessBackendOps<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Engine, Memory>
-            for FakeBackendOps
-        {
-            type Prepared = ();
-            type Backend = ();
-
-            fn prepare(
-                &mut self,
-                _memory: &mut Memory,
-                inventory: HvpatchProcessInventoryPreparation<'_>,
-                _request: carrick_hal::ProcessForkRequest,
-                _identity: carrick_vmm_hvf::hvf_aarch64_engine::HvpatchCarrierTaskIdentity,
-                mm_generation: u64,
-                asid_generation: u64,
-            ) -> Result<
-                (
-                    Self::Prepared,
-                    carrick_hal::threaded::GuestCpuState,
-                    Arc<dyn VcpuRegistry>,
-                ),
-                RuntimeError,
-            > {
-                match inventory {
-                    HvpatchProcessInventoryPreparation::Copied(_) => {
-                        self.copied_preparations += 1;
-                    }
-                    HvpatchProcessInventoryPreparation::SharedMm { .. } => {
-                        self.shared_preparations += 1;
-                    }
-                }
-                Ok((
-                    (),
-                    carrick_hal::threaded::GuestCpuState::from_aarch64_v1(
-                        carrick_hal::threaded::Aarch64TaskCpuStateV1 {
-                            gprs: [0; 31],
-                            pc: 0x1000,
-                            pstate: 0,
-                            trap_pc: 0,
-                            trap_pstate: 0,
-                            sp_el0: 0x8000,
-                            elr_el1: 0,
-                            spsr_el1: 0,
-                            ttbr0: 0,
-                            ttbr1: 0,
-                            tcr: 0,
-                            sctlr_el1: 0,
-                            mair_el1: 0,
-                            vbar_el1: 0,
-                            cpacr_el1: 0,
-                            cntkctl_el1: 0,
-                            tpidr_el1: 0,
-                            actlr_el1: 0,
-                            tpidr_el0: 0,
-                            tpidrro_el0: 0,
-                            contextidr_el1: 0,
-                            vregs: [0; 32],
-                            fpsr: 0,
-                            fpcr: 0,
-                            pending_resume_pc: None,
-                            last_syscall_nr: None,
-                            last_syscall_orig_x0: 0,
-                            last_fault_esr: 0,
-                            last_exit_class: 0,
-                            is_forked_child: true,
-                            syscall_continuation: None,
-                            mm_generation,
-                            asid_generation,
-                        },
-                    ),
-                    Arc::new(carrick_hal::GenericVcpuRegistry::new()),
-                ))
-            }
-
-            fn abort(&mut self, _prepared: Self::Prepared) -> Result<(), RuntimeError> {
-                Ok(())
-            }
-
-            fn commit_parent(&mut self, _memory: &mut Memory) -> Result<(), RuntimeError> {
-                self.parent_commits += 1;
-                Ok(())
-            }
-
-            fn rollback_parent(&mut self, _memory: &mut Memory) -> Result<(), RuntimeError> {
-                self.parent_rollbacks += 1;
-                Ok(())
-            }
-
-            fn commit(
-                &mut self,
-                _prepared: Self::Prepared,
-                _directory: Arc<
-                    carrick_vmm_hvf::hvf_aarch64_engine::HvpatchCarrierTaskStateDirectory,
-                >,
-            ) -> Result<Self::Backend, RuntimeError> {
-                Ok(())
-            }
-
-            fn apply_inventory(
-                &mut self,
-                _backend: &Self::Backend,
-                _kernel: &Arc<crate::kernel::Kernel>,
-                _mm: crate::kernel::MmId,
-            ) -> Result<(), RuntimeError> {
-                assert!(
-                    self.child_kernel_bound,
-                    "inventory must follow exact child Kernel/MM binding"
-                );
-                self.inventory_applies += 1;
-                Ok(())
-            }
-
-            fn bind_child_kernel(
-                &mut self,
-                _backend: &mut Self::Backend,
-                _token: carrick_vmm_hvf::hvf_aarch64_engine::HvpatchChildKernelBinding,
-            ) -> Result<(), RuntimeError> {
-                self.child_kernel_bound = true;
-                Ok(())
-            }
-
-            fn activate_child(&mut self, _backend: &mut Self::Backend) -> Result<(), RuntimeError> {
-                Ok(())
-            }
-
-            fn make_binding_state(
-                &mut self,
-                _backend: Self::Backend,
-            ) -> executor::HvpatchTaskEngineBindingState {
-                executor::HvpatchTaskEngineBindingState::test_only()
-            }
-
-            fn guest_sp(&self, _memory: &Memory) -> Option<u64> {
-                Some(0x8000)
-            }
-
-            fn fail_stop(&mut self, error: RuntimeError) -> RuntimeError {
-                self.fail_stops += 1;
-                error
-            }
-        }
-
-        struct NoopPlatformFutex;
-        impl PlatformFutex for NoopPlatformFutex {
-            fn private_wait(
-                &self,
-                _addr: u64,
-                _val: u32,
-                _tid: ThreadId,
-                _timeout: Option<Duration>,
-                _interrupted: &dyn Fn() -> bool,
-            ) -> carrick_hal::FutexOutcome {
-                carrick_hal::FutexOutcome::Interrupted
-            }
-            fn private_wake(&self, _addr: u64, _n: u32) -> u32 {
-                0
-            }
-            fn shared_wait(
-                &self,
-                _location: carrick_guest_mem::SharedFutexLocation,
-                _val: u32,
-                _tid: ThreadId,
-                _timeout: Option<Duration>,
-                _interrupted: &dyn Fn() -> bool,
-                _wait_enrolled: &dyn Fn(),
-            ) -> i64 {
-                -1
-            }
-            fn shared_wake(
-                &self,
-                _location: carrick_guest_mem::SharedFutexLocation,
-                _waiter_key: usize,
-                _n: u32,
-            ) -> i64 {
-                0
-            }
-            fn requeue(&self, _from: u64, _to: u64, _wake: u32, _requeue: u32) -> (u32, u32) {
-                (0, 0)
-            }
-            fn notify_signal_pending(&self) {}
-            fn notify_signal_pending_for(&self, _tid: ThreadId) {}
-        }
-
         for (case, phase) in [
             Some(HvpatchProcessFailpoint::ParentCopyout),
             Some(HvpatchProcessFailpoint::BackendCommit),
@@ -9862,6 +10167,190 @@ mod tests {
         assert_eq!(bootstrap.0[&0x3000], 33_i32.to_le_bytes());
         bootstrap_hvpatch_process_child_tid(&mut bootstrap, 0x3000, 44).unwrap();
         assert_eq!(bootstrap.0[&0x3000], 44_i32.to_le_bytes());
+    }
+
+    #[test]
+    fn backend_prepare_error_does_not_double_rollback() {
+        let pid = 42;
+        let dispatcher = SyscallDispatcher::new();
+        let (runtime, scheduler, kernel, root, process, root_generation) =
+            test_carrier_graph_with_dispatcher!(pid, dispatcher);
+        let root_authority = runtime
+            .persistent_bindings()
+            .take_submission_authority(root.thread().key(), root_generation)
+            .unwrap();
+        let this_tid = ThreadId::synthetic_for_tests(pid);
+        let registry = Arc::new(ThreadRegistry::new(this_tid));
+        let futex = Arc::new(FutexTable::new());
+        let platform: Arc<dyn PlatformFutex> = Arc::new(NoopPlatformFutex);
+        let platform_factory: PlatformFutexFactory = Arc::new(|_| Arc::new(NoopPlatformFutex));
+        let kicker: Arc<dyn VcpuRegistry> = Arc::new(carrick_hal::GenericVcpuRegistry::new());
+        let mut state =
+            ThreadRuntimeState::<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Engine>::new(
+                Arc::clone(&registry),
+                futex,
+                platform,
+                platform_factory,
+                kernel.process_fork_barrier.clone(),
+                kernel.crash_capture.clone(),
+                Some(Arc::clone(root.thread())),
+                Some(process.pid()),
+                root.thread().key().tid,
+                kernel.fatal_signal.current_generation(),
+                this_tid,
+                Arc::new(Mutex::new(Vec::new())),
+                kicker,
+                carrick_hal::InGuestFlag::for_guest_thread(),
+                1_000,
+            );
+        state.service_kernel_context = Some(root.retain_exact());
+        let mut memory = Memory::default();
+        let need_resched = std::sync::atomic::AtomicBool::new(false);
+        let mut submission = executor::ExecutorSubmissionContext {
+            scheduler: &scheduler,
+            publish_test_descendant: &|_, _| unreachable!(),
+            current: Some(&root_authority),
+            lease: None,
+            exec_replacement: None,
+        };
+        let mut control = executor::HvpatchQuantumControl {
+            need_resched: &need_resched,
+            submission: &mut submission,
+        };
+        let mut ops = FakeBackendOps {
+            prepare_fails: true,
+            ..Default::default()
+        };
+        let result = state.prepare_in_process_fork(
+            &kernel,
+            &root,
+            &mut memory,
+            &mut control,
+            &mut ops,
+            quiesce::ProcessForkAttempt {
+                request: quiesce::ForkRequest {
+                    flags: 0,
+                    pidfd_out: None,
+                    clone_parent: false,
+                    parent_tid_addr: None,
+                    child_tid_addr: None,
+                    exit_signal: crate::linux_abi::LINUX_SIGCHLD as u32,
+                    child_stack: 0,
+                    vfork: None,
+                },
+                coordinator: None,
+                external_exec: None,
+            },
+        );
+        assert!(result.is_err());
+        // Backend prepare handles its own rollback on error; caller must not roll back again.
+        assert_eq!(ops.backend_prepare_rollbacks, 1);
+        assert_eq!(ops.parent_rollbacks, 0);
+        assert_eq!(ops.aborts, 0);
+    }
+
+    #[test]
+    fn backend_staleness_after_successful_prepare_aborts_and_rolls_copied_parent_back_exactly_once()
+    {
+        let pid = 43;
+        let dispatcher = SyscallDispatcher::new();
+        let parent_context = dispatcher.capture_one_task_context().unwrap();
+        let (runtime, scheduler, kernel, root, process, root_generation) =
+            test_carrier_graph_with_dispatcher!(pid, dispatcher);
+        let root_authority = runtime
+            .persistent_bindings()
+            .take_submission_authority(root.thread().key(), root_generation)
+            .unwrap();
+        let this_tid = ThreadId::synthetic_for_tests(pid);
+        let registry = Arc::new(ThreadRegistry::new(this_tid));
+        let futex = Arc::new(FutexTable::new());
+        let platform: Arc<dyn PlatformFutex> = Arc::new(NoopPlatformFutex);
+        let platform_factory: PlatformFutexFactory = Arc::new(|_| Arc::new(NoopPlatformFutex));
+        let kicker: Arc<dyn VcpuRegistry> = Arc::new(carrick_hal::GenericVcpuRegistry::new());
+        let mut state =
+            ThreadRuntimeState::<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Engine>::new(
+                Arc::clone(&registry),
+                futex,
+                platform,
+                platform_factory,
+                kernel.process_fork_barrier.clone(),
+                kernel.crash_capture.clone(),
+                Some(Arc::clone(root.thread())),
+                Some(process.pid()),
+                root.thread().key().tid,
+                kernel.fatal_signal.current_generation(),
+                this_tid,
+                Arc::new(Mutex::new(Vec::new())),
+                kicker,
+                carrick_hal::InGuestFlag::for_guest_thread(),
+                1_000,
+            );
+        state.service_kernel_context = Some(root.retain_exact());
+        let mut memory = Memory::default();
+        let need_resched = std::sync::atomic::AtomicBool::new(false);
+        let mut submission = executor::ExecutorSubmissionContext {
+            scheduler: &scheduler,
+            publish_test_descendant: &|_, _| unreachable!(),
+            current: Some(&root_authority),
+            lease: None,
+            exec_replacement: None,
+        };
+        let mut control = executor::HvpatchQuantumControl {
+            need_resched: &need_resched,
+            submission: &mut submission,
+        };
+
+        let kernel_clone = Arc::clone(&kernel);
+        let mut ops = FakeBackendOps {
+            on_prepare: Some(Arc::new(move || {
+                // Simulate an authority swap / revision change during prepare
+                let replacement = Arc::new(
+                    crate::dispatch::DispatchMmAuthority::new_for_test_with_revision(
+                        crate::kernel::VmaRevision::from_authority_raw(999),
+                    ),
+                );
+                kernel_clone
+                    .dispatcher
+                    .replace_current_mm_for_test(replacement);
+            })),
+            ..Default::default()
+        };
+
+        let result = state.prepare_in_process_fork(
+            &kernel,
+            &root,
+            &mut memory,
+            &mut control,
+            &mut ops,
+            quiesce::ProcessForkAttempt {
+                request: quiesce::ForkRequest {
+                    flags: 0,
+                    pidfd_out: None,
+                    clone_parent: false,
+                    parent_tid_addr: None,
+                    child_tid_addr: None,
+                    exit_signal: crate::linux_abi::LINUX_SIGCHLD as u32,
+                    child_stack: 0,
+                    vfork: None,
+                },
+                coordinator: None,
+                external_exec: None,
+            },
+        );
+        assert!(matches!(
+            result,
+            Ok(quiesce::PreparedInProcessFork::Complete(Some(_)))
+        ));
+        // Fork lowered to EAGAIN and rolled back copied parent exactly once.
+        assert_eq!(ops.aborts, 1);
+        assert_eq!(ops.parent_rollbacks, 1);
+        assert_eq!(ops.parent_commits, 0);
+        assert_eq!(
+            ops.request_parent_mm,
+            Some(parent_context.shared().mm().id().raw())
+        );
+        assert!(ops.request_child_mm.is_some());
+        assert_ne!(ops.request_parent_mm, ops.request_child_mm);
     }
 
     #[test]

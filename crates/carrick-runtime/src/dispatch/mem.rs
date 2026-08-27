@@ -196,6 +196,11 @@ pub(crate) struct MemAuthority {
     revision: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
+struct DerivedForkProjection {
+    ranges: Vec<carrick_hal::ForkProjectionRange>,
+    omitted_ranges: Vec<(u64, u64)>,
+}
+
 impl std::fmt::Debug for MemAuthority {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -210,7 +215,7 @@ impl MemAuthority {
         Self::with_revision(state, crate::kernel::VmaRevision::INITIAL)
     }
 
-    fn with_revision(state: MemState, revision: crate::kernel::VmaRevision) -> Self {
+    pub(super) fn with_revision(state: MemState, revision: crate::kernel::VmaRevision) -> Self {
         Self {
             state: parking_lot::Mutex::new(state),
             revision: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(revision.raw())),
@@ -225,12 +230,89 @@ impl MemAuthority {
         std::sync::Arc::clone(&self.revision)
     }
 
+    fn derive_fork_projection(
+        state: &MemState,
+    ) -> Result<DerivedForkProjection, carrick_hal::ForkProjectionError> {
+        let mut projection_ranges = Vec::with_capacity(state.semantic_vmas.len());
+        let mut omitted_ranges = Vec::new();
+        let mut live_vmas = Vec::with_capacity(state.semantic_vmas.len());
+
+        for vma in &state.semantic_vmas {
+            let len = vma
+                .end
+                .checked_sub(vma.start)
+                .filter(|len| *len != 0)
+                .ok_or(carrick_hal::ForkProjectionError::ZeroLength)?;
+            let disposition = if vma.fork_policy.copy == carrick_abi::VmaForkCopyPolicy::Omit {
+                omitted_ranges.push((vma.start, len));
+                carrick_hal::ForkLeafDisposition::Omit
+            } else if vma.fork_policy.child_contents == carrick_abi::VmaForkChildPolicy::ZeroInChild
+            {
+                carrick_hal::ForkLeafDisposition::Zero
+            } else {
+                carrick_hal::ForkLeafDisposition::Preserve
+            };
+            live_vmas.push((vma.start, vma.end));
+            projection_ranges.push(carrick_hal::ForkProjectionRange {
+                va: vma.start,
+                len,
+                disposition,
+            });
+        }
+        carrick_hal::validate_total_fork_projection(&projection_ranges, &live_vmas)?;
+        Ok(DerivedForkProjection {
+            ranges: projection_ranges,
+            omitted_ranges,
+        })
+    }
+
+    pub(super) fn fork_private_with_policy(
+        &self,
+    ) -> Result<
+        (
+            Self,
+            crate::kernel::VmaRevision,
+            std::sync::Arc<[carrick_hal::ForkProjectionRange]>,
+        ),
+        carrick_hal::ForkProjectionError,
+    > {
+        let state = self.state.lock();
+        let revision = self.vma_revision();
+        let mut forked = state.clone();
+        let projection = Self::derive_fork_projection(&state)?;
+
+        for (start, len) in projection.omitted_ranges {
+            remove_mapping_metadata_locked(&mut forked, start, len);
+        }
+        Ok((
+            Self::with_revision(forked, revision),
+            revision,
+            std::sync::Arc::from(projection.ranges.into_boxed_slice()),
+        ))
+    }
+
+    pub(super) fn fork_projection_with_revision(
+        &self,
+    ) -> Result<
+        (
+            crate::kernel::VmaRevision,
+            std::sync::Arc<[carrick_hal::ForkProjectionRange]>,
+        ),
+        carrick_hal::ForkProjectionError,
+    > {
+        let state = self.state.lock();
+        let revision = self.vma_revision();
+        let projection = Self::derive_fork_projection(&state)?;
+        Ok((
+            revision,
+            std::sync::Arc::from(projection.ranges.into_boxed_slice()),
+        ))
+    }
+
     pub(super) fn fork_private(&self) -> std::sync::Arc<Self> {
         let state = self.state.lock();
         let revision = self.vma_revision();
-        let forked = state.clone();
-        drop(state);
-        std::sync::Arc::new(Self::with_revision(forked, revision))
+        std::sync::Arc::new(Self::with_revision(state.clone(), revision))
     }
 
     pub(super) fn vma_revision(&self) -> crate::kernel::VmaRevision {
@@ -266,10 +348,47 @@ impl MemAuthority {
     }
 }
 
+/// Provenance of backing for a canonical semantic VMA.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum VmaBackingProvenance {
+    PrivateAnonymous,
+    SharedAnonymous,
+    PrivateFile,
+    SharedFile,
+    SpecialKernelSynthetic,
+}
+
+impl VmaBackingProvenance {
+    pub const fn is_private_anonymous(self) -> bool {
+        matches!(self, Self::PrivateAnonymous)
+    }
+
+    pub const fn allows_wipe_on_fork(self) -> bool {
+        self.is_private_anonymous()
+    }
+}
+
+/// Canonical semantic VMA representation owned by `MemState`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SemanticVma {
+    pub start: u64,
+    pub end: u64,
+    pub read: bool,
+    pub write: bool,
+    pub execute: bool,
+    pub provenance: VmaBackingProvenance,
+    pub fork_policy: carrick_abi::VmaForkPolicy,
+    pub droppable: bool,
+    pub path: String,
+    pub file_page_offset: Option<u64>,
+}
+
 /// Owned memory-subsystem state. Split out of `SyscallDispatcher`.
 #[derive(Clone)]
-pub(super) struct MemState {
+pub(crate) struct MemState {
     pub layout: MemoryLayout,
+    /// Canonical semantic VMAs owned by this address space.
+    pub semantic_vmas: Vec<SemanticVma>,
     /// Current program break (`brk`/`sbrk`).
     pub brk_current: u64,
     /// Bump cursor for the anonymous mmap arena.
@@ -435,6 +554,7 @@ impl MemState {
     pub(super) fn new_with_layout(layout: MemoryLayout) -> Self {
         Self {
             layout,
+            semantic_vmas: Vec::new(),
             brk_current: layout.heap_base,
             mmap_next: layout.mmap_base,
             mmap_writable_high: layout.mmap_base,
@@ -930,8 +1050,13 @@ fn project_vma_summaries(mem: &MemState) -> Vec<crate::kernel::VmaSummary> {
             .iter()
             .filter_map(|(_, current, end)| (current < end).then_some((*current, *end))),
     );
-    if mem.layout.heap_base < mem.brk_current {
-        ranges.push((mem.layout.heap_base, mem.brk_current));
+    for vma in &mem.semantic_vmas {
+        if (vma.path == "[heap]"
+            || (vma.start >= mem.layout.heap_base && vma.end <= mem.brk_current))
+            && vma.start < vma.end
+        {
+            ranges.push((vma.start, vma.end));
+        }
     }
     ranges.sort_unstable();
 
@@ -964,23 +1089,26 @@ pub(super) fn project_core_maps(mem: &MemState) -> Vec<ProcMapsEntry> {
         .iter()
         .flatten()
         .filter(|map| !boot_region_is_carrick_kernel_hole(map))
-        .filter(|map| {
-            !boot_region_is_hidden_reservation(map, mem.layout)
-                || boot_region_is_hidden_heap_backing(map, mem.layout)
-        })
-        .filter_map(|map| {
-            let mut map = map.clone();
-            if boot_region_is_hidden_heap_backing(&map, mem.layout) {
-                map.end = mem.brk_current;
-            }
-            (map.start < map.end).then_some(map)
-        })
+        .filter(|map| !boot_region_is_hidden_reservation(map, mem.layout))
+        .filter_map(|map| (map.start < map.end).then_some(map.clone()))
         .collect();
-    // MAP_FIXED and equivalent committed dynamic mappings replace any
-    // Linux-visible boot VMA they overlap. Hidden reservations themselves stay
-    // alive as implementation backing, so trim the projected/clamped view
-    // rather than mutating that backing authority. The resulting PT_LOADs are
-    // a partition with one permission/backing identity per guest byte.
+    for vma in &mem.semantic_vmas {
+        if (vma.path == "[heap]"
+            || (vma.start >= mem.layout.heap_base && vma.end <= mem.brk_current))
+            && vma.start < vma.end
+        {
+            trim_dynamic_maps_for_range(&mut maps, vma.start, vma.end.saturating_sub(vma.start));
+            maps.push(ProcMapsEntry {
+                start: vma.start,
+                end: vma.end,
+                read: vma.read,
+                write: vma.write,
+                execute: vma.execute,
+                sharing: ProcMapSharing::Private,
+                path: vma.path.clone(),
+            });
+        }
+    }
     for dynamic in &mem.dynamic_maps {
         trim_dynamic_maps_for_range(
             &mut maps,
@@ -991,6 +1119,299 @@ pub(super) fn project_core_maps(mem: &MemState) -> Vec<ProcMapsEntry> {
     maps.extend(mem.dynamic_maps.iter().cloned());
     maps.sort_by_key(|map| (map.start, map.end));
     maps
+}
+
+fn trim_semantic_vmas(vmas: &mut Vec<SemanticVma>, start: u64, len: u64) {
+    let Some(end) = start.checked_add(len) else {
+        vmas.clear();
+        return;
+    };
+    let mut next = Vec::with_capacity(vmas.len());
+    for vma in vmas.drain(..) {
+        if !ranges_overlap(start, len, vma.start, vma.end) {
+            next.push(vma);
+            continue;
+        }
+        if vma.start < start {
+            let mut left = vma.clone();
+            left.end = start;
+            next.push(left);
+        }
+        if end < vma.end {
+            let offset_delta = if vma.file_page_offset.is_some() {
+                Some((end - vma.start) >> 12)
+            } else {
+                None
+            };
+            let mut right = vma;
+            right.start = end;
+            if let (Some(base_off), Some(delta)) = (right.file_page_offset, offset_delta) {
+                right.file_page_offset = Some(base_off + delta);
+            }
+            next.push(right);
+        }
+    }
+    *vmas = next;
+}
+
+fn update_semantic_vma_prot(
+    vmas: &mut Vec<SemanticVma>,
+    start: u64,
+    len: u64,
+    read: bool,
+    write: bool,
+    execute: bool,
+) {
+    let Some(end) = start.checked_add(len) else {
+        return;
+    };
+    let mut next = Vec::with_capacity(vmas.len() + 2);
+    for vma in vmas.drain(..) {
+        if !ranges_overlap(start, len, vma.start, vma.end) {
+            next.push(vma);
+            continue;
+        }
+        if vma.start < start {
+            let mut left = vma.clone();
+            left.end = start;
+            next.push(left);
+        }
+        let mid_start = vma.start.max(start);
+        let mid_end = vma.end.min(end);
+        let mid_offset = if let Some(base_off) = vma.file_page_offset {
+            Some(base_off + ((mid_start - vma.start) >> 12))
+        } else {
+            None
+        };
+        next.push(SemanticVma {
+            start: mid_start,
+            end: mid_end,
+            read,
+            write,
+            execute,
+            provenance: vma.provenance,
+            fork_policy: vma.fork_policy,
+            droppable: vma.droppable,
+            path: vma.path.clone(),
+            file_page_offset: mid_offset,
+        });
+        if end < vma.end {
+            let right_offset = if let Some(base_off) = vma.file_page_offset {
+                Some(base_off + ((end - vma.start) >> 12))
+            } else {
+                None
+            };
+            let mut right = vma;
+            right.start = end;
+            right.file_page_offset = right_offset;
+            next.push(right);
+        }
+    }
+    coalesce_semantic_vmas(&mut next);
+    *vmas = next;
+}
+
+fn update_semantic_vma_fork_policy(
+    vmas: &mut Vec<SemanticVma>,
+    start: u64,
+    len: u64,
+    copy_update: Option<carrick_abi::VmaForkCopyPolicy>,
+    child_update: Option<carrick_abi::VmaForkChildPolicy>,
+) {
+    let Some(end) = start.checked_add(len) else {
+        return;
+    };
+    let mut next = Vec::with_capacity(vmas.len() + 2);
+    for vma in vmas.drain(..) {
+        if !ranges_overlap(start, len, vma.start, vma.end) {
+            next.push(vma);
+            continue;
+        }
+        if vma.start < start {
+            let mut left = vma.clone();
+            left.end = start;
+            next.push(left);
+        }
+        let mid_start = vma.start.max(start);
+        let mid_end = vma.end.min(end);
+        let mid_offset = if let Some(base_off) = vma.file_page_offset {
+            Some(base_off + ((mid_start - vma.start) >> 12))
+        } else {
+            None
+        };
+        let mut fork_policy = vma.fork_policy;
+        if let Some(c) = copy_update {
+            fork_policy.copy = c;
+        }
+        if let Some(ch) = child_update {
+            fork_policy.child_contents = ch;
+        }
+        next.push(SemanticVma {
+            start: mid_start,
+            end: mid_end,
+            read: vma.read,
+            write: vma.write,
+            execute: vma.execute,
+            provenance: vma.provenance,
+            fork_policy,
+            droppable: vma.droppable,
+            path: vma.path.clone(),
+            file_page_offset: mid_offset,
+        });
+        if end < vma.end {
+            let right_offset = if let Some(base_off) = vma.file_page_offset {
+                Some(base_off + ((end - vma.start) >> 12))
+            } else {
+                None
+            };
+            let mut right = vma;
+            right.start = end;
+            right.file_page_offset = right_offset;
+            next.push(right);
+        }
+    }
+    coalesce_semantic_vmas(&mut next);
+    *vmas = next;
+}
+
+fn coalesce_semantic_vmas(vmas: &mut Vec<SemanticVma>) {
+    vmas.sort_by_key(|vma| (vma.start, vma.end));
+    let mut coalesced: Vec<SemanticVma> = Vec::with_capacity(vmas.len());
+    for vma in vmas.drain(..) {
+        if let Some(last) = coalesced.last_mut() {
+            let offset_contiguous = match (last.file_page_offset, vma.file_page_offset) {
+                (None, None) => true,
+                (Some(o1), Some(o2)) => o1 + ((last.end - last.start) >> 12) == o2,
+                _ => false,
+            };
+            if last.end == vma.start
+                && last.read == vma.read
+                && last.write == vma.write
+                && last.execute == vma.execute
+                && last.provenance == vma.provenance
+                && last.fork_policy == vma.fork_policy
+                && last.droppable == vma.droppable
+                && last.path == vma.path
+                && offset_contiguous
+            {
+                last.end = vma.end;
+                continue;
+            }
+        }
+        coalesced.push(vma);
+    }
+    *vmas = coalesced;
+}
+
+pub(super) fn update_semantic_heap_pages(mem: &mut MemState, old_page_end: u64, new_page_end: u64) {
+    if new_page_end < old_page_end {
+        trim_semantic_vmas(
+            &mut mem.semantic_vmas,
+            new_page_end,
+            old_page_end - new_page_end,
+        );
+    } else if new_page_end > old_page_end {
+        // Linux's do_brk_flags(..., EMPTY_VMA_FLAGS) gives newly allocated
+        // data pages default heap semantics. A modified tail VMA may merge
+        // only when those semantics already match; it must not lend its
+        // mprotect or MADV_* flags to pages that did not exist yet.
+        let grown = SemanticVma {
+            start: old_page_end,
+            end: new_page_end,
+            read: true,
+            write: true,
+            execute: false,
+            provenance: VmaBackingProvenance::PrivateAnonymous,
+            fork_policy: carrick_abi::VmaForkPolicy::DEFAULT,
+            droppable: false,
+            path: "[heap]".to_owned(),
+            file_page_offset: None,
+        };
+        trim_semantic_vmas(
+            &mut mem.semantic_vmas,
+            old_page_end,
+            new_page_end - old_page_end,
+        );
+        mem.semantic_vmas.push(grown);
+    }
+    coalesce_semantic_vmas(&mut mem.semantic_vmas);
+}
+
+pub(super) fn semantic_vmas_from_boot_regions(
+    regions: &[ProcMapsEntry],
+    file_mappings: &[crate::core_dump::FileMapping],
+    layout: MemoryLayout,
+    brk_current: u64,
+) -> Vec<SemanticVma> {
+    let mut semantic_vmas = Vec::with_capacity(regions.len());
+    for region in regions {
+        if boot_region_is_carrick_kernel_hole(region) {
+            continue;
+        }
+        let is_heap = region.path == "[heap]" || boot_region_is_hidden_heap_backing(region, layout);
+        if !is_heap && boot_region_is_hidden_reservation(region, layout) {
+            continue;
+        }
+        let mut start = region.start;
+        let mut end = region.end;
+        if is_heap {
+            start = layout.heap_base;
+            end = align_up_u64(brk_current, 4096).unwrap_or(brk_current);
+            end = end.min(layout.heap_base.saturating_add(layout.heap_size));
+        }
+        if start >= end {
+            continue;
+        }
+        let is_stack = region.path == "[stack]";
+        let is_shared_aperture = region.path == "[shared]";
+        let is_special =
+            region.path == "[vdso]" || region.path == "[vvar]" || region.path == "[kernel]";
+        let file_mapping = file_mappings
+            .iter()
+            .find(|fm| fm.start <= start && fm.end >= end);
+        let file_page_offset = file_mapping.map(|fm| {
+            fm.file_page_offset + ((start - fm.start) / crate::core_dump::GUEST_PAGE as u64)
+        });
+        let provenance = if is_stack || is_heap {
+            VmaBackingProvenance::PrivateAnonymous
+        } else if is_special {
+            VmaBackingProvenance::SpecialKernelSynthetic
+        } else if file_mapping.is_some() {
+            if region.sharing == ProcMapSharing::Shared {
+                VmaBackingProvenance::SharedFile
+            } else {
+                VmaBackingProvenance::PrivateFile
+            }
+        } else if is_shared_aperture {
+            VmaBackingProvenance::SharedAnonymous
+        } else if region.sharing == ProcMapSharing::Shared {
+            if !region.path.is_empty() && !region.path.starts_with('[') {
+                VmaBackingProvenance::SharedFile
+            } else {
+                VmaBackingProvenance::SharedAnonymous
+            }
+        } else {
+            if !region.path.is_empty() && !region.path.starts_with('[') {
+                VmaBackingProvenance::PrivateFile
+            } else {
+                VmaBackingProvenance::PrivateAnonymous
+            }
+        };
+        semantic_vmas.push(SemanticVma {
+            start,
+            end,
+            read: region.read,
+            write: region.write,
+            execute: region.execute,
+            provenance,
+            fork_policy: carrick_abi::VmaForkPolicy::DEFAULT,
+            droppable: false,
+            path: region.path.clone(),
+            file_page_offset,
+        });
+    }
+    coalesce_semantic_vmas(&mut semantic_vmas);
+    semantic_vmas
 }
 
 fn boot_region_source_intersects_hidden_backing(
@@ -1062,6 +1483,75 @@ fn proc_mapping_sharing(sharing: ProcMapSharing) -> carrick_guest_mem::MappingSh
 }
 
 #[derive(Clone, Debug)]
+struct MremapForkSemantics {
+    source_start: u64,
+    source_end: u64,
+    vmas: Vec<SemanticVma>,
+}
+
+impl MremapForkSemantics {
+    fn capture(vmas: &[SemanticVma], source_start: u64, source_len: u64) -> Option<Self> {
+        let source_end = source_start.checked_add(source_len)?;
+        let mut cursor = source_start;
+        let mut captured = Vec::new();
+        for vma in vmas
+            .iter()
+            .filter(|vma| vma.start < source_end && vma.end > source_start)
+        {
+            let start = vma.start.max(source_start);
+            let end = vma.end.min(source_end);
+            if start != cursor || end <= start {
+                return None;
+            }
+            let mut clipped = vma.clone();
+            clipped.start = start;
+            clipped.end = end;
+            if let Some(file_page_offset) = clipped.file_page_offset {
+                clipped.file_page_offset = Some(file_page_offset + ((start - vma.start) >> 12));
+            }
+            captured.push(clipped);
+            cursor = end;
+        }
+        (cursor == source_end && !captured.is_empty()).then_some(Self {
+            source_start,
+            source_end,
+            vmas: captured,
+        })
+    }
+
+    fn project(&self, destination_start: u64, new_len: u64) -> Option<Vec<SemanticVma>> {
+        let destination_end = destination_start.checked_add(new_len)?;
+        let source_len = self.source_end.checked_sub(self.source_start)?;
+        let copied_len = source_len.min(new_len);
+        let copied_end = self.source_start.checked_add(copied_len)?;
+        let mut projected = Vec::with_capacity(self.vmas.len());
+        for vma in &self.vmas {
+            let source_start = vma.start.max(self.source_start);
+            let source_end = vma.end.min(copied_end);
+            if source_start >= source_end {
+                break;
+            }
+            let mut moved = vma.clone();
+            moved.start = destination_start.checked_add(source_start - self.source_start)?;
+            moved.end = destination_start.checked_add(source_end - self.source_start)?;
+            if let Some(file_page_offset) = moved.file_page_offset {
+                moved.file_page_offset =
+                    Some(file_page_offset + ((source_start - vma.start) >> 12));
+            }
+            projected.push(moved);
+        }
+        if new_len > source_len {
+            projected.last_mut()?.end = destination_end;
+        }
+        (!projected.is_empty()).then_some(projected)
+    }
+
+    fn any_droppable(&self) -> bool {
+        self.vmas.iter().any(|vma| vma.droppable)
+    }
+}
+
+#[derive(Clone, Debug)]
 struct MremapMappingMetadata {
     start: u64,
     end: u64,
@@ -1069,11 +1559,20 @@ struct MremapMappingMetadata {
     sharing: ProcMapSharing,
     path: String,
     file_page_offset: Option<u64>,
+    droppable: bool,
+    fork_semantics: MremapForkSemantics,
+}
+
+struct DynamicMappingSemantics {
+    file_page_offset: Option<u64>,
+    droppable: bool,
+    semantic_vmas: Option<Vec<SemanticVma>>,
 }
 
 fn proc_maps_entry_mremap_metadata(
     map: &ProcMapsEntry,
     file_page_offset: Option<u64>,
+    fork_semantics: MremapForkSemantics,
 ) -> MremapMappingMetadata {
     let mut prot = LinuxProtFlags::empty();
     if map.read {
@@ -1092,6 +1591,8 @@ fn proc_maps_entry_mremap_metadata(
         sharing: map.sharing,
         path: map.path.clone(),
         file_page_offset,
+        droppable: fork_semantics.any_droppable(),
+        fork_semantics,
     }
 }
 
@@ -1106,6 +1607,8 @@ pub(crate) struct HostAliasMmapCommit {
     pub(super) sharing: ProcMapSharing,
     pub(super) path: String,
     pub(super) file_page_offset: Option<u64>,
+    pub(super) droppable: bool,
+    pub(super) semantic_vmas: Option<Vec<SemanticVma>>,
     pub(super) locked: Option<crate::vfs::GuestMemoryRange>,
     pub(super) resident: bool,
     pub(super) bus_fault: Option<(u64, u64)>,
@@ -1303,22 +1806,7 @@ fn trim_growdown_ranges_for_range(mem: &mut MemState, start: u64, len: u64) {
 }
 
 fn remove_mapping_metadata_locked(mem: &mut MemState, start: u64, len: u64) {
-    // Ledger audit: CARRICK_FORK_DEBUG_VA=<hex> logs any metadata removal
-    // covering that VA, with the caller — the hook that named the path
-    // deleting a LIVE mapping's ledger entry (the forkserver zeroed-granule
-    // corruption: the free list then honestly resold the range).
-    if let Some(debug_va) = std::env::var("CARRICK_FORK_DEBUG_VA")
-        .ok()
-        .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
-        && start <= debug_va
-        && debug_va < start.saturating_add(len)
-    {
-        eprintln!(
-            "[LEDGERDBG tid={:?}] remove_mapping_metadata {start:#x}+{len:#x}\n{}",
-            std::thread::current().id(),
-            std::backtrace::Backtrace::force_capture(),
-        );
-    }
+    trim_semantic_vmas(&mut mem.semantic_vmas, start, len);
     trim_dynamic_maps_for_range(&mut mem.dynamic_maps, start, len);
     trim_core_file_mappings_for_range(&mut mem.core_file_mappings, start, len);
     trim_live_boot_regions_for_range(mem, start, len);
@@ -1497,6 +1985,9 @@ struct MadviseRangeMeta {
     fully_mapped: bool,
     writable: bool,
     shared: bool,
+    all_private_anon: bool,
+    any_special: bool,
+    any_droppable: bool,
     locked: bool,
 }
 
@@ -1641,6 +2132,24 @@ impl SyscallDispatcher {
             sharing: commit.sharing,
             path: commit.path,
         };
+        let semantic = if let Some(semantic_vmas) = commit.semantic_vmas {
+            MremapForkSemantics::capture(&semantic_vmas, commit.start, commit.len)
+                .unwrap_or_else(|| std::process::abort())
+                .vmas
+        } else {
+            let mut semantic = semantic_vmas_from_boot_regions(
+                std::slice::from_ref(&entry),
+                &mem.core_file_mappings,
+                mem.layout,
+                mem.brk_current,
+            );
+            for vma in &mut semantic {
+                vma.droppable = commit.droppable;
+            }
+            semantic
+        };
+        mem.semantic_vmas.extend(semantic);
+        coalesce_semantic_vmas(&mut mem.semantic_vmas);
         let idx = mem
             .dynamic_maps
             .partition_point(|map| map.start < commit.start);
@@ -1709,59 +2218,56 @@ impl SyscallDispatcher {
     }
 
     /// Derive `madvise` range validity + properties from carrick's mapping
-    /// metadata (`dynamic_maps` plus the boot address-space regions), never by
-    /// probing a page. Coverage unions both sources so an advise on an
-    /// untracked initial region (heap/stack/ELF) is not mis-reported as a hole;
-    /// a post-`munmap` hole in a file/anon VMA (removed from `dynamic_maps`)
-    /// stays uncovered → ENOMEM.
+    /// metadata (`semantic_vmas`), never by probing a page.
     fn madvise_range_meta(&self, start: u64, end: u64) -> MadviseRangeMeta {
         let mem_authority_2 = self.mem();
         let mem = mem_authority_2.lock();
-        // (start, end, writable, shared) for every VMA overlapping [start, end).
-        let mut intervals: Vec<(u64, u64, bool, bool)> = Vec::new();
-        let mut push = |map: &ProcMapsEntry| {
-            if map.start < end && map.end > start {
-                intervals.push((
-                    map.start,
-                    map.end,
-                    map.write,
-                    map.sharing == ProcMapSharing::Shared,
-                ));
-            }
-        };
-        for map in &mem.dynamic_maps {
-            push(map);
-        }
-        if let Some(regions) = &mem.address_space_regions {
-            for map in regions {
-                push(map);
-            }
-        }
-        intervals.sort_by_key(|&(s, ..)| s);
-        // Walk the sorted intervals to confirm contiguous coverage of the range
-        // and fold the covering VMAs' writable/shared bits.
+        let mut intervals: Vec<&SemanticVma> = mem
+            .semantic_vmas
+            .iter()
+            .filter(|vma| vma.start < end && vma.end > start)
+            .collect();
+        intervals.sort_by_key(|vma| vma.start);
+
         let mut covered_to = start;
         let mut writable = true;
         let mut shared = false;
-        for (s, e, w, sh) in intervals {
-            if s > covered_to {
+        let mut all_private_anon = true;
+        let mut any_special = false;
+        let mut any_droppable = false;
+        let mut any_vma = false;
+
+        for vma in intervals {
+            if vma.start > covered_to {
                 break; // gap before this interval → unmapped hole
             }
-            if e > covered_to {
-                // This interval extends coverage; its bits apply to the range.
-                if !w {
+            if vma.end > covered_to {
+                any_vma = true;
+                if !vma.write {
                     writable = false;
                 }
-                if sh {
+                if matches!(
+                    vma.provenance,
+                    VmaBackingProvenance::SharedAnonymous | VmaBackingProvenance::SharedFile
+                ) {
                     shared = true;
                 }
-                covered_to = e;
+                if !vma.provenance.allows_wipe_on_fork() {
+                    all_private_anon = false;
+                }
+                if matches!(vma.provenance, VmaBackingProvenance::SpecialKernelSynthetic) {
+                    any_special = true;
+                }
+                if vma.droppable {
+                    any_droppable = true;
+                }
+                covered_to = vma.end;
             }
             if covered_to >= end {
                 break;
             }
         }
-        let fully_mapped = covered_to >= end;
+        let fully_mapped = any_vma && covered_to >= end;
         let locked = mem.locked_ranges.iter().any(|r| {
             let (rs, re) = (r.start().raw(), r.end().raw());
             rs < end && re > start
@@ -1770,8 +2276,29 @@ impl SyscallDispatcher {
             fully_mapped,
             writable: fully_mapped && writable,
             shared,
+            all_private_anon: fully_mapped && all_private_anon,
+            any_special,
+            any_droppable,
             locked,
         }
+    }
+
+    pub(crate) fn update_madvise_fork_policy(
+        &self,
+        start: u64,
+        len: u64,
+        copy_update: Option<carrick_abi::VmaForkCopyPolicy>,
+        child_update: Option<carrick_abi::VmaForkChildPolicy>,
+    ) {
+        let mem_authority = self.mem();
+        let mut mem = mem_authority.lock();
+        update_semantic_vma_fork_policy(
+            &mut mem.semantic_vmas,
+            start,
+            len,
+            copy_update,
+            child_update,
+        );
     }
 
     /// Private VMAs added after image construction. Dynamic mapping helpers
@@ -1999,7 +2526,7 @@ impl SyscallDispatcher {
     }
 
     #[cfg(test)]
-    fn record_dynamic_mapping(
+    pub(crate) fn record_dynamic_mapping(
         &self,
         start: u64,
         len: u64,
@@ -2007,7 +2534,18 @@ impl SyscallDispatcher {
         sharing: ProcMapSharing,
         path: String,
     ) {
-        self.record_dynamic_mapping_with_file_offset(start, len, prot, sharing, path, None);
+        self.record_dynamic_mapping_with_file_offset(
+            start,
+            len,
+            prot,
+            sharing,
+            path,
+            DynamicMappingSemantics {
+                file_page_offset: None,
+                droppable: false,
+                semantic_vmas: None,
+            },
+        );
     }
 
     fn record_dynamic_mapping_with_file_offset(
@@ -2017,8 +2555,13 @@ impl SyscallDispatcher {
         prot: LinuxProtFlags,
         sharing: ProcMapSharing,
         path: String,
-        file_page_offset: Option<u64>,
+        semantics: DynamicMappingSemantics,
     ) {
+        let DynamicMappingSemantics {
+            file_page_offset,
+            droppable,
+            semantic_vmas,
+        } = semantics;
         let Some(end) = start.checked_add(len) else {
             return;
         };
@@ -2048,6 +2591,21 @@ impl SyscallDispatcher {
             sharing,
             path,
         };
+        let semantic = semantic_vmas.unwrap_or_else(|| {
+            let mut semantic = semantic_vmas_from_boot_regions(
+                std::slice::from_ref(&entry),
+                &mem.core_file_mappings,
+                mem.layout,
+                mem.brk_current,
+            );
+            for vma in &mut semantic {
+                vma.droppable = droppable;
+            }
+            semantic
+        });
+        trim_semantic_vmas(&mut mem.semantic_vmas, start, len);
+        mem.semantic_vmas.extend(semantic);
+        coalesce_semantic_vmas(&mut mem.semantic_vmas);
 
         if !dynamic_mapping_overlaps_sorted(&mem.dynamic_maps, start, len) {
             let idx = mem.dynamic_maps.partition_point(|map| map.start < start);
@@ -2058,6 +2616,30 @@ impl SyscallDispatcher {
         trim_dynamic_maps_for_range(&mut mem.dynamic_maps, start, len);
         let idx = mem.dynamic_maps.partition_point(|map| map.start < start);
         mem.dynamic_maps.insert(idx, entry);
+    }
+
+    fn record_remapped_dynamic_mapping(
+        &self,
+        start: u64,
+        len: u64,
+        source: &MremapMappingMetadata,
+    ) {
+        let semantic_vmas = source
+            .fork_semantics
+            .project(start, len)
+            .unwrap_or_else(|| std::process::abort());
+        self.record_dynamic_mapping_with_file_offset(
+            start,
+            len,
+            source.prot,
+            source.sharing,
+            source.path.clone(),
+            DynamicMappingSemantics {
+                file_page_offset: source.file_page_offset,
+                droppable: source.droppable,
+                semantic_vmas: Some(semantic_vmas),
+            },
+        );
     }
 
     /// Whether one committed host-alias extent fully backs this guest-VA range.
@@ -2110,6 +2692,8 @@ impl SyscallDispatcher {
         let end = start.checked_add(len).ok_or(LINUX_EFAULT)?;
         let mem_authority_5 = self.mem();
         let mem = mem_authority_5.lock();
+        let fork_semantics =
+            MremapForkSemantics::capture(&mem.semantic_vmas, start, len).ok_or(LINUX_EFAULT)?;
         let mut overlapping_dynamic = mem
             .dynamic_maps
             .iter()
@@ -2126,7 +2710,11 @@ impl SyscallDispatcher {
                     mapping.file_page_offset
                         + (start - mapping.start) / crate::core_dump::GUEST_PAGE as u64
                 });
-            return Ok(proc_maps_entry_mremap_metadata(first, file_page_offset));
+            return Ok(proc_maps_entry_mremap_metadata(
+                first,
+                file_page_offset,
+                fork_semantics,
+            ));
         }
 
         // Complete mapping metadata is authoritative over the retained boot
@@ -2169,7 +2757,11 @@ impl SyscallDispatcher {
                 mapping.file_page_offset
                     + (start - mapping.start) / crate::core_dump::GUEST_PAGE as u64
             });
-        Ok(proc_maps_entry_mremap_metadata(region, file_page_offset))
+        Ok(proc_maps_entry_mremap_metadata(
+            region,
+            file_page_offset,
+            fork_semantics,
+        ))
     }
 
     pub(in crate::dispatch) fn record_mmap_bus_fault_range(&self, start: u64, len: u64) {
@@ -2246,6 +2838,14 @@ impl SyscallDispatcher {
         let mem_authority_8 = self.mem();
         let mut mem = mem_authority_8.lock();
         update_proc_map_prot(&mut mem.dynamic_maps, start, len, prot);
+        update_semantic_vma_prot(
+            &mut mem.semantic_vmas,
+            start,
+            len,
+            prot.contains(LinuxProtFlags::READ),
+            prot.contains(LinuxProtFlags::WRITE),
+            prot.contains(LinuxProtFlags::EXEC),
+        );
 
         let layout = mem.layout;
         if let Some(regions) = mem.address_space_regions.as_mut() {
@@ -2695,8 +3295,9 @@ impl SyscallDispatcher {
                         std::process::abort();
                     }
                     cx.memory.set_mapping_protection(grow_start, grow_len, false, false);
+                    update_semantic_heap_pages(&mut mem, old_page_end, new_page_end);
                     mem.brk_current = requested;
-                    host_alias_dispatch.mark_vma_revision(this.mem().revision_publisher());
+                    host_alias_dispatch.mark_vma_revision(mem_authority_13.revision_publisher());
                 } else if new_page_end < old_page_end {
                     // Shrink: first make removed page tail stage-1-invalid, then publish
                     // unmapped, then zero raw backing for safe reuse, then commit.
@@ -2716,12 +3317,13 @@ impl SyscallDispatcher {
                     if cx.memory.zero_backing(shrink_start, shrink_len).is_err() {
                         std::process::abort();
                     }
+                    update_semantic_heap_pages(&mut mem, old_page_end, new_page_end);
                     mem.brk_current = requested;
-                    host_alias_dispatch.mark_vma_revision(this.mem().revision_publisher());
+                    host_alias_dispatch.mark_vma_revision(mem_authority_13.revision_publisher());
                 } else if requested != current {
                     // Same-page movement: only update byte-precise break.
                     mem.brk_current = requested;
-                    host_alias_dispatch.mark_vma_revision(this.mem().revision_publisher());
+                    host_alias_dispatch.mark_vma_revision(mem_authority_13.revision_publisher());
                 }
             }
             Ok(DispatchOutcome::Returned {
@@ -2950,6 +3552,8 @@ impl SyscallDispatcher {
                         sharing: ProcMapSharing::Shared,
                         path: "anon_inode:[io_uring]".to_owned(),
                         file_page_offset: None,
+                        droppable: false,
+                        semantic_vmas: None,
                         locked: this.prepare_mmap_locked_range(map_flags, address, length)?,
                         resident: true,
                         bus_fault: None,
@@ -3265,6 +3869,8 @@ impl SyscallDispatcher {
                     file_page_offset: (!proc_map_path.is_empty()).then_some(
                         offset / crate::core_dump::GUEST_PAGE as u64,
                     ),
+                    droppable: map_flags.contains(LinuxMmapFlags::DROPPABLE),
+                    semantic_vmas: None,
                     locked: locked_range,
                     resident: !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                         || map_flags.contains(LinuxMmapFlags::POPULATE),
@@ -3426,6 +4032,8 @@ impl SyscallDispatcher {
                             file_page_offset: (!proc_map_path.is_empty()).then_some(
                                 offset / crate::core_dump::GUEST_PAGE as u64,
                             ),
+                            droppable: map_flags.contains(LinuxMmapFlags::DROPPABLE),
+                            semantic_vmas: None,
                             locked: locked_range,
                             resident: true,
                             bus_fault: None,
@@ -3613,7 +4221,11 @@ impl SyscallDispatcher {
                         prot_flags,
                         ProcMapSharing::Shared,
                         String::new(),
-                        None,
+                        DynamicMappingSemantics {
+                            file_page_offset: None,
+                            droppable: map_flags.contains(LinuxMmapFlags::DROPPABLE),
+                            semantic_vmas: None,
+                        },
                     );
                     this.mark_vma_dispatch(&mut host_alias_dispatch);
                     return Ok(DispatchOutcome::Returned { value: addr as i64 });
@@ -3716,7 +4328,11 @@ impl SyscallDispatcher {
                     prot_flags,
                     map_sharing.proc_map_sharing(),
                     String::new(),
-                    None,
+                    DynamicMappingSemantics {
+                        file_page_offset: None,
+                        droppable: map_flags.contains(LinuxMmapFlags::DROPPABLE),
+                        semantic_vmas: None,
+                    },
                 );
                 if address_uses_alias {
                     this.record_alias_vma(address, length);
@@ -3762,7 +4378,11 @@ impl SyscallDispatcher {
                     prot_flags,
                     map_sharing.proc_map_sharing(),
                     String::new(),
-                    None,
+                    DynamicMappingSemantics {
+                        file_page_offset: None,
+                        droppable: map_flags.contains(LinuxMmapFlags::DROPPABLE),
+                        semantic_vmas: None,
+                    },
                 );
                 if map_flags.contains(LinuxMmapFlags::GROWSDOWN) {
                     this.record_growdown_mapping(address, length);
@@ -4081,6 +4701,8 @@ impl SyscallDispatcher {
                         file_page_offset: (!proc_map_path.is_empty()).then_some(
                             offset / crate::core_dump::GUEST_PAGE as u64,
                         ),
+                        droppable: map_flags.contains(LinuxMmapFlags::DROPPABLE),
+                        semantic_vmas: None,
                         locked: locked_range,
                         resident: !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                             || map_flags.contains(LinuxMmapFlags::POPULATE),
@@ -4279,7 +4901,11 @@ impl SyscallDispatcher {
                 prot_flags,
                 map_sharing.proc_map_sharing(),
                 proc_map_path,
-                file_page_offset,
+                DynamicMappingSemantics {
+                    file_page_offset,
+                    droppable: map_flags.contains(LinuxMmapFlags::DROPPABLE),
+                    semantic_vmas: None,
+                },
             );
             this.mark_vma_dispatch(&mut host_alias_dispatch);
             Ok(DispatchOutcome::Returned {
@@ -5019,6 +5645,13 @@ impl SyscallDispatcher {
                             sharing: ProcMapSharing::Shared,
                             path: source_metadata.path.clone(),
                             file_page_offset: source_metadata.file_page_offset,
+                            droppable: source_metadata.droppable,
+                            semantic_vmas: Some(
+                                source_metadata
+                                    .fork_semantics
+                                    .project(va, new_size)
+                                    .unwrap_or_else(|| std::process::abort()),
+                            ),
                             locked: None,
                             resident: true,
                             bus_fault: None,
@@ -5075,14 +5708,11 @@ impl SyscallDispatcher {
                         old_address.0.saturating_add(bus_start),
                         new_size.saturating_sub(bus_start),
                     );
-                    this.record_dynamic_mapping_with_file_offset(
+                    this.record_remapped_dynamic_mapping(
                         old_address.0,
                         new_size,
-                        source_metadata.prot,
-                        source_metadata.sharing,
-                        source_metadata.path.clone(),
-                        source_metadata.file_page_offset,
-                    );
+                        &source_metadata,
+                        );
                     this.mark_vma_dispatch(&mut host_alias_dispatch);
                     return Ok(DispatchOutcome::Returned {
                         value: old_address.0 as i64,
@@ -5160,14 +5790,11 @@ impl SyscallDispatcher {
                             return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                         }
                     }
-                    this.record_dynamic_mapping_with_file_offset(
+                    this.record_remapped_dynamic_mapping(
                         old_address.0,
                         new_size,
-                        source_metadata.prot,
-                        source_metadata.sharing,
-                        source_metadata.path.clone(),
-                        source_metadata.file_page_offset,
-                    );
+                        &source_metadata,
+                        );
                     this.mark_vma_dispatch(&mut host_alias_dispatch);
                     return Ok(DispatchOutcome::Returned {
                         value: old_address.0 as i64,
@@ -5232,14 +5859,11 @@ impl SyscallDispatcher {
                             std::process::abort();
                         }
                     }
-                    this.record_dynamic_mapping_with_file_offset(
+                    this.record_remapped_dynamic_mapping(
                         old_address.0,
                         new_size,
-                        source_metadata.prot,
-                        source_metadata.sharing,
-                        source_metadata.path.clone(),
-                        source_metadata.file_page_offset,
-                    );
+                        &source_metadata,
+                        );
                     if new_size != old_size {
                         this.mark_vma_dispatch(&mut host_alias_dispatch);
                     }
@@ -5285,14 +5909,11 @@ impl SyscallDispatcher {
                         free_regions_insert(&mut mem.free_regions, tail_start, tail_len);
                     }
                 }
-                this.record_dynamic_mapping_with_file_offset(
+                this.record_remapped_dynamic_mapping(
                     old_address.0,
                     new_size,
-                    source_metadata.prot,
-                    source_metadata.sharing,
-                    source_metadata.path.clone(),
-                    source_metadata.file_page_offset,
-                );
+                    &source_metadata,
+                    );
                 if new_size != old_size {
                     this.mark_vma_dispatch(&mut host_alias_dispatch);
                 }
@@ -5401,14 +6022,11 @@ impl SyscallDispatcher {
                         let _ = memory.protect_range(bus_start_abs, bus_len_usize, 0);
                     }
                     this.record_mmap_bus_fault_range(bus_start_abs, bus_len);
-                    this.record_dynamic_mapping_with_file_offset(
+                    this.record_remapped_dynamic_mapping(
                         new_addr,
                         new_size,
-                        source_metadata.prot,
-                        source_metadata.sharing,
-                        source_metadata.path.clone(),
-                        source_metadata.file_page_offset,
-                    );
+                        &source_metadata,
+                        );
                     // Linux unmaps the source. Reclaim it exactly like munmap so
                     // a later access faults and the VA is reusable.
                     if let Ok(old_len) = usize::try_from(old_size)
@@ -5449,14 +6067,11 @@ impl SyscallDispatcher {
                     mem.mmap_next = new_end;
                 }
                 this.record_mmap_bus_fault_range(old_end, grow_len_u64);
-                this.record_dynamic_mapping_with_file_offset(
+                this.record_remapped_dynamic_mapping(
                     old_address.0,
                     new_size,
-                    source_metadata.prot,
-                    source_metadata.sharing,
-                    source_metadata.path.clone(),
-                    source_metadata.file_page_offset,
-                );
+                    &source_metadata,
+                    );
                 this.mark_vma_dispatch(&mut host_alias_dispatch);
                 return Ok(DispatchOutcome::Returned {
                     value: old_address.0 as i64,
@@ -5501,14 +6116,11 @@ impl SyscallDispatcher {
                         // munmap+rebump cannot expose bytes dirtied in this tail.
                         mem.mmap_writable_high = mem.mmap_writable_high.max(new_end);
                     }
-                    this.record_dynamic_mapping_with_file_offset(
+                    this.record_remapped_dynamic_mapping(
                         old_address.0,
                         new_size,
-                        source_metadata.prot,
-                        source_metadata.sharing,
-                        source_metadata.path.clone(),
-                        source_metadata.file_page_offset,
-                    );
+                        &source_metadata,
+                        );
                     this.mark_vma_dispatch(&mut host_alias_dispatch);
                     return Ok(DispatchOutcome::Returned {
                         value: old_address.0 as i64,
@@ -5593,14 +6205,11 @@ impl SyscallDispatcher {
                 this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
-            this.record_dynamic_mapping_with_file_offset(
+            this.record_remapped_dynamic_mapping(
                 new_addr,
                 new_size,
-                source_metadata.prot,
-                source_metadata.sharing,
-                source_metadata.path.clone(),
-                source_metadata.file_page_offset,
-            );
+                &source_metadata,
+                );
             // mremap MOVE on Linux UNMAPS the source [old, old+old_size) (unless
             // MREMAP_DONTUNMAP — refused above, so never true here: this handler
             // always reclaims the source). carrick previously LEAKED it: the
@@ -5764,6 +6373,13 @@ impl SyscallDispatcher {
                             sharing: reservation.sharing,
                             path: reservation.path,
                             file_page_offset: reservation.file_page_offset,
+                            droppable: reservation.droppable,
+                            semantic_vmas: Some(
+                                reservation
+                                    .fork_semantics
+                                    .project(address.0, length)
+                                    .unwrap_or_else(|| std::process::abort()),
+                            ),
                             locked: None,
                             resident: false,
                             bus_fault: None,
@@ -5929,7 +6545,7 @@ impl SyscallDispatcher {
         }
 
         fn madvise(this, cx, address: GuestPtr, length: u64, advice: u64) {
-            let _host_alias_dispatch = this.begin_host_alias_dispatch();
+            let mut host_alias_dispatch = this.begin_conditional_vma_dispatch();
             let page_size = this.linux_page_size();
             if !address.0.is_multiple_of(page_size) || !linux_madvise_advice_is_supported(advice) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
@@ -5959,6 +6575,27 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
             match advice {
+                LINUX_MADV_DONTFORK | LINUX_MADV_DOFORK | LINUX_MADV_WIPEONFORK | LINUX_MADV_KEEPONFORK => {
+                    if advice == LINUX_MADV_DOFORK && meta.any_special {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    }
+                    if advice == LINUX_MADV_WIPEONFORK && !meta.all_private_anon {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    }
+                    if advice == LINUX_MADV_KEEPONFORK && meta.any_droppable {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    }
+                    let (copy_update, child_update) = match advice {
+                        LINUX_MADV_DONTFORK => (Some(carrick_abi::VmaForkCopyPolicy::Omit), None),
+                        LINUX_MADV_DOFORK => (Some(carrick_abi::VmaForkCopyPolicy::Inherit), None),
+                        LINUX_MADV_WIPEONFORK => (None, Some(carrick_abi::VmaForkChildPolicy::ZeroInChild)),
+                        LINUX_MADV_KEEPONFORK => (None, Some(carrick_abi::VmaForkChildPolicy::Preserve)),
+                        _ => unreachable!(),
+                    };
+                    this.update_madvise_fork_policy(address.0, end - address.0, copy_update, child_update);
+                    this.mark_vma_dispatch(&mut host_alias_dispatch);
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
                 LINUX_MADV_DONTNEED => {
                     // Linux can_madv_lru_vma rejects VM_LOCKED (also VM_HUGETLB /
                     // VM_PFNMAP, which carrick does not model) with EINVAL before
@@ -6524,6 +7161,8 @@ fn linux_madvise_advice_is_supported(advice: u64) -> bool {
             | LINUX_MADV_FREE
             | LINUX_MADV_DONTFORK
             | LINUX_MADV_DOFORK
+            | LINUX_MADV_WIPEONFORK
+            | LINUX_MADV_KEEPONFORK
             // THP hints: advisory, accepted as a success no-op (see the abi
             // constants). carrick can't promote to huge pages, but neither must
             // it reject the hint — real Linux with THP built in returns 0.
