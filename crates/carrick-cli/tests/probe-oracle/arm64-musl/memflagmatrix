@@ -1,0 +1,12 @@
+3a93b33381a7d225
+mmap_no_type_einval=false
+mmap_both_types_einval=true
+mmap_len_zero_einval=true
+mmap_unaligned_offset_einval=true
+mmap_invalid_prot_einval=false
+mmap_fixed_unaligned_einval=true
+mmap_fixed_noreplace_eexist=true
+mmap_fixed_noreplace_unmapped_ok=true
+mmap_populate_resident=true
+mmap_unpopulated_not_resident=true
+Segmentation fault

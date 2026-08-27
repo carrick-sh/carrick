@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use carrick_conformance_next::{PullPolicy, TestContainer};
 
 /// Exact materialized list of generic conformance probes for shard 2 (index % 3 == 2).
-/// Hard-asserted to have exactly 142 sorted unique names.
+/// Hard-asserted to have exactly 143 sorted unique names.
 pub const SHARD_2_PROBES: &[&str] = &[
     "accessx",
     "alarmretval",
@@ -72,25 +72,26 @@ pub const SHARD_2_PROBES: &[&str] = &[
     "manythreads",
     "maskfork",
     "memfdcreate",
-    "mincoreedge",
-    "mlock2",
-    "mmapdevzero",
-    "mmapfileforkwriteback",
-    "mmapprivfile",
-    "mmaptrimprotect",
-    "mock_network_socket",
-    "mqueue",
-    "mremapsharedshrink",
-    "msgoverflow",
-    "mtidlesleep",
-    "nativebrk",
-    "net",
-    "netpoll",
-    "nofiledefault",
-    "odirectory",
-    "openat2resolve",
-    "openeloop",
-    "otmpfileforkexec",
+    "memmap",
+    "mknoddevnode",
+    "mmapcluster",
+    "mmapfile",
+    "mmapmunmap",
+    "mmapreuse",
+    "mmapzerofill",
+    "mqnotifycrossproc",
+    "mremapmove",
+    "msgctlstat",
+    "mtforkcorrupt",
+    "nanosleeprem",
+    "nativex18",
+    "netifmcast",
+    "newmountapi",
+    "nsfsioctl",
+    "oomscoreadj",
+    "openat2valid",
+    "openempty",
+    "overlaysymlink",
     "pathnonutf8",
     "pendingunblock",
     "pidnsinitsig",
@@ -156,7 +157,7 @@ pub const SHARD_2_PROBES: &[&str] = &[
     "zerolenio",
 ];
 
-const CACHED_SHARD_2_PROBE_COUNT: usize = 131;
+const CACHED_SHARD_2_PROBE_COUNT: usize = 133;
 
 const MUSL_BASELINE_GAPS: &[&str] = &[
     "budget_two_proc",
@@ -313,16 +314,16 @@ pub fn probe_campaign_dir(repo_root: &Path, target: &str) -> Option<PathBuf> {
 
 #[test]
 fn test_shard_2_inventory_definition() {
-    // 1. Hard-assert 142 sorted unique names.
+    // 1. Hard-assert 143 sorted unique names.
     assert_eq!(
         SHARD_2_PROBES.len(),
-        142,
-        "shard 2 must contain exactly 142 probes"
+        143,
+        "shard 2 must contain exactly 143 probes"
     );
     let probe_set: BTreeSet<&str> = SHARD_2_PROBES.iter().copied().collect();
     assert_eq!(
         probe_set.len(),
-        142,
+        143,
         "shard 2 probes list must contain no duplicate entries"
     );
     for window in SHARD_2_PROBES.windows(2) {
@@ -371,8 +372,8 @@ fn test_shard_2_inventory_definition() {
     generic_conformance_probes.dedup();
     assert_eq!(
         generic_conformance_probes.len(),
-        426,
-        "expected exactly 426 generic conformance probes across all shards"
+        429,
+        "expected exactly 429 generic conformance probes across all shards"
     );
 
     let derived_shard_2: Vec<&str> = generic_conformance_probes
@@ -384,8 +385,8 @@ fn test_shard_2_inventory_definition() {
 
     assert_eq!(
         derived_shard_2.len(),
-        142,
-        "derived shard 2 must have 142 items"
+        143,
+        "derived shard 2 must have 143 items"
     );
     assert_eq!(
         derived_shard_2.as_slice(),

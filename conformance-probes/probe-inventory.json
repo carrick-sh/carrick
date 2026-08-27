@@ -974,6 +974,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "memflagmatrix": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "memmap": {
     "class": "conformance",
     "excluded": false,
@@ -1179,6 +1184,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "netflagmatrix": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "netifmcast": {
     "class": "conformance",
     "excluded": false,
@@ -1275,6 +1285,11 @@
     "runner": "generic"
   },
   "patherrno": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "pathflagmatrix": {
     "class": "conformance",
     "excluded": false,
     "runner": "generic"
