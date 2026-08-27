@@ -1,6 +1,6 @@
 # Carrick exact conformance closure handoff
 
-**Updated:** 2026-08-27 (session 11 — conformance-next mechanical migration landed through `790a04d4e`; probe components green with one shard lifecycle flake; full suite still red)
+**Updated:** 2026-08-27 (session 12 — exhaustive 20-second-cap census complete; first clock regression closed at `f375ea664`; full suite still red)
 
 **Canonical host/lane:** macOS, Apple Silicon, HVF/HVPatch, Linux arm64 guest
 
@@ -56,6 +56,75 @@ Execution is a directed-worker model:
 Complete only when fail-closed gate integrity, exact correctness, and the <=2x
 performance gate pass together on the final integrated signed artifact. Do not
 push unless explicitly asked. Preserve unrelated worktree changes.
+
+## SESSION 12 — 2026-08-27: fast timeout census and clock closure begins
+
+`main` now defaults Carrick suite runs to a **20-second** emergency cap
+(`18bcd2407`); `--carrick-timeout-cap-s 0` remains the explicit targeted
+investigation override. Reducers are held to a tighter standard: every
+potentially blocking negative case carries an internal zero/short deadline.
+`eventwaitmatrix` was corrected accordingly and now completes both libc lanes
+in **2.45 seconds** instead of hanging. Routine generic-probe runs still use
+source-hash-validated committed Docker output and do not contact Docker.
+
+### Exhaustive cached-only measurement
+
+Command:
+
+```
+just conformance full --force --require-cached-oracle --no-image-refresh --workers 8
+```
+
+The run selected and emitted all **2,127/2,127** declarations, proved all 2,127
+oracle rows were cached up front, and ran **zero Docker containers**. Its exact
+receipt remains `target/conformance/results.hvf.full.jsonl`; the run-ID family
+is `conf-13982-cNN`. Scoped process cleanup was empty afterward.
+
+| verdict | count |
+|---|---:|
+| `MATCH` | 1,990 |
+| known `DIFF` | 14 |
+| `NEW` | 8 |
+| `REGRESSION` | 64 |
+| `TIMEOUT` | 50 |
+| `CARRICK_CRASH` | 1 |
+
+There are **115 gating rows**: 75 LTP, 10 Go, 2 Node, and 28 CPython. The lower
+cap deliberately exposes hangs sooner; the 50 timeout rows are correctness
+leads and their approximately 20–21 second ratios are not performance data.
+Among the 2,076 valid non-timeout rows with timings, 650 exceed 2x (128 LTP,
+143 Go, 1 Node, 378 CPython). This eight-worker census is a ranking surface,
+not a controlled final performance receipt.
+
+Exact exhaustive artifact at source `ed94642cd0c9`:
+
+| field | value |
+|---|---|
+| binary SHA-256 | `029f220ec401bfc24fdae73bf4d27cbf8c20e1ba032d661d1db5466bc0703eb4` |
+| LC_UUID | `B438D9AA-6BC3-31D8-9E3A-53784D90F7AF` |
+| hypervisor entitlement | present |
+| `__dof_carrick` | present |
+
+### First closed row and next reducer
+
+`f375ea664` implements Linux's `CLOCK_REALTIME >= CLOCK_MONOTONIC` invariant:
+a privileged `clock_settime` that would place wall time before boot now returns
+`EINVAL`. The unit test was red first (`Returned { value: 0 }` versus
+`EINVAL`), then the clock-settime unit pair, focused clippy, formatting, and
+diff checks passed. A signed cached-only run changed
+`ltp-clock_settime02` from **REGRESSION 11/12** to **MATCH 12/12**, with zero
+Docker runs.
+
+The next coherent closure cluster is privileged clock discipline:
+`ltp-clock_adjtime01`, `ltp-clock_adjtime02`, the `clock_adjtime` rows in
+`eventwaitmatrix`/`adjtimexstate`, and adjacent clock restoration behavior.
+Carrick receives `--cap-add SYS_TIME`, but its current `adjtimex_bootstrap`
+accepts only read-only state and always rejects real adjustments. Implement
+per-container discipline state with Linux validation/capability ordering; do
+not merely special-case LTP modes or pretend `ADJ_OFFSET` slews time. First
+split aggregate probe booleans into exact rc/errno/field assertions where they
+currently hide which subcase failed, then prove the focused LTP pair and both
+libc cached reducers before refreshing the exhaustive census.
 
 ## SESSION 11 — 2026-08-27: conformance-next migration and legacy carve
 
