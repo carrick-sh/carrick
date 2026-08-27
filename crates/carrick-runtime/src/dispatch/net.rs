@@ -746,20 +746,24 @@ impl SyscallDispatcher {
         // explicitly asks to watch for writability again. Keep read armed:
         // read-side ET uses FIONREAD growth to detect a new edge while data
         // remains buffered.
-        if events & LINUX_EPOLLET != 0
-            && interest.write
-            && last_ready & (LINUX_EPOLLOUT | LINUX_EPOLLHUP | LINUX_EPOLLERR) != 0
-            && !write_backpressured
-        {
-            interest.write = false;
-        }
-        if events & LINUX_EPOLLET != 0
-            && interest.read
-            && last_ready & LINUX_EPOLLIN != 0
-            && last_read_avail > 0
-            && self.fd_supports_read_lowat(fd)
-        {
-            interest.read_lowat = Some(last_read_avail.saturating_add(1));
+        if events & LINUX_EPOLLET != 0 {
+            if interest.write
+                && last_ready & (LINUX_EPOLLOUT | LINUX_EPOLLHUP | LINUX_EPOLLERR) != 0
+                && !write_backpressured
+            {
+                interest.write = false;
+            }
+            if interest.read {
+                if last_ready & (LINUX_EPOLLHUP | LINUX_EPOLLERR) != 0 {
+                    interest.read = false;
+                } else if last_ready & LINUX_EPOLLIN != 0 {
+                    if last_read_avail > 0 && self.fd_supports_read_lowat(fd) {
+                        interest.read_lowat = Some(last_read_avail.saturating_add(1));
+                    } else {
+                        interest.read = false;
+                    }
+                }
+            }
         }
         // A one-way pipe/FIFO read end is never writable under Linux, so it must
         // never carry a write filter. FreeBSD's kqueue arms `EVFILT_WRITE` on a
@@ -3709,7 +3713,7 @@ mod epoll_interest_tests {
         feature = "platform-netbsd"
     ))]
     #[test]
-    fn et_terminal_latch_disarms_host_write_filter() {
+    fn et_terminal_latch_disarms_host_filters() {
         let dispatcher = SyscallDispatcher::new();
         let events = LINUX_EPOLLET | LINUX_EPOLLIN | LINUX_EPOLLOUT;
 
@@ -3720,12 +3724,12 @@ mod epoll_interest_tests {
             0,
             false,
         );
-        assert!(hup_latched.read);
+        assert!(!hup_latched.read);
         assert!(!hup_latched.write);
 
         let err_latched =
             dispatcher.epoll_effective_interest(12345, events, LINUX_EPOLLERR, 0, false);
-        assert!(err_latched.read);
+        assert!(!err_latched.read);
         assert!(!err_latched.write);
 
         let backpressured = dispatcher.epoll_effective_interest(
@@ -3735,8 +3739,13 @@ mod epoll_interest_tests {
             0,
             true,
         );
-        assert!(backpressured.read);
+        assert!(!backpressured.read);
         assert!(backpressured.write);
+
+        let in_latched_zero =
+            dispatcher.epoll_effective_interest(12345, events, LINUX_EPOLLIN, 0, false);
+        assert!(!in_latched_zero.read);
+        assert!(in_latched_zero.write);
     }
 }
 
