@@ -1983,7 +1983,9 @@ impl SyscallDispatcher {
                 if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
-                timeout = Some(Duration::new(tv_sec as u64, tv_nsec as u32));
+                let raw_dur = Duration::new(tv_sec as u64, tv_nsec as u32);
+                let clock = Arc::clone(cx.kernel.task().container().clock());
+                timeout = Some(clock.scale_timeout(raw_dur));
             }
 
             this.drain_xsignals_process_directed(cx.kernel);

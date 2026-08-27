@@ -328,8 +328,14 @@ struct DeterministicWaiters {
 #[derive(Debug, Clone)]
 struct DeterministicWaiter {
     due_monotonic: Option<Duration>,
-    waker: Arc<std::sync::Condvar>,
-    done: Arc<std::sync::atomic::AtomicBool>,
+    pair: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+/// The vvar `VVAR_OFF_REALTIME_OFF_NS` word for a domain: the vDSO computes
+/// `realtime_ns = CNTVCT/freq + word` with u64 wrapping arithmetic, so a
+/// negative offset must be stored in its two's-complement representation.
+pub fn vvar_realtime_word(base_realtime_ns: u64, offset_ns: i64) -> u64 {
+    base_realtime_ns.wrapping_add(offset_ns as u64)
 }
 
 /// The container's time authority. Supports standard system time tracking
@@ -356,15 +362,8 @@ impl Default for ClockDomain {
     }
 }
 
-/// The vvar `VVAR_OFF_REALTIME_OFF_NS` word for a domain: the vDSO computes
-/// `realtime_ns = CNTVCT/freq + word` with u64 wrapping arithmetic, so a
-/// negative offset is published as its two's complement.
-pub fn vvar_realtime_word(base_off_ns: u64, offset_ns: i64) -> u64 {
-    crate::vdso::vvar_realtime_off_ns(base_off_ns, offset_ns)
-}
-
 impl ClockDomain {
-    /// Construct a domain with an explicit [`TimeControl`].
+    /// Create a new clock domain with the given `TimeControl`.
     pub fn new(control: TimeControl) -> Self {
         let initial_offset_ns = match &control {
             TimeControl::Offset(delta) => delta.as_nanos_i64().unwrap_or(0),
@@ -380,22 +379,22 @@ impl ClockDomain {
         }
     }
 
-    /// The host clock, unshifted.
+    /// Construct a standard `System` clock domain (real host time).
     pub fn system() -> Self {
         Self::new(TimeControl::System)
     }
 
-    /// Wall clock shifted by a fixed signed offset.
+    /// Construct an `Offset` clock domain with a fixed wall-clock delta.
     pub fn offset(delta: SignedDuration) -> Self {
         Self::new(TimeControl::Offset(delta))
     }
 
-    /// Wall clock frozen at a fixed time.
+    /// Construct a `Frozen` clock domain pinned at `base`.
     pub fn frozen(base: SystemTime) -> Self {
         Self::new(TimeControl::Frozen(base))
     }
 
-    /// Time scaled by rational factor `num / den`.
+    /// Construct a `Scaled` clock domain with rational speedup factor `num / den`.
     pub fn scaled(base: SystemTime, num: u32, den: u32) -> Result<Self, TimeError> {
         if den == 0 {
             return Err(TimeError::ZeroDenominator);
@@ -403,36 +402,37 @@ impl ClockDomain {
         Ok(Self::new(TimeControl::Scaled { base, num, den }))
     }
 
-    /// Strictly incrementing virtual time.
+    /// Construct a `Deterministic` clock domain with `epoch` virtual base.
     pub fn deterministic(epoch: SystemTime) -> Self {
         Self::new(TimeControl::Deterministic { epoch })
     }
 
-    /// The active time control mode.
+    /// The time control mode of this domain.
     pub fn control(&self) -> &TimeControl {
         &self.control
     }
 
-    /// True if the clock is controlled by the embedder rather than host system time.
+    /// Whether this clock domain is controlled by an embedder (not live System time).
     pub fn is_controlled(&self) -> bool {
         !matches!(self.control, TimeControl::System)
     }
 
-    /// True if the wall clock is frozen.
+    /// Whether realtime is frozen.
     pub fn is_frozen(&self) -> bool {
         matches!(self.control, TimeControl::Frozen(_))
     }
 
-    /// True if the clock is running with scaled time.
+    /// Whether time is scaled rationally.
     pub fn is_scaled(&self) -> bool {
         matches!(self.control, TimeControl::Scaled { .. })
     }
 
-    /// True if the clock is running with deterministic virtual time.
+    /// Whether virtual time is deterministic.
     pub fn is_deterministic(&self) -> bool {
         matches!(self.control, TimeControl::Deterministic { .. })
     }
 
+    /// Guest `CLOCK_REALTIME` minus host realtime, in nanoseconds.
     pub fn realtime_offset_ns(&self) -> i64 {
         match &self.control {
             TimeControl::Offset(delta) => delta.as_nanos_i64().unwrap_or(0),
@@ -440,6 +440,7 @@ impl ClockDomain {
         }
     }
 
+    /// The domain's generation counter; bumped on every offset change.
     pub fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::Acquire)
     }
@@ -593,8 +594,7 @@ impl ClockDomain {
             id,
             DeterministicWaiter {
                 due_monotonic,
-                waker: Arc::new(std::sync::Condvar::new()),
-                done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                pair: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
             },
         );
         id
@@ -617,8 +617,10 @@ impl ClockDomain {
         for waiter in state.waiters.values() {
             if let Some(due) = waiter.due_monotonic {
                 if due <= current_time {
-                    waiter.done.store(true, Ordering::SeqCst);
-                    waiter.waker.notify_all();
+                    let (lock, cvar) = &*waiter.pair;
+                    let mut done = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    *done = true;
+                    cvar.notify_all();
                 }
             }
         }
@@ -626,7 +628,7 @@ impl ClockDomain {
 
     /// In Deterministic mode, wait on the virtual clock until due time or host deadline.
     pub fn wait_virtual(&self, waiter_id: u64, host_deadline: Option<Instant>) -> bool {
-        let (waker, done) = {
+        let pair = {
             let state = self
                 .waiters
                 .lock()
@@ -634,36 +636,34 @@ impl ClockDomain {
             let Some(w) = state.waiters.get(&waiter_id) else {
                 return true;
             };
-            (Arc::clone(&w.waker), Arc::clone(&w.done))
+            Arc::clone(&w.pair)
         };
 
         self.maybe_auto_advance();
 
-        let mutex = std::sync::Mutex::new(());
-        let mut guard = mutex
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while !done.load(Ordering::SeqCst) {
+        let (lock, cvar) = &*pair;
+        let mut done = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !*done {
             if let Some(dl) = host_deadline {
                 let now = Instant::now();
                 if now >= dl {
                     return false;
                 }
                 let rem = dl - now;
-                let (g, res) = waker
-                    .wait_timeout(guard, rem)
+                let (g, res) = cvar
+                    .wait_timeout(done, rem)
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                guard = g;
+                done = g;
                 if res.timed_out() {
                     break;
                 }
             } else {
-                guard = waker
-                    .wait(guard)
+                done = cvar
+                    .wait(done)
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
             }
         }
-        done.load(Ordering::SeqCst)
+        *done
     }
 
     /// Auto-advance virtual time if all enrolled waiters have a due deadline.
@@ -676,16 +676,30 @@ impl ClockDomain {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut min_due: Option<Duration> = None;
+        let mut all_timed = true;
+        let mut active_count = 0;
         for waiter in state.waiters.values() {
-            if waiter.done.load(Ordering::SeqCst) {
+            let (lock, _) = &*waiter.pair;
+            let is_done = *lock.lock().unwrap_or_else(|p| p.into_inner());
+            if is_done {
                 continue;
             }
-            if let Some(due) = waiter.due_monotonic {
-                min_due = match min_due {
-                    None => Some(due),
-                    Some(m) => Some(m.min(due)),
-                };
+            active_count += 1;
+            match waiter.due_monotonic {
+                Some(due) => {
+                    min_due = match min_due {
+                        None => Some(due),
+                        Some(m) => Some(m.min(due)),
+                    };
+                }
+                None => {
+                    all_timed = false;
+                }
             }
+        }
+
+        if !all_timed || active_count == 0 {
+            return;
         }
 
         let current_ns = self.virtual_monotonic_ns.load(Ordering::SeqCst);
@@ -698,8 +712,10 @@ impl ClockDomain {
                 for waiter in state.waiters.values() {
                     if let Some(due) = waiter.due_monotonic {
                         if due <= earliest {
-                            waiter.done.store(true, Ordering::SeqCst);
-                            waiter.waker.notify_all();
+                            let (lock, cvar) = &*waiter.pair;
+                            let mut done = lock.lock().unwrap_or_else(|p| p.into_inner());
+                            *done = true;
+                            cvar.notify_all();
                         }
                     }
                 }
@@ -707,8 +723,10 @@ impl ClockDomain {
                 for waiter in state.waiters.values() {
                     if let Some(due) = waiter.due_monotonic {
                         if due <= current_dur {
-                            waiter.done.store(true, Ordering::SeqCst);
-                            waiter.waker.notify_all();
+                            let (lock, cvar) = &*waiter.pair;
+                            let mut done = lock.lock().unwrap_or_else(|p| p.into_inner());
+                            *done = true;
+                            cvar.notify_all();
                         }
                     }
                 }
@@ -1212,5 +1230,108 @@ mod clock_domain_tests {
         assert_eq!(vvar_realtime_word(1_000, 5), 1_005);
         assert_eq!(vvar_realtime_word(1_000, -400), 600);
         assert_eq!(vvar_realtime_word(u64::MAX, 1), 0);
+    }
+
+    #[test]
+    fn deterministic_auto_advance_wakes_waiters_in_deadline_order() {
+        let epoch = UNIX_EPOCH + Duration::from_secs(1000);
+        let clock = ClockDomain::deterministic(epoch);
+
+        let w1 = clock.enroll_waiter(Some(Duration::from_millis(100)));
+        let w2 = clock.enroll_waiter(Some(Duration::from_millis(200)));
+
+        assert_eq!(clock.monotonic_now(), Duration::ZERO);
+
+        // Auto-advance should jump to 100ms and wake w1
+        clock.maybe_auto_advance();
+        assert_eq!(clock.monotonic_now(), Duration::from_millis(100));
+
+        // w1 wait_virtual should return true immediately
+        assert!(clock.wait_virtual(w1, None));
+
+        // Auto-advance again should jump to 200ms and wake w2
+        clock.maybe_auto_advance();
+        assert_eq!(clock.monotonic_now(), Duration::from_millis(200));
+        assert!(clock.wait_virtual(w2, None));
+
+        clock.remove_waiter(w1);
+        clock.remove_waiter(w2);
+    }
+
+    #[test]
+    fn deterministic_threads_wait_and_wake_on_advance() {
+        use std::sync::Arc;
+        let epoch = UNIX_EPOCH + Duration::from_secs(100);
+        let clock = Arc::new(ClockDomain::deterministic(epoch));
+
+        let clock_clone = Arc::clone(&clock);
+        let waiter_id = clock.enroll_waiter(Some(Duration::from_millis(50)));
+
+        let handle = std::thread::spawn(move || {
+            let woke = clock_clone.wait_virtual(waiter_id, None);
+            assert!(woke);
+            assert!(clock_clone.monotonic_now() >= Duration::from_millis(50));
+        });
+
+        // Sleep briefly on host to ensure the thread is waiting, then advance
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(clock.advance(Duration::from_millis(50)).is_ok());
+
+        handle.join().expect("thread joined");
+        clock.remove_waiter(waiter_id);
+    }
+
+    #[test]
+    fn deterministic_wait_virtual_respects_host_deadline() {
+        let epoch = UNIX_EPOCH + Duration::from_secs(100);
+        let clock = ClockDomain::deterministic(epoch);
+        // An indefinite waiter (e.g. task blocked on I/O) prevents auto-advance
+        let indefinite = clock.enroll_waiter(None);
+        let waiter_id = clock.enroll_waiter(Some(Duration::from_secs(3600)));
+
+        let host_deadline = std::time::Instant::now() + Duration::from_millis(20);
+        let woke = clock.wait_virtual(waiter_id, Some(host_deadline));
+        assert!(
+            !woke,
+            "virtual wait should time out when host deadline passes"
+        );
+        clock.remove_waiter(indefinite);
+        clock.remove_waiter(waiter_id);
+    }
+
+    #[test]
+    fn advance_on_non_deterministic_returns_unsupported_mode() {
+        let clock = ClockDomain::system();
+        assert!(matches!(
+            clock.advance(Duration::from_secs(1)),
+            Err(TimeError::UnsupportedMode(_))
+        ));
+
+        let frozen = ClockDomain::frozen(UNIX_EPOCH);
+        assert!(matches!(
+            frozen.advance(Duration::from_secs(1)),
+            Err(TimeError::UnsupportedMode(_))
+        ));
+    }
+
+    #[test]
+    fn signed_duration_arithmetic() {
+        let pos = SignedDuration::from_secs(10);
+        assert!(!pos.is_negative());
+        assert!(!pos.is_zero());
+        assert_eq!(pos.as_nanos_i64(), Some(10_000_000_000));
+
+        let neg = SignedDuration::from_secs(-10);
+        assert!(neg.is_negative());
+        assert!(!neg.is_zero());
+        assert_eq!(neg.as_nanos_i64(), Some(-10_000_000_000));
+
+        let zero = SignedDuration::ZERO;
+        assert!(!zero.is_negative());
+        assert!(zero.is_zero());
+        assert_eq!(zero.as_nanos_i64(), Some(0));
+
+        let from_std: SignedDuration = Duration::from_secs(5).into();
+        assert_eq!(from_std.as_nanos_i64(), Some(5_000_000_000));
     }
 }
