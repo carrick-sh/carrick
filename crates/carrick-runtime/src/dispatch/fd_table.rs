@@ -1168,6 +1168,11 @@ pub(super) enum OpenDescription {
         base: OpenDescriptionBase,
         queue: Arc<crate::dispatch::mqueue::MqueueInner>,
     },
+    /// A pure in-memory stream or message socket (AF_UNIX or mocked AF_INET/AF_INET6).
+    InMemorySocket {
+        base: OpenDescriptionBase,
+        socket: Arc<crate::dispatch::net::unix_pure::PureSocketInner>,
+    },
 }
 
 #[derive(Debug)]
@@ -1263,6 +1268,7 @@ impl OpenDescription {
             Self::Mqueue { .. } => "mqueue",
             Self::BpfMap { .. } => "bpf_map",
             Self::BpfProg { .. } => "bpf_prog",
+            Self::InMemorySocket { .. } => "in_memory_socket",
         }
     }
 
@@ -1335,7 +1341,9 @@ impl OpenDescription {
             OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => {
                 format!("pipe:[{}]", inode_for_path(Path::new("pipe:[carrick]")))
             }
-            OpenDescription::HostSocket { .. } | OpenDescription::Netlink { .. } => {
+            OpenDescription::HostSocket { .. }
+            | OpenDescription::InMemorySocket { .. }
+            | OpenDescription::Netlink { .. } => {
                 format!("socket:[{}]", inode_for_path(Path::new("socket:[carrick]")))
             }
         };
@@ -1375,6 +1383,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
             OpenDescription::HostPipe { .. } => Kind::HostPipe,
             OpenDescription::HostFile { .. } => Kind::HostFile,
             OpenDescription::HostSocket { .. } => Kind::HostSocket,
+            OpenDescription::InMemorySocket { .. } => Kind::InMemorySocket,
             OpenDescription::Inotify { .. } => Kind::Inotify,
             OpenDescription::Fanotify { .. } => Kind::Fanotify,
             OpenDescription::SignalFd { .. } => Kind::SignalFd,
@@ -1731,7 +1740,7 @@ pub(super) enum OpenStatSource {
 }
 
 impl OpenDescription {
-    fn base(&self) -> &OpenDescriptionBase {
+    pub(crate) fn base(&self) -> &OpenDescriptionBase {
         match self {
             OpenDescription::Closed { .. } => {
                 tracing::error!("closed file description has no functional base");
@@ -1759,7 +1768,8 @@ impl OpenDescription {
             | OpenDescription::Netlink { base, .. }
             | OpenDescription::Mqueue { base, .. }
             | OpenDescription::BpfMap { base, .. }
-            | OpenDescription::BpfProg { base, .. } => base,
+            | OpenDescription::BpfProg { base, .. }
+            | OpenDescription::InMemorySocket { base, .. } => base,
         }
     }
 
@@ -1791,7 +1801,8 @@ impl OpenDescription {
             | OpenDescription::Netlink { base, .. }
             | OpenDescription::Mqueue { base, .. }
             | OpenDescription::BpfMap { base, .. }
-            | OpenDescription::BpfProg { base, .. } => base,
+            | OpenDescription::BpfProg { base, .. }
+            | OpenDescription::InMemorySocket { base, .. } => base,
         }
     }
 
@@ -2038,13 +2049,13 @@ impl OpenDescription {
                     }
                 }
             }
-            OpenDescription::HostSocket { .. } | OpenDescription::Netlink { .. } => {
-                OpenStatSource::Record(StatRecord::synthetic(
-                    "socket:[carrick]",
-                    0,
-                    LINUX_S_IFSOCK | 0o600,
-                ))
-            }
+            OpenDescription::HostSocket { .. }
+            | OpenDescription::InMemorySocket { .. }
+            | OpenDescription::Netlink { .. } => OpenStatSource::Record(StatRecord::synthetic(
+                "socket:[carrick]",
+                0,
+                LINUX_S_IFSOCK | 0o600,
+            )),
         }
     }
 }

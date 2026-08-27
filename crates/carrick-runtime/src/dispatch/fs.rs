@@ -1518,6 +1518,7 @@ impl SyscallDispatcher {
                 | OpenDescription::PipeReader { .. }
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
+                | OpenDescription::InMemorySocket { .. }
                 | OpenDescription::HostFile { .. }
                 // In-memory regular files (incl. the unnamed O_TMPFILE inode and
                 // overlay-backed `SyntheticFile`s) carry their `contents`/`offset`
@@ -4509,7 +4510,9 @@ impl SyscallDispatcher {
                 FicloneFs::Pipe
             }
             OpenDescription::HostPipe { pty: None, .. } => FicloneFs::Pipe,
-            OpenDescription::HostSocket { .. } => FicloneFs::Sock,
+            OpenDescription::HostSocket { .. } | OpenDescription::InMemorySocket { .. } => {
+                FicloneFs::Sock
+            }
             // Path-keyed classes cover File, SyntheticFile AND HostFile: the
             // guest's /dev/zero is a HostFile, so keying off the variant alone
             // put a character device on the rootfs and turned a devfs->pipefs
@@ -5309,6 +5312,7 @@ impl SyscallDispatcher {
                 &*of.description.read(),
                 OpenDescription::HostPipe { .. }
                     | OpenDescription::HostSocket { .. }
+                    | OpenDescription::InMemorySocket { .. }
                     | OpenDescription::PipeReader { .. }
                     | OpenDescription::PipeWriter { .. }
                     | OpenDescription::SyntheticDevice { .. }
@@ -7158,7 +7162,7 @@ impl SyscallDispatcher {
     /// disposition: a handler runs, SIG_DFL terminates, a blocked SIGPIPE stays
     /// pending. Skip the mark when SIGPIPE is ignored (the common case for
     /// pipe/socket-heavy programs) so we don't queue a signal that's discarded.
-    fn raise_sigpipe_on_epipe<M: GuestMemory>(
+    pub(crate) fn raise_sigpipe_on_epipe<M: GuestMemory>(
         &self,
         cx: &SyscallCtx<M>,
         outcome: DispatchOutcome,
@@ -7477,6 +7481,7 @@ impl SyscallDispatcher {
                 | OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
+                | OpenDescription::InMemorySocket { .. }
                 | OpenDescription::SignalFd { .. }
                 | OpenDescription::PerfEvent { .. }
                 | OpenDescription::FsContext { .. }
@@ -9872,6 +9877,7 @@ impl SyscallDispatcher {
                 | OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
+                | OpenDescription::InMemorySocket { .. }
                 | OpenDescription::SignalFd { .. }
                 // A perf event fd is an unseekable stream (verified ESPIPE
                 // against the Docker oracle).
@@ -9929,6 +9935,7 @@ impl SyscallDispatcher {
                 | OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
+                | OpenDescription::InMemorySocket { .. }
                 | OpenDescription::SignalFd { .. }
                 | OpenDescription::SyntheticDevice { .. }
                 | OpenDescription::PerfEvent { .. }
@@ -10322,6 +10329,27 @@ impl SyscallDispatcher {
                         ),
                     ));
                 }
+                OpenDescription::InMemorySocket { socket, .. } => {
+                    let socket = Arc::clone(socket);
+                    drop(open);
+                    let mut buf = vec![0u8; length];
+                    match socket.recv_stream(&mut buf, 0) {
+                        Ok((read_len, _)) => {
+                            if read_len > 0 {
+                                if memory.write_bytes(address, &buf[..read_len]).is_err() {
+                                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                                }
+                                return Ok(DispatchOutcome::Returned {
+                                    value: read_len as i64,
+                                });
+                            } else {
+                                return Ok(DispatchOutcome::Returned { value: 0 });
+                            }
+                        }
+                        Err(LINUX_EAGAIN) => return Ok(DispatchOutcome::errno(LINUX_EAGAIN)),
+                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    }
+                }
                 // Netlink: drain whatever a prior dump request queued. A bare
                 // read(2) is rare on netlink sockets (recvmsg is the norm), but
                 // model it as draining the synthetic response so it doesn't
@@ -10491,6 +10519,37 @@ impl SyscallDispatcher {
                         ),
                     ));
                 }
+                OpenDescription::InMemorySocket { socket, .. } => {
+                    let socket = Arc::clone(socket);
+                    drop(open);
+                    let mut total = 0i64;
+                    for iov in &iovecs {
+                        let len = usize::try_from(iov.iov_len)
+                            .map_err(|_| DispatchError::LengthTooLarge(iov.iov_len))?;
+                        if len == 0 {
+                            continue;
+                        }
+                        let mut buf = vec![0u8; len];
+                        match socket.recv_stream(&mut buf, 0) {
+                            Ok((read_len, _)) => {
+                                if read_len > 0 {
+                                    if memory.write_bytes(iov.iov_base, &buf[..read_len]).is_err() {
+                                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                                    }
+                                    total += read_len as i64;
+                                    if read_len < len {
+                                        break;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                            Err(LINUX_EAGAIN) if total > 0 => break,
+                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                        }
+                    }
+                    return Ok(DispatchOutcome::Returned { value: total });
+                }
                 OpenDescription::PipeReader { base, pipe } => {
                     let pipe = Arc::clone(pipe);
                     let flags = base.status_flags();
@@ -10576,6 +10635,7 @@ impl SyscallDispatcher {
                 | OpenDescription::PipeReader { .. }
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
+                | OpenDescription::InMemorySocket { .. }
                 | OpenDescription::SignalFd { .. }
                 | OpenDescription::PerfEvent { .. }
                 | OpenDescription::FsContext { .. }
@@ -10708,7 +10768,8 @@ impl SyscallDispatcher {
                 | OpenDescription::Mqueue { .. }
                 | OpenDescription::BpfMap { .. }
                 | OpenDescription::BpfProg { .. }
-                | OpenDescription::Netlink { .. } => {
+                | OpenDescription::Netlink { .. }
+                | OpenDescription::InMemorySocket { .. } => {
                     // Positional read on a non-seekable fd (pipe/socket/anon) is
                     // ESPIPE on Linux; a directory is EISDIR (above). pread02.
                     return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
@@ -10884,7 +10945,8 @@ impl SyscallDispatcher {
                 | OpenDescription::Mqueue { .. }
                 | OpenDescription::BpfMap { .. }
                 | OpenDescription::BpfProg { .. }
-                | OpenDescription::Netlink { .. } => {
+                | OpenDescription::Netlink { .. }
+                | OpenDescription::InMemorySocket { .. } => {
                     // Positional read on a non-seekable fd → ESPIPE; directory →
                     // EISDIR (above). preadv02.
                     return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
@@ -11102,7 +11164,8 @@ impl SyscallDispatcher {
                 | OpenDescription::Pidfd { .. }
                 | OpenDescription::Inotify { .. }
                 | OpenDescription::SyntheticDevice { .. }
-                | OpenDescription::Fanotify { .. } => LINUX_ESPIPE,
+                | OpenDescription::Fanotify { .. }
+                | OpenDescription::InMemorySocket { .. } => LINUX_ESPIPE,
             };
             Ok(DispatchOutcome::errno(errno))
 
@@ -11358,7 +11421,8 @@ impl SyscallDispatcher {
                 | OpenDescription::Pidfd { .. }
                 | OpenDescription::Inotify { .. }
                 | OpenDescription::SyntheticDevice { .. }
-                | OpenDescription::Fanotify { .. } => LINUX_ESPIPE,
+                | OpenDescription::Fanotify { .. }
+                | OpenDescription::InMemorySocket { .. } => LINUX_ESPIPE,
             };
             Ok(DispatchOutcome::errno(errno))
 
@@ -13084,6 +13148,23 @@ impl SyscallDispatcher {
                             this.fasync_notify_after_write(cx.kernel, key_fd, written);
                             return Ok(out);
                         }
+                        OpenDescription::InMemorySocket { socket, .. } => {
+                            let socket = Arc::clone(socket);
+                            drop(open);
+                            match socket.send_stream(&bytes, Vec::new()) {
+                                Ok(written) => {
+                                    this.notify_inmem_epoll();
+                                    return Ok(DispatchOutcome::Returned {
+                                        value: written as i64,
+                                    });
+                                }
+                                Err(LINUX_EPIPE) => {
+                                    let outcome = DispatchOutcome::errno(LINUX_EPIPE);
+                                    return Ok(this.raise_sigpipe_on_epipe(cx, outcome));
+                                }
+                                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                            }
+                        }
                         OpenDescription::HostFile {
                             base,
                             host_fd,
@@ -13591,6 +13672,24 @@ impl SyscallDispatcher {
                                             .unwrap_or_else(|| std::process::abort()),
                                     },
                                 );
+                                writeback = None;
+                            }
+                            OpenDescription::InMemorySocket { socket, .. } => {
+                                let socket = Arc::clone(socket);
+                                match socket.send_stream(&bytes, Vec::new()) {
+                                    Ok(written) => {
+                                        this.notify_inmem_epoll();
+                                        outcome = DispatchOutcome::Returned {
+                                            value: written as i64,
+                                        };
+                                    }
+                                    Err(LINUX_EPIPE) => {
+                                        outcome = DispatchOutcome::errno(LINUX_EPIPE);
+                                    }
+                                    Err(errno) => {
+                                        outcome = DispatchOutcome::errno(errno);
+                                    }
+                                }
                                 writeback = None;
                             }
                             OpenDescription::HostFile {

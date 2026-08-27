@@ -199,7 +199,8 @@ impl SyscallDispatcher {
             | OpenDescription::BpfMap { .. }
             | OpenDescription::BpfProg { .. }
             | OpenDescription::SyntheticDevice { .. }
-            | OpenDescription::Netlink { .. } => Ok(Err(LINUX_EINVAL)),
+            | OpenDescription::Netlink { .. }
+            | OpenDescription::InMemorySocket { .. } => Ok(Err(LINUX_EINVAL)),
         }
     }
 
@@ -267,7 +268,8 @@ impl SyscallDispatcher {
             | OpenDescription::BpfMap { .. }
             | OpenDescription::BpfProg { .. }
             | OpenDescription::SyntheticDevice { .. }
-            | OpenDescription::Netlink { .. } => return Err(LINUX_EINVAL),
+            | OpenDescription::Netlink { .. }
+            | OpenDescription::InMemorySocket { .. } => return Err(LINUX_EINVAL),
         };
         Ok(bytes)
     }
