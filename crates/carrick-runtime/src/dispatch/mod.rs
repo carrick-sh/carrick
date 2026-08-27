@@ -154,7 +154,19 @@ use crate::fs_backend::FsBackend;
 use crate::linux_abi::LINUX_MAP_ANONYMOUS;
 use crate::linux_abi::{
     KernelAbi,
+    LINUX_ADJ_ESTERROR,
+    LINUX_ADJ_FREQUENCY,
+    LINUX_ADJ_MAXERROR,
+    LINUX_ADJ_MICRO,
+    LINUX_ADJ_NANO,
+    LINUX_ADJ_OFFSET,
+    LINUX_ADJ_OFFSET_SINGLESHOT,
     LINUX_ADJ_OFFSET_SINGLESHOT_FLAG_ONLY,
+    LINUX_ADJ_OFFSET_SS_READ,
+    LINUX_ADJ_STATUS,
+    LINUX_ADJ_TAI,
+    LINUX_ADJ_TICK,
+    LINUX_ADJ_TIMECONST,
     // ABI constants moved from dispatch.rs (Goal #3, private set)
     LINUX_AF_INET,
     LINUX_AF_INET6,
@@ -507,6 +519,7 @@ use crate::linux_abi::{
     LINUX_SOL_UDP,
     LINUX_SS_DISABLE,
     LINUX_SS_ONSTACK,
+    LINUX_STA_NANO,
     LINUX_STATX_BASIC_STATS,
     LINUX_STATX_RESERVED,
     LINUX_TASK_COMM_LEN,
@@ -7968,13 +7981,14 @@ fn adjtimex_bootstrap(
     clock: &crate::kernel::container::ClockDomain,
     memory: &mut impl GuestMemory,
     address: u64,
+    can_adjust: bool,
 ) -> DispatchOutcome {
     let timex = match read_kernel_struct::<LinuxTimex>(memory, address) {
         Ok(timex) => timex,
         Err(errno) => return DispatchOutcome::Errno { errno },
     };
+    let mut current = LinuxTimex::new_read_state(linux_timeval_from_duration(clock.realtime_now()));
     if timex.modes == 0 {
-        let current = LinuxTimex::new_read_state(linux_timeval_from_duration(clock.realtime_now()));
         return match write_kernel_struct(memory, address, &current) {
             DispatchOutcome::Returned { value: 0 } => DispatchOutcome::Returned {
                 value: LINUX_TIME_ERROR,
@@ -7982,11 +7996,70 @@ fn adjtimex_bootstrap(
             other => other,
         };
     }
-    if timex.modes == LINUX_ADJ_OFFSET_SINGLESHOT_FLAG_ONLY {
+    if timex.modes & LINUX_ADJ_OFFSET_SINGLESHOT_FLAG_ONLY != 0
+        && timex.modes & LINUX_ADJ_OFFSET == 0
+    {
         let invalid = LinuxTimex::invalid_mode_error_state();
         return match write_kernel_struct(memory, address, &invalid) {
             DispatchOutcome::Returned { value: 0 } => DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
+            },
+            other => other,
+        };
+    }
+    if timex.modes == LINUX_ADJ_OFFSET_SS_READ {
+        current.modes = timex.modes;
+        return match write_kernel_struct(memory, address, &current) {
+            DispatchOutcome::Returned { value: 0 } => DispatchOutcome::Returned {
+                value: LINUX_TIME_ERROR,
+            },
+            other => other,
+        };
+    }
+    if !can_adjust {
+        return DispatchOutcome::Errno { errno: LINUX_EPERM };
+    }
+    if timex.modes & LINUX_ADJ_TICK != 0 {
+        let minimum = 900_000 / LINUX_CLK_TCK;
+        let maximum = 1_100_000 / LINUX_CLK_TCK;
+        let requested_tick = timex.tick;
+        if !(minimum..=maximum).contains(&requested_tick) {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+    }
+
+    // Accept an idempotent restore of the state Carrick truthfully reports.
+    // Stateful PLL/FLL discipline is deliberately not claimed here: any mode
+    // that would change a value remains EPERM until ClockDomain owns a real
+    // slew/frequency model.
+    let supported = LINUX_ADJ_OFFSET
+        | LINUX_ADJ_FREQUENCY
+        | LINUX_ADJ_MAXERROR
+        | LINUX_ADJ_ESTERROR
+        | LINUX_ADJ_STATUS
+        | LINUX_ADJ_TIMECONST
+        | LINUX_ADJ_TAI
+        | LINUX_ADJ_MICRO
+        | LINUX_ADJ_NANO
+        | LINUX_ADJ_TICK;
+    let idempotent = timex.modes & !supported == 0
+        && (timex.modes & LINUX_ADJ_OFFSET == 0 || timex.offset == current.offset)
+        && (timex.modes & LINUX_ADJ_FREQUENCY == 0 || timex.freq == current.freq)
+        && (timex.modes & LINUX_ADJ_MAXERROR == 0 || timex.maxerror == current.maxerror)
+        && (timex.modes & LINUX_ADJ_ESTERROR == 0 || timex.esterror == current.esterror)
+        && (timex.modes & LINUX_ADJ_STATUS == 0 || timex.status == current.status)
+        && (timex.modes & LINUX_ADJ_TIMECONST == 0 || timex.constant == current.constant)
+        && (timex.modes & LINUX_ADJ_TAI == 0 || timex.constant == i64::from(current.tai))
+        && (timex.modes & LINUX_ADJ_TICK == 0 || timex.tick == current.tick)
+        && (timex.modes & LINUX_ADJ_NANO == 0 || current.status & LINUX_STA_NANO != 0)
+        && (timex.modes & LINUX_ADJ_MICRO == 0 || current.status & LINUX_STA_NANO == 0);
+    if idempotent || (timex.modes == LINUX_ADJ_OFFSET_SINGLESHOT && timex.offset == 0) {
+        current.modes = timex.modes;
+        return match write_kernel_struct(memory, address, &current) {
+            DispatchOutcome::Returned { value: 0 } => DispatchOutcome::Returned {
+                value: LINUX_TIME_ERROR,
             },
             other => other,
         };

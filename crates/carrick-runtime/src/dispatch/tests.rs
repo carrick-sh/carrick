@@ -5065,10 +5065,12 @@ mod container_clock_tests {
     const SYS_TIMERFD_SETTIME: u64 = 86;
     const SYS_CLOCK_SETTIME: u64 = 112;
     const SYS_CLOCK_GETTIME: u64 = 113;
+    const SYS_CLOCK_ADJTIME: u64 = 266;
     const MEM_BASE: u64 = 0x4000_0000;
     const MEM_LEN: usize = 4096;
     const TIMESPEC_ADDR: u64 = MEM_BASE + 0x100;
     const ITIMERSPEC_ADDR: u64 = MEM_BASE + 0x200;
+    const TIMEX_ADDR: u64 = MEM_BASE + 0x300;
     const SLACK: Duration = Duration::from_secs(5);
 
     fn wall_now() -> Duration {
@@ -5194,6 +5196,110 @@ mod container_clock_tests {
             .expect("dispatch clock_settime");
 
         assert_eq!(outcome, DispatchOutcome::errno(LINUX_EINVAL));
+    }
+
+    #[test]
+    fn clock_adjtime_privileged_rejects_tick_outside_linux_bounds() {
+        const ADJ_TICK: u32 = 0x4000;
+        const MIN_TICK_USEC: i64 = 900_000 / LINUX_CLK_TCK;
+        const MAX_TICK_USEC: i64 = 1_100_000 / LINUX_CLK_TCK;
+
+        for invalid_tick in [MIN_TICK_USEC - 1, MAX_TICK_USEC + 1] {
+            let mut dispatcher = SyscallDispatcher::new();
+            let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
+            let reporter = CompatReporter::default();
+            let context = dispatcher.capture_one_task_context().expect("task context");
+            context
+                .task()
+                .with_caps(|caps| *caps = crate::namespace::process::CapabilitySet::full());
+            let mut timex = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
+            timex.modes = ADJ_TICK;
+            timex.tick = invalid_tick;
+            memory
+                .write_bytes(TIMEX_ADDR, timex.abi_bytes())
+                .expect("write timex");
+
+            let outcome = dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        SYS_CLOCK_ADJTIME,
+                        SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .expect("dispatch clock_adjtime");
+
+            assert_eq!(
+                outcome,
+                DispatchOutcome::errno(LINUX_EINVAL),
+                "ADJ_TICK={invalid_tick} must be range-validated after CAP_SYS_TIME"
+            );
+        }
+    }
+
+    #[test]
+    fn clock_adjtime_privileged_accepts_idempotent_discipline_restore() {
+        const ADJ_ALL: u32 = 0x403f;
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
+        let reporter = CompatReporter::default();
+        let context = dispatcher.capture_one_task_context().expect("task context");
+        context
+            .task()
+            .with_caps(|caps| *caps = crate::namespace::process::CapabilitySet::full());
+        let mut timex = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
+        timex.modes = ADJ_ALL;
+        memory
+            .write_bytes(TIMEX_ADDR, timex.abi_bytes())
+            .expect("write timex");
+
+        let outcome = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    SYS_CLOCK_ADJTIME,
+                    SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("dispatch clock_adjtime");
+
+        assert_eq!(outcome, DispatchOutcome::Returned { value: LINUX_TIME_ERROR });
+    }
+
+    #[test]
+    fn clock_adjtime_offset_ss_read_is_unprivileged_and_reports_no_pending_slew() {
+        const ADJ_OFFSET_SS_READ: u32 = 0xa001;
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
+        let reporter = CompatReporter::default();
+        let context = dispatcher.capture_one_task_context().expect("task context");
+        let mut timex = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
+        timex.modes = ADJ_OFFSET_SS_READ;
+        timex.offset = 123;
+        memory
+            .write_bytes(TIMEX_ADDR, timex.abi_bytes())
+            .expect("write timex");
+
+        let outcome = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    SYS_CLOCK_ADJTIME,
+                    SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("dispatch clock_adjtime");
+        let bytes = memory.read_bytes(TIMEX_ADDR + 8, 8).expect("returned offset");
+        let offset = i64::from_le_bytes(bytes.try_into().expect("offset bytes"));
+
+        assert_eq!(outcome, DispatchOutcome::Returned { value: LINUX_TIME_ERROR });
+        assert_eq!(offset, 0, "no singleshot slew is pending in a fresh domain");
     }
 
     fn armed_absolute_timerfd(
@@ -5343,4 +5449,3 @@ mod container_caps_tests {
         assert_eq!(container_with(&[]).granted_caps().effective & bit, 0);
     }
 }
-

@@ -1322,6 +1322,19 @@ impl LinuxTimeval {
 
 pub const LINUX_TIME_ERROR: i64 = 5;
 pub const LINUX_STA_UNSYNC: i32 = 0x0040;
+pub const LINUX_STA_NANO: i32 = 0x2000;
+pub const LINUX_ADJ_OFFSET: u32 = 0x0001;
+pub const LINUX_ADJ_FREQUENCY: u32 = 0x0002;
+pub const LINUX_ADJ_MAXERROR: u32 = 0x0004;
+pub const LINUX_ADJ_ESTERROR: u32 = 0x0008;
+pub const LINUX_ADJ_STATUS: u32 = 0x0010;
+pub const LINUX_ADJ_TIMECONST: u32 = 0x0020;
+pub const LINUX_ADJ_TAI: u32 = 0x0080;
+pub const LINUX_ADJ_MICRO: u32 = 0x1000;
+pub const LINUX_ADJ_NANO: u32 = 0x2000;
+pub const LINUX_ADJ_TICK: u32 = 0x4000;
+pub const LINUX_ADJ_OFFSET_SINGLESHOT: u32 = 0x8001;
+pub const LINUX_ADJ_OFFSET_SS_READ: u32 = 0xa001;
 pub const LINUX_ADJ_OFFSET_SINGLESHOT_FLAG_ONLY: u32 = 0x8000;
 
 #[repr(C, packed)]
