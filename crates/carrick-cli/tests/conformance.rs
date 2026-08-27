@@ -60,6 +60,8 @@ const KNOWN_PROBE_GAPS: &[&str] = &[
     // iouringenterflag FIXED in M4 (flag/arg validation + to_submit bound) — now PASSES.
     // sotimeo FIXED in M3 (SO_RCVTIMEO/SO_SNDTIMEO stored per-OFD + threaded into blocking_io) — now PASSES.
     // epollstaledel FIXED in M3 (pending_ready keyed by fd) — now PASSES.
+    // clocksettimevdso — Task 3 lands the vvar sync fix; excused during Task 2.
+    "clocksettimevdso",
 ];
 
 /// Probes kept as standalone REDUCERS but NOT run by the gate, for one of two
@@ -3327,7 +3329,12 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// `rlimitasdata` (mmap/brk growth past a soft `RLIMIT_AS`/`RLIMIT_DATA` must
 /// return `ENOMEM`) moves it from 467 to 468 and the gating rows from 882 to
 /// 884 — also `generic`, so the generic set goes 420 to 421.
-const PROBE_SOURCE_COUNT: usize = 468;
+
+/// `clocksettimevdso` (a guest `clock_settime` must move the vDSO's realtime
+/// word too, so vDSO and syscall CLOCK_REALTIME agree afterwards) moves it
+/// from 468 to 469 and the gating rows from 884 to 886 — `generic`, so the
+/// generic set goes 421 to 422.
+const PROBE_SOURCE_COUNT: usize = 469;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
@@ -3564,6 +3571,22 @@ fn probe_needs_unconfined(name: &str) -> bool {
     UNCONFINED_PROBES.contains(&name)
 }
 
+/// Probes that require capabilities beyond Docker's default set.
+///
+/// Each entry names the probe binary and the capability name (e.g. "SYS_TIME"
+/// for `CAP_SYS_TIME`). The harness passes `--cap-add <CAP>` to both
+/// `carrick run` and `docker run` so the probe exercises the syscall rather
+/// than getting rejected at capability validation on either side.
+const SYS_TIME_PROBES: &[&str] = &["clocksettimevdso"];
+
+fn probe_capabilities(name: &str) -> &'static [&'static str] {
+    if SYS_TIME_PROBES.contains(&name) {
+        &["SYS_TIME"]
+    } else {
+        &[]
+    }
+}
+
 fn probe_source_names() -> BTreeSet<String> {
     all_probe_source_names()
         .into_iter()
@@ -3726,7 +3749,7 @@ fn run_carrick_probe_with_deadline(
     stdin_bytes: &[u8],
     deadline: Duration,
 ) -> String {
-    run_carrick_probe_with_policy(bin, lane, stdin_bytes, deadline, false).normalized_output
+    run_carrick_probe_with_policy(bin, lane, stdin_bytes, deadline, false, &[]).normalized_output
 }
 
 fn run_carrick_probe_with_deadline_named(
@@ -3742,6 +3765,7 @@ fn run_carrick_probe_with_deadline_named(
         stdin_bytes,
         deadline,
         probe_needs_unconfined(name),
+        probe_capabilities(name),
     )
 }
 
@@ -3751,11 +3775,15 @@ fn run_carrick_probe_with_policy(
     stdin_bytes: &[u8],
     deadline: Duration,
     unconfined: bool,
+    caps: &[&str],
 ) -> CarrickProbeExecution {
     let mut command = Command::new(bin);
     command.args(["run", "--platform", lane.platform, "--raw", "--fs", "host"]);
     if unconfined {
         command.args(["--security-opt", "seccomp=unconfined"]);
+    }
+    for cap in caps {
+        command.args(["--cap-add", cap]);
     }
     command
         .args([lane.image, "/bin/sh", "-c", PROBE_SNIPPET])
@@ -3784,7 +3812,14 @@ fn run_carrick_bound_probe_named(
     deadline: Duration,
     name: &str,
 ) -> CarrickProbeExecution {
-    run_carrick_bound_probe_with_policy(bin, lane, probe, deadline, probe_needs_unconfined(name))
+    run_carrick_bound_probe_with_policy(
+        bin,
+        lane,
+        probe,
+        deadline,
+        probe_needs_unconfined(name),
+        probe_capabilities(name),
+    )
 }
 
 fn run_carrick_bound_probe_with_policy(
@@ -3793,6 +3828,7 @@ fn run_carrick_bound_probe_with_policy(
     probe: &Path,
     deadline: Duration,
     unconfined: bool,
+    caps: &[&str],
 ) -> CarrickProbeExecution {
     let init = probe
         .parent()
@@ -3821,6 +3857,9 @@ fn run_carrick_bound_probe_with_policy(
         .arg(init_volume);
     if unconfined {
         command.args(["--security-opt", "seccomp=unconfined"]);
+    }
+    for cap in caps {
+        command.args(["--cap-add", cap]);
     }
     command
         .arg(lane.image)
@@ -3949,23 +3988,32 @@ fn elf_file_type(path: &PathBuf) -> Option<u16> {
 /// than bollard because bollard stdin-attach is awkward; the shell-case path
 /// keeps using `run_docker` (bollard) unchanged.
 fn run_docker_probe(lane: Lane, stdin_bytes: &[u8]) -> std::io::Result<String> {
-    run_docker_probe_with_policy(lane, stdin_bytes, false)
+    run_docker_probe_with_policy(lane, stdin_bytes, false, &[])
 }
 
 fn run_docker_probe_named(lane: Lane, name: &str, stdin_bytes: &[u8]) -> std::io::Result<String> {
-    run_docker_probe_with_policy(lane, stdin_bytes, probe_needs_unconfined(name))
+    run_docker_probe_with_policy(
+        lane,
+        stdin_bytes,
+        probe_needs_unconfined(name),
+        probe_capabilities(name),
+    )
 }
 
 fn run_docker_probe_with_policy(
     lane: Lane,
     stdin_bytes: &[u8],
     unconfined: bool,
+    caps: &[&str],
 ) -> std::io::Result<String> {
     use std::io::Write;
     let mut command = Command::new("docker");
     command.args(["run", "-i", "--rm", "--platform", lane.platform]);
     if unconfined {
         command.args(["--security-opt", "seccomp=unconfined"]);
+    }
+    for cap in caps {
+        command.args(["--cap-add", cap]);
     }
     let mut child = command
         .args([lane.image, "/bin/sh", "-c", PROBE_SNIPPET])
@@ -5077,9 +5125,9 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
     let generic = validate_closure_probe_rows(&inventory(), &sources)
         .expect("checked-in closure probe inventory must match the source denominator");
-    assert_eq!(generic.len(), 421);
-    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 442);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 884);
+    assert_eq!(generic.len(), 422);
+    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 443);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 886);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")
@@ -5190,6 +5238,13 @@ fn clone_files_probes_run_without_container_seccomp() {
     assert!(probe_needs_unconfined("clonefilesexec"));
     assert!(!probe_needs_unconfined("forkfiletable"));
     assert!(!probe_needs_unconfined("forksplicestage"));
+}
+
+#[test]
+fn clock_settime_probe_is_granted_cap_sys_time_on_both_sides() {
+    assert_eq!(probe_capabilities("clocksettimevdso"), ["SYS_TIME"]);
+    assert!(probe_capabilities("futexrealtime").is_empty());
+    assert!(probe_capabilities("clonefileshare").is_empty());
 }
 
 #[test]
