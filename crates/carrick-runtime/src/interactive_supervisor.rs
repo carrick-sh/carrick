@@ -17,6 +17,14 @@ pub struct InteractiveSession {
     relay: Option<PtyRelay>,
 }
 
+impl std::fmt::Debug for InteractiveSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InteractiveSession")
+            .field("saved_stdio", &self.saved_stdio)
+            .finish_non_exhaustive()
+    }
+}
+
 impl InteractiveSession {
     pub fn start(dispatcher: &mut SyscallDispatcher) -> io::Result<Self> {
         crate::kernel::tty::prepare();

@@ -325,6 +325,31 @@ pub enum NetworkMode {
     None,
 }
 
+/// Where the guest's stdout/stderr bytes go for one run — the output mode the
+/// runtime installs on the dispatcher before boot. Replaces the retired
+/// `raw: bool` (stream vs. buffer, which the engine hardcoded on) and the
+/// never-read `interactive: bool`.
+///
+/// * `Inherit` — stream byte-exact to the carrier's own fds 1/2 as the guest
+///   writes, like `docker run`; `RunResult.stdout`/`stderr` stay empty. The
+///   CLI default.
+/// * `Captured` — buffer into `RunResult.stdout`/`stderr` and hand them back
+///   with the exit status (library callers, tests).
+/// * `Piped` — deliver to a caller-supplied `Write` sink installed through
+///   `Runtime::prepare`. `Runtime::execute` alone carries no sink and refuses
+///   this mode at configuration time instead of guessing.
+///
+/// A `tty: true` run allocates a pty and ignores this field; tty output modes
+/// are outside the embed v1 surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StdioMode {
+    #[default]
+    Inherit,
+    Captured,
+    Piped,
+}
+
 /// Launch-time container syscall policy — carrick's model of
 /// `docker run --security-opt seccomp=...`.
 ///
@@ -806,7 +831,8 @@ impl Default for Platform {
 /// - *What it sees*: `rootfs_layers` (the OCI layer dirs to stack into the
 ///   guest root), `fs_backend` (in-memory overlay vs. host-APFS passthrough,
 ///   see [`FsBackendKind`]), and `mounts` (host bind mounts).
-/// - *How it behaves*: `tty` / `raw` / `interactive` (terminal handling),
+/// - *How it behaves*: `tty` (pty allocation) and `stdio` (where guest fd 1/2
+///   bytes go — see [`StdioMode`]),
 ///   `platform` (native aarch64 vs. Rosetta-translated amd64), `pid`
 ///   (PID-namespace mode), `uid` / `gid` (initial guest credentials),
 ///   `max_traps` (a syscall-count guard rail for tests/debugging), and
@@ -825,8 +851,10 @@ pub struct RunSpec {
     pub fs_backend: FsBackendKind,
     pub mounts: Vec<Mount>,
     pub tty: bool,
-    pub raw: bool,
-    pub interactive: bool,
+    /// Output mode for guest fd 1/2 — see [`StdioMode`]. Serde-defaults to
+    /// `Inherit`, the docker-shaped streaming mode.
+    #[serde(default)]
+    pub stdio: StdioMode,
     pub max_traps: usize,
     pub debug_state_path: Option<Utf8PathBuf>,
     /// Target ISA of the container. On an aarch64 host, `Amd64` enables Rosetta 2
@@ -968,8 +996,6 @@ mod tests {
             "fs_backend": "Host",
             "mounts": [],
             "tty": false,
-            "raw": true,
-            "interactive": false,
             "max_traps": 100,
             "debug_state_path": null
         }"#;
@@ -978,9 +1004,26 @@ mod tests {
         assert_eq!(spec.network.mode, NetworkMode::Host);
         assert!(spec.network.namespace_id.is_none());
         assert!(spec.network.published_ports.is_empty());
+        // No `stdio` key: the serde default is the streaming CLI mode.
+        assert_eq!(spec.stdio, StdioMode::Inherit);
         // A container spec without the field is docker-shaped: the launch-time
         // default seccomp model applies.
         assert_eq!(spec.seccomp_policy, SeccompPolicy::ContainerDefault);
+    }
+
+    #[test]
+    fn stdio_mode_defaults_to_inherit_and_serializes_snake_case() {
+        // `Inherit` is the docker-shaped CLI default; the wire spelling is
+        // snake_case like `PidMode`/`NetworkMode`.
+        assert_eq!(StdioMode::default(), StdioMode::Inherit);
+        assert_eq!(
+            serde_json::to_string(&StdioMode::Captured).expect("serialize"),
+            r#""captured""#
+        );
+        assert_eq!(
+            serde_json::from_str::<StdioMode>(r#""piped""#).expect("deserialize"),
+            StdioMode::Piped
+        );
     }
 
     #[test]
@@ -1098,8 +1141,6 @@ mod tests {
             "fs_backend": "Host",
             "mounts": [],
             "tty": false,
-            "raw": true,
-            "interactive": false,
             "max_traps": 100,
             "debug_state_path": null
         }"#;
