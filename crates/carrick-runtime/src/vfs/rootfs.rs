@@ -653,17 +653,42 @@ impl RootFsVfs {
                 None => return Err(LINUX_ENOENT),
             },
         };
-        let dst_exists = match self.overlay.lookup(to) {
-            Some(OverlayEntry::Deleted) => false,
-            Some(OverlayEntry::Dir) | Some(OverlayEntry::File(_)) => true,
+        let dst_kind = match self.overlay.lookup(to) {
+            Some(OverlayEntry::Deleted) => None,
+            Some(OverlayEntry::Dir) => Some(RootFsEntryKind::Directory),
+            Some(OverlayEntry::File(_)) => Some(RootFsEntryKind::File),
             None => self
                 .rootfs
                 .as_ref()
-                .map(|r| r.symlink_metadata(to).is_ok())
-                .unwrap_or(false),
+                .and_then(|r| r.symlink_metadata(to).ok())
+                .map(|metadata| metadata.kind),
         };
-        if dst_exists && no_replace {
+        if dst_kind.is_some() && no_replace {
             return Err(LINUX_EEXIST);
+        }
+        if from == to {
+            return Ok(());
+        }
+        if let Some(dst_kind) = dst_kind {
+            match (
+                src_kind == RootFsEntryKind::Directory,
+                dst_kind == RootFsEntryKind::Directory,
+            ) {
+                (false, true) => return Err(LINUX_EISDIR),
+                (true, false) => return Err(LINUX_ENOTDIR),
+                (true, true) => {
+                    let entries = crate::fs_backend::layered_directory_entries(
+                        self.overlay.as_ref(),
+                        self.rootfs.as_ref(),
+                        to,
+                    )
+                    .map_err(crate::dispatch::rootfs_errno)?;
+                    if !entries.is_empty() {
+                        return Err(LINUX_ENOTEMPTY);
+                    }
+                }
+                (false, false) => {}
+            }
         }
         // Prefer the backend's real rename first. For a writable
         // backend (host: cap-std `dir.rename`; memory: in-place map
@@ -1992,6 +2017,49 @@ mod tests {
         let v = RootFsVfs::with_rootfs(rootfs_with_files());
         let result = v.rename_with_flags("/etc/no-such", "/etc/dest", false);
         assert_eq!(result, Err(LINUX_ENOENT));
+    }
+
+    #[test]
+    fn rename_file_over_directory_is_eisdir() {
+        let v = RootFsVfs::with_rootfs(rootfs_with_files());
+        v.overlay
+            .set_file_contents("/etc/source", b"payload".to_vec())
+            .unwrap();
+        v.overlay.make_dir("/etc/dest").unwrap();
+
+        assert_eq!(
+            v.rename_with_flags("/etc/source", "/etc/dest", false),
+            Err(LINUX_EISDIR)
+        );
+    }
+
+    #[test]
+    fn rename_directory_over_file_is_enotdir() {
+        let v = RootFsVfs::with_rootfs(rootfs_with_files());
+        v.overlay.make_dir("/etc/source").unwrap();
+        v.overlay
+            .set_file_contents("/etc/dest", b"payload".to_vec())
+            .unwrap();
+
+        assert_eq!(
+            v.rename_with_flags("/etc/source", "/etc/dest", false),
+            Err(LINUX_ENOTDIR)
+        );
+    }
+
+    #[test]
+    fn rename_directory_over_nonempty_directory_is_enotempty() {
+        let v = RootFsVfs::with_rootfs(rootfs_with_files());
+        v.overlay.make_dir("/etc/source").unwrap();
+        v.overlay.make_dir("/etc/dest").unwrap();
+        v.overlay
+            .set_file_contents("/etc/dest/child", b"payload".to_vec())
+            .unwrap();
+
+        assert_eq!(
+            v.rename_with_flags("/etc/source", "/etc/dest", false),
+            Err(LINUX_ENOTEMPTY)
+        );
     }
 
     #[test]

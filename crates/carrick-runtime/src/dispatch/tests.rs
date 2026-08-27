@@ -5372,6 +5372,16 @@ mod container_clock_tests {
     }
 }
 
+#[test]
+fn statx_sync_flags_are_mutually_exclusive() {
+    assert!(linux_statx_flags_are_supported(0));
+    assert!(linux_statx_flags_are_supported(LINUX_AT_STATX_FORCE_SYNC));
+    assert!(linux_statx_flags_are_supported(LINUX_AT_STATX_DONT_SYNC));
+    assert!(!linux_statx_flags_are_supported(
+        LINUX_AT_STATX_FORCE_SYNC | LINUX_AT_STATX_DONT_SYNC
+    ));
+}
+
 #[cfg(test)]
 mod container_caps_tests {
     //! Launch-time `--cap-add` grants are container state. Two containers in

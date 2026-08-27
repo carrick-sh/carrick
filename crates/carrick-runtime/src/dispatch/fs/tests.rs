@@ -2720,6 +2720,76 @@ fn openat2_resolve_no_symlinks_rejects_link_path() {
 }
 
 #[test]
+fn openat2_rejects_unknown_and_invalid_opath_flag_combinations() {
+    let backend = crate::fs_backend::MemoryBackend::new();
+    backend
+        .set_file_contents("/regular", b"payload".to_vec())
+        .unwrap();
+    backend.make_dir("/empty").unwrap();
+
+    let invalid_cases = [
+        (
+            "O_PATH|O_RDWR",
+            "/regular",
+            crate::linux_abi::LINUX_O_PATH | LINUX_O_RDWR,
+            0,
+        ),
+        (
+            "O_PATH|O_WRONLY",
+            "/regular",
+            crate::linux_abi::LINUX_O_PATH | LINUX_O_WRONLY,
+            0,
+        ),
+        (
+            "O_PATH|O_CREAT",
+            "/regular",
+            crate::linux_abi::LINUX_O_PATH | LINUX_O_CREAT,
+            0o644,
+        ),
+        (
+            "O_PATH|O_TRUNC",
+            "/regular",
+            crate::linux_abi::LINUX_O_PATH | LINUX_O_TRUNC,
+            0,
+        ),
+        (
+            "O_PATH|O_TMPFILE|O_WRONLY",
+            "/empty",
+            crate::linux_abi::LINUX_O_PATH
+                | crate::linux_abi::LINUX_O_TMPFILE
+                | LINUX_O_DIRECTORY
+                | LINUX_O_WRONLY,
+            0o644,
+        ),
+        ("unknown flag bit", "/regular", 1_u64 << 62, 0),
+    ];
+
+    for (label, path, flags, mode) in invalid_cases {
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(backend.clone()));
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+        let mut path_bytes = path.as_bytes().to_vec();
+        path_bytes.push(0);
+        memory.write_bytes(0x4000, &path_bytes).unwrap();
+
+        assert_eq!(
+            dispatch_openat2_for_test(
+                &mut dispatcher,
+                &mut memory,
+                LINUX_AT_FDCWD,
+                0x4000,
+                flags,
+                mode,
+                0,
+            )
+            .unwrap(),
+            DispatchOutcome::errno(LINUX_EINVAL),
+            "{label}"
+        );
+    }
+}
+
+#[test]
 fn openat2_resolve_beneath_rejects_dotdot_escape() {
     let backend = crate::fs_backend::MemoryBackend::new();
     backend.make_dir("/root").unwrap();
@@ -2887,6 +2957,58 @@ fn openat2_resolve_in_root_rejects_absolute_escape() {
         .unwrap(),
         DispatchOutcome::errno(crate::linux_abi::LINUX_ENOENT)
     );
+}
+
+#[test]
+fn openat2_resolve_in_root_clamps_parent_components_at_dirfd() {
+    let backend = crate::fs_backend::MemoryBackend::new();
+    backend.make_dir("/root").unwrap();
+    backend
+        .set_file_contents("/root/regfile", b"payload".to_vec())
+        .unwrap();
+
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+    let reporter = CompatReporter::default();
+    memory.write_bytes(0x4000, b"/root\0").unwrap();
+    let dirfd = match dispatcher
+        .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
+            SyscallRequest::new(
+                56,
+                SyscallArgs::from([
+                    LINUX_AT_FDCWD,
+                    0x4000,
+                    LINUX_O_RDONLY | crate::linux_abi::LINUX_O_DIRECTORY,
+                    0,
+                    0,
+                    0,
+                ]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap()
+    {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("root dir open failed: {other:?}"),
+    };
+    memory.write_bytes(0x4100, b"../../regfile\0").unwrap();
+
+    assert!(matches!(
+        dispatch_openat2_for_test(
+            &mut dispatcher,
+            &mut memory,
+            dirfd,
+            0x4100,
+            LINUX_O_RDONLY,
+            0,
+            LINUX_RESOLVE_IN_ROOT,
+        )
+        .unwrap(),
+        DispatchOutcome::Returned { value } if value >= 0
+    ));
 }
 
 const LINUX_RESOLVE_NO_XDEV: u64 = 0x01;

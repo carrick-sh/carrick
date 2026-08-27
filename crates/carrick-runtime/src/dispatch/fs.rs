@@ -6375,8 +6375,8 @@ impl SyscallDispatcher {
         }
 
         let anchor = self.openat2_anchor_for_dirfd(dirfd)?;
-        let effective_path = if resolve & RESOLVE_IN_ROOT != 0 && Path::new(path).is_absolute() {
-            std::borrow::Cow::Owned(join_rootfs_path(&anchor, path.trim_start_matches('/')))
+        let effective_path = if resolve & RESOLVE_IN_ROOT != 0 {
+            std::borrow::Cow::Owned(Self::openat2_in_root_path(&anchor, path))
         } else {
             std::borrow::Cow::Borrowed(path)
         };
@@ -6388,13 +6388,6 @@ impl SyscallDispatcher {
             let resolved = self.resolve_at_path(dirfd, path)?;
             if !path_is_under_or_equal(&resolved, &anchor) {
                 return Err(crate::linux_abi::LINUX_EXDEV);
-            }
-        }
-
-        if resolve & RESOLVE_IN_ROOT != 0 && !Path::new(path).is_absolute() {
-            let resolved = self.resolve_at_path(dirfd, path)?;
-            if !path_is_under_or_equal(&resolved, &anchor) {
-                return Err(LINUX_ENOENT);
             }
         }
 
@@ -6417,6 +6410,30 @@ impl SyscallDispatcher {
         }
 
         Ok(effective_path)
+    }
+
+    fn openat2_in_root_path(anchor: &str, path: &str) -> String {
+        let mut components: Vec<String> = anchor
+            .split('/')
+            .filter(|component| !component.is_empty() && *component != ".")
+            .map(str::to_owned)
+            .collect();
+        let root_depth = components.len();
+        for component in path.split('/') {
+            match component {
+                "" | "." => {}
+                ".." if components.len() > root_depth => {
+                    components.pop();
+                }
+                ".." => {}
+                component => components.push(component.to_owned()),
+            }
+        }
+        if components.is_empty() {
+            "/".to_owned()
+        } else {
+            format!("/{}", components.join("/"))
+        }
     }
 
     pub(super) fn openat2_anchor_for_dirfd(&self, dirfd: u64) -> Result<String, LinuxErrno> {
@@ -9499,6 +9516,18 @@ impl SyscallDispatcher {
             let mode = how.mode;
             let flags = how.flags;
             let resolve = how.resolve;
+            if flags & !LinuxOpenFlags::SUPPORTED_MASK != 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            if flags & crate::linux_abi::LINUX_O_PATH != 0 {
+                let path_allowed = crate::linux_abi::LINUX_O_PATH
+                    | LINUX_O_DIRECTORY
+                    | crate::linux_abi::LINUX_O_NOFOLLOW
+                    | LINUX_O_CLOEXEC;
+                if flags & !path_allowed != 0 {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+            }
             if mode & !0o7777 != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }

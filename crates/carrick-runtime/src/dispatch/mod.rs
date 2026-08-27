@@ -8092,7 +8092,8 @@ fn linux_statx_flags_are_supported(flags: u64) -> bool {
         | LINUX_AT_NO_AUTOMOUNT
         | LINUX_AT_STATX_FORCE_SYNC
         | LINUX_AT_STATX_DONT_SYNC;
-    flags & !SUPPORTED == 0
+    let sync = flags & (LINUX_AT_STATX_FORCE_SYNC | LINUX_AT_STATX_DONT_SYNC);
+    flags & !SUPPORTED == 0 && sync != (LINUX_AT_STATX_FORCE_SYNC | LINUX_AT_STATX_DONT_SYNC)
 }
 
 fn linux_access_flags_are_supported(flags: u64) -> bool {
