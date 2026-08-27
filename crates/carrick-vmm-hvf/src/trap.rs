@@ -12094,7 +12094,11 @@ impl HvfVmState {
                 relocated
             }
             None => {
-                for mapping in &plan.mappings {
+                for mapping in plan
+                    .mappings
+                    .iter()
+                    .filter(|mapping| !is_sparse_hvpatch_mmap_mapping(mapping))
+                {
                     #[cfg(feature = "trace-hvf")]
                     eprintln!(
                         "MAP guest_start=0x{:x} mapped_size=0x{:x} payload_size=0x{:x} perms=r{}w{}x{}",
