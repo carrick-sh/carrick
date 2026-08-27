@@ -40,7 +40,8 @@ thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
+flate2.workspace = true
+libc.workspace = true
 serde_json.workspace = true
 tar.workspace = true
-flate2.workspace = true
+tempfile.workspace = true
