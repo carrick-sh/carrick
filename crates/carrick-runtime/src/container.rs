@@ -189,8 +189,6 @@ pub struct RunConfig {
     /// means the container used the in-process memory fs, so `exec` (which needs
     /// a shareable overlay) is unsupported for it.
     pub scratch_path: Option<String>,
-    /// File-backed PID region path, `mmap`'d by `exec` to join the namespace.
-    pub region_path: Option<String>,
     /// `--entrypoint` override (`None` = the image ENTRYPOINT). Persisted as the
     /// SPLIT inputs — `command` holds only the cmd args — so `start` re-merges
     /// entrypoint+cmd through the engine instead of double-applying the image
@@ -279,7 +277,6 @@ impl Default for RunConfig {
             volumes_from: Vec::new(),
             published_ports: Vec::new(),
             scratch_path: None,
-            region_path: None,
             entrypoint: None,
             mounts: Vec::new(),
             fs: None,
@@ -998,7 +995,6 @@ mod tests {
             "exit_code":null,"auto_remove":false}"#;
         let s: ContainerState = serde_json::from_str(legacy).expect("legacy state loads");
         assert!(s.config.scratch_path.is_none());
-        assert!(s.config.region_path.is_none());
         assert_eq!(
             s.config.exec_backend,
             carrick_spec::ExecBackendRequest::HvPatch
@@ -1024,7 +1020,6 @@ mod tests {
         // A fully-populated config round-trips (all P5 relaunch fields).
         let mut s2 = s.clone();
         s2.config.scratch_path = Some("/p/scratch".into());
-        s2.config.region_path = Some("/p/region".into());
         s2.config.env = vec!["A=1".into()];
         s2.config.entrypoint = Some(vec!["/bin/sh".into()]);
         s2.config.mounts = vec![carrick_spec::Mount {
@@ -1041,7 +1036,6 @@ mod tests {
         let json = serde_json::to_string(&s2).expect("serialize");
         let round: ContainerState = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(round.config.scratch_path.as_deref(), Some("/p/scratch"));
-        assert_eq!(round.config.region_path.as_deref(), Some("/p/region"));
         assert_eq!(round.config.env, vec!["A=1".to_string()]);
         assert_eq!(round.config.entrypoint, Some(vec!["/bin/sh".to_string()]));
         assert_eq!(round.config.mounts.len(), 1);

@@ -1356,25 +1356,6 @@ mod tests {
     }
 
     #[test]
-    fn file_backed_arena_is_shared_across_independent_mappings() {
-        // exec relies on this: a fresh mmap of the container's arena file sees
-        // the same process section as the container's mapping.
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("arena");
-        let a = KernelArena::create_at(&path).expect("create file-backed arena");
-        a.layout().pid_namespaces.slots[0]
-            .next_ns_pid
-            .store(4242, Ordering::Relaxed);
-        let b = KernelArena::attach(&path).expect("attach the arena file");
-        assert_eq!(
-            b.layout().pid_namespaces.slots[0]
-                .next_ns_pid
-                .load(Ordering::Relaxed),
-            4242
-        );
-    }
-
-    #[test]
     fn pidns_descriptors() {
         let init = PidNs::initial(1);
         assert!(init.is_initial());
