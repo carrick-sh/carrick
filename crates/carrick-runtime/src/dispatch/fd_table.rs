@@ -599,6 +599,7 @@ impl HostWriteKind {
         }
     }
 
+    #[allow(dead_code)]
     pub(super) fn for_host_fd(host_fd: i32) -> Self {
         let mut st: libc::stat = unsafe { core::mem::zeroed() };
         if unsafe { libc::fstat(host_fd, &mut st) } == 0 {
@@ -1043,6 +1044,15 @@ pub(super) enum OpenDescription {
         base: OpenDescriptionBase,
         pipe: PipeRef,
     },
+    /// A standard I/O stream (0=stdin, 1=stdout, 2=stderr).
+    /// Used when bare stdio descriptors (0, 1, 2) are dup'd, dup2'd, or dup3'd.
+    /// Reads and writes route to the runtime's configured `StdioSink` (Captured,
+    /// Piped, or Inherit) rather than grabbing raw host fds.
+    Stdio {
+        base: OpenDescriptionBase,
+        stream: i32,
+        pty: Option<crate::vfs::PtyRole>,
+    },
     /// Host kernel pipe end backed by a real macOS file descriptor.
     /// Survives `libc::fork(2)` natively - both parent and child see
     /// the same kernel pipe object, so the post-fork sh-pipe demo
@@ -1269,6 +1279,7 @@ impl OpenDescription {
             Self::BpfMap { .. } => "bpf_map",
             Self::BpfProg { .. } => "bpf_prog",
             Self::InMemorySocket { .. } => "in_memory_socket",
+            Self::Stdio { .. } => "stdio",
         }
     }
 
@@ -1287,6 +1298,12 @@ impl OpenDescription {
             // readlink(/proc/self/fd/N) and fexecve (execveat AT_EMPTY_PATH)
             // recover the executable's path.
             OpenDescription::HostFile { metadata, .. } => metadata.path.to_str(),
+            OpenDescription::Stdio { stream, .. } => match stream {
+                0 => Some("/dev/stdin"),
+                1 => Some("/dev/stdout"),
+                2 => Some("/dev/stderr"),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -1323,7 +1340,10 @@ impl OpenDescription {
             OpenDescription::BpfProg { .. } => "anon_inode:bpf-prog".to_owned(),
             // A pty slave readlinks to its /dev/pts/N node (ttyname(3)); the
             // master has no /dev path, so report a stable anon label.
-            OpenDescription::HostPipe {
+            OpenDescription::Stdio {
+                pty: Some(role), ..
+            }
+            | OpenDescription::HostPipe {
                 pty: Some(role), ..
             } => {
                 if role.is_master {
@@ -1332,6 +1352,12 @@ impl OpenDescription {
                     format!("/dev/pts/{}", role.index)
                 }
             }
+            OpenDescription::Stdio { stream, .. } => match stream {
+                0 => "/dev/stdin".to_owned(),
+                1 => "/dev/stdout".to_owned(),
+                2 => "/dev/stderr".to_owned(),
+                _ => "anon_inode:[stdio]".to_owned(),
+            },
             // An anonymous pipe end (no recorded /dev path); a chardev like
             // /dev/null carries its path in fd_open_paths and is resolved earlier.
             OpenDescription::HostPipe { pipe_id, .. } => {
@@ -1393,6 +1419,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
             OpenDescription::BpfProg { .. } => Kind::BpfProg,
             OpenDescription::PerfEvent { .. } => Kind::PerfEvent,
             OpenDescription::FsContext { .. } => Kind::FsContext,
+            OpenDescription::Stdio { .. } => Kind::HostPipe,
         };
         let status_flags = (!matches!(&*description, OpenDescription::Closed { .. }))
             .then(|| description.base().status_flags());
@@ -1757,6 +1784,7 @@ impl OpenDescription {
             | OpenDescription::Pidfd { base, .. }
             | OpenDescription::PipeReader { base, .. }
             | OpenDescription::PipeWriter { base, .. }
+            | OpenDescription::Stdio { base, .. }
             | OpenDescription::HostPipe { base, .. }
             | OpenDescription::HostFile { base, .. }
             | OpenDescription::HostSocket { base, .. }
@@ -1790,6 +1818,7 @@ impl OpenDescription {
             | OpenDescription::Pidfd { base, .. }
             | OpenDescription::PipeReader { base, .. }
             | OpenDescription::PipeWriter { base, .. }
+            | OpenDescription::Stdio { base, .. }
             | OpenDescription::HostPipe { base, .. }
             | OpenDescription::HostFile { base, .. }
             | OpenDescription::HostSocket { base, .. }
@@ -2013,6 +2042,30 @@ impl OpenDescription {
                     0,
                     LINUX_S_IFIFO | 0o600,
                 ))
+            }
+            OpenDescription::Stdio { stream, pty, .. } => {
+                if let Some(role) = pty {
+                    if role.is_master {
+                        OpenStatSource::Record(StatRecord::synthetic(
+                            "char:[carrick-pty]",
+                            0,
+                            LINUX_S_IFCHR | 0o600,
+                        ))
+                    } else {
+                        OpenStatSource::Record(StatRecord::synthetic(
+                            &format!("/dev/pts/{}", role.index),
+                            0,
+                            LINUX_S_IFCHR | 0o620,
+                        ))
+                    }
+                } else {
+                    let (label, mode) = match *stream {
+                        0 => ("/dev/stdin", LINUX_S_IFCHR | 0o620),
+                        1 => ("/dev/stdout", LINUX_S_IFCHR | 0o620),
+                        _ => ("/dev/stderr", LINUX_S_IFCHR | 0o620),
+                    };
+                    OpenStatSource::Record(StatRecord::synthetic(label, 0, mode))
+                }
             }
             OpenDescription::HostPipe {
                 pty,

@@ -190,6 +190,7 @@ impl SyscallDispatcher {
             | OpenDescription::Fanotify { .. }
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
+            | OpenDescription::Stdio { .. }
             | OpenDescription::HostPipe { .. }
             | OpenDescription::HostSocket { .. }
             | OpenDescription::SignalFd { .. }
@@ -259,6 +260,7 @@ impl SyscallDispatcher {
             | OpenDescription::Fanotify { .. }
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
+            | OpenDescription::Stdio { .. }
             | OpenDescription::HostPipe { .. }
             | OpenDescription::HostSocket { .. }
             | OpenDescription::SignalFd { .. }
