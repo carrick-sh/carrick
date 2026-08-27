@@ -3462,12 +3462,10 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// carrier, sequential then concurrent, each pid 1 with its own rootfs,
 /// hostname and /proc; dedicated runner `conformance_container_gate`) moves
 /// the denominator from 469 to 470 and the gating rows from 886 to 888 — 444
-/// conformance sources (422 generic, 22 dedicated).
-///
-/// `vfs_mount_rw` (VFS injection read/write/readdir and cross-mount boundary semantics;
-/// generic runner) moves the denominator from 470 to 471 and the gating rows from
-/// 888 to 890 — 445 conformance sources (423 generic, 22 dedicated).
-const PROBE_SOURCE_COUNT: usize = 471;
+/// `shared_buffer_mmap` (shared memory zero-copy and cross-task futex synchronization;
+/// generic runner) moves the denominator from 471 to 472 and the gating rows from
+/// 890 to 892 — 446 conformance sources (424 generic, 22 dedicated).
+const PROBE_SOURCE_COUNT: usize = 472;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
@@ -5258,9 +5256,9 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
     let generic = validate_closure_probe_rows(&inventory(), &sources)
         .expect("checked-in closure probe inventory must match the source denominator");
-    assert_eq!(generic.len(), 423);
-    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 445);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 890);
+    assert_eq!(generic.len(), 424);
+    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 446);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 892);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")

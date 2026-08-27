@@ -1034,15 +1034,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 844618,
-        "byte_start": 844606,
+        "byte_end": 850625,
+        "byte_start": 850613,
         "column": 21,
         "column_end": 33,
         "column_start": 21,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 19421,
-        "line_end": 19421,
-        "line_start": 19421
+        "line": 19533,
+        "line_end": 19533,
+        "line_start": 19533
       }
     },
     {
@@ -1055,15 +1055,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 847249,
-        "byte_start": 847237,
+        "byte_end": 853256,
+        "byte_start": 853244,
         "column": 36,
         "column_end": 48,
         "column_start": 36,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 19467,
-        "line_end": 19467,
-        "line_start": 19467
+        "line": 19579,
+        "line_end": 19579,
+        "line_start": 19579
       }
     },
     {
@@ -1076,15 +1076,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 849566,
-        "byte_start": 849554,
+        "byte_end": 855573,
+        "byte_start": 855561,
         "column": 25,
         "column_end": 37,
         "column_start": 25,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 19508,
-        "line_end": 19508,
-        "line_start": 19508
+        "line": 19620,
+        "line_end": 19620,
+        "line_start": 19620
       }
     },
     {
@@ -10417,8 +10417,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 9091,
-        "byte_start": 9075,
+        "byte_end": 9103,
+        "byte_start": 9087,
         "column": 61,
         "column_end": 77,
         "column_start": 61,
@@ -12856,7 +12856,7 @@
       }
     }
   ],
-  "rows_sha256": "439d62217c24f955cab7e42e09e427073d70047a8d0583de4cfe98149d986ada",
+  "rows_sha256": "8654cf89c0e1820b3ce87b37fe1dbcf32bd95cd045acc551583db823998249f8",
   "schema": 1,
   "source_head": "18e5ed51ced5c483302127777d4711f2b418ff37",
   "toolchain": {

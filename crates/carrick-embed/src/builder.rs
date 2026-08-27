@@ -122,6 +122,7 @@ pub struct ContainerBuilder {
     time: Option<carrick_runtime::kernel::TimeControl>,
     max_traps: usize,
     observers: Vec<std::sync::Arc<dyn carrick_runtime::observe::SyscallObserver>>,
+    shared_buffers: Vec<(String, crate::SharedBuffer)>,
 }
 
 impl ContainerBuilder {
@@ -145,6 +146,7 @@ impl ContainerBuilder {
             time: None,
             max_traps: DEFAULT_MAX_TRAPS,
             observers: Vec::new(),
+            shared_buffers: Vec::new(),
         }
     }
 
@@ -273,6 +275,15 @@ impl ContainerBuilder {
         self
     }
 
+    /// Register a host-allocated [`SharedBuffer`](crate::SharedBuffer) into this container at `/dev/carrick/shm/<name>`.
+    ///
+    /// The buffer is exposed inside the guest as a host-fd-backed file in an in-memory VFS
+    /// mounted at `/dev/carrick/shm`. The guest can `mmap(MAP_SHARED, fd)` it with zero copies.
+    pub fn shared_buffer(mut self, name: impl Into<String>, buffer: &crate::SharedBuffer) -> Self {
+        self.shared_buffers.push((name.into(), buffer.clone()));
+        self
+    }
+
     /// Lower into the engine's request. Pure: no I/O, no ambient reads.
     pub fn to_run_request(&self) -> Result<RunRequest, EmbedError> {
         if self.image.trim().is_empty() {
@@ -347,6 +358,22 @@ impl ContainerBuilder {
             .await
             .map_err(EmbedError::Image)?;
         let plan = StdioPlan::lower(self.stdout, self.stderr);
+        let mut vfs_mounts = self.vfs_mounts;
+        if !self.shared_buffers.is_empty() {
+            let shm_vfs = crate::vfs::InMemoryFileVfs::new();
+            for (name, buffer) in &self.shared_buffers {
+                let node_path = format!("/{name}");
+                shm_vfs
+                    .add_host_file(&node_path, buffer.host_fd(), buffer.len() as u64)
+                    .map_err(|error| {
+                        EmbedError::Config(format!(
+                            "failed to expose shared buffer {name:?} at /dev/carrick/shm/{name}: {error:?}"
+                        ))
+                    })?;
+            }
+            vfs_mounts.push((Utf8PathBuf::from("/dev/carrick/shm"), Box::new(shm_vfs)));
+        }
+
         let mut extensions = RuntimeExtensions::default();
         if let StdioSink::Piped { .. } = plan.sink {
             extensions = extensions.stdio(plan.sink);
@@ -354,7 +381,7 @@ impl ContainerBuilder {
         for observer in self.observers {
             extensions = extensions.observer(observer);
         }
-        for (target, vfs) in self.vfs_mounts {
+        for (target, vfs) in vfs_mounts {
             extensions = extensions.vfs_mount(target, vfs);
         }
         if let Some(time) = self.time {
@@ -365,6 +392,7 @@ impl ContainerBuilder {
             warnings,
             extensions,
             plan.captured,
+            self.shared_buffers,
         ))
     }
 
@@ -845,5 +873,39 @@ mod tests {
             .await
             .expect("prepare succeeds");
         assert_eq!(prepared.run_spec().argv, strings(&["/bin/true"]));
+    }
+
+    #[tokio::test]
+    async fn prepare_wires_shared_buffer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path());
+        seed_local_image(
+            &store,
+            "shbuf-test:latest",
+            r#"{"architecture":"arm64","os":"linux","config":{"Cmd":["/bin/true"]}}"#,
+        );
+        let mut buf = crate::SharedBuffer::new(4096).expect("create buffer");
+        buf.as_mut_slice()[..11].copy_from_slice(b"embed_shbuf");
+
+        let prepared = ContainerBuilder::from_image("shbuf-test:latest")
+            .image_store(store)
+            .pull_policy(PullPolicy::Never)
+            .shared_buffer("tensor_mem", &buf)
+            .prepare()
+            .await
+            .expect("prepare succeeds with shared buffer");
+
+        let lease = prepared
+            .shared_buffer_lease("tensor_mem")
+            .expect("lease for registered buffer");
+        assert_eq!(lease.len(), buf.len());
+        let mut data = [0u8; 11];
+        lease.read_at(0, &mut data).unwrap();
+        assert_eq!(&data, b"embed_shbuf");
+
+        assert!(matches!(
+            prepared.shared_buffer_lease("nonexistent"),
+            Err(crate::SharedBufferError::NotFound(_))
+        ));
     }
 }
