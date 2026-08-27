@@ -7122,7 +7122,14 @@ impl SyscallDispatcher {
     /// `MAP_FIXED` overlaps, and walking/projecting VMAs.
     #[inline]
     pub(super) fn address_space_limits_apply(&self, data: bool) -> Option<(u64, u64)> {
-        let as_limit = self.effective_resource_limit(LINUX_RLIMIT_AS).rlim_cur;
+        let mut as_limit = self.effective_resource_limit(LINUX_RLIMIT_AS).rlim_cur;
+        if let Some(task) = super::resources::task() {
+            if let Some(budget) = task.container().budget() {
+                if let Some(max_mem) = budget.max_memory_limit() {
+                    as_limit = as_limit.min(max_mem);
+                }
+            }
+        }
         let data_limit = if data {
             self.effective_resource_limit(LINUX_RLIMIT_DATA).rlim_cur
         } else {

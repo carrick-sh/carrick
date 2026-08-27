@@ -37,6 +37,7 @@ pub(crate) fn entrypoint_not_found_result() -> RunResult {
         traps: 0,
         report: crate::compat::CompatReport::default(),
         trap_limit_hit: false,
+        terminal_reason: None,
     }
 }
 
@@ -69,6 +70,7 @@ pub(crate) fn entrypoint_not_executable_result() -> RunResult {
         traps: 0,
         report: crate::compat::CompatReport::default(),
         trap_limit_hit: false,
+        terminal_reason: None,
     }
 }
 

@@ -666,6 +666,30 @@ impl ClockDomain {
         *done
     }
 
+    /// Delay execution by `duration` using the container's clock domain.
+    ///
+    /// Under `Deterministic` mode this enrolls a due time on the virtual clock,
+    /// triggering virtual time auto-advance when all tasks are blocked. Under
+    /// `Scaled` mode the timeout is scaled by the rational factor. Never issues
+    /// a bare host `thread::sleep` that would block the carrier.
+    pub fn delay(&self, duration: Duration) {
+        if duration.is_zero() {
+            return;
+        }
+        let due = self.monotonic_now().saturating_add(duration);
+        let waiter_id = self.enroll_waiter(Some(due));
+        if self.is_deterministic() {
+            self.wait_virtual(waiter_id, None);
+        } else {
+            let scaled = self.scale_timeout(duration);
+            let pair = (std::sync::Mutex::new(false), std::sync::Condvar::new());
+            let (lock, cvar) = &pair;
+            let done = lock.lock().unwrap_or_else(|p| p.into_inner());
+            let _ = cvar.wait_timeout(done, scaled);
+        }
+        self.remove_waiter(waiter_id);
+    }
+
     /// Auto-advance virtual time if all enrolled waiters have a due deadline.
     pub fn maybe_auto_advance(&self) {
         if !self.is_deterministic() {
@@ -786,6 +810,7 @@ pub struct Container {
     /// `NsSharedRegion::retire`; dropping the last `Arc` is the safety net.
     pid_ns: OnceLock<Arc<crate::namespace::pid::NsSharedRegion>>,
     clock: Arc<ClockDomain>,
+    budget: Option<Arc<crate::observe::ResourceBudget>>,
     /// The capability set every process of this container starts from: the
     /// Docker default raised by the launch-time `--cap-add` grant. A launch
     /// constant — set once through `with_launch_capabilities` before the
@@ -804,8 +829,20 @@ impl Container {
             pid_root: OnceLock::new(),
             pid_ns: OnceLock::new(),
             clock: Arc::new(ClockDomain::default()),
+            budget: None,
             granted_caps: CapabilitySet::docker_default(),
         }
+    }
+
+    /// Attach a resource budget quota and counter set to the container.
+    pub fn with_resource_budget(mut self, budget: Arc<crate::observe::ResourceBudget>) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+
+    /// The container's resource budget, if configured.
+    pub fn budget(&self) -> Option<&Arc<crate::observe::ResourceBudget>> {
+        self.budget.as_ref()
     }
 
     /// Record the launch-time `--cap-add` grant. Unknown names are logged and

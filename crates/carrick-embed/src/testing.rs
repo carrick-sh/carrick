@@ -142,6 +142,7 @@ mod tests {
             trap_limit_hit: false,
             traps: 1,
             compat: CompatReport::default(),
+            terminal_reason: None,
         }
     }
 

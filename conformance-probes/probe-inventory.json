@@ -119,6 +119,11 @@
     "excluded": false,
     "runner": "conformance_bridge_udp_sendto_unreachable"
   },
+  "budget_two_proc": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "brkheapgrow": {
     "class": "conformance",
     "excluded": false,

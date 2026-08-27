@@ -96,7 +96,7 @@ impl PolicyRule {
 }
 
 /// Canonical syscall numbers served by the guest EL1 shim or vDSO fast paths.
-const FAST_PATH_SYSCALL_NUMBERS: &[u64] = &[
+pub(crate) const FAST_PATH_SYSCALL_NUMBERS: &[u64] = &[
     172, // getpid
     173, // getppid
     174, // getuid

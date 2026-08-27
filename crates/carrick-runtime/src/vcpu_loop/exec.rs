@@ -921,6 +921,7 @@ where
                     return Self::exec_failed_with_errno(engine, crate::linux_abi::LINUX_EACCES)
                         .map(ExecvePreparation::Complete);
                 }
+                crate::observe::SyscallAction::Short(_) => {}
             }
         }
         let proc_argv: Vec<String> = argv

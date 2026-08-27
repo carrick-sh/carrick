@@ -498,6 +498,7 @@ where
                     traps: 0,
                     report,
                     trap_limit_hit: false,
+                    terminal_reason: None,
                 }
             }
         },
