@@ -60,27 +60,35 @@ unsafe fn test_clock_and_timerfd_matrix() {
 
     // 1.1 clock_adjtime on non-adjustable clockids -> EINVAL
     let adj_mono = libc::syscall(SYS_CLOCK_ADJTIME, libc::CLOCK_MONOTONIC, &mut tx as *mut _);
-    let adj_mono_einval = adj_mono == -1 && errno() == libc::EINVAL;
+    let adj_mono_err = if adj_mono == -1 { errno() } else { 0 };
 
     let adj_boot = libc::syscall(SYS_CLOCK_ADJTIME, libc::CLOCK_BOOTTIME, &mut tx as *mut _);
-    let adj_boot_einval = adj_boot == -1 && errno() == libc::EINVAL;
+    let adj_boot_err = if adj_boot == -1 { errno() } else { 0 };
 
     let adj_cpu = libc::syscall(
         SYS_CLOCK_ADJTIME,
         libc::CLOCK_PROCESS_CPUTIME_ID,
         &mut tx as *mut _,
     );
-    let adj_cpu_einval = adj_cpu == -1 && errno() == libc::EINVAL;
+    let adj_cpu_err = if adj_cpu == -1 { errno() } else { 0 };
 
     let adj_bad = libc::syscall(SYS_CLOCK_ADJTIME, 99999i32, &mut tx as *mut _);
-    let adj_bad_einval = adj_bad == -1 && errno() == libc::EINVAL;
+    let adj_bad_err = if adj_bad == -1 { errno() } else { 0 };
 
     let adj_null = libc::syscall(
         SYS_CLOCK_ADJTIME,
         libc::CLOCK_REALTIME,
         std::ptr::null_mut::<libc::timex>(),
     );
-    let adj_null_efault = adj_null == -1 && errno() == libc::EFAULT;
+    let adj_null_err = if adj_null == -1 { errno() } else { 0 };
+
+    report!(
+        clock_adjtime_monotonic_einval = adj_mono == -1 && adj_mono_err == libc::EINVAL,
+        clock_adjtime_boottime_einval = adj_boot == -1 && adj_boot_err == libc::EINVAL,
+        clock_adjtime_process_cputime_einval = adj_cpu == -1 && adj_cpu_err == libc::EINVAL,
+        clock_adjtime_invalid_clockid_einval = adj_bad == -1 && adj_bad_err == libc::EINVAL,
+        clock_adjtime_null_timex_efault = adj_null == -1 && adj_null_err == libc::EFAULT,
+    );
 
     // 1.2 clock_settime on non-settable clockids and invalid timespec -> EINVAL / EFAULT
     let valid_ts = libc::timespec {
@@ -92,10 +100,10 @@ unsafe fn test_clock_and_timerfd_matrix() {
         libc::CLOCK_MONOTONIC,
         &valid_ts as *const _,
     );
-    let set_mono_einval = set_mono == -1 && errno() == libc::EINVAL;
+    let set_mono_err = if set_mono == -1 { errno() } else { 0 };
 
     let set_bad = libc::syscall(libc::SYS_clock_settime, 99999i32, &valid_ts as *const _);
-    let set_bad_einval = set_bad == -1 && errno() == libc::EINVAL;
+    let set_bad_err = if set_bad == -1 { errno() } else { 0 };
 
     let bad_ts_neg = libc::timespec {
         tv_sec: 1000,
@@ -106,7 +114,7 @@ unsafe fn test_clock_and_timerfd_matrix() {
         libc::CLOCK_REALTIME,
         &bad_ts_neg as *const _,
     );
-    let set_nsec_neg_einval = set_nsec_neg == -1 && errno() == libc::EINVAL;
+    let set_nsec_neg_err = if set_nsec_neg == -1 { errno() } else { 0 };
 
     let bad_ts_over = libc::timespec {
         tv_sec: 1000,
@@ -117,14 +125,22 @@ unsafe fn test_clock_and_timerfd_matrix() {
         libc::CLOCK_REALTIME,
         &bad_ts_over as *const _,
     );
-    let set_nsec_over_einval = set_nsec_over == -1 && errno() == libc::EINVAL;
+    let set_nsec_over_err = if set_nsec_over == -1 { errno() } else { 0 };
 
     let set_null = libc::syscall(
         libc::SYS_clock_settime,
         libc::CLOCK_REALTIME,
         std::ptr::null::<libc::timespec>(),
     );
-    let set_null_efault = set_null == -1 && errno() == libc::EFAULT;
+    let set_null_err = if set_null == -1 { errno() } else { 0 };
+
+    report!(
+        clock_settime_monotonic_einval = set_mono == -1 && set_mono_err == libc::EINVAL,
+        clock_settime_invalid_clockid_einval = set_bad == -1 && set_bad_err == libc::EINVAL,
+        clock_settime_negative_nsec_einval = set_nsec_neg == -1 && set_nsec_neg_err == libc::EINVAL,
+        clock_settime_overflow_nsec_einval = set_nsec_over == -1 && set_nsec_over_err == libc::EINVAL,
+        clock_settime_null_timespec_efault = set_null == -1 && set_null_err == libc::EFAULT,
+    );
 
     // 1.3 timerfd_create flags and clockids
     let tfd_nb_clo = libc::syscall(
@@ -160,23 +176,34 @@ unsafe fn test_clock_and_timerfd_matrix() {
     }
 
     let tfd_cpu = libc::syscall(SYS_TIMERFD_CREATE, libc::CLOCK_PROCESS_CPUTIME_ID, 0) as i32;
-    let tfd_cpu_einval = tfd_cpu == -1 && errno() == libc::EINVAL;
+    let tfd_cpu_err = if tfd_cpu == -1 { errno() } else { 0 };
     if tfd_cpu >= 0 {
         libc::close(tfd_cpu);
     }
 
     let tfd_bad_clk = libc::syscall(SYS_TIMERFD_CREATE, 99999i32, 0) as i32;
-    let tfd_bad_clk_einval = tfd_bad_clk == -1 && errno() == libc::EINVAL;
+    let tfd_bad_clk_err = if tfd_bad_clk == -1 { errno() } else { 0 };
     if tfd_bad_clk >= 0 {
         libc::close(tfd_bad_clk);
     }
 
     let tfd_bad_fl =
         libc::syscall(SYS_TIMERFD_CREATE, libc::CLOCK_MONOTONIC, 0x1000_0000i32) as i32;
-    let tfd_bad_fl_einval = tfd_bad_fl == -1 && errno() == libc::EINVAL;
+    let tfd_bad_fl_err = if tfd_bad_fl == -1 { errno() } else { 0 };
     if tfd_bad_fl >= 0 {
         libc::close(tfd_bad_fl);
     }
+
+    report!(
+        timerfd_create_nonblock_cloexec_ok = tfd_nb_clo_ok,
+        timerfd_create_is_nonblock = tfd_is_nb,
+        timerfd_create_is_cloexec = tfd_is_clo,
+        timerfd_create_realtime_ok = tfd_real_ok,
+        timerfd_create_boottime_ok = tfd_boot_ok,
+        timerfd_create_cputime_einval = tfd_cpu == -1 && tfd_cpu_err == libc::EINVAL,
+        timerfd_create_invalid_clockid_einval = tfd_bad_clk == -1 && tfd_bad_clk_err == libc::EINVAL,
+        timerfd_create_invalid_flags_einval = tfd_bad_fl == -1 && tfd_bad_fl_err == libc::EINVAL,
+    );
 
     // 1.4 timerfd_settime & timerfd_gettime error matrix and disarm lifecycle
     let tfd = libc::syscall(SYS_TIMERFD_CREATE, libc::CLOCK_MONOTONIC, TFD_NONBLOCK) as i32;
@@ -201,7 +228,7 @@ unsafe fn test_clock_and_timerfd_matrix() {
         &valid_spec as *const _,
         std::ptr::null_mut::<libc::itimerspec>(),
     );
-    let s_bad_fl_einval = s_bad_fl == -1 && errno() == libc::EINVAL;
+    let s_bad_fl_err = if s_bad_fl == -1 { errno() } else { 0 };
 
     let s_cancel_no_abs = libc::syscall(
         SYS_TIMERFD_SETTIME,
@@ -210,7 +237,7 @@ unsafe fn test_clock_and_timerfd_matrix() {
         &valid_spec as *const _,
         std::ptr::null_mut::<libc::itimerspec>(),
     );
-    let s_cancel_no_abs_einval = s_cancel_no_abs == -1 && errno() == libc::EINVAL;
+    let s_cancel_no_abs_err = if s_cancel_no_abs == -1 { errno() } else { 0 };
 
     let s_cancel_mono = libc::syscall(
         SYS_TIMERFD_SETTIME,
@@ -219,7 +246,7 @@ unsafe fn test_clock_and_timerfd_matrix() {
         &valid_spec as *const _,
         std::ptr::null_mut::<libc::itimerspec>(),
     );
-    let s_cancel_mono_einval = s_cancel_mono == -1 && errno() == libc::EINVAL;
+    let s_cancel_mono_err = if s_cancel_mono == -1 { errno() } else { 0 };
 
     let bad_val_spec = libc::itimerspec {
         it_interval: libc::timespec {
@@ -238,7 +265,7 @@ unsafe fn test_clock_and_timerfd_matrix() {
         &bad_val_spec as *const _,
         std::ptr::null_mut::<libc::itimerspec>(),
     );
-    let s_bad_val_einval = s_bad_val == -1 && errno() == libc::EINVAL;
+    let s_bad_val_err = if s_bad_val == -1 { errno() } else { 0 };
 
     let bad_int_spec = libc::itimerspec {
         it_interval: libc::timespec {
@@ -257,7 +284,7 @@ unsafe fn test_clock_and_timerfd_matrix() {
         &bad_int_spec as *const _,
         std::ptr::null_mut::<libc::itimerspec>(),
     );
-    let s_bad_int_einval = s_bad_int == -1 && errno() == libc::EINVAL;
+    let s_bad_int_err = if s_bad_int == -1 { errno() } else { 0 };
 
     let s_pipe = libc::syscall(
         SYS_TIMERFD_SETTIME,
@@ -266,7 +293,7 @@ unsafe fn test_clock_and_timerfd_matrix() {
         &valid_spec as *const _,
         std::ptr::null_mut::<libc::itimerspec>(),
     );
-    let s_pipe_einval = s_pipe == -1 && errno() == libc::EINVAL;
+    let s_pipe_err = if s_pipe == -1 { errno() } else { 0 };
 
     let s_badf = libc::syscall(
         SYS_TIMERFD_SETTIME,
@@ -275,7 +302,7 @@ unsafe fn test_clock_and_timerfd_matrix() {
         &valid_spec as *const _,
         std::ptr::null_mut::<libc::itimerspec>(),
     );
-    let s_badf_ebadf = s_badf == -1 && errno() == libc::EBADF;
+    let s_badf_err = if s_badf == -1 { errno() } else { 0 };
 
     let mut cur_spec: libc::itimerspec = MaybeUninit::zeroed().assume_init();
     let g_pipe = libc::syscall(
@@ -283,14 +310,14 @@ unsafe fn test_clock_and_timerfd_matrix() {
         pipe_fds[0],
         &mut cur_spec as *mut libc::itimerspec,
     );
-    let g_pipe_einval = g_pipe == -1 && errno() == libc::EINVAL;
+    let g_pipe_err = if g_pipe == -1 { errno() } else { 0 };
 
     let g_badf = libc::syscall(
         SYS_TIMERFD_GETTIME,
         -1,
         &mut cur_spec as *mut libc::itimerspec,
     );
-    let g_badf_ebadf = g_badf == -1 && errno() == libc::EBADF;
+    let g_badf_err = if g_badf == -1 { errno() } else { 0 };
 
     // Arm, then disarm and verify old_value and gettime
     libc::syscall(
@@ -322,16 +349,37 @@ unsafe fn test_clock_and_timerfd_matrix() {
         s_disarm == 0 && (old_spec.it_value.tv_sec > 0 || old_spec.it_value.tv_nsec > 0);
 
     let g_disarmed = libc::syscall(SYS_TIMERFD_GETTIME, tfd, &mut cur_spec as *mut _);
-    let gettime_zero =
-        g_disarmed == 0 && cur_spec.it_value.tv_sec == 0 && cur_spec.it_value.tv_nsec == 0;
+    let gettime_zero = g_disarmed == 0
+        && cur_spec.it_value.tv_sec == 0
+        && cur_spec.it_value.tv_nsec == 0
+        && cur_spec.it_interval.tv_sec == 0
+        && cur_spec.it_interval.tv_nsec == 0;
 
     let mut exp_cnt = 0u64;
     let r_unfired = libc::read(tfd, &mut exp_cnt as *mut _ as *mut libc::c_void, 8);
-    let unfired_eagain = r_unfired == -1 && errno() == libc::EAGAIN;
+    let r_unfired_err = if r_unfired == -1 { errno() } else { 0 };
 
     libc::close(tfd);
     libc::close(pipe_fds[0]);
     libc::close(pipe_fds[1]);
+
+    report!(
+        timerfd_settime_invalid_flags_einval = s_bad_fl == -1 && s_bad_fl_err == libc::EINVAL,
+        timerfd_settime_cancel_without_abstime_einval =
+            s_cancel_no_abs == -1 && s_cancel_no_abs_err == libc::EINVAL,
+        timerfd_settime_cancel_on_monotonic_einval =
+            s_cancel_mono == -1 && s_cancel_mono_err == libc::EINVAL,
+        timerfd_settime_bad_value_nsec_einval = s_bad_val == -1 && s_bad_val_err == libc::EINVAL,
+        timerfd_settime_bad_interval_nsec_einval =
+            s_bad_int == -1 && s_bad_int_err == libc::EINVAL,
+        timerfd_settime_pipe_fd_einval = s_pipe == -1 && s_pipe_err == libc::EINVAL,
+        timerfd_settime_bad_fd_ebadf = s_badf == -1 && s_badf_err == libc::EBADF,
+        timerfd_gettime_pipe_fd_einval = g_pipe == -1 && g_pipe_err == libc::EINVAL,
+        timerfd_gettime_bad_fd_ebadf = g_badf == -1 && g_badf_err == libc::EBADF,
+        timerfd_disarm_returned_old_value = disarm_had_old,
+        timerfd_disarm_gettime_zero = gettime_zero,
+        timerfd_unfired_nonblock_read_eagain = r_unfired == -1 && r_unfired_err == libc::EAGAIN,
+    );
 
     // 1.5 Raw timer syscalls with an invalid kernel timer ID. glibc's public
     // timer_t is an implementation pointer, so passing a fabricated timer_t to
@@ -344,52 +392,26 @@ unsafe fn test_clock_and_timerfd_matrix() {
         &valid_spec as *const _,
         std::ptr::null_mut::<libc::itimerspec>(),
     );
-    let t_set_bad_einval = t_set_bad == -1 && errno() == libc::EINVAL;
+    let t_set_bad_err = if t_set_bad == -1 { errno() } else { 0 };
 
     let t_get_bad = libc::syscall(
         libc::SYS_timer_gettime,
         bad_timer_id,
         &mut cur_spec as *mut _,
     );
-    let t_get_bad_einval = t_get_bad == -1 && errno() == libc::EINVAL;
+    let t_get_bad_err = if t_get_bad == -1 { errno() } else { 0 };
 
     let t_del_bad = libc::syscall(libc::SYS_timer_delete, bad_timer_id);
-    let t_del_bad_einval = t_del_bad == -1 && errno() == libc::EINVAL;
+    let t_del_bad_err = if t_del_bad == -1 { errno() } else { 0 };
 
     let t_ovr_bad = libc::syscall(libc::SYS_timer_getoverrun, bad_timer_id);
-    let t_ovr_bad_einval = t_ovr_bad == -1 && errno() == libc::EINVAL;
+    let t_ovr_bad_err = if t_ovr_bad == -1 { errno() } else { 0 };
 
     report!(
-        clock_adjtime_invalid_clockids = adj_mono_einval
-            && adj_boot_einval
-            && adj_cpu_einval
-            && adj_bad_einval
-            && adj_null_efault,
-        clock_settime_invalid_inputs = set_mono_einval
-            && set_bad_einval
-            && set_nsec_neg_einval
-            && set_nsec_over_einval
-            && set_null_efault,
-        timerfd_create_matrix = tfd_nb_clo_ok
-            && tfd_is_nb
-            && tfd_is_clo
-            && tfd_real_ok
-            && tfd_boot_ok
-            && tfd_cpu_einval
-            && tfd_bad_clk_einval
-            && tfd_bad_fl_einval,
-        timerfd_settime_error_matrix = s_bad_fl_einval
-            && s_cancel_no_abs_einval
-            && s_cancel_mono_einval
-            && s_bad_val_einval
-            && s_bad_int_einval
-            && s_pipe_einval
-            && s_badf_ebadf
-            && g_pipe_einval
-            && g_badf_ebadf,
-        timerfd_disarm_and_nonblock_read = disarm_had_old && gettime_zero && unfired_eagain,
-        timer_posix_invalid_id_errors =
-            t_set_bad_einval && t_get_bad_einval && t_del_bad_einval && t_ovr_bad_einval,
+        timer_settime_invalid_id_einval = t_set_bad == -1 && t_set_bad_err == libc::EINVAL,
+        timer_gettime_invalid_id_einval = t_get_bad == -1 && t_get_bad_err == libc::EINVAL,
+        timer_delete_invalid_id_einval = t_del_bad == -1 && t_del_bad_err == libc::EINVAL,
+        timer_getoverrun_invalid_id_einval = t_ovr_bad == -1 && t_ovr_bad_err == libc::EINVAL,
     );
 }
 
@@ -414,7 +436,7 @@ unsafe fn test_futex_wait_matrix() {
         std::ptr::null::<u32>(),
         0i64,
     );
-    let wait_ts_neg_einval = rc_neg == -1 && errno() == libc::EINVAL;
+    let rc_neg_err = if rc_neg == -1 { errno() } else { 0 };
 
     let bad_ts_over = libc::timespec {
         tv_sec: 0,
@@ -429,7 +451,7 @@ unsafe fn test_futex_wait_matrix() {
         std::ptr::null::<u32>(),
         0i64,
     );
-    let wait_ts_over_einval = rc_over == -1 && errno() == libc::EINVAL;
+    let rc_over_err = if rc_over == -1 { errno() } else { 0 };
 
     // Every case below that should reject before waiting still carries a zero
     // deadline. If Carrick fails to validate the earlier argument, the probe
@@ -451,7 +473,7 @@ unsafe fn test_futex_wait_matrix() {
         std::ptr::null::<u32>(),
         0i64,
     );
-    let unaligned_einval = rc_unaligned == -1 && errno() == libc::EINVAL;
+    let rc_unaligned_err = if rc_unaligned == -1 { errno() } else { 0 };
 
     // 2.3 Zero-timeout FUTEX_WAIT with matching value -> immediate ETIMEDOUT
     let rc_zero = libc::syscall(
@@ -463,7 +485,7 @@ unsafe fn test_futex_wait_matrix() {
         std::ptr::null::<u32>(),
         0i64,
     );
-    let zero_timeout_etimedout = rc_zero == -1 && errno() == libc::ETIMEDOUT;
+    let rc_zero_err = if rc_zero == -1 { errno() } else { 0 };
 
     // 2.4 FUTEX_WAIT_BITSET validation: bitset=0 -> EINVAL, bad timespec -> EINVAL, past CLOCK_REALTIME -> ETIMEDOUT
     let rc_bitset_zero = libc::syscall(
@@ -475,7 +497,7 @@ unsafe fn test_futex_wait_matrix() {
         std::ptr::null::<u32>(),
         0u32 as i64, // bitset 0 is invalid
     );
-    let bitset_zero_einval = rc_bitset_zero == -1 && errno() == libc::EINVAL;
+    let rc_bitset_zero_err = if rc_bitset_zero == -1 { errno() } else { 0 };
 
     let rc_bitset_bad_ts = libc::syscall(
         SYS_FUTEX,
@@ -486,7 +508,7 @@ unsafe fn test_futex_wait_matrix() {
         std::ptr::null::<u32>(),
         FUTEX_BITSET_MATCH_ANY as i64,
     );
-    let bitset_bad_ts_einval = rc_bitset_bad_ts == -1 && errno() == libc::EINVAL;
+    let rc_bitset_bad_ts_err = if rc_bitset_bad_ts == -1 { errno() } else { 0 };
 
     let past_realtime = libc::timespec {
         tv_sec: 1,
@@ -501,8 +523,11 @@ unsafe fn test_futex_wait_matrix() {
         std::ptr::null::<u32>(),
         FUTEX_BITSET_MATCH_ANY as i64,
     );
-    let bitset_past_realtime_etimedout =
-        rc_bitset_past_realtime == -1 && errno() == libc::ETIMEDOUT;
+    let rc_bitset_past_realtime_err = if rc_bitset_past_realtime == -1 {
+        errno()
+    } else {
+        0
+    };
 
     // 2.5 Invalid futex op -> ENOSYS
     let rc_inv_op = libc::syscall(
@@ -514,15 +539,21 @@ unsafe fn test_futex_wait_matrix() {
         std::ptr::null::<u32>(),
         0i64,
     );
-    let inv_op_enosys = rc_inv_op == -1 && errno() == libc::ENOSYS;
+    let rc_inv_op_err = if rc_inv_op == -1 { errno() } else { 0 };
 
     report!(
-        futex_wait_timespec_validation = wait_ts_neg_einval && wait_ts_over_einval,
-        futex_wait_unaligned_address_einval = unaligned_einval,
-        futex_wait_zero_timeout_etimedout = zero_timeout_etimedout,
-        futex_wait_bitset_matrix =
-            bitset_zero_einval && bitset_bad_ts_einval && bitset_past_realtime_etimedout,
-        futex_invalid_op_enosys = inv_op_enosys,
+        futex_wait_negative_nsec_einval = rc_neg == -1 && rc_neg_err == libc::EINVAL,
+        futex_wait_overflow_nsec_einval = rc_over == -1 && rc_over_err == libc::EINVAL,
+        futex_wait_unaligned_address_einval =
+            rc_unaligned == -1 && rc_unaligned_err == libc::EINVAL,
+        futex_wait_zero_timeout_etimedout = rc_zero == -1 && rc_zero_err == libc::ETIMEDOUT,
+        futex_wait_bitset_zero_mask_einval =
+            rc_bitset_zero == -1 && rc_bitset_zero_err == libc::EINVAL,
+        futex_wait_bitset_bad_timespec_einval =
+            rc_bitset_bad_ts == -1 && rc_bitset_bad_ts_err == libc::EINVAL,
+        futex_wait_bitset_past_realtime_etimedout =
+            rc_bitset_past_realtime == -1 && rc_bitset_past_realtime_err == libc::ETIMEDOUT,
+        futex_invalid_op_enosys = rc_inv_op == -1 && rc_inv_op_err == libc::ENOSYS,
     );
 }
 
@@ -581,7 +612,7 @@ unsafe fn test_mq_timed_matrix() {
         0u32,
         &past_ts as *const _,
     );
-    let s_badf_ebadf = s_badf == -1 && errno() == libc::EBADF;
+    let s_badf_err = if s_badf == -1 { errno() } else { 0 };
 
     let r_badf = libc::syscall(
         SYS_MQ_TIMEDRECEIVE,
@@ -591,7 +622,7 @@ unsafe fn test_mq_timed_matrix() {
         &mut prio as *mut _,
         &past_ts as *const _,
     );
-    let r_badf_ebadf = r_badf == -1 && errno() == libc::EBADF;
+    let r_badf_err = if r_badf == -1 { errno() } else { 0 };
 
     let s_pipe = libc::syscall(
         SYS_MQ_TIMEDSEND,
@@ -601,7 +632,7 @@ unsafe fn test_mq_timed_matrix() {
         0u32,
         &past_ts as *const _,
     );
-    let s_pipe_ebadf = s_pipe == -1 && errno() == libc::EBADF;
+    let s_pipe_err = if s_pipe == -1 { errno() } else { 0 };
 
     let r_pipe = libc::syscall(
         SYS_MQ_TIMEDRECEIVE,
@@ -611,7 +642,15 @@ unsafe fn test_mq_timed_matrix() {
         &mut prio as *mut _,
         &past_ts as *const _,
     );
-    let r_pipe_ebadf = r_pipe == -1 && errno() == libc::EBADF;
+    let r_pipe_err = if r_pipe == -1 { errno() } else { 0 };
+
+    report!(
+        mq_open_ok = mq_open_ok,
+        mq_timedsend_bad_fd_ebadf = s_badf == -1 && s_badf_err == libc::EBADF,
+        mq_timedreceive_bad_fd_ebadf = r_badf == -1 && r_badf_err == libc::EBADF,
+        mq_timedsend_pipe_fd_ebadf = s_pipe == -1 && s_pipe_err == libc::EBADF,
+        mq_timedreceive_pipe_fd_ebadf = r_pipe == -1 && r_pipe_err == libc::EBADF,
+    );
 
     // 3.2 Access mode mismatch
     let rd_mqd = libc::syscall(
@@ -629,7 +668,7 @@ unsafe fn test_mq_timed_matrix() {
         0u32,
         &past_ts as *const _,
     );
-    let s_rdonly_ebadf = s_rdonly == -1 && errno() == libc::EBADF;
+    let s_rdonly_err = if s_rdonly == -1 { errno() } else { 0 };
     if rd_mqd >= 0 {
         libc::close(rd_mqd);
     }
@@ -649,10 +688,15 @@ unsafe fn test_mq_timed_matrix() {
         &mut prio as *mut _,
         &past_ts as *const _,
     );
-    let r_wronly_ebadf = r_wronly == -1 && errno() == libc::EBADF;
+    let r_wronly_err = if r_wronly == -1 { errno() } else { 0 };
     if wr_mqd >= 0 {
         libc::close(wr_mqd);
     }
+
+    report!(
+        mq_timedsend_rdonly_ebadf = s_rdonly == -1 && s_rdonly_err == libc::EBADF,
+        mq_timedreceive_wronly_ebadf = r_wronly == -1 && r_wronly_err == libc::EBADF,
+    );
 
     // 3.3 Message size constraints: send > mq_msgsize -> EMSGSIZE, recv < mq_msgsize -> EMSGSIZE
     let s_toolarge = libc::syscall(
@@ -663,7 +707,7 @@ unsafe fn test_mq_timed_matrix() {
         0u32,
         &past_ts as *const _,
     );
-    let s_toolarge_emsgsize = s_toolarge == -1 && errno() == libc::EMSGSIZE;
+    let s_toolarge_err = if s_toolarge == -1 { errno() } else { 0 };
 
     let r_toosmall = libc::syscall(
         SYS_MQ_TIMEDRECEIVE,
@@ -673,7 +717,7 @@ unsafe fn test_mq_timed_matrix() {
         &mut prio as *mut _,
         &past_ts as *const _,
     );
-    let r_toosmall_emsgsize = r_toosmall == -1 && errno() == libc::EMSGSIZE;
+    let r_toosmall_err = if r_toosmall == -1 { errno() } else { 0 };
 
     // 3.4 Priority validation: prio >= 32768 -> EINVAL
     let s_bad_prio = libc::syscall(
@@ -684,7 +728,15 @@ unsafe fn test_mq_timed_matrix() {
         32768u32,
         &past_ts as *const _,
     );
-    let s_bad_prio_einval = s_bad_prio == -1 && errno() == libc::EINVAL;
+    let s_bad_prio_err = if s_bad_prio == -1 { errno() } else { 0 };
+
+    report!(
+        mq_timedsend_msg_too_large_emsgsize =
+            s_toolarge == -1 && s_toolarge_err == libc::EMSGSIZE,
+        mq_timedreceive_buffer_too_small_emsgsize =
+            r_toosmall == -1 && r_toosmall_err == libc::EMSGSIZE,
+        mq_timedsend_invalid_prio_einval = s_bad_prio == -1 && s_bad_prio_err == libc::EINVAL,
+    );
 
     // 3.5 Timespec validation -> EINVAL
     let s_ts_neg = libc::syscall(
@@ -695,7 +747,7 @@ unsafe fn test_mq_timed_matrix() {
         0u32,
         &bad_ts_neg as *const _,
     );
-    let s_ts_neg_einval = s_ts_neg == -1 && errno() == libc::EINVAL;
+    let s_ts_neg_err = if s_ts_neg == -1 { errno() } else { 0 };
 
     let s_ts_over = libc::syscall(
         SYS_MQ_TIMEDSEND,
@@ -705,7 +757,7 @@ unsafe fn test_mq_timed_matrix() {
         0u32,
         &bad_ts_over as *const _,
     );
-    let s_ts_over_einval = s_ts_over == -1 && errno() == libc::EINVAL;
+    let s_ts_over_err = if s_ts_over == -1 { errno() } else { 0 };
 
     let r_ts_neg = libc::syscall(
         SYS_MQ_TIMEDRECEIVE,
@@ -715,7 +767,7 @@ unsafe fn test_mq_timed_matrix() {
         &mut prio as *mut _,
         &bad_ts_neg as *const _,
     );
-    let r_ts_neg_einval = r_ts_neg == -1 && errno() == libc::EINVAL;
+    let r_ts_neg_err = if r_ts_neg == -1 { errno() } else { 0 };
 
     let r_ts_over = libc::syscall(
         SYS_MQ_TIMEDRECEIVE,
@@ -725,7 +777,14 @@ unsafe fn test_mq_timed_matrix() {
         &mut prio as *mut _,
         &bad_ts_over as *const _,
     );
-    let r_ts_over_einval = r_ts_over == -1 && errno() == libc::EINVAL;
+    let r_ts_over_err = if r_ts_over == -1 { errno() } else { 0 };
+
+    report!(
+        mq_timedsend_negative_nsec_einval = s_ts_neg == -1 && s_ts_neg_err == libc::EINVAL,
+        mq_timedsend_overflow_nsec_einval = s_ts_over == -1 && s_ts_over_err == libc::EINVAL,
+        mq_timedreceive_negative_nsec_einval = r_ts_neg == -1 && r_ts_neg_err == libc::EINVAL,
+        mq_timedreceive_overflow_nsec_einval = r_ts_over == -1 && r_ts_over_err == libc::EINVAL,
+    );
 
     // 3.6 Immediate timeouts on empty / full queues
     let r_empty_past = libc::syscall(
@@ -736,7 +795,7 @@ unsafe fn test_mq_timed_matrix() {
         &mut prio as *mut _,
         &past_ts as *const _,
     );
-    let r_empty_past_etimedout = r_empty_past == -1 && errno() == libc::ETIMEDOUT;
+    let r_empty_past_err = if r_empty_past == -1 { errno() } else { 0 };
 
     // Fill queue to maxmsg=2
     let s_msg1 = libc::syscall(
@@ -755,7 +814,6 @@ unsafe fn test_mq_timed_matrix() {
         2u32,
         0usize,
     );
-    let fill_ok = s_msg1 == 0 && s_msg2 == 0;
 
     let s_full_past = libc::syscall(
         SYS_MQ_TIMEDSEND,
@@ -765,7 +823,7 @@ unsafe fn test_mq_timed_matrix() {
         3u32,
         &past_ts as *const _,
     );
-    let s_full_past_etimedout = s_full_past == -1 && errno() == libc::ETIMEDOUT;
+    let s_full_past_err = if s_full_past == -1 { errno() } else { 0 };
 
     // Drain queue
     let r1 = libc::syscall(
@@ -784,7 +842,6 @@ unsafe fn test_mq_timed_matrix() {
         &mut prio as *mut _,
         0usize,
     );
-    let drain_ok = r1 == 4 && r2 == 4;
 
     if mqd >= 0 {
         libc::close(mqd);
@@ -794,15 +851,12 @@ unsafe fn test_mq_timed_matrix() {
     libc::close(pipe_fds[1]);
 
     report!(
-        mq_timed_descriptor_errors =
-            mq_open_ok && s_badf_ebadf && r_badf_ebadf && s_pipe_ebadf && r_pipe_ebadf,
-        mq_timed_access_mode_mismatch = s_rdonly_ebadf && r_wronly_ebadf,
-        mq_timed_msgsize_and_prio_limits =
-            s_toolarge_emsgsize && r_toosmall_emsgsize && s_bad_prio_einval,
-        mq_timed_timespec_validation =
-            s_ts_neg_einval && s_ts_over_einval && r_ts_neg_einval && r_ts_over_einval,
-        mq_timed_empty_and_full_timeouts =
-            r_empty_past_etimedout && fill_ok && s_full_past_etimedout && drain_ok,
+        mq_timedreceive_empty_past_etimedout =
+            r_empty_past == -1 && r_empty_past_err == libc::ETIMEDOUT,
+        mq_timedsend_fill_ok = s_msg1 == 0 && s_msg2 == 0,
+        mq_timedsend_full_past_etimedout =
+            s_full_past == -1 && s_full_past_err == libc::ETIMEDOUT,
+        mq_timedreceive_drain_ok = r1 == 4 && r2 == 4,
     );
 }
 
@@ -847,7 +901,7 @@ unsafe fn test_poll_select_ppoll_matrix() {
         std::ptr::null::<libc::sigset_t>(),
         8usize,
     );
-    let pp_neg_einval = pp_neg == -1 && errno() == libc::EINVAL;
+    let pp_neg_err = if pp_neg == -1 { errno() } else { 0 };
 
     let pp_over = libc::syscall(
         SYS_PPOLL,
@@ -857,7 +911,12 @@ unsafe fn test_poll_select_ppoll_matrix() {
         std::ptr::null::<libc::sigset_t>(),
         8usize,
     );
-    let pp_over_einval = pp_over == -1 && errno() == libc::EINVAL;
+    let pp_over_err = if pp_over == -1 { errno() } else { 0 };
+
+    report!(
+        ppoll_negative_nsec_einval = pp_neg == -1 && pp_neg_err == libc::EINVAL,
+        ppoll_overflow_nsec_einval = pp_over == -1 && pp_over_err == libc::EINVAL,
+    );
 
     // 4.2 Negative fd handling in poll and ppoll (ignored, revents zeroed)
     let mut pfd_neg = libc::pollfd {
@@ -873,11 +932,16 @@ unsafe fn test_poll_select_ppoll_matrix() {
         std::ptr::null::<libc::sigset_t>(),
         8usize,
     );
-    let pp_neg_fd_ok = pp_neg_fd == 0 && pfd_neg.revents == 0;
+    let pp_neg_revents = pfd_neg.revents;
 
     pfd_neg.revents = 0x7fff;
     let poll_neg_fd = libc::poll(&mut pfd_neg as *mut _, 1, 0);
-    let poll_neg_fd_ok = poll_neg_fd == 0 && pfd_neg.revents == 0;
+    let poll_neg_revents = pfd_neg.revents;
+
+    report!(
+        ppoll_negative_fd_ignored = pp_neg_fd == 0 && pp_neg_revents == 0,
+        poll_negative_fd_ignored = poll_neg_fd == 0 && poll_neg_revents == 0,
+    );
 
     // 4.3 pselect6 timespec validation
     let ps_neg = libc::syscall(
@@ -889,7 +953,7 @@ unsafe fn test_poll_select_ppoll_matrix() {
         &bad_ts_neg as *const _,
         0i64,
     );
-    let ps_neg_einval = ps_neg == -1 && errno() == libc::EINVAL;
+    let ps_neg_err = if ps_neg == -1 { errno() } else { 0 };
 
     let ps_over = libc::syscall(
         SYS_PSELECT6,
@@ -900,7 +964,12 @@ unsafe fn test_poll_select_ppoll_matrix() {
         &bad_ts_over as *const _,
         0i64,
     );
-    let ps_over_einval = ps_over == -1 && errno() == libc::EINVAL;
+    let ps_over_err = if ps_over == -1 { errno() } else { 0 };
+
+    report!(
+        pselect6_negative_nsec_einval = ps_neg == -1 && ps_neg_err == libc::EINVAL,
+        pselect6_overflow_nsec_einval = ps_over == -1 && ps_over_err == libc::EINVAL,
+    );
 
     // 4.4 Negative nfds rejection
     let sel_neg = libc::select(
@@ -910,7 +979,7 @@ unsafe fn test_poll_select_ppoll_matrix() {
         std::ptr::null_mut(),
         &mut zero_tv,
     );
-    let sel_neg_einval = sel_neg == -1 && errno() == libc::EINVAL;
+    let sel_neg_err = if sel_neg == -1 { errno() } else { 0 };
 
     let ps_neg_nfds = libc::syscall(
         SYS_PSELECT6,
@@ -921,7 +990,12 @@ unsafe fn test_poll_select_ppoll_matrix() {
         &zero_ts as *const _,
         0i64,
     );
-    let ps_neg_nfds_einval = ps_neg_nfds == -1 && errno() == libc::EINVAL;
+    let ps_neg_nfds_err = if ps_neg_nfds == -1 { errno() } else { 0 };
+
+    report!(
+        select_negative_nfds_einval = sel_neg == -1 && sel_neg_err == libc::EINVAL,
+        pselect6_negative_nfds_einval = ps_neg_nfds == -1 && ps_neg_nfds_err == libc::EINVAL,
+    );
 
     // 4.5 Zero-timeout non-blocking probe across event interfaces
     let mut rset: libc::fd_set = MaybeUninit::zeroed().assume_init();
@@ -935,7 +1009,6 @@ unsafe fn test_poll_select_ppoll_matrix() {
         std::ptr::null_mut(),
         &mut zero_tv,
     );
-    let sel_zero_ok = sel_zero == 0;
 
     libc::FD_ZERO(&mut rset);
     libc::FD_SET(rd, &mut rset);
@@ -948,11 +1021,10 @@ unsafe fn test_poll_select_ppoll_matrix() {
         &zero_ts as *const _ as i64,
         0i64,
     );
-    let ps_zero_ok = ps_zero == 0;
 
     pfd.revents = 0;
     let poll_zero = libc::poll(&mut pfd as *mut _, 1, 0);
-    let poll_zero_ok = poll_zero == 0 && pfd.revents == 0;
+    let poll_zero_revents = pfd.revents;
 
     pfd.revents = 0;
     let ppoll_zero = libc::syscall(
@@ -963,7 +1035,7 @@ unsafe fn test_poll_select_ppoll_matrix() {
         std::ptr::null::<libc::sigset_t>(),
         8usize,
     );
-    let ppoll_zero_ok = ppoll_zero == 0 && pfd.revents == 0;
+    let ppoll_zero_revents = pfd.revents;
 
     let ep = libc::epoll_create1(0);
     let mut ev = libc::epoll_event {
@@ -974,26 +1046,20 @@ unsafe fn test_poll_select_ppoll_matrix() {
 
     let mut events = [libc::epoll_event { events: 0, u64: 0 }; 1];
     let ep_wait_zero = libc::epoll_wait(ep, events.as_mut_ptr(), 1, 0);
-    let ep_wait_zero_ok = ep_wait_zero == 0;
 
     let ep_pwait_zero = libc::epoll_pwait(ep, events.as_mut_ptr(), 1, 0, std::ptr::null());
-    let ep_pwait_zero_ok = ep_pwait_zero == 0;
 
     libc::close(ep);
     libc::close(rd);
     libc::close(wr);
 
     report!(
-        ppoll_timespec_validation = pp_neg_einval && pp_over_einval,
-        poll_and_ppoll_negative_fd_ignored = pp_neg_fd_ok && poll_neg_fd_ok,
-        pselect6_timespec_validation = ps_neg_einval && ps_over_einval,
-        select_and_pselect6_neg_nfds_einval = sel_neg_einval && ps_neg_nfds_einval,
-        zero_timeout_readiness_coherence = sel_zero_ok
-            && ps_zero_ok
-            && poll_zero_ok
-            && ppoll_zero_ok
-            && ep_wait_zero_ok
-            && ep_pwait_zero_ok,
+        select_zero_timeout_ready_zero = sel_zero == 0,
+        pselect6_zero_timeout_ready_zero = ps_zero == 0,
+        poll_zero_timeout_revents_zero = poll_zero == 0 && poll_zero_revents == 0,
+        ppoll_zero_timeout_revents_zero = ppoll_zero == 0 && ppoll_zero_revents == 0,
+        epoll_wait_zero_timeout_events_zero = ep_wait_zero == 0,
+        epoll_pwait_zero_timeout_events_zero = ep_pwait_zero == 0,
     );
 }
 
