@@ -39,6 +39,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "archiveflagmatrix": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "bigallocfree": {
     "class": "conformance",
     "excluded": false,
@@ -385,6 +390,11 @@
     "runner": "generic"
   },
   "epollstaledel": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "eventwaitmatrix": {
     "class": "conformance",
     "excluded": false,
     "runner": "generic"
@@ -890,6 +900,11 @@
     "runner": "generic"
   },
   "linkatflag": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "lifecycleflagmatrix": {
     "class": "conformance",
     "excluded": false,
     "runner": "generic"
@@ -1694,6 +1709,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "ptyflagmatrix": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "ptyfionread": {
     "class": "conformance",
     "excluded": false,
@@ -2049,6 +2069,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "sigwaitmatrix": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "sigwaitthread": {
     "class": "conformance",
     "excluded": false,
@@ -2065,6 +2090,16 @@
     "runner": "generic"
   },
   "sotimeo": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "spawnflagmatrix": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "splicematrix": {
     "class": "conformance",
     "excluded": false,
     "runner": "generic"

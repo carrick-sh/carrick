@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use carrick_conformance_next::{PullPolicy, TestContainer};
 
-/// Exact materialized list of 143 sorted unique probe names for generic shard 0.
+/// Exact materialized list of 146 sorted unique probe names for generic shard 0.
 ///
 /// Conceptually defined as:
 /// - class: "conformance"
@@ -34,58 +34,59 @@ pub const SHARD_0_PROBES: &[&str] = &[
     "abortdeath",
     "accounting",
     "aliassize",
-    "bigread",
-    "brkheapgrow",
-    "cachestatpages",
-    "chmodfollowsymlink",
-    "clockgetres",
-    "clone3args",
-    "clone3signalflight",
-    "cloneexitsig",
-    "clonefsumask",
-    "cluster10errno",
-    "coredumpfile",
-    "ctrel0",
-    "dirfdnotdir",
-    "dnotify",
-    "epollclosenodel",
-    "epolletchildhup",
-    "epollexclusive",
-    "epolloutrearm",
-    "epollpwait",
-    "execfailsurvive",
-    "execpermitchurn",
-    "execsocket",
-    "execvereset",
-    "exitstatus127",
-    "faultaddr",
-    "fcntllease",
-    "fcntlowner",
-    "fdio",
-    "fexecveprobe",
-    "fifoforkeof",
-    "forkaltstack",
-    "forkfault",
-    "forkfpregs",
-    "forkshared",
-    "forksnapshot",
-    "fsescapeguard",
-    "fstatatflags",
-    "futexextra",
-    "futexghost",
-    "futexprivatewakeexact",
-    "futexshare",
-    "futexwaiterstates",
-    "getrandomflags",
-    "getrandomvdsoloop",
-    "icmp",
-    "iouring",
-    "iovecedge",
-    "itimer",
-    "keydeny",
-    "killgroup",
-    "killtarget",
-    "legacyaio",
+    "bigallocfree",
+    "blockingpipewrite",
+    "budget_two_proc",
+    "childsubreaper",
+    "clockcoherence",
+    "clocksettimevdso",
+    "clone3pidfdsig",
+    "cloneexithandled",
+    "clonefileshare",
+    "closedstdio",
+    "coredumpbit",
+    "credtransition",
+    "dirdac",
+    "dirrenamecache",
+    "dupclosestdin",
+    "epolletblockedhup",
+    "epolletpipeeof",
+    "epollinmemwake",
+    "epollpri",
+    "etchostnamefile",
+    "execfatalstatus",
+    "execpipe",
+    "execthreads",
+    "exitgroupmainthreads",
+    "expectcontinue",
+    "fchmoddir",
+    "fcntllock",
+    "fcntlpipesz",
+    "fdstat",
+    "fgetflcreate",
+    "fifonode",
+    "forkcow",
+    "forkfiletable",
+    "forkheapalloc",
+    "forksigwalk",
+    "forksplicestage",
+    "fsetfl",
+    "fsx",
+    "futexforkrequeue",
+    "futexpilock",
+    "futexrealtime",
+    "futexsharedalias",
+    "futexwakecount",
+    "getrandomvdso",
+    "getsocknameval",
+    "ioctlcluster",
+    "iouringenterflag",
+    "ipv6recvhoplimit",
+    "itimerprofidle",
+    "killchld",
+    "killreap",
+    "killuidperm",
+    "legacyfs",
     "linkstat",
     "ltpcheckpoint",
     "lxattr",
@@ -130,53 +131,55 @@ pub const SHARD_0_PROBES: &[&str] = &[
     "ptraceinvaliderrno",
     "ptracesigdeath",
     "ptracetraceme",
-    "ptyforkreopen",
-    "readwronly",
-    "recvmsgtrunc",
-    "rlimitasdata",
-    "rlimitresource",
-    "roprotect",
-    "rtsigqueueinfo",
-    "saresethand",
-    "schedparam",
-    "scmrightsfds",
-    "seekholedata",
-    "selfhostnameresolve",
-    "semgetnsems",
-    "setfsid",
-    "setpgidparentgroup",
-    "shmlinkat",
-    "sigactionresetinfo",
-    "siginfo",
-    "signalfd4",
-    "sigpairrace",
-    "sigreenter",
-    "sigtimedwaitintr",
-    "sigwaitblock",
-    "sockoptdomainproto",
-    "splicepipe",
-    "symlinkfollow",
-    "syscallregpreserve",
-    "sysvmsgwake",
-    "sysvshm",
-    "termiosflow",
-    "threadcommname",
-    "threadstatstate",
-    "timeextra",
-    "tlsswitch",
-    "traceexecstop",
-    "udplitesock",
-    "unicodenorm",
-    "usernsmap",
-    "vdsosymbols",
-    "vforkvmshare",
-    "waitexitstorm",
-    "waitidspec",
-    "waitsiblingsigchld",
-    "xsignal",
+    "ptyflagmatrix",
+    "readpasteof",
+    "recverrqueue",
+    "reparenttoinit",
+    "rlimitnproc",
+    "robustlist",
+    "rosharedbus",
+    "rtsigtimedwaitsiginfo",
+    "schedgetattr",
+    "schedthread",
+    "seccompexec",
+    "selecttimeout",
+    "semctlrange",
+    "sendfilebadf",
+    "setidthreadchurn",
+    "sharedanonfutexfork",
+    "shmrdonly",
+    "sigchld",
+    "signalexit",
+    "signals",
+    "sigqueueusr1",
+    "sigsuspendxthread",
+    "sigwaitalarm",
+    "sigwaitthread",
+    "sotimeo",
+    "splicenetpoll",
+    "statfdino",
+    "syncfilerange",
+    "sysvmsg",
+    "sysvsemstat",
+    "termiosbits",
+    "threadbarrier",
+    "threadspawn",
+    "timeclock",
+    "timeschildren",
+    "tmpfilewrite",
+    "udpconnectunspec",
+    "uffdpolicy",
+    "usernsisolation",
+    "vdsogtod",
+    "vforkpid",
+    "vmsplicepipe",
+    "waitidsiuid",
+    "waitrestart",
+    "xprocsigign",
+    "zerolenio",
 ];
 
-const CACHED_SHARD_0_PROBE_COUNT: usize = 131;
+const CACHED_SHARD_0_PROBE_COUNT: usize = 135;
 
 /// Complete baseline expected gaps for musl on arm64.
 pub const MUSL_BASELINE_GAPS: &[&str] = &[
@@ -338,11 +341,11 @@ pub fn find_probe_binary_dir(repo_root: &Path, target: &str) -> Option<PathBuf> 
 
 #[test]
 fn test_shard_0_inventory() {
-    // Hard-assert exactly 143 sorted unique names.
+    // Hard-assert exactly 146 sorted unique names.
     assert_eq!(
         SHARD_0_PROBES.len(),
-        143,
-        "shard 0 must have exactly 143 probes"
+        146,
+        "shard 0 must have exactly 146 probes"
     );
 
     let mut sorted_probes = SHARD_0_PROBES.to_vec();
@@ -356,8 +359,8 @@ fn test_shard_0_inventory() {
     let unique_probes: BTreeSet<_> = SHARD_0_PROBES.iter().copied().collect();
     assert_eq!(
         unique_probes.len(),
-        143,
-        "SHARD_0_PROBES must contain 143 unique names"
+        146,
+        "SHARD_0_PROBES must contain 146 unique names"
     );
     assert_eq!(
         SHARD_0_PROBES
@@ -421,8 +424,8 @@ fn test_shard_0_inventory() {
     selected_names.sort();
     assert_eq!(
         selected_names.len(),
-        429,
-        "expected exactly 429 conformance generic probes in inventory"
+        436,
+        "expected exactly 436 conformance generic probes in inventory"
     );
 
     let derived_shard_0: Vec<&str> = selected_names
@@ -433,8 +436,8 @@ fn test_shard_0_inventory() {
 
     assert_eq!(
         derived_shard_0.len(),
-        143,
-        "derived shard 0 must have exactly 143 items"
+        146,
+        "derived shard 0 must have exactly 146 items"
     );
     assert_eq!(
         SHARD_0_PROBES,
@@ -448,9 +451,21 @@ fn test_shard_0_expected_gaps_derivation() {
     let musl_shard_gaps = expected_shard_gaps(MUSL_BASELINE_GAPS);
     let gnu_shard_gaps = expected_shard_gaps(GNU_BASELINE_GAPS);
 
-    let expected_musl_set = BTreeSet::new();
+    let expected_musl_set = BTreeSet::from([
+        "budget_two_proc",
+        "childsubreaper",
+        "execthreads",
+        "rlimitnproc",
+    ]);
 
-    let expected_gnu_set = BTreeSet::new();
+    let expected_gnu_set = BTreeSet::from([
+        "budget_two_proc",
+        "childsubreaper",
+        "execthreads",
+        "killchld",
+        "rlimitnproc",
+        "setidthreadchurn",
+    ]);
 
     assert_eq!(
         musl_shard_gaps, expected_musl_set,
