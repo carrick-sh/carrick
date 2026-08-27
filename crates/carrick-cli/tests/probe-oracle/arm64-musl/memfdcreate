@@ -1,0 +1,6 @@
+d3449b82a41a47e3
+memfd_cloexec_ok=true
+memfd_sealing_ok=true
+memfd_bad_flag_einval=true
+memfd_null_name_efault=true
+memfd_long_name_einval=true

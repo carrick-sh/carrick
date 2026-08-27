@@ -1,0 +1,5 @@
+44c6486b35f8061f
+signalfd_ok=true
+read_returns_full_record=true
+ssi_signo_is_sigusr1=true
+short_buffer_einval=true

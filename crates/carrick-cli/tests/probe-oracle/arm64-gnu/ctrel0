@@ -1,0 +1,9 @@
+cc9fa39707525bac
+ctr_read_ok=true
+icache_line_in_range=true
+dcache_line_in_range=true
+dczid_read_ok=true
+dc_zva_permitted=true
+dc_zva_block_in_range=true
+dc_zva_zeroes_block=true
+cache_maintenance_ok=true

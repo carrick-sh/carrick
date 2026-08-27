@@ -1,0 +1,8 @@
+4441c11cca6e9266
+sysinfo_rc_zero=true
+mem_unit_is_one=true
+mem_unit_not_65536=true
+totalhigh_zero=true
+freehigh_zero=true
+totalram_nonzero=true
+procs_at_least_one=true

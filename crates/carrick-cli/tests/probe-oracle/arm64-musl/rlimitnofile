@@ -1,0 +1,3 @@
+022f7d11a9932ebb
+rlimit_nofile_raised=true
+set_rc=0 soft_after=1600 opened=1500/1500 last_errno=0

@@ -1,0 +1,6 @@
+532bd6e29809288d
+rt_tgsigqueueinfo_rc_ok=true
+rt_tgsigqueueinfo_errno=0
+handler_delivered=true
+handler_signo_matches=true
+handler_sival_int_propagated=true

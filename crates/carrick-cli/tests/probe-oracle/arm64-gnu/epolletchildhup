@@ -1,0 +1,4 @@
+1ce894ee99ec4b0b
+parent_wait_woke_on_child_exit=true
+reported_in_or_hup=true
+read_returns_eof=true

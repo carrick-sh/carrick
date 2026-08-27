@@ -1,0 +1,8 @@
+82e2ca69da6fe788
+exit_normal reaped_match=true ifexited=true exitstatus=42 not_signaled=true
+exit_signalled reaped_match=true ifsignaled=true termsig=15 not_exited=true
+execve_true ifexited=true exitstatus_match=true
+execve_false ifexited=true exitstatus_match=true
+wnohang first_zero=true final_match=true exitstatus=7
+pgroup pgrp_pos=true leads_own_group=true
+session sid_pos=true setsid_failed_eperm=true

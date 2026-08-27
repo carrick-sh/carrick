@@ -1,0 +1,9 @@
+9e05ade7732b010e
+semget_ok=true
+semctl_stat_ok=true
+sem_mode_lo9=418
+sem_nsems=3
+sem_uid_is_euid=true
+sem_gid_is_egid=true
+sem_cuid_is_euid=true
+sem_ctime_nonzero=true

@@ -1,0 +1,12 @@
+e001b0b32c6809fe
+fork_ok=true
+reaped_the_child=true
+child_exited_zero=true
+times_rc_valid=true
+times_children_nonzero=true
+times_self_below_children=true
+rusage_children_nonzero=true
+rusage_self_delta_below_children=true
+reaped_syscall_child=true
+children_system_advanced=true
+children_system_nonzero=true

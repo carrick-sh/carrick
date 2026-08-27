@@ -1,0 +1,8 @@
+8f99504235474a05
+private_perms=r--p
+shared_perms=rw-s
+write_only_errno=13
+noreplace_errno=17
+pagemap_open_ok=true
+bus_child_signal=7
+high_errno=0

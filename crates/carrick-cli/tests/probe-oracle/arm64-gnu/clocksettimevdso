@@ -1,0 +1,8 @@
+da48ec503132b468
+clock_settime_monotonic rc=-1 errno=22
+initial_reads rc_raw=0 rc_vdso=0 rc_gtod=0
+clock_settime_realtime rc=0 errno=0
+parent_shifted raw_shifted=true vdso_shifted=true gtod_shifted=true
+child_shifted raw_shifted=true vdso_shifted=true
+child_wait wait_rc_ok=true exit_ok=true
+clock_settime_restore rc=0 errno=0

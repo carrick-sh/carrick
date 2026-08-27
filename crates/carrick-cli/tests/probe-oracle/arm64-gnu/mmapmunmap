@@ -1,0 +1,9 @@
+af08a491576ef5fd
+mmap_badfd_len0_fails=true
+mmap_badfd_len0_ebadf=true
+mmap_validfd_len0_einval=true
+mmap_shared_ok=true
+munmap_shared_ok=true
+mmap_private_ok=true
+munmap_private_ok=true
+munmap_unaligned_einval=true

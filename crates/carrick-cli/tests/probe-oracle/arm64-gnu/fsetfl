@@ -1,0 +1,8 @@
+b09b73bb648ef5cc
+setup_open_ok=true
+setfl_rc_zero=true
+accmode_before_wronly=true
+accmode_after_still_wronly=true
+creat_bit_ignored=true
+trunc_bit_ignored=true
+nonblock_set=true

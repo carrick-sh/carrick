@@ -1,0 +1,16 @@
+f90e8fba9202e8c0
+parent_before_uid_map=0 0 4294967295
+parent_before_gid_map=0 0 4294967295
+parent_before_setgroups=allow
+child_unshare_newuser_rc=0
+child_after_unshare_uid_map=empty
+child_after_unshare_gid_map=empty
+child_after_unshare_setgroups=allow
+child_uid_map_write_rc=0
+child_after_write_uid_map=0 0 1
+child_after_write_gid_map=empty
+child_after_write_setgroups=allow
+child_exit=0
+parent_after_uid_map=0 0 4294967295
+parent_after_gid_map=0 0 4294967295
+parent_after_setgroups=allow

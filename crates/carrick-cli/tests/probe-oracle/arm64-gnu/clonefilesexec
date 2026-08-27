@@ -1,0 +1,9 @@
+fb820c9a6fe101a5
+clone_files_exec_clone_ok=true
+successor_exec_succeeded=true
+successor_closed_cloexec=true
+successor_inherited_noncloexec=true
+successor_closed_own_noncloexec=true
+parent_retained_cloexec_slot=true
+parent_retained_successor_closed_slot=true
+successor_exited_zero=true

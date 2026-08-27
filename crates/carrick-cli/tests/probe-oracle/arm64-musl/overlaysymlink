@@ -1,0 +1,8 @@
+c396077f65aa0d19
+link_to_image_file_stats=true
+link_to_image_file_same_size=true
+link_to_image_file_opens=true
+link_to_image_file_access_x=true
+link_to_image_binary_execs=true
+dangling_link_stat_enoent=true
+dangling_link_lstat_ok=true

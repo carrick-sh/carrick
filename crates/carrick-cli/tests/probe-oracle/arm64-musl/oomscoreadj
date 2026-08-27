@@ -1,0 +1,12 @@
+37da4b0d8650fd8c
+pipe_ok=true
+self_write_ok=false
+self_readback_is_minus1000=false
+child_inherited_parent_value=false
+child_sees_own=true
+foreign_pid_file_exists=true
+foreign_value_is_childs=true
+foreign_write_ok=true
+foreign_write_visible=true
+parent_unchanged_after_child_write=false
+dead_pid_file_absent=true

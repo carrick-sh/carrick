@@ -1,0 +1,14 @@
+efa977d954d3af5d
+eintr_on_caught_nonset=true
+handler_ran=true
+waitset_signum_ok=true
+waitset_si_code_is_user=true
+waitset_si_pid_is_child=true
+eagain_on_timeout=true
+sigchld_ignored_no_eintr=true
+rt_signum_ok=true
+rt_si_signo_ok=true
+rt_si_code_is_user=true
+rt_si_pid_is_child=true
+bad_info_efault=true
+handler_total_ok=true

@@ -1,0 +1,7 @@
+7cc21fb141e19db6
+wait4_reap_ok=true
+wait4_child_added_cpu=true
+waitid_reap_ok=true
+waitid_child_added_cpu=true
+no_children_rc_neg_one=true
+no_children_errno_echild=true

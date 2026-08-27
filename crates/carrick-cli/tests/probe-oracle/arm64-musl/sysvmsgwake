@@ -1,0 +1,5 @@
+9908cb8b0e8be63c
+nowait_empty_enomsg=true
+nowait_full_eagain=true
+fork_reader_wakes_sender=true
+rmid_wakes_receiver=true

@@ -1,0 +1,12 @@
+d63340a664614e26
+thp_valid_forms_supported=true
+ambient_valid_form_supported=true
+speculation_valid_form_supported=true
+thp_set_bad_arg_einval=true
+thp_get_bad_arg_einval=true
+ambient_bad_subcmd_einval=true
+speculation_extra_arg_einval=true
+seccomp_filter_bad_pointer_efault=true
+seccomp_filter_without_nnp_eacces=true
+securebits_without_setpcap_eperm=true
+capbset_drop_without_setpcap_eperm=true

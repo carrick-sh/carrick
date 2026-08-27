@@ -1,0 +1,11 @@
+c2f3c40f9466688e
+sigabrt_wifsignaled=true
+sigabrt_wcoredump_set=true
+sigsegv_wifsignaled=true
+sigsegv_wcoredump_set=true
+sigquit_wifsignaled=true
+sigquit_wcoredump_set=true
+sigterm_wifsignaled=true
+sigterm_wcoredump_clear=true
+sigkill_wifsignaled=true
+sigkill_wcoredump_clear=true

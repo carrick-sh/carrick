@@ -1,0 +1,10 @@
+70393505a28ebc78
+msgget_ok=true
+send_recv_roundtrip=true
+qnum_after_send_is_1=true
+qnum_after_recv_is_0=true
+proc_sysvipc_msg_present=true
+proc_sysvipc_msg_live_queue=true
+type_selective_recv=true
+xprocess_send_recv=true
+ipc_rmid_ok=true

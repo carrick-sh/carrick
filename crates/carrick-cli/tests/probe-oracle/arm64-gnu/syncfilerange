@@ -1,0 +1,7 @@
+03236b11a45f5cff
+sfr_badfd_ebadf=true
+sfr_pipe_espipe=true
+sfr_neg_offset_einval=true
+sfr_neg_nbytes_einval=true
+sfr_bad_flags_einval=true
+sfr_valid_ok=true

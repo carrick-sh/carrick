@@ -1,0 +1,5 @@
+018c6e34cdec4af8
+active_ipv6_iface_present=true
+igmp6_membership_present=true
+ipv6_iface_has_igmp6_membership=true
+iface_name_index_roundtrip=true

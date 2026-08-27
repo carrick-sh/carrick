@@ -1,0 +1,13 @@
+cc9a9445162d60ff
+mlock2_onfault_ok=true
+mlock2_vmlck_grew=true
+mlock2_repeat_not_double=true
+mlock2_invalid_flag_einval=true
+mlock2_unmapped_enomem=true
+mlock2_mincore_onfault_empty_pages=0
+mlock2_mincore_onfault_half_pages=4
+mlock2_mincore_populated_pages=8
+mlock2_mincore_onfault_empty=true
+mlock2_mincore_onfault_half=true
+mlock2_mincore_populated=true
+mmap_locked_vmlck_grew=true

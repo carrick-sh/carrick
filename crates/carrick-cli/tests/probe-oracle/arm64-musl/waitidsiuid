@@ -1,0 +1,7 @@
+8f85b85862c87dbe
+child_reported_ruid=true
+waitid_reaped_child=true
+waitid_si_pid_matches_child=true
+waitid_si_uid_matches_child_ruid=true
+waitid_si_code_is_cld_exited=true
+waitid_si_status_matches_exit=true

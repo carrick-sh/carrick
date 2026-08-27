@@ -1,0 +1,4 @@
+83e143f681ccc494
+pselect6_neg_nfds_einval=true
+pselect6_neg_nfds_with_set_einval=true
+pselect6_zero_nfds_returns_0=true

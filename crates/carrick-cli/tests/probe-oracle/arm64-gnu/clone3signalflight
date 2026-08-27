@@ -1,0 +1,6 @@
+ce65b10e28561388
+setup_vfork_ok_or_blocked=true
+install_ok=true
+clone3_blocked_or_sequence_ok=true
+child_payload_ok=true
+parent_exit_signals_ok=true

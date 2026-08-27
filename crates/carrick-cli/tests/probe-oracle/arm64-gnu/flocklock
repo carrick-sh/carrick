@@ -1,0 +1,6 @@
+bc922164a89cd7ed
+flock_ex_ok=true
+flock_conflict_eagain=true
+flock_un_ok=true
+flock_reacquire_ok=true
+flock_badfd_ebadf=true

@@ -1,0 +1,6 @@
+fe0bc9977ad7efe5
+nonexec_mmap_faults=true
+exec_mmap_fetch_allowed=true
+mprotect_drop_exec_faults=true
+mprotect_add_exec_fetch_allowed=true
+mprotect_exec_only_fetch_allowed=true

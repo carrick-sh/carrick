@@ -1,0 +1,14 @@
+fe319f82915f0195
+getfl_fd0_ok=true
+setfl_nonblock_fd0_ok=true
+getfd_fd0_ok=true
+setfd_fd0_ok=true
+getfl_fd1_ok=true
+setfl_nonblock_fd1_ok=true
+getfd_fd1_ok=true
+setfd_fd1_ok=true
+getfl_fd2_ok=true
+setfl_nonblock_fd2_ok=true
+getfd_fd2_ok=true
+setfd_fd2_ok=true
+setfl_badfd_ebadf=true

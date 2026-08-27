@@ -1,0 +1,5 @@
+640c9d947d1c30f8
+slave_prefix=/dev/pts
+slave_isatty=1
+slave_got=ping
+master_got=pong

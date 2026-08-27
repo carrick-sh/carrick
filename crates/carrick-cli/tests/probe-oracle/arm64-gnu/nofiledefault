@@ -1,0 +1,4 @@
+f98d7ccbd26b5919
+getrlimit_ok=true
+nofile_soft=1048576
+nofile_hard=1048576

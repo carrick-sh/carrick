@@ -1,0 +1,9 @@
+03a41be922cf8182
+sigchld_reset_to_dfl=true
+sigusr2_reset_to_dfl=true
+sigpipe_still_ign=true
+altstack_size_is_nonzero=true
+altstack_sp_is_nonnull=true
+altstack_flag_enabled=true
+sigusr1_mask_preserved=true
+sigusr1_pending_preserved=true

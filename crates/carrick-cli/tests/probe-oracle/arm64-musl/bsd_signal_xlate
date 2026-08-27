@@ -1,0 +1,7 @@
+547dfeb557efa014
+child_handlers_installed=true
+kill_sigstkflt_ok=true
+kill_sigpwr_ok=true
+kill_sigio_ok=true
+child_waited=true
+child_exited_zero=true

@@ -1,0 +1,7 @@
+b086a81174d0f1ff
+fork_exec_stage2_reached=true
+post_exec_pthread_create_ok=true
+post_exec_pthread_create_errno=0
+post_exec_worker_ran=true
+post_exec_pthread_join_ok=true
+parent_observed_child_success=true

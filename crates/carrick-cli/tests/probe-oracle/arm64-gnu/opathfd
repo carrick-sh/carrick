@@ -1,0 +1,8 @@
+0affc4eeec6cbdcf
+read_ebadf=true
+write_ebadf=true
+fchmod_ebadf=true
+fchown_ebadf=true
+fgetxattr_ebadf=true
+fstat_ok=true
+mmap_ebadf=true

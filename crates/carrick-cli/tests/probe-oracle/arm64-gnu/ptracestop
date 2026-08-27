@@ -1,0 +1,17 @@
+f2b5c5d729ba418d
+fork_ok=true
+blocking_wait_reaped_stop=true
+blocking_wait_completed_before_alarm=true
+blocking_wait_errno=0
+blocking_wait_errno_zero=true
+blocking_wait_stopped=true
+blocking_wait_stopsig=19
+blocking_wait_stopsig_is_sigstop=true
+cont_ok=true
+cont_errno=0
+cont_errno_zero=true
+exit_reaped=true
+exit_errno=0
+exit_errno_zero=true
+exit_exited=true
+exit_status_zero=true

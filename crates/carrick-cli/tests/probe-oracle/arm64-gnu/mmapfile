@@ -1,0 +1,9 @@
+e0359ae37090f933
+open_ftruncate ok
+mmap_shared ok
+plain_store ok rb_match=true
+atomic_add ok prev=0 now=1
+atomic_add_off64 ok prev=0 now=7
+cmpxchg ok matched=true
+msync ok rc=0
+DONE

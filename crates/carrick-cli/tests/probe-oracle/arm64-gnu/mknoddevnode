@@ -1,0 +1,11 @@
+d41806581e021e51
+cdev_is_chr=true
+cdev_perms=644
+cdev_major=1
+cdev_minor=3
+bdev_is_blk=true
+bdev_major=7
+bdev_minor=0
+sock_is_sock=true
+sock_perms=600
+cdev_eexist=true

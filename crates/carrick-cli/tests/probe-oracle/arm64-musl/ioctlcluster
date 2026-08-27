@@ -1,0 +1,11 @@
+f61d51e43ad7053c
+setup_ok=true
+tcgeta_null_errno=14
+tcgeta_ok_errno=0
+tcgeta_devnull_errno=25
+rndgetentcnt_errno=0
+rndgetentcnt_count=256
+proc_entropy=256
+rndgetentcnt_matches_proc=true
+ficlone_bad_src_errno=9
+ficlone_devnull_errno_accepted=true

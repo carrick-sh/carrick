@@ -1,0 +1,12 @@
+4dd1e3e55bc1cba3
+altstack_ok=true
+install_ok=true
+first_handler_seen=true
+first_handler_on_alt=true
+siglongjmp_returned=true
+after_longjmp_not_onstack=true
+replace_altstack_ok=true
+replace_altstack_errno=0
+second_handler_seen=true
+second_handler_on_replaced_alt=true
+after_second_not_onstack=true
