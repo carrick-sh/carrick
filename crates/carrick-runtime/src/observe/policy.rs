@@ -95,12 +95,30 @@ impl PolicyRule {
     }
 }
 
+/// Canonical syscall numbers served by the guest EL1 shim or vDSO fast paths.
+const FAST_PATH_SYSCALL_NUMBERS: &[u64] = &[
+    172, // getpid
+    173, // getppid
+    174, // getuid
+    175, // geteuid
+    176, // getgid
+    177, // getegid
+    178, // gettid
+    113, // clock_gettime
+    114, // clock_getres
+    169, // gettimeofday
+];
+
+fn is_fast_path_syscall(nr: CanonicalNr) -> bool {
+    FAST_PATH_SYSCALL_NUMBERS.contains(&nr.raw())
+}
+
 /// Policy observer applying typed rules over canonical syscall numbers and scalar arguments.
 #[derive(Debug, Clone, Default)]
 pub struct PolicyObserver {
     rules: Vec<PolicyRule>,
     default_action: SyscallAction,
-    fast_path_visibility: FastPathVisibility,
+    blind_spot_accepted: bool,
 }
 
 impl PolicyObserver {
@@ -108,7 +126,7 @@ impl PolicyObserver {
         Self {
             rules: Vec::new(),
             default_action: SyscallAction::Allow,
-            fast_path_visibility: FastPathVisibility::Blind,
+            blind_spot_accepted: false,
         }
     }
 
@@ -116,7 +134,7 @@ impl PolicyObserver {
         Self {
             rules: Vec::new(),
             default_action,
-            fast_path_visibility: FastPathVisibility::Blind,
+            blind_spot_accepted: false,
         }
     }
 
@@ -145,8 +163,11 @@ impl PolicyObserver {
         self
     }
 
-    pub fn require_fast_path_visibility(mut self) -> Self {
-        self.fast_path_visibility = FastPathVisibility::Required;
+    /// Explicitly opt out of mandatory fast-path visibility, accepting that
+    /// the EL1 shim and vDSO fast paths may handle identity/clock calls without
+    /// consulting this observer.
+    pub fn accept_fast_path_blind_spot(mut self) -> Self {
+        self.blind_spot_accepted = true;
         self
     }
 
@@ -166,6 +187,21 @@ impl SyscallObserver for PolicyObserver {
     }
 
     fn wants_fast_path_visibility(&self) -> FastPathVisibility {
-        self.fast_path_visibility
+        if self.blind_spot_accepted {
+            return FastPathVisibility::Blind;
+        }
+        if self.default_action != SyscallAction::Allow {
+            return FastPathVisibility::Required;
+        }
+        for rule in &self.rules {
+            if rule.action != SyscallAction::Allow {
+                match rule.canonical_nr {
+                    None => return FastPathVisibility::Required,
+                    Some(nr) if is_fast_path_syscall(nr) => return FastPathVisibility::Required,
+                    _ => {}
+                }
+            }
+        }
+        FastPathVisibility::Blind
     }
 }
