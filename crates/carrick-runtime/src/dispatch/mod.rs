@@ -6130,35 +6130,46 @@ impl SyscallDispatcher {
     }
 
     /// Apply a launch-time container syscall policy (the `carrick run` /
-    /// `--security-opt seccomp=…` resolution). Must be called before the guest
+    /// `--security-opt seccomp=…` resolution) with no capability grant —
+    /// the bare `run-elf`/unit-test shape. Must be called before the guest
     /// boots — the field is then read-only and inherited across guest
     /// fork/execve like a Linux seccomp filter. `Unconfined` clears it.
     pub fn apply_seccomp_policy(&mut self, policy: carrick_spec::SeccompPolicy) {
-        self.apply_launch_privileges(policy, &[]);
+        self.install_container_policy(
+            policy,
+            crate::namespace::process::CapabilitySet::docker_default(),
+        );
     }
 
-    /// Apply the launch-time policy AND the container's `--cap-add` grants
-    /// together, because Docker's profile is capability-conditional: the same
+    /// Apply the launch-time policy from the container's OWN capability set,
+    /// because Docker's profile is capability-conditional: the same
     /// `--cap-add SYS_ADMIN` that raises the capability set also lifts the
-    /// profile's denial of `bpf`/`unshare`/`setns`/`io_uring`. Applying one
-    /// without the other is what left carrick running at a DIFFERENT
-    /// privilege from the oracle on the 48 suites that grant capabilities.
-    /// Must be called before the guest boots.
+    /// profile's denial of `bpf`/`unshare`/`setns`/`io_uring`. The grant and
+    /// the policy now come from one authority (`Container::granted_caps`), so
+    /// they cannot disagree the way a static grant applied in a different
+    /// order could. Must be called before the guest boots.
     pub fn apply_launch_privileges(
         &mut self,
         policy: carrick_spec::SeccompPolicy,
-        cap_add: &[String],
+        container: &crate::kernel::container::Container,
     ) {
-        let (granted, unknown) = crate::namespace::process::capability_mask_for_names(cap_add);
-        for name in &unknown {
-            tracing::warn!(capability = %name, "ignoring unknown --cap-add name");
-        }
-        if granted != 0 {
-            crate::namespace::process::grant_launch_capabilities(granted);
-        }
+        self.install_container_policy(policy, container.granted_caps());
+    }
+
+    fn install_container_policy(
+        &mut self,
+        policy: carrick_spec::SeccompPolicy,
+        caps: crate::namespace::process::CapabilitySet,
+    ) {
+        // `docker_model_with_capabilities` tests CAP_SYS_ADMIN / CAP_SYS_PTRACE
+        // bits; the Docker default set holds neither (pinned by
+        // `docker_default_excludes_sys_ptrace`), so the container's effective
+        // set is exactly the old grant mask for the profile's purposes.
         self.container_policy = match policy {
             carrick_spec::SeccompPolicy::ContainerDefault => Some(
-                crate::container_policy::ContainerPolicy::docker_model_with_capabilities(granted),
+                crate::container_policy::ContainerPolicy::docker_model_with_capabilities(
+                    caps.effective,
+                ),
             ),
             carrick_spec::SeccompPolicy::Unconfined => None,
         };

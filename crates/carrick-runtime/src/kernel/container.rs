@@ -22,6 +22,7 @@ use std::sync::{Arc, OnceLock};
 use camino::Utf8PathBuf;
 
 use super::objects::TaskKey;
+use crate::namespace::process::{CapabilitySet, capability_mask_for_names};
 use crate::run_result::RuntimeError;
 
 /// Kernel-graph identity of one container.
@@ -357,6 +358,11 @@ pub struct Container {
     /// `NsSharedRegion::retire`; dropping the last `Arc` is the safety net.
     pid_ns: OnceLock<Arc<crate::namespace::pid::NsSharedRegion>>,
     clock: Arc<ClockDomain>,
+    /// The capability set every process of this container starts from: the
+    /// Docker default raised by the launch-time `--cap-add` grant. A launch
+    /// constant — set once through `with_launch_capabilities` before the
+    /// root task is bootstrapped, then read-only; forks copy it per task.
+    granted_caps: CapabilitySet,
 }
 
 impl Container {
@@ -370,7 +376,25 @@ impl Container {
             pid_root: OnceLock::new(),
             pid_ns: OnceLock::new(),
             clock: Arc::new(ClockDomain::default()),
+            granted_caps: CapabilitySet::docker_default(),
         }
+    }
+
+    /// Record the launch-time `--cap-add` grant. Unknown names are logged and
+    /// ignored, exactly as the dispatcher did when the grant was a static.
+    pub fn with_launch_capabilities(mut self, cap_add: &[String]) -> Self {
+        let (granted, unknown) = capability_mask_for_names(cap_add);
+        for name in &unknown {
+            tracing::warn!(capability = %name, "ignoring unknown --cap-add name");
+        }
+        self.granted_caps = CapabilitySet::docker_default_with_grants(granted);
+        self
+    }
+
+    /// The set this container's root task boots with (and every descendant
+    /// inherits by fork copy until it changes its own).
+    pub fn granted_caps(&self) -> CapabilitySet {
+        self.granted_caps
     }
 
     /// The container every in-crate reference-model kernel and the

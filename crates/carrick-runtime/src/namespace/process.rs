@@ -135,11 +135,18 @@ pub struct CapabilitySet {
 impl CapabilitySet {
     /// The default container set (effective=permitted=bounding = Docker
     /// default; inheritable/ambient empty), matching observed `docker run`.
+    /// A pure constant: launch-time `--cap-add` grants are container state
+    /// (`Container::granted_caps`), never folded into this default.
     pub fn docker_default() -> Self {
-        // `--cap-add` raises the effective/permitted/bounding sets exactly as
-        // docker does; the grant is a launch-time constant (see
-        // `grant_launch_capabilities`).
-        let caps = DOCKER_DEFAULT_CAPS | launch_granted_capabilities();
+        Self::docker_default_with_grants(0)
+    }
+
+    /// The Docker default raised by a launch-time `--cap-add` grant mask
+    /// (bits from `capability_mask_for_names`). `--cap-add` raises the
+    /// effective/permitted/bounding sets exactly as docker does and leaves
+    /// inheritable/ambient empty.
+    pub fn docker_default_with_grants(granted: u64) -> Self {
+        let caps = DOCKER_DEFAULT_CAPS | granted;
         Self {
             effective: caps,
             permitted: caps,
@@ -190,22 +197,6 @@ pub struct ProcessCredsNs {
     /// This process's user namespace. Starts as the identity initial ns
     /// (uid 0 → host uid 0), so the common `docker run` case is unchanged.
     pub user: UserNs,
-}
-
-/// Capabilities granted at launch by `--cap-add`, ORed into the container
-/// default set every process starts from. A launch-time constant: written
-/// once before the guest boots and read-only thereafter, exactly like the
-/// container syscall policy it travels with.
-static LAUNCH_GRANTED_CAPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Record the launch-time `--cap-add` grant. Called once, before boot.
-pub fn grant_launch_capabilities(mask: u64) {
-    LAUNCH_GRANTED_CAPS.store(mask, std::sync::atomic::Ordering::Release);
-}
-
-/// The launch-time grant, for the container default set.
-pub fn launch_granted_capabilities() -> u64 {
-    LAUNCH_GRANTED_CAPS.load(std::sync::atomic::Ordering::Acquire)
 }
 
 impl Default for ProcessCredsNs {
@@ -357,6 +348,26 @@ mod tests {
         let bit = 1u64 << CAP_SYS_PTRACE;
         assert_eq!(CapabilitySet::docker_default().effective & bit, 0);
         assert_ne!(CapabilitySet::full().effective & bit, 0);
+    }
+
+    #[test]
+    fn docker_default_with_grants_raises_effective_permitted_bounding_only() {
+        let bit = 1u64 << CAP_SYS_ADMIN;
+        let granted = CapabilitySet::docker_default_with_grants(bit);
+        assert_eq!(granted.effective, DOCKER_DEFAULT_CAPS | bit);
+        assert_eq!(granted.permitted, DOCKER_DEFAULT_CAPS | bit);
+        assert_eq!(granted.bounding, DOCKER_DEFAULT_CAPS | bit);
+        assert_eq!(granted.inheritable, 0);
+        assert_eq!(granted.ambient, 0);
+        // The plain default is a constant: no launch grant can leak into it.
+        assert_eq!(
+            CapabilitySet::docker_default(),
+            CapabilitySet::docker_default_with_grants(0)
+        );
+        assert_eq!(
+            CapabilitySet::docker_default().effective,
+            DOCKER_DEFAULT_CAPS
+        );
     }
 
     #[test]

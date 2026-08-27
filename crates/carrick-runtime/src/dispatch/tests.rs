@@ -5158,3 +5158,84 @@ mod container_clock_tests {
     }
 }
 
+#[cfg(test)]
+mod container_caps_tests {
+    //! Launch-time `--cap-add` grants are container state. Two containers in
+    //! one carrier must give their root tasks — and their launch policies —
+    //! different privilege, which a process-global grant cannot express.
+    use super::*;
+    use crate::kernel::container::Container;
+    use crate::kernel::{Kernel, KernelContext, RootBootstrap};
+    use crate::namespace::process::{CAP_SYS_ADMIN, CAP_SYS_PTRACE, DOCKER_DEFAULT_CAPS};
+    use carrick_spec::SeccompPolicy;
+
+    /// aarch64 `unshare`: Docker's default profile denies it unless the
+    /// container holds CAP_SYS_ADMIN (`container_policy.rs`, `SYS_UNSHARE`).
+    const SYS_UNSHARE: u64 = 97;
+
+    fn container_with(cap_add: &[&str]) -> Arc<Container> {
+        let names: Vec<String> = cap_add.iter().map(|name| (*name).to_owned()).collect();
+        Arc::new(Container::for_reference_model().with_launch_capabilities(&names))
+    }
+
+    fn root_context_in(container: Arc<Container>, pid: i32) -> KernelContext {
+        let bootstrap = RootBootstrap::for_reference_model(
+            pid,
+            crate::thread::ThreadId::synthetic_for_tests(pid),
+            "container-caps-root".to_owned(),
+        )
+        .expect("root bootstrap")
+        .with_container(container);
+        Kernel::bootstrap_root(bootstrap).expect("root kernel").1
+    }
+
+    #[test]
+    fn root_task_capabilities_come_from_its_container() {
+        let plain = root_context_in(container_with(&[]), 7101);
+        let ptrace = root_context_in(container_with(&["SYS_PTRACE"]), 7102);
+        let bit = 1u64 << CAP_SYS_PTRACE;
+        assert_eq!(plain.task().caps().effective, DOCKER_DEFAULT_CAPS);
+        assert_eq!(plain.task().caps().effective & bit, 0);
+        let granted = ptrace.task().caps();
+        assert_ne!(granted.effective & bit, 0);
+        assert_ne!(granted.permitted & bit, 0);
+        assert_ne!(granted.bounding & bit, 0);
+        assert_eq!(granted.inheritable, 0);
+        // Bootstrapping the second container never changed the first.
+        assert_eq!(plain.task().caps().effective, DOCKER_DEFAULT_CAPS);
+    }
+
+    #[test]
+    fn launch_policy_follows_the_containers_grant() {
+        let mut plain = SyscallDispatcher::new();
+        plain.apply_launch_privileges(SeccompPolicy::ContainerDefault, &container_with(&[]));
+        let mut admin = SyscallDispatcher::new();
+        admin.apply_launch_privileges(
+            SeccompPolicy::ContainerDefault,
+            &container_with(&["SYS_ADMIN"]),
+        );
+        assert_eq!(
+            plain
+                .container_policy
+                .as_ref()
+                .expect("plain policy")
+                .denied_errno_for_args(SYS_UNSHARE, 0),
+            Some(LINUX_EPERM),
+            "without CAP_SYS_ADMIN the Docker model denies unshare"
+        );
+        assert_eq!(
+            admin
+                .container_policy
+                .as_ref()
+                .expect("admin policy")
+                .denied_errno_for_args(SYS_UNSHARE, 0),
+            None,
+            "the container's own CAP_SYS_ADMIN lifts the denial"
+        );
+        let bit = 1u64 << CAP_SYS_ADMIN;
+        assert_ne!(container_with(&["SYS_ADMIN"]).granted_caps().effective & bit, 0);
+        assert_eq!(container_with(&[]).granted_caps().effective & bit, 0);
+    }
+}
+
+

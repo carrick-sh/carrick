@@ -855,6 +855,12 @@ impl Kernel {
             resources.credentials(),
             Arc::clone(&container),
         ));
+        // The container's launch-time grant is the root task's starting
+        // capability set; `Task::new` seeds the grant-free Docker default
+        // (`ProcessCredsNs::default()`) and forks copy whatever the parent
+        // holds (`inherit_creds_ns_from`).
+        let launch_caps = task.container().granted_caps();
+        task.with_caps(|caps| *caps = launch_caps);
         let leader_tid = LinuxTid::for_task_leader(bootstrap.task_id);
         let leader_key = ThreadKey {
             tid: leader_tid,
