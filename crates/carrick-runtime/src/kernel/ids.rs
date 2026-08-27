@@ -45,6 +45,14 @@ macro_rules! serial_id {
             pub const fn raw(self) -> u64 {
                 self.0.get()
             }
+
+            #[allow(dead_code)]
+            pub(crate) const fn from_raw_u64(raw: u64) -> Option<Self> {
+                match NonZeroU64::new(raw) {
+                    Some(nz) => Some(Self(nz)),
+                    None => None,
+                }
+            }
         }
     };
 }

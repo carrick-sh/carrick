@@ -945,6 +945,27 @@ where
             linux_tid: child_pid,
             asid: child_binding.asid.raw(),
         };
+        let prepared_dispatch_mm = match kernel.dispatcher.prepare_fork_mm(
+            parent_context.shared().mm().id(),
+            child_mm_id,
+            clone_plan.mm(),
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "dispatcher fork preparation rejected semantic MM projection; fork(2) = EAGAIN"
+                );
+                rollback_pidfd(installed_pidfd);
+                if quiesced {
+                    process_barrier.end_quiesce();
+                }
+                process_barrier.end_fork();
+                return Ok(PreparedInProcessFork::Complete(Some(
+                    crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+                )));
+            }
+        };
         let (prepared_backend, cpu, child_kicker) = match ops.prepare(
             memory,
             inventory_preparation,
@@ -957,7 +978,7 @@ where
                 child_ttbr0: child_binding.ttbr0.raw(),
                 root_slot_base: root_slot.map_or(0, |slot| slot.base()),
                 root_slot_size: root_slot.map_or(0, |slot| slot.size()),
-                shares_mm,
+                plan: prepared_dispatch_mm.fork_projection_plan(),
                 child_tid,
                 forking_tid: self.this_tid,
             },
@@ -979,11 +1000,10 @@ where
             .as_mut()
             .is_some_and(|work| !work.begin_publication())
         {
-            ops.abort(prepared_backend)
-                .unwrap_or_else(|_| std::process::abort());
-            if !shares_mm {
-                ops.rollback_parent(memory)
-                    .unwrap_or_else(|_| std::process::abort());
+            if let Err(error) =
+                ops.abort_and_rollback_prepared(prepared_backend, memory, !shares_mm)
+            {
+                return Err(ops.fail_stop(error));
             }
             rollback_pidfd(installed_pidfd);
             if quiesced {
@@ -1003,13 +1023,34 @@ where
             child_pid,
         );
 
-        let child_dispatcher = kernel.dispatcher.fork_clone_in_process_with_mm_mode(
-            self.this_tid,
-            child_tid,
+        let child_dispatcher = match kernel.dispatcher.fork_clone_with_prepared_mm(
+            parent_context.shared().mm().id(),
+            child_mm_id,
             parent_process.pid() as u32,
             child_pid as u32,
-            clone_plan.mm(),
-        );
+            prepared_dispatch_mm,
+        ) {
+            Ok(dispatcher) => dispatcher,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "dispatcher fork install rejected stale parent revision; fork(2) = EAGAIN"
+                );
+                if let Err(error) =
+                    ops.abort_and_rollback_prepared(prepared_backend, memory, !shares_mm)
+                {
+                    return Err(ops.fail_stop(error));
+                }
+                rollback_pidfd(installed_pidfd);
+                if quiesced {
+                    process_barrier.end_quiesce();
+                }
+                process_barrier.end_fork();
+                return Ok(PreparedInProcessFork::Complete(Some(
+                    crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+                )));
+            }
+        };
         if external_exec.is_some() {
             child_dispatcher.set_stream_stdio(false);
             child_dispatcher.enable_external_exec_capture();
@@ -1053,11 +1094,10 @@ where
                     std::process::abort();
                 });
             }
-            ops.abort(prepared_backend)
-                .unwrap_or_else(|_| std::process::abort());
-            if !shares_mm {
-                ops.rollback_parent(memory)
-                    .unwrap_or_else(|_| std::process::abort());
+            if let Err(cleanup_error) =
+                ops.abort_and_rollback_prepared(prepared_backend, memory, !shares_mm)
+            {
+                return Err(ops.fail_stop(cleanup_error));
             }
             rollback_pidfd(installed_pidfd);
             if quiesced {
@@ -1080,11 +1120,10 @@ where
                     .write_bytes(address, bytes)
                     .unwrap_or_else(|_| std::process::abort());
             }
-            ops.abort(prepared_backend)
-                .unwrap_or_else(|_| std::process::abort());
-            if !shares_mm {
-                ops.rollback_parent(memory)
-                    .unwrap_or_else(|_| std::process::abort());
+            if let Err(cleanup_error) =
+                ops.abort_and_rollback_prepared(prepared_backend, memory, !shares_mm)
+            {
+                return Err(ops.fail_stop(cleanup_error));
             }
             rollback_pidfd(installed_pidfd);
             if quiesced {
@@ -1106,11 +1145,10 @@ where
                     .write_bytes(address, bytes)
                     .unwrap_or_else(|_| std::process::abort());
             }
-            ops.abort(prepared_backend)
-                .unwrap_or_else(|_| std::process::abort());
-            if !shares_mm {
-                ops.rollback_parent(memory)
-                    .unwrap_or_else(|_| std::process::abort());
+            if let Err(cleanup_error) =
+                ops.abort_and_rollback_prepared(prepared_backend, memory, !shares_mm)
+            {
+                return Err(ops.fail_stop(cleanup_error));
             }
             rollback_pidfd(installed_pidfd);
             if quiesced {

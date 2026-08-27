@@ -3780,11 +3780,49 @@ pub const LINUX_MADV_SEQUENTIAL: u64 = 2;
 pub const LINUX_MADV_WILLNEED: u64 = 3;
 pub const LINUX_MADV_DONTNEED: u64 = 4;
 pub const LINUX_MADV_FREE: u64 = 8;
-// Fork-inheritance hints. Carrick does not currently clone by inheriting host
-// VM mappings directly, so the host-side VMA flag has no implementation work to
-// do here; Linux still accepts these advisory hints as successful madvise calls.
+// Fork-inheritance hints and policy controls.
 pub const LINUX_MADV_DONTFORK: u64 = 10;
 pub const LINUX_MADV_DOFORK: u64 = 11;
+pub const LINUX_MADV_WIPEONFORK: u64 = 18;
+pub const LINUX_MADV_KEEPONFORK: u64 = 19;
+
+/// Fork copy policy axis for a semantic VMA.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum VmaForkCopyPolicy {
+    #[default]
+    Inherit,
+    Omit,
+}
+
+/// Fork child-contents policy axis for a semantic VMA.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum VmaForkChildPolicy {
+    #[default]
+    Preserve,
+    ZeroInChild,
+}
+
+/// Two-axis fork inheritance policy for a semantic VMA.
+/// `copy` and `child_contents` are independent axes: DONTFORK and WIPEONFORK
+/// may coexist; DOFORK clears only `copy = Omit`; KEEPONFORK clears only
+/// `child_contents = ZeroInChild`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct VmaForkPolicy {
+    pub copy: VmaForkCopyPolicy,
+    pub child_contents: VmaForkChildPolicy,
+}
+
+impl VmaForkPolicy {
+    pub const DEFAULT: Self = Self {
+        copy: VmaForkCopyPolicy::Inherit,
+        child_contents: VmaForkChildPolicy::Preserve,
+    };
+
+    pub const fn is_default(self) -> bool {
+        matches!(self.copy, VmaForkCopyPolicy::Inherit)
+            && matches!(self.child_contents, VmaForkChildPolicy::Preserve)
+    }
+}
 // Transparent-huge-page advisory hints. carrick presents 4 KiB guest pages and
 // cannot promote a range to a huge page, but these advices are purely advisory:
 // real Linux returns 0 for them whenever THP is built in (the common

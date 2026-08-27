@@ -821,6 +821,8 @@ mod overlay_dispatch_tests {
                 sharing: ProcMapSharing::Private,
                 path: String::new(),
                 file_page_offset: None,
+                droppable: false,
+                semantic_vmas: None,
                 locked: None,
                 resident: false,
                 bus_fault: None,
@@ -4405,5 +4407,558 @@ mod container_policy_dispatch_tests {
                 other => panic!("expected OpenStatSource::Record, got {:?}", other),
             }
         }
+    }
+
+    #[test]
+    fn prepared_fork_mm_rejects_replaced_authority_with_equal_revision() {
+        let dispatcher = SyscallDispatcher::new();
+        let parent_mm_id = crate::kernel::MmId::from_raw_u64(1).unwrap();
+        let child_mm_id = crate::kernel::MmId::from_raw_u64(2).unwrap();
+        let prepared = dispatcher.prepare_fork_mm(
+            parent_mm_id,
+            child_mm_id,
+            crate::kernel::CloneObjectMode::Copy,
+        ).unwrap();
+
+        let replacement = Arc::new(DispatchMmAuthority::new_for_test_with_revision(
+            prepared.parent_revision,
+        ));
+        dispatcher.replace_current_mm_for_test(replacement);
+
+        let result = dispatcher.fork_clone_with_prepared_mm(
+            parent_mm_id,
+            child_mm_id,
+            100,
+            101,
+            prepared,
+        );
+        assert!(matches!(
+            result,
+            Err(crate::kernel::SnapshotError::ChangedDuringObservation)
+        ));
+    }
+
+    #[test]
+    fn prepared_fork_mm_clone_vm_uses_exact_dispatch_mm_authority_arc() {
+        let dispatcher = SyscallDispatcher::new();
+        let parent_mm_id = crate::kernel::MmId::from_raw_u64(1).unwrap();
+        let prepared = dispatcher.prepare_fork_mm(
+            parent_mm_id,
+            parent_mm_id,
+            crate::kernel::CloneObjectMode::Share,
+        ).unwrap();
+
+        assert!(Arc::ptr_eq(&prepared.parent_mm, &prepared.child_mm));
+        assert!(prepared.fork_projection_plan().is_shared());
+
+        let child_dispatcher = dispatcher
+            .fork_clone_with_prepared_mm(parent_mm_id, parent_mm_id, 100, 101, prepared)
+            .expect("install shared fork mm");
+
+        assert!(!Arc::ptr_eq(
+            &dispatcher.mm_binding,
+            &child_dispatcher.mm_binding
+        ));
+        assert!(Arc::ptr_eq(
+            &dispatcher.mm_binding.current.load_full(),
+            &child_dispatcher.mm_binding.current.load_full()
+        ));
+    }
+
+    #[test]
+    fn prepared_fork_mm_install_excludes_peer_vma_publication() {
+        let dispatcher = Arc::new(SyscallDispatcher::new());
+        let parent_mm_id = crate::kernel::MmId::from_raw_u64(1).unwrap();
+        let child_mm_id = crate::kernel::MmId::from_raw_u64(2).unwrap();
+        let prepared = dispatcher.prepare_fork_mm(
+            parent_mm_id,
+            child_mm_id,
+            crate::kernel::CloneObjectMode::Copy,
+        ).unwrap();
+        let install_complete = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let mut peer = None;
+
+        let child_dispatcher = dispatcher
+            .fork_clone_with_prepared_mm_observed(
+                parent_mm_id,
+                child_mm_id,
+                100,
+                101,
+                prepared,
+                |constructed| {
+                    if !constructed {
+                        let peer_dispatcher = Arc::clone(&dispatcher);
+                        let peer_complete = Arc::clone(&install_complete);
+                        let attempted_tx = attempted_tx.clone();
+                        let acquired_tx = acquired_tx.clone();
+                        peer = Some(std::thread::spawn(move || {
+                            attempted_tx.send(()).unwrap();
+                            let _vma = peer_dispatcher.begin_vma_dispatch();
+                            acquired_tx
+                                .send(peer_complete.load(std::sync::atomic::Ordering::Acquire))
+                                .unwrap();
+                        }));
+                        attempted_rx.recv().unwrap();
+                        assert!(acquired_rx.try_recv().is_err());
+                    } else {
+                        assert!(acquired_rx.try_recv().is_err());
+                        install_complete.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                },
+            )
+            .expect("install copied fork mm");
+
+        assert!(acquired_rx.recv().unwrap());
+        peer.unwrap().join().unwrap();
+        assert!(!Arc::ptr_eq(
+            &dispatcher.mm_binding.current.load_full(),
+            &child_dispatcher.mm_binding.current.load_full()
+        ));
+    }
+
+    #[test]
+    fn prepared_fork_mm_copied_fork_request_names_real_parent_mm() {
+        let dispatcher = SyscallDispatcher::new();
+        let parent_mm_id = crate::kernel::MmId::from_raw_u64(42).unwrap();
+        let child_mm_id = crate::kernel::MmId::from_raw_u64(43).unwrap();
+        let wrong_mm_id = crate::kernel::MmId::from_raw_u64(44).unwrap();
+        let prepared = dispatcher.prepare_fork_mm(
+            parent_mm_id,
+            child_mm_id,
+            crate::kernel::CloneObjectMode::Copy,
+        ).unwrap();
+
+        assert_eq!(prepared.parent_mm_id, parent_mm_id);
+        let request_plan = prepared.fork_projection_plan();
+        assert!(!request_plan.is_shared());
+        assert_eq!(request_plan.parent_mm(), parent_mm_id.raw());
+        assert_eq!(request_plan.child_mm(), child_mm_id.raw());
+        assert_ne!(request_plan.parent_mm(), request_plan.child_mm());
+        assert!(!Arc::ptr_eq(&prepared.parent_mm, &prepared.child_mm));
+
+        let result = dispatcher.fork_clone_with_prepared_mm(
+            wrong_mm_id,
+            child_mm_id,
+            100,
+            101,
+            prepared,
+        );
+        assert!(matches!(
+            result,
+            Err(crate::kernel::SnapshotError::ChangedDuringObservation)
+        ));
+    }
+
+    #[test]
+    fn prepared_fork_mm_rejects_wrong_child_identity_at_install() {
+        let dispatcher = SyscallDispatcher::new();
+        let parent_mm_id = crate::kernel::MmId::from_raw_u64(51).unwrap();
+        let child_mm_id = crate::kernel::MmId::from_raw_u64(52).unwrap();
+        let wrong_child_mm_id = crate::kernel::MmId::from_raw_u64(53).unwrap();
+        let prepared = dispatcher
+            .prepare_fork_mm(
+                parent_mm_id,
+                child_mm_id,
+                crate::kernel::CloneObjectMode::Copy,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            dispatcher.fork_clone_with_prepared_mm(
+                parent_mm_id,
+                wrong_child_mm_id,
+                100,
+                101,
+                prepared,
+            ),
+            Err(crate::kernel::SnapshotError::ChangedDuringObservation)
+        ));
+    }
+
+    #[test]
+    fn prepared_fork_mm_mode_requires_structurally_matching_mm_identities() {
+        let dispatcher = SyscallDispatcher::new();
+        let parent_mm_id = crate::kernel::MmId::from_raw_u64(61).unwrap();
+        let child_mm_id = crate::kernel::MmId::from_raw_u64(62).unwrap();
+
+        assert!(matches!(
+            dispatcher.prepare_fork_mm(
+                parent_mm_id,
+                child_mm_id,
+                crate::kernel::CloneObjectMode::Share,
+            ),
+            Err(PrepareDispatchMmForkError::SharedIdentityMismatch)
+        ));
+        assert!(matches!(
+            dispatcher.prepare_fork_mm(
+                parent_mm_id,
+                parent_mm_id,
+                crate::kernel::CloneObjectMode::Copy,
+            ),
+            Err(PrepareDispatchMmForkError::CopiedIdentityCollision)
+        ));
+    }
+
+    #[test]
+    fn prepared_fork_mm_copied_child_authority_is_independent_of_parent() {
+        let dispatcher = SyscallDispatcher::new();
+        dispatcher.set_address_space_regions(vec![
+            crate::vfs::ProcMapsEntry {
+                start: 0x10000,
+                end: 0x20000,
+                read: true,
+                write: true,
+                execute: false,
+                sharing: crate::vfs::ProcMapSharing::Private,
+                path: "[anon]".to_string(),
+            },
+        ]);
+        let parent_mm_id = crate::kernel::MmId::from_raw_u64(1).unwrap();
+        let child_mm_id = crate::kernel::MmId::from_raw_u64(2).unwrap();
+        let prepared = dispatcher.prepare_fork_mm(
+            parent_mm_id,
+            child_mm_id,
+            crate::kernel::CloneObjectMode::Copy,
+        ).unwrap();
+        let child_dispatcher = dispatcher
+            .fork_clone_with_prepared_mm(parent_mm_id, child_mm_id, 100, 101, prepared)
+            .expect("install copied fork mm");
+
+        // Mutating parent does not mutate child
+        dispatcher.record_dynamic_mapping(
+            0x30000,
+            0x1000,
+            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            crate::vfs::ProcMapSharing::Private,
+            "[parent_only]".to_string(),
+        );
+
+        let parent_vmas = dispatcher.mem().lock().semantic_vmas.clone();
+        let child_vmas = child_dispatcher.mem().lock().semantic_vmas.clone();
+        assert!(parent_vmas.iter().any(|v| v.path == "[parent_only]"));
+        assert!(!child_vmas.iter().any(|v| v.path == "[parent_only]"));
+    }
+
+    #[test]
+    fn fork_projection_copied_is_total_and_holes_are_absent() {
+        let dispatcher = SyscallDispatcher::new();
+        dispatcher.set_address_space_regions(vec![
+            crate::vfs::ProcMapsEntry {
+                start: 0x10000,
+                end: 0x14000,
+                read: true,
+                write: true,
+                execute: false,
+                sharing: crate::vfs::ProcMapSharing::Private,
+                path: "[anon1]".to_string(),
+            },
+            crate::vfs::ProcMapsEntry {
+                start: 0x20000,
+                end: 0x24000,
+                read: true,
+                write: true,
+                execute: false,
+                sharing: crate::vfs::ProcMapSharing::Private,
+                path: "[anon2]".to_string(),
+            },
+        ]);
+
+        // Mark 0x10000..0x12000 as DONTFORK
+        dispatcher.update_madvise_fork_policy(
+            0x10000,
+            0x2000,
+            Some(carrick_abi::VmaForkCopyPolicy::Omit),
+            None,
+        );
+        // Mark 0x22000..0x24000 as WIPEONFORK
+        dispatcher.update_madvise_fork_policy(
+            0x22000,
+            0x2000,
+            None,
+            Some(carrick_abi::VmaForkChildPolicy::ZeroInChild),
+        );
+
+        let parent_mm_id = crate::kernel::MmId::from_raw_u64(1).unwrap();
+        let child_mm_id = crate::kernel::MmId::from_raw_u64(2).unwrap();
+        let prepared = dispatcher.prepare_fork_mm(
+            parent_mm_id,
+            child_mm_id,
+            crate::kernel::CloneObjectMode::Copy,
+        ).unwrap();
+        let plan = prepared.fork_projection_plan();
+        let ranges = plan.ranges();
+
+        // Check totality over live leaves
+        assert_eq!(
+            carrick_hal::lookup_fork_projection(ranges, 0x10000),
+            Some(carrick_hal::ForkLeafDisposition::Omit)
+        );
+        assert_eq!(
+            carrick_hal::lookup_fork_projection(ranges, 0x12000),
+            Some(carrick_hal::ForkLeafDisposition::Preserve)
+        );
+        assert_eq!(
+            carrick_hal::lookup_fork_projection(ranges, 0x20000),
+            Some(carrick_hal::ForkLeafDisposition::Preserve)
+        );
+        assert_eq!(
+            carrick_hal::lookup_fork_projection(ranges, 0x22000),
+            Some(carrick_hal::ForkLeafDisposition::Zero)
+        );
+
+        // Gap/hole between 0x14000 and 0x20000 must be absent (None, never defaulting to Preserve)
+        assert_eq!(
+            carrick_hal::lookup_fork_projection(ranges, 0x15000),
+            None
+        );
+        assert_eq!(
+            carrick_hal::lookup_fork_projection(ranges, 0x1f000),
+            None
+        );
+    }
+
+    #[test]
+    fn fork_projection_brk_grow_and_shrink_tracks_heap_and_revision() {
+        let dispatcher = SyscallDispatcher::new();
+        let heap_base = dispatcher.mem().lock().layout.heap_base;
+        let initial_revision = dispatcher.mem().vma_revision();
+        {
+            let _vma = dispatcher.begin_vma_dispatch();
+            let authority = dispatcher.mem();
+            let mut state = authority.lock();
+            mem::update_semantic_heap_pages(&mut state, heap_base, heap_base + 0x3000);
+            state.brk_current = heap_base + 0x3000;
+        }
+        let grown_revision = dispatcher.mem().vma_revision();
+        assert!(grown_revision.raw() > initial_revision.raw());
+
+        let parent_mm_id = crate::kernel::MmId::from_raw_u64(71).unwrap();
+        let child_mm_id = crate::kernel::MmId::from_raw_u64(72).unwrap();
+        let grown = dispatcher
+            .prepare_fork_mm(
+                parent_mm_id,
+                child_mm_id,
+                crate::kernel::CloneObjectMode::Copy,
+            )
+            .unwrap();
+        assert_eq!(
+            carrick_hal::lookup_fork_projection(
+                grown.fork_projection_plan().ranges(),
+                heap_base + 0x2000,
+            ),
+            Some(carrick_hal::ForkLeafDisposition::Preserve)
+        );
+
+        {
+            let _vma = dispatcher.begin_vma_dispatch();
+            let authority = dispatcher.mem();
+            let mut state = authority.lock();
+            mem::update_semantic_heap_pages(
+                &mut state,
+                heap_base + 0x3000,
+                heap_base + 0x1000,
+            );
+            state.brk_current = heap_base + 0x1000;
+        }
+        assert!(dispatcher.mem().vma_revision().raw() > grown_revision.raw());
+        let shrunk = dispatcher
+            .prepare_fork_mm(
+                parent_mm_id,
+                child_mm_id,
+                crate::kernel::CloneObjectMode::Copy,
+            )
+            .unwrap();
+        assert_eq!(
+            carrick_hal::lookup_fork_projection(
+                shrunk.fork_projection_plan().ranges(),
+                heap_base,
+            ),
+            Some(carrick_hal::ForkLeafDisposition::Preserve)
+        );
+        assert_eq!(
+            carrick_hal::lookup_fork_projection(
+                shrunk.fork_projection_plan().ranges(),
+                heap_base + 0x1000,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn fork_projection_brk_growth_does_not_inherit_modified_tail_semantics() {
+        let dispatcher = SyscallDispatcher::new();
+        let heap_base = dispatcher.mem().lock().layout.heap_base;
+        let authority = dispatcher.mem();
+        let mut state = authority.lock();
+        mem::update_semantic_heap_pages(&mut state, heap_base, heap_base + 0x1000);
+        let tail = state
+            .semantic_vmas
+            .iter_mut()
+            .find(|vma| vma.start == heap_base && vma.end == heap_base + 0x1000)
+            .expect("initial heap VMA");
+        tail.read = false;
+        tail.write = false;
+        tail.fork_policy.copy = carrick_abi::VmaForkCopyPolicy::Omit;
+        tail.fork_policy.child_contents = carrick_abi::VmaForkChildPolicy::ZeroInChild;
+        tail.droppable = true;
+
+        mem::update_semantic_heap_pages(
+            &mut state,
+            heap_base + 0x1000,
+            heap_base + 0x3000,
+        );
+        let grown = state
+            .semantic_vmas
+            .iter()
+            .find(|vma| vma.start == heap_base + 0x1000 && vma.end == heap_base + 0x3000)
+            .expect("new default heap VMA");
+        assert!(grown.read);
+        assert!(grown.write);
+        assert!(!grown.execute);
+        assert_eq!(grown.fork_policy, carrick_abi::VmaForkPolicy::DEFAULT);
+        assert!(!grown.droppable);
+    }
+
+    #[test]
+    fn fork_projection_rejects_invalid_gapped_overflow_unaligned_overlapping_fail_closed() {
+        use carrick_hal::{
+            validate_fork_projection, validate_total_fork_projection, ForkLeafDisposition,
+            ForkProjectionError, ForkProjectionRange,
+        };
+
+        // Zero length
+        let zero_len = [ForkProjectionRange {
+            va: 0x1000,
+            len: 0,
+            disposition: ForkLeafDisposition::Preserve,
+        }];
+        assert_eq!(
+            validate_fork_projection(&zero_len),
+            Err(ForkProjectionError::ZeroLength)
+        );
+
+        // Unaligned VA
+        let unaligned_va = [ForkProjectionRange {
+            va: 0x1001,
+            len: 0x1000,
+            disposition: ForkLeafDisposition::Preserve,
+        }];
+        assert_eq!(
+            validate_fork_projection(&unaligned_va),
+            Err(ForkProjectionError::Unaligned)
+        );
+
+        // Unaligned length
+        let unaligned_len = [ForkProjectionRange {
+            va: 0x1000,
+            len: 0x1001,
+            disposition: ForkLeafDisposition::Preserve,
+        }];
+        assert_eq!(
+            validate_fork_projection(&unaligned_len),
+            Err(ForkProjectionError::Unaligned)
+        );
+
+        // Overflow
+        let overflow = [ForkProjectionRange {
+            va: 0xFFFF_FFFF_FFFF_F000,
+            len: 0x2000,
+            disposition: ForkLeafDisposition::Preserve,
+        }];
+        assert_eq!(
+            validate_fork_projection(&overflow),
+            Err(ForkProjectionError::Overflow)
+        );
+
+        // Overlapping
+        let overlapping = [
+            ForkProjectionRange {
+                va: 0x1000,
+                len: 0x2000,
+                disposition: ForkLeafDisposition::Preserve,
+            },
+            ForkProjectionRange {
+                va: 0x2000,
+                len: 0x2000,
+                disposition: ForkLeafDisposition::Preserve,
+            },
+        ];
+        assert_eq!(
+            validate_fork_projection(&overlapping),
+            Err(ForkProjectionError::OverlappingOrUnsorted)
+        );
+
+        // Unsorted
+        let unsorted = [
+            ForkProjectionRange {
+                va: 0x3000,
+                len: 0x1000,
+                disposition: ForkLeafDisposition::Preserve,
+            },
+            ForkProjectionRange {
+                va: 0x1000,
+                len: 0x1000,
+                disposition: ForkLeafDisposition::Preserve,
+            },
+        ];
+        assert_eq!(
+            validate_fork_projection(&unsorted),
+            Err(ForkProjectionError::OverlappingOrUnsorted)
+        );
+
+        let gapped = [ForkProjectionRange {
+            va: 0x1000,
+            len: 0x1000,
+            disposition: ForkLeafDisposition::Preserve,
+        }];
+        assert_eq!(
+            validate_total_fork_projection(&gapped, &[(0x1000, 0x3000)]),
+            Err(ForkProjectionError::IncompleteCoverage)
+        );
+
+        // Valid sorted, non-overlapping, aligned
+        let valid = [
+            ForkProjectionRange {
+                va: 0x1000,
+                len: 0x1000,
+                disposition: ForkLeafDisposition::Preserve,
+            },
+            ForkProjectionRange {
+                va: 0x3000,
+                len: 0x2000,
+                disposition: ForkLeafDisposition::Zero,
+            },
+        ];
+        assert_eq!(validate_fork_projection(&valid), Ok(()));
+    }
+
+    #[test]
+    fn fork_projection_invalid_semantic_vma_is_rejected_by_prepare() {
+        let dispatcher = SyscallDispatcher::new();
+        dispatcher.mem().lock().semantic_vmas.push(mem::SemanticVma {
+            start: 0x1001,
+            end: 0x2000,
+            read: true,
+            write: true,
+            execute: false,
+            provenance: mem::VmaBackingProvenance::PrivateAnonymous,
+            fork_policy: carrick_abi::VmaForkPolicy::DEFAULT,
+            droppable: false,
+            path: "[invalid]".to_owned(),
+            file_page_offset: None,
+        });
+        let parent_mm_id = crate::kernel::MmId::from_raw_u64(1).unwrap();
+        assert!(matches!(
+            dispatcher.prepare_fork_mm(
+                parent_mm_id,
+                crate::kernel::MmId::from_raw_u64(2).unwrap(),
+                crate::kernel::CloneObjectMode::Copy,
+            ),
+            Err(PrepareDispatchMmForkError::Projection(
+                carrick_hal::ForkProjectionError::Unaligned
+            ))
+        ));
     }
 }

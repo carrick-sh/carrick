@@ -16895,22 +16895,22 @@ impl HvfVmState {
             HvpatchForkProcessSpecStage, HvpatchForkProcessSpecStagePhase,
         };
 
-        let emit_stage =
-            |phase: HvpatchForkProcessSpecStagePhase, started: std::time::Instant, units: u64| {
-                let elapsed_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-                crate::probes::hvpatch_fork_process_spec_stage(HvpatchForkProcessSpecStage::new(
-                    phase,
-                    request.child_tid.raw(),
-                    request.forking_tid.raw(),
-                    elapsed_ns,
-                    units,
-                ));
-            };
+        let child_tid_raw = request.child_tid.raw();
+        let forking_tid_raw = request.forking_tid.raw();
+        let emit_stage = move |phase: HvpatchForkProcessSpecStagePhase,
+                               started: std::time::Instant,
+                               units: u64| {
+            let elapsed_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+            crate::probes::hvpatch_fork_process_spec_stage(HvpatchForkProcessSpecStage::new(
+                phase,
+                child_tid_raw,
+                forking_tid_raw,
+                elapsed_ns,
+                units,
+            ));
+        };
 
-        crate::probes::hvpatch_fork_snapshot_begin(
-            request.child_tid.raw(),
-            request.forking_tid.raw(),
-        );
+        crate::probes::hvpatch_fork_snapshot_begin(child_tid_raw, forking_tid_raw);
         let stage_started = std::time::Instant::now();
         const STAGE2_PAGE: u64 = 16 * 1024;
         let root_slot_end = request
@@ -17073,7 +17073,7 @@ impl HvfVmState {
         });
         for index in order {
             let mapping = &source_mappings[index];
-            let disposition = fork_mapping_disposition(mapping, request.shares_mm);
+            let disposition = fork_mapping_disposition(mapping, request.shares_mm());
             if matches!(
                 disposition,
                 ForkMappingDisposition::SharedFrameWritable
@@ -17457,7 +17457,7 @@ impl HvfVmState {
                     page_tables.debug_walk(mapping.start),
                 );
                 if leaf & VALID != 0 {
-                    let expected_ap = if request.shares_mm {
+                    let expected_ap = if request.shares_mm() {
                         // The descriptor can cover mixed ELF permissions; a
                         // shared-mm child keeps the exact cloned leaf rather
                         // than deriving AP from the coarse physical owner.
@@ -17470,7 +17470,7 @@ impl HvfVmState {
                     // CLONE_VM deliberately preserves the parent's exact
                     // user translation, including its global attribute: both
                     // ASIDs name the same frame until the child exits or execs.
-                    let expected_non_global = !request.shares_mm;
+                    let expected_non_global = !request.shares_mm();
                     if leaf & AP_MASK != expected_ap
                         || (expected_non_global && leaf & NON_GLOBAL == 0)
                     {
@@ -17530,7 +17530,7 @@ impl HvfVmState {
                 // includes the VA's offset inside that block. `shadow == live`
                 // plus the earlier software translation receipt authenticates
                 // the exact address without falsely applying an L3 mask.
-                || (!request.shares_mm
+                || (!request.shares_mm()
                     && live_leaf & 0x0000_FFFF_FFFF_F000
                         != expected_ipa & 0x0000_FFFF_FFFF_F000)
                 || live_leaf & (0b11 << 6) != expected_ap

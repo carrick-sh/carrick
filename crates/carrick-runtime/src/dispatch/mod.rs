@@ -330,11 +330,13 @@ use crate::linux_abi::{
     LINUX_MADV_DONTNEED,
     LINUX_MADV_FREE,
     LINUX_MADV_HUGEPAGE,
+    LINUX_MADV_KEEPONFORK,
     LINUX_MADV_NOHUGEPAGE,
     LINUX_MADV_NORMAL,
     LINUX_MADV_RANDOM,
     LINUX_MADV_SEQUENTIAL,
     LINUX_MADV_WILLNEED,
+    LINUX_MADV_WIPEONFORK,
     LINUX_MAP_FIXED,
     LINUX_MAP_FIXED_NOREPLACE,
     LINUX_MAX_SIGNUM,
@@ -2322,6 +2324,39 @@ impl DispatchMmAuthority {
         }
     }
 
+    fn fork_private_with_policy(
+        &self,
+    ) -> Result<
+        (
+            Self,
+            crate::kernel::VmaRevision,
+            Arc<[carrick_hal::ForkProjectionRange]>,
+        ),
+        carrick_hal::ForkProjectionError,
+    > {
+        let (forked_mem, revision, ranges) = self.mem.fork_private_with_policy()?;
+        Ok((
+            Self {
+                mem: Arc::new(forked_mem),
+                host_alias_transactions: Arc::new(HostAliasTransactions::new()),
+            },
+            revision,
+            ranges,
+        ))
+    }
+
+    fn fork_projection_with_revision(
+        &self,
+    ) -> Result<
+        (
+            crate::kernel::VmaRevision,
+            Arc<[carrick_hal::ForkProjectionRange]>,
+        ),
+        carrick_hal::ForkProjectionError,
+    > {
+        self.mem.fork_projection_with_revision()
+    }
+
     fn lock(&self) -> parking_lot::MutexGuard<'_, mem::MemState> {
         self.mem.lock()
     }
@@ -2330,9 +2365,19 @@ impl DispatchMmAuthority {
         self.mem.revision_publisher()
     }
 
-    #[cfg(test)]
-    fn vma_revision(&self) -> crate::kernel::VmaRevision {
+    pub(crate) fn vma_revision(&self) -> crate::kernel::VmaRevision {
         self.mem.vma_revision()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_revision(revision: crate::kernel::VmaRevision) -> Self {
+        Self {
+            mem: Arc::new(mem::MemAuthority::with_revision(
+                mem::MemState::new(),
+                revision,
+            )),
+            host_alias_transactions: Arc::new(HostAliasTransactions::new()),
+        }
     }
 
     #[cfg(test)]
@@ -2342,6 +2387,42 @@ impl DispatchMmAuthority {
     ) -> Result<crate::kernel::OwnedVmaSnapshot, crate::kernel::SnapshotError> {
         self.mem.snapshot_until(deadline)
     }
+}
+
+pub(crate) struct PreparedDispatchMmFork {
+    pub(crate) parent_mm_id: crate::kernel::MmId,
+    pub(crate) child_mm_id: crate::kernel::MmId,
+    pub(crate) parent_mm: Arc<DispatchMmAuthority>,
+    pub(crate) parent_revision: crate::kernel::VmaRevision,
+    pub(crate) mode: crate::kernel::CloneObjectMode,
+    pub(crate) child_mm: Arc<DispatchMmAuthority>,
+    pub(crate) backend_plan: Arc<[carrick_hal::ForkProjectionRange]>,
+}
+
+impl PreparedDispatchMmFork {
+    pub(crate) fn fork_projection_plan(&self) -> carrick_hal::ForkProjectionPlan {
+        match self.mode {
+            crate::kernel::CloneObjectMode::Share => carrick_hal::ForkProjectionPlan::Shared {
+                parent_mm: self.parent_mm_id.raw(),
+                ranges: Arc::clone(&self.backend_plan),
+            },
+            crate::kernel::CloneObjectMode::Copy => carrick_hal::ForkProjectionPlan::Copied {
+                parent_mm: self.parent_mm_id.raw(),
+                child_mm: self.child_mm_id.raw(),
+                ranges: Arc::clone(&self.backend_plan),
+            },
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PrepareDispatchMmForkError {
+    #[error(transparent)]
+    Projection(#[from] carrick_hal::ForkProjectionError),
+    #[error("shared MM preparation requires identical parent and child MM identities")]
+    SharedIdentityMismatch,
+    #[error("copied MM preparation requires distinct parent and child MM identities")]
+    CopiedIdentityCollision,
 }
 
 struct DispatchMmBinding {
@@ -4257,35 +4338,99 @@ impl SyscallDispatcher {
         )
     }
 
-    pub(crate) fn fork_clone_in_process_with_mm_mode(
+    pub(crate) fn prepare_fork_mm(
         &self,
-        _parent_tid: crate::thread::ThreadId,
-        _child_tid: crate::thread::ThreadId,
-        parent_guest_pid: u32,
-        child_guest_pid: u32,
-        mm_mode: crate::kernel::CloneObjectMode,
-    ) -> Self {
-        // Select the binding and quiesce that exact authority as one operation
-        // relative to exec promotion.
+        parent_mm_id: crate::kernel::MmId,
+        child_mm_id: crate::kernel::MmId,
+        mode: crate::kernel::CloneObjectMode,
+    ) -> Result<PreparedDispatchMmFork, PrepareDispatchMmForkError> {
+        match mode {
+            crate::kernel::CloneObjectMode::Share if parent_mm_id != child_mm_id => {
+                return Err(PrepareDispatchMmForkError::SharedIdentityMismatch);
+            }
+            crate::kernel::CloneObjectMode::Copy if parent_mm_id == child_mm_id => {
+                return Err(PrepareDispatchMmForkError::CopiedIdentityCollision);
+            }
+            _ => {}
+        }
         let vma_snapshot = self.mm_binding.begin_dispatch(false);
         let parent_mm = Arc::clone(vma_snapshot.authority.as_ref().unwrap_or_else(|| {
             tracing::error!("fork guard lacks MM authority");
             std::process::abort();
         }));
-        let _vma_snapshot = vma_snapshot;
-        let child_mm = match mm_mode {
-            crate::kernel::CloneObjectMode::Share => parent_mm,
-            crate::kernel::CloneObjectMode::Copy => Arc::new(parent_mm.fork_private()),
+        let (parent_revision, child_mm, backend_plan) = match mode {
+            crate::kernel::CloneObjectMode::Share => {
+                let (revision, ranges) = parent_mm.fork_projection_with_revision()?;
+                (revision, Arc::clone(&parent_mm), ranges)
+            }
+            crate::kernel::CloneObjectMode::Copy => {
+                let (forked, revision, ranges) = parent_mm.fork_private_with_policy()?;
+                (revision, Arc::new(forked), ranges)
+            }
         };
-        Self {
+        drop(vma_snapshot);
+        Ok(PreparedDispatchMmFork {
+            parent_mm_id,
+            child_mm_id,
+            parent_mm,
+            parent_revision,
+            mode,
+            child_mm,
+            backend_plan,
+        })
+    }
+
+    pub(crate) fn fork_clone_with_prepared_mm(
+        &self,
+        observed_parent_mm_id: crate::kernel::MmId,
+        observed_child_mm_id: crate::kernel::MmId,
+        parent_guest_pid: u32,
+        child_guest_pid: u32,
+        prepared_mm: PreparedDispatchMmFork,
+    ) -> Result<Self, crate::kernel::SnapshotError> {
+        self.fork_clone_with_prepared_mm_observed(
+            observed_parent_mm_id,
+            observed_child_mm_id,
+            parent_guest_pid,
+            child_guest_pid,
+            prepared_mm,
+            |_| {},
+        )
+    }
+
+    fn fork_clone_with_prepared_mm_observed(
+        &self,
+        observed_parent_mm_id: crate::kernel::MmId,
+        observed_child_mm_id: crate::kernel::MmId,
+        parent_guest_pid: u32,
+        child_guest_pid: u32,
+        prepared_mm: PreparedDispatchMmFork,
+        mut observe_install: impl FnMut(bool),
+    ) -> Result<Self, crate::kernel::SnapshotError> {
+        if observed_parent_mm_id != prepared_mm.parent_mm_id
+            || observed_child_mm_id != prepared_mm.child_mm_id
+        {
+            return Err(crate::kernel::SnapshotError::ChangedDuringObservation);
+        }
+        let dispatch = self.mm_binding.begin_dispatch(false);
+        let current_authority = dispatch.authority.as_ref().unwrap_or_else(|| {
+            tracing::error!("fork install guard lacks MM authority");
+            std::process::abort();
+        });
+        if !Arc::ptr_eq(current_authority, &prepared_mm.parent_mm) {
+            return Err(crate::kernel::SnapshotError::ChangedDuringObservation);
+        }
+        if current_authority.vma_revision() != prepared_mm.parent_revision {
+            return Err(crate::kernel::SnapshotError::ChangedDuringObservation);
+        }
+        observe_install(false);
+        let child_binding = DispatchMmBinding::new(prepared_mm.child_mm);
+        let child_dispatcher = Self {
             kernel_binding: RwLock::new(self.kernel_binding.read().clone()),
-            // Linux interval timers are not inherited across fork. The child
-            // receives a fresh exact-task delivery when bind_hvpatch_process
-            // publishes its authoritative ProcessContext.
             timer_delivery: RwLock::new(None),
             file_authority: RwLock::new(self.file_authority.read().clone()),
             io: self.io.fork_clone(),
-            mm_binding: DispatchMmBinding::new(child_mm),
+            mm_binding: child_binding,
             proc: Mutex::new(
                 self.proc
                     .lock()
@@ -4302,7 +4447,50 @@ impl SyscallDispatcher {
             signal_pump_requested: std::sync::atomic::AtomicBool::new(false),
             async_signal_wake_owner: self.async_signal_wake_owner,
             exec_host_fs_fallback: self.exec_host_fs_fallback,
-        }
+        };
+        observe_install(true);
+        drop(dispatch);
+        Ok(child_dispatcher)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fork_clone_in_process_with_mm_mode(
+        &self,
+        _parent_tid: crate::thread::ThreadId,
+        _child_tid: crate::thread::ThreadId,
+        parent_guest_pid: u32,
+        child_guest_pid: u32,
+        mm_mode: crate::kernel::CloneObjectMode,
+    ) -> Self {
+        let parent_mm_id = crate::kernel::MmId::from_registry_allocation(std::num::NonZeroU64::MIN);
+        let child_mm_id = match mm_mode {
+            crate::kernel::CloneObjectMode::Share => parent_mm_id,
+            crate::kernel::CloneObjectMode::Copy => crate::kernel::MmId::from_registry_allocation(
+                std::num::NonZeroU64::new(2).expect("nonzero synthetic child MM id"),
+            ),
+        };
+        let prepared_mm = self
+            .prepare_fork_mm(parent_mm_id, child_mm_id, mm_mode)
+            .unwrap_or_else(|error| {
+                tracing::error!(?error, "dispatcher fork preparation failed");
+                std::process::abort()
+            });
+        self.fork_clone_with_prepared_mm(
+            parent_mm_id,
+            child_mm_id,
+            parent_guest_pid,
+            child_guest_pid,
+            prepared_mm,
+        )
+        .unwrap_or_else(|_| {
+            tracing::error!("fork_clone_in_process_with_mm_mode stale revision");
+            std::process::abort()
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_current_mm_for_test(&self, replacement: Arc<DispatchMmAuthority>) {
+        self.mm_binding.current.store(replacement);
     }
 
     /// Apply Linux's process-exit fd lifetime at the HvPatch process boundary.
@@ -4693,14 +4881,30 @@ impl SyscallDispatcher {
     /// succeeds.
     pub fn set_address_space_regions(&self, regions: Vec<ProcMapsEntry>) {
         let _vma_dispatch = self.begin_vma_dispatch();
-        self.mem().lock().address_space_regions = Some(regions);
+        let mem_authority = self.mem();
+        let mut mem = mem_authority.lock();
+        let layout = mem.layout;
+        let brk_current = mem.brk_current;
+        let file_mappings = mem.core_file_mappings.clone();
+        mem.semantic_vmas =
+            mem::semantic_vmas_from_boot_regions(&regions, &file_mappings, layout, brk_current);
+        mem.address_space_regions = Some(regions);
     }
 
     pub(crate) fn set_address_space_file_mappings(
         &self,
         mappings: Vec<crate::core_dump::FileMapping>,
     ) {
-        self.mem().lock().core_file_mappings = mappings;
+        let _vma_dispatch = self.begin_vma_dispatch();
+        let mem_authority = self.mem();
+        let mut mem = mem_authority.lock();
+        let layout = mem.layout;
+        let brk_current = mem.brk_current;
+        if let Some(regions) = &mem.address_space_regions {
+            mem.semantic_vmas =
+                mem::semantic_vmas_from_boot_regions(regions, &mappings, layout, brk_current);
+        }
+        mem.core_file_mappings = mappings;
     }
 
     /// Publish a replacement image's complete dispatcher memory generation.
@@ -4724,6 +4928,10 @@ impl SyscallDispatcher {
             .with_vma_revision(authority.mem.revision_publisher());
         let mut mem = authority.mem.lock();
         mem.reset_for_execve();
+        let layout = mem.layout;
+        let brk_current = mem.brk_current;
+        mem.semantic_vmas =
+            mem::semantic_vmas_from_boot_regions(&regions, &file_mappings, layout, brk_current);
         mem.address_space_regions = Some(regions);
         mem.linux_auxv_image = auxv;
         mem.core_file_mappings = file_mappings;

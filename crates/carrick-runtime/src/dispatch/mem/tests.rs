@@ -609,6 +609,8 @@ where
         sharing: ProcMapSharing::Private,
         path: String::new(),
         file_page_offset: None,
+        droppable: false,
+        semantic_vmas: None,
         locked: None,
         resident: false,
         bus_fault: None,
@@ -3401,6 +3403,10 @@ fn mremap_boot_heap_fallback_accepts_live_prefix_and_rejects_hidden_suffix() {
     const SYS_MREMAP: u64 = 216;
     let mut dispatcher = SyscallDispatcher::new();
     let layout = dispatcher.mem().lock().layout;
+    // Boot publication derives the canonical semantic heap VMA from the live
+    // break. Set the fixture's break first instead of mutating `brk_current`
+    // behind that authority after publication.
+    dispatcher.mem().lock().brk_current = layout.heap_base + (2 * LINUX_PAGE_SIZE);
     dispatcher.set_address_space_regions(vec![ProcMapsEntry {
         start: layout.heap_base,
         end: layout.heap_base + layout.heap_size,
@@ -3410,7 +3416,6 @@ fn mremap_boot_heap_fallback_accepts_live_prefix_and_rejects_hidden_suffix() {
         sharing: ProcMapSharing::Private,
         path: "hidden-heap-backing".into(),
     }]);
-    dispatcher.mem().lock().brk_current = layout.heap_base + (2 * LINUX_PAGE_SIZE);
     let mut memory =
         ProtectionTrackingMemory::new(layout.heap_base, (4 * LINUX_PAGE_SIZE) as usize);
     let reporter = CompatReporter::default();
@@ -3945,6 +3950,8 @@ fn native16k_rejects_write_exec_alias_mprotect() {
         sharing: ProcMapSharing::Private,
         path: String::new(),
         file_page_offset: None,
+        droppable: false,
+        semantic_vmas: None,
         locked: None,
         resident: false,
         bus_fault: None,
@@ -3995,6 +4002,8 @@ fn committed_high_alias_mprotect_readonly_edits_guest_page_tables() {
         sharing: ProcMapSharing::Shared,
         path: "/tmp/mprotect03".to_owned(),
         file_page_offset: Some(0),
+        droppable: false,
+        semantic_vmas: None,
         locked: None,
         resident: true,
         bus_fault: None,
@@ -4042,6 +4051,8 @@ fn committed_high_alias_mprotect_reports_backend_edit_failure() {
         sharing: ProcMapSharing::Shared,
         path: "/tmp/mprotect03-failure".to_owned(),
         file_page_offset: Some(0),
+        droppable: false,
+        semantic_vmas: None,
         locked: None,
         resident: true,
         bus_fault: None,
@@ -4240,6 +4251,8 @@ fn native16k_allows_private_alias_write_exec_for_translation_backend() {
         sharing: ProcMapSharing::Private,
         path: String::new(),
         file_page_offset: None,
+        droppable: false,
+        semantic_vmas: None,
         locked: None,
         resident: false,
         bus_fault: None,
@@ -4586,6 +4599,7 @@ fn guest_vma_occupancy_excludes_hidden_arenas_but_includes_live_ranges() {
     let dispatcher = SyscallDispatcher::new();
     let layout = dispatcher.mem().lock().layout;
     const BOOT: u64 = 0x20_0000_0000;
+    dispatcher.mem().lock().brk_current = layout.heap_base + LINUX_PAGE_SIZE;
     dispatcher.set_address_space_regions(vec![
         ProcMapsEntry {
             start: layout.heap_base,
@@ -4615,7 +4629,6 @@ fn guest_vma_occupancy_excludes_hidden_arenas_but_includes_live_ranges() {
             path: "boot-text".into(),
         },
     ]);
-    dispatcher.mem().lock().brk_current = layout.heap_base + LINUX_PAGE_SIZE;
     dispatcher.record_dynamic_mapping(
         layout.mmap_base + (2 * LINUX_PAGE_SIZE),
         LINUX_PAGE_SIZE,
@@ -4664,6 +4677,7 @@ fn guest_vma_occupancy_excludes_hidden_arenas_but_includes_live_ranges() {
 fn core_vma_projection_subtracts_map_fixed_replacement_from_live_heap() {
     let dispatcher = SyscallDispatcher::new();
     let layout = dispatcher.mem().lock().layout;
+    dispatcher.mem().lock().brk_current = layout.heap_base + (2 * LINUX_PAGE_SIZE);
     dispatcher.set_address_space_regions(vec![ProcMapsEntry {
         start: layout.heap_base,
         end: layout.heap_base + layout.heap_size,
@@ -4673,7 +4687,6 @@ fn core_vma_projection_subtracts_map_fixed_replacement_from_live_heap() {
         sharing: ProcMapSharing::Private,
         path: "heap-backing".into(),
     }]);
-    dispatcher.mem().lock().brk_current = layout.heap_base + (2 * LINUX_PAGE_SIZE);
     dispatcher.record_dynamic_mapping(
         layout.heap_base,
         LINUX_PAGE_SIZE,
@@ -5890,6 +5903,8 @@ fn replacement_commit_trims_every_predecessor_classification_to_prefix_and_suffi
         sharing: ProcMapSharing::Private,
         path: "replacement".into(),
         file_page_offset: None,
+        droppable: false,
+        semantic_vmas: None,
         locked: None,
         resident: false,
         bus_fault: None,
@@ -5965,6 +5980,8 @@ fn core_file_provenance_keeps_mmap_offset_and_excludes_anonymous_exec() {
         sharing: ProcMapSharing::Private,
         path: "/tmp/nonzero-map".to_owned(),
         file_page_offset: Some(3),
+        droppable: false,
+        semantic_vmas: None,
         locked: None,
         resident: true,
         bus_fault: None,
@@ -5981,6 +5998,8 @@ fn core_file_provenance_keeps_mmap_offset_and_excludes_anonymous_exec() {
         sharing: ProcMapSharing::Private,
         path: String::new(),
         file_page_offset: None,
+        droppable: false,
+        semantic_vmas: None,
         locked: None,
         resident: true,
         bus_fault: None,
@@ -6016,6 +6035,8 @@ fn host_alias_inventory_commits_trims_and_fork_clones_exact_ranges() {
         sharing: ProcMapSharing::Shared,
         path: String::new(),
         file_page_offset: None,
+        droppable: false,
+        semantic_vmas: None,
         locked: None,
         resident: false,
         bus_fault: None,
@@ -6105,6 +6126,8 @@ fn host_alias_abort_preserves_replaced_vma_lock_residency_bus_and_seal_metadata(
         sharing: ProcMapSharing::Shared,
         path: "replacement".to_string(),
         file_page_offset: None,
+        droppable: false,
+        semantic_vmas: None,
         locked: None,
         resident: false,
         bus_fault: None,
@@ -6170,6 +6193,8 @@ fn pending_host_alias_transaction_drop_aborts_and_notifies_waiters() {
         sharing: ProcMapSharing::Private,
         path: String::new(),
         file_page_offset: None,
+        droppable: false,
+        semantic_vmas: None,
         locked: None,
         resident: false,
         bus_fault: None,
@@ -6216,6 +6241,8 @@ fn dropping_unconsumed_host_alias_outcome_closes_fd_and_aborts_transaction() {
         sharing: ProcMapSharing::Shared,
         path: String::new(),
         file_page_offset: None,
+        droppable: false,
+        semantic_vmas: None,
         locked: None,
         resident: false,
         bus_fault: None,
@@ -6268,6 +6295,8 @@ fn installing_host_alias_blocks_sibling_mapping_dispatch_until_resolution() {
         sharing: ProcMapSharing::Private,
         path: String::new(),
         file_page_offset: None,
+        droppable: false,
+        semantic_vmas: None,
         locked: None,
         resident: false,
         bus_fault: None,
@@ -6865,4 +6894,115 @@ fn core_maps_keep_guest_visible_neighbours_of_the_kernel_hole() {
 
     let maps = project_core_maps(&mem);
     assert_eq!(maps.len(), 3, "nothing outside the kernel hole is dropped");
+}
+
+fn test_semantic_vma(
+    start: u64,
+    end: u64,
+    fork_policy: carrick_abi::VmaForkPolicy,
+    droppable: bool,
+) -> SemanticVma {
+    SemanticVma {
+        start,
+        end,
+        read: true,
+        write: true,
+        execute: false,
+        provenance: VmaBackingProvenance::PrivateAnonymous,
+        fork_policy,
+        droppable,
+        path: "[mremap-policy]".to_owned(),
+        file_page_offset: None,
+    }
+}
+
+fn dontfork_policy() -> carrick_abi::VmaForkPolicy {
+    carrick_abi::VmaForkPolicy {
+        copy: carrick_abi::VmaForkCopyPolicy::Omit,
+        child_contents: carrick_abi::VmaForkChildPolicy::Preserve,
+    }
+}
+
+fn wipeonfork_policy() -> carrick_abi::VmaForkPolicy {
+    carrick_abi::VmaForkPolicy {
+        copy: carrick_abi::VmaForkCopyPolicy::Inherit,
+        child_contents: carrick_abi::VmaForkChildPolicy::ZeroInChild,
+    }
+}
+
+#[test]
+fn mremap_fork_semantics_preserve_splits_across_move_and_grow() {
+    let source = [
+        test_semantic_vma(0x1000, 0x2000, carrick_abi::VmaForkPolicy::DEFAULT, false),
+        test_semantic_vma(0x2000, 0x3000, dontfork_policy(), true),
+        test_semantic_vma(0x3000, 0x5000, wipeonfork_policy(), false),
+    ];
+    let semantics =
+        MremapForkSemantics::capture(&source, 0x1000, 0x4000).expect("source is totally covered");
+
+    let moved = semantics
+        .project(0x9000, 0x6000)
+        .expect("move and grow are representable");
+    assert_eq!(
+        moved
+            .iter()
+            .map(|vma| (vma.start, vma.end, vma.fork_policy, vma.droppable))
+            .collect::<Vec<_>>(),
+        vec![
+            (0x9000, 0xa000, carrick_abi::VmaForkPolicy::DEFAULT, false),
+            (0xa000, 0xb000, dontfork_policy(), true),
+            (0xb000, 0xf000, wipeonfork_policy(), false),
+        ]
+    );
+}
+
+#[test]
+fn mremap_fork_semantics_preserve_splits_across_shrink() {
+    let source = [
+        test_semantic_vma(0x1000, 0x3000, dontfork_policy(), true),
+        test_semantic_vma(0x3000, 0x5000, wipeonfork_policy(), false),
+    ];
+    let semantics =
+        MremapForkSemantics::capture(&source, 0x1000, 0x4000).expect("source is totally covered");
+
+    let shrunk = semantics
+        .project(0x1000, 0x3000)
+        .expect("shrink is representable");
+    assert_eq!(
+        shrunk
+            .iter()
+            .map(|vma| (vma.start, vma.end, vma.fork_policy, vma.droppable))
+            .collect::<Vec<_>>(),
+        vec![
+            (0x1000, 0x3000, dontfork_policy(), true),
+            (0x3000, 0x4000, wipeonfork_policy(), false),
+        ]
+    );
+}
+
+#[test]
+fn host_alias_map_droppable_reaches_keeponfork_rejection_metadata() {
+    let dispatcher = SyscallDispatcher::new();
+    dispatcher.commit_host_alias_mmap(HostAliasMmapCommit {
+        start: 0x9000,
+        len: 0x1000,
+        prot: LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+        sharing: ProcMapSharing::Private,
+        path: String::new(),
+        file_page_offset: None,
+        droppable: true,
+        semantic_vmas: None,
+        locked: None,
+        resident: false,
+        bus_fault: None,
+        write_sealed_shared: false,
+        read_only_shared_file: false,
+        secretmem: false,
+        writable_memfd: None,
+        shared_file_alias: None,
+    });
+
+    let metadata = dispatcher.madvise_range_meta(0x9000, 0xa000);
+    assert!(metadata.fully_mapped);
+    assert!(metadata.any_droppable);
 }

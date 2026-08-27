@@ -842,18 +842,169 @@ pub struct GuestEntryRegs {
     pub tls: Option<u64>,
 }
 
+/// Single 4 KiB leaf disposition for fork projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ForkLeafDisposition {
+    Preserve,
+    Zero,
+    Omit,
+}
+
+/// A 4 KiB-aligned semantic range covering live or omitted semantic leaves.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ForkProjectionRange {
+    pub va: u64,
+    pub len: u64,
+    pub disposition: ForkLeafDisposition,
+}
+
+/// Type-bound fork projection plan ensuring MM sharing mode and projection ranges
+/// cannot disagree.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ForkProjectionPlan {
+    Shared {
+        parent_mm: u64,
+        ranges: std::sync::Arc<[ForkProjectionRange]>,
+    },
+    Copied {
+        parent_mm: u64,
+        child_mm: u64,
+        ranges: std::sync::Arc<[ForkProjectionRange]>,
+    },
+}
+
+impl ForkProjectionPlan {
+    pub fn is_shared(&self) -> bool {
+        matches!(self, Self::Shared { .. })
+    }
+
+    pub fn ranges(&self) -> &std::sync::Arc<[ForkProjectionRange]> {
+        match self {
+            Self::Shared { ranges, .. } | Self::Copied { ranges, .. } => ranges,
+        }
+    }
+
+    pub fn parent_mm(&self) -> u64 {
+        match self {
+            Self::Shared { parent_mm, .. } | Self::Copied { parent_mm, .. } => *parent_mm,
+        }
+    }
+
+    pub fn child_mm(&self) -> u64 {
+        match self {
+            Self::Shared { parent_mm, .. } => *parent_mm,
+            Self::Copied { child_mm, .. } => *child_mm,
+        }
+    }
+}
+
+/// Look up the fork projection disposition for a single 4 KiB page VA.
+/// Returns None if the VA is not covered by any semantic VMA (i.e. absent/unmapped).
+pub fn lookup_fork_projection(
+    ranges: &[ForkProjectionRange],
+    page_va: u64,
+) -> Option<ForkLeafDisposition> {
+    let idx = ranges.partition_point(|r| r.va <= page_va);
+    if idx > 0 {
+        let r = &ranges[idx - 1];
+        if r.va.checked_add(r.len).is_some_and(|end| page_va < end) {
+            return Some(r.disposition);
+        }
+    }
+    None
+}
+
+/// Error returned when fork projection validation fails.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ForkProjectionError {
+    ZeroLength,
+    Unaligned,
+    Overflow,
+    OverlappingOrUnsorted,
+    IncompleteCoverage,
+}
+
+impl std::fmt::Display for ForkProjectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroLength => write!(f, "zero length projection range"),
+            Self::Unaligned => write!(f, "unaligned projection range"),
+            Self::Overflow => write!(f, "projection range overflow"),
+            Self::OverlappingOrUnsorted => write!(f, "overlapping or unsorted projection ranges"),
+            Self::IncompleteCoverage => write!(f, "projection does not exactly cover live VMAs"),
+        }
+    }
+}
+
+/// Validate a total fork projection against the exact live semantic VMA ranges.
+/// Holes between live VMAs remain absent; each live VMA must have one exact,
+/// typed projection range, so missing coverage can never default to Preserve.
+pub fn validate_total_fork_projection(
+    ranges: &[ForkProjectionRange],
+    live_vmas: &[(u64, u64)],
+) -> Result<(), ForkProjectionError> {
+    validate_fork_projection(ranges)?;
+    if ranges.len() != live_vmas.len() {
+        return Err(ForkProjectionError::IncompleteCoverage);
+    }
+    for (range, &(start, end)) in ranges.iter().zip(live_vmas) {
+        let len = end
+            .checked_sub(start)
+            .filter(|len| *len != 0)
+            .ok_or(ForkProjectionError::ZeroLength)?;
+        if range.va != start || range.len != len {
+            return Err(ForkProjectionError::IncompleteCoverage);
+        }
+    }
+    Ok(())
+}
+
+impl std::error::Error for ForkProjectionError {}
+
+/// Validate that a fork projection range slice is sorted, non-overlapping,
+/// 4 KiB aligned, and has nonzero lengths.
+pub fn validate_fork_projection(ranges: &[ForkProjectionRange]) -> Result<(), ForkProjectionError> {
+    let mut prev_end = 0u64;
+    for (i, r) in ranges.iter().enumerate() {
+        if r.len == 0 {
+            return Err(ForkProjectionError::ZeroLength);
+        }
+        if r.va & 0xFFF != 0 || r.len & 0xFFF != 0 {
+            return Err(ForkProjectionError::Unaligned);
+        }
+        let end =
+            r.va.checked_add(r.len)
+                .ok_or(ForkProjectionError::Overflow)?;
+        if i > 0 && r.va < prev_end {
+            return Err(ForkProjectionError::OverlappingOrUnsorted);
+        }
+        prev_end = end;
+    }
+    Ok(())
+}
+
 /// Complete AArch64 input for materializing a logical process inside one
 /// persistent backend VM. The root-slot fields describe the current HVPatch
 /// execution adapter; other backends retain the default unsupported method.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ProcessForkRequest {
     pub entry: GuestEntryRegs,
     pub child_ttbr0: u64,
     pub root_slot_base: u64,
     pub root_slot_size: u64,
-    pub shares_mm: bool,
+    pub plan: ForkProjectionPlan,
     pub child_tid: ThreadId,
     pub forking_tid: ThreadId,
+}
+
+impl ProcessForkRequest {
+    pub fn shares_mm(&self) -> bool {
+        self.plan.is_shared()
+    }
+
+    pub fn projection_plan(&self) -> &std::sync::Arc<[ForkProjectionRange]> {
+        self.plan.ranges()
+    }
 }
 
 /// Minimal architecture-neutral register set recorded when a guest thread
