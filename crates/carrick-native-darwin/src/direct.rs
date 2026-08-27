@@ -6537,13 +6537,33 @@ mod tests {
             observed, 0x1818_1818_1818_1818,
             "the dynamic instruction must read virtual guest x18"
         );
-        let patched = unsafe {
-            std::ptr::read_unaligned((address + (x18_site * 4) as u64) as usize as *const u32)
-        };
+        let site_va = address + (x18_site * 4) as u64;
+        let patched = unsafe { std::ptr::read_unaligned(site_va as usize as *const u32) };
+        // A bare `left: 0` here is unactionable, and this assertion has fired
+        // exactly once (2026-08-27, inside a whole-workspace run) and has not
+        // reproduced in 30 targeted attempts or any full-crate run since. A
+        // read of zero says the VA is not showing the published text, but not
+        // WHY: the candidates are shadow-mode publication (the patch went to
+        // the shadow, not this VA), a writable PT_LOAD replaced in place by a
+        // fresh anonymous MAP_FIXED page (which reads as zeros), and a missing
+        // publication barrier. Each leaves a different fingerprint, so capture
+        // them at the point of failure rather than paying another
+        // unreproducible cycle guessing between them.
         assert_eq!(
             patched & 0xfc00_0000,
             0x1400_0000,
-            "site branches to veneer"
+            "site branches to veneer: word={patched:#010x} at site_va={site_va:#x} \
+             (base={address:#x}, x18_site={x18_site}); shadowed={shadowed}; \
+             neighbours={neighbours:#010x?}",
+            shadowed = group.dynamic_exec_is_shadowed(address),
+            neighbours = unsafe {
+                let base = (address as usize) as *const u32;
+                [
+                    std::ptr::read_unaligned(base),
+                    std::ptr::read_unaligned(base.add(x18_site.saturating_sub(1))),
+                    std::ptr::read_unaligned(base.add(x18_site + 1)),
+                ]
+            },
         );
 
         jit_write_protect(false);
