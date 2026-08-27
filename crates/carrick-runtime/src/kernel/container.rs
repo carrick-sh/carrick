@@ -412,6 +412,11 @@ impl Container {
         &self,
         region: Arc<crate::namespace::pid::NsSharedRegion>,
     ) -> Result<(), Arc<crate::namespace::pid::NsSharedRegion>> {
+        if let Some(key) = self.pid_root() {
+            if let Ok(pid) = u32::try_from(key.id.raw()) {
+                region.set_init(pid);
+            }
+        }
         self.pid_ns.set(region)
     }
 
@@ -442,7 +447,13 @@ impl Container {
     pub(super) fn publish_pid_root(&self, key: TaskKey) -> Result<(), super::KernelError> {
         self.pid_root
             .set(key)
-            .map_err(|_| super::KernelError::ContainerRootAlreadyPublished(self.id))
+            .map_err(|_| super::KernelError::ContainerRootAlreadyPublished(self.id))?;
+        if let Some(region) = self.pid_region() {
+            if let Ok(pid) = u32::try_from(key.id.raw()) {
+                region.set_init(pid);
+            }
+        }
+        Ok(())
     }
 
     pub fn clock(&self) -> &Arc<ClockDomain> {

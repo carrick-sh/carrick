@@ -371,7 +371,6 @@ impl Runtime {
                         "all 64 arena PID namespace slots are claimed: {e:?}"
                     ))
                 })?;
-                region.set_init(std::process::id());
                 container.install_pid_ns(region).map_err(|_| {
                     RuntimeError::Configuration("pid namespace already installed".into())
                 })?;

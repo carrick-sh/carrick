@@ -336,15 +336,16 @@ impl SyscallDispatcher {
         }
     }
 
-    /// Capture the per-process identity fast-path value at an explicit Kernel
+    /// Capture the process identity snapshot published across the guest-visible
     /// boundary. The context parameter prevents lifecycle callers from silently
     /// reintroducing registry recapture even though PID itself is process-wide.
     pub(crate) fn identity_snapshot(
         &self,
-        _kernel: &crate::kernel::KernelContext,
+        kernel: &crate::kernel::KernelContext,
     ) -> IdentitySnapshot {
+        let task_id = u32::try_from(kernel.task().key().id.raw()).unwrap_or(0);
         IdentitySnapshot {
-            pid: self.identity_pid(),
+            pid: crate::namespace::pid::host_to_ns_or_self_for(kernel, task_id),
         }
     }
 
@@ -352,14 +353,20 @@ impl SyscallDispatcher {
     ///
     /// This is the only correct source for a guest-visible "my pid" field
     /// (`si_pid`, SysV `msg_lspid`/`msg_lrpid`/`shm_cpid`/`shm_lpid`, …).
-    /// NEVER reach for `crate::namespace::pid::self_ns_pid()` there: it starts
-    /// from `std::process::id()`, and under HVPatch every logical Linux process
-    /// is a thread of ONE VM carrier, so that value is identical for all of
-    /// them. `virtual_pid` is the carrier's kernel-graph task id for this exact
-    /// process, published by `bind_hvpatch_process`; the `self_ns_pid()`
-    /// fallback only runs where no kernel-graph process is bound.
     pub(crate) fn identity_pid(&self) -> u32 {
+        if let Some(pid) = crate::dispatch::resources::with_active_context(|context| {
+            let task_id = u32::try_from(context.task().key().id.raw()).unwrap_or(0);
+            crate::namespace::pid::host_to_ns_or_self_for(context, task_id)
+        }) {
+            return pid;
+        }
         if let Some(pid) = self.proc.lock().virtual_pid {
+            let container = self.installed_container();
+            if let Some(container) = container {
+                if let Some(region) = container.pid_region() {
+                    return region.host_to_ns(pid).unwrap_or(0);
+                }
+            }
             return pid;
         }
         crate::namespace::pid::self_ns_pid()
@@ -1348,6 +1355,169 @@ mod identity_snapshot_tests {
             )
             .unwrap();
         assert!(matches!(outcome, DispatchOutcome::Returned { value: 0 }));
+    }
+
+    #[test]
+    fn two_containers_in_one_carrier_both_see_init_as_pid_1_and_children_as_ns_local() {
+        use crate::kernel::{
+            ClonePlan, Container, Kernel, LaunchContext, LinuxTid, RootBootstrap, RunId,
+        };
+        use crate::namespace::pid::NsSharedRegion;
+        use carrick_abi::LinuxCloneFlags;
+        use carrick_hal::ThreadId;
+        use carrick_kernel::arena::KernelArena;
+
+        let arena = Box::leak(Box::new(KernelArena::create().expect("create test arena")));
+
+        // Container 1
+        let container1 = Arc::new(Container::new(LaunchContext::unmanaged(RunId::new(
+            "gate-alpha",
+        ))));
+        let region1 = NsSharedRegion::allocate(arena).expect("allocate region 1");
+        container1
+            .install_pid_ns(region1)
+            .expect("install region 1");
+
+        let input1 = RootBootstrap::for_reference_model(
+            4100,
+            ThreadId::synthetic_for_tests(4100),
+            "gate-alpha-init".to_owned(),
+        )
+        .expect("bootstrap input 1")
+        .with_container(Arc::clone(&container1));
+
+        let (kernel1, context1) = Kernel::bootstrap_root(input1).expect("bootstrap container 1");
+
+        // Container 2
+        let container2 = Arc::new(Container::new(LaunchContext::unmanaged(RunId::new(
+            "gate-beta",
+        ))));
+        let region2 = NsSharedRegion::allocate(arena).expect("allocate region 2");
+        container2
+            .install_pid_ns(region2)
+            .expect("install region 2");
+
+        let input2 = RootBootstrap::for_reference_model(
+            4200,
+            ThreadId::synthetic_for_tests(4200),
+            "gate-beta-init".to_owned(),
+        )
+        .expect("bootstrap input 2")
+        .with_container(Arc::clone(&container2));
+
+        let (kernel2, context2) = Kernel::bootstrap_root(input2).expect("bootstrap container 2");
+
+        let mut d1 = SyscallDispatcher::new();
+        d1.set_container(Arc::clone(&container1));
+
+        let mut d2 = SyscallDispatcher::new();
+        d2.set_container(Arc::clone(&container2));
+
+        // 1. Both containers see their own init as PID 1 through identity_snapshot (EL1 page)
+        assert_eq!(
+            d1.identity_snapshot(&context1).pid,
+            1,
+            "container 1 init must see pid 1"
+        );
+        assert_eq!(
+            d2.identity_snapshot(&context2).pid,
+            1,
+            "container 2 init must see pid 1"
+        );
+
+        // 2. Syscall 172 dispatch returns 1 for both container inits
+        let reporter = CompatReporter::default();
+        let mut mem1 = LinearMemory::new(0x1000, vec![0; 0x1000]);
+        let mut mem2 = LinearMemory::new(0x1000, vec![0; 0x1000]);
+
+        let outcome1 = d1
+            .dispatch(
+                &context1,
+                SyscallRequest::new(172, SyscallArgs::from([0; 6])),
+                &mut mem1,
+                &reporter,
+            )
+            .unwrap();
+        assert!(
+            matches!(outcome1, DispatchOutcome::Returned { value: 1 }),
+            "container 1 getpid syscall must return 1"
+        );
+
+        let outcome2 = d2
+            .dispatch(
+                &context2,
+                SyscallRequest::new(172, SyscallArgs::from([0; 6])),
+                &mut mem2,
+                &reporter,
+            )
+            .unwrap();
+        assert!(
+            matches!(outcome2, DispatchOutcome::Returned { value: 1 }),
+            "container 2 getpid syscall must return 1"
+        );
+
+        // 3. Fork in container 1 produces child with ns-local pid 2 and ppid 1
+        let plan = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
+        let reservation1 = kernel1
+            .reserve_fork(&context1, plan, "child1".to_string(), None)
+            .expect("reserve fork 1");
+        let child_id1 = reservation1.child_id();
+        let prepared1 = reservation1
+            .prepare_reference(ThreadId::synthetic_for_tests(4101))
+            .expect("prepare reference 1");
+        let _published1 = prepared1.commit().expect("publish child 1");
+        let child_context1 = kernel1
+            .context(child_id1, LinuxTid::for_task_leader(child_id1))
+            .expect("capture child context 1");
+
+        assert_eq!(
+            d1.identity_snapshot(&child_context1).pid,
+            2,
+            "container 1 child must see pid 2"
+        );
+        let child_outcome1 = d1
+            .dispatch(
+                &child_context1,
+                SyscallRequest::new(172, SyscallArgs::from([0; 6])),
+                &mut mem1,
+                &reporter,
+            )
+            .unwrap();
+        assert!(
+            matches!(child_outcome1, DispatchOutcome::Returned { value: 2 }),
+            "container 1 child getpid syscall must return 2"
+        );
+
+        // 4. Fork in container 2 produces child with ns-local pid 2 and ppid 1
+        let reservation2 = kernel2
+            .reserve_fork(&context2, plan, "child2".to_string(), None)
+            .expect("reserve fork 2");
+        let child_id2 = reservation2.child_id();
+        let prepared2 = reservation2
+            .prepare_reference(ThreadId::synthetic_for_tests(4201))
+            .expect("prepare reference 2");
+        let _published2 = prepared2.commit().expect("publish child 2");
+        let child_context2 = kernel2
+            .context(child_id2, LinuxTid::for_task_leader(child_id2))
+            .expect("capture child context 2");
+
+        assert_eq!(
+            d2.identity_snapshot(&child_context2).pid,
+            2,
+            "container 2 child must see pid 2"
+        );
+        let child_outcome2 = d2
+            .dispatch(
+                &child_context2,
+                SyscallRequest::new(172, SyscallArgs::from([0; 6])),
+                &mut mem2,
+                &reporter,
+            )
+            .unwrap();
+        assert!(
+            matches!(child_outcome2, DispatchOutcome::Returned { value: 2 }),
+            "container 2 child getpid syscall must return 2"
+        );
     }
 }
 
