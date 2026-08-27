@@ -2190,6 +2190,63 @@ fn rebuilt_vm_cell() -> &'static parking_lot::Mutex<Option<SharedVm>> {
     CELL.get_or_init(|| parking_lot::Mutex::new(None))
 }
 
+/// Carrier-lifetime HVF VM authority: the ONE `hv_vm_create` per carrier plus
+/// the five VM-global control mappings and the mailbox-slot allocator that
+/// every container's executors share (`PersistentExecutorSpec`).
+///
+/// Published by the FIRST root bring-up (`HvfVmState::take_persistent_executor_spec`),
+/// consumed by every LATER root bring-up (`HvfVmState::new_with_plan` builds
+/// the new container's root inside this VM instead of calling `hv_vm_create`,
+/// which would return `HV_BUSY`), and drained exactly once by
+/// [`destroy_persistent_vm_at_carrier_exit`]. It is never drained at a
+/// container's run terminal: containers come and go inside one VM. Readers
+/// still consult [`rebuilt_vm_cell`] first, exactly as
+/// `from_persistent_executor_spec` does, so a VM rebuilt after publication
+/// supersedes the bundle's handle.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn persistent_carrier_cell() -> &'static parking_lot::Mutex<Option<PersistentExecutorSpec>> {
+    static CELL: std::sync::OnceLock<parking_lot::Mutex<Option<PersistentExecutorSpec>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| parking_lot::Mutex::new(None))
+}
+
+/// Signalled by `take_persistent_executor_spec` when the first root publishes
+/// the carrier bundle; paired with `persistent_carrier_cell`'s mutex.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn carrier_published() -> &'static parking_lot::Condvar {
+    static PUBLISHED: parking_lot::Condvar = parking_lot::Condvar::new();
+    &PUBLISHED
+}
+
+/// Serializes the "does this carrier own a VM yet?" decision across roots
+/// booting at the same time. Held across the FIRST root's `hv_vm_create`, so
+/// a second root arriving mid-create observes `carrier_vm_live()` and waits
+/// for the published bundle instead of issuing its own `hv_vm_create`
+/// (which would return `HV_BUSY`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn carrier_root_boot_gate() -> &'static parking_lot::Mutex<()> {
+    static GATE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    &GATE
+}
+
+/// Bound on how long a later root waits for the first root to publish the
+/// carrier bundle (publication happens at that root's persistent-lane start,
+/// before any guest instruction runs).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const CARRIER_PUBLISH_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether this carrier currently owns a live HVF VM. Set on the single create
+/// funnel's success (`create_vm_with_admission`), cleared by
+/// `record_vm_released` after a successful `hv_vm_destroy`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+static CARRIER_VM_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True while this carrier owns a live HVF VM.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn carrier_vm_live() -> bool {
+    CARRIER_VM_LIVE.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// How guest-visible sharing maps onto the host and HVPatch's one VM.
 ///
 /// `ForkSharedAnonymous` deliberately shares only the host backing and explicit
@@ -4125,21 +4182,37 @@ fn record_vm_resident() {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn record_vm_released() {
     crate::probes::vm_lifecycle(3, -1);
+    CARRIER_VM_LIVE.store(false, std::sync::atomic::Ordering::Release);
     if !atomic_permit_enabled() {
         return;
     }
     vm_residency_region().release_token(VM_RESIDENCY_LOCAL_KEY);
 }
 
-/// Explicitly retire the one persistent HVPatch VM after every guest vCPU has
-/// left the threaded loop. The VM wrapper is `ManuallyDrop`, so relying on host
-/// process death would leave no authoritative destroy-success boundary.
-pub fn destroy_persistent_vm_at_run_terminal() -> Result<(), TrapError> {
+/// Retire the one persistent HVPatch VM when the CARRIER exits — never at a
+/// container's run terminal. Containers boot, run and retire inside this VM;
+/// the VM wrapper is `ManuallyDrop`, so relying on host process death would
+/// leave no authoritative destroy-success boundary for the lifecycle ledger.
+///
+/// Idempotent and honest about "nothing to do": a carrier that never created
+/// a VM (image resolution failed, an entrypoint resolved to 127, or the second
+/// call after a successful destroy) records no lifecycle event at all.
+pub fn destroy_persistent_vm_at_carrier_exit() -> Result<(), TrapError> {
+    if !carrier_vm_live() {
+        return Ok(());
+    }
+    // Drop the carrier's control-mapping authority first: `PersistentCarrierMappings`'s
+    // `Drop` unmaps the five fixed stage-2 extents, which must precede
+    // `hv_vm_destroy`. This only releases the cell's `Arc`; every executor pool
+    // holding another `Arc` must already have been shut down by its container's
+    // run terminal (`pool_shutdown` in `run_threaded_loop_inner`) — a retained
+    // `Arc` leaves the extents mapped until `hv_vm_destroy` tears them down.
+    drop(persistent_carrier_cell().lock().take());
     crate::probes::vm_lifecycle(2, -1);
     let rc = unsafe { inventory_hv_vm_destroy() };
     if rc != 0 {
         return Err(TrapError::Hypervisor(format!(
-            "terminal hv_vm_destroy rc={rc:#x}"
+            "carrier-exit hv_vm_destroy rc={rc:#x}"
         )));
     }
     record_vm_released();
@@ -4428,6 +4501,7 @@ fn create_vm_with_admission(
     }) {
         Ok(vm) => {
             record_vm_resident();
+            CARRIER_VM_LIVE.store(true, std::sync::atomic::Ordering::Release);
             crate::probes::vm_lifecycle(1, admission.probe_code());
             Ok((vm, permit))
         }
@@ -6656,6 +6730,85 @@ impl ThreadMappingDesc {
             owner_generation: self.owner_generation,
         }
     }
+}
+
+/// A root booting inside a live carrier must carry the SAME control image the
+/// carrier installed: identical geometry for all five fixed mappings, and
+/// identical bytes for the three code pages (EL0 trampoline, EL1 vectors, EL1
+/// maintenance). The mailbox arena and the carrier maintenance root are live
+/// data, so only their geometry is compared. Divergence is a build/config
+/// error, never something to paper over by remapping.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn audit_plan_against_installed_carrier(
+    plan: &GuestMappingPlan,
+    carrier: &PersistentCarrierMappings,
+) -> Result<(), TrapError> {
+    let code_pages = [
+        carrick_mem::memory::LINUX_EL0_TRAMPOLINE_BASE,
+        carrick_mem::memory::LINUX_EL1_VECTORS_BASE,
+        carrick_mem::memory::LINUX_EL1_MAINT_BASE,
+    ];
+    let mut seen = 0_usize;
+    for mapping in plan
+        .mappings
+        .iter()
+        .filter(|mapping| is_persistent_executor_carrier_guest_mapping(mapping))
+    {
+        seen += 1;
+        let installed = carrier
+            .mappings
+            .iter()
+            .find(|installed| installed.start == mapping.guest_start)
+            .ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "carrier has no control mapping at 0x{:x}",
+                    mapping.guest_start
+                ))
+            })?;
+        if installed.end.saturating_sub(installed.start) != mapping.mapped_size {
+            return Err(TrapError::Hypervisor(format!(
+                "carrier control mapping 0x{:x} size {} differs from plan size {}",
+                mapping.guest_start,
+                installed.end.saturating_sub(installed.start),
+                mapping.mapped_size
+            )));
+        }
+        if code_pages.contains(&mapping.guest_start) {
+            let payload = usize::try_from(mapping.payload_size)
+                .map_err(|_| TrapError::MappingTooLarge(mapping.payload_size))?;
+            let offset = usize::try_from(mapping.offset_in_mapping)
+                .map_err(|_| TrapError::MappingTooLarge(mapping.offset_in_mapping))?;
+            let planned = mapping.image.get(offset..offset + payload).ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "carrier control image at 0x{:x} is shorter than its payload",
+                    mapping.guest_start
+                ))
+            })?;
+            let live = carrier
+                .host_pointer(mapping.guest_start + mapping.offset_in_mapping, payload)
+                .ok_or_else(|| {
+                    TrapError::Hypervisor(format!(
+                        "carrier control mapping 0x{:x} payload is not host-visible",
+                        mapping.guest_start
+                    ))
+                })?;
+            // SAFETY: `host_pointer` proved `[ptr, ptr+payload)` lies inside one
+            // live carrier mapping; the code pages are immutable after install.
+            let live = unsafe { std::slice::from_raw_parts(live.as_ptr(), payload) };
+            if live != planned {
+                return Err(TrapError::Hypervisor(format!(
+                    "carrier control code at 0x{:x} differs from this image's bytes",
+                    mapping.guest_start
+                )));
+            }
+        }
+    }
+    if seen != 5 {
+        return Err(TrapError::Hypervisor(format!(
+            "root image carries {seen} carrier control mappings, expected 5"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -11774,12 +11927,77 @@ impl HvfVmState {
     ) -> Result<(HvfVmState, applevisor::vcpu::Vcpu, MailboxBinding), TrapError> {
         use applevisor::prelude::*;
 
-        let (vm, permit) = create_vm_with_admission(VmCreateAdmission::Initial)?;
-        let vcpu = create_vcpu_with_permit(&vm, permit)?;
+        // Carrier reuse: when this carrier already owns a VM, a new container's
+        // root boots INSIDE it. Its image is placed the way `execve_rebuild`
+        // places a replacement image (global-frame stage-2 leases + rebased
+        // stage-1 tables), so two live roots never collide on identity IPAs,
+        // and the five carrier control mappings are shared, not re-mapped.
+        //
+        // The boot gate is held across the first root's `hv_vm_create`, so two
+        // roots racing here cannot both create (HV_BUSY for the loser); a root
+        // that finds the VM live but the bundle not yet published waits for
+        // the first root's `take_persistent_executor_spec`.
+        let boot_gate = carrier_root_boot_gate().lock();
+        let carrier: Option<PersistentExecutorSpec> = if carrier_vm_live() {
+            let mut cell = persistent_carrier_cell().lock();
+            while cell.is_none() {
+                if carrier_published()
+                    .wait_for(&mut cell, CARRIER_PUBLISH_WAIT)
+                    .timed_out()
+                {
+                    return Err(TrapError::Hypervisor(
+                        "carrier VM is live but its executor bundle was never published".to_owned(),
+                    ));
+                }
+            }
+            cell.clone()
+        } else {
+            None
+        };
+        let mut global_plan = match &carrier {
+            Some(spec) => {
+                spec.carrier_mappings.audit()?;
+                audit_plan_against_installed_carrier(plan, &spec.carrier_mappings)?;
+                Some(prepare_global_exec_plan(plan, None)?)
+            }
+            None => None,
+        };
+        let (vm, permit, syscall_transport, mailbox_slots, carrier_mappings) = match &carrier {
+            Some(spec) => (
+                // A VM rebuilt since publication supersedes the bundle's handle,
+                // exactly as `from_persistent_executor_spec` reads it.
+                rebuilt_vm_cell()
+                    .lock()
+                    .clone()
+                    .unwrap_or_else(|| spec.vm.clone()),
+                None,
+                spec.syscall_transport,
+                std::sync::Arc::clone(&spec.mailbox_slots),
+                Some(std::sync::Arc::clone(&spec.carrier_mappings)),
+            ),
+            None => {
+                let (vm, permit) = create_vm_with_admission(VmCreateAdmission::Initial)?;
+                let syscall_transport = HvfSyscallTransport::from_env()
+                    .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
+                (
+                    vm,
+                    permit,
+                    syscall_transport,
+                    std::sync::Arc::new(MailboxSlotAllocator::new()),
+                    None,
+                )
+            }
+        };
+        drop(boot_gate);
+        let vcpu = if carrier.is_some() {
+            // Existing-VM vCPU: admitted by the in-process scheduler, like a
+            // thread sibling (see `create_vcpu`).
+            create_vcpu(&vm)?
+        } else {
+            create_vcpu_with_permit(&vm, permit)?
+        };
         enable_el0_counter_access(vcpu.id());
 
-        let syscall_transport = HvfSyscallTransport::from_env()
-            .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
         let mut state = HvfVmState {
             _vm: std::mem::ManuallyDrop::new(vm),
             task: HvfTaskState {
@@ -11811,29 +12029,81 @@ impl HvfVmState {
                 cow_rollback_scratch: None,
                 registration: None,
             },
-            carrier_mappings: None,
+            carrier_mappings,
             reclaim_authority: ReclaimParkAuthority::Live,
-            mailbox_slots: std::sync::Arc::new(MailboxSlotAllocator::new()),
+            mailbox_slots,
             syscall_transport,
             vcpu_id: vcpu.id(),
             vcpu_handle: vcpu.get_handle(),
         };
         state.seed_readonly_spans_from_plan(plan);
 
-        for mapping in &plan.mappings {
-            #[cfg(feature = "trace-hvf")]
-            eprintln!(
-                "MAP guest_start=0x{:x} mapped_size=0x{:x} payload_size=0x{:x} perms=r{}w{}x{}",
-                mapping.guest_start,
-                mapping.mapped_size,
-                mapping.payload_size,
-                if mapping.perms.read { '+' } else { '-' },
-                if mapping.perms.write { '+' } else { '-' },
-                if mapping.perms.execute { '+' } else { '-' },
-            );
-            let region = map_region_raw(mapping, false)?;
-            state.mappings.push(region);
-        }
+        // Reuse lane: map the relocated image with owning stage-2 leases (the
+        // exec placement); first-boot lane: the identity `map_region_raw`
+        // placement. `plan` is rebound so the register programming below reads
+        // the relocated stage-1 table root (guest VAs are unchanged).
+        let plan: &GuestMappingPlan = match global_plan.as_mut() {
+            Some(GlobalExecPlan {
+                plan: relocated,
+                stage2_leases,
+            }) => {
+                for mapping in relocated.mappings.iter().filter(|mapping| {
+                    !is_sparse_hvpatch_mmap_mapping(mapping)
+                        && !is_persistent_executor_carrier_guest_mapping(mapping)
+                }) {
+                    let key = (mapping.ipa_start, mapping.mapped_size);
+                    let mut lease = stage2_leases.remove(&key).ok_or_else(|| {
+                        TrapError::Hypervisor(format!(
+                            "carrier root mapping IPA 0x{:x} size {} has no owning lease",
+                            key.0, key.1
+                        ))
+                    })?;
+                    let mut region = prepare_exec_region_raw(mapping)?;
+                    let install = exec_stage2_install(mapping, &region);
+                    let rc = unsafe {
+                        inventory_hv_vm_map(
+                            install.host.cast(),
+                            install.ipa,
+                            install.size,
+                            install.perms,
+                        )
+                    };
+                    if rc != 0 {
+                        return Err(TrapError::Hypervisor(format!(
+                            "map carrier root IPA 0x{:x} size {} failed: 0x{rc:x}",
+                            install.ipa, install.size
+                        )));
+                    }
+                    lease.mark_mapped();
+                    region.stage2_lease = Some(lease);
+                    state.mappings.push(region);
+                }
+                if !stage2_leases.is_empty() {
+                    return Err(TrapError::Hypervisor(format!(
+                        "carrier root left {} reserved stage-2 leases unmaterialized",
+                        stage2_leases.len()
+                    )));
+                }
+                relocated
+            }
+            None => {
+                for mapping in &plan.mappings {
+                    #[cfg(feature = "trace-hvf")]
+                    eprintln!(
+                        "MAP guest_start=0x{:x} mapped_size=0x{:x} payload_size=0x{:x} perms=r{}w{}x{}",
+                        mapping.guest_start,
+                        mapping.mapped_size,
+                        mapping.payload_size,
+                        if mapping.perms.read { '+' } else { '-' },
+                        if mapping.perms.write { '+' } else { '-' },
+                        if mapping.perms.execute { '+' } else { '-' },
+                    );
+                    let region = map_region_raw(mapping, false)?;
+                    state.mappings.push(region);
+                }
+                plan
+            }
+        };
 
         // Start PC: if an EL0 entry trampoline is installed, the vCPU begins
         // at the trampoline page (in EL1h) and executes the single `eret`
@@ -11982,7 +12252,12 @@ impl HvfVmState {
         // CNTVCT_EL0 in userspace. Best-effort: if the page isn't mapped (a load
         // path without with_vdso) just skip — the guest falls back to syscalls.
         state.populate_vdso_data_page();
-        let mailbox = state.allocate_mailbox_for_vcpu(&vcpu)?;
+        let mailbox = match &carrier {
+            // Shared arena, shared allocator: the slot is unique across every
+            // container's vCPUs in this VM.
+            Some(spec) => Self::allocate_persistent_mailbox_for_vcpu(spec, &vcpu)?,
+            None => state.allocate_mailbox_for_vcpu(&vcpu)?,
+        };
         Ok((state, vcpu, mailbox))
     }
 }
@@ -16611,19 +16886,41 @@ impl HvfVmState {
     pub(crate) fn take_persistent_executor_spec(
         &mut self,
     ) -> Result<PersistentExecutorSpec, TrapError> {
-        if self.carrier_mappings.is_some() {
-            return Err(TrapError::Hypervisor(
-                "persistent executor carrier authority was already extracted".to_owned(),
-            ));
+        if let Some(carrier_mappings) = self.carrier_mappings.as_ref() {
+            // A later container's root was built INSIDE the carrier VM
+            // (`new_with_plan` reuse lane) and already shares the carrier's
+            // control-mapping authority: hand back the carrier's own bundle.
+            // Any other holder (a worker) is still refused as before.
+            let cell = persistent_carrier_cell().lock();
+            return match cell.as_ref() {
+                Some(spec) if std::sync::Arc::ptr_eq(&spec.carrier_mappings, carrier_mappings) => {
+                    Ok(spec.clone())
+                }
+                _ => Err(TrapError::Hypervisor(
+                    "persistent executor carrier authority was already extracted".to_owned(),
+                )),
+            };
         }
         let carrier_mappings =
             std::sync::Arc::new(PersistentCarrierMappings::extract(&mut self.mappings)?);
-        Ok(PersistentExecutorSpec {
+        let spec = PersistentExecutorSpec {
             vm: (*self._vm).clone(),
             carrier_mappings,
             mailbox_slots: std::sync::Arc::clone(&self.mailbox_slots),
             syscall_transport: self.syscall_transport,
-        })
+        };
+        // First root of this carrier: publish the VM-global bundle for every
+        // later container's root bring-up and wake any root parked on it. The
+        // boot gate in `new_with_plan` guarantees only ONE first root exists,
+        // so the cell is empty here; the guard is defensive.
+        {
+            let mut cell = persistent_carrier_cell().lock();
+            if cell.is_none() {
+                *cell = Some(spec.clone());
+            }
+        }
+        carrier_published().notify_all();
+        Ok(spec)
     }
 
     fn allocate_persistent_mailbox_for_vcpu(
@@ -19546,6 +19843,37 @@ fn reclaim_park_authority_contains_no_task_snapshot() {
     authority.mark_live_after_recreate().unwrap();
     assert_eq!(authority, ReclaimParkAuthority::Live);
     assert!(authority.destination_vcpu_is_live().is_ok());
+}
+
+#[cfg(test)]
+#[test]
+fn carrier_exit_without_a_vm_is_a_recorded_no_op() {
+    use carrick_observability::vm_lifecycle::{VmLifecycleOperation, process_snapshot};
+    fn destroy_events() -> usize {
+        process_snapshot()
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.operation,
+                    VmLifecycleOperation::DestroyAttempt | VmLifecycleOperation::DestroySuccess
+                )
+            })
+            .count()
+    }
+    // An unsigned test executable can never create a VM (HV_DENIED), so this
+    // process has no live carrier VM: carrier exit must destroy nothing and
+    // must NOT append DestroyAttempt/DestroySuccess to the lifecycle ledger.
+    // Only destroy-class events are counted: a sibling test in this binary may
+    // record a failed LogicalCreateAttempt concurrently.
+    let before = destroy_events();
+    assert!(!carrier_vm_live());
+    destroy_persistent_vm_at_carrier_exit().expect("no VM: nothing to destroy");
+    assert_eq!(
+        destroy_events(),
+        before,
+        "carrier exit without a VM must not record destroy events"
+    );
 }
 
 fn prepare_exec_region_raw(mapping: &GuestMapping) -> Result<HvfMappedRegion, TrapError> {

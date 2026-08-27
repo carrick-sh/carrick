@@ -1005,10 +1005,9 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             // runs the guest synchronously in this carrier.
             let resolved = match block_on_oci(engine.resolve(req.run.clone())) {
                 Ok(resolved) => resolved,
-                // No guest has started yet → normal exit is safe.
                 Err(e) => {
                     eprintln!("carrick: {e:#}");
-                    std::process::exit(125);
+                    carrick_runtime::carrier::exit_carrier(125);
                 }
             };
             crate::runtime_util::emit_resolve_warnings(&resolved.warnings);
@@ -1017,7 +1016,10 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("carrick: {e:#}");
-                    std::process::exit(125);
+                    // The interactive PTY relay is a thread of this carrier
+                    // (no host fork survives), so the carrier exit funnel is
+                    // the right teardown on every lane.
+                    carrick_runtime::carrier::exit_carrier(125);
                 }
             };
 
@@ -1043,7 +1045,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             // Interactive / tty: the guest's stdio already went straight to the
             // terminal; nothing to emit, just take the exit code.
             if tty || interactive {
-                std::process::exit(status);
+                carrick_runtime::carrier::exit_carrier(status);
             }
 
             // `--json`: opt into the legacy compat-report envelope on stdout.
@@ -1065,7 +1067,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         "report": result.report,
                     }))?
                 );
-                std::process::exit(status);
+                carrick_runtime::carrier::exit_carrier(status);
             }
 
             // Default: behave like `docker run`. The guest's stdout/stderr
@@ -1079,7 +1081,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     result.traps
                 );
             }
-            std::process::exit(status);
+            carrick_runtime::carrier::exit_carrier(status);
         }
         // `Shell` is normalised to `Run` (interactive /bin/sh) before this
         // match, so it is never reached here.

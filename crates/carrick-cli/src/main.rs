@@ -63,13 +63,19 @@
 //! logical Carrick-kernel operations inside the existing carrier and never
 //! inherit or recreate a host async runtime.
 //!
-//! ## Process model: one container == one host carrier
+//! ## Process model: one carrier hosts many containers
 //!
 //! HVPatch keeps every logical Linux process, thread, wait edge and signal in
-//! the Carrick kernel graph inside one carrier. Guest `fork`/`clone` and Docker
-//! exec do not create host subprocesses. Detached launch has one typed
-//! `posix_spawn` carrier-birth boundary; the Docker API server remains an
-//! operator process and launches exactly one carrier per running container.
+//! the Carrick kernel graph inside one carrier, which owns ONE HVF VM and ONE
+//! kernel arena for its whole life (`carrick_runtime::carrier`). Containers are
+//! namespace trees on that graph: the CLI boots one per `carrick run`, and
+//! `carrick debug container-gate` (Gate B) boots two — in sequence or at once
+//! — in the same carrier, the shape the Phase C embed library generalises.
+//! Guest `fork`/`clone` and Docker exec do not create host subprocesses.
+//! Detached launch has one typed `posix_spawn` carrier-birth boundary; the
+//! Docker API server remains an operator process and launches one carrier per
+//! running container. Every exit goes through `carrier::exit_carrier`, which
+//! retires the VM and publishes the lifecycle ledger.
 //! The loud [`install_guest_abort_banner`] panic hook attributes failures in
 //! that carrier without inventing a host-process identity for logical tasks.
 //!

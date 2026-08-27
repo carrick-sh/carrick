@@ -95,6 +95,14 @@ impl VfsMounts {
         }
     }
 
+    /// Drain all registered mounts and the overridden set, returning the number of mounts dropped.
+    pub fn clear_all(&mut self) -> usize {
+        let count = self.entries.len();
+        self.entries.clear();
+        self.overridden.write().clear();
+        count
+    }
+
     /// Resolve `path` to the mount that owns it. Returns the full
     /// absolute path back to the caller — most mounts (proc, sys)
     /// know their own mount point and already accept absolute paths,

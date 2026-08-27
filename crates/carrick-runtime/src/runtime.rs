@@ -558,18 +558,18 @@ where
     )
 }
 
-fn finalize_persistent_hvf_run<Destroy, Record, Publish>(
+fn finalize_persistent_hvf_run<Retire, Record, Publish>(
     mut run: Result<RunResult, RuntimeError>,
-    destroy_vm: Destroy,
+    retire: Retire,
     record_terminal: Record,
     publish_artifact: Publish,
 ) -> Result<RunResult, RuntimeError>
 where
-    Destroy: FnOnce() -> Result<(), RuntimeError>,
+    Retire: FnOnce() -> Result<(), RuntimeError>,
     Record: FnOnce(crate::vm_lifecycle::VmRunTerminalOutcome),
     Publish: FnOnce(&Result<RunResult, RuntimeError>) -> Result<(), RuntimeError>,
 {
-    if let Err(error) = destroy_vm()
+    if let Err(error) = retire()
         && run.is_ok()
     {
         run = Err(error);
@@ -593,12 +593,18 @@ fn run_address_space_with_hvf_and_dispatcher(
     max_traps: usize,
 ) -> Result<RunResult, RuntimeError> {
     let _ = crate::ulock::preinit_waiter_table();
-    // The carrier owns the kernel arena directly (in-memory singleton; B2
-    // deletes the path-based constructor).
+    // The carrier owns the kernel arena; this container owns its pid region
+    // inside it. Guest fork/clone creates logical Carrick-kernel tasks, never a
+    // host namespace-supervisor process.
     let _ = carrick_kernel::arena::KernelArena::global();
+    let container = dispatcher.container();
+    let admission = crate::carrier::admit_container(container.id());
+    // Taken by the run terminal (inside `finalize_persistent_hvf_run`), or by
+    // the boot-failure path below when the loop never ran.
+    let mut retire = Some((container, admission));
     let container_id = std::env::var("CARRICK_CONTAINER_ID").ok();
     let mut exact_control_installed = false;
-    let run = (|| -> Result<RunResult, RuntimeError> {
+    let mut run = (|| -> Result<RunResult, RuntimeError> {
         dispatcher.activate_file_authority().map_err(|error| {
             RuntimeError::Configuration(format!("activate per-run FileAuthority: {error}"))
         })?;
@@ -619,26 +625,19 @@ fn run_address_space_with_hvf_and_dispatcher(
         let _ = stamp_identity_page(&mut trap, &dispatcher, &boot_context);
         drop(boot_context);
         let mut completion = run_threaded_hvf_loop(trap, dispatcher, max_traps);
+        // Container teardown: reap, drop mounts, release the pid region. The
+        // VM, the arena and every other carrier facility persist for the next
+        // container; `carrier::shutdown` retires them at carrier exit.
         let mut run = finalize_persistent_hvf_run(
             completion.run,
-            || crate::trap::destroy_persistent_vm_at_run_terminal().map_err(RuntimeError::from),
-            crate::vm_lifecycle::record_process_terminal,
-            |run| {
-                if let Some(path) =
-                    std::env::var_os(crate::vm_lifecycle::VM_LIFECYCLE_ARTIFACT_PATH_ENV)
-                    && let Err(artifact_error) =
-                        crate::vm_lifecycle::write_completed_process_artifact(Path::new(&path))
-                {
-                    let run_context = run
-                        .as_ref()
-                        .err()
-                        .map_or_else(|| "guest run completed".to_owned(), ToString::to_string);
-                    return Err(RuntimeError::Unsupported(format!(
-                        "HVPatch VM lifecycle artifact publication failed after {run_context}: {artifact_error}"
-                    )));
-                }
-                Ok(())
+            || {
+                let (container, admission) = retire.take().ok_or_else(|| {
+                    RuntimeError::Configuration("container retired twice".to_owned())
+                })?;
+                crate::carrier::retire_container(container, admission).map(|_| ())
             },
+            crate::carrier::record_container_terminal,
+            |_| Ok(()),
         );
         // Keep mutating control live through VM destruction, terminal receipt,
         // and optional lifecycle-artifact publication.  Only then publish the
@@ -657,6 +656,16 @@ fn run_address_space_with_hvf_and_dispatcher(
         }
         run
     })();
+    // Boot failed before the loop (file authority, VM/root bring-up, boot
+    // identity): `finalize_persistent_hvf_run` never ran, so the container is
+    // still admitted. Retire it here; the admission's RAII drop alone would
+    // un-count it but leave its tasks/mounts/pid region behind.
+    if let Some((container, admission)) = retire.take()
+        && let Err(error) = crate::carrier::retire_container(container, admission)
+        && run.is_ok()
+    {
+        run = Err(error);
+    }
     if !exact_control_installed && let Some(id) = container_id.as_deref() {
         let exit_code = run.as_ref().map_or(125, |result| result.exit_code);
         crate::container::mark_exited(id, exit_code);
