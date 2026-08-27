@@ -9,10 +9,13 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::domains::{HostPid, ProcessGeneration};
+use crate::pidns::PidNamespaceSection;
 use crate::process::ProcessSection;
 
 pub const ARENA_MAGIC: u32 = 0x434b_4131;
-pub const ARENA_VERSION: u32 = 4;
+/// Bumped to 5 when `pid_namespaces` was appended and `ProcessRecord` gained
+/// `pid_ns`; a version-4 file is refused by `attach` (fail closed).
+pub const ARENA_VERSION: u32 = 5;
 pub const ARENA_PATH_ENV: &str = "CARRICK_KERNEL_ARENA";
 
 /// Permit-section constants. These must stay byte-identical to the landed
@@ -63,6 +66,11 @@ pub struct ArenaLayout {
     /// vCPU-only park frees its permit while keeping its VM
     /// (docs/2026-07-09-mt-residency-lease-evidence.md, Next Track 1).
     pub vm_slots: PermitSection,
+    /// Per-PID-namespace numbering slots (`pidns.rs`): one claimed per live
+    /// container / pid namespace. Member records in `processes` carry the
+    /// owning namespace id in `ProcessRecord::pid_ns`. Zero-filled by the
+    /// `ftruncate` in `create_with_path`, so every slot starts free.
+    pub pid_namespaces: PidNamespaceSection,
 }
 
 #[derive(Debug)]
@@ -514,6 +522,11 @@ mod tests {
                 .next_ns_pid
                 .load(std::sync::atomic::Ordering::Relaxed),
             2
+        );
+        assert_eq!(
+            l.pid_namespaces.claimed(),
+            0,
+            "a fresh arena has no namespace"
         );
     }
 

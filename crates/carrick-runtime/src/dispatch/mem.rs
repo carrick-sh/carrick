@@ -1050,6 +1050,9 @@ fn project_vma_summaries(mem: &MemState) -> Vec<crate::kernel::VmaSummary> {
             .iter()
             .filter_map(|(_, current, end)| (current < end).then_some((*current, *end))),
     );
+    if mem.brk_current > mem.layout.heap_base {
+        ranges.push((mem.layout.heap_base, mem.brk_current));
+    }
     for vma in &mem.semantic_vmas {
         if (vma.path == "[heap]"
             || (vma.start >= mem.layout.heap_base && vma.end <= mem.brk_current))
