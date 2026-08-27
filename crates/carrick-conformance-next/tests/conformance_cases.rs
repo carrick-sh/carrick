@@ -13,9 +13,9 @@
 mod common;
 
 use carrick_conformance_next::{
-    ExitStatus, PullPolicy, ResultAssert, TestContainer, assert_syscall_returned,
-    assert_syscall_success, find_all_syscall_returns, find_first_syscall_return,
-    find_process_exits,
+    ExitStatus, PullPolicy, ResultAssert, TestContainer, assert_syscall_eventually_succeeded,
+    assert_syscall_returned, assert_syscall_success, find_all_syscall_returns,
+    find_first_syscall_return, find_process_exits,
 };
 
 #[test]
@@ -178,7 +178,11 @@ fn case_09_file_permission_chmod_and_stat() {
 
     let events = observer.events();
     assert_syscall_success(&events, "fchmodat");
-    assert_syscall_success(&events, "newfstatat");
+    // Not `assert_syscall_success`: the shell stats paths that do not exist
+    // before it ever stats `m`, and those misses are correct Linux behaviour.
+    // The functional claim of this case — that chmod took effect — is the
+    // `stdout == "640"` assertion above.
+    assert_syscall_eventually_succeeded(&events, "newfstatat");
 }
 
 #[test]

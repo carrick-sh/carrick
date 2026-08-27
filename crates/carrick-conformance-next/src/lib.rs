@@ -81,6 +81,30 @@ pub fn assert_syscall_success(events: &[AuditEvent], syscall_name: &str) {
     );
 }
 
+/// Assert that a syscall occurred and that at least one of its returns succeeded.
+///
+/// Use this, not [`assert_syscall_success`], for any syscall a shell pipeline
+/// issues repeatedly against different paths. `newfstatat` is the standard
+/// example: `sh -c "touch m && chmod 640 m && stat m"` stats paths that do not
+/// exist long before it stats `m` — a loader probing a search path, a utility
+/// checking for a file it is about to create — and every one of those misses is
+/// correct Linux behaviour, not a divergence. Asserting on the FIRST return
+/// there tests the order in which a shell happens to probe the filesystem,
+/// which is not a property carrick owns.
+#[allow(clippy::panic)]
+pub fn assert_syscall_eventually_succeeded(events: &[AuditEvent], syscall_name: &str) {
+    let outcomes = find_all_syscall_returns(events, syscall_name);
+    if outcomes.is_empty() {
+        panic!("expected return event for syscall {syscall_name:?}, but none was recorded");
+    }
+    assert!(
+        outcomes.iter().any(|outcome| outcome.is_ok()),
+        "expected at least one {syscall_name:?} to succeed; all {} returns failed: {:?}",
+        outcomes.len(),
+        outcomes.iter().map(|o| o.errno).collect::<Vec<_>>()
+    );
+}
+
 /// Assert that a syscall occurred and its first return outcome had the exact return value `expected`.
 #[allow(clippy::panic)]
 pub fn assert_syscall_returned(events: &[AuditEvent], syscall_name: &str, expected: i64) {
