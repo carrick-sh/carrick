@@ -1,26 +1,29 @@
-//! Pure in-memory AF_UNIX socket implementation.
+//! Pure in-memory stream and message socket implementation.
 //!
 //! Provides bidirectional byte streams (`SOCK_STREAM`), message queues
 //! (`SOCK_DGRAM`, `SOCK_SEQPACKET`), the Linux abstract namespace (`@name` /
 //! `\0...`), autobind, zero-copy file descriptor passing (`SCM_RIGHTS`),
-//! and peer credential queries (`SO_PEERCRED` / `SCM_CREDENTIALS`) within
-//! the Carrick runtime without creating host Darwin sockets or host temporary
-//! files.
+//! peer credential queries (`SO_PEERCRED` / `SCM_CREDENTIALS`), and mocked
+//! `AF_INET`/`AF_INET6` streams within the Carrick runtime without creating
+//! host Darwin sockets or host temporary files.
 
 #![allow(dead_code)]
 
 use parking_lot::{Condvar, Mutex};
 use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use crate::dispatch::OpenFile;
 use crate::linux_abi::{
-    LINUX_EADDRINUSE, LINUX_EAGAIN, LINUX_ECONNREFUSED, LINUX_EDESTADDRREQ, LINUX_EINVAL,
-    LINUX_ENOTCONN, LINUX_EOPNOTSUPP, LINUX_EPIPE, LINUX_EPOLLERR, LINUX_EPOLLHUP, LINUX_EPOLLIN,
-    LINUX_EPOLLOUT, LINUX_EPOLLRDHUP, LINUX_SOCK_DGRAM, LINUX_SOCK_SEQPACKET, LINUX_SOCK_STREAM,
-    LinuxErrno,
+    LINUX_AF_UNIX, LINUX_EADDRINUSE, LINUX_EAGAIN, LINUX_ECONNREFUSED, LINUX_EDESTADDRREQ,
+    LINUX_EINVAL, LINUX_ENOTCONN, LINUX_EOPNOTSUPP, LINUX_EPIPE, LINUX_EPOLLERR, LINUX_EPOLLHUP,
+    LINUX_EPOLLIN, LINUX_EPOLLOUT, LINUX_EPOLLRDHUP, LINUX_SOCK_DGRAM, LINUX_SOCK_SEQPACKET,
+    LINUX_SOCK_STREAM, LinuxErrno,
 };
+use crate::network::interposer::{ConnectionRecordState, MockService};
 
 pub const LINUX_SHUT_RD: i32 = 0;
 pub const LINUX_SHUT_WR: i32 = 1;
@@ -57,13 +60,14 @@ pub(crate) struct UnixDatagram {
     pub rights: Vec<Arc<OpenFile>>,
 }
 
-#[derive(Debug)]
-pub(crate) struct UnixSocketState {
+pub(crate) struct PureSocketState {
     pub bound_addr: Option<Vec<u8>>,
-    pub peer: Option<Weak<UnixSocketInner>>,
+    pub local_sockaddr: Option<SocketAddr>,
+    pub peer_sockaddr: Option<SocketAddr>,
+    pub peer: Option<Weak<PureSocketInner>>,
     pub listening: bool,
     pub backlog_limit: usize,
-    pub accept_queue: VecDeque<Arc<UnixSocketInner>>,
+    pub accept_queue: VecDeque<Arc<PureSocketInner>>,
     pub stream_buf: VecDeque<u8>,
     pub stream_rights: VecDeque<Arc<OpenFile>>,
     pub dgram_queue: VecDeque<UnixDatagram>,
@@ -73,21 +77,54 @@ pub(crate) struct UnixSocketState {
     pub shutdown_write: bool,
     pub so_passcred: bool,
     pub so_error: Option<i32>,
+    pub so_rcvtimeo: Option<Duration>,
+    pub so_sndtimeo: Option<Duration>,
+    pub mock_service: Option<Arc<dyn MockService>>,
+    pub mock_peer_closed: bool,
+    pub connection_record: Option<Arc<Mutex<ConnectionRecordState>>>,
+    pub request_buf: Vec<u8>,
 }
 
-#[derive(Debug)]
-pub(crate) struct UnixSocketInner {
-    pub socket_type: i32,
-    pub state: Mutex<UnixSocketState>,
-    pub changed: Condvar,
+pub struct PureSocketInner {
+    pub(crate) family: i32,
+    pub(crate) socket_type: i32,
+    pub(crate) protocol: i32,
+    pub(crate) state: Mutex<PureSocketState>,
+    pub(crate) changed: Condvar,
 }
 
-impl UnixSocketInner {
+impl std::fmt::Debug for PureSocketInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PureSocketInner")
+            .field("family", &self.family)
+            .field("socket_type", &self.socket_type)
+            .field("protocol", &self.protocol)
+            .finish()
+    }
+}
+
+pub(crate) type UnixSocketState = PureSocketState;
+pub(crate) type UnixSocketInner = PureSocketInner;
+
+impl PureSocketInner {
     pub(crate) fn new(socket_type: i32, creds: LinuxUcred) -> Arc<Self> {
+        Self::new_with_family(LINUX_AF_UNIX, socket_type, 0, creds)
+    }
+
+    pub(crate) fn new_with_family(
+        family: i32,
+        socket_type: i32,
+        protocol: i32,
+        creds: LinuxUcred,
+    ) -> Arc<Self> {
         Arc::new(Self {
+            family,
             socket_type,
-            state: Mutex::new(UnixSocketState {
+            protocol,
+            state: Mutex::new(PureSocketState {
                 bound_addr: None,
+                local_sockaddr: None,
+                peer_sockaddr: None,
                 peer: None,
                 listening: false,
                 backlog_limit: 0,
@@ -101,6 +138,53 @@ impl UnixSocketInner {
                 shutdown_write: false,
                 so_passcred: false,
                 so_error: None,
+                so_rcvtimeo: None,
+                so_sndtimeo: None,
+                mock_service: None,
+                mock_peer_closed: false,
+                connection_record: None,
+                request_buf: Vec::new(),
+            }),
+            changed: Condvar::new(),
+        })
+    }
+
+    pub(crate) fn new_mock(
+        family: i32,
+        socket_type: i32,
+        protocol: i32,
+        local_addr: Option<SocketAddr>,
+        peer_addr: Option<SocketAddr>,
+        mock: Arc<dyn MockService>,
+        record: Option<Arc<Mutex<ConnectionRecordState>>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            family,
+            socket_type,
+            protocol,
+            state: Mutex::new(PureSocketState {
+                bound_addr: None,
+                local_sockaddr: local_addr,
+                peer_sockaddr: peer_addr,
+                peer: None,
+                listening: false,
+                backlog_limit: 0,
+                accept_queue: VecDeque::new(),
+                stream_buf: VecDeque::new(),
+                stream_rights: VecDeque::new(),
+                dgram_queue: VecDeque::new(),
+                creds: LinuxUcred::default(),
+                peer_creds: None,
+                shutdown_read: false,
+                shutdown_write: false,
+                so_passcred: false,
+                so_error: None,
+                so_rcvtimeo: None,
+                so_sndtimeo: None,
+                mock_service: Some(mock),
+                mock_peer_closed: false,
+                connection_record: record,
+                request_buf: Vec::new(),
             }),
             changed: Condvar::new(),
         })
@@ -112,8 +196,18 @@ impl UnixSocketInner {
         creds1: LinuxUcred,
         creds2: LinuxUcred,
     ) -> (Arc<Self>, Arc<Self>) {
-        let first = Self::new(socket_type, creds1);
-        let second = Self::new(socket_type, creds2);
+        Self::pair_with_family(LINUX_AF_UNIX, socket_type, 0, creds1, creds2)
+    }
+
+    pub(crate) fn pair_with_family(
+        family: i32,
+        socket_type: i32,
+        protocol: i32,
+        creds1: LinuxUcred,
+        creds2: LinuxUcred,
+    ) -> (Arc<Self>, Arc<Self>) {
+        let first = Self::new_with_family(family, socket_type, protocol, creds1);
+        let second = Self::new_with_family(family, socket_type, protocol, creds2);
 
         {
             let mut s1 = first.state.lock();
@@ -127,6 +221,69 @@ impl UnixSocketInner {
         (first, second)
     }
 
+    pub(crate) fn mock_on_connect(&self) -> Option<Vec<u8>> {
+        let state = self.state.lock();
+        if let Some(mock) = &state.mock_service
+            && let Some(peer_addr) = state.peer_sockaddr
+        {
+            mock.on_connect(peer_addr)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn queue_mock_response(&self, bytes: &[u8]) {
+        let mut state = self.state.lock();
+        state.stream_buf.extend(bytes);
+        if let Some(rec_ref) = &state.connection_record {
+            let mut rec = rec_ref.lock();
+            rec.bytes_received += bytes.len();
+            if rec.capture_payload {
+                if let Some(payload) = &mut rec.received_payload {
+                    payload.extend_from_slice(bytes);
+                }
+            }
+        }
+        self.changed.notify_all();
+    }
+
+    pub(crate) fn buffered_bytes(&self) -> usize {
+        self.state.lock().stream_buf.len()
+    }
+
+    pub(crate) fn local_addr(&self) -> Option<SocketAddr> {
+        self.state.lock().local_sockaddr
+    }
+
+    pub(crate) fn peer_addr(&self) -> Option<SocketAddr> {
+        self.state.lock().peer_sockaddr
+    }
+
+    pub(crate) fn take_so_error(&self) -> Option<i32> {
+        self.state.lock().so_error.take()
+    }
+
+    pub(crate) fn set_so_error(&self, err: i32) {
+        self.state.lock().so_error = Some(err);
+        self.changed.notify_all();
+    }
+
+    pub(crate) fn set_rcvtimeo(&self, dur: Option<Duration>) {
+        self.state.lock().so_rcvtimeo = dur;
+    }
+
+    pub(crate) fn get_rcvtimeo(&self) -> Option<Duration> {
+        self.state.lock().so_rcvtimeo
+    }
+
+    pub(crate) fn set_sndtimeo(&self, dur: Option<Duration>) {
+        self.state.lock().so_sndtimeo = dur;
+    }
+
+    pub(crate) fn get_sndtimeo(&self) -> Option<Duration> {
+        self.state.lock().so_sndtimeo
+    }
+
     pub(crate) fn bind(
         self: &Arc<Self>,
         sun_path: &[u8],
@@ -138,16 +295,13 @@ impl UnixSocketInner {
         }
 
         let bound = if sun_path.is_empty() {
-            // Autobind: assign unique abstract name \0xxxxx
             let auto = registry.autobind_abstract_name();
             registry.register_abstract(auto.clone(), Arc::clone(self))?;
             auto
         } else if sun_path[0] == 0 {
-            // Abstract socket
             registry.register_abstract(sun_path.to_vec(), Arc::clone(self))?;
             sun_path.to_vec()
         } else {
-            // Pathname socket
             let nul = sun_path
                 .iter()
                 .position(|&b| b == 0)
@@ -204,7 +358,6 @@ impl UnixSocketInner {
             return Ok(());
         }
 
-        // Stream / SeqPacket connection
         let mut target_state = target.state.lock();
         if !target_state.listening {
             return Err(LINUX_ECONNREFUSED);
@@ -214,7 +367,12 @@ impl UnixSocketInner {
             return Err(LINUX_EAGAIN);
         }
 
-        let server_side = Self::new(self.socket_type, target_state.creds);
+        let server_side = Self::new_with_family(
+            self.family,
+            self.socket_type,
+            self.protocol,
+            target_state.creds,
+        );
         {
             let mut server_state = server_side.state.lock();
             let mut client_state = self.state.lock();
@@ -231,7 +389,7 @@ impl UnixSocketInner {
         Ok(())
     }
 
-    pub(crate) fn accept(self: &Arc<Self>) -> Result<Arc<UnixSocketInner>, LinuxErrno> {
+    pub(crate) fn accept(self: &Arc<Self>) -> Result<Arc<PureSocketInner>, LinuxErrno> {
         let mut state = self.state.lock();
         if !state.listening {
             return Err(LINUX_EINVAL);
@@ -249,11 +407,58 @@ impl UnixSocketInner {
         data: &[u8],
         rights: Vec<Arc<OpenFile>>,
     ) -> Result<usize, LinuxErrno> {
-        let peer_arc = {
-            let state = self.state.lock();
-            if state.shutdown_write {
+        let mut state = self.state.lock();
+        if state.shutdown_write {
+            return Err(LINUX_EPIPE);
+        }
+
+        // Mock Service Interception Path
+        if let Some(mock) = state.mock_service.clone() {
+            if state.mock_peer_closed {
                 return Err(LINUX_EPIPE);
             }
+            let available = DEFAULT_STREAM_BUFFER_CAPACITY.saturating_sub(state.request_buf.len());
+            if available == 0 && !data.is_empty() {
+                return Err(LINUX_EAGAIN);
+            }
+            let to_write = data.len().min(available);
+            state.request_buf.extend_from_slice(&data[..to_write]);
+
+            if let Some(rec_ref) = &state.connection_record {
+                let mut rec = rec_ref.lock();
+                rec.bytes_sent += to_write;
+                if rec.capture_payload {
+                    if let Some(payload) = &mut rec.sent_payload {
+                        payload.extend_from_slice(&data[..to_write]);
+                    }
+                }
+            }
+
+            let response_bytes = mock.handle(&state.request_buf);
+            if !response_bytes.is_empty() {
+                state.stream_buf.extend(&response_bytes);
+                if let Some(rec_ref) = &state.connection_record {
+                    let mut rec = rec_ref.lock();
+                    rec.bytes_received += response_bytes.len();
+                    if rec.capture_payload {
+                        if let Some(payload) = &mut rec.received_payload {
+                            payload.extend_from_slice(&response_bytes);
+                        }
+                    }
+                }
+                state.request_buf.clear();
+                if mock.should_close() {
+                    state.mock_peer_closed = true;
+                }
+            }
+
+            drop(state);
+            self.changed.notify_all();
+            return Ok(to_write);
+        }
+
+        // Interconnected Peer Path
+        let peer_arc = {
             let Some(peer_weak) = &state.peer else {
                 return Err(LINUX_ENOTCONN);
             };
@@ -262,6 +467,7 @@ impl UnixSocketInner {
             };
             peer
         };
+        drop(state);
 
         let mut peer_state = peer_arc.state.lock();
         if peer_state.shutdown_read {
@@ -293,6 +499,13 @@ impl UnixSocketInner {
         }
 
         if state.stream_buf.is_empty() {
+            if state.mock_service.is_some() {
+                if state.mock_peer_closed {
+                    return Ok((0, Vec::new()));
+                }
+                return Err(LINUX_EAGAIN);
+            }
+
             let is_peer_alive = state
                 .peer
                 .as_ref()
@@ -421,17 +634,24 @@ impl UnixSocketInner {
         }
 
         if self.socket_type == LINUX_SOCK_STREAM || self.socket_type == LINUX_SOCK_SEQPACKET {
-            let peer_alive = state
-                .peer
-                .as_ref()
-                .and_then(|p| p.upgrade())
-                .is_some_and(|p| !p.state.lock().shutdown_write);
+            let has_mock = state.mock_service.is_some();
+            let peer_alive = if has_mock {
+                !state.mock_peer_closed
+            } else {
+                state
+                    .peer
+                    .as_ref()
+                    .and_then(|p| p.upgrade())
+                    .is_some_and(|p| !p.state.lock().shutdown_write)
+            };
 
             if !state.stream_buf.is_empty() || state.shutdown_read || !peer_alive {
                 mask |= LINUX_EPOLLIN;
             }
             if !state.shutdown_write && peer_alive {
-                if let Some(peer) = state.peer.as_ref().and_then(|p| p.upgrade()) {
+                if has_mock {
+                    mask |= LINUX_EPOLLOUT;
+                } else if let Some(peer) = state.peer.as_ref().and_then(|p| p.upgrade()) {
                     let peer_used = peer.state.lock().stream_buf.len();
                     if peer_used < DEFAULT_STREAM_BUFFER_CAPACITY {
                         mask |= LINUX_EPOLLOUT;
@@ -442,7 +662,6 @@ impl UnixSocketInner {
                 mask |= LINUX_EPOLLHUP | LINUX_EPOLLRDHUP;
             }
         } else {
-            // Datagram
             if !state.dgram_queue.is_empty() {
                 mask |= LINUX_EPOLLIN;
             }
@@ -464,10 +683,26 @@ impl UnixSocketInner {
     }
 }
 
+impl Drop for PureSocketInner {
+    fn drop(&mut self) {
+        let mut state = self.state.lock();
+        state.shutdown_read = true;
+        state.shutdown_write = true;
+        state.mock_peer_closed = true;
+        if let Some(rec_ref) = &state.connection_record {
+            let mut rec = rec_ref.lock();
+            rec.completed = true;
+        }
+        if let Some(peer) = state.peer.as_ref().and_then(|p| p.upgrade()) {
+            peer.changed.notify_all();
+        }
+    }
+}
+
 #[derive(Default, Debug)]
 pub(crate) struct UnixSocketRegistry {
-    pub(crate) abstract_sockets: Mutex<HashMap<Vec<u8>, Arc<UnixSocketInner>>>,
-    pub(crate) pathname_sockets: Mutex<HashMap<String, Arc<UnixSocketInner>>>,
+    pub(crate) abstract_sockets: Mutex<HashMap<Vec<u8>, Arc<PureSocketInner>>>,
+    pub(crate) pathname_sockets: Mutex<HashMap<String, Arc<PureSocketInner>>>,
     pub(crate) autobind_counter: AtomicU32,
 }
 
@@ -479,7 +714,7 @@ impl UnixSocketRegistry {
     pub(crate) fn register_abstract(
         &self,
         name: Vec<u8>,
-        sock: Arc<UnixSocketInner>,
+        sock: Arc<PureSocketInner>,
     ) -> Result<(), LinuxErrno> {
         let mut map = self.abstract_sockets.lock();
         if map.contains_key(&name) {
@@ -493,14 +728,14 @@ impl UnixSocketRegistry {
         self.abstract_sockets.lock().remove(name);
     }
 
-    pub(crate) fn lookup_abstract(&self, name: &[u8]) -> Option<Arc<UnixSocketInner>> {
+    pub(crate) fn lookup_abstract(&self, name: &[u8]) -> Option<Arc<PureSocketInner>> {
         self.abstract_sockets.lock().get(name).cloned()
     }
 
     pub(crate) fn register_pathname(
         &self,
         path: String,
-        sock: Arc<UnixSocketInner>,
+        sock: Arc<PureSocketInner>,
     ) -> Result<(), LinuxErrno> {
         let mut map = self.pathname_sockets.lock();
         if map.contains_key(&path) {
@@ -514,7 +749,7 @@ impl UnixSocketRegistry {
         self.pathname_sockets.lock().remove(path);
     }
 
-    pub(crate) fn lookup_pathname(&self, path: &str) -> Option<Arc<UnixSocketInner>> {
+    pub(crate) fn lookup_pathname(&self, path: &str) -> Option<Arc<PureSocketInner>> {
         self.pathname_sockets.lock().get(path).cloned()
     }
 
@@ -529,6 +764,7 @@ impl UnixSocketRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::interposer::HttpMock;
 
     #[test]
     fn socketpair_stream_round_trip() {
@@ -542,7 +778,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
         };
-        let (s1, s2) = UnixSocketInner::pair(LINUX_SOCK_STREAM, creds1, creds2);
+        let (s1, s2) = PureSocketInner::pair(LINUX_SOCK_STREAM, creds1, creds2);
 
         assert_eq!(s1.peer_creds(), Ok(creds2));
         assert_eq!(s2.peer_creds(), Ok(creds1));
@@ -566,12 +802,12 @@ mod tests {
             gid: 0,
         };
 
-        let server = UnixSocketInner::new(LINUX_SOCK_STREAM, creds);
+        let server = PureSocketInner::new(LINUX_SOCK_STREAM, creds);
         let abstract_name = b"\0test_service";
         server.bind(abstract_name, &registry).unwrap();
         server.listen(10).unwrap();
 
-        let client = UnixSocketInner::new(LINUX_SOCK_STREAM, creds);
+        let client = PureSocketInner::new(LINUX_SOCK_STREAM, creds);
         client.connect(abstract_name, &registry).unwrap();
 
         let accepted = server.accept().unwrap();
@@ -591,11 +827,11 @@ mod tests {
             gid: 0,
         };
 
-        let server = UnixSocketInner::new(LINUX_SOCK_DGRAM, creds);
+        let server = PureSocketInner::new(LINUX_SOCK_DGRAM, creds);
         let server_name = b"\0dgram_server";
         server.bind(server_name, &registry).unwrap();
 
-        let client = UnixSocketInner::new(LINUX_SOCK_DGRAM, creds);
+        let client = PureSocketInner::new(LINUX_SOCK_DGRAM, creds);
         client
             .send_dgram(
                 Some(server_name),
@@ -608,5 +844,42 @@ mod tests {
         let dgram = server.recv_dgram().unwrap();
         assert_eq!(dgram.payload, b"dgram msg");
         assert_eq!(dgram.sender_creds, Some(creds));
+    }
+
+    #[test]
+    fn in_memory_mock_http_round_trip() {
+        let mock = Arc::new(HttpMock::new().route("GET /test", 200, "mock reply"));
+        let peer_addr = "198.18.0.1:80".parse().unwrap();
+        let sock = PureSocketInner::new_mock(
+            crate::linux_abi::LINUX_AF_INET,
+            LINUX_SOCK_STREAM,
+            0,
+            Some("127.0.0.1:49152".parse().unwrap()),
+            Some(peer_addr),
+            mock,
+            None,
+        );
+
+        assert_eq!(sock.poll_mask() & LINUX_EPOLLOUT, LINUX_EPOLLOUT);
+
+        // Send HTTP request
+        let n = sock
+            .send_stream(b"GET /test HTTP/1.1\r\n\r\n", Vec::new())
+            .unwrap();
+        assert_eq!(n, 22);
+
+        // Socket is now readable with response
+        assert_eq!(sock.poll_mask() & LINUX_EPOLLIN, LINUX_EPOLLIN);
+
+        let mut buf = [0u8; 128];
+        let (read_len, _) = sock.recv_stream(&mut buf, 0).unwrap();
+        assert!(read_len > 0);
+        let resp = String::from_utf8_lossy(&buf[..read_len]);
+        assert!(resp.contains("HTTP/1.1 200 OK"));
+        assert!(resp.contains("mock reply"));
+
+        // Subsequent read on EOF returns 0
+        let (eof_len, _) = sock.recv_stream(&mut buf, 0).unwrap();
+        assert_eq!(eof_len, 0);
     }
 }

@@ -4222,6 +4222,7 @@ pub const LINUX_POLLOUT: i16 = 0x0004;
 pub const LINUX_POLLERR: i16 = 0x0008;
 pub const LINUX_POLLHUP: i16 = 0x0010;
 pub const LINUX_POLLNVAL: i16 = 0x0020;
+pub const LINUX_POLLRDHUP: i16 = 0x2000;
 pub const LINUX_TFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
 pub const LINUX_TFD_CLOEXEC: u64 = LINUX_O_CLOEXEC;
 pub const LINUX_TIMER_ABSTIME: u64 = 0x1;
@@ -5491,7 +5492,9 @@ pub const LINUX_CMSGHDR_LEN: usize = 16;
 pub const LINUX_CMSG_ALIGN: usize = 8;
 pub const LINUX_SOL_IP: i32 = 0; // IPPROTO_IP
 pub const LINUX_SOL_TCP: i32 = 6; // IPPROTO_TCP
+pub const LINUX_IPPROTO_TCP: i32 = 6;
 pub const LINUX_SOL_UDP: i32 = 17; // IPPROTO_UDP
+pub const LINUX_IPPROTO_UDP: i32 = 17;
 /// Linux protocol number for UDP-Lite (RFC 3828). macOS has no such protocol;
 /// carrick backs it with a plain UDP socket (only the checksum-coverage
 /// sockopts differ, accepted as no-ops).

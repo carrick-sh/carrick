@@ -1069,6 +1069,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "mock_network_socket": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "mprotectexec": {
     "class": "conformance",
     "excluded": false,

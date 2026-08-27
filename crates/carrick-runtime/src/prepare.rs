@@ -105,6 +105,7 @@ pub struct RuntimeExtensions {
     observers: Vec<Arc<dyn crate::observe::SyscallObserver>>,
     time: Option<crate::kernel::container::TimeControl>,
     budget: Option<Arc<crate::observe::ResourceBudget>>,
+    network_interposer: Option<crate::network::interposer::NetworkInterposer>,
 }
 
 impl RuntimeExtensions {
@@ -153,6 +154,15 @@ impl RuntimeExtensions {
     /// Attach a resource budget quota to the container.
     pub fn resource_budget(mut self, budget: crate::observe::ResourceBudget) -> Self {
         self.budget = Some(Arc::new(budget));
+        self
+    }
+
+    /// Register a network interposer to mock or intercept outbound guest connections.
+    pub fn network_interposer(
+        mut self,
+        interposer: crate::network::interposer::NetworkInterposer,
+    ) -> Self {
+        self.network_interposer = Some(interposer);
         self
     }
 }
@@ -389,12 +399,40 @@ impl Runtime {
             observers,
             time,
             budget,
+            network_interposer,
         } = ext;
         let sink = resolve_stdio(spec, stdio)?;
         if spec.platform == Platform::Amd64 {
             rosetta_license_notice();
         }
-        let plan = resolve_plan(spec, launch)?;
+        let ExecutionPlan {
+            launch,
+            page,
+            host_resolver,
+            network,
+            env,
+        } = resolve_plan(spec, launch)?;
+        let network = if let Some(interposer) = network_interposer {
+            let net = match Arc::try_unwrap(network) {
+                Ok(net) => net.with_interposer(interposer),
+                Err(_) => {
+                    let net = RuntimeNetwork::create(&spec.network).map_err(|e| {
+                        RuntimeError::Unsupported(format!("network setup failed: {e}"))
+                    })?;
+                    net.with_interposer(interposer)
+                }
+            };
+            Arc::new(net)
+        } else {
+            network
+        };
+        let plan = ExecutionPlan {
+            launch,
+            page,
+            host_resolver,
+            network,
+            env,
+        };
 
         let mut container = crate::kernel::Container::new(plan.launch.clone())
             .with_launch_capabilities(&spec.cap_add);
