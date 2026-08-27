@@ -133,7 +133,7 @@ unsafe fn test_splice_matrix() {
     libc::lseek(f1, 0, libc::SEEK_SET);
 
     let mut pipe_fds = [-1i32; 2];
-    libc::pipe(pipe_fds.as_mut_ptr());
+    libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_NONBLOCK);
     let (rd, wr) = (pipe_fds[0], pipe_fds[1]);
 
     // 2.1 Invalid FDs -> EBADF
@@ -321,8 +321,8 @@ unsafe fn test_vmsplice_and_tee_matrix() {
 
     let mut pipe_a = [-1i32; 2];
     let mut pipe_b = [-1i32; 2];
-    libc::pipe(pipe_a.as_mut_ptr());
-    libc::pipe(pipe_b.as_mut_ptr());
+    libc::pipe2(pipe_a.as_mut_ptr(), libc::O_NONBLOCK);
+    libc::pipe2(pipe_b.as_mut_ptr(), libc::O_NONBLOCK);
     let (a_rd, a_wr) = (pipe_a[0], pipe_a[1]);
     let (b_rd, b_wr) = (pipe_b[0], pipe_b[1]);
 
