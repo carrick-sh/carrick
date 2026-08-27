@@ -9,7 +9,7 @@
 //!    EDESTADDRREQ, MSG_OOB on UDP -> EOPNOTSUPP, non-socket send -> ENOTSOCK).
 //! 3. Recv and recvfrom flags (MSG_PEEK preserving queue, MSG_TRUNC returning full
 //!    datagram length on SOCK_DGRAM, MSG_PEEK | MSG_DONTWAIT on empty socket -> EAGAIN,
-//!    MSG_OOB on AF_UNIX -> EOPNOTSUPP / EINVAL, non-socket recv -> ENOTSOCK).
+//!    MSG_OOB on AF_UNIX -> EINVAL, non-socket recv -> ENOTSOCK).
 //! 4. Socket options (SO_ACCEPTCONN lifecycle across listen, SO_ERROR read-and-clear,
 //!    read-only setsockopt rejections -> ENOPROTOOPT, invalid optnames -> ENOPROTOOPT,
 //!    short optlen -> EINVAL, non-socket sockopt -> ENOTSOCK).
@@ -19,6 +19,7 @@
 //!    EPOLLRDHUP + EPOLLONESHOT disarm/rearm lifecycle, and MSG_PEEK poll/epoll coherence).
 //!
 //! Self-contained on AF_UNIX socketpairs and loopback sockets; deterministic boolean/key-value output only.
+//! Filesystem paths use per-process unique names with explicit unlink cleanup before and after use.
 
 use conformance_probes::{errno, report};
 use std::ffi::CString;
@@ -115,7 +116,7 @@ unsafe fn test_socket_creation_matrix() {
         libc::close(sv[1]);
     }
 
-    // 1.5 socketpair() with unsupported family (AF_INET) -> EAFNOSUPPORT or EOPNOTSUPP
+    // 1.5 socketpair() with unsupported family (AF_INET) -> EOPNOTSUPP
     let mut bad_sv = [-1i32; 2];
     let sp_bad = libc::socketpair(libc::AF_INET, libc::SOCK_STREAM, 0, bad_sv.as_mut_ptr());
     let sp_bad_errno = if sp_bad < 0 { errno() } else { 0 };
@@ -128,8 +129,9 @@ unsafe fn test_socket_creation_matrix() {
 
     // 1.6 accept4() with SOCK_NONBLOCK | SOCK_CLOEXEC and error paths
     let lfd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
-    let sock_path = "/tmp/netflagmatrix_acc.sock";
-    unlink_file(sock_path);
+    let pid = libc::getpid();
+    let sock_path = format!("/tmp/netflagmatrix_acc_{pid}.sock");
+    unlink_file(&sock_path);
     let mut sun: libc::sockaddr_un = MaybeUninit::zeroed().assume_init();
     sun.sun_family = libc::AF_UNIX as libc::sa_family_t;
     let path_bytes = sock_path.as_bytes();
@@ -187,7 +189,7 @@ unsafe fn test_socket_creation_matrix() {
     if lfd >= 0 {
         libc::close(lfd);
     }
-    unlink_file(sock_path);
+    unlink_file(&sock_path);
 
     report!(
         sock_create_nonblock_cloexec = s_ok && s_nonblock && s_cloexec,
@@ -195,8 +197,7 @@ unsafe fn test_socket_creation_matrix() {
         sock_create_invalid_family_eafnosupport =
             s_bad_fam == -1 && s_bad_fam_errno == libc::EAFNOSUPPORT,
         sockpair_dgram_nonblock_cloexec = sp_ok && sp0_nb && sp0_clo && sp1_nb && sp1_clo,
-        sockpair_inet_eafnosupport = sp_bad == -1
-            && (sp_bad_errno == libc::EAFNOSUPPORT || sp_bad_errno == libc::EOPNOTSUPP),
+        sockpair_inet_eopnotsupp = sp_bad == -1 && sp_bad_errno == libc::EOPNOTSUPP,
         accept4_setup_ok = bind_ok && listen_ok && conn_ok,
         accept4_invalid_flags_einval = acc_inv == -1 && acc_inv_errno == libc::EINVAL,
         accept4_not_socket_enotsock = acc_pipe == -1 && acc_pipe_errno == libc::ENOTSOCK,
@@ -330,7 +331,7 @@ unsafe fn test_recv_matrix() {
     );
     let empty_eagain = r4 == -1 && errno() == libc::EAGAIN;
 
-    // 3.2 MSG_OOB on AF_UNIX stream socket -> EOPNOTSUPP / EINVAL
+    // 3.2 MSG_OOB on AF_UNIX stream socket -> EINVAL
     let r_oob = libc::recv(
         sv[1],
         b4.as_mut_ptr() as *mut libc::c_void,
@@ -396,8 +397,7 @@ unsafe fn test_recv_matrix() {
 
     report!(
         recv_msg_peek_preserves_data = peek1_ok && peek2_ok && consume_ok && empty_eagain,
-        recv_oob_af_unix_eopnotsupp =
-            r_oob == -1 && (r_oob_errno == libc::EOPNOTSUPP || r_oob_errno == libc::EINVAL),
+        recv_oob_af_unix_einval = r_oob == -1 && r_oob_errno == libc::EINVAL,
         recv_dgram_msg_trunc_returns_full_length = trunc_ret_full_len && notrunc_ret_buf_len,
         recv_not_socket_enotsock = r_pipe == -1 && r_pipe_errno == libc::ENOTSOCK,
     );
@@ -422,8 +422,9 @@ unsafe fn test_sockopt_matrix() {
     );
     let acc_before_listen = g_acc1 == 0 && acc_val == 0;
 
-    let sock_path = "/tmp/netflagmatrix_opt.sock";
-    unlink_file(sock_path);
+    let pid = libc::getpid();
+    let sock_path = format!("/tmp/netflagmatrix_opt_{pid}.sock");
+    unlink_file(&sock_path);
     let mut sun: libc::sockaddr_un = MaybeUninit::zeroed().assume_init();
     sun.sun_family = libc::AF_UNIX as libc::sa_family_t;
     let path_bytes = sock_path.as_bytes();
@@ -572,7 +573,7 @@ unsafe fn test_sockopt_matrix() {
     libc::close(pipe_fds[0]);
     libc::close(pipe_fds[1]);
     libc::close(s);
-    unlink_file(sock_path);
+    unlink_file(&sock_path);
 
     report!(
         sockopt_so_acceptconn_lifecycle = acc_before_listen && acc_after_listen,
@@ -732,12 +733,14 @@ unsafe fn test_poll_epoll_matrix() {
     let ctl_self_einval = ctl_self == -1 && errno() == libc::EINVAL;
 
     // epoll on regular file -> EPERM
-    let temp_path = "/tmp/netflagmatrix_ep_file.tmp";
-    let file_fd = create_temp_file(temp_path);
+    let pid = libc::getpid();
+    let temp_path = format!("/tmp/netflagmatrix_ep_file_{pid}.tmp");
+    unlink_file(&temp_path);
+    let file_fd = create_temp_file(&temp_path);
     let ctl_file = libc::epoll_ctl(ep, libc::EPOLL_CTL_ADD, file_fd, &mut ev);
     let ctl_file_eperm = ctl_file == -1 && errno() == libc::EPERM;
     libc::close(file_fd);
-    unlink_file(temp_path);
+    unlink_file(&temp_path);
 
     // DEL / MOD on fd not in epoll -> ENOENT
     let ctl_del_enoent = libc::epoll_ctl(ep, libc::EPOLL_CTL_DEL, p[0], &mut ev);
