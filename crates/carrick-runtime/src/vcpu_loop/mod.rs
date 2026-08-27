@@ -1823,12 +1823,26 @@ fn stamp_identity_values<M: GuestMemory>(
     pid: u32,
     shim_enabled: u32,
 ) -> Result<(), carrick_guest_mem::MemoryError> {
-    for (off, val) in [
-        (crate::memory::IDENTITY_OFF_PID, pid),
-        (crate::memory::IDENTITY_OFF_SHIM_ENABLED, shim_enabled),
-    ] {
-        memory.write_bytes(base + off, &val.to_le_bytes())?;
-    }
+    // Disable the fast path FIRST, then publish the identity, then re-enable.
+    //
+    // The shim word is the gate: while it is non-zero the guest answers
+    // getpid/gettid from this page in userspace with NO vm exit, so nothing
+    // re-checks the value it reads. Writing the pid before the gate is only
+    // safe if the gate is known to be closed, and on a carrier VM it is not —
+    // the identity page's backing is recycled between containers, so a
+    // container can begin life with a predecessor's `1` still in the gate
+    // while its own pid slot reads zero. The guest then reports pid 0, which
+    // no Linux process ever sees. It is rare because the window is short, and
+    // it widens under load, which is precisely why it must be closed rather
+    // than tolerated.
+    //
+    // Closing the gate first costs nothing: a guest that reads it mid-stamp
+    // takes the trap path and gets the correct answer from the dispatcher.
+    memory.write_bytes(
+        base + crate::memory::IDENTITY_OFF_SHIM_ENABLED,
+        &0_u32.to_le_bytes(),
+    )?;
+    memory.write_bytes(base + crate::memory::IDENTITY_OFF_PID, &pid.to_le_bytes())?;
     // A fresh stamp starts a fresh serviced-syscall ledger: a forked child
     // COWs its parent's identity page and must not inherit the parent's
     // counter (Linux children start rusage at zero), and an exec'd image
@@ -1837,6 +1851,11 @@ fn stamp_identity_values<M: GuestMemory>(
     memory.write_bytes(
         base + crate::memory::IDENTITY_OFF_SHIM_SYSCALLS,
         &0_u64.to_le_bytes(),
+    )?;
+    // Open the gate last, once pid and the ledger are both published.
+    memory.write_bytes(
+        base + crate::memory::IDENTITY_OFF_SHIM_ENABLED,
+        &shim_enabled.to_le_bytes(),
     )?;
     Ok(())
 }
@@ -8960,6 +8979,89 @@ mod tests {
         assert!(
             stack.start > crate::memory::LINUX_STACK_TOP - crate::memory::LINUX_STACK_SIZE,
             "the full RLIMIT-sized backing is not the initially grown Linux VMA"
+        );
+    }
+
+    #[test]
+    fn identity_stamp_closes_the_shim_gate_before_publishing_a_new_pid() {
+        // The shim word gates a userspace read with NO vm exit, so the guest
+        // may look at this page at any instant. Starting from a page that a
+        // previous container left ENABLED with a stale pid, the stamp must
+        // never leave the gate open over a pid it has not written yet —
+        // otherwise the guest reads a pid that belongs to no one (observed as
+        // `getpid=0` from a container's init, which no Linux process reports).
+        //
+        // Records the exact write order and asserts the gate is shut before the
+        // pid moves and reopened only after. Under the old order (pid, then
+        // gate) the first recorded write is the pid, and this fails.
+        #[derive(Default)]
+        struct RecordingMemory {
+            base: u64,
+            page: Vec<u8>,
+            order: Vec<(u64, u64)>,
+        }
+        impl carrick_guest_mem::GuestMemory for RecordingMemory {
+            fn read_bytes_raw(
+                &self,
+                addr: u64,
+                len: usize,
+            ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
+                let off = (addr - self.base) as usize;
+                Ok(self.page[off..off + len].to_vec())
+            }
+            fn write_bytes_raw(
+                &mut self,
+                addr: u64,
+                bytes: &[u8],
+            ) -> Result<(), carrick_guest_mem::MemoryError> {
+                let off = (addr - self.base) as usize;
+                self.page[off..off + bytes.len()].copy_from_slice(bytes);
+                let mut word = [0u8; 8];
+                let n = bytes.len().min(8);
+                word[..n].copy_from_slice(&bytes[..n]);
+                self.order
+                    .push((addr - self.base, u64::from_le_bytes(word)));
+                Ok(())
+            }
+        }
+
+        let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
+        let mut memory = RecordingMemory {
+            base,
+            page: vec![0; 4096],
+            order: Vec::new(),
+        };
+        // The predecessor's residue: gate open, someone else's pid.
+        memory.page[crate::memory::IDENTITY_OFF_SHIM_ENABLED as usize] = 1;
+        memory.page[crate::memory::IDENTITY_OFF_PID as usize] = 7;
+
+        stamp_identity_values(&mut memory, base, 1, 1).expect("stamp");
+
+        let gate = crate::memory::IDENTITY_OFF_SHIM_ENABLED;
+        let pid_off = crate::memory::IDENTITY_OFF_PID;
+        let first_gate_write = memory
+            .order
+            .iter()
+            .position(|(off, _)| *off == gate)
+            .expect("the gate must be written");
+        let pid_write = memory
+            .order
+            .iter()
+            .position(|(off, _)| *off == pid_off)
+            .expect("the pid must be written");
+        assert!(
+            first_gate_write < pid_write,
+            "the shim gate must be CLOSED before the pid moves; write order was {:?}",
+            memory.order
+        );
+        assert_eq!(
+            memory.order[first_gate_write].1, 0,
+            "the first gate write must shut it, not re-open it"
+        );
+        assert_eq!(
+            memory.order.last().map(|(off, val)| (*off, *val)),
+            Some((gate, 1)),
+            "the gate must be re-opened LAST, after pid and ledger are published"
         );
     }
 
