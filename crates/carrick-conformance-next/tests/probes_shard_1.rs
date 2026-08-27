@@ -427,6 +427,22 @@ fn test_cache_freshness_and_validation() {
     assert_ne!(hash_line, expected);
 }
 
+#[test]
+fn test_shard_1_cached_oracles_are_complete() {
+    let root = common::repo_root();
+    for libc in ["musl", "gnu"] {
+        for probe in SHARD_1_PROBES
+            .iter()
+            .copied()
+            .filter(|name| !common::needs_live_oracle(name))
+        {
+            cached_probe_oracle(&root, "arm64", libc, probe).unwrap_or_else(|error| {
+                panic!("arm64-{libc}/{probe} must have a fresh committed oracle: {error}")
+            });
+        }
+    }
+}
+
 /// Probes in Shard 1 that require container seccomp=unconfined.
 pub fn probe_needs_unconfined(name: &str) -> bool {
     name == "clonefilesexec"

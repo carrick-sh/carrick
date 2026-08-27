@@ -495,6 +495,22 @@ fn test_shard_2_cache_freshness() {
 }
 
 #[test]
+fn test_shard_2_cached_oracles_are_complete() {
+    let repo_root = common::repo_root();
+    for libc in ["musl", "gnu"] {
+        for probe in SHARD_2_PROBES
+            .iter()
+            .copied()
+            .filter(|name| !common::needs_live_oracle(name))
+        {
+            cached_probe_oracle(&repo_root, libc, probe).unwrap_or_else(|error| {
+                panic!("arm64-{libc}/{probe} must have a fresh committed oracle: {error}")
+            });
+        }
+    }
+}
+
+#[test]
 fn test_normalization_rules() {
     let input = "hello world  \ncase-insensitive; defaulting to something\nPass `--fs host` to avoid\nline 2   \n\n";
     let normalized = normalize(input);
