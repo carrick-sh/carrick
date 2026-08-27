@@ -152,6 +152,14 @@ guest tree — concurrent lanes and worktrees never reap each other. A
 `CASE_DEADLINE` of 45 s SIGKILLs a wedged guest and marks the case
 `FAIL(timeout)` so one stuck process can't stall the run.
 
+The ecosystem/LTP harness additionally caps every Carrick suite at 60 seconds
+by default (`--carrick-timeout-cap-s`, or
+`CARRICK_CONFORMANCE_TIMEOUT_CAP_S`). This cap does not alter the suite
+declaration, Docker oracle key, or cached Docker result. A timeout is a bug
+signal under the `<2x` goal, not a performance sample. Set the cap to `0` only
+for a named, targeted investigation that genuinely needs the full declared
+budget; do not weaken the routine gate globally.
+
 Timing-sensitive probes (`futex*`, `posixtimers`, `itimer`, `iouring`,
 `sigchld`, …, see `TIMING_SENSITIVE_PROBES`) are quarantined to a *serial tail*
 after the parallel batch, because they flake under concurrent CPU load (the

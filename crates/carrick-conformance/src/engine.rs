@@ -307,8 +307,11 @@ pub fn carrick_dry_run(
     carrick_bin: &str,
     run_id: &str,
     lane: &crate::lane::Lane,
+    timeout_cap_s: u64,
 ) -> Vec<String> {
-    crate::lane::carrick_invocation_argv(suite, carrick_bin, run_id, lane)
+    let mut effective_suite = suite.clone();
+    effective_suite.timeout_s = effective_carrick_timeout_s(suite.timeout_s, timeout_cap_s);
+    crate::lane::carrick_invocation_argv(&effective_suite, carrick_bin, run_id, lane)
 }
 pub fn docker_dry_run(
     suite: &Suite,
@@ -323,8 +326,12 @@ pub fn run_carrick(
     carrick_bin: &str,
     run_id: &str,
     lane: &crate::lane::Lane,
+    timeout_cap_s: u64,
 ) -> anyhow::Result<RunOutput> {
-    let argv = crate::lane::carrick_invocation_argv(suite, carrick_bin, run_id, lane);
+    let effective_timeout_s = effective_carrick_timeout_s(suite.timeout_s, timeout_cap_s);
+    let mut effective_suite = suite.clone();
+    effective_suite.timeout_s = effective_timeout_s;
+    let argv = crate::lane::carrick_invocation_argv(&effective_suite, carrick_bin, run_id, lane);
     // SAFE: argv comes from the version-controlled manifest (suites.toml), not external
     // input; `Command::args` passes each token literally (no shell), so there is no
     // metacharacter interpolation / injection surface.
@@ -349,11 +356,22 @@ pub fn run_carrick(
     run_one(
         cmd,
         argv,
-        lane.scaled_timeout(suite.timeout_s),
+        lane.scaled_timeout(effective_timeout_s),
         run_id,
         Engine::Carrick,
         Some(cleanup),
     )
+}
+
+/// Apply the operator's Carrick-only diagnostic deadline without changing the
+/// suite declaration or Docker oracle key. A zero cap explicitly preserves the
+/// declared suite budget for a targeted long-run investigation.
+fn effective_carrick_timeout_s(declared_s: u64, timeout_cap_s: u64) -> u64 {
+    if timeout_cap_s == 0 {
+        declared_s
+    } else {
+        declared_s.min(timeout_cap_s)
+    }
 }
 
 fn clear_inherited_carrick_run_id(cmd: &mut Command) {
@@ -708,6 +726,13 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn carrick_timeout_cap_shortens_only_long_suite_budgets() {
+        assert_eq!(effective_carrick_timeout_s(300, 60), 60);
+        assert_eq!(effective_carrick_timeout_s(40, 60), 40);
+        assert_eq!(effective_carrick_timeout_s(300, 0), 300);
+    }
 
     #[test]
     fn carrick_command_removes_inherited_outer_run_id() {
