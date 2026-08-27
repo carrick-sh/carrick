@@ -29,9 +29,9 @@ use carrick_conformance_next::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LegacySource {
-    /// From legacy `CASES` table in `crates/carrick-cli/tests/conformance.rs` (18 cases).
+    /// From the retired legacy `CASES` table (18 cases).
     CasesTable,
-    /// From legacy `EXIT_CASES` table in `crates/carrick-cli/tests/conformance.rs` (5 cases).
+    /// From the retired legacy `EXIT_CASES` table (5 cases).
     ExitCasesTable,
     /// Container-level PID namespace invariant test.
     ContainerInvariant,
@@ -251,77 +251,8 @@ pub const LEGACY_CONFORMANCE_MAPPINGS: &[ConformanceCaseMapping] = &[
     },
 ];
 
-/// Helper to parse named case definitions (`name: "...", snippet: "...",`) from legacy conformance.rs.
-fn parse_legacy_cases_from_source(source: &str, const_name: &str) -> Vec<(String, String)> {
-    let marker = format!("const {const_name}:");
-    let Some(start_pos) = source.find(&marker) else {
-        panic!("could not find constant {const_name} in legacy conformance.rs");
-    };
-    let slice = &source[start_pos..];
-    let Some(open_bracket) = slice.find("&[") else {
-        panic!("could not find array start `&[` in {const_name} definition");
-    };
-    let after_open = &slice[open_bracket + 2..];
-    let Some(close_bracket) = after_open.find("];") else {
-        panic!("could not find array end `];` in {const_name} definition");
-    };
-    let block = &after_open[..close_bracket];
-
-    let mut cases = Vec::new();
-    let mut lines = block.lines().map(str::trim).peekable();
-    while let Some(line) = lines.next() {
-        if line.starts_with("name:") {
-            let name = extract_quoted_value(line, "name:");
-            while let Some(s_line) = lines.next() {
-                let s_line = s_line.trim();
-                if s_line.starts_with("snippet:") {
-                    let snippet = extract_quoted_value(s_line, "snippet:");
-                    cases.push((name, snippet));
-                    break;
-                }
-            }
-        }
-    }
-    cases
-}
-
-fn extract_quoted_value(line: &str, prefix: &str) -> String {
-    let remainder = line.trim_start_matches(prefix).trim();
-    let start = remainder
-        .find('"')
-        .expect("expected opening double quote in case definition");
-    let after_start = &remainder[start + 1..];
-    let end = after_start
-        .rfind('"')
-        .expect("expected closing double quote in case definition");
-    after_start[..end].to_string()
-}
-
 #[test]
 fn legacy_conformance_cases_parity_and_denominator_audit() {
-    let legacy_conformance_path =
-        common::repo_root().join("crates/carrick-cli/tests/conformance.rs");
-    let source = std::fs::read_to_string(&legacy_conformance_path).unwrap_or_else(|err| {
-        panic!(
-            "failed to read legacy conformance.rs at {}: {err}",
-            legacy_conformance_path.display()
-        )
-    });
-
-    let parsed_cases = parse_legacy_cases_from_source(&source, "CASES");
-    let parsed_exit_cases = parse_legacy_cases_from_source(&source, "EXIT_CASES");
-
-    assert_eq!(
-        parsed_cases.len(),
-        18,
-        "legacy CASES table in conformance.rs must contain exactly 18 cases"
-    );
-    assert_eq!(
-        parsed_exit_cases.len(),
-        5,
-        "legacy EXIT_CASES table in conformance.rs must contain exactly 5 cases"
-    );
-
     let cases_table_mappings: BTreeMap<&str, &ConformanceCaseMapping> = LEGACY_CONFORMANCE_MAPPINGS
         .iter()
         .filter(|m| m.legacy_source == LegacySource::CasesTable)
@@ -330,27 +261,9 @@ fn legacy_conformance_cases_parity_and_denominator_audit() {
 
     assert_eq!(
         cases_table_mappings.len(),
-        parsed_cases.len(),
-        "mapped CASES entries count must equal parsed CASES entries count from conformance.rs"
+        18,
+        "the retired CASES denominator must remain exactly represented"
     );
-
-    for (legacy_name, legacy_snippet) in &parsed_cases {
-        let Some(mapping) = cases_table_mappings.get(legacy_name.as_str()) else {
-            panic!(
-                "legacy CASES entry {legacy_name:?} from conformance.rs is missing from in-process mappings"
-            );
-        };
-        assert_eq!(
-            mapping.snippet, legacy_snippet,
-            "snippet mismatch for legacy CASES entry {legacy_name:?}:\n  legacy: {legacy_snippet:?}\n  mapped: {:?}",
-            mapping.snippet
-        );
-        assert_eq!(
-            mapping.status,
-            MigrationStatus::Mapped,
-            "legacy CASES entry {legacy_name:?} must be marked Mapped"
-        );
-    }
 
     let exit_cases_table_mappings: BTreeMap<&str, &ConformanceCaseMapping> =
         LEGACY_CONFORMANCE_MAPPINGS
@@ -361,26 +274,24 @@ fn legacy_conformance_cases_parity_and_denominator_audit() {
 
     assert_eq!(
         exit_cases_table_mappings.len(),
-        parsed_exit_cases.len(),
-        "mapped EXIT_CASES entries count must equal parsed EXIT_CASES entries count from conformance.rs"
+        5,
+        "the retired EXIT_CASES denominator must remain exactly represented"
     );
 
-    for (legacy_name, legacy_snippet) in &parsed_exit_cases {
-        let Some(mapping) = exit_cases_table_mappings.get(legacy_name.as_str()) else {
-            panic!(
-                "legacy EXIT_CASES entry {legacy_name:?} from conformance.rs is missing from in-process mappings"
-            );
-        };
-        assert_eq!(
-            mapping.snippet, legacy_snippet,
-            "snippet mismatch for legacy EXIT_CASES entry {legacy_name:?}:\n  legacy: {legacy_snippet:?}\n  mapped: {:?}",
-            mapping.snippet
-        );
-        assert_eq!(
-            mapping.status,
-            MigrationStatus::Mapped,
-            "legacy EXIT_CASES entry {legacy_name:?} must be marked Mapped"
-        );
+    let mapped_tests: BTreeMap<&str, &ConformanceCaseMapping> = LEGACY_CONFORMANCE_MAPPINGS
+        .iter()
+        .map(|mapping| (mapping.in_process_test, mapping))
+        .collect();
+    assert_eq!(
+        mapped_tests.len(),
+        24,
+        "each retired case must map to a distinct in-process test"
+    );
+    for mapping in LEGACY_CONFORMANCE_MAPPINGS {
+        assert!(!mapping.legacy_name.is_empty());
+        assert!(!mapping.snippet.is_empty());
+        assert!(!mapping.in_process_test.is_empty());
+        assert_eq!(mapping.status, MigrationStatus::Mapped);
     }
 
     let container_invariant_count = LEGACY_CONFORMANCE_MAPPINGS
@@ -679,11 +590,10 @@ fn case_13_dpkg_print_architecture() {
     assert_eq!(result.stderr_utf8(), "");
 
     let events = observer.events();
-    let exec_ok = find_first_syscall_return(&events, "execve")
-        .or_else(|| find_first_syscall_return(&events, "execveat"));
+    let exits = find_process_exits(&events);
     assert!(
-        exec_ok.is_some_and(|o| o.is_ok()),
-        "expected successful execve/execveat syscall for dpkg"
+        exits.contains(&ExitStatus::Exited(0)),
+        "expected dpkg process exit status 0 in audit log, got: {exits:?}"
     );
 }
 
@@ -748,7 +658,9 @@ fn case_16_readdir_created_file() {
     assert_eq!(result.stderr_utf8(), "");
 
     let events = observer.events();
-    assert_syscall_success(&events, "openat");
+    // The shell legitimately probes missing startup paths before creating the
+    // requested file, so require a later successful open rather than the first.
+    assert_syscall_eventually_succeeded(&events, "openat");
     let getdents_ok = find_first_syscall_return(&events, "getdents64")
         .or_else(|| find_first_syscall_return(&events, "getdents"));
     assert!(
