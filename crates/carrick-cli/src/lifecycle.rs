@@ -22,18 +22,20 @@
 //!
 //! ## The detach handshake (`run -d`, shared with `start`)
 //!
-//! `run -d` is a bare `fork(2)`, done here in the CLI while it is still
-//! single-threaded (no tokio runtime is live — `block_on_oci` builds and drops
-//! its own per-call runtime; see [`crate::runtime_util`]). The PARENT writes a
-//! `Created` registry entry, prints the container id, and returns, freeing the
-//! user's shell. The CHILD becomes the container's lifetime:
+//! `run -d` is a `posix_spawn` of this same binary as the hidden
+//! `__carrier-entry` subcommand (`CarrierLauncher::launch`, the one product
+//! boundary allowed to create a carrier; it carries no borrowed Rust/tokio
+//! state, so it is equally safe from the API server's multi-threaded runtime).
+//! The LAUNCHER writes a `Created` registry entry, waits for the carrier's
+//! readiness receipt, prints the container id, and returns, freeing the user's
+//! shell. The CARRIER (`carrier_entry`) becomes the container's lifetime:
 //! `setsid()` → redirect stdio (stdin←`/dev/null`, stdout/stderr→`output.log`,
 //! so `carrick logs` can replay it) → export `CARRICK_CONTAINER_ID` → run the
-//! engine in that same process. The carrier records itself as `Running`, owns
-//! every logical guest task, and marks the entry `Exited` (or removes it for
-//! `--rm`) on normal completion. `run_detached_carrier` is the shared post-fork
-//! body; `start`/`restart` reuse it, additionally setting `CARRICK_EXEC_OVERLAY`
-//! to re-attach an already-extracted rootfs overlay instead of re-extracting.
+//! engine in that same process. It records itself as `Running`, owns every
+//! logical guest task, and marks the entry `Exited` (or removes it for `--rm`)
+//! on normal completion. `run_detached_carrier` is the shared carrier body;
+//! `start`/`restart` reuse it, additionally setting `CARRICK_EXEC_OVERLAY` to
+//! re-attach an already-extracted rootfs overlay instead of re-extracting.
 //!
 //! Image resolution is deliberately done in the FOREGROUND before forking
 //! (`resolve_request_image`), so a pull error reaches the user's terminal rather

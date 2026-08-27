@@ -1,5 +1,5 @@
 //! The run lifecycle: load an image, drive the trap→dispatch→complete loop, and
-//! own the fork/clone, signal-delivery, and fault-handling models.
+//! own the process/thread, signal-delivery, and fault-handling models.
 //!
 //! # The loop
 //!
@@ -16,67 +16,56 @@
 //!    primitives and returns a [`DispatchOutcome`].
 //! 3. The loop acts on the outcome — write the return value into `x0` and resume
 //!    (`Returned`/`Errno`), block on host fds and re-dispatch on readiness
-//!    (`WaitOn*`), spawn/teardown a process or thread (`Fork`/`CloneThread`/
-//!    `Execve`/`Exit`), or pop a signal frame (`SigReturn`).
+//!    (`WaitOn*`), create or retire a logical process or thread
+//!    (`Fork`/`CloneThread`/`Execve`/`Exit`), or pop a signal frame (`SigReturn`).
 //! 4. Between syscalls it delivers any pending signal ([`deliver_pending_signal`]).
 //!
-//! There are **two** loop implementations, chosen by the guest's threading:
+//! There are **two** loop implementations:
 //!
-//! - **Single-threaded** ([`run_combined_syscall_loop_with_dispatcher`], and its
-//!   split-view sibling [`run_split_loop`]): one vCPU, no locks, no thread
-//!   registry. Used by `run-elf` of a static binary, the in-process test
-//!   harnesses, and LTP fixtures. A guest `fork(2)` here is a plain `libc::fork`;
-//!   the child keeps running the same loop.
-//! - **Multi-threaded** ([`run_threaded_hvf_loop`] → `run_vcpu_until_exit`):
-//!   **one host thread plus one HVF vCPU per guest thread**, all sharing one
-//!   process VM (stage-2 mappings are visible to every vCPU). Shared kernel
-//!   state lives behind [`KernelState`](crate::vcpu_loop::KernelState) (an `Arc`, each subsystem internally
-//!   synchronised — there is no longer a single big lock). This is the path real
-//!   workloads (Go, CPython, Node, apt/dpkg) take.
+//! - **Single-threaded fixture loop** ([`run_combined_syscall_loop_with_dispatcher`],
+//!   and its split-view sibling [`run_split_loop`]): one vCPU, no thread
+//!   registry. Retained only as a deterministic syscall/memory fixture for the
+//!   in-process test harnesses and `run-elf`. It runs exactly one logical
+//!   process: a guest `fork(2)` here lowers to `EOPNOTSUPP`.
+//! - **HVPatch unified kernel loop** ([`run_threaded_hvf_loop`] →
+//!   `threaded_loop::run_threaded_loop` → `vcpu_loop::run_vcpu_until_exit`):
+//!   every Linux process and thread of the container is a logical task in
+//!   Carrick's kernel graph, multiplexed inside ONE host process (the carrier)
+//!   and ONE HVF VM. Each logical guest thread has a host pthread, but HVF
+//!   vCPUs are a bounded, reclaimable set of leases (`carrick_hal::vcpu_sched`).
+//!   Shared kernel state lives behind [`KernelState`](crate::vcpu_loop::KernelState)
+//!   (an `Arc`, each subsystem internally synchronised — there is no single big
+//!   lock). This is the path every product run takes (Go, CPython, Node,
+//!   apt/dpkg).
 //!
 //! Both loops produce a [`RunResult`] (exit code + captured stdio + the
 //! [`CompatReport`](crate::compat::CompatReport)).
 //!
-//! # The fork/clone model (the hard part)
+//! # The process/thread model
 //!
-//! macOS HVF is **not fork-safe**: a live VM in the parent at `libc::fork(2)`
-//! makes the child's `hv_vm_create` return `HV_BUSY`. carrick has three distinct
-//! fork shapes, and each works around this differently:
+//! No guest operation creates a host process. macOS HVF allows one VM per host
+//! process (a second `hv_vm_create` returns `HV_BUSY`), and the kernel graph
+//! makes that irrelevant:
 //!
-//! - **`clone(2)` that creates a thread** (`CLONE_VM`): no `libc::fork` at all.
-//!   [`ThreadRuntimeState::spawn_clone_thread`](crate::vcpu_loop::ThreadRuntimeState)
-//!   spawns a host thread that builds
-//!   its own vCPU in the *same* VM and runs `run_vcpu_until_exit`. HVF caps
-//!   concurrent vCPUs (64 on this host); a guest with more live threads than the
-//!   cap blocks in `wait_for_vcpu_slot` until one frees, since `clone(2)` already
-//!   reported success and the guest may `join` the thread.
-//! - **`fork(2)` from a single-threaded guest**: a plain `libc::fork`. The
-//!   engine snapshots and rebuilds the address space; the child resets its
-//!   per-process state (event ring, self-pipe, kqueue — none survive fork) and
-//!   continues.
-//! - **`fork(2)` from a multithreaded guest**
-//!   ([`ThreadRuntimeState::handle_fork`](crate::vcpu_loop::ThreadRuntimeState)):
-//!   a *stop-the-world*. `libc::fork` replicates only the calling thread, so the
-//!   child would otherwise inherit carrick locks held by threads that no longer
-//!   exist. The forker therefore quiesces every **other** live vCPU at its
-//!   lock-safe run-loop top (via the kicker + the [`fork_quiesce`] barrier),
-//!   tears the VM down, forks, and republishes a rebuilt VM the parked siblings
-//!   recreate their vCPUs in. Concurrent forks serialise transparently (a loser
-//!   parks at the in-flight fork's barrier). The quiesce loop re-reads the live
-//!   sibling count every iteration — a sibling that exits mid-quiesce must drop
-//!   out, or the wait would spin forever waiting for a parker that no longer
-//!   exists (this was the multithreaded-fork wedge).
-//!
-//! [`fork_quiesce`]: crate::fork_quiesce
+//! - **`clone(2)` that creates a thread** (`CLONE_VM`):
+//!   [`DispatchOutcome::CloneThread`] spawns a host thread that acquires a vCPU
+//!   lease in the *same* VM and runs `run_vcpu_until_exit`.
+//! - **`fork(2)` / `vfork(2)` / process-creating `clone(2)`**:
+//!   [`DispatchOutcome::Fork`] is a logical kernel-graph fork
+//!   (`prepare_in_process_fork` → `complete_persistent_process_fork` in
+//!   `vcpu_loop`): the child gets its own mm, pid, credentials and wait edges
+//!   inside the carrier, COW-armed private pages, and a fresh logical thread.
+//!   Process-fork admission must win before the child waits for a vCPU lease,
+//!   and fork participates in exec/exit cancellation.
+//! - **`execve(2)`**: [`DispatchOutcome::Execve`] tears down the task's address
+//!   space and reloads the new ELF in place; the host process is untouched.
 //!
 //! Orthogonal to fork, a stage-1 **page-table edit** (mmap/mprotect/munmap that
-//! changes the guest's shared descriptors) is its own, lighter stop-the-world:
-//! [`ThreadRuntimeState::pt_pause`](crate::vcpu_loop::ThreadRuntimeState) kicks
-//! in-guest siblings out so none walks a
-//! half-edited table, but — unlike fork — it *keeps* every vCPU alive. The
-//! handshake between an editing coordinator and a vCPU about to enter the guest
-//! is a Dekker pattern on `quiescing` ↔ `in_guest` (SeqCst), so neither side
-//! misses the other.
+//! changes a mm's shared descriptors) is a lighter stop-the-world: `pt_pause`
+//! (in `vcpu_loop`) kicks in-guest siblings of that mm out so none walks a
+//! half-edited table, but *keeps* every vCPU alive. The handshake between an
+//! editing coordinator and a vCPU about to enter the guest is a Dekker pattern
+//! on `quiescing` ↔ `in_guest` (SeqCst), so neither side misses the other.
 //!
 //! # PID-namespace placement
 //!
@@ -94,6 +83,12 @@
 //! to the Linux `(signum, si_code)` the kernel would deliver (SIGSEGV/SIGBUS/
 //! SIGTRAP) and injects it into the guest, so Go's `sigpanic`/`recover`, glibc
 //! backtraces, and any installed handler run exactly as on Linux.
+//!
+//! # Exit is an unwind, never `_exit`
+//!
+//! Because no guest exit is a host-process exit, every exit path of both loops
+//! returns a [`RunResult`] and unwinds normally through `Drop`.
+//!
 //! [`AddressSpace`]: crate::memory::AddressSpace
 
 use std::os::fd::IntoRawFd;
@@ -972,8 +967,8 @@ where
                     .map(|a| String::from_utf8_lossy(a).into_owned())
                     .collect();
                 // Reflect the new program into the host process name
-                // (`carrick: <argv>`), so a hung forked-exec'd
-                // child is identifiable in `ps -M` / Activity Monitor.
+                // (`carrick: <argv>`), so a hung exec'd guest is
+                // identifiable in `ps -M` / Activity Monitor.
                 let cmdline = proc_argv.join(" ");
                 crate::dispatch::set_host_process_name(cmdline.as_bytes());
                 let proc_env = env.clone();

@@ -15,9 +15,9 @@
 //! The relay thread ([`relay_loop`]) is a single `poll(2)` over up to five fds:
 //! `real_in` → master, master → `real_out`, a shutdown self-pipe (so
 //! [`PtyRelay::stop`] terminates the thread without a signal or timeout), a
-//! SIGWINCH self-pipe, and an out-of-band winsize-message fd (used when a helper
-//! stayed behind in the original terminal session — see
-//! [`interactive_supervisor`](crate::interactive_supervisor)). The user's real
+//! SIGWINCH self-pipe, and an optional out-of-band winsize-message fd
+//! (`winsize_r`; the carrier-local [`interactive_supervisor`](crate::interactive_supervisor)
+//! passes none, so that fifth slot is inert in production). The user's real
 //! terminal is put in raw mode while the relay runs so the guest's slave-side
 //! line discipline is the only one cooking input; a [`crate::host_tty`] guard
 //! restores it on teardown (even on a guest crash).
@@ -259,9 +259,10 @@ impl PtyRelay {
         Self::start_with_pair(pair, real_in, real_out)
     }
 
-    /// Production entry using a pty allocated before the runtime child is
-    /// forked. The interactive supervisor uses this to set the child pgrp as
-    /// foreground before any relay traffic reaches the guest.
+    /// Production entry over a pty the caller already allocated: the
+    /// carrier-local [`InteractiveSession`](crate::interactive_supervisor::InteractiveSession)
+    /// allocates the pair, starts this relay, then `dup2`s the slave over the
+    /// carrier's fds 0-2 before any guest traffic flows.
     pub fn start_with_pair(pair: PtyPair, real_in: RawFd, real_out: RawFd) -> io::Result<Self> {
         Self::start_with_pair_and_winsize(pair, real_in, real_out, -1)
     }

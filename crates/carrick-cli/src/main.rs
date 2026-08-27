@@ -201,12 +201,11 @@ static ALLOC_CENSUS: dhat::Alloc = dhat::Alloc;
 static ALLOC_OWNER_CENSUS: carrick_runtime::alloc_owner_census::TaggedSystem =
     carrick_runtime::alloc_owner_census::TaggedSystem;
 
-/// One output file per process, because a cold `go build` runs ~70 of them.
-/// The profiler must outlive all guest work, so `main` holds it to the end; a
-/// process that `execve`s (carrick's guest-exec is a host self-re-exec) never
-/// drops it and writes nothing, which is expected -- the POST-exec image is the
-/// one that does the guest work and exits normally, so it is the one that
-/// reports.
+/// One output file per carrier process. The profiler must outlive all guest
+/// work, so `main` holds it to the end; the only host re-exec left is
+/// `carrick trace`'s sudo re-exec (`trace_cli`), whose pre-exec image never
+/// drops it and writes nothing, which is expected -- the POST-exec image does
+/// the work and reports.
 #[cfg(feature = "alloc-census")]
 static ALLOC_CENSUS_PROFILER: std::sync::Mutex<Option<dhat::Profiler>> =
     std::sync::Mutex::new(None);
@@ -273,12 +272,10 @@ fn main() -> anyhow::Result<()> {
     start_alloc_owner_census()?;
     #[cfg(feature = "alloc-census")]
     start_alloc_census();
-    // FIRST, before any dispatch or fork: record this process as the one
-    // true top-level `carrick` invocation. The NATIVEPERF supervisor record
-    // (supervisor_perf) is gated on this pid — interactive `-t` runs fork a
-    // pty-relay supervisor and a runtime child that BOTH bubble back through
-    // `Commands::Run`'s tail with `CARRICK_DSR_PROFILE` inherited, and only
-    // the process recorded here may emit.
+    // FIRST, before any dispatch: record this process as the one true
+    // top-level `carrick` invocation. The NATIVEPERF supervisor record
+    // (supervisor_perf) is gated on this pid so an image that reaches
+    // `Commands::Run`'s tail without passing through `main` fails quiet.
     supervisor_perf::record_top_level_pid();
     configure_process_environment();
     register_dtrace_probes();

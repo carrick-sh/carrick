@@ -29,34 +29,24 @@
 //!
 //! ## Why the emitter is gated on PROCESS IDENTITY, not call-site placement
 //!
-//! Every guest process on the native_darwin backend is a REAL host process
-//! spawned by `run_image_in_child`'s `fork()` (see
-//! `crates/carrick-runtime/src/native_darwin.rs`), and the guest branch of
-//! that fork never returns into `Commands::Run` — so guests can't reach the
-//! emit call site. But call-site reachability is NOT sufficient for
-//! interactive runs: `carrick run -t`/`-it` goes through
-//! `fork_interactive_session` (`crates/carrick-runtime/src/interactive_supervisor.rs`),
-//! which forks twice into a Launcher / pty-relay Supervisor / runtime-child
-//! triple. The Supervisor early-returns an `Ok(RunResult)` from
-//! `Runtime::execute` after `relay_and_wait` (`execute.rs`), and the
-//! runtime child proceeds into the backend and returns its own
-//! `Ok(RunResult)` — so up to THREE OS processes per invocation bubble back
-//! to `Commands::Run`'s tail, all with `CARRICK_DSR_PROFILE` inherited. An
-//! env-only gate would therefore write 2-3 supervisor lines into one stderr
-//! stream, and `parse_nativeperf` hard-fails on the duplicate.
+//! Under HVPatch one `carrick run` is one host process: every guest process
+//! and thread is a logical kernel-graph task on the carrier's own threads, so
+//! `RUSAGE_SELF` already covers the whole guest tree and `RUSAGE_CHILDREN` is
+//! the CPU of real host children only (none on the run path). Exactly one
+//! process therefore reaches `Commands::Run`'s tail per invocation. The pid
+//! gate stays as the fail-closed guard for the two ways a second image can
+//! exist: a detached `run -d` `posix_spawn`s `__carrier-entry`, which runs
+//! `main` (recording its own pid) but dispatches to `carrier_entry`, never to
+//! `Commands::Run`; and `carrick trace`'s sudo re-exec (`trace_cli`) replaces
+//! this image with `exec` before any run, so the pre-exec image never reaches
+//! the tail and the re-exec'd carrick is simply the one top-level process of
+//! its own pid. A path that reaches the emit site without passing through
+//! `main` — no recorded pid — fails quiet rather than double-reporting, since
+//! `parse_nativeperf` hard-fails on a duplicate supervisor line.
 //!
 //! The discriminator is process identity: `main` records `getpid()` in
-//! [`TOP_LEVEL_PID`] before any dispatch or fork; `fork()` copies that value
-//! into every descendant, whose own `getpid()` then differs, so only the one
-//! true top-level process ever emits. Never-recorded (a path that reaches
-//! the emit site without passing through `main`) fails quiet.
-//!
-//! `RUSAGE_CHILDREN` on the top-level Launcher still covers the whole tree
-//! in the interactive case: the Launcher `waitpid`s the pty-relay Supervisor
-//! (`wait_for_child`), which `waitpid`s the runtime child
-//! (`wait_for_runtime_child`) — each reap folds the exited process's
-//! `RUSAGE_SELF` + its own collected `RUSAGE_CHILDREN` into the reaper, so
-//! the totals fold transitively up to the Launcher by exit.
+//! [`TOP_LEVEL_PID`] before any dispatch, and only the process whose
+//! `getpid()` matches may emit.
 
 /// Wire prefix shared with the in-guest NATIVEPERF v2 protocol
 /// (`crate::native_darwin::dsr::profile::PROTOCOL_PREFIX` in carrick-runtime;
@@ -66,19 +56,13 @@
 const PROTOCOL_PREFIX: &str = "NATIVEPERF1";
 
 /// The pid of the ONE true top-level `carrick` process, recorded exactly once
-/// at CLI entry (`main`, before any command dispatch or fork). The env var
-/// alone cannot identify the supervisor: for `-t`/`-it` runs
-/// `fork_interactive_session` (carrick-runtime's interactive_supervisor)
-/// forks twice, and BOTH the pty-relay Supervisor process and the runtime
-/// child bubble back through `Runtime::execute` to `Commands::Run`'s tail —
-/// each with `CARRICK_DSR_PROFILE` inherited — so call-site reachability
-/// spans up to three OS processes per invocation. A `fork()` copies this
-/// recorded value into the child, whose own `getpid()` then differs, which is
-/// exactly the discriminator: only the process whose pid MATCHES the recorded
-/// one is the top-level supervisor. The PID-preserving guest self-reexec
-/// (`execve`) wipes the slot and re-records in the fresh image, but that
-/// image dispatches to `__native-exec-resume`, never `Commands::Run`, so it
-/// cannot reach the emit site.
+/// at CLI entry (`main`, before any command dispatch). Under HVPatch a run
+/// never forks a host descendant, so this is a fail-closed guard, not a
+/// disambiguator: a `posix_spawn`ed `__carrier-entry` carrier records its own
+/// pid but dispatches to `carrier_entry`, never `Commands::Run`; and
+/// `carrick trace`'s sudo re-exec replaces the pre-exec image outright, so the
+/// re-exec'd process records afresh and is the only image of its pid that
+/// can reach the emit site.
 static TOP_LEVEL_PID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 
 /// Record the current process as the top-level `carrick` invocation. Call
