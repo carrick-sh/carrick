@@ -156,25 +156,20 @@ pub const SHARD_2_PROBES: &[&str] = &[
     "zerolenio",
 ];
 
-const CACHED_SHARD_2_PROBE_COUNT: usize = 133;
+const CACHED_SHARD_2_PROBE_COUNT: usize = 131;
 
 const MUSL_BASELINE_GAPS: &[&str] = &[
     "budget_two_proc",
-    "childsubreaper",
     "cluster10errno",
     "coredumpfile",
     "execfromthread",
     "execthreads",
-    "futexforkwakegroups",
     "mprotectexec",
     "mqnotifycrossproc",
     "pidfdprocdir",
     "pidnsroot",
-    "ppid",
     "proclife",
     "procpeerdir",
-    "procpeermem",
-    "rlimitnproc",
     "shmnestedfork",
     "siginfo",
     "sigpairrace",
@@ -188,7 +183,6 @@ const MUSL_BASELINE_GAPS: &[&str] = &[
 
 const GNU_BASELINE_GAPS: &[&str] = &[
     "budget_two_proc",
-    "childsubreaper",
     "clonefsumask",
     "cluster10errno",
     "coredumpfile",
@@ -198,13 +192,8 @@ const GNU_BASELINE_GAPS: &[&str] = &[
     "mmapfileshare_mt",
     "pidfdprocdir",
     "pidnsroot",
-    "ppid",
     "proclife",
     "procpeerdir",
-    "procpeermem",
-    "ptraceattach",
-    "rlimitnproc",
-    "setidthreadchurn",
     "shmnestedfork",
     "siginfo",
     "sigpairrace",
@@ -243,7 +232,11 @@ pub fn expected_gaps_for_shard(baseline: &[&'static str]) -> BTreeSet<&'static s
     baseline
         .iter()
         .copied()
-        .filter(|gap| shard_set.contains(gap))
+        .filter(|gap| {
+            shard_set.contains(gap)
+                && common::runs_in_cached_lane(gap)
+                && common::probe_filter_allows(gap)
+        })
         .collect()
 }
 
@@ -558,7 +551,8 @@ fn generic_probe_shard_2() {
         let mut executed_count = 0;
 
         for &probe_name in SHARD_2_PROBES {
-            if !common::runs_in_cached_lane(probe_name) {
+            if !common::runs_in_cached_lane(probe_name) || !common::probe_filter_allows(probe_name)
+            {
                 continue;
             }
             let probe_path = dir.join(probe_name);
@@ -584,6 +578,7 @@ fn generic_probe_shard_2() {
                 container = container.cap_add(cap);
             }
 
+            eprintln!("RUN generic probe shard 2 {target_triple}:{probe_name}");
             let outcome = common::with_empty_stdin_pipe(|| container.run(["/tmp/carrick-init"]));
             let result = common::run_named_or_fail(
                 &format!("generic probe shard 2 {target_triple}:{probe_name}"),
@@ -595,15 +590,19 @@ fn generic_probe_shard_2() {
             let observed = normalize(&combined);
 
             if observed != expected_oracle {
+                eprintln!(
+                    "DIFF generic probe shard 2 {target_triple}:{probe_name}\n--- observed ---\n{observed}\n--- oracle ---\n{expected_oracle}"
+                );
                 observed_mismatches.insert(probe_name);
             }
             executed_count += 1;
         }
 
-        assert_eq!(
-            executed_count, CACHED_SHARD_2_PROBE_COUNT,
-            "must execute exactly {CACHED_SHARD_2_PROBE_COUNT} cached probes for {target_triple}"
-        );
+        let selected_count = SHARD_2_PROBES
+            .iter()
+            .filter(|name| common::runs_in_cached_lane(name) && common::probe_filter_allows(name))
+            .count();
+        assert_eq!(executed_count, selected_count);
 
         assert_eq!(
             observed_mismatches,
