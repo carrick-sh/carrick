@@ -123,6 +123,7 @@ acceptance surfaces, and integrated only reviewed commits.
 | CLI boundary contract | **green**, 5/5, no Docker contacted |
 | retained legacy phase | **green**, 46 passed / 1 explicit bless ignored; the three MM-authority failures are fail-closed XFAILs and unexpected passes fail the gate (`790a04d4e`) |
 | full `just conformance full` | **red / incomplete**: fail-fast after 51 gating verdicts; 1,092/2,127 rows emitted (`1022 match`, `12 diff`, `7 new`, `45 regression`, `6 timeout`). Receipt: `target/conformance/results.hvf.full.jsonl`. Do not call this a refreshed 93% result. |
+| `RUST_TEST_THREADS=1 just ci` | **green**, exit 0 at documentation HEAD `aeec834a9`; fmt, clippy, typed-domain lint, deny, matrix drift, build, docs, serialized host tests, and host integration tests all passed. This host-only gate did not relink the signed artifact recorded above. |
 
 The first aggregate `just conformance-probes` attempt is not green because the
 shard-0 test executable aborted before its phase completed. The same revision's
@@ -145,8 +146,9 @@ is valid. The bounded next steps are:
    base run before filing any of its 51 gating verdicts as migration regressions;
 3. migrate dedicated tests only after the corresponding public embed topology
    APIs exist; do not replace them with passing blocker stubs;
-4. run final `just ci` after the guest machine is quiet, then record the exact
-   final artifact again.
+4. after any code change, rerun `RUST_TEST_THREADS=1 just ci`; the current
+   documentation HEAD `aeec834a9` is green. Rebuild and restamp the signed
+   artifact only when a later guest-running checkpoint actually changes code.
 
 There is no phase-completion receipt yet.
 
