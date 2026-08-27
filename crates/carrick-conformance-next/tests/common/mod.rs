@@ -69,6 +69,21 @@ pub fn probe_filter_allows(probe: &str) -> bool {
     })
 }
 
+#[test]
+fn retained_probe_manifest_matches_classification() {
+    let manifest = std::fs::read_to_string(
+        repo_root().join("scripts/conformance/retained-generic-probes.txt"),
+    )
+    .expect("read retained generic probe manifest");
+    let actual = manifest.lines().collect::<std::collections::BTreeSet<_>>();
+    let expected = LIVE_ORACLE_PROBES
+        .iter()
+        .chain(OUT_OF_PROCESS_PROBES)
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(actual, expected);
+}
+
 /// Run one embedded container while host fd 0 is an already-EOF pipe, matching
 /// the old direct-probe transport and Docker's `-i` pipe after payload upload.
 /// Callers must hold [`guest_lock`] because fd 0 is process-global.

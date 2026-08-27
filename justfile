@@ -369,7 +369,17 @@ conformance-probes: build
     case "$(uname -m)" in
         x86_64|amd64) ./scripts/build-probes.sh ;;
     esac
-    cargo test -p carrick-cli --test conformance {{_platform_features}} -- --nocapture
+    if [[ "$(uname -s):$(uname -m)" == "Darwin:arm64" ]]; then
+        # The deterministic arm64 rows run in-process against committed Docker
+        # oracles. Only live-oracle and process-poisoning exceptions retain the
+        # old signed-binary harness while their embed blockers remain open.
+        ./scripts/test-signed.sh carrick-conformance-next generic_probe_shard_ --nocapture
+        retained_filter="$(paste -sd, scripts/conformance/retained-generic-probes.txt)"
+        CARRICK_PROBE_LANE=arm64 CARRICK_PROBE_FILTER="$retained_filter" \
+          cargo test -p carrick-cli --test conformance {{_platform_features}} -- --nocapture
+    else
+        cargo test -p carrick-cli --test conformance {{_platform_features}} -- --nocapture
+    fi
 
 # Verify the frozen 2,127-suite discovery surface against the current clean
 # source tree, signed Carrick binary, manifest, and live image identities.
