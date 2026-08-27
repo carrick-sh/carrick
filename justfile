@@ -127,6 +127,7 @@ clippy *ARGS:
 # checks this host's product profiles and reports all other required profiles
 # pending; a partial local pass is not matrix completeness.
 lint-domains:
+    python3 scripts/conformance/check-next-strategy.py
     ./scripts/lint-domains.sh
     python3 scripts/migrate/check-host-authority-transitions.py --check
 

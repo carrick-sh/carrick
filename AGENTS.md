@@ -251,6 +251,17 @@ If it fails in Docker too, it's not carrick's bug.
   routine gates run carrick-only. Single-run gating is non-deterministic
   (Go-under-HVF races); treat flaky flips as flakiness (retry / `known_gaps`),
   not regressions.
+- **New probe coverage belongs in `carrick-conformance-next`.** Generic probes
+  run in-process through `carrick-embed` and compare against committed,
+  source-hash-validated Docker oracle output. Do not add a new `carrick run`
+  subprocess probe or invoke `carrick-cli --test conformance` as the routine
+  probe gate. The only exceptions are the exact entries in
+  `scripts/conformance/retained-generic-probes.txt`, the audited dedicated
+  topology/service runners whose required embed APIs do not exist yet, and the
+  single explicit CLI process-boundary contract. `just conformance-probes` is
+  the public gate. `just lint-domains` runs
+  `scripts/conformance/check-next-strategy.py` to reject subprocess execution
+  inside `carrick-conformance-next` and direct legacy probe invocation in CI.
 - **Linux syscall shape comes from `bpftrace` INSIDE the Docker oracle — never
   from guest `strace`.** `strace` perturbs test behaviour and is not accepted as
   Docker-oracle syscall evidence. The container ships `bpftrace`; run it in a

@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
-# Run ONE conformance probe the EXACT way tests/conformance.rs does, under BOTH
-# carrick and Docker linux/arm64, and diff — for fast, FAITHFUL single-probe
-# iteration.
+# LEGACY DIAGNOSTIC ONLY. New and routine probe coverage must use the signed
+# carrick-conformance-next in-process lane (`CARRICK_PROBE_FILTER=<name> just
+# conformance-probes`). This script remains for an explicitly retained
+# live-oracle/process-boundary exception and for migration parity diagnosis.
+#
+# Run ONE retained conformance probe the exact old way under both Carrick and
+# Docker linux/arm64 and diff it.
 #
 # Faithful = the same path the gate uses: the probe is base64'd onto the guest's
 # stdin and decoded + exec'd via `/bin/sh -c` under `carrick run <image>` (the
 # THREADED run-loop, shell-launched). `carrick run-elf <probe>` is a DIFFERENT,
 # lighter path (bare rootfs, single-threaded) and can PASS a probe the gate
-# FAILS (signal/timing/threading differences). Always verify a probe here, not
-# just via run-elf.
+# FAILS (signal/timing/threading differences). That distinction is why this is
+# retained as a diagnostic, not the default authoring or gating strategy.
 #
 # Usage: scripts/run-probe.sh <probe-name> [image]
 #   image defaults to ubuntu:24.04 (what the conformance harness uses).

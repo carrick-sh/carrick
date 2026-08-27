@@ -9,7 +9,14 @@
 #   docker run --rm --platform linux/arm64 -i ubuntu:24.04 \
 #     sh -c 'base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p' < <(base64 < $PROBE)
 #
-# Carrick verification runs in batch later via `cargo test --release --test conformance`.
+# Add the probe to probe-inventory.json and the derived conformance-next shard.
+# Refresh its committed Docker oracle deliberately, then use the signed,
+# in-process cached lane for Carrick iteration:
+#
+#   CARRICK_PROBE_FILTER=<name> just conformance-probes
+#
+# Do not add it to the legacy carrick-cli conformance runner. The retained
+# manifest is only for reviewed live-oracle or process-isolation exceptions.
 
 set -e
 name="$1"
@@ -44,4 +51,4 @@ fn main() {
 }
 EOF
 echo "created $out"
-echo "next: edit, then scripts/build-probes.sh && docker-run to diff"
+echo "next: edit, classify in probe-inventory.json, refresh the Docker oracle, then run CARRICK_PROBE_FILTER=$name just conformance-probes"
