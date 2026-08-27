@@ -162,9 +162,27 @@ struct Stage1MmPoolInner {
     free_root_slots: BTreeSet<Stage1RootSlot>,
 }
 
+fn carrier_stage1_mm_pool() -> &'static Arc<Mutex<Stage1MmPoolInner>> {
+    static CELL: std::sync::OnceLock<Arc<Mutex<Stage1MmPoolInner>>> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        Arc::new(Mutex::new(Stage1MmPoolInner {
+            asids: AsidAllocator::new(),
+            free_root_slots: (0..STAGE1_ROOT_SLOT_COUNT).map(Stage1RootSlot).collect(),
+        }))
+    })
+}
+
 impl Stage1MmPool {
     pub(crate) fn new_root(stage1_root: u64) -> Result<(Self, Arc<Stage1MmLease>), Stage1MmError> {
-        Self::with_allocator(stage1_root, AsidAllocator::new())
+        let pool = Self {
+            inner: Arc::clone(carrier_stage1_mm_pool()),
+        };
+        let inner = pool.inner.lock();
+        let asid = inner.asids.allocate()?;
+        let stage1_root = Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa(stage1_root))?;
+        let root = Arc::new(Stage1MmLease::new(asid, stage1_root, None));
+        drop(inner);
+        Ok((pool, root))
     }
 
     #[cfg(test)]
@@ -175,6 +193,7 @@ impl Stage1MmPool {
         Self::with_allocator(stage1_root, AsidAllocator::with_limit_for_tests(asid_limit))
     }
 
+    #[cfg(test)]
     fn with_allocator(
         stage1_root: u64,
         asids: AsidAllocator,
@@ -1518,5 +1537,48 @@ mod tests {
                 crate::kernel::SnapshotTable::Vmas
             ))
         );
+    }
+
+    #[test]
+    fn concurrent_carrier_roots_allocate_distinct_asids_and_root_slots() {
+        let start_barrier = Arc::new(std::sync::Barrier::new(3));
+        let hold_barrier = Arc::new(std::sync::Barrier::new(3));
+        let s1 = Arc::clone(&start_barrier);
+        let s2 = Arc::clone(&start_barrier);
+        let h1 = Arc::clone(&hold_barrier);
+        let h2 = Arc::clone(&hold_barrier);
+
+        let t1 = std::thread::spawn(move || {
+            s1.wait();
+            let (pool, root) = Stage1MmPool::new_root(0x10000).expect("first carrier root");
+            let child = pool.prepare_child().expect("child for root 1");
+            let slot = child.root_slot();
+            let lease = child.commit();
+            h1.wait();
+            (root.binding(), lease.binding(), slot)
+        });
+
+        let t2 = std::thread::spawn(move || {
+            s2.wait();
+            let (pool, root) = Stage1MmPool::new_root(0x20000).expect("second carrier root");
+            let child = pool.prepare_child().expect("child for root 2");
+            let slot = child.root_slot();
+            let lease = child.commit();
+            h2.wait();
+            (root.binding(), lease.binding(), slot)
+        });
+
+        start_barrier.wait();
+        hold_barrier.wait();
+        let (root1, child1, slot1) = t1.join().expect("thread 1");
+        let (root2, child2, slot2) = t2.join().expect("thread 2");
+
+        // ASIDs must be all mutually distinct across both containers
+        let asids = vec![root1.asid, child1.asid, root2.asid, child2.asid];
+        let asid_set: std::collections::BTreeSet<_> = asids.iter().copied().collect();
+        assert_eq!(asid_set.len(), 4, "all 4 ASIDs must be distinct: {asids:?}");
+
+        // Child root slots must also be distinct
+        assert_ne!(slot1, slot2, "child root slots must not collide");
     }
 }

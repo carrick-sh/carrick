@@ -10056,6 +10056,10 @@ mod tests {
                 .unwrap();
             let mut root_state = executor::tests::task_state(&root, 500 + case as u64);
             root_state.asid_generation = process.asid_generation();
+            let carrick_hal::threaded::GuestCpuState::Aarch64V1(cpu) = &mut root_state.cpu else {
+                unreachable!()
+            };
+            Arc::make_mut(cpu).asid_generation = process.asid_generation();
             let root_generation = root
                 .thread()
                 .publish_initial_task_state(root_state.clone())
