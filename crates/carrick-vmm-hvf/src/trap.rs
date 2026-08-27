@@ -21388,9 +21388,17 @@ mod frame_inventory_backend_tests {
             .iter()
             .find(|mapping| mapping.guest_start == carrick_mem::memory::LINUX_PAGE_TABLES_BASE)
             .expect("exec stage-1 table mapping");
+        // No `heap` row: since `59cfc210f` ("make HVPatch brk heap a real
+        // VMA") the heap L1 entry is SPLIT INTO A TABLE and left
+        // `set_prot_none` until `brk` grows it, so `terminal_descriptor`
+        // returns a zero leaf — it is neither mapped nor nG-tagged, and both
+        // assertions below are meaningless for it. `59cfc210f` dropped the
+        // identical row from the `carrick-mem` `stage1_tests` twin and missed
+        // this one, which is why `just test` was red on main. The heap's new
+        // shape is asserted where it now lives: "L1A[..] (heap split) must be
+        // a table" in `carrick_mem::memory` stage1_tests.
         for (name, va) in [
             ("user text", 0x0040_0000),
-            ("heap", carrick_mem::memory::LINUX_HEAP_BASE),
             ("mmap", carrick_mem::memory::LINUX_MMAP_BASE),
             (
                 "shared aperture",
