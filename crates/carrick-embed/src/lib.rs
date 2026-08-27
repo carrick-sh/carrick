@@ -53,6 +53,7 @@ pub use carrick_engine::{ResolveWarning, RunRequest};
 pub use carrick_image::{ImageStore, PullPolicy};
 pub use carrick_runtime::compat::CompatReport;
 pub use carrick_runtime::dispatch::Signal;
+pub use carrick_runtime::kernel::{ClockDomain, SignedDuration, TimeControl, TimeError};
 pub use carrick_runtime::observe::{
     ArgFilter, AuditEvent, AuditObserver, ExitStatus, FastPathVisibility, PolicyObserver,
     PolicyRule, ProcessInfo, SandboxObserver, SandboxPreset, SyscallAction, SyscallInfo,

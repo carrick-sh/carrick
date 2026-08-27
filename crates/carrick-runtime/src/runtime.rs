@@ -132,7 +132,7 @@ pub use crate::trap::SyscallTrap;
 // native backend resolves them on every host OS. Re-exported here so the
 // original `crate::runtime::…` paths are unchanged on this arm.
 pub(crate) use crate::vdso_policy::{
-    debug_env_flag_enabled, vdso_enabled_for_debug, with_optional_vdso,
+    debug_env_flag_enabled, vdso_enabled_for_debug, with_optional_vdso_for_clock,
 };
 
 pub use crate::debug_state::{DebugRegionSnapshot, DebugStateSnapshot, maybe_dump_debug_state};
@@ -719,7 +719,8 @@ pub(crate) fn finish_and_run_image(
     // builder.
     let image = with_hvf_syscall_mailbox(image)?;
     let image = image.with_hvpatch_stage1_page_tables()?;
-    let image = with_optional_vdso::<HvfArch>(image)?;
+    let container = dispatcher.container();
+    let image = with_optional_vdso_for_clock::<HvfArch>(image, container.clock())?;
     if let Some(p) = maybe_dump_debug_state(&image, debug_state_path) {
         eprintln!("debug state written: {}", p.display());
     }

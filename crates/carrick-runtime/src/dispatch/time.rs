@@ -236,11 +236,15 @@ impl SyscallDispatcher {
             // multithreaded fork-quiesce. The run loop owns EINTR completion, so
             // carry the optional `rem` pointer there for remaining-time copyout.
             let remaining = (rem_ptr.0 != 0).then_some(rem_ptr);
+            let clock = Arc::clone(cx.kernel.task().container().clock());
             match duration {
-                Some(duration) => Ok(DispatchOutcome::WaitOnSleep {
-                    duration,
-                    remaining,
-                }),
+                Some(duration) => {
+                    let scaled_duration = clock.scale_timeout(duration);
+                    Ok(DispatchOutcome::WaitOnSleep {
+                        duration: scaled_duration,
+                        remaining,
+                    })
+                }
                 None => Ok(DispatchOutcome::Returned { value: 0 }),
             }
         }
@@ -260,21 +264,44 @@ impl SyscallDispatcher {
                 Ok(duration) => duration.unwrap_or(Duration::ZERO),
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
-            let sleep_duration = if flags & LINUX_TIMER_ABSTIME != 0 {
+
+            let is_abstime = flags & LINUX_TIMER_ABSTIME != 0;
+
+            if is_abstime && requested <= now {
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+
+            if clock.is_frozen()
+                && is_abstime
+                && (clock_id == LINUX_CLOCK_REALTIME
+                    || clock_id == LINUX_CLOCK_REALTIME_COARSE
+                    || clock_id == LINUX_CLOCK_REALTIME_ALARM
+                    || clock_id == LINUX_CLOCK_TAI)
+            {
+                // Frozen absolute realtime deadline in the future never expires on host time!
+                return Ok(DispatchOutcome::WaitOnSleep {
+                    duration: Duration::MAX,
+                    remaining: None,
+                });
+            }
+
+            let sleep_duration = if is_abstime {
                 requested.saturating_sub(now)
             } else {
                 requested
             };
+
+            let scaled_duration = clock.scale_timeout(sleep_duration);
             // See nanosleep: the run loop performs the timed wait (WaitOnSleep)
             // so it is fork-quiesce-parkable. ABSTIME is pre-converted to the
             // relative `sleep_duration` here; on a quiesce re-dispatch the run
             // loop keeps the original deadline, so it stays absolute-correct.
-            let remaining = (flags & LINUX_TIMER_ABSTIME == 0 && rem_ptr.0 != 0).then_some(rem_ptr);
-            if sleep_duration.is_zero() {
+            let remaining = (!is_abstime && rem_ptr.0 != 0).then_some(rem_ptr);
+            if scaled_duration.is_zero() {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
             Ok(DispatchOutcome::WaitOnSleep {
-                duration: sleep_duration,
+                duration: scaled_duration,
                 remaining,
             })
         }

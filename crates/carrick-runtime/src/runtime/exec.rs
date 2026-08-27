@@ -33,11 +33,12 @@ fn finalize_hvf_exec_base(
         .map_err(|_| LINUX_ENOEXEC)?;
     use carrick_hal::GuestArch as _;
     type HvfArch = <crate::trap::HvfTrapEngine as carrick_hal::ThreadedEngine>::Arch;
+    let container = dispatcher.container();
     staged
         .with_el0_trampoline_bytes(HvfArch::entry_trampoline_bytes())
         .and_then(with_hvf_syscall_mailbox)
         .and_then(|address_space| address_space.with_hvpatch_stage1_page_tables())
-        .and_then(with_optional_vdso::<HvfArch>)
+        .and_then(|image| with_optional_vdso_for_clock::<HvfArch>(image, container.clock()))
         .map_err(|_| LINUX_ENOENT)
 }
 
