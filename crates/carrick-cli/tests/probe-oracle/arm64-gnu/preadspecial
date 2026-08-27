@@ -1,0 +1,5 @@
+c464deef4be20224
+pread_pipe_espipe=true
+pread_dir_eisdir=true
+readv_dir_eisdir=true
+pread_regular_ok=true

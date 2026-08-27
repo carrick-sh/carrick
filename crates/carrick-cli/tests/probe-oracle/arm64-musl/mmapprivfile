@@ -1,0 +1,10 @@
+ba31b1bb6d826c66
+content_at_zero_offset=true
+zero_tail_after_eof=true
+beyond_eof_page=SIGBUS
+cow_store_private_to_file=true
+cow_store_visible_in_map=true
+written_page_survives_truncate=true
+nonzero_offset_rdonly_content=true
+mapping_survives_fd_close=true
+DONE

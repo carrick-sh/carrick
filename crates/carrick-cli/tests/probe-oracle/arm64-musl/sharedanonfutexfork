@@ -1,0 +1,10 @@
+f13360726852fe2d
+shared_map_ok=true
+forked_all=true
+wake_calls_succeeded=true
+all_waiters_woken=true
+normal_wake_count_expected=true
+timeout_count_zero=true
+other_return_count_zero=true
+returned_all=true
+children_exited_all=true

@@ -1,0 +1,9 @@
+ea5502338133b862
+fdstat_size_match=true
+fdstat_mtime_match=true
+fdstat_mode_match=true
+fdstat_ino_match=true
+fdstat_mtime_is_set=true
+statx_emptypath_mtime_match=true
+statx_emptypath_size_match=true
+statx_emptypath_ino_match=true

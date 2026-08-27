@@ -1,0 +1,10 @@
+9fd040e0bbc559da
+fork_succeeded=true
+child_open_isolated_from_parent=true
+parent_slot_installed=true
+parent_open_isolated_from_child=true
+shared_offset_child_read_prefix=true
+shared_offset_parent_read_next=true
+shared_status_visible_in_parent=true
+descriptor_flags_isolated_from_parent=true
+child_exited_zero=true

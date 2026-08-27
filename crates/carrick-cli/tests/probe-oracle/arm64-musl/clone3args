@@ -1,0 +1,15 @@
+933b7754350aa329
+clone3_happy_rejected_or_succeeded=true
+clone3_extra_size_efault_or_blocked=true
+clone3_truncated_rc_minus_one=true
+clone3_truncated_rejected=true
+clone3_sighand_no_vm_rejected=true
+clone3_thread_no_sighand_rejected=true
+clone3_fs_newns_rejected=true
+clone3_invalid_pidfd_efault_or_blocked=true
+clone3_invalid_signal_rejected=true
+clone3_newpid_fork_or_blocked=true
+clone3_badflag_rc_minus_one=true
+clone3_badflag_rejected=true
+clone3_badstack_rc_minus_one=true
+clone3_badstack_rejected=true

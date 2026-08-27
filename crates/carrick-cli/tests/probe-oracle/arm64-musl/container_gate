@@ -1,0 +1,12 @@
+4e01f030ad050098
+role=alpha
+getpid=9
+hostname=8354835e8aa3
+own_marker_written=true
+foreign_marker_visible=false
+child_comm_visible=false
+foreign_proc_visible=false
+peer_ready=true
+mmap_arena_ok=true
+getpid_again=9
+proc_status_pid=9

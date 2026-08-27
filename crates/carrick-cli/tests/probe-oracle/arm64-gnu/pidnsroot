@@ -1,0 +1,5 @@
+86d9a62555dcbb80
+parent_is_init=true
+child_parent_is_me=true
+wait_returned_child=true
+child_pid_eq_fork_ret=true

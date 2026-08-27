@@ -1,0 +1,5 @@
+b8a52ea319fed4dd
+signalfd4_created=true
+signalfd4_cloexec=true
+signalfd4_nonblock=true
+signalfd4_bad_flag_einval=true

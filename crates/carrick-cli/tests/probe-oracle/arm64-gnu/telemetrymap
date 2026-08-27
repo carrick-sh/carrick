@@ -1,0 +1,11 @@
+5e711c06b4dc1780
+openmapped_fdwrite ok
+main_hasprefix true
+hash_slot_empty true
+main_record_add prev=0 val=1
+sib_hasprefix 1
+sib_hash_links 1
+sib_record_val 1
+sib_record_name 1
+file_record_val rc=8 val=1
+DONE

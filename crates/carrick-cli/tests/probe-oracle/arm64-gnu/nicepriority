@@ -1,0 +1,9 @@
+f0f2de744e62728a
+set_nice_2_ok=true
+get_nice_is_2=true
+isolation_parent_nice=7
+isolation_child_a_exited_0=true
+isolation_child_b_nice=7
+set_nice_50_ok=true
+get_nice_clamped_19=true
+getpriority_bad_which_einval=true

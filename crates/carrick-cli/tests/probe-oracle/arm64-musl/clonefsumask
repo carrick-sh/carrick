@@ -1,0 +1,4 @@
+35235a81a30e2da2
+clone_fs_thread_change_visible=true
+fork_child_inherited_umask=true
+fork_child_change_isolated=true

@@ -1,0 +1,8 @@
+722bc1893b5bf0fa
+mkfifo_ok=true
+open_ok=true
+epoll_add_ok=true
+child_closed_writer=true
+epoll_woke_after_all_writers_closed=true
+reported_hup_or_in=true
+read_returns_eof=true

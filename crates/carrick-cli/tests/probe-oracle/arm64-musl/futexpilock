@@ -1,0 +1,9 @@
+d8c65a23dd277588
+lock_pi_uncontended_rc_zero=true
+lock_pi_records_owner_tid=true
+trylock_pi_self_rc_neg_one=true
+trylock_pi_self_errno_edeadlk=true
+unlock_pi_owner_rc_zero=true
+unlock_pi_clears_word=true
+unlock_pi_unowned_rc_neg_one=true
+unlock_pi_unowned_errno_eperm=true

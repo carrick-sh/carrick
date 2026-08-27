@@ -1,0 +1,8 @@
+0b8cead4aab26435
+privileged_setresuid_ok=true
+privileged_setresuid_readback=true
+setreuid_to_real_ok=true
+setreuid_saved_unchanged=true
+unpriv_setresuid_foreign_eperm=true
+unpriv_setuid_to_saved_ok=true
+unpriv_setuid_only_euid_changed=true

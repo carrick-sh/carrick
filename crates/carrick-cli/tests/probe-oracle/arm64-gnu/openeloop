@@ -1,0 +1,4 @@
+b89df05e2fb2874e
+open_loop_fd=-1 open_loop_errno=40
+open_loop_is_eloop=true
+open_missing_still_enoent=true

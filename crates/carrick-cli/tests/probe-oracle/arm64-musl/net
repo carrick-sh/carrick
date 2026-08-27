@@ -1,0 +1,12 @@
+4301954fd13daa99
+socketpair_bytes=hi
+socketpair_ok=true
+socket_inet_ok=true
+socket_inet6_ok=true
+socket_netlink_ok=true
+unix_getsockname_is_unix=true
+unix_listen_rc=0
+unix_connect_ok=true
+unix_loopback_bytes=ping
+so_reuseaddr_value=1
+so_type_is_stream=true

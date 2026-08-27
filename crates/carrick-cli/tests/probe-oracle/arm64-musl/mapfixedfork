@@ -1,0 +1,9 @@
+7d53b3028a3f9c50
+setup_ok=true
+fixed_ok=true
+fixed_failed=false
+fixed_errno=0
+child_inherited_private=true
+parent_isolated_from_child=true
+child_isolated_from_parent=true
+parent_keeps_own_write=true

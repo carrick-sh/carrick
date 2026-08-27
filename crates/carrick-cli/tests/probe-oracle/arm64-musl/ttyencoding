@@ -1,0 +1,10 @@
+ab704a08214eda1f
+setup_ok=true
+pipe_is_not_tty=true
+pipe_tcgets_enotty=true
+pipe_isatty_matches_tcgets=true
+pty_isatty=true
+pty_tcgets_ok=true
+pty_isatty_matches_tcgets=true
+stdin_is_not_tty=true
+stdin_isatty_matches_tcgets=true

@@ -1,0 +1,7 @@
+133671c7689aadf8
+child_tid_positive=true
+sched_getscheduler_live_thread_is_other=true
+sched_getscheduler_live_thread_errno_zero=true
+sched_getparam_live_thread_rc_zero=true
+sched_getparam_live_thread_errno_zero=true
+sched_getparam_live_thread_priority_zero=true

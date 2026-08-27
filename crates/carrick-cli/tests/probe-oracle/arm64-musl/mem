@@ -1,0 +1,12 @@
+02e87c9d4443d16f
+mmap_anon_ok=true
+mmap_anon_readback=0,1,2,3
+mprotect_r_rc=0
+madvise_dontneed_rc=0
+munmap_rc=0
+mremap_ok=true
+mremap_preserved=true
+sbrk0_nonzero=true
+mlock_rc=0
+munlock_rc=0
+msync_rc=0

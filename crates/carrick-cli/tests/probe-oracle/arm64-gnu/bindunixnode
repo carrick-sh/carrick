@@ -1,0 +1,11 @@
+93868d2c6f2b9f1f
+socket_ok=true
+bind_ok=true
+stat_ok=true
+is_sock=true
+access_ok=true
+chmod_ok=true
+chmod_bits_600=true
+still_sock=true
+unlink_ok=true
+gone_after_unlink=true

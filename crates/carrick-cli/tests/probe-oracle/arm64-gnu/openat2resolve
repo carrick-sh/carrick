@@ -1,0 +1,9 @@
+689c1f4b2a076f5d
+plain_symlink_open_ok=true
+no_symlinks_rejects_symlink_eloop=true
+dirfd_open_ok=true
+plain_dotdot_escape_ok=true
+beneath_rejects_dotdot_escape_exdev=true
+no_xdev_rejects_proc_exdev=true
+no_magiclinks_rejects_proc_fd_eloop=true
+in_root_absolute_scoped_open_ok=true

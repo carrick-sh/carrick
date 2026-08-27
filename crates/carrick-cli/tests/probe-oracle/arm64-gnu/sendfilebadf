@@ -1,0 +1,4 @@
+18ace2aedcea0b4f
+sendfile_in_wronly_ebadf=true
+sendfile_out_rdonly_ebadf=true
+sendfile_valid_returns_8=true

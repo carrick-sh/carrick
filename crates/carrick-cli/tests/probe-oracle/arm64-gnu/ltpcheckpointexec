@@ -1,0 +1,5 @@
+4833e95b82e9d3a2
+shm_create_ok=true
+shm_mmap_ok=true
+exec_child_woke_parent_wait=true
+exec_child_exit_ok=true

@@ -1,0 +1,8 @@
+26ebfbfd48a9909d
+splice_staged_all=true
+fork_after_splice_succeeded=true
+parent_consumed_prefix=true
+child_consumed_middle=true
+parent_consumed_suffix=true
+global_pipe_order_exact=true
+child_exited_zero=true

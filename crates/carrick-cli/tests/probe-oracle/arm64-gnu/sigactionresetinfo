@@ -1,0 +1,8 @@
+5cde5392fad4b401
+install_ok=true
+self_signal_ok=true
+handler_ran=true
+handler_siginfo_nonnull=true
+handler_query_ok=true
+handler_query_retained_siginfo=true
+disposition_reset_to_dfl=true

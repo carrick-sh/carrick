@@ -1,0 +1,8 @@
+0b21f46ab071172c
+set_subreaper_ok=true
+child_subreaper_not_inherited=true
+grandchild_pid_reported=true
+orphan_ppid_is_subreaper=true
+wait_reaped_orphan=true
+orphan_exit_status=true
+sigchld_from_orphan=true

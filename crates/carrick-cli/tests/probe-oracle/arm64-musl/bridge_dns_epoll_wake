@@ -1,0 +1,9 @@
+3d42ea906dc3ef53
+dns_epoll_nameserver_ok=true
+dns_epoll_socket_ok=true
+dns_epoll_add_ok=true
+dns_epoll_send_ok=true
+dns_epoll_ready_after_send=true
+dns_epoll_reply_id_matches=true
+dns_epoll_wake_while_parked=true
+dns_epoll_parked_reply_id_matches=true

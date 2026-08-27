@@ -1,0 +1,4 @@
+388829ddf1f21d19
+ppoll_returned=true
+ppoll_eintr=true
+ppoll_did_not_time_out=true

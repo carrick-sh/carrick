@@ -1,0 +1,15 @@
+55b32e17a0b33827
+null_attach_ok=true
+aligned_attach_ok=true
+aligned_errno=0
+child_aligned_status=0
+rounded_attach_ok=true
+rounded_errno=0
+readonly_errno=0
+readonly_signal=11
+shm_info_ok=true
+shm_info_errno=0
+stat_any_ok=true
+stat_any_errno=0
+remap_invalid=-1
+remap_invalid_errno=22

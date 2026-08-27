@@ -1,0 +1,15 @@
+9b1aedf50367b938
+fork_ok=true
+traceme_stop_reaped=true
+traceme_stopped=true
+traceme_stopsig=19
+traceme_stopsig_is_sigstop=true
+traceme_stopped_before_exit=true
+traceme_early_exit_status=0
+traceme_repeat_eperm=true
+ptrace_cont_ok=true
+ptrace_cont_errno=0
+ptrace_cont_errno_zero=true
+final_reaped=true
+final_exited=true
+final_exit_status_is_42=true

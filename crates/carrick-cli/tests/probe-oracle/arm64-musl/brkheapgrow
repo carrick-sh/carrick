@@ -1,0 +1,10 @@
+ebb7fb3528db626b
+brk_initial_nonzero=true
+brk_grow_32mib=true
+grow_zero_fill=true
+grow_write_readback=true
+brk_shrink=true
+brk_regrow=true
+regrow_zero_fill=true
+regrow_write_readback=true
+brkheapgrow=done

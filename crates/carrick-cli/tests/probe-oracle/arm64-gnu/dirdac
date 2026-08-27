@@ -1,0 +1,6 @@
+a355597278d202be
+dropped_to_nonroot=true
+mkdir_in_unwritable_eacces=true
+mkdir_in_writable_ok=true
+rmdir_in_writable_ok=true
+symlink_in_unwritable_eacces=true

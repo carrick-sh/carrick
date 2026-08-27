@@ -1,0 +1,5 @@
+48e633995a759388
+rlimit_stack_soft_8mib=true
+rlimit_stack_max_unlimited=true
+main_stack_size_8mib=false
+deep_c_recursion_fits=true

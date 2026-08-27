@@ -1,0 +1,9 @@
+b557395a3b8b658d
+pipe_ok=true
+pipe_read_rdonly=true
+pipe_write_wronly=true
+pipe_cloexec_not_nonblock=true
+socket_ok=true
+socket0_rdwr=true
+socket1_rdwr=true
+sock_cloexec_not_nonblock=true

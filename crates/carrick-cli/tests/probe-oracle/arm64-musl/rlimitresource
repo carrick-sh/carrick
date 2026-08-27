@@ -1,0 +1,7 @@
+55f9f22fcb2de465
+prlimit_bad_resource_einval=true
+prlimit_resource16_einval=true
+prlimit_nofile_ok=true
+prlimit_self_ok=true
+prlimit_pid_neg1_esrch=true
+prlimit_pid_999999_esrch=true

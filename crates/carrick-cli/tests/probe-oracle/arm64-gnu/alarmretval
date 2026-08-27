@@ -1,0 +1,9 @@
+c7c3bc6ae23f4e29
+fresh_alarm_returns_zero=true
+cancel_returns_remaining=true
+big_alarm_returns_zero=true
+big_cancel_exact=true
+setitimer_arm_ok=true
+setitimer_disarm_ok=true
+old_value_sec_intmax=true
+old_value_usec_range=true

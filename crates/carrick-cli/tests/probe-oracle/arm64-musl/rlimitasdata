@@ -1,0 +1,15 @@
+80c2b82a86d7cb8e
+data_limit_set=true
+brk_16mib_ok=true
+brk_past_data_unchanged=true
+mmap_rw_private_past_data_enomem=true
+mmap_prot_none_not_data=true
+mmap_shared_rw_not_data=true
+brk_shrink_ok=true
+mmap_rw_private_within_data_ok=true
+as_limit_set=true
+mmap_within_as_ok=true
+mmap_past_as_enomem=true
+mremap_past_as_enomem=true
+mremap_within_as_ok=true
+child_inherits_as_limit=true

@@ -1,0 +1,9 @@
+faf1bf50b9187b89
+add_key_ret=-1
+add_key_errno=1
+request_key_ret=-1
+request_key_errno=1
+keyctl_join_ret=-1
+keyctl_join_errno=1
+keyctl_get_keyring_id_ret=-1
+keyctl_get_keyring_id_errno=1

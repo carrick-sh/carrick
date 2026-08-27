@@ -1,0 +1,6 @@
+4fffe4962128c6d8
+setup_master=true
+setup_name=true
+setup_slave=true
+child_reopened_slave=true
+parent_slave_still_reads=true

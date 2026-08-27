@@ -1,0 +1,5 @@
+045cad373c6e76dd
+open_empty_fails=true
+open_empty_enoent=true
+openat_empty_enoent=true
+nonempty_open_ok=true

@@ -1,0 +1,6 @@
+bfbc0da149628fb1
+siginfo_kill_rc_zero=true
+siginfo_handler_ran_once=true
+siginfo_si_code_is_si_user=true
+siginfo_si_pid_is_sender=true
+siginfo_si_uid_is_sender=true

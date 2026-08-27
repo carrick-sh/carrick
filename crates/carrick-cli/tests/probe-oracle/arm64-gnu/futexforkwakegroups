@@ -1,0 +1,17 @@
+0c4ea6b8d6bdb5df
+grandchild_fork_ok=true
+child_known_tids=55
+spawned_threads=55
+last_pthread_errno=0
+task_dir_has_tgid=true
+child_direct_sleeping=55
+child_task_sleeping=55
+child_first_not_sleeping=none
+missing_direct_after_wake=0
+missing_task_after_wake=0
+wake_returns=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+wake_counts_ok=true
+child_exited=55
+child_joined=true
+fork_ok=true
+child_exit_ok=true

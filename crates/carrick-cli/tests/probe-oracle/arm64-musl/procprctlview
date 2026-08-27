@@ -1,0 +1,7 @@
+32482cc32ce92d50
+proc_self_comm_set_name=true
+proc_self_comm_truncated=true
+proc_self_timerslack_min=true
+proc_self_timerslack_middle=true
+forked_timerslack_default=true
+proc_self_timerslack_reset=true

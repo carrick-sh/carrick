@@ -1,0 +1,11 @@
+904445f4e6a953cd
+setrlimit_nproc_2=true
+setresuid_unprivileged=true
+fork_a_ok=true
+fork_b_eagain=true
+reap_a_ok=true
+fork_c_after_reap_ok=true
+setrlimit_nproc_3=true
+fork_d_ok=true
+reap_c_ok=true
+reap_d_ok=true

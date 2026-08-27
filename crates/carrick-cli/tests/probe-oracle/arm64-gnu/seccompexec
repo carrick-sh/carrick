@@ -1,0 +1,4 @@
+473fe2e926c4803e
+no_new_privs_survives_exec=true
+seccomp_filter_survives_exec=true
+replacement_exited_zero=true

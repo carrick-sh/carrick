@@ -1,0 +1,17 @@
+ec2f6940ae5c7796
+signal_queue_opened=true
+signal_notification_registered=true
+signal_child_sent=true
+signal_received=true
+signal_code_is_mesgq=true
+signal_sender_pid_matches_child=true
+signal_sender_uid_matches_child_ruid=true
+signal_value_matches=true
+signal_child_reaped=true
+thread_exercised=true
+thread_queue_opened=true
+thread_notification_registered=true
+thread_child_sent=true
+thread_callback_ran=true
+thread_value_matches=true
+thread_child_reaped=true

@@ -1,0 +1,14 @@
+44b8fc674d834c6b
+getrusage_self_ok=true
+getrusage_self_cpu_pos=true
+getrusage_self_maxrss_pos=true
+getrusage_thread_cpu_pos=true
+times_ok=true
+times_cpu_pos=true
+times_monotonic=true
+statm_size_pos=true
+statm_resident_pos=true
+statm_resident_le_size=true
+status_vmsize_pos=true
+status_vmrss_pos=true
+status_vmrss_le_vmsize=true

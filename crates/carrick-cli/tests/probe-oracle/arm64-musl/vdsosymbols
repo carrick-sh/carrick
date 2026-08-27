@@ -1,0 +1,7 @@
+9a4cc90496cef7b5
+vdso_present=true
+has_clock_gettime=true
+has_gettimeofday=true
+has_clock_getres=true
+has_rt_sigreturn=true
+all_expected_present=true
