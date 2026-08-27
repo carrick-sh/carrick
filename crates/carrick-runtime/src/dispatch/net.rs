@@ -686,7 +686,7 @@ impl SyscallDispatcher {
         };
         matches!(
             &*open_file.description.read(),
-            OpenDescription::HostPipe { .. } | OpenDescription::HostSocket { .. }
+            OpenDescription::HostSocket { .. }
         )
     }
 
