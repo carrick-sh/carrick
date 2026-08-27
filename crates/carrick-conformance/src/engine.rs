@@ -729,8 +729,8 @@ mod tests {
 
     #[test]
     fn carrick_timeout_cap_shortens_only_long_suite_budgets() {
-        assert_eq!(effective_carrick_timeout_s(300, 60), 60);
-        assert_eq!(effective_carrick_timeout_s(40, 60), 40);
+        assert_eq!(effective_carrick_timeout_s(300, 20), 20);
+        assert_eq!(effective_carrick_timeout_s(15, 20), 15);
         assert_eq!(effective_carrick_timeout_s(300, 0), 300);
     }
 
