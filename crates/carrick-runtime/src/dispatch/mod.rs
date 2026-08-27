@@ -2779,15 +2779,9 @@ pub struct SyscallDispatcher {
     /// process memory copy and sibling threads share them (process-wide), which
     /// matches Linux's filter-inheritance semantics. See [`crate::seccomp`].
     seccomp: crate::seccomp::SeccompState,
-    /// Launch-time container syscall-deny policy (the Docker default-seccomp
-    /// model), checked at dispatch entry before any handler — alongside the
-    /// guest-installed filters above, which stack on top of it exactly like a
-    /// guest filter stacks on Docker's launch profile. `None` = unconfined.
-    /// Plain field set once before boot (`apply_seccomp_policy`), read through
-    /// `&self`; a forked child inherits it via the process memory copy and it
-    /// survives in-process execve — per-process-tree, like a seccomp filter.
-    /// See [`crate::container_policy`].
-    container_policy: Option<crate::container_policy::ContainerPolicy>,
+    /// Observer chain for syscall and lifecycle interception (container deny policy,
+    /// compat reporting, audit, user observers). `None` when unconfined and no observers.
+    observers: Option<Arc<crate::observe::ObserverChain>>,
     /// SysV IPC namespace shared by every logical process in this run.
     sysv: Arc<sysv::SysvIpcNamespace>,
     /// Per-process shmat/shmdt bookkeeping, inherited by value at fork.
@@ -4471,7 +4465,7 @@ impl SyscallDispatcher {
             ),
             fs: self.fs.fork_clone(),
             seccomp: self.seccomp.fork_clone(),
-            container_policy: self.container_policy.clone(),
+            observers: self.observers.clone(),
             sysv: Arc::clone(&self.sysv),
             sysv_process: Mutex::new(self.fork_sysv_process_attachments()),
             mqueue: Arc::clone(&self.mqueue),
@@ -4680,9 +4674,8 @@ impl SyscallDispatcher {
             proc: Mutex::new(proc::ProcState::new()),
             fs: fs::FsState::new_with_host_resolver(snapshot),
             seccomp: crate::seccomp::SeccompState::default(),
-            // Unconfined until a frontend applies a policy: bare run-elf boots
-            // and unit tests keep today's handler-honest behavior.
-            container_policy: None,
+            // Unconfined until a frontend applies a policy or installs observers.
+            observers: None,
             sysv: Arc::new(sysv::SysvIpcNamespace::new()),
             sysv_process: Mutex::new(sysv::SysvProcessAttachments::default()),
             mqueue: Arc::new(mqueue::MqueueRegistry::default()),
@@ -6156,11 +6149,7 @@ impl SyscallDispatcher {
         policy: carrick_spec::SeccompPolicy,
         caps: crate::namespace::process::CapabilitySet,
     ) {
-        // `docker_model_with_capabilities` tests CAP_SYS_ADMIN / CAP_SYS_PTRACE
-        // bits; the Docker default set holds neither (pinned by
-        // `docker_default_excludes_sys_ptrace`), so the container's effective
-        // set is exactly the old grant mask for the profile's purposes.
-        self.container_policy = match policy {
+        let policy_model = match policy {
             carrick_spec::SeccompPolicy::ContainerDefault => Some(
                 crate::container_policy::ContainerPolicy::docker_model_with_capabilities(
                     caps.effective,
@@ -6168,30 +6157,46 @@ impl SyscallDispatcher {
             ),
             carrick_spec::SeccompPolicy::Unconfined => None,
         };
+        let user_observers = self
+            .observers
+            .as_ref()
+            .map(|c| c.user_observers().to_vec())
+            .unwrap_or_default();
+        if policy_model.is_some() || !user_observers.is_empty() {
+            self.observers = Some(Arc::new(crate::observe::ObserverChain::new(
+                policy_model,
+                user_observers,
+            )));
+        } else {
+            self.observers = None;
+        }
     }
 
-    /// Evaluate the launch-time container deny table against `request` before
-    /// its handler runs — the carrick seam where Docker's default seccomp
-    /// profile sits (after the guest issues the syscall, before any handler).
-    /// Returns `Some(errno outcome)` for a policy-denied call, `None` to pass
-    /// through. The denial is recorded as a *policy* event (distinct from
-    /// `UnhandledSyscall`, so coverage reporting never counts it as an
-    /// unimplemented handler).
-    fn container_policy_precheck(
-        &self,
-        request: &SyscallRequest,
-        reporter: &CompatReporter,
-    ) -> Option<DispatchOutcome> {
-        let policy = self.container_policy.as_ref()?;
-        let errno = policy.denied_errno_for_args(request.number.raw(), request.args.0[0])?;
-        let name = lookup_aarch64(request.number.raw()).map_or("unknown", |syscall| syscall.name);
-        reporter.record(CompatEvent::partial_syscall(
-            request.number.raw(),
-            name,
-            request.args,
-            "denied by launch-time container syscall policy (Docker default-seccomp model)",
-        ));
-        Some(DispatchOutcome::Errno { errno })
+    pub fn install_observer(&mut self, observer: Arc<dyn crate::observe::SyscallObserver>) {
+        let policy = self.observers.as_ref().and_then(|c| c.policy().cloned());
+        let mut user_observers = self
+            .observers
+            .as_ref()
+            .map(|c| c.user_observers().to_vec())
+            .unwrap_or_default();
+        user_observers.push(observer);
+        self.observers = Some(Arc::new(crate::observe::ObserverChain::new(
+            policy,
+            user_observers,
+        )));
+    }
+
+    pub fn observers(&self) -> Option<&Arc<crate::observe::ObserverChain>> {
+        self.observers.as_ref()
+    }
+
+    pub fn set_observers(&mut self, observers: Option<Arc<crate::observe::ObserverChain>>) {
+        self.observers = observers;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn container_policy(&self) -> Option<&crate::container_policy::ContainerPolicy> {
+        self.observers.as_ref().and_then(|c| c.policy())
     }
 
     /// Evaluate installed seccomp filters against `request` before its handler
@@ -6250,12 +6255,10 @@ impl SyscallDispatcher {
 
     pub(crate) fn identity_fast_path_enabled(&self) -> bool {
         // The EL1 shim answers identity syscalls without a dispatch, so it must
-        // be off whenever a guest filter is active OR the launch-time policy
-        // denies an identity syscall (the Docker default model never does —
-        // container runs keep the fast path).
+        // be off whenever a guest filter is active OR an observer requests full visibility.
         !self.seccomp.is_active()
-            && !self.container_policy.as_ref().is_some_and(|policy| {
-                policy.denies_any(crate::container_policy::IDENTITY_FAST_PATH_SYSCALLS)
+            && !self.observers.as_ref().is_some_and(|chain| {
+                chain.wants_fast_path_visibility() == crate::observe::FastPathVisibility::Required
             })
     }
 
@@ -6264,8 +6267,8 @@ impl SyscallDispatcher {
     /// returned atomic word from 1 to 0 before publishing their filter.
     #[allow(dead_code)]
     pub(crate) fn identity_fast_path_word(&self) -> Option<&std::sync::atomic::AtomicU32> {
-        if self.container_policy.as_ref().is_some_and(|policy| {
-            policy.denies_any(crate::container_policy::IDENTITY_FAST_PATH_SYSCALLS)
+        if self.observers.as_ref().is_some_and(|chain| {
+            chain.wants_fast_path_visibility() == crate::observe::FastPathVisibility::Required
         }) {
             None
         } else {
@@ -6289,18 +6292,51 @@ impl SyscallDispatcher {
         registry: &crate::thread::ThreadRegistry,
         futex: &crate::thread::FutexTable,
     ) -> Result<DispatchOutcome, DispatchError> {
-        // Launch-time container policy first (it is installed before the guest
-        // boots, like Docker's profile), then guest-installed seccomp filters —
-        // both process-wide, both before any handler, including the lockless
-        // hot path.
-        if let Some(outcome) = self.container_policy_precheck(&request, reporter) {
-            return Ok(outcome);
+        let s = crate::observe::SyscallInfo::new(&request);
+        let p = crate::observe::ProcessInfo::new(kernel);
+
+        // 1. Policy observer precheck (first built-in observer in the chain)
+        if let Some(ref chain) = self.observers {
+            if let Some(action) = chain.check_policy(&p, &s) {
+                match action {
+                    crate::observe::SyscallAction::Allow => {}
+                    crate::observe::SyscallAction::Deny(errno) => {
+                        let name = s.name();
+                        reporter.record(CompatEvent::partial_syscall(
+                            request.number.raw(),
+                            name,
+                            request.args,
+                            "denied by launch-time container syscall policy (Docker default-seccomp model)",
+                        ));
+                        return Ok(DispatchOutcome::Errno { errno });
+                    }
+                    crate::observe::SyscallAction::Kill(sig) => {
+                        return Ok(DispatchOutcome::SignalDeath { signum: sig.0 });
+                    }
+                }
+            }
         }
-        // seccomp veto applies on the multi-threaded path too (filters are
-        // process-wide), before any handler — including the lockless hot path.
+
+        // 2. seccomp veto applies before user observers and handlers
         if let Some(outcome) = self.seccomp_precheck(&request) {
             return Ok(outcome);
         }
+
+        // 3. User observers
+        if let Some(ref chain) = self.observers {
+            if chain.has_user_observers() {
+                match chain.on_user_syscall(&p, &s) {
+                    crate::observe::SyscallAction::Allow => {}
+                    crate::observe::SyscallAction::Deny(errno) => {
+                        return Ok(DispatchOutcome::Errno { errno });
+                    }
+                    crate::observe::SyscallAction::Kill(sig) => {
+                        return Ok(DispatchOutcome::SignalDeath { signum: sig.0 });
+                    }
+                }
+            }
+        }
+
         // The calling MM's vDSO realtime word follows a guest `clock_settime`
         // made by any process (one atomic compare when nothing changed).
         if let Err(error) =
@@ -6626,21 +6662,39 @@ impl SyscallDispatcher {
             args: request.args,
         });
 
-        // Launch-time container policy: the Docker default-seccomp model vetoes
-        // a denied syscall before its handler runs, exactly where the guest's
-        // own filters are checked below.
-        if let Some(outcome) = self.container_policy_precheck(&request, reporter) {
-            let (retval, errno) = outcome.retval_errno();
-            reporter.record(CompatEvent::SyscallReturn {
-                number: request.number.raw(),
-                name: ::std::borrow::Cow::Borrowed(name),
-                retval,
-                errno,
-            });
-            return Ok(outcome);
+        let s = crate::observe::SyscallInfo::new(&request);
+        let p = crate::observe::ProcessInfo::new(kernel);
+
+        // 1. Policy observer precheck (first built-in observer in the chain)
+        if let Some(ref chain) = self.observers {
+            if let Some(action) = chain.check_policy(&p, &s) {
+                match action {
+                    crate::observe::SyscallAction::Allow => {}
+                    crate::observe::SyscallAction::Deny(errno) => {
+                        let name = s.name();
+                        reporter.record(CompatEvent::partial_syscall(
+                            request.number.raw(),
+                            name,
+                            request.args,
+                            "denied by launch-time container syscall policy (Docker default-seccomp model)",
+                        ));
+                        let (retval, errno_val) = (errno.guest_retval(), Some(errno.get()));
+                        reporter.record(CompatEvent::SyscallReturn {
+                            number: request.number.raw(),
+                            name: ::std::borrow::Cow::Borrowed(name),
+                            retval,
+                            errno: errno_val,
+                        });
+                        return Ok(DispatchOutcome::Errno { errno });
+                    }
+                    crate::observe::SyscallAction::Kill(sig) => {
+                        return Ok(DispatchOutcome::SignalDeath { signum: sig.0 });
+                    }
+                }
+            }
         }
 
-        // seccomp: installed cBPF filters get to veto the syscall before its
+        // 2. seccomp: installed cBPF filters get to veto the syscall before its
         // handler runs (ERRNO / kill), mirroring the kernel's pre-syscall check.
         if let Some(outcome) = self.seccomp_precheck(&request) {
             let (retval, errno) = outcome.retval_errno();
@@ -6651,6 +6705,28 @@ impl SyscallDispatcher {
                 errno,
             });
             return Ok(outcome);
+        }
+
+        // 3. User observers
+        if let Some(ref chain) = self.observers {
+            if chain.has_user_observers() {
+                match chain.on_user_syscall(&p, &s) {
+                    crate::observe::SyscallAction::Allow => {}
+                    crate::observe::SyscallAction::Deny(errno) => {
+                        let (retval, errno_val) = (errno.guest_retval(), Some(errno.get()));
+                        reporter.record(CompatEvent::SyscallReturn {
+                            number: request.number.raw(),
+                            name: ::std::borrow::Cow::Borrowed(name),
+                            retval,
+                            errno: errno_val,
+                        });
+                        return Ok(DispatchOutcome::Errno { errno });
+                    }
+                    crate::observe::SyscallAction::Kill(sig) => {
+                        return Ok(DispatchOutcome::SignalDeath { signum: sig.0 });
+                    }
+                }
+            }
         }
         // The calling MM's vDSO realtime word follows a guest `clock_settime`
         // made by any process (see `dispatch_threaded`).

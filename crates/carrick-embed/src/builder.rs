@@ -118,6 +118,7 @@ pub struct ContainerBuilder {
     stdout: StdioConfig,
     stderr: StdioConfig,
     max_traps: usize,
+    observers: Vec<std::sync::Arc<dyn carrick_runtime::observe::SyscallObserver>>,
 }
 
 impl ContainerBuilder {
@@ -138,6 +139,7 @@ impl ContainerBuilder {
             stdout: StdioConfig::Captured,
             stderr: StdioConfig::Captured,
             max_traps: DEFAULT_MAX_TRAPS,
+            observers: Vec::new(),
         }
     }
 
@@ -245,6 +247,15 @@ impl ContainerBuilder {
         self
     }
 
+    /// Register a syscall observer to receive lifecycle and syscall events for this container.
+    pub fn observer(
+        mut self,
+        observer: std::sync::Arc<dyn carrick_runtime::observe::SyscallObserver>,
+    ) -> Self {
+        self.observers.push(observer);
+        self
+    }
+
     /// Lower into the engine's request. Pure: no I/O, no ambient reads.
     pub fn to_run_request(&self) -> Result<RunRequest, EmbedError> {
         if self.image.trim().is_empty() {
@@ -315,6 +326,9 @@ impl ContainerBuilder {
         let mut extensions = RuntimeExtensions::default();
         if let StdioSink::Piped { .. } = plan.sink {
             extensions = extensions.stdio(plan.sink);
+        }
+        for observer in self.observers {
+            extensions = extensions.observer(observer);
         }
         Ok(PreparedContainer::new(
             spec,
