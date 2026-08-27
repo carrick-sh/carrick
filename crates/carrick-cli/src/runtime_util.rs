@@ -41,6 +41,31 @@ pub(crate) fn emit_raw(result: &carrick_runtime::runtime::RunResult) {
     let _ = std::io::stderr().flush();
 }
 
+/// The environment a bare `-e KEY` imports from: this CLI process's own,
+/// snapshotted once per request (docker `-e KEY` semantics). The engine never
+/// reads `std::env` itself.
+pub(crate) fn host_env_snapshot() -> Vec<(String, String)> {
+    std::env::vars().collect()
+}
+
+/// The network-namespace id an unnamed bridge container falls back to:
+/// `anon-<pid>` of this carrier process, minted once here so every guest fork
+/// child inherits the same id. Passed to the engine explicitly; it never
+/// samples the pid itself.
+pub(crate) fn anon_bridge_namespace_id() -> String {
+    carrick_spec::NetworkNamespaceId::anonymous(std::process::id())
+        .as_str()
+        .to_owned()
+}
+
+/// Relay the engine's merge warnings (e.g. a named `--user` falling back to
+/// root) to stderr with the CLI's `carrick:` prefix.
+pub(crate) fn emit_resolve_warnings(warnings: &[carrick_engine::ResolveWarning]) {
+    for warning in warnings {
+        eprintln!("carrick: {warning}");
+    }
+}
+
 pub(crate) fn parse_volume_mount(s: &str) -> anyhow::Result<carrick_spec::Mount> {
     let parts: Vec<&str> = s.split(':').collect();
     if parts.len() < 2 || parts.len() > 3 {

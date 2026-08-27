@@ -44,8 +44,9 @@
 //!
 //! ## Relaunch over a persisted config
 //!
-//! `create`/`start`/`restart` reconstruct a [`carrick_engine::CliRunRequest`]
-//! from the stored [`RunConfig`] via `rebuild_request_from_state`. The subtlety
+//! `create`/`start`/`restart` reconstruct a [`LaunchRequest`] (the engine's
+//! [`carrick_engine::RunRequest`] plus the CLI's lifecycle fields) from the
+//! stored [`RunConfig`] via `rebuild_request_from_state`. The subtlety
 //! captured there: the command is persisted *split* (state.command = the cmd
 //! args, config.entrypoint = the override) so the engine re-merges
 //! entrypoint+cmd on relaunch rather than double-applying the image's
@@ -92,6 +93,28 @@ use carrick_runtime::kernel::control::{ControlOperation, ControlOutcome};
 
 use crate::runtime_util::{human_age, human_size, truncate_str};
 
+/// A `run`/`create` request as the CLI owns it: the engine's
+/// [`carrick_engine::RunRequest`] (everything `resolve_run_spec` merges) plus
+/// the container-lifecycle inputs the engine never reads. Those are persisted
+/// into [`RunConfig`] at create time and consumed by `stop`/`rm`/`inspect` and
+/// the Docker API — never by the merge.
+#[derive(Debug, Clone)]
+pub(crate) struct LaunchRequest {
+    pub run: carrick_engine::RunRequest,
+    /// `-i`: keep stdin open (persisted for `start --attach` / API attach).
+    pub interactive: bool,
+    /// `--rm`: remove the container when it exits.
+    pub rm: bool,
+    /// Raw `--stop-signal` value, resolved against the image `STOPSIGNAL` at
+    /// create time; `None` defers to the image.
+    pub stop_signal: Option<String>,
+    /// `--stop-timeout` seconds; `None` for the default grace window.
+    pub stop_timeout: Option<u64>,
+    /// Raw `--volumes-from` specs. Already expanded into `run.mounts`; kept so
+    /// `inspect` can report `VolumesFrom`.
+    pub volumes_from: Vec<String>,
+}
+
 /// Detach into the background and run the container as one VM carrier,
 /// printing the container id and returning. Mirrors `docker run -d`.
 ///
@@ -104,7 +127,7 @@ use crate::runtime_util::{human_age, human_size, truncate_str};
 ///     runs the engine in that same carrier process, records itself as Running,
 ///     and blocks until the logical guest-init exits.
 pub(crate) fn run_detached(
-    req: carrick_engine::CliRunRequest,
+    req: LaunchRequest,
     store: carrick_image::ImageStore,
     name: Option<String>,
 ) -> anyhow::Result<()> {
@@ -114,7 +137,7 @@ pub(crate) fn run_detached(
     // Resolve the image in the foreground (before carrier birth) so pull errors reach
     // the user's terminal — and so the effective stop signal (flag > image
     // STOPSIGNAL) is baked into the persisted RunConfig for a later `stop`.
-    let resolved = resolve_request_image(&req, &store)?;
+    let resolved = resolve_request_image(&req.run, &store)?;
     let stop_signal = resolve_stop_signal(
         req.stop_signal.as_deref(),
         resolved.config.stop_signal.as_deref(),
@@ -445,17 +468,18 @@ fn resolve_name(name: Option<String>, id: &str) -> anyhow::Result<Option<String>
 /// relaunch inputs into RunConfig. `scratch_path` is filled in by the runtime
 /// once the launched carrier sets up its overlay.
 fn build_created_state(
-    req: &carrick_engine::CliRunRequest,
+    req: &LaunchRequest,
     id: &str,
     name: Option<String>,
     created_secs: u64,
     stop_signal: Option<i32>,
 ) -> ContainerState {
+    let run = &req.run;
     ContainerState {
         id: id.to_string(),
         name,
-        image: req.image_ref.clone(),
-        command: req.args.clone(),
+        image: run.image_ref.clone(),
+        command: run.args.clone(),
         status: ContainerStatus::Created,
         supervisor_pid: 0,
         init_pid: 0,
@@ -468,45 +492,45 @@ fn build_created_state(
         terminal_control: None,
         launch_ticket: None,
         config: RunConfig {
-            platform: req.platform.clone(),
-            exec_backend: req.exec_backend,
-            env: req.env_overrides.clone(),
-            workdir: req.workdir.clone(),
-            user: req.user.clone(),
-            hostname: req.hostname.clone(),
-            pid: req.pid,
-            network: req.network,
-            api_network_mode: req.network_bridge.clone().or_else(|| match req.network {
+            platform: run.platform.clone(),
+            exec_backend: run.exec_backend,
+            env: run.env_overrides.clone(),
+            workdir: run.workdir.clone(),
+            user: run.user.clone(),
+            hostname: run.hostname.clone(),
+            pid: run.pid,
+            network: run.network,
+            api_network_mode: run.network_bridge.clone().or_else(|| match run.network {
                 carrick_spec::NetworkMode::Bridge => Some("bridge".to_string()),
                 carrick_spec::NetworkMode::Host => Some("host".to_string()),
                 carrick_spec::NetworkMode::None => Some("none".to_string()),
             }),
-            network_aliases: req.network_aliases.clone(),
+            network_aliases: run.network_aliases.clone(),
             network_attachments: default_network_attachments(
-                req.network,
-                req.network_bridge.as_deref(),
-                &req.network_aliases,
-                req.network_ipv4.as_deref(),
+                run.network,
+                run.network_bridge.as_deref(),
+                &run.network_aliases,
+                run.network_ipv4.as_deref(),
             ),
-            network_container: req.network_container.clone(),
-            extra_hosts: req.extra_hosts.clone(),
-            dns_servers: req.dns_servers.clone(),
-            dns_search: req.dns_search.clone(),
-            dns_options: req.dns_options.clone(),
+            network_container: run.network_container.clone(),
+            extra_hosts: run.extra_hosts.clone(),
+            dns_servers: run.dns_servers.clone(),
+            dns_search: run.dns_search.clone(),
+            dns_options: run.dns_options.clone(),
             volumes_from: req.volumes_from.clone(),
-            published_ports: req.published_ports.clone(),
+            published_ports: run.published_ports.clone(),
             scratch_path: None,
-            entrypoint: req.entrypoint_override.clone(),
-            mounts: req.mounts.clone(),
-            fs: req.fs,
-            tty: req.tty,
+            entrypoint: run.entrypoint_override.clone(),
+            mounts: run.mounts.clone(),
+            fs: run.fs,
+            tty: run.tty,
             interactive: req.interactive,
-            max_traps: req.max_traps,
+            max_traps: run.max_traps,
             stop_signal,
             stop_signal_abi: StopSignalAbi::Linux,
             stop_timeout: req.stop_timeout,
-            security_opts: req.security_opts.clone(),
-            cap_add: req.cap_add.clone(),
+            security_opts: run.security_opts.clone(),
+            cap_add: run.cap_add.clone(),
         },
     }
 }
@@ -539,7 +563,7 @@ fn default_network_attachments(
 /// surface eagerly, like `docker create`/`run -d`). Shared by `create` and
 /// `run_detached`, which both need the image's `STOPSIGNAL` before forking.
 fn resolve_request_image(
-    req: &carrick_engine::CliRunRequest,
+    req: &carrick_engine::RunRequest,
     store: &carrick_image::ImageStore,
 ) -> anyhow::Result<carrick_image::ResolvedImage> {
     // Reject an unrunnable `--platform` (e.g. amd64 on an Apple Silicon host with
@@ -566,7 +590,7 @@ fn resolve_request_image(
 /// overlay (`attach_overlay` — set on `start`/`restart` to skip re-extraction),
 /// run the engine, and exit with the container's code. Never returns.
 fn run_detached_carrier(
-    req: carrick_engine::CliRunRequest,
+    req: LaunchRequest,
     store: carrick_image::ImageStore,
     id: &str,
     log: &std::path::Path,
@@ -591,14 +615,16 @@ fn run_detached_carrier(
     let engine = carrick_engine::Engine::new(store);
     // Resolve under tokio, then drop the runtime before forking in execute (no
     // tokio alive across the fork — see the tokio-fork-isolation spec).
-    let spec = match crate::runtime_util::block_on_oci(engine.resolve(req)) {
-        Ok(s) => s,
+    let resolved = match crate::runtime_util::block_on_oci(engine.resolve(req.run)) {
+        Ok(resolved) => resolved,
         Err(_) => {
             container::mark_exited(id, 1);
             std::process::exit(1);
         }
     };
-    match carrick_runtime::Runtime::execute(&spec) {
+    // stderr is the container log here; the notice lands with the run.
+    crate::runtime_util::emit_resolve_warnings(&resolved.warnings);
+    match carrick_runtime::Runtime::execute(&resolved.spec) {
         Ok(r) => std::process::exit(r.exit_code),
         Err(_) => {
             container::mark_exited(id, 1);
@@ -611,7 +637,7 @@ fn run_detached_carrier(
 /// surface now, like `docker create`) WITHOUT starting it; print its id. The
 /// rootfs overlay is extracted lazily on the first `start`.
 pub(crate) fn create(
-    req: carrick_engine::CliRunRequest,
+    req: LaunchRequest,
     store: carrick_image::ImageStore,
     name: Option<String>,
 ) -> anyhow::Result<()> {
@@ -621,7 +647,7 @@ pub(crate) fn create(
 }
 
 pub(crate) fn create_one_direct(
-    req: carrick_engine::CliRunRequest,
+    req: LaunchRequest,
     store: carrick_image::ImageStore,
     name: Option<String>,
 ) -> anyhow::Result<String> {
@@ -650,7 +676,7 @@ fn apply_initial_metadata(state: &mut ContainerState, metadata: InitialContainer
 }
 
 pub(crate) fn create_one_direct_with_metadata(
-    req: carrick_engine::CliRunRequest,
+    req: LaunchRequest,
     store: carrick_image::ImageStore,
     name: Option<String>,
     metadata: InitialContainerMetadata,
@@ -659,7 +685,7 @@ pub(crate) fn create_one_direct_with_metadata(
     let id = new_container_id(created_secs);
     // Warm the image cache + surface image errors at create time, and capture
     // the image's STOPSIGNAL so a later `stop` honors it (flag > image > TERM).
-    let resolved = resolve_request_image(&req, &store)?;
+    let resolved = resolve_request_image(&req.run, &store)?;
     let stop_signal = resolve_stop_signal(
         req.stop_signal.as_deref(),
         resolved.config.stop_signal.as_deref(),
@@ -675,11 +701,11 @@ pub(crate) fn create_one_direct_with_metadata(
     Ok(id)
 }
 
-/// Reconstruct a `CliRunRequest` from a persisted container so `start` can
+/// Reconstruct a [`LaunchRequest`] from a persisted container so `start` can
 /// relaunch it. The command is persisted SPLIT (state.command = cmd args,
 /// config.entrypoint = the override) so the engine re-merges entrypoint+cmd
 /// instead of double-applying the image entrypoint.
-fn rebuild_request_from_state(state: &ContainerState) -> carrick_engine::CliRunRequest {
+fn rebuild_request_from_state(state: &ContainerState) -> LaunchRequest {
     let c = &state.config;
     let network_source = shared_network_source_state(c);
     let effective_network = network_source
@@ -690,50 +716,59 @@ fn rebuild_request_from_state(state: &ContainerState) -> carrick_engine::CliRunR
         .as_ref()
         .and_then(|state| state.name.as_deref())
         .or(state.name.as_deref());
-    carrick_engine::CliRunRequest {
-        image_ref: state.image.clone(),
-        // Restart/exec reuses the already-resolved image; no re-pull.
-        pull: carrick_image::PullPolicy::Missing,
-        platform: c.platform.clone(),
-        args: state.command.clone(),
-        env_overrides: c.env.clone(),
-        mounts: c.mounts.clone(),
-        workdir: c.workdir.clone(),
-        user: c.user.clone(),
-        hostname: c.hostname.clone(),
-        entrypoint_override: c.entrypoint.clone(),
-        tty: c.tty,
+    LaunchRequest {
+        run: carrick_engine::RunRequest {
+            image_ref: state.image.clone(),
+            // Restart/exec reuses the already-resolved image; no re-pull.
+            pull: carrick_image::PullPolicy::Missing,
+            platform: c.platform.clone(),
+            args: state.command.clone(),
+            env_overrides: c.env.clone(),
+            // A bare `-e KEY` persisted in `env` re-imports from THIS process's
+            // environment at relaunch, exactly as before.
+            host_env: Some(crate::runtime_util::host_env_snapshot()),
+            mounts: c.mounts.clone(),
+            workdir: c.workdir.clone(),
+            user: c.user.clone(),
+            hostname: c.hostname.clone(),
+            entrypoint_override: c.entrypoint.clone(),
+            tty: c.tty,
+            stdio: carrick_spec::StdioMode::Inherit,
+            name: state.name.clone(),
+            max_traps: c.max_traps,
+            debug_state_path: None,
+            fs: c.fs,
+            exec_backend: c.exec_backend,
+            pid: c.pid,
+            network: effective_network.network,
+            network_bridge: bridge_network_name(effective_network),
+            network_container: c.network_container.clone(),
+            network_namespace_id: Some(
+                c.network_container
+                    .clone()
+                    .unwrap_or_else(|| state.id.clone()),
+            ),
+            // `network_namespace_id` above is always set on a relaunch, so the
+            // anonymous fallback can never be consulted.
+            bridge_namespace_id: None,
+            network_attachments: bridge_network_attachments(effective_network, effective_name),
+            network_ipv4: bridge_network_ipv4(effective_network, effective_name),
+            network_aliases: bridge_network_aliases(effective_network),
+            extra_hosts: c.extra_hosts.clone(),
+            dns_servers: c.dns_servers.clone(),
+            dns_search: c.dns_search.clone(),
+            dns_options: c.dns_options.clone(),
+            published_ports: c.published_ports.clone(),
+            security_opts: c.security_opts.clone(),
+            cap_add: c.cap_add.clone(),
+        },
         interactive: c.interactive,
         rm: state.auto_remove,
-        name: state.name.clone(),
-        max_traps: c.max_traps,
-        debug_state_path: None,
-        fs: c.fs,
-        exec_backend: c.exec_backend,
-        pid: c.pid,
-        network: effective_network.network,
-        network_bridge: bridge_network_name(effective_network),
-        network_container: c.network_container.clone(),
-        network_namespace_id: Some(
-            c.network_container
-                .clone()
-                .unwrap_or_else(|| state.id.clone()),
-        ),
-        network_attachments: bridge_network_attachments(effective_network, effective_name),
-        network_ipv4: bridge_network_ipv4(effective_network, effective_name),
-        network_aliases: bridge_network_aliases(effective_network),
-        extra_hosts: c.extra_hosts.clone(),
-        dns_servers: c.dns_servers.clone(),
-        dns_search: c.dns_search.clone(),
-        dns_options: c.dns_options.clone(),
-        volumes_from: c.volumes_from.clone(),
-        published_ports: c.published_ports.clone(),
         // The effective Linux stop signum is already persisted in RunConfig and
-        // preserved across relaunch; engine.run ignores these, so leave unset.
+        // preserved across relaunch, so leave these unset.
         stop_signal: None,
         stop_timeout: None,
-        security_opts: c.security_opts.clone(),
-        cap_add: c.cap_add.clone(),
+        volumes_from: c.volumes_from.clone(),
     }
 }
 
@@ -909,7 +944,7 @@ fn start_one_locked(store: &carrick_image::ImageStore, id: &str) -> anyhow::Resu
     // lost Rosetta) here in the foreground, before creating the carrier —
     // `Engine::resolve`'s re-check otherwise fires inside the detached child,
     // where its actionable message is swallowed to the container log.
-    carrick_engine::check_platform_runnable(carrick_engine::request_platform(&req))
+    carrick_engine::check_platform_runnable(carrick_engine::request_platform(&req.run))
         .map_err(anyhow::Error::msg)?;
     let pid = CarrierLauncher::launch(store, id)?;
     await_detached_ready(id, pid)?;
@@ -2774,36 +2809,66 @@ mod tests {
     #[test]
     fn rebuild_request_reproduces_run_inputs_split_not_merged() {
         let req = rebuild_request_from_state(&sample_state());
-        assert_eq!(req.image_ref, "ubuntu:24.04");
-        assert_eq!(req.platform.as_deref(), Some("linux/arm64"));
+        assert_eq!(req.run.image_ref, "ubuntu:24.04");
+        assert_eq!(req.run.platform.as_deref(), Some("linux/arm64"));
         // D1: persisted SPLIT — args is the cmd, entrypoint is the override; the
         // engine re-merges (storing the merged argv would double-apply the image
         // entrypoint).
-        assert_eq!(req.args, vec!["echo".to_string(), "hi".to_string()]);
+        assert_eq!(req.run.args, vec!["echo".to_string(), "hi".to_string()]);
         assert_eq!(
-            req.entrypoint_override,
+            req.run.entrypoint_override,
             Some(vec!["/bin/sh".to_string(), "-c".to_string()])
         );
-        assert_eq!(req.env_overrides, vec!["A=1".to_string()]);
-        assert_eq!(req.workdir.as_deref(), Some("/w"));
-        assert_eq!(req.user.as_deref(), Some("1000"));
-        assert_eq!(req.mounts.len(), 1);
-        assert_eq!(req.fs, Some(carrick_spec::FsBackendKind::Host));
-        assert!(req.tty);
-        assert_eq!(req.max_traps, 4242);
-        assert_eq!(req.exec_backend, carrick_spec::ExecBackendRequest::HvPatch);
-        assert_eq!(req.pid, carrick_spec::PidMode::Private);
-        assert_eq!(req.network_aliases, vec!["api".to_string()]);
+        assert_eq!(req.run.env_overrides, vec!["A=1".to_string()]);
+        assert_eq!(req.run.workdir.as_deref(), Some("/w"));
+        assert_eq!(req.run.user.as_deref(), Some("1000"));
+        assert_eq!(req.run.mounts.len(), 1);
+        assert_eq!(req.run.fs, Some(carrick_spec::FsBackendKind::Host));
+        assert!(req.run.tty);
+        assert_eq!(req.run.max_traps, 4242);
+        assert_eq!(
+            req.run.exec_backend,
+            carrick_spec::ExecBackendRequest::HvPatch
+        );
+        assert_eq!(req.run.pid, carrick_spec::PidMode::Private);
+        assert_eq!(req.run.network_aliases, vec!["api".to_string()]);
         assert!(!req.rm);
         // start/restart relaunch under the SAME launch-time syscall policy the
         // container was created with.
-        assert_eq!(req.security_opts, vec!["seccomp=unconfined".to_string()]);
+        assert_eq!(
+            req.run.security_opts,
+            vec!["seccomp=unconfined".to_string()]
+        );
+    }
+
+    #[test]
+    fn launch_request_keeps_lifecycle_fields_beside_the_engine_request() {
+        let launch = rebuild_request_from_state(&sample_state());
+        // Lifecycle inputs live on the CLI wrapper, not on the engine request.
+        assert!(!launch.rm);
+        assert!(!launch.interactive);
+        assert_eq!(launch.stop_signal, None);
+        assert_eq!(launch.stop_timeout, None);
+        assert!(launch.volumes_from.is_empty());
+        // The CLI always lowers docker-shaped output and its own environment.
+        assert_eq!(launch.run.stdio, carrick_spec::StdioMode::Inherit);
+        assert!(launch.run.host_env.is_some());
+        // A relaunch always carries the persisted namespace id; no anon fallback.
+        assert!(launch.run.network_namespace_id.is_some());
+        assert_eq!(launch.run.bridge_namespace_id, None);
+
+        let state = build_created_state(&launch, "container-id", None, 17, Some(libc::SIGQUIT));
+        assert_eq!(state.auto_remove, launch.rm);
+        assert_eq!(state.config.interactive, launch.interactive);
+        assert_eq!(state.config.stop_timeout, launch.stop_timeout);
+        assert_eq!(state.config.volumes_from, launch.volumes_from);
+        assert_eq!(state.config.stop_signal, Some(libc::SIGQUIT));
     }
 
     #[test]
     fn create_and_relaunch_preserve_explicit_hvpatch_backend() {
         let mut req = rebuild_request_from_state(&sample_state());
-        req.exec_backend = carrick_spec::ExecBackendRequest::HvPatch;
+        req.run.exec_backend = carrick_spec::ExecBackendRequest::HvPatch;
 
         let state = build_created_state(&req, "container-id", None, 17, None);
         assert_eq!(
@@ -2813,7 +2878,7 @@ mod tests {
 
         let rebuilt = rebuild_request_from_state(&state);
         assert_eq!(
-            rebuilt.exec_backend,
+            rebuilt.run.exec_backend,
             carrick_spec::ExecBackendRequest::HvPatch
         );
     }
@@ -2848,7 +2913,11 @@ mod tests {
                 stop_signal: None,
             },
         };
-        let spec = carrick_engine::resolve_run_spec(req, image).expect("resolve run spec");
+        let spec = carrick_engine::resolve_run_spec(req.run, image)
+            .expect("resolve run spec")
+            .spec;
+        // The CLI's wrapper lowers docker-shaped streaming into the spec.
+        assert_eq!(spec.stdio, carrick_spec::StdioMode::Inherit);
 
         assert_eq!(spec.network.mode, carrick_spec::NetworkMode::Bridge);
         assert_eq!(spec.network.bridge_id.as_str(), "compose_default");
@@ -2887,8 +2956,8 @@ mod tests {
 
         let req = rebuild_request_from_state(&state);
 
-        assert_eq!(req.network_bridge.as_deref(), Some("compose_default"));
-        assert_eq!(req.network_aliases, vec!["api".to_string()]);
+        assert_eq!(req.run.network_bridge.as_deref(), Some("compose_default"));
+        assert_eq!(req.run.network_aliases, vec!["api".to_string()]);
     }
 
     #[test]
@@ -2914,16 +2983,19 @@ mod tests {
 
         let req = rebuild_request_from_state(&sidecar);
 
-        assert_eq!(req.network, carrick_spec::NetworkMode::None);
+        assert_eq!(req.run.network, carrick_spec::NetworkMode::None);
         assert_eq!(
-            req.network_namespace_id.as_deref(),
+            req.run.network_namespace_id.as_deref(),
             Some(target_id.as_str())
         );
-        assert_eq!(req.network_container.as_deref(), Some(target_id.as_str()));
-        assert_eq!(req.network_bridge, None);
-        assert!(req.network_attachments.is_empty());
-        assert_eq!(req.network_ipv4, None);
-        assert!(req.network_aliases.is_empty());
+        assert_eq!(
+            req.run.network_container.as_deref(),
+            Some(target_id.as_str())
+        );
+        assert_eq!(req.run.network_bridge, None);
+        assert!(req.run.network_attachments.is_empty());
+        assert_eq!(req.run.network_ipv4, None);
+        assert!(req.run.network_aliases.is_empty());
 
         let _ = ContainerState::remove(&target_id);
     }
@@ -2959,29 +3031,29 @@ mod tests {
         ];
 
         let req = rebuild_request_from_state(&state);
-        assert_eq!(req.network_attachments.len(), 2);
+        assert_eq!(req.run.network_attachments.len(), 2);
         assert_eq!(
-            req.network_attachments[0].bridge_id.as_str(),
+            req.run.network_attachments[0].bridge_id.as_str(),
             "compose_backend"
         );
         assert_eq!(
-            req.network_attachments[0].aliases,
+            req.run.network_attachments[0].aliases,
             vec!["web".to_string(), "api-backend".to_string()]
         );
         assert_eq!(
-            req.network_attachments[0].ipv4.as_deref(),
+            req.run.network_attachments[0].ipv4.as_deref(),
             Some("172.31.10.9")
         );
         assert_eq!(
-            req.network_attachments[1].bridge_id.as_str(),
+            req.run.network_attachments[1].bridge_id.as_str(),
             "compose_frontend"
         );
         assert_eq!(
-            req.network_attachments[1].aliases,
+            req.run.network_attachments[1].aliases,
             vec!["web".to_string(), "api-frontend".to_string()]
         );
         assert_eq!(
-            req.network_attachments[1].ipv4.as_deref(),
+            req.run.network_attachments[1].ipv4.as_deref(),
             Some("172.31.20.9")
         );
     }
