@@ -3341,14 +3341,19 @@ impl SyscallDispatcher {
                     // RLIMIT_AS / RLIMIT_DATA on the page-rounded growth; the
                     // heap is data by definition. brk(2) reports ENOMEM by
                     // returning the unchanged break.
-                    let page_size = this.linux_page_size();
-                    let grow = align_up_u64(requested, page_size)
-                        .zip(align_up_u64(current, page_size))
-                        .map_or(u64::MAX, |(new_end, old_end)| new_end.saturating_sub(old_end));
-                    if this.check_address_space_limits(&mem, grow, true).is_err() {
-                        return Ok(DispatchOutcome::Returned {
-                            value: current as i64,
-                        });
+                    if let Some((as_limit, data_limit)) = this.address_space_limits_apply(true) {
+                        let page_size = this.linux_page_size();
+                        let grow = align_up_u64(requested, page_size)
+                            .zip(align_up_u64(current, page_size))
+                            .map_or(u64::MAX, |(new_end, old_end)| new_end.saturating_sub(old_end));
+                        if this
+                            .check_address_space_limits_locked(&mem, as_limit, data_limit, grow, true)
+                            .is_err()
+                        {
+                            return Ok(DispatchOutcome::Returned {
+                                value: current as i64,
+                            });
+                        }
                     }
                 }
 
@@ -3549,25 +3554,30 @@ impl SyscallDispatcher {
 
             // RLIMIT_AS / RLIMIT_DATA admission before any allocator, backing
             // or VMA mutation. A MAP_FIXED replacement is charged only for the
-            // bytes not already mapped.
+            // bytes not already mapped. If both limits are infinite (default),
+            // no MemState lock, no overlap calculation, and no VMA walk occurs.
             {
-                let mem_authority_rlimit = this.mem();
-                let mem = mem_authority_rlimit.lock();
-                let grow = if map_flags.contains(LinuxMmapFlags::FIXED) {
-                    length.saturating_sub(mapped_overlap_bytes(&mem, requested.0, length))
-                } else {
-                    length
-                };
                 let data = mapping_is_data(
                     prot_flags.contains(LinuxProtFlags::WRITE),
                     map_sharing == MmapSharing::Private,
                     map_flags.contains(LinuxMmapFlags::GROWSDOWN),
                 );
-                if let Err(errno) = this.check_address_space_limits(&mem, grow, data) {
-                    return Ok(request.refused(
-                        MmapRefusal::Spec("RLIMIT_AS or RLIMIT_DATA soft limit reached"),
-                        errno,
-                    ));
+                if let Some((as_limit, data_limit)) = this.address_space_limits_apply(data) {
+                    let mem_authority_rlimit = this.mem();
+                    let mem = mem_authority_rlimit.lock();
+                    let grow = if map_flags.contains(LinuxMmapFlags::FIXED) {
+                        length.saturating_sub(mapped_overlap_bytes(&mem, requested.0, length))
+                    } else {
+                        length
+                    };
+                    if let Err(errno) = this.check_address_space_limits_locked(
+                        &mem, as_limit, data_limit, grow, data,
+                    ) {
+                        return Ok(request.refused(
+                            MmapRefusal::Spec("RLIMIT_AS or RLIMIT_DATA soft limit reached"),
+                            errno,
+                        ));
+                    }
                 }
             }
 
@@ -5480,18 +5490,27 @@ impl SyscallDispatcher {
                 // RLIMIT_AS / RLIMIT_DATA on the growth, before any page-table,
                 // allocator or VMA mutation. A move is charged like an in-place
                 // grow (`new_size - old_size`): the source is unmapped again.
-                let mem_authority_rlimit = this.mem();
-                let mem = mem_authority_rlimit.lock();
+                // If both limits are infinite (default), no MemState lock is taken.
                 let data = mapping_is_data(
                     source_metadata.prot.contains(LinuxProtFlags::WRITE),
                     source_metadata.sharing == ProcMapSharing::Private,
                     false,
                 );
-                if this
-                    .check_address_space_limits(&mem, new_size - old_size, data)
-                    .is_err()
-                {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                if let Some((as_limit, data_limit)) = this.address_space_limits_apply(data) {
+                    let mem_authority_rlimit = this.mem();
+                    let mem = mem_authority_rlimit.lock();
+                    if this
+                        .check_address_space_limits_locked(
+                            &mem,
+                            as_limit,
+                            data_limit,
+                            new_size - old_size,
+                            data,
+                        )
+                        .is_err()
+                    {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    }
                 }
             }
             let shared_aperture_alloc = this.mem()
@@ -7063,20 +7082,34 @@ impl SyscallDispatcher {
         Ok(Some(range))
     }
 
-    /// `RLIMIT_AS` / `RLIMIT_DATA` admission for a mapping change that grows
-    /// this mm by `grow` page-rounded bytes; `data` says whether the grown
-    /// bytes are data (`mapping_is_data`). setrlimit(2): both limits fail
-    /// brk(2)/mmap(2)/mremap(2) with ENOMEM at the SOFT limit. Zero cost
-    /// while both limits are infinite (carrick's defaults): two `ArcSwap`
-    /// loads and no VMA walk. The caller holds the `MemState` lock so the
-    /// population it reads is the one it is about to mutate.
-    fn check_address_space_limits(
+    /// Fast lock-free check for whether `RLIMIT_AS` or (for data mappings) `RLIMIT_DATA`
+    /// is finite. If neither applies or both are `LINUX_RLIM_INFINITY` (carrick's default),
+    /// returns `None`, allowing callers to skip acquiring `MemState` locks, calculating
+    /// `MAP_FIXED` overlaps, and walking/projecting VMAs.
+    #[inline]
+    pub(super) fn address_space_limits_apply(&self, data: bool) -> Option<(u64, u64)> {
+        let as_limit = self.effective_resource_limit(LINUX_RLIMIT_AS).rlim_cur;
+        let data_limit = if data {
+            self.effective_resource_limit(LINUX_RLIMIT_DATA).rlim_cur
+        } else {
+            LINUX_RLIM_INFINITY
+        };
+        if as_limit != LINUX_RLIM_INFINITY || data_limit != LINUX_RLIM_INFINITY {
+            Some((as_limit, data_limit))
+        } else {
+            None
+        }
+    }
+
+    /// Check address space limits when at least one limit is finite, under an existing `MemState` lock.
+    pub(super) fn check_address_space_limits_locked(
         &self,
         mem: &MemState,
+        as_limit: u64,
+        data_limit: u64,
         grow: u64,
         data: bool,
     ) -> Result<(), LinuxErrno> {
-        let as_limit = self.effective_resource_limit(LINUX_RLIMIT_AS).rlim_cur;
         if as_limit != LINUX_RLIM_INFINITY
             && committed_va_bytes(mem)
                 .checked_add(grow)
@@ -7084,15 +7117,13 @@ impl SyscallDispatcher {
         {
             return Err(LINUX_ENOMEM);
         }
-        if data {
-            let data_limit = self.effective_resource_limit(LINUX_RLIMIT_DATA).rlim_cur;
-            if data_limit != LINUX_RLIM_INFINITY
-                && data_va_bytes(mem)
-                    .checked_add(grow)
-                    .is_none_or(|total| total > data_limit)
-            {
-                return Err(LINUX_ENOMEM);
-            }
+        if data
+            && data_limit != LINUX_RLIM_INFINITY
+            && data_va_bytes(mem)
+                .checked_add(grow)
+                .is_none_or(|total| total > data_limit)
+        {
+            return Err(LINUX_ENOMEM);
         }
         Ok(())
     }
