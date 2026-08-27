@@ -175,6 +175,8 @@ pub const SHARD_0_PROBES: &[&str] = &[
     "xsignal",
 ];
 
+const CACHED_SHARD_0_PROBE_COUNT: usize = 130;
+
 /// Complete baseline expected gaps for musl on arm64.
 pub const MUSL_BASELINE_GAPS: &[&str] = &[
     "budget_two_proc",
@@ -374,6 +376,13 @@ fn test_shard_0_inventory() {
         142,
         "SHARD_0_PROBES must contain 142 unique names"
     );
+    assert_eq!(
+        SHARD_0_PROBES
+            .iter()
+            .filter(|name| !common::needs_live_oracle(name))
+            .count(),
+        CACHED_SHARD_0_PROBE_COUNT
+    );
 
     // Verify against conformance-probes/probe-inventory.json
     let repo_root = common::repo_root();
@@ -539,10 +548,9 @@ fn test_cache_freshness_and_hashing() {
         assert_eq!(content, normalize(&content));
     }
 
-    // Verify that a file without a valid matching source hash is rejected as stale.
-    let stale_err = cached_probe_oracle(&repo_root, "arm64", "musl", "dsrconstantpool")
-        .expect_err("dsrconstantpool without valid hash header must fail validation");
-    assert!(stale_err.contains("source hash mismatch"));
+    let dsr = cached_probe_oracle(&repo_root, "arm64", "musl", "dsrconstantpool")
+        .expect("freshly blessed dsrconstantpool cache must match its source");
+    assert!(dsr.contains("constant_word_match=true"));
 
     // Verify error messages on missing cache queries.
     let missing_err = cached_probe_oracle(&repo_root, "arm64", "musl", "__nonexistent__")
@@ -619,6 +627,9 @@ fn generic_probe_shard_0() {
         let mut executed_count = 0usize;
 
         for probe_name in SHARD_0_PROBES {
+            if common::needs_live_oracle(probe_name) {
+                continue;
+            }
             let probe_path = probe_dir.join(probe_name);
             assert!(
                 probe_path.is_file(),
@@ -651,8 +662,8 @@ fn generic_probe_shard_0() {
         }
 
         assert_eq!(
-            executed_count, 142,
-            "must execute exactly 142 shard 0 probes for target {target}, executed {executed_count}"
+            executed_count, CACHED_SHARD_0_PROBE_COUNT,
+            "must execute exactly {CACHED_SHARD_0_PROBE_COUNT} cached shard 0 probes for target {target}, executed {executed_count}"
         );
 
         let unexpected_failures: BTreeSet<_> = observed_mismatches

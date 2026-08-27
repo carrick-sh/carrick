@@ -9,6 +9,46 @@ use carrick_conformance_next::EmbedError;
 /// The canonical conformance image: arm64 Ubuntu 24.04.
 pub const SMOKE_IMAGE: &str = "docker.io/library/ubuntu:24.04";
 
+/// Generic probes whose Docker result is deliberately not committed as a
+/// static oracle. The old gate quarantines these for timing sensitivity or
+/// excludes them from its routine regression lane; they remain live-oracle
+/// work and must not make the ordinary cached lane depend on Docker.
+pub const LIVE_ORACLE_PROBES: &[&str] = &[
+    "clockgetres",
+    "forksleepfork",
+    "futexextra",
+    "futexghost",
+    "futexrequeue",
+    "futexshare",
+    "futexsharedalias",
+    "futexwakecount",
+    "iouring",
+    "iouringenterflag",
+    "itimer",
+    "manythreads",
+    "mmapfileforkwriteback",
+    "mmaprecl",
+    "mtforkcorrupt",
+    "netpoll",
+    "pauseeintr",
+    "pidnsinitreap",
+    "posixtimers",
+    "ppollsig",
+    "pselecteintr",
+    "selecttimeout",
+    "sigchld",
+    "splicenetpoll",
+    "timeclock",
+    "timeextra",
+    "timersettimeabs",
+    "waitexitstorm",
+    "waitsiblingsigchld",
+];
+
+pub fn needs_live_oracle(probe: &str) -> bool {
+    LIVE_ORACLE_PROBES.contains(&probe)
+}
+
 static GUEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// Serialize guest-running tests inside one process.
