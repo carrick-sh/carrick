@@ -54,21 +54,20 @@ pub(crate) fn debug_env_flag_enabled(value: Option<&str>) -> bool {
     )
 }
 
-// Called only by the macOS `runtime` arm today; the non-macOS arms reach the
-// `_at` form directly until M0.8 wires the native run path on every host.
-#[cfg_attr(
-    any(
-        feature = "platform-linux",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
-    ),
-    allow(dead_code)
-)]
+#[allow(dead_code)]
 pub(crate) fn with_optional_vdso<A: carrick_hal::GuestArch>(
     image: AddressSpace,
 ) -> Result<AddressSpace, AddressSpaceError> {
-    with_optional_vdso_at::<A>(
+    with_optional_vdso_for_clock::<A>(image, &crate::kernel::container::ClockDomain::system())
+}
+
+pub(crate) fn with_optional_vdso_for_clock<A: carrick_hal::GuestArch>(
+    image: AddressSpace,
+    clock: &crate::kernel::container::ClockDomain,
+) -> Result<AddressSpace, AddressSpaceError> {
+    with_optional_vdso_for_clock_at::<A>(
         image,
+        clock,
         carrick_mem::vdso::LINUX_VVAR_BASE,
         carrick_mem::vdso::LINUX_VDSO_BASE,
     )
@@ -78,19 +77,47 @@ pub(crate) fn with_optional_vdso<A: carrick_hal::GuestArch>(
 /// native backend relocates both pages out of the Darwin-reserved host VA hole
 /// the canonical bases sit in (see `AddressSpace::with_vdso_bytes_at`). The
 /// same `CARRICK_DISABLE_VDSO` / `CARRICK_VDSO_MODE` debug controls apply.
+#[allow(dead_code)]
 pub(crate) fn with_optional_vdso_at<A: carrick_hal::GuestArch>(
     image: AddressSpace,
     vvar_base: u64,
     vdso_base: u64,
 ) -> Result<AddressSpace, AddressSpaceError> {
-    let vdso_bytes = match vdso_debug_mode() {
-        VdsoDebugMode::Full => A::vdso_bytes(),
-        VdsoDebugMode::Disabled => return Ok(image),
-        // Debug variants are aarch64-only escape hatches; only the production
-        // image routes through GuestArch.
+    with_optional_vdso_for_clock_at::<A>(
+        image,
+        &crate::kernel::container::ClockDomain::system(),
+        vvar_base,
+        vdso_base,
+    )
+}
+
+/// [`with_optional_vdso_for_clock`] with caller-chosen vvar/vdso guest VAs and
+/// container clock domain awareness. Under `Scaled`, `Deterministic`, or
+/// `Frozen` modes, the vDSO is built with clock syscall stubs so monotonic and
+/// controlled realtime reads route through the domain rather than bypassing it
+/// via unscaled hardware counters.
+pub(crate) fn with_optional_vdso_for_clock_at<A: carrick_hal::GuestArch>(
+    image: AddressSpace,
+    clock: &crate::kernel::container::ClockDomain,
+    vvar_base: u64,
+    vdso_base: u64,
+) -> Result<AddressSpace, AddressSpaceError> {
+    let mode = vdso_debug_mode();
+    if mode == VdsoDebugMode::Disabled {
+        return Ok(image);
+    }
+    let vdso_bytes = match mode {
         VdsoDebugMode::NoGetrandom => carrick_mem::vdso::vdso_image_bytes_without_getrandom(),
         VdsoDebugMode::NoFastpaths => carrick_mem::vdso::vdso_image_bytes_without_fastpaths(),
         VdsoDebugMode::ClockSyscalls => carrick_mem::vdso::vdso_image_bytes_with_clock_syscalls(),
+        VdsoDebugMode::Full => {
+            if clock.is_scaled() || clock.is_deterministic() || clock.is_frozen() {
+                carrick_mem::vdso::vdso_image_bytes_with_clock_syscalls()
+            } else {
+                A::vdso_bytes()
+            }
+        }
+        VdsoDebugMode::Disabled => unreachable!(),
     };
     image.with_vdso_bytes_at(vdso_bytes, vvar_base, vdso_base)
 }
@@ -137,6 +164,80 @@ mod tests {
         assert_eq!(
             vdso_debug_mode_from_env(Some("on"), None),
             VdsoDebugMode::Disabled
+        );
+    }
+
+    #[test]
+    fn vdso_clock_policy_selects_syscall_stubs_for_controlled_monotonic_or_frozen() {
+        use crate::kernel::container::ClockDomain;
+        use carrick_hal::aarch64_arch::Aarch64GuestArch;
+        use std::time::{Duration, SystemTime};
+
+        let sys = ClockDomain::system();
+        let offset = ClockDomain::offset(Duration::from_secs(10).into());
+        let frozen = ClockDomain::frozen(SystemTime::UNIX_EPOCH + Duration::from_secs(100));
+        let scaled = ClockDomain::scaled(SystemTime::UNIX_EPOCH, 2, 1).unwrap();
+        let det = ClockDomain::deterministic(SystemTime::UNIX_EPOCH);
+
+        let space_sys = with_optional_vdso_for_clock::<Aarch64GuestArch>(
+            AddressSpace::from_regions(0, Vec::new()).unwrap(),
+            &sys,
+        )
+        .unwrap();
+        let space_offset = with_optional_vdso_for_clock::<Aarch64GuestArch>(
+            AddressSpace::from_regions(0, Vec::new()).unwrap(),
+            &offset,
+        )
+        .unwrap();
+        let space_frozen = with_optional_vdso_for_clock::<Aarch64GuestArch>(
+            AddressSpace::from_regions(0, Vec::new()).unwrap(),
+            &frozen,
+        )
+        .unwrap();
+        let space_scaled = with_optional_vdso_for_clock::<Aarch64GuestArch>(
+            AddressSpace::from_regions(0, Vec::new()).unwrap(),
+            &scaled,
+        )
+        .unwrap();
+        let space_det = with_optional_vdso_for_clock::<Aarch64GuestArch>(
+            AddressSpace::from_regions(0, Vec::new()).unwrap(),
+            &det,
+        )
+        .unwrap();
+
+        // System and Offset use standard full vDSO bytes
+        let full_bytes = carrick_mem::vdso::vdso_image_bytes();
+        let syscall_bytes = carrick_mem::vdso::vdso_image_bytes_with_clock_syscalls();
+
+        let get_vdso = |space: &AddressSpace| {
+            space
+                .regions()
+                .iter()
+                .find(|r| r.start == carrick_mem::vdso::LINUX_VDSO_BASE)
+                .unwrap()
+                .bytes()
+                .to_vec()
+        };
+
+        assert_eq!(
+            &get_vdso(&space_sys)[..full_bytes.len()],
+            full_bytes.as_slice()
+        );
+        assert_eq!(
+            &get_vdso(&space_offset)[..full_bytes.len()],
+            full_bytes.as_slice()
+        );
+        assert_eq!(
+            &get_vdso(&space_frozen)[..syscall_bytes.len()],
+            syscall_bytes.as_slice()
+        );
+        assert_eq!(
+            &get_vdso(&space_scaled)[..syscall_bytes.len()],
+            syscall_bytes.as_slice()
+        );
+        assert_eq!(
+            &get_vdso(&space_det)[..syscall_bytes.len()],
+            syscall_bytes.as_slice()
         );
     }
 }
