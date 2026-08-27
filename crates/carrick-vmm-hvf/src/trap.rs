@@ -5867,6 +5867,58 @@ impl HvfTaskState {
         self.frame_inventory
             .begin_exec_inventory(retired, replacement)
     }
+
+    pub(crate) fn set_persistent_vm_lifecycle(&mut self, enabled: bool) {
+        self.persistent_vm_lifecycle = enabled;
+    }
+
+    pub(crate) fn sparse_mmap_arena_enabled(&self) -> bool {
+        self.persistent_vm_lifecycle
+    }
+
+    /// Retire the generic boot loader's hidden 32 GiB mmap backing after the
+    /// runtime selects HVPatch, but before initial frame inventory publication.
+    /// Mature VMM never enables the persistent lifecycle and keeps its existing
+    /// eager identity mapping unchanged.
+    ///
+    /// When the carrier VM persists across containers, subsequent containers
+    /// boot via global exec plans that omit the eager 32 GiB mapping from stage 2
+    /// and prepare sparse page tables upfront. Retirement is therefore idempotent:
+    /// if the eager mapping is present, it is validated and unmapped; if absent,
+    /// the arena is already sparsely backed on demand.
+    pub(crate) fn retire_initial_mmap_arena(&mut self) -> Result<(), TrapError> {
+        if !self.persistent_vm_lifecycle {
+            return Ok(());
+        }
+        let Some(index) = self
+            .mappings
+            .iter()
+            .position(|mapping| mapping.start == crate::memory::LINUX_MMAP_BASE)
+        else {
+            return Ok(());
+        };
+        let mapping = &self.mappings[index];
+        if mapping.end
+            != crate::memory::LINUX_MMAP_BASE.saturating_add(crate::memory::mmap_arena_size())
+            || mapping.physical_ipa != crate::memory::LINUX_MMAP_BASE
+            || mapping.physical_size as u64 != crate::memory::mmap_arena_size()
+            || mapping.is_dynamic_alias
+            || mapping.stage2_lease.is_some()
+            || mapping.host_mapping.is_none()
+        {
+            return Err(TrapError::Hypervisor(
+                "HVPatch initial mmap arena backing has unexpected shape or ownership".to_owned(),
+            ));
+        }
+        let rc = unsafe { inventory_hv_vm_unmap(mapping.physical_ipa, mapping.physical_size) };
+        if rc != 0 {
+            return Err(TrapError::Hypervisor(format!(
+                "unmap HVPatch initial sparse mmap arena: 0x{rc:x}"
+            )));
+        }
+        drop(self.mappings.remove(index));
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -11482,51 +11534,6 @@ impl HvfVmState {
         &mut self,
     ) -> Option<carrick_hal::FrameInventoryCommit<()>> {
         self.frame_inventory.lock().retirement_commit.take()
-    }
-
-    pub(crate) fn set_persistent_vm_lifecycle(&mut self, enabled: bool) {
-        self.persistent_vm_lifecycle = enabled;
-    }
-
-    pub(crate) fn sparse_mmap_arena_enabled(&self) -> bool {
-        self.persistent_vm_lifecycle
-    }
-
-    /// Retire the generic boot loader's hidden 32 GiB mmap backing after the
-    /// runtime selects HVPatch, but before initial frame inventory publication.
-    /// Mature VMM never enables the persistent lifecycle and keeps its existing
-    /// eager identity mapping unchanged.
-    pub(crate) fn retire_initial_mmap_arena(&mut self) -> Result<(), TrapError> {
-        if !self.persistent_vm_lifecycle {
-            return Ok(());
-        }
-        let Some(index) = self.mappings.iter().position(|mapping| {
-            mapping.start == crate::memory::LINUX_MMAP_BASE
-                && mapping.end
-                    == crate::memory::LINUX_MMAP_BASE
-                        .saturating_add(crate::memory::mmap_arena_size())
-                && mapping.physical_ipa == crate::memory::LINUX_MMAP_BASE
-                && mapping.physical_size as u64 == crate::memory::mmap_arena_size()
-                && !mapping.is_dynamic_alias
-        }) else {
-            return Err(TrapError::Hypervisor(
-                "HVPatch initial mmap arena backing is absent or has unexpected shape".to_owned(),
-            ));
-        };
-        let mapping = &self.mappings[index];
-        if mapping.stage2_lease.is_some() || mapping.host_mapping.is_none() {
-            return Err(TrapError::Hypervisor(
-                "HVPatch initial mmap arena has unexpected ownership".to_owned(),
-            ));
-        }
-        let rc = unsafe { inventory_hv_vm_unmap(mapping.physical_ipa, mapping.physical_size) };
-        if rc != 0 {
-            return Err(TrapError::Hypervisor(format!(
-                "unmap HVPatch initial sparse mmap arena: 0x{rc:x}"
-            )));
-        }
-        drop(self.mappings.remove(index));
-        Ok(())
     }
 
     pub(crate) fn page_tables_snapshot(&self) -> Option<crate::page_table::PageTableManager> {
@@ -21316,6 +21323,29 @@ mod frame_inventory_backend_tests {
                 .all(|first| second_keys.iter().all(|second| first != second)),
             "a successor root image must not reuse a frame still retained by a child or predecessor"
         );
+    }
+
+    #[test]
+    fn retire_initial_mmap_arena_is_idempotent_when_sparse_mapping_absent() {
+        let mut state = HvfTaskState::neutral();
+        state.persistent_vm_lifecycle = true;
+        // Under persistent VM lifecycle, if the initial eager mmap arena was not mapped
+        // (as for subsequent containers in a persistent carrier), retirement is an idempotent Ok(()).
+        assert!(state.retire_initial_mmap_arena().is_ok());
+    }
+
+    #[test]
+    fn retire_initial_mmap_arena_rejects_corrupted_shape() {
+        let mut state = HvfTaskState::neutral();
+        state.persistent_vm_lifecycle = true;
+        let mut region = thread_sibling_tests::mapped_region(
+            crate::memory::LINUX_MMAP_BASE,
+            crate::memory::LINUX_MMAP_BASE + 0x4000,
+            crate::memory::LINUX_MMAP_BASE,
+        );
+        region.physical_size = 0x4000;
+        state.mappings.push(region);
+        assert!(state.retire_initial_mmap_arena().is_err());
     }
 
     #[test]
