@@ -1008,7 +1008,7 @@ def main() -> int:
         print(f"carrier topology gate: ARTIFACT PREFLIGHT FAIL: {error}", file=os.sys.stderr)
         return 1
 
-    base = ["run", "--raw", "--fs", "host", "--pid", "private", args.image]
+    base = ["run", "--fs", "host", "--pid", "private", args.image]
     detached_name = f"topology-detached-{os.getpid()}-{time.time_ns()}"
     arms = [
         (
@@ -1042,7 +1042,6 @@ def main() -> int:
                 [
                     "run",
                     "-d",
-                    "--raw",
                     "--fs",
                     "host",
                     "--name",

@@ -163,7 +163,7 @@ JIT→gateway→Rust frames (synthesize unwind info from the gateway's saved
    target/release/carrick debug lldb-run \
      --deadline-seconds 20 --run-id <run-id> -- \
      --exec-backend native --native-page-profile native16k \
-     --raw --fs host <image> <command> ...
+     --fs host <image> <command> ...
    ```
 
 Immediate fork-child exits can finish before lldb attaches. In that case use

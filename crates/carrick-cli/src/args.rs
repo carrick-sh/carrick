@@ -22,9 +22,8 @@
 //! - **`__trace-child` and the `--trace-uid/-gid/-groups` flags** are `hide`den
 //!   internal plumbing for the trace privilege split (see [`crate::trace_cli`]),
 //!   never typed by a user.
-//! - **`--raw` vs `--json` on `run`** select the output envelope: `--raw` is now
-//!   a no-op alias for the default docker-shaped streaming output, `--json` opts
-//!   back into the legacy compat-report envelope.
+//! - **`--json` on `run`** opts out of the default docker-shaped streaming
+//!   output into the JSON envelope (exit code, traps, compat report).
 //! - The **diagnostic/ELF-fixture verbs** (`run-elf`, `dispatch-syscall`,
 //!   `inspect-elf`, `plan-elf-load`, `load-elf`, `rootfs`, `syscalls`,
 //!   `trap-capabilities`, `debug`, `volume`) have no docker analogue; they exist
@@ -383,11 +382,6 @@ pub(crate) enum Commands {
         /// See `run-elf --debug-state-path`.
         #[arg(long = "debug-state-path")]
         debug_state_path: Option<PathBuf>,
-        /// Deprecated/no-op: the default `run` output is now docker-shaped
-        /// (streamed stdio + the container's exit code). Kept so existing
-        /// `--raw` invocations keep working; use `--json` for the old envelope.
-        #[arg(long)]
-        raw: bool,
         /// Emit the JSON compat-report envelope (exit code, traps, report) on
         /// stdout instead of behaving like `docker run`. Opt-in; off by default.
         #[arg(long)]

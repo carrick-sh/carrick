@@ -7,8 +7,8 @@
 //!
 //! Flag ordering: carrick's `run` declares `command` as `trailing_var_arg`, so
 //! the FIRST positional (the image) terminates option parsing and everything
-//! after it is handed to the guest. Therefore ALL envelope flags (`--raw`,
-//! `--fs`, `-v`, `-w`, `-e`, `--entrypoint`) go BEFORE the image, and only `cmd`
+//! after it is handed to the guest. Therefore ALL envelope flags (`--fs`,
+//! `-v`, `-w`, `-e`, `--entrypoint`) go BEFORE the image, and only `cmd`
 //! follows it — identical to `docker run [opts] <image> <cmd>` (and to
 //! `scripts/go-conformance-image.sh`).
 

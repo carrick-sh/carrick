@@ -89,7 +89,7 @@ pub struct Suite {
     pub timeout_s: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub known_gaps: Vec<String>,
-    /// carrick-only envelope flags (e.g. `["--raw","--fs","host"]`).
+    /// carrick-only envelope flags (e.g. `["--fs","host"]`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub carrick_flags: Vec<String>,
     /// docker-only flags (e.g. `["--user","65534"]`).
@@ -240,7 +240,7 @@ verdict = "regrtest"
 tier = "smoke"
 weight = "heavy"
 timeout_s = 180
-carrick_flags = ["--raw", "--fs", "host"]
+carrick_flags = ["--fs", "host"]
 "#;
 
     #[test]

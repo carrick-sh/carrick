@@ -50,7 +50,7 @@ for p in "${pkgs[@]}"; do
   # cwd = the package source dir so the test's relative file reads resolve;
   # cap output hard (some failures dump megabytes).
   CARRICK_EXPOSED_CPUS="$EXPOSED_CPUS" timeout -s KILL "$RUN_TIMEOUT" \
-    "$carrick" run --raw -w "/usr/local/go/src/$p" "$IMG" \
+    "$carrick" run -w "/usr/local/go/src/$p" "$IMG" \
     "/conformance/$n.test" -test.run Test -test.short $skip 2>&1 | head -c 200000 > "$log"
   # PIPESTATUS[0] is `timeout` (137 on SIGKILL); [1] is head. We want the former.
   rc=${PIPESTATUS[0]}

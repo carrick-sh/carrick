@@ -361,7 +361,6 @@ fn bridge_publish_probe_args(platform: &str, image: &str, host_port: u16) -> Vec
         "run".to_string(),
         "--platform".to_string(),
         platform.to_string(),
-        "--raw".to_string(),
         "--fs".to_string(),
         "host".to_string(),
         "--net".to_string(),
@@ -396,7 +395,6 @@ fn bridge_probe_args(platform: &str, image: &str) -> Vec<String> {
         "run".to_string(),
         "--platform".to_string(),
         platform.to_string(),
-        "--raw".to_string(),
         "--fs".to_string(),
         "host".to_string(),
         "--net".to_string(),
@@ -418,7 +416,6 @@ fn bridge_named_probe_args(
         "run".to_string(),
         "--platform".to_string(),
         platform.to_string(),
-        "--raw".to_string(),
         "--fs".to_string(),
         "host".to_string(),
         "--net".to_string(),
@@ -450,7 +447,6 @@ fn native_bound_named_probe_args(
         "run".to_string(),
         "--platform".to_string(),
         platform.to_string(),
-        "--raw".to_string(),
         "--fs".to_string(),
         "host".to_string(),
         "--net".to_string(),
@@ -2758,7 +2754,6 @@ fn run_carrick(bin: &PathBuf, lane: Lane, snippet: &str) -> String {
             "run",
             "--platform",
             lane.platform,
-            "--raw",
             "--fs",
             "host",
             lane.image,
@@ -2967,7 +2962,7 @@ fn indent(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Default-run contract: unlike `conformance` (which runs `--raw` and merges
+// Default-run contract: unlike `conformance` (which merges
 // streams), this asserts the DEFAULT `carrick run` path is docker-shaped —
 // exit-code parity, no JSON envelope on stdout, and stdout/stderr separation —
 // against the real-docker oracle. This is the guard that the default path (the
@@ -3004,7 +2999,7 @@ const EXIT_CASES: &[ExitCase] = &[
     },
 ];
 
-/// Run a snippet under carrick on the DEFAULT path (no `--raw`): returns
+/// Run a snippet under carrick on the DEFAULT path: returns
 /// `(host_exit_code, stdout, stderr)` with the streams captured separately.
 /// Mirrors `run_carrick`'s deadline + process-group-kill guard.
 fn run_carrick_default(bin: &PathBuf, snippet: &str) -> (i32, String, String) {
@@ -3328,7 +3323,7 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// `rlimitasdata` (mmap/brk growth past a soft `RLIMIT_AS`/`RLIMIT_DATA` must
 /// return `ENOMEM`) moves it from 467 to 468 and the gating rows from 882 to
 /// 884 — also `generic`, so the generic set goes 420 to 421.
-
+///
 /// `clocksettimevdso` (a guest `clock_settime` must move the vDSO's realtime
 /// word too, so vDSO and syscall CLOCK_REALTIME agree afterwards) moves it
 /// from 468 to 469 and the gating rows from 884 to 886 — `generic`, so the
@@ -3777,7 +3772,7 @@ fn run_carrick_probe_with_policy(
     caps: &[&str],
 ) -> CarrickProbeExecution {
     let mut command = Command::new(bin);
-    command.args(["run", "--platform", lane.platform, "--raw", "--fs", "host"]);
+    command.args(["run", "--platform", lane.platform, "--fs", "host"]);
     if unconfined {
         command.args(["--security-opt", "seccomp=unconfined"]);
     }
@@ -3846,7 +3841,6 @@ fn run_carrick_bound_probe_with_policy(
             "run",
             "--platform",
             lane.platform,
-            "--raw",
             "--fs",
             "host",
             "--volume",

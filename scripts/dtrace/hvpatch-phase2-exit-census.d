@@ -23,7 +23,7 @@
  *   target/release/carrick trace \
  *     --script scripts/dtrace/hvpatch-phase2-exit-census.d \
  *     --trace-out /tmp/hvpatch-phase2-exit-census.out -- \
- *     run --raw --exec-backend hvpatch IMAGE /bin/sh -c WORKLOAD
+ *     run --exec-backend hvpatch IMAGE /bin/sh -c WORKLOAD
  */
 
 #pragma D option quiet

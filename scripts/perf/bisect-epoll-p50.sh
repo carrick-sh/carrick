@@ -11,7 +11,7 @@ cd "$(git rev-parse --show-toplevel)"
 runs=()
 for i in 1 2 3; do
   p50=$(base64 -i "$EPOLL_PROBE" | CARRICK_RUN_ID="bisect-$$-$i" timeout 120 \
-    target/release/carrick run ubuntu:24.04 --raw --fs host \
+    target/release/carrick run ubuntu:24.04 --fs host \
     /bin/sh -c 'base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p' 2>/dev/null \
     | awk -F= '/^epoll_pipe_loop_p50_us=/{print $2}')
   [ -n "$p50" ] || exit 125                             # run failed here: skip

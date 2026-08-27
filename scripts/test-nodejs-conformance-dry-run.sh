@@ -88,7 +88,6 @@ PATH="$fakebin:$PATH" FAKE_DOCKER_ARGS="$fake_args" FAKE_CARRICK_ARGS="$fake_car
   --runner both --suite v8-smoke --line 26 --timeout 5 --jsonl "$rel_jsonl" --smoke
 carrick_out="$(cat "$fake_carrick_args")"
 contains "$carrick_out" "<run>"
-contains "$carrick_out" "<--raw>"
 contains "$carrick_out" "<--entrypoint>"
 contains "$carrick_out" "</bin/bash>"
 contains "$carrick_out" "<NODEJS_CONFORMANCE_EFFECTIVE_RUNNER=carrick>"

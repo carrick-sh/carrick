@@ -3307,7 +3307,6 @@ def _carrick_command(repo: pathlib.Path, manifest: WorkloadManifest, run_id: str
         run_id,
         "--max-traps",
         str(manifest.max_traps),
-        "--raw",
         "--fs",
         "host",
         "-w",

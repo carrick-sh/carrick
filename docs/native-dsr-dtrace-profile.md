@@ -51,7 +51,7 @@ CARRICK_RUN_ID=dsr-indirect-v8 target/release/carrick trace \
   --trace-out target/conformance/dsr-indirect-v8.raw \
   --summary-jsonl target/conformance/dsr-indirect-v8.jsonl -- \
   run --name dsr-indirect-v8 --max-traps 18446744073709551615 \
-  --raw --fs host --entrypoint /opt/nodejs-conformance/bin/node24 \
+  --fs host --entrypoint /opt/nodejs-conformance/bin/node24 \
   --exec-backend native --native-page-profile native16k \
   localhost:5005/carrick-nodejs-conformance:24.16.0-26.2.0 \
   /opt/nodejs-conformance/fixtures/v8-smoke.js

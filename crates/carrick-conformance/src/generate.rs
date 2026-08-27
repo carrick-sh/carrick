@@ -334,7 +334,7 @@ const KNOWN_GAP_EXACT_OVERRIDES: &[(&str, &[&str])] = &[
     ("ltp-semget05", &["summary"]),
 ];
 
-/// carrick's launch flags for a suite. The base is `--raw --fs host`; on top
+/// carrick's launch flags for a suite. The base is `--fs host`; on top
 /// of that, any capability the ORACLE is granted via `--cap-add` in
 /// `docker_flag_overrides` is mirrored onto the carrick side, so the two
 /// sides run at the SAME privilege. Without this the oracle ran e.g. the
@@ -344,7 +344,7 @@ const KNOWN_GAP_EXACT_OVERRIDES: &[(&str, &[&str])] = &[
 /// here: `engine::carrick_argv` mirrors those from `docker_flags` at runtime and
 /// is their single authority.
 fn carrick_flags_for(name: &str) -> Vec<String> {
-    let mut flags = vec!["--raw".to_string(), "--fs".to_string(), "host".to_string()];
+    let mut flags = vec!["--fs".to_string(), "host".to_string()];
     if let Some(docker) = docker_flag_overrides(name) {
         let mut it = docker.iter();
         while let Some(flag) = it.next() {
@@ -878,7 +878,7 @@ mod tests {
             );
             assert_eq!(
                 carrick_flags_for(name),
-                vec!["--raw", "--fs", "host", "--cap-add", "SYS_TIME"],
+                vec!["--fs", "host", "--cap-add", "SYS_TIME"],
                 "{name} must mirror SYS_TIME onto Carrick"
             );
         }
@@ -887,7 +887,7 @@ mod tests {
             assert_eq!(docker_flag_overrides(name), None, "{name}");
             assert_eq!(
                 carrick_flags_for(name),
-                vec!["--raw", "--fs", "host"],
+                vec!["--fs", "host"],
                 "{name} tests the rejection path and must stay unprivileged"
             );
         }
@@ -898,13 +898,13 @@ mod tests {
         for name in ["ltp-add_key01", "ltp-clone301"] {
             assert_eq!(
                 carrick_flags_for(name),
-                vec!["--raw", "--fs", "host"],
+                vec!["--fs", "host"],
                 "{name} must leave Docker seccomp mirroring to carrick_argv"
             );
         }
         assert_eq!(
             carrick_flags_for("ltp-fanotify01"),
-            vec!["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"],
+            vec!["--fs", "host", "--cap-add", "SYS_ADMIN"],
             "capability mirroring must remain while security-opt stays runtime-owned"
         );
     }
@@ -930,10 +930,7 @@ mod tests {
             docker_flag_overrides("ltp-fgetxattr02"),
             Some(vec!["--privileged".into()])
         );
-        assert_eq!(
-            carrick_flags_for("ltp-fgetxattr02"),
-            vec!["--raw", "--fs", "host"]
-        );
+        assert_eq!(carrick_flags_for("ltp-fgetxattr02"), vec!["--fs", "host"]);
         assert_eq!(known_gap_overrides("ltp-fgetxattr02"), None);
 
         for name in [
@@ -956,7 +953,7 @@ mod tests {
             );
             assert_eq!(
                 carrick_flags_for(name),
-                vec!["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"],
+                vec!["--fs", "host", "--cap-add", "SYS_ADMIN"],
                 "{name}"
             );
             assert_eq!(known_gap_overrides(name), None, "{name}");
@@ -992,14 +989,14 @@ mod tests {
             assert_eq!(suite.docker_flags, ["--cap-add", "SYS_TIME"], "{name}");
             assert_eq!(
                 suite.carrick_flags,
-                ["--raw", "--fs", "host", "--cap-add", "SYS_TIME"],
+                ["--fs", "host", "--cap-add", "SYS_TIME"],
                 "{name}"
             );
         }
         for name in ["ltp-settimeofday02", "ltp-stime02"] {
             let suite = find(name);
             assert!(suite.docker_flags.is_empty(), "{name}");
-            assert_eq!(suite.carrick_flags, ["--raw", "--fs", "host"], "{name}");
+            assert_eq!(suite.carrick_flags, ["--fs", "host"], "{name}");
         }
 
         let expected_cmd = ["/opt/ltp/testcases/bin/ioctl02", "-d", "/dev/tty0"];

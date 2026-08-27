@@ -98,7 +98,7 @@ def run_carrick_traced(test):
     env = dict(os.environ, CARRICK_TRACE_TRAPS="1")
     try:
         r = subprocess.run(
-            [CARRICK, "run", CARRICK_IMAGE, "--raw", "--fs", "host",
+            [CARRICK, "run", CARRICK_IMAGE, "--fs", "host",
              "/bin/sh", "-c", f"/opt/ltp/testcases/bin/{test}"],
             capture_output=True, text=True, timeout=CARRICK_TIMEOUT, env=env)
         stdout, stderr, rc = r.stdout, r.stderr, r.returncode

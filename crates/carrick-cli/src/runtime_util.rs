@@ -29,10 +29,10 @@
 //! `human_size`/`human_age`/`truncate_str` formatters that reproduce docker's
 //! decimal-unit sizes, relative ages, and truncated table columns.
 
-/// When `--raw` is set, emit the guest's buffered stdout/stderr to the
-/// carrick host process's fd 1 / fd 2 instead of wrapping them in JSON.
-/// This makes carrick feel like a normal command runner: `carrick run
-/// alpine /bin/busybox echo hi --raw` prints just `hi`.
+/// Emit the guest's residual buffered stdout/stderr to the carrick host
+/// process's fd 1 / fd 2 (the default `run` path and `run-elf --raw`) instead
+/// of wrapping them in JSON, so `carrick run alpine /bin/busybox echo hi`
+/// prints just `hi`.
 pub(crate) fn emit_raw(result: &carrick_runtime::runtime::RunResult) {
     use std::io::Write;
     let _ = std::io::stdout().write_all(&result.stdout);

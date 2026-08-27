@@ -39,8 +39,8 @@
 //!    `126`/`127` for a bad entrypoint are produced *inside* the runtime and
 //!    flow through as the container code. The default output is docker-shaped
 //!    (stdio already streamed live by the engine; the CLI just flushes residual
-//!    bytes and adopts the code); `--json` opts into the legacy compat-report
-//!    envelope; `--raw` is now a no-op alias for the default.
+//!    bytes and adopts the code); `--json` opts into the JSON compat
+//!    envelope.
 //! ## `trace`: the auto-sudo re-exec
 //!
 //! `Commands::Trace` is the one arm with real control-flow weight, because
@@ -405,7 +405,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 platform: None,
                 max_traps: DEFAULT_MAX_TRAPS,
                 debug_state_path: None,
-                raw: !interactive,
                 json: false,
                 pull: crate::args::PullArg::Missing,
                 tty: interactive,
@@ -835,7 +834,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             platform,
             max_traps,
             debug_state_path,
-            raw,
             json,
             tty,
             interactive,
@@ -1060,11 +1058,10 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 std::process::exit(status);
             }
 
-            // Default (and the back-compat `--raw`): behave like `docker run`.
-            // The guest's stdout/stderr already streamed byte-exact; flush any
-            // residual buffered bytes, surface a trap-limit failure on stderr
-            // (never polluting stdout), and exit with the container's code.
-            let _ = raw; // `--raw` is now the default behavior; accepted for compat.
+            // Default: behave like `docker run`. The guest's stdout/stderr
+            // already streamed byte-exact; flush any residual buffered bytes,
+            // surface a trap-limit failure on stderr (never polluting stdout),
+            // and exit with the container's code.
             emit_raw(&result);
             if result.trap_limit_hit {
                 eprintln!(

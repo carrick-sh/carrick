@@ -313,7 +313,6 @@ pub fn run_carrick(
         "run".into(),
         "--platform".into(),
         PLATFORM.into(),
-        "--raw".into(),
         "--fs".into(),
         fs_mode.into(),
     ];

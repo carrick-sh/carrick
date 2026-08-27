@@ -54,7 +54,7 @@ for t in "$@"; do
   D=$(verdict "$D_OUT")
   sudo -n "$KILL" "$RUN_ID" >/dev/null 2>&1
   : > "$C_OUT"
-  timeout 40 "$CARRICK" run "$IMAGE" --raw --fs host /bin/sh -c "/opt/ltp/testcases/bin/$t" > "$C_OUT" 2>&1
+  timeout 40 "$CARRICK" run "$IMAGE" --fs host /bin/sh -c "/opt/ltp/testcases/bin/$t" > "$C_OUT" 2>&1
   rc=$?
   sudo -n "$KILL" "$RUN_ID" >/dev/null 2>&1
   grep -vE "case-insensitive|Pass .--fs" "$C_OUT" > "$C_CLEAN"

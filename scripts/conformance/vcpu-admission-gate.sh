@@ -127,7 +127,7 @@ PY
 done
 
 log "NOTE: apt has no conformance fixture — manual repro (best-effort, not gated):"
-log "  just run run --raw --fs host ubuntu:24.04 apt-get install -y hello   # expect exit 0"
+log "  just run run --fs host ubuntu:24.04 apt-get install -y hello   # expect exit 0"
 
 if [ "$gate_fail" -ne 0 ]; then
     log "GATE FAILED: at least one of the 4 workloads did not verdict=match — see $OUT"

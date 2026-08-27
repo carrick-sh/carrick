@@ -205,7 +205,6 @@ def capture(
             "run",
             "--exec-backend",
             "native",
-            "--raw",
             "--fs",
             "host",
             "--rm",

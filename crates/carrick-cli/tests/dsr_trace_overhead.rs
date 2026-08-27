@@ -758,7 +758,6 @@ fn workload_args(workload: Workload, root: &Path, run_id: &str) -> Vec<String> {
             format!("{run_id}-v8"),
             "--max-traps".to_owned(),
             u64::MAX.to_string(),
-            "--raw".to_owned(),
             "--fs".to_owned(),
             "host".to_owned(),
             "--entrypoint".to_owned(),

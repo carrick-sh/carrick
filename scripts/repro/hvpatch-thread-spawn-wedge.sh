@@ -32,7 +32,7 @@ sys.stdout.flush()
 "
 echo "RUN_ID=$CARRICK_RUN_ID BIN=$BIN"
 "$BIN" run --name "spawn-$TAG" --max-traps 18446744073709551615 \
-  --raw --fs host localhost:5050/cpython-test:3.12.13 \
+  --fs host localhost:5050/cpython-test:3.12.13 \
   /usr/local/bin/python3 -c "$CODE" > "$SCRATCH/$TAG.sout" 2> "$SCRATCH/$TAG.serr"
 echo "exit=$?"
 grep -a "SPAWN" "$SCRATCH/$TAG.sout" || echo "NO SPAWN LINE"

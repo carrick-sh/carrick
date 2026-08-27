@@ -103,7 +103,7 @@ carrick-vs-Docker diff engine:
 
 * **Shell snippets** (`CASES`) — a `/bin/sh -c` snippet (e.g. `uname -m`,
   `stat -c '%s %F %a' /etc/passwd`, `cd /tmp && ln -sf … && readlink lnk`) run
-  under `carrick run --raw --fs host` and inside the `linux/arm64` container,
+  under `carrick run --fs host` and inside the `linux/arm64` container,
   byte-diffed after a `normalize()` pass that strips carrick's host-side scratch
   notices. A diff is a candidate syscall gap *surfaced by name* — `dpkg returned
   100` becomes `FAIL arm64:stat`.
@@ -116,7 +116,7 @@ carrick-vs-Docker diff engine:
   container cross-builds the static musl ELFs); without them the probe test
   self-skips.
 * **Default-run contract** (`conformance_default_run_contract`) — asserts the
-  *default* `carrick run` path (no `--raw`) is docker-shaped: exit-code parity,
+  *default* `carrick run` path is docker-shaped: exit-code parity,
   stdout/stderr separation, no JSON envelope on stdout.
 
 The same two-sided run also drives `conformance_go_fixture` (a Go hello-world
@@ -212,7 +212,7 @@ should graduate to an owned probe row.
   wraps the suite runner (`localhost:5005/carrick-nodejs-conformance:24.16.0-26.2.0`),
   covering `node-core`, `libuv`, `v8-smoke`, `npm-smoke`, `app-smoke`. Under
   carrick the suites run via the image's native entrypoint, e.g.
-  `carrick run --raw --entrypoint /bin/bash <image> /usr/local/bin/nodejs-conformance
+  `carrick run --entrypoint /bin/bash <image> /usr/local/bin/nodejs-conformance
   --runner carrick --suite <suite>` (a `#!` script entrypoint is honored by
   carrick's execve/shebang support).
 * **CPython** — [`scripts/cpython-parity.py`](../scripts/cpython-parity.py) runs

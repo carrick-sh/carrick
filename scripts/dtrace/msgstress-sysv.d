@@ -4,7 +4,7 @@
  * Use with carrick trace, for example:
  *
  *   carrick trace --script scripts/dtrace/msgstress-sysv.d --trace-out /tmp/msgstress.out -- \
- *     run --name "$CARRICK_RUN_ID" --raw --fs host localhost:5050/ltp:arm64 \
+ *     run --name "$CARRICK_RUN_ID" --fs host localhost:5050/ltp:arm64 \
  *     /opt/ltp/testcases/bin/msgstress01
  *
  * The script intentionally aggregates instead of printing every msgsnd/msgrcv:
