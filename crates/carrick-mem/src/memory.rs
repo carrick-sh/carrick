@@ -192,8 +192,9 @@ const _: () = assert!(
     "EL1 maintenance trampoline escapes the kernel-only first 2 MiB block",
 );
 // Carrick's per-process identity data page. The EL1 syscall-shim vector
-// dispatcher (`el1_vectors_bytes_shim`) reads pid/uid/gid from here to service
-// getpid/getuid/geteuid/getgid/getegid entirely at EL1 — no VM exit. It sits
+// dispatcher (`el1_vectors_bytes_shim`) reads pid from here to service
+// getpid directly at EL1 — no VM exit. (gettid is read from CONTEXTIDR_EL1;
+// clock syscalls are served via the vDSO and dispatch, not the EL1 shim.) It sits
 // immediately past the EL1 maintenance trampoline, still inside the kernel
 // hole's first 2 MiB block, so it inherits the kernel-only (AP=00) block
 // mapping: the EL1 stub can read it under PSTATE.PAN=1, and guest EL0 cannot.
