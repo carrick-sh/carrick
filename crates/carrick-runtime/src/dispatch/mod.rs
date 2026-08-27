@@ -6520,7 +6520,9 @@ impl SyscallDispatcher {
             }
             98 => {
                 let hvpatch_linux_tid = u32::try_from(kernel.thread().key().tid.raw()).ok();
+                let clock = Arc::clone(kernel.task().container().clock());
                 dispatch_threaded_futex(
+                    &clock,
                     request,
                     memory,
                     reporter,
@@ -6590,15 +6592,19 @@ impl SyscallDispatcher {
             178 => DispatchOutcome::Returned {
                 value: i64::from(kernel.thread().key().tid.raw()),
             },
-            449 => dispatch_futex_waitv_args(
-                memory,
-                Some(futex),
-                request.arg(0),
-                request.arg(1),
-                request.arg(2),
-                request.arg(3),
-                request.arg(4),
-            ),
+            449 => {
+                let clock = Arc::clone(kernel.task().container().clock());
+                dispatch_futex_waitv_args(
+                    &clock,
+                    memory,
+                    Some(futex),
+                    request.arg(0),
+                    request.arg(1),
+                    request.arg(2),
+                    request.arg(3),
+                    request.arg(4),
+                )
+            }
             _ => DispatchOutcome::Errno {
                 errno: LINUX_ENOSYS,
             },
@@ -6981,37 +6987,28 @@ pub(super) fn rosetta_handshake_ioctl(
 /// duration from now, on the host monotonic clock (or realtime when
 /// FUTEX_CLOCK_REALTIME is set). Clamps to zero if already past — Linux then
 /// returns ETIMEDOUT immediately.
-fn relative_from_absolute_timespec(tv_sec: i64, tv_nsec: i64, realtime: bool) -> Duration {
+fn relative_from_absolute_timespec(
+    clock: &crate::kernel::container::ClockDomain,
+    tv_sec: i64,
+    tv_nsec: i64,
+    realtime: bool,
+) -> Duration {
     let abs_ns = (tv_sec as i128) * 1_000_000_000 + tv_nsec as i128;
-    // The guest built `abs_ns` on ITS clock, so "now" here MUST read the SAME
-    // base or `abs_ns - now` is skewed and the deadline is mis-computed.
-    //
-    // Non-FUTEX_CLOCK_REALTIME → the guest clock is Linux CLOCK_MONOTONIC, which
-    // carrick services via `monotonic_duration()` (Linux host: the *virtualized*
-    // libc::CLOCK_MONOTONIC; macOS host: CLOCK_UPTIME_RAW — neither counts
-    // suspend). Read "now" from that SAME function, not a raw clock id: reading
-    // `carrick_portable::CLOCK_UPTIME_RAW` (== Linux CLOCK_MONOTONIC_RAW) skewed
-    // `now` from the guest base by the MONOTONIC vs MONOTONIC_RAW delta — tens of
-    // seconds inside an LXC/time-namespace (measured +57s on the KVM box) — so
-    // every absolute deadline computed as already-past → instant spurious
-    // ETIMEDOUT (broke timed lock/sem/condvar; probe: futexdeadline). On macOS
-    // this is identical to the previous CLOCK_UPTIME_RAW read, so the HVF lane is
-    // unchanged.
-    //
-    // The FUTEX_CLOCK_REALTIME case reads the GUEST's CLOCK_REALTIME
-    // (`realtime_duration`: host calibration + the guest-settable offset).
-    // Reading the raw host wall clock here was wrong the moment a guest moved
-    // its clock with `clock_settime`: every absolute deadline was then computed
-    // against a "now" one step behind. Probe: futexrealtime.
+    if realtime && clock.is_frozen() {
+        let frozen_ns = clock.realtime_now().as_nanos() as i128;
+        if abs_ns <= frozen_ns {
+            return Duration::ZERO;
+        }
+        return Duration::MAX;
+    }
     let now_ns: i128 = if realtime {
-        crate::kernel::container::ClockDomain::system()
-            .realtime_now()
-            .as_nanos() as i128
+        clock.realtime_now().as_nanos() as i128
     } else {
-        monotonic_duration().as_nanos() as i128
+        clock.monotonic_now().as_nanos() as i128
     };
     let rel_ns = (abs_ns - now_ns).max(0);
-    Duration::from_nanos(rel_ns.min(u64::MAX as i128) as u64)
+    let dur = Duration::from_nanos(rel_ns.min(u64::MAX as i128) as u64);
+    clock.scale_timeout(dur)
 }
 
 fn dispatch_futex_pi(
@@ -7067,7 +7064,9 @@ fn dispatch_futex_pi(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_threaded_futex(
+    clock: &crate::kernel::container::ClockDomain,
     request: SyscallRequest,
     memory: &mut impl GuestMemory,
     reporter: &CompatReporter,
@@ -7260,6 +7259,7 @@ fn dispatch_threaded_futex(
                 // else the wait would block until now+deadline ≈ forever.
                 if raw_command == LINUX_FUTEX_WAIT_BITSET {
                     Some(relative_from_absolute_timespec(
+                        clock,
                         timespec.tv_sec,
                         timespec.tv_nsec,
                         futex_flags.contains(LinuxFutexFlags::CLOCK_REALTIME),
@@ -7275,7 +7275,7 @@ fn dispatch_threaded_futex(
                     // Force the zero case to a ZERO duration so the park deadline is
                     // `now` and fires immediately (mirrors the proc.rs fix 519dd40f).
                     match duration_from_linux_timespec(timespec) {
-                        Ok(t) => Some(t.unwrap_or(std::time::Duration::ZERO)),
+                        Ok(t) => Some(clock.scale_timeout(t.unwrap_or(std::time::Duration::ZERO))),
                         Err(errno) => return DispatchOutcome::Errno { errno },
                     }
                 }
@@ -7379,7 +7379,9 @@ struct FutexWaitvEntry {
     private: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn dispatch_futex_waitv_args(
+    clock: &crate::kernel::container::ClockDomain,
     memory: &mut impl GuestMemory,
     futex: Option<&crate::thread::FutexTable>,
     waiters: u64,
@@ -7407,6 +7409,7 @@ pub(super) fn dispatch_futex_waitv_args(
             Err(errno) => return DispatchOutcome::Errno { errno },
         };
         Some(relative_from_absolute_timespec(
+            clock,
             timespec.tv_sec,
             timespec.tv_nsec,
             clockid == LINUX_CLOCK_REALTIME,
@@ -7726,10 +7729,10 @@ fn linux_clock_duration(
         | LINUX_CLOCK_REALTIME_ALARM
         | LINUX_CLOCK_TAI => Some(clock.realtime_now()),
         LINUX_CLOCK_MONOTONIC | LINUX_CLOCK_MONOTONIC_RAW | LINUX_CLOCK_MONOTONIC_COARSE => {
-            Some(monotonic_duration())
+            Some(clock.monotonic_now())
         }
         // BOOTTIME includes suspend time; on macOS that is CLOCK_MONOTONIC.
-        LINUX_CLOCK_BOOTTIME | LINUX_CLOCK_BOOTTIME_ALARM => Some(boottime_duration()),
+        LINUX_CLOCK_BOOTTIME | LINUX_CLOCK_BOOTTIME_ALARM => Some(clock.boottime_now()),
         // Linux↔macOS clock-id numbering DIFFERS, so map the Linux ids to
         // the host's symbolic libc constants rather than passing through.
         LINUX_CLOCK_PROCESS_CPUTIME_ID => {
@@ -9247,7 +9250,10 @@ fn linux_utimensat_timespec_is_valid(timespec: LinuxTimespec) -> bool {
 /// Resolve a validated utimensat timespec into the (sec, nsec) the backend
 /// should write, or `None` to leave the time untouched (UTIME_OMIT).
 /// UTIME_NOW resolves to the current wall-clock time.
-fn resolve_utimensat_timespec(timespec: LinuxTimespec) -> Option<(i64, i64)> {
+fn resolve_utimensat_timespec(
+    clock: &crate::kernel::container::ClockDomain,
+    timespec: LinuxTimespec,
+) -> Option<(i64, i64)> {
     // Copy out of the packed struct before matching (taking a reference to
     // a packed field is UB).
     let nsec = timespec.tv_nsec;
@@ -9255,7 +9261,7 @@ fn resolve_utimensat_timespec(timespec: LinuxTimespec) -> Option<(i64, i64)> {
     if nsec == LINUX_UTIME_OMIT {
         None
     } else if nsec == LINUX_UTIME_NOW {
-        Some(now_realtime_timespec())
+        Some(now_realtime_timespec(clock))
     } else {
         Some((sec, nsec))
     }
@@ -9263,8 +9269,8 @@ fn resolve_utimensat_timespec(timespec: LinuxTimespec) -> Option<(i64, i64)> {
 
 /// The guest's current CLOCK_REALTIME as a (sec, nsec) pair, for UTIME_NOW /
 /// NULL times.
-fn now_realtime_timespec() -> (i64, i64) {
-    let now = crate::kernel::container::ClockDomain::system().realtime_now();
+fn now_realtime_timespec(clock: &crate::kernel::container::ClockDomain) -> (i64, i64) {
+    let now = clock.realtime_now();
     (now.as_secs() as i64, i64::from(now.subsec_nanos()))
 }
 

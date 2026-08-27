@@ -14592,6 +14592,7 @@ impl SyscallDispatcher {
             // (sec, nsec) pairs or `None` (omit) for the backend.
             #[allow(clippy::type_complexity)]
             let (atime_set, mtime_set): (Option<(i64, i64)>, Option<(i64, i64)>);
+            let clock = Arc::clone(cx.kernel.task().container().clock());
             if times != 0 {
                 let atime = read_timespec(memory, times)?;
                 let mtime_address = times
@@ -14603,11 +14604,11 @@ impl SyscallDispatcher {
                 {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
-                atime_set = resolve_utimensat_timespec(atime);
-                mtime_set = resolve_utimensat_timespec(mtime);
+                atime_set = resolve_utimensat_timespec(&clock, atime);
+                mtime_set = resolve_utimensat_timespec(&clock, mtime);
             } else {
                 // NULL → set both to the current wall-clock time.
-                let now = now_realtime_timespec();
+                let now = now_realtime_timespec(&clock);
                 atime_set = Some(now);
                 mtime_set = Some(now);
             }
