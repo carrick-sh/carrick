@@ -117,6 +117,7 @@ pub struct ContainerBuilder {
     mounts: Vec<Mount>,
     stdout: StdioConfig,
     stderr: StdioConfig,
+    time: Option<carrick_runtime::kernel::TimeControl>,
     max_traps: usize,
 }
 
@@ -137,6 +138,7 @@ impl ContainerBuilder {
             mounts: Vec::new(),
             stdout: StdioConfig::Captured,
             stderr: StdioConfig::Captured,
+            time: None,
             max_traps: DEFAULT_MAX_TRAPS,
         }
     }
@@ -245,6 +247,12 @@ impl ContainerBuilder {
         self
     }
 
+    /// Configure time control for the container.
+    pub fn time(mut self, control: carrick_runtime::kernel::TimeControl) -> Self {
+        self.time = Some(control);
+        self
+    }
+
     /// Lower into the engine's request. Pure: no I/O, no ambient reads.
     pub fn to_run_request(&self) -> Result<RunRequest, EmbedError> {
         if self.image.trim().is_empty() {
@@ -315,6 +323,9 @@ impl ContainerBuilder {
         let mut extensions = RuntimeExtensions::default();
         if let StdioSink::Piped { .. } = plan.sink {
             extensions = extensions.stdio(plan.sink);
+        }
+        if let Some(time) = self.time {
+            extensions = extensions.time(time);
         }
         Ok(PreparedContainer::new(
             spec,
@@ -746,5 +757,27 @@ mod tests {
             panic!("an absent image under PullPolicy::Never must not resolve");
         };
         assert!(matches!(error, EmbedError::Image(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn prepare_wires_time_control() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path());
+        seed_local_image(
+            &store,
+            "embedtest:latest",
+            r#"{"architecture":"arm64","os":"linux","config":{"Cmd":["/bin/sh"]}}"#,
+        );
+
+        let target_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+        let prepared = ContainerBuilder::from_image("embedtest:latest")
+            .image_store(store)
+            .pull_policy(PullPolicy::Never)
+            .command(["/bin/true"])
+            .time(carrick_runtime::kernel::TimeControl::Frozen(target_time))
+            .prepare()
+            .await
+            .expect("prepare succeeds");
+        assert_eq!(prepared.run_spec().argv, strings(&["/bin/true"]));
     }
 }

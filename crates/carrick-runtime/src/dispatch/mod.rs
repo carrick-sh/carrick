@@ -4779,7 +4779,10 @@ impl SyscallDispatcher {
         clock: &crate::kernel::container::ClockDomain,
         memory: &mut impl GuestMemory,
         target: Duration,
-    ) -> Result<(), MemoryError> {
+    ) -> Result<(), DispatchError> {
+        if clock.is_controlled() {
+            return Err(DispatchError::Errno(carrick_abi::LINUX_EPERM));
+        }
         let base = clock.realtime_base_now();
         let delta_ns = if target >= base {
             i64::try_from((target - base).as_nanos()).unwrap_or(i64::MAX)
@@ -4788,8 +4791,11 @@ impl SyscallDispatcher {
                 .map(|n| -n)
                 .unwrap_or(i64::MIN)
         };
-        clock.set_realtime_offset_ns(delta_ns);
-        self.sync_vvar_realtime_offset(clock, memory)
+        clock
+            .try_set_realtime_offset_ns(delta_ns)
+            .map_err(DispatchError::Errno)?;
+        self.sync_vvar_realtime_offset(clock, memory)?;
+        Ok(())
     }
 
     pub(crate) fn begin_host_alias_dispatch(&self) -> HostAliasDispatchGuard {
@@ -7915,7 +7921,7 @@ pub(crate) fn host_clock_duration(clock_id: libc::clockid_t) -> Option<Duration>
     Some(Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
 }
 
-fn monotonic_duration() -> Duration {
+pub(crate) fn monotonic_duration() -> Duration {
     // On a Linux host the guest's CLOCK_MONOTONIC IS the host's — read the host
     // CLOCK_MONOTONIC (NOT CLOCK_MONOTONIC_RAW). RAW is the un-virtualized
     // hardware clock; inside a time-namespace (LXC/containers) it is NOT offset
