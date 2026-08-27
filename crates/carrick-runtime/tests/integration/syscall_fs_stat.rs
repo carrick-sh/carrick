@@ -265,12 +265,9 @@ fn faccessat2_supports_bootstrap_access_flags_and_fd_checks() {
                 &reporter,
             )
             .unwrap(),
-        // motd-link points at the 0o644 regular file "motd": even as root,
-        // X_OK on a regular file with no execute bit set returns EACCES, which
-        // is exactly what real Linux does.
-        DispatchOutcome::Errno {
-            errno: LinuxErrno::new(13)
-        }
+        // AT_SYMLINK_NOFOLLOW checks the link itself rather than the 0o644
+        // target. Linux symlink permissions are permissive, so X_OK succeeds.
+        DispatchOutcome::Returned { value: 0 }
     );
     assert_eq!(
         dispatcher
@@ -1043,6 +1040,60 @@ fn faccessat2_dotdot_after_missing_intermediate_returns_enoent() {
         DispatchOutcome::Errno {
             errno: LinuxErrno::new(2)
         }
+    );
+}
+
+#[test]
+fn faccessat2_follows_dangling_symlinks_unless_nofollow_is_set() {
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar_with_links(
+        [("etc/.keep", b"".as_slice())],
+        [("etc/dangling", "missing")],
+    ))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    memory.write_bytes(0x4000, b"/etc/dangling\0").unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+    let context = dispatcher.capture_one_task_context().unwrap();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    439,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        },
+        "the default access check follows the dangling link"
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    439,
+                    SyscallArgs::from([
+                        (-100_i64) as u64,
+                        0x4000,
+                        0,
+                        LINUX_AT_SYMLINK_NOFOLLOW,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+        "AT_SYMLINK_NOFOLLOW checks the link itself"
     );
 }
 

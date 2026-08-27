@@ -40,6 +40,11 @@ impl SyscallDispatcher {
         }
 
         let path = self.resolve_at_path(dirfd, &path)?;
+        let path = if flags & LINUX_AT_SYMLINK_NOFOLLOW == 0 {
+            self.canonicalize_following(&path)?
+        } else {
+            path
+        };
         Ok(self.access_resolved_path(context, &path, mode, flags))
     }
 
@@ -131,6 +136,25 @@ impl SyscallDispatcher {
         // layered view: they have their own permission model.
         if let Some(outcome) = self.synthetic_access(context, path, mode) {
             return outcome;
+        }
+        if flags & LINUX_AT_SYMLINK_NOFOLLOW != 0 {
+            let metadata = if let Some(m) = self.fs.vfs_mounts.resolve(path) {
+                m.vfs
+                    .lookup_nofollow(&m.full_path)
+                    .map(|md| vfs_md_to_rootfs_md(path, &md))
+            } else {
+                self.fs
+                    .rootfs_vfs
+                    .lookup_nofollow(path)
+                    .map(|md| vfs_md_to_rootfs_md(path, &md))
+            };
+            match metadata {
+                Ok(md) if md.kind == RootFsEntryKind::Symlink => {
+                    return access_metadata(&md, mode);
+                }
+                Ok(_) => {}
+                Err(errno) => return DispatchOutcome::errno(errno),
+            }
         }
         // VFS mounts (e.g. /dev/shm BindVfs) own their lookup — consult them
         // first, otherwise an `access("/dev/shm", F_OK)` falls through to
