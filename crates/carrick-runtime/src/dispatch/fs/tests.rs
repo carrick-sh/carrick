@@ -4065,3 +4065,207 @@ fn non_pipe_access_mode_readv_writev_and_splice_precedence() {
         "writev on directory descriptor must return EBADF"
     );
 }
+
+#[test]
+fn cross_mount_rename_and_link_boundary_semantics() {
+    use crate::vfs::{EntryKind, Metadata, Vfs, VfsError};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct TestMountVfs {
+        name: &'static str,
+        renamed: Arc<AtomicBool>,
+        linked: Arc<AtomicBool>,
+    }
+
+    impl Vfs for TestMountVfs {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn lookup(&self, path: &str) -> Result<Metadata, VfsError> {
+            if path.contains("file.txt") {
+                Ok(Metadata {
+                    kind: EntryKind::File,
+                    mode: 0o644,
+                    size: 10,
+                    uid: 0,
+                    gid: 0,
+                    mtime_secs: 0,
+                    mtime_nanos: 0,
+                })
+            } else {
+                Err(LINUX_ENOENT)
+            }
+        }
+
+        fn rename(&self, _from: &str, _to: &str) -> Result<(), LinuxErrno> {
+            self.renamed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn link(&self, _src: &str, _dst: &str) -> Result<(), LinuxErrno> {
+            self.linked.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let backend = crate::fs_backend::MemoryBackend::new();
+    backend
+        .set_file_contents("/rootfs_file.txt", b"payload".to_vec())
+        .unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+
+    let mount1_renamed = Arc::new(AtomicBool::new(false));
+    let mount1_linked = Arc::new(AtomicBool::new(false));
+    dispatcher.register_mount(
+        "/data1",
+        Box::new(TestMountVfs {
+            name: "mount1",
+            renamed: Arc::clone(&mount1_renamed),
+            linked: Arc::clone(&mount1_linked),
+        }),
+    );
+
+    let mount2_renamed = Arc::new(AtomicBool::new(false));
+    let mount2_linked = Arc::new(AtomicBool::new(false));
+    dispatcher.register_mount(
+        "/data2",
+        Box::new(TestMountVfs {
+            name: "mount2",
+            renamed: Arc::clone(&mount2_renamed),
+            linked: Arc::clone(&mount2_linked),
+        }),
+    );
+
+    let ctx = dispatcher.capture_one_task_context().unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+
+    memory.write_bytes(0x4000, b"/data1/file.txt\0").unwrap();
+    memory.write_bytes(0x4040, b"/rootfs_file.txt\0").unwrap();
+    memory.write_bytes(0x4080, b"/data2/file.txt\0").unwrap();
+    memory.write_bytes(0x40c0, b"/data1/renamed.txt\0").unwrap();
+    memory.write_bytes(0x4100, b"/data1/linked.txt\0").unwrap();
+    memory.write_bytes(0x4140, b"/rootfs_link.txt\0").unwrap();
+    memory
+        .write_bytes(0x4180, b"/data1/cross_link.txt\0")
+        .unwrap();
+    memory
+        .write_bytes(0x41c0, b"/data2/cross_link.txt\0")
+        .unwrap();
+
+    // 1. Rename mount1 -> rootfs: EXDEV
+    let res = dispatcher
+        .dispatch(
+            &ctx,
+            SyscallRequest::new(
+                38, // SYS_RENAMEAT
+                SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, LINUX_AT_FDCWD, 0x4040, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert_eq!(res, DispatchOutcome::errno(crate::linux_abi::LINUX_EXDEV));
+
+    // 2. Rename rootfs -> mount1: EXDEV
+    let res = dispatcher
+        .dispatch(
+            &ctx,
+            SyscallRequest::new(
+                38, // SYS_RENAMEAT
+                SyscallArgs::from([LINUX_AT_FDCWD, 0x4040, LINUX_AT_FDCWD, 0x4000, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert_eq!(res, DispatchOutcome::errno(crate::linux_abi::LINUX_EXDEV));
+
+    // 3. Rename mount1 -> mount2: EXDEV
+    let res = dispatcher
+        .dispatch(
+            &ctx,
+            SyscallRequest::new(
+                38, // SYS_RENAMEAT
+                SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, LINUX_AT_FDCWD, 0x4080, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert_eq!(res, DispatchOutcome::errno(crate::linux_abi::LINUX_EXDEV));
+
+    // 4. Rename within mount1 (mount1 -> mount1): Success (0)
+    let res = dispatcher
+        .dispatch(
+            &ctx,
+            SyscallRequest::new(
+                38, // SYS_RENAMEAT
+                SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, LINUX_AT_FDCWD, 0x40c0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert_eq!(res, DispatchOutcome::Returned { value: 0 });
+    assert!(mount1_renamed.load(Ordering::SeqCst));
+
+    // 5. Link mount1 -> rootfs: EXDEV
+    let res = dispatcher
+        .dispatch(
+            &ctx,
+            SyscallRequest::new(
+                37, // SYS_LINKAT
+                SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, LINUX_AT_FDCWD, 0x4140, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert_eq!(res, DispatchOutcome::errno(crate::linux_abi::LINUX_EXDEV));
+
+    // 6. Link rootfs -> mount1: EXDEV
+    let res = dispatcher
+        .dispatch(
+            &ctx,
+            SyscallRequest::new(
+                37, // SYS_LINKAT
+                SyscallArgs::from([LINUX_AT_FDCWD, 0x4040, LINUX_AT_FDCWD, 0x4180, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert_eq!(res, DispatchOutcome::errno(crate::linux_abi::LINUX_EXDEV));
+
+    // 7. Link mount1 -> mount2: EXDEV
+    let res = dispatcher
+        .dispatch(
+            &ctx,
+            SyscallRequest::new(
+                37, // SYS_LINKAT
+                SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, LINUX_AT_FDCWD, 0x41c0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert_eq!(res, DispatchOutcome::errno(crate::linux_abi::LINUX_EXDEV));
+
+    // 8. Link within mount1 (mount1 -> mount1): Success (0)
+    let res = dispatcher
+        .dispatch(
+            &ctx,
+            SyscallRequest::new(
+                37, // SYS_LINKAT
+                SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, LINUX_AT_FDCWD, 0x4100, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert_eq!(res, DispatchOutcome::Returned { value: 0 });
+    assert!(mount1_linked.load(Ordering::SeqCst));
+}
