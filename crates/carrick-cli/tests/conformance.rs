@@ -37,6 +37,14 @@ static CONFORMANCE_LOCK: Mutex<()> = Mutex::new(());
 /// FAILS so we remove it from this list — that's the signal the gap was
 /// fixed. Each entry must cite the gap.
 const KNOWN_PROBE_GAPS: &[&str] = &[
+    // These exec-from-thread reducers abort in the HVPatch MM-authority
+    // retirement path. They remain on the out-of-process legacy lane because
+    // the abort would poison a shared embedded test process. Unexpected passes
+    // fail the gate so they are removed from this list when the runtime closes
+    // the gap.
+    "execthreads",
+    "execfromthread",
+    "vforkexecthread",
     // Audit remediation program.
     // Each probe encodes a confirmed, dynamically-validated finding whose fix is
     // scheduled for the cited milestone; removed from this list when the fix lands
