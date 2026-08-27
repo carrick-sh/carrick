@@ -712,4 +712,205 @@ mod stdio_sink_tests {
         assert_eq!(parent.stdout(), b"parent out\nchild out\n");
         assert_eq!(parent.stderr(), b"child err\nparent err\n");
     }
+
+    fn dup_fd(dispatcher: &mut SyscallDispatcher, oldfd: u64) -> DispatchOutcome {
+        let mut memory = LinearMemory::new(0, vec![]);
+        let reporter = CompatReporter::default();
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(23, SyscallArgs::from([oldfd, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap()
+    }
+
+    fn dup3_fd(
+        dispatcher: &mut SyscallDispatcher,
+        oldfd: u64,
+        newfd: u64,
+        flags: u64,
+    ) -> DispatchOutcome {
+        let mut memory = LinearMemory::new(0, vec![]);
+        let reporter = CompatReporter::default();
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(24, SyscallArgs::from([oldfd, newfd, flags, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap()
+    }
+
+    fn close_fd(dispatcher: &mut SyscallDispatcher, fd: u64) -> DispatchOutcome {
+        let mut memory = LinearMemory::new(0, vec![]);
+        let reporter = CompatReporter::default();
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(57, SyscallArgs::from([fd, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn inherit_dup_redirection_sequence_returns_success() {
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_stdio_sink(StdioSink::Inherit);
+
+        // exec 3>&1
+        assert_eq!(
+            dup3_fd(&mut dispatcher, 1, 3, 0),
+            DispatchOutcome::Returned { value: 3 }
+        );
+        // echo via3 >&3 (direct write to 3)
+        assert_eq!(
+            write_fd(&mut dispatcher, 3, b"via3\n"),
+            DispatchOutcome::Returned { value: 5 }
+        );
+        // echo via3 >&3 (shell redirection dance: save 1 to 10, dup 3 to 1, write 1, restore 1, close 10)
+        assert_eq!(
+            dup3_fd(&mut dispatcher, 1, 10, 0),
+            DispatchOutcome::Returned { value: 10 }
+        );
+        assert_eq!(
+            dup3_fd(&mut dispatcher, 3, 1, 0),
+            DispatchOutcome::Returned { value: 1 }
+        );
+        assert_eq!(
+            write_fd(&mut dispatcher, 1, b"via3\n"),
+            DispatchOutcome::Returned { value: 5 }
+        );
+        assert_eq!(
+            dup3_fd(&mut dispatcher, 10, 1, 0),
+            DispatchOutcome::Returned { value: 1 }
+        );
+        assert_eq!(
+            close_fd(&mut dispatcher, 10),
+            DispatchOutcome::Returned { value: 0 }
+        );
+    }
+
+    #[test]
+    fn captured_dup_redirection_captures_to_stdout() {
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_stdio_sink(StdioSink::Captured);
+
+        // exec 3>&1
+        assert_eq!(
+            dup3_fd(&mut dispatcher, 1, 3, 0),
+            DispatchOutcome::Returned { value: 3 }
+        );
+        // write to fd 3
+        assert_eq!(
+            write_fd(&mut dispatcher, 3, b"via3\n"),
+            DispatchOutcome::Returned { value: 5 }
+        );
+        // shell redirection dance
+        assert_eq!(
+            dup3_fd(&mut dispatcher, 1, 10, 0),
+            DispatchOutcome::Returned { value: 10 }
+        );
+        assert_eq!(
+            dup3_fd(&mut dispatcher, 3, 1, 0),
+            DispatchOutcome::Returned { value: 1 }
+        );
+        assert_eq!(
+            write_fd(&mut dispatcher, 1, b"via1\n"),
+            DispatchOutcome::Returned { value: 5 }
+        );
+        assert_eq!(
+            dup3_fd(&mut dispatcher, 10, 1, 0),
+            DispatchOutcome::Returned { value: 1 }
+        );
+        assert_eq!(
+            close_fd(&mut dispatcher, 10),
+            DispatchOutcome::Returned { value: 0 }
+        );
+
+        assert_eq!(dispatcher.stdout(), b"via3\nvia1\n");
+    }
+
+    #[test]
+    fn captured_stream_separation_with_dup2() {
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_stdio_sink(StdioSink::Captured);
+
+        assert_eq!(
+            write_fd(&mut dispatcher, 1, b"OUT\n"),
+            DispatchOutcome::Returned { value: 4 }
+        );
+        // 1>&2: redirect stdout to stderr
+        assert_eq!(
+            dup3_fd(&mut dispatcher, 2, 1, 0),
+            DispatchOutcome::Returned { value: 1 }
+        );
+        assert_eq!(
+            write_fd(&mut dispatcher, 1, b"ERR\n"),
+            DispatchOutcome::Returned { value: 4 }
+        );
+        assert_eq!(dispatcher.stdout(), b"OUT\n");
+        assert_eq!(dispatcher.stderr(), b"ERR\n");
+    }
+
+    #[test]
+    fn child_writes_to_duped_stdio_after_fork_captured() {
+        let mut parent = SyscallDispatcher::new();
+        parent.set_stdio_sink(StdioSink::Captured);
+
+        // dup 1 to 3
+        assert_eq!(
+            dup_fd(&mut parent, 1),
+            DispatchOutcome::Returned { value: 3 }
+        );
+
+        let parent_context = parent.capture_one_task_context().unwrap();
+        let parent_tid = parent_context.thread().registry_id();
+        let child_tid = crate::thread::ThreadId::from_guest_supplied_tid(2);
+        let mut child = parent.fork_clone_in_process(parent_tid, child_tid, 10, 11);
+        *child.kernel_binding.write() = parent_context.task_binding();
+
+        assert_eq!(
+            write_fd(&mut child, 3, b"child via 3\n"),
+            DispatchOutcome::Returned { value: 12 }
+        );
+        assert_eq!(parent.stdout(), b"child via 3\n");
+    }
+
+    #[test]
+    fn piped_dup_and_stream_separation() {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let err = Arc::new(Mutex::new(Vec::new()));
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_stdio_sink(StdioSink::Piped {
+            stdout: Box::new(Recorder(Arc::clone(&out))),
+            stderr: Box::new(Recorder(Arc::clone(&err))),
+        });
+
+        // exec 3>&1
+        assert_eq!(
+            dup3_fd(&mut dispatcher, 1, 3, 0),
+            DispatchOutcome::Returned { value: 3 }
+        );
+        assert_eq!(
+            write_fd(&mut dispatcher, 3, b"piped 3\n"),
+            DispatchOutcome::Returned { value: 8 }
+        );
+        assert_eq!(&*out.lock(), b"piped 3\n");
+
+        // 1>&2
+        assert_eq!(
+            dup3_fd(&mut dispatcher, 2, 1, 0),
+            DispatchOutcome::Returned { value: 1 }
+        );
+        assert_eq!(
+            write_fd(&mut dispatcher, 1, b"piped err\n"),
+            DispatchOutcome::Returned { value: 10 }
+        );
+        assert_eq!(&*err.lock(), b"piped err\n");
+    }
 }

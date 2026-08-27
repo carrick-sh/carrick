@@ -2637,6 +2637,7 @@ impl SyscallDispatcher {
                         pty: None,
                         bidirectional: access == LINUX_O_RDWR,
                         write_kind: HostWriteKind::PipeLike,
+                        stdio_stream: None,
                     };
                     let open_file = OpenFile::from_open_description(
                         Arc::new(RwLock::new(description)),
@@ -3818,6 +3819,7 @@ impl SyscallDispatcher {
                     pty,
                     bidirectional: false,
                     write_kind,
+                    stdio_stream: Some(old_fd),
                 })))
             }
             None => return DispatchOutcome::errno(LINUX_EBADF),
@@ -3887,6 +3889,7 @@ impl SyscallDispatcher {
                     pty,
                     bidirectional: false,
                     write_kind,
+                    stdio_stream: Some(old_fd),
                 })))
             }
             None => return DispatchOutcome::errno(LINUX_EBADF),
@@ -4126,6 +4129,7 @@ impl SyscallDispatcher {
                         // EOF). Shared with HVF: same latent gap there.
                         bidirectional: access == LINUX_O_RDWR,
                         write_kind,
+                        stdio_stream: None,
                     }
                 };
                 let open_file = OpenFile::from_open_description(
@@ -4201,6 +4205,7 @@ impl SyscallDispatcher {
                         // pty bidirectionality is already expressed by `pty`.
                         bidirectional: false,
                         write_kind: HostWriteKind::Other,
+                        stdio_stream: None,
                     })),
                     linux_fd_flags_from_open_flags(flags),
                 );
@@ -5829,8 +5834,17 @@ impl SyscallDispatcher {
                         pty,
                         bidirectional,
                         write_kind,
+                        stdio_stream,
                         ..
                     } => {
+                        if let Some(stream) = *stdio_stream {
+                            if stream == 0 {
+                                return DispatchOutcome::errno(LINUX_EBADF);
+                            }
+                            if !self.io.inherits_host_stdio() {
+                                return self.write_stdio_sink(stream, bytes);
+                            }
+                        }
                         // pty ends and O_RDWR FIFOs are bidirectional; only real
                         // one-way pipe ends are gated by is_read_end.
                         #[cfg(feature = "trace-tty")]
@@ -13065,8 +13079,18 @@ impl SyscallDispatcher {
                             pty,
                             bidirectional,
                             write_kind,
+                            stdio_stream,
                             ..
                         } => {
+                            if let Some(stream) = *stdio_stream {
+                                if stream == 0 {
+                                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                                }
+                                if !this.io.inherits_host_stdio() {
+                                    drop(open);
+                                    return Ok(this.write_stdio_sink(stream, &bytes));
+                                }
+                            }
                             // pty ends and O_RDWR FIFOs are bidirectional; only
                             // real one-way pipe ends are gated by is_read_end.
                             #[cfg(feature = "trace-tty")]
@@ -13624,8 +13648,18 @@ impl SyscallDispatcher {
                                 pty,
                                 bidirectional,
                                 write_kind,
+                                stdio_stream,
                                 ..
                             } => {
+                                if let Some(stream) = *stdio_stream {
+                                    if stream == 0 {
+                                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                                    }
+                                    if !this.io.inherits_host_stdio() {
+                                        drop(open);
+                                        return Ok(this.write_stdio_sink(stream, &bytes));
+                                    }
+                                }
                                 // pty ends and O_RDWR FIFOs are bidirectional;
                                 // only real one-way pipe ends gate on is_read_end.
                                 if *is_read_end && pty.is_none() && !*bidirectional {

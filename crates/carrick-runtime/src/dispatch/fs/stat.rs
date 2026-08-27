@@ -242,6 +242,7 @@ mod tests {
                 pty: None,
                 bidirectional: false,
                 write_kind,
+                stdio_stream: None,
             })),
             0,
         )
