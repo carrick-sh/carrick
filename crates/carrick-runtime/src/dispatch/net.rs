@@ -971,9 +971,19 @@ impl SyscallDispatcher {
                     }
                     _ => false,
                 };
-                let stream_socket_fd = match &*open {
-                    OpenDescription::HostSocket { host_fd, .. } => Some(host_fd.raw()),
-                    _ => None,
+                // A datagram carrick itself queued (the bridge DNS gateway's
+                // answer, a loopback ICMP echo reply) sits in `synthetic_recv`,
+                // invisible to the host poll below: it is readable to the
+                // guest, so it is EPOLLIN here too. `poll_ready_events` already
+                // does this; `epoll_pwait` recomputes host-backed readiness
+                // through THIS function, so it must as well.
+                let (stream_socket_fd, synthetic_datagram_ready) = match &*open {
+                    OpenDescription::HostSocket {
+                        host_fd,
+                        synthetic_recv,
+                        ..
+                    } => (Some(host_fd.raw()), !synthetic_recv.is_empty()),
+                    _ => (None, false),
                 };
                 drop(open);
                 let Some(host_fd) = self.host_fd_for_poll(fd) else {
@@ -1080,6 +1090,13 @@ impl SyscallDispatcher {
                 {
                     ready |= LINUX_EPOLLIN | LINUX_EPOLLRDHUP;
                 }
+                // Asserted AFTER the SO_REUSEPORT turn-taking above: a synthetic
+                // datagram is addressed to this exact socket (it answered this
+                // socket's query), never to the group, so the group mask must
+                // not hide it.
+                if requested_events & LINUX_EPOLLIN != 0 && synthetic_datagram_ready {
+                    ready |= LINUX_EPOLLIN;
+                }
                 // Only report events the caller is watching, plus the
                 // always-reported HUP/ERR conditions Linux delivers regardless.
                 ready & (requested_events | LINUX_EPOLLHUP | LINUX_EPOLLERR)
@@ -1088,14 +1105,26 @@ impl SyscallDispatcher {
     }
 
     fn host_read_avail_for_poll(&self, fd: i32) -> u64 {
+        // Bytes carrick queued on a socket outside the host kernel
+        // (`synthetic_recv`). Counted into the ET read-growth baseline so a
+        // gateway reply is a visible arrival, exactly as `pipe.buffered_bytes()`
+        // is for an in-memory pipe; FIONREAD on the host fd cannot see them.
+        let mut synthetic_bytes = 0u64;
         if let Some(open_file) = self.open_file(fd) {
             let open = open_file.description.read();
-            if let OpenDescription::PipeReader { pipe, .. } = &*open {
-                return pipe.buffered_bytes() as u64;
+            match &*open {
+                OpenDescription::PipeReader { pipe, .. } => return pipe.buffered_bytes() as u64,
+                OpenDescription::HostSocket { synthetic_recv, .. } => {
+                    synthetic_bytes = synthetic_recv
+                        .iter()
+                        .map(|(payload, _source)| payload.len() as u64)
+                        .sum();
+                }
+                _ => {}
             }
         }
         let Some(host_fd) = self.host_fd_for_poll(fd) else {
-            return 0;
+            return synthetic_bytes;
         };
         let mut avail: libc::c_int = 0;
         let rc = unsafe { libc::ioctl(host_fd.get(), libc::FIONREAD, &mut avail) };
@@ -1105,6 +1134,7 @@ impl SyscallDispatcher {
             0
         };
         host.saturating_add(self.staged_splice_pipe_bytes(fd) as u64)
+            .saturating_add(synthetic_bytes)
     }
 
     /// Consumption-based EPOLLET re-arm for the Linux lane's sampled epoll
@@ -3269,6 +3299,59 @@ mod icmp_ping_tests {
         assert_eq!(reply[1], 0);
         assert_eq!(internet_checksum(&reply), 0);
         assert_eq!(source, socket_addr_to_linux_sockaddr(loopback).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod synthetic_datagram_readiness_tests {
+    use super::*;
+
+    /// A datagram carrick itself queued on a host-backed UDP socket (the bridge
+    /// DNS gateway's answer, a loopback ICMP echo reply) lives in
+    /// `synthetic_recv`, not in the host kernel, so the host `poll(2)` that
+    /// `epoll_ready_events` trusts for sockets can never see it. Linux reports
+    /// EPOLLIN for any queued datagram; so must the recompute `epoll_pwait`
+    /// runs on every host-backed interest, and the ET read-growth baseline
+    /// must count its bytes the way it counts an in-memory pipe's.
+    #[test]
+    fn queued_synthetic_datagram_is_epollin_ready() {
+        let dispatcher = SyscallDispatcher::new();
+        let fd = match dispatcher.host_socket_install(LINUX_AF_INET, LINUX_SOCK_DGRAM, 0) {
+            DispatchOutcome::Returned { value } => value as i32,
+            other => panic!("udp socket creation failed: {other:?}"),
+        };
+        // An unbound, unconnected UDP socket: the host kernel has nothing
+        // queued, so any readiness below comes from the synthetic queue alone.
+        assert_eq!(dispatcher.epoll_ready_events(fd, LINUX_EPOLLIN), 0);
+        assert_eq!(dispatcher.host_read_avail_for_poll(fd), 0);
+
+        let payload = b"\x12\x34\x81\x80reply".to_vec();
+        let source = socket_addr_to_linux_sockaddr("172.31.0.1:53".parse().unwrap()).unwrap();
+        {
+            let open_file = dispatcher.open_file(fd).expect("udp socket open file");
+            let mut open = open_file.description.write();
+            let OpenDescription::HostSocket { synthetic_recv, .. } = &mut *open else {
+                panic!("udp socket must be a HostSocket");
+            };
+            synthetic_recv.push_back((payload.clone(), source));
+        }
+
+        let ready = dispatcher.epoll_ready_events(fd, LINUX_EPOLLIN);
+        assert_eq!(
+            ready & LINUX_EPOLLIN,
+            LINUX_EPOLLIN,
+            "synthetic datagram must make the socket EPOLLIN-ready, got {ready:#x}"
+        );
+        assert_eq!(
+            dispatcher.host_read_avail_for_poll(fd),
+            payload.len() as u64,
+            "the ET read-growth baseline must count synthetic bytes"
+        );
+
+        // Draining the queue takes the readiness with it.
+        assert!(dispatcher.synthetic_datagram_drain(fd).is_some());
+        assert_eq!(dispatcher.epoll_ready_events(fd, LINUX_EPOLLIN), 0);
+        assert_eq!(dispatcher.host_read_avail_for_poll(fd), 0);
     }
 }
 
