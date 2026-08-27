@@ -5841,6 +5841,67 @@ impl HvfTaskState {
         }
     }
 
+    pub(crate) fn physical_cow_source(&self, semantic_va: u64, ipa: u64) -> Option<(*mut u8, u64)> {
+        let physical_ipa = align_down(ipa, CowArmedRanges::COMPOUND_SIZE);
+        let physical_end = physical_ipa.checked_add(CowArmedRanges::COMPOUND_SIZE)?;
+        if let Some(alias) = alias_registry().lock().iter().rev().find(|alias| {
+            alias_matches_process_scope(
+                alias.ownership_scope,
+                self.mm_root_slot,
+                self.container_root,
+            ) && semantic_va >= alias.start
+                && semantic_va < alias.start.saturating_add(alias.size as u64)
+                && alias
+                    .ipa
+                    .checked_add(semantic_va.saturating_sub(alias.start))
+                    == Some(ipa)
+                && physical_ipa >= alias.physical_ipa
+                && physical_end
+                    <= alias
+                        .physical_ipa
+                        .saturating_add(alias.physical_size as u64)
+                && if self.persistent_vm_lifecycle
+                    && is_reusable_global_frame_extent(
+                        alias.physical_ipa,
+                        alias.physical_size as u64,
+                    )
+                {
+                    global_frame_host_owner_matches(
+                        alias.physical_ipa,
+                        alias.physical_size as u64,
+                        alias.physical_host_addr,
+                        alias.owner_generation,
+                    )
+                } else {
+                    alias_backing_is_live(alias.physical_host_addr)
+                }
+        }) {
+            let offset = usize::try_from(physical_ipa - alias.physical_ipa).ok()?;
+            return Some((
+                unsafe { (alias.physical_host_addr as *mut u8).add(offset) },
+                physical_ipa,
+            ));
+        }
+        let mapping = self.mappings.iter().rev().find(|mapping| {
+            let mapping_end = mapping.ipa.checked_add(mapping.size as u64);
+            mapping.contains_range(semantic_va, 1)
+                && mapping
+                    .ipa
+                    .checked_add(semantic_va.saturating_sub(mapping.start))
+                    == Some(ipa)
+                && physical_ipa >= mapping.ipa
+                && mapping_end.is_some_and(|limit| physical_end <= limit)
+                && (!self.persistent_vm_lifecycle
+                    || !is_reusable_global_frame_extent(
+                        mapping.physical_ipa,
+                        mapping.physical_size as u64,
+                    )
+                    || global_frame_region_owner_matches(mapping))
+        })?;
+        let offset = usize::try_from(physical_ipa - mapping.ipa).ok()?;
+        Some((unsafe { mapping.host_addr.add(offset) }, physical_ipa))
+    }
+
     fn neutral() -> Self {
         Self {
             mappings: Vec::new(),
@@ -6831,6 +6892,10 @@ impl ThreadMappingDesc {
     /// sibling thread mirrors it as an UNOWNED `HvfMappedRegion`). Called by
     /// `HvfVmState::build_thread_spec` (the per-VMM `build_sibling_builder`).
     fn from_region(region: &HvfMappedRegion) -> Self {
+        let semantic_offset =
+            usize::try_from(region.ipa.saturating_sub(region.physical_ipa)).unwrap_or(0);
+        let physical_host_addr =
+            (region.host_addr as usize).saturating_sub(semantic_offset) as *mut u8;
         Self {
             start: region.start,
             ipa: region.ipa,
@@ -6838,7 +6903,7 @@ impl ThreadMappingDesc {
             host_addr: region.host_addr,
             size: semantic_extent_size(region.start, region.end),
             physical_ipa: region.physical_ipa,
-            physical_host_addr: region.host_addr,
+            physical_host_addr,
             physical_size: region.physical_size,
             perms: region.perms,
             is_dynamic_alias: region.is_dynamic_alias,
@@ -7289,18 +7354,10 @@ fn inherited_fork_inventory_extents(
     mapping: &ThreadMappingDesc,
     inventory: &std::collections::BTreeMap<(u64, u64), InventoryExtent>,
 ) -> Vec<((u64, u64), InventoryExtent)> {
-    let expected_owner = mapping
-        .ipa
-        .checked_sub(mapping.physical_ipa)
-        .and_then(|offset| {
-            (mapping.owner_generation != 0).then_some(InventoryStage2OwnerIdentity {
-                host_addr: mapping
-                    .physical_host_addr
-                    .wrapping_add(usize::try_from(offset).ok()?)
-                    as usize,
-                generation: mapping.owner_generation,
-            })
-        });
+    let expected_owner = (mapping.owner_generation != 0).then_some(InventoryStage2OwnerIdentity {
+        host_addr: mapping.physical_host_addr as usize,
+        generation: mapping.owner_generation,
+    });
     let live_owner =
         global_frame_host_owner_identity(mapping.physical_ipa, mapping.physical_size as u64);
     inventory
@@ -12883,67 +12940,6 @@ impl HvfVmState {
             .copied()
             .unwrap_or(0)
             > 1
-    }
-
-    fn physical_cow_source(&self, semantic_va: u64, ipa: u64) -> Option<(*mut u8, u64)> {
-        let physical_ipa = align_down(ipa, CowArmedRanges::COMPOUND_SIZE);
-        let physical_end = physical_ipa.checked_add(CowArmedRanges::COMPOUND_SIZE)?;
-        if let Some(alias) = alias_registry().lock().iter().rev().find(|alias| {
-            alias_matches_process_scope(
-                alias.ownership_scope,
-                self.mm_root_slot,
-                self.container_root,
-            ) && semantic_va >= alias.start
-                && semantic_va < alias.start.saturating_add(alias.size as u64)
-                && alias
-                    .ipa
-                    .checked_add(semantic_va.saturating_sub(alias.start))
-                    == Some(ipa)
-                && physical_ipa >= alias.physical_ipa
-                && physical_end
-                    <= alias
-                        .physical_ipa
-                        .saturating_add(alias.physical_size as u64)
-                && if self.persistent_vm_lifecycle
-                    && is_reusable_global_frame_extent(
-                        alias.physical_ipa,
-                        alias.physical_size as u64,
-                    )
-                {
-                    global_frame_host_owner_matches(
-                        alias.physical_ipa,
-                        alias.physical_size as u64,
-                        alias.physical_host_addr,
-                        alias.owner_generation,
-                    )
-                } else {
-                    alias_backing_is_live(alias.physical_host_addr)
-                }
-        }) {
-            let offset = usize::try_from(physical_ipa - alias.physical_ipa).ok()?;
-            return Some((
-                unsafe { (alias.physical_host_addr as *mut u8).add(offset) },
-                physical_ipa,
-            ));
-        }
-        let mapping = self.mappings.iter().rev().find(|mapping| {
-            let mapping_end = mapping.ipa.checked_add(mapping.size as u64);
-            mapping.contains_range(semantic_va, 1)
-                && mapping
-                    .ipa
-                    .checked_add(semantic_va.saturating_sub(mapping.start))
-                    == Some(ipa)
-                && physical_ipa >= mapping.ipa
-                && mapping_end.is_some_and(|limit| physical_end <= limit)
-                && (!self.persistent_vm_lifecycle
-                    || !is_reusable_global_frame_extent(
-                        mapping.physical_ipa,
-                        mapping.physical_size as u64,
-                    )
-                    || global_frame_region_owner_matches(mapping))
-        })?;
-        let offset = usize::try_from(physical_ipa - mapping.ipa).ok()?;
-        Some((unsafe { mapping.host_addr.add(offset) }, physical_ipa))
     }
 
     /// Materialize private zero backing for the exact accessible pieces of the
@@ -27668,5 +27664,145 @@ mod tag_strip_tests {
             vec![alias_c2_root],
             "container 1 unregister must not touch container 2 alias"
         );
+    }
+
+    #[test]
+    fn container_child_cow_physical_source_lookup() {
+        let container_1 = ContainerRootToken::from_raw(2);
+        let child_root_slot = (
+            carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE + 0x20_0000,
+            2 * 1024 * 1024,
+        );
+        let mmap_va = 0x6000004000_u64;
+        let mmap_ipa = 0x9b00204000_u64;
+        let host_buf = vec![0u8; 0x4000];
+        let host_ptr = host_buf.as_ptr() as usize;
+
+        let alias = AliasBacking {
+            start: mmap_va,
+            ipa: mmap_ipa,
+            host_addr: host_ptr,
+            size: 0x4000,
+            physical_ipa: mmap_ipa,
+            physical_host_addr: host_ptr,
+            physical_size: 0x4000,
+            perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+            guest_writable: true,
+            sharing: GuestMappingSharing::Private,
+            ownership_scope: AliasOwnershipScope::MmRootSlot {
+                base: child_root_slot.0,
+                size: child_root_slot.1,
+            },
+            inventory_backing: InventoryBackingIdentity::Private(1),
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: 0,
+        };
+
+        alias_registry().lock().push(alias);
+
+        let mut child_task = super::HvfTaskState::neutral();
+        child_task.container_root = container_1;
+        child_task.mm_root_slot = Some(child_root_slot);
+        child_task.persistent_vm_lifecycle = true;
+
+        let source = child_task.physical_cow_source(mmap_va, mmap_ipa);
+        assert!(
+            source.is_some(),
+            "child task must find physical COW source for rebound alias"
+        );
+
+        alias_registry().lock().retain(|a| a.start != mmap_va);
+    }
+
+    #[test]
+    fn thread_mapping_desc_from_region_and_fork_inheritance_with_offset() {
+        static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        let _test_lock = TEST_LOCK.lock();
+        let physical_ipa = 0x9b00_2000_0000_u64;
+        let physical_len = 0x8000_usize;
+        let semantic_offset = 0x4000_u64;
+        let semantic_ipa = physical_ipa + semantic_offset;
+        let semantic_va = 0x6000_004000_u64;
+        let semantic_len = 0x4000_usize;
+
+        let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            physical_len,
+            crate::host_mapping::HostMappingKind::FrameCow,
+        )
+        .expect("test host owner");
+        let physical_host = host_mapping.as_ptr() as usize;
+        let semantic_host = (physical_host + semantic_offset as usize) as *mut u8;
+
+        let generation = super::next_global_frame_owner_generation();
+        let owner = super::GlobalFrameHostOwner {
+            _mapping: host_mapping,
+            _lease: super::GlobalFrameStage2Lease::fixed(physical_ipa, physical_len as u64),
+            perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+            generation,
+        };
+        assert!(
+            super::global_frame_host_owners()
+                .lock()
+                .insert((physical_ipa, physical_len as u64), owner)
+                .is_none()
+        );
+
+        let region = HvfMappedRegion {
+            start: semantic_va,
+            ipa: semantic_ipa,
+            physical_ipa,
+            end: semantic_va + semantic_len as u64,
+            host_addr: semantic_host,
+            size: semantic_len,
+            physical_size: physical_len,
+            perms: applevisor::memory::MemPerms::ReadWrite,
+            memory: None,
+            host_mapping: None,
+            stage2_lease: None,
+            is_dynamic_alias: true,
+            sharing: GuestMappingSharing::Private,
+            guest_writable: true,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: generation,
+        };
+
+        let desc = ThreadMappingDesc::from_region(&region);
+        assert_eq!(
+            desc.physical_host_addr as usize, physical_host,
+            "from_region must derive physical host base from semantic host and IPA offset"
+        );
+        assert_eq!(desc.host_addr as usize, semantic_host as usize);
+
+        let id = |raw: u64| std::num::NonZeroU64::new(raw).unwrap();
+        let inventory_extent = super::InventoryExtent {
+            frame: carrick_hal::FrameId::from_kernel_allocation(id(9801)),
+            mapping: carrick_hal::MappingId::from_kernel_allocation(id(9802)),
+            backing: InventoryBackingIdentity::Private(9803),
+            stage2_base: physical_ipa,
+            stage2_length: physical_len as u64,
+            stage2_owner: super::InventoryStage2OwnerIdentity {
+                host_addr: physical_host,
+                generation,
+            },
+        };
+        let parent_inventory = std::collections::BTreeMap::from([(
+            (physical_ipa, physical_len as u64),
+            inventory_extent,
+        )]);
+
+        let inherited = inherited_fork_inventory_extents(&desc, &parent_inventory);
+        assert_eq!(
+            inherited.len(),
+            1,
+            "fork inventory inheritance must succeed for region with non-zero semantic offset"
+        );
+        assert_eq!(inherited[0].1.stage2_owner.host_addr, physical_host);
+        assert_eq!(inherited[0].1.stage2_owner.generation, generation);
+
+        super::global_frame_host_owners()
+            .lock()
+            .remove(&(physical_ipa, physical_len as u64));
     }
 }
