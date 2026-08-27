@@ -304,7 +304,7 @@ jobs:
       - name: Full test suite (incl. HVF integration)
         run: cargo test --workspace
 
-      # Differential carrick-vs-Docker suite. Self-skips if Docker is unreachable
-      # or the signed binary is missing, so it is safe even on a partial runner.
-      - name: Conformance (carrick vs Docker)
-        run: cargo test -p carrick-cli --test conformance -- --nocapture
+      # The public probe gate uses conformance-next in-process with committed
+      # Docker oracles, plus only its reviewed legacy exceptions.
+      - name: Conformance probes
+        run: just conformance-probes
