@@ -216,7 +216,20 @@ impl Runtime {
         // mode never creates a host namespace-supervisor process.
         match spec.pid {
             PidMode::Host => {} // share the host pid ns — no placement.
-            PidMode::Private => crate::namespace::pid::request(),
+            PidMode::Private => {
+                let region = crate::namespace::pid::NsSharedRegion::allocate(
+                    carrick_kernel::arena::KernelArena::global(),
+                )
+                .map_err(|e| {
+                    RuntimeError::Configuration(format!(
+                        "all 64 arena PID namespace slots are claimed: {e:?}"
+                    ))
+                })?;
+                region.set_init(std::process::id());
+                container.install_pid_ns(region).map_err(|_| {
+                    RuntimeError::Configuration("pid namespace already installed".into())
+                })?;
+            }
         }
         // Name the host process `carrick: <argv>` up front so
         // it's identifiable in ps/Activity Monitor even before the

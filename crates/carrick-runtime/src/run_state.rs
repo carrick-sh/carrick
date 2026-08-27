@@ -136,13 +136,13 @@ fn unpack(raw: u64) -> Option<(u32, RunState)> {
 }
 
 fn processes() -> &'static ProcessSection {
-    &KernelArena::init_global().layout().processes
+    &KernelArena::global().layout().processes
 }
 
 /// Ensure the arena exists before the first guest fork (so every descendant
 /// inherits the SAME mapping). Idempotent. Called once at loop start.
 pub fn init_table() {
-    let _ = KernelArena::init_global();
+    let _ = KernelArena::global();
 }
 
 const REF_NONE: u64 = u64::MAX;

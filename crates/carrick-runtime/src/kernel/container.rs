@@ -266,6 +266,13 @@ pub struct Container {
     /// REGION (`pid_ns`) beside it; the two are different domains (a task key
     /// versus an arena slot) and both stay.
     pid_root: OnceLock<TaskKey>,
+    /// The PID namespace root's region (`None` = the container shares the
+    /// host pid namespace, `PidMode::Host`). Installed once by
+    /// `Runtime::execute` before the root task boots; every task reaches it
+    /// through `Task::pid_ns_region`. `Container::retire` (Task 23) retires
+    /// the namespace's members and releases its arena slot through
+    /// `NsSharedRegion::retire`; dropping the last `Arc` is the safety net.
+    pid_ns: OnceLock<Arc<crate::namespace::pid::NsSharedRegion>>,
     clock: Arc<ClockDomain>,
 }
 
@@ -278,6 +285,7 @@ impl Container {
             id: launch.container_id,
             launch,
             pid_root: OnceLock::new(),
+            pid_ns: OnceLock::new(),
             clock: Arc::new(ClockDomain::default()),
         }
     }
@@ -288,6 +296,21 @@ impl Container {
     /// can chain further defaults (B3 adds `with_launch_capabilities`).
     pub fn for_reference_model() -> Self {
         Self::new(LaunchContext::unmanaged(RunId::new("reference-model")))
+    }
+
+    /// Install the container's PID namespace region. Exactly once, before any
+    /// task of the container runs; a second install is refused and hands the
+    /// region back so the caller cannot silently leak a claimed slot.
+    pub(crate) fn install_pid_ns(
+        &self,
+        region: Arc<crate::namespace::pid::NsSharedRegion>,
+    ) -> Result<(), Arc<crate::namespace::pid::NsSharedRegion>> {
+        self.pid_ns.set(region)
+    }
+
+    /// The container's PID namespace region, `None` under `PidMode::Host`.
+    pub(crate) fn pid_region(&self) -> Option<Arc<crate::namespace::pid::NsSharedRegion>> {
+        self.pid_ns.get().cloned()
     }
 
     pub fn id(&self) -> ContainerId {

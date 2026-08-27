@@ -1660,7 +1660,7 @@ where
                 .map(Some);
             }
         }
-        crate::namespace::pid::mark_self_execed();
+        crate::namespace::pid::mark_self_execed_for(&committed_context);
         // execve_into rebuilt a fresh vCPU: re-stamp the identity page
         // (zeroed) and TPIDR_EL1 (reset) for the same thread/tid.
         let identity_base = if inventory_failure_injection

@@ -746,14 +746,14 @@ impl SysvShmState {
         let counter = self.private_counter.fetch_add(1, Ordering::Relaxed);
         format!(
             "{}-private-{}-{}",
-            sysv_run_scope(),
+            sysv_scope(),
             std::process::id(),
             counter
         )
     }
 
     fn key_name(key: i32) -> String {
-        format!("{}-key-{}", sysv_run_scope(), key as u32)
+        format!("{}-key-{}", sysv_scope(), key as u32)
     }
 }
 
@@ -864,43 +864,19 @@ impl SysvIpcService {
     }
 }
 
-static SYSV_FALLBACK_ROOT_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-/// Freeze the no-run-id SysV IPC scope before creating the first guest
-/// process. Descendants must keep using the top-level runtime pid: recomputing
-/// `pid-{getpid()}` after a host fork splits one guest IPC namespace into one
-/// directory namespace per process.
-#[allow(dead_code)]
-pub(crate) fn init_sysv_run_scope() {
-    let _ = SYSV_FALLBACK_ROOT_PID.compare_exchange(
-        0,
-        std::process::id(),
-        std::sync::atomic::Ordering::AcqRel,
-        std::sync::atomic::Ordering::Acquire,
-    );
+/// The SysV IPC scope for the active container.
+///
+/// Reached from the calling task via `KernelContext::container` (`sysv_scope_for`),
+/// falling back during early pre-dispatch bringup or tests to the active context,
+/// and only then to an unmanaged fallback stamp. Two containers in one carrier
+/// cannot see each other's SysV keys.
+pub(super) fn sysv_scope() -> String {
+    crate::dispatch::resources::with_active_context(sysv_scope_for)
+        .unwrap_or_else(|| "unscoped-sysv".to_string())
 }
 
-fn sysv_run_scope() -> String {
-    let raw = std::env::var("CARRICK_RUN_ID").unwrap_or_else(|_| {
-        std::env::var("CARRICK_CONTAINER_ID").unwrap_or_else(|_| {
-            let frozen = SYSV_FALLBACK_ROOT_PID.load(std::sync::atomic::Ordering::Acquire);
-            let root_pid = if frozen == 0 {
-                std::process::id()
-            } else {
-                frozen
-            };
-            format!("pid-{root_pid}")
-        })
-    });
-    raw.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+pub(super) fn sysv_scope_for(context: &crate::kernel::KernelContext) -> String {
+    context.container().run_id().as_str().to_string()
 }
 
 #[cfg(test)]
@@ -908,7 +884,7 @@ fn scoped_host_sem_key(key: i32) -> libc::key_t {
     if key == LINUX_IPC_PRIVATE {
         return LINUX_IPC_PRIVATE as libc::key_t;
     }
-    scoped_host_sem_key_for_scope(&sysv_run_scope(), key)
+    scoped_host_sem_key_for_scope(&sysv_scope(), key)
 }
 
 #[cfg(test)]
@@ -1188,17 +1164,17 @@ fn unix_now_secs() -> u64 {
 fn msg_queue_path_for_private(state: &SysvShmState) -> PathBuf {
     PathBuf::from(SHM_DIR).join(format!(
         "{}-msg-private-{}",
-        sysv_run_scope(),
+        sysv_scope(),
         state.private_name()
     ))
 }
 
 fn msg_queue_path_for_key(key: i32) -> PathBuf {
-    PathBuf::from(SHM_DIR).join(format!("{}-msg-key-{}", sysv_run_scope(), key as u32))
+    PathBuf::from(SHM_DIR).join(format!("{}-msg-key-{}", sysv_scope(), key as u32))
 }
 
 fn msg_queue_path_for_id(id: MsgQueueId) -> PathBuf {
-    PathBuf::from(SHM_DIR).join(format!("{}-msg-id-{}", sysv_run_scope(), id.raw() as u32))
+    PathBuf::from(SHM_DIR).join(format!("{}-msg-id-{}", sysv_scope(), id.raw() as u32))
 }
 
 fn msg_queue_wait_path(path: &Path) -> PathBuf {
@@ -1219,7 +1195,7 @@ fn msg_queue_id_for_fd(fd: i32) -> Result<MsgQueueId, LinuxErrno> {
 }
 
 fn msg_queue_scope_prefix() -> String {
-    format!("{}-msg-", sysv_run_scope())
+    format!("{}-msg-", sysv_scope())
 }
 
 fn is_msg_queue_path(path: &std::path::Path) -> bool {
@@ -2324,11 +2300,6 @@ impl SyscallDispatcher {
             .commit(commit.atime, commit.lpid)
             .unwrap_or_else(|()| std::process::abort());
         process.attachments.insert(commit.va, shmid);
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn init_sysv_run_scope(&self) {
-        init_sysv_run_scope();
     }
 
     pub(crate) fn sysvipc_shm_table(&self) -> String {
@@ -5414,5 +5385,27 @@ mod ipc_set_tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn sysv_scope_reads_container_run_id() {
+        let container = std::sync::Arc::new(crate::kernel::Container::new(
+            crate::kernel::LaunchContext::unmanaged(crate::kernel::RunId::new("test-sysv-run")),
+        ));
+        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+            100,
+            crate::thread::ThreadId::synthetic_for_tests(100),
+            "sysv-test".to_owned(),
+        )
+        .expect("bootstrap")
+        .with_container(container);
+        let (_binding, context) =
+            crate::kernel::Kernel::bootstrap_root(bootstrap).expect("bootstrap root");
+        assert_eq!(sysv_scope_for(&context), "test-sysv-run");
+    }
+
+    #[test]
+    fn sysv_scope_falls_back_when_no_active_context() {
+        assert_eq!(sysv_scope(), "unscoped-sysv");
     }
 }

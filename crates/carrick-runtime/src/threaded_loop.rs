@@ -231,12 +231,6 @@ where
     // Root guest pid (before any fork) so /proc/<pid>/ can tell a guest
     // descendant from a host process.
     crate::host_proc::set_root_guest_pid(std::process::id());
-    // PID-namespace launch-placement fallback (container path only; a no-op when
-    // not requested → kick+futex backends unaffected): if the ns supervisor fork
-    // was skipped, identity-init so getpid()==1 still holds.
-    if crate::namespace::pid::requested() && !crate::namespace::pid::enabled() {
-        let _ = crate::namespace::pid::init(std::process::id());
-    }
     // Shared reaped-child CPU table, allocated before any fork so every guest
     // descendant inherits the same MAP_SHARED region.
     crate::guest_cpu::init_child_table();

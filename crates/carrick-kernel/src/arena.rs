@@ -16,7 +16,6 @@ pub const ARENA_MAGIC: u32 = 0x434b_4131;
 /// Bumped to 5 when `pid_namespaces` was appended and `ProcessRecord` gained
 /// `pid_ns`; a version-4 file is refused by `attach` (fail closed).
 pub const ARENA_VERSION: u32 = 5;
-pub const ARENA_PATH_ENV: &str = "CARRICK_KERNEL_ARENA";
 
 /// Permit-section constants. These must stay byte-identical to the landed
 /// `SharedPermitTable` in `carrick-vmm-hvf/src/trap.rs`: magic "CRP1",
@@ -200,11 +199,11 @@ impl KernelArena {
         Ok(arena)
     }
 
-    /// Process-wide singleton. Must be initialized before the first guest fork;
-    /// repeated calls return the same inherited mapping.
+    /// Process-wide singleton. Always created fresh in memory for the carrier;
+    /// B2 deletes the path-based constructor and environment-variable lookup.
     #[allow(clippy::panic)]
     pub fn init_global() -> &'static KernelArena {
-        GLOBAL.get_or_init(|| match KernelArena::create_or_attach_from_env() {
+        GLOBAL.get_or_init(|| match KernelArena::create() {
             Ok(arena) => arena,
             Err(err) => {
                 panic!("carrick-kernel arena creation failed: {err}");
@@ -374,20 +373,6 @@ impl KernelArena {
         unsafe { &*(self.base as *const ArenaLayout) }
     }
 
-    fn create_or_attach_from_env() -> std::io::Result<KernelArena> {
-        match std::env::var_os(ARENA_PATH_ENV) {
-            Some(path) => {
-                let path = Path::new(&path);
-                if path.exists() {
-                    Self::attach(path)
-                } else {
-                    Self::create_at(path)
-                }
-            }
-            None => Self::create(),
-        }
-    }
-
     fn create_with_path(path: &Path, unlink_on_success: bool) -> std::io::Result<KernelArena> {
         let size = std::mem::size_of::<ArenaLayout>();
         let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
@@ -463,7 +448,6 @@ impl KernelArena {
             .permits
             .version
             .store(PERMIT_VERSION, Ordering::Relaxed);
-        layout.processes.next_ns_pid.store(2, Ordering::Relaxed);
         layout.vm_slots.next_generation.store(1, Ordering::Relaxed);
         layout
             .vm_slots
@@ -516,12 +500,6 @@ mod tests {
                 .next_generation
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
-        );
-        assert_eq!(
-            l.processes
-                .next_ns_pid
-                .load(std::sync::atomic::Ordering::Relaxed),
-            2
         );
         assert_eq!(
             l.pid_namespaces.claimed(),
