@@ -213,6 +213,28 @@ const GNU_BASELINE_GAPS: &[&str] = &[
     "vfs_mount_rw",
 ];
 
+/// Launch policy for a probe.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProbeLaunchPolicy {
+    pub security_opt: Option<&'static str>,
+    pub cap_add: Option<&'static str>,
+}
+
+/// Derive the launch policy for a probe.
+pub fn probe_launch_policy(name: &str) -> ProbeLaunchPolicy {
+    match name {
+        "clonefileshare" | "usernsisolation" => ProbeLaunchPolicy {
+            security_opt: Some("seccomp=unconfined"),
+            cap_add: None,
+        },
+        "clocksettimevdso" => ProbeLaunchPolicy {
+            security_opt: None,
+            cap_add: Some("SYS_TIME"),
+        },
+        _ => ProbeLaunchPolicy::default(),
+    }
+}
+
 /// Derive the shard expected gap subset from the complete baseline gap set.
 pub fn expected_gaps_for_shard(baseline: &[&'static str]) -> BTreeSet<&'static str> {
     let shard_set: BTreeSet<&str> = SHARD_2_PROBES.iter().copied().collect();
@@ -371,6 +393,42 @@ fn test_shard_2_inventory_definition() {
 }
 
 #[test]
+fn test_probe_launch_policies() {
+    assert_eq!(
+        probe_launch_policy("clonefileshare"),
+        ProbeLaunchPolicy {
+            security_opt: Some("seccomp=unconfined"),
+            cap_add: None,
+        }
+    );
+    assert_eq!(
+        probe_launch_policy("usernsisolation"),
+        ProbeLaunchPolicy {
+            security_opt: Some("seccomp=unconfined"),
+            cap_add: None,
+        }
+    );
+    assert_eq!(
+        probe_launch_policy("clocksettimevdso"),
+        ProbeLaunchPolicy {
+            security_opt: None,
+            cap_add: Some("SYS_TIME"),
+        }
+    );
+
+    // Verify all other shard 2 probes have default empty policy
+    for &probe in SHARD_2_PROBES {
+        if probe != "clonefileshare" && probe != "usernsisolation" && probe != "clocksettimevdso" {
+            assert_eq!(
+                probe_launch_policy(probe),
+                ProbeLaunchPolicy::default(),
+                "probe '{probe}' should have default launch policy"
+            );
+        }
+    }
+}
+
+#[test]
 fn test_shard_2_cache_freshness() {
     let repo_root = common::repo_root();
 
@@ -460,45 +518,43 @@ fn generic_probe_shard_2() {
     ];
 
     for (target_triple, libc, expected_gaps) in targets {
-        let Some(dir) = probe_campaign_dir(&repo_root, target_triple) else {
-            eprintln!(
-                "SKIP generic_probe_shard_2[{}]: probes directory not found",
-                target_triple
-            );
-            continue;
-        };
+        let dir = probe_campaign_dir(&repo_root, target_triple).unwrap_or_else(|| {
+            panic!("probes directory not found for {target_triple} — run scripts/build-probes.sh")
+        });
 
         let probeinit_path = dir.join("probeinit");
-        if !probeinit_path.is_file() {
-            eprintln!(
-                "SKIP generic_probe_shard_2[{}]: probeinit missing at {}",
-                target_triple,
-                probeinit_path.display()
-            );
-            continue;
-        }
+        assert!(
+            probeinit_path.is_file(),
+            "probeinit transport helper missing at {} — run scripts/build-probes.sh",
+            probeinit_path.display()
+        );
 
         let mut observed_mismatches = BTreeSet::new();
+        let mut executed_count = 0;
 
         for &probe_name in SHARD_2_PROBES {
             let probe_path = dir.join(probe_name);
-            if !probe_path.is_file() {
-                eprintln!(
-                    "SKIP generic_probe_shard_2[{}:{}]: binary not found at {}",
-                    target_triple,
-                    probe_name,
-                    probe_path.display()
-                );
-                continue;
-            }
+            assert!(
+                probe_path.is_file(),
+                "probe binary missing for {probe_name} at {} — run scripts/build-probes.sh",
+                probe_path.display()
+            );
 
             let expected_oracle = cached_probe_oracle(&repo_root, libc, probe_name)
                 .unwrap_or_else(|err| panic!("{err}"));
 
-            let container = TestContainer::new(common::SMOKE_IMAGE)
+            let policy = probe_launch_policy(probe_name);
+            let mut container = TestContainer::new(common::SMOKE_IMAGE)
                 .pull_policy(PullPolicy::Missing)
                 .mount_readonly(probe_path.to_string_lossy(), "/tmp/p")
                 .mount_readonly(probeinit_path.to_string_lossy(), "/tmp/carrick-init");
+
+            if let Some(opt) = policy.security_opt {
+                container = container.security_opt(opt);
+            }
+            if let Some(cap) = policy.cap_add {
+                container = container.cap_add(cap);
+            }
 
             let result = common::run_or_fail(container.run(["/tmp/carrick-init"]));
 
@@ -509,7 +565,13 @@ fn generic_probe_shard_2() {
             if observed != expected_oracle {
                 observed_mismatches.insert(probe_name);
             }
+            executed_count += 1;
         }
+
+        assert_eq!(
+            executed_count, 142,
+            "must execute exactly 142 probes for {target_triple}"
+        );
 
         assert_eq!(
             observed_mismatches,
