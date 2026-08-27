@@ -511,7 +511,8 @@ impl SyscallDispatcher {
             | OpenDescription::BpfMap { .. }
             | OpenDescription::BpfProg { .. }
             | OpenDescription::SyntheticDevice { .. }
-            | OpenDescription::Netlink { .. } => synthetic_readonly_access(mode),
+            | OpenDescription::Netlink { .. }
+            | OpenDescription::InMemorySocket { .. } => synthetic_readonly_access(mode),
         }
     }
 

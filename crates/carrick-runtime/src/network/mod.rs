@@ -5,10 +5,16 @@ use carrick_spec::{
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 pub(crate) mod dns;
+pub mod interposer;
 pub(crate) mod model;
 pub mod socket_namespace;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub use interposer::{
+    ConnectionRecord, HttpMock, InterceptRuleBuilder, IntoTargetSpec, MockService,
+    NetworkInterposer, TargetSpec,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct NetworkCapabilities {
     pub same_bridge_ip_connectivity: bool,
     pub multi_network_attachments: bool,
@@ -57,11 +63,37 @@ pub enum BindTarget {
     Unchanged,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub enum ConnectTarget {
     Host(HostSocketAddr),
     Unchanged,
     Denied(LinuxErrno),
+    Intercept(std::sync::Arc<dyn interposer::MockService>),
+}
+
+impl PartialEq for ConnectTarget {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Host(a), Self::Host(b)) => a == b,
+            (Self::Unchanged, Self::Unchanged) => true,
+            (Self::Denied(a), Self::Denied(b)) => a == b,
+            (Self::Intercept(a), Self::Intercept(b)) => std::sync::Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ConnectTarget {}
+
+impl std::fmt::Debug for ConnectTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Host(addr) => f.debug_tuple("Host").field(addr).finish(),
+            Self::Unchanged => write!(f, "Unchanged"),
+            Self::Denied(errno) => f.debug_tuple("Denied").field(errno).finish(),
+            Self::Intercept(_) => write!(f, "Intercept(<MockService>)"),
+        }
+    }
 }
 
 /// Provider-owned exclusion held across a host `fork()`. Host/none providers
@@ -424,6 +456,12 @@ impl RuntimeNetwork {
                 crate::dispatch::net::unix_pure::UnixSocketRegistry::new(),
             ),
         }
+    }
+
+    pub fn with_interposer(mut self, interposer: NetworkInterposer) -> Self {
+        let prev = std::mem::replace(&mut self.provider, Box::new(HostNetworkProvider));
+        self.provider = Box::new(interposer.with_inner(prev));
+        self
     }
 
     pub fn guest_hosts_entries(&self) -> Result<Vec<NetworkHostsEntry>, String> {

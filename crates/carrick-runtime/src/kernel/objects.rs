@@ -458,6 +458,8 @@ pub enum FileDescriptionBackingKind {
     IoUring,
     /// A new-mount-API filesystem context (`fsopen(2)`/`fspick(2)`).
     FsContext,
+    /// Pure in-memory stream/dgram socket (mocked network or AF_UNIX).
+    InMemorySocket,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

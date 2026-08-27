@@ -123,6 +123,7 @@ pub struct ContainerBuilder {
     budget: Option<carrick_runtime::observe::ResourceBudget>,
     max_traps: usize,
     observers: Vec<std::sync::Arc<dyn carrick_runtime::observe::SyscallObserver>>,
+    network_interposer: Option<carrick_runtime::network::interposer::NetworkInterposer>,
 }
 
 impl ContainerBuilder {
@@ -147,6 +148,7 @@ impl ContainerBuilder {
             budget: None,
             max_traps: DEFAULT_MAX_TRAPS,
             observers: Vec::new(),
+            network_interposer: None,
         }
     }
 
@@ -286,6 +288,15 @@ impl ContainerBuilder {
         self
     }
 
+    /// Register a network interposer to mock or intercept outbound guest connections.
+    pub fn network_interposer(
+        mut self,
+        interposer: carrick_runtime::network::interposer::NetworkInterposer,
+    ) -> Self {
+        self.network_interposer = Some(interposer);
+        self
+    }
+
     /// Lower into the engine's request. Pure: no I/O, no ambient reads.
     pub fn to_run_request(&self) -> Result<RunRequest, EmbedError> {
         if self.image.trim().is_empty() {
@@ -375,6 +386,9 @@ impl ContainerBuilder {
         }
         if let Some(budget) = self.budget {
             extensions = extensions.resource_budget(budget);
+        }
+        if let Some(interposer) = self.network_interposer {
+            extensions = extensions.network_interposer(interposer);
         }
         Ok(PreparedContainer::new(
             spec,
@@ -860,6 +874,31 @@ mod tests {
             .prepare()
             .await
             .expect("prepare succeeds");
+        assert_eq!(prepared.run_spec().argv, strings(&["/bin/true"]));
+    }
+
+    #[tokio::test]
+    async fn prepare_wires_network_interposer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path());
+        seed_local_image(
+            &store,
+            "embedtest:latest",
+            r#"{"architecture":"arm64","os":"linux","config":{"Cmd":["/bin/sh"]}}"#,
+        );
+
+        let interposer = crate::NetworkInterposer::new()
+            .on_connect(("api.example.com", 80))
+            .mock(crate::HttpMock::new().route("GET /test", 200, "hello"));
+
+        let prepared = ContainerBuilder::from_image("embedtest:latest")
+            .image_store(store)
+            .pull_policy(PullPolicy::Never)
+            .command(["/bin/true"])
+            .network_interposer(interposer)
+            .prepare()
+            .await
+            .expect("prepare succeeds with network interposer");
         assert_eq!(prepared.run_spec().argv, strings(&["/bin/true"]));
     }
 }

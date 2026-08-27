@@ -106,8 +106,8 @@ pub unsafe fn arm_alarm_ms(ms: i64) {
             tv_usec: 0,
         },
         it_value: libc::timeval {
-            tv_sec: ms / 1000,
-            tv_usec: (ms % 1000) * 1000,
+            tv_sec: (ms / 1000) as _,
+            tv_usec: ((ms % 1000) * 1000) as _,
         },
     };
     libc::setitimer(libc::ITIMER_REAL, &it, core::ptr::null_mut());

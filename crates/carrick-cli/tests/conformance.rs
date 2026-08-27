@@ -3468,10 +3468,14 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// generic runner) moves the denominator from 470 to 471 and the gating rows from
 /// 888 to 890 — 445 conformance sources (423 generic, 22 dedicated).
 ///
-/// `budget_two_proc` (Phase G fault injection and resource budget two-process differential
-/// invariants; generic runner) moves the denominator from 471 to 472 and the gating rows from
-/// 890 to 892 — 446 conformance sources (424 generic, 22 dedicated).
-const PROBE_SOURCE_COUNT: usize = 472;
+/// Two probes land together: `budget_two_proc` (Phase G fault injection and
+/// resource budget two-process differential invariants) and
+/// `mock_network_socket` (Phase H network mocking socket semantics), both
+/// generic runners. Each was written against a 471 denominator in its own
+/// branch; both exist after the merge, so the denominator moves 471 -> 473 and
+/// the gating rows 890 -> 894 — 447 conformance sources (425 generic, 22
+/// dedicated). Counted from the tree, not from either branch's arithmetic.
+const PROBE_SOURCE_COUNT: usize = 473;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
@@ -5262,9 +5266,9 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
     let generic = validate_closure_probe_rows(&inventory(), &sources)
         .expect("checked-in closure probe inventory must match the source denominator");
-    assert_eq!(generic.len(), 424);
-    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 446);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 892);
+    assert_eq!(generic.len(), 425);
+    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 447);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 894);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")
