@@ -1518,6 +1518,75 @@ mod identity_snapshot_tests {
             matches!(child_outcome2, DispatchOutcome::Returned { value: 2 }),
             "container 2 child getpid syscall must return 2"
         );
+
+        // 5. EL1 identity page stamping stamps ns-pid 1 for container inits
+        if crate::syscall_shim_enabled() {
+            let mut id_mem1 =
+                LinearMemory::new(crate::memory::LINUX_IDENTITY_PAGE_BASE, vec![0; 0x4000]);
+            crate::vcpu_loop::stamp_identity_page(&mut id_mem1, &d1, &context1)
+                .expect("stamp identity page for container 1 root");
+            let bytes1 = id_mem1
+                .read_bytes(
+                    crate::memory::LINUX_IDENTITY_PAGE_BASE + crate::memory::IDENTITY_OFF_PID,
+                    4,
+                )
+                .expect("read stamped pid 1");
+            let stamped_pid1 = u32::from_ne_bytes(bytes1.try_into().unwrap());
+            assert_eq!(
+                stamped_pid1, 1,
+                "container 1 identity page must stamp ns-pid 1"
+            );
+
+            let mut id_mem2 =
+                LinearMemory::new(crate::memory::LINUX_IDENTITY_PAGE_BASE, vec![0; 0x4000]);
+            crate::vcpu_loop::stamp_identity_page(&mut id_mem2, &d2, &context2)
+                .expect("stamp identity page for container 2 root");
+            let bytes2 = id_mem2
+                .read_bytes(
+                    crate::memory::LINUX_IDENTITY_PAGE_BASE + crate::memory::IDENTITY_OFF_PID,
+                    4,
+                )
+                .expect("read stamped pid 2");
+            let stamped_pid2 = u32::from_ne_bytes(bytes2.try_into().unwrap());
+            assert_eq!(
+                stamped_pid2, 1,
+                "container 2 identity page must stamp ns-pid 1"
+            );
+        }
+
+        // 6. PR_SET_NAME updates task diagnostic_name in kernel graph
+        let mut pr_mem = LinearMemory::new(0x2000, vec![0; 0x1000]);
+        pr_mem
+            .write_bytes(0x2000, b"worker\0")
+            .expect("write comm bytes");
+        let prctl_outcome = d1
+            .dispatch(
+                &child_context1,
+                SyscallRequest::new(
+                    167, // prctl
+                    SyscallArgs::from([
+                        15, // PR_SET_NAME
+                        0x2000, 0, 0, 0, 0,
+                    ]),
+                ),
+                &mut pr_mem,
+                &reporter,
+            )
+            .unwrap();
+        assert!(
+            matches!(prctl_outcome, DispatchOutcome::Returned { value: 0 }),
+            "PR_SET_NAME must return 0"
+        );
+        let live_child = kernel1
+            .registry()
+            .live_processes()
+            .into_iter()
+            .find(|p| p.key.id == child_id1)
+            .expect("live child process");
+        assert_eq!(
+            live_child.diagnostic_name, "worker",
+            "PR_SET_NAME must update task diagnostic_name in kernel graph"
+        );
     }
 }
 
