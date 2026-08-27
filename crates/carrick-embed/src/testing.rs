@@ -3,17 +3,45 @@
 //! [`ContainerResult`]. Guest-running uses of these belong in tests executed
 //! by the signed `just test-embed` recipe.
 
-use crate::{ContainerBuilder, ContainerResult, EmbedError, ImageStore};
+use std::sync::Arc;
+
+use crate::{
+    AuditObserver, ContainerBuilder, ContainerResult, EmbedError, ImageStore, PullPolicy,
+    SyscallObserver,
+};
 
 /// One image, many commands: each [`Self::run`] builds a fresh
 /// [`ContainerBuilder`] with captured stdio, so tests read the guest's bytes
 /// from the returned [`ContainerResult`].
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TestContainer {
     image: String,
     env: Vec<(String, String)>,
+    workdir: Option<String>,
+    user: Option<String>,
+    hostname: Option<String>,
+    mounts: Vec<(String, String, bool)>,
     max_traps: Option<usize>,
     store: Option<ImageStore>,
+    pull: Option<PullPolicy>,
+    observers: Vec<Arc<dyn SyscallObserver>>,
+}
+
+impl std::fmt::Debug for TestContainer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestContainer")
+            .field("image", &self.image)
+            .field("env", &self.env)
+            .field("workdir", &self.workdir)
+            .field("user", &self.user)
+            .field("hostname", &self.hostname)
+            .field("mounts", &self.mounts)
+            .field("max_traps", &self.max_traps)
+            .field("store", &self.store)
+            .field("pull", &self.pull)
+            .field("observers_count", &self.observers.len())
+            .finish()
+    }
 }
 
 impl TestContainer {
@@ -21,13 +49,44 @@ impl TestContainer {
         Self {
             image: image.into(),
             env: Vec::new(),
+            workdir: None,
+            user: None,
+            hostname: None,
+            mounts: Vec::new(),
             max_traps: None,
             store: None,
+            pull: None,
+            observers: Vec::new(),
         }
     }
 
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.push((key.into(), value.into()));
+        self
+    }
+
+    pub fn workdir(mut self, path: impl Into<String>) -> Self {
+        self.workdir = Some(path.into());
+        self
+    }
+
+    pub fn user(mut self, user: impl Into<String>) -> Self {
+        self.user = Some(user.into());
+        self
+    }
+
+    pub fn hostname(mut self, hostname: impl Into<String>) -> Self {
+        self.hostname = Some(hostname.into());
+        self
+    }
+
+    pub fn mount(mut self, host: impl Into<String>, guest: impl Into<String>) -> Self {
+        self.mounts.push((host.into(), guest.into(), false));
+        self
+    }
+
+    pub fn mount_readonly(mut self, host: impl Into<String>, guest: impl Into<String>) -> Self {
+        self.mounts.push((host.into(), guest.into(), true));
         self
     }
 
@@ -38,6 +97,16 @@ impl TestContainer {
 
     pub fn image_store(mut self, store: ImageStore) -> Self {
         self.store = Some(store);
+        self
+    }
+
+    pub fn pull_policy(mut self, pull: PullPolicy) -> Self {
+        self.pull = Some(pull);
+        self
+    }
+
+    pub fn observer(mut self, observer: Arc<dyn SyscallObserver>) -> Self {
+        self.observers.push(observer);
         self
     }
 
@@ -52,11 +121,33 @@ impl TestContainer {
         for (key, value) in &self.env {
             builder = builder.env(key.clone(), value.clone());
         }
+        if let Some(workdir) = &self.workdir {
+            builder = builder.workdir(workdir.clone());
+        }
+        if let Some(user) = &self.user {
+            builder = builder.user(user.clone());
+        }
+        if let Some(hostname) = &self.hostname {
+            builder = builder.hostname(hostname.clone());
+        }
+        for (host, guest, readonly) in &self.mounts {
+            if *readonly {
+                builder = builder.mount_readonly(host.clone(), guest.clone());
+            } else {
+                builder = builder.mount(host.clone(), guest.clone());
+            }
+        }
         if let Some(max_traps) = self.max_traps {
             builder = builder.max_traps(max_traps);
         }
         if let Some(store) = &self.store {
             builder = builder.image_store(store.clone());
+        }
+        if let Some(pull) = self.pull {
+            builder = builder.pull_policy(pull);
+        }
+        for obs in &self.observers {
+            builder = builder.observer(Arc::clone(obs));
         }
         builder
     }
@@ -68,6 +159,24 @@ impl TestContainer {
         S: Into<String>,
     {
         self.builder(argv).run_blocking()
+    }
+
+    /// Run `argv` with a fresh [`AuditObserver`] installed with fast-path visibility enabled.
+    ///
+    /// Returns both the [`ContainerResult`] and the [`AuditObserver`] holding the recorded events.
+    pub fn run_with_audit<I, S>(
+        &self,
+        argv: I,
+    ) -> Result<(ContainerResult, Arc<AuditObserver>), EmbedError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let audit = Arc::new(AuditObserver::new().require_fast_path_visibility());
+        let mut builder = self.builder(argv);
+        builder = builder.observer(Arc::clone(&audit) as Arc<dyn SyscallObserver>);
+        let result = builder.run_blocking()?;
+        Ok((result, audit))
     }
 }
 

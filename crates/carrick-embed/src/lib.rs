@@ -54,7 +54,10 @@ pub use carrick_guest_mem::{Gpa, GuestMemory, GuestVa, HostVa, MemoryError, Shar
 pub use carrick_image::{ImageStore, PullPolicy};
 pub use carrick_runtime::compat::CompatReport;
 pub use carrick_runtime::dispatch::Signal;
-pub use carrick_runtime::kernel::{ClockDomain, SignedDuration, TimeControl, TimeError};
+pub use carrick_runtime::kernel::{
+    ClockDomain, LinuxTid, ObjectIdRegistry, SignedDuration, TaskId, TaskKey, TaskSerial,
+    ThreadKey, ThreadSerial, TimeControl, TimeError,
+};
 pub use carrick_runtime::network::{
     ConnectionRecord, HttpMock, InterceptRuleBuilder, IntoTargetSpec, MockService,
     NetworkInterposer, TargetSpec,
