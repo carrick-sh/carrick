@@ -15,8 +15,8 @@ from typing import Any
 
 
 LIBCS = ("gnu", "musl")
-DEDICATED_SOURCE_COUNT = 21
-DEDICATED_RUNNER_COUNT = 15
+DEDICATED_SOURCE_COUNT = 22
+DEDICATED_RUNNER_COUNT = 16
 Source = namedtuple("Source", "name runner")
 RunnerCommand = namedtuple("RunnerCommand", "runner test_target sources")
 Plan = namedtuple("Plan", "sources commands")

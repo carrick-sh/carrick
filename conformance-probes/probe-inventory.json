@@ -244,6 +244,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "container_gate": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "conformance_container_gate"
+  },
   "coredumpbit": {
     "class": "conformance",
     "excluded": false,
