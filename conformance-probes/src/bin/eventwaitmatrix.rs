@@ -165,7 +165,7 @@ unsafe fn test_clock_and_timerfd_matrix() {
     // 1.4 timerfd_settime & timerfd_gettime error matrix and disarm lifecycle
     let tfd = libc::syscall(SYS_TIMERFD_CREATE, libc::CLOCK_MONOTONIC, TFD_NONBLOCK) as i32;
     let mut pipe_fds = [-1i32; 2];
-    libc::pipe(pipe_fds.as_mut_ptr());
+    libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_NONBLOCK);
 
     let valid_spec = libc::itimerspec {
         it_interval: libc::timespec {
@@ -472,7 +472,7 @@ unsafe fn test_futex_wait_matrix() {
     let bitset_past_realtime_etimedout =
         rc_bitset_past_realtime == -1 && errno() == libc::ETIMEDOUT;
 
-    // 2.5 Invalid futex op
+    // 2.5 Invalid futex op -> ENOSYS
     let rc_inv_op = libc::syscall(
         SYS_FUTEX,
         &mut word as *mut u32,
@@ -482,9 +482,7 @@ unsafe fn test_futex_wait_matrix() {
         std::ptr::null::<u32>(),
         0i64,
     );
-    let inv_op_errno = errno();
-    let inv_op_err =
-        rc_inv_op == -1 && (inv_op_errno == libc::ENOSYS || inv_op_errno == libc::EINVAL);
+    let inv_op_enosys = rc_inv_op == -1 && errno() == libc::ENOSYS;
 
     report!(
         futex_wait_timespec_validation = wait_ts_neg_einval && wait_ts_over_einval,
@@ -492,7 +490,7 @@ unsafe fn test_futex_wait_matrix() {
         futex_wait_zero_timeout_etimedout = zero_timeout_etimedout,
         futex_wait_bitset_matrix =
             bitset_zero_einval && bitset_bad_ts_einval && bitset_past_realtime_etimedout,
-        futex_invalid_op_error = inv_op_err,
+        futex_invalid_op_enosys = inv_op_enosys,
     );
 }
 
@@ -524,7 +522,7 @@ unsafe fn test_mq_timed_matrix() {
     let mq_open_ok = mqd >= 0;
 
     let mut pipe_fds = [-1i32; 2];
-    libc::pipe(pipe_fds.as_mut_ptr());
+    libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_NONBLOCK);
 
     let buf = [0x41u8; 64];
     let mut recv_buf = [0u8; 64];
@@ -782,7 +780,7 @@ unsafe fn test_mq_timed_matrix() {
 
 unsafe fn test_poll_select_ppoll_matrix() {
     let mut pipe_fds = [-1i32; 2];
-    libc::pipe(pipe_fds.as_mut_ptr());
+    libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_NONBLOCK);
     let (rd, wr) = (pipe_fds[0], pipe_fds[1]);
 
     let mut pfd = libc::pollfd {
