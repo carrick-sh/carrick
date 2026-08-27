@@ -99,7 +99,7 @@ struct Args {
     /// Maximum wall-clock seconds for each Carrick run. This is a diagnostic
     /// cap only: Docker oracle keys and declared suite budgets are unchanged.
     /// Set to 0 only for a deliberate targeted long-run investigation.
-    #[arg(long, default_value_t = 60, env = "CARRICK_CONFORMANCE_TIMEOUT_CAP_S")]
+    #[arg(long, default_value_t = 20, env = "CARRICK_CONFORMANCE_TIMEOUT_CAP_S")]
     carrick_timeout_cap_s: u64,
     /// Filter to these ecosystems (repeatable): cpython|go|node|ltp.
     #[arg(long)]
@@ -2828,7 +2828,7 @@ mod tests {
     #[test]
     fn carrick_timeout_cap_is_tight_by_default_and_explicitly_disableable() {
         let default = Args::parse_from(["carrick-conformance"]);
-        assert_eq!(default.carrick_timeout_cap_s, 60);
+        assert_eq!(default.carrick_timeout_cap_s, 20);
 
         let uncapped = Args::parse_from(["carrick-conformance", "--carrick-timeout-cap-s", "0"]);
         assert_eq!(uncapped.carrick_timeout_cap_s, 0);
