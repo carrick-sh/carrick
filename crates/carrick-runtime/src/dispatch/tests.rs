@@ -2890,7 +2890,9 @@ mod overlay_dispatch_tests {
             ]),
         );
 
+        let clock = crate::kernel::container::ClockDomain::default();
         let outcome = dispatch_threaded_futex(
+            &clock,
             request,
             &mut memory,
             &reporter,
@@ -2923,7 +2925,9 @@ mod overlay_dispatch_tests {
             SyscallArgs::from([0x10800, LINUX_FUTEX_WAKE, 1, 0, 0, 0]),
         );
 
+        let clock = crate::kernel::container::ClockDomain::default();
         let outcome = dispatch_threaded_futex(
+            &clock,
             request,
             &mut memory,
             &reporter,
@@ -2985,7 +2989,9 @@ mod overlay_dispatch_tests {
             SyscallArgs::from([0x10800, LINUX_FUTEX_WAKE, 3, 0, 0, 0]),
         );
 
+        let clock = crate::kernel::container::ClockDomain::default();
         let outcome = dispatch_threaded_futex(
+            &clock,
             request,
             &mut memory,
             &reporter,
@@ -3039,7 +3045,9 @@ mod overlay_dispatch_tests {
             ]),
         );
 
+        let clock = crate::kernel::container::ClockDomain::default();
         let outcome = dispatch_threaded_futex(
+            &clock,
             request,
             &mut memory,
             &reporter,

@@ -2421,7 +2421,9 @@ impl SyscallDispatcher {
             timeout: GuestPtr,
             clockid: u64,
         ) {
+            let clock = Arc::clone(cx.kernel.task().container().clock());
             Ok(dispatch_futex_waitv_args(
+                &clock,
                 &mut *cx.memory,
                 cx.thread.map(|t| t.futex),
                 waiters.0,

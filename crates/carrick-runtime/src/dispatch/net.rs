@@ -4938,7 +4938,14 @@ impl SyscallDispatcher {
             // negative value arrives as a huge u64, so check the signed form.
             // (LTP epoll_wait03.)
             let max_events_signed = maxevents as i32;
-            let timeout_ms = timeout as i32;
+            let clock = Arc::clone(cx.kernel.task().container().clock());
+            let timeout_ms = if timeout as i32 > 0 && clock.is_scaled() {
+                let scaled =
+                    clock.scale_timeout(std::time::Duration::from_millis(timeout as i32 as u64));
+                i32::try_from(scaled.as_millis()).unwrap_or(i32::MAX)
+            } else {
+                timeout as i32
+            };
             // epoll_pwait carries a sigmask (arg4) + sigsetsize (arg5); epoll_wait
             // passes a NULL mask. A non-NULL mask must have the right size and a
             // readable pointer, else EINVAL/EFAULT. (LTP epoll_pwait04.)
@@ -5074,10 +5081,11 @@ impl SyscallDispatcher {
                 let ms = sec.saturating_mul(1000).saturating_add(nsec / 1_000_000);
                 if ms <= 0 {
                     0
-                } else if ms > i32::MAX as i64 {
-                    i32::MAX
                 } else {
-                    ms as i32
+                    let dur = std::time::Duration::from_millis(ms as u64);
+                    let clock = Arc::clone(cx.kernel.task().container().clock());
+                    let scaled = clock.scale_timeout(dur);
+                    i32::try_from(scaled.as_millis()).unwrap_or(i32::MAX)
                 }
             };
             let files = this.captured_file_table();
@@ -5235,10 +5243,11 @@ impl SyscallDispatcher {
                         let ms = sec.saturating_mul(1000).saturating_add(nsec / 1_000_000);
                         if ms <= 0 {
                             0
-                        } else if ms > i32::MAX as i64 {
-                            i32::MAX
                         } else {
-                            ms as i32
+                            let dur = std::time::Duration::from_millis(ms as u64);
+                            let clock = Arc::clone(cx.kernel.task().container().clock());
+                            let scaled = clock.scale_timeout(dur);
+                            i32::try_from(scaled.as_millis()).unwrap_or(i32::MAX)
                         }
                     }
                     // A bad timeout pointer: the raw pselect6/select syscall reads
@@ -5577,14 +5586,23 @@ impl SyscallDispatcher {
                         let ms = sec.saturating_mul(1000).saturating_add(nsec / 1_000_000);
                         if ms <= 0 {
                             0
-                        } else if ms > i32::MAX as i64 {
-                            i32::MAX
                         } else {
-                            ms as i32
+                            let dur = std::time::Duration::from_millis(ms as u64);
+                            let clock = Arc::clone(cx.kernel.task().container().clock());
+                            let scaled = clock.scale_timeout(dur);
+                            i32::try_from(scaled.as_millis()).unwrap_or(i32::MAX)
                         }
                     }
                     _ => 0,
                 }
+            };
+            let clock = Arc::clone(cx.kernel.task().container().clock());
+            let timeout_ms = if timeout_ms > 0 && is_poll && clock.is_scaled() {
+                let dur = std::time::Duration::from_millis(timeout_ms as u64);
+                let scaled = clock.scale_timeout(dur);
+                i32::try_from(scaled.as_millis()).unwrap_or(i32::MAX)
+            } else {
+                timeout_ms
             };
 
             // ppoll(fds, nfds, timeout, sigmask, sigsetsize): capture the sigmask

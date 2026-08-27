@@ -103,6 +103,7 @@ pub struct RuntimeExtensions {
     vfs_mounts: Vec<(Utf8PathBuf, Box<dyn Vfs>)>,
     stdio: Option<StdioSink>,
     observers: Vec<Arc<dyn crate::observe::SyscallObserver>>,
+    time: Option<crate::kernel::container::TimeControl>,
 }
 
 impl RuntimeExtensions {
@@ -134,6 +135,12 @@ impl RuntimeExtensions {
         I: IntoIterator<Item = Arc<dyn crate::observe::SyscallObserver>>,
     {
         self.observers.extend(observers);
+        self
+    }
+
+    /// Time control for the container.
+    pub fn time(mut self, control: crate::kernel::container::TimeControl) -> Self {
+        self.time = Some(control);
         self
     }
 }
@@ -368,6 +375,7 @@ impl Runtime {
             vfs_mounts,
             stdio,
             observers,
+            time,
         } = ext;
         let sink = resolve_stdio(spec, stdio)?;
         if spec.platform == Platform::Amd64 {
@@ -375,10 +383,12 @@ impl Runtime {
         }
         let plan = resolve_plan(spec, launch)?;
 
-        let container = Arc::new(
-            crate::kernel::Container::new(plan.launch.clone())
-                .with_launch_capabilities(&spec.cap_add),
-        );
+        let mut container = crate::kernel::Container::new(plan.launch.clone())
+            .with_launch_capabilities(&spec.cap_add);
+        if let Some(control) = time {
+            container = container.with_time_control(control);
+        }
+        let container = Arc::new(container);
 
         match spec.pid {
             PidMode::Host => {}
