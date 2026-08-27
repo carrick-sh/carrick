@@ -440,6 +440,7 @@ mod task_only_carrier_directory_tests {
         };
         let ledger = Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
         let task_mm = Arc::new(HvpatchTaskMmAuthority {
+            container_root: ContainerRootToken::ROOT,
             mappings: Vec::new(),
             mm_root_slot: Some((0xb1_0000_0000, 0x20_0000)),
             inventory: parking_lot::Mutex::new(HvpatchTaskInventoryAuthority::SiblingShared {
@@ -919,7 +920,7 @@ mod task_only_carrier_directory_tests {
             AliasOwnershipScope::MmRootSlot { base, size } => Some((base, size)),
             _ => None,
         };
-        unregister_alias(owned.start, owned.size, scope);
+        unregister_alias(owned.start, owned.size, scope, ContainerRootToken::ROOT);
         receipt.retire_exact();
         assert!(!alias_registry().lock().contains(&preimage));
         assert!(!alias_registry().lock().contains(&owned));
@@ -1300,6 +1301,7 @@ mod task_only_carrier_directory_tests {
             Vec::new(),
         );
         let authority = HvpatchTaskMmAuthority {
+            container_root: ContainerRootToken::ROOT,
             mappings: Vec::new(),
             mm_root_slot: Some((0x1000_0000, 0x20_0000)),
             inventory: parking_lot::Mutex::new(HvpatchTaskInventoryAuthority::Active {
@@ -1357,6 +1359,7 @@ mod task_only_carrier_directory_tests {
                 .unwrap(),
         );
         let replacement = Arc::new(HvpatchTaskMmAuthority {
+            container_root: ContainerRootToken::ROOT,
             mappings: Vec::new(),
             mm_root_slot: Some((0x1200_0000, 0x20_0000)),
             inventory: parking_lot::Mutex::new(HvpatchTaskInventoryAuthority::SharedProcess {
@@ -1434,6 +1437,7 @@ mod task_only_carrier_directory_tests {
         assert!(Arc::ptr_eq(&first_mm, &second_mm));
 
         let replacement = Arc::new(HvpatchTaskMmAuthority {
+            container_root: ContainerRootToken::ROOT,
             mappings: Vec::new(),
             mm_root_slot: Some((0x1000_0000, 0x20_0000)),
             inventory: parking_lot::Mutex::new(HvpatchTaskInventoryAuthority::SharedProcess {
@@ -2318,11 +2322,66 @@ impl GuestMappingSharing {
 /// it never participates in Drop / double-free; the backing's lifetime stays with
 /// the owning thread's `mappings` Vec and this entry is removed on `munmap`
 /// (`unregister_alias`).
+/// A unique monotonic token identifying a container root address space within
+/// the carrier.
+///
+/// This distinguishes private alias ownership across independent containers
+/// sharing the single VM carrier, without conflating ownership scope with
+/// stage-1 page table root slot allocations. It identifies container instance
+/// scope in the VMM layer; it is not a guest PID or a security boundary.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct ContainerRootToken(u64);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ContainerRootToken {
+    /// The sentinel used by fixtures and by contexts that predate container
+    /// minting. Minted tokens never take this value — see [`Self::next`].
+    pub const ROOT: Self = Self(1);
+
+    /// Mints a fresh, distinct token for a new container root.
+    ///
+    /// Starts ABOVE [`Self::ROOT`] deliberately: a minted token that aliased
+    /// the sentinel would make the first container's private aliases match
+    /// every ROOT-scoped alias again, which is the exact collision this type
+    /// exists to remove.
+    pub fn next() -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(ContainerRootToken::ROOT.0 + 1);
+        Self(NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    pub fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct ContainerRootToken(u64);
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+impl ContainerRootToken {
+    pub const ROOT: Self = Self(1);
+
+    pub fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 enum AliasOwnershipScope {
-    /// Alias belongs to the original/root address space in this host process.
-    Root,
+    /// Alias belongs to the root address space of a specific container in this carrier.
+    ContainerRoot(ContainerRootToken),
     /// Alias belongs to exactly one HVPatch address space.  The scope is
     /// rebound in the forked host child when an inherited shared-anonymous
     /// frame is materialized into that child's new mm. The stage-1 root slot
@@ -2336,13 +2395,14 @@ enum AliasOwnershipScope {
 fn alias_ownership_scope(
     sharing: GuestMappingSharing,
     mm_root_slot: Option<(u64, u64)>,
+    container_root: ContainerRootToken,
 ) -> AliasOwnershipScope {
     if sharing.uses_global_ipa() {
         AliasOwnershipScope::Global
     } else if let Some((base, size)) = mm_root_slot {
         AliasOwnershipScope::MmRootSlot { base, size }
     } else {
-        AliasOwnershipScope::Root
+        AliasOwnershipScope::ContainerRoot(container_root)
     }
 }
 
@@ -3127,10 +3187,13 @@ fn lookup_shared_alias(ipa: u64) -> Option<AliasBacking> {
 fn alias_matches_process_scope(
     ownership_scope: AliasOwnershipScope,
     mm_root_slot: Option<(u64, u64)>,
+    container_root: ContainerRootToken,
 ) -> bool {
     match ownership_scope {
         AliasOwnershipScope::Global => true,
-        AliasOwnershipScope::Root => mm_root_slot.is_none(),
+        AliasOwnershipScope::ContainerRoot(container) => {
+            mm_root_slot.is_none() && container == container_root
+        }
         AliasOwnershipScope::MmRootSlot { base, size } => mm_root_slot == Some((base, size)),
     }
 }
@@ -3142,14 +3205,15 @@ fn alias_matches_process_scope(
 fn alias_is_owned_by_process(
     ownership_scope: AliasOwnershipScope,
     mm_root_slot: Option<(u64, u64)>,
+    container_root: ContainerRootToken,
 ) -> bool {
     match (ownership_scope, mm_root_slot) {
-        (AliasOwnershipScope::Root, None) => true,
+        (AliasOwnershipScope::ContainerRoot(container), None) => container == container_root,
         (AliasOwnershipScope::MmRootSlot { base, size }, Some(root_slot)) => {
             (base, size) == root_slot
         }
         (AliasOwnershipScope::Global, _)
-        | (AliasOwnershipScope::Root, Some(_))
+        | (AliasOwnershipScope::ContainerRoot(_), Some(_))
         | (AliasOwnershipScope::MmRootSlot { .. }, None) => false,
     }
 }
@@ -3162,13 +3226,14 @@ fn missing_process_aliases(
     local_ipas: &std::collections::HashSet<u64>,
     aliases: &[AliasBacking],
     mm_root_slot: Option<(u64, u64)>,
+    container_root: ContainerRootToken,
 ) -> Vec<AliasBacking> {
     aliases
         .iter()
         .copied()
         .filter(|alias| {
             !local_ipas.contains(&alias.ipa)
-                && alias_matches_process_scope(alias.ownership_scope, mm_root_slot)
+                && alias_matches_process_scope(alias.ownership_scope, mm_root_slot, container_root)
         })
         .collect()
 }
@@ -3195,10 +3260,11 @@ type ProcessAliasKey = (u64, u64, usize, usize, u64);
 fn process_alias_index(
     aliases: &[AliasBacking],
     mm_root_slot: Option<(u64, u64)>,
+    container_root: ContainerRootToken,
 ) -> std::collections::HashMap<ProcessAliasKey, AliasBacking> {
     let mut index = std::collections::HashMap::with_capacity(aliases.len());
     for alias in aliases {
-        if alias_matches_process_scope(alias.ownership_scope, mm_root_slot) {
+        if alias_matches_process_scope(alias.ownership_scope, mm_root_slot, container_root) {
             index
                 .entry((
                     alias.start,
@@ -3234,8 +3300,9 @@ fn current_dynamic_alias_ipas(
     mappings: &[HvfMappedRegion],
     aliases: &[AliasBacking],
     mm_root_slot: Option<(u64, u64)>,
+    container_root: ContainerRootToken,
 ) -> std::collections::HashSet<u64> {
-    let index = process_alias_index(aliases, mm_root_slot);
+    let index = process_alias_index(aliases, mm_root_slot, container_root);
     mappings
         .iter()
         .filter(|mapping| {
@@ -3250,6 +3317,7 @@ fn lookup_shared_alias_by_va(
     va: u64,
     len: usize,
     mm_root_slot: Option<(u64, u64)>,
+    container_root: ContainerRootToken,
 ) -> Option<AliasBacking> {
     let end = va.saturating_add(len as u64);
     alias_registry()
@@ -3257,7 +3325,7 @@ fn lookup_shared_alias_by_va(
         .iter()
         .rev()
         .find(|e| {
-            alias_matches_process_scope(e.ownership_scope, mm_root_slot)
+            alias_matches_process_scope(e.ownership_scope, mm_root_slot, container_root)
                 && va >= e.start
                 && end <= e.start.saturating_add(e.size as u64)
                 // Reject an entry whose backing is not mapped in THIS process
@@ -3300,13 +3368,14 @@ fn unregister_alias_entries(
     va: u64,
     len: usize,
     mm_root_slot: Option<(u64, u64)>,
+    container_root: ContainerRootToken,
 ) -> std::collections::BTreeSet<(u64, u64)> {
     let end = va.saturating_add(len as u64);
     let mut replacement = Vec::with_capacity(registry.len().saturating_add(1));
     let mut candidates = std::collections::BTreeSet::new();
     for entry in registry.drain(..) {
         let entry_end = entry.start.saturating_add(entry.size as u64);
-        if !alias_matches_process_scope(entry.ownership_scope, mm_root_slot)
+        if !alias_matches_process_scope(entry.ownership_scope, mm_root_slot, container_root)
             || entry_end <= va
             || entry.start >= end
         {
@@ -3335,7 +3404,7 @@ fn unregister_alias_entries(
     *registry = replacement;
     candidates.retain(|&(physical_ipa, physical_size)| {
         !registry.iter().any(|entry| {
-            alias_matches_process_scope(entry.ownership_scope, mm_root_slot)
+            alias_matches_process_scope(entry.ownership_scope, mm_root_slot, container_root)
                 && (entry.physical_ipa, entry.physical_size as u64) == (physical_ipa, physical_size)
         })
     });
@@ -3349,6 +3418,7 @@ fn retained_private_reuse_alias_fragment(
     ipa: u64,
     len: usize,
     mm_root_slot: Option<(u64, u64)>,
+    container_root: ContainerRootToken,
 ) -> Option<AliasBacking> {
     if len == 0 {
         return None;
@@ -3358,7 +3428,7 @@ fn retained_private_reuse_alias_fragment(
     // An existing semantic fragment is already an exact lifetime owner. Do not
     // replace a wider entry with this one-page reuse observation.
     if registry.iter().any(|entry| {
-        alias_matches_process_scope(entry.ownership_scope, mm_root_slot)
+        alias_matches_process_scope(entry.ownership_scope, mm_root_slot, container_root)
             && va >= entry.start
             && end <= entry.start.saturating_add(entry.size as u64)
             && entry.ipa.checked_add(va.saturating_sub(entry.start)) == Some(ipa)
@@ -3368,7 +3438,7 @@ fn retained_private_reuse_alias_fragment(
 
     let source = registry.iter().rev().find(|entry| {
         entry.sharing == GuestMappingSharing::Private
-            && alias_matches_process_scope(entry.ownership_scope, mm_root_slot)
+            && alias_matches_process_scope(entry.ownership_scope, mm_root_slot, container_root)
             && ipa >= entry.physical_ipa
             && ipa_end
                 <= entry
@@ -3398,7 +3468,11 @@ fn retained_private_reuse_alias_fragment(
         perms: source.perms,
         guest_writable: true,
         sharing: GuestMappingSharing::Private,
-        ownership_scope: alias_ownership_scope(GuestMappingSharing::Private, mm_root_slot),
+        ownership_scope: alias_ownership_scope(
+            GuestMappingSharing::Private,
+            mm_root_slot,
+            container_root,
+        ),
         inventory_backing: source.inventory_backing,
         shared_key_base: 0,
         shared_key_offset: 0,
@@ -3412,13 +3486,14 @@ fn retired_alias_disarm_spans(
     va: u64,
     len: usize,
     mm_root_slot: Option<(u64, u64)>,
+    container_root: ContainerRootToken,
     retired_leases: &std::collections::BTreeSet<(u64, u64)>,
 ) -> Vec<CowArmedSpan> {
     let end = va.saturating_add(len as u64);
     registry
         .iter()
         .filter(|entry| {
-            alias_matches_process_scope(entry.ownership_scope, mm_root_slot)
+            alias_matches_process_scope(entry.ownership_scope, mm_root_slot, container_root)
                 && retired_leases.contains(&(entry.physical_ipa, entry.physical_size as u64))
         })
         .filter_map(|entry| {
@@ -3440,9 +3515,10 @@ fn unregister_alias(
     va: u64,
     len: usize,
     mm_root_slot: Option<(u64, u64)>,
+    container_root: ContainerRootToken,
 ) -> std::collections::BTreeSet<(u64, u64)> {
     mutate_external_alias_state(|_, registry| {
-        unregister_alias_entries(registry, va, len, mm_root_slot)
+        unregister_alias_entries(registry, va, len, mm_root_slot, container_root)
     })
 }
 
@@ -5376,6 +5452,9 @@ pub(crate) struct HvfTaskState {
     /// only; guest data frames live at stable global IPAs outside the slot.
     /// Ordinary VMM engines leave this unset.
     mm_root_slot: Option<(u64, u64)>,
+    /// Monotonic token identifying the container root this task belongs to,
+    /// used to scope private aliases across containers sharing the carrier.
+    container_root: ContainerRootToken,
     pending_exec_mm_root_slot: Option<(u64, u64)>,
     pending_exec_asid: Option<u16>,
     pending_exec_predecessor_identity: Option<carrick_hal::ExecPredecessorIdentity>,
@@ -5469,6 +5548,7 @@ struct PendingExecStage2Cleanup {
     frames: std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
     /// Semantic alias ownership of the address space replaced by exec.
     mm_root_slot: Option<(u64, u64)>,
+    container_root: ContainerRootToken,
     /// Immutable exact Kernel identity captured before exec replaces the task.
     predecessor_identity: carrick_hal::ExecPredecessorIdentity,
     /// Never-reused predecessor MM identity from the matching COW binding.
@@ -5566,8 +5646,11 @@ impl PendingExecStage2Cleanup {
         }
         mutate_external_alias_state(|_, registry| {
             registry.retain(|alias| {
-                !alias_is_owned_by_process(alias.ownership_scope, self.mm_root_slot)
-                    && !retired_extents.contains(&(alias.physical_ipa, alias.physical_size))
+                !alias_is_owned_by_process(
+                    alias.ownership_scope,
+                    self.mm_root_slot,
+                    self.container_root,
+                ) && !retired_extents.contains(&(alias.physical_ipa, alias.physical_size))
             });
         });
         let mut retained_backings = Vec::new();
@@ -5588,11 +5671,11 @@ impl PendingExecStage2Cleanup {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl Drop for PendingExecStage2Cleanup {
     fn drop(&mut self) {
-        if self.armed
-            && let Err(error) = self.retire()
-        {
-            eprintln!("carrick: FATAL: drop detached exec predecessor cleanup: {error}");
-            std::process::abort();
+        if self.armed {
+            if let Err(error) = self.retire() {
+                eprintln!("carrick: FATAL: drop pending exec predecessor cleanup: {error}");
+                std::process::abort();
+            }
         }
     }
 }
@@ -5762,6 +5845,7 @@ impl HvfTaskState {
         Self {
             mappings: Vec::new(),
             mm_root_slot: None,
+            container_root: ContainerRootToken(0),
             pending_exec_mm_root_slot: None,
             pending_exec_asid: None,
             pending_exec_predecessor_identity: None,
@@ -5796,6 +5880,7 @@ impl HvfTaskState {
         let frames = inventory.frames.lock();
         let neutral = self.mappings.is_empty()
             && self.mm_root_slot.is_none()
+            && self.container_root == ContainerRootToken(0)
             && self.pending_exec_mm_root_slot.is_none()
             && self.pending_exec_asid.is_none()
             && self.pending_exec_stage2_cleanup.is_none()
@@ -5985,6 +6070,7 @@ pub(crate) fn hvpatch_task_state_test_fixture(
             owner_generation: mm_slot,
         }],
         mm_root_slot: Some((mm_slot << 20, 0x20_0000)),
+        container_root: ContainerRootToken::from_raw(1),
         pending_exec_mm_root_slot: None,
         pending_exec_asid: None,
         pending_exec_predecessor_identity: None,
@@ -7105,6 +7191,7 @@ pub struct ThreadSpec {
     syscall_transport: HvfSyscallTransport,
     persistent_vm_lifecycle: bool,
     mm_root_slot: Option<(u64, u64)>,
+    container_root: ContainerRootToken,
     frame_inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
     cow_authority: Option<std::sync::Arc<dyn carrick_hal::FrameCowAuthority>>,
     cow_identity: Option<carrick_hal::FrameCowIdentity>,
@@ -7154,9 +7241,9 @@ struct ProcessMappingDesc {
     is_dynamic_alias: bool,
     sharing: GuestMappingSharing,
     guest_writable: bool,
+    inherited_frame: Option<carrick_hal::FrameId>,
     shared_key_base: u64,
     shared_key_offset: u64,
-    inherited_frame: Option<carrick_hal::FrameId>,
     owner_generation: u64,
 }
 
@@ -7205,11 +7292,14 @@ fn inherited_fork_inventory_extents(
     let expected_owner = mapping
         .ipa
         .checked_sub(mapping.physical_ipa)
-        .and_then(|offset| usize::try_from(offset).ok())
-        .and_then(|offset| (mapping.host_addr as usize).checked_sub(offset))
-        .map(|host_addr| InventoryStage2OwnerIdentity {
-            host_addr,
-            generation: mapping.owner_generation,
+        .and_then(|offset| {
+            (mapping.owner_generation != 0).then_some(InventoryStage2OwnerIdentity {
+                host_addr: mapping
+                    .physical_host_addr
+                    .wrapping_add(usize::try_from(offset).ok()?)
+                    as usize,
+                generation: mapping.owner_generation,
+            })
         });
     let live_owner =
         global_frame_host_owner_identity(mapping.physical_ipa, mapping.physical_size as u64);
@@ -7237,6 +7327,7 @@ fn fork_translation_has_overlay_owner(
     va: u64,
     translated: u64,
     mm_root_slot: Option<(u64, u64)>,
+    container_root: ContainerRootToken,
 ) -> bool {
     mappings.iter().enumerate().any(|(index, overlay)| {
         index != candidate_index
@@ -7247,8 +7338,8 @@ fn fork_translation_has_overlay_owner(
                 .checked_add(va - overlay.start)
                 .is_some_and(|ipa| ipa == translated)
     }) || alias_registry().lock().iter().any(|alias| {
-        (alias_matches_process_scope(alias.ownership_scope, mm_root_slot)
-            || matches!(alias.ownership_scope, AliasOwnershipScope::Root))
+        (alias_matches_process_scope(alias.ownership_scope, mm_root_slot, container_root)
+            || matches!(alias.ownership_scope, AliasOwnershipScope::ContainerRoot(container) if container == container_root))
             && va >= alias.start
             && va < alias.start.saturating_add(alias.size as u64)
             && alias.ipa.checked_add(va.saturating_sub(alias.start)) == Some(translated)
@@ -7396,6 +7487,7 @@ pub struct ProcessSpec {
     syscall_transport: HvfSyscallTransport,
     persistent_vm_lifecycle: bool,
     mm_root_slot: (u64, u64),
+    container_root: ContainerRootToken,
     frame_inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
     cow_armed: std::sync::Arc<parking_lot::Mutex<CowArmedRanges>>,
 }
@@ -7738,6 +7830,7 @@ impl HvpatchTaskMappingState {
 struct HvpatchPreparedTaskAuthority {
     mappings: Vec<HvpatchTaskMappingState>,
     mm_root_slot: Option<(u64, u64)>,
+    container_root: ContainerRootToken,
     /// Shared processes use the Kernel's exact MM identity to intern one MM
     /// projection even when the root parent has no task-only directory row.
     shared_kernel_mm: Option<u64>,
@@ -8230,6 +8323,7 @@ impl std::fmt::Display for HvpatchTaskMmHolder {
 pub(crate) struct HvpatchTaskMmAuthority {
     mappings: Vec<HvpatchTaskMappingState>,
     mm_root_slot: Option<(u64, u64)>,
+    container_root: ContainerRootToken,
     inventory: parking_lot::Mutex<HvpatchTaskInventoryAuthority>,
     kernel_mm: parking_lot::Mutex<Option<std::num::NonZeroU64>>,
     cow_armed: Option<std::sync::Arc<parking_lot::Mutex<CowArmedRanges>>>,
@@ -8257,6 +8351,7 @@ impl HvpatchTaskMmAuthority {
         Self {
             mappings: std::mem::take(&mut prepared.mappings),
             mm_root_slot: prepared.mm_root_slot,
+            container_root: prepared.container_root,
             inventory: parking_lot::Mutex::new(std::mem::take(&mut prepared.inventory)),
             kernel_mm: parking_lot::Mutex::new(None),
             cow_armed: prepared.cow_armed.take(),
@@ -9082,6 +9177,7 @@ impl HvpatchTaskRegistration {
                 .map(HvpatchTaskMappingState::unowned_runtime_region)
                 .collect(),
             mm_root_slot: task_mm.mm_root_slot,
+            container_root: task_mm.container_root,
             pending_exec_mm_root_slot: None,
             pending_exec_asid: None,
             pending_exec_predecessor_identity: None,
@@ -9323,6 +9419,7 @@ impl HvpatchPreparedCarrierTaskState {
             syscall_transport: _,
             persistent_vm_lifecycle: _,
             mm_root_slot,
+            container_root,
             frame_inventory,
             cow_authority: _,
             cow_identity: _,
@@ -9360,6 +9457,7 @@ impl HvpatchPreparedCarrierTaskState {
             HvpatchPreparedTaskAuthority {
                 mappings,
                 mm_root_slot,
+                container_root,
                 shared_kernel_mm,
                 inventory: if shared_kernel_mm.is_some() {
                     HvpatchTaskInventoryAuthority::SharedProcess {
@@ -11889,7 +11987,11 @@ impl HvfVmState {
         }
         mutate_external_alias_state(|_, registry| {
             registry.retain(|alias| {
-                if alias_is_owned_by_process(alias.ownership_scope, task.mm_root_slot) {
+                if alias_is_owned_by_process(
+                    alias.ownership_scope,
+                    task.mm_root_slot,
+                    task.container_root,
+                ) {
                     false
                 } else if matches!(alias.ownership_scope, AliasOwnershipScope::Global) {
                     let key = (alias.physical_ipa, alias.physical_size as u64);
@@ -12044,6 +12146,7 @@ impl HvfVmState {
             task: HvfTaskState {
                 mappings: Vec::new(),
                 mm_root_slot: None,
+                container_root: ContainerRootToken::next(),
                 pending_exec_mm_root_slot: None,
                 pending_exec_asid: None,
                 pending_exec_predecessor_identity: None,
@@ -12516,7 +12619,7 @@ impl HvfVmState {
     /// installed by sibling vCPUs and filters retired lifetime-owner rows.
     pub(crate) fn fork_cow_ranges(&self) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
         let aliases = alias_registry().lock().clone();
-        let alias_index = process_alias_index(&aliases, self.mm_root_slot);
+        let alias_index = process_alias_index(&aliases, self.mm_root_slot, self.container_root);
         let mut ranges: Vec<_> = self
             .mappings
             .iter()
@@ -12539,20 +12642,30 @@ impl HvfVmState {
                 ),
             })
             .collect();
-        let local_ipas = current_dynamic_alias_ipas(&self.mappings, &aliases, self.mm_root_slot);
+        let local_ipas = current_dynamic_alias_ipas(
+            &self.mappings,
+            &aliases,
+            self.mm_root_slot,
+            self.container_root,
+        );
         ranges.extend(
-            missing_process_aliases(&local_ipas, &aliases, self.mm_root_slot)
-                .into_iter()
-                .filter(|mapping| {
-                    mapping.sharing == GuestMappingSharing::Private
-                        && !is_kernel_only_stage1_range(mapping.start, mapping.size)
-                })
-                .map(|mapping| carrick_aarch64::vmm::ForkCowRange {
-                    va: mapping.start,
-                    len: mapping.size,
-                    executable: mapping.perms & 4 != 0,
-                    kernel_only: is_kernel_only_stage1_range(mapping.start, mapping.size),
-                }),
+            missing_process_aliases(
+                &local_ipas,
+                &aliases,
+                self.mm_root_slot,
+                self.container_root,
+            )
+            .into_iter()
+            .filter(|mapping| {
+                mapping.sharing == GuestMappingSharing::Private
+                    && !is_kernel_only_stage1_range(mapping.start, mapping.size)
+            })
+            .map(|mapping| carrick_aarch64::vmm::ForkCowRange {
+                va: mapping.start,
+                len: mapping.size,
+                executable: mapping.perms & 4 != 0,
+                kernel_only: is_kernel_only_stage1_range(mapping.start, mapping.size),
+            }),
         );
         ranges.sort_by_key(|range| (range.va, range.len));
         ranges.dedup_by_key(|range| (range.va, range.len));
@@ -12672,7 +12785,7 @@ impl HvfVmState {
             perms: u64::from(perms),
             guest_writable: true,
             sharing,
-            ownership_scope: alias_ownership_scope(sharing, self.mm_root_slot),
+            ownership_scope: alias_ownership_scope(sharing, self.mm_root_slot, self.container_root),
             inventory_backing,
             shared_key_base: 0,
             shared_key_offset: 0,
@@ -12776,8 +12889,11 @@ impl HvfVmState {
         let physical_ipa = align_down(ipa, CowArmedRanges::COMPOUND_SIZE);
         let physical_end = physical_ipa.checked_add(CowArmedRanges::COMPOUND_SIZE)?;
         if let Some(alias) = alias_registry().lock().iter().rev().find(|alias| {
-            alias_matches_process_scope(alias.ownership_scope, self.mm_root_slot)
-                && semantic_va >= alias.start
+            alias_matches_process_scope(
+                alias.ownership_scope,
+                self.mm_root_slot,
+                self.container_root,
+            ) && semantic_va >= alias.start
                 && semantic_va < alias.start.saturating_add(alias.size as u64)
                 && alias
                     .ipa
@@ -12880,8 +12996,11 @@ impl HvfVmState {
                 .lock()
                 .iter()
                 .filter(|alias| {
-                    alias_matches_process_scope(alias.ownership_scope, self.mm_root_slot)
-                        && alias.start > current
+                    alias_matches_process_scope(
+                        alias.ownership_scope,
+                        self.mm_root_slot,
+                        self.container_root,
+                    ) && alias.start > current
                         && alias.start < end
                         && alias_backing_is_live(alias.physical_host_addr)
                 })
@@ -12942,8 +13061,11 @@ impl HvfVmState {
             .iter()
             .rev()
             .find(|alias| {
-                alias_matches_process_scope(alias.ownership_scope, self.mm_root_slot)
-                    && start >= alias.start
+                alias_matches_process_scope(
+                    alias.ownership_scope,
+                    self.mm_root_slot,
+                    self.container_root,
+                ) && start >= alias.start
                     && start < alias.start.saturating_add(alias.size as u64)
                     && global_frame_host_owner_matches(
                         alias.physical_ipa,
@@ -12974,8 +13096,11 @@ impl HvfVmState {
             .lock()
             .iter()
             .filter(|alias| {
-                alias_matches_process_scope(alias.ownership_scope, self.mm_root_slot)
-                    && alias.start > start
+                alias_matches_process_scope(
+                    alias.ownership_scope,
+                    self.mm_root_slot,
+                    self.container_root,
+                ) && alias.start > start
                     && alias.start < end
                     && global_frame_host_owner_matches(
                         alias.physical_ipa,
@@ -13228,7 +13353,7 @@ impl HvfVmState {
             perms: u64::from(stage2_perms),
             guest_writable: true,
             sharing,
-            ownership_scope: alias_ownership_scope(sharing, self.mm_root_slot),
+            ownership_scope: alias_ownership_scope(sharing, self.mm_root_slot, self.container_root),
             inventory_backing: Self::private_backing_identity(),
             shared_key_base: 0,
             shared_key_offset: 0,
@@ -13666,7 +13791,7 @@ impl HvfVmState {
             perms: u64::from(stage2_perms),
             guest_writable: true,
             sharing,
-            ownership_scope: alias_ownership_scope(sharing, self.mm_root_slot),
+            ownership_scope: alias_ownership_scope(sharing, self.mm_root_slot, self.container_root),
             inventory_backing: backing,
             shared_key_base: 0,
             shared_key_offset: 0,
@@ -14386,7 +14511,11 @@ impl HvfVmState {
             perms: u64::from(stage2_perms),
             guest_writable: source_guest_writable,
             sharing: GuestMappingSharing::Private,
-            ownership_scope: alias_ownership_scope(GuestMappingSharing::Private, self.mm_root_slot),
+            ownership_scope: alias_ownership_scope(
+                GuestMappingSharing::Private,
+                self.mm_root_slot,
+                self.container_root,
+            ),
             inventory_backing: backing,
             shared_key_base: 0,
             shared_key_offset: 0,
@@ -14553,6 +14682,7 @@ impl HvfVmState {
                                         != alias_ownership_scope(
                                             GuestMappingSharing::Private,
                                             self.mm_root_slot,
+                                            self.container_root,
                                         )
                             })
                             .map(|alias| (alias.start, alias.physical_ipa, alias.ownership_scope))
@@ -15016,7 +15146,7 @@ impl HvfVmState {
         let backing = if gpa != 0 {
             lookup_shared_alias(gpa)
         } else {
-            lookup_shared_alias_by_va(va, 1, self.mm_root_slot)
+            lookup_shared_alias_by_va(va, 1, self.mm_root_slot, self.container_root)
         };
         let Some(b) = backing else {
             return false;
@@ -15248,7 +15378,7 @@ impl HvfVmState {
             perms: u64::from(perms),
             guest_writable: alias_guest_writable,
             sharing,
-            ownership_scope: alias_ownership_scope(sharing, self.mm_root_slot),
+            ownership_scope: alias_ownership_scope(sharing, self.mm_root_slot, self.container_root),
             inventory_backing,
             shared_key_base,
             shared_key_offset,
@@ -15746,6 +15876,7 @@ impl HvfVmState {
                     ipa,
                     chunk_len,
                     self.mm_root_slot,
+                    self.container_root,
                 )
             });
             // WRITE TARGETS ARE STAGE-1-AUTHENTICATED, PERIOD. This used to
@@ -16137,7 +16268,7 @@ impl HvfVmState {
                 executable: false,
                 kernel_only: false,
             });
-            let _ = unregister_alias(va, len, self.mm_root_slot);
+            let _ = unregister_alias(va, len, self.mm_root_slot, self.container_root);
             self.split_local_rows_for_unmap(va, len);
             return Ok(());
         }
@@ -16165,17 +16296,24 @@ impl HvfVmState {
         let registry_before = alias_registry().lock().clone();
         let planned_leases = {
             let mut planned = registry_before.clone();
-            unregister_alias_entries(&mut planned, va, len, self.mm_root_slot)
+            unregister_alias_entries(
+                &mut planned,
+                va,
+                len,
+                self.mm_root_slot,
+                self.container_root,
+            )
         };
         let disarm_spans = retired_alias_disarm_spans(
             &registry_before,
             va,
             len,
             self.mm_root_slot,
+            self.container_root,
             &planned_leases,
         );
         if planned_leases.is_empty() {
-            let actual = unregister_alias(va, len, self.mm_root_slot);
+            let actual = unregister_alias(va, len, self.mm_root_slot, self.container_root);
             debug_assert!(actual.is_empty());
             // Keep this engine's rows in step with the split the registry just
             // took (see `split_local_rows_for_unmap`).
@@ -16200,7 +16338,7 @@ impl HvfVmState {
             })?
         };
         if retirement.mappings.is_empty() {
-            let actual = unregister_alias(va, len, self.mm_root_slot);
+            let actual = unregister_alias(va, len, self.mm_root_slot, self.container_root);
             debug_assert_eq!(actual, planned_leases);
             let mut armed = self.cow_armed.lock();
             for span in disarm_spans {
@@ -16230,7 +16368,7 @@ impl HvfVmState {
             ))
         })?;
         Self::stage_inventory_lease_retirement(&mut reservation, &retirement)?;
-        let actual_leases = unregister_alias(va, len, self.mm_root_slot);
+        let actual_leases = unregister_alias(va, len, self.mm_root_slot, self.container_root);
         if actual_leases != planned_leases {
             eprintln!(
                 "carrick: FATAL: HVPatch alias registry changed under topology lock: planned={planned_leases:?} actual={actual_leases:?}"
@@ -16381,8 +16519,11 @@ impl HvfVmState {
                 .iter()
                 .rev()
                 .find(|alias| {
-                    alias_matches_process_scope(alias.ownership_scope, self.mm_root_slot)
-                        && address >= alias.start
+                    alias_matches_process_scope(
+                        alias.ownership_scope,
+                        self.mm_root_slot,
+                        self.container_root,
+                    ) && address >= alias.start
                         && end <= alias.start.saturating_add(alias.size as u64)
                         && alias_is_live(alias)
                 })
@@ -16542,7 +16683,11 @@ impl HvfVmState {
                         == Some(ipa)
                     && ipa >= alias.ipa
                     && alias_end.is_some_and(|limit| end <= limit)
-                    && alias_matches_process_scope(alias.ownership_scope, self.mm_root_slot)
+                    && alias_matches_process_scope(
+                        alias.ownership_scope,
+                        self.mm_root_slot,
+                        self.container_root,
+                    )
                     && (!self.persistent_vm_lifecycle
                         || !is_reusable_global_frame_extent(
                             alias.physical_ipa,
@@ -16840,8 +16985,11 @@ impl HvfVmState {
                 .is_dynamic_alias
                 .then(|| {
                     registered_aliases.iter().find(|alias| {
-                        alias_matches_process_scope(alias.ownership_scope, self.mm_root_slot)
-                            && alias.start == mapping.start
+                        alias_matches_process_scope(
+                            alias.ownership_scope,
+                            self.mm_root_slot,
+                            self.container_root,
+                        ) && alias.start == mapping.start
                             && alias.ipa == mapping.ipa
                             && alias.host_addr == mapping.host_addr as usize
                             && alias.size == semantic_extent_size(mapping.start, mapping.end)
@@ -16885,8 +17033,11 @@ impl HvfVmState {
             // Copy the entries out so the registry mutex isn't held across the
             // hv_vm_map syscalls (`AliasBacking` is `Copy`).
             for b in registered_aliases {
-                if !alias_matches_process_scope(b.ownership_scope, self.mm_root_slot)
-                    || !mapped_extents.insert((b.physical_ipa, b.physical_size))
+                if !alias_matches_process_scope(
+                    b.ownership_scope,
+                    self.mm_root_slot,
+                    self.container_root,
+                ) || !mapped_extents.insert((b.physical_ipa, b.physical_size))
                     || !alias_backing_is_live(b.host_addr)
                 {
                     continue;
@@ -17133,6 +17284,7 @@ impl HvfVmState {
             syscall_transport: self.syscall_transport,
             persistent_vm_lifecycle: self.persistent_vm_lifecycle,
             mm_root_slot: self.mm_root_slot,
+            container_root: self.container_root,
             frame_inventory: self.frame_inventory.shared_ledger(),
             cow_authority: self.cow_authority.clone(),
             cow_identity: self.cow_identity,
@@ -17158,6 +17310,7 @@ impl HvfVmState {
             syscall_transport,
             persistent_vm_lifecycle,
             mm_root_slot,
+            container_root,
             frame_inventory,
             cow_authority,
             cow_identity,
@@ -17181,6 +17334,7 @@ impl HvfVmState {
             task: HvfTaskState {
                 mappings: Vec::with_capacity(mappings.len()),
                 mm_root_slot,
+                container_root,
                 pending_exec_mm_root_slot: None,
                 pending_exec_asid: None,
                 pending_exec_predecessor_identity: None,
@@ -17263,7 +17417,7 @@ impl HvfVmState {
             })?;
         let mut cursor = request.root_slot_base;
         let aliases = alias_registry().lock().clone();
-        let alias_index = process_alias_index(&aliases, self.mm_root_slot);
+        let alias_index = process_alias_index(&aliases, self.mm_root_slot, self.container_root);
         let mut seen_dynamic_aliases = std::collections::HashSet::new();
         let mut source_mappings: Vec<ThreadMappingDesc> = self
             .mappings
@@ -17312,7 +17466,11 @@ impl HvfVmState {
                     alias.physical_ipa,
                     alias.physical_size,
                     alias.ownership_scope,
-                    alias_matches_process_scope(alias.ownership_scope, self.mm_root_slot),
+                    alias_matches_process_scope(
+                        alias.ownership_scope,
+                        self.mm_root_slot,
+                        self.container_root,
+                    ),
                     alias.sharing,
                     alias.guest_writable,
                     alias.start <= debug_va
@@ -17369,7 +17527,12 @@ impl HvfVmState {
             .filter(|mapping| mapping.is_dynamic_alias)
             .map(|mapping| mapping.ipa)
             .collect();
-        let missing = missing_process_aliases(&local_ipas, &aliases, self.mm_root_slot);
+        let missing = missing_process_aliases(
+            &local_ipas,
+            &aliases,
+            self.mm_root_slot,
+            self.container_root,
+        );
         let candidate_regions = missing.len() as u64;
         let mut added_regions = 0_u64;
         let mut added_bytes = 0_u64;
@@ -17778,6 +17941,7 @@ impl HvfVmState {
                 mapping.start,
                 translated,
                 self.mm_root_slot,
+                self.container_root,
             );
             if translated != mapping.ipa && !overlay_matches {
                 return Err(TrapError::Hypervisor(format!(
@@ -17949,6 +18113,7 @@ impl HvfVmState {
             syscall_transport: self.syscall_transport,
             persistent_vm_lifecycle: self.persistent_vm_lifecycle,
             mm_root_slot: (request.root_slot_base, request.root_slot_size),
+            container_root: self.container_root,
             frame_inventory,
             cow_armed: std::sync::Arc::new(parking_lot::Mutex::new(child_cow_armed)),
         };
@@ -18027,7 +18192,11 @@ impl HvfVmState {
                     perms: u64::from(mapping.perms),
                     guest_writable: mapping.guest_writable,
                     sharing: mapping.sharing,
-                    ownership_scope: alias_ownership_scope(mapping.sharing, None),
+                    ownership_scope: alias_ownership_scope(
+                        mapping.sharing,
+                        None,
+                        spec.container_root,
+                    ),
                     inventory_backing: mapping.inventory_backing,
                     shared_key_base: mapping.shared_key_base,
                     shared_key_offset: mapping.shared_key_offset,
@@ -18193,6 +18362,7 @@ impl HvfVmState {
             HvpatchPreparedTaskAuthority {
                 mappings: mapped,
                 mm_root_slot: Some(spec.mm_root_slot),
+                container_root: spec.container_root,
                 inventory: HvpatchTaskInventoryAuthority::ProcessPrepared {
                     ledger: spec.frame_inventory,
                     staged: staged_inventory_mappings,
@@ -18276,7 +18446,11 @@ impl HvfVmState {
                     perms: u64::from(mapping.perms),
                     guest_writable: mapping.guest_writable,
                     sharing: mapping.sharing,
-                    ownership_scope: alias_ownership_scope(mapping.sharing, None),
+                    ownership_scope: alias_ownership_scope(
+                        mapping.sharing,
+                        None,
+                        spec.container_root,
+                    ),
                     inventory_backing: mapping.inventory_backing,
                     shared_key_base: mapping.shared_key_base,
                     shared_key_offset: mapping.shared_key_offset,
@@ -18362,6 +18536,7 @@ impl HvfVmState {
             task: HvfTaskState {
                 mappings: mapped,
                 mm_root_slot: Some(spec.mm_root_slot),
+                container_root: spec.container_root,
                 pending_exec_mm_root_slot: None,
                 pending_exec_asid: None,
                 pending_exec_predecessor_identity: None,
@@ -18852,6 +19027,7 @@ impl HvfVmState {
                     )
                 })
                 .collect();
+            let container_root = self.container_root;
             if self
                 .pending_exec_stage2_cleanup
                 .replace(PendingExecStage2Cleanup {
@@ -18859,6 +19035,7 @@ impl HvfVmState {
                     extents: predecessor_extents,
                     frames: predecessor_frames,
                     mm_root_slot: predecessor_mm_root_slot,
+                    container_root,
                     predecessor_identity,
                     predecessor_mm: predecessor_cow_identity.mm,
                     shared_projection,
@@ -19065,6 +19242,7 @@ impl HvfVmState {
                 let new_task_mm = std::sync::Arc::new(HvpatchTaskMmAuthority {
                     mappings: mapped_task_mappings,
                     mm_root_slot: Some(replacement_mm_root_slot),
+                    container_root: self.container_root,
                     inventory: parking_lot::Mutex::new(new_authority),
                     kernel_mm: parking_lot::Mutex::new(None),
                     cow_armed: Some(std::sync::Arc::clone(&self.cow_armed)),
@@ -20847,6 +21025,61 @@ mod vm_create_admission_tests {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg(test)]
 mod frame_inventory_backend_tests {
+
+    /// Two live containers in one carrier must never share private alias
+    /// ownership.
+    ///
+    /// Before `ContainerRoot`, `alias_ownership_scope` fell back to a single
+    /// `Root` variant whenever `mm_root_slot` was `None`, and
+    /// `alias_matches_process_scope` matched it with `mm_root_slot.is_none()`.
+    /// `None` is the default in `HvfTaskState::neutral()`, and a later
+    /// container's root is built through the carrier REUSE lane which leaves it
+    /// `None` — so both containers matched every `Root`-scoped alias and each
+    /// treated the other's private aliases as its own. The guest symptom was a
+    /// deterministic SIGSEGV writing `LINUX_MMAP_BASE + 8`, a level-1
+    /// translation fault, on whichever container lost.
+    ///
+    /// This binds the discriminator. Collapse `ContainerRoot` back to a single
+    /// variant, or compare without the token, and the cross-container
+    /// assertions below fail.
+    #[test]
+    fn private_alias_scopes_never_collide_across_carrier_containers() {
+        let alpha = ContainerRootToken::next();
+        let beta = ContainerRootToken::next();
+        assert_ne!(alpha, beta, "each container root mints a distinct token");
+        assert_ne!(
+            alpha,
+            ContainerRootToken::ROOT,
+            "a minted token must never alias the ROOT sentinel"
+        );
+
+        let alpha_scope = alias_ownership_scope(GuestMappingSharing::Private, None, alpha);
+        let beta_scope = alias_ownership_scope(GuestMappingSharing::Private, None, beta);
+        assert_ne!(
+            alpha_scope, beta_scope,
+            "two containers on the carrier reuse lane (mm_root_slot = None) must \
+             not share one private ownership scope"
+        );
+
+        // The cross-container half: alpha's alias must not be claimed by beta.
+        assert!(
+            alias_matches_process_scope(alpha_scope, None, alpha),
+            "a container owns its own private aliases"
+        );
+        assert!(
+            !alias_matches_process_scope(alpha_scope, None, beta),
+            "a container must NOT own a sibling's private aliases"
+        );
+        assert!(
+            !alias_matches_process_scope(beta_scope, None, alpha),
+            "ownership is not symmetric-by-accident either"
+        );
+
+        // Shared-file aliases stay VM-global and are unaffected.
+        let global = alias_ownership_scope(GuestMappingSharing::GlobalShared, None, alpha);
+        assert_eq!(global, AliasOwnershipScope::Global);
+        assert!(alias_matches_process_scope(global, None, beta));
+    }
     use super::*;
 
     fn predecessor_test_identity(
@@ -21680,6 +21913,7 @@ mod frame_inventory_backend_tests {
             extents: [((0x1234_0000, 0x4000), 0)].into_iter().collect(),
             frames: std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default())),
             mm_root_slot: task.mm_root_slot,
+            container_root: task.container_root,
             predecessor_identity,
             predecessor_mm,
             shared_projection: false,
@@ -21703,6 +21937,7 @@ mod frame_inventory_backend_tests {
             extents: std::collections::BTreeMap::new(),
             frames: std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default())),
             mm_root_slot: task.mm_root_slot,
+            container_root: task.container_root,
             predecessor_identity,
             predecessor_mm,
             shared_projection: true,
@@ -21805,6 +22040,7 @@ mod frame_inventory_backend_tests {
             extents: [(lease_key, 0)].into_iter().collect(),
             frames,
             mm_root_slot: task.mm_root_slot,
+            container_root: task.container_root,
             predecessor_identity,
             predecessor_mm,
             shared_projection: false,
@@ -21874,6 +22110,7 @@ mod frame_inventory_backend_tests {
                 .collect(),
             frames: std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default())),
             mm_root_slot: task.mm_root_slot,
+            container_root: task.container_root,
             predecessor_identity,
             predecessor_mm,
             shared_projection: false,
@@ -23164,7 +23401,7 @@ mod frame_inventory_backend_tests {
             perms: u64::from(applevisor::memory::MemPerms::ReadWriteExec),
             guest_writable: true,
             sharing: GuestMappingSharing::Private,
-            ownership_scope: AliasOwnershipScope::Root,
+            ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken::ROOT),
             inventory_backing: InventoryBackingIdentity::Private(401),
             shared_key_base: 0,
             shared_key_offset: 0,
@@ -23177,6 +23414,7 @@ mod frame_inventory_backend_tests {
                 key.0 + 0x1000,
                 0x1000,
                 None,
+                ContainerRootToken::ROOT,
             )
             .is_none(),
             "a stale source must not launder itself through the live successor owner"
@@ -23192,6 +23430,7 @@ mod frame_inventory_backend_tests {
             key.0 + 0x1000,
             0x1000,
             None,
+            ContainerRootToken::ROOT,
         )
         .expect("the exact live source may republish its missing semantic fragment");
         assert_eq!(reused.owner_generation, generation);
@@ -24084,6 +24323,7 @@ mod frame_inventory_backend_tests {
         let task_mm = std::sync::Arc::new(HvpatchTaskMmAuthority {
             mappings: Vec::new(),
             mm_root_slot: Some((0x7e20_0000_0000, 0x20_0000)),
+            container_root: ContainerRootToken::ROOT,
             inventory: parking_lot::Mutex::new(HvpatchTaskInventoryAuthority::ProcessPrepared {
                 ledger: std::sync::Arc::clone(&ledger),
                 staged: vec![(key, extent)],
@@ -25114,6 +25354,7 @@ mod frame_inventory_backend_tests {
             0x4000_0000,
             winning_ipa,
             None,
+            ContainerRootToken::ROOT,
         ));
     }
 }
@@ -25136,7 +25377,7 @@ mod alias_remap_limiter_tests {
             perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
             guest_writable: true,
             sharing: GuestMappingSharing::Private,
-            ownership_scope: AliasOwnershipScope::Root,
+            ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken::ROOT),
             inventory_backing: InventoryBackingIdentity::Private(1),
             shared_key_base: 0,
             shared_key_offset: 0,
@@ -25178,7 +25419,7 @@ mod alias_remap_limiter_tests {
             perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
             guest_writable: true,
             sharing: GuestMappingSharing::Private,
-            ownership_scope: AliasOwnershipScope::Root,
+            ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken::ROOT),
             inventory_backing: InventoryBackingIdentity::Private(2),
             shared_key_base: 0,
             shared_key_offset: 0,
@@ -26161,9 +26402,9 @@ pub(crate) fn hvf_set_sys_reg(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod tag_strip_tests {
     use super::{
-        AliasBacking, AliasOwnershipScope, CowArmedSpan, GuestMappingPlan, GuestMappingSharing,
-        HVF_PAGE_SIZE, HvfMappedRegion, InventoryBackingIdentity, ThreadMappingDesc,
-        alias_is_owned_by_process, alias_matches_process_scope, alias_registry,
+        AliasBacking, AliasOwnershipScope, ContainerRootToken, CowArmedSpan, GuestMappingPlan,
+        GuestMappingSharing, HVF_PAGE_SIZE, HvfMappedRegion, InventoryBackingIdentity,
+        ThreadMappingDesc, alias_is_owned_by_process, alias_matches_process_scope, alias_registry,
         current_dynamic_alias_ipas, forget_replay_extent, inherited_fork_inventory_extents,
         lookup_shared_alias, mapping_is_current_for_process_fork_indexed, missing_process_aliases,
         process_alias_index,
@@ -26176,7 +26417,7 @@ mod tag_strip_tests {
     ) -> bool {
         mapping_is_current_for_process_fork_indexed(
             mapping,
-            &process_alias_index(aliases, mm_root_slot),
+            &process_alias_index(aliases, mm_root_slot, ContainerRootToken::ROOT),
         )
     }
     #[allow(unused_imports)]
@@ -26416,35 +26657,56 @@ mod tag_strip_tests {
             carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE,
             2 * 1024 * 1024,
         );
+        let container_a = ContainerRootToken::ROOT;
+        let container_b = ContainerRootToken::from_raw(2);
         assert!(alias_matches_process_scope(
             AliasOwnershipScope::MmRootSlot {
                 base: root_slot.0,
                 size: root_slot.1
             },
-            Some(root_slot)
+            Some(root_slot),
+            container_a,
         ));
         assert!(!alias_matches_process_scope(
-            AliasOwnershipScope::Root,
-            Some(root_slot)
+            AliasOwnershipScope::ContainerRoot(container_a),
+            Some(root_slot),
+            container_a,
         ));
-        assert!(alias_matches_process_scope(AliasOwnershipScope::Root, None));
+        assert!(alias_matches_process_scope(
+            AliasOwnershipScope::ContainerRoot(container_a),
+            None,
+            container_a,
+        ));
+        assert!(!alias_matches_process_scope(
+            AliasOwnershipScope::ContainerRoot(container_a),
+            None,
+            container_b,
+        ));
         assert!(!alias_matches_process_scope(
             AliasOwnershipScope::MmRootSlot {
                 base: root_slot.0,
                 size: root_slot.1
             },
-            None
+            None,
+            container_a,
         ));
         assert!(!alias_matches_process_scope(
             AliasOwnershipScope::MmRootSlot {
                 base: root_slot.0 + root_slot.1,
                 size: root_slot.1
             },
-            Some(root_slot)
+            Some(root_slot),
+            container_a,
         ));
         assert!(alias_matches_process_scope(
             AliasOwnershipScope::Global,
-            Some(root_slot)
+            Some(root_slot),
+            container_a,
+        ));
+        assert!(alias_matches_process_scope(
+            AliasOwnershipScope::Global,
+            Some(root_slot),
+            container_b,
         ));
     }
 
@@ -26492,7 +26754,8 @@ mod tag_strip_tests {
             missing_process_aliases(
                 &std::collections::HashSet::new(),
                 &[alias],
-                Some(parent_root_slot)
+                Some(parent_root_slot),
+                ContainerRootToken::ROOT,
             )
             .len(),
             1,
@@ -26502,7 +26765,8 @@ mod tag_strip_tests {
             missing_process_aliases(
                 &std::collections::HashSet::new(),
                 &[alias],
-                Some(foreign_root_slot)
+                Some(foreign_root_slot),
+                ContainerRootToken::ROOT,
             )
             .is_empty(),
             "an unrelated mm must not acquire anonymous backing through global alias scope"
@@ -26512,28 +26776,43 @@ mod tag_strip_tests {
     #[test]
     fn address_space_replacement_drops_only_its_private_alias_scope() {
         let root_slot = (0x9000_0000, 0x20_0000);
-        assert!(alias_is_owned_by_process(AliasOwnershipScope::Root, None));
+        let container_a = ContainerRootToken::ROOT;
+        let container_b = ContainerRootToken::from_raw(2);
+        assert!(alias_is_owned_by_process(
+            AliasOwnershipScope::ContainerRoot(container_a),
+            None,
+            container_a,
+        ));
         assert!(!alias_is_owned_by_process(
-            AliasOwnershipScope::Root,
-            Some(root_slot)
+            AliasOwnershipScope::ContainerRoot(container_a),
+            None,
+            container_b,
+        ));
+        assert!(!alias_is_owned_by_process(
+            AliasOwnershipScope::ContainerRoot(container_a),
+            Some(root_slot),
+            container_a,
         ));
         assert!(alias_is_owned_by_process(
             AliasOwnershipScope::MmRootSlot {
                 base: root_slot.0,
                 size: root_slot.1,
             },
-            Some(root_slot)
+            Some(root_slot),
+            container_a,
         ));
         assert!(!alias_is_owned_by_process(
             AliasOwnershipScope::MmRootSlot {
                 base: root_slot.0 + root_slot.1,
                 size: root_slot.1,
             },
-            Some(root_slot)
+            Some(root_slot),
+            container_a,
         ));
         assert!(!alias_is_owned_by_process(
             AliasOwnershipScope::Global,
-            Some(root_slot)
+            Some(root_slot),
+            container_a,
         ));
     }
 
@@ -26579,6 +26858,7 @@ mod tag_strip_tests {
                 &std::collections::HashSet::new(),
                 &[alias],
                 Some(child_root_slot),
+                ContainerRootToken::ROOT,
             )
             .len(),
             1,
@@ -26589,6 +26869,7 @@ mod tag_strip_tests {
                 &std::collections::HashSet::new(),
                 &[alias],
                 Some(child_root_slot),
+                ContainerRootToken::ROOT,
             )[0]
             .inventory_backing,
             InventoryBackingIdentity::SharedAnon(42),
@@ -26623,6 +26904,7 @@ mod tag_strip_tests {
                 &std::collections::HashSet::new(),
                 &[grandchild_alias],
                 Some(grandchild_root_slot),
+                ContainerRootToken::ROOT,
             )[0]
             .inventory_backing,
             alias.inventory_backing,
@@ -26633,6 +26915,7 @@ mod tag_strip_tests {
                 &std::collections::HashSet::new(),
                 &[grandchild_alias],
                 Some(unrelated_root_slot),
+                ContainerRootToken::ROOT,
             )
             .is_empty(),
             "an unrelated mm must not gain the inherited frame"
@@ -26667,7 +26950,15 @@ mod tag_strip_tests {
         };
         let retained = std::collections::BTreeSet::new();
         assert!(
-            retired_alias_disarm_spans(&[alias], va + 0x4000, 0x4000, None, &retained).is_empty(),
+            retired_alias_disarm_spans(
+                &[alias],
+                va + 0x4000,
+                0x4000,
+                None,
+                ContainerRootToken::ROOT,
+                &retained
+            )
+            .is_empty(),
             "a semantic hole in a retained physical frame must keep its COW arm for same-VA reuse",
         );
         assert_eq!(
@@ -26676,6 +26967,7 @@ mod tag_strip_tests {
                 va + 0x4000,
                 0x4000,
                 None,
+                ContainerRootToken::ROOT,
                 &std::collections::BTreeSet::from([(ipa, 0xc000)]),
             ),
             vec![CowArmedSpan {
@@ -26688,7 +26980,7 @@ mod tag_strip_tests {
         );
         register_shared_alias(alias);
 
-        let retired = unregister_alias(va + 0x4000, 0x4000, None);
+        let retired = unregister_alias(va + 0x4000, 0x4000, None, ContainerRootToken::ROOT);
         assert!(
             retired.is_empty(),
             "a partial semantic unmap must retain its containing stage-2 lease"
@@ -26746,7 +27038,7 @@ mod tag_strip_tests {
         }
 
         assert_eq!(
-            unregister_alias(va, 0xc000, None),
+            unregister_alias(va, 0xc000, None, ContainerRootToken::ROOT),
             std::collections::BTreeSet::from([(ipa, 0xc000)]),
             "the last semantic fragment retires the exact physical lease"
         );
@@ -26793,6 +27085,7 @@ mod tag_strip_tests {
             physical_ipa + 0x1000,
             0x1000,
             Some(root_slot),
+            ContainerRootToken::ROOT,
         )
         .expect("reused Linux page must regain semantic lifetime ownership");
         assert_eq!(reused.start, va + 0x1000);
@@ -26803,12 +27096,25 @@ mod tag_strip_tests {
         registry.push(reused);
 
         assert!(
-            unregister_alias_entries(&mut registry, va, 0x1000, Some(root_slot)).is_empty(),
+            unregister_alias_entries(
+                &mut registry,
+                va,
+                0x1000,
+                Some(root_slot),
+                ContainerRootToken::ROOT
+            )
+            .is_empty(),
             "unmapping the old sibling must retain the frame owned by the reused page",
         );
         assert_eq!(registry, vec![reused]);
         assert_eq!(
-            unregister_alias_entries(&mut registry, va + 0x1000, 0x1000, Some(root_slot),),
+            unregister_alias_entries(
+                &mut registry,
+                va + 0x1000,
+                0x1000,
+                Some(root_slot),
+                ContainerRootToken::ROOT,
+            ),
             std::collections::BTreeSet::from([(physical_ipa, 0x4000)]),
             "the physical lease retires only after the reused page is also unmapped",
         );
@@ -26829,14 +27135,14 @@ mod tag_strip_tests {
             perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
             guest_writable: true,
             sharing: GuestMappingSharing::ForkSharedAnonymous,
-            ownership_scope: AliasOwnershipScope::Root,
+            ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken::ROOT),
             inventory_backing: InventoryBackingIdentity::SharedAnon(44),
             shared_key_base: 0,
             shared_key_offset: 0,
             owner_generation: 0,
         };
         register_shared_alias(alias);
-        unregister_alias(va, 0x4000, None);
+        unregister_alias(va, 0x4000, None, ContainerRootToken::ROOT);
         let fragment = alias_registry()
             .lock()
             .iter()
@@ -26878,7 +27184,7 @@ mod tag_strip_tests {
             frame,
             "the exact suffix must remain forkable through the retained physical extent",
         );
-        unregister_alias(va, 0xc000, None);
+        unregister_alias(va, 0xc000, None, ContainerRootToken::ROOT);
     }
 
     #[test]
@@ -26896,14 +27202,14 @@ mod tag_strip_tests {
             perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
             guest_writable: true,
             sharing: GuestMappingSharing::ForkSharedAnonymous,
-            ownership_scope: AliasOwnershipScope::Root,
+            ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken::ROOT),
             inventory_backing: InventoryBackingIdentity::SharedAnon(45),
             shared_key_base: 0,
             shared_key_offset: 0,
             owner_generation: 0,
         };
         register_shared_alias(alias);
-        unregister_alias(va + 0x8000, 0x4000, None);
+        unregister_alias(va + 0x8000, 0x4000, None, ContainerRootToken::ROOT);
         let fragment = alias_registry()
             .lock()
             .iter()
@@ -26945,7 +27251,7 @@ mod tag_strip_tests {
             frame,
             "the exact prefix must remain forkable through the retained physical extent",
         );
-        unregister_alias(va, 0xc000, None);
+        unregister_alias(va, 0xc000, None, ContainerRootToken::ROOT);
     }
 
     #[test]
@@ -26995,7 +27301,7 @@ mod tag_strip_tests {
             perms: u64::from(desc.perms),
             guest_writable: desc.guest_writable,
             sharing: desc.sharing,
-            ownership_scope: AliasOwnershipScope::Root,
+            ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken::ROOT),
             inventory_backing: InventoryBackingIdentity::SharedAnon(46),
             shared_key_base: 0,
             shared_key_offset: 0,
@@ -27003,7 +27309,7 @@ mod tag_strip_tests {
         };
         register_shared_alias(alias);
 
-        unregister_alias(va, guest_size, None);
+        unregister_alias(va, guest_size, None, ContainerRootToken::ROOT);
         let fragments: Vec<_> = alias_registry()
             .lock()
             .iter()
@@ -27011,8 +27317,12 @@ mod tag_strip_tests {
             .filter(|entry| entry.physical_ipa == ipa)
             .collect();
         let padding_replay_candidate = lookup_shared_alias(ipa + guest_size as u64);
-        let fork_candidates =
-            missing_process_aliases(&std::collections::HashSet::new(), &fragments, None);
+        let fork_candidates = missing_process_aliases(
+            &std::collections::HashSet::new(),
+            &fragments,
+            None,
+            ContainerRootToken::ROOT,
+        );
 
         alias_registry()
             .lock()
@@ -27175,7 +27485,12 @@ mod tag_strip_tests {
             ),
         ];
 
-        let missing = missing_process_aliases(&local_ipas, &aliases, Some(root_slot));
+        let missing = missing_process_aliases(
+            &local_ipas,
+            &aliases,
+            Some(root_slot),
+            ContainerRootToken::ROOT,
+        );
 
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].ipa, sibling_ipa);
@@ -27227,12 +27542,131 @@ mod tag_strip_tests {
         };
         let aliases = [live_fragment];
 
-        let current = current_dynamic_alias_ipas(&[mapping], &aliases, Some(root_slot));
+        let current = current_dynamic_alias_ipas(
+            &[mapping],
+            &aliases,
+            Some(root_slot),
+            ContainerRootToken::ROOT,
+        );
         assert!(current.is_empty(), "the unsplit local owner is retired");
         assert_eq!(
-            missing_process_aliases(&current, &aliases, Some(root_slot)),
+            missing_process_aliases(
+                &current,
+                &aliases,
+                Some(root_slot),
+                ContainerRootToken::ROOT
+            ),
             vec![live_fragment],
             "the retired row must not suppress the live suffix from fork arming",
+        );
+    }
+
+    #[test]
+    fn container_root_isolation_prevents_cross_container_alias_visibility() {
+        let container_1 = ContainerRootToken::ROOT;
+        let container_2 = ContainerRootToken::from_raw(2);
+        let root_slot_1 = (
+            carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE,
+            2 * 1024 * 1024,
+        );
+        let root_slot_2 = (
+            carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE + 0x1000_0000,
+            2 * 1024 * 1024,
+        );
+
+        let alias_c1_root = AliasBacking {
+            start: 0x1000_0000,
+            ipa: 0x2000_0000,
+            host_addr: 0x3000_0000,
+            size: 0x4000,
+            physical_ipa: 0x2000_0000,
+            physical_host_addr: 0x3000_0000,
+            physical_size: 0x4000,
+            perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+            guest_writable: true,
+            sharing: GuestMappingSharing::Private,
+            ownership_scope: AliasOwnershipScope::ContainerRoot(container_1),
+            inventory_backing: InventoryBackingIdentity::Private(1),
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: 0,
+        };
+
+        let alias_c2_root = AliasBacking {
+            start: 0x1000_0000,
+            ipa: 0x2000_4000,
+            host_addr: 0x3000_4000,
+            size: 0x4000,
+            physical_ipa: 0x2000_4000,
+            physical_host_addr: 0x3000_4000,
+            physical_size: 0x4000,
+            perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+            guest_writable: true,
+            sharing: GuestMappingSharing::Private,
+            ownership_scope: AliasOwnershipScope::ContainerRoot(container_2),
+            inventory_backing: InventoryBackingIdentity::Private(2),
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: 0,
+        };
+
+        let aliases = [alias_c1_root, alias_c2_root];
+
+        // Container 1 root process looking for aliases (None root_slot)
+        let c1_root_missing = missing_process_aliases(
+            &std::collections::HashSet::new(),
+            &aliases,
+            None,
+            container_1,
+        );
+        assert_eq!(c1_root_missing.len(), 1);
+        assert_eq!(c1_root_missing[0].ipa, alias_c1_root.ipa);
+
+        // Container 2 root process looking for aliases (None root_slot)
+        let c2_root_missing = missing_process_aliases(
+            &std::collections::HashSet::new(),
+            &aliases,
+            None,
+            container_2,
+        );
+        assert_eq!(c2_root_missing.len(), 1);
+        assert_eq!(c2_root_missing[0].ipa, alias_c2_root.ipa);
+
+        // Neither container sees the other's root alias when acting as child process
+        assert!(
+            missing_process_aliases(
+                &std::collections::HashSet::new(),
+                &aliases,
+                Some(root_slot_1),
+                container_1,
+            )
+            .is_empty()
+        );
+        assert!(
+            missing_process_aliases(
+                &std::collections::HashSet::new(),
+                &aliases,
+                Some(root_slot_2),
+                container_2,
+            )
+            .is_empty()
+        );
+
+        // Test unregister_alias_entries across containers
+        let mut registry = vec![alias_c1_root, alias_c2_root];
+        let retired =
+            unregister_alias_entries(&mut registry, 0x1000_0000, 0x4000, None, container_1);
+        assert_eq!(
+            retired,
+            std::collections::BTreeSet::from([(
+                alias_c1_root.physical_ipa,
+                alias_c1_root.physical_size as u64
+            )])
+        );
+        assert_eq!(
+            registry,
+            vec![alias_c2_root],
+            "container 1 unregister must not touch container 2 alias"
         );
     }
 }
