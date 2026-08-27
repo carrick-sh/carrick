@@ -10,9 +10,10 @@
 //!    F_SETPIPE_SZ, F_GETPIPE_SZ on pipe vs non-pipe).
 //! 5. `prctl(2)` process lifecycle (PR_SET_PDEATHSIG, PR_GET_PDEATHSIG, PR_SET_NO_NEW_PRIVS,
 //!    PR_GET_NO_NEW_PRIVS, PR_SET_DUMPABLE, PR_GET_DUMPABLE).
-//! 6. `execve(2)` descriptor inheritance and flag persistence across self-exec.
+//! 6. `execve(2)` descriptor inheritance and flag persistence across self-exec (fail-fast
+//!    non-blocking pipe poll with monotonic deadlines and scoped SIGKILL cleanup).
 //! 7. `waitid(2)` and `wait4(2)` status and flags (P_PID, P_ALL, WEXITED, WNOWAIT, WNOHANG,
-//!    siginfo_t status and rusage reporting).
+//!    siginfo_t status and rusage reporting with fail-fast timeouts).
 //!
 //! Compact table-driven structure reporting deterministic boolean and error observations.
 
@@ -71,6 +72,35 @@ impl Drop for DirGuard {
     }
 }
 
+unsafe fn reap_bounded(pid: libc::pid_t, timeout: Duration) -> Option<libc::c_int> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut status = 0;
+        let rc = libc::waitpid(pid, &mut status, libc::WNOHANG);
+        if rc == pid {
+            return Some(status);
+        }
+        if rc == -1 && errno() != libc::EINTR {
+            return None;
+        }
+        if Instant::now() >= deadline {
+            libc::kill(pid, libc::SIGKILL);
+            let kill_deadline = Instant::now() + Duration::from_millis(500);
+            loop {
+                let rc = libc::waitpid(pid, &mut status, libc::WNOHANG);
+                if rc == pid || (rc == -1 && errno() != libc::EINTR) {
+                    return None;
+                }
+                if Instant::now() >= kill_deadline {
+                    return None;
+                }
+                libc::usleep(1_000);
+            }
+        }
+        libc::usleep(1_000);
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Execve Helper Sub-process
 // -----------------------------------------------------------------------------
@@ -91,7 +121,7 @@ unsafe fn run_spawn_exec_helper() {
     let fd_42 = libc::fcntl(42, libc::F_GETFD);
     let ok_42 = fl_42 >= 0 && (fl_42 & libc::O_NONBLOCK) != 0 && fd_42 == 0;
 
-    // fd 43: pipe write end without FD_CLOEXEC -> write token
+    // fd 43: pipe write end without FD_CLOEXEC -> write token non-blockingly
     let token = b"spawn_exec_token_ok\n";
     let w_43 = libc::write(43, token.as_ptr().cast(), token.len());
     let ok_43 = w_43 == token.len() as isize;
@@ -481,9 +511,9 @@ unsafe fn test_execve_inheritance_matrix(base: &str) {
         libc::close(sock);
     }
 
-    // Communication pipe for child token
+    // Communication pipe for child token with O_NONBLOCK
     let mut pipe_comm = [0i32; 2];
-    libc::pipe(pipe_comm.as_mut_ptr());
+    sys_pipe2(pipe_comm.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK);
     // Move write end to fd 43 without CLOEXEC
     libc::dup2(pipe_comm[1], 43);
     libc::fcntl(43, libc::F_SETFD, 0);
@@ -510,37 +540,50 @@ unsafe fn test_execve_inheritance_matrix(base: &str) {
         return;
     }
 
-    // Read token from child
+    // Read token from child with poll + O_NONBLOCK + bounded monotonic deadline
     let mut buf = [0u8; 64];
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(2);
     let mut read_len = 0;
     while Instant::now() < deadline {
-        let n = libc::read(
-            pipe_comm[0],
-            buf[read_len..].as_mut_ptr().cast(),
-            buf.len() - read_len,
-        );
-        if n > 0 {
-            read_len += n as usize;
-            if &buf[..read_len] == b"spawn_exec_token_ok\n" {
+        let mut pfd = libc::pollfd {
+            fd: pipe_comm[0],
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let remaining_ms = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            .min(200) as libc::c_int;
+        let prc = libc::poll(&mut pfd, 1, remaining_ms);
+        if prc > 0 && (pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0 {
+            let n = libc::read(
+                pipe_comm[0],
+                buf[read_len..].as_mut_ptr().cast(),
+                buf.len() - read_len,
+            );
+            if n > 0 {
+                read_len += n as usize;
+                if &buf[..read_len] == b"spawn_exec_token_ok\n" {
+                    break;
+                }
+            } else if n == 0 {
+                break;
+            } else if errno() != libc::EINTR && errno() != libc::EAGAIN {
                 break;
             }
-        } else if n == 0 {
-            break;
-        } else if errno() != libc::EINTR && errno() != libc::EAGAIN {
-            break;
         }
     }
     libc::close(pipe_comm[0]);
 
-    let mut status = 0;
-    while libc::waitpid(pid, &mut status, 0) < 0 && errno() == libc::EINTR {}
-    let exited = libc::WIFEXITED(status);
-    let exit_code = if exited {
-        libc::WEXITSTATUS(status)
-    } else {
-        -1
-    };
+    let status_opt = reap_bounded(pid, Duration::from_secs(2));
+    let exited = status_opt.map_or(false, |s| libc::WIFEXITED(s));
+    let exit_code = status_opt.map_or(-1, |s| {
+        if libc::WIFEXITED(s) {
+            libc::WEXITSTATUS(s)
+        } else {
+            -1
+        }
+    });
 
     report!(
         execve_inheritance_child_exited_zero = exited && exit_code == 0,
@@ -553,7 +596,7 @@ unsafe fn test_execve_inheritance_matrix(base: &str) {
 // -----------------------------------------------------------------------------
 
 unsafe fn test_wait_matrix() {
-    // 7.1 waitid with WNOWAIT leaves child reapable by wait4
+    // 7.1 waitid with WNOWAIT leaves child reapable by wait4 (bounded polling with WNOHANG)
     let pid1 = libc::fork();
     if pid1 == 0 {
         libc::_exit(42);
@@ -561,28 +604,55 @@ unsafe fn test_wait_matrix() {
     if pid1 < 0 {
         report!(waitid_wnowait_preserves_child = false);
     } else {
+        let deadline = Instant::now() + Duration::from_secs(2);
         let mut info: libc::siginfo_t = std::mem::zeroed();
-        let r_waitid = libc::waitid(
-            libc::P_PID,
-            pid1 as libc::id_t,
-            &mut info,
-            libc::WEXITED | libc::WNOWAIT,
-        );
-        let info_ok = r_waitid == 0
+        let mut saw_exit = false;
+        while Instant::now() < deadline {
+            let mut cur_info: libc::siginfo_t = std::mem::zeroed();
+            let r = libc::waitid(
+                libc::P_PID,
+                pid1 as libc::id_t,
+                &mut cur_info,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            );
+            if r == 0 && cur_info.si_pid() == pid1 {
+                info = cur_info;
+                saw_exit = true;
+                break;
+            }
+            libc::usleep(1_000);
+        }
+
+        let info_ok = saw_exit
             && info.si_signo == libc::SIGCHLD
             && info.si_code == libc::CLD_EXITED
             && info.si_status() == 42;
 
         let mut status = 0;
         let mut ru: libc::rusage = std::mem::zeroed();
-        let r_wait4 = libc::wait4(pid1, &mut status, 0, &mut ru);
-        let wait4_ok =
-            r_wait4 == pid1 && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 42;
+        let mut wait4_ok = false;
+        let reap_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < reap_deadline {
+            let r = libc::wait4(pid1, &mut status, libc::WNOHANG, &mut ru);
+            if r == pid1 {
+                wait4_ok = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 42;
+                break;
+            }
+            if r == -1 && errno() != libc::EINTR {
+                break;
+            }
+            libc::usleep(1_000);
+        }
+
+        if !wait4_ok {
+            libc::kill(pid1, libc::SIGKILL);
+            let _ = reap_bounded(pid1, Duration::from_millis(500));
+        }
 
         report!(waitid_wnowait_preserves_child = info_ok && wait4_ok);
     }
 
-    // 7.2 waitid with P_ALL
+    // 7.2 waitid with P_ALL (bounded polling with WNOHANG)
     let pid2 = libc::fork();
     if pid2 == 0 {
         libc::_exit(17);
@@ -590,9 +660,23 @@ unsafe fn test_wait_matrix() {
     if pid2 < 0 {
         report!(waitid_p_all_ok = false);
     } else {
-        let mut info2: libc::siginfo_t = std::mem::zeroed();
-        let r2 = libc::waitid(libc::P_ALL, 0, &mut info2, libc::WEXITED);
-        let p_all_ok = r2 == 0 && info2.si_pid() == pid2 && info2.si_status() == 17;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut p_all_ok = false;
+        while Instant::now() < deadline {
+            let mut cur: libc::siginfo_t = std::mem::zeroed();
+            let r = libc::waitid(libc::P_ALL, 0, &mut cur, libc::WEXITED | libc::WNOHANG);
+            if r == 0 && cur.si_pid() == pid2 {
+                p_all_ok = cur.si_status() == 17;
+                break;
+            }
+            libc::usleep(1_000);
+        }
+
+        if !p_all_ok {
+            libc::kill(pid2, libc::SIGKILL);
+            let _ = reap_bounded(pid2, Duration::from_millis(500));
+        }
+
         report!(waitid_p_all_ok = p_all_ok);
     }
 

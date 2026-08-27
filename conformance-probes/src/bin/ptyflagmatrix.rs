@@ -360,6 +360,10 @@ unsafe fn test_fionread_hangup_matrix() {
     tio.c_oflag &= !libc::OPOST;
     libc::tcsetattr(pty.slave, libc::TCSANOW, &tio);
 
+    // Set O_NONBLOCK on both master and slave so reads are fail-fast
+    libc::fcntl(pty.master, libc::F_SETFL, libc::O_NONBLOCK);
+    libc::fcntl(pty.slave, libc::F_SETFL, libc::O_NONBLOCK);
+
     // 6.1 FIONREAD on master before write -> 0 bytes
     let mut n_avail: libc::c_int = -1;
     let r_fn0 = libc::ioctl(pty.master, FIONREAD as _, &mut n_avail);
@@ -371,9 +375,19 @@ unsafe fn test_fionread_hangup_matrix() {
     let r_fn1 = libc::ioctl(pty.master, FIONREAD as _, &mut n_avail);
     report!(fionread_master_after_slave_write = w1 == 5 && r_fn1 == 0 && n_avail == 5);
 
-    // Read bytes from master
+    // Read bytes from master with bounded poll
+    let mut pfd_m = libc::pollfd {
+        fd: pty.master,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let prc_m = libc::poll(&mut pfd_m, 1, 500);
     let mut rbuf = [0u8; 16];
-    let r1 = libc::read(pty.master, rbuf.as_mut_ptr().cast(), rbuf.len());
+    let r1 = if prc_m > 0 {
+        libc::read(pty.master, rbuf.as_mut_ptr().cast(), rbuf.len())
+    } else {
+        -1
+    };
     report!(pty_master_read_slave_data = r1 == 5 && &rbuf[..5] == msg1);
 
     // 6.3 Master writes 4 bytes -> FIONREAD on slave sees 4 bytes
@@ -383,8 +397,18 @@ unsafe fn test_fionread_hangup_matrix() {
     let r_fn2 = libc::ioctl(pty.slave, FIONREAD as _, &mut n_slave);
     report!(fionread_slave_after_master_write = w2 == 4 && r_fn2 == 0 && n_slave == 4);
 
+    let mut pfd_s = libc::pollfd {
+        fd: pty.slave,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let prc_s = libc::poll(&mut pfd_s, 1, 500);
     let mut sbuf = [0u8; 16];
-    let r2 = libc::read(pty.slave, sbuf.as_mut_ptr().cast(), sbuf.len());
+    let r2 = if prc_s > 0 {
+        libc::read(pty.slave, sbuf.as_mut_ptr().cast(), sbuf.len())
+    } else {
+        -1
+    };
     report!(pty_slave_read_master_data = r2 == 4 && &sbuf[..4] == msg2);
 
     // 6.4 FIONREAD on pipe
