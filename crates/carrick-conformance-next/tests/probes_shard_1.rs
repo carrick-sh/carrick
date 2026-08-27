@@ -450,6 +450,8 @@ fn test_shard_1_security_policy_mapping() {
 fn generic_probe_shard_1() {
     let _guard = common::guest_lock();
     let root = common::repo_root();
+    let requested_filter = std::env::var("CARRICK_PROBE_FILTER").ok();
+    let selected_probes = common::select_cached_probes(SHARD_1_PROBES, requested_filter.as_deref());
 
     let targets = [
         (
@@ -484,10 +486,7 @@ fn generic_probe_shard_1() {
         let mut observed_mismatches = Vec::new();
         let mut executed_count = 0;
 
-        for &probe_name in SHARD_1_PROBES {
-            if !common::runs_in_cached_lane(probe_name) {
-                continue;
-            }
+        for &probe_name in &selected_probes {
             let probe_bin = dir.join(probe_name);
             if !probe_bin.is_file() {
                 panic!(
@@ -537,11 +536,17 @@ fn generic_probe_shard_1() {
         }
 
         assert_eq!(
-            executed_count, CACHED_SHARD_1_PROBE_COUNT,
-            "must execute all {CACHED_SHARD_1_PROBE_COUNT} cached probes in shard 1 for libc {libc}"
+            executed_count,
+            selected_probes.len(),
+            "must execute every selected cached shard 1 probe for libc {libc}"
         );
 
-        let expected_set: BTreeSet<&str> = expected_gaps.iter().copied().collect();
+        let selected_set: BTreeSet<&str> = selected_probes.iter().copied().collect();
+        let expected_set: BTreeSet<&str> = expected_gaps
+            .iter()
+            .copied()
+            .filter(|probe| selected_set.contains(probe))
+            .collect();
         let observed_set: BTreeSet<&str> = observed_mismatches.iter().map(String::as_str).collect();
 
         let unexpected_regressions: Vec<&str> =

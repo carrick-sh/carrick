@@ -568,6 +568,9 @@ fn test_probe_binary_locator_and_gap_counts() {
 fn generic_probe_shard_0() {
     let _guard = common::guest_lock();
     let root = common::repo_root();
+    let requested_filter = std::env::var("CARRICK_PROBE_FILTER").ok();
+    let selected_probes = common::select_cached_probes(SHARD_0_PROBES, requested_filter.as_deref());
+    let selected_set: BTreeSet<&str> = selected_probes.iter().copied().collect();
 
     let targets = [
         ("aarch64-unknown-linux-musl", "musl"),
@@ -575,11 +578,14 @@ fn generic_probe_shard_0() {
     ];
 
     for (target, libc) in targets {
-        let expected_gaps = match libc {
+        let expected_gaps: BTreeSet<&str> = match libc {
             "musl" => expected_shard_gaps(MUSL_BASELINE_GAPS),
             "gnu" => expected_shard_gaps(GNU_BASELINE_GAPS),
             _ => unreachable!(),
-        };
+        }
+        .intersection(&selected_set)
+        .copied()
+        .collect();
 
         let probe_dir = find_probe_binary_dir(&root, target).unwrap_or_else(|| {
             panic!(
@@ -600,10 +606,7 @@ fn generic_probe_shard_0() {
         let mut diff_details = Vec::new();
         let mut executed_count = 0usize;
 
-        for probe_name in SHARD_0_PROBES {
-            if !common::runs_in_cached_lane(probe_name) {
-                continue;
-            }
+        for probe_name in &selected_probes {
             eprintln!("RUN generic probe shard 0 {target}:{probe_name}");
             let probe_path = probe_dir.join(probe_name);
             assert!(
@@ -641,8 +644,9 @@ fn generic_probe_shard_0() {
         }
 
         assert_eq!(
-            executed_count, CACHED_SHARD_0_PROBE_COUNT,
-            "must execute exactly {CACHED_SHARD_0_PROBE_COUNT} cached shard 0 probes for target {target}, executed {executed_count}"
+            executed_count,
+            selected_probes.len(),
+            "must execute every selected cached shard 0 probe for target {target}, executed {executed_count}"
         );
 
         let unexpected_failures: BTreeSet<_> = observed_mismatches

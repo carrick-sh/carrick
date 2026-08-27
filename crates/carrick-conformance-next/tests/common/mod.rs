@@ -69,6 +69,41 @@ pub fn probe_filter_allows(probe: &str) -> bool {
     })
 }
 
+pub fn select_cached_probes<'a>(probes: &'a [&'a str], requested: Option<&str>) -> Vec<&'a str> {
+    let requested = requested.map(|names| {
+        names
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .collect::<std::collections::BTreeSet<_>>()
+    });
+
+    probes
+        .iter()
+        .copied()
+        .filter(|probe| runs_in_cached_lane(probe))
+        .filter(|probe| requested.as_ref().is_none_or(|names| names.contains(probe)))
+        .collect()
+}
+
+#[test]
+fn cached_probe_selection_honors_requested_filter_and_lane_classification() {
+    let probes = ["acceptsock", "clockgetres", "telemetrymap"];
+
+    assert_eq!(
+        select_cached_probes(&probes, Some("telemetrymap")),
+        vec!["telemetrymap"]
+    );
+    assert_eq!(
+        select_cached_probes(&probes, Some("acceptsock, telemetrymap")),
+        vec!["acceptsock", "telemetrymap"]
+    );
+    assert_eq!(
+        select_cached_probes(&probes, None),
+        vec!["acceptsock", "telemetrymap"]
+    );
+}
+
 #[test]
 fn retained_probe_manifest_matches_classification() {
     let manifest = std::fs::read_to_string(

@@ -521,6 +521,9 @@ fn test_normalization_rules() {
 fn generic_probe_shard_2() {
     let _guard = common::guest_lock();
     let repo_root = common::repo_root();
+    let requested_filter = std::env::var("CARRICK_PROBE_FILTER").ok();
+    let selected_probes = common::select_cached_probes(SHARD_2_PROBES, requested_filter.as_deref());
+    let selected_set: BTreeSet<&str> = selected_probes.iter().copied().collect();
 
     let targets = [
         (
@@ -536,6 +539,8 @@ fn generic_probe_shard_2() {
     ];
 
     for (target_triple, libc, expected_gaps) in targets {
+        let expected_gaps: BTreeSet<&str> =
+            expected_gaps.intersection(&selected_set).copied().collect();
         let dir = probe_campaign_dir(&repo_root, target_triple).unwrap_or_else(|| {
             panic!("probes directory not found for {target_triple} — run scripts/build-probes.sh")
         });
@@ -550,11 +555,7 @@ fn generic_probe_shard_2() {
         let mut observed_mismatches = BTreeSet::new();
         let mut executed_count = 0;
 
-        for &probe_name in SHARD_2_PROBES {
-            if !common::runs_in_cached_lane(probe_name) || !common::probe_filter_allows(probe_name)
-            {
-                continue;
-            }
+        for &probe_name in &selected_probes {
             let probe_path = dir.join(probe_name);
             assert!(
                 probe_path.is_file(),
@@ -598,11 +599,7 @@ fn generic_probe_shard_2() {
             executed_count += 1;
         }
 
-        let selected_count = SHARD_2_PROBES
-            .iter()
-            .filter(|name| common::runs_in_cached_lane(name) && common::probe_filter_allows(name))
-            .count();
-        assert_eq!(executed_count, selected_count);
+        assert_eq!(executed_count, selected_probes.len());
 
         assert_eq!(
             observed_mismatches,
