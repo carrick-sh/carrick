@@ -3694,6 +3694,76 @@ mod hvpatch_in_process_fork_tests {
     }
 
     #[test]
+    fn in_memory_file_open_handle_survives_fork_and_reexec_filtering() {
+        let child_tid = crate::thread::ThreadId::synthetic_for_tests(4102);
+        let parent = SyscallDispatcher::new();
+        let parent_context = parent.capture_one_task_context().unwrap();
+        let parent_tid = parent_context.thread().registry_id();
+
+        let shared_buf = Arc::new(RwLock::new(b"initial_data".to_vec()));
+        let desc_non_cloexec = kernel_file_description(Arc::new(RwLock::new(
+            OpenDescription::InMemoryFile {
+                base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
+                path: "/in_memory_1.txt".to_string(),
+                contents: Arc::clone(&shared_buf),
+                offset: 0,
+                writable: true,
+                max_size: 1024 * 1024,
+            },
+        )));
+        let desc_cloexec = kernel_file_description(Arc::new(RwLock::new(
+            OpenDescription::InMemoryFile {
+                base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
+                path: "/in_memory_2.txt".to_string(),
+                contents: Arc::new(RwLock::new(b"secret".to_vec())),
+                offset: 0,
+                writable: true,
+                max_size: 1024 * 1024,
+            },
+        )));
+
+        parent.captured_file_table().write_open_files().insert(
+            3,
+            OpenFile::new(Arc::clone(&desc_non_cloexec), 0),
+        );
+        parent.captured_file_table().write_open_files().insert(
+            4,
+            OpenFile::new(Arc::clone(&desc_cloexec), crate::linux_abi::LINUX_FD_CLOEXEC),
+        );
+
+        let (child, _child_context) = fork_dispatcher(&parent, parent_tid, child_tid, 51, 52);
+
+        // 1. Fork preserves both open file descriptions in child
+        {
+            let child_ft = child.captured_file_table();
+            let child_files = child_ft.read_open_files();
+            let child_f3 = child_files.get(&3).unwrap();
+            let child_f4 = child_files.get(&4).unwrap();
+            assert!(Arc::ptr_eq(&desc_non_cloexec, &child_f3.description));
+            assert!(Arc::ptr_eq(&desc_cloexec, &child_f4.description));
+            assert_eq!(child_f3.fd_flags, 0);
+            assert_eq!(child_f4.fd_flags, crate::linux_abi::LINUX_FD_CLOEXEC);
+        }
+
+        // 2. Modifying shared buffer via child is visible to parent
+        shared_buf.write().extend_from_slice(b"_appended");
+        assert_eq!(&*shared_buf.read(), b"initial_data_appended");
+
+        // 3. Exec retains non-CLOEXEC file (fd 3) and closes CLOEXEC file (fd 4)
+        child
+            .captured_file_table()
+            .write_open_files()
+            .retain(|_, of| {
+                !carrick_abi::LinuxFdFlags::from_bits_truncate(of.fd_flags)
+                    .contains(carrick_abi::LinuxFdFlags::CLOEXEC)
+            });
+        let child_ft = child.captured_file_table();
+        let post_exec_files = child_ft.read_open_files();
+        assert!(post_exec_files.contains_key(&3));
+        assert!(!post_exec_files.contains_key(&4));
+    }
+
+    #[test]
     fn hvpatch_exit_notification_observes_retired_inherited_pipe_writer() {
         let mut host_fds = [-1; 2];
         assert_eq!(unsafe { libc::pipe(host_fds.as_mut_ptr()) }, 0);

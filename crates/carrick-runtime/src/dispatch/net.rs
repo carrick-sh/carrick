@@ -657,6 +657,7 @@ impl SyscallDispatcher {
         let open = open_file.description.read();
         match &*open {
             OpenDescription::File { .. }
+            | OpenDescription::InMemoryFile { .. }
             | OpenDescription::Directory { .. }
             | OpenDescription::SyntheticFile { .. } => false,
             OpenDescription::HostFile { metadata, .. } => {
@@ -1803,7 +1804,9 @@ impl SyscallDispatcher {
         let mut ready = 0;
         match &*open {
             OpenDescription::Closed { .. } => ready |= LINUX_POLLNVAL,
-            OpenDescription::File { .. } | OpenDescription::SyntheticFile { .. } => {
+            OpenDescription::File { .. }
+            | OpenDescription::InMemoryFile { .. }
+            | OpenDescription::SyntheticFile { .. } => {
                 if requested_events & LINUX_POLLIN != 0 {
                     ready |= LINUX_POLLIN;
                 }

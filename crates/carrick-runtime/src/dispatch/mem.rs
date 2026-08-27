@@ -2250,6 +2250,15 @@ impl SyscallDispatcher {
                 }
                 shared_file_bus_offset(contents.len() as u64, offset, length_u64, page_size)
             }
+            OpenDescription::InMemoryFile { contents, .. } => {
+                let data = contents.read();
+                if offset_usize < data.len() {
+                    let available = &data[offset_usize..];
+                    let copy_len = available.len().min(length);
+                    bytes[..copy_len].copy_from_slice(&available[..copy_len]);
+                }
+                shared_file_bus_offset(data.len() as u64, offset, length_u64, page_size)
+            }
             OpenDescription::HostFile { host_fd, .. } => {
                 let file_len = host_fd_file_len(host_fd.raw()).ok_or(linux_errno::EIO)?;
                 snapshot_private_host_file(host_fd.raw(), offset, &mut bytes)?;
@@ -3474,7 +3483,8 @@ impl SyscallDispatcher {
                         let open = open_file.description.read();
                         match &*open {
                             OpenDescription::File { path, .. }
-                            | OpenDescription::SyntheticFile { path, .. } => path.clone(),
+                            | OpenDescription::SyntheticFile { path, .. }
+                            | OpenDescription::InMemoryFile { path, .. } => path.clone(),
                             OpenDescription::HostFile { metadata, .. } => {
                                 metadata.path.to_string_lossy().into_owned()
                             }
@@ -4670,6 +4680,27 @@ impl SyscallDispatcher {
                         }
                         if offset_usize < contents.len() {
                             let available = &contents[offset_usize..];
+                            let copy_len = available.len().min(length_usize);
+                            bytes[..copy_len].copy_from_slice(&available[..copy_len]);
+                        }
+                    }
+                    OpenDescription::InMemoryFile { contents, path, .. } => {
+                        let data = contents.read();
+                        if let Some(bus_offset) = shared_file_bus_offset(
+                                data.len() as u64,
+                                offset,
+                                length,
+                                page_size,
+                            )
+                        {
+                            bus_fault_offset = Some(bus_offset);
+                            bus_fault_debug = Some(format!(
+                                "vfs path={path:?} file_len={} desc=InMemoryFile",
+                                data.len()
+                            ));
+                        }
+                        if offset_usize < data.len() {
+                            let available = &data[offset_usize..];
                             let copy_len = available.len().min(length_usize);
                             bytes[..copy_len].copy_from_slice(&available[..copy_len]);
                         }

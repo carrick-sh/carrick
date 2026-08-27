@@ -122,6 +122,7 @@ impl VfsMounts {
         Some(MountRef {
             vfs: self.entries[idx].vfs.as_ref(),
             full_path: path,
+            point: self.entries[idx].point.as_path(),
         })
     }
 
@@ -136,8 +137,10 @@ impl VfsMounts {
             .entries
             .iter()
             .position(|e| path_starts_with_mount(&path, &e.point))?;
+        let entry = &mut self.entries[idx];
         Some(MountRefMut {
-            vfs: self.entries[idx].vfs.as_mut(),
+            point: entry.point.as_path(),
+            vfs: entry.vfs.as_mut(),
             full_path: path,
         })
     }
@@ -169,6 +172,66 @@ impl VfsMounts {
         self.entries.iter().map(|e| e.point.as_path())
     }
 
+    /// Return the synthetic directory entries for mounts directly below `parent`
+    /// (or intermediate directories leading to deeper mounts), so an injected
+    /// mount point appears in the parent directory's `readdir`.
+    pub fn mount_children_of(&self, parent: &str) -> Vec<super::DirEnt> {
+        let Some(parent_canonical) = canonicalise_path(parent) else {
+            return Vec::new();
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+
+        let overridden = self.overridden.read();
+        for entry in &self.entries {
+            let point_str = entry.point.to_string_lossy();
+            if overridden.contains(point_str.as_ref()) {
+                continue;
+            }
+            if point_str == parent_canonical {
+                continue;
+            }
+
+            let tail = if parent_canonical == "/" {
+                point_str.strip_prefix('/')
+            } else if let Some(rest) = point_str.strip_prefix(parent_canonical.as_str()) {
+                rest.strip_prefix('/')
+            } else {
+                None
+            };
+
+            let Some(tail) = tail else {
+                continue;
+            };
+
+            let first_component = match tail.split_once('/') {
+                Some((first, _)) => first,
+                None => tail,
+            };
+
+            if first_component.is_empty() || !seen.insert(first_component.to_string()) {
+                continue;
+            }
+
+            let is_exact_child = !tail.contains('/');
+            let kind = if is_exact_child {
+                entry
+                    .vfs
+                    .lookup(point_str.as_ref())
+                    .map(|md| md.kind)
+                    .unwrap_or(super::EntryKind::Directory)
+            } else {
+                super::EntryKind::Directory
+            };
+
+            out.push(super::DirEnt {
+                name: first_component.to_string(),
+                kind,
+            });
+        }
+        out
+    }
+
     /// Number of mounts.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -182,11 +245,13 @@ impl VfsMounts {
 pub struct MountRef<'a> {
     pub vfs: &'a dyn Vfs,
     pub full_path: String,
+    pub point: &'a Path,
 }
 
 pub struct MountRefMut<'a> {
     pub vfs: &'a mut dyn Vfs,
     pub full_path: String,
+    pub point: &'a Path,
 }
 
 pub struct MountRefRelative<'a> {
@@ -494,5 +559,56 @@ mod tests {
         // The single-component mounts come next in alphabetical order
         // (deterministic tie-break), then root.
         assert_eq!(pts.last().map(String::as_str), Some("/"));
+    }
+
+    #[test]
+    fn mount_children_of_synthesizes_direct_and_nested_children() {
+        let mut m = VfsMounts::new();
+        m.mount("/data", mount("data"));
+        m.mount("/etc/resolv.conf", mount("resolvconf"));
+        m.mount("/mnt/storage/vfs", mount("storage"));
+
+        let root_children = m.mount_children_of("/");
+        let names: Vec<&str> = root_children.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"data"));
+        assert!(names.contains(&"etc"));
+        assert!(names.contains(&"mnt"));
+
+        let data_child = root_children.iter().find(|c| c.name == "data").unwrap();
+        assert_eq!(data_child.kind, EntryKind::File);
+
+        let etc_children = m.mount_children_of("/etc");
+        assert_eq!(etc_children.len(), 1);
+        assert_eq!(etc_children[0].name, "resolv.conf");
+        assert_eq!(etc_children[0].kind, EntryKind::File);
+
+        let mnt_children = m.mount_children_of("/mnt");
+        assert_eq!(mnt_children.len(), 1);
+        assert_eq!(mnt_children[0].name, "storage");
+        assert_eq!(mnt_children[0].kind, EntryKind::Directory);
+    }
+
+    #[test]
+    fn longest_prefix_mount_routing_and_component_boundaries() {
+        let mut m = VfsMounts::new();
+        m.mount("/data", mount("data"));
+        m.mount("/data/inner", mount("data_inner"));
+        m.mount("/", mount("root"));
+
+        // Routes to longest prefix
+        let res_inner = m.resolve("/data/inner/file.txt").unwrap();
+        assert_eq!(res_inner.vfs.name(), "data_inner");
+        assert_eq!(res_inner.point, Path::new("/data/inner"));
+
+        let res_data = m.resolve("/data/file.txt").unwrap();
+        assert_eq!(res_data.vfs.name(), "data");
+        assert_eq!(res_data.point, Path::new("/data"));
+
+        // Path component boundary: /database must NOT match /data
+        let res_database = m.resolve("/database").unwrap();
+        assert_eq!(res_database.vfs.name(), "root");
+
+        let res_database_file = m.resolve("/database/item").unwrap();
+        assert_eq!(res_database_file.vfs.name(), "root");
     }
 }

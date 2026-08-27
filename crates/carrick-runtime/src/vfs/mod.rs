@@ -196,7 +196,7 @@ pub struct DirEnt {
 /// only care about read/write distinctions don't have to decode the
 /// raw Linux O_* bits themselves; the dispatcher does that once
 /// before handing flags to the Vfs.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OpenFlags {
     pub read: bool,
     pub write: bool,
@@ -267,7 +267,7 @@ impl SyntheticDeviceKind {
 ///   `ls /dev` shows the device nodes rather than the (typically empty) `/dev`
 ///   in the OCI image layer. The rootfs `/` mount serves its directories
 ///   through [`RootFsVfs::open_for_dispatch`] instead, not this variant.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum VfsHandle {
     /// A host fd that the dispatcher should route I/O through via the
     /// `HostPipe` `OpenDescription` variant. `is_read_end` controls
@@ -311,7 +311,103 @@ pub enum VfsHandle {
         entries: Vec<DirEnt>,
         status_flags: u32,
     },
+    /// A writable or read-only in-memory regular file backed by a shared buffer.
+    /// The dispatcher routes reads, writes, truncates and memory-mapping directly
+    /// to `contents`.
+    InMemoryFile {
+        path: String,
+        contents: std::sync::Arc<parking_lot::RwLock<Vec<u8>>>,
+        status_flags: u32,
+        writable: bool,
+        max_size: usize,
+    },
 }
+
+impl PartialEq for VfsHandle {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::HostFd {
+                    host_fd: h1,
+                    is_read_end: r1,
+                    status_flags: s1,
+                },
+                Self::HostFd {
+                    host_fd: h2,
+                    is_read_end: r2,
+                    status_flags: s2,
+                },
+            ) => h1 == h2 && r1 == r2 && s1 == s2,
+            (
+                Self::SyntheticDevice {
+                    kind: k1,
+                    status_flags: s1,
+                },
+                Self::SyntheticDevice {
+                    kind: k2,
+                    status_flags: s2,
+                },
+            ) => k1 == k2 && s1 == s2,
+            (
+                Self::Bytes {
+                    path: p1,
+                    contents: c1,
+                    status_flags: s1,
+                },
+                Self::Bytes {
+                    path: p2,
+                    contents: c2,
+                    status_flags: s2,
+                },
+            ) => p1 == p2 && c1 == c2 && s1 == s2,
+            (
+                Self::Pty {
+                    host_fd: h1,
+                    pts_index: i1,
+                    is_master: m1,
+                    status_flags: s1,
+                },
+                Self::Pty {
+                    host_fd: h2,
+                    pts_index: i2,
+                    is_master: m2,
+                    status_flags: s2,
+                },
+            ) => h1 == h2 && i1 == i2 && m1 == m2 && s1 == s2,
+            (
+                Self::Directory {
+                    path: p1,
+                    entries: e1,
+                    status_flags: s1,
+                },
+                Self::Directory {
+                    path: p2,
+                    entries: e2,
+                    status_flags: s2,
+                },
+            ) => p1 == p2 && e1 == e2 && s1 == s2,
+            (
+                Self::InMemoryFile {
+                    path: p1,
+                    contents: c1,
+                    status_flags: s1,
+                    writable: w1,
+                    max_size: m1,
+                },
+                Self::InMemoryFile {
+                    path: p2,
+                    contents: c2,
+                    status_flags: s2,
+                    writable: w2,
+                    max_size: m2,
+                },
+            ) => p1 == p2 && std::sync::Arc::ptr_eq(c1, c2) && s1 == s2 && w1 == w2 && m1 == m2,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for VfsHandle {}
 
 /// Live dispatcher state that some VFS mounts need at `open` time
 /// (e.g. `/proc/self/maps` reflecting the loaded address space).

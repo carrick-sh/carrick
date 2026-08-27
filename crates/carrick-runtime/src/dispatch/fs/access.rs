@@ -484,6 +484,13 @@ impl SyscallDispatcher {
             OpenDescription::File { metadata, .. }
             | OpenDescription::HostFile { metadata, .. }
             | OpenDescription::Directory { metadata, .. } => access_metadata(metadata, mode),
+            OpenDescription::InMemoryFile { writable, .. } => {
+                if (mode & LINUX_X_OK != 0) || (mode & LINUX_W_OK != 0 && !*writable) {
+                    DispatchOutcome::errno(LINUX_EACCES)
+                } else {
+                    DispatchOutcome::Returned { value: 0 }
+                }
+            }
             OpenDescription::SyntheticFile { path, .. } => self
                 .synthetic_access(context, path, mode)
                 .unwrap_or(DispatchOutcome::errno(LINUX_ENOENT)),
