@@ -57,14 +57,17 @@ unsafe fn test_statfs_matrix(base: &str) {
     let tmp_path = CString::new("/tmp").unwrap();
     let mut st: libc::statfs = std::mem::zeroed();
     let r_statfs = libc::statfs(tmp_path.as_ptr(), &mut st);
+    let err_statfs = if r_statfs == -1 { errno() } else { 0 };
 
-    let statfs_fields_ok = r_statfs == 0
-        && st.f_type != 0
-        && st.f_bsize > 0
-        && st.f_blocks > 0
-        && st.f_namelen >= 255
-        && st.f_frsize > 0;
-    report!(statfs_tmp_ok = statfs_fields_ok);
+    report!(
+        statfs_tmp_rc = r_statfs,
+        statfs_tmp_errno = err_statfs,
+        statfs_tmp_ftype_nonzero = st.f_type != 0,
+        statfs_tmp_bsize_positive = st.f_bsize > 0,
+        statfs_tmp_blocks_positive = st.f_blocks > 0,
+        statfs_tmp_namelen_ge_255 = st.f_namelen >= 255,
+        statfs_tmp_frsize_positive = st.f_frsize > 0,
+    );
 
     // 1.2 fstatfs on open file matches statfs
     let reg_path = CString::new(format!("{base}/statfs_file")).unwrap();
@@ -73,36 +76,55 @@ unsafe fn test_statfs_matrix(base: &str) {
         libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
         0o644,
     );
-    if fd >= 0 {
-        let mut fst: libc::statfs = std::mem::zeroed();
-        let r_fstatfs = libc::fstatfs(fd, &mut fst);
-        report!(
-            fstatfs_regfile_matches_statfs = r_fstatfs == 0
-                && fst.f_type == st.f_type
-                && fst.f_bsize == st.f_bsize
-                && fst.f_namelen == st.f_namelen
-        );
-        libc::close(fd);
+    let open_ok = fd >= 0;
+    let mut fst: libc::statfs = std::mem::zeroed();
+    let r_fstatfs = if fd >= 0 {
+        libc::fstatfs(fd, &mut fst)
     } else {
-        report!(fstatfs_regfile_matches_statfs = false);
+        -1
+    };
+    let err_fstatfs = if r_fstatfs == -1 { errno() } else { 0 };
+    report!(
+        fstatfs_regfile_open_ok = open_ok,
+        fstatfs_regfile_rc = r_fstatfs,
+        fstatfs_regfile_errno = err_fstatfs,
+        fstatfs_regfile_match_type = fst.f_type == st.f_type,
+        fstatfs_regfile_match_bsize = fst.f_bsize == st.f_bsize,
+        fstatfs_regfile_match_namelen = fst.f_namelen == st.f_namelen,
+        fstatfs_regfile_match_frsize = fst.f_frsize == st.f_frsize,
+    );
+    if fd >= 0 {
+        libc::close(fd);
     }
 
     // 1.3 statfs on empty path -> ENOENT
     let empty_path = CString::new("").unwrap();
     let mut st_empty: libc::statfs = std::mem::zeroed();
     let r_empty = libc::statfs(empty_path.as_ptr(), &mut st_empty);
-    report!(statfs_empty_path_enoent = r_empty == -1 && errno() == libc::ENOENT);
+    let err_empty = if r_empty == -1 { errno() } else { 0 };
+    report!(
+        statfs_empty_path_rc = r_empty,
+        statfs_empty_path_errno = err_empty,
+    );
 
     // 1.4 statfs on non-existent path -> ENOENT
-    let missing_path = CString::new("/no/such/statfs/path").unwrap();
+    let missing_path = CString::new(format!("{base}/nonexistent_statfs_path")).unwrap();
     let mut st_missing: libc::statfs = std::mem::zeroed();
     let r_missing = libc::statfs(missing_path.as_ptr(), &mut st_missing);
-    report!(statfs_nonexistent_enoent = r_missing == -1 && errno() == libc::ENOENT);
+    let err_missing = if r_missing == -1 { errno() } else { 0 };
+    report!(
+        statfs_nonexistent_rc = r_missing,
+        statfs_nonexistent_errno = err_missing,
+    );
 
     // 1.5 fstatfs on bad fd -> EBADF
     let mut st_bad: libc::statfs = std::mem::zeroed();
     let r_bad_fd = libc::fstatfs(-1, &mut st_bad);
-    report!(fstatfs_bad_fd_ebadf = r_bad_fd == -1 && errno() == libc::EBADF);
+    let err_bad_fd = if r_bad_fd == -1 { errno() } else { 0 };
+    report!(
+        fstatfs_bad_fd_rc = r_bad_fd,
+        fstatfs_bad_fd_errno = err_bad_fd,
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -126,8 +148,9 @@ unsafe fn test_getdents64_matrix(base: &str) {
 
     let c_dir = CString::new(dir_path.as_str()).unwrap();
     let dir_fd = libc::open(c_dir.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY);
+    let dir_open_ok = dir_fd >= 0;
+    report!(getdents64_open_dir_ok = dir_open_ok);
     if dir_fd < 0 {
-        report!(getdents64_setup_ok = false);
         return;
     }
 
@@ -138,6 +161,7 @@ unsafe fn test_getdents64_matrix(base: &str) {
         buf.as_mut_ptr(),
         buf.len(),
     );
+    let err_read = if n_read == -1 { errno() } else { 0 };
 
     let mut saw_reg = false;
     let mut saw_sub = false;
@@ -209,14 +233,16 @@ unsafe fn test_getdents64_matrix(base: &str) {
     }
 
     report!(
-        getdents64_types_and_alignment = saw_reg
-            && saw_sub
-            && saw_lnk
-            && saw_fifo
-            && saw_dot
-            && saw_dotdot
-            && all_reclen_aligned
-            && off_progressive
+        getdents64_initial_nread_positive = n_read > 0,
+        getdents64_initial_errno = err_read,
+        getdents64_saw_dot_dir = saw_dot,
+        getdents64_saw_dotdot_dir = saw_dotdot,
+        getdents64_saw_file_reg = saw_reg,
+        getdents64_saw_subdir_dir = saw_sub,
+        getdents64_saw_symlink_lnk = saw_lnk,
+        getdents64_saw_fifo_node = saw_fifo,
+        getdents64_all_reclen_aligned = all_reclen_aligned,
+        getdents64_off_progressive = off_progressive,
     );
 
     // 2.2 Reaching EOF returns 0
@@ -226,31 +252,46 @@ unsafe fn test_getdents64_matrix(base: &str) {
         buf.as_mut_ptr(),
         buf.len(),
     );
-    report!(getdents64_eof_zero = n_eof == 0);
+    let err_eof = if n_eof == -1 { errno() } else { 0 };
+    report!(getdents64_eof_rc = n_eof, getdents64_eof_errno = err_eof,);
 
     // 2.3 Rewind via lseek(0, SEEK_SET) and re-read
     let r_seek = libc::lseek(dir_fd, 0, libc::SEEK_SET);
+    let err_seek = if r_seek == -1 { errno() } else { 0 };
     let n_rewound = libc::syscall(
         libc::SYS_getdents64,
         dir_fd as libc::c_long,
         buf.as_mut_ptr(),
         buf.len(),
     );
-    report!(getdents64_rewind_ok = r_seek == 0 && n_rewound > 0);
+    let err_rewound = if n_rewound == -1 { errno() } else { 0 };
+    report!(
+        getdents64_lseek_rewind_rc = r_seek,
+        getdents64_lseek_rewind_errno = err_seek,
+        getdents64_rewound_nread_positive = n_rewound > 0,
+        getdents64_rewound_errno = err_rewound,
+    );
 
     // 2.4 getdents64 on regular file -> ENOTDIR
     let reg_c = CString::new(reg_path.as_str()).unwrap();
     let reg_fd = libc::open(reg_c.as_ptr(), libc::O_RDONLY);
-    if reg_fd >= 0 {
-        let r_notdir = libc::syscall(
+    let (r_notdir, err_notdir) = if reg_fd >= 0 {
+        let r = libc::syscall(
             libc::SYS_getdents64,
             reg_fd as libc::c_long,
             buf.as_mut_ptr(),
             buf.len(),
         );
-        report!(getdents64_on_file_enotdir = r_notdir == -1 && errno() == libc::ENOTDIR);
+        let err = if r == -1 { errno() } else { 0 };
         libc::close(reg_fd);
-    }
+        (r, err)
+    } else {
+        (-1, errno())
+    };
+    report!(
+        getdents64_on_file_rc = r_notdir,
+        getdents64_on_file_errno = err_notdir,
+    );
 
     // 2.5 getdents64 on bad fd -> EBADF
     let r_bad_fd = libc::syscall(
@@ -259,7 +300,11 @@ unsafe fn test_getdents64_matrix(base: &str) {
         buf.as_mut_ptr(),
         buf.len(),
     );
-    report!(getdents64_bad_fd_ebadf = r_bad_fd == -1 && errno() == libc::EBADF);
+    let err_bad_fd = if r_bad_fd == -1 { errno() } else { 0 };
+    report!(
+        getdents64_bad_fd_rc = r_bad_fd,
+        getdents64_bad_fd_errno = err_bad_fd,
+    );
 
     // 2.6 Buffer too small for even one dirent -> EINVAL
     let mut small_buf = [0u8; 1];
@@ -269,7 +314,11 @@ unsafe fn test_getdents64_matrix(base: &str) {
         small_buf.as_mut_ptr(),
         1,
     );
-    report!(getdents64_short_buf_einval = r_small == -1 && errno() == libc::EINVAL);
+    let err_small = if r_small == -1 { errno() } else { 0 };
+    report!(
+        getdents64_short_buf_rc = r_small,
+        getdents64_short_buf_errno = err_small,
+    );
 
     libc::close(dir_fd);
 }
@@ -285,8 +334,9 @@ unsafe fn test_xattr_matrix(base: &str) {
         libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
         0o644,
     );
+    let target_open_ok = fd >= 0;
+    report!(xattr_target_open_ok = target_open_ok);
     if fd < 0 {
-        report!(xattr_setup_ok = false);
         return;
     }
 
@@ -301,7 +351,11 @@ unsafe fn test_xattr_matrix(base: &str) {
         attr_val1.len(),
         0,
     );
-    report!(fsetxattr_initial_ok = r_set0 == 0);
+    let err_set0 = if r_set0 == -1 { errno() } else { 0 };
+    report!(
+        fsetxattr_initial_rc = r_set0,
+        fsetxattr_initial_errno = err_set0,
+    );
 
     // 3.2 XATTR_CREATE on already existing attr -> EEXIST
     let attr_val2 = b"archive_payload_v2";
@@ -312,7 +366,11 @@ unsafe fn test_xattr_matrix(base: &str) {
         attr_val2.len(),
         XATTR_CREATE,
     );
-    report!(fsetxattr_create_existing_eexist = r_create_dup == -1 && errno() == libc::EEXIST);
+    let err_create_dup = if r_create_dup == -1 { errno() } else { 0 };
+    report!(
+        fsetxattr_create_existing_rc = r_create_dup,
+        fsetxattr_create_existing_errno = err_create_dup,
+    );
 
     // 3.3 XATTR_REPLACE on missing attr -> ENODATA
     let missing_name = CString::new("user.arch_nonexistent").unwrap();
@@ -323,7 +381,11 @@ unsafe fn test_xattr_matrix(base: &str) {
         attr_val2.len(),
         XATTR_REPLACE,
     );
-    report!(fsetxattr_replace_missing_enodata = r_repl_miss == -1 && errno() == libc::ENODATA);
+    let err_repl_miss = if r_repl_miss == -1 { errno() } else { 0 };
+    report!(
+        fsetxattr_replace_missing_rc = r_repl_miss,
+        fsetxattr_replace_missing_errno = err_repl_miss,
+    );
 
     // 3.4 XATTR_REPLACE on existing attr -> success
     let r_repl_ok = libc::fsetxattr(
@@ -333,11 +395,19 @@ unsafe fn test_xattr_matrix(base: &str) {
         attr_val2.len(),
         XATTR_REPLACE,
     );
-    report!(fsetxattr_replace_existing_ok = r_repl_ok == 0);
+    let err_repl_ok = if r_repl_ok == -1 { errno() } else { 0 };
+    report!(
+        fsetxattr_replace_existing_rc = r_repl_ok,
+        fsetxattr_replace_existing_errno = err_repl_ok,
+    );
 
     // 3.5 Query value size with NULL buffer and size = 0
     let size_query = libc::fgetxattr(fd, attr_name.as_ptr(), core::ptr::null_mut(), 0);
-    report!(fgetxattr_size_query = size_query == attr_val2.len() as isize);
+    let err_size_query = if size_query == -1 { errno() } else { 0 };
+    report!(
+        fgetxattr_size_query_val = size_query,
+        fgetxattr_size_query_errno = err_size_query,
+    );
 
     // 3.6 Buffer too small -> ERANGE
     let mut small_buf = [0u8; 4];
@@ -347,7 +417,11 @@ unsafe fn test_xattr_matrix(base: &str) {
         small_buf.as_mut_ptr().cast(),
         small_buf.len(),
     );
-    report!(fgetxattr_buffer_too_small_erange = r_erange == -1 && errno() == libc::ERANGE);
+    let err_erange = if r_erange == -1 { errno() } else { 0 };
+    report!(
+        fgetxattr_buffer_too_small_rc = r_erange,
+        fgetxattr_buffer_too_small_errno = err_erange,
+    );
 
     // 3.7 Exact readback
     let mut get_buf = [0u8; 64];
@@ -357,13 +431,17 @@ unsafe fn test_xattr_matrix(base: &str) {
         get_buf.as_mut_ptr().cast(),
         get_buf.len(),
     );
+    let err_get = if r_get == -1 { errno() } else { 0 };
     report!(
-        fgetxattr_readback_matches =
-            r_get == attr_val2.len() as isize && &get_buf[..attr_val2.len()] == attr_val2
+        fgetxattr_readback_rc = r_get,
+        fgetxattr_readback_errno = err_get,
+        fgetxattr_readback_payload_matches =
+            r_get == attr_val2.len() as isize && &get_buf[..attr_val2.len()] == attr_val2,
     );
 
     // 3.8 flistxattr size query and list content
     let list_size = libc::flistxattr(fd, core::ptr::null_mut(), 0);
+    let err_list_size = if list_size == -1 { errno() } else { 0 };
     let mut list_buf = vec![
         0u8;
         if list_size > 0 {
@@ -373,30 +451,50 @@ unsafe fn test_xattr_matrix(base: &str) {
         }
     ];
     let r_list = libc::flistxattr(fd, list_buf.as_mut_ptr().cast(), list_buf.len());
+    let err_list = if r_list == -1 { errno() } else { 0 };
     let has_name = r_list > 0
         && list_buf[..r_list as usize]
             .split(|&b| b == 0)
             .any(|s| s == b"user.arch_meta");
-    report!(flistxattr_contains_name = list_size > 0 && r_list == list_size && has_name);
+    report!(
+        flistxattr_size_query_val = list_size,
+        flistxattr_size_query_errno = err_list_size,
+        flistxattr_fetch_rc = r_list,
+        flistxattr_fetch_errno = err_list,
+        flistxattr_contains_name = has_name,
+    );
 
     // 3.9 flistxattr with short buffer -> ERANGE
     let r_list_small = libc::flistxattr(fd, small_buf.as_mut_ptr().cast(), 1);
-    report!(flistxattr_short_buf_erange = r_list_small == -1 && errno() == libc::ERANGE);
+    let err_list_small = if r_list_small == -1 { errno() } else { 0 };
+    report!(
+        flistxattr_short_buf_rc = r_list_small,
+        flistxattr_short_buf_errno = err_list_small,
+    );
 
     // 3.10 fremovexattr missing attr -> ENODATA
     let r_rm_miss = libc::fremovexattr(fd, missing_name.as_ptr());
-    report!(fremovexattr_missing_enodata = r_rm_miss == -1 && errno() == libc::ENODATA);
+    let err_rm_miss = if r_rm_miss == -1 { errno() } else { 0 };
+    report!(
+        fremovexattr_missing_rc = r_rm_miss,
+        fremovexattr_missing_errno = err_rm_miss,
+    );
 
     // 3.11 fremovexattr existing attr -> success
     let r_rm_ok = libc::fremovexattr(fd, attr_name.as_ptr());
+    let err_rm_ok = if r_rm_ok == -1 { errno() } else { 0 };
     let r_get_after = libc::fgetxattr(
         fd,
         attr_name.as_ptr(),
         get_buf.as_mut_ptr().cast(),
         get_buf.len(),
     );
+    let err_get_after = if r_get_after == -1 { errno() } else { 0 };
     report!(
-        fremovexattr_existing_ok = r_rm_ok == 0 && r_get_after == -1 && errno() == libc::ENODATA
+        fremovexattr_existing_rc = r_rm_ok,
+        fremovexattr_existing_errno = err_rm_ok,
+        fgetxattr_after_remove_rc = r_get_after,
+        fgetxattr_after_remove_errno = err_get_after,
     );
 
     // 3.12 Invalid namespace -> EOPNOTSUPP
@@ -408,7 +506,11 @@ unsafe fn test_xattr_matrix(base: &str) {
         attr_val1.len(),
         0,
     );
-    report!(fsetxattr_invalid_ns_eopnotsupp = r_bad_ns == -1 && errno() == libc::EOPNOTSUPP);
+    let err_bad_ns = if r_bad_ns == -1 { errno() } else { 0 };
+    report!(
+        fsetxattr_invalid_ns_rc = r_bad_ns,
+        fsetxattr_invalid_ns_errno = err_bad_ns,
+    );
 
     // 3.13 Bad fd -> EBADF
     let r_bad_fd = libc::fsetxattr(
@@ -418,7 +520,11 @@ unsafe fn test_xattr_matrix(base: &str) {
         attr_val1.len(),
         0,
     );
-    report!(fsetxattr_bad_fd_ebadf = r_bad_fd == -1 && errno() == libc::EBADF);
+    let err_bad_fd = if r_bad_fd == -1 { errno() } else { 0 };
+    report!(
+        fsetxattr_bad_fd_rc = r_bad_fd,
+        fsetxattr_bad_fd_errno = err_bad_fd,
+    );
 
     // 3.14 Symlink user xattr rejection -> EPERM on Linux
     let symlink_path = format!("{base}/xattr_symlink");
@@ -431,7 +537,11 @@ unsafe fn test_xattr_matrix(base: &str) {
         attr_val1.len(),
         0,
     );
-    report!(lsetxattr_symlink_user_eperm = r_sym_xattr == -1 && errno() == libc::EPERM);
+    let err_sym_xattr = if r_sym_xattr == -1 { errno() } else { 0 };
+    report!(
+        lsetxattr_symlink_user_rc = r_sym_xattr,
+        lsetxattr_symlink_user_errno = err_sym_xattr,
+    );
 
     libc::close(fd);
 }
@@ -465,10 +575,15 @@ unsafe fn test_archive_meta_matrix(base: &str) {
         c_follow.as_ptr(),
         AT_SYMLINK_FOLLOW,
     );
+    let err_follow = if r_follow == -1 { errno() } else { 0 };
     let mut st_follow: libc::stat = std::mem::zeroed();
     libc::lstat(c_follow.as_ptr(), &mut st_follow);
     let follow_is_reg = (st_follow.st_mode & libc::S_IFMT) == libc::S_IFREG;
-    report!(linkat_symlink_follow_is_reg = r_follow == 0 && follow_is_reg);
+    report!(
+        linkat_symlink_follow_rc = r_follow,
+        linkat_symlink_follow_errno = err_follow,
+        linkat_symlink_follow_target_is_reg = follow_is_reg,
+    );
 
     // 4.2 linkat with flags = 0 links to symlink itself
     let r_nofollow = libc::linkat(
@@ -478,20 +593,31 @@ unsafe fn test_archive_meta_matrix(base: &str) {
         c_nofollow.as_ptr(),
         0,
     );
+    let err_nofollow = if r_nofollow == -1 { errno() } else { 0 };
     let mut st_nofollow: libc::stat = std::mem::zeroed();
     libc::lstat(c_nofollow.as_ptr(), &mut st_nofollow);
     let nofollow_is_lnk = (st_nofollow.st_mode & libc::S_IFMT) == libc::S_IFLNK;
-    report!(linkat_symlink_nofollow_is_lnk = r_nofollow == 0 && nofollow_is_lnk);
+    report!(
+        linkat_symlink_nofollow_rc = r_nofollow,
+        linkat_symlink_nofollow_errno = err_nofollow,
+        linkat_symlink_nofollow_target_is_lnk = nofollow_is_lnk,
+    );
 
     // 4.3 linkat on directory -> EPERM
     let dummy_link = CString::new(format!("{base}/dummy_dir_link")).unwrap();
     let r_dir_link = libc::linkat(AT_FDCWD, c_dir.as_ptr(), AT_FDCWD, dummy_link.as_ptr(), 0);
-    report!(linkat_directory_eperm = r_dir_link == -1 && errno() == libc::EPERM);
+    let err_dir_link = if r_dir_link == -1 { errno() } else { 0 };
+    report!(
+        linkat_directory_rc = r_dir_link,
+        linkat_directory_errno = err_dir_link,
+    );
 
     // 4.4 fchmodat with AT_SYMLINK_NOFOLLOW -> EOPNOTSUPP on Linux
     let r_chmod_sym = libc::fchmodat(AT_FDCWD, c_symlink.as_ptr(), 0o644, AT_SYMLINK_NOFOLLOW);
+    let err_chmod_sym = if r_chmod_sym == -1 { errno() } else { 0 };
     report!(
-        fchmodat_symlink_nofollow_eopnotsupp = r_chmod_sym == -1 && errno() == libc::EOPNOTSUPP
+        fchmodat_symlink_nofollow_rc = r_chmod_sym,
+        fchmodat_symlink_nofollow_errno = err_chmod_sym,
     );
 
     // 4.5 utimensat with UTIME_NOW and UTIME_OMIT combinations
@@ -506,6 +632,7 @@ unsafe fn test_archive_meta_matrix(base: &str) {
         },
     ];
     let r_utime1 = libc::utimensat(AT_FDCWD, c_target.as_ptr(), ts_now_omit.as_ptr(), 0);
+    let err_utime1 = if r_utime1 == -1 { errno() } else { 0 };
 
     let ts_omit_now = [
         libc::timespec {
@@ -518,7 +645,13 @@ unsafe fn test_archive_meta_matrix(base: &str) {
         },
     ];
     let r_utime2 = libc::utimensat(AT_FDCWD, c_target.as_ptr(), ts_omit_now.as_ptr(), 0);
-    report!(utimensat_now_omit_combinations_ok = r_utime1 == 0 && r_utime2 == 0);
+    let err_utime2 = if r_utime2 == -1 { errno() } else { 0 };
+    report!(
+        utimensat_atime_now_mtime_omit_rc = r_utime1,
+        utimensat_atime_now_mtime_omit_errno = err_utime1,
+        utimensat_atime_omit_mtime_now_rc = r_utime2,
+        utimensat_atime_omit_mtime_now_errno = err_utime2,
+    );
 
     // 4.6 utimensat on symlink with AT_SYMLINK_NOFOLLOW
     let r_utime_sym = libc::utimensat(
@@ -527,7 +660,11 @@ unsafe fn test_archive_meta_matrix(base: &str) {
         ts_now_omit.as_ptr(),
         AT_SYMLINK_NOFOLLOW,
     );
-    report!(utimensat_symlink_nofollow_ok = r_utime_sym == 0);
+    let err_utime_sym = if r_utime_sym == -1 { errno() } else { 0 };
+    report!(
+        utimensat_symlink_nofollow_rc = r_utime_sym,
+        utimensat_symlink_nofollow_errno = err_utime_sym,
+    );
 
     // 4.7 utimensat invalid tv_nsec (1_000_000_000) -> EINVAL
     let ts_invalid = [
@@ -541,7 +678,11 @@ unsafe fn test_archive_meta_matrix(base: &str) {
         },
     ];
     let r_utime_bad = libc::utimensat(AT_FDCWD, c_target.as_ptr(), ts_invalid.as_ptr(), 0);
-    report!(utimensat_invalid_nsec_einval = r_utime_bad == -1 && errno() == libc::EINVAL);
+    let err_utime_bad = if r_utime_bad == -1 { errno() } else { 0 };
+    report!(
+        utimensat_invalid_nsec_rc = r_utime_bad,
+        utimensat_invalid_nsec_errno = err_utime_bad,
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -556,24 +697,41 @@ unsafe fn test_fifo_node_matrix(base: &str) {
 
     // 5.1 mkfifo creates FIFO with exact mode & S_ISFIFO
     let r_mkfifo = libc::mkfifo(c_fifo1.as_ptr(), 0o640);
+    let err_mkfifo = if r_mkfifo == -1 { errno() } else { 0 };
     let mut st_fifo: libc::stat = std::mem::zeroed();
     libc::lstat(c_fifo1.as_ptr(), &mut st_fifo);
     let is_fifo = (st_fifo.st_mode & libc::S_IFMT) == libc::S_IFIFO;
     let mode_ok = (st_fifo.st_mode & 0o777) == 0o640;
-    report!(mkfifo_mode_and_type_ok = r_mkfifo == 0 && is_fifo && mode_ok && st_fifo.st_size == 0);
+    report!(
+        mkfifo_rc = r_mkfifo,
+        mkfifo_errno = err_mkfifo,
+        mkfifo_is_fifo = is_fifo,
+        mkfifo_mode_0640 = mode_ok,
+        mkfifo_size_zero = st_fifo.st_size == 0,
+    );
 
     // 5.2 open(FIFO, O_RDONLY | O_NONBLOCK) succeeds even without writer
     let r_fd = libc::open(c_fifo1.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK);
-    report!(open_fifo_rdonly_nonblock_ok = r_fd >= 0);
+    let err_r_fd = if r_fd == -1 { errno() } else { 0 };
+    report!(
+        open_fifo_rdonly_nonblock_ok = r_fd >= 0,
+        open_fifo_rdonly_nonblock_errno = err_r_fd,
+    );
     if r_fd >= 0 {
         libc::close(r_fd);
     }
 
     // 5.3 open(FIFO, O_WRONLY | O_NONBLOCK) fails with ENXIO when no reader exists
-    libc::mkfifo(c_fifo2.as_ptr(), 0o644);
+    let r_mk2 = libc::mkfifo(c_fifo2.as_ptr(), 0o644);
+    let err_mk2 = if r_mk2 == -1 { errno() } else { 0 };
     let w_fd = libc::open(c_fifo2.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK);
-    let err_w = errno();
-    report!(open_fifo_wronly_nonblock_no_reader_enxio = w_fd == -1 && err_w == libc::ENXIO);
+    let err_w = if w_fd == -1 { errno() } else { 0 };
+    report!(
+        mkfifo_for_writer_rc = r_mk2,
+        mkfifo_for_writer_errno = err_mk2,
+        open_fifo_wronly_nonblock_no_reader_rc = if w_fd >= 0 { 0 } else { -1 },
+        open_fifo_wronly_nonblock_no_reader_errno = err_w,
+    );
     if w_fd >= 0 {
         libc::close(w_fd);
     }
@@ -581,24 +739,36 @@ unsafe fn test_fifo_node_matrix(base: &str) {
     // 5.4 mknodat with S_IFIFO creates FIFO
     let fifo3_path = CString::new(format!("{base}/fifo_mknod")).unwrap();
     let r_mknod_fifo = libc::mknodat(AT_FDCWD, fifo3_path.as_ptr(), libc::S_IFIFO | 0o644, 0);
+    let err_mknod_fifo = if r_mknod_fifo == -1 { errno() } else { 0 };
     let mut st_mknod: libc::stat = std::mem::zeroed();
     libc::lstat(fifo3_path.as_ptr(), &mut st_mknod);
     report!(
-        mknodat_fifo_ok = r_mknod_fifo == 0 && (st_mknod.st_mode & libc::S_IFMT) == libc::S_IFIFO
+        mknodat_fifo_rc = r_mknod_fifo,
+        mknodat_fifo_errno = err_mknod_fifo,
+        mknodat_fifo_is_fifo = (st_mknod.st_mode & libc::S_IFMT) == libc::S_IFIFO,
+        mknodat_fifo_mode_0644 = (st_mknod.st_mode & 0o777) == 0o644,
     );
 
     // 5.5 mknodat with S_IFREG creates regular file
     let reg_mknod_path = CString::new(format!("{base}/reg_mknod")).unwrap();
     let r_mknod_reg = libc::mknodat(AT_FDCWD, reg_mknod_path.as_ptr(), libc::S_IFREG | 0o644, 0);
+    let err_mknod_reg = if r_mknod_reg == -1 { errno() } else { 0 };
     let mut st_reg_mknod: libc::stat = std::mem::zeroed();
     libc::lstat(reg_mknod_path.as_ptr(), &mut st_reg_mknod);
     report!(
-        mknodat_reg_ok = r_mknod_reg == 0 && (st_reg_mknod.st_mode & libc::S_IFMT) == libc::S_IFREG
+        mknodat_reg_rc = r_mknod_reg,
+        mknodat_reg_errno = err_mknod_reg,
+        mknodat_reg_is_reg = (st_reg_mknod.st_mode & libc::S_IFMT) == libc::S_IFREG,
+        mknodat_reg_mode_0644 = (st_reg_mknod.st_mode & 0o777) == 0o644,
     );
 
     // 5.6 mknodat on existing path -> EEXIST
     let r_mknod_dup = libc::mknodat(AT_FDCWD, reg_mknod_path.as_ptr(), libc::S_IFREG | 0o644, 0);
-    report!(mknodat_existing_eexist = r_mknod_dup == -1 && errno() == libc::EEXIST);
+    let err_mknod_dup = if r_mknod_dup == -1 { errno() } else { 0 };
+    report!(
+        mknodat_existing_rc = r_mknod_dup,
+        mknodat_existing_errno = err_mknod_dup,
+    );
 }
 
 // -----------------------------------------------------------------------------

@@ -97,6 +97,7 @@ unsafe fn open_pty_pair() -> Option<PtyPair> {
 unsafe fn test_openpt_matrix() {
     // 1.1 posix_openpt with O_RDWR | O_NOCTTY | O_CLOEXEC | O_NONBLOCK
     let m1 = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    let openpt_opened = m1 >= 0;
     let fd_fl = if m1 >= 0 {
         libc::fcntl(m1, libc::F_GETFD)
     } else {
@@ -108,8 +109,9 @@ unsafe fn test_openpt_matrix() {
         -1
     };
     report!(
-        openpt_rdwr_cloexec_nonblock_ok =
-            m1 >= 0 && fd_fl == libc::FD_CLOEXEC && (fl_fl & libc::O_NONBLOCK) != 0
+        openpt_rdwr_cloexec_nonblock_opened = openpt_opened,
+        openpt_rdwr_cloexec_nonblock_has_cloexec = fd_fl == libc::FD_CLOEXEC,
+        openpt_rdwr_cloexec_nonblock_has_nonblock = fl_fl >= 0 && (fl_fl & libc::O_NONBLOCK) != 0,
     );
     if m1 >= 0 {
         libc::close(m1);
@@ -118,14 +120,22 @@ unsafe fn test_openpt_matrix() {
     // 1.2 Open /dev/ptmx with O_RDONLY -> EINVAL on Linux
     let ptmx_path = CString::new("/dev/ptmx").unwrap();
     let r_rdonly = libc::open(ptmx_path.as_ptr(), libc::O_RDONLY);
-    report!(openpt_rdonly_einval = r_rdonly == -1 && errno() == libc::EINVAL);
+    let err_rdonly = if r_rdonly == -1 { errno() } else { 0 };
+    report!(
+        openpt_rdonly_rc = r_rdonly,
+        openpt_rdonly_errno = err_rdonly,
+    );
     if r_rdonly >= 0 {
         libc::close(r_rdonly);
     }
 
     // 1.3 Open /dev/ptmx with O_WRONLY -> EINVAL on Linux
     let r_wronly = libc::open(ptmx_path.as_ptr(), libc::O_WRONLY);
-    report!(openpt_wronly_einval = r_wronly == -1 && errno() == libc::EINVAL);
+    let err_wronly = if r_wronly == -1 { errno() } else { 0 };
+    report!(
+        openpt_wronly_rc = r_wronly,
+        openpt_wronly_errno = err_wronly,
+    );
     if r_wronly >= 0 {
         libc::close(r_wronly);
     }
@@ -137,20 +147,26 @@ unsafe fn test_openpt_matrix() {
 
 unsafe fn test_pty_ioctl_lock_matrix() {
     let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC);
+    let master_open_ok = master >= 0;
+    report!(pty_master_open_ok = master_open_ok);
     if master < 0 {
-        report!(pty_ioctl_setup_ok = false);
         return;
     }
 
     // 2.1 TIOCGPTN gets valid slave number
     let mut ptn: libc::c_uint = 0;
     let r_ptn = libc::ioctl(master, TIOCGPTN as _, &mut ptn);
-    report!(pty_tiocgptn_ok = r_ptn == 0);
+    let err_ptn = if r_ptn == -1 { errno() } else { 0 };
+    report!(pty_tiocgptn_rc = r_ptn, pty_tiocgptn_errno = err_ptn,);
 
     // 2.2 TIOCSPTLCK unlocks slave
     let unlock: libc::c_int = 0;
     let r_unlock = libc::ioctl(master, TIOCSPTLCK as _, &unlock);
-    report!(pty_tiocsptlck_unlock_ok = r_unlock == 0);
+    let err_unlock = if r_unlock == -1 { errno() } else { 0 };
+    report!(
+        pty_tiocsptlck_unlock_rc = r_unlock,
+        pty_tiocsptlck_unlock_errno = err_unlock,
+    );
 
     // 2.3 Open slave device and verify isatty
     let slave_path = CString::new(format!("/dev/pts/{ptn}")).unwrap();
@@ -159,7 +175,10 @@ unsafe fn test_pty_ioctl_lock_matrix() {
         libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
     );
     let is_tty = if slave >= 0 { libc::isatty(slave) } else { 0 };
-    report!(pty_slave_open_isatty = slave >= 0 && is_tty == 1);
+    report!(
+        pty_slave_open_ok = slave >= 0,
+        pty_slave_isatty = is_tty == 1,
+    );
     if slave >= 0 {
         libc::close(slave);
     }
@@ -169,11 +188,19 @@ unsafe fn test_pty_ioctl_lock_matrix() {
     libc::pipe(pipefd.as_mut_ptr());
     let mut dummy_ptn: libc::c_uint = 0;
     let r_bad_ptn = libc::ioctl(pipefd[0], TIOCGPTN as _, &mut dummy_ptn);
-    report!(pty_tiocgptn_non_pty_enotty = r_bad_ptn == -1 && errno() == libc::ENOTTY);
+    let err_bad_ptn = if r_bad_ptn == -1 { errno() } else { 0 };
+    report!(
+        pty_tiocgptn_non_pty_rc = r_bad_ptn,
+        pty_tiocgptn_non_pty_errno = err_bad_ptn,
+    );
 
     // 2.5 TIOCSPTLCK on non-PTY -> ENOTTY
     let r_bad_lck = libc::ioctl(pipefd[0], TIOCSPTLCK as _, &unlock);
-    report!(pty_tiocsptlck_non_pty_enotty = r_bad_lck == -1 && errno() == libc::ENOTTY);
+    let err_bad_lck = if r_bad_lck == -1 { errno() } else { 0 };
+    report!(
+        pty_tiocsptlck_non_pty_rc = r_bad_lck,
+        pty_tiocsptlck_non_pty_errno = err_bad_lck,
+    );
 
     libc::close(pipefd[0]);
     libc::close(pipefd[1]);
@@ -192,6 +219,7 @@ unsafe fn test_winsize_matrix() {
             return;
         }
     };
+    report!(winsize_setup_ok = true);
 
     // 3.1 Master sets window size via TIOCSWINSZ, slave reads matching size via TIOCGWINSZ
     let ws_set1 = Winsize {
@@ -201,9 +229,17 @@ unsafe fn test_winsize_matrix() {
         ws_ypixel: 480,
     };
     let r_s1 = libc::ioctl(pty.master, TIOCSWINSZ as _, &ws_set1);
+    let err_s1 = if r_s1 == -1 { errno() } else { 0 };
     let mut ws_get1 = Winsize::default();
     let r_g1 = libc::ioctl(pty.slave, TIOCGWINSZ as _, &mut ws_get1);
-    report!(tiocswinsz_master_tiocgwinsz_slave = r_s1 == 0 && r_g1 == 0 && ws_get1 == ws_set1);
+    let err_g1 = if r_g1 == -1 { errno() } else { 0 };
+    report!(
+        tiocswinsz_master_rc = r_s1,
+        tiocswinsz_master_errno = err_s1,
+        tiocgwinsz_slave_rc = r_g1,
+        tiocgwinsz_slave_errno = err_g1,
+        tiocgwinsz_slave_matches_master_set = ws_get1 == ws_set1,
+    );
 
     // 3.2 Slave sets window size via TIOCSWINSZ, master reads matching size via TIOCGWINSZ
     let ws_set2 = Winsize {
@@ -213,21 +249,37 @@ unsafe fn test_winsize_matrix() {
         ws_ypixel: 768,
     };
     let r_s2 = libc::ioctl(pty.slave, TIOCSWINSZ as _, &ws_set2);
+    let err_s2 = if r_s2 == -1 { errno() } else { 0 };
     let mut ws_get2 = Winsize::default();
     let r_g2 = libc::ioctl(pty.master, TIOCGWINSZ as _, &mut ws_get2);
-    report!(tiocswinsz_slave_tiocgwinsz_master = r_s2 == 0 && r_g2 == 0 && ws_get2 == ws_set2);
+    let err_g2 = if r_g2 == -1 { errno() } else { 0 };
+    report!(
+        tiocswinsz_slave_rc = r_s2,
+        tiocswinsz_slave_errno = err_s2,
+        tiocgwinsz_master_rc = r_g2,
+        tiocgwinsz_master_errno = err_g2,
+        tiocgwinsz_master_matches_slave_set = ws_get2 == ws_set2,
+    );
 
     // 3.3 TIOCGWINSZ on pipe -> ENOTTY
     let mut pipefd = [0i32; 2];
     libc::pipe(pipefd.as_mut_ptr());
     let mut ws_bad = Winsize::default();
     let r_pipe = libc::ioctl(pipefd[0], TIOCGWINSZ as _, &mut ws_bad);
-    report!(tiocgwinsz_pipe_enotty = r_pipe == -1 && errno() == libc::ENOTTY);
+    let err_pipe = if r_pipe == -1 { errno() } else { 0 };
+    report!(
+        tiocgwinsz_pipe_rc = r_pipe,
+        tiocgwinsz_pipe_errno = err_pipe,
+    );
 
     // 3.4 TIOCGWINSZ on socket -> ENOTTY
     let sock = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
     let r_sock = libc::ioctl(sock, TIOCGWINSZ as _, &mut ws_bad);
-    report!(tiocgwinsz_socket_enotty = r_sock == -1 && errno() == libc::ENOTTY);
+    let err_sock = if r_sock == -1 { errno() } else { 0 };
+    report!(
+        tiocgwinsz_socket_rc = r_sock,
+        tiocgwinsz_socket_errno = err_sock,
+    );
     if sock >= 0 {
         libc::close(sock);
     }
@@ -243,13 +295,21 @@ unsafe fn test_winsize_matrix() {
 unsafe fn test_termios_matrix() {
     let pty = match open_pty_pair() {
         Some(p) => p,
-        None => return,
+        None => {
+            report!(termios_setup_ok = false);
+            return;
+        }
     };
+    report!(termios_setup_ok = true);
 
     // 4.1 tcgetattr on slave
     let mut tio: libc::termios = std::mem::zeroed();
     let r_get = libc::tcgetattr(pty.slave, &mut tio);
-    report!(termios_tcgetattr_slave_ok = r_get == 0);
+    let err_get = if r_get == -1 { errno() } else { 0 };
+    report!(
+        termios_tcgetattr_slave_rc = r_get,
+        termios_tcgetattr_slave_errno = err_get,
+    );
 
     // 4.2 Modify attributes (raw mode configuration) and apply with TCSANOW
     tio.c_iflag &= !(libc::IGNBRK
@@ -268,35 +328,62 @@ unsafe fn test_termios_matrix() {
     tio.c_cc[libc::VTIME] = 0;
 
     let r_set_now = libc::tcsetattr(pty.slave, libc::TCSANOW, &tio);
+    let err_set_now = if r_set_now == -1 { errno() } else { 0 };
     let mut tio_readback: libc::termios = std::mem::zeroed();
     let r_get2 = libc::tcgetattr(pty.slave, &mut tio_readback);
+    let err_get2 = if r_get2 == -1 { errno() } else { 0 };
     let lflag_ok = (tio_readback.c_lflag & (libc::ECHO | libc::ICANON | libc::ISIG)) == 0;
     let cc_ok = tio_readback.c_cc[libc::VMIN] == 1 && tio_readback.c_cc[libc::VTIME] == 0;
     report!(
-        termios_tcsetattr_tcsanow_roundtrip = r_set_now == 0 && r_get2 == 0 && lflag_ok && cc_ok
+        termios_tcsetattr_tcsanow_rc = r_set_now,
+        termios_tcsetattr_tcsanow_errno = err_set_now,
+        termios_tcgetattr_readback_rc = r_get2,
+        termios_tcgetattr_readback_errno = err_get2,
+        termios_readback_lflag_cleared = lflag_ok,
+        termios_readback_vmin_vtime_ok = cc_ok,
     );
 
     // 4.3 tcsetattr with TCSADRAIN and TCSAFLUSH
     let r_drain = libc::tcsetattr(pty.slave, libc::TCSADRAIN, &tio);
+    let err_drain = if r_drain == -1 { errno() } else { 0 };
     let r_flush = libc::tcsetattr(pty.slave, libc::TCSAFLUSH, &tio);
-    report!(termios_tcsetattr_drain_flush_ok = r_drain == 0 && r_flush == 0);
+    let err_flush = if r_flush == -1 { errno() } else { 0 };
+    report!(
+        termios_tcsetattr_tcsadrain_rc = r_drain,
+        termios_tcsetattr_tcsadrain_errno = err_drain,
+        termios_tcsetattr_tcsaflush_rc = r_flush,
+        termios_tcsetattr_tcsaflush_errno = err_flush,
+    );
 
     // 4.4 tcflush and tcflow on slave
     let r_tcflush = libc::tcflush(pty.slave, libc::TCIOFLUSH);
+    let err_tcflush = if r_tcflush == -1 { errno() } else { 0 };
     let r_tcflow = libc::tcflow(pty.slave, libc::TCOON);
-    report!(termios_tcflush_tcflow_ok = r_tcflush == 0 && r_tcflow == 0);
+    let err_tcflow = if r_tcflow == -1 { errno() } else { 0 };
+    report!(
+        termios_tcflush_tcioflush_rc = r_tcflush,
+        termios_tcflush_tcioflush_errno = err_tcflush,
+        termios_tcflow_tcoon_rc = r_tcflow,
+        termios_tcflow_tcoon_errno = err_tcflow,
+    );
 
     // 4.5 tcgetattr on non-tty -> ENOTTY
     let mut pipefd = [0i32; 2];
     libc::pipe(pipefd.as_mut_ptr());
     let mut tio_pipe: libc::termios = std::mem::zeroed();
     let r_pipe_tio = libc::tcgetattr(pipefd[0], &mut tio_pipe);
-    report!(termios_tcgetattr_pipe_enotty = r_pipe_tio == -1 && errno() == libc::ENOTTY);
+    let err_pipe_tio = if r_pipe_tio == -1 { errno() } else { 0 };
+    report!(
+        termios_tcgetattr_pipe_rc = r_pipe_tio,
+        termios_tcgetattr_pipe_errno = err_pipe_tio,
+    );
 
     // 4.6 tcsetattr with invalid action -> EINVAL
     let r_inv_action = libc::tcsetattr(pty.slave, 9999, &tio);
+    let err_inv_action = if r_inv_action == -1 { errno() } else { 0 };
     report!(
-        termios_tcsetattr_invalid_action_einval = r_inv_action == -1 && errno() == libc::EINVAL
+        termios_tcsetattr_invalid_action_rc = r_inv_action,
+        termios_tcsetattr_invalid_action_errno = err_inv_action,
     );
 
     libc::close(pipefd[0]);
@@ -310,8 +397,12 @@ unsafe fn test_termios_matrix() {
 unsafe fn test_pgrp_ctty_matrix() {
     let pty = match open_pty_pair() {
         Some(p) => p,
-        None => return,
+        None => {
+            report!(pgrp_ctty_setup_ok = false);
+            return;
+        }
     };
+    report!(pgrp_ctty_setup_ok = true);
 
     // 5.1 TIOCGPGRP on slave when not the controlling terminal
     let mut pgrp: libc::pid_t = 0;
@@ -327,7 +418,11 @@ unsafe fn test_pgrp_ctty_matrix() {
     libc::pipe(pipefd.as_mut_ptr());
     let dummy_pgrp = libc::getpgrp();
     let r_spgrp_pipe = libc::ioctl(pipefd[0], TIOCSPGRP as _, &dummy_pgrp);
-    report!(pgrp_tiocspgrp_pipe_enotty = r_spgrp_pipe == -1 && errno() == libc::ENOTTY);
+    let err_spgrp_pipe = if r_spgrp_pipe == -1 { errno() } else { 0 };
+    report!(
+        pgrp_tiocspgrp_pipe_rc = r_spgrp_pipe,
+        pgrp_tiocspgrp_pipe_errno = err_spgrp_pipe,
+    );
 
     // 5.3 TIOCSCTTY on slave: attempt to set controlling terminal
     let r_sctty = libc::ioctl(pty.slave, TIOCSCTTY as _, 0);
@@ -359,8 +454,12 @@ unsafe fn test_pgrp_ctty_matrix() {
 unsafe fn test_fionread_hangup_matrix() {
     let pty = match open_pty_pair() {
         Some(p) => p,
-        None => return,
+        None => {
+            report!(fionread_setup_ok = false);
+            return;
+        }
     };
+    report!(fionread_setup_ok = true);
 
     // Put slave in raw mode so data passes verbatim without transformation
     let mut tio: libc::termios = std::mem::zeroed();
@@ -376,13 +475,26 @@ unsafe fn test_fionread_hangup_matrix() {
     // 6.1 FIONREAD on master before write -> 0 bytes
     let mut n_avail: libc::c_int = -1;
     let r_fn0 = libc::ioctl(pty.master, FIONREAD as _, &mut n_avail);
-    report!(fionread_master_empty_zero = r_fn0 == 0 && n_avail == 0);
+    let err_fn0 = if r_fn0 == -1 { errno() } else { 0 };
+    report!(
+        fionread_master_empty_rc = r_fn0,
+        fionread_master_empty_errno = err_fn0,
+        fionread_master_empty_avail = n_avail,
+    );
 
     // 6.2 Slave writes 5 bytes -> FIONREAD on master sees 5 bytes
     let msg1 = b"hello";
     let w1 = libc::write(pty.slave, msg1.as_ptr().cast(), msg1.len());
+    let err_w1 = if w1 == -1 { errno() } else { 0 };
     let r_fn1 = libc::ioctl(pty.master, FIONREAD as _, &mut n_avail);
-    report!(fionread_master_after_slave_write = w1 == 5 && r_fn1 == 0 && n_avail == 5);
+    let err_fn1 = if r_fn1 == -1 { errno() } else { 0 };
+    report!(
+        slave_write_hello_rc = w1,
+        slave_write_hello_errno = err_w1,
+        fionread_master_after_slave_write_rc = r_fn1,
+        fionread_master_after_slave_write_errno = err_fn1,
+        fionread_master_after_slave_write_avail = n_avail,
+    );
 
     // Read bytes from master with bounded poll
     let mut pfd_m = libc::pollfd {
@@ -397,14 +509,28 @@ unsafe fn test_fionread_hangup_matrix() {
     } else {
         -1
     };
-    report!(pty_master_read_slave_data = r1 == 5 && &rbuf[..5] == msg1);
+    let err_r1 = if r1 == -1 { errno() } else { 0 };
+    report!(
+        pty_master_poll_readable = prc_m > 0 && (pfd_m.revents & libc::POLLIN) != 0,
+        pty_master_read_rc = r1,
+        pty_master_read_errno = err_r1,
+        pty_master_read_payload_matches = r1 == 5 && &rbuf[..5] == msg1,
+    );
 
     // 6.3 Master writes 4 bytes -> FIONREAD on slave sees 4 bytes
     let msg2 = b"ping";
     let w2 = libc::write(pty.master, msg2.as_ptr().cast(), msg2.len());
+    let err_w2 = if w2 == -1 { errno() } else { 0 };
     let mut n_slave: libc::c_int = -1;
     let r_fn2 = libc::ioctl(pty.slave, FIONREAD as _, &mut n_slave);
-    report!(fionread_slave_after_master_write = w2 == 4 && r_fn2 == 0 && n_slave == 4);
+    let err_fn2 = if r_fn2 == -1 { errno() } else { 0 };
+    report!(
+        master_write_ping_rc = w2,
+        master_write_ping_errno = err_w2,
+        fionread_slave_after_master_write_rc = r_fn2,
+        fionread_slave_after_master_write_errno = err_fn2,
+        fionread_slave_after_master_write_avail = n_slave,
+    );
 
     let mut pfd_s = libc::pollfd {
         fd: pty.slave,
@@ -418,44 +544,69 @@ unsafe fn test_fionread_hangup_matrix() {
     } else {
         -1
     };
-    report!(pty_slave_read_master_data = r2 == 4 && &sbuf[..4] == msg2);
+    let err_r2 = if r2 == -1 { errno() } else { 0 };
+    report!(
+        pty_slave_poll_readable = prc_s > 0 && (pfd_s.revents & libc::POLLIN) != 0,
+        pty_slave_read_rc = r2,
+        pty_slave_read_errno = err_r2,
+        pty_slave_read_payload_matches = r2 == 4 && &sbuf[..4] == msg2,
+    );
 
     // 6.4 FIONREAD on pipe
     let mut pipefd = [0i32; 2];
     libc::pipe(pipefd.as_mut_ptr());
     let w_pipe = libc::write(pipefd[1], b"pipe1234".as_ptr().cast(), 8);
+    let err_w_pipe = if w_pipe == -1 { errno() } else { 0 };
     let mut n_pipe: libc::c_int = -1;
     let r_pipe_fn = libc::ioctl(pipefd[0], FIONREAD as _, &mut n_pipe);
-    report!(fionread_pipe_after_write = w_pipe == 8 && r_pipe_fn == 0 && n_pipe == 8);
+    let err_pipe_fn = if r_pipe_fn == -1 { errno() } else { 0 };
+    report!(
+        pipe_write_rc = w_pipe,
+        pipe_write_errno = err_w_pipe,
+        fionread_pipe_rc = r_pipe_fn,
+        fionread_pipe_errno = err_pipe_fn,
+        fionread_pipe_avail = n_pipe,
+    );
     libc::close(pipefd[0]);
     libc::close(pipefd[1]);
 
     // 6.5 FIONBIO enable and disable on master
     let on: libc::c_int = 1;
     let r_on = libc::ioctl(pty.master, FIONBIO as _, &on);
+    let err_on = if r_on == -1 { errno() } else { 0 };
     let fl_on = libc::fcntl(pty.master, libc::F_GETFL);
     let off: libc::c_int = 0;
     let r_off = libc::ioctl(pty.master, FIONBIO as _, &off);
+    let err_off = if r_off == -1 { errno() } else { 0 };
     let fl_off = libc::fcntl(pty.master, libc::F_GETFL);
     report!(
-        fionbio_master_toggle = r_on == 0
-            && (fl_on & libc::O_NONBLOCK) != 0
-            && r_off == 0
-            && (fl_off & libc::O_NONBLOCK) == 0
+        fionbio_enable_rc = r_on,
+        fionbio_enable_errno = err_on,
+        fionbio_enabled_has_nonblock = fl_on >= 0 && (fl_on & libc::O_NONBLOCK) != 0,
+        fionbio_disable_rc = r_off,
+        fionbio_disable_errno = err_off,
+        fionbio_disabled_cleared_nonblock = fl_off >= 0 && (fl_off & libc::O_NONBLOCK) == 0,
     );
 
     // 6.6 Hangup: close slave -> non-blocking master read returns EIO (Linux PTY contract!)
     let pty2 = match open_pty_pair() {
         Some(p) => p,
-        None => return,
+        None => {
+            report!(pty_hangup_setup_ok = false);
+            return;
+        }
     };
+    report!(pty_hangup_setup_ok = true);
     libc::fcntl(pty2.master, libc::F_SETFL, libc::O_NONBLOCK);
     // Close slave
     libc::close(pty2.slave);
     let mut dummy_buf = [0u8; 16];
     let r_eio = libc::read(pty2.master, dummy_buf.as_mut_ptr().cast(), dummy_buf.len());
-    let err_eio = errno();
-    report!(pty_master_read_on_slave_close_eio = r_eio == -1 && err_eio == libc::EIO);
+    let err_eio = if r_eio == -1 { errno() } else { 0 };
+    report!(
+        pty_master_read_on_slave_close_rc = r_eio,
+        pty_master_read_on_slave_close_errno = err_eio,
+    );
     libc::close(pty2.master);
     // Avoid double close in drop
     std::mem::forget(pty2);
