@@ -35,7 +35,10 @@ use carrick_runtime::runtime::DebugStateSnapshot;
 use crate::args::DebugCommand;
 use crate::debug_layout::native_x86_layout_json;
 
-pub(crate) fn run_debug(command: DebugCommand) -> anyhow::Result<()> {
+pub(crate) fn run_debug(
+    command: DebugCommand,
+    store: carrick_image::ImageStore,
+) -> anyhow::Result<()> {
     match command {
         DebugCommand::Core { core } => {
             crate::debug_core::run_debug_core(&core).map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -227,6 +230,15 @@ pub(crate) fn run_debug(command: DebugCommand) -> anyhow::Result<()> {
             no_core,
         } => {
             run_lldb_snapshot(run_id, out_dir, lldb_plugin, no_core)?;
+        }
+        DebugCommand::ContainerGate {
+            image,
+            probe,
+            gate_dir,
+            mode,
+            output,
+        } => {
+            run_container_gate(store, &image, &probe, &gate_dir, mode, &output)?;
         }
     }
     Ok(())
@@ -882,6 +894,144 @@ fn run_hvpatch_kernel_snapshot(
     let snapshot = carrick_runtime::kernel::kernel_debug_fetch(run_id, selected)
         .map_err(|error| anyhow::anyhow!("{error}"))?;
     println!("{}", serde_json::to_string_pretty(&snapshot)?);
+    Ok(())
+}
+
+fn container_gate_request(
+    image: &str,
+    probe: &Path,
+    gate_dir: &Path,
+    role: &str,
+    mode: &str,
+) -> carrick_engine::RunRequest {
+    use camino::Utf8PathBuf;
+    carrick_engine::RunRequest {
+        image_ref: image.to_owned(),
+        platform: Some("linux/arm64".to_owned()),
+        args: vec!["/tmp/p".to_owned(), role.to_owned(), mode.to_owned()],
+        mounts: vec![
+            carrick_engine::Mount {
+                source: Utf8PathBuf::from_path_buf(probe.to_path_buf())
+                    .unwrap_or_else(|p| Utf8PathBuf::from(p.to_string_lossy().into_owned())),
+                target: Utf8PathBuf::from("/tmp/p"),
+                readonly: true,
+            },
+            carrick_engine::Mount {
+                source: Utf8PathBuf::from_path_buf(gate_dir.to_path_buf())
+                    .unwrap_or_else(|p| Utf8PathBuf::from(p.to_string_lossy().into_owned())),
+                target: Utf8PathBuf::from("/gate"),
+                readonly: false,
+            },
+        ],
+        hostname: Some(format!("gate-{role}")),
+        entrypoint_override: Some(Vec::new()),
+        fs: Some(carrick_spec::FsBackendKind::Host),
+        exec_backend: carrick_spec::ExecBackendRequest::HvPatch,
+        pid: carrick_spec::PidMode::Private,
+        network: carrick_spec::NetworkMode::Host,
+        ..carrick_engine::RunRequest::default()
+    }
+}
+
+fn container_gate_outcome(
+    run: &Result<carrick_runtime::runtime::RunResult, carrick_runtime::runtime::RuntimeError>,
+) -> serde_json::Value {
+    match run {
+        Ok(result) => serde_json::json!({
+            "exit_code": result.exit_code,
+            "terminating_signal": result.terminating_signal,
+            "trap_limit_hit": result.trap_limit_hit,
+            "traps": result.traps,
+        }),
+        Err(error) => serde_json::json!({ "error": format!("{error:#}") }),
+    }
+}
+
+/// Two containers, one carrier. Resolution runs under a short-lived tokio
+/// runtime that is dropped before execution (the CLI's own pattern, see
+/// `commands.rs`); execution is plain `Runtime::execute` — on this thread in
+/// sequence, or on two host threads at once.
+fn run_container_gate(
+    store: carrick_image::ImageStore,
+    image: &str,
+    probe: &Path,
+    gate_dir: &Path,
+    mode: crate::args::ContainerGateMode,
+    output: &Path,
+) -> anyhow::Result<()> {
+    use crate::args::ContainerGateMode;
+    if !probe.is_file() {
+        bail!("container_gate probe is not a file: {}", probe.display());
+    }
+    fs::create_dir_all(gate_dir)
+        .with_context(|| format!("failed to create {}", gate_dir.display()))?;
+    carrick_runtime::memory::init_alias_ipa_allocator();
+    carrick_runtime::fs_resolve_cache::init();
+    let engine = carrick_engine::Engine::new(store);
+    let probe_mode = match mode {
+        ContainerGateMode::Sequential => "solo",
+        ContainerGateMode::Concurrent => "paired",
+    };
+    let alpha = crate::runtime_util::block_on_oci(engine.resolve(container_gate_request(
+        image, probe, gate_dir, "alpha", probe_mode,
+    )))
+    .map_err(|error| anyhow::anyhow!("resolve alpha: {error:#}"))?;
+    let beta = crate::runtime_util::block_on_oci(engine.resolve(container_gate_request(
+        image, probe, gate_dir, "beta", probe_mode,
+    )))
+    .map_err(|error| anyhow::anyhow!("resolve beta: {error:#}"))?;
+    let started = Instant::now();
+    let (alpha_run, beta_run) = match mode {
+        ContainerGateMode::Sequential => (
+            carrick_runtime::Runtime::execute(&alpha.spec),
+            carrick_runtime::Runtime::execute(&beta.spec),
+        ),
+        ContainerGateMode::Concurrent => {
+            let alpha_thread = thread::Builder::new()
+                .name("gate-alpha".into())
+                .spawn(move || carrick_runtime::Runtime::execute(&alpha.spec))
+                .context("spawn alpha container thread")?;
+            let beta_thread = thread::Builder::new()
+                .name("gate-beta".into())
+                .spawn(move || carrick_runtime::Runtime::execute(&beta.spec))
+                .context("spawn beta container thread")?;
+            let alpha_run = alpha_thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("alpha container thread panicked"))?;
+            let beta_run = beta_thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("beta container thread panicked"))?;
+            (alpha_run, beta_run)
+        }
+    };
+    let elapsed_ms = started.elapsed().as_millis();
+    let snapshot = carrick_runtime::vm_lifecycle::process_snapshot();
+    let vm_creates = snapshot
+        .events
+        .iter()
+        .filter(|event| {
+            event.operation == carrick_runtime::vm_lifecycle::VmLifecycleOperation::CreateSuccess
+        })
+        .count();
+    let receipt = serde_json::json!({
+        "schema": "carrick.container-gate.v1",
+        "mode": match mode {
+            ContainerGateMode::Sequential => "sequential",
+            ContainerGateMode::Concurrent => "concurrent",
+        },
+        "carrier_pid": std::process::id(),
+        "image": image,
+        "elapsed_ms": elapsed_ms,
+        "vm_create_success_events": vm_creates,
+        "live_containers_after": carrick_runtime::carrier::live_container_count(),
+        "alpha": container_gate_outcome(&alpha_run),
+        "beta": container_gate_outcome(&beta_run),
+    });
+    fs::write(output, serde_json::to_vec_pretty(&receipt)?)
+        .with_context(|| format!("failed to write {}", output.display()))?;
+    carrick_runtime::carrier::shutdown().map_err(|error| anyhow::anyhow!("{error:#}"))?;
+    alpha_run.map_err(|error| anyhow::anyhow!("alpha container: {error:#}"))?;
+    beta_run.map_err(|error| anyhow::anyhow!("beta container: {error:#}"))?;
     Ok(())
 }
 

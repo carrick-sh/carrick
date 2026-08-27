@@ -1172,6 +1172,31 @@ pub(crate) enum DebugCommand {
         #[arg(long = "no-core")]
         no_core: bool,
     },
+    /// Gate B: run two containers (sequential or concurrent) in THIS carrier
+    /// process, and write the structured execution summary to `--output`.
+    ContainerGate {
+        /// OCI image ref to run the containers from (e.g. `ubuntu:24.04`).
+        #[arg(long)]
+        image: String,
+        /// Host path to the `container_gate` probe binary.
+        #[arg(long)]
+        probe: PathBuf,
+        /// Host rendezvous directory, bind-mounted at `/gate` in both.
+        #[arg(long)]
+        gate_dir: PathBuf,
+        /// `sequential` (default) or `concurrent`.
+        #[arg(long, default_value = "sequential")]
+        mode: ContainerGateMode,
+        /// Path to write the JSON receipt to.
+        #[arg(long)]
+        output: PathBuf,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+pub(crate) enum ContainerGateMode {
+    Sequential,
+    Concurrent,
 }
 
 #[derive(Debug, Subcommand)]

@@ -1967,6 +1967,129 @@ fn conformance_native_host_gateway() {
     );
 }
 
+/// Gate B of the embed program (docs/superpowers/specs/2026-08-25-carrick-embed-program-design.md,
+/// "Phase B"): two containers in ONE carrier, first sequentially and then
+/// concurrently, each seeing `getpid() == 1`, its own rootfs marker, its own
+/// hostname, no cross-visible `/proc/<pid>`, and an independent exit status —
+/// on the signed artifact, via `carrick debug container-gate`. One HVF VM
+/// serves both containers (`vm_create_success_events == 1` per invocation).
+#[test]
+fn conformance_container_gate() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let closure = dedicated_closure_mode();
+    let bin = match carrick_bin() {
+        Some(bin) => bin,
+        None if closure => panic!("closure gate requires target/release/carrick"),
+        None => {
+            eprintln!("SKIP conformance_container_gate: target/release/carrick not built");
+            return;
+        }
+    };
+    if !lane_runnable_here(&ARM64) {
+        assert!(!closure, "closure gate requires an arm64 host");
+        eprintln!("SKIP conformance_container_gate: host cannot run linux/arm64 guests");
+        return;
+    }
+    let target = selected_dedicated_probe_target(&ARM64).expect("select dedicated probe target");
+    let probe = probes_dir(target).join("container_gate");
+    if !probe.is_file() {
+        assert!(
+            !closure,
+            "closure gate requires {} — run scripts/build-probes.sh",
+            probe.display()
+        );
+        eprintln!(
+            "SKIP conformance_container_gate: probe not built at {}",
+            probe.display()
+        );
+        return;
+    }
+    ensure_signed(&bin);
+
+    fn assert_report(report: &str, role: &str) {
+        let expected = [
+            format!("role={role}"),
+            "getpid=1".to_string(),
+            format!("hostname=gate-{role}"),
+            "own_marker_written=true".to_string(),
+            "foreign_marker_visible=false".to_string(),
+            "child_comm_visible=true".to_string(),
+            "foreign_proc_visible=false".to_string(),
+            "peer_ready=true".to_string(),
+        ];
+        for line in expected {
+            assert!(
+                report.lines().any(|l| l == line),
+                "{role} report missing `{line}`:\n{report}"
+            );
+        }
+    }
+
+    for mode in ["sequential", "concurrent"] {
+        let gate = tempfile::tempdir().expect("gate tempdir");
+        let receipt_path = gate.path().join("receipt.json");
+        let mut command = Command::new(&bin);
+        command
+            .args([
+                "debug",
+                "container-gate",
+                "--image",
+                ARM64.image,
+                "--mode",
+                mode,
+            ])
+            .arg("--probe")
+            .arg(&probe)
+            .arg("--gate-dir")
+            .arg(gate.path())
+            .arg("--output")
+            .arg(&receipt_path)
+            .env("CARRICK_ACCEPT_ROSETTA_TERMS", "0");
+        let out = run_carrick_probe_process(command, None, Duration::from_secs(240));
+        assert!(
+            !out.timed_out,
+            "container-gate ({mode}) timed out:\n{}",
+            out.normalized_output
+        );
+        assert!(
+            out.exit_status.is_some_and(|s| s.success()),
+            "container-gate ({mode}) failed: {}\nstdout:\n{}\nstderr:\n{}",
+            format_exit_status(out.exit_status.as_ref(), out.timed_out, out.deadline),
+            String::from_utf8_lossy(&out.raw_stdout),
+            String::from_utf8_lossy(&out.raw_stderr)
+        );
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&receipt_path).expect("container-gate receipt"))
+                .expect("parse container-gate receipt");
+        assert_eq!(receipt["mode"], mode);
+        assert_eq!(
+            receipt["alpha"]["exit_code"], 7,
+            "alpha status ({mode}): {receipt}"
+        );
+        assert_eq!(
+            receipt["beta"]["exit_code"], 9,
+            "beta status ({mode}): {receipt}"
+        );
+        assert_eq!(receipt["alpha"]["trap_limit_hit"], false);
+        assert_eq!(receipt["beta"]["trap_limit_hit"], false);
+        assert_eq!(
+            receipt["vm_create_success_events"], 1,
+            "both containers must share ONE HVF VM ({mode}): {receipt}"
+        );
+        assert_eq!(receipt["live_containers_after"], 0);
+        let alpha =
+            std::fs::read_to_string(gate.path().join("alpha.report")).expect("alpha report");
+        let beta = std::fs::read_to_string(gate.path().join("beta.report")).expect("beta report");
+        assert_report(&alpha, "alpha");
+        assert_report(&beta, "beta");
+        if mode == "concurrent" {
+            // Both rendezvous files prove the two inits overlapped in time.
+            assert!(gate.path().join("alpha.scanned").exists());
+            assert!(gate.path().join("beta.scanned").exists());
+        }
+    }
+}
+
 #[test]
 fn conformance_bridge_net_identity() {
     let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -3328,7 +3451,13 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// word too, so vDSO and syscall CLOCK_REALTIME agree afterwards) moves it
 /// from 468 to 469 and the gating rows from 884 to 886 — `generic`, so the
 /// generic set goes 421 to 422.
-const PROBE_SOURCE_COUNT: usize = 469;
+///
+/// `container_gate` (Gate B of the embed program: two containers in ONE
+/// carrier, sequential then concurrent, each pid 1 with its own rootfs,
+/// hostname and /proc; dedicated runner `conformance_container_gate`) moves
+/// the denominator from 469 to 470 and the gating rows from 886 to 888 — 444
+/// conformance sources (422 generic, 22 dedicated).
+const PROBE_SOURCE_COUNT: usize = 470;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
@@ -3358,6 +3487,7 @@ const DEDICATED_PROBE_RUNNERS: &[(&str, &str)] = &[
         "bridge_udp_sendto_unreachable",
         "conformance_bridge_udp_sendto_unreachable",
     ),
+    ("container_gate", "conformance_container_gate"),
     ("host_gateway_client", "conformance_native_host_gateway"),
     (
         "multi_network_client",
@@ -5114,13 +5244,13 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     }
 
     let sources = all_probe_source_names();
-    assert_eq!(DEDICATED_PROBE_RUNNERS.len(), 21);
+    assert_eq!(DEDICATED_PROBE_RUNNERS.len(), 22);
     assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
     let generic = validate_closure_probe_rows(&inventory(), &sources)
         .expect("checked-in closure probe inventory must match the source denominator");
     assert_eq!(generic.len(), 422);
-    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 443);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 886);
+    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 444);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 888);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")

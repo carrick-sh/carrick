@@ -369,6 +369,16 @@ conformance-probes-closure: build
       exit 1
     fi
 
+# Gate B: run the two-container conformance suite (sequential and concurrent)
+# in THIS carrier on the signed artifact.
+gate-containers: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ./scripts/build-probes.sh --closure-arm64
+    CARRICK_PROBE_MODE=closure CARRICK_PROBE_LANE=arm64 CARRICK_EXEC_BACKEND=hvpatch \
+    CARRICK_PROBE_SCENARIO_LIBC=musl cargo test -p carrick-cli --test conformance \
+      conformance_container_gate -- --exact --nocapture
+
 # Re-sign an already-built release binary (rarely needed on its own).
 sign:
     codesign --force --sign - --entitlements scripts/entitlements.plist target/release/carrick

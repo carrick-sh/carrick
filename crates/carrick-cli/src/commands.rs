@@ -1314,7 +1314,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             bail!("trap-capabilities is HVF-only; not available on this backend");
         }
         #[cfg(feature = "platform-macos")]
-        Commands::Debug { command } => run_debug(command)?,
+        Commands::Debug { command } => run_debug(command, store.clone())?,
         #[cfg(any(
             feature = "platform-linux",
             feature = "platform-freebsd",
