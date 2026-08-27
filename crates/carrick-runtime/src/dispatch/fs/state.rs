@@ -712,4 +712,239 @@ mod stdio_sink_tests {
         assert_eq!(parent.stdout(), b"parent out\nchild out\n");
         assert_eq!(parent.stderr(), b"child err\nparent err\n");
     }
+
+    fn dup_fd(dispatcher: &mut SyscallDispatcher, oldfd: u64) -> DispatchOutcome {
+        let mut memory = LinearMemory::new(0, vec![]);
+        let reporter = CompatReporter::default();
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(23, SyscallArgs::from([oldfd, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap()
+    }
+
+    fn dup3_fd(
+        dispatcher: &mut SyscallDispatcher,
+        oldfd: u64,
+        newfd: u64,
+        flags: u64,
+    ) -> DispatchOutcome {
+        let mut memory = LinearMemory::new(0, vec![]);
+        let reporter = CompatReporter::default();
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(24, SyscallArgs::from([oldfd, newfd, flags, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn grandchild_output_captured_across_nested_forks() {
+        let parent = SyscallDispatcher::new();
+        parent.set_stdio_sink(StdioSink::Captured);
+        let parent_context = parent.capture_one_task_context().unwrap();
+        let parent_tid = parent_context.thread().registry_id();
+        let child_tid = crate::thread::ThreadId::from_guest_supplied_tid(2);
+        let child = parent.fork_clone_in_process(parent_tid, child_tid, 10, 11);
+        *child.kernel_binding.write() = parent_context.task_binding();
+
+        let child_context = child.capture_one_task_context().unwrap();
+        let grandchild_tid = crate::thread::ThreadId::from_guest_supplied_tid(3);
+        let mut grandchild = child.fork_clone_in_process(child_tid, grandchild_tid, 20, 21);
+        *grandchild.kernel_binding.write() = child_context.task_binding();
+
+        assert_eq!(
+            write_fd(&mut grandchild, 1, b"grandchild out\n"),
+            DispatchOutcome::Returned { value: 15 }
+        );
+        assert_eq!(
+            write_fd(&mut grandchild, 2, b"grandchild err\n"),
+            DispatchOutcome::Returned { value: 15 }
+        );
+        assert_eq!(parent.stdout(), b"grandchild out\n");
+        assert_eq!(parent.stderr(), b"grandchild err\n");
+    }
+
+    #[test]
+    fn grandchild_output_streamed_to_piped_sink() {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let err = Arc::new(Mutex::new(Vec::new()));
+        let parent = SyscallDispatcher::new();
+        parent.set_stdio_sink(StdioSink::Piped {
+            stdout: Box::new(Recorder(Arc::clone(&out))),
+            stderr: Box::new(Recorder(Arc::clone(&err))),
+        });
+        let parent_context = parent.capture_one_task_context().unwrap();
+        let parent_tid = parent_context.thread().registry_id();
+        let child_tid = crate::thread::ThreadId::from_guest_supplied_tid(2);
+        let child = parent.fork_clone_in_process(parent_tid, child_tid, 10, 11);
+        *child.kernel_binding.write() = parent_context.task_binding();
+
+        let child_context = child.capture_one_task_context().unwrap();
+        let grandchild_tid = crate::thread::ThreadId::from_guest_supplied_tid(3);
+        let mut grandchild = child.fork_clone_in_process(child_tid, grandchild_tid, 20, 21);
+        *grandchild.kernel_binding.write() = child_context.task_binding();
+
+        assert_eq!(
+            write_fd(&mut grandchild, 1, b"grandchild piped out\n"),
+            DispatchOutcome::Returned { value: 21 }
+        );
+        assert_eq!(
+            write_fd(&mut grandchild, 2, b"grandchild piped err\n"),
+            DispatchOutcome::Returned { value: 21 }
+        );
+        assert_eq!(&*out.lock(), b"grandchild piped out\n");
+        assert_eq!(&*err.lock(), b"grandchild piped err\n");
+    }
+
+    #[test]
+    fn child_output_after_plain_dup_captured() {
+        let parent = SyscallDispatcher::new();
+        parent.set_stdio_sink(StdioSink::Captured);
+        let parent_context = parent.capture_one_task_context().unwrap();
+        let parent_tid = parent_context.thread().registry_id();
+        let child_tid = crate::thread::ThreadId::from_guest_supplied_tid(2);
+        let mut child = parent.fork_clone_in_process(parent_tid, child_tid, 10, 11);
+        *child.kernel_binding.write() = parent_context.task_binding();
+
+        let duped = dup_fd(&mut child, 1);
+        let DispatchOutcome::Returned { value: dup_fd_num } = duped else {
+            panic!("dup failed: {:?}", duped);
+        };
+        assert!(dup_fd_num >= 3);
+        assert_eq!(
+            write_fd(&mut child, dup_fd_num as u64, b"via dup(1)\n"),
+            DispatchOutcome::Returned { value: 11 }
+        );
+        assert_eq!(parent.stdout(), b"via dup(1)\n");
+    }
+
+    #[test]
+    fn child_output_after_dup_and_redirection_captured() {
+        let parent = SyscallDispatcher::new();
+        parent.set_stdio_sink(StdioSink::Captured);
+        let parent_context = parent.capture_one_task_context().unwrap();
+        let parent_tid = parent_context.thread().registry_id();
+        let child_tid = crate::thread::ThreadId::from_guest_supplied_tid(2);
+        let mut child = parent.fork_clone_in_process(parent_tid, child_tid, 10, 11);
+        *child.kernel_binding.write() = parent_context.task_binding();
+
+        assert_eq!(
+            dup3_fd(&mut child, 1, 3, 0),
+            DispatchOutcome::Returned { value: 3 }
+        );
+        assert_eq!(
+            write_fd(&mut child, 3, b"via fd 3\n"),
+            DispatchOutcome::Returned { value: 9 }
+        );
+        assert_eq!(parent.stdout(), b"via fd 3\n");
+    }
+
+    #[test]
+    fn subshell_stream_separation_with_dup2_redirection() {
+        let parent = SyscallDispatcher::new();
+        parent.set_stdio_sink(StdioSink::Captured);
+        let parent_context = parent.capture_one_task_context().unwrap();
+        let parent_tid = parent_context.thread().registry_id();
+        let child_tid = crate::thread::ThreadId::from_guest_supplied_tid(2);
+        let mut child = parent.fork_clone_in_process(parent_tid, child_tid, 10, 11);
+        *child.kernel_binding.write() = parent_context.task_binding();
+
+        assert_eq!(
+            write_fd(&mut child, 1, b"OUT\n"),
+            DispatchOutcome::Returned { value: 4 }
+        );
+        // 1>&2: redirect fd 1 to fd 2
+        assert_eq!(
+            dup3_fd(&mut child, 2, 1, 0),
+            DispatchOutcome::Returned { value: 1 }
+        );
+        assert_eq!(
+            write_fd(&mut child, 1, b"ERR\n"),
+            DispatchOutcome::Returned { value: 4 }
+        );
+        assert_eq!(parent.stdout(), b"OUT\n");
+        assert_eq!(parent.stderr(), b"ERR\n");
+    }
+
+    #[test]
+    fn dup_saved_stdout_restore_preserves_capture() {
+        let parent = SyscallDispatcher::new();
+        parent.set_stdio_sink(StdioSink::Captured);
+        let parent_context = parent.capture_one_task_context().unwrap();
+        let parent_tid = parent_context.thread().registry_id();
+        let child_tid = crate::thread::ThreadId::from_guest_supplied_tid(2);
+        let mut child = parent.fork_clone_in_process(parent_tid, child_tid, 10, 11);
+        *child.kernel_binding.write() = parent_context.task_binding();
+
+        // save stdout to fd 10
+        assert_eq!(
+            dup3_fd(&mut child, 1, 10, 0),
+            DispatchOutcome::Returned { value: 10 }
+        );
+        // redirect stdout to stderr
+        assert_eq!(
+            dup3_fd(&mut child, 2, 1, 0),
+            DispatchOutcome::Returned { value: 1 }
+        );
+        assert_eq!(
+            write_fd(&mut child, 1, b"err msg\n"),
+            DispatchOutcome::Returned { value: 8 }
+        );
+        // restore stdout from fd 10
+        assert_eq!(
+            dup3_fd(&mut child, 10, 1, 0),
+            DispatchOutcome::Returned { value: 1 }
+        );
+        assert_eq!(
+            write_fd(&mut child, 1, b"restored out\n"),
+            DispatchOutcome::Returned { value: 13 }
+        );
+
+        assert_eq!(parent.stdout(), b"restored out\n");
+        assert_eq!(parent.stderr(), b"err msg\n");
+    }
+
+    #[test]
+    fn child_output_after_dup_and_redirection_piped() {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let err = Arc::new(Mutex::new(Vec::new()));
+        let parent = SyscallDispatcher::new();
+        parent.set_stdio_sink(StdioSink::Piped {
+            stdout: Box::new(Recorder(Arc::clone(&out))),
+            stderr: Box::new(Recorder(Arc::clone(&err))),
+        });
+        let parent_context = parent.capture_one_task_context().unwrap();
+        let parent_tid = parent_context.thread().registry_id();
+        let child_tid = crate::thread::ThreadId::from_guest_supplied_tid(2);
+        let mut child = parent.fork_clone_in_process(parent_tid, child_tid, 10, 11);
+        *child.kernel_binding.write() = parent_context.task_binding();
+
+        assert_eq!(
+            dup3_fd(&mut child, 1, 3, 0),
+            DispatchOutcome::Returned { value: 3 }
+        );
+        assert_eq!(
+            write_fd(&mut child, 3, b"piped via 3\n"),
+            DispatchOutcome::Returned { value: 12 }
+        );
+        assert_eq!(&*out.lock(), b"piped via 3\n");
+
+        // 1>&2
+        assert_eq!(
+            dup3_fd(&mut child, 2, 1, 0),
+            DispatchOutcome::Returned { value: 1 }
+        );
+        assert_eq!(
+            write_fd(&mut child, 1, b"piped err\n"),
+            DispatchOutcome::Returned { value: 10 }
+        );
+        assert_eq!(&*err.lock(), b"piped err\n");
+    }
 }
