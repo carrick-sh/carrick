@@ -3324,7 +3324,10 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// non-root real uid) moves it again from 466 to 467 and the gating rows from
 /// 880 to 882 — it uses the `generic` runner, so the generic set goes 419 to
 /// 420 while the dedicated set stays at 21.
-const PROBE_SOURCE_COUNT: usize = 467;
+/// `rlimitasdata` (mmap/brk growth past a soft `RLIMIT_AS`/`RLIMIT_DATA` must
+/// return `ENOMEM`) moves it from 467 to 468 and the gating rows from 882 to
+/// 884 — also `generic`, so the generic set goes 420 to 421.
+const PROBE_SOURCE_COUNT: usize = 468;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
@@ -5074,9 +5077,9 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
     let generic = validate_closure_probe_rows(&inventory(), &sources)
         .expect("checked-in closure probe inventory must match the source denominator");
-    assert_eq!(generic.len(), 420);
-    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 441);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 882);
+    assert_eq!(generic.len(), 421);
+    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 442);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 884);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")
