@@ -99,6 +99,12 @@ any number of single-process cases** for this class.
 | host identity | 18 sites | `/proc/<B>/fd/N` returns a dup of **A's** fd |
 | address space | 4 sites + 1 missing capability | `/proc/<pid>/mem` returned the caller's memory |
 
+The carrier-global row is re-counted per static for the embed program in
+[`identity-and-scope-domains-embed-census.md`](identity-and-scope-domains-embed-census.md):
+every `static`/`OnceLock`/`std::env::var` in `carrick-runtime` and
+`carrick-kernel`, classified container-state versus carrier-infra, each with
+its Phase-B destination.
+
 Two are worth stating in full because they are not "wrong errno" bugs.
 
 **The `in_guest` decay** (fixed 2026-08-16). `unregister` dropped a thread from
