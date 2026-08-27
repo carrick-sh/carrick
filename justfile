@@ -167,10 +167,16 @@ test *ARGS:
         # keeping the Rust and Python paired-statistics implementations in
         # agreement. `--lib` on a lib-less package is not an error, it is a
         # no-op, which is why this went unnoticed.
-        # NOT added: carrick-cli's `tests/cli.rs`, whose `run_elf_command_*`
-        # cases execute real guests. This recipe is defined as the tests that do
-        # NOT need the HVF runtime or Docker; those belong to a guest-capable
-        # lane.
+        # NOT added: carrick-cli's `tests/` integration targets. `cli.rs` and
+        # `fs_backend_flag.rs` drive the cargo-built binary via assert_cmd and
+        # run no guest (adding `--test cli --test fs_backend_flag` here is a
+        # follow-up; the recipe body is unchanged in this commit). The others
+        # (`conformance.rs`, `perf_runner.rs`, `dsr_trace_overhead.rs`,
+        # `trace_profile.rs`) shell out to the SIGNED `target/release/carrick`
+        # and run real guests or dtrace. This recipe is defined as the tests
+        # that do NOT need the HVF runtime or Docker; those belong to a
+        # guest-capable lane (`just conformance*`,
+        # `cargo test -p carrick-cli --test <name>`).
         cargo test --workspace --exclude carrick-runtime --exclude carrick-cli --exclude carrick-native-darwin --exclude carrick-host --lib --bins {{ARGS}}
         # The authenticated jit-shape builders/parsers have measured >1 MiB
         # debug frames. Several tests need two in one body; libtest's ~2 MiB

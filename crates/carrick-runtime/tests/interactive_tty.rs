@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 /// missing or unsigned. HVF needs `com.apple.security.hypervisor`, present only
 /// on the build-signed.sh output; the unsigned debug binary fails HV_DENIED.
 fn signed_bin() -> Option<&'static str> {
-    let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/target/release/carrick");
+    let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/release/carrick");
     if !std::path::Path::new(bin).exists() {
         eprintln!("SKIP: {bin} not found — run ./scripts/build-signed.sh first");
         return None;
