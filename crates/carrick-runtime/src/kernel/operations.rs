@@ -2552,6 +2552,7 @@ impl Kernel {
                 return Err(KernelOperationError::StaleContext);
             }
             let caller_revision = caller_record.revision;
+            enforce_rlimit_nproc(&state, parent)?;
             let (child_parent_task, child_parent_revision) = match plan.fork_parent() {
                 ForkParentMode::Caller => (Arc::clone(&parent.task), caller_revision),
                 ForkParentMode::InheritCallerParent => {
@@ -4171,6 +4172,77 @@ fn next_revision(revision: TaskRevision) -> Result<TaskRevision, KernelOperation
         .ok_or(KernelOperationError::RevisionExhausted)
 }
 
+/// `RLIMIT_NPROC` at fork reservation — setrlimit(2): while the number of
+/// extant threads for the caller's REAL user ID is greater than or equal to
+/// the soft limit, `fork(2)` fails with `EAGAIN`; not enforced for real uid 0
+/// or a caller holding effective `CAP_SYS_ADMIN` or `CAP_SYS_RESOURCE`.
+///
+/// Reservation, not `PreparedFork::commit`, is the enforcement point: by the
+/// time `commit` runs, the frame inventory and the parent's backend
+/// transaction have already committed and `vcpu_loop/quiesce.rs` aborts the
+/// carrier on a commit error. Every reservation error still lowers to guest
+/// `EAGAIN` there, and this runs under the same registry write lock `commit`
+/// validates under.
+///
+/// Counting rule (Linux counts threads, not thread-group leaders): every live
+/// thread claim of every live task in the registry whose thread's own real
+/// uid equals the caller's — credentials are per thread. Zombies, retired
+/// threads and in-flight reservations are NOT counted, so two forks racing
+/// exactly at the limit can both win by one; `clone_thread` is not gated.
+/// Both are deliberate approximations.
+fn enforce_rlimit_nproc(
+    state: &RegistryState,
+    caller: &KernelContext,
+) -> Result<(), KernelOperationError> {
+    let ruid = caller.resources.credentials().ruid();
+    if ruid == NsUid::ROOT {
+        return Ok(());
+    }
+    let limit = caller
+        .task()
+        .rlimit(carrick_abi::LinuxResource::Nproc)
+        .rlim_cur;
+    if limit == carrick_abi::LINUX_RLIM_INFINITY {
+        return Ok(());
+    }
+    let caps = caller.task().caps();
+    if caps.has_effective(crate::namespace::process::CAP_SYS_ADMIN)
+        || caps.has_effective(crate::namespace::process::CAP_SYS_RESOURCE)
+    {
+        return Ok(());
+    }
+    // Fast path for the default (8192): fewer live threads in the whole
+    // kernel graph than the limit means no uid can be at it — the ordinary
+    // fork reads no per-thread credentials.
+    let total_threads: usize = state
+        .tasks
+        .values()
+        .map(|record| record.thread_claims.len())
+        .sum();
+    if u64::try_from(total_threads).is_ok_and(|total| total < limit) {
+        return Ok(());
+    }
+    let count = state
+        .tasks
+        .values()
+        .flat_map(|record| {
+            record
+                .thread_claims
+                .keys()
+                .filter_map(|tid| record.task.thread(*tid))
+        })
+        .filter(|thread| thread.resources().credentials().ruid() == ruid)
+        .count();
+    if u64::try_from(count).is_ok_and(|count| count < limit) {
+        return Ok(());
+    }
+    Err(KernelOperationError::ProcessLimitExceeded {
+        uid: ruid,
+        count,
+        limit,
+    })
+}
+
 fn remove_group_member(
     state: &mut RegistryState,
     group_id: ProcessGroupId,
@@ -4250,6 +4322,12 @@ pub enum KernelOperationError {
     ForkParentExited,
     #[error("selected fork parent changed before commit")]
     ForkParentChanged,
+    #[error("RLIMIT_NPROC reached for real uid {uid:?}: {count} live threads, soft limit {limit}")]
+    ProcessLimitExceeded {
+        uid: NsUid,
+        count: usize,
+        limit: u64,
+    },
     #[error("fork does not request a pidfd subscription")]
     UnexpectedPidfdSubscription,
     #[error("fork already has a reserved pidfd subscription")]
@@ -4374,6 +4452,93 @@ mod tests {
         )
         .expect("bootstrap input");
         Kernel::bootstrap_root(input).expect("kernel")
+    }
+
+    /// `RLIMIT_NPROC` is counted per REAL uid over live threads and refused at
+    /// fork RESERVATION — the last point whose error still lowers to guest
+    /// `EAGAIN` (`vcpu_loop/quiesce.rs` aborts the carrier on a `commit`
+    /// failure). It needs TWO live tasks to mean anything: a single task can
+    /// never be at a limit of two.
+    #[test]
+    fn fork_reservation_enforces_rlimit_nproc_per_real_uid() {
+        use carrick_abi::{LinuxResource, LinuxRlimit};
+        use std::convert::Infallible;
+
+        let (kernel, root) = bootstrap(9_300);
+        let user = kernel
+            .update_credentials(&root, |credentials| {
+                credentials
+                    .seed_identity(carrick_abi::NsUid::new(1000), carrick_abi::NsGid::new(1000))
+            })
+            .expect("seed unprivileged credentials");
+        let fork_plan = || ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
+        let set_nproc = |soft: u64| {
+            user.task()
+                .replace_rlimit(LinuxResource::Nproc, |_| {
+                    Ok::<_, Infallible>(LinuxRlimit::new(soft, 8_192))
+                })
+                .expect("set RLIMIT_NPROC");
+        };
+
+        // One live thread for uid 1000 and a soft limit of one: refused.
+        set_nproc(1);
+        assert!(matches!(
+            kernel.reserve_fork(&user, fork_plan(), "refused-at-one".to_owned(), None),
+            Err(KernelOperationError::ProcessLimitExceeded { uid, count: 1, limit: 1 })
+                if uid == carrick_abi::NsUid::new(1000)
+        ));
+
+        // Limit two: the first fork publishes; the second is refused because
+        // the child's leader thread carries the same real uid.
+        set_nproc(2);
+        let reservation = kernel
+            .reserve_fork(&user, fork_plan(), "first child".to_owned(), None)
+            .expect("reserve first child");
+        let child_id = reservation.child_id();
+        let published = reservation
+            .prepare_reference(ThreadId::synthetic_for_tests(9_301))
+            .expect("prepare first child")
+            .commit()
+            .expect("publish first child");
+        drop(published);
+        assert!(kernel.task_is_live(child_id));
+        assert!(matches!(
+            kernel.reserve_fork(&user, fork_plan(), "refused-at-two".to_owned(), None),
+            Err(KernelOperationError::ProcessLimitExceeded {
+                count: 2,
+                limit: 2,
+                ..
+            })
+        ));
+
+        // CAP_SYS_RESOURCE exempts the caller even at the limit.
+        user.task().with_caps(|caps| {
+            caps.effective |= 1u64 << crate::namespace::process::CAP_SYS_RESOURCE;
+        });
+        let exempt = kernel
+            .reserve_fork(&user, fork_plan(), "cap-exempt".to_owned(), None)
+            .expect("CAP_SYS_RESOURCE exempts RLIMIT_NPROC")
+            .prepare_reference(ThreadId::synthetic_for_tests(9_302))
+            .expect("prepare exempt child")
+            .commit()
+            .expect("publish exempt child");
+        drop(exempt);
+
+        // Real uid 0 is exempt: a limit of one with one live thread still forks.
+        let (kernel, root) = bootstrap(9_400);
+        root.task()
+            .replace_rlimit(LinuxResource::Nproc, |_| {
+                Ok::<_, Infallible>(LinuxRlimit::new(1, 1))
+            })
+            .expect("set RLIMIT_NPROC on root");
+        let root_child = kernel
+            .reserve_fork(&root, fork_plan(), "root-exempt".to_owned(), None)
+            .expect("real uid 0 is exempt from RLIMIT_NPROC")
+            .prepare_reference(ThreadId::synthetic_for_tests(9_401))
+            .expect("prepare root child")
+            .commit()
+            .expect("publish root child");
+        drop(root_child);
     }
 
     /// `nice` is inherited at fork and independent thereafter — and, crucially,

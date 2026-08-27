@@ -1714,6 +1714,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "rlimitnproc": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "rlimitresource": {
     "class": "conformance",
     "excluded": false,

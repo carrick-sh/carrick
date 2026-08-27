@@ -3320,7 +3320,11 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// gating rows from 878 to 880 — 440 conformance sources under both
 /// variants; it runs under the dedicated `conformance_bridge_dns_epoll_wake`
 /// runner, so the generic set stays at 419.
-const PROBE_SOURCE_COUNT: usize = 466;
+/// `rlimitnproc` (fork past a soft `RLIMIT_NPROC` must return `EAGAIN` for a
+/// non-root real uid) moves it again from 466 to 467 and the gating rows from
+/// 880 to 882 — it uses the `generic` runner, so the generic set goes 419 to
+/// 420 while the dedicated set stays at 21.
+const PROBE_SOURCE_COUNT: usize = 467;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
@@ -5070,9 +5074,9 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
     let generic = validate_closure_probe_rows(&inventory(), &sources)
         .expect("checked-in closure probe inventory must match the source denominator");
-    assert_eq!(generic.len(), 419);
-    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 440);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 880);
+    assert_eq!(generic.len(), 420);
+    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 441);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 882);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")
