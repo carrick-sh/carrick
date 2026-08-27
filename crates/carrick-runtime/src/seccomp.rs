@@ -323,10 +323,16 @@ impl SeccompSnapshot {
 #[derive(Debug)]
 pub(crate) struct SeccompState {
     programs: Mutex<SeccompSnapshot>,
-    /// Live JIT gate: 1 only while no guest-installed filter exists. Emitted
-    /// identity code reads this aligned atomic word directly with acquire-safe
-    /// x86 load semantics, so a sibling's seccomp install disables every active
-    /// context without waiting for a Rust gateway boundary.
+    /// Live JIT gate AND the lock-free source of truth for [`Self::is_active`]:
+    /// 1 only while no guest-installed filter exists. Emitted identity code
+    /// reads this aligned atomic word directly with acquire-safe x86 load
+    /// semantics, so a sibling's seccomp install disables every active context
+    /// without waiting for a Rust gateway boundary. Invariant: every writer
+    /// (`install`, `install_strict`, `restore`; `fork_clone` builds a fresh
+    /// struct) stores it as exactly `u32::from(!(strict || !filters.is_empty()))`
+    /// while holding `programs`, BEFORE the new programs become visible, so a
+    /// reader never needs the lock to learn whether seccomp is active and can
+    /// never skip `check` for a filter that is already live.
     identity_fast_path_allowed: AtomicU32,
 }
 
@@ -350,9 +356,14 @@ impl SeccompState {
             return Err("invalid seccomp snapshot");
         }
         let active = snapshot.strict || !snapshot.filters.is_empty();
-        *self.programs.lock() = snapshot.clone();
+        // Hold the guard across the store and flip the word BEFORE the
+        // programs are visible — the same order `install` uses — so a
+        // lock-free `is_active` reader can never see restored filters while
+        // the word still says "inactive".
+        let mut programs = self.programs.lock();
         self.identity_fast_path_allowed
             .store(u32::from(!active), Ordering::Release);
+        *programs = snapshot.clone();
         Ok(())
     }
 
@@ -397,9 +408,16 @@ impl SeccompState {
         &self.identity_fast_path_allowed
     }
 
+    /// `true` once strict mode is set or any filter is installed — the
+    /// per-syscall gate for `seccomp_precheck` and the identity shim. One
+    /// acquire load of `identity_fast_path_allowed`, never a lock on
+    /// `programs` (see the field's invariant). The word flips to 0 BEFORE a
+    /// filter is pushed so the JIT gate can never race past a live filter; a
+    /// reader that observes that early `true` only proceeds into `check`,
+    /// which does lock and therefore sees the pushed filter. Filters are
+    /// irreversible, so the word never goes back to 1.
     pub(crate) fn is_active(&self) -> bool {
-        let programs = self.programs.lock();
-        programs.strict || !programs.filters.is_empty()
+        self.identity_fast_path_allowed.load(Ordering::Acquire) == 0
     }
 
     /// Evaluate all installed filters against `data` and return the winning
@@ -809,5 +827,101 @@ mod tests {
             SECCOMP_RET_KILL_PROCESS,
             "x86_64 strict mode should kill close(2)"
         );
+    }
+
+    /// `seccomp_precheck` asks `is_active` on every guest syscall that goes
+    /// through `dispatch_threaded` (and `identity_fast_path_enabled` asks it
+    /// whenever a vCPU context is published), so it must be a plain atomic
+    /// load: taking `programs` there serialises every vCPU thread of a Linux
+    /// process on one mutex, in the common case where no filter is
+    /// installed. Hold the lock on this thread and prove a sibling thread's
+    /// `is_active` still answers.
+    #[test]
+    fn is_active_does_not_take_the_programs_lock() {
+        let state = SeccompState::default();
+        state
+            .install(deny_nr_filter(101, 1))
+            .expect("install valid filter");
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        std::thread::scope(|scope| {
+            // Declared INSIDE the scope closure so a failing assertion drops
+            // the guard during unwinding, before `scope` joins the sibling.
+            let held = state.programs.lock();
+            let state = &state;
+            scope.spawn(move || {
+                let _ = tx.send(state.is_active());
+            });
+            let answer = rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("is_active blocked behind the programs lock");
+            assert!(answer, "an installed filter must report active");
+            drop(held);
+        });
+    }
+
+    /// `is_active` must equal `strict || !filters.is_empty()` after every
+    /// transition, and a filter is irreversible: once active, every later
+    /// install, snapshot/restore and fork keeps it active. This pins the
+    /// contract the lock-free read relies on: each writer stores the atomic
+    /// word as exactly `u32::from(!active)` before its programs are visible.
+    #[test]
+    fn is_active_tracks_installed_filters_and_never_reverts() {
+        fn locked_truth(state: &SeccompState) -> bool {
+            let programs = state.programs.lock();
+            programs.strict || !programs.filters.is_empty()
+        }
+
+        let state = SeccompState::default();
+        assert!(!state.is_active());
+        assert_eq!(state.is_active(), locked_truth(&state));
+
+        state
+            .install(deny_nr_filter(101, 1))
+            .expect("install first filter");
+        assert!(state.is_active());
+        assert_eq!(state.is_active(), locked_truth(&state));
+
+        state
+            .install(deny_nr_filter(202, 1))
+            .expect("install second filter");
+        assert!(state.is_active(), "a second install must keep it active");
+        assert_eq!(state.is_active(), locked_truth(&state));
+
+        // A rejected install must not flip an inactive state.
+        let fresh = SeccompState::default();
+        assert_eq!(
+            fresh.install(Vec::new()),
+            Err(SeccompInstallError::InvalidProgram)
+        );
+        assert!(!fresh.is_active());
+        assert_eq!(fresh.is_active(), locked_truth(&fresh));
+
+        // Restore follows the snapshot: active stays active, empty stays off.
+        let restored = SeccompState::default();
+        restored
+            .restore(&state.snapshot())
+            .expect("restore active snapshot");
+        assert!(restored.is_active());
+        assert_eq!(restored.is_active(), locked_truth(&restored));
+        let empty = SeccompState::default();
+        empty
+            .restore(&SeccompSnapshot::default())
+            .expect("restore empty snapshot");
+        assert!(!empty.is_active());
+        assert_eq!(empty.is_active(), locked_truth(&empty));
+
+        // Fork inherits the parent's activity in both directions.
+        let child = state.fork_clone();
+        assert!(child.is_active());
+        assert_eq!(child.is_active(), locked_truth(&child));
+        let quiet_child = SeccompState::default().fork_clone();
+        assert!(!quiet_child.is_active());
+        assert_eq!(quiet_child.is_active(), locked_truth(&quiet_child));
+
+        // Strict mode is active with no filter program at all.
+        let strict = SeccompState::default();
+        strict.install_strict();
+        assert!(strict.is_active());
+        assert_eq!(strict.is_active(), locked_truth(&strict));
     }
 }
