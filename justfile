@@ -40,7 +40,11 @@ build *ARGS:
     fi
     exec cargo build --release -p carrick-cli {{_platform_features}} {{ARGS}}
 
-# Build the runnable binary with debug entitlements (get-task-allow) for lldb attaching.
+# Build the runnable RELEASE binary with debug entitlements (get-task-allow) for
+# lldb attaching. NOTE: this is an optimized release build that is merely
+# DEBUGGABLE — it is not the debug profile, so `debug_assert!` is compiled out.
+# For a guest run that actually evaluates `debug_assert!`, use
+# `just build-debug-profile`.
 build-debug *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -48,6 +52,25 @@ build-debug *ARGS:
         exec ./scripts/build-signed.sh --debug {{ARGS}}
     fi
     exec cargo build -p carrick-cli {{_platform_features}} {{ARGS}}
+
+# Build + sign the DEBUG PROFILE so `debug_assert!` is live in a guest run.
+#
+# Every other signed lane is a release build, so every `debug_assert!` on the
+# HVPatch boot path — the stage-1 TTBR0 consistency check in
+# `hvpatch/mod.rs`, among others — is compiled out and can never fire in any
+# runnable configuration. Without this recipe those assertions are decoration:
+# an invariant that looks guarded and is not. Slow, and never a perf or
+# conformance artifact; use it to make a boot-path invariant actually assert.
+build-debug-profile *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build -p carrick-cli {{_platform_features}} {{ARGS}}
+    if [ "{{os()}}" = "macos" ]; then
+        codesign -f -s - --entitlements scripts/entitlements-debug.plist target/debug/carrick
+        codesign -d --entitlements - target/debug/carrick 2>&1 | grep -q hypervisor \
+            || { echo "build-debug-profile: hypervisor entitlement missing after signing" >&2; exit 1; }
+        echo "built + signed (debug profile, debug_assert live): target/debug/carrick"
+    fi
 
 # Build + sign, then run the signed binary (e.g. `just run run ubuntu:24.04 /bin/echo hi`).
 run *ARGS: build
