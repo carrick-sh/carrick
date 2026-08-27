@@ -2742,17 +2742,7 @@ impl SyscallDispatcher {
         response[2..4].fill(0);
         let checksum = internet_checksum(&response);
         response[2..4].copy_from_slice(&checksum.to_be_bytes());
-        let Some(open_file) = self.open_file(fd) else {
-            return false;
-        };
-        let mut open = open_file.description.write();
-        let OpenDescription::HostSocket { synthetic_recv, .. } = &mut *open else {
-            return false;
-        };
-        synthetic_recv.push_back((response, source));
-        drop(open);
-        self.notify_inmem_epoll();
-        true
+        self.queue_synthetic_datagram(fd, response, source)
     }
 
     fn maybe_queue_dns_response(
@@ -2778,14 +2768,32 @@ impl SyscallDispatcher {
         }) else {
             return false;
         };
+        self.queue_synthetic_datagram(fd, response, source)
+    }
+
+    /// Park a datagram carrick produced in-process on `fd`'s synthetic receive
+    /// queue and publish the readiness change.
+    ///
+    /// The host kernel never sees these bytes, so nothing on an epoll
+    /// instance's kqueue fires for them: a waiter already parked in
+    /// `epoll_wait` must be pulsed through `notify_inmem_epoll`, after which
+    /// its re-sample (`epoll_ready_events`) reports the queue as EPOLLIN. A
+    /// `recvfrom`/`recvmsg` issued after the send needs no wake -- it drains
+    /// this queue before touching the host fd (`synthetic_datagram_drain`).
+    /// Every in-process datagram producer (ICMP echo, the DNS gateway) goes
+    /// through here so none can forget the broadcast again.
+    fn queue_synthetic_datagram(&self, fd: i32, payload: Vec<u8>, source: Vec<u8>) -> bool {
         let Some(open_file) = self.open_file(fd) else {
             return false;
         };
-        let mut open = open_file.description.write();
-        let OpenDescription::HostSocket { synthetic_recv, .. } = &mut *open else {
-            return false;
-        };
-        synthetic_recv.push_back((response, source));
+        {
+            let mut open = open_file.description.write();
+            let OpenDescription::HostSocket { synthetic_recv, .. } = &mut *open else {
+                return false;
+            };
+            synthetic_recv.push_back((payload, source));
+        }
+        self.notify_inmem_epoll();
         true
     }
 
@@ -3352,6 +3360,95 @@ mod synthetic_datagram_readiness_tests {
         assert!(dispatcher.synthetic_datagram_drain(fd).is_some());
         assert_eq!(dispatcher.epoll_ready_events(fd, LINUX_EPOLLIN), 0);
         assert_eq!(dispatcher.host_read_avail_for_poll(fd), 0);
+    }
+}
+
+#[cfg(test)]
+mod dns_gateway_wake_tests {
+    use super::*;
+    use hickory_proto::op::{Message, Query};
+    use hickory_proto::rr::{Name, RecordType};
+
+    fn poll_fd_readable(fd: i32) -> bool {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd as *mut _, 1, 0) };
+        rc == 1 && pfd.revents & libc::POLLIN != 0
+    }
+
+    /// The bridge DNS gateway answers a guest query in-process, straight into
+    /// the socket's `synthetic_recv`. A thread already parked in `epoll_wait`
+    /// on that socket sits on the instance kqueue, which only the host kernel
+    /// or `notify_inmem_epoll` can pulse; the host never sees the reply, so
+    /// the gateway must publish the wake itself (as the ICMP echo path does).
+    #[test]
+    fn dns_gateway_reply_wakes_parked_epoll_instance() {
+        let network = crate::network::RuntimeNetwork::create(
+            &carrick_spec::NetworkNamespaceSpec::bridge_default(
+                Some("dns-epoll-wake".to_string()),
+                Vec::new(),
+                Vec::new(),
+            ),
+        )
+        .expect("create bridge network");
+        // Direct field assignment (net.rs is a child module of `dispatch`, so
+        // the private field is visible) rather than
+        // `SyscallDispatcher::with_network`: that constructor also publishes
+        // the root net view process-wide and mounts `/etc/resolv.conf`,
+        // neither of which this test needs and the former of which would leak
+        // into sibling tests in the same process.
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.network = Arc::new(network);
+        let gateway =
+            std::net::SocketAddr::new(std::net::IpAddr::V4(dispatcher.network.spec.gateway_v4), 53);
+        assert!(dispatcher.is_dns_gateway_addr(gateway));
+
+        let fd = match dispatcher.host_socket_install(LINUX_AF_INET, LINUX_SOCK_DGRAM, 0) {
+            DispatchOutcome::Returned { value } => value as i32,
+            other => panic!("udp socket creation failed: {other:?}"),
+        };
+
+        // Exactly what `epoll_create1` builds (net.rs:4430-4439): a multiplexer
+        // with its user-wake armed, registered in THIS dispatcher's wake
+        // registry.
+        let mut mux = crate::event_mux::make_event_multiplexer().expect("event multiplexer");
+        mux.register_user(0).expect("register user wake");
+        let epoll = crate::dispatch::EpollKqueue::new(
+            mux,
+            Arc::clone(dispatcher.captured_file_table().epoll_wake_registry()),
+        );
+        assert!(
+            !poll_fd_readable(epoll.poll_fd()),
+            "a fresh epoll instance must be quiet"
+        );
+
+        let mut query = Message::query();
+        query.add_query(Query::query(
+            Name::from_ascii("localhost.").expect("name"),
+            RecordType::A,
+        ));
+        let request = query.to_vec().expect("encode query");
+
+        assert!(
+            dispatcher.maybe_queue_dns_response(fd, &request, gateway),
+            "the gateway must answer a query addressed to gateway_v4:53"
+        );
+        assert!(
+            poll_fd_readable(epoll.poll_fd()),
+            "DNS gateway reply must wake the epoll instance's poll fd"
+        );
+
+        let (reply, source) = dispatcher
+            .synthetic_datagram_drain(fd)
+            .expect("reply queued on the querying socket");
+        assert_eq!(
+            Message::from_vec(&reply).expect("parse reply").metadata.id,
+            query.metadata.id
+        );
+        assert_eq!(source, socket_addr_to_linux_sockaddr(gateway).unwrap());
     }
 }
 
