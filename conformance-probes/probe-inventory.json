@@ -2289,6 +2289,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "vfs_mount_rw": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "waitexitstorm": {
     "class": "conformance",
     "excluded": false,
