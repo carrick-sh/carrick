@@ -38,7 +38,7 @@ pub use clone_plan::{
 };
 pub use container::{
     ClockDomain, Container, ContainerId, LaunchAuthorization, LaunchContext, RegistryContainerId,
-    RunId,
+    RunId, SignedDuration, TimeControl, TimeError,
 };
 pub use crash_capture::{
     CrashCaptureAuthority, CrashCaptureGeneration, CrashGenerationExhausted, CrashQuorum,

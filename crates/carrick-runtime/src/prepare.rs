@@ -102,6 +102,7 @@ pub fn resolve_plan(spec: &RunSpec, launch: LaunchContext) -> Result<ExecutionPl
 pub struct RuntimeExtensions {
     vfs_mounts: Vec<(Utf8PathBuf, Box<dyn Vfs>)>,
     stdio: Option<StdioSink>,
+    time: Option<crate::kernel::container::TimeControl>,
 }
 
 impl RuntimeExtensions {
@@ -118,6 +119,12 @@ impl RuntimeExtensions {
     /// `resolve_stdio`) — never a silent override of the spec.
     pub fn stdio(mut self, sink: StdioSink) -> Self {
         self.stdio = Some(sink);
+        self
+    }
+
+    /// Time control for the container.
+    pub fn time(mut self, control: crate::kernel::container::TimeControl) -> Self {
+        self.time = Some(control);
         self
     }
 }
@@ -348,17 +355,23 @@ impl Runtime {
             crate::fs_resolve_cache::init();
         });
 
-        let RuntimeExtensions { vfs_mounts, stdio } = ext;
+        let RuntimeExtensions {
+            vfs_mounts,
+            stdio,
+            time,
+        } = ext;
         let sink = resolve_stdio(spec, stdio)?;
         if spec.platform == Platform::Amd64 {
             rosetta_license_notice();
         }
         let plan = resolve_plan(spec, launch)?;
 
-        let container = Arc::new(
-            crate::kernel::Container::new(plan.launch.clone())
-                .with_launch_capabilities(&spec.cap_add),
-        );
+        let mut container = crate::kernel::Container::new(plan.launch.clone())
+            .with_launch_capabilities(&spec.cap_add);
+        if let Some(control) = time {
+            container = container.with_time_control(control);
+        }
+        let container = Arc::new(container);
 
         match spec.pid {
             PidMode::Host => {}
