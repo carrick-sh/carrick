@@ -1034,15 +1034,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 850769,
-        "byte_start": 850757,
+        "byte_end": 852104,
+        "byte_start": 852092,
         "column": 21,
         "column_end": 33,
         "column_start": 21,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 19537,
-        "line_end": 19537,
-        "line_start": 19537
+        "line": 19562,
+        "line_end": 19562,
+        "line_start": 19562
       }
     },
     {
@@ -1055,15 +1055,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 853400,
-        "byte_start": 853388,
+        "byte_end": 854735,
+        "byte_start": 854723,
         "column": 36,
         "column_end": 48,
         "column_start": 36,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 19583,
-        "line_end": 19583,
-        "line_start": 19583
+        "line": 19608,
+        "line_end": 19608,
+        "line_start": 19608
       }
     },
     {
@@ -1076,15 +1076,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 855717,
-        "byte_start": 855705,
+        "byte_end": 857052,
+        "byte_start": 857040,
         "column": 25,
         "column_end": 37,
         "column_start": 25,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 19624,
-        "line_end": 19624,
-        "line_start": 19624
+        "line": 19649,
+        "line_end": 19649,
+        "line_start": 19649
       }
     },
     {
@@ -12796,9 +12796,9 @@
       }
     }
   ],
-  "rows_sha256": "5a35a11b7e39939d92743b4c497bf5c26cc0f261dab75c109c3a2b7f918b1161",
+  "rows_sha256": "8775e45e349b3dc5ebf6cc6249da748bc63a08e3822c6bf291c793dfab4672a7",
   "schema": 1,
-  "source_head": "27a8af5595d383327a3dedf6f058b47efff38b6c",
+  "source_head": "eb4a4ea40cc8890dc58e5a87469df1f6a48834fe",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
