@@ -1,6 +1,6 @@
 # Carrick exact conformance closure handoff
 
-**Updated:** 2026-08-27 (session 12 — exhaustive 20-second-cap census complete; first clock regression closed at `f375ea664`; full suite still red)
+**Updated:** 2026-08-27 (session 13 — four aggregate reducers split into exact atomic assertions; focused embedded gate green in under 4 seconds; full suite still red)
 
 **Canonical host/lane:** macOS, Apple Silicon, HVF/HVPatch, Linux arm64 guest
 
@@ -56,6 +56,48 @@ Execution is a directed-worker model:
 Complete only when fail-closed gate integrity, exact correctness, and the <=2x
 performance gate pass together on the final integrated signed artifact. Do not
 push unless explicitly asked. Preserve unrelated worktree changes.
+
+## SESSION 13 — 2026-08-27: atomic reducers expose hidden gap clusters
+
+Three parallel Antigravity workers mechanically split `eventwaitmatrix`,
+`lifecycleflagmatrix`, `archiveflagmatrix`, and `ptyflagmatrix` into exact
+per-subcase observations. Codex reviewed the actual diffs for scenario loss,
+errno capture ordering, cleanup safety, and timeout inflation before integrating
+them as `8430e4673`, `677b04955`, and `4e6eef72e`. No runtime behavior or
+subprocess strategy changed. Every lifecycle section retains a 500 ms monotonic
+deadline, PTY readiness uses two bounded 500 ms polls, and there are no new
+unbounded waits.
+
+The four probes were rebuilt and executed in serial Docker-only phases for both
+arm64 musl and arm64 glibc. Their eight committed oracle bodies were produced
+independently and are byte-identical across the two libc lanes; each carries the
+new exact source hash. Cache-completeness tests for all three shards pass.
+
+The first signed embedded run correctly failed closed and exposed three probe
+groups whose old aggregate booleans had hidden Carrick-specific divergences:
+
+- `ptyflagmatrix`: slave-side `FIONREAD` accounting and master-read behavior
+  after the slave closes;
+- `lifecycleflagmatrix`: cross-process `process_vm_*`, child/session/process
+  group identity, and adjacent wait/ptrace details;
+- `archiveflagmatrix`: regular-file `getdents64` errno, symlink xattrs, and
+  `linkat(..., AT_SYMLINK_FOLLOW)` target typing.
+
+Those probe names are now explicit expected gaps in both libc lanes; they were
+not re-blessed to Carrick output. `eventwaitmatrix` remains an expected gap with
+its former aggregate differences now individually named. The focused signed
+rerun executed all four matrices in both libc lanes, matched the exact expected
+gap sets, and passed the unsigned entitlement negative control. Guest execution
+finished in approximately 3.7 seconds total (shard 2 0.45 s, shard 0 0.42 s,
+shard 1 2.87 s), well below the outer 20-second emergency cap. Static gates also
+pass: `just fmt-check`, focused conformance-next clippy with warnings denied,
+all three oracle-completeness tests, `git diff --check`, and
+`scripts/conformance/check-next-strategy.py`.
+
+Next runtime work remains the privileged clock-discipline cluster described
+below. The new atomic `eventwaitmatrix` output should be used as its reducer;
+the three newly exposed archive/lifecycle/PTY clusters are now ranked follow-on
+work rather than hidden false matches.
 
 ## SESSION 12 — 2026-08-27: fast timeout census and clock closure begins
 
