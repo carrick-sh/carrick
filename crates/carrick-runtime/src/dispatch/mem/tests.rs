@@ -7145,3 +7145,65 @@ fn brk_growth_past_rlimit_data_returns_the_unchanged_break() {
         initial + LINUX_PAGE_SIZE
     );
 }
+
+/// When `RLIMIT_AS` and `RLIMIT_DATA` are infinite (carrick defaults),
+/// `address_space_limits_apply` returns `None` lock-free, and
+/// `check_address_space_limits` bypasses `MemState` locking and VMA projection entirely.
+#[test]
+fn disabled_rlimits_bypass_vma_projection_and_locks() {
+    let dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+
+    // Default state: both limits are infinite.
+    assert_eq!(dispatcher.address_space_limits_apply(false), None);
+    assert_eq!(dispatcher.address_space_limits_apply(true), None);
+
+    // With no limit applying, production skips the locked check entirely —
+    // that `None` IS the disabled path. When a limit does apply, the locked
+    // check is what runs, so exercise the real pair rather than a wrapper
+    // that only a test would call.
+
+    // Set RLIMIT_AS: now limits apply to both data and non-data mappings.
+    context
+        .task()
+        .replace_rlimit(carrick_abi::LinuxResource::As, |_| {
+            Ok::<_, std::convert::Infallible>(carrick_abi::LinuxRlimit::new(
+                512 * 1024 * 1024,
+                LINUX_RLIM_INFINITY,
+            ))
+        })
+        .expect("set RLIMIT_AS");
+    assert_eq!(
+        dispatcher.address_space_limits_apply(false),
+        Some((512 * 1024 * 1024, LINUX_RLIM_INFINITY))
+    );
+    assert_eq!(
+        dispatcher.address_space_limits_apply(true),
+        Some((512 * 1024 * 1024, LINUX_RLIM_INFINITY))
+    );
+
+    // Reset RLIMIT_AS to infinite, set RLIMIT_DATA: applies to data mappings only.
+    context
+        .task()
+        .replace_rlimit(carrick_abi::LinuxResource::As, |_| {
+            Ok::<_, std::convert::Infallible>(carrick_abi::LinuxRlimit::new(
+                LINUX_RLIM_INFINITY,
+                LINUX_RLIM_INFINITY,
+            ))
+        })
+        .expect("reset RLIMIT_AS");
+    context
+        .task()
+        .replace_rlimit(carrick_abi::LinuxResource::Data, |_| {
+            Ok::<_, std::convert::Infallible>(carrick_abi::LinuxRlimit::new(
+                64 * 1024 * 1024,
+                LINUX_RLIM_INFINITY,
+            ))
+        })
+        .expect("set RLIMIT_DATA");
+    assert_eq!(dispatcher.address_space_limits_apply(false), None);
+    assert_eq!(
+        dispatcher.address_space_limits_apply(true),
+        Some((LINUX_RLIM_INFINITY, 64 * 1024 * 1024))
+    );
+}

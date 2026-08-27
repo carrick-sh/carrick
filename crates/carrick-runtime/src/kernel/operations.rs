@@ -4174,8 +4174,25 @@ fn next_revision(revision: TaskRevision) -> Result<TaskRevision, KernelOperation
 
 /// `RLIMIT_NPROC` at fork reservation — setrlimit(2): while the number of
 /// extant threads for the caller's REAL user ID is greater than or equal to
-/// the soft limit, `fork(2)` fails with `EAGAIN`; not enforced for real uid 0
-/// or a caller holding effective `CAP_SYS_ADMIN` or `CAP_SYS_RESOURCE`.
+/// the soft limit, `fork(2)` fails with `EAGAIN`.
+///
+/// Two exemptions, both measured against the native-arm64 Docker oracle on
+/// 2026-08-26 rather than assumed from the man page (which documents only the
+/// capability one):
+///
+/// - **real uid 0 is exempt outright.** A container running as root with
+///   Docker's DEFAULT capability set — `CapEff: 00000000a80425fb`, which
+///   contains neither `CAP_SYS_ADMIN` (21) nor `CAP_SYS_RESOURCE` (24) — and a
+///   soft limit of 3 forked 12 live children with no `EAGAIN`. Exempting only
+///   by capability would therefore refuse forks that Linux allows, in the
+///   configuration every default carrick guest runs in.
+/// - effective `CAP_SYS_ADMIN` or `CAP_SYS_RESOURCE` exempts any uid, per
+///   setrlimit(2).
+///
+/// The same oracle pins the counting rule for the enforced case: as uid 1000
+/// with a soft limit of 3, exactly 2 live children were created before the
+/// third `fork(2)` returned `EAGAIN` — so the count INCLUDES the caller, and
+/// the comparison is `count >= limit`.
 ///
 /// Reservation, not `PreparedFork::commit`, is the enforcement point: by the
 /// time `commit` runs, the frame inventory and the parent's backend
@@ -4539,6 +4556,27 @@ mod tests {
             .commit()
             .expect("publish root child");
         drop(root_child);
+
+        // Real uid 0 stays exempt even with BOTH exempting capabilities
+        // dropped. Measured against the native-arm64 Docker oracle on
+        // 2026-08-26: container root with `CapEff: 00000000a80425fb` (neither
+        // CAP_SYS_ADMIN nor CAP_SYS_RESOURCE) and a soft limit of 3 forked 12
+        // LIVE children with no EAGAIN, while uid 1000 under the identical
+        // capability set and limit got EAGAIN on its third fork. That is the
+        // configuration every default carrick guest runs in, so exempting
+        // only by capability would refuse forks Linux allows.
+        root.task().with_caps(|caps| {
+            caps.effective &= !(1u64 << crate::namespace::process::CAP_SYS_RESOURCE);
+            caps.effective &= !(1u64 << crate::namespace::process::CAP_SYS_ADMIN);
+        });
+        let root_uncapped = kernel
+            .reserve_fork(&root, fork_plan(), "root-uncapped-exempt".to_owned(), None)
+            .expect("real uid 0 is exempt regardless of capabilities (Docker oracle)")
+            .prepare_reference(ThreadId::synthetic_for_tests(9_402))
+            .expect("prepare uncapped root child")
+            .commit()
+            .expect("publish uncapped root child");
+        drop(root_uncapped);
     }
 
     /// `nice` is inherited at fork and independent thereafter — and, crucially,
