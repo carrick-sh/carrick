@@ -56,6 +56,8 @@ pub struct ContainerResult {
     pub stderr: Vec<u8>,
     /// The run stopped at `max_traps` without the guest exiting.
     pub trap_limit_hit: bool,
+    /// Typed reason why the run terminated, if due to a limit or budget.
+    pub terminal_reason: Option<carrick_runtime::runtime::TerminalReason>,
     /// Syscall traps serviced during the run.
     pub traps: usize,
     /// The runtime's compat summary (unhandled/deferred/partial syscalls).
@@ -72,6 +74,7 @@ impl ContainerResult {
             traps,
             report,
             trap_limit_hit,
+            terminal_reason,
         } = result;
         Self {
             exit_code,
@@ -79,6 +82,7 @@ impl ContainerResult {
             stdout: captured.stdout.map_or(stdout, |buffer| buffer.take()),
             stderr: captured.stderr.map_or(stderr, |buffer| buffer.take()),
             trap_limit_hit,
+            terminal_reason,
             traps,
             compat: report,
         }
@@ -129,6 +133,7 @@ mod tests {
             traps: 3,
             report: CompatReport::default(),
             trap_limit_hit: false,
+            terminal_reason: None,
         }
     }
 

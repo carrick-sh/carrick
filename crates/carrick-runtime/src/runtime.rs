@@ -173,7 +173,7 @@ pub const DEFAULT_MAX_TRAPS: usize = usize::MAX;
 // `crate::run_result` (unified with the Linux KVM loop). Re-export them under
 // the original `carrick_runtime::runtime::{RunResult, RuntimeError}` paths so
 // every call site (carrick-engine, carrick-cli, the runtime tests) is unchanged.
-pub use crate::run_result::{RunResult, RuntimeError};
+pub use crate::run_result::{RunResult, RuntimeError, TerminalReason};
 
 pub fn run_static_elf_with_hvf(
     path: impl AsRef<Path>,
@@ -818,6 +818,7 @@ where
                             traps,
                             report: reporter.finish(),
                             trap_limit_hit: false,
+                            terminal_reason: None,
                         });
                     }
                 }
@@ -885,6 +886,7 @@ where
                     traps,
                     report: reporter.finish(),
                     trap_limit_hit: false,
+                    terminal_reason: None,
                 });
             }
             DispatchOutcome::SignalDeath { signum } => {
@@ -897,6 +899,7 @@ where
                     traps,
                     report: reporter.finish(),
                     trap_limit_hit: false,
+                    terminal_reason: None,
                 });
             }
             DispatchOutcome::Returned { value } => {
@@ -1284,6 +1287,7 @@ where
                     traps,
                     report: reporter.finish(),
                     trap_limit_hit: false,
+                    terminal_reason: None,
                 });
             }
         }
@@ -1297,6 +1301,7 @@ where
         traps: max_traps,
         report: reporter.finish(),
         trap_limit_hit: true,
+        terminal_reason: Some(TerminalReason::TrapLimit),
     })
 }
 

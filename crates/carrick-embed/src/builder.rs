@@ -120,6 +120,7 @@ pub struct ContainerBuilder {
     stdout: StdioConfig,
     stderr: StdioConfig,
     time: Option<carrick_runtime::kernel::TimeControl>,
+    budget: Option<carrick_runtime::observe::ResourceBudget>,
     max_traps: usize,
     observers: Vec<std::sync::Arc<dyn carrick_runtime::observe::SyscallObserver>>,
 }
@@ -143,6 +144,7 @@ impl ContainerBuilder {
             stdout: StdioConfig::Captured,
             stderr: StdioConfig::Captured,
             time: None,
+            budget: None,
             max_traps: DEFAULT_MAX_TRAPS,
             observers: Vec::new(),
         }
@@ -267,6 +269,17 @@ impl ContainerBuilder {
         self
     }
 
+    /// Attach a fault injector to simulate syscall and I/O failures.
+    pub fn fault_injector(self, injector: carrick_runtime::observe::FaultInjector) -> Self {
+        self.observer(std::sync::Arc::new(injector))
+    }
+
+    /// Attach a resource budget quota to the container.
+    pub fn resource_budget(mut self, budget: carrick_runtime::observe::ResourceBudget) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+
     /// Configure time control for the container.
     pub fn time(mut self, control: carrick_runtime::kernel::TimeControl) -> Self {
         self.time = Some(control);
@@ -359,6 +372,9 @@ impl ContainerBuilder {
         }
         if let Some(time) = self.time {
             extensions = extensions.time(time);
+        }
+        if let Some(budget) = self.budget {
+            extensions = extensions.resource_budget(budget);
         }
         Ok(PreparedContainer::new(
             spec,

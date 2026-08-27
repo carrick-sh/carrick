@@ -45,7 +45,6 @@
 //! Methods are `impl` blocks on [`SyscallDispatcher`]; see [`super`] for the
 //! dispatcher struct and the normalized dispatch table.
 use carrick_timer_core::TimerSpecNs;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::*;
@@ -126,27 +125,6 @@ impl SyscallDispatcher {
             return context.task().rlimits();
         }
         crate::kernel::RlimitSet::carrick_defaults()
-    }
-
-    /// A host fork discards the parent's unregistered enforcement pthread.
-    /// Re-read the inherited override only after `proc_after_fork_child` has
-    /// reset child process state, then arm exactly one child-local helper for a
-    /// finite limit. `arm_rlimit_cpu` advances the child COW generation first,
-    /// so no inherited generation can be mistaken for a live helper.
-    #[allow(dead_code)]
-    pub(crate) fn begin_rlimit_cpu_fork_guard_until(
-        &self,
-        deadline: std::time::Instant,
-    ) -> Option<RlimitCpuForkGuard> {
-        try_hold_rlimit_cpu_for_fork_until(deadline)
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn rlimit_cpu_after_fork_child(
-        &self,
-    ) -> Result<RlimitCpuChildRearm, std::io::Error> {
-        let limit = self.task_rlimits().get(carrick_abi::LinuxResource::Cpu);
-        arm_rlimit_cpu(limit, self.async_signal_wake_owner())
     }
 
     define_syscall! {
@@ -1046,13 +1024,62 @@ impl SyscallDispatcher {
                     // stay. Only ever raises, and is clamped to the host's hard
                     // limit.
                     raise_host_nofile_backing(soft);
-                } else if resource == carrick_abi::LinuxResource::Cpu {
-                    let _ = arm_rlimit_cpu(limit, this.async_signal_wake_owner());
                 }
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
     }
+}
+
+/// Check the task's user CPU time against RLIMIT_CPU and container budget quota.
+///
+/// Guest CPU time is wall-clock duration inside `hv_vcpu_run`.
+#[allow(clippy::result_large_err)]
+pub(crate) fn check_cpu_limits(
+    kernel: &crate::kernel::KernelContext,
+) -> Result<(), DispatchOutcome> {
+    let task = kernel.task();
+    let cpu_limit = task.rlimit(carrick_abi::LinuxResource::Cpu);
+    let user_cpu_us = task.self_cpu_us();
+    let user_cpu_s = user_cpu_us / 1_000_000;
+
+    // Check hard limit (SIGKILL)
+    if cpu_limit.rlim_max != LINUX_RLIM_INFINITY && user_cpu_s >= cpu_limit.rlim_max {
+        return Err(DispatchOutcome::SignalDeath {
+            signum: carrick_abi::LINUX_SIGKILL,
+        });
+    }
+
+    // Check soft limit (SIGXCPU)
+    if cpu_limit.rlim_cur != LINUX_RLIM_INFINITY && user_cpu_s >= cpu_limit.rlim_cur {
+        if let Ok(sig) = crate::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGXCPU) {
+            let _ = kernel
+                .kernel()
+                .post_signal_to_task_key(task.key(), sig, None);
+        }
+    }
+
+    // Check container resource budget CPU limit
+    if let Some(budget) = task.container().budget() {
+        let total_cpu_us = user_cpu_us.saturating_add(task.self_system_cpu_us());
+        if let Some(action) = budget.check_cpu_time(total_cpu_us) {
+            match action {
+                crate::observe::ExceedAction::Kill => {
+                    return Err(DispatchOutcome::SignalDeath {
+                        signum: carrick_abi::LINUX_SIGKILL,
+                    });
+                }
+                crate::observe::ExceedAction::Signal(sig) => {
+                    return Err(DispatchOutcome::SignalDeath { signum: sig.0 });
+                }
+                crate::observe::ExceedAction::Errno(errno) => {
+                    return Err(DispatchOutcome::Errno { errno });
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Raise the HOST (native_run) process's soft `RLIMIT_NOFILE` so the guest's
@@ -1100,154 +1127,6 @@ fn raise_host_nofile_backing(guest_soft: u64) {
     unsafe {
         libc::setrlimit(libc::RLIMIT_NOFILE, &new);
     }
-}
-
-static RLIMIT_CPU_GENERATION: AtomicU64 = AtomicU64::new(0);
-/// Outer exclusion for the unregistered RLIMIT_CPU helper. Every iteration
-/// owns it from the guest CPU clock read through any signal/timer publication;
-/// host fork takes the same gate only after registered guest threads drain.
-static RLIMIT_CPU_FORK_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-const RLIMIT_CPU_RECHECK_NS: u64 = 1_000_000;
-const RLIMIT_CPU_REPEAT_NS: u64 = 1_000_000_000;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RlimitCpuChildRearm {
-    InfiniteNoHelper,
-    FiniteHelperSpawned,
-}
-
-#[cfg(test)]
-thread_local! {
-    static FAIL_NEXT_RLIMIT_CPU_SPAWN: std::cell::Cell<bool> = const {
-        std::cell::Cell::new(false)
-    };
-}
-
-#[allow(dead_code)]
-pub(crate) struct RlimitCpuForkGuard {
-    _guard: std::sync::MutexGuard<'static, ()>,
-}
-
-#[allow(dead_code)]
-pub(crate) fn try_hold_rlimit_cpu_for_fork_until(
-    deadline: std::time::Instant,
-) -> Option<RlimitCpuForkGuard> {
-    loop {
-        match RLIMIT_CPU_FORK_GATE.try_lock() {
-            Ok(guard) => return Some(RlimitCpuForkGuard { _guard: guard }),
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                return Some(RlimitCpuForkGuard {
-                    _guard: poisoned.into_inner(),
-                });
-            }
-            Err(std::sync::TryLockError::WouldBlock) => {}
-        }
-        if std::time::Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::yield_now();
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn hold_rlimit_cpu_iteration_for_test(
-    on_locked: impl FnOnce(),
-    wait_for_release: impl FnOnce(),
-) {
-    let _gate = RLIMIT_CPU_FORK_GATE
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    on_locked();
-    wait_for_release();
-}
-
-fn arm_rlimit_cpu(
-    limit: LinuxRlimit,
-    wake_owner: crate::dispatch::AsyncSignalWakeOwner,
-) -> Result<RlimitCpuChildRearm, std::io::Error> {
-    let generation = RLIMIT_CPU_GENERATION
-        .fetch_add(1, Ordering::SeqCst)
-        .wrapping_add(1);
-    let (soft, hard) = (limit.rlim_cur, limit.rlim_max);
-    if soft == LINUX_RLIM_INFINITY && hard == LINUX_RLIM_INFINITY {
-        return Ok(RlimitCpuChildRearm::InfiniteNoHelper);
-    }
-    #[cfg(test)]
-    if FAIL_NEXT_RLIMIT_CPU_SPAWN.with(|fail| fail.replace(false)) {
-        return Err(std::io::Error::other(
-            "injected RLIMIT_CPU helper spawn failure",
-        ));
-    }
-    std::thread::Builder::new()
-        .name("carrick-rlimit-cpu".to_owned())
-        .spawn(move || enforce_rlimit_cpu(generation, soft, hard, wake_owner))?;
-    Ok(RlimitCpuChildRearm::FiniteHelperSpawned)
-}
-
-fn enforce_rlimit_cpu(
-    generation: u64,
-    soft_secs: u64,
-    hard_secs: u64,
-    wake_owner: crate::dispatch::AsyncSignalWakeOwner,
-) {
-    let soft_ns = rlimit_cpu_secs_to_ns(soft_secs);
-    let hard_ns = rlimit_cpu_secs_to_ns(hard_secs);
-    let mut next_sigxcpu_ns = soft_ns;
-    loop {
-        if RLIMIT_CPU_GENERATION.load(Ordering::SeqCst) != generation {
-            return;
-        }
-        let delay_ns = {
-            let _fork_gate = RLIMIT_CPU_FORK_GATE
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            // A newer setrlimit may have raced while this helper waited for a
-            // fork owner. Re-check under the outer gate before reading clocks
-            // or publishing into timer/signal state.
-            if RLIMIT_CPU_GENERATION.load(Ordering::SeqCst) != generation {
-                return;
-            }
-            let now = crate::guest_cpu::total_ns_including_active();
-            if let Some(hard) = hard_ns
-                && now >= hard
-            {
-                publish_rlimit_cpu_signal(wake_owner, crate::linux_abi::LINUX_SIGKILL);
-                return;
-            }
-            if let Some(soft) = next_sigxcpu_ns
-                && now >= soft
-            {
-                publish_rlimit_cpu_signal(wake_owner, crate::linux_abi::LINUX_SIGXCPU);
-                next_sigxcpu_ns = now.checked_add(RLIMIT_CPU_REPEAT_NS);
-            }
-            let next = [next_sigxcpu_ns, hard_ns]
-                .into_iter()
-                .flatten()
-                .filter(|deadline| *deadline > now)
-                .min();
-            next.map(|deadline| deadline.saturating_sub(now))
-                .unwrap_or(RLIMIT_CPU_REPEAT_NS)
-                .clamp(1, RLIMIT_CPU_RECHECK_NS)
-        };
-        // Never sleep while holding the fork gate: a healthy enforcement
-        // helper adds no fork-path latency beyond its short publication step.
-        std::thread::sleep(Duration::from_nanos(delay_ns));
-    }
-}
-
-fn rlimit_cpu_secs_to_ns(secs: u64) -> Option<u64> {
-    if secs == LINUX_RLIM_INFINITY {
-        None
-    } else {
-        Some(secs.saturating_mul(1_000_000_000))
-    }
-}
-
-pub(crate) fn publish_rlimit_cpu_signal(
-    wake_owner: crate::dispatch::AsyncSignalWakeOwner,
-    signum: i32,
-) {
-    wake_owner.publish_process_signal(signum);
 }
 
 /// Convert a Linux `timeval` to a `Duration` (saturating; negative components,
@@ -1377,8 +1256,6 @@ fn x86_alarm_remaining_seconds(state: Option<crate::dispatch::proc::ItimerState>
 mod rlimit_tests {
     use super::*;
 
-    static RLIMIT_CPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn thread_cpu_surfaces_read_exact_logical_thread_accounting() {
         let dispatcher = SyscallDispatcher::new();
@@ -1428,99 +1305,57 @@ mod rlimit_tests {
     }
 
     #[test]
-    fn fork_gate_waits_for_real_enforcement_iteration() {
-        let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(1);
-        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
-        let helper = std::thread::spawn(move || {
-            hold_rlimit_cpu_iteration_for_test(
-                || {
-                    locked_tx
-                        .send(())
-                        .expect("report locked RLIMIT_CPU iteration")
-                },
-                || release_rx.recv().expect("release RLIMIT_CPU iteration"),
-            );
-        });
-        locked_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("enforcement iteration holds actual fork gate");
-        let releaser = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
-            release_tx.send(()).expect("release enforcement iteration");
-        });
-        let guard =
-            try_hold_rlimit_cpu_for_fork_until(std::time::Instant::now() + Duration::from_secs(1))
-                .expect("bounded fork acquisition waits for iteration");
-        drop(guard);
-        releaser.join().expect("join gate releaser");
-        helper.join().expect("join gate holder");
+    fn check_cpu_limits_enforces_hard_limit() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().expect("task context");
+        context
+            .task()
+            .replace_rlimit(carrick_abi::LinuxResource::Cpu, |_| {
+                Ok::<_, ()>(LinuxRlimit::new(10, 20))
+            })
+            .expect("set cpu limit");
+
+        // Below soft limit (0 µs < 10 s): passes
+        assert!(check_cpu_limits(&context).is_ok());
+
+        // Above hard limit (25 s >= 20 s)
+        context.thread().charge_user_ns(25_000_000_000);
+        let outcome = check_cpu_limits(&context);
+        assert!(matches!(
+            outcome,
+            Err(DispatchOutcome::SignalDeath { signum }) if signum == carrick_abi::LINUX_SIGKILL
+        ));
     }
 
     #[test]
-    fn fork_child_rearms_only_finite_inherited_cpu_limit() {
-        let _test_lock = RLIMIT_CPU_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let dispatcher = SyscallDispatcher::new();
-        dispatcher
-            .capture_one_task_context()
-            .expect("task context")
-            .task()
-            .replace_rlimit(carrick_abi::LinuxResource::Cpu, |_| {
-                Ok::<_, ()>(LinuxRlimit::new(u64::MAX - 1, LINUX_RLIM_INFINITY))
-            })
-            .expect("set cpu limit");
-        let before = RLIMIT_CPU_GENERATION.load(Ordering::SeqCst);
-        assert_eq!(
-            dispatcher
-                .rlimit_cpu_after_fork_child()
-                .expect("finite rearm"),
-            RlimitCpuChildRearm::FiniteHelperSpawned,
-            "finite inherited CPU limit must spawn a fresh child helper"
+    fn check_cpu_limits_enforces_container_budget() {
+        let budget = Arc::new(
+            crate::observe::ResourceBudget::new()
+                .max_cpu_time(Duration::from_millis(50))
+                .on_exceed(crate::observe::ExceedAction::Kill),
         );
-        assert_eq!(
-            RLIMIT_CPU_GENERATION.load(Ordering::SeqCst),
-            before.wrapping_add(1),
-            "child hook must arm exactly once"
-        );
+        let container =
+            Arc::new(crate::kernel::Container::for_reference_model().with_resource_budget(budget));
+        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+            100,
+            crate::thread::ThreadId::synthetic_for_tests(100),
+            "test-budget".to_string(),
+        )
+        .expect("root bootstrap")
+        .with_container(container);
+        let (_kernel, context) =
+            crate::kernel::Kernel::bootstrap_root(bootstrap).expect("root kernel");
 
-        dispatcher
-            .capture_one_task_context()
-            .expect("task context")
-            .task()
-            .replace_rlimit(carrick_abi::LinuxResource::Cpu, |_| {
-                Ok::<_, ()>(LinuxRlimit::new(LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY))
-            })
-            .expect("set cpu limit");
-        assert_eq!(
-            dispatcher
-                .rlimit_cpu_after_fork_child()
-                .expect("infinite rearm"),
-            RlimitCpuChildRearm::InfiniteNoHelper,
-            "infinite inherited CPU limit must not spawn a helper"
-        );
-    }
+        // Below budget (10 ms < 50 ms): passes
+        context.thread().charge_user_ns(10_000_000);
+        assert!(check_cpu_limits(&context).is_ok());
 
-    #[test]
-    fn fork_child_finite_cpu_limit_reports_injected_spawn_failure() {
-        let _test_lock = RLIMIT_CPU_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let dispatcher = SyscallDispatcher::new();
-        dispatcher
-            .capture_one_task_context()
-            .expect("task context")
-            .task()
-            .replace_rlimit(carrick_abi::LinuxResource::Cpu, |_| {
-                Ok::<_, ()>(LinuxRlimit::new(1, 2))
-            })
-            .expect("set cpu limit");
-        FAIL_NEXT_RLIMIT_CPU_SPAWN.with(|fail| fail.set(true));
-
-        let error = dispatcher
-            .rlimit_cpu_after_fork_child()
-            .expect_err("finite child limit must surface helper spawn failure");
-
-        assert!(error.to_string().contains("injected RLIMIT_CPU"));
+        // Above budget (60 ms >= 50 ms): killed
+        context.thread().charge_user_ns(50_000_000);
+        let outcome = check_cpu_limits(&context);
+        assert!(matches!(
+            outcome,
+            Err(DispatchOutcome::SignalDeath { signum }) if signum == carrick_abi::LINUX_SIGKILL
+        ));
     }
 }

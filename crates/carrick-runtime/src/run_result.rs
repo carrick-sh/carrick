@@ -11,7 +11,19 @@ use thiserror::Error;
 use crate::compat::CompatReport;
 use crate::dispatch::DispatchError;
 use crate::memory::AddressSpaceError;
+use crate::observe::BudgetResource;
 use crate::trap::TrapError;
+
+/// Why a guest run reached a terminal non-exit state short of regular guest exit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum TerminalReason {
+    TrapLimit,
+    BudgetExceeded {
+        resource: BudgetResource,
+        limit: u64,
+        observed: u64,
+    },
+}
 
 /// Why a guest run stopped short of (or completed with) a clean exit. Shared by
 /// the HVF loops and the KVM single-threaded loop.
@@ -105,6 +117,8 @@ pub struct RunResult {
     pub report: CompatReport,
     #[serde(default)]
     pub trap_limit_hit: bool,
+    #[serde(default)]
+    pub terminal_reason: Option<TerminalReason>,
 }
 
 impl RunResult {
@@ -137,6 +151,7 @@ mod tests {
             traps: 0,
             report: Default::default(),
             trap_limit_hit: false,
+            terminal_reason: None,
         }
     }
 
