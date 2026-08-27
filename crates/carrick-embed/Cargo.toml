@@ -28,6 +28,7 @@ platform-netbsd = ["carrick-runtime/platform-netbsd", "carrick-engine/platform-n
 fs-memory = ["carrick-spec/fs-memory", "carrick-engine/fs-memory", "carrick-runtime/fs-memory"]
 
 [dependencies]
+carrick-abi = { path = "../carrick-abi" }
 carrick-engine = { path = "../carrick-engine", default-features = false }
 carrick-runtime = { path = "../carrick-runtime", default-features = false }
 # The engine re-exports neither PullPolicy nor the spec's StdioMode; take the
@@ -36,6 +37,7 @@ carrick-image = { path = "../carrick-image" }
 carrick-spec = { path = "../carrick-spec" }
 anyhow.workspace = true
 camino.workspace = true
+parking_lot.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 
