@@ -201,26 +201,17 @@ pub const MUSL_BASELINE_GAPS: &[&str] = &[
 pub const GNU_BASELINE_GAPS: &[&str] = &[
     "budget_two_proc",
     "childsubreaper",
-    "clonefsumask",
-    "cluster10errno",
-    "coredumpfile",
     "execfromthread",
     "execthreads",
     "killchld",
-    "mmapfileshare_mt",
-    "pidfdprocdir",
     "pidnsroot",
     "ppid",
-    "proclife",
     "procpeerdir",
     "procpeermem",
     "ptraceattach",
     "rlimitnproc",
     "setidthreadchurn",
     "shmnestedfork",
-    "siginfo",
-    "sigpairrace",
-    "sigwaitblock",
     "sysinfo",
     "telemetrymap",
     "vforkexecthread",
@@ -458,19 +449,7 @@ fn test_shard_0_expected_gaps_derivation() {
 
     let expected_musl_set = BTreeSet::new();
 
-    let expected_gnu_set: BTreeSet<&str> = [
-        "clonefsumask",
-        "cluster10errno",
-        "coredumpfile",
-        "mmapfileshare_mt",
-        "pidfdprocdir",
-        "proclife",
-        "siginfo",
-        "sigpairrace",
-        "sigwaitblock",
-    ]
-    .into_iter()
-    .collect();
+    let expected_gnu_set = BTreeSet::new();
 
     assert_eq!(
         musl_shard_gaps, expected_musl_set,
