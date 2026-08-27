@@ -84,7 +84,7 @@ pub use carrick_runtime::runtime::RunResult;
 pub use carrick_spec::{
     BridgeId, FsBackendKind, ImageConfig, Mount, NetworkAttachmentSpec, NetworkMode,
     NetworkNamespaceId, NetworkNamespaceSpec, PidMode, Platform, PortMapping, RunSpec,
-    SeccompPolicy,
+    SeccompPolicy, StdioMode,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -446,8 +446,8 @@ pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunS
         fs_backend,
         mounts: req.mounts,
         tty: req.tty,
-        raw: true,
-        interactive: req.interactive,
+        // Docker-shaped streaming until `RunRequest.stdio` lands (next commit).
+        stdio: StdioMode::Inherit,
         max_traps: req.max_traps,
         debug_state_path,
         platform,

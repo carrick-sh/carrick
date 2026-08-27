@@ -12,7 +12,7 @@ use crate::runtime::run_rootfs_elf_with_hvf_args_and_dispatcher_debug;
 use crate::runtime::{RunResult, RuntimeError, run_elf_from_dispatcher_debug};
 use crate::vfs::BindVfs;
 use anyhow::{Context, Result};
-use carrick_spec::{FsBackendKind, NetworkNamespaceSpec, PidMode, Platform, RunSpec};
+use carrick_spec::{FsBackendKind, NetworkNamespaceSpec, PidMode, Platform, RunSpec, StdioMode};
 use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -366,14 +366,16 @@ impl Runtime {
 
                 let _ = dispatcher.set_fs_backend(Box::new(host));
 
-                // Interactive pty or raw stream
+                // Interactive pty, or the requested output mode for fd 1/2
                 let _interactive_session =
-                    setup_interactive_stdio(&mut dispatcher, spec.tty, spec.raw).map_err(|e| {
-                        RuntimeError::FsBackend(anyhow::anyhow!(
-                            "failed to setup interactive stdio: {}",
-                            e
-                        ))
-                    })?;
+                    setup_interactive_stdio(&mut dispatcher, spec.tty, spec.stdio).map_err(
+                        |e| {
+                            RuntimeError::FsBackend(anyhow::anyhow!(
+                                "failed to setup interactive stdio: {}",
+                                e
+                            ))
+                        },
+                    )?;
 
                 let debug_path = spec
                     .debug_state_path
@@ -459,14 +461,16 @@ impl Runtime {
                     install_rosetta_mounts(&mut dispatcher);
                 }
 
-                // Interactive pty or raw stream
+                // Interactive pty, or the requested output mode for fd 1/2
                 let _interactive_session =
-                    setup_interactive_stdio(&mut dispatcher, spec.tty, spec.raw).map_err(|e| {
-                        RuntimeError::FsBackend(anyhow::anyhow!(
-                            "failed to setup interactive stdio: {}",
-                            e
-                        ))
-                    })?;
+                    setup_interactive_stdio(&mut dispatcher, spec.tty, spec.stdio).map_err(
+                        |e| {
+                            RuntimeError::FsBackend(anyhow::anyhow!(
+                                "failed to setup interactive stdio: {}",
+                                e
+                            ))
+                        },
+                    )?;
 
                 let debug_path = spec
                     .debug_state_path
@@ -722,17 +726,63 @@ fn set_baseline_file_if_missing(
 fn setup_interactive_stdio(
     dispatcher: &mut SyscallDispatcher,
     tty: bool,
-    raw: bool,
+    stdio: StdioMode,
 ) -> anyhow::Result<Option<crate::interactive_supervisor::InteractiveSession>> {
     if !tty {
-        if raw {
-            dispatcher.set_stream_stdio(true);
+        match stdio {
+            // Docker-shaped: guest fd 1/2 bytes go straight to the carrier's
+            // own fds as they are written.
+            StdioMode::Inherit => dispatcher.set_stream_stdio(true),
+            // The dispatcher's default: accumulate into RunResult.stdout/stderr.
+            StdioMode::Captured => {}
+            // A Piped sink is installed by `Runtime::prepare`; `Runtime::execute`
+            // carries none, so refuse rather than silently buffer or stream.
+            StdioMode::Piped => anyhow::bail!(
+                "StdioMode::Piped needs a sink installed through Runtime::prepare; \
+                 Runtime::execute carries none"
+            ),
         }
         return Ok(None);
     }
     crate::interactive_supervisor::InteractiveSession::start(dispatcher)
         .context("failed to create carrier-local interactive PTY")
         .map(Some)
+}
+
+#[cfg(test)]
+mod stdio_mode_tests {
+    use super::setup_interactive_stdio;
+    use crate::dispatch::SyscallDispatcher;
+    use carrick_spec::StdioMode;
+
+    #[test]
+    fn captured_keeps_the_dispatcher_buffering_and_inherit_streams() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let session = setup_interactive_stdio(&mut dispatcher, false, StdioMode::Captured)
+            .expect("captured is always installable");
+        assert!(session.is_none());
+        assert!(
+            !dispatcher.stream_stdio_enabled(),
+            "Captured must buffer into RunResult"
+        );
+
+        let session = setup_interactive_stdio(&mut dispatcher, false, StdioMode::Inherit)
+            .expect("inherit is always installable");
+        assert!(session.is_none());
+        assert!(
+            dispatcher.stream_stdio_enabled(),
+            "Inherit must stream to the carrier fds"
+        );
+    }
+
+    #[test]
+    fn piped_is_refused_without_a_prepare_installed_sink() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let err = setup_interactive_stdio(&mut dispatcher, false, StdioMode::Piped)
+            .expect_err("Runtime::execute has no sink for Piped");
+        assert!(err.to_string().contains("Runtime::prepare"), "{err}");
+        assert!(!dispatcher.stream_stdio_enabled());
+    }
 }
 
 #[cfg(test)]
@@ -745,6 +795,7 @@ mod exit_code_tests {
     use camino::Utf8PathBuf;
     use carrick_spec::{
         ExecBackendRequest, FsBackendKind, NetworkNamespaceSpec, PidMode, Platform, RunSpec,
+        StdioMode,
     };
     use std::io::{Error as IoError, ErrorKind};
 
@@ -766,8 +817,7 @@ mod exit_code_tests {
             fs_backend: FsBackendKind::Host,
             mounts: Vec::new(),
             tty: false,
-            raw: true,
-            interactive: false,
+            stdio: StdioMode::Inherit,
             max_traps: 100,
             debug_state_path: None,
             platform: Platform::Aarch64,
