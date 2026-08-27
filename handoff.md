@@ -1,6 +1,6 @@
 # Carrick exact conformance closure handoff
 
-**Updated:** 2026-08-27 (session 13 — four aggregate reducers split into exact atomic assertions; focused embedded gate green in under 4 seconds; full suite still red)
+**Updated:** 2026-08-27 (session 14 — bounded clock discipline validation closes clock_adjtime02; stateful clock_adjtime01 remains honestly red)
 
 **Canonical host/lane:** macOS, Apple Silicon, HVF/HVPatch, Linux arm64 guest
 
@@ -56,6 +56,52 @@ Execution is a directed-worker model:
 Complete only when fail-closed gate integrity, exact correctness, and the <=2x
 performance gate pass together on the final integrated signed artifact. Do not
 push unless explicitly asked. Preserve unrelated worktree changes.
+
+## SESSION 14 — 2026-08-27: bounded clock discipline validation
+
+`dfcde4574` closes the honest validation/capability boundary of the privileged
+clock-discipline cluster without pretending Carrick has a stateful Linux NTP
+discipline. `clock_adjtime`/`adjtimex` now:
+
+- permit unprivileged `ADJ_OFFSET_SS_READ` and report no pending single-shot
+  slew in a fresh domain;
+- validate privileged `ADJ_TICK` against Linux's 90%-110% tick bounds after
+  the `CAP_SYS_TIME` check; and
+- accept only an idempotent restore of the exact state Carrick reports.
+
+Any request that would actually change offset, frequency, error, status,
+time-constant, TAI, resolution, or tick remains `EPERM`. Three unit reducers
+were red first against the old always-`EPERM` behavior and are now green in
+0.01 seconds. The existing unprivileged EPERM integration contract remains
+green, formatting and focused warnings-denied clippy pass, and the release
+binary was rebuilt through `just build` and signed.
+
+The decisive cached-only signed result is:
+
+```
+just conformance full --suite ltp-clock_adjtime02 --force \
+  --require-cached-oracle --no-image-refresh --workers 1
+```
+
+It ran zero Docker containers and changed `ltp-clock_adjtime02` to **MATCH
+6/6**, finishing end-to-end in 6.7 seconds under the 20-second emergency cap.
+The adjacent stateful `ltp-clock_adjtime01` remains deliberately red at **3/9**
+and finished in 4.6 seconds, proving the implementation did not over-accept
+unsupported NTP mutations.
+
+A full `just conformance-probes` run was intentionally cut off after the first
+two shards had already failed on unrelated current mismatch-set divergence:
+unexpected `memflagmatrix`, `netflagmatrix`, and `pathflagmatrix` regressions,
+plus stale expected gaps that now pass. It was continuing to walk hundreds of
+unrelated probes after decisive failure, so it is not claimed green and was not
+allowed to become another long feedback loop. Use focused shard/probe filters
+for reducers; reserve the full gate for an integration checkpoint.
+
+Next clock work is the real per-container NTP discipline model needed by
+`ltp-clock_adjtime01`; do not broaden the idempotent shim. The higher-leverage
+immediate work may instead be one of the deterministic atomic archive,
+lifecycle, PTY, memory, network, or path clusters exposed in session 13, with a
+focused embedded reducer before any aggregate run.
 
 ## SESSION 13 — 2026-08-27: atomic reducers expose hidden gap clusters
 
