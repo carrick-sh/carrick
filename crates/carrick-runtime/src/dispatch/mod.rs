@@ -6840,14 +6840,13 @@ fn relative_from_absolute_timespec(tv_sec: i64, tv_nsec: i64, realtime: bool) ->
     // this is identical to the previous CLOCK_UPTIME_RAW read, so the HVF lane is
     // unchanged.
     //
-    // The FUTEX_CLOCK_REALTIME case reads the host wall clock, correct because
-    // the guest's vDSO CLOCK_REALTIME is calibrated to the same wall clock.
-    // Probe: futexrealtime.
+    // The FUTEX_CLOCK_REALTIME case reads the GUEST's CLOCK_REALTIME
+    // (`realtime_duration`: host calibration + the guest-settable offset).
+    // Reading the raw host wall clock here was wrong the moment a guest moved
+    // its clock with `clock_settime`: every absolute deadline was then computed
+    // against a "now" one step behind. Probe: futexrealtime.
     let now_ns: i128 = if realtime {
-        let mut now: libc::timespec = unsafe { std::mem::zeroed() };
-        // SAFETY: clock_gettime writes a timespec for a valid clock id.
-        unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut now) };
-        (now.tv_sec as i128) * 1_000_000_000 + now.tv_nsec as i128
+        realtime_duration().as_nanos() as i128
     } else {
         monotonic_duration().as_nanos() as i128
     };
@@ -7747,7 +7746,11 @@ pub(crate) fn set_guest_realtime_offset_ns(delta_ns: i64) {
     GUEST_REALTIME_OFFSET_NS.store(delta_ns, std::sync::atomic::Ordering::SeqCst);
 }
 
-fn realtime_duration() -> Duration {
+/// The guest's `CLOCK_REALTIME`: THE wall-clock authority for every realtime
+/// consumer in the runtime (clock reads, absolute deadlines, file and IPC
+/// stamps, `/proc` epochs). Nothing else in the runtime may read the host wall
+/// clock for a guest-visible value.
+pub(crate) fn realtime_duration() -> Duration {
     let offset_ns = get_guest_realtime_offset_ns();
     let base = {
         #[cfg(not(target_os = "linux"))]
@@ -9126,11 +9129,11 @@ fn resolve_utimensat_timespec(timespec: LinuxTimespec) -> Option<(i64, i64)> {
     }
 }
 
-/// Current CLOCK_REALTIME as a (sec, nsec) pair, for UTIME_NOW / NULL times.
+/// The guest's current CLOCK_REALTIME as a (sec, nsec) pair, for UTIME_NOW /
+/// NULL times.
 fn now_realtime_timespec() -> (i64, i64) {
-    let mut ts: libc::timespec = unsafe { core::mem::zeroed() };
-    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
-    (ts.tv_sec as i64, ts.tv_nsec as i64)
+    let now = realtime_duration();
+    (now.as_secs() as i64, i64::from(now.subsec_nanos()))
 }
 
 /// Read a NULL-terminated array of guest VA pointers, dereferencing each to a
@@ -9192,6 +9195,97 @@ mod exec_vector_tests {
 
         let oversized = vec![vec![b'x'; crate::linux_abi::LINUX_ARG_MAX]];
         assert_eq!(validate_exec_vector_size(&oversized, &[]), Err(LINUX_E2BIG));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod realtime_test_support {
+    use std::sync::{Mutex, MutexGuard};
+
+    static GUEST_REALTIME_OFFSET_LOCK: Mutex<()> = Mutex::new(());
+
+    struct ResetOnDrop {
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for ResetOnDrop {
+        fn drop(&mut self) {
+            super::set_guest_realtime_offset_ns(0);
+        }
+    }
+
+    /// Run `f` with the guest CLOCK_REALTIME delta set to `delta_ns`,
+    /// serialized against every other offset-moving test, and reset to 0
+    /// afterwards (also on panic). `just test` already runs carrick-runtime
+    /// under RUST_TEST_THREADS=1; the lock keeps a focused parallel
+    /// `cargo test -p carrick-runtime` honest too.
+    pub(crate) fn with_guest_realtime_offset<R>(delta_ns: i64, f: impl FnOnce() -> R) -> R {
+        let guard = GUEST_REALTIME_OFFSET_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _reset = ResetOnDrop { _guard: guard };
+        super::set_guest_realtime_offset_ns(delta_ns);
+        f()
+    }
+}
+
+#[cfg(test)]
+mod realtime_authority_tests {
+    use super::realtime_test_support::with_guest_realtime_offset;
+    use super::*;
+
+    const HOUR_NS: i64 = 3_600 * 1_000_000_000;
+
+    fn host_wall_secs() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
+    /// FUTEX_WAIT_BITSET|FUTEX_CLOCK_REALTIME: the guest built its absolute
+    /// deadline on ITS CLOCK_REALTIME, so "now" must be read from the same
+    /// authority. Reading the host wall clock instead put every deadline one
+    /// hour in the future once the guest had moved its clock forward.
+    #[test]
+    fn futex_realtime_deadline_is_measured_on_the_guest_clock() {
+        with_guest_realtime_offset(HOUR_NS, || {
+            let deadline = realtime_duration() + Duration::from_millis(200);
+            let remaining = relative_from_absolute_timespec(
+                deadline.as_secs() as i64,
+                i64::from(deadline.subsec_nanos()),
+                true,
+            );
+            assert!(
+                remaining <= Duration::from_millis(200),
+                "deadline 200ms past the guest clock must not wait longer: {remaining:?}"
+            );
+            assert!(
+                remaining >= Duration::from_millis(100),
+                "deadline 200ms past the guest clock must not be already past: {remaining:?}"
+            );
+        });
+    }
+
+    /// `utimensat(UTIME_NOW)` and the NULL-times form stamp the file with the
+    /// GUEST's wall clock, like every other realtime read.
+    #[test]
+    fn utimensat_utime_now_stamps_the_guest_clock() {
+        with_guest_realtime_offset(HOUR_NS, || {
+            let (sec, nsec) = now_realtime_timespec();
+            assert!((0..1_000_000_000).contains(&nsec));
+            assert!(
+                sec - host_wall_secs() >= 3_599,
+                "NULL-times stamp must carry the guest offset: sec={sec}"
+            );
+            let resolved = resolve_utimensat_timespec(LinuxTimespec::new(0, LINUX_UTIME_NOW))
+                .expect("UTIME_NOW resolves to a concrete stamp");
+            assert!(
+                resolved.0 - host_wall_secs() >= 3_599,
+                "UTIME_NOW must carry the guest offset: sec={}",
+                resolved.0
+            );
+        });
     }
 }
 

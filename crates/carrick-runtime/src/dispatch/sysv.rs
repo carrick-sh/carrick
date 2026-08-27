@@ -1177,11 +1177,12 @@ impl MsgQueueFile {
     }
 }
 
+/// Seconds since the Epoch on the GUEST's CLOCK_REALTIME, for every
+/// `ipc_perm`-adjacent stamp (`*_ctime`/`*_atime`/`*_dtime`/`*_otime`,
+/// `msg_stime`/`msg_rtime`). The single SysV stamp source; never read the
+/// host wall clock inline.
 fn unix_now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    realtime_duration().as_secs()
 }
 
 fn msg_queue_path_for_private(state: &SysvShmState) -> PathBuf {
@@ -2138,10 +2139,7 @@ pub(super) fn shmget_open(
     let inode = st.st_ino as u64;
     let shmid = (inode as i32).max(1); // never 0 (would collide with shmctl(IPC_RMID))
     let actual_size = if size > 0 { size } else { st.st_size as usize };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = unix_now_secs();
     state
         .segments
         .entry(shmid)
@@ -2572,10 +2570,7 @@ impl SyscallDispatcher {
                         drop(state);
                         reservation
                             .commit(
-                                std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_secs())
-                                    .unwrap_or(0),
+                                unix_now_secs(),
                                 lpid,
                             )
                             .unwrap_or_else(|()| std::process::abort());
@@ -2660,10 +2655,7 @@ impl SyscallDispatcher {
                 },
                 HostAliasShmatCommit {
                     va,
-                    atime: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0),
+                    atime: unix_now_secs(),
                     lpid,
                     reservation,
                 },
@@ -2729,10 +2721,7 @@ impl SyscallDispatcher {
             }
             cx.memory.set_unmapped(addr, len, true);
             this.remove_mapping_metadata(addr, len as u64);
-            let dtime = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+            let dtime = unix_now_secs();
             let lpid = this.identity_pid() as i32;
             let mut process = this.sysv_process.lock();
             let mut state = this.sysv.state.lock();
@@ -2833,10 +2822,7 @@ impl SyscallDispatcher {
                         Ok(b) => u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
                         Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
                     };
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
+                    let now = unix_now_secs();
                     let mut state = this.sysv.state.lock();
                     match state.segments.get_mut(&shmid).filter(|segment| !segment.removed) {
                         Some(seg) => {
@@ -3165,10 +3151,7 @@ impl SyscallDispatcher {
             if nsems_usize == 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+            let now = unix_now_secs();
             let mut state = this.sysv.state.lock();
             if state.semaphores.len() >= LINUX_SEMMNI {
                 return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
@@ -3998,10 +3981,7 @@ impl SyscallDispatcher {
             )
         };
         let completed = |sops: &[LinuxSembuf]| {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+            let now = unix_now_secs();
             if let Some(pid) = logical_operator
                 && let Some(meta) = self.sysv.state.lock().semaphores.get_mut(&guest_semid)
             {
@@ -4062,10 +4042,7 @@ impl SyscallDispatcher {
         if matches!(cmd, LINUX_IPC_RMID | LINUX_IPC_SET) && !meta.can_admin(creds) {
             return Ok(DispatchOutcome::errno(LINUX_EPERM));
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now = unix_now_secs();
         let caller_pid = self
             .hvpatch_process()
             .map(|_| cx.kernel.task().key().id.raw())
@@ -5416,6 +5393,26 @@ mod ipc_set_tests {
             0o666,
             "IPC_SET must store the requested mode so IPC_STAT reads it back \
              (pre-fix IPC_SET was a no-op and this stayed 0o600)"
+        );
+    }
+
+    /// `shm_ctime`/`shm_atime`/`shm_dtime`, `sem_otime`/`sem_ctime` and the
+    /// msg queue stamps are guest-visible wall-clock values: they come from the
+    /// guest's CLOCK_REALTIME, not the host's.
+    #[test]
+    fn sysv_ipc_stamps_follow_the_guest_clock() {
+        crate::dispatch::realtime_test_support::with_guest_realtime_offset(
+            3_600 * 1_000_000_000,
+            || {
+                let host_now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                assert!(
+                    unix_now_secs() >= host_now + 3_599,
+                    "SysV stamp must carry the guest offset"
+                );
+            },
         );
     }
 }
