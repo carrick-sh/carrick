@@ -2767,7 +2767,10 @@ impl SyscallDispatcher {
                     writable,
                 }
             }
-            Ok(crate::vfs::rootfs::OpenDispatchResult::Directory { metadata, entries }) => {
+            Ok(crate::vfs::rootfs::OpenDispatchResult::Directory {
+                metadata,
+                mut entries,
+            }) => {
                 // A directory can never be the target of a write-intent open
                 // (O_WRONLY/O_RDWR) nor of an O_CREAT open — Linux returns
                 // EISDIR in both cases (a directory is never "created" by
@@ -2776,6 +2779,7 @@ impl SyscallDispatcher {
                 if writable_request || want_create {
                     return Ok(DispatchOutcome::errno(LINUX_EISDIR));
                 }
+                self.inject_mount_dir_entries(&path, &mut entries);
                 OpenDescription::Directory {
                     path,
                     metadata,
@@ -3603,7 +3607,44 @@ impl SyscallDispatcher {
             )
             .unwrap_or_default(),
         };
+        self.inject_mount_dir_entries(dir_path, entries);
         trusted.entries_loaded = true;
+    }
+
+    /// Inject entries for mounts registered below `dir_path` so that injected
+    /// mount points (such as `/data`) appear in parent directory readdir listings
+    /// even when the underlying image has no such directory.
+    fn inject_mount_dir_entries(&self, dir_path: &str, entries: &mut Vec<RootFsDirEntry>) {
+        let mount_children = self.fs.vfs_mounts.mount_children_of(dir_path);
+        for child in mount_children {
+            let child_kind = match child.kind {
+                crate::vfs::EntryKind::Directory => RootFsEntryKind::Directory,
+                crate::vfs::EntryKind::Symlink => RootFsEntryKind::Symlink,
+                crate::vfs::EntryKind::Fifo => RootFsEntryKind::Fifo,
+                crate::vfs::EntryKind::Socket => RootFsEntryKind::Socket,
+                crate::vfs::EntryKind::CharDevice => RootFsEntryKind::CharDevice,
+                crate::vfs::EntryKind::File => RootFsEntryKind::File,
+            };
+            if let Some(existing) = entries.iter_mut().find(|e| e.name == child.name) {
+                existing.metadata.kind = child_kind;
+            } else {
+                let metadata = RootFsMetadata {
+                    path: std::path::Path::new(dir_path).join(&child.name),
+                    kind: child_kind,
+                    mode: if child_kind == RootFsEntryKind::Directory {
+                        0o755
+                    } else {
+                        0o644
+                    },
+                    size: 0,
+                };
+                entries.push(RootFsDirEntry {
+                    name: child.name,
+                    ino: 0,
+                    metadata,
+                });
+            }
+        }
     }
 
     /// Render `/proc/self/fdinfo/N` (proc_pid_fdinfo(5)): pos, the open flags
@@ -4237,6 +4278,33 @@ impl SyscallDispatcher {
                     Ok(fd) => fd,
                     Err(_) => return VfsOpenAttempt::Errno(linux_errno::EMFILE),
                 };
+                VfsOpenAttempt::Installed(new_fd)
+            }
+            crate::vfs::VfsHandle::InMemoryFile {
+                path,
+                contents,
+                status_flags,
+                writable,
+                max_size,
+            } => {
+                let open_file = OpenFile::from_open_description(
+                    Arc::new(RwLock::new(OpenDescription::InMemoryFile {
+                        path: path.clone(),
+                        contents,
+                        offset: 0,
+                        writable,
+                        max_size,
+                        base: OpenDescriptionBase::new(
+                            ((status_flags as u64) | flags) & !LINUX_O_CLOEXEC,
+                        ),
+                    })),
+                    linux_fd_flags_from_open_flags(flags),
+                );
+                let new_fd = match self.install_fd_at_or_above(0, open_file) {
+                    Ok(fd) => fd,
+                    Err(_) => return VfsOpenAttempt::Errno(linux_errno::EMFILE),
+                };
+                self.record_fd_open_path(new_fd, path);
                 VfsOpenAttempt::Installed(new_fd)
             }
         }
@@ -6122,21 +6190,25 @@ impl SyscallDispatcher {
         {
             self.fs.vfs_mounts.override_path(&resolved_new);
         }
-        let old_is_vfs_mount = self.fs.vfs_mounts.resolve(&resolved_old).is_some();
-        if let Some(mnew) = self.fs.vfs_mounts.resolve(&resolved_new) {
-            if !old_is_vfs_mount {
+        let mold = self.fs.vfs_mounts.resolve(&resolved_old);
+        let mnew = self.fs.vfs_mounts.resolve(&resolved_new);
+        match (mold, mnew) {
+            (Some(mold), Some(mnew)) => {
+                if mold.point != mnew.point {
+                    return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EXDEV));
+                }
+                if no_replace && mnew.vfs.lookup(&mnew.full_path).is_ok() {
+                    return Ok(DispatchOutcome::errno(LINUX_EEXIST));
+                }
+                return match mnew.vfs.rename(&mold.full_path, &mnew.full_path) {
+                    Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+                    Err(errno) => Ok(DispatchOutcome::errno(errno)),
+                };
+            }
+            (Some(_), None) | (None, Some(_)) => {
                 return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EXDEV));
             }
-            if no_replace && mnew.vfs.lookup(&mnew.full_path).is_ok() {
-                return Ok(DispatchOutcome::errno(LINUX_EEXIST));
-            }
-            return match mnew.vfs.rename(&resolved_old, &mnew.full_path) {
-                Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
-                Err(errno) => Ok(DispatchOutcome::errno(errno)),
-            };
-        }
-        if old_is_vfs_mount {
-            return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EXDEV));
+            (None, None) => {}
         }
         // Capture the source kind before the move (for IN_ISDIR) only when
         // something is watching.
@@ -7392,6 +7464,7 @@ impl SyscallDispatcher {
                     DispatchOutcome::Returned { value: 0 }
                 }
                 OpenDescription::File { .. }
+                | OpenDescription::InMemoryFile { .. }
                 | OpenDescription::HostFile { .. }
                 | OpenDescription::SyntheticFile { .. }
                 | OpenDescription::EventFd { .. }
@@ -9198,6 +9271,25 @@ impl SyscallDispatcher {
                     OpenDescription::SyntheticFile { .. } => {
                         return Ok(DispatchOutcome::errno(LINUX_EROFS));
                     }
+                    OpenDescription::InMemoryFile {
+                        contents,
+                        writable,
+                        max_size,
+                        ..
+                    } => {
+                        if !*writable {
+                            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                        }
+                        if new_size as usize > *max_size {
+                            return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                        }
+                        let mut data = contents.write();
+                        if (new_size as usize) > data.len() {
+                            data.resize(new_size as usize, 0);
+                        }
+                        writeback = None;
+                        outcome = DispatchOutcome::Returned { value: 0 };
+                    }
                     OpenDescription::Directory { .. } => {
                         return Ok(DispatchOutcome::errno(LINUX_EISDIR));
                     }
@@ -9279,6 +9371,32 @@ impl SyscallDispatcher {
                         }
                         metadata.size = contents.len();
                         writeback = Some((path.clone(), contents.to_vec()));
+                        outcome = DispatchOutcome::Returned { value: 0 };
+                    }
+                    OpenDescription::InMemoryFile {
+                        contents,
+                        offset,
+                        writable,
+                        max_size,
+                        ..
+                    } => {
+                        if !*writable {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        }
+                        if length as usize > *max_size {
+                            return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                        }
+                        let new_len = length as usize;
+                        let mut data = contents.write();
+                        if new_len > data.len() {
+                            data.resize(new_len, 0);
+                        } else {
+                            data.truncate(new_len);
+                            if *offset > new_len {
+                                *offset = new_len;
+                            }
+                        }
+                        writeback = None;
                         outcome = DispatchOutcome::Returned { value: 0 };
                     }
                     OpenDescription::HostFile {
@@ -9726,6 +9844,9 @@ impl SyscallDispatcher {
                 OpenDescription::SyntheticFile {
                     contents, offset, ..
                 } => (*offset as i64, contents.len() as i64),
+                OpenDescription::InMemoryFile {
+                    contents, offset, ..
+                } => (*offset as i64, contents.read().len() as i64),
                 OpenDescription::Directory {
                     entries, offset, ..
                 } => (*offset as i64, entries.len() as i64),
@@ -9793,7 +9914,8 @@ impl SyscallDispatcher {
                 }
                 OpenDescription::File { offset, .. }
                 | OpenDescription::Directory { offset, .. }
-                | OpenDescription::SyntheticFile { offset, .. } => *offset = next as usize,
+                | OpenDescription::SyntheticFile { offset, .. }
+                | OpenDescription::InMemoryFile { offset, .. } => *offset = next as usize,
                 OpenDescription::HostFile { .. } => {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
@@ -9916,6 +10038,7 @@ impl SyscallDispatcher {
                 &*open,
                 OpenDescription::File { .. }
                     | OpenDescription::SyntheticFile { .. }
+                    | OpenDescription::InMemoryFile { .. }
                     | OpenDescription::HostFile { .. }
             ) && open.status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY
             {
@@ -9930,6 +10053,18 @@ impl SyscallDispatcher {
                 } => {
                     let bytes = contents.read_at(*offset, length);
                     let read_len = bytes.len();
+                    *offset += read_len;
+                    (read_len, bytes)
+                }
+                OpenDescription::InMemoryFile {
+                    contents,
+                    offset,
+                    ..
+                } => {
+                    let data = contents.read();
+                    let remaining: &[u8] = data.get(*offset..).unwrap_or(&[]);
+                    let read_len = remaining.len().min(length);
+                    let bytes = remaining[..read_len].to_vec();
                     *offset += read_len;
                     (read_len, bytes)
                 }
@@ -10409,6 +10544,14 @@ impl SyscallDispatcher {
                     *offset += read_len;
                     read_len
                 }
+                OpenDescription::InMemoryFile {
+                    contents, offset, ..
+                } => {
+                    let data = contents.read();
+                    let read_len = read_from_contents_at(memory, &data, *offset, &iovecs)?;
+                    *offset += read_len;
+                    read_len
+                }
                 OpenDescription::SyntheticDevice { kind, .. } => {
                     read_from_synthetic_device_iovecs(memory, *kind, &iovecs)?
                 }
@@ -10504,6 +10647,14 @@ impl SyscallDispatcher {
                 }
                 OpenDescription::File { contents, .. } => contents.read_at(offset, length),
                 OpenDescription::SyntheticFile { contents, .. } => contents
+                    .get(offset..)
+                    .unwrap_or_default()
+                    .iter()
+                    .take(length)
+                    .copied()
+                    .collect(),
+                OpenDescription::InMemoryFile { contents, .. } => contents
+                    .read()
                     .get(offset..)
                     .unwrap_or_default()
                     .iter()
@@ -10694,6 +10845,10 @@ impl SyscallDispatcher {
                 OpenDescription::SyntheticFile { contents, .. } => {
                     read_from_contents_at(memory, contents, offset, &iovecs)?
                 }
+                OpenDescription::InMemoryFile { contents, .. } => {
+                    let data = contents.read();
+                    read_from_contents_at(memory, &data, offset, &iovecs)?
+                }
                 OpenDescription::SyntheticDevice { kind, .. } => {
                     read_from_synthetic_device_iovecs(memory, *kind, &iovecs)?
                 }
@@ -10837,10 +10992,41 @@ impl SyscallDispatcher {
             // In-memory File (memfd / O_TMPFILE fallback): positional write into
             // the cached contents, honoring memfd write/grow seals. Previously an
             // unconditional EBADF (memfd_create01 CHECK_MFD_*_BY_WRITE pwrites).
-            let is_inmem_file = matches!(&*open, OpenDescription::File { .. });
+            let is_inmem_file = matches!(&*open, OpenDescription::File { .. } | OpenDescription::InMemoryFile { .. });
             drop(open);
             if is_inmem_file {
                 let mut open = open_file.description.write();
+                if let OpenDescription::InMemoryFile {
+                    contents,
+                    writable,
+                    max_size,
+                    ..
+                } = &mut *open
+                {
+                    if !*writable {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    }
+                    let mut data = contents.write();
+                    let write_at = if is_append {
+                        data.len()
+                    } else {
+                        offset as usize
+                    };
+                    if write_at + bytes.len() > *max_size {
+                        return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                    }
+                    if write_at > data.len() {
+                        data.resize(write_at, 0);
+                    }
+                    let end = write_at + bytes.len();
+                    if end > data.len() {
+                        data.resize(end, 0);
+                    }
+                    data[write_at..end].copy_from_slice(&bytes);
+                    return Ok(DispatchOutcome::Returned {
+                        value: bytes.len() as i64,
+                    });
+                }
                 if let OpenDescription::File {
                     base,
                     path,
@@ -10888,6 +11074,7 @@ impl SyscallDispatcher {
             let errno = match &*open {
                 OpenDescription::Closed { .. }
                 | OpenDescription::File { .. }
+                | OpenDescription::InMemoryFile { .. }
                 | OpenDescription::SyntheticFile { .. }
                 | OpenDescription::PipeReader { .. } => LINUX_EBADF,
                 OpenDescription::HostPipe {
@@ -10987,6 +11174,84 @@ impl SyscallDispatcher {
                     }
                 }
             }
+            if let OpenDescription::InMemoryFile {
+                contents,
+                writable,
+                offset: current_offset,
+                max_size,
+                ..
+            } = &*open
+            {
+                if !*writable {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                }
+                let mut data = contents.write();
+                let mut cur = if is_append {
+                    data.len()
+                } else if write_at_current {
+                    *current_offset
+                } else {
+                    offset as usize
+                };
+                let mut total = 0i64;
+                if let PwritevPayloads::Borrowed(borrowed_iovecs) = &payloads {
+                    for iov in borrowed_iovecs {
+                        let len = iov.iov_len;
+                        if len == 0 {
+                            continue;
+                        }
+                        let buf = unsafe { std::slice::from_raw_parts(iov.iov_base as *const u8, len) };
+                        if cur + len > *max_size {
+                            if total > 0 {
+                                break;
+                            }
+                            return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                        }
+                        if cur > data.len() {
+                            data.resize(cur, 0);
+                        }
+                        let end = cur + len;
+                        if end > data.len() {
+                            data.resize(end, 0);
+                        }
+                        data[cur..end].copy_from_slice(buf);
+                        cur += len;
+                        total += len as i64;
+                    }
+                } else if let PwritevPayloads::Staged(staged_iovecs) = &payloads {
+                    for buf in staged_iovecs {
+                        let len = buf.len();
+                        if len == 0 {
+                            continue;
+                        }
+                        if cur + len > *max_size {
+                            if total > 0 {
+                                break;
+                            }
+                            return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                        }
+                        if cur > data.len() {
+                            data.resize(cur, 0);
+                        }
+                        let end = cur + len;
+                        if end > data.len() {
+                            data.resize(end, 0);
+                        }
+                        data[cur..end].copy_from_slice(buf);
+                        cur += len;
+                        total += len as i64;
+                    }
+                }
+                drop(data);
+                if write_at_current {
+                    drop(open);
+                    let mut open_write = open_file.description.write();
+                    if let OpenDescription::InMemoryFile { offset: off, .. } = &mut *open_write {
+                        *off = cur;
+                    }
+                }
+                return Ok(DispatchOutcome::Returned { value: total });
+            }
             // Real host file: positional writev via libc::pwrite per iovec.
             if let OpenDescription::HostFile {
                 host_fd, writable, ..
@@ -11065,6 +11330,7 @@ impl SyscallDispatcher {
             let errno = match &*open {
                 OpenDescription::Closed { .. }
                 | OpenDescription::File { .. }
+                | OpenDescription::InMemoryFile { .. }
                 | OpenDescription::SyntheticFile { .. }
                 | OpenDescription::PipeReader { .. } => LINUX_EBADF,
                 OpenDescription::HostPipe {
@@ -12866,6 +13132,44 @@ impl SyscallDispatcher {
                                 },
                             ));
                         }
+                        OpenDescription::InMemoryFile {
+                            base,
+                            contents,
+                            offset,
+                            writable,
+                            max_size,
+                            ..
+                        } => {
+                            if !*writable {
+                                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                            }
+                            let write_offset = if base.is_append() {
+                                contents.read().len()
+                            } else {
+                                *offset
+                            };
+                            match this.fsize_write_len(cx, write_offset as u64, bytes.len()) {
+                                Ok(len) => bytes.truncate(len),
+                                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                            }
+                            if write_offset + bytes.len() > *max_size {
+                                return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                            }
+                            let mut data = contents.write();
+                            if write_offset > data.len() {
+                                data.resize(write_offset, 0);
+                            }
+                            let end = write_offset + bytes.len();
+                            if end > data.len() {
+                                data.resize(end, 0);
+                            }
+                            data[write_offset..end].copy_from_slice(&bytes);
+                            *offset = end;
+                            outcome = DispatchOutcome::Returned {
+                                value: bytes.len() as i64,
+                            };
+                            writeback = None;
+                        }
                         OpenDescription::File {
                             base,
                             path,
@@ -13321,6 +13625,40 @@ impl SyscallDispatcher {
                                             .unwrap_or_else(|| std::process::abort()),
                                     },
                                 );
+                                writeback = None;
+                            }
+                            OpenDescription::InMemoryFile {
+                                base,
+                                contents,
+                                offset,
+                                writable,
+                                max_size,
+                                ..
+                            } => {
+                                if !*writable {
+                                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                                }
+                                let mut data = contents.write();
+                                let write_offset = if base.is_append() {
+                                    data.len()
+                                } else {
+                                    *offset
+                                };
+                                if write_offset + bytes.len() > *max_size {
+                                    return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                                }
+                                if write_offset > data.len() {
+                                    data.resize(write_offset, 0);
+                                }
+                                let end = write_offset + bytes.len();
+                                if end > data.len() {
+                                    data.resize(end, 0);
+                                }
+                                data[write_offset..end].copy_from_slice(&bytes);
+                                *offset = end;
+                                outcome = DispatchOutcome::Returned {
+                                    value: bytes.len() as i64,
+                                };
                                 writeback = None;
                             }
                             OpenDescription::File {
@@ -14071,6 +14409,7 @@ impl SyscallDispatcher {
                 let exists =
                     crate::vfs::is_synthetic_virtual_file(&resolved, &this.synthetic_proc_context(cx.kernel))
                         || this.layered_metadata(&resolved).is_ok()
+                        || this.fs.vfs_mounts.resolve(&resolved).is_some_and(|m| m.vfs.lookup(&m.full_path).is_ok())
                         // An anon fd's magic symlink has no layered metadata; its
                         // existence is the live fd, validated below in the
                         // materialize branch.
@@ -14146,33 +14485,32 @@ impl SyscallDispatcher {
             ) {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
-            // A hard link whose source lives on a synthetic pseudo-filesystem
-            // (/proc, /sys) crosses a device boundary into the rootfs overlay →
-            // EXDEV, not the EROFS a failed overlay hard_link would yield
-            // (linkat01 case 20 links /proc/cpuinfo into a real dir).
-            if crate::vfs::is_synthetic_virtual_file(&src, &this.synthetic_proc_context(cx.kernel))
-                && this.fs.vfs_mounts.resolve(&resolved_new).is_none()
-            {
-                return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EXDEV));
-            }
-            // Route a hard link whose NEW path is under a VFS mount (e.g.
-            // /dev/shm, a BindVfs) to that mount's link() — the rootfs overlay
-            // can't hard-link mount-backed paths and would wrongly return EROFS.
-            // glibc sem_open does openat(temp) -> linkat(temp,final) ->
-            // unlink(temp), so without this the whole multiprocessing SemLock
-            // path fails EROFS and every multiprocessing/concurrent_futures
-            // module SKIPS ("broken multiprocessing SemLock"). open already
-            // routes through the mounts (try_mount_open); linkat must mirror it.
-            // BindVfs::to_host rejects a `src` outside the mount, so a cross-fs
-            // link returns ENOENT (not a corrupt link).
-            if let Some(mnew) = this.fs.vfs_mounts.resolve(&resolved_new) {
-                return Ok(match mnew.vfs.link(&src, &resolved_new) {
-                    Ok(()) => {
-                        this.dnotify_child(cx.kernel, &resolved_new, LinuxDnotifyMask::CREATE);
-                        DispatchOutcome::Returned { value: 0 }
+            let msrc = this.fs.vfs_mounts.resolve(&src);
+            let mnew = this.fs.vfs_mounts.resolve(&resolved_new);
+            match (msrc, mnew) {
+                (Some(msrc), Some(mnew)) => {
+                    if msrc.point != mnew.point {
+                        return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EXDEV));
                     }
-                    Err(errno) => DispatchOutcome::errno(errno),
-                });
+                    return Ok(match mnew.vfs.link(&msrc.full_path, &mnew.full_path) {
+                        Ok(()) => {
+                            this.dnotify_child(cx.kernel, &resolved_new, LinuxDnotifyMask::CREATE);
+                            DispatchOutcome::Returned { value: 0 }
+                        }
+                        Err(errno) => DispatchOutcome::errno(errno),
+                    });
+                }
+                (Some(_), None) | (None, Some(_)) => {
+                    return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EXDEV));
+                }
+                (None, None) => {
+                    if crate::vfs::is_synthetic_virtual_file(
+                        &src,
+                        &this.synthetic_proc_context(cx.kernel),
+                    ) {
+                        return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EXDEV));
+                    }
+                }
             }
             match this.fs.rootfs_vfs.overlay.hard_link(&src, &resolved_new) {
                 Ok(()) => {

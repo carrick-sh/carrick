@@ -170,6 +170,7 @@ impl SyscallDispatcher {
         match &*open {
             OpenDescription::Closed { .. } => Ok(Err(LINUX_EBADF)),
             OpenDescription::File { offset, .. }
+            | OpenDescription::InMemoryFile { offset, .. }
             | OpenDescription::SyntheticFile { offset, .. } => Ok(Ok(*offset)),
             // HostFile: current offset is the kernel's; query via lseek.
             OpenDescription::HostFile { host_fd, .. } => {
@@ -238,6 +239,12 @@ impl SyscallDispatcher {
             OpenDescription::File { contents, .. } => contents.read_at(offset, count),
             OpenDescription::SyntheticFile { contents, .. } => {
                 let available = contents.get(offset..).unwrap_or_default();
+                let write_len = available.len().min(count);
+                available[..write_len].to_vec()
+            }
+            OpenDescription::InMemoryFile { contents, .. } => {
+                let data = contents.read();
+                let available = data.get(offset..).unwrap_or_default();
                 let write_len = available.len().min(count);
                 available[..write_len].to_vec()
             }
