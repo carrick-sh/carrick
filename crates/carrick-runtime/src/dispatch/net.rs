@@ -641,6 +641,30 @@ fn host_stream_socket_read_eof(host_fd: i32) -> bool {
     rc == 0
 }
 
+fn decode_accept4_flags(flags: i32) -> Option<LinuxSocketTypeFlags> {
+    LinuxSocketTypeFlags::from_bits(flags)
+}
+
+#[cfg(test)]
+mod accept4_flag_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_unknown_flags_before_accept_side_effects() {
+        assert_eq!(decode_accept4_flags(0), Some(LinuxSocketTypeFlags::empty()));
+        assert_eq!(
+            decode_accept4_flags(LinuxSocketTypeFlags::NONBLOCK.bits()),
+            Some(LinuxSocketTypeFlags::NONBLOCK)
+        );
+        assert_eq!(
+            decode_accept4_flags(LinuxSocketTypeFlags::CLOEXEC.bits()),
+            Some(LinuxSocketTypeFlags::CLOEXEC)
+        );
+        assert_eq!(decode_accept4_flags(0x1234_5678), None);
+        assert_eq!(decode_accept4_flags(-1), None);
+    }
+}
+
 impl SyscallDispatcher {
     /// Whether `fd` is a pollable target for `epoll_ctl(ADD)`. The kernel
     /// returns EPERM when adding an fd whose file has no `->poll` op — regular
@@ -2851,6 +2875,9 @@ impl SyscallDispatcher {
         memory: &mut impl GuestMemory,
         accept4_flags: i32,
     ) -> DispatchOutcome {
+        let Some(socket_flags) = decode_accept4_flags(accept4_flags) else {
+            return DispatchOutcome::errno(LINUX_EINVAL);
+        };
         let fd = fd.0;
         let addr_addr = addr.0;
         let addrlen_addr = addrlen.0;
@@ -3003,7 +3030,6 @@ impl SyscallDispatcher {
                 return DispatchOutcome::errno(LINUX_EFAULT);
             }
         }
-        let socket_flags = LinuxSocketTypeFlags::from_bits_retain(accept4_flags);
         let nonblock = socket_flags.contains(LinuxSocketTypeFlags::NONBLOCK);
         let cloexec = socket_flags.contains(LinuxSocketTypeFlags::CLOEXEC);
         // Keep the host socket non-blocking; Linux-visible blocking intent is
