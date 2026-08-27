@@ -499,7 +499,15 @@ impl PreparedRun {
                 "failed to run rootfs ELF",
             ),
         };
-        #[cfg(not(feature = "platform-macos"))]
+        // Explicit positive predicate, not `not(platform-macos)`: the host-OS
+        // and hypervisor-backend axes are distinct, and a negation silently
+        // captures every future non-macOS host as well
+        // (`.semgrep/typed-domains.yml::no-cfg-not-platform-macos`).
+        #[cfg(any(
+            feature = "platform-linux",
+            feature = "platform-freebsd",
+            feature = "platform-netbsd"
+        ))]
         let run = {
             let _ = (
                 executable,
