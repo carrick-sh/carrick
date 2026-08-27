@@ -209,6 +209,16 @@ pub(in crate::dispatch) struct FsState {
     pub(in crate::dispatch) classic_record_locks: std::sync::Arc<super::LogicalRecordLocks>,
 }
 
+/// Where a guest's bare fd 1/2 bytes go for the whole run. Chosen at
+/// `Runtime::prepare`, sealed at boot, inherited by every logical child.
+pub enum StdioSink {
+    /// Buffer into `RunResult::{stdout,stderr}`; nothing reaches the host fds.
+    Captured,
+    /// Write through to the carrier's own host fds 1/2 — `docker run` shape,
+    /// the CLI default (`StdioMode::Inherit`).
+    Inherit,
+}
+
 /// Process-local output transport. Linux fd-table authority lives exclusively
 /// in the captured Kernel [`crate::kernel::FileTable`].
 pub(in crate::dispatch) struct RuntimeIo {

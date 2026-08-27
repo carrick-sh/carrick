@@ -324,6 +324,7 @@ pub mod exec_stamps;
 #[cfg(feature = "platform-macos")]
 pub mod execute;
 pub(crate) mod hvpatch;
+pub mod prepare;
 pub mod pty_relay;
 pub mod rootfs;
 #[cfg(feature = "platform-macos")]
@@ -331,8 +332,9 @@ pub mod runtime;
 pub(crate) mod seccomp;
 pub(crate) mod vdso_policy;
 pub mod vfs;
-#[cfg(feature = "platform-macos")]
-pub use execute::Runtime;
+pub use prepare::{
+    ExecutionPlan, PreparedRun, Runtime, RuntimeExtensions, StdioSink, resolve_plan,
+};
 
 /// Absolute host path to Apple's Rosetta 2 Linux interpreter that carrick probes
 /// (and, on macOS, redirects x86_64 ELF loads to). Resolution order, so the same
@@ -401,44 +403,7 @@ pub mod execute {
     pub fn guest_hostname() -> String {
         crate::kernel::root_uts_ns().nodename()
     }
-
-    /// Linux mirror of the macOS `execute::Runtime`. The CLI's run seam
-    /// (`carrick_runtime::Runtime::execute(&spec)`, carrick-cli `commands.rs`) is
-    /// platform-agnostic: on macOS it drives the HVF run loop, on Linux it drives
-    /// the KVM OCI path. Both consume the SAME `carrick_spec::RunSpec` the engine
-    /// already resolved and return the SAME `Result<RunResult, RuntimeError>`, so
-    /// the CLI call site is byte-identical across platforms — only symbol
-    /// resolution flips per feature. Mirrors how `runtime::run_oci` already mirrors
-    /// the macOS `Runtime::execute` shape.
-    // Non-macOS run entry: Linux drives the KVM OCI path; FreeBSD drives the
-    // bhyve OCI path. guest_hostname above stays shared.
-    #[cfg(any(
-        feature = "platform-linux",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
-    ))]
-    pub struct Runtime;
-
-    #[cfg(any(
-        feature = "platform-linux",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
-    ))]
-    impl Runtime {
-        pub fn execute(
-            spec: &carrick_spec::RunSpec,
-        ) -> Result<crate::run_result::RunResult, crate::run_result::RuntimeError> {
-            crate::runtime::run_oci(spec)
-        }
-    }
 }
-
-#[cfg(any(
-    feature = "platform-linux",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
-pub use execute::Runtime;
 
 #[cfg(any(
     feature = "platform-linux",

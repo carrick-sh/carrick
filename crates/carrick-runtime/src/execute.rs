@@ -7,21 +7,19 @@ use crate::fs_backend::MemoryBackend;
 use crate::fs_backend::{FsBackend, HostFsBackend};
 use crate::network::NetworkHostsEntry;
 use crate::rootfs::RootFs;
-#[cfg(feature = "fs-memory")]
-use crate::runtime::run_rootfs_elf_with_hvf_args_and_dispatcher_debug;
-use crate::runtime::{RunResult, RuntimeError, run_elf_from_dispatcher_debug};
+use crate::runtime::{RunResult, RuntimeError};
 use crate::vfs::BindVfs;
-use anyhow::{Context, Result};
-use carrick_spec::{FsBackendKind, NetworkNamespaceSpec, PidMode, Platform, RunSpec, StdioMode};
+#[cfg(feature = "fs-memory")]
+use carrick_spec::FsBackendKind;
+use carrick_spec::{NetworkNamespaceSpec, RunSpec};
 use std::borrow::Cow;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 /// True when a runtime error means the ENTRYPOINT executable (or its loader)
 /// could not be found/read. The runc/shell convention is to exit 127 for that —
 /// `docker run img /nope` and `sh -c nope` both yield 127 — not the generic 1 a
 /// propagated error would produce.
-fn is_entrypoint_not_found(e: &RuntimeError) -> bool {
+pub(crate) fn is_entrypoint_not_found(e: &RuntimeError) -> bool {
     matches!(
         e,
         RuntimeError::AddressSpace(crate::memory::AddressSpaceError::Io(io))
@@ -30,7 +28,7 @@ fn is_entrypoint_not_found(e: &RuntimeError) -> bool {
 }
 
 /// A 127 ("command not found") result for a failed entrypoint load.
-fn entrypoint_not_found_result() -> RunResult {
+pub(crate) fn entrypoint_not_found_result() -> RunResult {
     RunResult {
         exit_code: 127,
         terminating_signal: None,
@@ -47,7 +45,7 @@ fn entrypoint_not_found_result() -> RunResult {
 /// permission denial (EACCES). The runc/shell convention is to exit 126 for
 /// that — `docker run img /etc/hostname` yields 126 — distinct from 127 (not
 /// found) and the generic 1 a propagated error would produce.
-fn is_entrypoint_not_executable(e: &RuntimeError) -> bool {
+pub(crate) fn is_entrypoint_not_executable(e: &RuntimeError) -> bool {
     match e {
         // A file that isn't a loadable AArch64 ELF (wrong magic, truncated,
         // wrong machine, parse error): docker's "exec format error".
@@ -62,7 +60,7 @@ fn is_entrypoint_not_executable(e: &RuntimeError) -> bool {
 
 /// A 126 ("command found but not executable") result for an entrypoint that
 /// exists but cannot be loaded/exec'd.
-fn entrypoint_not_executable_result() -> RunResult {
+pub(crate) fn entrypoint_not_executable_result() -> RunResult {
     RunResult {
         exit_code: 126,
         terminating_signal: None,
@@ -74,30 +72,38 @@ fn entrypoint_not_executable_result() -> RunResult {
     }
 }
 
-/// For a detached container (`CARRICK_CONTAINER_ID` set), the stable on-disk
-/// overlay path `<registry>/<id>/scratch`, recording it into the registry so
-/// `carrick exec` can attach the same filesystem. `None` for a foreground run
-/// (which uses an ephemeral per-run scratch). Best-effort registry write — a
-/// failure just means `exec` can't find the overlay later, not a run failure.
-fn detached_stable_scratch(registry_id: Option<&str>) -> Option<PathBuf> {
-    let id = registry_id?;
-    let scratch = crate::container::container_dir(id).join("scratch");
+/// For a managed (detached) container, the stable on-disk overlay path
+/// `<registry>/<id>/scratch`. `None` for an id that is not a safe registry
+/// key. A foreground run never calls this (it uses an ephemeral per-run
+/// scratch).
+pub(crate) fn detached_stable_scratch_path(id: &str) -> Option<PathBuf> {
+    if !crate::container::is_safe_id(id) {
+        return None;
+    }
+    Some(crate::container::container_dir(id).join("scratch"))
+}
+
+/// Record a managed container's overlay path into its registry record so
+/// `carrick exec`/`rm` find the same filesystem. Called only once the overlay
+/// has been attached and its root prepared: a preparation that fails earlier
+/// publishes nothing. Best-effort — a failed write means `exec` cannot find
+/// the overlay later, not a run failure.
+pub(crate) fn record_detached_scratch(id: &str, scratch: &std::path::Path) {
     if let Ok(mut state) = crate::container::ContainerState::load(id) {
         state.config.scratch_path = Some(scratch.to_string_lossy().into_owned());
         let _ = state.persist();
     }
-    Some(scratch)
 }
 
 #[derive(Debug)]
-enum HostRootLayout {
+pub(crate) enum HostRootLayout {
     /// Historical path: the writable host root contains the complete image.
     Materialized,
     /// Sparse writable upper paired with the shared immutable cache lower.
     CachedLower(RootFs),
 }
 
-fn prepare_host_root(
+pub(crate) fn prepare_host_root(
     host: &mut HostFsBackend,
     layer_paths: &[PathBuf],
     existing_overlay: bool,
@@ -120,7 +126,7 @@ fn prepare_host_root(
     Ok(HostRootLayout::Materialized)
 }
 
-fn cached_lower_enabled(execution_plan: &crate::page_profile::ExecutionPlan) -> bool {
+pub(crate) fn cached_lower_enabled(execution_plan: &crate::page_profile::ExecutionPlan) -> bool {
     #[cfg(target_os = "macos")]
     {
         let _ = execution_plan;
@@ -152,7 +158,7 @@ pub const ROSETTA_ACCEPT_ENV: &str = "CARRICK_ACCEPT_ROSETTA_TERMS";
 /// operator accepts the terms via [`ROSETTA_ACCEPT_ENV`] (or the legacy
 /// `CARRICK_NO_ROSETTA_NOTICE`). Goes to stderr so it never corrupts a streaming
 /// guest's stdout.
-fn rosetta_license_notice() {
+pub(crate) fn rosetta_license_notice() {
     use std::sync::atomic::{AtomicBool, Ordering};
     static SHOWN: AtomicBool = AtomicBool::new(false);
     if std::env::var_os(ROSETTA_ACCEPT_ENV).is_some()
@@ -171,7 +177,7 @@ fn rosetta_license_notice() {
     );
 }
 
-fn install_rosetta_mounts(dispatcher: &mut SyscallDispatcher) {
+pub(crate) fn install_rosetta_mounts(dispatcher: &mut SyscallDispatcher) {
     const ROSETTA_RUNTIME_DIR: &str = "/Library/Apple/usr/libexec/oah";
     const ROSETTA_CACHE_DIR: &str = "/var/db/oah";
     for (path, readonly) in [(ROSETTA_RUNTIME_DIR, true), (ROSETTA_CACHE_DIR, false)] {
@@ -180,337 +186,6 @@ fn install_rosetta_mounts(dispatcher: &mut SyscallDispatcher) {
         }
         let bind = BindVfs::new(path, PathBuf::from(path), readonly);
         dispatcher.register_mount(PathBuf::from(path), Box::new(bind));
-    }
-}
-
-pub struct Runtime;
-
-impl Runtime {
-    pub fn execute(spec: &RunSpec) -> Result<RunResult, RuntimeError> {
-        // The run's identity, read from the process environment ONCE, here,
-        // and carried as a typed value from now on. C2 Task 28 moves this
-        // read to the CLI and passes the context into `Runtime::prepare`.
-        // The container is built BEFORE the dispatcher so that B2's
-        // `install_pid_ns`, B4's `admit_container`/`retire_container` and the
-        // dispatcher all hold the one `Arc`.
-        let launch = crate::kernel::LaunchContext::from_process_env()?;
-        let container =
-            Arc::new(crate::kernel::Container::new(launch).with_launch_capabilities(&spec.cap_add));
-        if spec.platform == Platform::Amd64 {
-            rosetta_license_notice();
-        }
-        let execution_plan = crate::page_profile::resolve_execution_plan(spec)?;
-        let host_resolver_snapshot =
-            crate::vfs::HostResolverSnapshot::capture_for_network(&spec.network)
-                .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-        debug_assert_eq!(
-            execution_plan.page_geometry.linux_page_size,
-            crate::page_profile::DEFAULT_LINUX_PAGE_SIZE
-        );
-        // Container launch (`carrick run <image>`) places the root guest in a
-        // fresh PID namespace so its init sees getpid()==1, ns-local child
-        // pids, and an ns-filtered /proc — the headline docker-run behavior
-        // (docs/namespaces-design.md §1.0, §5.2). `run-elf` bypasses
-        // Runtime::execute entirely, so it stays in the identity namespace.
-        // `--pid=host` opts out (shares the host pid ns, like docker). Private
-        // placement is always initialized inside the single VM carrier; output
-        // mode never creates a host namespace-supervisor process.
-        match spec.pid {
-            PidMode::Host => {} // share the host pid ns — no placement.
-            PidMode::Private => {
-                let region = crate::namespace::pid::NsSharedRegion::allocate(
-                    carrick_kernel::arena::KernelArena::global(),
-                )
-                .map_err(|e| {
-                    RuntimeError::Configuration(format!(
-                        "all 64 arena PID namespace slots are claimed: {e:?}"
-                    ))
-                })?;
-                region.set_init(std::process::id());
-                container.install_pid_ns(region).map_err(|_| {
-                    RuntimeError::Configuration("pid namespace already installed".into())
-                })?;
-            }
-        }
-        // Name the host process `carrick: <argv>` up front so
-        // it's identifiable in ps/Activity Monitor even before the
-        // guest sets its own comm via prctl.
-        {
-            let cmdline = spec.argv.join(" ");
-            crate::dispatch::set_host_process_name(cmdline.as_bytes());
-        }
-
-        // The environment is already fully resolved by the engine layer
-        // (image ENV + baseline defaults for missing keys + CLI overrides, in
-        // docker precedence). Pass it through verbatim — injecting a second
-        // baseline here would place duplicate keys *before* spec.envp, and
-        // glibc's getenv returns the first match, silently overriding the
-        // image's own ENV (e.g. PATH). The engine is the single source of env.
-        let env: Vec<String> = spec.envp.clone();
-        let runtime_network = std::sync::Arc::new(
-            crate::network::RuntimeNetwork::create(&spec.network)
-                .map_err(|e| RuntimeError::Unsupported(format!("network setup failed: {e}")))?,
-        );
-
-        let result = match spec.fs_backend {
-            FsBackendKind::Host => {
-                // Stream every OCI layer straight onto the cap-std scratch Dir.
-                // `carrick exec` ATTACHES the running container's existing overlay
-                // (already holds the full rootfs + the container's writes) and
-                // skips extraction. A DETACHED container gets a STABLE overlay
-                // under its registry dir (persisted + shared with `exec`, cleaned
-                // up by `rm`); a foreground run gets an ephemeral per-run TempDir.
-                let exec_overlay = container.launch().exec_overlay.as_deref();
-                let mut host = if let Some(scratch) = exec_overlay {
-                    HostFsBackend::attach(scratch.as_std_path()).map_err(|e| {
-                        RuntimeError::FsBackend(anyhow::anyhow!(
-                            "failed to attach container overlay {scratch}: {e}"
-                        ))
-                    })?
-                } else if let Some(scratch) =
-                    detached_stable_scratch(container.launch().registry_id())
-                {
-                    HostFsBackend::attach_or_create(&scratch).map_err(|e| {
-                        RuntimeError::FsBackend(anyhow::anyhow!(
-                            "failed to create container overlay: {}",
-                            e
-                        ))
-                    })?
-                } else {
-                    HostFsBackend::new().map_err(|e| {
-                        RuntimeError::FsBackend(anyhow::anyhow!(
-                            "failed to create scratch directory: {}",
-                            e
-                        ))
-                    })?
-                };
-
-                // Convert layers to Vec<PathBuf>
-                let layer_paths: Vec<PathBuf> = spec
-                    .rootfs_layers
-                    .iter()
-                    .map(|p| PathBuf::from(p.as_std_path()))
-                    .collect();
-
-                // Darwin native runs bind the once-extracted digest-keyed cache
-                // directly as an immutable lower and leave this run's host root
-                // sparse. The exact `=0` hatch keeps the previous full-root
-                // extraction/clone path. `exec` never re-extracts its attached
-                // upper; with the cached layout it reacquires the same lower
-                // from the image's ordered layer stack.
-                let cache_root = crate::fs_backend::default_scratch_root().map_err(|error| {
-                    RuntimeError::FsBackend(anyhow::anyhow!(
-                        "failed to locate rootfs cache directory: {error}"
-                    ))
-                })?;
-                let root_layout = prepare_host_root(
-                    &mut host,
-                    &layer_paths,
-                    exec_overlay.is_some(),
-                    cached_lower_enabled(&execution_plan),
-                    &cache_root,
-                )
-                .map_err(|error| {
-                    RuntimeError::FsBackend(anyhow::anyhow!(
-                        "failed to prepare OCI rootfs: {error}"
-                    ))
-                })?;
-
-                let mut dispatcher = SyscallDispatcher::with_network_and_host_resolver(
-                    runtime_network.clone(),
-                    host_resolver_snapshot.as_ref(),
-                );
-                dispatcher.set_container(Arc::clone(&container));
-                if let HostRootLayout::CachedLower(rootfs) = root_layout {
-                    dispatcher.set_rootfs_layer(rootfs);
-                }
-                dispatcher.set_page_geometry(execution_plan.page_geometry);
-                let guest_hostname = effective_guest_hostname(spec);
-                dispatcher.set_guest_hostname(guest_hostname.as_ref());
-                // Sandboxed container fs (extracted OCI layers on a cap-std
-                // overlay): forbid the execve host-fs fallback so a target
-                // absent from the container ENOENTs instead of escaping to the
-                // matching host binary.
-                dispatcher.sandbox_exec_to_container();
-                dispatcher.set_executable_path(spec.executable.clone());
-                if let Some(cwd) = &spec.cwd {
-                    dispatcher.set_cwd(cwd.as_str());
-                }
-                dispatcher.set_credentials(spec.uid, spec.gid);
-                // Launch-time container syscall policy (the Docker default-
-                // seccomp model, or unconfined) — before boot, inherited by the
-                // whole guest process tree. See crate::container_policy.
-                dispatcher.apply_launch_privileges(spec.seccomp_policy, &container);
-
-                let hosts_entries = runtime_network.guest_hosts_entries().map_err(|e| {
-                    RuntimeError::Unsupported(format!("network hosts setup failed: {e}"))
-                })?;
-                seed_guest_baseline(
-                    &mut host,
-                    dispatcher.rootfs(),
-                    &spec.network,
-                    &hosts_entries,
-                    &spec.extra_hosts,
-                    guest_hostname.as_ref(),
-                );
-
-                // Install custom bind mounts on dispatcher
-                for mount in &spec.mounts {
-                    let host_path = PathBuf::from(mount.source.as_std_path());
-                    let target_path = PathBuf::from(mount.target.as_std_path());
-                    let bind_vfs = BindVfs::new(mount.target.as_str(), host_path, mount.readonly);
-                    dispatcher.register_mount(target_path, Box::new(bind_vfs));
-                }
-                if spec.platform == Platform::Amd64 {
-                    install_rosetta_mounts(&mut dispatcher);
-                }
-
-                let _ = dispatcher.set_fs_backend(Box::new(host));
-
-                // Interactive pty, or the requested output mode for fd 1/2
-                let _interactive_session =
-                    setup_interactive_stdio(&mut dispatcher, spec.tty, spec.stdio).map_err(
-                        |e| {
-                            RuntimeError::FsBackend(anyhow::anyhow!(
-                                "failed to setup interactive stdio: {}",
-                                e
-                            ))
-                        },
-                    )?;
-
-                let debug_path = spec
-                    .debug_state_path
-                    .as_ref()
-                    .map(|p| PathBuf::from(p.as_std_path()));
-                let run_result = run_elf_from_dispatcher_debug(
-                    &spec.executable,
-                    dispatcher,
-                    spec.argv.clone(),
-                    env,
-                    spec.max_traps,
-                    debug_path.as_ref(),
-                );
-                match run_result {
-                    Ok(r) => r,
-                    Err(e) if is_entrypoint_not_found(&e) => {
-                        return Ok(entrypoint_not_found_result());
-                    }
-                    Err(e) if is_entrypoint_not_executable(&e) => {
-                        return Ok(entrypoint_not_executable_result());
-                    }
-                    // A configuration-time refusal (a removed env knob) is
-                    // not an execution failure — pass it through unwrapped
-                    // so it surfaces labeled as what it is.
-                    Err(e @ RuntimeError::Configuration(_)) => {
-                        return Err(e);
-                    }
-                    Err(e) => {
-                        return Err(RuntimeError::FsBackend(anyhow::anyhow!(
-                            "failed to run ELF from dispatcher: {}",
-                            e
-                        )));
-                    }
-                }
-            }
-            #[cfg(feature = "fs-memory")]
-            FsBackendKind::Memory => {
-                let layer_paths: Vec<PathBuf> = spec
-                    .rootfs_layers
-                    .iter()
-                    .map(|p| PathBuf::from(p.as_std_path()))
-                    .collect();
-
-                let rootfs = RootFs::from_layer_paths(&layer_paths).map_err(|e| {
-                    RuntimeError::FsBackend(anyhow::anyhow!("failed to compose rootfs: {}", e))
-                })?;
-
-                let mut dispatcher = SyscallDispatcher::with_rootfs_and_executable(
-                    rootfs.clone(),
-                    spec.executable.clone(),
-                );
-                dispatcher.set_container(Arc::clone(&container));
-                if let Some(snapshot) = host_resolver_snapshot.as_ref() {
-                    dispatcher.set_host_resolver_snapshot(snapshot);
-                }
-                dispatcher.set_page_geometry(execution_plan.page_geometry);
-                let guest_hostname = effective_guest_hostname(spec);
-                dispatcher.set_guest_hostname(guest_hostname.as_ref());
-                if let Some(cwd) = &spec.cwd {
-                    dispatcher.set_cwd(cwd.as_str());
-                }
-                dispatcher.set_credentials(spec.uid, spec.gid);
-                // Same launch-time policy application as the Host branch.
-                dispatcher.apply_launch_privileges(spec.seccomp_policy, &container);
-
-                install_fs_backend(
-                    &mut dispatcher,
-                    FsBackendKind::Memory,
-                    guest_hostname.as_ref(),
-                )
-                .map_err(|e| {
-                    RuntimeError::FsBackend(anyhow::anyhow!("failed to install fs backend: {}", e))
-                })?;
-
-                // Install custom bind mounts on dispatcher
-                for mount in &spec.mounts {
-                    let host_path = PathBuf::from(mount.source.as_std_path());
-                    let target_path = PathBuf::from(mount.target.as_std_path());
-                    let bind_vfs = BindVfs::new(mount.target.as_str(), host_path, mount.readonly);
-                    dispatcher.register_mount(target_path, Box::new(bind_vfs));
-                }
-                if spec.platform == Platform::Amd64 {
-                    install_rosetta_mounts(&mut dispatcher);
-                }
-
-                // Interactive pty, or the requested output mode for fd 1/2
-                let _interactive_session =
-                    setup_interactive_stdio(&mut dispatcher, spec.tty, spec.stdio).map_err(
-                        |e| {
-                            RuntimeError::FsBackend(anyhow::anyhow!(
-                                "failed to setup interactive stdio: {}",
-                                e
-                            ))
-                        },
-                    )?;
-
-                let debug_path = spec
-                    .debug_state_path
-                    .as_ref()
-                    .map(|p| PathBuf::from(p.as_std_path()));
-                let run_result = run_rootfs_elf_with_hvf_args_and_dispatcher_debug(
-                    &spec.executable,
-                    &rootfs,
-                    dispatcher,
-                    spec.argv.clone(),
-                    env,
-                    spec.max_traps,
-                    debug_path.as_ref(),
-                );
-                match run_result {
-                    Ok(r) => r,
-                    Err(e) if is_entrypoint_not_found(&e) => {
-                        return Ok(entrypoint_not_found_result());
-                    }
-                    Err(e) if is_entrypoint_not_executable(&e) => {
-                        return Ok(entrypoint_not_executable_result());
-                    }
-                    // A configuration-time refusal (a removed env knob) is
-                    // not an execution failure — pass it through unwrapped
-                    // so it surfaces labeled as what it is.
-                    Err(e @ RuntimeError::Configuration(_)) => {
-                        return Err(e);
-                    }
-                    Err(e) => {
-                        return Err(RuntimeError::FsBackend(anyhow::anyhow!(
-                            "failed to run rootfs ELF: {}",
-                            e
-                        )));
-                    }
-                }
-            }
-        };
-
-        Ok(result)
     }
 }
 
@@ -527,7 +202,7 @@ fn host_failure_fallback(reason: &str) -> anyhow::Result<Box<dyn FsBackend>> {
 /// reachable from the `fs-memory`-gated `FsBackendKind::Memory` arm above, so it
 /// is compiled only when that feature is on.
 #[cfg(feature = "fs-memory")]
-fn install_fs_backend(
+pub(crate) fn install_fs_backend(
     dispatcher: &mut SyscallDispatcher,
     kind: FsBackendKind,
     guest_hostname: &str,
@@ -575,7 +250,7 @@ pub fn guest_hostname() -> String {
     crate::kernel::root_uts_ns().nodename()
 }
 
-fn effective_guest_hostname(spec: &RunSpec) -> Cow<'_, str> {
+pub(crate) fn effective_guest_hostname(spec: &RunSpec) -> Cow<'_, str> {
     spec.hostname
         .as_deref()
         .filter(|hostname| !hostname.is_empty())
@@ -583,7 +258,7 @@ fn effective_guest_hostname(spec: &RunSpec) -> Cow<'_, str> {
         .unwrap_or_else(|| Cow::Owned(guest_hostname()))
 }
 
-fn seed_guest_baseline(
+pub(crate) fn seed_guest_baseline(
     backend: &mut dyn FsBackend,
     rootfs: Option<&RootFs>,
     network: &NetworkNamespaceSpec,
@@ -724,80 +399,17 @@ fn set_baseline_file_if_missing(
     let _ = backend.set_file_contents(path, contents);
 }
 
-fn setup_interactive_stdio(
-    dispatcher: &mut SyscallDispatcher,
-    tty: bool,
-    stdio: StdioMode,
-) -> anyhow::Result<Option<crate::interactive_supervisor::InteractiveSession>> {
-    if !tty {
-        match stdio {
-            // Docker-shaped: guest fd 1/2 bytes go straight to the carrier's
-            // own fds as they are written.
-            StdioMode::Inherit => dispatcher.set_stream_stdio(true),
-            // The dispatcher's default: accumulate into RunResult.stdout/stderr.
-            StdioMode::Captured => {}
-            // A Piped sink is installed by `Runtime::prepare`; `Runtime::execute`
-            // carries none, so refuse rather than silently buffer or stream.
-            StdioMode::Piped => anyhow::bail!(
-                "StdioMode::Piped needs a sink installed through Runtime::prepare; \
-                 Runtime::execute carries none"
-            ),
-        }
-        return Ok(None);
-    }
-    crate::interactive_supervisor::InteractiveSession::start(dispatcher)
-        .context("failed to create carrier-local interactive PTY")
-        .map(Some)
-}
-
-#[cfg(test)]
-mod stdio_mode_tests {
-    use super::setup_interactive_stdio;
-    use crate::dispatch::SyscallDispatcher;
-    use carrick_spec::StdioMode;
-
-    #[test]
-    fn captured_keeps_the_dispatcher_buffering_and_inherit_streams() {
-        let mut dispatcher = SyscallDispatcher::new();
-        let session = setup_interactive_stdio(&mut dispatcher, false, StdioMode::Captured)
-            .expect("captured is always installable");
-        assert!(session.is_none());
-        assert!(
-            !dispatcher.stream_stdio_enabled(),
-            "Captured must buffer into RunResult"
-        );
-
-        let session = setup_interactive_stdio(&mut dispatcher, false, StdioMode::Inherit)
-            .expect("inherit is always installable");
-        assert!(session.is_none());
-        assert!(
-            dispatcher.stream_stdio_enabled(),
-            "Inherit must stream to the carrier fds"
-        );
-    }
-
-    #[test]
-    fn piped_is_refused_without_a_prepare_installed_sink() {
-        let mut dispatcher = SyscallDispatcher::new();
-        let err = setup_interactive_stdio(&mut dispatcher, false, StdioMode::Piped)
-            .expect_err("Runtime::execute has no sink for Piped");
-        assert!(err.to_string().contains("Runtime::prepare"), "{err}");
-        assert!(!dispatcher.stream_stdio_enabled());
-    }
-}
-
 #[cfg(test)]
 mod exit_code_tests {
-    use super::{Runtime, is_entrypoint_not_executable, is_entrypoint_not_found};
+    use super::{
+        HostRootLayout, is_entrypoint_not_executable, is_entrypoint_not_found, prepare_host_root,
+        seed_guest_baseline,
+    };
     use crate::elf::ElfInspectError;
     use crate::fs_backend::{FsBackend, HostFsBackend, MemoryBackend};
     use crate::memory::AddressSpaceError;
     use crate::runtime::RuntimeError;
-    use camino::Utf8PathBuf;
-    use carrick_spec::{
-        ExecBackendRequest, FsBackendKind, NetworkNamespaceSpec, PidMode, Platform, RunSpec,
-        StdioMode,
-    };
+    use carrick_spec::NetworkNamespaceSpec;
     use std::io::{Error as IoError, ErrorKind};
 
     fn rt_io(kind: ErrorKind) -> RuntimeError {
@@ -805,32 +417,6 @@ mod exit_code_tests {
     }
     fn rt_not_elf() -> RuntimeError {
         RuntimeError::AddressSpace(AddressSpaceError::Elf(ElfInspectError::NotElf))
-    }
-
-    fn hvpatch_run_spec() -> RunSpec {
-        RunSpec {
-            cap_add: Vec::new(),
-            executable: "/bin/sh".to_string(),
-            argv: vec!["/bin/sh".to_string()],
-            envp: Vec::new(),
-            cwd: Some(Utf8PathBuf::from("/")),
-            rootfs_layers: Vec::new(),
-            fs_backend: FsBackendKind::Host,
-            mounts: Vec::new(),
-            tty: false,
-            stdio: StdioMode::Inherit,
-            max_traps: 100,
-            debug_state_path: None,
-            platform: Platform::Aarch64,
-            exec_backend: ExecBackendRequest::HvPatch,
-            pid: PidMode::Host,
-            hostname: None,
-            network: NetworkNamespaceSpec::default(),
-            extra_hosts: Vec::new(),
-            uid: carrick_abi::NsUid::ROOT,
-            gid: carrick_abi::NsGid::ROOT,
-            seccomp_policy: carrick_spec::SeccompPolicy::ContainerDefault,
-        }
     }
 
     #[cfg(target_os = "macos")]
@@ -864,9 +450,8 @@ mod exit_code_tests {
         write_host_root_test_layer(&layer);
         let mut host = HostFsBackend::new_in(&upper_root).unwrap();
 
-        let layout =
-            super::prepare_host_root(&mut host, &[layer], false, true, &cache_root).unwrap();
-        let super::HostRootLayout::CachedLower(rootfs) = layout else {
+        let layout = prepare_host_root(&mut host, &[layer], false, true, &cache_root).unwrap();
+        let HostRootLayout::CachedLower(rootfs) = layout else {
             panic!("default setup should select an immutable cached lower");
         };
         assert_eq!(rootfs.read("/etc/motd").unwrap(), b"cached-lower\n");
@@ -892,9 +477,8 @@ mod exit_code_tests {
         write_host_root_test_layer(&layer);
         let mut host = HostFsBackend::new_in(&upper_root).unwrap();
 
-        let layout =
-            super::prepare_host_root(&mut host, &[layer], true, true, &cache_root).unwrap();
-        assert!(matches!(layout, super::HostRootLayout::CachedLower(_)));
+        let layout = prepare_host_root(&mut host, &[layer], true, true, &cache_root).unwrap();
+        assert!(matches!(layout, HostRootLayout::CachedLower(_)));
         assert!(
             !host.fast_nofollow_absent("/etc/motd"),
             "an attached or previously-used upper must never infer sparse authority"
@@ -913,9 +497,8 @@ mod exit_code_tests {
         write_host_root_test_layer(&layer);
         let mut host = HostFsBackend::new_in(&upper_root).unwrap();
 
-        let layout =
-            super::prepare_host_root(&mut host, &[layer], false, false, &cache_root).unwrap();
-        assert!(matches!(layout, super::HostRootLayout::Materialized));
+        let layout = prepare_host_root(&mut host, &[layer], false, false, &cache_root).unwrap();
+        assert!(matches!(layout, HostRootLayout::Materialized));
         assert_eq!(host.file_contents("/etc/motd").unwrap(), b"cached-lower\n");
     }
 
@@ -941,37 +524,11 @@ mod exit_code_tests {
         assert!(!is_entrypoint_not_executable(&rt_io(ErrorKind::NotFound)));
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    #[test]
-    fn hvpatch_uses_container_entrypoint_resolution_for_every_container_in_one_carrier() {
-        // Two sequential containers in ONE carrier process: each resolves its
-        // entrypoint independently (127 both times) and leaves no live
-        // container behind, and carrier shutdown afterwards is a no-op. A 127
-        // run never boots a VM (it fails in `run_elf_from_dispatcher_debug`,
-        // before `run_address_space_with_hvf_and_dispatcher`), so this proves
-        // the carrier module's idempotency without HVF; the live two-container
-        // proof is Gate B (`conformance_container_gate`, Task 17).
-        for round in 0..2 {
-            let result = Runtime::execute(&hvpatch_run_spec())
-                .expect("hvpatch container setup should classify a missing entrypoint");
-            assert_eq!(result.exit_code, 127, "round {round}");
-            assert!(result.stdout.is_empty());
-            assert!(result.stderr.is_empty());
-            assert_eq!(
-                crate::carrier::live_container_count(),
-                0,
-                "round {round}: container must be retired at run end"
-            );
-        }
-        crate::carrier::shutdown().expect("carrier shutdown without a VM is a no-op");
-        assert!(crate::vm_lifecycle::process_snapshot().terminal.is_none());
-    }
-
     #[test]
     fn seed_guest_baseline_writes_extra_hosts_entries() {
         let mut backend = MemoryBackend::new();
         let network = NetworkNamespaceSpec::default();
-        super::seed_guest_baseline(
+        seed_guest_baseline(
             &mut backend,
             None,
             &network,
@@ -992,7 +549,7 @@ mod exit_code_tests {
         let mut backend = MemoryBackend::new();
         let network =
             NetworkNamespaceSpec::bridge_default(Some("web".to_string()), Vec::new(), Vec::new());
-        super::seed_guest_baseline(&mut backend, None, &network, &[], &[], "api-host");
+        seed_guest_baseline(&mut backend, None, &network, &[], &[], "api-host");
 
         let hosts = String::from_utf8(backend.file_contents("/etc/hosts").unwrap()).unwrap();
         assert!(
@@ -1006,7 +563,7 @@ mod exit_code_tests {
         let mut backend = MemoryBackend::new();
         let network =
             NetworkNamespaceSpec::bridge_default(Some("web".to_string()), Vec::new(), Vec::new());
-        super::seed_guest_baseline(
+        seed_guest_baseline(
             &mut backend,
             None,
             &network,
@@ -1027,7 +584,7 @@ mod exit_code_tests {
         let mut backend = MemoryBackend::new();
         let network =
             NetworkNamespaceSpec::bridge_default(Some("web".to_string()), Vec::new(), Vec::new());
-        super::seed_guest_baseline(
+        seed_guest_baseline(
             &mut backend,
             None,
             &network,
@@ -1055,7 +612,7 @@ mod exit_code_tests {
     fn seed_guest_baseline_writes_requested_hostname_surfaces() {
         let mut backend = MemoryBackend::new();
         let network = NetworkNamespaceSpec::default();
-        super::seed_guest_baseline(&mut backend, None, &network, &[], &[], "api-host");
+        seed_guest_baseline(&mut backend, None, &network, &[], &[], "api-host");
 
         let hosts = String::from_utf8(backend.file_contents("/etc/hosts").unwrap()).unwrap();
         assert!(
