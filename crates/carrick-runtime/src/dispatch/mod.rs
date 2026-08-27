@@ -6539,7 +6539,7 @@ impl SyscallDispatcher {
             }
             124 => DispatchOutcome::SchedulerYield,
             172 => DispatchOutcome::Returned {
-                value: i64::from(kernel.task().key().id.raw()),
+                value: i64::from(self.identity_snapshot(kernel).pid),
             },
             130 => {
                 let target =

@@ -342,10 +342,9 @@ pub fn ns_to_host_or_self(ns_pid: u32) -> Option<u32> {
 /// the honest answer rather than a wrong one.
 pub fn self_ns_pid() -> u32 {
     if let Some(pid) = crate::dispatch::resources::with_active_context(|context| {
-        u32::try_from(context.task().key().id.raw()).ok()
-    })
-    .flatten()
-    {
+        let task_id = u32::try_from(context.task().key().id.raw()).unwrap_or(0);
+        host_to_ns_or_self_for(context, task_id)
+    }) {
         return pid;
     }
     let host = std::process::id();
@@ -378,7 +377,10 @@ pub fn self_ns_ppid() -> u32 {
             .map(|identity| {
                 identity
                     .parent
-                    .and_then(|parent| u32::try_from(parent.raw()).ok())
+                    .and_then(|parent| {
+                        let parent_raw = u32::try_from(parent.raw()).ok()?;
+                        Some(host_to_ns_or_self_for(context, parent_raw))
+                    })
                     .unwrap_or(0)
             })
     })

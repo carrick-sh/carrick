@@ -853,6 +853,17 @@ impl PreparedFork {
                     diagnostic_name,
                 },
             );
+            if let Some(region) = child.pid_ns_region() {
+                if let (Ok(child_pid), Ok(parent_pid)) = (
+                    u32::try_from(child_id.raw()),
+                    u32::try_from(child_parent_task.key().id.raw()),
+                ) {
+                    if region.host_to_ns(child_pid).is_none() {
+                        let ns_pid = region.alloc_ns_pid();
+                        let _ = region.register(child_pid, ns_pid, parent_pid);
+                    }
+                }
+            }
             kernel.observe_task_publication(
                 &child,
                 &leader,
