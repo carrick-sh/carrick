@@ -1,10 +1,15 @@
 # Carrick Crate Map
 
-Carrick is a 30-crate Cargo workspace. The product path is:
+Carrick is a 31-crate Cargo workspace. The product path is:
 
 ```text
-carrick-cli -> carrick-engine -> { carrick-image, carrick-runtime } -> carrick-spec
+carrick-cli   -> carrick-engine -> { carrick-image, carrick-runtime } -> carrick-spec
+carrick-embed -> { carrick-engine, carrick-runtime }                   -> carrick-spec
 ```
+
+`carrick-embed` is the library front door and takes the runtime directly (for
+`RuntimeExtensions`, the `Vfs` trait and, in later phases, observers); the CLI
+reaches the runtime only through the engine.
 
 Platform code is selected by Cargo features. The default feature is
 `platform-macos`; non-macOS builds use `--no-default-features` plus exactly one
@@ -16,6 +21,7 @@ Platform code is selected by Cargo features. The default feature is
 | --- | --- |
 | `carrick-cli` | The `carrick` binary: docker-compatible command surface, lifecycle commands, diagnostics, and final runtime execution. |
 | `carrick-engine` | Docker-style request merge layer: image config + CLI flags -> `RunSpec`. |
+| `carrick-embed` | Library embedding surface: `ContainerBuilder` -> `RunRequest` -> `Engine::resolve` -> `Runtime::prepare`/`PreparedRun::execute`, with captured, inherited or piped stdio and the `testing` helpers (`TestContainer`, `run_in_container`, `ResultAssert`). The dog-food consumer for Carrick's own guest tests; guest-running tests need the signed `just test-embed` recipe. |
 | `carrick-image` | OCI reference parsing, pull/cache, config and layer resolution. |
 | `carrick-runtime` | Linux behavior core: ELF execution, syscall dispatch, VFS/rootfs, process model, namespaces, credentials, sockets, IPC, procfs/sysfs, and platform-selected execution loops. |
 | `carrick-spec` | Shared vocabulary types: `RunSpec`, `ContainerSpec`, `ImageConfig`, mounts, namespace config, platform requests. |
@@ -68,6 +74,7 @@ Platform code is selected by Cargo features. The default feature is
 | Crate | Role |
 | --- | --- |
 | `carrick-conformance` | Differential conformance harness; shells out to built carrick binaries and Docker oracles, classifies baselines, renders support matrix. |
+| `carrick-conformance-next` | **Planned, not yet in the tree** (Phase J of `docs/superpowers/specs/2026-08-25-carrick-embed-program-design.md`): self-hosted conformance over `carrick-embed` — `TestContainer` ports of LTP/probe cases, in-process dispatcher fuzzing, Docker `bpftrace` alignment. `carrick-conformance` stays the verdict authority until it reproduces every historical false-green rejection. |
 | `carrick-test-support` | Shared integration/CLI test helpers, mainly synthetic rootfs tar/gzip assembly. |
 
 ## Feature Closure Rules
@@ -80,6 +87,14 @@ Platform code is selected by Cargo features. The default feature is
   not pull HVF/applevisor.
 - `platform-netbsd` pulls `carrick-vmm-nvmm` and `carrick-host-bsd`; it must not
   pull HVF/applevisor.
+- `carrick-embed` forwards `platform-*` and `syscall-shim` to `carrick-runtime`
+  and `carrick-engine` exactly as `carrick-cli` does (default
+  `["platform-macos", "syscall-shim"]`), so an embedded guest runs with the same
+  EL1 shim as the shipped binary. `scripts/closure-assert-no-hvf.sh` walks
+  `carrick-cli` only; check the embed closure with
+  `cargo tree -p carrick-embed --no-default-features --features platform-linux
+  --target aarch64-unknown-linux-gnu --edges normal | grep -Ei
+  'carrick-vmm-hvf|applevisor'` (expect no output).
 
 Use `cargo metadata --no-deps` and `scripts/closure-assert-no-hvf.sh` when
 changing feature wiring.
