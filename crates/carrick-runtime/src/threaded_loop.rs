@@ -104,14 +104,9 @@ pub trait HostBackend: Send + Sync + 'static {
     }
 }
 
-/// The ONE threaded vCPU run loop, parameterized over the host seam
-/// [`HostBackend`]. Replaces `run_threaded_kvm_loop` / `run_threaded_bhyve_loop`
-/// (and any future kick+futex backend's): builds the shared scaffold + the
-/// host's four trait objects, installs the kick handler / pump via the
-/// coordinator, wires timer delivery, and drives the generic
-/// `vcpu_loop::run_vcpu_until_exit`. `handle_fork` (real `libc::fork` + child VM
-/// rebuild), `spawn_clone_thread` (sibling vCPUs), and the private/shared futex
-/// paths all flow through the shared loop.
+/// Publish the root mm's initial frame inventory as one reserve→commit
+/// transaction; a rejected publication aborts, because the HVF mappings
+/// already exist and running with two truths is not recoverable.
 fn publish_initial_frame_inventory<Inventory>(
     context: Option<&crate::kernel::KernelContext>,
     extent_count: usize,
@@ -181,6 +176,12 @@ pub(crate) struct ThreadedLoopCompletion {
     pub(crate) carrier_control: Option<crate::kernel::control::ManagedCarrierControl>,
 }
 
+/// The ONE threaded vCPU run loop, parameterized over the host seam
+/// [`HostBackend`]: builds the shared scaffold + the host's trait objects,
+/// installs the kick handler / pump via the coordinator, wires timer
+/// delivery, and drives the generic `vcpu_loop::run_vcpu_until_exit`. Logical
+/// process fork (`DispatchOutcome::Fork`, no host process), sibling-vCPU
+/// thread clone, and the private/shared futex paths all flow through it.
 pub(crate) fn run_threaded_loop<E, H>(
     engine: E,
     dispatcher: SyscallDispatcher,
@@ -265,8 +266,8 @@ where
     // dispatch + complete_futex_wait path (the generation-snapshot lost-wake
     // protocol stays byte-identical). The host's object-safe `PlatformFutex`
     // wraps the SAME table for the SHARED-futex / notify-signal-pending ops;
-    // the factory rebuilds that pairing over a fresh table on the fork CHILD
-    // side (`vcpu_loop::handle_fork`).
+    // the factory rebuilds that pairing over a fresh table on the fork child
+    // side.
     let futex = Arc::new(FutexTable::new());
     let platform_futex: Arc<dyn carrick_hal::PlatformFutex> = host.make_futex(Arc::clone(&futex));
     let host_for_factory = std::sync::Arc::new(host);

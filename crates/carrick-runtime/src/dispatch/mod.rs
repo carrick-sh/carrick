@@ -84,7 +84,8 @@
 //! afterwards. The categories:
 //!
 //! - **Address-space / vCPU effects the dispatcher cannot perform.**
-//!   [`DispatchOutcome::Fork`] (real `libc::fork` against the trap engine),
+//!   [`DispatchOutcome::Fork`] (a logical kernel-graph fork inside the carrier;
+//!   no host process is created),
 //!   [`DispatchOutcome::Execve`] (tear down + reload the ELF; argv/env are raw
 //!   *byte* strings, not UTF-8), [`DispatchOutcome::CloneThread`] (spawn a host
 //!   thread + sibling vCPU sharing the VM), [`DispatchOutcome::ThreadExit`],

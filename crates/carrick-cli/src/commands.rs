@@ -1024,10 +1024,9 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             // Top-level diagnostics: the NATIVEPERF supervisor record is gated
             // by CARRICK_DSR_PROFILE, while the exact exec-stamp run-complete
             // denominator is gated independently by CARRICK_EXEC_STAMPS. Both
-            // share the one-true-top-level PID check: interactive `-t` runs
-            // fork descendants that also reach this tail, but only the
-            // Launcher has reaped the complete guest tree. Placed before every
-            // exit path (interactive/json/raw) so both exports fire uniformly.
+            // share the one-true-top-level PID check (see `supervisor_perf`).
+            // Placed before every exit path (interactive/json/default) so both
+            // exports fire uniformly.
             crate::supervisor_perf::emit_supervisor_record_if_profiling();
 
             // Interactive / tty: the guest's stdio already went straight to the

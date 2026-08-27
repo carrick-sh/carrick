@@ -726,25 +726,20 @@ pub mod host_signal {
     /// Real POSIX impl shared with HVF (via carrick-host), no longer an identity
     /// stub that left internal fds at low, collision-prone numbers.
     pub use carrick_host::internal_fd::{duplicate_internal_fd, relocate_internal_fd};
-    /// Reset inherited host-signal state in the runtime child after the
-    /// interactive-`--tty` session supervisor forks (called from
-    /// `interactive_supervisor::adopt_stdio`, in the freshly-forked child BEFORE
-    /// it runs the normal runtime setup). The child must NOT inherit the
-    /// supervisor's stale pending signals, mirrored host dispositions, child-exit
-    /// watches, or its now-defunct signal-pump bookkeeping — it re-derives all of
-    /// them from scratch as it boots its own guest.
+    /// Reset the process-wide host-signal state to its pristine boot shape.
+    /// No product path forks a host process any more (guest `fork` is a
+    /// logical kernel-graph clone inside the carrier); the remaining callers
+    /// are in-process test harnesses that boot several dispatchers in one
+    /// test process and must not inherit a previous boot's pending signals,
+    /// mirrored dispositions, child-exit watches or signal-pump guards.
     ///
-    /// NEUTRAL vs GLUE (mirrors the HVF arm's rationale,
-    /// `carrick_vmm_hvf::host_signal::reset_after_supervisor_fork`). The load-bearing
-    /// CORRECTNESS clears are the platform-NEUTRAL `carrick-signal-core` state —
-    /// the same pending / disposition / child-watch the HVF arm clears — so the
-    /// child starts with an empty pending set and re-derives its own host
-    /// dispositions. The PUMP re-arm is KVM GLUE: where HVF reopens its self-pipe
-    /// here, KVM resets the inherited pump guards (`PUMP_STARTED` /
-    /// `SIGCHLD_INSTALLED` / the stale `SELF_PIPE_W`) so the child's subsequent
-    /// `start_signal_pump` (the normal runtime setup, lib.rs:477 / runtime.rs:1500)
-    /// actually re-spawns a fresh pump instead of no-opping on the inherited
-    /// `PUMP_STARTED == true` guard and leaving a dead pump.
+    /// NEUTRAL vs GLUE (mirrors the HVF arm,
+    /// `carrick_vmm_hvf::host_signal::reset_after_supervisor_fork`). The
+    /// load-bearing clears are the platform-NEUTRAL `carrick-signal-core`
+    /// state — pending / disposition / child-watch. The PUMP re-arm is KVM
+    /// GLUE: it resets the pump guards (`PUMP_STARTED` / `SIGCHLD_INSTALLED` /
+    /// the stale `SELF_PIPE_W`) so the next `start_signal_pump` spawns a fresh
+    /// pump instead of no-opping on `PUMP_STARTED == true`.
     pub fn reset_after_supervisor_fork() {
         carrick_signal_core::xsig::xsig_refresh_self_host_pid();
         // ---- NEUTRAL (shared with HVF): drop inherited pending / disposition /
