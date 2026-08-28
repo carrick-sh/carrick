@@ -240,11 +240,6 @@ pub(super) struct TimerFdInner {
 
 #[derive(Debug, Clone)]
 pub(super) struct OpenDescriptionBase {
-    /// The description-level state this backing shares with its owning
-    /// `kernel::FileDescription`. TRANSIENT: `OpenDescriptionBase` stops
-    /// carrying it entirely once every reader goes through the description
-    /// (see the deletion commit in this series).
-    common: std::sync::Arc<crate::kernel::objects::DescriptionCommon>,
     /// SO_RCVTIMEO: bounds a blocking recv on this socket. None = block forever.
     recv_timeout: Option<Duration>,
     /// SO_SNDTIMEO: bounds a blocking send on this socket. None = block forever.
@@ -322,11 +317,8 @@ pub(super) struct SocketMulticastMembership {
 }
 
 impl OpenDescriptionBase {
-    pub(super) fn new(status_flags: u64) -> Self {
+    pub(super) fn new(#[allow(unused)] status_flags: u64) -> Self {
         Self {
-            common: std::sync::Arc::new(crate::kernel::objects::DescriptionCommon::new(
-                status_flags,
-            )),
             so_reuseaddr: false,
             so_reuseport: false,
             ipv6_multicast_if: None,
@@ -342,26 +334,6 @@ impl OpenDescriptionBase {
             pipe_capacity: crate::linux_abi::LINUX_PIPE_BUF_SIZE,
             pipe_capacity_shared: None,
         }
-    }
-
-    pub(super) fn common(&self) -> &std::sync::Arc<crate::kernel::objects::DescriptionCommon> {
-        &self.common
-    }
-
-    pub(super) fn seals(&self) -> Option<u32> {
-        self.common.seals()
-    }
-
-    pub(super) fn set_seals(&self, seals: Option<u32>) {
-        self.common.set_seals(seals);
-    }
-
-    pub(super) fn secretmem(&self) -> bool {
-        self.common.secretmem()
-    }
-
-    pub(super) fn set_secretmem(&self, secretmem: bool) {
-        self.common.set_secretmem(secretmem);
     }
 
     /// Route pipe capacity through a cell shared with the pipe's other end.
@@ -384,89 +356,6 @@ impl OpenDescriptionBase {
             Some(cell) => cell.store(capacity, std::sync::atomic::Ordering::Relaxed),
             None => self.pipe_capacity = capacity,
         }
-    }
-
-    pub(super) fn status_flags(&self) -> u64 {
-        self.common.status_flags()
-    }
-
-    #[inline]
-    pub(super) fn is_append(&self) -> bool {
-        carrick_abi::LinuxOpenFlags::from_bits_truncate(self.status_flags())
-            .contains(carrick_abi::LinuxOpenFlags::APPEND)
-    }
-
-    #[inline]
-    pub(super) fn is_nonblocking(&self) -> bool {
-        carrick_abi::LinuxOpenFlags::from_bits_truncate(self.status_flags())
-            .contains(carrick_abi::LinuxOpenFlags::NONBLOCK)
-    }
-
-    #[inline]
-    pub(super) fn is_async(&self) -> bool {
-        carrick_abi::LinuxOpenFlags::from_bits_truncate(self.status_flags())
-            .contains(carrick_abi::LinuxOpenFlags::ASYNC)
-    }
-
-    #[inline]
-    pub(super) fn access_mode(&self) -> u64 {
-        self.status_flags() & carrick_abi::LINUX_O_ACCMODE
-    }
-
-    #[inline]
-    pub(super) fn is_write_only(&self) -> bool {
-        self.access_mode() == carrick_abi::LINUX_O_WRONLY
-    }
-
-    #[inline]
-    pub(super) fn is_read_only(&self) -> bool {
-        self.access_mode() == carrick_abi::LINUX_O_RDONLY
-    }
-
-    #[inline]
-    pub(super) fn is_path(&self) -> bool {
-        carrick_abi::LinuxOpenFlags::from_bits_truncate(self.status_flags())
-            .contains(carrick_abi::LinuxOpenFlags::PATH)
-    }
-
-    /// F_GETOWN_EX returns the (type, pid); (0, 0) means no owner set.
-    #[allow(dead_code)]
-    pub(super) fn owner(&self) -> (i32, i32) {
-        let owner = self.common.owner();
-        (owner.owner_type, owner.owner_pid)
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn set_owner(&self, owner_type: i32, owner_pid: i32) {
-        self.common.set_owner(crate::kernel::objects::AsyncIoOwner {
-            owner_type,
-            owner_pid,
-        });
-    }
-
-    /// F_GETSIG: 0 = the default SIGIO.
-    #[allow(dead_code)]
-    pub(super) fn async_sig(&self) -> i32 {
-        self.common.async_sig()
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn set_async_sig(&self, sig: i32) {
-        self.common.set_async_sig(sig);
-    }
-
-    pub(super) fn set_status_flags(&self, next: u64) {
-        self.common.set_status_flags(next);
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn lease(&self) -> i32 {
-        self.common.lease()
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn set_lease(&self, lease: i32) {
-        self.common.set_lease(lease);
     }
 
     pub(super) fn recv_timeout(&self) -> Option<Duration> {
@@ -868,6 +757,7 @@ impl TrustedHostDir {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(super) enum OpenDescription {
     /// Observable identity shell retained after the last functional fd slot
     /// closes. All host descriptors and subsystem resources have already been
@@ -1211,21 +1101,46 @@ pub(crate) type OpenFile = crate::kernel::FileSlot;
 
 pub(super) fn kernel_file_description(
     description: OpenDescriptionRef,
+    status_flags: u64,
 ) -> Arc<crate::kernel::FileDescription> {
-    let common = std::sync::Arc::clone(description.read().base().common());
     Arc::new(
-        crate::kernel::FileDescription::concrete_with_common(description, common).unwrap_or_else(
-            |error| {
-                tracing::error!(%error, "file-description identity allocation failed");
-                std::process::abort();
-            },
-        ),
+        crate::kernel::FileDescription::concrete_with_common(
+            description,
+            Arc::new(crate::kernel::DescriptionCommon::new(status_flags)),
+        )
+        .unwrap_or_else(|error| {
+            tracing::error!(%error, "file-description identity allocation failed");
+            std::process::abort();
+        }),
     )
 }
 
 impl crate::kernel::FileSlot {
-    pub(super) fn from_open_description(description: OpenDescriptionRef, fd_flags: u64) -> Self {
-        Self::new(kernel_file_description(description), fd_flags)
+    pub(super) fn from_open_description_with_status_flags(
+        description: OpenDescriptionRef,
+        status_flags: u64,
+        fd_flags: u64,
+    ) -> Self {
+        Self::from_open_description_with_common(
+            description,
+            Arc::new(crate::kernel::DescriptionCommon::new(status_flags)),
+            fd_flags,
+        )
+    }
+
+    pub(super) fn from_open_description_with_common(
+        description: OpenDescriptionRef,
+        common: Arc<crate::kernel::DescriptionCommon>,
+        fd_flags: u64,
+    ) -> Self {
+        let file_desc = Arc::new(
+            crate::kernel::FileDescription::concrete_with_common(description, common)
+                .unwrap_or_else(|error| {
+                    tracing::error!(%error, "file-description identity allocation failed");
+                    std::process::abort();
+                }),
+        );
+        Self::new(file_desc, fd_flags)
     }
 }
 
@@ -1384,8 +1299,6 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
             OpenDescription::PerfEvent { .. } => Kind::PerfEvent,
             OpenDescription::FsContext { .. } => Kind::FsContext,
         };
-        let status_flags = (!matches!(&*description, OpenDescription::Closed { .. }))
-            .then(|| description.base().status_flags());
         let offset = match &*description {
             OpenDescription::File { offset, .. }
             | OpenDescription::Directory { offset, .. }
@@ -1427,24 +1340,17 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
         Some(crate::kernel::FileDescriptionBackingSnapshot::Open(
             crate::kernel::OpenDescriptionBackingSnapshot {
                 kind,
-                status_flags,
                 offset,
                 host_fd,
                 path,
                 pipe_id,
-                logical_fd_refs: if matches!(&*description, OpenDescription::Closed { .. }) {
-                    0
-                } else {
-                    description.fd_ref_count()
-                },
                 epoll_interests,
             },
         ))
     }
 
-    fn retain_fd_ref(&self) {
+    fn on_first_fd_ref(&self) {
         let description = self.read();
-        description.retain_fd_ref();
         match &*description {
             OpenDescription::PipeReader { pipe, .. } => {
                 let mut state = pipe.state.lock();
@@ -1460,9 +1366,8 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
         }
     }
 
-    fn release_fd_ref(&self) {
+    fn on_last_fd_ref(&self) {
         let mut description = self.write();
-        let remaining = description.release_fd_ref();
         match &*description {
             OpenDescription::PipeReader { pipe, .. } => {
                 let mut state = pipe.state.lock();
@@ -1480,14 +1385,8 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
             }
             _ => {}
         }
-        if remaining == 0 {
-            let was_epoll = matches!(&*description, OpenDescription::Epoll { .. });
-            *description = OpenDescription::Closed { was_epoll };
-        }
-    }
-
-    fn fd_ref_count(&self) -> usize {
-        self.read().fd_ref_count()
+        let was_epoll = matches!(&*description, OpenDescription::Epoll { .. });
+        *description = OpenDescription::Closed { was_epoll };
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -1496,36 +1395,30 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
 }
 
 impl crate::kernel::FileDescription {
-    fn open_description(&self) -> &RwLock<OpenDescription> {
-        if let Some(description) = self.concrete_backing::<RwLock<OpenDescription>>() {
-            return description;
-        }
-        if let Some(ring) = self.concrete_backing::<super::ioring::IoUringBacking>() {
-            return ring.open_metadata();
-        }
-        tracing::error!("model-only file description escaped into dispatch");
-        std::process::abort();
+    pub(in crate::dispatch) fn open_description(&self) -> Option<&RwLock<OpenDescription>> {
+        self.concrete_backing::<RwLock<OpenDescription>>()
     }
 
-    pub(super) fn read(&self) -> RwLockReadGuard<'_, OpenDescription> {
-        self.open_description().read()
+    pub(super) fn read(&self) -> Option<RwLockReadGuard<'_, OpenDescription>> {
+        self.open_description().map(|d| d.read())
     }
 
     pub(super) fn try_read(&self) -> Option<RwLockReadGuard<'_, OpenDescription>> {
-        self.open_description().try_read()
+        self.open_description().and_then(|d| d.try_read())
     }
 
-    pub(super) fn write(&self) -> FileDescriptionWriteGuard<'_> {
-        FileDescriptionWriteGuard {
-            guard: self.open_description().write(),
-            description: self,
-        }
+    pub(super) fn write(&self) -> Option<FileDescriptionWriteGuard<'_>> {
+        self.open_description()
+            .map(|guard| FileDescriptionWriteGuard {
+                guard: guard.write(),
+                description: self,
+            })
     }
 
     #[cfg(test)]
     pub(super) fn try_write_for_test(&self) -> Option<FileDescriptionWriteGuard<'_>> {
         self.open_description()
-            .try_write()
+            .and_then(|guard| guard.try_write())
             .map(|guard| FileDescriptionWriteGuard {
                 guard,
                 description: self,
@@ -1718,188 +1611,6 @@ pub(super) enum OpenStatSource {
 }
 
 impl OpenDescription {
-    pub(crate) fn base(&self) -> &OpenDescriptionBase {
-        match self {
-            OpenDescription::Closed { .. } => {
-                tracing::error!("closed file description has no functional base");
-                std::process::abort();
-            }
-            OpenDescription::File { base, .. }
-            | OpenDescription::Directory { base, .. }
-            | OpenDescription::SyntheticFile { base, .. }
-            | OpenDescription::InMemoryFile { base, .. }
-            | OpenDescription::SyntheticDevice { base, .. }
-            | OpenDescription::EventFd { base, .. }
-            | OpenDescription::TimerFd { base, .. }
-            | OpenDescription::Epoll { base, .. }
-            | OpenDescription::Pidfd { base, .. }
-            | OpenDescription::PipeReader { base, .. }
-            | OpenDescription::PipeWriter { base, .. }
-            | OpenDescription::HostPipe { base, .. }
-            | OpenDescription::HostFile { base, .. }
-            | OpenDescription::HostSocket { base, .. }
-            | OpenDescription::Inotify { base, .. }
-            | OpenDescription::Fanotify { base, .. }
-            | OpenDescription::SignalFd { base, .. }
-            | OpenDescription::PerfEvent { base, .. }
-            | OpenDescription::FsContext { base, .. }
-            | OpenDescription::Netlink { base, .. }
-            | OpenDescription::Mqueue { base, .. }
-            | OpenDescription::BpfMap { base, .. }
-            | OpenDescription::BpfProg { base, .. }
-            | OpenDescription::InMemorySocket { base, .. } => base,
-        }
-    }
-
-    fn base_mut(&mut self) -> &mut OpenDescriptionBase {
-        match self {
-            OpenDescription::Closed { .. } => {
-                tracing::error!("closed file description has no functional base");
-                std::process::abort();
-            }
-            OpenDescription::File { base, .. }
-            | OpenDescription::Directory { base, .. }
-            | OpenDescription::SyntheticFile { base, .. }
-            | OpenDescription::InMemoryFile { base, .. }
-            | OpenDescription::SyntheticDevice { base, .. }
-            | OpenDescription::EventFd { base, .. }
-            | OpenDescription::TimerFd { base, .. }
-            | OpenDescription::Epoll { base, .. }
-            | OpenDescription::Pidfd { base, .. }
-            | OpenDescription::PipeReader { base, .. }
-            | OpenDescription::PipeWriter { base, .. }
-            | OpenDescription::HostPipe { base, .. }
-            | OpenDescription::HostFile { base, .. }
-            | OpenDescription::HostSocket { base, .. }
-            | OpenDescription::Inotify { base, .. }
-            | OpenDescription::Fanotify { base, .. }
-            | OpenDescription::SignalFd { base, .. }
-            | OpenDescription::PerfEvent { base, .. }
-            | OpenDescription::FsContext { base, .. }
-            | OpenDescription::Netlink { base, .. }
-            | OpenDescription::Mqueue { base, .. }
-            | OpenDescription::BpfMap { base, .. }
-            | OpenDescription::BpfProg { base, .. }
-            | OpenDescription::InMemorySocket { base, .. } => base,
-        }
-    }
-
-    pub(super) fn retain_fd_ref(&self) {
-        match self {
-            OpenDescription::Closed { .. } => {}
-            _ => self.base().common().retain_fd_ref(),
-        }
-    }
-
-    pub(super) fn release_fd_ref(&self) -> usize {
-        match self {
-            OpenDescription::Closed { .. } => 0,
-            _ => self.base().common().release_fd_ref(),
-        }
-    }
-
-    pub(super) fn fd_ref_count(&self) -> usize {
-        match self {
-            OpenDescription::Closed { .. } => 0,
-            _ => self.base().common().fd_refs(),
-        }
-    }
-
-    pub(super) fn status_flags(&self) -> u64 {
-        self.base().status_flags()
-    }
-
-    #[inline]
-    pub(super) fn is_append(&self) -> bool {
-        self.base().is_append()
-    }
-
-    #[inline]
-    pub(super) fn is_nonblocking(&self) -> bool {
-        self.base().is_nonblocking()
-    }
-
-    #[inline]
-    pub(super) fn is_async(&self) -> bool {
-        self.base().is_async()
-    }
-
-    #[inline]
-    pub(super) fn is_write_only(&self) -> bool {
-        self.base().is_write_only()
-    }
-
-    #[inline]
-    pub(super) fn is_read_only(&self) -> bool {
-        self.base().is_read_only()
-    }
-
-    #[inline]
-    pub(super) fn is_path(&self) -> bool {
-        self.base().is_path()
-    }
-
-    /// True for a `memfd_secret(2)` description: no file read/write methods
-    /// (the read/write/splice family is EINVAL), MAP_SHARED-only mmap, and
-    /// mapped pages hidden from `/proc/<pid>/mem`.
-    #[allow(dead_code)]
-    #[inline]
-    pub(super) fn is_secretmem(&self) -> bool {
-        self.base().secretmem()
-    }
-
-    pub(super) fn set_status_flags(&self, next: u64) {
-        self.base().set_status_flags(next);
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn lease(&self) -> i32 {
-        self.base().lease()
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn set_lease(&self, lease: i32) {
-        self.base().set_lease(lease);
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn seals(&self) -> Option<u32> {
-        self.base().seals()
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn set_seals(&self, seals: Option<u32>) {
-        self.base().set_seals(seals);
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn owner(&self) -> (i32, i32) {
-        self.base().owner()
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn set_owner(&self, owner_type: i32, owner_pid: i32) {
-        self.base().set_owner(owner_type, owner_pid);
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn async_sig(&self) -> i32 {
-        self.base().async_sig()
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn set_async_sig(&self, sig: i32) {
-        self.base().set_async_sig(sig);
-    }
-
-    pub(super) fn pipe_capacity(&self) -> i64 {
-        self.base().pipe_capacity()
-    }
-
-    pub(super) fn set_pipe_capacity(&mut self, capacity: i64) {
-        self.base_mut().set_pipe_capacity(capacity);
-    }
-
     /// SO_RCVTIMEO for this description. Only HostSocket carries one; every
     /// other variant has no socket timeout, so returns None.
     pub(super) fn recv_timeout(&self) -> Option<Duration> {

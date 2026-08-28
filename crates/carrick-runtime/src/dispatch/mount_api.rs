@@ -347,7 +347,9 @@ impl SyscallDispatcher {
                     LINUX_EBADF
                 }));
             };
-            let description = open_file.description.read();
+            let Some(description) = open_file.description.read() else {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            };
             let OpenDescription::FsContext { state, .. } = &*description else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
@@ -424,7 +426,9 @@ impl SyscallDispatcher {
                     LINUX_EBADF
                 }));
             };
-            let description = open_file.description.read();
+            let Some(description) = open_file.description.read() else {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            };
             if !matches!(&*description, OpenDescription::FsContext { .. }) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }

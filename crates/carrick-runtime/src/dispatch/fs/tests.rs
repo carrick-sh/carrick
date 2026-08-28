@@ -253,7 +253,7 @@ fn test_directory_open_file(path: &str) -> OpenFile {
         mode: 0o755,
         size: 0,
     };
-    OpenFile::from_open_description(
+    OpenFile::from_open_description_with_status_flags(
         Arc::new(RwLock::new(OpenDescription::Directory {
             path: path.to_owned(),
             metadata,
@@ -262,6 +262,7 @@ fn test_directory_open_file(path: &str) -> OpenFile {
             base: OpenDescriptionBase::new(0),
             trusted_host_dir: None,
         })),
+        LINUX_O_RDONLY,
         0,
     )
 }
@@ -580,13 +581,12 @@ fn lane_openat(
 #[cfg(target_os = "macos")]
 fn lane_dir_is_trusted(dispatcher: &SyscallDispatcher, fd: i64) -> bool {
     let open_file = dispatcher.open_file(fd as i32).unwrap();
-    let open = open_file.description.read();
     matches!(
-        &*open,
-        OpenDescription::Directory {
+        open_file.description.read().as_deref(),
+        Some(OpenDescription::Directory {
             trusted_host_dir: Some(_),
             ..
-        }
+        })
     )
 }
 
@@ -689,7 +689,7 @@ fn trusted_dirfd_lane_serves_walk_and_recurses() {
     assert!(file >= 0, "openat(sub, deep.txt): {file}");
     {
         let open_file = dispatcher.open_file(file as i32).unwrap();
-        let open = open_file.description.read();
+        let open = open_file.description.read().expect("open description");
         assert!(
             matches!(&*open, OpenDescription::HostFile { .. }),
             "lane-served regular file must be a HostFile, got {open:?}"
@@ -1052,7 +1052,7 @@ fn trusted_dirfd_lane_falls_back_for_special_shapes() {
     assert!(fifo >= 0, "fifo openat: {fifo}");
     {
         let open_file = dispatcher.open_file(fifo as i32).unwrap();
-        let open = open_file.description.read();
+        let open = open_file.description.read().expect("open description");
         assert!(
             matches!(&*open, OpenDescription::HostPipe { .. }),
             "FIFO child must be a HostPipe, got {open:?}"
@@ -1380,13 +1380,13 @@ fn dnotify_child_attrib_queues_parent_before_child() {
         .open_file(parent_fd)
         .unwrap()
         .description
-        .write()
+        .common()
         .set_async_sig(signum);
     dispatcher
         .open_file(child_fd)
         .unwrap()
         .description
-        .write()
+        .common()
         .set_async_sig(signum);
 
     dispatcher
@@ -1444,7 +1444,7 @@ fn dnotify_child_attrib_matches_macos_private_tmp_alias() {
         .open_file(parent_fd)
         .unwrap()
         .description
-        .write()
+        .common()
         .set_async_sig(signum);
 
     dispatcher
@@ -1476,7 +1476,7 @@ fn staged_splice_pipe_bytes_preserve_fifo_order() {
     assert_eq!(unsafe { libc::pipe(host_fds.as_mut_ptr()) }, 0);
 
     let dispatcher = SyscallDispatcher::new();
-    let read_open = OpenFile::from_open_description(
+    let read_open = OpenFile::from_open_description_with_status_flags(
         Arc::new(RwLock::new(OpenDescription::HostPipe {
             host_fd: HostFdRef::new(host_fds[0]),
             is_read_end: true,
@@ -1487,9 +1487,10 @@ fn staged_splice_pipe_bytes_preserve_fifo_order() {
             write_kind: HostWriteKind::PipeLike,
             stdio_stream: None,
         })),
+        LINUX_O_RDONLY,
         0,
     );
-    let write_open = OpenFile::from_open_description(
+    let write_open = OpenFile::from_open_description_with_status_flags(
         Arc::new(RwLock::new(OpenDescription::HostPipe {
             host_fd: HostFdRef::new(host_fds[1]),
             is_read_end: false,
@@ -1500,6 +1501,7 @@ fn staged_splice_pipe_bytes_preserve_fifo_order() {
             write_kind: HostWriteKind::PipeLike,
             stdio_stream: None,
         })),
+        LINUX_O_WRONLY,
         0,
     );
     let (read_fd, _write_fd) = dispatcher
@@ -1531,7 +1533,7 @@ fn staged_splice_pipe_bytes_are_visible_to_read() {
     }
 
     let mut dispatcher = SyscallDispatcher::new();
-    let read_open = OpenFile::from_open_description(
+    let read_open = OpenFile::from_open_description_with_status_flags(
         Arc::new(RwLock::new(OpenDescription::HostPipe {
             host_fd: HostFdRef::new(host_fds[0]),
             is_read_end: true,
@@ -1542,9 +1544,10 @@ fn staged_splice_pipe_bytes_are_visible_to_read() {
             write_kind: HostWriteKind::PipeLike,
             stdio_stream: None,
         })),
+        LINUX_O_RDONLY,
         0,
     );
-    let write_open = OpenFile::from_open_description(
+    let write_open = OpenFile::from_open_description_with_status_flags(
         Arc::new(RwLock::new(OpenDescription::HostPipe {
             host_fd: HostFdRef::new(host_fds[1]),
             is_read_end: false,
@@ -1555,6 +1558,7 @@ fn staged_splice_pipe_bytes_are_visible_to_read() {
             write_kind: HostWriteKind::PipeLike,
             stdio_stream: None,
         })),
+        LINUX_O_WRONLY,
         0,
     );
     let (read_fd, _write_fd) = dispatcher
@@ -1598,7 +1602,7 @@ fn splice_host_file_to_pipe_returns_short_and_advances_offset() {
     assert!(host_fd >= 0, "open splice source");
 
     let dispatcher = SyscallDispatcher::new();
-    let source = OpenFile::from_open_description(
+    let source = OpenFile::from_open_description_with_status_flags(
         Arc::new(RwLock::new(OpenDescription::HostFile {
             host_fd: HostFdRef::new(host_fd),
             metadata: RootFsMetadata {
@@ -1610,6 +1614,7 @@ fn splice_host_file_to_pipe_returns_short_and_advances_offset() {
             base: OpenDescriptionBase::new(0),
             writable: false,
         })),
+        LINUX_O_RDONLY,
         0,
     );
     let in_fd = dispatcher
@@ -1618,7 +1623,7 @@ fn splice_host_file_to_pipe_returns_short_and_advances_offset() {
 
     let mut host_pipe = [-1; 2];
     assert_eq!(unsafe { libc::pipe(host_pipe.as_mut_ptr()) }, 0);
-    let read_open = OpenFile::from_open_description(
+    let read_open = OpenFile::from_open_description_with_status_flags(
         Arc::new(RwLock::new(OpenDescription::HostPipe {
             host_fd: HostFdRef::new(host_pipe[0]),
             is_read_end: true,
@@ -1629,9 +1634,10 @@ fn splice_host_file_to_pipe_returns_short_and_advances_offset() {
             write_kind: HostWriteKind::PipeLike,
             stdio_stream: None,
         })),
+        LINUX_O_RDONLY,
         0,
     );
-    let write_open = OpenFile::from_open_description(
+    let write_open = OpenFile::from_open_description_with_status_flags(
         Arc::new(RwLock::new(OpenDescription::HostPipe {
             host_fd: HostFdRef::new(host_pipe[1]),
             is_read_end: false,
@@ -1642,6 +1648,7 @@ fn splice_host_file_to_pipe_returns_short_and_advances_offset() {
             write_kind: HostWriteKind::PipeLike,
             stdio_stream: None,
         })),
+        LINUX_O_WRONLY,
         0,
     );
     let (_read_fd, write_fd) = dispatcher
@@ -2097,6 +2104,7 @@ fn splice_synthetic_devices_pipe_capacity_and_nonblocking() {
         .expect("write file")
         .description
         .read()
+        .expect("open description")
     {
         OpenDescription::PipeWriter { pipe, .. } => (
             pipe.write_poll_fd()
@@ -2308,10 +2316,10 @@ fn bind_mount_rejects_o_directory_for_regular_file() {
 #[test]
 fn f_add_seals_waits_for_alias_dispatch_and_publishes_under_same_exclusion() {
     let dispatcher = std::sync::Arc::new(SyscallDispatcher::new());
-    let base = OpenDescriptionBase::new(LINUX_O_RDWR);
-    base.set_seals(Some(0));
+    let common = std::sync::Arc::new(crate::kernel::DescriptionCommon::new(LINUX_O_RDWR));
+    common.set_seals(Some(0));
     let description = std::sync::Arc::new(RwLock::new(OpenDescription::SyntheticFile {
-        base,
+        base: OpenDescriptionBase::new(0),
         path: "/memfd:test".to_string(),
         contents: Vec::new(),
         offset: 0,
@@ -2319,7 +2327,11 @@ fn f_add_seals_waits_for_alias_dispatch_and_publishes_under_same_exclusion() {
     let fd = dispatcher
         .install_fd_at_or_above(
             3,
-            OpenFile::from_open_description(std::sync::Arc::clone(&description), 0),
+            OpenFile::from_open_description_with_common(
+                std::sync::Arc::clone(&description),
+                std::sync::Arc::clone(&common),
+                0,
+            ),
         )
         .expect("install sealable fd");
 
@@ -2366,7 +2378,7 @@ fn f_add_seals_waits_for_alias_dispatch_and_publishes_under_same_exclusion() {
         "F_ADD_SEALS raced an in-flight alias dispatch"
     );
     assert_eq!(
-        description.read().seals(),
+        common.seals(),
         Some(carrick_abi::LinuxMemfdSeals::empty().bits())
     );
 
@@ -2379,7 +2391,7 @@ fn f_add_seals_waits_for_alias_dispatch_and_publishes_under_same_exclusion() {
         DispatchOutcome::Returned { value: 0 }
     );
     assert_eq!(
-        description.read().seals(),
+        common.seals(),
         Some(carrick_abi::LinuxMemfdSeals::SHRINK.bits())
     );
     thread.join().expect("join F_ADD_SEALS thread");
@@ -2617,7 +2629,7 @@ fn rlimit_fsize_straddling_regular_write_returns_only_the_limit_prefix() {
     let open = dispatcher
         .open_file(fd)
         .expect("created regular file remains open");
-    let description = open.description.read();
+    let description = open.description.read().expect("open description");
     let OpenDescription::File { contents, .. } = &*description else {
         panic!("expected in-memory regular-file description");
     };
@@ -3304,18 +3316,20 @@ impl TestInMemoryPipe {
         let mut write_base = OpenDescriptionBase::new(LINUX_O_WRONLY);
         write_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
 
-        let read_open = OpenFile::from_open_description(
+        let read_open = OpenFile::from_open_description_with_status_flags(
             Arc::new(RwLock::new(OpenDescription::PipeReader {
                 base: read_base,
                 pipe: Arc::clone(&pipe),
             })),
+            LINUX_O_RDONLY,
             0,
         );
-        let write_open = OpenFile::from_open_description(
+        let write_open = OpenFile::from_open_description_with_status_flags(
             Arc::new(RwLock::new(OpenDescription::PipeWriter {
                 base: write_base,
                 pipe: Arc::clone(&pipe),
             })),
+            LINUX_O_WRONLY,
             0,
         );
         let (_read_fd, write_fd) = dispatcher
@@ -3499,7 +3513,11 @@ impl TestPipePair {
                         pipe: Arc::clone(pipe),
                     }
                 };
-                OpenFile::from_open_description(Arc::new(RwLock::new(d)), 0)
+                OpenFile::from_open_description_with_status_flags(
+                    Arc::new(RwLock::new(d)),
+                    flags,
+                    0,
+                )
             };
             dispatcher
                 .install_fd_pair_at_or_above(
@@ -3932,16 +3950,20 @@ fn pipe_end_direction_matrix_and_fd_lifecycle_closure() {
         .dispatcher
         .install_fd_at_or_above(
             3,
-            OpenFile::from_open_description(Arc::new(RwLock::new(pty_desc)), 0),
+            OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(pty_desc)),
+                LINUX_O_RDWR,
+                0,
+            ),
         )
         .expect("install bidirectional pipe");
     let bi_file = pair.dispatcher.open_file(bi_fd).expect("open file");
     assert!(matches!(
-        &*bi_file.description.read(),
-        OpenDescription::HostPipe {
+        bi_file.description.read().as_deref(),
+        Some(OpenDescription::HostPipe {
             bidirectional: true,
             ..
-        }
+        })
     ));
 }
 
@@ -4124,7 +4146,11 @@ fn non_pipe_access_mode_readv_writev_and_splice_precedence() {
         .dispatcher
         .install_fd_at_or_above(
             3,
-            OpenFile::from_open_description(Arc::new(RwLock::new(wr_file_desc)), 0),
+            OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(wr_file_desc)),
+                carrick_abi::LINUX_O_WRONLY,
+                0,
+            ),
         )
         .expect("install wronly file");
 
@@ -4177,7 +4203,11 @@ fn non_pipe_access_mode_readv_writev_and_splice_precedence() {
         .dispatcher
         .install_fd_at_or_above(
             3,
-            OpenFile::from_open_description(Arc::new(RwLock::new(dir_desc)), 0),
+            OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(dir_desc)),
+                LINUX_O_RDONLY,
+                0,
+            ),
         )
         .expect("install directory fd");
 

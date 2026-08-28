@@ -6,13 +6,10 @@ use super::*;
 use crate::linux_abi::LinuxErrno;
 
 pub(in crate::dispatch) fn event_ring_host_fd(open_file: &OpenFile) -> i32 {
-    let Some(description) = open_file
-        .description
-        .concrete_backing::<RwLock<OpenDescription>>()
-    else {
+    let Some(description) = open_file.description.read() else {
         return -1;
     };
-    match &*description.read() {
+    match &*description {
         OpenDescription::HostPipe { host_fd, .. }
         | OpenDescription::HostFile { host_fd, .. }
         | OpenDescription::HostSocket { host_fd, .. } => host_fd.raw(),
@@ -198,8 +195,33 @@ impl SyscallDispatcher {
         description: OpenDescription,
         fd_flags: u64,
     ) -> DispatchOutcome {
-        let open_file =
-            OpenFile::from_open_description(Arc::new(RwLock::new(description)), fd_flags);
+        self.install_fd_with_status_flags(description, 0, fd_flags)
+    }
+
+    pub(in crate::dispatch) fn install_fd_with_status_flags(
+        &self,
+        description: OpenDescription,
+        status_flags: u64,
+        fd_flags: u64,
+    ) -> DispatchOutcome {
+        self.install_fd_with_common(
+            description,
+            Arc::new(crate::kernel::DescriptionCommon::new(status_flags)),
+            fd_flags,
+        )
+    }
+
+    pub(in crate::dispatch) fn install_fd_with_common(
+        &self,
+        description: OpenDescription,
+        common: Arc<crate::kernel::DescriptionCommon>,
+        fd_flags: u64,
+    ) -> DispatchOutcome {
+        let open_file = OpenFile::from_open_description_with_common(
+            Arc::new(RwLock::new(description)),
+            common,
+            fd_flags,
+        );
         // POSIX lowest-free-descriptor (min_fd = 0): reuses a stdio number the
         // guest explicitly closed — busybox ash's background-job forkchild does
         // `close(0); open("/dev/null")` and treats anything but fd 0 as an error
@@ -248,7 +270,7 @@ impl SyscallDispatcher {
     /// macOS `sendfile(2)` can stream.
     pub(in crate::dispatch) fn regular_host_file_fd(&self, fd: i32) -> Option<HostFd> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.read();
+        let open = open_file.description.read()?;
         match &*open {
             OpenDescription::HostFile { host_fd, .. } => Some(host_fd.view()),
             _ => None,
@@ -260,7 +282,7 @@ impl SyscallDispatcher {
     /// write-side callers must use this helper rather than `regular_host_file_fd`.
     pub(in crate::dispatch) fn regular_host_file_write_fd(&self, fd: i32) -> Option<HostFd> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.read();
+        let open = open_file.description.read()?;
         match &*open {
             OpenDescription::HostFile {
                 host_fd,
@@ -275,7 +297,7 @@ impl SyscallDispatcher {
     /// `sendfile(2)` streams to.
     pub(in crate::dispatch) fn host_socket_fd(&self, fd: i32) -> Option<HostFd> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.read();
+        let open = open_file.description.read()?;
         match &*open {
             OpenDescription::HostSocket { host_fd, .. } => Some(host_fd.view()),
             _ => None,
@@ -288,7 +310,7 @@ impl SyscallDispatcher {
         fd: i32,
     ) -> Option<Arc<crate::inotify::InotifyState>> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.read();
+        let open = open_file.description.read()?;
         match &*open {
             OpenDescription::Inotify { state, .. } => Some(Arc::clone(state)),
             _ => None,
@@ -302,7 +324,7 @@ impl SyscallDispatcher {
         fd: i32,
     ) -> Option<Arc<crate::fanotify::FanotifyGroup>> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.read();
+        let open = open_file.description.read()?;
         match &*open {
             OpenDescription::Fanotify { group, .. } => Some(Arc::clone(group)),
             _ => None,
@@ -425,7 +447,9 @@ impl SyscallDispatcher {
             return;
         };
         let is_dir = {
-            let open = open_file.description.read();
+            let Some(open) = open_file.description.read() else {
+                return;
+            };
             match &*open {
                 OpenDescription::File { .. }
                 | OpenDescription::SyntheticFile { .. }
@@ -469,8 +493,10 @@ impl SyscallDispatcher {
         let Some(open_file) = self.open_file(fd) else {
             return;
         };
-        let mask = {
-            let open = open_file.description.read();
+        let (mask, is_dir) = {
+            let Some(open) = open_file.description.read() else {
+                return;
+            };
             let writable = match &*open {
                 OpenDescription::File { writable, .. }
                 | OpenDescription::HostFile { writable, .. } => *writable,
@@ -478,15 +504,12 @@ impl SyscallDispatcher {
                 OpenDescription::SyntheticFile { .. } | OpenDescription::Directory { .. } => false,
                 _ => return,
             };
-            if writable {
+            let mask = if writable {
                 carrick_abi::LINUX_IN_CLOSE_WRITE
             } else {
                 carrick_abi::LINUX_IN_CLOSE_NOWRITE
-            }
-        };
-        let is_dir = {
-            let open = open_file.description.read();
-            matches!(&*open, OpenDescription::Directory { .. })
+            };
+            (mask, matches!(&*open, OpenDescription::Directory { .. }))
         };
         let Some(path) = self.lookup_recorded_fd_open_path(fd) else {
             return;
@@ -562,7 +585,9 @@ impl SyscallDispatcher {
             return;
         };
         let is_dir = {
-            let open = open_file.description.read();
+            let Some(open) = open_file.description.read() else {
+                return;
+            };
             match &*open {
                 OpenDescription::File { .. }
                 | OpenDescription::SyntheticFile { .. }
@@ -594,7 +619,9 @@ impl SyscallDispatcher {
             return;
         };
         let (events, is_dir) = {
-            let open = open_file.description.read();
+            let Some(open) = open_file.description.read() else {
+                return;
+            };
             let writable = match &*open {
                 OpenDescription::File { writable, .. }
                 | OpenDescription::HostFile { writable, .. } => *writable,
@@ -647,22 +674,24 @@ impl SyscallDispatcher {
 
     pub(in crate::dispatch) fn pipe_reader(&self, fd: i32) -> Option<(PipeRef, u64)> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.read();
+        let open = open_file.description.read()?;
         match &*open {
-            OpenDescription::PipeReader { base, pipe } => {
-                Some((Arc::clone(pipe), base.status_flags()))
-            }
+            OpenDescription::PipeReader { pipe, .. } => Some((
+                Arc::clone(pipe),
+                open_file.description.common().status_flags(),
+            )),
             _ => None,
         }
     }
 
     pub(in crate::dispatch) fn pipe_writer(&self, fd: i32) -> Option<(PipeRef, u64)> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.read();
+        let open = open_file.description.read()?;
         match &*open {
-            OpenDescription::PipeWriter { base, pipe } => {
-                Some((Arc::clone(pipe), base.status_flags()))
-            }
+            OpenDescription::PipeWriter { pipe, .. } => Some((
+                Arc::clone(pipe),
+                open_file.description.common().status_flags(),
+            )),
             _ => None,
         }
     }
@@ -675,7 +704,9 @@ impl SyscallDispatcher {
                 Err(LINUX_EBADF)
             };
         };
-        let open = open_file.description.read();
+        let Some(open) = open_file.description.read() else {
+            return Ok(false);
+        };
         Ok(match &*open {
             OpenDescription::PipeWriter { .. } => true,
             // Real host pipe write end (fork-safe pipe model). A pty end is
@@ -692,7 +723,7 @@ impl SyscallDispatcher {
     /// read end, else `None`. Lets `splice` drain a real host pipe.
     pub(in crate::dispatch) fn host_pipe_read_fd(&self, fd: i32) -> Option<HostFd> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.read();
+        let open = open_file.description.read()?;
         match &*open {
             OpenDescription::HostPipe {
                 host_fd,
@@ -713,7 +744,7 @@ impl SyscallDispatcher {
         want_read: bool,
     ) -> Option<(HostFd, u64)> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.read();
+        let open = open_file.description.read()?;
         match &*open {
             OpenDescription::HostPipe {
                 host_fd,
@@ -732,7 +763,7 @@ impl SyscallDispatcher {
         let Some(open_file) = self.open_file(fd) else {
             return Some(LINUX_EBADF);
         };
-        let open = open_file.description.read();
+        let open = open_file.description.read()?;
         match &*open {
             OpenDescription::PipeWriter { pipe, .. } => {
                 if pipe.state.lock().readers == 0 {
@@ -755,17 +786,11 @@ impl SyscallDispatcher {
             // write_output_fd. A read-only fd is EBADF; an O_APPEND destination
             // is EINVAL (splice(2): "fd_out has the O_APPEND flag set" — LTP
             // splice03's appendfd case, which carrick previously spliced into).
-            OpenDescription::HostFile {
-                base,
-                writable: true,
-                ..
-            }
-            | OpenDescription::File {
-                base,
-                writable: true,
-                ..
-            } => {
-                if base.is_append() {
+            OpenDescription::HostFile { writable: true, .. }
+            | OpenDescription::File { writable: true, .. } => {
+                if LinuxOpenFlags::from_bits_truncate(open_file.description.common().status_flags())
+                    .contains(LinuxOpenFlags::APPEND)
+                {
                     Some(LINUX_EINVAL)
                 } else {
                     None
@@ -776,12 +801,14 @@ impl SyscallDispatcher {
             // sink when opened writable (LTP splice09). They are synthetic in
             // Carrick, so the host cannot supply that file operation for us.
             OpenDescription::SyntheticDevice {
-                base,
                 kind: crate::vfs::SyntheticDeviceKind::Null | crate::vfs::SyntheticDeviceKind::Zero,
+                ..
             } => {
-                if base.is_read_only() {
+                let flags = open_file.description.common().status_flags();
+                if flags & LINUX_O_ACCMODE == LINUX_O_RDONLY {
                     Some(LINUX_EBADF)
-                } else if base.is_append() {
+                } else if LinuxOpenFlags::from_bits_truncate(flags).contains(LinuxOpenFlags::APPEND)
+                {
                     Some(LINUX_EINVAL)
                 } else {
                     None
@@ -817,11 +844,14 @@ impl SyscallDispatcher {
             // opens them O_RDWR), which is why the split is spelled out
             // rather than derived from `is_read_only`.
             OpenDescription::Inotify { .. } | OpenDescription::Fanotify { .. } => Some(LINUX_EBADF),
-            other => Some(if other.is_read_only() {
-                LINUX_EBADF
-            } else {
-                LINUX_EINVAL
-            }),
+            _ => Some(
+                if open_file.description.common().status_flags() & LINUX_O_ACCMODE == LINUX_O_RDONLY
+                {
+                    LINUX_EBADF
+                } else {
+                    LINUX_EINVAL
+                },
+            ),
         }
     }
 }

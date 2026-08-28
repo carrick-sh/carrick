@@ -192,6 +192,8 @@ pub struct FileDescriptionSnapshotRow {
     pub backing: Option<super::objects::FileDescriptionBackingSnapshot>,
     pub epoll_interests: Vec<FileDescriptionId>,
     pub epoll_owners: Vec<(FileDescriptionId, i32)>,
+    pub status_flags: u64,
+    pub logical_fd_refs: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -737,7 +739,7 @@ impl Kernel {
 
         let mut file_descriptions = Vec::new();
         for description in description_by_id.into_values() {
-            let (revision, epoll, interests, backing, owners) =
+            let (revision, epoll, interests, backing, owners, status_flags, logical_fd_refs) =
                 lock_result(description.snapshot_until(deadline), deadline)?;
             checks
                 .descriptions
@@ -758,16 +760,16 @@ impl Kernel {
                 backing,
                 epoll_interests: interests,
                 epoll_owners: owners,
+                status_flags,
+                logical_fd_refs,
             });
         }
         if file_descriptions.iter().any(|description| {
-            description.backing.as_ref().is_some_and(|backing| {
-                backing.logical_fd_refs()
-                    != logical_slot_refs
-                        .get(&description.id)
-                        .copied()
-                        .unwrap_or_default()
-            })
+            description.logical_fd_refs
+                != logical_slot_refs
+                    .get(&description.id)
+                    .copied()
+                    .unwrap_or_default()
         }) {
             return Err(AttemptError::Race);
         }
@@ -2031,8 +2033,10 @@ mod tests {
         let backing =
             crate::dispatch::ioring::IoUringBacking::create(8, 4096).expect("ring backing");
         let layout = backing.reexec_layout();
-        let description =
-            Arc::new(FileDescription::concrete(backing).expect("ring description identity"));
+        let description = Arc::new(
+            FileDescription::concrete_with_status_flags(backing, carrick_abi::LINUX_O_RDWR)
+                .expect("ring description identity"),
+        );
         let mm = context.shared().mm();
         for (start, region, backing_offset) in [
             (0x1000, crate::dispatch::ioring::IoUringRegion::SqCq, 0),

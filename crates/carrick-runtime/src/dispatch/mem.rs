@@ -2234,7 +2234,9 @@ impl SyscallDispatcher {
         let Some(open_file) = self.open_file(fd.0) else {
             return Err(LINUX_EBADF);
         };
-        let open = open_file.description.read();
+        let Some(open) = open_file.description.read() else {
+            return Err(LINUX_EBADF);
+        };
         let offset_usize = usize::try_from(offset).map_err(|_| linux_errno::EOVERFLOW)?;
         let bus_fault_offset = match &*open {
             OpenDescription::File { contents, .. } => {
@@ -3263,21 +3265,21 @@ impl SyscallDispatcher {
 impl SyscallDispatcher {
     define_syscall! {
         fn readahead(this, cx, fd: Fd, _offset: u64, _count: u64) {
-            // readahead(2) warms the page cache. carrick has no guest page
-            // cache to populate, so the operation itself is a no-op returning
-            // 0 — but it must reproduce the kernel's fd validation, which LTP
-            // readahead01 asserts. Order matches ksys_readahead: FMODE_READ is
+            // Linux readahead(2): fd must be a valid open descriptor; EBADF is
             // checked FIRST (EBADF), THEN the mapping type (EINVAL).
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            let desc = open_file.description.read();
+            let status_flags = open_file.description.common().status_flags();
             // An O_PATH descriptor (or an O_WRONLY fd) is not open for reading.
-            if LinuxOpenFlags::from_bits_truncate(desc.status_flags()).contains(LinuxOpenFlags::PATH)
-                || desc.is_write_only()
+            if LinuxOpenFlags::from_bits_truncate(status_flags).contains(LinuxOpenFlags::PATH)
+                || (status_flags & carrick_abi::LINUX_O_ACCMODE) == carrick_abi::LINUX_O_WRONLY
             {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
+            let Some(desc) = open_file.description.read() else {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            };
             // readahead only applies to objects with a readahead-capable
             // address space — regular files (and block devices). Pipes, FIFOs,
             // sockets, char devices, directories, and the anonymous fd types
@@ -3302,9 +3304,9 @@ impl SyscallDispatcher {
             // ask the host kernel (fstat S_IFIFO) rather than keying on the
             // variant alone.
             if let Some(open_file) = this.open_file(fd.0) {
-                let is_fifo = match &*open_file.description.read() {
-                    OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => true,
-                    OpenDescription::HostPipe { host_fd, .. } => {
+                let is_fifo = match open_file.description.read().as_deref() {
+                    Some(OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. }) => true,
+                    Some(OpenDescription::HostPipe { host_fd, .. }) => {
                         let mut st: libc::stat = unsafe { core::mem::zeroed() };
                         let fstat_ok = unsafe { libc::fstat(host_fd.raw(), &mut st) } == 0;
                         fstat_ok
@@ -3480,7 +3482,9 @@ impl SyscallDispatcher {
             } else {
                 this.open_file(fd.0)
                     .map(|open_file| {
-                        let open = open_file.description.read();
+                        let Some(open) = open_file.description.read() else {
+                            return String::new();
+                        };
                         match &*open {
                             OpenDescription::File { path, .. }
                             | OpenDescription::SyntheticFile { path, .. }
@@ -3719,7 +3723,8 @@ impl SyscallDispatcher {
 
             if !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                 && let Some(open_file) = this.open_file(fd.0)
-                && open_file.description.read().is_write_only()
+                && (open_file.description.common().status_flags() & carrick_abi::LINUX_O_ACCMODE)
+                    == carrick_abi::LINUX_O_WRONLY
             {
                 return Ok(request.refused(
                     MmapRefusal::Spec("mmap of a write-only descriptor"),
@@ -3737,7 +3742,7 @@ impl SyscallDispatcher {
                 && let Some(open_file) = this.open_file(fd.0)
                 && let Some(seals) = open_file
                     .description
-                    .read()
+                    .common()
                     .seals()
                     .and_then(carrick_abi::LinuxMemfdSeals::from_bits)
                 && seals.intersects(
@@ -4033,8 +4038,8 @@ impl SyscallDispatcher {
                         ));
                     };
                     let open = open_file.description.read();
-                    match &*open {
-                        OpenDescription::HostFile { host_fd, .. } => {
+                    match open.as_deref() {
+                        Some(OpenDescription::HostFile { host_fd, .. }) => {
                             // Two named preconditions decide the live alias, so
                             // neither is discovered as an opaque hypervisor
                             // error deep inside the VMM backend: the mapping
@@ -4531,7 +4536,9 @@ impl SyscallDispatcher {
                 && !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                 && let Some(open_file) = this.open_file(fd.0)
             {
-                mmap_read_only_shared_file = open_file.description.read().is_read_only();
+                mmap_read_only_shared_file = (open_file.description.common().status_flags()
+                    & carrick_abi::LINUX_O_ACCMODE)
+                    == carrick_abi::LINUX_O_RDONLY;
             }
             // A live MAP_SHARED, PROT_WRITE mapping of an (unsealed) memfd — its
             // backing description is recorded so F_ADD_SEALS F_SEAL_WRITE can
@@ -4579,8 +4586,10 @@ impl SyscallDispatcher {
                 && mmap_file_backed_lowering_enabled()
                 && let Some(open_file) = this.open_file(fd.0)
             {
-                lowering_candidate =
-                    matches!(&*open_file.description.read(), OpenDescription::HostFile { .. });
+                lowering_candidate = matches!(
+                    open_file.description.read().as_deref(),
+                    Some(OpenDescription::HostFile { .. })
+                );
             }
             let bytes = if map_flags.contains(LinuxMmapFlags::ANONYMOUS) || lowering_candidate {
                 Vec::new()
@@ -4599,34 +4608,39 @@ impl SyscallDispatcher {
                 // EOF classification and the initial mapped bytes come from the
                 // live inode rather than a stale per-open snapshot.
                 if map_sharing == MmapSharing::Shared {
-                    let path = match &*open_file.description.read() {
-                        OpenDescription::File { path, .. } => Some(path.clone()),
+                    let path = match open_file.description.read().as_deref() {
+                        Some(OpenDescription::File { path, .. }) => Some(path.clone()),
                         _ => None,
                     };
                     if let Some(path) = path
                         && let Some(live) = this.fs.rootfs_vfs.overlay.file_contents(&path)
                     {
-                        let mut open = open_file.description.write();
-                        if let OpenDescription::File {
-                            path: open_path,
-                            contents,
-                            metadata,
-                            ..
-                        } = &mut *open
-                            && *open_path == path
-                        {
-                            metadata.size = live.len();
-                            *contents = FileContents::dense(live);
+                        if let Some(mut open) = open_file.description.write() {
+                            if let OpenDescription::File {
+                                path: open_path,
+                                contents,
+                                metadata,
+                                ..
+                            } = &mut *open
+                                && *open_path == path
+                            {
+                                metadata.size = live.len();
+                                *contents = FileContents::dense(live);
+                            }
                         }
                     }
                 }
-                let open = open_file.description.read();
+                let Some(open) = open_file.description.read() else {
+                    return Ok(request.refused(
+                        MmapRefusal::Internal("file description vanished mid-dispatch (content load)"),
+                        LINUX_EBADF,
+                    ));
+                };
                 let offset_usize =
                     usize::try_from(offset).map_err(|_| DispatchError::LengthTooLarge(offset))?;
                 match &*open {
                     OpenDescription::File {
                         contents,
-                        base,
                         path,
                         ..
                     } => {
@@ -4645,7 +4659,11 @@ impl SyscallDispatcher {
                         }
                         if map_sharing == MmapSharing::Shared
                             && matches!(
-                                base.seals().and_then(carrick_abi::LinuxMemfdSeals::from_bits),
+                                open_file
+                                    .description
+                                    .common()
+                                    .seals()
+                                    .and_then(carrick_abi::LinuxMemfdSeals::from_bits),
                                 Some(s) if s.intersects(
                                     carrick_abi::LinuxMemfdSeals::WRITE
                                         | carrick_abi::LinuxMemfdSeals::FUTURE_WRITE,
@@ -4656,7 +4674,7 @@ impl SyscallDispatcher {
                         }
                         if map_sharing == MmapSharing::Shared
                             && prot_flags.contains(LinuxProtFlags::WRITE)
-                            && base.seals().is_some()
+                            && open_file.description.common().seals().is_some()
                         {
                             writable_memfd_desc =
                                 Some(std::sync::Arc::clone(&open_file.description));
@@ -4896,7 +4914,7 @@ impl SyscallDispatcher {
                     ));
                 };
                 let open = open_file.description.read();
-                let OpenDescription::HostFile { host_fd, .. } = &*open else {
+                let Some(OpenDescription::HostFile { host_fd, .. }) = open.as_deref() else {
                     return Ok(request.refused(
                         MmapRefusal::Internal("file description changed type mid-dispatch (file-backed lowering)"),
                         LINUX_EBADF,
@@ -5610,8 +5628,8 @@ impl SyscallDispatcher {
                     .unwrap_or(0)
                     .checked_mul(crate::core_dump::GUEST_PAGE as u64)?;
                 let open = description.read();
-                let file_len = match &*open {
-                    OpenDescription::HostFile { host_fd, .. } => host_fd_file_len(host_fd.raw()),
+                let file_len = match open.as_deref() {
+                    Some(OpenDescription::HostFile { host_fd, .. }) => host_fd_file_len(host_fd.raw()),
                     _ => None,
                 }?;
                 Some((file_len, file_offset))
@@ -5759,8 +5777,8 @@ impl SyscallDispatcher {
                     };
                     let dup_fd = {
                         let open = description.read();
-                        match &*open {
-                            OpenDescription::HostFile { host_fd, .. } => {
+                        match open.as_deref() {
+                            Some(OpenDescription::HostFile { host_fd, .. }) => {
                                 if host_fd_can_back_shared_alias(host_fd.raw()) {
                                     let d = unsafe { libc::dup(host_fd.raw()) };
                                     (d >= 0).then_some(d)

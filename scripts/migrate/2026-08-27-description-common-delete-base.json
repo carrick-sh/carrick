@@ -1,0 +1,14 @@
+[
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
+    "old": "    pub(super) fn base(&self) -> &OpenDescriptionBase {\n        &self.base\n    }\n\n    pub(super) fn base_mut(&mut self) -> &mut OpenDescriptionBase {\n        &mut self.base\n    }\n",
+    "new": "",
+    "count": 0
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/ioring.rs",
+    "old": "    pub(crate) fn open_metadata(&self) -> &RwLock<OpenDescription> {\n        &self.open_metadata\n    }\n",
+    "new": "",
+    "count": 0
+  }
+]

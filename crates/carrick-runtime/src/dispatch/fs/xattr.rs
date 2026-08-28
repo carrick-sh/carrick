@@ -43,7 +43,7 @@ impl SyscallDispatcher {
             }
             XattrTarget::Fd(fd) => {
                 let open_file = self.open_file(fd.0).ok_or(LINUX_EBADF)?;
-                let open = open_file.description.read();
+                let open = open_file.description.read().ok_or(LINUX_ENOTSUP)?;
                 match &*open {
                     OpenDescription::File { path, .. }
                     | OpenDescription::Directory { path, .. } => Ok(path.clone()),

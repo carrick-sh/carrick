@@ -465,12 +465,10 @@ pub enum FileDescriptionBackingKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OpenDescriptionBackingSnapshot {
     pub kind: FileDescriptionBackingKind,
-    pub status_flags: Option<u64>,
     pub offset: Option<u64>,
     pub host_fd: Option<i32>,
     pub path: Option<String>,
     pub pipe_id: Option<u64>,
-    pub logical_fd_refs: usize,
     pub epoll_interests: Vec<FileDescriptionId>,
 }
 
@@ -485,13 +483,6 @@ impl FileDescriptionBackingSnapshot {
         match self {
             Self::Open(snapshot) => snapshot.kind,
             Self::IoUring(_) => FileDescriptionBackingKind::IoUring,
-        }
-    }
-
-    pub(crate) const fn logical_fd_refs(&self) -> usize {
-        match self {
-            Self::Open(snapshot) => snapshot.logical_fd_refs,
-            Self::IoUring(snapshot) => snapshot.logical_fd_refs,
         }
     }
 
@@ -511,11 +502,9 @@ pub(crate) trait FileDescriptionBacking: Any + Send + Sync {
         deadline: std::time::Instant,
     ) -> Option<FileDescriptionBackingSnapshot>;
 
-    fn retain_fd_ref(&self);
+    fn on_first_fd_ref(&self) {}
 
-    fn release_fd_ref(&self);
-
-    fn fd_ref_count(&self) -> usize;
+    fn on_last_fd_ref(&self) {}
 
     fn as_any(&self) -> &dyn Any;
 }
@@ -559,6 +548,8 @@ type FileDescriptionObservation = (
     Vec<FileDescriptionId>,
     Option<FileDescriptionBackingSnapshot>,
     Vec<(FileDescriptionId, i32)>,
+    u64,
+    usize,
 );
 
 /// The async-I/O owner set by `F_SETOWN`/`F_SETOWN_EX`: the SIGIO/SIGURG
@@ -630,8 +621,8 @@ impl DescriptionCommon {
         self.fd_refs.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn retain_fd_ref(&self) {
-        self.fd_refs.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn retain_fd_ref(&self) -> usize {
+        self.fd_refs.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// Returns the count AFTER the release. Aborts on underflow: a negative
@@ -693,6 +684,7 @@ pub struct FileDescription {
     id: FileDescriptionId,
     kind: FileDescriptionKind,
     common: Arc<DescriptionCommon>,
+    lifecycle_transition: Mutex<()>,
     epoll_registrations: Mutex<BTreeMap<(FileDescriptionId, i32), Weak<FileDescription>>>,
     revision: ObjectRevision,
 }
@@ -713,23 +705,28 @@ impl FileDescription {
             id: super::ids::allocate_file_description_id()?,
             kind: FileDescriptionKind::Concrete(OpaqueFileDescriptionBacking::new(backing)),
             common,
+            lifecycle_transition: Mutex::new(()),
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
         })
     }
 
     #[allow(dead_code)]
-    pub(crate) fn concrete<T>(backing: Arc<T>) -> Result<Self, ObjectIdError>
+    pub(crate) fn concrete_with_status_flags<T>(
+        backing: Arc<T>,
+        status_flags: u64,
+    ) -> Result<Self, ObjectIdError>
     where
         T: FileDescriptionBacking,
     {
-        Self::concrete_with_common(backing, Arc::new(DescriptionCommon::new(0)))
+        Self::concrete_with_common(backing, Arc::new(DescriptionCommon::new(status_flags)))
     }
 
     #[allow(dead_code)]
-    pub(crate) fn concrete_restored<T>(
+    pub(crate) fn concrete_restored_with_common<T>(
         stable_id: u64,
         backing: Arc<T>,
+        common: Arc<DescriptionCommon>,
     ) -> Result<Self, ObjectIdError>
     where
         T: FileDescriptionBacking,
@@ -737,10 +734,27 @@ impl FileDescription {
         Ok(Self {
             id: super::ids::restore_file_description_id(stable_id)?,
             kind: FileDescriptionKind::Concrete(OpaqueFileDescriptionBacking::new(backing)),
-            common: Arc::new(DescriptionCommon::new(0)),
+            common,
+            lifecycle_transition: Mutex::new(()),
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
         })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn concrete_restored_with_status_flags<T>(
+        stable_id: u64,
+        backing: Arc<T>,
+        status_flags: u64,
+    ) -> Result<Self, ObjectIdError>
+    where
+        T: FileDescriptionBacking,
+    {
+        Self::concrete_restored_with_common(
+            stable_id,
+            backing,
+            Arc::new(DescriptionCommon::new(status_flags)),
+        )
     }
 
     pub fn regular(id: FileDescriptionId) -> Self {
@@ -748,6 +762,7 @@ impl FileDescription {
             id,
             kind: FileDescriptionKind::Regular,
             common: Arc::new(DescriptionCommon::new(0)),
+            lifecycle_transition: Mutex::new(()),
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
         }
@@ -758,6 +773,7 @@ impl FileDescription {
             id,
             kind: FileDescriptionKind::Epoll(Mutex::new(BTreeMap::new())),
             common: Arc::new(DescriptionCommon::new(0)),
+            lifecycle_transition: Mutex::new(()),
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
         }
@@ -819,26 +835,29 @@ impl FileDescription {
     }
 
     pub(crate) fn retain_fd_ref(&self) {
-        let FileDescriptionKind::Concrete(backing) = &self.kind else {
-            return;
-        };
-        backing.0.retain_fd_ref();
+        let _guard = self.lifecycle_transition.lock();
+        let count = self.common.retain_fd_ref();
+        if count == 1 {
+            if let FileDescriptionKind::Concrete(backing) = &self.kind {
+                backing.0.on_first_fd_ref();
+            }
+        }
         self.revision.publish();
     }
 
     pub(crate) fn release_fd_ref(&self) {
-        let FileDescriptionKind::Concrete(backing) = &self.kind else {
-            return;
-        };
-        backing.0.release_fd_ref();
+        let _guard = self.lifecycle_transition.lock();
+        let count = self.common.release_fd_ref();
+        if count == 0 {
+            if let FileDescriptionKind::Concrete(backing) = &self.kind {
+                backing.0.on_last_fd_ref();
+            }
+        }
         self.revision.publish();
     }
 
     pub(crate) fn fd_ref_count(&self) -> usize {
-        let FileDescriptionKind::Concrete(backing) = &self.kind else {
-            return 0;
-        };
-        backing.0.fd_ref_count()
+        self.common.fd_refs()
     }
 
     pub fn add_epoll_interest(
@@ -883,6 +902,8 @@ impl FileDescription {
             .filter_map(|(&(owner, fd), weak)| (weak.strong_count() != 0).then_some((owner, fd)))
             .collect::<Vec<_>>();
         owners.sort_unstable();
+        let status_flags = self.common.status_flags();
+        let logical_fd_refs = self.common.fd_refs();
         match &self.kind {
             FileDescriptionKind::Concrete(backing) => {
                 let state = backing.0.snapshot_until(deadline)?;
@@ -894,11 +915,19 @@ impl FileDescription {
                     interests,
                     Some(state),
                     owners,
+                    status_flags,
+                    logical_fd_refs,
                 ))
             }
-            FileDescriptionKind::Regular => {
-                Some((self.revision.load(), false, Vec::new(), None, owners))
-            }
+            FileDescriptionKind::Regular => Some((
+                self.revision.load(),
+                false,
+                Vec::new(),
+                None,
+                owners,
+                status_flags,
+                logical_fd_refs,
+            )),
             FileDescriptionKind::Epoll(interests) => {
                 let interests = interests.try_lock_until(deadline)?;
                 Some((
@@ -910,6 +939,8 @@ impl FileDescription {
                         .collect(),
                     None,
                     owners,
+                    status_flags,
+                    logical_fd_refs,
                 ))
             }
         }

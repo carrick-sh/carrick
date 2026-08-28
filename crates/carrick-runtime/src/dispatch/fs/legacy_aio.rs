@@ -111,21 +111,24 @@ fn legacy_aio_context_exists(this: &SyscallDispatcher, ctx: LegacyAioContextId) 
 
 fn legacy_aio_iocb_errno(this: &SyscallDispatcher, iocb: LegacyAioIocb) -> Option<LinuxErrno> {
     let open_file = this.open_file(iocb.fd.0)?;
-    let open = open_file.description.read();
-    let access = open.status_flags() & LINUX_O_ACCMODE;
+    let access = open_file.description.common().status_flags() & LINUX_O_ACCMODE;
     if iocb.opcode.needs_readable_fd() && access == LINUX_O_WRONLY {
         return Some(LINUX_EBADF);
     }
     if iocb.opcode.needs_writable_fd() {
-        match &*open {
-            OpenDescription::File {
-                writable: false, ..
+        if access == LINUX_O_RDONLY {
+            return Some(LINUX_EBADF);
+        }
+        if let Some(open) = open_file.description.read() {
+            match &*open {
+                OpenDescription::File {
+                    writable: false, ..
+                }
+                | OpenDescription::HostFile {
+                    writable: false, ..
+                } => return Some(LINUX_EBADF),
+                _ => {}
             }
-            | OpenDescription::HostFile {
-                writable: false, ..
-            } => return Some(LINUX_EBADF),
-            _ if access == LINUX_O_RDONLY => return Some(LINUX_EBADF),
-            _ => {}
         }
     }
     None

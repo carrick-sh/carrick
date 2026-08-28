@@ -1191,7 +1191,7 @@ impl SyscallDispatcher {
 
     fn pidfd_target(&self, fd: i32) -> Option<PidfdTarget> {
         let open = self.open_file(fd)?;
-        let desc = open.description.read();
+        let desc = open.description.read()?;
         match &*desc {
             OpenDescription::Pidfd { target, .. } => Some(*target),
             // A `/proc/<pid>` directory fd is a valid pidfd on Linux (e.g.
@@ -1225,9 +1225,14 @@ impl SyscallDispatcher {
         let Some(open) = self.open_file(fd) else {
             return false;
         };
-        let desc = open.description.read();
+        let Some(desc) = open.description.read() else {
+            return false;
+        };
         match &*desc {
-            OpenDescription::Pidfd { base, .. } => base.is_nonblocking(),
+            OpenDescription::Pidfd { .. } => carrick_abi::LinuxOpenFlags::from_bits_truncate(
+                open.description.common().status_flags(),
+            )
+            .contains(carrick_abi::LinuxOpenFlags::NONBLOCK),
             _ => false,
         }
     }
@@ -3901,7 +3906,7 @@ impl SyscallDispatcher {
                 // path it was opened at (HostFile/File/etc.) and execve that.
                 let fd = dirfd as i32;
                 let p = this.open_file(fd).and_then(|f| {
-                    let d = f.description.read();
+                    let d = f.description.read()?;
                     d.open_path().map(|s| s.to_string())
                 });
                 match p {

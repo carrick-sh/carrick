@@ -5082,14 +5082,15 @@ mod ipc_set_tests {
             .insert(addr, shmid);
         let range = crate::vfs::GuestMemoryRange::new(GuestVa(addr), GuestVa(addr + len))
             .expect("shmat metadata range");
-        let writable_memfd = kernel_file_description(std::sync::Arc::new(
-            parking_lot::RwLock::new(OpenDescription::SyntheticFile {
+        let writable_memfd = kernel_file_description(
+            std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {
                 base: OpenDescriptionBase::new(0),
                 path: "memfd:shmdt-test".into(),
                 contents: Vec::new(),
                 offset: 0,
-            }),
-        ));
+            })),
+            crate::linux_abi::LINUX_O_RDWR,
+        );
         dispatcher.commit_host_alias_mmap(crate::dispatch::mem::HostAliasMmapCommit {
             start: addr,
             len,

@@ -276,20 +276,18 @@ fn host_fd_matches_device(host_fd: i32, path: &str) -> bool {
 }
 
 fn fd_is_random_device(this: &SyscallDispatcher, fd: i32) -> bool {
-    this.open_file(fd).is_some_and(|open_file| {
-        let open = open_file.description.read();
-        match &*open {
-            OpenDescription::HostPipe { host_fd, .. } => {
+    this.open_file(fd)
+        .is_some_and(|open_file| match open_file.description.read().as_deref() {
+            Some(OpenDescription::HostPipe { host_fd, .. }) => {
                 host_fd_matches_device(host_fd.raw(), "/dev/random")
                     || host_fd_matches_device(host_fd.raw(), "/dev/urandom")
             }
-            OpenDescription::SyntheticDevice { kind, .. } => matches!(
+            Some(OpenDescription::SyntheticDevice { kind, .. }) => matches!(
                 kind,
                 crate::vfs::SyntheticDeviceKind::Random | crate::vfs::SyntheticDeviceKind::Urandom
             ),
             _ => false,
-        }
-    })
+        })
 }
 
 /// The readable PREFIX of a gather list, plus whether the walk stopped on an
@@ -1508,7 +1506,9 @@ impl SyscallDispatcher {
         let Some(open_file) = self.open_file(fd) else {
             return true;
         };
-        let open = open_file.description.read();
+        let Some(open) = open_file.description.read() else {
+            return true;
+        };
         matches!(
             &*open,
             OpenDescription::EventFd { .. }
@@ -1569,12 +1569,12 @@ impl SyscallDispatcher {
     /// host fd in one fd-table lookup.
     fn pty_info(&self, fd: i32) -> Option<(crate::vfs::PtyRole, i32)> {
         self.open_file(fd)
-            .and_then(|of| match &*of.description.read() {
-                OpenDescription::HostPipe {
+            .and_then(|of| match of.description.read().as_deref() {
+                Some(OpenDescription::HostPipe {
                     host_fd,
                     pty: Some(role),
                     ..
-                } => Some((*role, host_fd.raw())),
+                }) => Some((*role, host_fd.raw())),
                 _ => None,
             })
     }
@@ -1610,8 +1610,10 @@ impl SyscallDispatcher {
             return Vec::new();
         };
         let target_id = {
-            let desc = target.description.read();
-            Self::lease_file_identity(&desc)
+            target
+                .description
+                .read()
+                .and_then(|desc| Self::lease_file_identity(&desc))
         };
         let Some(target_id) = target_id else {
             return Vec::new();
@@ -1627,9 +1629,10 @@ impl SyscallDispatcher {
             if Arc::ptr_eq(&open_file.description, &target.description) {
                 continue;
             }
-            let desc = open_file.description.read();
-            if Self::lease_file_identity(&desc).as_ref() == Some(&target_id) {
-                others.push(desc.status_flags() & LINUX_O_ACCMODE);
+            if let Some(desc) = open_file.description.read()
+                && Self::lease_file_identity(&desc).as_ref() == Some(&target_id)
+            {
+                others.push(open_file.description.common().status_flags() & LINUX_O_ACCMODE);
             }
         }
         others
@@ -1662,8 +1665,10 @@ impl SyscallDispatcher {
         open_file: &OpenFile,
     ) {
         let file = {
-            let description = open_file.description.read();
-            Self::lease_file_identity(&description)
+            open_file
+                .description
+                .read()
+                .and_then(|description| Self::lease_file_identity(&description))
         };
         if let Some(file) = file {
             self.fs
@@ -1682,8 +1687,10 @@ impl SyscallDispatcher {
     /// ioctl/fgetxattr must all fail with EBADF (LTP open13). The flag is
     /// preserved in the description's status_flags at open time.
     pub(super) fn fd_is_o_path(&self, fd: i32) -> bool {
-        self.open_file(fd)
-            .is_some_and(|of| of.description.read().is_path())
+        self.open_file(fd).is_some_and(|of| {
+            LinuxOpenFlags::from_bits_truncate(of.description.common().status_flags())
+                .contains(LinuxOpenFlags::PATH)
+        })
     }
 
     /// True iff `fd` is a `memfd_secret(2)` description. Secret memory has no
@@ -2174,8 +2181,10 @@ impl SyscallDispatcher {
                     base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
                     writable: true,
                 };
-                let open_file = OpenFile::from_open_description(
+                let status = flags & !LINUX_O_CLOEXEC;
+                let open_file = OpenFile::from_open_description_with_status_flags(
                     Arc::new(RwLock::new(description)),
+                    status,
                     linux_fd_flags_from_open_flags(flags),
                 );
                 return match self.install_fd_at_or_above(0, open_file) {
@@ -2260,10 +2269,8 @@ impl SyscallDispatcher {
                 && let Some(open_file) = self.open_file(n)
             {
                 let mut truncated_path: Option<String> = None;
-                {
-                    let mut open = open_file.description.write();
+                if let Some(mut open) = open_file.description.write() {
                     if let OpenDescription::File {
-                        base,
                         path,
                         contents,
                         metadata,
@@ -2273,8 +2280,11 @@ impl SyscallDispatcher {
                         && *writable
                         && contents.len() != 0
                     {
-                        if let Err(errno) = memfd_seal_resize_check(base.seals(), 0, contents.len())
-                        {
+                        if let Err(errno) = memfd_seal_resize_check(
+                            open_file.description.common().seals(),
+                            0,
+                            contents.len(),
+                        ) {
                             return Ok(DispatchOutcome::errno(errno));
                         }
                         contents.truncate(0);
@@ -2415,15 +2425,17 @@ impl SyscallDispatcher {
                 // it as an O_PATH File carrying the symlink's own lstat metadata;
                 // every I/O op already rejects an O_PATH fd with EBADF.
                 if open_flags.contains(LinuxOpenFlags::PATH) {
-                    let open_file = OpenFile::from_open_description(
+                    let status = flags & !LINUX_O_CLOEXEC;
+                    let open_file = OpenFile::from_open_description_with_status_flags(
                         Arc::new(RwLock::new(OpenDescription::File {
-                            base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
+                            base: OpenDescriptionBase::new(status),
                             path: path.clone(),
                             metadata: md,
                             contents: FileContents::dense(Vec::new()),
                             offset: 0,
                             writable: false,
                         })),
+                        status,
                         linux_fd_flags_from_open_flags(flags),
                     );
                     let Ok(fd) = self.install_fd_at_or_above(0, open_file) else {
@@ -2639,8 +2651,10 @@ impl SyscallDispatcher {
                         write_kind: HostWriteKind::PipeLike,
                         stdio_stream: None,
                     };
-                    let open_file = OpenFile::from_open_description(
+                    let status = flags & !LINUX_O_CLOEXEC;
+                    let open_file = OpenFile::from_open_description_with_status_flags(
                         Arc::new(RwLock::new(description)),
+                        status,
                         linux_fd_flags_from_open_flags(flags),
                     );
                     let Ok(fd) = self.install_fd_at_or_above(0, open_file) else {
@@ -2900,8 +2914,10 @@ impl SyscallDispatcher {
             OpenDescription::File { .. } | OpenDescription::Directory { .. }
         );
         let opened_is_dir = matches!(&description, OpenDescription::Directory { .. });
-        let open_file = OpenFile::from_open_description(
+        let status = flags & !LINUX_O_CLOEXEC;
+        let open_file = OpenFile::from_open_description_with_status_flags(
             Arc::new(RwLock::new(description)),
+            status,
             linux_fd_flags_from_open_flags(flags),
         );
         let Ok(fd) = self.install_fd_at_or_above(0, open_file) else {
@@ -3000,7 +3016,7 @@ impl SyscallDispatcher {
             return None; // AT_FDCWD and friends
         }
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.read();
+        let open = open_file.description.read()?;
         match &*open {
             OpenDescription::Directory {
                 path,
@@ -3092,8 +3108,10 @@ impl SyscallDispatcher {
             base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
             writable: false,
         };
-        let open_file = OpenFile::from_open_description(
+        let status = flags & !LINUX_O_CLOEXEC;
+        let open_file = OpenFile::from_open_description_with_status_flags(
             Arc::new(RwLock::new(description)),
+            status,
             linux_fd_flags_from_open_flags(flags),
         );
         let Ok(fd) = self.install_fd_at_or_above(0, open_file) else {
@@ -3178,8 +3196,10 @@ impl SyscallDispatcher {
             base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
             trusted_host_dir: Some(trusted),
         };
-        let open_file = OpenFile::from_open_description(
+        let status = flags & !LINUX_O_CLOEXEC;
+        let open_file = OpenFile::from_open_description_with_status_flags(
             Arc::new(RwLock::new(description)),
+            status,
             linux_fd_flags_from_open_flags(flags),
         );
         let Ok(fd) = self.install_fd_at_or_above(0, open_file) else {
@@ -3330,8 +3350,10 @@ impl SyscallDispatcher {
                     None => TrustedHostDir::new(HostFdRef::new(fd.into_raw_fd())),
                 }),
             };
-            let open_file = OpenFile::from_open_description(
+            let status = flags & !LINUX_O_CLOEXEC;
+            let open_file = OpenFile::from_open_description_with_status_flags(
                 Arc::new(RwLock::new(description)),
+                status,
                 linux_fd_flags_from_open_flags(flags),
             );
             let Ok(new_fd) = self.install_fd_at_or_above(0, open_file) else {
@@ -3392,8 +3414,10 @@ impl SyscallDispatcher {
             base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
             writable: write,
         };
-        let open_file = OpenFile::from_open_description(
+        let status = flags & !LINUX_O_CLOEXEC;
+        let open_file = OpenFile::from_open_description_with_status_flags(
             Arc::new(RwLock::new(description)),
+            status,
             linux_fd_flags_from_open_flags(flags),
         );
         let Ok(new_fd) = self.install_fd_at_or_above(0, open_file) else {
@@ -3657,18 +3681,15 @@ impl SyscallDispatcher {
         let of = self.open_file(n)?;
         let desc = of.description.read();
         let cloexec = of.fd_flags & LINUX_FD_CLOEXEC != 0;
-        // The open status flags (access mode + O_NONBLOCK/O_APPEND/…) with
-        // O_CLOEXEC folded in — the bits callers parse to recover an inherited
-        // fd's mode. (O_LARGEFILE is elided: arch-specific and not load-bearing.)
-        // Like F_GETFL, fdinfo's `flags:` reports status flags only; creation
-        // flags are consumed by open(). (audit M8)
-        let flags = reportable_status_flags(desc.status_flags())
+        let flags = reportable_status_flags(of.description.common().status_flags())
             | if cloexec { LINUX_O_CLOEXEC } else { 0 };
-        let pos = match &*desc {
-            OpenDescription::File { offset, .. }
-            | OpenDescription::SyntheticFile { offset, .. }
-            | OpenDescription::Directory { offset, .. } => *offset as u64,
-            OpenDescription::HostFile { host_fd, .. } => {
+        let pos = match desc.as_deref() {
+            Some(
+                OpenDescription::File { offset, .. }
+                | OpenDescription::SyntheticFile { offset, .. }
+                | OpenDescription::Directory { offset, .. },
+            ) => *offset as u64,
+            Some(OpenDescription::HostFile { host_fd, .. }) => {
                 host_fd_offset(host_fd.view()).unwrap_or(0)
             }
             _ => 0,
@@ -3693,7 +3714,7 @@ impl SyscallDispatcher {
         let files = self.captured_file_table();
         let table = files.read_open_files();
         let open_file = table.get(&fd)?;
-        let description = open_file.description.read();
+        let description = open_file.description.read()?;
         let path = description.open_path()?;
         proc_ns_link(path).map(|t| t.to_owned())
     }
@@ -3704,13 +3725,15 @@ impl SyscallDispatcher {
         contents: Vec<u8>,
         flags: u64,
     ) -> DispatchOutcome {
-        let open_file = OpenFile::from_open_description(
+        let status = flags & !LINUX_O_CLOEXEC;
+        let open_file = OpenFile::from_open_description_with_status_flags(
             Arc::new(RwLock::new(OpenDescription::SyntheticFile {
                 path: path.to_string(),
                 contents,
                 offset: 0,
-                base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
+                base: OpenDescriptionBase::new(status),
             })),
+            status,
             linux_fd_flags_from_open_flags(flags),
         );
         match self.install_fd_at_or_above(0, open_file) {
@@ -3765,11 +3788,11 @@ impl SyscallDispatcher {
         let files = self.captured_file_table();
         let table = files.read_open_files();
         for of in table.values() {
-            if let OpenDescription::HostPipe {
+            if let Some(OpenDescription::HostPipe {
                 host_fd: slave_host_fd,
                 pty: Some(slave_role),
                 ..
-            } = &*of.description.read()
+            }) = of.description.read().as_deref()
                 && !slave_role.is_master
                 && slave_role.index == role.index
             {
@@ -3806,21 +3829,29 @@ impl SyscallDispatcher {
                 crate::dispatch::net::set_host_nonblocking(duped);
                 let write_kind = HostWriteKind::for_host_fd(duped);
                 let pty = self.dup_stdio_pty_role(old_fd);
-                kernel_file_description(Arc::new(RwLock::new(OpenDescription::HostPipe {
-                    // A duped stdio fd has no separate pipe peer to coordinate
-                    // a FASYNC arm/trigger with; the host inode is still a
-                    // unique id (FASYNC is not exercised on bare stdio).
-                    pipe_id: host_inode_pipe_id(duped),
-                    // `duped` is a genuinely NEW host fd, so this fresh owned
-                    // handle is its one owner.
-                    host_fd: HostFdRef::new(duped),
-                    is_read_end: old_fd == 0,
-                    base: OpenDescriptionBase::new(0),
-                    pty,
-                    bidirectional: false,
-                    write_kind,
-                    stdio_stream: Some(old_fd),
-                })))
+                let status_flags = if old_fd == 0 {
+                    LINUX_O_RDONLY
+                } else {
+                    LINUX_O_WRONLY
+                };
+                kernel_file_description(
+                    Arc::new(RwLock::new(OpenDescription::HostPipe {
+                        // A duped stdio fd has no separate pipe peer to coordinate
+                        // a FASYNC arm/trigger with; the host inode is still a
+                        // unique id (FASYNC is not exercised on bare stdio).
+                        pipe_id: host_inode_pipe_id(duped),
+                        // `duped` is a genuinely NEW host fd, so this fresh owned
+                        // handle is its one owner.
+                        host_fd: HostFdRef::new(duped),
+                        is_read_end: old_fd == 0,
+                        base: OpenDescriptionBase::new(0),
+                        pty,
+                        bidirectional: false,
+                        write_kind,
+                        stdio_stream: Some(old_fd),
+                    })),
+                    status_flags,
+                )
             }
             None => return DispatchOutcome::errno(LINUX_EBADF),
         };
@@ -3876,21 +3907,29 @@ impl SyscallDispatcher {
                 crate::dispatch::net::set_host_nonblocking(duped);
                 let write_kind = HostWriteKind::for_host_fd(duped);
                 let pty = self.dup_stdio_pty_role(old_fd);
-                kernel_file_description(Arc::new(RwLock::new(OpenDescription::HostPipe {
-                    // A duped stdio fd has no separate pipe peer to coordinate
-                    // a FASYNC arm/trigger with; the host inode is still a
-                    // unique id (FASYNC is not exercised on bare stdio).
-                    pipe_id: host_inode_pipe_id(duped),
-                    // `duped` is a genuinely NEW host fd, so this fresh owned
-                    // handle is its one owner.
-                    host_fd: HostFdRef::new(duped),
-                    is_read_end: old_fd == 0,
-                    base: OpenDescriptionBase::new(0),
-                    pty,
-                    bidirectional: false,
-                    write_kind,
-                    stdio_stream: Some(old_fd),
-                })))
+                let status_flags = if old_fd == 0 {
+                    LINUX_O_RDONLY
+                } else {
+                    LINUX_O_WRONLY
+                };
+                kernel_file_description(
+                    Arc::new(RwLock::new(OpenDescription::HostPipe {
+                        // A duped stdio fd has no separate pipe peer to coordinate
+                        // a FASYNC arm/trigger with; the host inode is still a
+                        // unique id (FASYNC is not exercised on bare stdio).
+                        pipe_id: host_inode_pipe_id(duped),
+                        // `duped` is a genuinely NEW host fd, so this fresh owned
+                        // handle is its one owner.
+                        host_fd: HostFdRef::new(duped),
+                        is_read_end: old_fd == 0,
+                        base: OpenDescriptionBase::new(0),
+                        pty,
+                        bidirectional: false,
+                        write_kind,
+                        stdio_stream: Some(old_fd),
+                    })),
+                    status_flags,
+                )
             }
             None => return DispatchOutcome::errno(LINUX_EBADF),
         };
@@ -4132,8 +4171,10 @@ impl SyscallDispatcher {
                         stdio_stream: None,
                     }
                 };
-                let open_file = OpenFile::from_open_description(
+                let description_status_flags = access | (flags & !LINUX_O_CLOEXEC);
+                let open_file = OpenFile::from_open_description_with_status_flags(
                     Arc::new(RwLock::new(description)),
+                    description_status_flags,
                     linux_fd_flags_from_open_flags(flags),
                 );
                 let new_fd = match self.install_fd_at_or_above(0, open_file) {
@@ -4143,13 +4184,13 @@ impl SyscallDispatcher {
                 VfsOpenAttempt::Installed(new_fd)
             }
             crate::vfs::VfsHandle::SyntheticDevice { kind, status_flags } => {
-                let open_file = OpenFile::from_open_description(
+                let status = ((status_flags as u64) | flags) & !LINUX_O_CLOEXEC;
+                let open_file = OpenFile::from_open_description_with_status_flags(
                     Arc::new(RwLock::new(OpenDescription::SyntheticDevice {
                         kind,
-                        base: OpenDescriptionBase::new(
-                            ((status_flags as u64) | flags) & !LINUX_O_CLOEXEC,
-                        ),
+                        base: OpenDescriptionBase::new(status),
                     })),
+                    status,
                     linux_fd_flags_from_open_flags(flags),
                 );
                 let new_fd = match self.install_fd_at_or_above(0, open_file) {
@@ -4164,15 +4205,15 @@ impl SyscallDispatcher {
                 contents,
                 status_flags,
             } => {
-                let open_file = OpenFile::from_open_description(
+                let status = ((status_flags as u64) | flags) & !LINUX_O_CLOEXEC;
+                let open_file = OpenFile::from_open_description_with_status_flags(
                     Arc::new(RwLock::new(OpenDescription::SyntheticFile {
                         path,
                         contents,
                         offset: 0,
-                        base: OpenDescriptionBase::new(
-                            ((status_flags as u64) | flags) & !LINUX_O_CLOEXEC,
-                        ),
+                        base: OpenDescriptionBase::new(status),
                     })),
+                    status,
                     linux_fd_flags_from_open_flags(flags),
                 );
                 let new_fd = match self.install_fd_at_or_above(0, open_file) {
@@ -4188,7 +4229,8 @@ impl SyscallDispatcher {
                 status_flags,
             } => {
                 crate::dispatch::net::set_host_nonblocking(host_fd);
-                let open_file = OpenFile::from_open_description(
+                let status = status_flags as u64;
+                let open_file = OpenFile::from_open_description_with_status_flags(
                     Arc::new(RwLock::new(OpenDescription::HostPipe {
                         // A pty end's host inode is a unique id (FASYNC is not
                         // exercised on ptys).
@@ -4197,7 +4239,7 @@ impl SyscallDispatcher {
                         // A pty end is bidirectional; route reads and
                         // writes through the host fd like /dev/null.
                         is_read_end: true,
-                        base: OpenDescriptionBase::new(status_flags as u64),
+                        base: OpenDescriptionBase::new(status),
                         pty: Some(crate::vfs::PtyRole {
                             index: pts_index,
                             is_master,
@@ -4207,6 +4249,7 @@ impl SyscallDispatcher {
                         write_kind: HostWriteKind::Other,
                         stdio_stream: None,
                     })),
+                    status,
                     linux_fd_flags_from_open_flags(flags),
                 );
                 // Remember where this pty's MASTER lives. The slave's close
@@ -4267,17 +4310,19 @@ impl SyscallDispatcher {
                     mode: 0o755,
                     size: 0,
                 };
-                let open_file = OpenFile::from_open_description(
+                let status = status_flags as u64;
+                let open_file = OpenFile::from_open_description_with_status_flags(
                     Arc::new(RwLock::new(OpenDescription::Directory {
                         path,
                         metadata,
                         entries: rootfs_entries,
                         offset: 0,
-                        base: OpenDescriptionBase::new(status_flags as u64),
+                        base: OpenDescriptionBase::new(status),
                         // VFS-mount (synthetic) directories never take the
                         // trusted host-dirfd lane.
                         trusted_host_dir: None,
                     })),
+                    status,
                     linux_fd_flags_from_open_flags(flags),
                 );
                 let new_fd = match self.install_fd_at_or_above(0, open_file) {
@@ -4293,17 +4338,17 @@ impl SyscallDispatcher {
                 writable,
                 max_size,
             } => {
-                let open_file = OpenFile::from_open_description(
+                let status = ((status_flags as u64) | flags) & !LINUX_O_CLOEXEC;
+                let open_file = OpenFile::from_open_description_with_status_flags(
                     Arc::new(RwLock::new(OpenDescription::InMemoryFile {
                         path: path.clone(),
                         contents,
                         offset: 0,
                         writable,
                         max_size,
-                        base: OpenDescriptionBase::new(
-                            ((status_flags as u64) | flags) & !LINUX_O_CLOEXEC,
-                        ),
+                        base: OpenDescriptionBase::new(status),
                     })),
+                    status,
                     linux_fd_flags_from_open_flags(flags),
                 );
                 let new_fd = match self.install_fd_at_or_above(0, open_file) {
@@ -4332,7 +4377,9 @@ impl SyscallDispatcher {
                 Err(LINUX_EBADF)
             };
         };
-        let open = open_file.description.read();
+        let Some(open) = open_file.description.read() else {
+            return Ok(None);
+        };
         Ok(match &*open {
             OpenDescription::HostFile { host_fd, .. } => Some(host_fd.raw()),
             _ => None,
@@ -4350,7 +4397,8 @@ impl SyscallDispatcher {
     /// socket fstat.
     fn host_pipe_pipe_id(&self, fd: i32) -> Option<u64> {
         let open_file = self.open_file(fd)?;
-        let host_socket_fd = match &*open_file.description.read() {
+        let open = open_file.description.read()?;
+        let host_socket_fd = match &*open {
             OpenDescription::PipeReader { pipe, .. } | OpenDescription::PipeWriter { pipe, .. } => {
                 return Some(pipe.pipe_id());
             }
@@ -4377,7 +4425,9 @@ impl SyscallDispatcher {
             };
         };
 
-        let open = open_file.description.read();
+        let Some(open) = open_file.description.read() else {
+            return Ok(None);
+        };
         match &*open {
             OpenDescription::PipeReader { pipe, .. } | OpenDescription::PipeWriter { pipe, .. } => {
                 Ok(Some(pipe.buffered_bytes()))
@@ -4402,7 +4452,9 @@ impl SyscallDispatcher {
                 let files = self.captured_file_table();
                 let table = files.read_open_files();
                 for other in table.values() {
-                    let other_open = other.description.read();
+                    let Some(other_open) = other.description.read() else {
+                        continue;
+                    };
                     if let OpenDescription::HostPipe {
                         host_fd,
                         is_read_end: true,
@@ -4424,7 +4476,9 @@ impl SyscallDispatcher {
         let files = self.captured_file_table();
         let table = files.read_open_files();
         for (fd, other) in table.iter() {
-            let other_open = other.description.read();
+            let Some(other_open) = other.description.read() else {
+                continue;
+            };
             if let OpenDescription::HostPipe {
                 host_fd,
                 is_read_end: true,
@@ -4451,7 +4505,9 @@ impl SyscallDispatcher {
         let files = self.captured_file_table();
         let table = files.read_open_files();
         for (_fd, other) in table.iter() {
-            let other_open = other.description.read();
+            let Some(other_open) = other.description.read() else {
+                continue;
+            };
             if let OpenDescription::HostPipe {
                 host_fd,
                 is_read_end: false,
@@ -4475,7 +4531,10 @@ impl SyscallDispatcher {
         let Some(open_file) = self.open_file(fd) else {
             return false;
         };
-        match &*open_file.description.read() {
+        let Some(open) = open_file.description.read() else {
+            return false;
+        };
+        match &*open {
             OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => true,
             OpenDescription::HostPipe {
                 write_kind, pty, ..
@@ -4491,8 +4550,9 @@ impl SyscallDispatcher {
     /// True when the FICLONE destination cannot be written (a read-only
     /// description such as a procfs file), which Linux reports as EBADF.
     fn ficlone_dest_unwritable(&self, fd: i32) -> bool {
-        self.open_file(fd)
-            .is_some_and(|of| of.description.read().is_read_only())
+        self.open_file(fd).is_some_and(|of| {
+            of.description.common().status_flags() & LINUX_O_ACCMODE == LINUX_O_RDONLY
+        })
     }
 
     /// The filesystem class `FICLONE` error precedence keys on — see
@@ -4501,7 +4561,9 @@ impl SyscallDispatcher {
         let Some(open_file) = self.open_file(fd) else {
             return FicloneFs::Other;
         };
-        let open = open_file.description.read();
+        let Some(open) = open_file.description.read() else {
+            return FicloneFs::Other;
+        };
         match &*open {
             OpenDescription::Directory { .. } => FicloneFs::Root { is_dir: true },
             OpenDescription::Epoll { .. }
@@ -4522,9 +4584,9 @@ impl SyscallDispatcher {
             // guest's /dev/zero is a HostFile, so keying off the variant alone
             // put a character device on the rootfs and turned a devfs->pipefs
             // pairing into a same-fs one.
-            OpenDescription::File { base, .. } | OpenDescription::SyntheticFile { base, .. } => {
+            OpenDescription::File { .. } | OpenDescription::SyntheticFile { .. } => {
                 let path = open.open_path().unwrap_or_default();
-                if base.secretmem() {
+                if open_file.description.common().secretmem() {
                     FicloneFs::Unclonable(1)
                 } else if path.starts_with("/dev/") {
                     FicloneFs::Dev
@@ -4586,9 +4648,13 @@ impl SyscallDispatcher {
         if std::env::var_os("CARRICK_FICLONE_DEBUG").is_some() {
             let name = |fd: i32| {
                 self.open_file(fd)
-                    .map(|of| {
-                        let g = of.description.read();
-                        format!("{}:{}", g.reexec_kind_name(), g.open_path().unwrap_or("-"))
+                    .and_then(|of| {
+                        let g = of.description.read()?;
+                        Some(format!(
+                            "{}:{}",
+                            g.reexec_kind_name(),
+                            g.open_path().unwrap_or("-")
+                        ))
                     })
                     .unwrap_or_else(|| "<none>".into())
             };
@@ -4630,13 +4696,15 @@ impl SyscallDispatcher {
         let Some(open_file) = self.open_file(fd) else {
             return false;
         };
-        let open = open_file.description.read();
+        let Some(open) = open_file.description.read() else {
+            return false;
+        };
         match &*open {
             OpenDescription::File { .. }
             | OpenDescription::SyntheticFile { .. }
             | OpenDescription::HostFile { .. }
             | OpenDescription::SyntheticDevice { .. } => {
-                open.status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY
+                open_file.description.common().status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY
             }
             OpenDescription::PipeWriter { .. } => true,
             OpenDescription::HostPipe {
@@ -4827,7 +4895,7 @@ impl SyscallDispatcher {
     fn host_pipe_splice_staging_target(&self, fd: i32) -> Option<(i32, usize)> {
         let (pipe_id, capacity) = {
             let open_file = self.open_file(fd)?;
-            let open = open_file.description.read();
+            let open = open_file.description.read()?;
             match &*open {
                 OpenDescription::HostPipe {
                     base,
@@ -4854,7 +4922,7 @@ impl SyscallDispatcher {
     /// write end, including in-memory pipes, pty, and bidirectional ends.
     fn splice_pipe_write_room(&self, fd: i32) -> Option<usize> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.read();
+        let open = open_file.description.read()?;
         match &*open {
             OpenDescription::PipeWriter { pipe, .. } => {
                 let state = pipe.state.lock();
@@ -4962,16 +5030,16 @@ impl SyscallDispatcher {
         let Some(open_file) = self.open_file(fd) else {
             return;
         };
-        let desc = open_file.description.read();
-        let armed = desc.is_async();
+        let common = open_file.description.common();
+        let armed = LinuxOpenFlags::from_bits_truncate(common.status_flags())
+            .contains(LinuxOpenFlags::ASYNC);
         if !armed {
-            drop(desc);
             carrick_signal_core::fasync::disarm(pipe_id);
             return;
         }
-        let (owner_type, owner_pid) = desc.owner();
-        let sig = desc.async_sig();
-        drop(desc);
+        let owner = common.owner();
+        let (owner_type, owner_pid) = (owner.owner_type, owner.owner_pid);
+        let sig = common.async_sig();
         carrick_signal_core::fasync::arm(
             pipe_id,
             carrick_signal_core::fasync::FasyncOwner {
@@ -5111,8 +5179,8 @@ impl SyscallDispatcher {
         let Some(open_file) = self.open_file(fd) else {
             return Err(LINUX_EBADF);
         };
-        let path = match &*open_file.description.read() {
-            OpenDescription::Directory { path, .. } => path.clone(),
+        let path = match open_file.description.read().as_deref() {
+            Some(OpenDescription::Directory { path, .. }) => path.clone(),
             _ => match self.lookup_recorded_fd_open_path(fd) {
                 Some(path) => path,
                 None => return Err(LINUX_EINVAL),
@@ -5279,11 +5347,10 @@ impl SyscallDispatcher {
                 continue;
             }
             if let Some(open_file) = self.open_file(entry.fd) {
-                let (owner_type, owner_pid, sig) = {
-                    let desc = open_file.description.read();
-                    let (owner_type, owner_pid) = desc.owner();
-                    (owner_type, owner_pid, desc.async_sig())
-                };
+                let common = open_file.description.common();
+                let owner = common.owner();
+                let (owner_type, owner_pid, sig) =
+                    (owner.owner_type, owner.owner_pid, common.async_sig());
                 self.send_async_owner_signal(
                     context,
                     owner_type,
@@ -5314,13 +5381,15 @@ impl SyscallDispatcher {
     fn fd_lacks_fsync(&self, fd: i32) -> bool {
         self.open_file(fd).is_some_and(|of| {
             matches!(
-                &*of.description.read(),
-                OpenDescription::HostPipe { .. }
-                    | OpenDescription::HostSocket { .. }
-                    | OpenDescription::InMemorySocket { .. }
-                    | OpenDescription::PipeReader { .. }
-                    | OpenDescription::PipeWriter { .. }
-                    | OpenDescription::SyntheticDevice { .. }
+                of.description.read().as_deref(),
+                Some(
+                    OpenDescription::HostPipe { .. }
+                        | OpenDescription::HostSocket { .. }
+                        | OpenDescription::InMemorySocket { .. }
+                        | OpenDescription::PipeReader { .. }
+                        | OpenDescription::PipeWriter { .. }
+                        | OpenDescription::SyntheticDevice { .. }
+                )
             )
         })
     }
@@ -5494,16 +5563,20 @@ impl SyscallDispatcher {
     ) -> DispatchOutcome {
         if off_out_addr == 0 {
             if let Some(open_file) = self.open_file(out_fd) {
-                let open = open_file.description.read();
-                if let OpenDescription::SyntheticDevice {
-                    base,
-                    kind:
-                        crate::vfs::SyntheticDeviceKind::Null | crate::vfs::SyntheticDeviceKind::Zero,
-                } = &*open
+                if let Some(open) = open_file.description.read()
+                    && let OpenDescription::SyntheticDevice {
+                        kind:
+                            crate::vfs::SyntheticDeviceKind::Null
+                            | crate::vfs::SyntheticDeviceKind::Zero,
+                        ..
+                    } = &*open
                 {
-                    return if base.is_read_only() {
+                    let flags = open_file.description.common().status_flags();
+                    return if flags & LINUX_O_ACCMODE == LINUX_O_RDONLY {
                         DispatchOutcome::errno(LINUX_EBADF)
-                    } else if base.is_append() {
+                    } else if LinuxOpenFlags::from_bits_truncate(flags)
+                        .contains(LinuxOpenFlags::APPEND)
+                    {
                         DispatchOutcome::errno(LINUX_EINVAL)
                     } else {
                         DispatchOutcome::Returned {
@@ -5528,13 +5601,15 @@ impl SyscallDispatcher {
             Err(errno) => return DispatchOutcome::errno(errno),
         };
         let host_fd = match self.open_file(out_fd).as_ref() {
-            Some(of) => match &*of.description.read() {
-                OpenDescription::HostFile {
+            Some(of) => match of.description.read().as_deref() {
+                Some(OpenDescription::HostFile {
                     host_fd,
                     writable: true,
                     ..
-                } => host_fd.raw(),
-                OpenDescription::HostFile { .. } => return DispatchOutcome::errno(LINUX_EBADF),
+                }) => host_fd.raw(),
+                Some(OpenDescription::HostFile { .. }) => {
+                    return DispatchOutcome::errno(LINUX_EBADF);
+                }
                 _ => return DispatchOutcome::errno(LINUX_EINVAL),
             },
             None => return DispatchOutcome::errno(LINUX_EBADF),
@@ -5697,7 +5772,7 @@ impl SyscallDispatcher {
     /// the wait; a non-blocking caller gets `EAGAIN` instead.
     fn splice_output_would_block(&self, fd: i32, nonblocking: bool) -> DispatchOutcome {
         let target = self.open_file(fd).and_then(|file| {
-            let open = file.description.read();
+            let open = file.description.read()?;
             match &*open {
                 OpenDescription::HostPipe { host_fd, .. }
                 | OpenDescription::HostSocket { host_fd, .. } => {
@@ -5807,13 +5882,15 @@ impl SyscallDispatcher {
             let outcome: DispatchOutcome;
             let writeback: Option<(String, usize, usize)>;
             {
-                let mut open = open_file.description.write();
+                let Some(mut open) = open_file.description.write() else {
+                    return DispatchOutcome::errno(LINUX_EBADF);
+                };
                 match &mut *open {
-                    OpenDescription::PipeWriter { base, pipe } => {
+                    OpenDescription::PipeWriter { pipe, .. } => {
                         let flags = if nonblocking {
-                            base.status_flags() | LINUX_O_NONBLOCK
+                            open_file.description.common().status_flags() | LINUX_O_NONBLOCK
                         } else {
-                            base.status_flags()
+                            open_file.description.common().status_flags()
                         };
                         return write_pipe(
                             bytes,
@@ -5842,6 +5919,7 @@ impl SyscallDispatcher {
                                 return DispatchOutcome::errno(LINUX_EBADF);
                             }
                             if !self.io.inherits_host_stdio() {
+                                drop(open);
                                 return self.write_stdio_sink(stream, bytes);
                             }
                         }
@@ -5859,8 +5937,8 @@ impl SyscallDispatcher {
                         return if *is_read_end && pty.is_none() && !*bidirectional {
                             DispatchOutcome::errno(LINUX_EBADF)
                         } else {
-                            write_host_pipe(
-                                bytes,
+                            write_host_pipe_owned(
+                                bytes.to_vec(),
                                 HostPipeWriteTarget {
                                     host_fd: host_fd.raw(),
                                     host_fd_owner: Some(host_fd.clone()),
@@ -5874,7 +5952,7 @@ impl SyscallDispatcher {
                                         host_fd.raw(),
                                     ),
                                     tid,
-                                    sigpipe_on_epipe: false,
+                                    sigpipe_on_epipe: true,
                                     authority: self
                                         .captured_slot_authority(fd)
                                         .map(WaitFdAuthority::logical)
@@ -5884,8 +5962,8 @@ impl SyscallDispatcher {
                         };
                     }
                     OpenDescription::HostSocket { host_fd, .. } => {
-                        return write_host_pipe(
-                            bytes,
+                        return write_host_pipe_owned(
+                            bytes.to_vec(),
                             HostPipeWriteTarget {
                                 host_fd: host_fd.raw(),
                                 host_fd_owner: Some(host_fd.clone()),
@@ -5901,16 +5979,29 @@ impl SyscallDispatcher {
                             },
                         );
                     }
+                    OpenDescription::InMemorySocket { socket, .. } => {
+                        let socket = Arc::clone(socket);
+                        return match socket.send_stream(bytes, Vec::new()) {
+                            Ok(written) => {
+                                self.notify_inmem_epoll();
+                                DispatchOutcome::Returned {
+                                    value: written as i64,
+                                }
+                            }
+                            Err(errno) => DispatchOutcome::errno(errno),
+                        };
+                    }
                     OpenDescription::HostFile {
-                        base,
-                        host_fd,
-                        writable,
-                        ..
+                        host_fd, writable, ..
                     } => {
                         if !*writable {
                             return DispatchOutcome::errno(LINUX_EBADF);
                         }
-                        if base.is_append() {
+                        if LinuxOpenFlags::from_bits_truncate(
+                            open_file.description.common().status_flags(),
+                        )
+                        .contains(LinuxOpenFlags::APPEND)
+                        {
                             // Let the HOST kernel perform the append. Linux's
                             // O_APPEND seeks to end and writes as ONE atomic
                             // operation; emulating it as `lseek(SEEK_END)` then
@@ -6045,7 +6136,7 @@ impl SyscallDispatcher {
     /// the size is whatever the guest has written so far.
     fn materialize_anon_fd_to(&self, fd: i32, target: &str) -> Option<Result<(), LinuxErrno>> {
         let open_file = self.open_file(fd)?;
-        let desc = open_file.description.read();
+        let desc = open_file.description.read()?;
         let (bytes, mode) = match &*desc {
             // Real anonymous host inode (`--fs host` O_TMPFILE / memfd). The
             // metadata path is the synthetic "/__carrick_o_tmpfile" sentinel set
@@ -6096,7 +6187,7 @@ impl SyscallDispatcher {
                 contents,
                 metadata,
                 ..
-            } if is_anon_overlay_path(path) => (contents.to_vec(), metadata.mode & 0o7777),
+            } if is_anon_overlay_path(path.as_str()) => (contents.to_vec(), metadata.mode & 0o7777),
             _ => return None,
         };
         drop(desc);
@@ -6299,7 +6390,9 @@ impl SyscallDispatcher {
         let Some(open_file) = self.open_file(fd) else {
             return DispatchOutcome::errno(LINUX_EBADF);
         };
-        let open = open_file.description.read();
+        let Some(open) = open_file.description.read() else {
+            return DispatchOutcome::errno(LINUX_EBADF);
+        };
         match &*open {
             OpenDescription::HostFile { host_fd, .. } => {
                 let to_ts = |t: Option<(i64, i64)>| match t {
@@ -6442,8 +6535,8 @@ impl SyscallDispatcher {
             return Ok(self.cwd());
         }
         match self.open_file(dirfd as i32).as_ref() {
-            Some(open_file) => match &*open_file.description.read() {
-                OpenDescription::Directory { path, .. } => {
+            Some(open_file) => match open_file.description.read().as_deref() {
+                Some(OpenDescription::Directory { path, .. }) => {
                     if self.layered_metadata(path).is_err() {
                         Err(LINUX_ENOENT)
                     } else {
@@ -6624,8 +6717,8 @@ impl SyscallDispatcher {
         } else if dirfd == LINUX_AT_FDCWD {
             (fs_context.cwd(), path)
         } else {
-            match &*self.open_file(dirfd as i32)?.description.read() {
-                OpenDescription::Directory { path: dir, .. } => (dir.clone(), path),
+            match self.open_file(dirfd as i32)?.description.read().as_deref() {
+                Some(OpenDescription::Directory { path: dir, .. }) => (dir.clone(), path),
                 _ => return None,
             }
         };
@@ -6756,8 +6849,8 @@ impl SyscallDispatcher {
             (fs_context.cwd(), path)
         } else {
             match self.open_file(dirfd as i32).as_ref() {
-                Some(open_file) => match &*open_file.description.read() {
-                    OpenDescription::Directory { path: dir, .. } => {
+                Some(open_file) => match open_file.description.read().as_deref() {
+                    Some(OpenDescription::Directory { path: dir, .. }) => {
                         // A relative *at op through a dirfd whose directory has
                         // since been removed (rmdir) resolves to ENOENT on Linux:
                         // the open fd persists but its path no longer exists.
@@ -7162,12 +7255,12 @@ impl SyscallDispatcher {
     ) -> DispatchOutcome {
         let path = self
             .open_file(fd)
-            .and_then(|of| match &*of.description.read() {
-                OpenDescription::HostFile { metadata, .. }
-                | OpenDescription::File { metadata, .. }
-                | OpenDescription::Directory { metadata, .. } => {
-                    Some(metadata.path.to_string_lossy().into_owned())
-                }
+            .and_then(|of| match of.description.read().as_deref() {
+                Some(
+                    OpenDescription::HostFile { metadata, .. }
+                    | OpenDescription::File { metadata, .. }
+                    | OpenDescription::Directory { metadata, .. },
+                ) => Some(metadata.path.to_string_lossy().into_owned()),
                 _ => None,
             });
         if let Some(path) = path {
@@ -7465,7 +7558,9 @@ impl SyscallDispatcher {
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            let open = open_file.description.read();
+            let Some(open) = open_file.description.read() else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
             Ok(match &*open {
                 OpenDescription::Closed { .. } => DispatchOutcome::errno(LINUX_EBADF),
                 OpenDescription::Directory { metadata, .. } => {
@@ -7556,18 +7651,20 @@ impl SyscallDispatcher {
             let mut write_base = OpenDescriptionBase::new(LINUX_O_WRONLY | nonblock);
             write_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
 
-            let read_open = OpenFile::from_open_description(
+            let read_open = OpenFile::from_open_description_with_status_flags(
                 Arc::new(RwLock::new(OpenDescription::PipeReader {
                     base: read_base,
                     pipe: Arc::clone(&pipe),
                 })),
+                LINUX_O_RDONLY | nonblock,
                 fd_flags,
             );
-            let write_open = OpenFile::from_open_description(
+            let write_open = OpenFile::from_open_description_with_status_flags(
                 Arc::new(RwLock::new(OpenDescription::PipeWriter {
                     base: write_base,
                     pipe,
                 })),
+                LINUX_O_WRONLY | nonblock,
                 fd_flags,
             );
             let Ok((read_fd, write_fd)) = this.install_fd_pair_at_or_above(3, read_open, write_open)
@@ -7676,14 +7773,16 @@ impl SyscallDispatcher {
                     let Some(open_file) = this.open_file(fd.0) else {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     };
-                    let open = open_file.description.read();
+                    let Some(open) = open_file.description.read() else {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    };
                     match &*open {
-                        OpenDescription::PipeReader { .. }
-                        | OpenDescription::PipeWriter { .. }
-                        | OpenDescription::HostPipe { .. } => DispatchOutcome::Returned {
+                        OpenDescription::PipeReader { base, .. }
+                        | OpenDescription::PipeWriter { base, .. }
+                        | OpenDescription::HostPipe { base, .. } => DispatchOutcome::Returned {
                             // The per-description capacity, set by a prior
                             // F_SETPIPE_SZ or the default pipe buffer size.
-                            value: open.pipe_capacity(),
+                            value: base.pipe_capacity(),
                         },
                         OpenDescription::HostSocket { .. } => DispatchOutcome::errno(LINUX_EBADF),
                         _ => DispatchOutcome::errno(LINUX_EBADF),
@@ -7697,10 +7796,12 @@ impl SyscallDispatcher {
                     // (Linux: F_SETPIPE_SZ on a non-pipe fd is EBADF, mirroring
                     // F_GETPIPE_SZ above).
                     let is_pipe = matches!(
-                        &*open_file.description.read(),
-                        OpenDescription::PipeReader { .. }
-                            | OpenDescription::PipeWriter { .. }
-                            | OpenDescription::HostPipe { .. }
+                        open_file.description.read().as_deref(),
+                        Some(
+                            OpenDescription::PipeReader { .. }
+                                | OpenDescription::PipeWriter { .. }
+                                | OpenDescription::HostPipe { .. }
+                        )
                     );
                     if !is_pipe {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
@@ -7729,16 +7830,22 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(LINUX_EBUSY));
                     }
                     let capacity = rounded.max(page) as i64;
-                    let is_inmem_pipe = match &*open_file.description.read() {
-                        OpenDescription::PipeReader { pipe, .. }
-                        | OpenDescription::PipeWriter { pipe, .. } => {
+                    let is_inmem_pipe = match open_file.description.read().as_deref() {
+                        Some(
+                            OpenDescription::PipeReader { pipe, .. }
+                            | OpenDescription::PipeWriter { pipe, .. }
+                        ) => {
                             pipe.set_capacity(capacity as usize)?;
                             true
                         }
                         _ => false,
                     };
                     if !is_inmem_pipe {
-                        open_file.description.write().set_pipe_capacity(capacity);
+                        if let Some(mut open) = open_file.description.write()
+                            && let OpenDescription::HostPipe { base, .. } = &mut *open
+                        {
+                            base.set_pipe_capacity(capacity);
+                        }
                     }
                     DispatchOutcome::Returned { value: capacity }
                 }
@@ -7801,62 +7908,35 @@ impl SyscallDispatcher {
                 }
                 LINUX_F_GETFL => {
                     if let Some(open_file) = this.open_file(fd.0) {
-                        let open = open_file.description.read();
-                        // Report only file STATUS flags; creation-only flags are
-                        // consumed by open() and must not be reported. (audit M8)
-                        let mut flags = reportable_status_flags(open.status_flags());
-                        // A regular host file's open-description flags are
-                        // already fork-coherent in the host kernel. Overlay the
-                        // mutable bits from that authority so a parent's
-                        // F_GETFL observes a child's F_SETFL after real host
-                        // fork even though the Rust description shell is COW.
-                        if let OpenDescription::HostFile { host_fd, .. } = &*open {
-                            let host_flags = match (unsafe {
-                                libc::fcntl(host_fd.raw(), libc::F_GETFL, 0)
-                            })
-                            .host_syscall_errno()
-                            {
-                                Ok(value) => value,
-                                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                            };
-                            // The host fd is only a truthful authority for a
-                            // flag it actually carries. Carrick never opens an
-                            // overlay/scratch host file with O_APPEND — the
-                            // backend's `open_raw_fd` has no append parameter —
-                            // so trusting the host bit unconditionally REPORTED
-                            // O_APPEND AS ABSENT for every guest that opened
-                            // with it, and the guest then wrote that answer
-                            // back via the standard F_SETFL read-modify-write,
-                            // destroying the flag for good. Go does exactly
-                            // that in `syscall.SetNonblock`, which `os.OpenFile`
-                            // runs on every file, and `cmd/go` opens archives
-                            // with `O_WRONLY|O_APPEND`: the append branch in
-                            // `write` then went dead and the member header
-                            // landed at offset 0, corrupting the archive.
-                            //
-                            // Keep the host as the fork-coherent authority by
-                            // making it TRUE rather than by believing it: push
-                            // the description's O_APPEND down to the host fd,
-                            // and only then read the flag back.
-                            if flags & LINUX_O_APPEND != 0 && host_flags & libc::O_APPEND == 0 {
-                                unsafe {
-                                    libc::fcntl(
-                                        host_fd.raw(),
-                                        libc::F_SETFL,
-                                        host_flags | libc::O_APPEND,
-                                    )
+                        let mut flags =
+                            reportable_status_flags(open_file.description.common().status_flags());
+                        if let Some(open) = open_file.description.read() {
+                            if let OpenDescription::HostFile { host_fd, .. } = &*open {
+                                let host_flags = match (unsafe {
+                                    libc::fcntl(host_fd.raw(), libc::F_GETFL, 0)
+                                })
+                                .host_syscall_errno()
+                                {
+                                    Ok(value) => value,
+                                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                                 };
+                                if flags & LINUX_O_APPEND != 0 && host_flags & libc::O_APPEND == 0 {
+                                    unsafe {
+                                        libc::fcntl(
+                                            host_fd.raw(),
+                                            libc::F_SETFL,
+                                            host_flags | libc::O_APPEND,
+                                        )
+                                    };
+                                }
+                                flags &= !LINUX_O_NONBLOCK;
+                                if host_flags & libc::O_NONBLOCK != 0 {
+                                    flags |= LINUX_O_NONBLOCK;
+                                }
                             }
-                            flags &= !LINUX_O_NONBLOCK;
-                            if host_flags & libc::O_NONBLOCK != 0 {
-                                flags |= LINUX_O_NONBLOCK;
+                            if matches!(&*open, OpenDescription::HostPipe { pty: Some(_), .. }) {
+                                flags |= LINUX_O_RDWR;
                             }
-                        }
-                        // A pty end is bidirectional (opened O_RDWR); report the
-                        // O_RDWR access mode rather than the default O_RDONLY (0),
-                        // so libc/readline see a read-write terminal.
-                        if matches!(&*open, OpenDescription::HostPipe { pty: Some(_), .. }) {
-                            flags |= LINUX_O_RDWR;
                         }
                         return Ok(DispatchOutcome::Returned {
                             value: flags as i64,
@@ -7924,9 +8004,12 @@ impl SyscallDispatcher {
                     // kernel signals the F_SETOWN owner on a readiness edge).
                     const LINUX_F_SETFL_MUTABLE: u64 =
                         LINUX_O_APPEND | LINUX_O_NONBLOCK | LINUX_O_ASYNC;
-                    let open = open_file.description.read();
-                    let next_flags =
-                        (open.status_flags() & LINUX_O_ACCMODE) | (arg & LINUX_F_SETFL_MUTABLE);
+                    let Some(open) = open_file.description.read() else {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    };
+                    let next_flags = (open_file.description.common().status_flags()
+                        & LINUX_O_ACCMODE)
+                        | (arg & LINUX_F_SETFL_MUTABLE);
                     // Regular host files delegate O_APPEND/O_NONBLOCK to the
                     // shared host open description, which is the only mutable
                     // state that remains coherent across a real host fork.
@@ -7966,7 +8049,7 @@ impl SyscallDispatcher {
                         _ => {}
                     }
                     drop(open);
-                    open_file.description.write().set_status_flags(next_flags);
+                    open_file.description.common().set_status_flags(next_flags);
                     // Reflect the new O_ASYNC state into the fork-coherent FASYNC
                     // registry so a WRITER in another guest process can deliver the
                     // owner's signal on the readiness edge (the arming lives on the
@@ -8876,8 +8959,8 @@ impl SyscallDispatcher {
                     // pipe (`pipe2(2)` backing) forwards the ioctl to the real host fd so the
                     // guest sees the kernel's actual queued-byte count.
                     let available: i32 = match this.open_file(fd.0).as_ref() {
-                        Some(open_file) => match &*open_file.description.read() {
-                            OpenDescription::PipeReader { pipe, .. } => {
+                        Some(open_file) => match open_file.description.read().as_deref() {
+                            Some(OpenDescription::PipeReader { pipe, .. }) => {
                                 let len = pipe.buffered_bytes();
                                 i32::try_from(len).unwrap_or(i32::MAX)
                             }
@@ -8886,24 +8969,26 @@ impl SyscallDispatcher {
                             // FIONREAD on a write fd returns 0, so consult the
                             // paired read end's queued byte count instead — pipe12
                             // reads FIONREAD on fds[1] after filling the pipe.
-                            OpenDescription::HostPipe {
+                            Some(OpenDescription::HostPipe {
                                 is_read_end: false,
                                 pipe_id,
                                 pty: None,
                                 bidirectional: false,
                                 ..
-                            } if *pipe_id != 0 => {
+                            }) if *pipe_id != 0 => {
                                 i32::try_from(this.host_pipe_read_end_buffered_bytes(*pipe_id))
                                     .unwrap_or(i32::MAX)
                             }
-                            OpenDescription::HostPipe { host_fd, .. }
-                            | OpenDescription::HostSocket { host_fd, .. } => {
+                            Some(
+                                OpenDescription::HostPipe { host_fd, .. }
+                                | OpenDescription::HostSocket { host_fd, .. },
+                            ) => {
                                 let mut n: libc::c_int = 0;
                                 let rc =
                                     unsafe { libc::ioctl(host_fd.raw(), libc::FIONREAD, &mut n) };
                                 if rc == 0 { n as i32 } else { 0 }
                             }
-                            OpenDescription::Inotify { state, .. } => {
+                            Some(OpenDescription::Inotify { state, .. }) => {
                                 i32::try_from(state.queued_bytes()).unwrap_or(i32::MAX)
                             }
                             _ => 0,
@@ -8927,11 +9012,12 @@ impl SyscallDispatcher {
                             status_flags &= !LINUX_O_NONBLOCK;
                         }
                         common.set_status_flags(status_flags);
-                        let open = open_file.description.read();
-                        let host_fd = match &*open {
-                            OpenDescription::HostPipe { host_fd, .. }
-                            | OpenDescription::HostSocket { host_fd, .. }
-                            | OpenDescription::HostFile { host_fd, .. } => Some(host_fd.raw()),
+                        let host_fd = match open_file.description.read().as_deref() {
+                            Some(
+                                OpenDescription::HostPipe { host_fd, .. }
+                                | OpenDescription::HostSocket { host_fd, .. }
+                                | OpenDescription::HostFile { host_fd, .. },
+                            ) => Some(host_fd.raw()),
                             _ => None,
                         };
                         if let Some(host_fd) = host_fd {
@@ -8949,8 +9035,8 @@ impl SyscallDispatcher {
                     Err(errno) => DispatchOutcome::errno(errno),
                 },
                 LINUX_SIOCGIFNAME => match this.open_file(fd.0).as_ref() {
-                    Some(open_file) => match &*open_file.description.read() {
-                        OpenDescription::HostSocket { .. } => {
+                    Some(open_file) => match open_file.description.read().as_deref() {
+                        Some(OpenDescription::HostSocket { .. }) => {
                             let Ok(bytes) = cx.memory.read_bytes(arg + 16, 4) else {
                                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                             };
@@ -8972,8 +9058,8 @@ impl SyscallDispatcher {
                     None => DispatchOutcome::errno(LINUX_ENOTTY),
                 },
                 LINUX_SIOCGIFINDEX => match this.open_file(fd.0).as_ref() {
-                    Some(open_file) => match &*open_file.description.read() {
-                        OpenDescription::HostSocket { .. } => {
+                    Some(open_file) => match open_file.description.read().as_deref() {
+                        Some(OpenDescription::HostSocket { .. }) => {
                             let Ok(bytes) = cx.memory.read_bytes(arg, 16) else {
                                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                             };
@@ -9165,7 +9251,9 @@ impl SyscallDispatcher {
             }
 
             let file = {
-                let description = open_file.description.read();
+                let Some(description) = open_file.description.read() else {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                };
                 Self::lease_file_identity(&description)
             };
             let Some(file) = file else {
@@ -9236,10 +9324,11 @@ impl SyscallDispatcher {
             let writeback: Option<(String, Vec<u8>)>;
             let outcome: DispatchOutcome;
             {
-                let mut open = open_file.description.write();
+                let Some(mut open) = open_file.description.write() else {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                };
                 match &mut *open {
                     OpenDescription::File {
-                        base,
                         path,
                         contents,
                         metadata,
@@ -9254,7 +9343,11 @@ impl SyscallDispatcher {
                         // F_SEAL_WRITE does NOT block a pure grow (memfd_create01
                         // seals WRITE then grows via fallocate successfully).
                         if matches!(
-                            base.seals().and_then(carrick_abi::LinuxMemfdSeals::from_bits),
+                            open_file
+                                .description
+                                .common()
+                                .seals()
+                                .and_then(carrick_abi::LinuxMemfdSeals::from_bits),
                             Some(s) if s.contains(carrick_abi::LinuxMemfdSeals::GROW)
                         ) && new_size as usize > contents.len()
                         {
@@ -9274,7 +9367,7 @@ impl SyscallDispatcher {
                         writeback = Some((path.clone(), contents.to_vec()));
                         outcome = DispatchOutcome::Returned { value: 0 };
                     }
-                    OpenDescription::File { base, writable, .. } => {
+                    OpenDescription::File { writable, .. } => {
                         if !*writable {
                             return Ok(DispatchOutcome::errno(LINUX_EBADF));
                         }
@@ -9282,7 +9375,12 @@ impl SyscallDispatcher {
                         // (memfd_create01 check_mfd_non_writeable). A plain
                         // KEEP_SIZE preallocate changes nothing and is unaffected.
                         if mode & LINUX_FALLOC_FL_PUNCH_HOLE != 0
-                            && let Err(errno) = memfd_seal_write_check(base.seals(), 0, 0, 0)
+                            && let Err(errno) = memfd_seal_write_check(
+                                open_file.description.common().seals(),
+                                0,
+                                0,
+                                0,
+                            )
                         {
                             return Ok(DispatchOutcome::errno(errno));
                         }
@@ -9382,10 +9480,11 @@ impl SyscallDispatcher {
             let writeback: Option<(String, Vec<u8>)>;
             let outcome: DispatchOutcome;
             {
-                let mut open = open_file.description.write();
+                let Some(mut open) = open_file.description.write() else {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                };
                 match &mut *open {
                     OpenDescription::File {
-                        base,
                         path,
                         contents,
                         offset,
@@ -9405,9 +9504,11 @@ impl SyscallDispatcher {
                         let new_len = length as usize;
                         // memfd resize seals: F_SEAL_SHRINK blocks shrink,
                         // F_SEAL_GROW blocks grow (memfd_create01).
-                        if let Err(errno) =
-                            memfd_seal_resize_check(base.seals(), new_len, contents.len())
-                        {
+                        if let Err(errno) = memfd_seal_resize_check(
+                            open_file.description.common().seals(),
+                            new_len,
+                            contents.len(),
+                        ) {
                             return Ok(DispatchOutcome::errno(errno));
                         }
                         if new_len > contents.len() {
@@ -9743,7 +9844,9 @@ impl SyscallDispatcher {
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            let mut open = open_file.description.write();
+            let Some(mut open) = open_file.description.write() else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
             let OpenDescription::Directory {
                 entries,
                 offset,
@@ -9831,7 +9934,12 @@ impl SyscallDispatcher {
                 }
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            let mut open = open_file.description.write();
+            let Some(mut open) = open_file.description.write() else {
+                if is_stdio_fd(fd.0) && !this.stdio_is_closed(fd.0) {
+                    return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
+                }
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
 
             // HostFile: the kernel owns the offset — delegate straight to
             // libc::lseek on the real fd.
@@ -10092,7 +10200,9 @@ impl SyscallDispatcher {
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            let mut open = open_file.description.write();
+            let Some(mut open) = open_file.description.write() else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
             // read() on a regular file opened write-only (O_WRONLY) → EBADF
             // (open09/creat01 read a creat()'d write-only fd). Only regular-file
             // descriptions carry O_ACCMODE semantics; pipes/sockets/eventfds and
@@ -10103,7 +10213,7 @@ impl SyscallDispatcher {
                     | OpenDescription::SyntheticFile { .. }
                     | OpenDescription::InMemoryFile { .. }
                     | OpenDescription::HostFile { .. }
-            ) && open.status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY
+            ) && open_file.description.common().status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY
             {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
@@ -10209,13 +10319,16 @@ impl SyscallDispatcher {
                     (read_len, bytes)
                 }
                 OpenDescription::EventFd {
-                    base,
                     state,
                     semaphore,
+                    ..
                 } => {
                     let state = Arc::clone(state);
                     let semaphore = *semaphore;
-                    let nonblocking = base.is_nonblocking();
+                    let nonblocking = LinuxOpenFlags::from_bits_truncate(
+                        open_file.description.common().status_flags(),
+                    )
+                    .contains(LinuxOpenFlags::NONBLOCK);
                     drop(open);
                     return Ok(read_eventfd(
                         memory,
@@ -10229,9 +10342,10 @@ impl SyscallDispatcher {
                         ),
                     ));
                 }
-                OpenDescription::TimerFd { base, state } => {
+                OpenDescription::TimerFd { state, .. } => {
                     let state = Arc::clone(state);
-                    let nonblocking = base.status_flags() & LINUX_TFD_NONBLOCK != 0;
+                    let nonblocking =
+                        open_file.description.common().status_flags() & LINUX_TFD_NONBLOCK != 0;
                     drop(open);
                     return Ok(read_timerfd(memory, address, length, &state, nonblocking));
                 }
@@ -10265,13 +10379,13 @@ impl SyscallDispatcher {
                         Err(errno) => DispatchOutcome::errno(errno),
                     });
                 }
-                OpenDescription::Fanotify { base, group } => {
+                OpenDescription::Fanotify { group, .. } => {
                     let group = Arc::clone(group);
                     // FAN_NONBLOCK (init) and O_NONBLOCK (a later fcntl) are
                     // independent switches; either one makes the read
                     // non-blocking.
                     let nonblocking = group.init_nonblocking()
-                        || base.status_flags() & LINUX_O_NONBLOCK != 0;
+                        || open_file.description.common().status_flags() & LINUX_O_NONBLOCK != 0;
                     drop(open);
                     return read_fanotify(
                         this,
@@ -10286,9 +10400,9 @@ impl SyscallDispatcher {
                         fd.0,
                     );
                 }
-                OpenDescription::PipeReader { base, pipe } => {
+                OpenDescription::PipeReader { pipe, .. } => {
                     let pipe = Arc::clone(pipe);
-                    let flags = base.status_flags();
+                    let flags = open_file.description.common().status_flags();
                     drop(open);
                     return Ok(read_pipe(
                         memory,
@@ -10470,14 +10584,16 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
             let nonblocking = this.io_is_nonblocking(fd.0, 0);
-            let mut open = open_file.description.write();
+            let Some(mut open) = open_file.description.write() else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
             // readv() on a regular file opened write-only (O_WRONLY) → EBADF.
             if matches!(
                 &*open,
                 OpenDescription::File { .. }
                     | OpenDescription::SyntheticFile { .. }
                     | OpenDescription::HostFile { .. }
-            ) && open.status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY
+            ) && open_file.description.common().status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY
             {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
@@ -10630,9 +10746,9 @@ impl SyscallDispatcher {
                     }
                     return Ok(DispatchOutcome::Returned { value: total });
                 }
-                OpenDescription::PipeReader { base, pipe } => {
+                OpenDescription::PipeReader { pipe, .. } => {
                     let pipe = Arc::clone(pipe);
-                    let flags = base.status_flags();
+                    let flags = open_file.description.common().status_flags();
                     drop(open);
                     let mut total = 0i64;
                     for iov in &iovecs {
@@ -10752,11 +10868,13 @@ impl SyscallDispatcher {
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            let open = open_file.description.read();
+            let Some(open) = open_file.description.read() else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
             // pread reads the fd, so a descriptor not open for reading
             // (O_WRONLY) is EBADF (pread02 "not open for reading" case), exactly
             // as the kernel rejects it before touching the data.
-            if open.status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY {
+            if open_file.description.common().status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
             // Real host file: positional read via libc::pread (doesn't
@@ -10903,11 +11021,13 @@ impl SyscallDispatcher {
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            let open = open_file.description.read();
+            let Some(open) = open_file.description.read() else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
             // preadv reads the fd, so a descriptor not open for reading
             // (O_WRONLY) is EBADF (preadv02 "not open for reading" case), exactly
             // as the kernel rejects it before touching the data.
-            if open.status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY {
+            if open_file.description.common().status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
             // Real host file: positional readv via libc::pread per iovec
@@ -11075,12 +11195,17 @@ impl SyscallDispatcher {
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            let open = open_file.description.read();
+            let Some(open) = open_file.description.read() else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
             // An O_APPEND fd forces EVERY write to EOF, ignoring the supplied
             // offset (pwrite04). macOS pwrite() on an O_APPEND fd returns EINVAL,
             // so seek-to-end then write() instead (matching the plain write()
             // append path).
-            let is_append = open.is_append();
+            let is_append = LinuxOpenFlags::from_bits_truncate(
+                open_file.description.common().status_flags(),
+            )
+            .contains(LinuxOpenFlags::APPEND);
             if let OpenDescription::SyntheticDevice { kind, .. } = &*open {
                 match kind {
                     crate::vfs::SyntheticDeviceKind::Full => {
@@ -11137,7 +11262,9 @@ impl SyscallDispatcher {
             let is_inmem_file = matches!(&*open, OpenDescription::File { .. } | OpenDescription::InMemoryFile { .. });
             drop(open);
             if is_inmem_file {
-                let mut open = open_file.description.write();
+                let Some(mut open) = open_file.description.write() else {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                };
                 if let OpenDescription::InMemoryFile {
                     contents,
                     writable,
@@ -11170,7 +11297,6 @@ impl SyscallDispatcher {
                     });
                 }
                 if let OpenDescription::File {
-                    base,
                     path,
                     contents,
                     writable,
@@ -11187,7 +11313,7 @@ impl SyscallDispatcher {
                         offset as usize
                     };
                     if let Err(errno) = memfd_seal_write_check(
-                        base.seals(),
+                        open_file.description.common().seals(),
                         write_at,
                         bytes.len(),
                         contents.len(),
@@ -11212,7 +11338,9 @@ impl SyscallDispatcher {
                 }
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
-            let open = open_file.description.read();
+            let Some(open) = open_file.description.read() else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
             let errno = match &*open {
                 OpenDescription::Closed { .. }
                 | OpenDescription::File { .. }
@@ -11296,13 +11424,18 @@ impl SyscallDispatcher {
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            let open = open_file.description.read();
+            let Some(open) = open_file.description.read() else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
             // An O_APPEND fd writes at EOF regardless of the offset, but pwritev
             // (like pwrite) MUST leave the file offset untouched. Save the
             // offset, seek to EOF, then write via writev()/write() (macOS rejects
             // pwritev() on an O_APPEND fd with EINVAL), and restore the offset
             // afterward.
-            let is_append = open.is_append();
+            let is_append = LinuxOpenFlags::from_bits_truncate(
+                open_file.description.common().status_flags(),
+            )
+            .contains(LinuxOpenFlags::APPEND);
             if let OpenDescription::SyntheticDevice { kind, .. } = &*open {
                 match kind {
                     crate::vfs::SyntheticDeviceKind::Full => {
@@ -11388,9 +11521,10 @@ impl SyscallDispatcher {
                 drop(data);
                 if write_at_current {
                     drop(open);
-                    let mut open_write = open_file.description.write();
-                    if let OpenDescription::InMemoryFile { offset: off, .. } = &mut *open_write {
-                        *off = cur;
+                    if let Some(mut open_write) = open_file.description.write() {
+                        if let OpenDescription::InMemoryFile { offset: off, .. } = &mut *open_write {
+                            *off = cur;
+                        }
                     }
                 }
                 return Ok(DispatchOutcome::Returned { value: total });
@@ -11631,8 +11765,9 @@ impl SyscallDispatcher {
             let written = usize::try_from(value).unwrap_or(0);
             offset = offset.saturating_add(written);
             if offset_address == 0 {
-                if let Some(open_file) = this.open_file(in_fd.0) {
-                    let mut open = open_file.description.write();
+                if let Some(open_file) = this.open_file(in_fd.0)
+                    && let Some(mut open) = open_file.description.write()
+                {
                     match &mut *open {
                         OpenDescription::File {
                             offset: current, ..
@@ -11747,13 +11882,13 @@ impl SyscallDispatcher {
             } else {
                 let out_off = read_u64(memory, off_out_addr)?;
                 let host_fd = match this.open_file(out_fd.0).as_ref() {
-                    Some(of) => match &*of.description.read() {
-                        OpenDescription::HostFile {
+                    Some(of) => match of.description.read().as_deref() {
+                        Some(OpenDescription::HostFile {
                             host_fd,
                             writable: true,
                             ..
-                        } => host_fd.raw(),
-                        OpenDescription::HostFile { .. } => {
+                        }) => host_fd.raw(),
+                        Some(OpenDescription::HostFile { .. }) => {
                             return Ok(DispatchOutcome::errno(LINUX_EBADF));
                         }
                         _ => {
@@ -11786,8 +11921,9 @@ impl SyscallDispatcher {
             // Advance the input offset (pointer or the fd's own position).
             let new_in = in_offset.saturating_add(written);
             if off_in_addr == 0 {
-                if let Some(of) = this.open_file(in_fd.0).as_ref() {
-                    let mut open = of.description.write();
+                if let Some(of) = this.open_file(in_fd.0).as_ref()
+                    && let Some(mut open) = of.description.write()
+                {
                     match &mut *open {
                         OpenDescription::File { offset, .. }
                         | OpenDescription::SyntheticFile { offset, .. } => *offset = new_in,
@@ -12008,7 +12144,7 @@ impl SyscallDispatcher {
                 let in_nonblocking = splice_flags.contains(LinuxSpliceFlags::NONBLOCK)
                     || this.fd_is_nonblocking(in_fd.0);
                 let host_fd_owner = this.open_file(in_fd.0).and_then(|file| {
-                    let open = file.description.read();
+                    let open = file.description.read()?;
                     match &*open {
                         OpenDescription::HostPipe { host_fd, .. } => Some(host_fd.clone()),
                         _ => None,
@@ -12201,8 +12337,9 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
             }
 
-            if let Some(open_file) = this.open_file(in_fd.0) {
-                let open = open_file.description.read();
+            if let Some(open_file) = this.open_file(in_fd.0)
+                && let Some(open) = open_file.description.read()
+            {
                 if let OpenDescription::SyntheticDevice { kind, .. } = &*open {
                     let kind = *kind;
                     drop(open);
@@ -12288,8 +12425,9 @@ impl SyscallDispatcher {
             let written = usize::try_from(value).unwrap_or(0);
             offset = offset.saturating_add(written);
             if off_in_address == 0 {
-                if let Some(open_file) = this.open_file(in_fd.0) {
-                    let mut open = open_file.description.write();
+                if let Some(open_file) = this.open_file(in_fd.0)
+                    && let Some(mut open) = open_file.description.write()
+                {
                     match &mut *open {
                         OpenDescription::File {
                             offset: current, ..
@@ -12361,7 +12499,9 @@ impl SyscallDispatcher {
                 ReadMem,
             }
             let dir = {
-                let open = open_file.description.read();
+                let Some(open) = open_file.description.read() else {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                };
                 match &*open {
                     OpenDescription::HostPipe {
                         host_fd,
@@ -12926,24 +13066,26 @@ impl SyscallDispatcher {
             // inotify/signalfd/netlink fd has no page-cache range to sync →
             // ESPIPE.
             let is_special = matches!(
-                &*open_file.description.read(),
-                OpenDescription::SyntheticDevice { .. }
-                    | OpenDescription::HostPipe { .. }
-                    | OpenDescription::HostSocket { .. }
-                    | OpenDescription::PipeReader { .. }
-                    | OpenDescription::PipeWriter { .. }
-                    | OpenDescription::EventFd { .. }
-                    | OpenDescription::TimerFd { .. }
-                    | OpenDescription::Epoll { .. }
-                    | OpenDescription::Pidfd { .. }
-                    | OpenDescription::Inotify { .. }
-                    | OpenDescription::Fanotify { .. }
-                    | OpenDescription::SignalFd { .. }
-                | OpenDescription::FsContext { .. }
-                    | OpenDescription::Mqueue { .. }
-                    | OpenDescription::BpfMap { .. }
-                    | OpenDescription::BpfProg { .. }
-                    | OpenDescription::Netlink { .. }
+                open_file.description.read().as_deref(),
+                Some(
+                    OpenDescription::SyntheticDevice { .. }
+                        | OpenDescription::HostPipe { .. }
+                        | OpenDescription::HostSocket { .. }
+                        | OpenDescription::PipeReader { .. }
+                        | OpenDescription::PipeWriter { .. }
+                        | OpenDescription::EventFd { .. }
+                        | OpenDescription::TimerFd { .. }
+                        | OpenDescription::Epoll { .. }
+                        | OpenDescription::Pidfd { .. }
+                        | OpenDescription::Inotify { .. }
+                        | OpenDescription::Fanotify { .. }
+                        | OpenDescription::SignalFd { .. }
+                        | OpenDescription::FsContext { .. }
+                        | OpenDescription::Mqueue { .. }
+                        | OpenDescription::BpfMap { .. }
+                        | OpenDescription::BpfProg { .. }
+                        | OpenDescription::Netlink { .. }
+                )
             );
             if is_special {
                 return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
@@ -12972,7 +13114,9 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
             let file_size: u64 = {
-                let open = open_file.description.read();
+                let Some(open) = open_file.description.read() else {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                };
                 match &*open {
                     OpenDescription::HostFile { host_fd, .. } => {
                         let mut st: libc::stat = unsafe { core::mem::zeroed() };
@@ -13112,7 +13256,9 @@ impl SyscallDispatcher {
                 let outcome: DispatchOutcome;
                 let writeback: Option<FileWriteback>;
                 {
-                    let mut open = open_file.description.write();
+                    let Some(mut open) = open_file.description.write() else {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    };
                     match &mut *open {
                         OpenDescription::SyntheticDevice { kind, .. } => {
                             match kind {
@@ -13129,9 +13275,9 @@ impl SyscallDispatcher {
                         OpenDescription::EventFd { state, .. } => {
                             return Ok(write_eventfd(this, &bytes, state));
                         }
-                        OpenDescription::PipeWriter { base, pipe } => {
+                        OpenDescription::PipeWriter { pipe, .. } => {
                             let pipe = Arc::clone(pipe);
-                            let flags = base.status_flags();
+                            let flags = open_file.description.common().status_flags();
                             let tid = cx.tid();
                             drop(open);
                             let outcome = write_pipe(
@@ -13277,10 +13423,7 @@ impl SyscallDispatcher {
                             }
                         }
                         OpenDescription::HostFile {
-                            base,
-                            host_fd,
-                            writable,
-                            ..
+                            host_fd, writable, ..
                         } => {
                             if !*writable {
                                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
@@ -13290,7 +13433,11 @@ impl SyscallDispatcher {
                             // host fd isn't opened O_APPEND, so we emulate the
                             // seek-then-write; single-writer, which covers the
                             // shell/dpkg append cases.)
-                            if base.is_append() {
+                            if LinuxOpenFlags::from_bits_truncate(
+                                open_file.description.common().status_flags(),
+                            )
+                            .contains(LinuxOpenFlags::APPEND)
+                            {
                                 unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_END) };
                             }
                             // The offset lives in the host kernel; read it back
@@ -13325,7 +13472,6 @@ impl SyscallDispatcher {
                             ));
                         }
                         OpenDescription::InMemoryFile {
-                            base,
                             contents,
                             offset,
                             writable,
@@ -13335,7 +13481,11 @@ impl SyscallDispatcher {
                             if !*writable {
                                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
                             }
-                            let write_offset = if base.is_append() {
+                            let write_offset = if LinuxOpenFlags::from_bits_truncate(
+                                open_file.description.common().status_flags(),
+                            )
+                            .contains(LinuxOpenFlags::APPEND)
+                            {
                                 contents.read().len()
                             } else {
                                 *offset
@@ -13363,7 +13513,6 @@ impl SyscallDispatcher {
                             writeback = None;
                         }
                         OpenDescription::File {
-                            base,
                             path,
                             contents,
                             offset,
@@ -13377,7 +13526,7 @@ impl SyscallDispatcher {
                             // memfd write seals: F_SEAL_WRITE → EPERM; F_SEAL_GROW
                             // → EPERM when the write would extend the file.
                             if let Err(errno) = memfd_seal_write_check(
-                                base.seals(),
+                                open_file.description.common().seals(),
                                 *offset,
                                 bytes.len(),
                                 contents.len(),
@@ -13548,8 +13697,8 @@ impl SyscallDispatcher {
 
             let host_target = if let Some(open_file) = this.open_file(fd) {
                 let open = open_file.description.read();
-                match &*open {
-                    OpenDescription::HostPipe {
+                match open.as_deref() {
+                    Some(OpenDescription::HostPipe {
                         base,
                         host_fd,
                         is_read_end,
@@ -13558,7 +13707,7 @@ impl SyscallDispatcher {
                         bidirectional,
                         write_kind,
                         ..
-                    } => {
+                    }) => {
                         // pty ends and O_RDWR FIFOs are bidirectional; only
                         // real one-way pipe ends gate on is_read_end.
                         if *is_read_end && pty.is_none() && !*bidirectional {
@@ -13579,7 +13728,7 @@ impl SyscallDispatcher {
                             append: false,
                         })
                     }
-                    OpenDescription::HostSocket { host_fd, .. } => Some(HostWritevTarget {
+                    Some(OpenDescription::HostSocket { host_fd, .. }) => Some(HostWritevTarget {
                         host_fd: host_fd.raw(),
                         host_fd_owner: Some(host_fd.clone()),
                         write_kind: HostWriteKind::SocketLike,
@@ -13587,12 +13736,9 @@ impl SyscallDispatcher {
                         sigpipe_on_epipe: false,
                         append: false,
                     }),
-                    OpenDescription::HostFile {
-                        base,
-                        host_fd,
-                        writable,
-                        ..
-                    } => {
+                    Some(OpenDescription::HostFile {
+                        host_fd, writable, ..
+                    }) => {
                         if !*writable {
                             return Ok(DispatchOutcome::errno(LINUX_EBADF));
                         }
@@ -13602,7 +13748,10 @@ impl SyscallDispatcher {
                             write_kind: HostWriteKind::RegularFile,
                             pipe_state: None,
                             sigpipe_on_epipe: false,
-                            append: base.is_append(),
+                            append: LinuxOpenFlags::from_bits_truncate(
+                                open_file.description.common().status_flags(),
+                            )
+                            .contains(LinuxOpenFlags::APPEND),
                         })
                     }
                     _ => None,
@@ -13692,7 +13841,9 @@ impl SyscallDispatcher {
                     let outcome: DispatchOutcome;
                     let writeback: Option<FileWriteback>;
                     {
-                        let mut open = open_file.description.write();
+                        let Some(mut open) = open_file.description.write() else {
+                            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                        };
                         match &mut *open {
                             OpenDescription::SyntheticDevice { kind, .. } => {
                                 match kind {
@@ -13707,12 +13858,12 @@ impl SyscallDispatcher {
                                     }
                                 }
                             }
-                            OpenDescription::PipeWriter { base, pipe } => {
+                            OpenDescription::PipeWriter { pipe, .. } => {
                                 let tid = cx.tid();
                                 outcome = write_pipe(
                                     &bytes,
                                     pipe,
-                                    base.status_flags(),
+                                    open_file.description.common().status_flags(),
                                     fd,
                                     this.captured_slot_authority(fd)
                                         .map(WaitFdAuthority::logical)
@@ -13814,10 +13965,7 @@ impl SyscallDispatcher {
                                 writeback = None;
                             }
                             OpenDescription::HostFile {
-                                base,
-                                host_fd,
-                                writable,
-                                ..
+                                host_fd, writable, ..
                             } => {
                                 if !*writable {
                                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
@@ -13826,7 +13974,11 @@ impl SyscallDispatcher {
                                 // libc::write to the real fd advances the shared
                                 // kernel offset (visible across fork and to the
                                 // readv that follows).
-                                if base.is_append() {
+                                if LinuxOpenFlags::from_bits_truncate(
+                                    open_file.description.common().status_flags(),
+                                )
+                                .contains(LinuxOpenFlags::APPEND)
+                                {
                                     unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_END) };
                                 }
                                 outcome = write_host_pipe_owned(
@@ -13848,7 +14000,6 @@ impl SyscallDispatcher {
                                 writeback = None;
                             }
                             OpenDescription::InMemoryFile {
-                                base,
                                 contents,
                                 offset,
                                 writable,
@@ -13859,7 +14010,11 @@ impl SyscallDispatcher {
                                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                                 }
                                 let mut data = contents.write();
-                                let write_offset = if base.is_append() {
+                                let write_offset = if LinuxOpenFlags::from_bits_truncate(
+                                    open_file.description.common().status_flags(),
+                                )
+                                .contains(LinuxOpenFlags::APPEND)
+                                {
                                     data.len()
                                 } else {
                                     *offset
@@ -13882,7 +14037,6 @@ impl SyscallDispatcher {
                                 writeback = None;
                             }
                             OpenDescription::File {
-                                base,
                                 path,
                                 contents,
                                 offset,
@@ -13894,7 +14048,7 @@ impl SyscallDispatcher {
                                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                                 }
                                 if let Err(errno) = memfd_seal_write_check(
-                                    base.seals(),
+                                    open_file.description.common().seals(),
                                     *offset,
                                     bytes.len(),
                                     contents.len(),
@@ -14054,15 +14208,23 @@ impl SyscallDispatcher {
             } else if let Some(t) = proc_self_fd_number(&path).and_then(|n| {
                 this.lookup_recorded_fd_open_path(n).or_else(|| {
                     this.open_file(n)
-                        .and_then(|f| f.description.read().open_path().map(str::to_owned))
+                        .and_then(|f| f.description.read().and_then(|g| g.open_path().map(str::to_owned)))
                 })
             }) {
                 // /proc/self/fd/N → the path fd N was opened at. Rosetta readlinks
                 // its main-binary fd this way to recover the binary's path.
                 t
             } else if let Some(t) = proc_self_fd_number(&path).and_then(|n| {
-                this.open_file(n)
-                    .and_then(|f| f.description.read().readlink_target())
+                this.open_file(n).and_then(|f| {
+                    if f.description
+                        .concrete_backing::<crate::dispatch::ioring::IoUringBacking>()
+                        .is_some()
+                    {
+                        Some("anon_inode:[io_uring]".to_string())
+                    } else {
+                        f.description.read().and_then(|g| g.readlink_target())
+                    }
+                })
             }) {
                 // /proc/self/fd/N for an fd with NO backing path (pipe/socket/
                 // eventfd/…) → the synthetic pipe:[ino]/socket:[ino]/anon_inode:[…]
@@ -14384,12 +14546,12 @@ impl SyscallDispatcher {
             // directly, so fstat kept reporting the stale creation-time mode.
             let path = this
                 .open_file(fd.0)
-                .and_then(|of| match &*of.description.read() {
-                    OpenDescription::HostFile { metadata, .. }
-                    | OpenDescription::File { metadata, .. }
-                    | OpenDescription::Directory { metadata, .. } => {
-                        Some(metadata.path.to_string_lossy().into_owned())
-                    }
+                .and_then(|of| match of.description.read().as_deref() {
+                    Some(
+                        OpenDescription::HostFile { metadata, .. }
+                        | OpenDescription::File { metadata, .. }
+                        | OpenDescription::Directory { metadata, .. },
+                    ) => Some(metadata.path.to_string_lossy().into_owned()),
                     _ => None,
                 });
             if let Some(path) = path {
@@ -14411,13 +14573,15 @@ impl SyscallDispatcher {
                 // open-time mode (LTP fchmod04/05). metadata.mode holds the
                 // permission bits; the type comes from `kind`.
                 if let Some(of) = this.open_file(fd.0) {
-                    match &mut *of.description.write() {
-                        OpenDescription::Directory { metadata, .. }
-                        | OpenDescription::File { metadata, .. }
-                        | OpenDescription::HostFile { metadata, .. } => {
-                            metadata.mode = mode;
+                    if let Some(mut open) = of.description.write() {
+                        match &mut *open {
+                            OpenDescription::Directory { metadata, .. }
+                            | OpenDescription::File { metadata, .. }
+                            | OpenDescription::HostFile { metadata, .. } => {
+                                metadata.mode = mode;
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
                 // inotify IN_ATTRIB (chmod is a metadata change).
@@ -14938,8 +15102,8 @@ impl SyscallDispatcher {
             };
             // A memfd is opened O_RDWR (memfd_create(2)); F_ADD_SEALS requires
             // the description carry write access (FMODE_WRITE).
-            let base = OpenDescriptionBase::new(LINUX_O_RDWR);
-            base.set_seals(Some(initial_seals));
+            let common = Arc::new(crate::kernel::DescriptionCommon::new(LINUX_O_RDWR));
+            common.set_seals(Some(initial_seals));
             let description = OpenDescription::File {
                 metadata: RootFsMetadata {
                     path: Path::new(&path).to_path_buf(),
@@ -14950,7 +15114,7 @@ impl SyscallDispatcher {
                 path,
                 contents: FileContents::dense(Vec::new()),
                 offset: 0,
-                base,
+                base: OpenDescriptionBase::new(0),
                 writable: true,
             };
             let fd_flags = if memfd_flags.contains(LinuxMemfdFlags::CLOEXEC) {
@@ -14958,7 +15122,7 @@ impl SyscallDispatcher {
             } else {
                 0
             };
-            Ok(this.install_fd(description, fd_flags))
+            Ok(this.install_fd_with_common(description, common, fd_flags))
         }
 
         fn memfd_secret(this, cx, flags: u64) {
@@ -14988,8 +15152,8 @@ impl SyscallDispatcher {
             let path = "/secretmem".to_string();
             // No sealing support: seals stay None (F_GET_SEALS/F_ADD_SEALS →
             // EINVAL), unlike memfd_create.
-            let base = OpenDescriptionBase::new(LINUX_O_RDWR);
-            base.set_secretmem(true);
+            let common = Arc::new(crate::kernel::DescriptionCommon::new(LINUX_O_RDWR));
+            common.set_secretmem(true);
             let description = OpenDescription::File {
                 metadata: RootFsMetadata {
                     path: Path::new(&path).to_path_buf(),
@@ -15000,7 +15164,7 @@ impl SyscallDispatcher {
                 path,
                 contents: FileContents::dense(Vec::new()),
                 offset: 0,
-                base,
+                base: OpenDescriptionBase::new(0),
                 writable: true,
             };
             let fd_flags = if flags & LINUX_O_CLOEXEC != 0 {
@@ -15008,7 +15172,7 @@ impl SyscallDispatcher {
             } else {
                 0
             };
-            Ok(this.install_fd(description, fd_flags))
+            Ok(this.install_fd_with_common(description, common, fd_flags))
         }
 
         fn unlinkat(this, cx, dirfd: u64, pathname: GuestPtr, flags: u64) {

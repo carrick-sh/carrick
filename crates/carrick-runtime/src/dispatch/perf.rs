@@ -429,7 +429,7 @@ impl SyscallDispatcher {
     /// The `PerfEvent` state behind `fd`, if that is what `fd` is.
     pub(super) fn perf_event_state(&self, fd: i32) -> Option<Arc<PerfEventState>> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.read();
+        let open = open_file.description.read()?;
         match &*open {
             OpenDescription::PerfEvent { state, .. } => Some(Arc::clone(state)),
             _ => None,
