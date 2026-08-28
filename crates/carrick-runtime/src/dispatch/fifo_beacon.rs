@@ -118,7 +118,7 @@ pub(crate) fn register_open(host_fd: i32, access_idx: u32) {
 /// close may have dropped the writer count to zero).
 pub(crate) fn register_close(host_fd: i32) -> bool {
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    st.read_ends.remove(&host_fd);
+    let read_id = st.read_ends.remove(&host_fd);
     // Find which FIFO (if any) this fd was a writer for.
     let mut writer_of = None;
     for (id, b) in st.beacons.iter() {
@@ -127,15 +127,45 @@ pub(crate) fn register_close(host_fd: i32) -> bool {
             break;
         }
     }
-    if let Some(id) = writer_of {
+    let was_writer = if let Some(id) = writer_of {
         if let Some(b) = st.beacons.get_mut(&id)
             && let Some(bw) = b.writer_bw.remove(&host_fd)
         {
             unsafe { libc::close(bw) };
         }
-        return true;
+        true
+    } else {
+        false
+    };
+
+    let ids_to_check = match (read_id, writer_of) {
+        (Some(r), Some(w)) if r == w => vec![r],
+        (Some(r), Some(w)) => vec![r, w],
+        (Some(r), None) => vec![r],
+        (None, Some(w)) => vec![w],
+        (None, None) => Vec::new(),
+    };
+
+    for id in ids_to_check {
+        let has_readers = st.read_ends.values().any(|&r_id| r_id == id);
+        let has_writers = st.beacons.get(&id).is_some_and(|b| !b.writer_bw.is_empty());
+        if !has_readers && !has_writers {
+            if let Some(b) = st.beacons.remove(&id) {
+                unsafe { libc::close(b.read_fd) };
+            }
+        }
     }
-    false
+
+    was_writer
+}
+
+#[cfg(test)]
+pub(crate) fn has_beacon_for_fd(host_fd: i32) -> bool {
+    let st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(id) = fifo_identity(host_fd) else {
+        return false;
+    };
+    st.beacons.contains_key(&id) || st.read_ends.contains_key(&host_fd)
 }
 
 /// True iff `host_fd` is a FIFO read-end whose writers have all closed — decided

@@ -4965,6 +4965,22 @@ impl SyscallDispatcher {
         Some((base.pipe_capacity(), queued))
     }
 
+    pub(in crate::dispatch) fn host_pipe_capacity_room(
+        &self,
+        pipe_capacity: i64,
+        pipe_id: u64,
+        is_read_end: bool,
+        bidirectional: bool,
+        host_fd: i32,
+    ) -> Option<usize> {
+        let queued = if is_read_end || bidirectional {
+            host_pipe_readable_bytes(host_fd).ok().unwrap_or(0)
+        } else {
+            self.host_pipe_read_end_buffered_bytes(pipe_id)
+        };
+        super::host_pipe_write_room(pipe_capacity, queued)
+    }
+
     fn host_pipe_read_end_buffered_bytes(&self, pipe_id: u64) -> usize {
         let files = self.captured_file_table();
         let table = files.read_open_files();
