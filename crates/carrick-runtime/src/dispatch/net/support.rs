@@ -325,7 +325,7 @@ pub(super) fn pollevent_to_epoll(ev: &carrick_hal::event::PollEvent) -> u32 {
 /// (`POLLPRI`) or has no kqueue equivalent, so this returns `false` and the
 /// caller falls back to its `libc::poll(POLLPRI)` path.
 #[cfg(any(target_os = "macos", target_os = "openbsd", target_os = "dragonfly"))]
-pub(super) fn host_fd_has_oob(host_fd: i32) -> bool {
+pub(in crate::dispatch) fn host_fd_has_oob(host_fd: i32) -> bool {
     use carrick_host_bsd::Kqueue;
     use carrick_host_bsd::kqueue::{EVFILT_EXCEPT, Kevent, NOTE_OOB};
 
@@ -361,7 +361,7 @@ pub(super) fn host_fd_has_oob(host_fd: i32) -> bool {
 /// Non-Darwin hosts answer OOB readiness through their native `POLLPRI`
 /// (Linux) or have no `EVFILT_EXCEPT` (FreeBSD, NetBSD); see [`host_fd_has_oob`].
 #[cfg(not(any(target_os = "macos", target_os = "openbsd", target_os = "dragonfly")))]
-pub(super) fn host_fd_has_oob(_host_fd: i32) -> bool {
+pub(in crate::dispatch) fn host_fd_has_oob(_host_fd: i32) -> bool {
     false
 }
 

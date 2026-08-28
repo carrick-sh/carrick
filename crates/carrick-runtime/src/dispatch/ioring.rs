@@ -445,19 +445,6 @@ impl IoUringBacking {
         }))
     }
 
-    pub(in crate::dispatch) fn ready_events(&self, requested: u32) -> u32 {
-        let mut ready = requested & LINUX_EPOLLOUT;
-        let cq_head = self.load_u32(self.layout.cq_off.head as u64, Ordering::Acquire);
-        let cq_tail = self.load_u32(self.layout.cq_off.tail as u64, Ordering::Acquire);
-        if cq_head
-            .zip(cq_tail)
-            .is_some_and(|(head, tail)| head != tail)
-        {
-            ready |= requested & LINUX_EPOLLIN;
-        }
-        ready
-    }
-
     pub(crate) fn dup_data_fd(&self) -> Option<OwnedFd> {
         let fd = unsafe { libc::dup(self.data_fd.as_raw_fd()) };
         (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
@@ -549,6 +536,24 @@ impl crate::kernel::FileDescriptionBacking for IoUringBacking {
                 backing_len: self.layout_snapshot().backing_len,
             },
         ))
+    }
+
+    fn readiness(
+        &self,
+        _description_id: crate::kernel::FileDescriptionId,
+        interest: carrick_abi::LinuxEpollEvents,
+        _cx: &dyn crate::kernel::ReadinessContext,
+    ) -> carrick_abi::LinuxEpollEvents {
+        let mut ready = carrick_abi::LinuxEpollEvents::OUT;
+        let cq_head = self.load_u32(self.layout.cq_off.head as u64, Ordering::Acquire);
+        let cq_tail = self.load_u32(self.layout.cq_off.tail as u64, Ordering::Acquire);
+        if cq_head
+            .zip(cq_tail)
+            .is_some_and(|(head, tail)| head != tail)
+        {
+            ready |= carrick_abi::LinuxEpollEvents::IN;
+        }
+        ready & (interest | carrick_abi::LinuxEpollEvents::ERR | carrick_abi::LinuxEpollEvents::HUP)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

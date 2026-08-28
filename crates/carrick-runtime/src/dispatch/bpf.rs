@@ -515,6 +515,25 @@ mod tests {
     }
 
     #[test]
+    fn bpf_map_and_prog_readiness_reports_in_and_out() {
+        let map = array_map(1, 4);
+        let open_desc = Arc::new(parking_lot::RwLock::new(OpenDescription::BpfMap {
+            base: OpenDescriptionBase::new(0),
+            map: Arc::new(map),
+        }));
+        let open_file = OpenFile::from_open_description_with_status_flags(open_desc, 0, 0);
+        let ready = open_file.description.readiness(
+            carrick_abi::LinuxEpollEvents::IN | carrick_abi::LinuxEpollEvents::OUT,
+            crate::kernel::NO_READINESS_CONTEXT,
+        );
+        assert_eq!(
+            ready,
+            carrick_abi::LinuxEpollEvents::IN | carrick_abi::LinuxEpollEvents::OUT,
+            "bpf map readiness authority must report IN and OUT"
+        );
+    }
+
+    #[test]
     fn create_validates_geometry() {
         // Array demands a 4-byte key.
         let bad_key = BpfMapCreateAttr {

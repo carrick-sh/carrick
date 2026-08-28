@@ -142,7 +142,7 @@ pub(super) fn leave(host_fd: i32) {
 /// The other live members of `host_fd`'s group, in turn order starting at the
 /// cursor. Empty when `host_fd` is in no group or is the only member — in which
 /// case the caller must behave exactly as it did before reuseport existed.
-pub(super) fn siblings(host_fd: i32) -> Vec<i32> {
+pub(in crate::dispatch) fn siblings(host_fd: i32) -> Vec<i32> {
     let groups = GROUPS.lock().unwrap_or_else(|e| e.into_inner());
     for group in groups.values() {
         if !group.members.contains(&host_fd) {
@@ -178,7 +178,7 @@ pub(super) fn steal_targets(host_fd: i32) -> Vec<i32> {
 
 /// Whether it is `host_fd`'s turn. A socket in no group, or the only member of
 /// its group, is always its own turn.
-pub(super) fn is_turn(host_fd: i32) -> bool {
+pub(in crate::dispatch) fn is_turn(host_fd: i32) -> bool {
     let groups = GROUPS.lock().unwrap_or_else(|e| e.into_inner());
     for group in groups.values() {
         if let Some(index) = group.members.iter().position(|&fd| fd == host_fd) {
@@ -190,7 +190,7 @@ pub(super) fn is_turn(host_fd: i32) -> bool {
 
 /// Whether `host_fd` belongs to a group with more than one member. Callers use
 /// this to stay entirely on the pre-existing path for ordinary sockets.
-pub(super) fn is_shared(host_fd: i32) -> bool {
+pub(in crate::dispatch) fn is_shared(host_fd: i32) -> bool {
     let groups = GROUPS.lock().unwrap_or_else(|e| e.into_inner());
     groups
         .values()

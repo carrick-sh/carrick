@@ -84,6 +84,7 @@
 //! dispatcher struct and the normalized dispatch table. Socket/netlink/fd-set
 //! helper routines and the AF_UNIX registry live in the `support` submodule.
 use super::*;
+use crate::kernel::FileDescriptionBacking;
 use crate::linux_abi::{
     LINUX_ICMP_ECHO_REPLY, LINUX_ICMP_ECHO_REQUEST, LINUX_IPPROTO_ICMP, LINUX_IPPROTO_TCP,
     LINUX_MSG_NOSIGNAL, LINUX_POLLRDHUP, LinuxPollEvents,
@@ -301,7 +302,7 @@ fn socket_addr_to_linux_sockaddr(addr: std::net::SocketAddr) -> Option<Vec<u8>> 
 /// does.
 /// Whether `host_fd` has something to read RIGHT NOW, without consuming it.
 /// Used to ask whether a reuseport sibling is holding the group's work.
-fn host_fd_has_pending_input(host_fd: i32) -> bool {
+pub(super) fn host_fd_has_pending_input(host_fd: i32) -> bool {
     let mut pfd = libc::pollfd {
         fd: host_fd,
         events: libc::POLLIN,
@@ -340,15 +341,15 @@ fn host_socket_is_connected(host_fd: i32) -> bool {
         unsafe { libc::getpeername(host_fd, sa.as_mut_ptr() as *mut _, &mut sa_len as *mut _) };
     rc == 0
 }
-mod recverr;
+pub(super) mod recverr;
 mod sctp;
 
 /// Drop a closed socket's SCTP message boundaries (see [`sctp`]).
 pub(crate) fn sctp_forget(host_fd: i32) {
     sctp::forget(host_fd);
 }
-mod reuseport;
-mod support;
+pub(super) mod reuseport;
+pub(super) mod support;
 pub(crate) mod unix_pure;
 
 /// Drop `host_fd` from any `SO_REUSEPORT` group. Called from the close path in
@@ -654,7 +655,7 @@ fn host_stream_socket_read_eof(host_fd: i32) -> bool {
     feature = "platform-freebsd",
     feature = "platform-netbsd"
 ))]
-fn host_stream_socket_rdhup(host_fd: i32) -> bool {
+pub(super) fn host_stream_socket_rdhup(host_fd: i32) -> bool {
     use carrick_host_bsd::Kqueue;
     use carrick_host_bsd::kqueue::Kevent;
 
@@ -682,7 +683,7 @@ fn host_stream_socket_rdhup(host_fd: i32) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn host_stream_socket_rdhup(host_fd: i32) -> bool {
+pub(super) fn host_stream_socket_rdhup(host_fd: i32) -> bool {
     let mut pfd = libc::pollfd {
         fd: host_fd,
         events: libc::POLLRDHUP,
@@ -697,7 +698,7 @@ fn host_stream_socket_rdhup(host_fd: i32) -> bool {
     feature = "platform-netbsd",
     target_os = "linux"
 )))]
-fn host_stream_socket_rdhup(host_fd: i32) -> bool {
+pub(super) fn host_stream_socket_rdhup(host_fd: i32) -> bool {
     host_stream_socket_read_eof(host_fd)
 }
 
@@ -884,33 +885,39 @@ impl SyscallDispatcher {
         )
     }
 
-    fn epoll_path_reaches(
+    fn epoll_path_reaches_desc(
         &self,
-        current_fd: i32,
-        target_fd: i32,
+        current_desc: &Arc<crate::kernel::FileDescription>,
+        target_id: crate::kernel::FileDescriptionId,
         depth: usize,
-        seen: &mut std::collections::BTreeSet<i32>,
+        seen: &mut std::collections::BTreeSet<crate::kernel::FileDescriptionId>,
     ) -> bool {
-        if current_fd == target_fd || depth >= 5 || !seen.insert(current_fd) {
+        if current_desc.id() == target_id || depth >= 5 || !seen.insert(current_desc.id()) {
             return true;
         }
-        let Some(open_file) = self.open_file(current_fd) else {
-            return false;
-        };
-        let Some(open) = open_file.description.read() else {
+        let Some(open) = current_desc.read() else {
             return false;
         };
         let OpenDescription::Epoll { interest, .. } = &*open else {
             return false;
         };
-        interest
-            .keys()
-            .any(|child| self.epoll_path_reaches(*child, target_fd, depth + 1, seen))
+        let children: Vec<_> = interest
+            .values()
+            .filter_map(|reg| reg.target.clone())
+            .collect();
+        drop(open);
+        children
+            .into_iter()
+            .any(|child| self.epoll_path_reaches_desc(&child, target_id, depth + 1, seen))
     }
 
-    fn epoll_add_would_loop(&self, epfd: i32, fd: i32) -> bool {
+    fn epoll_add_would_loop_desc(
+        &self,
+        target_desc: &Arc<crate::kernel::FileDescription>,
+        epoll_id: crate::kernel::FileDescriptionId,
+    ) -> bool {
         let mut seen = std::collections::BTreeSet::new();
-        self.epoll_path_reaches(fd, epfd, 0, &mut seen)
+        self.epoll_path_reaches_desc(target_desc, epoll_id, 0, &mut seen)
     }
 
     fn epoll_effective_interest(
@@ -1063,7 +1070,13 @@ impl SyscallDispatcher {
             .description
             .concrete_backing::<crate::dispatch::ioring::IoUringBacking>()
         {
-            return ring.ready_events(requested_events);
+            return ring
+                .readiness(
+                    open_file.description.id(),
+                    carrick_abi::LinuxEpollEvents::from_bits_retain(requested_events),
+                    self,
+                )
+                .bits();
         }
         let Some(open) = open_file.description.read() else {
             return 0;
@@ -1130,8 +1143,48 @@ impl SyscallDispatcher {
                 socket.poll_mask()
                     & (requested_events | LINUX_EPOLLERR | LINUX_EPOLLHUP | LINUX_EPOLLRDHUP)
             }
+            OpenDescription::Epoll {
+                interest,
+                pending_ready,
+                kqueue,
+                ..
+            } => {
+                let mut ready = 0;
+                if requested_events & LINUX_EPOLLIN != 0 {
+                    if !pending_ready.is_empty() {
+                        ready |= LINUX_EPOLLIN;
+                    } else {
+                        let mut pfd = libc::pollfd {
+                            fd: kqueue.poll_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        };
+                        let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+                        if (rc > 0
+                            && pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0)
+                            || interest.iter().any(|(fd, interest)| {
+                                self.host_fd_for_poll(*fd).is_none()
+                                    && self.epoll_ready_events(*fd, interest.event.events) != 0
+                            })
+                        {
+                            ready |= LINUX_EPOLLIN;
+                        }
+                    }
+                }
+                ready
+            }
             OpenDescription::HostSocket { base, .. } if base.pending_socket_error().is_some() => {
                 let mut ready = LINUX_EPOLLERR;
+                if requested_events & LINUX_EPOLLOUT != 0 {
+                    ready |= LINUX_EPOLLOUT;
+                }
+                ready
+            }
+            OpenDescription::Netlink { recv_queue, .. } => {
+                let mut ready = 0;
+                if requested_events & LINUX_EPOLLIN != 0 && !recv_queue.is_empty() {
+                    ready |= LINUX_EPOLLIN;
+                }
                 if requested_events & LINUX_EPOLLOUT != 0 {
                     ready |= LINUX_EPOLLOUT;
                 }
@@ -2010,11 +2063,21 @@ impl SyscallDispatcher {
                 LINUX_POLLNVAL
             };
         };
+        if open_file.description.is_closed() {
+            return LINUX_POLLNVAL;
+        }
         if let Some(ring) = open_file
             .description
             .concrete_backing::<crate::dispatch::ioring::IoUringBacking>()
         {
-            return ring.ready_events(requested_events as u32) as i16;
+            return ring
+                .readiness(
+                    open_file.description.id(),
+                    carrick_abi::LinuxPollEvents::from_bits_truncate(requested_events).to_epoll(),
+                    self,
+                )
+                .to_poll()
+                .bits();
         }
         let Some(open) = open_file.description.read() else {
             return LINUX_POLLNVAL;
@@ -2877,7 +2940,13 @@ impl SyscallDispatcher {
         };
         if let Some(mut open) = open_file.description.write() {
             if let OpenDescription::Netlink { recv_queue, .. } = &mut *open {
+                let was_empty = recv_queue.is_empty();
                 recv_queue.extend(reply);
+                if was_empty && !recv_queue.is_empty() {
+                    drop(open);
+                    self.notify_inmem_epoll();
+                    crate::host_signal::wake_all_waiters();
+                }
             }
         }
         DispatchOutcome::Returned {
@@ -4041,6 +4110,616 @@ mod staged_splice_readiness_tests {
     }
 }
 
+#[cfg(test)]
+mod netlink_readiness_tests {
+    use super::*;
+
+    #[test]
+    fn epoll_and_poll_agree_that_a_queued_netlink_dump_is_readable() {
+        let dispatcher = SyscallDispatcher::new();
+        let open_file = OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::Netlink {
+                base: OpenDescriptionBase::new(0),
+                protocol: 0,
+                sock_type: LINUX_SOCK_DGRAM,
+                pid: 0,
+                groups: 0,
+                recv_queue: VecDeque::from(vec![0xAAu8; 32]),
+            })),
+            0,
+            0,
+        );
+        let description = Arc::clone(&open_file.description);
+        let fd = dispatcher
+            .install_fd_at_or_above(3, open_file)
+            .expect("install netlink fd");
+
+        assert_eq!(
+            dispatcher.poll_ready_events(fd, LINUX_POLLIN) & LINUX_POLLIN,
+            LINUX_POLLIN,
+            "poll(2) already reports a queued netlink dump as readable"
+        );
+        assert_eq!(
+            dispatcher.epoll_ready_events(fd, LINUX_EPOLLIN) & LINUX_EPOLLIN,
+            LINUX_EPOLLIN,
+            "epoll must report the same readiness as poll for the same description; \
+             a synthetic netlink socket has no host fd, so the host-poll fallback \
+             answers 0 and glibc's __check_pf/getaddrinfo never wakes"
+        );
+        assert_eq!(
+            description.readiness(carrick_abi::LinuxEpollEvents::IN, &dispatcher)
+                & carrick_abi::LinuxEpollEvents::IN,
+            carrick_abi::LinuxEpollEvents::IN,
+            "underlying backing readiness also reports netlink readable"
+        );
+    }
+
+    #[test]
+    fn staged_splice_bytes_are_pollin_and_epollin_ready_through_readiness_authority() {
+        let dispatcher = SyscallDispatcher::new();
+        let mut host_fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(host_fds.as_mut_ptr()) }, 0);
+        let read_open = OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::HostPipe {
+                host_fd: HostFdRef::new(host_fds[0]),
+                is_read_end: true,
+                pipe_id: 88,
+                base: OpenDescriptionBase::new(0),
+                pty: None,
+                bidirectional: false,
+                write_kind: HostWriteKind::PipeLike,
+                stdio_stream: None,
+            })),
+            LINUX_O_RDONLY,
+            0,
+        );
+        let write_open = OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::HostPipe {
+                host_fd: HostFdRef::new(host_fds[1]),
+                is_read_end: false,
+                pipe_id: 88,
+                base: OpenDescriptionBase::new(0),
+                pty: None,
+                bidirectional: false,
+                write_kind: HostWriteKind::PipeLike,
+                stdio_stream: None,
+            })),
+            LINUX_O_WRONLY,
+            0,
+        );
+        let (read_fd, _write_fd) = dispatcher
+            .install_fd_pair_at_or_above(3, read_open, write_open)
+            .expect("install host pipe pair");
+
+        dispatcher.stage_splice_pipe_bytes_owned(read_fd, b"staged".to_vec());
+        let open_file = dispatcher.open_file(read_fd).expect("open file");
+
+        assert_eq!(
+            dispatcher.poll_ready_events(read_fd, LINUX_POLLIN) & LINUX_POLLIN,
+            LINUX_POLLIN,
+            "poll reports staged splice bytes as POLLIN"
+        );
+        assert_eq!(
+            dispatcher.epoll_ready_events(read_fd, LINUX_EPOLLIN) & LINUX_EPOLLIN,
+            LINUX_EPOLLIN,
+            "epoll reports staged splice bytes as EPOLLIN"
+        );
+        assert_eq!(
+            open_file
+                .description
+                .readiness(carrick_abi::LinuxEpollEvents::IN, &dispatcher)
+                & carrick_abi::LinuxEpollEvents::IN,
+            carrick_abi::LinuxEpollEvents::IN,
+            "readiness authority must see staged splice bytes as readable"
+        );
+    }
+
+    #[test]
+    fn epoll_description_with_ready_synthetic_child_is_pollin_and_epollin_ready() {
+        use std::collections::HashMap;
+        let dispatcher = SyscallDispatcher::new();
+        let child_open_file = OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::Netlink {
+                base: OpenDescriptionBase::new(0),
+                protocol: 0,
+                sock_type: LINUX_SOCK_DGRAM,
+                pid: 0,
+                groups: 0,
+                recv_queue: VecDeque::from(vec![0xAAu8; 32]),
+            })),
+            0,
+            0,
+        );
+        let child_desc = Arc::clone(&child_open_file.description);
+        let child_fd = dispatcher
+            .install_fd_at_or_above(10, child_open_file)
+            .expect("child fd");
+
+        let mut interest_map = HashMap::new();
+        interest_map.insert(
+            child_fd,
+            EpollInterest {
+                target: Some(child_desc),
+                event: LinuxEpollEvent {
+                    events: LINUX_EPOLLIN,
+                    data: 1234,
+                    _pad: 0,
+                },
+                last_ready: 0,
+                last_read_avail: 0,
+                write_backpressured: false,
+                io_gen: 0,
+                reg_gen: 0,
+            },
+        );
+        let mut mux = crate::event_mux::make_event_multiplexer().expect("event multiplexer");
+        mux.register_user(0).expect("register user wake");
+        let epoll_open_file = OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::Epoll {
+                base: OpenDescriptionBase::new(0),
+                interest: interest_map,
+                pending_ready: VecDeque::new(),
+                kqueue: Arc::new(crate::dispatch::EpollKqueue::new(
+                    mux,
+                    crate::dispatch::new_epoll_wake_registry(),
+                )),
+            })),
+            0,
+            0,
+        );
+        let epfd = dispatcher
+            .install_fd_at_or_above(3, epoll_open_file)
+            .expect("install epoll fd");
+
+        let epoll_file = dispatcher.open_file(epfd).expect("epoll open file");
+
+        assert_eq!(
+            dispatcher.poll_ready_events(epfd, LINUX_POLLIN) & LINUX_POLLIN,
+            LINUX_POLLIN,
+            "poll reports epoll with ready synthetic child as readable"
+        );
+        assert_eq!(
+            dispatcher.epoll_ready_events(epfd, LINUX_EPOLLIN) & LINUX_EPOLLIN,
+            LINUX_EPOLLIN,
+            "epoll reports epoll with ready synthetic child as readable"
+        );
+        assert_eq!(
+            epoll_file
+                .description
+                .readiness(carrick_abi::LinuxEpollEvents::IN, &dispatcher)
+                & carrick_abi::LinuxEpollEvents::IN,
+            carrick_abi::LinuxEpollEvents::IN,
+            "readiness authority must report epoll with ready synthetic child as readable"
+        );
+    }
+
+    #[test]
+    fn poll_reports_pollnval_for_installed_closed_description() {
+        let dispatcher = SyscallDispatcher::new();
+        let closed_open_file = OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::Closed { was_epoll: false })),
+            0,
+            0,
+        );
+        let closed_desc = Arc::clone(&closed_open_file.description);
+        let fd = dispatcher
+            .install_fd_at_or_above(20, closed_open_file)
+            .expect("install closed fd");
+
+        assert!(closed_desc.is_closed(), "description is closed");
+        assert_eq!(
+            dispatcher.poll_ready_events(fd, LINUX_POLLIN),
+            LINUX_POLLNVAL,
+            "poll reports POLLNVAL for closed description"
+        );
+        assert_eq!(
+            dispatcher.epoll_ready_events(fd, LINUX_EPOLLIN),
+            0,
+            "epoll reports 0 for closed description"
+        );
+        assert_eq!(
+            closed_desc.readiness(carrick_abi::LinuxEpollEvents::IN, &dispatcher),
+            carrick_abi::LinuxEpollEvents::empty(),
+            "readiness authority reports empty for closed description"
+        );
+    }
+
+    #[test]
+    fn epoll_ctl_rejects_alias_of_same_epoll_description_with_einval() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut mux = crate::event_mux::make_event_multiplexer().expect("mux");
+        mux.register_user(0).expect("register user wake");
+        let epoll_open_file = OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::Epoll {
+                base: OpenDescriptionBase::new(0),
+                interest: HashMap::new(),
+                pending_ready: VecDeque::new(),
+                kqueue: Arc::new(crate::dispatch::EpollKqueue::new(
+                    mux,
+                    crate::dispatch::new_epoll_wake_registry(),
+                )),
+            })),
+            0,
+            0,
+        );
+        let epfd = dispatcher
+            .install_fd_at_or_above(3, epoll_open_file.clone())
+            .expect("install epoll");
+        let alias_fd = dispatcher
+            .install_fd_at_or_above(4, epoll_open_file)
+            .expect("install alias epoll");
+
+        let mut guest_mem = crate::dispatch::LinearMemory::new(0x1000, vec![0; 0x1000]);
+        let event_ptr = 0x1000u64;
+        let mut guest_event = [0u8; 12];
+        guest_event[0..4].copy_from_slice(&LINUX_EPOLLIN.to_le_bytes());
+        guest_mem.write_bytes(event_ptr, &guest_event).unwrap();
+
+        let kernel = dispatcher.capture_one_task_context().unwrap();
+        let reporter = crate::compat::CompatReporter::default();
+        let request = SyscallRequest::new(
+            21,
+            SyscallArgs::from([
+                epfd as u64,
+                LINUX_EPOLL_CTL_ADD,
+                alias_fd as u64,
+                event_ptr,
+                0,
+                0,
+            ]),
+        );
+
+        let outcome = dispatcher.dispatch(&kernel, request, &mut guest_mem, &reporter);
+        assert!(
+            matches!(outcome, Ok(DispatchOutcome::Errno { errno }) if errno == LINUX_EINVAL),
+            "epoll_ctl must reject adding an alias of the same epoll description with EINVAL"
+        );
+    }
+
+    #[test]
+    fn epoll_readiness_tracks_stored_target_identity_after_fd_close_and_reuse() {
+        let dispatcher = SyscallDispatcher::new();
+        let child_open_file = OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::Netlink {
+                base: OpenDescriptionBase::new(0),
+                protocol: 0,
+                sock_type: LINUX_SOCK_DGRAM,
+                pid: 0,
+                groups: 0,
+                recv_queue: VecDeque::new(),
+            })),
+            0,
+            0,
+        );
+        let child_desc = Arc::clone(&child_open_file.description);
+        let alias_child_fd = dispatcher
+            .install_fd_at_or_above(11, child_open_file)
+            .expect("dup child fd");
+
+        // Install a ready EventFd (counter = 1) at reused fd 10.
+        let ready_eventfd = OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::EventFd {
+                base: OpenDescriptionBase::new(0),
+                state: Arc::new(crate::dispatch::EventFdState::new(1)),
+                semaphore: false,
+            })),
+            0,
+            0,
+        );
+        let reused_fd = dispatcher
+            .install_fd_at_or_above(10, ready_eventfd)
+            .expect("install at 10");
+        assert_eq!(reused_fd, 10);
+
+        // Epoll has an interest registered under fd 10, but whose target is the Netlink description.
+        let mut interest_map = HashMap::new();
+        interest_map.insert(
+            reused_fd,
+            EpollInterest {
+                target: Some(Arc::clone(&child_desc)),
+                event: LinuxEpollEvent {
+                    events: LINUX_EPOLLIN,
+                    data: 999,
+                    _pad: 0,
+                },
+                last_ready: 0,
+                last_read_avail: 0,
+                write_backpressured: false,
+                io_gen: 0,
+                reg_gen: 0,
+            },
+        );
+        let mut mux = crate::event_mux::make_event_multiplexer().expect("mux");
+        mux.register_user(0).expect("register user wake");
+        let epoll_open_file = OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::Epoll {
+                base: OpenDescriptionBase::new(0),
+                interest: interest_map,
+                pending_ready: VecDeque::new(),
+                kqueue: Arc::new(crate::dispatch::EpollKqueue::new(
+                    mux,
+                    crate::dispatch::new_epoll_wake_registry(),
+                )),
+            })),
+            0,
+            0,
+        );
+        let epfd = dispatcher
+            .install_fd_at_or_above(3, epoll_open_file)
+            .expect("epfd");
+
+        // Before data is queued in original child_desc (Netlink), epoll is not ready even though fd 10 (EventFd) is ready!
+        let epoll_file = dispatcher.open_file(epfd).expect("epoll file");
+        assert_eq!(
+            epoll_file
+                .description
+                .readiness(carrick_abi::LinuxEpollEvents::IN, &dispatcher),
+            carrick_abi::LinuxEpollEvents::empty(),
+            "epoll readiness must query target identity (empty netlink), not replacement fd 10 (ready eventfd)"
+        );
+
+        // Queue data into the original registered description (alias_child_fd 11 / target).
+        dispatcher
+            .enqueue_netlink_message(alias_child_fd, &[1, 2, 3, 4])
+            .expect("enqueue netlink message");
+
+        // Epoll readiness must now report IN because it tracks target identity!
+        assert_eq!(
+            epoll_file
+                .description
+                .readiness(carrick_abi::LinuxEpollEvents::IN, &dispatcher)
+                & carrick_abi::LinuxEpollEvents::IN,
+            carrick_abi::LinuxEpollEvents::IN,
+            "epoll readiness must track stored target identity across fd close and reuse"
+        );
+    }
+
+    #[test]
+    fn pidfd_and_inotify_readiness_reports_in_when_host_poll_fd_ready() {
+        let dispatcher = SyscallDispatcher::new();
+        // Create an inotify description with a valid inotify state
+        let inotify_state = Arc::new(crate::inotify::InotifyState::new().expect("inotify state"));
+        let inotify_open_file = OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::Inotify {
+                base: OpenDescriptionBase::new(0),
+                state: Arc::clone(&inotify_state),
+            })),
+            0,
+            0,
+        );
+        let inotify_desc = Arc::clone(&inotify_open_file.description);
+        let inotify_fd = dispatcher
+            .install_fd_at_or_above(5, inotify_open_file)
+            .expect("inotify fd");
+
+        assert!(
+            inotify_desc.has_host_poll_source(),
+            "inotify has host poll source"
+        );
+        // Empty inotify is not ready
+        assert_eq!(
+            inotify_desc.readiness(carrick_abi::LinuxEpollEvents::IN, &dispatcher),
+            carrick_abi::LinuxEpollEvents::empty()
+        );
+        assert_eq!(
+            dispatcher.poll_ready_events(inotify_fd, LINUX_POLLIN) & LINUX_POLLIN,
+            0
+        );
+    }
+
+    #[test]
+    fn netlink_send_reply_wakes_parked_epoll_waiter() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let netlink_open_file = OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::Netlink {
+                base: OpenDescriptionBase::new(0),
+                protocol: 0,
+                sock_type: LINUX_SOCK_DGRAM,
+                pid: 0,
+                groups: 0,
+                recv_queue: VecDeque::new(),
+            })),
+            0,
+            0,
+        );
+        let netlink_desc = Arc::clone(&netlink_open_file.description);
+        let netlink_fd = dispatcher
+            .install_fd_at_or_above(7, netlink_open_file)
+            .expect("netlink fd");
+
+        let mut interest_map = HashMap::new();
+        interest_map.insert(
+            netlink_fd,
+            EpollInterest {
+                target: Some(Arc::clone(&netlink_desc)),
+                event: LinuxEpollEvent {
+                    events: LINUX_EPOLLIN,
+                    data: 42,
+                    _pad: 0,
+                },
+                last_ready: 0,
+                last_read_avail: 0,
+                write_backpressured: false,
+                io_gen: 0,
+                reg_gen: 0,
+            },
+        );
+        let mut mux = crate::event_mux::make_event_multiplexer().expect("mux");
+        mux.register_user(0).expect("register user wake");
+        let epoll_open_file = OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::Epoll {
+                base: OpenDescriptionBase::new(0),
+                interest: interest_map,
+                pending_ready: VecDeque::new(),
+                kqueue: Arc::new(crate::dispatch::EpollKqueue::new(
+                    mux,
+                    crate::dispatch::new_epoll_wake_registry(),
+                )),
+            })),
+            0,
+            0,
+        );
+        let epfd = dispatcher
+            .install_fd_at_or_above(8, epoll_open_file)
+            .expect("epfd");
+
+        // Before sending request, epoll is not ready
+        assert_eq!(dispatcher.epoll_ready_events(epfd, LINUX_EPOLLIN), 0);
+
+        // Perform netlink_send by sending a dump request
+        let mut guest_mem = crate::dispatch::LinearMemory::new(0x1000, vec![0; 0x2000]);
+        let buf_ptr = 0x2000u64;
+        let mut nl_hdr = [0u8; 16];
+        nl_hdr[0..4].copy_from_slice(&16u32.to_le_bytes());
+        nl_hdr[4..6].copy_from_slice(&18u16.to_le_bytes()); // RTM_GETLINK
+        nl_hdr[6..8].copy_from_slice(&0x301u16.to_le_bytes()); // NLM_F_REQUEST | NLM_F_DUMP
+        nl_hdr[8..12].copy_from_slice(&1u32.to_le_bytes()); // seq
+        nl_hdr[12..16].copy_from_slice(&0u32.to_le_bytes()); // pid
+        guest_mem.write_bytes(buf_ptr, &nl_hdr).unwrap();
+
+        let kernel = dispatcher.capture_one_task_context().unwrap();
+        let reporter = crate::compat::CompatReporter::default();
+        let request = SyscallRequest::new(
+            206,
+            SyscallArgs::from([netlink_fd as u64, buf_ptr, 16, 0, 0, 0]),
+        );
+
+        let outcome = dispatcher.dispatch(&kernel, request, &mut guest_mem, &reporter);
+        assert!(matches!(
+            outcome,
+            Ok(DispatchOutcome::Returned { value: 16 })
+        ));
+
+        // After netlink_send, epoll must be IN-ready!
+        assert_eq!(
+            dispatcher.epoll_ready_events(epfd, LINUX_EPOLLIN) & LINUX_EPOLLIN,
+            LINUX_EPOLLIN,
+            "netlink reply publication must wake epoll waiter"
+        );
+    }
+
+    #[test]
+    fn epoll_readiness_does_not_recursively_sample_host_backed_registrations() {
+        let mut host_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(host_fds.as_mut_ptr()) }, 0);
+        let dispatcher = SyscallDispatcher::new();
+        let read_open = OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::HostPipe {
+                host_fd: HostFdRef::new(host_fds[0]),
+                is_read_end: true,
+                pipe_id: 100,
+                base: OpenDescriptionBase::new(0),
+                pty: None,
+                bidirectional: false,
+                write_kind: HostWriteKind::PipeLike,
+                stdio_stream: None,
+            })),
+            LINUX_O_RDONLY,
+            0,
+        );
+        let read_desc = Arc::clone(&read_open.description);
+        assert!(
+            read_desc.has_host_poll_source(),
+            "host pipe has host poll source"
+        );
+
+        let pipe_fd = dispatcher
+            .install_fd_at_or_above(20, read_open)
+            .expect("pipe fd");
+        let mut interest_map = HashMap::new();
+        interest_map.insert(
+            pipe_fd,
+            EpollInterest {
+                target: Some(Arc::clone(&read_desc)),
+                event: LinuxEpollEvent {
+                    events: LINUX_EPOLLIN,
+                    data: 777,
+                    _pad: 0,
+                },
+                last_ready: 0,
+                last_read_avail: 0,
+                write_backpressured: false,
+                io_gen: 0,
+                reg_gen: 0,
+            },
+        );
+        let mut mux = crate::event_mux::make_event_multiplexer().expect("mux");
+        mux.register_user(0).expect("register user wake");
+        let epoll_open_file = OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::Epoll {
+                base: OpenDescriptionBase::new(0),
+                interest: interest_map,
+                pending_ready: VecDeque::new(),
+                kqueue: Arc::new(crate::dispatch::EpollKqueue::new(
+                    mux,
+                    crate::dispatch::new_epoll_wake_registry(),
+                )),
+            })),
+            0,
+            0,
+        );
+        let epfd = dispatcher
+            .install_fd_at_or_above(21, epoll_open_file)
+            .expect("epfd");
+
+        // Custom ReadinessContext that panics if description_readiness is called for a host-backed child
+        struct NoHostSampleContext;
+        impl crate::kernel::ReadinessContext for NoHostSampleContext {
+            fn staged_splice_bytes(&self, _id: crate::kernel::FileDescriptionId) -> usize {
+                0
+            }
+            fn description_readiness(
+                &self,
+                _description: &Arc<crate::kernel::FileDescription>,
+                _interest: carrick_abi::LinuxEpollEvents,
+            ) -> carrick_abi::LinuxEpollEvents {
+                panic!(
+                    "host-backed child must not be recursively sampled by epoll readiness authority"
+                );
+            }
+        }
+
+        let epoll_file = dispatcher.open_file(epfd).expect("epoll file");
+        // Must NOT panic because host-backed child is omitted from synthetic child traversal!
+        let ready = epoll_file
+            .description
+            .readiness(carrick_abi::LinuxEpollEvents::IN, &NoHostSampleContext);
+        assert_eq!(ready, carrick_abi::LinuxEpollEvents::empty());
+        unsafe {
+            libc::close(host_fds[0]);
+            libc::close(host_fds[1]);
+        }
+    }
+}
+
+impl crate::kernel::ReadinessContext for SyscallDispatcher {
+    fn staged_splice_bytes(&self, id: crate::kernel::FileDescriptionId) -> usize {
+        self.staged_splice_description_bytes(id)
+    }
+
+    fn description_readiness(
+        &self,
+        description: &Arc<crate::kernel::FileDescription>,
+        interest: carrick_abi::LinuxEpollEvents,
+    ) -> carrick_abi::LinuxEpollEvents {
+        thread_local! {
+            static VISITED: std::cell::RefCell<Vec<crate::kernel::FileDescriptionId>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        VISITED.with(|v| {
+            let mut visited = v.borrow_mut();
+            if visited.len() >= 5 || visited.contains(&description.id()) {
+                return carrick_abi::LinuxEpollEvents::empty();
+            }
+            visited.push(description.id());
+            drop(visited);
+            let res = description.readiness(interest, self);
+            v.borrow_mut().pop();
+            res
+        })
+    }
+}
+
 impl SyscallDispatcher {
     /// Shared wait core for `epoll_pwait`/`epoll_pwait2`. Both callers do
     /// their own arg + timeout decode and epfd validation, then hand the
@@ -4972,12 +5651,19 @@ impl SyscallDispatcher {
                 }));
             };
             let epoll_description = Arc::clone(&open_file.description);
+            let Some(target_file) = this.open_file(fd) else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
+            // Same-description alias check (LTP / Linux epoll_ctl EINVAL when target refers to this epoll instance)
+            if epoll_description.id() == target_file.description.id() {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
             // The host fd backing this target (sockets/pipes/ptys); `None` for an
             // in-memory eventfd/pipe/timerfd, whose readiness is recomputed each
             // `epoll_wait` rather than registered on the kqueue. Computed before
             // taking the epoll write lock (it locks the *target* fd's description).
             let host_fd = this.host_fd_for_poll(fd);
-            let target_description = this.open_file(fd).map(|file| file.description);
+            let target_description = Some(Arc::clone(&target_file.description));
 
             // Record this epoll instance for the consumption-based EPOLLET
             // re-arm ([`Self::epoll_rearm_after_io`]) BEFORE taking the
@@ -5008,7 +5694,7 @@ impl SyscallDispatcher {
                     if !this.fd_is_epollable(fd) {
                         return Ok(DispatchOutcome::errno(LINUX_EPERM));
                     }
-                    if this.epoll_add_would_loop(epfd, fd) {
+                    if this.epoll_add_would_loop_desc(&target_file.description, epoll_description.id()) {
                         return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ELOOP));
                     }
                     if interest.contains_key(&fd) {

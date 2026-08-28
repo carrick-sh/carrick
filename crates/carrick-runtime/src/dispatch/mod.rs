@@ -8826,7 +8826,7 @@ fn refresh_timerfd_locked(
     ready
 }
 
-fn timerfd_ready_count(state: &TimerFdState) -> u64 {
+pub(in crate::dispatch) fn timerfd_ready_count(state: &TimerFdState) -> u64 {
     let mut timer = state.inner.lock();
     refresh_timerfd_locked(&state.clock, &mut timer)
 }

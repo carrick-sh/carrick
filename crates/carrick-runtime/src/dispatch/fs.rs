@@ -4993,7 +4993,7 @@ impl SyscallDispatcher {
         })
     }
 
-    fn staged_splice_description_bytes(
+    pub(super) fn staged_splice_description_bytes(
         &self,
         description: crate::kernel::FileDescriptionId,
     ) -> usize {

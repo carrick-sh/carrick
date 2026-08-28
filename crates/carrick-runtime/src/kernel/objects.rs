@@ -8,8 +8,8 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use carrick_abi::keyring::{KeyRequestDefault, KeySerial};
 use carrick_abi::{
-    LINUX_RLIM_INFINITY, LinuxGuestAbi, LinuxResource, LinuxRlimit, LinuxSigaction,
-    LinuxSigaltstack, LinuxSiginfo, NsGid, NsUid, SigSet, WaitSigMask,
+    LINUX_RLIM_INFINITY, LinuxEpollEvents, LinuxGuestAbi, LinuxResource, LinuxRlimit,
+    LinuxSigaction, LinuxSigaltstack, LinuxSiginfo, NsGid, NsUid, SigSet, WaitSigMask,
 };
 use carrick_hal::ThreadId;
 use carrick_hal::threaded::GuestCpuState;
@@ -494,13 +494,66 @@ impl FileDescriptionBackingSnapshot {
     }
 }
 
+/// Context provided to [`FileDescriptionBacking::readiness`] to resolve
+/// external readiness state (such as staged splice pushback buffers and nested
+/// synthetic epoll child interests) without coupling backings directly to the
+/// full dispatcher.
+pub(crate) trait ReadinessContext {
+    fn staged_splice_bytes(&self, id: FileDescriptionId) -> usize;
+
+    fn description_readiness(
+        &self,
+        description: &Arc<FileDescription>,
+        interest: LinuxEpollEvents,
+    ) -> LinuxEpollEvents;
+}
+
+#[allow(dead_code)]
+pub(crate) struct NoReadinessContext;
+impl ReadinessContext for NoReadinessContext {
+    fn staged_splice_bytes(&self, _id: FileDescriptionId) -> usize {
+        0
+    }
+
+    fn description_readiness(
+        &self,
+        _description: &Arc<FileDescription>,
+        _interest: LinuxEpollEvents,
+    ) -> LinuxEpollEvents {
+        LinuxEpollEvents::empty()
+    }
+}
+#[allow(dead_code)]
+pub(crate) const NO_READINESS_CONTEXT: &NoReadinessContext = &NoReadinessContext;
+
 pub(crate) trait FileDescriptionBacking: Any + Send + Sync {
     fn is_epoll(&self) -> bool;
+
+    #[allow(dead_code)]
+    fn is_closed(&self) -> bool {
+        false
+    }
+
+    fn has_host_poll_source(&self) -> bool {
+        false
+    }
 
     fn snapshot_until(
         &self,
         deadline: std::time::Instant,
     ) -> Option<FileDescriptionBackingSnapshot>;
+
+    /// Level readiness for `interest`, in epoll's domain. This is the ONE
+    /// readiness authority: `poll`/`ppoll` and `epoll_pwait` both translate to
+    /// and from it rather than keeping separate state machines. A backing whose
+    /// readiness lives in a real host object returns the host's answer; a
+    /// synthetic backing answers from its own queues.
+    fn readiness(
+        &self,
+        description_id: FileDescriptionId,
+        interest: LinuxEpollEvents,
+        cx: &dyn ReadinessContext,
+    ) -> LinuxEpollEvents;
 
     fn on_first_fd_ref(&self) {}
 
@@ -788,6 +841,37 @@ impl FileDescription {
             FileDescriptionKind::Concrete(backing) => backing.0.is_epoll(),
             FileDescriptionKind::Regular => false,
             FileDescriptionKind::Epoll(_) => true,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn is_closed(&self) -> bool {
+        match &self.kind {
+            FileDescriptionKind::Concrete(backing) => backing.0.is_closed(),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn has_host_poll_source(&self) -> bool {
+        match &self.kind {
+            FileDescriptionKind::Concrete(backing) => backing.0.has_host_poll_source(),
+            FileDescriptionKind::Regular => false,
+            FileDescriptionKind::Epoll(_) => false,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn readiness(
+        &self,
+        interest: LinuxEpollEvents,
+        cx: &dyn ReadinessContext,
+    ) -> LinuxEpollEvents {
+        match &self.kind {
+            FileDescriptionKind::Concrete(backing) => backing.0.readiness(self.id, interest, cx),
+            FileDescriptionKind::Regular => {
+                interest & (LinuxEpollEvents::IN | LinuxEpollEvents::OUT)
+            }
+            FileDescriptionKind::Epoll(_) => LinuxEpollEvents::empty(),
         }
     }
 

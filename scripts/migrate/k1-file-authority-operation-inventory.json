@@ -3,19 +3,19 @@
   "scope": "production Rust sources under crates/carrick-runtime/src",
   "counts": {
     "table_guard": 132,
-    "description_guard": 218,
+    "description_guard": 217,
     "description_backing": 19,
-    "epoll": 292,
-    "stream": 165,
+    "epoll": 326,
+    "stream": 169,
     "mapping": 895,
     "lifecycle": 23
   },
   "production_counts": {
     "table_guard": 112,
-    "description_guard": 218,
+    "description_guard": 217,
     "description_backing": 10,
-    "epoll": 247,
-    "stream": 162,
+    "epoll": 276,
+    "stream": 165,
     "mapping": 875,
     "lifecycle": 6
   },
@@ -508,7 +508,16 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 1388,
+      "line": 1409,
+      "categories": [
+        "epoll"
+      ],
+      "text": "OpenDescription::Epoll {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
+      "line": 1738,
       "categories": [
         "epoll"
       ],
@@ -517,7 +526,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 1399,
+      "line": 1749,
       "categories": [
         "description_backing"
       ],
@@ -526,7 +535,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 1403,
+      "line": 1753,
       "categories": [
         "description_backing"
       ],
@@ -535,7 +544,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 1407,
+      "line": 1757,
       "categories": [
         "description_backing"
       ],
@@ -544,7 +553,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 1411,
+      "line": 1761,
       "categories": [
         "description_backing"
       ],
@@ -553,7 +562,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 1420,
+      "line": 1770,
       "categories": [
         "description_backing"
       ],
@@ -562,7 +571,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 1675,
+      "line": 2025,
       "categories": [
         "epoll"
       ],
@@ -3796,7 +3805,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/ioring.rs",
-      "line": 544,
+      "line": 531,
       "categories": [
         "mapping"
       ],
@@ -3805,7 +3814,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/ioring.rs",
-      "line": 617,
+      "line": 622,
       "categories": [
         "mapping"
       ],
@@ -3814,7 +3823,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/ioring.rs",
-      "line": 644,
+      "line": 649,
       "categories": [
         "mapping"
       ],
@@ -3823,7 +3832,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/ioring.rs",
-      "line": 755,
+      "line": 760,
       "categories": [
         "mapping"
       ],
@@ -3832,7 +3841,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/ioring.rs",
-      "line": 793,
+      "line": 798,
       "categories": [
         "mapping"
       ],
@@ -3841,7 +3850,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/ioring.rs",
-      "line": 809,
+      "line": 814,
       "categories": [
         "description_backing"
       ],
@@ -3850,7 +3859,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/ioring.rs",
-      "line": 831,
+      "line": 836,
       "categories": [
         "description_backing"
       ],
@@ -3859,7 +3868,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/ioring.rs",
-      "line": 1064,
+      "line": 1069,
       "categories": [
         "epoll"
       ],
@@ -3868,7 +3877,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/ioring.rs",
-      "line": 1067,
+      "line": 1072,
       "categories": [
         "table_guard"
       ],
@@ -3877,7 +3886,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/ioring.rs",
-      "line": 1078,
+      "line": 1083,
       "categories": [
         "table_guard"
       ],
@@ -3886,7 +3895,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/ioring.rs",
-      "line": 1318,
+      "line": 1323,
       "categories": [
         "mapping"
       ],
@@ -3895,7 +3904,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/ioring.rs",
-      "line": 1319,
+      "line": 1324,
       "categories": [
         "mapping"
       ],
@@ -3904,7 +3913,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/ioring.rs",
-      "line": 1392,
+      "line": 1397,
       "categories": [
         "mapping"
       ],
@@ -3913,7 +3922,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/ioring.rs",
-      "line": 1637,
+      "line": 1642,
       "categories": [
         "mapping"
       ],
@@ -3922,7 +3931,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/ioring.rs",
-      "line": 1719,
+      "line": 1724,
       "categories": [
         "description_backing"
       ],
@@ -3931,7 +3940,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/ioring.rs",
-      "line": 1729,
+      "line": 1734,
       "categories": [
         "mapping"
       ],
@@ -3940,7 +3949,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/ioring.rs",
-      "line": 1735,
+      "line": 1740,
       "categories": [
         "mapping"
       ],
@@ -3949,7 +3958,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/ioring.rs",
-      "line": 1737,
+      "line": 1742,
       "categories": [
         "mapping"
       ],
@@ -7803,7 +7812,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 830,
+      "line": 831,
       "categories": [
         "epoll"
       ],
@@ -7812,7 +7821,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 837,
+      "line": 838,
       "categories": [
         "description_backing",
         "mapping"
@@ -7822,7 +7831,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 842,
+      "line": 843,
       "categories": [
         "description_guard"
       ],
@@ -7831,7 +7840,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 862,
+      "line": 863,
       "categories": [
         "description_guard"
       ],
@@ -7840,7 +7849,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 872,
+      "line": 873,
       "categories": [
         "description_guard"
       ],
@@ -7849,7 +7858,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 882,
+      "line": 883,
       "categories": [
         "description_guard"
       ],
@@ -7858,16 +7867,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 900,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(open) = open_file.description.read() else {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 903,
+      "line": 901,
       "categories": [
         "epoll"
       ],
@@ -7876,7 +7876,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 924,
+      "line": 931,
       "categories": [
         "epoll"
       ],
@@ -7885,7 +7885,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 929,
+      "line": 936,
       "categories": [
         "epoll"
       ],
@@ -7894,7 +7894,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1064,
+      "line": 1071,
       "categories": [
         "description_backing",
         "mapping"
@@ -7904,7 +7904,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1068,
+      "line": 1081,
       "categories": [
         "description_guard"
       ],
@@ -7913,314 +7913,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1145,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// libc::poll(timeout 0), then translate revents \u2192 epoll events.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1314,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(open) = open_file.description.read() else {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1345,
-      "categories": [
-        "epoll"
-      ],
-      "text": "/// Consumption-based EPOLLET re-arm for the Linux lane's sampled epoll",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1347,
-      "categories": [
-        "epoll"
-      ],
-      "text": "/// clear the read-side bits of `last_ready` for X in every epoll interest",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1356,
-      "categories": [
-        "stream"
-      ],
-      "text": "/// writer's `write(1025)+close` lands between the reader's splice EAGAIN",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1365,
-      "categories": [
-        "epoll"
-      ],
-      "text": "/// event, which epoll's contract permits (and ET consumers drain to",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1394,
-      "categories": [
-        "stream"
-      ],
-      "text": "// sendfile/splice/copy_file_range/tee: positive return is bytes",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1428,
-      "categories": [
-        "stream"
-      ],
-      "text": "// sendfile(out_fd, in_fd, ..): reads in_fd, writes out_fd.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1431,
-      "categories": [
-        "stream"
-      ],
-      "text": "// splice(fd_in, off_in, fd_out, ..) / copy_file_range: reads",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1432,
-      "categories": [
-        "stream"
-      ],
-      "text": "// arg0, writes arg2. tee(fd_in, fd_out, ..): reads arg0, writes",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1441,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// Snapshot the registered epoll fds and DROP the set lock before",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1446,
-      "categories": [
-        "table_guard"
-      ],
-      "text": ".read_epoll_fds()",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1454,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1457,
-      "categories": [
-        "epoll"
-      ],
-      "text": "if let OpenDescription::Epoll {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1604,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// Lazy prune: the fd was closed or recycled as a non-epoll.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1606,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "self.captured_file_table().write_epoll_fds().remove(&epfd);",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1628,
-      "categories": [
-        "epoll"
-      ],
-      "text": "/// `None` means it's synthetic (epoll/eventfd/timerfd/in-memory pipe)",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1637,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let open = open_file.description.read()?;",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1655,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// pidfd-bearing epoll fd on Linux) is what poll/epoll watch.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1657,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// inotify readiness is the backing kqueue's fd, so poll/epoll/",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1661,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// an event is queued, so poll/epoll and a blocking read all",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1685,
-      "categories": [
-        "epoll"
-      ],
-      "text": "/// Such an fd is NEVER writable under Linux `poll(2)`/`epoll(7)`: a read end",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1708,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "open_file.description.read().as_deref(),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1718,
-      "categories": [
-        "epoll"
-      ],
-      "text": "/// Remove `fd` from every epoll instance's interest set (and purge any",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1720,
-      "categories": [
-        "epoll"
-      ],
-      "text": "/// epoll interest lists; carrick keys interest by guest fd NUMBER, so a",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1725,
-      "categories": [
-        "epoll"
-      ],
-      "text": "/// keeps the host fd alive within the SAME epoll is the rarer",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1737,
-      "categories": [
-        "epoll"
-      ],
-      "text": "let OpenDescription::Epoll {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1767,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "let table = files.read_open_files();",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1788,
-      "categories": [
-        "epoll"
-      ],
-      "text": "if let OpenDescription::Epoll {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1817,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// table, while the inherited epoll description (and its",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1968,
-      "categories": [
-        "epoll"
-      ],
-      "text": "/// epoll netpollBreak (EVFILT_READ on the readiness pipe) is unaffected.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1972,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "f.description.read().as_deref(),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 2015,
-      "categories": [
-        "description_backing",
-        "mapping"
-      ],
-      "text": ".concrete_backing::<crate::dispatch::ioring::IoUringBacking>()",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 2019,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(open) = open_file.description.read() else {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 2067,
+      "line": 1146,
       "categories": [
         "epoll"
       ],
@@ -8229,331 +7922,115 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 2159,
+      "line": 1198,
       "categories": [
         "epoll"
       ],
-      "text": "// epoll path's host_fd_is_oneway_pipe_read_end suppression).",
+      "text": "// libc::poll(timeout 0), then translate revents \u2192 epoll events.",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 2250,
+      "line": 1367,
       "categories": [
-        "epoll"
+        "description_guard"
       ],
-      "text": "// Same as the epoll path: a queued error-queue entry is both",
+      "text": "let Some(open) = open_file.description.read() else {",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 2405,
+      "line": 1398,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// Consumption-based EPOLLET re-arm for the Linux lane's sampled epoll",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 1400,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// clear the read-side bits of `last_ready` for X in every epoll interest",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 1409,
       "categories": [
         "stream"
       ],
-      "text": "// non-blocking copy/splice loops do not churn on macOS' small defaults.",
+      "text": "/// writer's `write(1025)+close` lands between the reader's splice EAGAIN",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 2444,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let open = open_file.description.read()?;",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 2553,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let open = open_file.description.read().ok_or(LINUX_ENOTSOCK)?;",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 2566,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "matches!(of.description.read().as_deref(), Some(OpenDescription::HostSocket { base, .. }) if base.connect_in_progress())",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 2573,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 2582,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 2591,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let mut open = open_file.description.write()?;",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 2604,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 2613,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 2624,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let mut open = open_file.description.write().ok_or(LINUX_ENOTSOCK)?;",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 2665,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 2756,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "matches!(of.description.read().as_deref(), Some(OpenDescription::HostSocket { base, .. }) if base.so_passcred())",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 2788,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let open = open_file.description.read()?;",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 2806,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let open = open_file.description.read()?;",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 2822,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let open = open_file.description.read()?;",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 2832,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "matches!(of.description.read().as_deref(), Some(OpenDescription::HostSocket { base, .. }) if base.so_reuseport())",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 2848,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "of.description.read().as_deref(),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 2862,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(open) = open_file.description.read() else {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 2878,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "if let Some(mut open) = open_file.description.write() {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 2920,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 2959,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 2969,
+      "line": 1418,
       "categories": [
         "epoll"
       ],
-      "text": "// an epoll instance. The queue mutation above is durable; wake the",
+      "text": "/// event, which epoll's contract permits (and ET consumers drain to",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 3030,
+      "line": 1447,
+      "categories": [
+        "stream"
+      ],
+      "text": "// sendfile/splice/copy_file_range/tee: positive return is bytes",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 1481,
+      "categories": [
+        "stream"
+      ],
+      "text": "// sendfile(out_fd, in_fd, ..): reads in_fd, writes out_fd.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 1484,
+      "categories": [
+        "stream"
+      ],
+      "text": "// splice(fd_in, off_in, fd_out, ..) / copy_file_range: reads",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 1485,
+      "categories": [
+        "stream"
+      ],
+      "text": "// arg0, writes arg2. tee(fd_in, fd_out, ..): reads arg0, writes",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 1494,
       "categories": [
         "epoll"
       ],
-      "text": "/// The host kernel never sees these bytes, so nothing on an epoll",
+      "text": "// Snapshot the registered epoll fds and DROP the set lock before",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 3043,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 3057,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let mut open = open_file.description.write()?;",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 3104,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "match open_file.description.read().as_deref() {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 3309,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// connect(2) core with always-wait-on-block semantics, for the io_uring",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 3654,
-      "categories": [
-        "epoll"
-      ],
-      "text": "Some(\"dns-epoll-wake\".to_string()),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 3682,
-      "categories": [
-        "epoll"
-      ],
-      "text": "let epoll = crate::dispatch::EpollKqueue::new(",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 3684,
+      "line": 1499,
       "categories": [
         "table_guard"
       ],
-      "text": "Arc::clone(dispatcher.captured_file_table().epoll_wake_registry()),",
+      "text": ".read_epoll_fds()",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 3687,
-      "categories": [
-        "epoll"
-      ],
-      "text": "!poll_fd_readable(epoll.poll_fd()),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 3688,
-      "categories": [
-        "epoll"
-      ],
-      "text": "\"a fresh epoll instance must be quiet\"",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 3703,
-      "categories": [
-        "epoll"
-      ],
-      "text": "poll_fd_readable(epoll.poll_fd()),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 3704,
-      "categories": [
-        "epoll"
-      ],
-      "text": "\"DNS gateway reply must wake the epoll instance's poll fd\"",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4075,
+      "line": 1507,
       "categories": [
         "description_guard"
       ],
@@ -8562,115 +8039,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4078,
-      "categories": [
-        "epoll"
-      ],
-      "text": "let OpenDescription::Epoll { pending_ready, .. } = &mut *open else {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4093,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// Multiplexer-backed readiness (kqueue on macOS, epoll on Linux). The",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4103,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(open) = open_file.description.read() else {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4106,
-      "categories": [
-        "epoll"
-      ],
-      "text": "let OpenDescription::Epoll {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4124,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// guest_fd -> (accumulated epoll events, epoll_data); read+write filters",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4173,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// here, then the epoll lock is dropped before the per-fd",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4181,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(open) = open_file.description.read() else {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4184,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// Per-guest-fd epoll interest snapshot: (host_fd,",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4185,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// events, epoll data, reg_gen, io_gen, last_ready,",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4190,
-      "categories": [
-        "epoll"
-      ],
-      "text": "if let OpenDescription::Epoll { interest, .. } = &*open {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4410,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// epoll waiter while the host fd is already readable/writable.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4628,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "if let Some(mut open) = open_file.description.write() {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4629,
+      "line": 1510,
       "categories": [
         "epoll"
       ],
@@ -8679,259 +8048,34 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4750,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "if let Some(mut open) = open_file.description.write() {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4751,
+      "line": 1657,
       "categories": [
         "epoll"
       ],
-      "text": "if let OpenDescription::Epoll { pending_ready, .. } = &mut *open {",
+      "text": "// Lazy prune: the fd was closed or recycled as a non-epoll.",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4836,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// the epoll kqueue inside the per-thread kqueue, and unlike calling",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4837,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// kevent() here it does not consume pending epoll events before the",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4896,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// macOS, epoll-backed on Linux. The user-wake channel `register_user(0)`",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4903,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// The backing kqueue/epoll fd couldn't be allocated (fd table full).",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4909,
+      "line": 1659,
       "categories": [
         "table_guard"
       ],
-      "text": "Arc::clone(this.captured_file_table().epoll_wake_registry()),",
+      "text": "self.captured_file_table().write_epoll_fds().remove(&epfd);",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4912,
+      "line": 1681,
       "categories": [
         "epoll"
       ],
-      "text": "let description = OpenDescription::Epoll {",
+      "text": "/// `None` means it's synthetic (epoll/eventfd/timerfd/in-memory pipe)",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4925,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// but the kernel still rejects size <= 0 with EINVAL (epoll-ltp /",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4938,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "Arc::clone(this.captured_file_table().epoll_wake_registry()),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4941,
-      "categories": [
-        "epoll"
-      ],
-      "text": "let description = OpenDescription::Epoll {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4958,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// A bad target fd is EBADF; a target equal to the epoll fd itself is",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4959,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// EINVAL (an epoll instance can't monitor itself). (LTP epoll_ctl02.)",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4978,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// taking the epoll write lock (it locks the *target* fd's description).",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4982,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// Record this epoll instance for the consumption-based EPOLLET",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4986,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// acyclic). A non-epoll epfd inserted on the error path below is",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4988,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "this.captured_file_table().write_epoll_fds().insert(epfd);",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4990,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4993,
-      "categories": [
-        "epoll"
-      ],
-      "text": "let OpenDescription::Epoll {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 5043,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// epoll and the level recompute reports the queued",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 5147,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// Other guest fds in THIS epoll instance can be dups of the",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 5149,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// registration (kqueue filter / epoll entry) is keyed by host",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 5151,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// survivors \u2014 but Linux epoll interest is per-fd, so they",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 5158,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// With no survivor, deregister as before. Native epoll is",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 5277,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "let open_file = files.read_open_files().get(&epfd).cloned();",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 5296,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// A valid fd that simply isn't an epoll instance is EINVAL; only a",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 5382,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "let open_file = files.read_open_files().get(&epfd).cloned();",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 5564,
-      "categories": [
-        "epoll"
-      ],
-      "text": "//   - any fd synthetic (eventfd/timerfd/epoll/in-memory pipe) \u2192 the",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 5986,
+      "line": 1690,
       "categories": [
         "description_guard"
       ],
@@ -8940,205 +8084,143 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 6299,
+      "line": 1708,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// pidfd-bearing epoll fd on Linux) is what poll/epoll watch.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 1710,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// inotify readiness is the backing kqueue's fd, so poll/epoll/",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 1714,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// an event is queued, so poll/epoll and a blocking read all",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 1738,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// Such an fd is NEVER writable under Linux `poll(2)`/`epoll(7)`: a read end",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 1761,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "open_file.description.read().as_deref(),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 1771,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// Remove `fd` from every epoll instance's interest set (and purge any",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 1773,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// epoll interest lists; carrick keys interest by guest fd NUMBER, so a",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 1778,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// keeps the host fd alive within the SAME epoll is the rarer",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 1790,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let OpenDescription::Epoll {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 1820,
       "categories": [
         "table_guard"
       ],
-      "text": "let mut table = files.write_open_files();",
+      "text": "let table = files.read_open_files();",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 6323,
+      "line": 1841,
+      "categories": [
+        "epoll"
+      ],
+      "text": "if let OpenDescription::Epoll {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 1870,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// table, while the inherited epoll description (and its",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 2021,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// epoll netpollBreak (EVFILT_READ on the readiness pipe) is unaffected.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 2025,
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
+      "text": "f.description.read().as_deref(),",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 6638,
+      "line": 2071,
       "categories": [
-        "description_guard"
-      ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 6743,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let open = open_file.description.read();",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 6777,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "if let Some(mut open) = open_file.description.write() {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 7010,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "&& let Some(OpenDescription::Netlink { pid, groups, .. }) = open_file.description.read().as_deref()",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 7019,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "&& let Some(open) = open_file.description.read()",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 7090,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "&& let Some(open) = open_file.description.read()",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 7181,
-      "categories": [
-        "description_guard"
-      ],
-      "text": ".and_then(|of| of.description.read().map(|g| g.reexec_kind_name().to_string()))",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 7207,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "&& let Some(open) = open_file.description.read()",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 7350,
-      "categories": [
-        "description_guard"
-      ],
-      "text": ".and_then(|f| f.description.read()?.send_timeout());",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 7454,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "&& let Some(open) = open_file.description.read()",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 7557,
-      "categories": [
+        "description_backing",
         "mapping"
       ],
-      "text": "// mapping returns None \u2192 checked write path \u2192 EFAULT).",
+      "text": ".concrete_backing::<crate::dispatch::ioring::IoUringBacking>()",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 7579,
-      "categories": [
-        "description_guard"
-      ],
-      "text": ".and_then(|f| f.description.read()?.recv_timeout());",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 7722,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(desc) = of.description.read() else {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 7749,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 7801,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 7820,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 7860,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 7903,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "if let Some(mut open) = open_file.description.write() {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 7978,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 8090,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(desc) = of.description.read() else {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 8166,
+      "line": 2082,
       "categories": [
         "description_guard"
       ],
@@ -9147,7 +8229,1025 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 8201,
+      "line": 2130,
+      "categories": [
+        "epoll"
+      ],
+      "text": "OpenDescription::Epoll {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 2222,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// epoll path's host_fd_is_oneway_pipe_read_end suppression).",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 2313,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// Same as the epoll path: a queued error-queue entry is both",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 2468,
+      "categories": [
+        "stream"
+      ],
+      "text": "// non-blocking copy/splice loops do not churn on macOS' small defaults.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 2507,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let open = open_file.description.read()?;",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 2616,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let open = open_file.description.read().ok_or(LINUX_ENOTSOCK)?;",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 2629,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "matches!(of.description.read().as_deref(), Some(OpenDescription::HostSocket { base, .. }) if base.connect_in_progress())",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 2636,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "&& let Some(mut open) = open_file.description.write()",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 2645,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "&& let Some(mut open) = open_file.description.write()",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 2654,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let mut open = open_file.description.write()?;",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 2667,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "&& let Some(mut open) = open_file.description.write()",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 2676,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "&& let Some(mut open) = open_file.description.write()",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 2687,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let mut open = open_file.description.write().ok_or(LINUX_ENOTSOCK)?;",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 2728,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "&& let Some(mut open) = open_file.description.write()",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 2819,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "matches!(of.description.read().as_deref(), Some(OpenDescription::HostSocket { base, .. }) if base.so_passcred())",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 2851,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let open = open_file.description.read()?;",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 2869,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let open = open_file.description.read()?;",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 2885,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let open = open_file.description.read()?;",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 2895,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "matches!(of.description.read().as_deref(), Some(OpenDescription::HostSocket { base, .. }) if base.so_reuseport())",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 2911,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "of.description.read().as_deref(),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 2925,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(open) = open_file.description.read() else {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 2941,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "if let Some(mut open) = open_file.description.write() {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 2989,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(mut open) = open_file.description.write() else {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 3028,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(mut open) = open_file.description.write() else {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 3038,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// an epoll instance. The queue mutation above is durable; wake the",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 3099,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// The host kernel never sees these bytes, so nothing on an epoll",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 3112,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(mut open) = open_file.description.write() else {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 3126,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let mut open = open_file.description.write()?;",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 3173,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "match open_file.description.read().as_deref() {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 3378,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// connect(2) core with always-wait-on-block semantics, for the io_uring",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 3723,
+      "categories": [
+        "epoll"
+      ],
+      "text": "Some(\"dns-epoll-wake\".to_string()),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 3751,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let epoll = crate::dispatch::EpollKqueue::new(",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 3753,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "Arc::clone(dispatcher.captured_file_table().epoll_wake_registry()),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 3756,
+      "categories": [
+        "epoll"
+      ],
+      "text": "!poll_fd_readable(epoll.poll_fd()),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 3757,
+      "categories": [
+        "epoll"
+      ],
+      "text": "\"a fresh epoll instance must be quiet\"",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 3772,
+      "categories": [
+        "epoll"
+      ],
+      "text": "poll_fd_readable(epoll.poll_fd()),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 3773,
+      "categories": [
+        "epoll"
+      ],
+      "text": "\"DNS gateway reply must wake the epoll instance's poll fd\"",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4145,
+      "categories": [
+        "epoll"
+      ],
+      "text": "\"epoll must report the same readiness as poll for the same description; \\",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4200,
+      "categories": [
+        "stream"
+      ],
+      "text": "\"poll reports staged splice bytes as POLLIN\"",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4205,
+      "categories": [
+        "epoll",
+        "stream"
+      ],
+      "text": "\"epoll reports staged splice bytes as EPOLLIN\"",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4213,
+      "categories": [
+        "stream"
+      ],
+      "text": "\"readiness authority must see staged splice bytes as readable\"",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4258,
+      "categories": [
+        "epoll"
+      ],
+      "text": "Arc::new(RwLock::new(OpenDescription::Epoll {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4272,
+      "categories": [
+        "epoll"
+      ],
+      "text": ".expect(\"install epoll fd\");",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4274,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let epoll_file = dispatcher.open_file(epfd).expect(\"epoll open file\");",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4279,
+      "categories": [
+        "epoll"
+      ],
+      "text": "\"poll reports epoll with ready synthetic child as readable\"",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4284,
+      "categories": [
+        "epoll"
+      ],
+      "text": "\"epoll reports epoll with ready synthetic child as readable\"",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4292,
+      "categories": [
+        "epoll"
+      ],
+      "text": "\"readiness authority must report epoll with ready synthetic child as readable\"",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4318,
+      "categories": [
+        "epoll"
+      ],
+      "text": "\"epoll reports 0 for closed description\"",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4333,
+      "categories": [
+        "epoll"
+      ],
+      "text": "Arc::new(RwLock::new(OpenDescription::Epoll {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4347,
+      "categories": [
+        "epoll"
+      ],
+      "text": ".expect(\"install epoll\");",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4350,
+      "categories": [
+        "epoll"
+      ],
+      "text": ".expect(\"install alias epoll\");",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4375,
+      "categories": [
+        "epoll"
+      ],
+      "text": "\"epoll_ctl must reject adding an alias of the same epoll description with EINVAL\"",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4414,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// Epoll has an interest registered under fd 10, but whose target is the Netlink description.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4435,
+      "categories": [
+        "epoll"
+      ],
+      "text": "Arc::new(RwLock::new(OpenDescription::Epoll {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4451,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// Before data is queued in original child_desc (Netlink), epoll is not ready even though fd 10 (EventFd) is ready!",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4452,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let epoll_file = dispatcher.open_file(epfd).expect(\"epoll file\");",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4458,
+      "categories": [
+        "epoll"
+      ],
+      "text": "\"epoll readiness must query target identity (empty netlink), not replacement fd 10 (ready eventfd)\"",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4466,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// Epoll readiness must now report IN because it tracks target identity!",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4473,
+      "categories": [
+        "epoll"
+      ],
+      "text": "\"epoll readiness must track stored target identity across fd close and reuse\"",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4550,
+      "categories": [
+        "epoll"
+      ],
+      "text": "Arc::new(RwLock::new(OpenDescription::Epoll {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4566,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// Before sending request, epoll is not ready",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4593,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// After netlink_send, epoll must be IN-ready!",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4597,
+      "categories": [
+        "epoll"
+      ],
+      "text": "\"netlink reply publication must wake epoll waiter\"",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4649,
+      "categories": [
+        "epoll"
+      ],
+      "text": "Arc::new(RwLock::new(OpenDescription::Epoll {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4677,
+      "categories": [
+        "epoll"
+      ],
+      "text": "\"host-backed child must not be recursively sampled by epoll readiness authority\"",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4682,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let epoll_file = dispatcher.open_file(epfd).expect(\"epoll file\");",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4754,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(mut open) = open_file.description.write() else {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4757,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let OpenDescription::Epoll { pending_ready, .. } = &mut *open else {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4772,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// Multiplexer-backed readiness (kqueue on macOS, epoll on Linux). The",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4782,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(open) = open_file.description.read() else {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4785,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let OpenDescription::Epoll {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4803,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// guest_fd -> (accumulated epoll events, epoll_data); read+write filters",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4852,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// here, then the epoll lock is dropped before the per-fd",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4860,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(open) = open_file.description.read() else {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4863,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// Per-guest-fd epoll interest snapshot: (host_fd,",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4864,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// events, epoll data, reg_gen, io_gen, last_ready,",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 4869,
+      "categories": [
+        "epoll"
+      ],
+      "text": "if let OpenDescription::Epoll { interest, .. } = &*open {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 5089,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// epoll waiter while the host fd is already readable/writable.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 5307,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "if let Some(mut open) = open_file.description.write() {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 5308,
+      "categories": [
+        "epoll"
+      ],
+      "text": "if let OpenDescription::Epoll {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 5429,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "if let Some(mut open) = open_file.description.write() {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 5430,
+      "categories": [
+        "epoll"
+      ],
+      "text": "if let OpenDescription::Epoll { pending_ready, .. } = &mut *open {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 5515,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// the epoll kqueue inside the per-thread kqueue, and unlike calling",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 5516,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// kevent() here it does not consume pending epoll events before the",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 5575,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// macOS, epoll-backed on Linux. The user-wake channel `register_user(0)`",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 5582,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// The backing kqueue/epoll fd couldn't be allocated (fd table full).",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 5588,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "Arc::clone(this.captured_file_table().epoll_wake_registry()),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 5591,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let description = OpenDescription::Epoll {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 5604,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// but the kernel still rejects size <= 0 with EINVAL (epoll-ltp /",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 5617,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "Arc::clone(this.captured_file_table().epoll_wake_registry()),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 5620,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let description = OpenDescription::Epoll {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 5637,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// A bad target fd is EBADF; a target equal to the epoll fd itself is",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 5638,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// EINVAL (an epoll instance can't monitor itself). (LTP epoll_ctl02.)",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 5657,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// Same-description alias check (LTP / Linux epoll_ctl EINVAL when target refers to this epoll instance)",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 5664,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// taking the epoll write lock (it locks the *target* fd's description).",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 5668,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// Record this epoll instance for the consumption-based EPOLLET",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 5672,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// acyclic). A non-epoll epfd inserted on the error path below is",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 5674,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "this.captured_file_table().write_epoll_fds().insert(epfd);",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 5676,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(mut open) = open_file.description.write() else {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 5679,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let OpenDescription::Epoll {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 5729,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// epoll and the level recompute reports the queued",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 5833,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// Other guest fds in THIS epoll instance can be dups of the",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 5835,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// registration (kqueue filter / epoll entry) is keyed by host",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 5837,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// survivors \u2014 but Linux epoll interest is per-fd, so they",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 5844,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// With no survivor, deregister as before. Native epoll is",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 5963,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "let open_file = files.read_open_files().get(&epfd).cloned();",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 5982,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// A valid fd that simply isn't an epoll instance is EINVAL; only a",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 6068,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "let open_file = files.read_open_files().get(&epfd).cloned();",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 6250,
+      "categories": [
+        "epoll"
+      ],
+      "text": "//   - any fd synthetic (eventfd/timerfd/epoll/in-memory pipe) \u2192 the",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 6672,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let open = open_file.description.read()?;",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 6985,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "let mut table = files.write_open_files();",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 7009,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "&& let Some(mut open) = open_file.description.write()",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 7324,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "&& let Some(mut open) = open_file.description.write()",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 7429,
       "categories": [
         "description_guard"
       ],
@@ -9156,16 +9256,25 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 8227,
+      "line": 7463,
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(OpenDescription::HostSocket { base, .. }) = open_file.description.read().as_deref() {",
+      "text": "if let Some(mut open) = open_file.description.write() {",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 8397,
+      "line": 7696,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "&& let Some(OpenDescription::Netlink { pid, groups, .. }) = open_file.description.read().as_deref()",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 7705,
       "categories": [
         "description_guard"
       ],
@@ -9174,7 +9283,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 8453,
+      "line": 7776,
       "categories": [
         "description_guard"
       ],
@@ -9183,7 +9292,25 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 8577,
+      "line": 7867,
+      "categories": [
+        "description_guard"
+      ],
+      "text": ".and_then(|of| of.description.read().map(|g| g.reexec_kind_name().to_string()))",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 7893,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "&& let Some(open) = open_file.description.read()",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 8036,
       "categories": [
         "description_guard"
       ],
@@ -9192,7 +9319,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 8718,
+      "line": 8140,
       "categories": [
         "description_guard"
       ],
@@ -9201,7 +9328,160 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 8910,
+      "line": 8243,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// mapping returns None \u2192 checked write path \u2192 EFAULT).",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 8265,
+      "categories": [
+        "description_guard"
+      ],
+      "text": ".and_then(|f| f.description.read()?.recv_timeout());",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 8408,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(desc) = of.description.read() else {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 8435,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "&& let Some(mut open) = open_file.description.write()",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 8487,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "&& let Some(mut open) = open_file.description.write()",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 8506,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "&& let Some(mut open) = open_file.description.write()",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 8546,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(mut open) = open_file.description.write() else {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 8589,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "if let Some(mut open) = open_file.description.write() {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 8664,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(mut open) = open_file.description.write() else {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 8776,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(desc) = of.description.read() else {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 8852,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(open) = open_file.description.read() else {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 8887,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let open = open_file.description.read();",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 8913,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "&& let Some(OpenDescription::HostSocket { base, .. }) = open_file.description.read().as_deref() {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 9083,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "&& let Some(open) = open_file.description.read()",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 9139,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "&& let Some(open) = open_file.description.read()",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 9263,
+      "categories": [
+        "description_guard"
+      ],
+      "text": ".and_then(|f| f.description.read()?.send_timeout());",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 9404,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "&& let Some(open) = open_file.description.read()",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 9596,
       "categories": [
         "description_guard"
       ],
@@ -10525,7 +10805,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/tests.rs",
-      "line": 5584,
+      "line": 5593,
       "categories": [
         "description_backing"
       ],
@@ -12883,7 +13163,34 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 540,
+      "line": 498,
+      "categories": [
+        "stream"
+      ],
+      "text": "/// external readiness state (such as staged splice pushback buffers and nested",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 499,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// synthetic epoll child interests) without coupling backings directly to the",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 546,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// Level readiness for `interest`, in epoll's domain. This is the ONE",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 593,
       "categories": [
         "epoll"
       ],
@@ -12892,7 +13199,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 543,
+      "line": 596,
       "categories": [
         "epoll"
       ],
@@ -12901,7 +13208,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 771,
+      "line": 824,
       "categories": [
         "epoll"
       ],
@@ -12910,7 +13217,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 774,
+      "line": 827,
       "categories": [
         "epoll"
       ],
@@ -12919,7 +13226,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 790,
+      "line": 843,
       "categories": [
         "epoll"
       ],
@@ -12928,7 +13235,25 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 867,
+      "line": 859,
+      "categories": [
+        "epoll"
+      ],
+      "text": "FileDescriptionKind::Epoll(_) => false,",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 874,
+      "categories": [
+        "epoll"
+      ],
+      "text": "FileDescriptionKind::Epoll(_) => LinuxEpollEvents::empty(),",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 951,
       "categories": [
         "epoll"
       ],
@@ -12937,7 +13262,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 883,
+      "line": 967,
       "categories": [
         "epoll"
       ],
@@ -12946,7 +13271,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 910,
+      "line": 994,
       "categories": [
         "epoll"
       ],
@@ -12955,7 +13280,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 931,
+      "line": 1015,
       "categories": [
         "epoll"
       ],
@@ -12964,7 +13289,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1232,
+      "line": 1316,
       "categories": [
         "table_guard"
       ],
@@ -12973,7 +13298,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1250,
+      "line": 1334,
       "categories": [
         "table_guard"
       ],
@@ -12982,7 +13307,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1258,
+      "line": 1342,
       "categories": [
         "lifecycle"
       ],
@@ -12991,7 +13316,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1263,
+      "line": 1347,
       "categories": [
         "table_guard"
       ],
@@ -13000,7 +13325,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1273,
+      "line": 1357,
       "categories": [
         "table_guard"
       ],
@@ -13009,7 +13334,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1285,
+      "line": 1369,
       "categories": [
         "lifecycle"
       ],
@@ -13018,7 +13343,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1302,
+      "line": 1386,
       "categories": [
         "table_guard"
       ],
@@ -13027,7 +13352,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1318,
+      "line": 1402,
       "categories": [
         "stream"
       ],
@@ -13036,7 +13361,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1321,
+      "line": 1405,
       "categories": [
         "stream"
       ],
@@ -13045,7 +13370,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1340,
+      "line": 1424,
       "categories": [
         "table_guard"
       ],
@@ -13054,7 +13379,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1428,
+      "line": 1512,
       "categories": [
         "table_guard"
       ],
@@ -13063,7 +13388,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1432,
+      "line": 1516,
       "categories": [
         "table_guard"
       ],
@@ -13072,7 +13397,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1449,
+      "line": 1533,
       "categories": [
         "table_guard"
       ],
@@ -13081,7 +13406,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1453,
+      "line": 1537,
       "categories": [
         "table_guard"
       ],
@@ -13090,7 +13415,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1457,
+      "line": 1541,
       "categories": [
         "table_guard"
       ],
@@ -13099,7 +13424,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1461,
+      "line": 1545,
       "categories": [
         "table_guard"
       ],
@@ -13108,7 +13433,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1465,
+      "line": 1549,
       "categories": [
         "table_guard"
       ],
@@ -13117,7 +13442,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1469,
+      "line": 1553,
       "categories": [
         "table_guard"
       ],
@@ -13126,7 +13451,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1478,
+      "line": 1562,
       "categories": [
         "table_guard"
       ],
@@ -13135,7 +13460,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1482,
+      "line": 1566,
       "categories": [
         "table_guard"
       ],
@@ -13144,7 +13469,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1486,
+      "line": 1570,
       "categories": [
         "table_guard"
       ],
@@ -13153,7 +13478,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1487,
+      "line": 1571,
       "categories": [
         "table_guard"
       ],
@@ -13162,7 +13487,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1737,
+      "line": 1821,
       "categories": [
         "lifecycle"
       ],
@@ -13171,7 +13496,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 2238,
+      "line": 2322,
       "categories": [
         "lifecycle"
       ],
@@ -13180,7 +13505,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 2269,
+      "line": 2353,
       "categories": [
         "lifecycle"
       ],
@@ -13189,7 +13514,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 2369,
+      "line": 2453,
       "categories": [
         "lifecycle"
       ],
@@ -13198,7 +13523,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 2565,
+      "line": 2649,
       "categories": [
         "lifecycle"
       ],
@@ -13207,7 +13532,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 2572,
+      "line": 2656,
       "categories": [
         "lifecycle"
       ],
@@ -13216,7 +13541,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 2587,
+      "line": 2671,
       "categories": [
         "lifecycle"
       ],
@@ -13225,7 +13550,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 2589,
+      "line": 2673,
       "categories": [
         "lifecycle"
       ],
@@ -13234,7 +13559,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 4001,
+      "line": 4085,
       "categories": [
         "lifecycle"
       ],
@@ -13243,7 +13568,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 6860,
+      "line": 6944,
       "categories": [
         "epoll"
       ],
@@ -13252,7 +13577,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 6862,
+      "line": 6946,
       "categories": [
         "epoll"
       ],
@@ -13261,7 +13586,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 6864,
+      "line": 6948,
       "categories": [
         "epoll"
       ],
@@ -13270,7 +13595,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 7298,
+      "line": 7382,
       "categories": [
         "lifecycle"
       ],
@@ -13279,7 +13604,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 7302,
+      "line": 7386,
       "categories": [
         "lifecycle"
       ],
@@ -13288,7 +13613,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 7395,
+      "line": 7479,
       "categories": [
         "lifecycle"
       ],
@@ -13297,7 +13622,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 7537,
+      "line": 7621,
       "categories": [
         "epoll"
       ],
@@ -13306,7 +13631,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 7538,
+      "line": 7622,
       "categories": [
         "epoll"
       ],
@@ -13315,7 +13640,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 7540,
+      "line": 7624,
       "categories": [
         "epoll"
       ],
@@ -13324,7 +13649,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 7541,
+      "line": 7625,
       "categories": [
         "epoll"
       ],
@@ -13333,7 +13658,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 7548,
+      "line": 7632,
       "categories": [
         "epoll"
       ],
@@ -13342,7 +13667,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 7549,
+      "line": 7633,
       "categories": [
         "epoll"
       ],
@@ -13351,7 +13676,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 7552,
+      "line": 7636,
       "categories": [
         "epoll"
       ],
@@ -13360,7 +13685,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 7555,
+      "line": 7639,
       "categories": [
         "epoll"
       ],
@@ -13369,7 +13694,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 7558,
+      "line": 7642,
       "categories": [
         "epoll"
       ],
@@ -13378,7 +13703,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 7560,
+      "line": 7644,
       "categories": [
         "epoll"
       ],
@@ -13387,7 +13712,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 7632,
+      "line": 7716,
       "categories": [
         "lifecycle"
       ],
@@ -13396,7 +13721,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 7638,
+      "line": 7722,
       "categories": [
         "stream"
       ],
@@ -13405,7 +13730,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 7715,
+      "line": 7799,
       "categories": [
         "table_guard"
       ],
@@ -13414,7 +13739,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 7727,
+      "line": 7811,
       "categories": [
         "table_guard"
       ],
