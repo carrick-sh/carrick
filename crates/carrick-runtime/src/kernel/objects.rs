@@ -532,14 +532,12 @@ pub(crate) trait FileDescriptionBacking: Any + Send + Sync {
     /// Snapshot the description identities registered by an epoll backing.
     /// `None` means this is not an epoll description. Callers receive owned
     /// identities so they never hold a backing lock while walking the graph.
-    fn epoll_targets(&self) -> Option<Vec<Arc<FileDescription>>>;
+    fn epoll_targets(&self) -> Option<Vec<Arc<FileDescription>>> {
+        None
+    }
 
     #[allow(dead_code)]
     fn is_closed(&self) -> bool {
-        false
-    }
-
-    fn has_host_poll_source(&self) -> bool {
         false
     }
 
@@ -868,14 +866,6 @@ impl FileDescription {
         match &self.kind {
             FileDescriptionKind::Concrete(backing) => backing.0.is_closed(),
             _ => false,
-        }
-    }
-
-    pub(crate) fn has_host_poll_source(&self) -> bool {
-        match &self.kind {
-            FileDescriptionKind::Concrete(backing) => backing.0.has_host_poll_source(),
-            FileDescriptionKind::Regular => false,
-            FileDescriptionKind::Epoll(_) => false,
         }
     }
 

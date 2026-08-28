@@ -367,6 +367,18 @@ pub(in crate::dispatch) fn recverr_close(host_fd: i32) {
 use support::*;
 pub(super) use support::{drain_netlink_queue, set_host_nonblocking};
 
+fn remove_epoll_interest(
+    interest: &mut HashMap<i32, EpollInterest>,
+    synthetic_interest_count: &mut usize,
+    fd: i32,
+) -> Option<EpollInterest> {
+    let removed = interest.remove(&fd)?;
+    if !removed.host_poll_source {
+        *synthetic_interest_count = synthetic_interest_count.saturating_sub(1);
+    }
+    Some(removed)
+}
+
 fn merge_epoll_edge_sample(
     accumulated: &mut (u32, u64),
     edge_bits: u32,
@@ -1781,6 +1793,7 @@ impl SyscallDispatcher {
             };
             let OpenDescription::Epoll {
                 interest,
+                synthetic_interest_count,
                 pending_ready,
                 kqueue,
                 ..
@@ -1794,7 +1807,7 @@ impl SyscallDispatcher {
             if !registered_target.is_some_and(|registered| Arc::ptr_eq(registered, target)) {
                 continue;
             }
-            interest.remove(&registration_fd);
+            let _ = remove_epoll_interest(interest, synthetic_interest_count, registration_fd);
             clear_pending_epoll_ready(pending_ready, registration_fd);
             if let Some(host_fd) = detached_host_fd {
                 kqueue.with_mux(|mux| {
@@ -1832,6 +1845,7 @@ impl SyscallDispatcher {
             };
             if let OpenDescription::Epoll {
                 interest,
+                synthetic_interest_count,
                 pending_ready,
                 kqueue,
                 ..
@@ -1853,7 +1867,11 @@ impl SyscallDispatcher {
                 }
                 if should_auto_detach {
                     for registered_fd in matching_fds {
-                        interest.remove(&registered_fd);
+                        let _ = remove_epoll_interest(
+                            interest,
+                            synthetic_interest_count,
+                            registered_fd,
+                        );
                         clear_pending_epoll_ready(pending_ready, registered_fd);
                     }
                 }
@@ -4247,6 +4265,7 @@ mod netlink_readiness_tests {
             child_fd,
             EpollInterest {
                 target: Some(child_desc),
+                host_poll_source: false,
                 event: LinuxEpollEvent {
                     events: LINUX_EPOLLIN,
                     data: 1234,
@@ -4265,6 +4284,7 @@ mod netlink_readiness_tests {
             Arc::new(RwLock::new(OpenDescription::Epoll {
                 base: OpenDescriptionBase::new(0),
                 interest: interest_map,
+                synthetic_interest_count: 1,
                 pending_ready: VecDeque::new(),
                 kqueue: Arc::new(crate::dispatch::EpollKqueue::new(
                     mux,
@@ -4340,6 +4360,7 @@ mod netlink_readiness_tests {
             Arc::new(RwLock::new(OpenDescription::Epoll {
                 base: OpenDescriptionBase::new(0),
                 interest: HashMap::new(),
+                synthetic_interest_count: 0,
                 pending_ready: VecDeque::new(),
                 kqueue: Arc::new(crate::dispatch::EpollKqueue::new(
                     mux,
@@ -4392,6 +4413,7 @@ mod netlink_readiness_tests {
                 Arc::new(RwLock::new(OpenDescription::Epoll {
                     base: OpenDescriptionBase::new(0),
                     interest: HashMap::new(),
+                    synthetic_interest_count: 0,
                     pending_ready: VecDeque::new(),
                     kqueue: Arc::new(crate::dispatch::EpollKqueue::new(
                         mux,
@@ -4495,6 +4517,7 @@ mod netlink_readiness_tests {
             reused_fd,
             EpollInterest {
                 target: Some(Arc::clone(&child_desc)),
+                host_poll_source: false,
                 event: LinuxEpollEvent {
                     events: LINUX_EPOLLIN,
                     data: 999,
@@ -4513,6 +4536,7 @@ mod netlink_readiness_tests {
             Arc::new(RwLock::new(OpenDescription::Epoll {
                 base: OpenDescriptionBase::new(0),
                 interest: interest_map,
+                synthetic_interest_count: 1,
                 pending_ready: VecDeque::new(),
                 kqueue: Arc::new(crate::dispatch::EpollKqueue::new(
                     mux,
@@ -4643,6 +4667,7 @@ mod netlink_readiness_tests {
             netlink_fd,
             EpollInterest {
                 target: Some(Arc::clone(&netlink_desc)),
+                host_poll_source: false,
                 event: LinuxEpollEvent {
                     events: LINUX_EPOLLIN,
                     data: 42,
@@ -4660,6 +4685,7 @@ mod netlink_readiness_tests {
             Arc::new(RwLock::new(OpenDescription::Epoll {
                 base: OpenDescriptionBase::new(0),
                 interest: interest_map,
+                synthetic_interest_count: 1,
                 pending_ready: VecDeque::new(),
                 kqueue: Arc::clone(&epoll_kqueue),
             })),
@@ -4733,11 +4759,6 @@ mod netlink_readiness_tests {
             0,
         );
         let read_desc = Arc::clone(&read_open.description);
-        assert!(
-            read_desc.has_host_poll_source(),
-            "host pipe has host poll source"
-        );
-
         let pipe_fd = dispatcher
             .install_fd_at_or_above(20, read_open)
             .expect("pipe fd");
@@ -4746,6 +4767,7 @@ mod netlink_readiness_tests {
             pipe_fd,
             EpollInterest {
                 target: Some(Arc::clone(&read_desc)),
+                host_poll_source: true,
                 event: LinuxEpollEvent {
                     events: LINUX_EPOLLIN,
                     data: 777,
@@ -4760,19 +4782,18 @@ mod netlink_readiness_tests {
         );
         let mut mux = crate::event_mux::make_event_multiplexer().expect("mux");
         mux.register_user(0).expect("register user wake");
-        let epoll_open_file = OpenFile::from_open_description_with_status_flags(
-            Arc::new(RwLock::new(OpenDescription::Epoll {
-                base: OpenDescriptionBase::new(0),
-                interest: interest_map,
-                pending_ready: VecDeque::new(),
-                kqueue: Arc::new(crate::dispatch::EpollKqueue::new(
-                    mux,
-                    crate::dispatch::new_epoll_wake_registry(),
-                )),
-            })),
-            0,
-            0,
-        );
+        let epoll_backing = Arc::new(RwLock::new(OpenDescription::Epoll {
+            base: OpenDescriptionBase::new(0),
+            interest: interest_map,
+            synthetic_interest_count: 0,
+            pending_ready: VecDeque::new(),
+            kqueue: Arc::new(crate::dispatch::EpollKqueue::new(
+                mux,
+                crate::dispatch::new_epoll_wake_registry(),
+            )),
+        }));
+        let epoll_open_file =
+            OpenFile::from_open_description_with_status_flags(Arc::clone(&epoll_backing), 0, 0);
         let epfd = dispatcher
             .install_fd_at_or_above(21, epoll_open_file)
             .expect("epfd");
@@ -4795,15 +4816,111 @@ mod netlink_readiness_tests {
         }
 
         let epoll_file = dispatcher.open_file(epfd).expect("epoll file");
+        let synthetic_count = match &*epoll_backing.read() {
+            OpenDescription::Epoll {
+                synthetic_interest_count,
+                ..
+            } => *synthetic_interest_count,
+            _ => usize::MAX,
+        };
+        assert_eq!(
+            synthetic_count, 0,
+            "host-backed registrations must preserve the O(1) quiet fast path"
+        );
         // Must NOT panic because host-backed child is omitted from synthetic child traversal!
         let ready = epoll_file
             .description
             .readiness(carrick_abi::LinuxEpollEvents::IN, &NoHostSampleContext);
         assert_eq!(ready, carrick_abi::LinuxEpollEvents::empty());
-        unsafe {
-            libc::close(host_fds[0]);
-            libc::close(host_fds[1]);
-        }
+        unsafe { libc::close(host_fds[1]) };
+    }
+
+    #[test]
+    fn epoll_ctl_tracks_the_synthetic_registration_count() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut mux = crate::event_mux::make_event_multiplexer().expect("mux");
+        mux.register_user(0).expect("register user wake");
+        let epoll_backing = Arc::new(RwLock::new(OpenDescription::Epoll {
+            base: OpenDescriptionBase::new(0),
+            interest: HashMap::new(),
+            synthetic_interest_count: 0,
+            pending_ready: VecDeque::new(),
+            kqueue: Arc::new(crate::dispatch::EpollKqueue::new(
+                mux,
+                crate::dispatch::new_epoll_wake_registry(),
+            )),
+        }));
+        let epoll_open_file =
+            OpenFile::from_open_description_with_status_flags(Arc::clone(&epoll_backing), 0, 0);
+        let epfd = dispatcher
+            .install_fd_at_or_above(3, epoll_open_file)
+            .expect("epoll fd");
+        let target_fd = dispatcher
+            .install_fd_at_or_above(
+                4,
+                OpenFile::from_open_description_with_status_flags(
+                    Arc::new(RwLock::new(OpenDescription::Netlink {
+                        base: OpenDescriptionBase::new(0),
+                        protocol: 0,
+                        sock_type: LINUX_SOCK_DGRAM,
+                        pid: 0,
+                        groups: 0,
+                        recv_queue: VecDeque::new(),
+                    })),
+                    0,
+                    0,
+                ),
+            )
+            .expect("synthetic target fd");
+
+        let mut guest_mem = crate::dispatch::LinearMemory::new(0x1000, vec![0; 0x1000]);
+        let event_ptr = 0x1000u64;
+        let mut guest_event = [0u8; 12];
+        guest_event[0..4].copy_from_slice(&LINUX_EPOLLIN.to_le_bytes());
+        guest_mem.write_bytes(event_ptr, &guest_event).unwrap();
+        let kernel = dispatcher.capture_one_task_context().unwrap();
+        let reporter = crate::compat::CompatReporter::default();
+        let mut call = |op, event| {
+            dispatcher.dispatch(
+                &kernel,
+                SyscallRequest::new(
+                    21,
+                    SyscallArgs::from([epfd as u64, op, target_fd as u64, event, 0, 0]),
+                ),
+                &mut guest_mem,
+                &reporter,
+            )
+        };
+
+        assert!(matches!(
+            call(LINUX_EPOLL_CTL_ADD, event_ptr),
+            Ok(DispatchOutcome::Returned { value: 0 })
+        ));
+        assert_eq!(
+            match &*epoll_backing.read() {
+                OpenDescription::Epoll {
+                    synthetic_interest_count,
+                    ..
+                } => *synthetic_interest_count,
+                _ => usize::MAX,
+            },
+            1
+        );
+
+        assert!(matches!(
+            call(LINUX_EPOLL_CTL_DEL, 0),
+            Ok(DispatchOutcome::Returned { value: 0 })
+        ));
+        assert_eq!(
+            match &*epoll_backing.read() {
+                OpenDescription::Epoll {
+                    synthetic_interest_count,
+                    ..
+                } => *synthetic_interest_count,
+                _ => usize::MAX,
+            },
+            0
+        );
     }
 }
 
@@ -5705,6 +5822,7 @@ impl SyscallDispatcher {
             };
             let description = OpenDescription::Epoll {
                 interest: HashMap::new(),
+                synthetic_interest_count: 0,
                 base: OpenDescriptionBase::new(0),
                 pending_ready: VecDeque::new(),
                 kqueue: Arc::new(epoll_kqueue),
@@ -5734,6 +5852,7 @@ impl SyscallDispatcher {
             };
             let description = OpenDescription::Epoll {
                 interest: HashMap::new(),
+                synthetic_interest_count: 0,
                 base: OpenDescriptionBase::new(0),
                 pending_ready: VecDeque::new(),
                 kqueue: Arc::new(epoll_kqueue),
@@ -5793,6 +5912,7 @@ impl SyscallDispatcher {
             };
             let OpenDescription::Epoll {
                 interest,
+                synthetic_interest_count,
                 pending_ready,
                 kqueue,
                 ..
@@ -5876,6 +5996,7 @@ impl SyscallDispatcher {
                         fd,
                         EpollInterest {
                             target: target_description,
+                            host_poll_source: host_fd.is_some(),
                             event,
                             last_ready: 0,
                             last_read_avail: 0,
@@ -5884,6 +6005,9 @@ impl SyscallDispatcher {
                             reg_gen,
                         },
                     );
+                    if host_fd.is_none() {
+                        *synthetic_interest_count += 1;
+                    }
                     // A waiter parked on this instance's ppoll snapshot does
                     // not watch the just-added fd; pop it so it rebuilds.
                     kqueue.wake_parked();
@@ -5903,6 +6027,7 @@ impl SyscallDispatcher {
                     // SAME registration, so it preserves `reg_gen` (the generational
                     // handle is unchanged — see EPOLL_CTL_ADD).
                     let reg_gen = slot.reg_gen;
+                    let host_poll_source = slot.host_poll_source;
                     if let Some(host_fd) = host_fd {
                         let effective =
                             this.epoll_effective_interest(fd, event.events, 0, 0, false);
@@ -5925,6 +6050,7 @@ impl SyscallDispatcher {
                     clear_pending_epoll_ready(pending_ready, fd);
                     *slot = EpollInterest {
                         target: slot.target.clone(),
+                        host_poll_source,
                         event,
                         last_ready: 0,
                         last_read_avail: 0,
@@ -5938,7 +6064,9 @@ impl SyscallDispatcher {
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 LINUX_EPOLL_CTL_DEL => {
-                    let Some(removed) = interest.remove(&fd) else {
+                    let Some(removed) =
+                        remove_epoll_interest(interest, synthetic_interest_count, fd)
+                    else {
                         return Ok(DispatchOutcome::errno(LINUX_ENOENT));
                     };
                     if let Some(target) = removed.target {

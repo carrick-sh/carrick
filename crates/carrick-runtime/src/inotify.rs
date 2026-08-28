@@ -32,7 +32,10 @@ use zerocopy::IntoBytes;
     feature = "platform-freebsd",
     feature = "platform-netbsd"
 ))]
-use carrick_hal::event::{EventMultiplexer, PollEvent, VnodeEvents};
+use carrick_hal::event::VnodeEvents;
+use carrick_hal::event::{EventMultiplexer, PollEvent};
+#[cfg(feature = "platform-linux")]
+use carrick_hal::event::{Interest, TriggerMode};
 #[cfg(any(
     feature = "platform-macos",
     feature = "platform-freebsd",
@@ -51,11 +54,6 @@ use std::os::unix::ffi::OsStrExt;
     feature = "platform-netbsd"
 ))]
 use std::path::{Path, PathBuf};
-#[cfg(any(
-    feature = "platform-macos",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
 use std::time::Duration;
 
 // Linux inotify event/mask bits live in `carrick-abi` (the shared ABI crate).
@@ -299,6 +297,9 @@ impl Inner {
 trait InotifyBackend: Send + Sync {
     /// The backing pollable fd (the kqueue fd on macOS, the inotify fd on Linux).
     fn poll_fd(&self) -> RawFd;
+    /// Pulse the same pollable multiplexer fd used by poll/epoll after the
+    /// dispatch layer queues a synthetic record below the host watcher.
+    fn wake(&self);
     /// Register a batch of watched fds under one guest wd; mirrors the old
     /// per-platform `add_watch_fds`. Takes ownership of the fds.
     fn add_watch_fds(
@@ -324,12 +325,19 @@ struct NativeLinuxInotify {
     /// The native Linux inotify fd (`IN_NONBLOCK | IN_CLOEXEC`). Pollable
     /// directly; `read(2)` returns native `inotify_event` records.
     inotify_fd: RawFd,
+    /// Wrap the native inotify fd together with a user-wake channel so a
+    /// dispatch-synthesized record makes one pollable fd readable too.
+    mux: Mutex<Box<dyn EventMultiplexer>>,
 }
 
 #[cfg(feature = "platform-linux")]
 impl InotifyBackend for NativeLinuxInotify {
     fn poll_fd(&self) -> RawFd {
-        self.inotify_fd
+        self.mux.lock().poll_fd()
+    }
+
+    fn wake(&self) {
+        let _ = self.mux.lock().trigger_user(0);
     }
 
     fn add_watch_fds(
@@ -423,6 +431,11 @@ impl InotifyBackend for NativeLinuxInotify {
     }
 
     fn read_records(&self, max_bytes: usize, inner: &Mutex<Inner>) -> Result<Vec<u8>, LinuxErrno> {
+        // Clear both the native-fd edge and any dispatch user wake before
+        // draining records. InotifyState re-pulses the user channel below when
+        // a short read leaves queued records, preserving level readiness.
+        let mut fired = Vec::<PollEvent>::new();
+        let _ = self.mux.lock().wait(&mut fired, Some(Duration::ZERO));
         let mut inner = inner.lock();
         // Drain whatever the kernel has queued on the native inotify fd, rewrite
         // each record's wd from the host's space into the guest's, and enqueue
@@ -501,6 +514,10 @@ struct VnodeDiffInotify {
 impl InotifyBackend for VnodeDiffInotify {
     fn poll_fd(&self) -> RawFd {
         self.mux.lock().poll_fd()
+    }
+
+    fn wake(&self) {
+        let _ = self.mux.lock().trigger_user(0);
     }
 
     fn add_watch_fds(
@@ -707,7 +724,25 @@ fn make_inotify_backend() -> Option<Box<dyn InotifyBackend>> {
         if fd < 0 {
             return None;
         }
-        Some(Box::new(NativeLinuxInotify { inotify_fd: fd }))
+        let mut mux = match crate::event_mux::make_event_multiplexer() {
+            Ok(mux) => mux,
+            Err(_) => {
+                unsafe { libc::close(fd) };
+                return None;
+            }
+        };
+        if mux.register_user(0).is_err()
+            || mux
+                .register_io(fd, 1, Interest::READ, TriggerMode::Level)
+                .is_err()
+        {
+            unsafe { libc::close(fd) };
+            return None;
+        }
+        Some(Box::new(NativeLinuxInotify {
+            inotify_fd: fd,
+            mux: Mutex::new(mux),
+        }))
     }
     #[cfg(any(
         feature = "platform-macos",
@@ -715,7 +750,8 @@ fn make_inotify_backend() -> Option<Box<dyn InotifyBackend>> {
         feature = "platform-netbsd"
     ))]
     {
-        let mux = crate::event_mux::make_event_multiplexer().ok()?;
+        let mut mux = crate::event_mux::make_event_multiplexer().ok()?;
+        mux.register_user(0).ok()?;
         Some(Box::new(VnodeDiffInotify {
             mux: Mutex::new(mux),
         }))
@@ -857,6 +893,12 @@ impl InotifyState {
     pub(crate) fn enqueue(&self, wd: i32, mask: u32, cookie: u32, name: Option<&[u8]>) {
         let record = encode_event_raw(wd, mask, cookie, name);
         self.inner.lock().push_record(record);
+        // The record was produced below the host vnode/native-inotify source,
+        // so make the backend multiplexer itself readable. This is the fd on
+        // which poll, ppoll, and epoll actually park.
+        if self.queued_bytes() != 0 {
+            self.backend.wake();
+        }
     }
 
     /// Mark this instance as dispatch-authoritative: the macOS/BSD kqueue
@@ -895,7 +937,14 @@ impl InotifyState {
     /// wait on [`Self::poll_fd`]). A non-empty queue with `max_bytes` too small
     /// for a single record is signalled by `Err(EINVAL)`, matching Linux.
     pub(crate) fn read_records(&self, max_bytes: usize) -> Result<Vec<u8>, LinuxErrno> {
-        self.backend.read_records(max_bytes, &self.inner)
+        let result = self.backend.read_records(max_bytes, &self.inner);
+        // A backend wait consumes the user wake. Re-arm it when a short read or
+        // EINVAL leaves complete records queued so readiness remains level-
+        // triggered until the queue is fully drained.
+        if self.queued_bytes() != 0 {
+            self.backend.wake();
+        }
+        result
     }
 
     /// Render the per-watch `/proc/<pid>/fdinfo/<fd>` lines for this inotify
@@ -1446,6 +1495,64 @@ impl Drop for NativeLinuxInotify {
         unsafe {
             libc::close(self.inotify_fd);
         }
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_enqueue_makes_the_inotify_poll_fd_readable() {
+        let state = InotifyState::new().expect("inotify backend");
+        let wd = state.add_virtual_watch(carrick_abi::LINUX_IN_MODIFY);
+
+        let poll_readable = || {
+            let mut pfd = libc::pollfd {
+                fd: state.poll_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+            rc == 1 && pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
+        };
+
+        assert!(!poll_readable(), "a fresh inotify instance is quiet");
+        state.enqueue(wd, carrick_abi::LINUX_IN_MODIFY, 0, None);
+        assert!(
+            poll_readable(),
+            "dispatch-synthesized events must wake the same poll fd used by poll and epoll"
+        );
+    }
+
+    #[test]
+    fn short_read_rearms_dispatch_queue_level_readiness() {
+        let state = InotifyState::new().expect("inotify backend");
+        let wd = state.add_virtual_watch(carrick_abi::LINUX_IN_ALL_EVENTS);
+        state.enqueue(wd, carrick_abi::LINUX_IN_MODIFY, 0, None);
+        state.enqueue(wd, carrick_abi::LINUX_IN_ATTRIB, 0, None);
+
+        let first = state
+            .read_records(INOTIFY_EVENT_HEADER_SIZE)
+            .expect("first record");
+        assert_eq!(first.len(), INOTIFY_EVENT_HEADER_SIZE);
+
+        let mut pfd = libc::pollfd {
+            fd: state.poll_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+        assert_eq!(
+            rc, 1,
+            "a short read must leave the inotify poll fd level-readable"
+        );
+        assert_ne!(pfd.revents & libc::POLLIN, 0);
+
+        let second = state
+            .read_records(INOTIFY_EVENT_HEADER_SIZE)
+            .expect("second record");
+        assert_eq!(second.len(), INOTIFY_EVENT_HEADER_SIZE);
     }
 }
 
