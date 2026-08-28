@@ -836,15 +836,12 @@ impl KernelDebugSnapshot {
                                 .backing
                                 .as_ref()
                                 .map(|backing| backing_kind_name(backing).to_owned()),
-                            status_flags: open.and_then(|open| open.status_flags),
+                            status_flags: Some(row.status_flags),
                             offset: open.and_then(|open| open.offset),
                             host_fd: open.and_then(|open| open.host_fd),
                             path: open.and_then(|open| open.path.clone()),
                             pipe_id: open.and_then(|open| open.pipe_id),
-                            logical_fd_refs: row
-                                .backing
-                                .as_ref()
-                                .map(|backing| backing.logical_fd_refs() as u64),
+                            logical_fd_refs: Some(row.logical_fd_refs as u64),
                             epoll_interests: row
                                 .epoll_interests
                                 .iter()

@@ -139,7 +139,12 @@ impl SyscallDispatcher {
                 state: Arc::new(TimerFdState::new(clock, clock_id)),
                 base: OpenDescriptionBase::new(flags & LINUX_TFD_NONBLOCK),
             };
-            Ok(this.install_fd(description, linux_fd_flags_from_open_flags(flags)))
+            let status = flags & LINUX_TFD_NONBLOCK;
+            Ok(this.install_fd_with_status_flags(
+                description,
+                status,
+                linux_fd_flags_from_open_flags(flags),
+            ))
         }
 
         fn timerfd_settime(this, cx, fd: Fd, flags: u64, new_value: u64, old_value: u64) {
@@ -157,7 +162,9 @@ impl SyscallDispatcher {
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            let open = open_file.description.read();
+            let Some(open) = open_file.description.read() else {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            };
             let OpenDescription::TimerFd { state, .. } = &*open else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
@@ -192,7 +199,9 @@ impl SyscallDispatcher {
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            let open = open_file.description.read();
+            let Some(open) = open_file.description.read() else {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            };
             let OpenDescription::TimerFd { state, .. } = &*open else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };

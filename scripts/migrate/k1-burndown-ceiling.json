@@ -3,11 +3,11 @@
   "ceiling": {
     "create_install": 80,
     "epoll_wait": 38,
-    "inspect_misc": 152,
-    "lifecycle": 36,
-    "mapping_ring": 13,
+    "inspect_misc": 149,
+    "lifecycle": 35,
+    "mapping_ring": 11,
     "read_attempt": 13,
-    "slot_description_mutation": 17,
+    "slot_description_mutation": 16,
     "stream_transfer": 16,
     "write_attempt": 21
   }

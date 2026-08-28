@@ -166,8 +166,6 @@ pub struct IoUringDescriptionSnapshot {
     pub data_identity: HostBackingIdentity,
     pub lock_identity: HostBackingIdentity,
     pub backing_len: u64,
-    pub status_flags: u64,
-    pub logical_fd_refs: usize,
 }
 
 struct SharedMapping {
@@ -242,10 +240,6 @@ pub(crate) struct IoUringBacking {
     lock_fd: OwnedFd,
     lock_identity: HostBackingIdentity,
     local_enter: parking_lot::Mutex<()>,
-    /// Generic anonymous-inode metadata (status flags, fd-reference count,
-    /// and `/proc/self/fd` label) owned by this typed ring backing. Queue and
-    /// mapping authority never live in this view.
-    open_metadata: parking_lot::RwLock<OpenDescription>,
 }
 
 impl std::fmt::Debug for IoUringBacking {
@@ -343,12 +337,6 @@ impl IoUringBacking {
             lock_fd,
             lock_identity,
             local_enter: parking_lot::Mutex::new(()),
-            open_metadata: parking_lot::RwLock::new(OpenDescription::SyntheticFile {
-                base: OpenDescriptionBase::new(LINUX_O_RDWR),
-                path: "anon_inode:[io_uring]".to_owned(),
-                contents: Vec::new(),
-                offset: 0,
-            }),
         });
         backing.initialize_controls()?;
         Ok(backing)
@@ -454,17 +442,7 @@ impl IoUringBacking {
             lock_fd,
             lock_identity,
             local_enter: parking_lot::Mutex::new(()),
-            open_metadata: parking_lot::RwLock::new(OpenDescription::SyntheticFile {
-                base: OpenDescriptionBase::new(LINUX_O_RDWR),
-                path: "anon_inode:[io_uring]".to_owned(),
-                contents: Vec::new(),
-                offset: 0,
-            }),
         }))
-    }
-
-    pub(in crate::dispatch) fn open_metadata(&self) -> &parking_lot::RwLock<OpenDescription> {
-        &self.open_metadata
     }
 
     pub(in crate::dispatch) fn ready_events(&self, requested: u32) -> u32 {
@@ -561,30 +539,18 @@ impl crate::kernel::FileDescriptionBacking for IoUringBacking {
 
     fn snapshot_until(
         &self,
-        deadline: std::time::Instant,
+        _deadline: std::time::Instant,
     ) -> Option<crate::kernel::FileDescriptionBackingSnapshot> {
-        let metadata = self.open_metadata.try_read_until(deadline)?;
         Some(crate::kernel::FileDescriptionBackingSnapshot::IoUring(
             IoUringDescriptionSnapshot {
                 layout: self.layout_snapshot(),
                 data_identity: self.data_identity,
                 lock_identity: self.lock_identity,
                 backing_len: self.layout_snapshot().backing_len,
-                status_flags: metadata.status_flags(),
-                logical_fd_refs: metadata.fd_ref_count(),
             },
         ))
     }
 
-    fn retain_fd_ref(&self) {
-        self.open_metadata.read().retain_fd_ref();
-    }
-    fn release_fd_ref(&self) {
-        self.open_metadata.read().release_fd_ref();
-    }
-    fn fd_ref_count(&self) -> usize {
-        self.open_metadata.read().fd_ref_count()
-    }
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -820,7 +786,7 @@ impl SyscallDispatcher {
             return DispatchOutcome::errno(LINUX_EFAULT);
         }
 
-        let common = Arc::clone(backing.open_metadata.read().base().common());
+        let common = Arc::new(crate::kernel::DescriptionCommon::new(LINUX_O_RDWR));
         let description = Arc::new(
             crate::kernel::FileDescription::concrete_with_common(backing, common).unwrap_or_else(
                 |error| {
@@ -1631,7 +1597,7 @@ mod tests {
 
     fn test_description() -> (Arc<crate::kernel::FileDescription>, Arc<IoUringBacking>) {
         let backing = IoUringBacking::create(8, 4096).expect("ring backing");
-        let common = Arc::clone(backing.open_metadata.read().base().common());
+        let common = Arc::new(crate::kernel::DescriptionCommon::new(LINUX_O_RDWR));
         let description = Arc::new(
             crate::kernel::FileDescription::concrete_with_common(Arc::clone(&backing), common)
                 .expect("ring description"),

@@ -89,7 +89,7 @@ impl RetainedNetlinkDescription {
     }
 
     fn enqueue(&self, bytes: &[u8]) -> Result<(), LinuxErrno> {
-        let mut open = self.description.write();
+        let mut open = self.description.write().ok_or(LINUX_EBADF)?;
         let OpenDescription::Netlink { recv_queue, .. } = &mut *open else {
             return Err(LINUX_EBADF);
         };
@@ -332,7 +332,7 @@ fn validate_mqueue_name(name: &str) -> Result<String, LinuxErrno> {
 }
 
 struct MqDescription {
-    base: OpenDescriptionBase,
+    description: Arc<crate::kernel::FileDescription>,
     queue: Arc<MqueueInner>,
 }
 
@@ -358,7 +358,11 @@ impl SyscallDispatcher {
             .get(&fd)
             .map(crate::kernel::FileSlot::description)
             .ok_or(LINUX_EBADF)?;
-        if !matches!(&*description.read(), OpenDescription::Netlink { .. }) {
+        let is_netlink = matches!(
+            description.read().as_deref(),
+            Some(OpenDescription::Netlink { .. })
+        );
+        if !is_netlink {
             return Err(LINUX_EBADF);
         }
         // Retain while the fd-table read lock still prevents a concurrent
@@ -369,10 +373,10 @@ impl SyscallDispatcher {
 
     fn mq_description(&self, fd: i32) -> Result<MqDescription, LinuxErrno> {
         let open_file = self.open_file(fd).ok_or(LINUX_EBADF)?;
-        let open = open_file.description.read();
+        let open = open_file.description.read().ok_or(LINUX_EBADF)?;
         match &*open {
-            OpenDescription::Mqueue { base, queue } => Ok(MqDescription {
-                base: base.clone(),
+            OpenDescription::Mqueue { queue, .. } => Ok(MqDescription {
+                description: Arc::clone(&open_file.description),
                 queue: Arc::clone(queue),
             }),
             _ => Err(LINUX_EBADF),
@@ -382,7 +386,7 @@ impl SyscallDispatcher {
     fn mqueue_description_queue(
         description: &Arc<crate::kernel::FileDescription>,
     ) -> Option<Arc<MqueueInner>> {
-        let open = description.read();
+        let open = description.read()?;
         let OpenDescription::Mqueue { queue, .. } = &*open else {
             return None;
         };
@@ -463,7 +467,9 @@ impl SyscallDispatcher {
         // removal already linearized under table WRITE; take description WRITE
         // before queue so an in-flight registrar either published first (and
         // is removed here) or cannot validate the now-absent owner-local alias.
-        let open = open_file.description.write();
+        let Some(open) = open_file.description.write() else {
+            return;
+        };
         let OpenDescription::Mqueue { queue, .. } = &*open else {
             return;
         };
@@ -492,7 +498,9 @@ impl SyscallDispatcher {
         file_table: crate::kernel::FileTableId,
         open_file: &OpenFile,
     ) {
-        let open = open_file.description.write();
+        let Some(open) = open_file.description.write() else {
+            return;
+        };
         let OpenDescription::Mqueue { queue, .. } = &*open else {
             return;
         };
@@ -631,11 +639,12 @@ impl SyscallDispatcher {
                     0
                 };
             let description = OpenDescription::Mqueue {
-                base: OpenDescriptionBase::new(status_flags),
+                base: OpenDescriptionBase::new(0),
                 queue,
             };
-            let open_file = OpenFile::from_open_description(
+            let open_file = OpenFile::from_open_description_with_status_flags(
                 std::sync::Arc::new(parking_lot::RwLock::new(description)),
+                status_flags,
                 linux_fd_flags_from_open_flags(oflag),
             );
             match this.install_fd_at_or_above(0, open_file) {
@@ -681,7 +690,7 @@ impl SyscallDispatcher {
                 Ok(v) => v,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
-            let access = mq.base.status_flags() & LINUX_O_ACCMODE;
+            let access = mq.description.common().status_flags() & LINUX_O_ACCMODE;
             if access == LINUX_O_RDONLY {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
@@ -703,7 +712,8 @@ impl SyscallDispatcher {
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
 
-            let nonblock = mq.base.is_nonblocking();
+            let nonblock = LinuxOpenFlags::from_bits_truncate(mq.description.common().status_flags())
+                .contains(LinuxOpenFlags::NONBLOCK);
             let tid = cx.tid();
             loop {
                 if mq_wait_interrupted(this, cx.kernel, tid) {
@@ -756,7 +766,7 @@ impl SyscallDispatcher {
                 Ok(v) => v,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
-            let access = mq.base.status_flags() & LINUX_O_ACCMODE;
+            let access = mq.description.common().status_flags() & LINUX_O_ACCMODE;
             if access == LINUX_O_WRONLY {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
@@ -769,7 +779,8 @@ impl SyscallDispatcher {
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
 
-            let nonblock = mq.base.is_nonblocking();
+            let nonblock = LinuxOpenFlags::from_bits_truncate(mq.description.common().status_flags())
+                .contains(LinuxOpenFlags::NONBLOCK);
             let tid = cx.tid();
             loop {
                 if mq_wait_interrupted(this, cx.kernel, tid) {
@@ -831,7 +842,9 @@ impl SyscallDispatcher {
                 // READ->queue order until publication, so either unregister
                 // wins before close (and close observes no record) or close
                 // wins and this sees Closed/EBADF. There is no stale midpoint.
-                let open = description.read();
+                let Some(open) = description.read() else {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                };
                 let OpenDescription::Mqueue { queue, .. } = &*open else {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
@@ -935,7 +948,9 @@ impl SyscallDispatcher {
             // See unregister above: the read guard is the lifetime lease that
             // prevents last-close from turning the description into Closed
             // between validation and queue publication.
-            let open = description.read();
+            let Some(open) = description.read() else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
             let OpenDescription::Mqueue { queue, .. } = &*open else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
@@ -962,8 +977,16 @@ impl SyscallDispatcher {
 
             if oldattr.0 != 0 {
                 let state = mq.queue.state.lock();
+                let nonblock = LinuxOpenFlags::from_bits_truncate(
+                    mq.description.common().status_flags(),
+                )
+                .contains(LinuxOpenFlags::NONBLOCK);
                 let out = crate::linux_abi::LinuxMqAttr {
-                    mq_flags: if mq.base.is_nonblocking() { LINUX_O_NONBLOCK as i64 } else { 0 },
+                    mq_flags: if nonblock {
+                        LINUX_O_NONBLOCK as i64
+                    } else {
+                        0
+                    },
                     mq_maxmsg: state.max_msg as i64,
                     mq_msgsize: state.msg_size as i64,
                     mq_curmsgs: state.messages.len() as i64,
@@ -1367,7 +1390,7 @@ mod tests {
     ) -> (Arc<crate::kernel::FileDescription>, Arc<MqueueInner>) {
         let description = file_description(dispatcher, context, fd);
         let queue = {
-            let open = description.read();
+            let open = description.read().expect("mqueue open description");
             let OpenDescription::Mqueue { queue, .. } = &*open else {
                 panic!("fd {fd} is not an mqueue");
             };
@@ -1395,7 +1418,7 @@ mod tests {
     ) -> Vec<u8> {
         super::super::resources::with_captured_resources(context, || {
             let open_file = dispatcher.open_file(fd).expect("netlink fd");
-            let open = open_file.description.read();
+            let open = open_file.description.read().expect("netlink description");
             let OpenDescription::Netlink { recv_queue, .. } = &*open else {
                 panic!("fd {fd} is not netlink");
             };
@@ -1428,8 +1451,8 @@ mod tests {
     impl crate::kernel::TaskWaker for NetlinkObservingWaker {
         fn wake_task(&self) {
             let open = self.description.read();
-            let queued = match &*open {
-                OpenDescription::Netlink { recv_queue, .. } => recv_queue.len(),
+            let queued = match open.as_deref() {
+                Some(OpenDescription::Netlink { recv_queue, .. }) => recv_queue.len(),
                 _ => 0,
             };
             self.bytes_when_woken.store(queued, Ordering::SeqCst);

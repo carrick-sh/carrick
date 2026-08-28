@@ -502,7 +502,9 @@ impl SyscallDispatcher {
         let Some(open_file) = self.open_file(fd) else {
             return DispatchOutcome::errno(LINUX_EBADF);
         };
-        let open = open_file.description.read();
+        let Some(open) = open_file.description.read() else {
+            return synthetic_readonly_access(mode);
+        };
         match &*open {
             OpenDescription::Closed { .. } => DispatchOutcome::errno(LINUX_EBADF),
             OpenDescription::File { metadata, .. }

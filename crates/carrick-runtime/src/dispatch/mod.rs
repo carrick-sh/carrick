@@ -3529,13 +3529,15 @@ mod kernel_context_tests {
             .resources()
             .fs_context()
             .set_chroot_root(Some("/inherited/root".to_owned()));
-        let description =
-            kernel_file_description(Arc::new(RwLock::new(OpenDescription::SyntheticFile {
+        let description = kernel_file_description(
+            Arc::new(RwLock::new(OpenDescription::SyntheticFile {
                 base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
                 path: "/inherited/file".to_owned(),
                 contents: Vec::new(),
                 offset: 0,
-            })));
+            })),
+            crate::linux_abi::LINUX_O_RDONLY,
+        );
         let inherited_fd = dispatcher
             .install_fd_at_or_above(3, OpenFile::new(Arc::clone(&description), LINUX_FD_CLOEXEC))
             .unwrap();
@@ -3606,13 +3608,15 @@ mod kernel_context_tests {
         assert!(rebound_signals.altstack_enabled());
         assert_eq!(rebound_signals.handler_frame_depth(), 1);
         assert_eq!(rebound.shared().pending_signals().pending_count(), 0);
-        let post_fork_description =
-            kernel_file_description(Arc::new(RwLock::new(OpenDescription::SyntheticFile {
+        let post_fork_description = kernel_file_description(
+            Arc::new(RwLock::new(OpenDescription::SyntheticFile {
                 base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
                 path: "/post-fork/file".to_owned(),
                 contents: Vec::new(),
                 offset: 0,
-            })));
+            })),
+            crate::linux_abi::LINUX_O_RDONLY,
+        );
         assert_ne!(description.id(), post_fork_description.id());
         assert!(description.id() < post_fork_description.id());
         assert_eq!(
@@ -4551,7 +4555,7 @@ impl SyscallDispatcher {
     /// are already the guest/host fd pair.
     fn record_fd_close_owner(&self, fd: i32, guest_tid: i32, open_file: &OpenFile) {
         let guest_pid = self.event_ring_guest_pid();
-        let refs_before = open_file.description.read().fd_ref_count();
+        let refs_before = open_file.description.fd_ref_count();
         crate::event_ring::rec(crate::event_ring::FDOWNER, guest_pid, guest_tid, fd);
         crate::event_ring::rec(
             crate::event_ring::FDREF,
@@ -5774,17 +5778,9 @@ impl SyscallDispatcher {
         // duplicate to trigger the host kernel's process-lock release without
         // shortening the shared description's actual fd lifetime. OFD locks are
         // tied to the open file description and survive a non-final dup close.
-        let classic_lock_release_fd = if open_file
-            .description
-            .concrete_backing::<crate::dispatch::ioring::IoUringBacking>()
-            .is_some()
-        {
-            None
-        } else {
-            match &*open_file.description.read() {
-                OpenDescription::HostFile { host_fd, .. } => Some(host_fd.raw()),
-                _ => None,
-            }
+        let classic_lock_release_fd = match open_file.description.read().as_deref() {
+            Some(OpenDescription::HostFile { host_fd, .. }) => Some(host_fd.raw()),
+            _ => None,
         };
         if let Some(host_fd) = classic_lock_release_fd {
             let duped = unsafe { libc::dup(host_fd) };
@@ -5802,83 +5798,82 @@ impl SyscallDispatcher {
         let mut fifo_host_fd = None;
         let mut closing_inotify = None;
         let mut closing_fanotify = false;
-        if last_ref
-            && open_file
-                .description
-                .concrete_backing::<crate::dispatch::ioring::IoUringBacking>()
-                .is_none()
-        {
-            // A reuseport membership must never outlive its socket: host fds
-            // are REUSED, so a stale entry would hand a later unrelated
-            // socket's traffic to this group. Removal is by host fd and is a
-            // no-op for a socket that never joined.
-            if let OpenDescription::HostSocket { host_fd, .. } = &*open_file.description.read() {
-                crate::dispatch::net::reuseport_leave(host_fd.raw());
-                crate::dispatch::net::recverr_close(host_fd.raw());
-                // Drop this connection's SCTP message boundaries while the fd is
-                // still open — they are keyed by address pair, and a recycled
-                // pair must not inherit a dead connection's boundaries.
-                crate::dispatch::net::sctp_forget(host_fd.raw());
-                // Same rule, same reason: a recorded guest-visible address must
-                // not outlive its socket either. It used to, and a reused fd
-                // inherited the dead socket's address — glibc's `rfc3484_sort`
-                // closes an AF_INET probe socket and immediately opens an
-                // AF_INET6 one onto the same number, got the v4 sockaddr back
-                // from `getsockname`, and aborted the guest.
-                self.network
-                    .provider
-                    .forget_socket_addresses(crate::network::SocketKey::for_host_fd(host_fd.raw()));
-            }
-            // A pty SLAVE is about to close. Darwin DESTROYS whatever is still
-            // queued in the pty when the last slave fd goes away; Linux hands it
-            // over and only then reports EOF. Rescue it onto the master's
-            // staging queue, which the pipe read path already drains before it
-            // touches the host fd and the readiness paths already count.
-            let closing_slave = match &*open_file.description.read() {
-                OpenDescription::HostPipe {
-                    pty: Some(role), ..
-                } if !role.is_master => Some(role.index),
-                _ => None,
-            };
-            if let Some(index) = closing_slave {
-                self.rescue_pty_master_before_slave_close(index);
-            }
-            match &*open_file.description.read() {
-                OpenDescription::HostPipe { pty, host_fd, .. } => {
-                    fifo_host_fd = Some(host_fd.raw());
-                    if let Some(role) = pty
-                        && role.is_master
-                    {
-                        pty_master_index = Some(role.index);
+        if last_ref {
+            if let Some(open) = open_file.description.read() {
+                // A reuseport membership must never outlive its socket: host fds
+                // are REUSED, so a stale entry would hand a later unrelated
+                // socket's traffic to this group. Removal is by host fd and is a
+                // no-op for a socket that never joined.
+                if let OpenDescription::HostSocket { host_fd, .. } = &*open {
+                    crate::dispatch::net::reuseport_leave(host_fd.raw());
+                    crate::dispatch::net::recverr_close(host_fd.raw());
+                    // Drop this connection's SCTP message boundaries while the fd is
+                    // still open — they are keyed by address pair, and a recycled
+                    // pair must not inherit a dead connection's boundaries.
+                    crate::dispatch::net::sctp_forget(host_fd.raw());
+                    // Same rule, same reason: a recorded guest-visible address must
+                    // not outlive its socket either. It used to, and a reused fd
+                    // inherited the dead socket's address — glibc's `rfc3484_sort`
+                    // closes an AF_INET probe socket and immediately opens an
+                    // AF_INET6 one onto the same number, got the v4 sockaddr back
+                    // from `getsockname`, and aborted the guest.
+                    self.network.provider.forget_socket_addresses(
+                        crate::network::SocketKey::for_host_fd(host_fd.raw()),
+                    );
+                }
+                // A pty SLAVE is about to close. Darwin DESTROYS whatever is still
+                // queued in the pty when the last slave fd goes away; Linux hands it
+                // over and only then reports EOF. Rescue it onto the master's
+                // staging queue, which the pipe read path already drains before it
+                // touches the host fd and the readiness paths already count.
+                let closing_slave = match &*open {
+                    OpenDescription::HostPipe {
+                        pty: Some(role), ..
+                    } if !role.is_master => Some(role.index),
+                    _ => None,
+                };
+                if let Some(index) = closing_slave {
+                    self.rescue_pty_master_before_slave_close(index);
+                }
+                match &*open {
+                    OpenDescription::HostPipe { pty, host_fd, .. } => {
+                        fifo_host_fd = Some(host_fd.raw());
+                        if let Some(role) = pty
+                            && role.is_master
+                        {
+                            pty_master_index = Some(role.index);
+                        }
                     }
+                    // The inotify fd is closing for good: drop every dispatch-registry
+                    // entry it owned so stale watches don't keep firing (and so the
+                    // registry doesn't pin the InotifyState alive via its Arc).
+                    OpenDescription::Inotify { state, .. } => {
+                        closing_inotify = Some(Arc::clone(state));
+                    }
+                    // A fanotify fd closing is NOT automatically the end of its
+                    // group: a `dup`, or a guest fork that shared the description,
+                    // may still hold it, and a forked child routinely closes its
+                    // inherited fd while the parent keeps reading. So do not drop
+                    // the marks here — just note that a reference went away and let
+                    // the sweep below remove marks whose group actually died.
+                    OpenDescription::Fanotify { .. } => {
+                        closing_fanotify = true;
+                    }
+                    _ => {}
                 }
-                // The inotify fd is closing for good: drop every dispatch-registry
-                // entry it owned so stale watches don't keep firing (and so the
-                // registry doesn't pin the InotifyState alive via its Arc).
-                OpenDescription::Inotify { state, .. } => {
-                    closing_inotify = Some(Arc::clone(state));
-                }
-                // A fanotify fd closing is NOT automatically the end of its
-                // group: a `dup`, or a guest fork that shared the description,
-                // may still hold it, and a forked child routinely closes its
-                // inherited fd while the parent keeps reading. So do not drop
-                // the marks here — just note that a reference went away and let
-                // the sweep below remove marks whose group actually died.
-                OpenDescription::Fanotify { .. } => {
-                    closing_fanotify = true;
-                }
-                _ => {}
             }
         }
         if let Some(state) = closing_inotify {
             self.fs.inotify_registry.unregister_all(&state);
         }
         let is_inmem_stream = matches!(
-            &*open_file.description.read(),
-            OpenDescription::PipeReader { .. }
-                | OpenDescription::PipeWriter { .. }
-                | OpenDescription::EventFd { .. }
-                | OpenDescription::TimerFd { .. }
+            open_file.description.read().as_deref(),
+            Some(
+                OpenDescription::PipeReader { .. }
+                    | OpenDescription::PipeWriter { .. }
+                    | OpenDescription::EventFd { .. }
+                    | OpenDescription::TimerFd { .. }
+            )
         );
         // Drop `open_file` first so the description — and with it the last
         // `Arc<FanotifyGroup>`, if this really was the last reference — is gone

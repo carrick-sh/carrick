@@ -6860,8 +6860,10 @@ mod tests {
             .expect("active dispatch lease");
         let backing =
             crate::dispatch::ioring::IoUringBacking::create(8, 4096).expect("ring backing");
-        let description =
-            Arc::new(FileDescription::concrete(backing).expect("ring description identity"));
+        let description = Arc::new(
+            FileDescription::concrete_with_status_flags(backing, carrick_abi::LINUX_O_RDWR)
+                .expect("ring description identity"),
+        );
         let parent_mm = root.shared().mm();
         parent_mm.replace_io_uring_mappings(
             0x1000,

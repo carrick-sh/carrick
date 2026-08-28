@@ -1624,12 +1624,19 @@ impl SyscallDispatcher {
                     ),
                     mask: mask_val,
                 };
-                Ok(this.install_fd(description, linux_fd_flags_from_open_flags(flags)))
+                let status = flags & carrick_abi::LinuxOpenFlags::NONBLOCK.bits();
+                Ok(this.install_fd_with_status_flags(
+                    description,
+                    status,
+                    linux_fd_flags_from_open_flags(flags),
+                ))
             } else {
                 let Some(open_file) = this.open_file(fd.0) else {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
-                let mut open = open_file.description.write();
+                let Some(mut open) = open_file.description.write() else {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                };
                 match &mut *open {
                     OpenDescription::SignalFd { mask, .. } => {
                         *mask = mask_val;

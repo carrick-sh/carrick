@@ -77,7 +77,9 @@ impl SyscallDispatcher {
         {
             return Ok(StatRecord::synthetic("anon_inode:[io_uring]", 0, 0o600));
         }
-        let open = open_file.description.read();
+        let Some(open) = open_file.description.read() else {
+            return Err(LINUX_EBADF);
+        };
         // A named FIFO opened by path is modelled as a `HostPipe` (no pty),
         // whose `stat_source` hands back a SYNTHETIC record (hashed inode,
         // mode 0o600). But a path-stat (lstat) of the same FIFO reports the
@@ -89,6 +91,7 @@ impl SyscallDispatcher {
         // `HostPipe` but carry no recorded path, so they keep the synthetic
         // record. Recover the real FIFO stat from the fd's recorded path.
         let is_named_pipe = matches!(&*open, OpenDescription::HostPipe { pty: None, .. });
+        let source = open.stat_source();
         drop(open);
         if is_named_pipe
             && let Some(path) = self.lookup_recorded_fd_open_path(fd)
@@ -97,9 +100,6 @@ impl SyscallDispatcher {
         {
             return Ok(StatRecord::from_real(&path, &real));
         }
-        let open = open_file.description.read();
-        let source = open.stat_source();
-        drop(open);
         match source {
             OpenStatSource::Record(record) => Ok(record),
             OpenStatSource::HostStream {
@@ -229,7 +229,7 @@ mod tests {
         is_read_end: bool,
         write_kind: HostWriteKind,
     ) -> OpenFile {
-        OpenFile::from_open_description(
+        OpenFile::from_open_description_with_status_flags(
             Arc::new(RwLock::new(OpenDescription::HostPipe {
                 base: OpenDescriptionBase::new(if is_read_end {
                     LINUX_O_RDONLY
@@ -244,6 +244,11 @@ mod tests {
                 write_kind,
                 stdio_stream: None,
             })),
+            if is_read_end {
+                LINUX_O_RDONLY
+            } else {
+                LINUX_O_WRONLY
+            },
             0,
         )
     }
@@ -289,7 +294,7 @@ mod tests {
 
         let pipe_link = dispatcher
             .open_file(20)
-            .and_then(|file| file.description.read().readlink_target())
+            .and_then(|file| file.description.read()?.readlink_target())
             .expect("pipe readlink target");
         assert_eq!(pipe_link, format!("pipe:[{}]", pipe_read.ino));
     }

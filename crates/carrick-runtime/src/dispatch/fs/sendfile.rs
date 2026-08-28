@@ -108,7 +108,7 @@ impl SyscallDispatcher {
 
     fn host_fd_dev_ino(&self, fd: i32) -> Option<(i64, u64)> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.read();
+        let open = open_file.description.read()?;
         let OpenDescription::HostFile { host_fd, .. } = &*open else {
             return None;
         };
@@ -126,7 +126,7 @@ impl SyscallDispatcher {
     #[cfg(target_os = "macos")]
     fn host_file_copy_info(&self, fd: i32) -> Option<HostFileCopyInfo> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.read();
+        let open = open_file.description.read()?;
         let OpenDescription::HostFile {
             host_fd, writable, ..
         } = &*open
@@ -166,7 +166,9 @@ impl SyscallDispatcher {
         let Some(in_file) = self.open_file(in_fd) else {
             return Ok(Err(LINUX_EBADF));
         };
-        let open = in_file.description.read();
+        let Some(open) = in_file.description.read() else {
+            return Ok(Err(LINUX_EINVAL));
+        };
         match &*open {
             OpenDescription::Closed { .. } => Ok(Err(LINUX_EBADF)),
             OpenDescription::File { offset, .. }
@@ -213,7 +215,9 @@ impl SyscallDispatcher {
         let Some(in_file) = self.open_file(in_fd) else {
             return Err(LINUX_EBADF);
         };
-        let open = in_file.description.read();
+        let Some(open) = in_file.description.read() else {
+            return Err(LINUX_EINVAL);
+        };
         // HostFile: pread the requested window from the real fd. Cap the buffer:
         // callers (Go's poll.SendFile) pass count = INT_MAX, and a naive
         // `vec![0u8; count]` would zero-fill 2 GiB per call. Linux sendfile is

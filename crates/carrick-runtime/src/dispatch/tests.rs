@@ -30,12 +30,13 @@ mod overlay_dispatch_tests {
     const O_RDONLY: u64 = 0;
 
     fn eventfd_open_file(counter: u64) -> OpenFile {
-        OpenFile::from_open_description(
+        OpenFile::from_open_description_with_status_flags(
             Arc::new(RwLock::new(OpenDescription::EventFd {
                 state: Arc::new(EventFdState::new(counter)),
                 semaphore: false,
                 base: OpenDescriptionBase::new(0),
             })),
+            crate::linux_abi::LINUX_O_RDWR,
             0,
         )
     }
@@ -281,7 +282,7 @@ mod overlay_dispatch_tests {
         let mut fds = [-1; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         let owner = HostFdRef::new(fds[0]);
-        let open_file = OpenFile::from_open_description(
+        let open_file = OpenFile::from_open_description_with_status_flags(
             Arc::new(RwLock::new(OpenDescription::HostPipe {
                 base: OpenDescriptionBase::new(0),
                 host_fd: owner.clone(),
@@ -292,6 +293,7 @@ mod overlay_dispatch_tests {
                 write_kind: HostWriteKind::PipeLike,
                 stdio_stream: None,
             })),
+            crate::linux_abi::LINUX_O_RDONLY,
             0,
         );
         let wait_fds = WaitFds::anchored_one(fds[0], libc::POLLIN, Some(owner));
@@ -381,12 +383,13 @@ mod overlay_dispatch_tests {
         };
         let cloexec_fd = match dispatcher.install_fd_at_or_above(
             3,
-            OpenFile::from_open_description(
+            OpenFile::from_open_description_with_status_flags(
                 Arc::new(RwLock::new(OpenDescription::EventFd {
                     state: Arc::new(EventFdState::new(2)),
                     semaphore: false,
                     base: OpenDescriptionBase::new(0),
                 })),
+                crate::linux_abi::LINUX_O_RDWR,
                 LINUX_FD_CLOEXEC,
             ),
         ) {
@@ -415,8 +418,8 @@ mod overlay_dispatch_tests {
             unsafe { libc::fcntl(host_fd, libc::F_SETLK, &raw mut lock) },
             0
         );
-        let description =
-            kernel_file_description(Arc::new(RwLock::new(OpenDescription::HostFile {
+        let description = kernel_file_description(
+            Arc::new(RwLock::new(OpenDescription::HostFile {
                 base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
                 host_fd: HostFdRef::new(host_fd),
                 metadata: RootFsMetadata {
@@ -426,7 +429,9 @@ mod overlay_dispatch_tests {
                     size: 0,
                 },
                 writable: true,
-            })));
+            })),
+            crate::linux_abi::LINUX_O_RDWR,
+        );
         let fd = dispatcher
             .install_fd_at_or_above(3, OpenFile::new(Arc::clone(&description), 0))
             .unwrap();
@@ -450,12 +455,14 @@ mod overlay_dispatch_tests {
     #[test]
     fn dropping_drained_exec_generation_does_not_release_surviving_slot_twice() {
         let dispatcher = SyscallDispatcher::new();
-        let description =
-            kernel_file_description(Arc::new(RwLock::new(OpenDescription::EventFd {
+        let description = kernel_file_description(
+            Arc::new(RwLock::new(OpenDescription::EventFd {
                 state: Arc::new(EventFdState::new(1)),
                 semaphore: false,
                 base: OpenDescriptionBase::new(0),
-            })));
+            })),
+            crate::linux_abi::LINUX_O_RDWR,
+        );
         let fd = dispatcher
             .install_fd_at_or_above(3, OpenFile::new(Arc::clone(&description), 0))
             .unwrap();
@@ -481,8 +488,8 @@ mod overlay_dispatch_tests {
         dispatcher.close_open_file_and_free_pty(&removed);
         assert_eq!(description.fd_ref_count(), 0);
         assert!(matches!(
-            &*description.read(),
-            OpenDescription::Closed { .. }
+            description.read().as_deref(),
+            Some(OpenDescription::Closed { .. })
         ));
     }
 
@@ -492,16 +499,19 @@ mod overlay_dispatch_tests {
         let mut host_fds = [-1; 2];
         assert_eq!(unsafe { libc::pipe(host_fds.as_mut_ptr()) }, 0);
         let read_host_fd = host_fds[0];
-        let writer = kernel_file_description(Arc::new(RwLock::new(OpenDescription::HostPipe {
-            host_fd: HostFdRef::new(host_fds[1]),
-            is_read_end: false,
-            pipe_id: 0x51,
-            base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_WRONLY),
-            pty: None,
-            bidirectional: false,
-            write_kind: HostWriteKind::PipeLike,
-            stdio_stream: None,
-        })));
+        let writer = kernel_file_description(
+            Arc::new(RwLock::new(OpenDescription::HostPipe {
+                host_fd: HostFdRef::new(host_fds[1]),
+                is_read_end: false,
+                pipe_id: 0x51,
+                base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_WRONLY),
+                pty: None,
+                bidirectional: false,
+                write_kind: HostWriteKind::PipeLike,
+                stdio_stream: None,
+            })),
+            crate::linux_abi::LINUX_O_WRONLY,
+        );
         let writer_fd = dispatcher
             .install_fd_at_or_above(3, OpenFile::new(Arc::clone(&writer), LINUX_FD_CLOEXEC))
             .unwrap();
@@ -515,7 +525,7 @@ mod overlay_dispatch_tests {
         assert!(!old_files.functional_refs_active());
         assert!(old_files.read_open_files().contains_key(&writer_fd));
         assert!(replacement.resources().files().slot_count() == 0);
-        assert!(matches!(&*writer.read(), OpenDescription::Closed { .. }));
+        assert!(matches!(writer.read().as_deref(), Some(OpenDescription::Closed { .. })));
 
         let mut pollfd = libc::pollfd {
             fd: read_host_fd,
@@ -888,7 +898,7 @@ mod overlay_dispatch_tests {
 
         let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
         {
-            let open = epoll_open.description.read();
+            let open = epoll_open.description.read().expect("open description");
             let OpenDescription::Epoll { kqueue, .. } = &*open else {
                 panic!("epfd should be an epoll description");
             };
@@ -1296,7 +1306,7 @@ mod overlay_dispatch_tests {
             .open_file(registered_reader)
             .expect("registered description")
             .description;
-        let (_, is_epoll, interests, backing, owners) = epoll_description
+        let (_, is_epoll, interests, backing, owners, _, _) = epoll_description
             .snapshot_for_test(std::time::Instant::now() + std::time::Duration::from_secs(1))
             .expect("concrete epoll snapshot");
         assert!(is_epoll);
@@ -1344,7 +1354,7 @@ mod overlay_dispatch_tests {
             .epoll_rearm_after_io(&read_request, &read_outcome);
         {
             let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
-            let open = epoll_open.description.read();
+            let open = epoll_open.description.read().expect("epoll open description");
             let OpenDescription::Epoll { interest, .. } = &*open else {
                 panic!("epfd should be an epoll description");
             };
@@ -1652,7 +1662,7 @@ mod overlay_dispatch_tests {
         };
         let listener_latch = |h: &Harness| {
             let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
-            let open = epoll_open.description.read();
+            let open = epoll_open.description.read().expect("epoll open description");
             let OpenDescription::Epoll { interest, .. } = &*open else {
                 panic!("epfd should be an epoll description");
             };
@@ -1769,7 +1779,7 @@ mod overlay_dispatch_tests {
 
         let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
         {
-            let mut open = epoll_open.description.write();
+            let mut open = epoll_open.description.write().expect("epoll open description");
             let OpenDescription::Epoll { interest, .. } = &mut *open else {
                 panic!("epfd should be an epoll description");
             };
@@ -1783,7 +1793,7 @@ mod overlay_dispatch_tests {
         h.dispatcher
             .epoll_rearm_after_io(&write_request, &DispatchOutcome::Returned { value: 1 });
         {
-            let open = epoll_open.description.read();
+            let open = epoll_open.description.read().expect("epoll open description");
             let OpenDescription::Epoll { interest, .. } = &*open else {
                 panic!("epfd should be an epoll description");
             };
@@ -1799,7 +1809,7 @@ mod overlay_dispatch_tests {
             },
         );
         {
-            let open = epoll_open.description.read();
+            let open = epoll_open.description.read().expect("epoll open description");
             let OpenDescription::Epoll { interest, .. } = &*open else {
                 panic!("epfd should be an epoll description");
             };
@@ -1864,7 +1874,7 @@ mod overlay_dispatch_tests {
         assert_eq!(returned(h.call(57, [closing_dup as u64, 0, 0, 0, 0, 0])), 0);
         {
             let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
-            let open = epoll_open.description.read();
+            let open = epoll_open.description.read().expect("epoll open description");
             let OpenDescription::Epoll { interest, .. } = &*open else {
                 panic!("epfd should be an epoll description");
             };
@@ -1883,7 +1893,7 @@ mod overlay_dispatch_tests {
 
         let delivered_guest_fd = {
             let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
-            let open = epoll_open.description.read();
+            let open = epoll_open.description.read().expect("open description");
             let OpenDescription::Epoll { kqueue, .. } = &*open else {
                 panic!("epfd should be an epoll description");
             };
@@ -1907,7 +1917,7 @@ mod overlay_dispatch_tests {
         );
         assert_eq!(returned(h.call(57, [survivor as u64, 0, 0, 0, 0, 0])), 0);
         let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
-        let open = epoll_open.description.read();
+        let open = epoll_open.description.read().expect("epoll open description");
         let OpenDescription::Epoll { interest, .. } = &*open else {
             panic!("epfd should be an epoll description");
         };
@@ -3425,23 +3435,22 @@ mod overlay_dispatch_tests {
     }
 
     #[test]
-    fn status_flags_are_one_value_shared_by_the_description_and_its_backing() {
+    fn status_flags_are_one_value_owned_by_description_common() {
         let open_file = eventfd_open_file(0);
         let description = &open_file.description;
 
         // The description answers without taking the backing lock...
-        assert_eq!(description.common().status_flags(), 0);
+        assert_eq!(description.common().status_flags(), crate::linux_abi::LINUX_O_RDWR);
 
-        // ...and it is the SAME storage the enum forwarder reads, not a copy.
         description
             .common()
             .set_status_flags(carrick_abi::LINUX_O_NONBLOCK);
         assert_eq!(
-            description.read().status_flags(),
+            description.common().status_flags(),
             carrick_abi::LINUX_O_NONBLOCK
         );
 
-        description.write().set_status_flags(0);
+        description.common().set_status_flags(0);
         assert_eq!(description.common().status_flags(), 0);
     }
 
@@ -3452,22 +3461,28 @@ mod overlay_dispatch_tests {
 
         description.common().retain_fd_ref();
         description.common().set_lease(crate::linux_abi::LINUX_F_WRLCK);
-        assert_eq!(description.read().lease(), crate::linux_abi::LINUX_F_WRLCK);
+        assert_eq!(description.common().lease(), crate::linux_abi::LINUX_F_WRLCK);
         description.common().set_owner(crate::kernel::objects::AsyncIoOwner {
             owner_type: 2,
             owner_pid: 77,
         });
-        assert_eq!(description.read().owner(), (2, 77));
+        assert_eq!(
+            description.common().owner(),
+            crate::kernel::objects::AsyncIoOwner {
+                owner_type: 2,
+                owner_pid: 77,
+            }
+        );
         description.common().set_async_sig(carrick_abi::LINUX_SIGUSR2);
-        assert_eq!(description.read().async_sig(), carrick_abi::LINUX_SIGUSR2);
+        assert_eq!(description.common().async_sig(), carrick_abi::LINUX_SIGUSR2);
         description.common().set_seals(Some(0b0010));
-        assert_eq!(description.read().seals(), Some(0b0010));
+        assert_eq!(description.common().seals(), Some(0b0010));
         description.common().set_secretmem(true);
-        assert!(description.read().is_secretmem());
+        assert!(description.common().secretmem());
 
         // Drain the backing to its Closed identity shell. Reaching this state used
         // to abort the process through OpenDescription::base().
-        *description.write() = OpenDescription::Closed { was_epoll: false };
+        *description.write().expect("open description write guard") = OpenDescription::Closed { was_epoll: false };
 
         assert_eq!(description.common().fd_refs(), 1);
         assert_eq!(description.common().lease(), crate::linux_abi::LINUX_F_WRLCK);
@@ -3545,7 +3560,7 @@ mod rosetta_handshake_tests {
 mod hvpatch_in_process_fork_tests {
     use super::*;
 
-    fn fork_dispatcher(
+    pub(super) fn fork_dispatcher(
         parent: &SyscallDispatcher,
         parent_tid: crate::thread::ThreadId,
         child_tid: crate::thread::ThreadId,
@@ -3599,13 +3614,15 @@ mod hvpatch_in_process_fork_tests {
         let parent = SyscallDispatcher::new();
         let parent_context = parent.capture_one_task_context().unwrap();
         let parent_tid = parent_context.thread().registry_id();
-        let description =
-            kernel_file_description(Arc::new(RwLock::new(OpenDescription::SyntheticFile {
+        let description = kernel_file_description(
+            Arc::new(RwLock::new(OpenDescription::SyntheticFile {
                 base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
                 path: "/close-range-unshare".to_owned(),
                 contents: b"payload".to_vec(),
                 offset: 0,
-            })));
+            })),
+            crate::linux_abi::LINUX_O_RDWR,
+        );
         parent.captured_file_table().write_open_files().insert(
             3,
             OpenFile::new(Arc::clone(&description), 0),
@@ -3656,7 +3673,7 @@ mod hvpatch_in_process_fork_tests {
             .expect("parent fd 3 retained");
         assert!(Arc::ptr_eq(&parent_slot.description, &parent_after.description));
         assert!(Arc::ptr_eq(&description, &parent_after.description));
-        assert_eq!(description.read().fd_ref_count(), 1);
+        assert_eq!(parent_after.description.fd_ref_count(), 1);
     }
 
     #[test]
@@ -3711,13 +3728,15 @@ mod hvpatch_in_process_fork_tests {
         let parent = SyscallDispatcher::new();
         let parent_context = parent.capture_one_task_context().unwrap();
         let parent_tid = parent_context.thread().registry_id();
-        let description =
-            kernel_file_description(Arc::new(RwLock::new(OpenDescription::SyntheticFile {
+        let description = kernel_file_description(
+            Arc::new(RwLock::new(OpenDescription::SyntheticFile {
                 base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
                 path: "/fork-clone".to_owned(),
                 contents: b"payload".to_vec(),
                 offset: 2,
-            })));
+            })),
+            crate::linux_abi::LINUX_O_RDWR,
+        );
         parent.captured_file_table().write_open_files().insert(
             3,
             OpenFile::new(Arc::clone(&description), crate::linux_abi::LINUX_FD_CLOEXEC),
@@ -3770,26 +3789,28 @@ mod hvpatch_in_process_fork_tests {
         let parent_tid = parent_context.thread().registry_id();
 
         let shared_buf = Arc::new(RwLock::new(b"initial_data".to_vec()));
-        let desc_non_cloexec = kernel_file_description(Arc::new(RwLock::new(
-            OpenDescription::InMemoryFile {
+        let desc_non_cloexec = kernel_file_description(
+            Arc::new(RwLock::new(OpenDescription::InMemoryFile {
                 base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
                 path: "/in_memory_1.txt".to_string(),
                 contents: Arc::clone(&shared_buf),
                 offset: 0,
                 writable: true,
                 max_size: 1024 * 1024,
-            },
-        )));
-        let desc_cloexec = kernel_file_description(Arc::new(RwLock::new(
-            OpenDescription::InMemoryFile {
+            })),
+            crate::linux_abi::LINUX_O_RDWR,
+        );
+        let desc_cloexec = kernel_file_description(
+            Arc::new(RwLock::new(OpenDescription::InMemoryFile {
                 base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
                 path: "/in_memory_2.txt".to_string(),
                 contents: Arc::new(RwLock::new(b"secret".to_vec())),
                 offset: 0,
                 writable: true,
                 max_size: 1024 * 1024,
-            },
-        )));
+            })),
+            crate::linux_abi::LINUX_O_RDWR,
+        );
 
         parent.captured_file_table().write_open_files().insert(
             3,
@@ -3842,7 +3863,7 @@ mod hvpatch_in_process_fork_tests {
         let parent = SyscallDispatcher::new();
         parent.captured_file_table().write_open_files().insert(
             3,
-            OpenFile::from_open_description(
+            OpenFile::from_open_description_with_status_flags(
                 Arc::new(RwLock::new(OpenDescription::HostPipe {
                     host_fd: HostFdRef::new(read_host_fd),
                     is_read_end: true,
@@ -3853,12 +3874,13 @@ mod hvpatch_in_process_fork_tests {
                     write_kind: HostWriteKind::PipeLike,
                     stdio_stream: None,
                 })),
+                crate::linux_abi::LINUX_O_RDONLY,
                 0,
             ),
         );
         parent.captured_file_table().write_open_files().insert(
             4,
-            OpenFile::from_open_description(
+            OpenFile::from_open_description_with_status_flags(
                 Arc::new(RwLock::new(OpenDescription::HostPipe {
                     host_fd: HostFdRef::new(write_host_fd),
                     is_read_end: false,
@@ -3869,6 +3891,7 @@ mod hvpatch_in_process_fork_tests {
                     write_kind: HostWriteKind::PipeLike,
                     stdio_stream: None,
                 })),
+                crate::linux_abi::LINUX_O_WRONLY,
                 0,
             ),
         );
@@ -3926,7 +3949,7 @@ mod hvpatch_in_process_fork_tests {
         let fd = dispatcher
             .install_fd_at_or_above(
                 3,
-                OpenFile::from_open_description(Arc::clone(&description), 0),
+                OpenFile::from_open_description_with_status_flags(Arc::clone(&description), crate::linux_abi::LINUX_O_RDONLY, 0),
             )
             .unwrap();
         let parent_tid = crate::thread::ThreadId::synthetic_for_tests(5200);
@@ -3934,7 +3957,7 @@ mod hvpatch_in_process_fork_tests {
         let (child, _) = fork_dispatcher(&dispatcher, parent_tid, child_tid, 61, 62);
 
         let child_file = child.open_file(fd).unwrap();
-        assert_eq!(description.read().fd_ref_count(), 2);
+        assert_eq!(child_file.description.fd_ref_count(), 2);
         assert!(!is_last_open_file_ref(&child_file));
 
         let child_file = child
@@ -3943,8 +3966,8 @@ mod hvpatch_in_process_fork_tests {
             .remove(&fd)
             .unwrap();
         child.close_open_file_and_free_pty(&child_file);
-        assert_eq!(description.read().fd_ref_count(), 1);
         let parent_file = dispatcher.open_file(fd).unwrap();
+        assert_eq!(parent_file.description.fd_ref_count(), 1);
         assert!(is_last_open_file_ref(&parent_file));
     }
 
@@ -4025,7 +4048,7 @@ mod hvpatch_in_process_fork_tests {
             .expect("parent target fd")
             .description;
         let epoll_description = parent.open_file(epfd).expect("parent epoll fd").description;
-        let (_, _, _, _, owners) = target_description
+        let (_, _, _, _, owners, _, _) = target_description
             .snapshot_for_test(std::time::Instant::now() + std::time::Duration::from_secs(1))
             .expect("target reverse epoll snapshot");
         assert_eq!(owners, vec![(epoll_description.id(), read_fd)]);
@@ -4050,12 +4073,12 @@ mod hvpatch_in_process_fork_tests {
             DispatchOutcome::Returned { value: 0 }
         );
 
-        let (_, _, _, _, owners) = target_description
+        let (_, _, _, _, owners, _, _) = target_description
             .snapshot_for_test(std::time::Instant::now() + std::time::Duration::from_secs(1))
             .expect("detached target snapshot");
         assert!(owners.is_empty());
         let epoll = parent.open_file(epfd).expect("parent epoll fd");
-        let epoll = epoll.description.read();
+        let epoll = epoll.description.read().expect("epoll open description");
         let OpenDescription::Epoll { interest, .. } = &*epoll else {
             panic!("epoll fd changed description kind");
         };
@@ -4173,7 +4196,7 @@ mod hvpatch_in_process_fork_tests {
         );
 
         let epoll = parent.open_file(epfd).expect("parent epoll fd");
-        let epoll = epoll.description.read();
+        let epoll = epoll.description.read().expect("epoll open description");
         let OpenDescription::Epoll { interest, .. } = &*epoll else {
             panic!("epoll fd changed description kind");
         };
@@ -4201,7 +4224,7 @@ mod hvpatch_in_process_fork_tests {
         );
         let epoll = parent.open_file(epfd).expect("parent epoll fd");
         let poll_fd = {
-            let epoll = epoll.description.read();
+            let epoll = epoll.description.read().expect("open description");
             let OpenDescription::Epoll { kqueue, .. } = &*epoll else {
                 panic!("epoll fd changed description kind");
             };
@@ -5400,7 +5423,7 @@ mod container_clock_tests {
             DispatchOutcome::Returned { value: 0 }
         );
         let open_file = dispatcher.open_file(fd as i32).expect("timerfd open file");
-        let open = open_file.description.read();
+        let open = open_file.description.read().expect("timerfd open description");
         let OpenDescription::TimerFd { state, .. } = &*open else {
             panic!("fd {fd} is not a timerfd");
         };
@@ -5516,5 +5539,223 @@ mod container_caps_tests {
         let bit = 1u64 << CAP_SYS_ADMIN;
         assert_ne!(container_with(&["SYS_ADMIN"]).granted_caps().effective & bit, 0);
         assert_eq!(container_with(&[]).granted_caps().effective & bit, 0);
+    }
+}
+
+#[test]
+fn a_backing_with_no_open_description_answers_generic_questions_without_aborting() {
+    // A backing that is NOT RwLock<OpenDescription> and carries no shadow copy
+    // of one. Before this change, asking it a generic question reached
+    // the open description resolver, which aborted the process.
+    #[derive(Debug)]
+    struct BareBacking;
+
+    impl crate::kernel::FileDescriptionBacking for BareBacking {
+        fn is_epoll(&self) -> bool {
+            false
+        }
+
+        fn snapshot_until(
+            &self,
+            _deadline: std::time::Instant,
+        ) -> Option<crate::kernel::FileDescriptionBackingSnapshot> {
+            None
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    let description = crate::kernel::FileDescription::concrete_with_common(
+        std::sync::Arc::new(BareBacking),
+        std::sync::Arc::new(crate::kernel::DescriptionCommon::new(
+            carrick_abi::LINUX_O_NONBLOCK,
+        )),
+    )
+    .expect("file description identity");
+
+    assert_eq!(
+        description.common().status_flags(),
+        carrick_abi::LINUX_O_NONBLOCK
+    );
+    assert_eq!(description.common().fd_refs(), 0);
+    assert!(!description.is_epoll());
+    assert!(description.open_description().is_none());
+    assert!(description.read().is_none());
+    assert!(description.write().is_none());
+
+    // Exercise retain_fd_ref() and release_fd_ref() directly on FileDescription,
+    // asserting common counts after each and proving default no-op hooks make a third backing valid.
+    description.retain_fd_ref();
+    assert_eq!(description.common().fd_refs(), 1);
+    description.retain_fd_ref();
+    assert_eq!(description.common().fd_refs(), 2);
+    description.release_fd_ref();
+    assert_eq!(description.common().fd_refs(), 1);
+    description.release_fd_ref();
+    assert_eq!(description.common().fd_refs(), 0);
+}
+
+#[test]
+fn pipe_lifecycle_tracks_logical_fd_references_across_dup_and_close() {
+    fn poll_fd_readable(fd: i32) -> bool {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd as *mut _, 1, 0) };
+        rc == 1 && pfd.revents & libc::POLLIN != 0
+    }
+
+    let parent = SyscallDispatcher::new();
+    let pipe = Arc::new(crate::dispatch::fs::PipeInner::new(42, 65536));
+    let mut read_base = OpenDescriptionBase::new(LINUX_O_RDONLY);
+    read_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+    let mut write_base = OpenDescriptionBase::new(LINUX_O_WRONLY);
+    write_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+
+    let read_desc = Arc::new(RwLock::new(OpenDescription::PipeReader {
+        base: read_base,
+        pipe: Arc::clone(&pipe),
+    }));
+    let write_desc = Arc::new(RwLock::new(OpenDescription::PipeWriter {
+        base: write_base,
+        pipe: Arc::clone(&pipe),
+    }));
+
+    let read_file = OpenFile::from_open_description_with_status_flags(
+        Arc::clone(&read_desc),
+        LINUX_O_RDONLY,
+        0,
+    );
+    let write_file = OpenFile::from_open_description_with_status_flags(
+        Arc::clone(&write_desc),
+        LINUX_O_WRONLY,
+        0,
+    );
+
+    let (read_fd, write_fd) = parent
+        .install_fd_pair_at_or_above(3, read_file, write_file)
+        .expect("install pipe pair");
+
+    let read_description = parent.open_file(read_fd).expect("read file").description();
+    let write_description = parent.open_file(write_fd).expect("write file").description();
+
+    let read_poll_fd = pipe.read_poll_fd().expect("read poll fd").raw();
+    let write_poll_fd = pipe.write_poll_fd().expect("write poll fd").raw();
+
+    // 1. Initial installation activates exactly one reader/writer endpoint and readiness state.
+    assert_eq!(read_description.common().fd_refs(), 1);
+    assert_eq!(write_description.common().fd_refs(), 1);
+    {
+        let state = pipe.state.lock();
+        assert_eq!(state.readers, 1);
+        assert_eq!(state.writers, 1);
+    }
+    // Pipe has active writer and empty buffer: not readable, but is writable.
+    assert!(
+        !poll_fd_readable(read_poll_fd),
+        "an empty pipe with an active writer must not be read-ready"
+    );
+    assert!(
+        poll_fd_readable(write_poll_fd),
+        "an empty pipe with an active reader must be write-ready"
+    );
+
+    // 2. Real in-process fork path increments DescriptionCommon fd_refs
+    // without duplicating backing pipe endpoints or perturbing readiness.
+    let parent_tid = crate::thread::ThreadId::synthetic_for_tests(6000);
+    let child_tid = crate::thread::ThreadId::synthetic_for_tests(6001);
+    let (child, _) = hvpatch_in_process_fork_tests::fork_dispatcher(&parent, parent_tid, child_tid, 71, 72);
+
+    assert_eq!(read_description.common().fd_refs(), 2);
+    assert_eq!(write_description.common().fd_refs(), 2);
+    {
+        let state = pipe.state.lock();
+        assert_eq!(
+            state.readers, 1,
+            "fork copy must not increment backing reader endpoint count"
+        );
+        assert_eq!(
+            state.writers, 1,
+            "fork copy must not increment backing writer endpoint count"
+        );
+    }
+    assert!(
+        !poll_fd_readable(read_poll_fd),
+        "fork copy must not publish EOF/read readiness"
+    );
+
+    // 3. Intermediate close of the write end (in parent) decrements logical ref to 1
+    // but retains the backing endpoint (writers=1) and does NOT publish EOF or wake readers.
+    parent.close_fd_for_internal_rollback(write_fd);
+    assert_eq!(write_description.common().fd_refs(), 1);
+    {
+        let state = pipe.state.lock();
+        assert_eq!(
+            state.writers, 1,
+            "intermediate close must retain backing writer count"
+        );
+        assert!(
+            matches!(&*write_desc.read(), OpenDescription::PipeWriter { .. }),
+            "intermediate close must not close the OpenDescription backing"
+        );
+    }
+    assert!(
+        !poll_fd_readable(read_poll_fd),
+        "intermediate close of write end must not publish EOF to readers"
+    );
+
+    // 4. Final release of the write end (in child) drops logical ref to 0, decrements
+    // backing endpoint (writers=0), publishes EOF to readers, and transitions backing to Closed.
+    child.close_fd_for_internal_rollback(write_fd);
+    assert_eq!(write_description.common().fd_refs(), 0);
+    {
+        let state = pipe.state.lock();
+        assert_eq!(
+            state.writers, 0,
+            "final release must decrement backing writer count to 0"
+        );
+        assert!(
+            matches!(&*write_desc.read(), OpenDescription::Closed { .. }),
+            "final release must transition OpenDescription to Closed"
+        );
+    }
+    assert!(
+        poll_fd_readable(read_poll_fd),
+        "final release of last writer must publish EOF / wake readers"
+    );
+
+    // 5. Intermediate close of read end (in parent) retains reader endpoint (readers=1).
+    parent.close_fd_for_internal_rollback(read_fd);
+    assert_eq!(read_description.common().fd_refs(), 1);
+    {
+        let state = pipe.state.lock();
+        assert_eq!(
+            state.readers, 1,
+            "intermediate close must retain backing reader count"
+        );
+        assert!(
+            matches!(&*read_desc.read(), OpenDescription::PipeReader { .. }),
+            "intermediate close must not close reader OpenDescription backing"
+        );
+    }
+
+    // 6. Final release of read end (in child) drops logical ref to 0, decrements readers=0,
+    // and transitions OpenDescription to Closed.
+    child.close_fd_for_internal_rollback(read_fd);
+    assert_eq!(read_description.common().fd_refs(), 0);
+    {
+        let state = pipe.state.lock();
+        assert_eq!(
+            state.readers, 0,
+            "final release must decrement backing reader count to 0"
+        );
+        assert!(
+            matches!(&*read_desc.read(), OpenDescription::Closed { .. }),
+            "final release must transition reader OpenDescription to Closed"
+        );
     }
 }

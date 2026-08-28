@@ -831,13 +831,14 @@ fn file_private_fixed_shared_aperture_repoints_snapshot_and_publishes_map_time_b
     file_bytes.extend_from_slice(&[0x90, 0xc3, 0x4a]);
     dispatcher.captured_file_table().write_open_files().insert(
         FD,
-        OpenFile::from_open_description(
+        OpenFile::from_open_description_with_status_flags(
             std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {
                 base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
                 path: "private-replacement".into(),
                 contents: file_bytes,
                 offset: 0,
             })),
+            crate::linux_abi::LINUX_O_RDONLY,
             0,
         ),
     );
@@ -991,31 +992,35 @@ fn private_file_snapshot_computes_identical_bus_tail_for_memfd_synthetic_and_hos
         mode: 0o600,
         size: FILE_LENGTH,
     };
-    let memfd_base = OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR);
-    memfd_base.set_seals(Some(0));
+    let memfd_common = std::sync::Arc::new(crate::kernel::DescriptionCommon::new(
+        crate::linux_abi::LINUX_O_RDWR,
+    ));
+    memfd_common.set_seals(Some(0));
     dispatcher.captured_file_table().write_open_files().insert(
         20,
-        OpenFile::from_open_description(
+        OpenFile::from_open_description_with_common(
             std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::File {
-                base: memfd_base,
+                base: OpenDescriptionBase::new(0),
                 path: "/memfd:private-eof".into(),
                 metadata: metadata.clone(),
                 contents: FileContents::dense(payload.clone()),
                 offset: 0,
                 writable: true,
             })),
+            memfd_common,
             0,
         ),
     );
     dispatcher.captured_file_table().write_open_files().insert(
         21,
-        OpenFile::from_open_description(
+        OpenFile::from_open_description_with_status_flags(
             std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {
                 base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
                 path: "/synthetic-private-eof".into(),
                 contents: payload.clone(),
                 offset: 0,
             })),
+            crate::linux_abi::LINUX_O_RDONLY,
             0,
         ),
     );
@@ -1033,13 +1038,14 @@ fn private_file_snapshot_computes_identical_bus_tail_for_memfd_synthetic_and_hos
     );
     dispatcher.captured_file_table().write_open_files().insert(
         22,
-        OpenFile::from_open_description(
+        OpenFile::from_open_description_with_status_flags(
             std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::HostFile {
                 base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
                 host_fd: HostFdRef::new(host_file.into_raw_fd()),
                 metadata,
                 writable: false,
             })),
+            crate::linux_abi::LINUX_O_RDONLY,
             0,
         ),
     );
@@ -1082,7 +1088,7 @@ fn shared_mmap_refreshes_an_independently_opened_vfs_inode() {
     let install_snapshot = |fd| {
         dispatcher.captured_file_table().write_open_files().insert(
             fd,
-            OpenFile::from_open_description(
+            OpenFile::from_open_description_with_status_flags(
                 std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::File {
                     base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
                     path: PATH.into(),
@@ -1096,6 +1102,7 @@ fn shared_mmap_refreshes_an_independently_opened_vfs_inode() {
                     offset: 0,
                     writable: true,
                 })),
+                crate::linux_abi::LINUX_O_RDWR,
                 0,
             ),
         );
@@ -1150,7 +1157,7 @@ fn shared_mmap_refreshes_an_independently_opened_vfs_inode() {
     );
     let mapper = dispatcher.open_file(MAPPER_FD).expect("mapper fd");
     assert_eq!(
-        match &*mapper.description.read() {
+        match &*mapper.description.read().expect("mapper open description") {
             OpenDescription::File { contents, .. } => contents.len(),
             other => panic!("expected File, got {other:?}"),
         },
@@ -1251,7 +1258,7 @@ fn install_host_file_fd(dispatcher: &SyscallDispatcher, fd: i32, payload: &[u8])
     );
     dispatcher.captured_file_table().write_open_files().insert(
         fd,
-        OpenFile::from_open_description(
+        OpenFile::from_open_description_with_status_flags(
             std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::HostFile {
                 base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
                 host_fd: HostFdRef::new(host_file.into_raw_fd()),
@@ -1263,6 +1270,7 @@ fn install_host_file_fd(dispatcher: &SyscallDispatcher, fd: i32, payload: &[u8])
                 },
                 writable: false,
             })),
+            crate::linux_abi::LINUX_O_RDONLY,
             0,
         ),
     );
@@ -1385,7 +1393,7 @@ fn mmap_private_hostfile_refusal_with_unstattable_fd_keeps_legacy_success() {
     assert_eq!(unsafe { libc::close(dead) }, 0);
     dispatcher.captured_file_table().write_open_files().insert(
         34,
-        OpenFile::from_open_description(
+        OpenFile::from_open_description_with_status_flags(
             std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::HostFile {
                 base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
                 host_fd: HostFdRef::new(dead),
@@ -1397,6 +1405,7 @@ fn mmap_private_hostfile_refusal_with_unstattable_fd_keeps_legacy_success() {
                 },
                 writable: false,
             })),
+            crate::linux_abi::LINUX_O_RDONLY,
             0,
         ),
     );
@@ -5815,14 +5824,15 @@ fn range_owned_metadata_removal_clears_every_mmap_classification() {
     let len = 2 * LINUX_PAGE_SIZE;
     let range = crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start + len))
         .expect("metadata range");
-    let writable_memfd = kernel_file_description(std::sync::Arc::new(parking_lot::RwLock::new(
-        OpenDescription::SyntheticFile {
+    let writable_memfd = kernel_file_description(
+        std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {
             base: OpenDescriptionBase::new(0),
             path: "memfd:metadata-remove".into(),
             contents: Vec::new(),
             offset: 0,
-        },
-    )));
+        })),
+        crate::linux_abi::LINUX_O_RDWR,
+    );
     dispatcher.record_dynamic_mapping(
         start,
         len,
@@ -5861,14 +5871,15 @@ fn replacement_commit_trims_every_predecessor_classification_to_prefix_and_suffi
     let middle = start + page;
     let whole = crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start + len))
         .expect("whole predecessor range");
-    let writable_memfd = kernel_file_description(std::sync::Arc::new(parking_lot::RwLock::new(
-        OpenDescription::SyntheticFile {
+    let writable_memfd = kernel_file_description(
+        std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {
             base: OpenDescriptionBase::new(0),
             path: "memfd:split-predecessor".into(),
             contents: Vec::new(),
             offset: 0,
-        },
-    )));
+        })),
+        crate::linux_abi::LINUX_O_RDWR,
+    );
     dispatcher.record_dynamic_mapping(
         start,
         len,
@@ -6096,14 +6107,15 @@ fn host_alias_abort_preserves_replaced_vma_lock_residency_bus_and_seal_metadata(
         ProcMapSharing::Private,
         "prior".to_string(),
     );
-    let writable_memfd = kernel_file_description(std::sync::Arc::new(parking_lot::RwLock::new(
-        OpenDescription::SyntheticFile {
+    let writable_memfd = kernel_file_description(
+        std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {
             base: OpenDescriptionBase::new(0),
             path: "memfd:test".into(),
             contents: Vec::new(),
             offset: 0,
-        },
-    )));
+        })),
+        crate::linux_abi::LINUX_O_RDWR,
+    );
     {
         let mem_authority_124 = dispatcher.mem();
         let mut mem = mem_authority_124.lock();

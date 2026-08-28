@@ -335,7 +335,7 @@ impl SyscallDispatcher {
     /// not a bpf map).
     fn bpf_map_fd(&self, fd: i32) -> Result<Arc<BpfMap>, LinuxErrno> {
         let open_file = self.open_file(fd).ok_or(LINUX_EBADF)?;
-        let open = open_file.description.read();
+        let open = open_file.description.read().ok_or(LINUX_EINVAL)?;
         match &*open {
             OpenDescription::BpfMap { map, .. } => Ok(map.clone()),
             _ => Err(LINUX_EINVAL),
@@ -345,8 +345,9 @@ impl SyscallDispatcher {
     /// Install an anonymous bpf object fd. Linux creates bpf fds
     /// close-on-exec (`bpf(2)`).
     fn install_bpf_fd(&self, description: OpenDescription) -> Result<i32, LinuxErrno> {
-        let open_file = OpenFile::from_open_description(
+        let open_file = OpenFile::from_open_description_with_status_flags(
             std::sync::Arc::new(parking_lot::RwLock::new(description)),
+            carrick_abi::LINUX_O_RDWR,
             linux_fd_flags_from_open_flags(carrick_abi::LINUX_O_CLOEXEC),
         );
         self.install_fd_at_or_above(0, open_file)
