@@ -4789,7 +4789,7 @@ mod tests {
             "PreparedInProcessFork::SuspendVfork",
             "if is_external_exec || request.clone_parent",
             "PreparedInProcessFork::Retry",
-            "subscribe_quiesced_progress",
+            "subscribe_lease_drain",
             "try_acquire_topology_lock",
             "subscribe_topology_release",
             "parent_context.task().threads().len().saturating_sub(1)",
