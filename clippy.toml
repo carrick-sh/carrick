@@ -16,6 +16,7 @@ disallowed-methods = [
     { path = "libc::getuid", reason = "HA-CATALOG-PROCESS-GETUID: host user identity requires reviewed authority" },
     { path = "libc::kill", reason = "HA-CATALOG-PROCESS-KILL: host signal target or liveness requires reviewed authority" },
     { path = "libc::killpg", reason = "HA-CATALOG-PROCESS-KILLPG: host process-group signaling requires reviewed authority" },
+    { path = "libc::proc_listallpids", reason = "HA-CATALOG-PROCESS-LIST-ALL-PIDS: host process enumeration requires reviewed authority" },
     { path = "libc::setrlimit", reason = "HA-CATALOG-PROCESS-SETRLIMIT: host resource-limit mutation requires reviewed authority" },
     { path = "libc::syscall", reason = "HA-CATALOG-ESCAPE-SYSCALL: raw host syscall dispatch can bypass reviewed host-operation bindings" },
     { path = "libc::wait4", reason = "HA-CATALOG-PROCESS-WAIT4: host child state requires reviewed authority" },

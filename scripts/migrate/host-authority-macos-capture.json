@@ -1,10 +1,10 @@
 {
-  "catalog_sha256": "78bbda851abe90bc1336e6aee5124545142860fa02fcba739f65a0b1f0f8baba",
+  "catalog_sha256": "aa230c66221233fd4f87b931261e33b4975eedfb45efa04d6929a502a7d392ad",
   "diagnostic_counts": {
-    "macos-cli-default": 640,
+    "macos-cli-default": 642,
     "macos-hvf-default": 93,
-    "macos-runtime-default": 463,
-    "merged": 640
+    "macos-runtime-default": 465,
+    "merged": 642
   },
   "executed_profiles": [
     "macos-cli-default",
@@ -1499,6 +1499,46 @@
         "line": 321,
         "line_end": 321,
         "line_start": 321
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-PROCESS-LIST-ALL-PIDS",
+      "expansion": null,
+      "operation": "libc::proc_listallpids",
+      "profiles": [
+        "macos-cli-default",
+        "macos-runtime-default"
+      ],
+      "source": {
+        "byte_end": 101417,
+        "byte_start": 101395,
+        "column": 26,
+        "column_end": 48,
+        "column_start": 26,
+        "file": "crates/carrick-runtime/src/vfs/proc.rs",
+        "line": 2330,
+        "line_end": 2330,
+        "line_start": 2330
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-PROCESS-LIST-ALL-PIDS",
+      "expansion": null,
+      "operation": "libc::proc_listallpids",
+      "profiles": [
+        "macos-cli-default",
+        "macos-runtime-default"
+      ],
+      "source": {
+        "byte_end": 101668,
+        "byte_start": 101646,
+        "column": 24,
+        "column_end": 46,
+        "column_start": 24,
+        "file": "crates/carrick-runtime/src/vfs/proc.rs",
+        "line": 2336,
+        "line_end": 2336,
+        "line_start": 2336
       }
     },
     {
@@ -12796,7 +12836,7 @@
       }
     }
   ],
-  "rows_sha256": "fc7426ccedfc5be01101dae9f343832672e7ded1249f5887f39c7d37580e0e74",
+  "rows_sha256": "8700cc1ece75cb99c31c8f994489cb2cf5edcb08a0fbf9d5664096da203969c0",
   "schema": 1,
   "source_head": "dd345b9f8c6b5a76e265d6de1e1c8d8466a8f150",
   "toolchain": {
