@@ -1,6 +1,6 @@
 # Carrick exact conformance closure handoff
 
-**Updated:** 2026-08-27 (session 17 — netflagmatrix closes both libc lanes; Linux MSG_TRUNC and RDHUP semantics corrected)
+**Updated:** 2026-08-27 (session 18 — archiveflagmatrix closes both libc lanes; path errno/follow semantics corrected)
 
 **Canonical host/lane:** macOS, Apple Silicon, HVF/HVPatch, Linux arm64 guest
 
@@ -56,6 +56,48 @@ Execution is a directed-worker model:
 Complete only when fail-closed gate integrity, exact correctness, and the <=2x
 performance gate pass together on the final integrated signed artifact. Do not
 push unless explicitly asked. Preserve unrelated worktree changes.
+
+## SESSION 18 — 2026-08-27: archiveflagmatrix closed on both libc lanes
+
+`b341b6f4f` closes all three deterministic `archiveflagmatrix` differences
+without changing the probe or committed Docker oracle:
+
+- `getdents64` on an existing non-directory fd now returns Linux `ENOTDIR`
+  rather than conflating a valid fd of the wrong type with `EBADF`;
+- no-follow `lsetxattr` validates the symlink itself, so `user.*` on a symlink
+  returns Linux `EPERM` instead of following the target and succeeding; and
+- `linkat(..., AT_SYMLINK_FOLLOW)` canonicalizes an ordinary symlink source
+  before creating the hard link, while retaining the existing anonymous-fd
+  handling path.
+
+The embedded matrix witnessed the exact three-line red state first on both
+arm64 musl and glibc. After the runtime correction it failed closed as an
+unexpected pass until `archiveflagmatrix` was removed from both expected-gap
+sets. The final committed-source run executed both libc lanes in 0.46 seconds
+under a 15-second hard outer bound, with the unentitled negative control green.
+No Docker oracle was started.
+
+The adjacent cached-only embedded battery executed `lxattr`, `pathflagmatrix`,
+`shmlinkat`, `symlinkfollow`, and `linkatflag` across both libc lanes in addition
+to `archiveflagmatrix`; all 12 libc/probe rows passed. Focused warnings-denied
+clippy for `carrick-runtime` and `carrick-conformance-next`, formatting, and
+diff checks passed.
+
+Authoritative signed artifact:
+
+| field | value |
+|---|---|
+| source HEAD | `b341b6f4f189b024a62853c6431abf0466a3646e` |
+| binary SHA-256 | `517939765f1d56a67620c0d787c577d11cf9dce8e5f6576cbde2fba49e6e5d35` |
+| CDHash | `59fb2fc1be206f49e8cca1d9231dd97996540abf` |
+| LC_UUID | `FB5DB73C-C579-3D6F-977B-7B65EFB993FB` |
+| hypervisor entitlement | present |
+| `__dof_carrick` | present |
+
+Three approved read-only Antigravity audits are running concurrently over
+filesystem, process/signal, and network/event coverage. Review their concrete
+missing-interface findings before creating isolated write-worker tasks; do not
+accept proposed coverage based on the report alone.
 
 ## SESSION 17 — 2026-08-27: netflagmatrix closed on both libc lanes
 
