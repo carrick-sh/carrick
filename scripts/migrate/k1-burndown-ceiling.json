@@ -7,7 +7,7 @@
     "lifecycle": 35,
     "mapping_ring": 11,
     "read_attempt": 13,
-    "slot_description_mutation": 16,
+    "slot_description_mutation": 14,
     "stream_transfer": 16,
     "write_attempt": 21
   }

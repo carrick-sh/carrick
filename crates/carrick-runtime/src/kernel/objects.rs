@@ -699,7 +699,6 @@ pub(crate) struct DescriptionCommon {
     seals: Mutex<Option<u32>>,
 }
 
-#[allow(dead_code)]
 impl DescriptionCommon {
     pub(crate) fn new(status_flags: u64) -> Self {
         Self {
