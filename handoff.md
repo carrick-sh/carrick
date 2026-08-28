@@ -1,6 +1,6 @@
 # Carrick exact conformance closure handoff
 
-**Updated:** 2026-08-27 (session 19 — three missing-interface probes added; all newly exposed gaps closed)
+**Updated:** 2026-08-27 (session 21 — three probe families integrated; clean stopping checkpoint)
 
 **Canonical host/lane:** macOS, Apple Silicon, HVF/HVPatch, Linux arm64 guest
 
@@ -56,6 +56,120 @@ Execution is a directed-worker model:
 Complete only when fail-closed gate integrity, exact correctness, and the <=2x
 performance gate pass together on the final integrated signed artifact. Do not
 push unless explicitly asked. Preserve unrelated worktree changes.
+
+## SESSION 21 — 2026-08-27: inotify/eventfd/memfd batch integrated
+
+Three isolated Antigravity workers produced file-disjoint probe families and
+Codex reviewed each final source before integration:
+
+- `015aa7807` adds `inotifymatrix`;
+- `cc016ceaf` adds `memfdsealmatrix`; and
+- `9f1c243ab` adds `eventfdsignalmatrix`, with thread-local signal masking and
+  bounded pending-signal draining rather than process-global dispositions.
+
+`dbe0bcaf7` wires all three into the authoritative 490-source inventory and the
+exact 442-probe three-way embedded partition, and commits six source-hash-
+validated arm64 musl/glibc Docker oracle entries. The oracle refresh was one
+deliberate serialized Docker-only phase; routine execution is cached and has no
+Docker dependency.
+
+The embedded red-first pass found no eventfd/signalfd difference, one real
+memfd coherence difference, and five inotify differences. `bd437a4dc` closes
+the bounded inotify seams: bad-fd errno precedence, same-path watch replacement
+and `IN_MASK_ADD`, explicit `IN_IGNORED`, and queued-record `FIONREAD`. The
+committed-source event/inotify four-row reducer passes in 1.76 seconds and the
+two-row memfd reducer passes expected-gap accounting in 0.42 seconds. The
+memfd difference is deliberately still fail-closed: an existing writable
+`MAP_SHARED` alias does not become immediately coherent with `pread` after
+`F_SEAL_FUTURE_WRITE`. Correcting that requires a live shared-file alias seam,
+not a local errno patch, so it was not expanded into an architectural rabbit
+hole.
+
+Two harness integrity findings were also closed. `72b6c6052` removes an
+artificial process-group boundary that made the sole retained CLI contract hang
+inside its Rust test wrapper, while the identical direct CLI invocation passed;
+it also reduces the per-case deadline from 45 seconds to 8 seconds. All five
+exit/stream contracts then pass in 1.04-1.25 seconds. `d15a722a1` refreshes the
+hard denominator invariant to 490 sources, 464 conformance sources (442 generic
++ 22 dedicated), and 928 two-libc conformance rows.
+
+Focused public `just conformance-probes` with only the three new generic probes
+selected is green, including 24 core embed cases, the CLI boundary contract,
+the retained probe sweep, and both entitlement controls. Its transcript is
+`/tmp/carrick-s20-new3-quiet.log`. The unfiltered cached aggregate was then run
+with no Docker phase and correctly failed closed. It reported six unexpected
+failures (`memflagmatrix`, `nsfsioctl`, `oomscoreadj`, `clocksettimevdso`,
+`procselfdir`, `usernsisolation`) and nineteen candidate fixed gaps across the
+three shards. Do not bulk edit either baseline from this one load-sensitive
+run. Repeat each small filtered set on a quiet host, at least twice, then remove
+only stable unexpected passes and reduce stable failures through embed. Receipt:
+`/tmp/carrick-confnext-full-d15a722a.log`.
+
+Authoritative signed stopping artifact:
+
+| field | value |
+|---|---|
+| source HEAD | `d15a722a181180784e8c60319116c5e5fc40d420` |
+| binary SHA-256 | `4f9b6097b03b0020bcbed52f53c96c9ce3708145b32150877877b99a3b8bb7b9` |
+| CDHash | `1cb0bc6098748f17ca208af26a3caddbcf154245` |
+| LC_UUID | `972A7FE1-016A-3378-BDFE-D75874E12EFF` |
+| hypervisor entitlement | present |
+| `__dof_carrick` | present |
+
+The frozen 2,127-suite correctness ledger has not yet been refreshed after this
+batch, and the <=2x ecosystem performance gate remains pending. Resume with the
+small repeated embedded filters above; do not launch Docker or the exhaustive
+suite until those classifications are stable.
+
+## SESSION 20 — 2026-08-27: PTY reducer closed; next probe batch isolated
+
+`7045be836` removes `ptyflagmatrix` from both centralized expected-gap sets.
+The original exact reducer had two apparent differences on both libc lanes.
+One was a probe-ordering defect: it queried slave-side `FIONREAD` immediately
+after a master write, before Linux's asynchronous line discipline published
+readiness, despite the probe comment claiming it measured the stable four-byte
+queue. Twenty serialized Docker repetitions returned the transient zero every
+time. The probe now waits on its existing bounded 500 ms poll before querying;
+the deliberately refreshed arm64 musl and glibc oracles both report four.
+
+The remaining difference was real: Darwin returns host EOF when a pty master's
+last slave closes, while Linux returns `EIO`. Carrick now translates only a
+zero-byte host read on a pty MASTER after the existing rescued-byte staging
+queue has drained. Ordinary pipes, sockets, slaves, and nonzero reads retain
+their former behavior. The probe was extended to `readv`; the new row was
+witnessed red with `read` green and `readv` returning zero, then green after
+the same role-scoped translation was restored.
+
+The final cached-only embedded matrix executes arm64 musl and glibc in 0.42
+seconds and the unsigned entitlement negative control passes. Focused
+warnings-denied clippy, formatting, diff checks, conformance-next strategy,
+the 487-source inventory check, and 42 PTY-filtered runtime host tests pass.
+Only the two source-hash-validated PTY oracle entries were refreshed; routine
+runs are Docker-independent again.
+
+Authoritative signed artifact:
+
+| field | value |
+|---|---|
+| source HEAD | `7045be8365360e65041dae65c56602bf06500af2` |
+| binary SHA-256 | `2c6b30be902b9cd1cd34c04db67d836c8d2f60b9b73d04e6a09aa874fe9024a6` |
+| CDHash | `140efbd579d9b590aa772c8465dfb5588d0aa4ca` |
+| LC_UUID | `FAC7D116-AE85-35EA-8258-83D44D8F67C4` |
+| hypervisor entitlement | present |
+| `__dof_carrick` | present |
+
+Three read-only Antigravity audits then checked missing filesystem/memory,
+process/IPC, and network/event coverage. Codex accepted the genuinely absent
+inotify and memfd-seal batches, rejected the proposed POSIX MQ matrix because
+it overlaps `mqueue` and `eventwaitmatrix`, and substituted an independently
+bounded eventfd/signalfd state matrix. Three write workers are isolated at the
+exact checkpoint above in `.worktrees/agy-s20-{inotify,memfdseal,eventfd}` and
+may create only their single probe source. Codex must review their actual
+diffs, require revision rounds as needed, wire them centrally, refresh only
+their Docker oracles serially, and use the cached embedded lane red-first.
+
+Do not infer ecosystem closure from this reducer. The frozen correctness
+denominator and controlled <=2x workload refresh remain open.
 
 ## SESSION 19 — 2026-08-27: three new probe families added and closed
 
