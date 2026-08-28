@@ -1,9 +1,10 @@
 //! The minimal hypervisor-specific surface the shared threaded run-loop drives.
 //! `SyscallTrap` (per-syscall) stays separate; this carries the per-thread /
 //! fork / kick / futex lifecycle so single-threaded backends are unaffected.
+use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU64;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use carrick_guest_mem::GuestMemory;
@@ -184,12 +185,35 @@ impl InGuestFlag {
 /// code. It also gives the drain its real invariant — anything observable as
 /// in-guest is, by construction, kickable.
 pub trait VcpuRegistry: Send + Sync {
+    /// Temporarily retained until every backend and runtime caller has moved to
+    /// [`VcpuRegistry::subscribe_register`]. New production decisions must use
+    /// the atomic enrollment API instead.
     /// Register (or RE-register, after a reclaim/rebind) this thread's vCPU.
     ///
     /// `in_guest` is the thread's one lifetime flag, not a fresh cell: the
     /// registry stores a clone of it, and the caller keeps storing through the
     /// flag it already owns.
     fn register(&self, tid: ThreadId, handle: Box<dyn VcpuKickDyn>, in_guest: &InGuestFlag);
+    /// Atomically diagnose whether every registration other than `except` has
+    /// drained. This is diagnostic only; protected work requires a
+    /// [`VcpuLeaseDrainGuard`] returned by [`VcpuRegistry::subscribe_lease_drain`].
+    fn poll_lease_drain(&self, except: ThreadId) -> VcpuLeaseDrainPoll;
+    /// Atomically wait for sibling membership to change or freeze new sibling
+    /// registrations when the sibling set is already empty.
+    fn subscribe_lease_drain(
+        &self,
+        except: ThreadId,
+        callback: Arc<dyn Fn() + Send + Sync + 'static>,
+    ) -> VcpuLeaseDrainEnrollment;
+    /// Atomically publish a registration or wait for a conflicting lease
+    /// freeze to thaw.
+    fn subscribe_register(
+        &self,
+        tid: ThreadId,
+        handle: Box<dyn VcpuKickDyn>,
+        in_guest: &InGuestFlag,
+        callback: Arc<dyn Fn() + Send + Sync + 'static>,
+    ) -> VcpuRegistrationEnrollment;
     /// Drop this thread's whole registration — it holds no live vCPU, so it can
     /// neither be kicked nor counted as in-guest until it registers again.
     fn unregister(&self, tid: ThreadId);
@@ -210,15 +234,62 @@ pub trait VcpuRegistry: Send + Sync {
     fn kick_all_in_guest(&self) -> bool;
     fn kick_all_except(&self, except: ThreadId);
     fn any_other_in_guest(&self, except: ThreadId) -> bool;
+    /// Temporary diagnostic compatibility shim. Task 6 deletes it after the
+    /// remaining callers move to typed identity-aware queries.
     fn count(&self) -> usize;
     /// Bounded timeout diagnostics only: registered vCPU identities and their
     /// current in-guest handshake state, read from the SAME entries
     /// [`VcpuRegistry::any_other_in_guest`] reads, so a timeout dump cannot
     /// disagree with the predicate that produced the timeout. Ordinary
-    /// coordination must use the scalar predicates above rather than snapshots.
+    /// coordination must use the typed predicates above rather than snapshots.
     fn debug_registered_vcpus(&self) -> Vec<(ThreadId, bool)> {
         Vec::new()
     }
+}
+
+/// Diagnostic result for the live sibling-vCPU lease set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VcpuLeaseDrainPoll {
+    Complete,
+    Waiting(ThreadId),
+}
+
+type VcpuLeaseChangeCallback = Arc<dyn Fn() + Send + Sync + 'static>;
+
+/// Cancellation-on-drop registration for one registry-owned change callback.
+pub struct VcpuLeaseChangeSubscription {
+    state: Weak<Mutex<VcpuRegistryState>>,
+    listener_id: u64,
+}
+
+/// Unique witness that no sibling lease was registered when it was minted and
+/// no non-owner registration can publish while it remains live.
+pub struct VcpuLeaseDrainGuard {
+    state: Weak<Mutex<VcpuRegistryState>>,
+    owner: ThreadId,
+    generation: u64,
+}
+
+/// Atomic enrollment for a sibling lease drain.
+pub enum VcpuLeaseDrainEnrollment {
+    Frozen(VcpuLeaseDrainGuard),
+    Waiting {
+        tid: ThreadId,
+        subscription: VcpuLeaseChangeSubscription,
+    },
+    Busy {
+        owner: ThreadId,
+        subscription: VcpuLeaseChangeSubscription,
+    },
+}
+
+/// Atomic enrollment for one exact vCPU registration.
+pub enum VcpuRegistrationEnrollment {
+    Registered,
+    Waiting {
+        owner: ThreadId,
+        subscription: VcpuLeaseChangeSubscription,
+    },
 }
 
 /// The platform-NEUTRAL [`VcpuRegistry`] implementation, shared by every backend.
@@ -238,9 +309,45 @@ pub trait VcpuRegistry: Send + Sync {
 /// SIGRTMIN kick-signal handler) wraps this in a thin newtype whose `new()` does
 /// the setup and delegates the trait. This struct is only ever driven through
 /// [`VcpuRegistry`], so it intentionally has no inherent kick API.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VcpuLeaseListenerKind {
+    Membership,
+    Thaw,
+}
+
+struct VcpuLeaseListener {
+    kind: VcpuLeaseListenerKind,
+    callback: VcpuLeaseChangeCallback,
+}
+
+struct VcpuLeaseFreeze {
+    owner: ThreadId,
+    generation: u64,
+}
+
+struct VcpuRegistryState {
+    vcpus: HashMap<ThreadId, VcpuRegistration>,
+    freeze: Option<VcpuLeaseFreeze>,
+    listeners: BTreeMap<u64, VcpuLeaseListener>,
+    next_listener: u64,
+    next_freeze_generation: u64,
+}
+
+impl Default for VcpuRegistryState {
+    fn default() -> Self {
+        Self {
+            vcpus: HashMap::new(),
+            freeze: None,
+            listeners: BTreeMap::new(),
+            next_listener: 1,
+            next_freeze_generation: 1,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct GenericVcpuRegistry {
-    vcpus: std::sync::Mutex<std::collections::HashMap<ThreadId, VcpuRegistration>>,
+    state: Arc<Mutex<VcpuRegistryState>>,
 }
 
 /// One live vCPU's registration: the two facets that must exist together or
@@ -262,37 +369,228 @@ impl GenericVcpuRegistry {
         Self::default()
     }
 
-    fn lock(
-        &self,
-    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<ThreadId, VcpuRegistration>> {
-        self.vcpus.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock(&self) -> std::sync::MutexGuard<'_, VcpuRegistryState> {
+        self.state.lock().unwrap_or_else(|error| error.into_inner())
     }
+}
+
+impl VcpuRegistryState {
+    fn add_listener(
+        &mut self,
+        kind: VcpuLeaseListenerKind,
+        callback: VcpuLeaseChangeCallback,
+    ) -> u64 {
+        let listener_id = NonZeroU64::new(self.next_listener)
+            .unwrap_or_else(|| std::process::abort())
+            .get();
+        self.next_listener = self
+            .next_listener
+            .checked_add(1)
+            .unwrap_or_else(|| std::process::abort());
+        let replaced = self
+            .listeners
+            .insert(listener_id, VcpuLeaseListener { kind, callback });
+        if replaced.is_some() {
+            std::process::abort();
+        }
+        listener_id
+    }
+
+    fn next_freeze_generation(&mut self) -> u64 {
+        let generation = NonZeroU64::new(self.next_freeze_generation)
+            .unwrap_or_else(|| std::process::abort())
+            .get();
+        self.next_freeze_generation = self
+            .next_freeze_generation
+            .checked_add(1)
+            .unwrap_or_else(|| std::process::abort());
+        generation
+    }
+
+    fn take_listeners(&mut self, kind: VcpuLeaseListenerKind) -> Vec<VcpuLeaseChangeCallback> {
+        let listener_ids: Vec<_> = self
+            .listeners
+            .iter()
+            .filter_map(|(listener_id, listener)| (listener.kind == kind).then_some(*listener_id))
+            .collect();
+        listener_ids
+            .into_iter()
+            .filter_map(|listener_id| self.listeners.remove(&listener_id))
+            .map(|listener| listener.callback)
+            .collect()
+    }
+}
+
+impl Drop for VcpuLeaseChangeSubscription {
+    fn drop(&mut self) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .listeners
+            .remove(&self.listener_id);
+    }
+}
+
+impl Drop for VcpuLeaseDrainGuard {
+    fn drop(&mut self) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let callbacks = {
+            let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+            match state.freeze.as_ref() {
+                Some(freeze)
+                    if freeze.owner == self.owner && freeze.generation == self.generation =>
+                {
+                    state.freeze = None;
+                    state.take_listeners(VcpuLeaseListenerKind::Thaw)
+                }
+                Some(_) | None => std::process::abort(),
+            }
+        };
+        for callback in callbacks {
+            callback();
+        }
+    }
+}
+
+fn lowest_sibling(state: &VcpuRegistryState, except: ThreadId) -> Option<ThreadId> {
+    state
+        .vcpus
+        .keys()
+        .copied()
+        .filter(|tid| *tid != except)
+        .min()
 }
 
 impl VcpuRegistry for GenericVcpuRegistry {
     fn register(&self, tid: ThreadId, handle: Box<dyn VcpuKickDyn>, in_guest: &InGuestFlag) {
-        self.lock().insert(
-            tid,
-            VcpuRegistration {
-                kick: handle,
-                in_guest: in_guest.share(),
-            },
-        );
+        // Temporary compatibility path until Task 6 migrates the remaining
+        // callers. A legacy caller cannot wait safely, so fail closed if a
+        // sibling freeze denies admission.
+        if let VcpuRegistrationEnrollment::Waiting { .. } =
+            self.subscribe_register(tid, handle, in_guest, Arc::new(|| {}))
+        {
+            std::process::abort();
+        }
+    }
+
+    fn poll_lease_drain(&self, except: ThreadId) -> VcpuLeaseDrainPoll {
+        match lowest_sibling(&self.lock(), except) {
+            Some(tid) => VcpuLeaseDrainPoll::Waiting(tid),
+            None => VcpuLeaseDrainPoll::Complete,
+        }
+    }
+
+    fn subscribe_lease_drain(
+        &self,
+        except: ThreadId,
+        callback: VcpuLeaseChangeCallback,
+    ) -> VcpuLeaseDrainEnrollment {
+        let mut state = self.lock();
+        if let Some(freeze) = state.freeze.as_ref() {
+            let owner = freeze.owner;
+            let listener_id = state.add_listener(VcpuLeaseListenerKind::Thaw, callback);
+            return VcpuLeaseDrainEnrollment::Busy {
+                owner,
+                subscription: VcpuLeaseChangeSubscription {
+                    state: Arc::downgrade(&self.state),
+                    listener_id,
+                },
+            };
+        }
+        if let Some(tid) = lowest_sibling(&state, except) {
+            let listener_id = state.add_listener(VcpuLeaseListenerKind::Membership, callback);
+            return VcpuLeaseDrainEnrollment::Waiting {
+                tid,
+                subscription: VcpuLeaseChangeSubscription {
+                    state: Arc::downgrade(&self.state),
+                    listener_id,
+                },
+            };
+        }
+        let generation = state.next_freeze_generation();
+        state.freeze = Some(VcpuLeaseFreeze {
+            owner: except,
+            generation,
+        });
+        VcpuLeaseDrainEnrollment::Frozen(VcpuLeaseDrainGuard {
+            state: Arc::downgrade(&self.state),
+            owner: except,
+            generation,
+        })
+    }
+
+    fn subscribe_register(
+        &self,
+        tid: ThreadId,
+        handle: Box<dyn VcpuKickDyn>,
+        in_guest: &InGuestFlag,
+        callback: VcpuLeaseChangeCallback,
+    ) -> VcpuRegistrationEnrollment {
+        let callbacks = {
+            let mut state = self.lock();
+            if let Some(freeze) = state.freeze.as_ref()
+                && freeze.owner != tid
+            {
+                let owner = freeze.owner;
+                let listener_id = state.add_listener(VcpuLeaseListenerKind::Thaw, callback);
+                return VcpuRegistrationEnrollment::Waiting {
+                    owner,
+                    subscription: VcpuLeaseChangeSubscription {
+                        state: Arc::downgrade(&self.state),
+                        listener_id,
+                    },
+                };
+            }
+            let inserted = state
+                .vcpus
+                .insert(
+                    tid,
+                    VcpuRegistration {
+                        kick: handle,
+                        in_guest: in_guest.share(),
+                    },
+                )
+                .is_none();
+            if inserted {
+                state.take_listeners(VcpuLeaseListenerKind::Membership)
+            } else {
+                Vec::new()
+            }
+        };
+        for callback in callbacks {
+            callback();
+        }
+        VcpuRegistrationEnrollment::Registered
     }
 
     fn unregister(&self, tid: ThreadId) {
-        self.lock().remove(&tid);
+        let callbacks = {
+            let mut state = self.lock();
+            if state.vcpus.remove(&tid).is_some() {
+                state.take_listeners(VcpuLeaseListenerKind::Membership)
+            } else {
+                Vec::new()
+            }
+        };
+        for callback in callbacks {
+            callback();
+        }
     }
 
     fn kick(&self, tid: ThreadId) {
-        if let Some(entry) = self.lock().get(&tid) {
+        if let Some(entry) = self.lock().vcpus.get(&tid) {
             entry.kick.kick();
         }
     }
 
     fn kick_if_in_guest(&self, tid: ThreadId) -> bool {
         let registrations = self.lock();
-        let Some(entry) = registrations.get(&tid) else {
+        let Some(entry) = registrations.vcpus.get(&tid) else {
             return false;
         };
         if !entry.is_in_guest() {
@@ -303,7 +601,7 @@ impl VcpuRegistry for GenericVcpuRegistry {
     }
 
     fn kick_all(&self) {
-        for entry in self.lock().values() {
+        for entry in self.lock().vcpus.values() {
             entry.kick.kick();
         }
     }
@@ -311,7 +609,7 @@ impl VcpuRegistry for GenericVcpuRegistry {
     fn kick_all_in_guest(&self) -> bool {
         let registrations = self.lock();
         let mut kicked = false;
-        for entry in registrations.values() {
+        for entry in registrations.vcpus.values() {
             if entry.is_in_guest() {
                 entry.kick.kick();
                 kicked = true;
@@ -321,7 +619,7 @@ impl VcpuRegistry for GenericVcpuRegistry {
     }
 
     fn kick_all_except(&self, except: ThreadId) {
-        for (tid, entry) in self.lock().iter() {
+        for (tid, entry) in self.lock().vcpus.iter() {
             if *tid != except {
                 entry.kick.kick();
             }
@@ -330,17 +628,19 @@ impl VcpuRegistry for GenericVcpuRegistry {
 
     fn any_other_in_guest(&self, except: ThreadId) -> bool {
         self.lock()
+            .vcpus
             .iter()
             .any(|(tid, entry)| *tid != except && entry.is_in_guest())
     }
 
     fn count(&self) -> usize {
-        self.lock().len()
+        self.lock().vcpus.len()
     }
 
     fn debug_registered_vcpus(&self) -> Vec<(ThreadId, bool)> {
         let mut snapshot: Vec<_> = self
             .lock()
+            .vcpus
             .iter()
             .map(|(tid, entry)| (*tid, entry.is_in_guest()))
             .collect();
@@ -352,7 +652,7 @@ impl VcpuRegistry for GenericVcpuRegistry {
 #[cfg(test)]
 mod generic_registry_tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     fn t(raw: i32) -> ThreadId {
         ThreadId::synthetic_for_tests(raw)
@@ -367,6 +667,224 @@ mod generic_registry_tests {
 
     fn noop() -> Box<dyn VcpuKickDyn> {
         Box::new(CountingHandle(Arc::new(AtomicU64::new(0))))
+    }
+
+    #[test]
+    fn lease_drain_is_identity_aware_and_freezes_registration() {
+        let registry = GenericVcpuRegistry::new();
+        let owner = t(10);
+        let sibling = t(20);
+        let owner_flag = InGuestFlag::for_guest_thread();
+        let sibling_flag = InGuestFlag::for_guest_thread();
+        assert!(matches!(
+            registry.subscribe_register(owner, noop(), &owner_flag, Arc::new(|| {})),
+            VcpuRegistrationEnrollment::Registered
+        ));
+        assert_eq!(
+            registry.poll_lease_drain(owner),
+            VcpuLeaseDrainPoll::Complete
+        );
+        let guard = match registry.subscribe_lease_drain(owner, Arc::new(|| {})) {
+            VcpuLeaseDrainEnrollment::Frozen(guard) => guard,
+            _ => panic!("sole owner must freeze"),
+        };
+        assert!(matches!(
+            registry.subscribe_register(sibling, noop(), &sibling_flag, Arc::new(|| {})),
+            VcpuRegistrationEnrollment::Waiting { owner: waiting, .. } if waiting == owner
+        ));
+        assert_eq!(
+            registry.poll_lease_drain(owner),
+            VcpuLeaseDrainPoll::Complete
+        );
+        drop(guard);
+        assert!(matches!(
+            registry.subscribe_register(sibling, noop(), &sibling_flag, Arc::new(|| {})),
+            VcpuRegistrationEnrollment::Registered
+        ));
+        assert_eq!(
+            registry.poll_lease_drain(owner),
+            VcpuLeaseDrainPoll::Waiting(sibling)
+        );
+    }
+
+    #[test]
+    fn lease_drain_absent_owner_still_waits_on_only_registration() {
+        let registry = GenericVcpuRegistry::new();
+        let absent_owner = t(10);
+        let sibling = t(20);
+        let sibling_flag = InGuestFlag::for_guest_thread();
+        registry.register(sibling, noop(), &sibling_flag);
+
+        assert_eq!(
+            registry.poll_lease_drain(absent_owner),
+            VcpuLeaseDrainPoll::Waiting(sibling)
+        );
+        assert!(matches!(
+            registry.subscribe_lease_drain(absent_owner, Arc::new(|| {})),
+            VcpuLeaseDrainEnrollment::Waiting { tid, .. } if tid == sibling
+        ));
+    }
+
+    #[test]
+    fn lease_drain_returns_lowest_sibling_identity() {
+        let registry = GenericVcpuRegistry::new();
+        let owner = t(10);
+        let owner_flag = InGuestFlag::for_guest_thread();
+        let high_flag = InGuestFlag::for_guest_thread();
+        let low_flag = InGuestFlag::for_guest_thread();
+        registry.register(owner, noop(), &owner_flag);
+        registry.register(t(30), noop(), &high_flag);
+        registry.register(t(20), noop(), &low_flag);
+
+        assert_eq!(
+            registry.poll_lease_drain(owner),
+            VcpuLeaseDrainPoll::Waiting(t(20))
+        );
+        assert!(matches!(
+            registry.subscribe_lease_drain(owner, Arc::new(|| {})),
+            VcpuLeaseDrainEnrollment::Waiting { tid, .. } if tid == t(20)
+        ));
+    }
+
+    #[test]
+    fn lease_drain_same_owner_reentry_is_busy() {
+        let registry = GenericVcpuRegistry::new();
+        let owner = t(10);
+        let guard = match registry.subscribe_lease_drain(owner, Arc::new(|| {})) {
+            VcpuLeaseDrainEnrollment::Frozen(guard) => guard,
+            _ => panic!("empty registry must freeze"),
+        };
+
+        assert!(matches!(
+            registry.subscribe_lease_drain(owner, Arc::new(|| {})),
+            VcpuLeaseDrainEnrollment::Busy { owner: busy, .. } if busy == owner
+        ));
+        drop(guard);
+    }
+
+    #[test]
+    fn lease_guard_drop_wakes_busy_drain_and_registration_waiters() {
+        let registry = GenericVcpuRegistry::new();
+        let owner = t(10);
+        let sibling = t(20);
+        let sibling_flag = InGuestFlag::for_guest_thread();
+        let drain_wakes = Arc::new(AtomicUsize::new(0));
+        let registration_wakes = Arc::new(AtomicUsize::new(0));
+        let guard = match registry.subscribe_lease_drain(owner, Arc::new(|| {})) {
+            VcpuLeaseDrainEnrollment::Frozen(guard) => guard,
+            _ => panic!("empty registry must freeze"),
+        };
+        let drain_wakes_for_callback = Arc::clone(&drain_wakes);
+        let drain_wait = registry.subscribe_lease_drain(
+            t(30),
+            Arc::new(move || {
+                drain_wakes_for_callback.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        assert!(matches!(
+            &drain_wait,
+            VcpuLeaseDrainEnrollment::Busy { owner: busy, .. } if *busy == owner
+        ));
+        let registration_wakes_for_callback = Arc::clone(&registration_wakes);
+        let registration_wait = registry.subscribe_register(
+            sibling,
+            noop(),
+            &sibling_flag,
+            Arc::new(move || {
+                registration_wakes_for_callback.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        assert!(matches!(
+            &registration_wait,
+            VcpuRegistrationEnrollment::Waiting { owner: busy, .. } if *busy == owner
+        ));
+
+        assert_eq!(drain_wakes.load(Ordering::SeqCst), 0);
+        assert_eq!(registration_wakes.load(Ordering::SeqCst), 0);
+        drop(guard);
+        assert_eq!(drain_wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(registration_wakes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn lease_membership_mutation_wakes_waiter_after_removal() {
+        let registry = GenericVcpuRegistry::new();
+        let owner = t(10);
+        let sibling = t(20);
+        let sibling_flag = InGuestFlag::for_guest_thread();
+        registry.register(sibling, noop(), &sibling_flag);
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wakes_for_callback = Arc::clone(&wakes);
+        let wait = registry.subscribe_lease_drain(
+            owner,
+            Arc::new(move || {
+                wakes_for_callback.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        assert!(matches!(
+            &wait,
+            VcpuLeaseDrainEnrollment::Waiting { tid, .. } if *tid == sibling
+        ));
+
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+        registry.unregister(sibling);
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn lease_registration_replacement_does_not_publish_membership_change() {
+        let registry = GenericVcpuRegistry::new();
+        let owner = t(10);
+        let sibling = t(20);
+        let first_flag = InGuestFlag::for_guest_thread();
+        let replacement_flag = InGuestFlag::for_guest_thread();
+        registry.register(sibling, noop(), &first_flag);
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wakes_for_callback = Arc::clone(&wakes);
+        let wait = registry.subscribe_lease_drain(
+            owner,
+            Arc::new(move || {
+                wakes_for_callback.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        assert!(matches!(
+            &wait,
+            VcpuLeaseDrainEnrollment::Waiting { tid, .. } if *tid == sibling
+        ));
+
+        registry.register(sibling, noop(), &replacement_flag);
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn lease_subscription_drop_cancels_only_unclaimed_listener() {
+        let registry = GenericVcpuRegistry::new();
+        let owner = t(10);
+        let sibling = t(20);
+        let sibling_flag = InGuestFlag::for_guest_thread();
+        registry.register(sibling, noop(), &sibling_flag);
+        let cancelled_wakes = Arc::new(AtomicUsize::new(0));
+        let retained_wakes = Arc::new(AtomicUsize::new(0));
+        let cancelled_wakes_for_callback = Arc::clone(&cancelled_wakes);
+        let cancelled = registry.subscribe_lease_drain(
+            owner,
+            Arc::new(move || {
+                cancelled_wakes_for_callback.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let retained_wakes_for_callback = Arc::clone(&retained_wakes);
+        let retained = registry.subscribe_lease_drain(
+            owner,
+            Arc::new(move || {
+                retained_wakes_for_callback.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        drop(cancelled);
+        registry.unregister(sibling);
+        assert_eq!(cancelled_wakes.load(Ordering::SeqCst), 0);
+        assert_eq!(retained_wakes.load(Ordering::SeqCst), 1);
+        drop(retained);
     }
 
     #[test]

@@ -111,7 +111,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::{GenericVcpuRegistry, ThreadId, VcpuKickDyn};
+    use crate::{
+        GenericVcpuRegistry, ThreadId, VcpuKickDyn, VcpuRegistrationEnrollment, VcpuRegistry,
+    };
 
     struct CountingKick(Arc<AtomicU64>);
 
@@ -129,11 +131,15 @@ mod tests {
         let kicks = Arc::new(AtomicU64::new(0));
         let registry = Arc::new(GenericVcpuRegistry::new());
         let in_guest = crate::InGuestFlag::for_guest_thread();
-        registry.register(
-            ThreadId::synthetic_for_tests(1),
-            Box::new(CountingKick(Arc::clone(&kicks))),
-            &in_guest,
-        );
+        assert!(matches!(
+            registry.subscribe_register(
+                ThreadId::synthetic_for_tests(1),
+                Box::new(CountingKick(Arc::clone(&kicks))),
+                &in_guest,
+                Arc::new(|| {}),
+            ),
+            VcpuRegistrationEnrollment::Registered
+        ));
         let kicker: Arc<dyn VcpuRegistry> = registry;
         let id = carrick_timer_core::posix::create(0, 14);
 
