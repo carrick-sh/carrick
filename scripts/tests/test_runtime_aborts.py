@@ -89,6 +89,208 @@ mod inner_tests {
         self.assertEqual(
             scan_abort_source(Path("crates/carrick-runtime/src/lib.rs"), source), ())
 
+    def test_parameter_level_cfg_test_does_not_make_function_test_only(self):
+        source = r'''
+fn production(#[cfg(test)] x: u8) {
+    std::process::abort();
+}
+'''
+        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+        self.assertEqual(
+            [(r.function, r.ordinal_in_function) for r in rows],
+            [("production", 1)],
+        )
+
+    def test_aggregate_final_member_cfg_test_does_not_leak_to_next_item(self):
+        cases = [
+            ("struct", r'''
+struct X {
+    #[cfg(test)]
+    field: u8
+}
+fn production() { std::process::abort(); }
+'''),
+            ("union", r'''
+union U {
+    #[cfg(test)]
+    field: u8
+}
+fn production() { std::process::abort(); }
+'''),
+            ("enum", r'''
+enum E {
+    #[cfg(test)]
+    Variant
+}
+fn production() { std::process::abort(); }
+'''),
+        ]
+        for kind, source in cases:
+            with self.subTest(kind=kind):
+                rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+                self.assertEqual(
+                    [(r.function, r.ordinal_in_function) for r in rows],
+                    [("production", 1)],
+                )
+
+    def test_array_types_and_nested_semicolons_preserve_function_identity(self):
+        cases = [
+            ("array_param", r'''
+fn production(x: [u8; 1]) {
+    std::process::abort();
+}
+''', [("production", 1)]),
+            ("array_return", r'''
+fn production() -> [u8; 1] {
+    std::process::abort();
+}
+''', [("production", 1)]),
+            ("impl_method", r'''
+impl X {
+    fn production(&self, x: [u8; 1]) -> [u8; 2] {
+        std::process::abort();
+    }
+}
+''', [("X::production", 1)]),
+            ("cfg_test_array_param", r'''
+fn production(#[cfg(test)] x: [u8; 1]) {
+    std::process::abort();
+}
+''', [("production", 1)]),
+        ]
+        for name, source, expected in cases:
+            with self.subTest(case=name):
+                rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+                self.assertEqual(
+                    [(r.function, r.ordinal_in_function) for r in rows],
+                    expected,
+                )
+
+    def test_trait_default_methods_and_insertion_stability(self):
+        source = r'''
+trait A {
+    fn reset() { std::process::abort(); }
+}
+trait B {
+    fn reset() { std::process::abort(); }
+}
+'''
+        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+        self.assertEqual(
+            [(r.function, r.ordinal_in_function) for r in rows],
+            [("A::reset", 1), ("B::reset", 1)],
+        )
+
+        source_with_insertion = r'''
+trait A {
+    fn unrelated() {}
+    fn reset() { std::process::abort(); }
+}
+trait B {
+    fn reset() { std::process::abort(); }
+    fn other() {}
+}
+'''
+        rows_inserted = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source_with_insertion)
+        self.assertEqual(
+            [(r.function, r.ordinal_in_function) for r in rows_inserted],
+            [("A::reset", 1), ("B::reset", 1)],
+        )
+
+    def test_complete_lexical_module_ancestry(self):
+        source = r'''
+mod a {
+    mod shared {
+        fn run() { std::process::abort(); }
+    }
+}
+mod b {
+    mod shared {
+        fn run() { std::process::abort(); }
+    }
+}
+mod c {
+    impl X {
+        fn run() { std::process::abort(); }
+    }
+}
+'''
+        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+        self.assertEqual(
+            [(r.function, r.ordinal_in_function) for r in rows],
+            [("a::shared::run", 1), ("b::shared::run", 1), ("c::X::run", 1)],
+        )
+
+    def test_attributed_if_else_chain_covers_all_branches(self):
+        source = r'''
+fn f(c: bool) {
+    #[cfg(test)]
+    if c {
+        std::process::abort();
+    } else if false {
+        std::process::abort();
+    } else {
+        std::process::abort();
+    }
+    std::process::abort();
+}
+'''
+        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+        self.assertEqual(
+            [(r.function, r.ordinal_in_function) for r in rows],
+            [("f", 1)],
+        )
+
+    def test_always_applied_cfg_attr_test_exclusion(self):
+        source = r'''
+#[cfg_attr(all(), cfg(test))]
+fn hidden_all() { std::process::abort(); }
+
+#[cfg_attr(not(test), cfg(test))]
+fn hidden_not_test() { std::process::abort(); }
+
+#[cfg_attr(feature = "unknown", cfg(test))]
+fn shown_feature() { std::process::abort(); }
+
+#[cfg_attr(test, allow(dead_code))]
+fn shown_cfg_attr_test_allow() { std::process::abort(); }
+'''
+        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+        self.assertEqual(
+            [(r.function, r.ordinal_in_function) for r in rows],
+            [("shown_feature", 1), ("shown_cfg_attr_test_allow", 1)],
+        )
+
+    def test_fingerprints_start_at_function_body_brace_excluding_declaration_const_blocks(self):
+        source1 = r'''
+fn f() where [(); { 1 }]: Sized {
+    std::process::abort();
+}
+'''
+        source2 = r'''
+fn f() where [(); { 2 }]: Sized {
+    std::process::abort();
+}
+'''
+        r1 = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source1)
+        r2 = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source2)
+        self.assertEqual(len(r1), 1)
+        self.assertEqual(len(r2), 1)
+        self.assertEqual(r1[0].fingerprint, r2[0].fingerprint)
+
+    def test_macro_argument_tokens_do_not_overwrite_declaration_identity(self):
+        source = r'''
+macro_rules! ty { ($($t:tt)*) => { () }; }
+fn outer(_: ty!(fn fake), _: ty![impl fake2], _: ty!{trait fake3}) -> ty!(fn fake4) {
+    std::process::abort();
+}
+'''
+        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+        self.assertEqual(
+            [(r.function, r.ordinal_in_function) for r in rows],
+            [("outer", 1)],
+        )
+
     def test_production_capable_attributes_are_discovered(self):
         source = r'''
 #[cfg(not(test))]

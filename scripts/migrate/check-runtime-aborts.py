@@ -36,11 +36,13 @@ class Token:
 
 @dataclass
 class Scope:
-    kind: str  # "root", "mod", "impl", "fn", "block"
+    kind: str  # "root", "mod", "impl", "trait", "fn", "block"
     name: str
     is_test: bool
     brace_depth: int
     fn_start_token_idx: int = 0
+    body_brace_token_idx: int = 0
+    is_if_then: bool = False
 
 
 def lex_rust(source: str) -> list[Token]:
@@ -251,6 +253,61 @@ def is_test_only_attribute(tokens: list[Token]) -> bool:
         and tokens[-1].text == ")"
     ):
         return True not in cfg_possible_values(tokens[2:-1])
+    if (
+        len(tokens) >= 4
+        and tokens[0].text == "cfg_attr"
+        and tokens[1].text == "("
+        and tokens[-1].text == ")"
+    ):
+        inner = tokens[2:-1]
+        comma_idx = None
+        paren_depth = 0
+        bracket_depth = 0
+        for idx, tok in enumerate(inner):
+            if tok.text == "(":
+                paren_depth += 1
+            elif tok.text == ")":
+                paren_depth -= 1
+            elif tok.text == "[":
+                bracket_depth += 1
+            elif tok.text == "]":
+                bracket_depth -= 1
+            elif tok.text == "," and paren_depth == 0 and bracket_depth == 0:
+                comma_idx = idx
+                break
+        if comma_idx is not None:
+            pred_tokens = inner[:comma_idx]
+            attr_tokens = inner[comma_idx + 1:]
+            if cfg_possible_values(pred_tokens) == {True}:
+                sub_attrs: list[list[Token]] = []
+                curr: list[Token] = []
+                p_d = 0
+                b_d = 0
+                for t in attr_tokens:
+                    if t.text == "(":
+                        p_d += 1
+                        curr.append(t)
+                    elif t.text == ")":
+                        p_d -= 1
+                        curr.append(t)
+                    elif t.text == "[":
+                        b_d += 1
+                        curr.append(t)
+                    elif t.text == "]":
+                        b_d -= 1
+                        curr.append(t)
+                    elif t.text == "," and p_d == 0 and b_d == 0:
+                        if curr:
+                            sub_attrs.append(curr)
+                            curr = []
+                    else:
+                        curr.append(t)
+                if curr:
+                    sub_attrs.append(curr)
+
+                for sub_attr in sub_attrs:
+                    if is_test_only_attribute(sub_attr):
+                        return True
     return False
 
 
@@ -436,12 +493,7 @@ def compute_fingerprint(context_tokens: list[Token]) -> str:
     return hashlib.sha256(norm.encode("utf-8")).hexdigest()
 
 
-def extract_statement_context(tokens: list[Token], abort_idx: int, fn_start_idx: int) -> list[Token]:
-    # Find the opening "{" of the enclosing fn body
-    fn_body_brace_idx = fn_start_idx
-    while fn_body_brace_idx < len(tokens) and tokens[fn_body_brace_idx].text != "{":
-        fn_body_brace_idx += 1
-
+def extract_statement_context(tokens: list[Token], abort_idx: int, fn_body_brace_idx: int) -> list[Token]:
     # Scan from fn_body_brace_idx + 1 to abort_idx to find the start of the enclosing statement at fn depth
     depth = 0
     stmt_start = fn_body_brace_idx + 1
@@ -512,12 +564,18 @@ def scan_abort_source(
     posix_path = PurePosixPath(Path(path).as_posix()).as_posix()
     tokens = lex_rust(source)
 
-    scopes: list[Scope] = [Scope("root", "<root>", False, 0, 0)]
+    scopes: list[Scope] = [Scope("root", "<root>", False, 0, 0, 0)]
     pending_test = False
+    pending_if = False
     pending_fn: str | None = None
     pending_fn_tok_idx: int = 0
+    pending_fn_is_test = False
     pending_impl: str | None = None
+    pending_impl_is_test = False
+    pending_trait: str | None = None
+    pending_trait_is_test = False
     pending_mod: str | None = None
+    pending_mod_is_test = False
     pending_test_delimiters: tuple[int, int, int] | None = None
     pending_test_angle_depth = 0
     current_brace_depth = 0
@@ -569,20 +627,49 @@ def scan_abort_source(
                 i = attr_idx
                 continue
 
-        if tok.kind == "ident":
-            if tok.text == "fn" and i + 1 < n and tokens[i + 1].kind == "ident":
+        if (
+            tok.kind == "ident"
+            and declaration_paren_depth == 0
+            and declaration_bracket_depth == 0
+            and declaration_angle_depth == 0
+            and non_scope_brace_depth == 0
+        ):
+            if tok.text == "if":
+                pending_if = True
+            elif tok.text == "fn" and pending_fn is None and i + 1 < n and tokens[i + 1].kind == "ident":
                 pending_fn = tokens[i + 1].text
                 pending_fn_tok_idx = i
+                pending_fn_is_test = pending_test
+                pending_test = False
+                pending_test_delimiters = None
+                pending_test_angle_depth = 0
                 declaration_angle_depth = 0
                 declaration_paren_depth = 0
                 declaration_bracket_depth = 0
-            elif tok.text == "impl" and not pending_fn and scopes[-1].kind in ("root", "mod"):
+            elif tok.text == "impl" and pending_fn is None and scopes[-1].kind in ("root", "mod"):
                 pending_impl = extract_impl_name(tokens, i)
+                pending_impl_is_test = pending_test
+                pending_test = False
+                pending_test_delimiters = None
+                pending_test_angle_depth = 0
                 declaration_angle_depth = 0
                 declaration_paren_depth = 0
                 declaration_bracket_depth = 0
-            elif tok.text == "mod" and not pending_fn and scopes[-1].kind in ("root", "mod") and i + 1 < n and tokens[i + 1].kind == "ident":
+            elif tok.text == "trait" and pending_fn is None and scopes[-1].kind in ("root", "mod") and i + 1 < n and tokens[i + 1].kind == "ident":
+                pending_trait = tokens[i + 1].text
+                pending_trait_is_test = pending_test
+                pending_test = False
+                pending_test_delimiters = None
+                pending_test_angle_depth = 0
+                declaration_angle_depth = 0
+                declaration_paren_depth = 0
+                declaration_bracket_depth = 0
+            elif tok.text == "mod" and pending_fn is None and scopes[-1].kind in ("root", "mod") and i + 1 < n and tokens[i + 1].kind == "ident":
                 pending_mod = tokens[i + 1].text
+                pending_mod_is_test = pending_test
+                pending_test = False
+                pending_test_delimiters = None
+                pending_test_angle_depth = 0
 
         if tok.text == "}" and non_scope_brace_depth > 0:
             non_scope_brace_depth -= 1
@@ -596,7 +683,24 @@ def scan_abort_source(
             continue
 
         if non_scope_brace_depth == 0:
-            if pending_fn is not None or pending_impl is not None:
+            if tok.text == "(":
+                current_paren_depth += 1
+            elif tok.text == ")":
+                current_paren_depth = max(0, current_paren_depth - 1)
+                if pending_test_delimiters and pending_test_delimiters[1] > current_paren_depth:
+                    pending_test = False
+                    pending_test_delimiters = None
+                    pending_test_angle_depth = 0
+            elif tok.text == "[":
+                current_bracket_depth += 1
+            elif tok.text == "]":
+                current_bracket_depth = max(0, current_bracket_depth - 1)
+                if pending_test_delimiters and pending_test_delimiters[2] > current_bracket_depth:
+                    pending_test = False
+                    pending_test_delimiters = None
+                    pending_test_angle_depth = 0
+
+            if pending_fn is not None or pending_impl is not None or pending_trait is not None:
                 if tok.text == "(":
                     declaration_paren_depth += 1
                 elif tok.text == ")":
@@ -629,13 +733,30 @@ def scan_abort_source(
             i += 1
             continue
 
-        if tok.text == ";":
+        if tok.text == ";" and (
+            declaration_angle_depth == 0
+            and declaration_paren_depth == 0
+            and declaration_bracket_depth == 0
+            and non_scope_brace_depth == 0
+            and (
+                pending_test_delimiters is None
+                or (
+                    current_paren_depth <= pending_test_delimiters[1]
+                    and current_bracket_depth <= pending_test_delimiters[2]
+                )
+            )
+        ):
             pending_test = False
             pending_test_delimiters = None
             pending_test_angle_depth = 0
             pending_fn = None
+            pending_fn_is_test = False
             pending_impl = None
+            pending_impl_is_test = False
+            pending_trait = None
+            pending_trait_is_test = False
             pending_mod = None
+            pending_mod_is_test = False
             declaration_angle_depth = 0
             declaration_paren_depth = 0
             declaration_bracket_depth = 0
@@ -645,9 +766,6 @@ def scan_abort_source(
         if (
             tok.text == ","
             and pending_test
-            and pending_fn is None
-            and pending_impl is None
-            and pending_mod is None
             and pending_test_angle_depth == 0
             and pending_test_delimiters
             == (current_brace_depth, current_paren_depth, current_bracket_depth)
@@ -660,40 +778,59 @@ def scan_abort_source(
 
         if tok.text == "{":
             current_brace_depth += 1
-            is_test_scope = pending_test or any(s.is_test for s in scopes)
+            if pending_fn:
+                is_test_scope = pending_fn_is_test or any(s.is_test for s in scopes)
+                scopes.append(Scope("fn", pending_fn, is_test_scope, current_brace_depth, pending_fn_tok_idx, i))
+                pending_fn = None
+                pending_fn_is_test = False
+            elif pending_impl:
+                is_test_scope = pending_impl_is_test or any(s.is_test for s in scopes)
+                scopes.append(Scope("impl", pending_impl, is_test_scope, current_brace_depth))
+                pending_impl = None
+                pending_impl_is_test = False
+            elif pending_trait:
+                is_test_scope = pending_trait_is_test or any(s.is_test for s in scopes)
+                scopes.append(Scope("trait", pending_trait, is_test_scope, current_brace_depth))
+                pending_trait = None
+                pending_trait_is_test = False
+            elif pending_mod:
+                is_test_scope = pending_mod_is_test or any(s.is_test for s in scopes)
+                scopes.append(Scope("mod", pending_mod, is_test_scope, current_brace_depth))
+                pending_mod = None
+                pending_mod_is_test = False
+            else:
+                is_test_scope = pending_test or any(s.is_test for s in scopes)
+                is_if_block = pending_if
+                scopes.append(Scope("block", "", is_test_scope, current_brace_depth, is_if_then=is_if_block))
+            pending_if = False
             pending_test = False
             pending_test_delimiters = None
             pending_test_angle_depth = 0
             declaration_angle_depth = 0
             declaration_paren_depth = 0
             declaration_bracket_depth = 0
-            if pending_fn:
-                scopes.append(Scope("fn", pending_fn, is_test_scope, current_brace_depth, pending_fn_tok_idx))
-                pending_fn = None
-            elif pending_impl:
-                scopes.append(Scope("impl", pending_impl, is_test_scope, current_brace_depth))
-                pending_impl = None
-            elif pending_mod:
-                scopes.append(Scope("mod", pending_mod, is_test_scope, current_brace_depth))
-                pending_mod = None
-            else:
-                scopes.append(Scope("block", "", is_test_scope, current_brace_depth))
             i += 1
             continue
 
-        if tok.text == "(":
-            current_paren_depth += 1
-        elif tok.text == ")":
-            current_paren_depth = max(0, current_paren_depth - 1)
-        elif tok.text == "[":
-            current_bracket_depth += 1
-        elif tok.text == "]":
-            current_bracket_depth = max(0, current_bracket_depth - 1)
-
         if tok.text == "}":
+            is_test_branch = False
             if len(scopes) > 1 and scopes[-1].brace_depth == current_brace_depth:
+                is_test_branch = scopes[-1].is_test and scopes[-1].is_if_then
                 scopes.pop()
             current_brace_depth = max(0, current_brace_depth - 1)
+
+            # If this was an if/else if test branch and next token is else, continue test scope
+            if is_test_branch and i + 1 < n and tokens[i + 1].text == "else":
+                pending_test = True
+                pending_test_delimiters = (
+                    current_brace_depth,
+                    current_paren_depth,
+                    current_bracket_depth,
+                )
+            else:
+                pending_test = False
+                pending_test_delimiters = None
+            pending_test_angle_depth = 0
             i += 1
             continue
 
@@ -710,21 +847,25 @@ def scan_abort_source(
             is_in_test = pending_test or any(s.is_test for s in scopes)
             if not is_in_test:
                 fn_name = "<module>"
-                container_name: str | None = None
-                fn_start_idx = 0
+                fn_body_brace_idx = 0
                 for s in reversed(scopes):
-                    if s.kind == "fn" and fn_name == "<module>":
+                    if s.kind == "fn":
                         fn_name = s.name
-                        fn_start_idx = s.fn_start_token_idx
-                    elif s.kind in ("impl", "mod") and container_name is None:
-                        container_name = s.name
+                        fn_body_brace_idx = s.body_brace_token_idx
+                        break
 
-                qualified_fn = f"{container_name}::{fn_name}" if container_name else fn_name
+                container_parts = [
+                    s.name for s in scopes if s.kind in ("mod", "impl", "trait")
+                ]
+                if container_parts:
+                    qualified_fn = "::".join(container_parts + [fn_name])
+                else:
+                    qualified_fn = fn_name
 
                 ord_val = fn_ordinals.get(qualified_fn, 0) + 1
                 fn_ordinals[qualified_fn] = ord_val
 
-                context_tokens = extract_statement_context(tokens, i, fn_start_idx)
+                context_tokens = extract_statement_context(tokens, i, fn_body_brace_idx)
                 fp = compute_fingerprint(context_tokens)
 
                 findings.append(
