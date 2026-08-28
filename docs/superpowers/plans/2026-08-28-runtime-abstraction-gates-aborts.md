@@ -30,10 +30,10 @@
 | `docs/superpowers/plans/2026-08-12-per-run-file-authority-atomic-migration.md` | Direct-core amendment removing retired helper/IPC production requirements. |
 | `docs/runtime-abstraction-audit-2026-08-27.md` | Accepted answers to its two person-decision questions. |
 | `scripts/migrate/check-runtime-global-state.py` | Token-aware discovery and exact monotone comparison for process-global state/env sources. |
-| `scripts/migrate/test-runtime-global-state.py` | Synthetic red/green tests for additions, removals, source drift, comments and strings. |
+| `scripts/tests/test_runtime_global_state.py` | Synthetic red/green tests for additions, removals, source drift, comments and strings. |
 | `scripts/migrate/runtime-global-state.json` | Reviewed current global-state rows, classified by scope. |
 | `scripts/migrate/check-runtime-aborts.py` | Raw `std::process::abort()` discovery and sharded exact-ledger gate. |
-| `scripts/migrate/test-runtime-aborts.py` | Synthetic red/green tests for abort discovery and ledger monotonicity. |
+| `scripts/tests/test_runtime_aborts.py` | Synthetic red/green tests for abort discovery and ledger monotonicity. |
 | `scripts/migrate/runtime-aborts/vcpu-loop.json` | `carrick-runtime/src/vcpu_loop/**` classifications. |
 | `scripts/migrate/runtime-aborts/runtime.json` | Remaining `carrick-runtime/src/**` classifications. |
 | `scripts/migrate/runtime-aborts/hvf.json` | `carrick-vmm-hvf/src/**` classifications. |
@@ -144,7 +144,7 @@ git commit -m "docs(runtime): resolve abstraction audit decisions"
 
 **Files:**
 - Create: `scripts/migrate/check-runtime-global-state.py`
-- Create: `scripts/migrate/test-runtime-global-state.py`
+- Create: `scripts/tests/test_runtime_global_state.py`
 - Create: `scripts/migrate/runtime-global-state.json`
 - Modify: `justfile`
 - Modify: `docs/identity-and-scope-domains-embed-census.md`
@@ -224,7 +224,8 @@ initializer, function-local `static`, `thread_local!`, `std::env::var`,
 Run:
 
 ```bash
-python3 scripts/migrate/test-runtime-global-state.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
+  scripts.tests.test_runtime_global_state
 ```
 
 Expected: FAIL because the checker module does not exist.
@@ -285,7 +286,8 @@ for every row.
 Run:
 
 ```bash
-python3 scripts/migrate/test-runtime-global-state.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
+  scripts.tests.test_runtime_global_state
 ```
 
 Expected: PASS with every red-shape exercised.
@@ -311,7 +313,8 @@ Run:
 
 ```bash
 python3 scripts/migrate/check-runtime-global-state.py --check
-python3 scripts/migrate/test-runtime-global-state.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
+  scripts.tests.test_runtime_global_state
 just lint-domains
 ```
 
@@ -322,7 +325,7 @@ may still report `changed=[]`; do not refresh it in this task.
 
 ```bash
 git add scripts/migrate/check-runtime-global-state.py \
-  scripts/migrate/test-runtime-global-state.py \
+  scripts/tests/test_runtime_global_state.py \
   scripts/migrate/runtime-global-state.json \
   docs/identity-and-scope-domains-embed-census.md justfile
 git commit -m "chore(runtime): gate process-global scope"
@@ -432,7 +435,7 @@ git commit -m "chore(runtime): complete host pid authority catalog"
 
 **Files:**
 - Create: `scripts/migrate/check-runtime-aborts.py`
-- Create: `scripts/migrate/test-runtime-aborts.py`
+- Create: `scripts/tests/test_runtime_aborts.py`
 - Create: `scripts/migrate/runtime-aborts/vcpu-loop.json`
 - Modify: `justfile`
 
@@ -498,7 +501,7 @@ const TEXT: &str = "std::process::abort()";
 Run:
 
 ```bash
-python3 scripts/migrate/test-runtime-aborts.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts.tests.test_runtime_aborts
 ```
 
 Expected: FAIL because the checker does not exist.
@@ -542,7 +545,7 @@ removals require lowering the ceiling in the same change.
 Run:
 
 ```bash
-python3 scripts/migrate/test-runtime-aborts.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts.tests.test_runtime_aborts
 ```
 
 Expected: PASS.
@@ -583,7 +586,7 @@ silently ignore those roots once Task 5 lands.
 Run:
 
 ```bash
-python3 scripts/migrate/test-runtime-aborts.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts.tests.test_runtime_aborts
 python3 scripts/migrate/check-runtime-aborts.py --check
 git diff --check
 ```
@@ -592,7 +595,7 @@ Commit:
 
 ```bash
 git add scripts/migrate/check-runtime-aborts.py \
-  scripts/migrate/test-runtime-aborts.py \
+  scripts/tests/test_runtime_aborts.py \
   scripts/migrate/runtime-aborts/vcpu-loop.json justfile
 git commit -m "chore(runtime): classify vcpu loop aborts"
 ```
@@ -653,11 +656,12 @@ the historical `28a8678c4` snapshot, not a current assertion.
 Run:
 
 ```bash
-python3 scripts/migrate/test-runtime-global-state.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
+  scripts.tests.test_runtime_global_state
 python3 scripts/migrate/check-runtime-global-state.py --check
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
   scripts.tests.test_host_authority_transitions
-python3 scripts/migrate/test-runtime-aborts.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts.tests.test_runtime_aborts
 python3 scripts/migrate/check-runtime-aborts.py --check
 RUSTC_WRAPPER= just fmt-check
 RUSTC_WRAPPER= just clippy
