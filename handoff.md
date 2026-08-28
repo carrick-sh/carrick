@@ -1,6 +1,6 @@
 # Carrick exact conformance closure handoff
 
-**Updated:** 2026-08-27 (session 16 — routine ecosystem deadlines are now 5s and oracle-relative; explicit caps remain hard)
+**Updated:** 2026-08-27 (session 17 — netflagmatrix closes both libc lanes; Linux MSG_TRUNC and RDHUP semantics corrected)
 
 **Canonical host/lane:** macOS, Apple Silicon, HVF/HVPatch, Linux arm64 guest
 
@@ -56,6 +56,55 @@ Execution is a directed-worker model:
 Complete only when fail-closed gate integrity, exact correctness, and the <=2x
 performance gate pass together on the final integrated signed artifact. Do not
 push unless explicitly asked. Preserve unrelated worktree changes.
+
+## SESSION 17 — 2026-08-27: netflagmatrix closed on both libc lanes
+
+`0ff301096` closes the three deterministic `netflagmatrix` differences without
+changing the probe, committed oracle, or expected-gap inventory:
+
+- Darwin returns only the copied byte count for an atomic `recv(MSG_TRUNC)`;
+  Carrick now widens only the host-side datagram/seqpacket bounce to the socket
+  receive capacity, copies at most the guest-requested prefix, and returns the
+  full record length. Stream receives never widen and retain their zero-copy
+  path.
+- Darwin `poll(2)` has no `POLLRDHUP`. Direct poll now queries kqueue `EV_EOF`
+  only when RDHUP was explicitly requested, including while unread payload is
+  still buffered. Linux keeps its native POLLRDHUP query.
+- Epoll does not create a second transient kqueue: it retains the terminal EOF
+  bit from its existing generation-validated persistent multiplexer edge and
+  combines it with the live readiness sample. This closes the RDHUP + ONESHOT
+  lifecycle without adding a kqueue construction to the ordinary epoll hot
+  path.
+
+Both independent mechanisms were witnessed red first. The host socketpair
+regressions now pass, as do 29/29 adjacent network support tests and focused
+warnings-denied clippy. The cached-only embedded network battery executed
+`netflagmatrix`, `recvmsgtrunc`, `epolletchildhup`, `epolloutrearm`,
+`fifoepolleof`, `scmrightsfds`, and `sockbufreuseport` on both arm64 musl and
+glibc (14/14 executions) with no diff. The authoritative focused matrix ran
+both libc lanes in 0.42 seconds under a 15-second outer bound; the unentitled
+negative control passed. Docker was not started.
+
+Six cached-only LTP cross-checks (`epoll_ctl01`, `epoll_wait01`, `poll01`,
+`ppoll01`, `recvmsg01`, `recvmsg02`) all TBROKed before their syscall assertions
+on the existing `/proc/2/oom_score_adj` prerequisite. Their 0/1 results are proc
+PID-2 blocker evidence, not network regressions.
+
+Authoritative signed artifact:
+
+| field | value |
+|---|---|
+| source HEAD | `0ff301096589fce40420eb25005192552cf0af3f` |
+| binary SHA-256 | `2932af3f2911bfff612a6cf89204485631fa52d47e7e1dfe3a18e6dabfb817e4` |
+| CDHash | `773a4f2844e7cdd28cf277fa7c7805f60362c28e` |
+| LC_UUID | `1A65257D-1421-344D-9D96-83BA7C272DE1` |
+| hypervisor entitlement | present |
+| `__dof_carrick` | present |
+
+Next rank should come from the remaining atomic embedded differences, not from
+the six proc-blocked LTP wrappers. The archive audit's getdents64 regular-file
+errno, lsetxattr symlink no-follow behavior, and linkat follow canonicalization
+remain a cohesive candidate cluster.
 
 ## SESSION 16 — 2026-08-27: timeout feedback loop tightened
 
