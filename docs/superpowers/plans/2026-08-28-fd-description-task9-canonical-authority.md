@@ -1,209 +1,285 @@
-# Task 9 Canonical FileAuthority Cutover Implementation Plan
+# Task 9 Canonical FileAuthority Vertical Slice Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Route the first production file-description mutation family through one `FileAuthority` that operates on the exact `Arc<FileTable>` and `Arc<FileDescription>` objects already published by the kernel, with no second slot or description store.
+**Goal:** Give `FileAuthorityCore` its first production caller by routing `F_SETPIPE_SZ` through a serialized transaction over the exact canonical `Arc<FileTable>` and `Arc<FileDescription>` captured from the kernel context, without creating or synchronizing a second file-object store.
 
-**Architecture:** `FileAuthorityCore` becomes the transaction coordinator and owner registry for the kernel's canonical file objects. Authority-created descriptions place their mutable state in one concrete `FileDescriptionBacking`; pre-existing dispatch descriptions are mutated through typed methods on the same canonical `FileDescription`. Fork, clone, exec, unshare, host-fork, and exit use prepared authority bindings: preparation may fail before kernel publication, publication is infallible, and dropping an unpublished preparation rolls it back.
+**Architecture:** Production launch authenticates one run/client but does not issue `CreateTable`; the model tables already used by the authority test suite remain empty in production. A direct-only `CanonicalAuthorityTarget` accompanies the value-only command to the in-carrier core and contains the exact captured `Arc<FileTable>` plus a `FileSlotAuthority` generation token. The core resolves and mutates the canonical description under its existing transaction lock; no production table/description registry, lifecycle binding, observer, or mirrored snapshot is introduced in this Task 9 slice.
 
-**Tech Stack:** Rust, `Arc`, `parking_lot`, Carrick kernel object graph, direct `FileAuthorityTransport`, typed K1 migration ledgers, signed HVPatch conformance.
+**Tech Stack:** Rust, `Arc`, Carrick `KernelContext`, `FileTable`, `FileDescription`, direct `FileAuthorityTransport`, typed K1 migration ledgers, signed HVPatch conformance.
 
-**Spec:** `docs/superpowers/plans/2026-08-12-per-run-file-authority-atomic-migration.md`, as amended by the user's 2026-08-28 approval that FileAuthority operate on the existing canonical kernel objects.
+**Spec:** `docs/superpowers/plans/2026-08-12-per-run-file-authority-atomic-migration.md`, as amended by the user's 2026-08-28 approval that the Task 9 production slice operate on the existing canonical kernel objects.
+
+## Why this supersedes the first replacement draft
+
+Independent review rejected the first draft before implementation because it tried to combine Task 9's first direct production call with the later full lifecycle/backend cutover. That created a root-binding bootstrap cycle, required a complete description registry while 75 creation paths remained direct, could not atomically publish prepared bindings, omitted fd-reuse freshness, collided independent ID allocators, overstated host-fork/IPC support, and lacked close-effect ordering. This plan removes those false claims and implements only the direct, in-carrier vertical slice Task 9 actually gates.
 
 ## Global Constraints
 
-- There is one mutable slot map and one mutable description payload. Do not add a canonical/legacy enum, read-through fallback, dual write, synchronization copy, or production mode switch.
-- The maps in `FileAuthorityCore` hold the exact canonical `Arc<FileTable>` and `Arc<FileDescription>` objects; lifecycle metadata may be separate but may not repeat slots, offsets, flags, readiness, pipe capacity, or backing state.
-- `ObjectGeneration` authenticates an object incarnation. Mutation freshness uses canonical slot generation and canonical object revision; do not reinterpret `ObjectGeneration` as a mutation counter.
-- Preserve `AuthorityFatal` separately from guest-semantic `AuthorityError`. Fatal authority failures terminate the run and never degrade to errno or a legacy path.
-- Authority preparation may block before kernel publication. Kernel publication must not perform a fallible authority call or hold an authority lock. Dropping an unpublished preparation aborts it.
-- Never transact while holding a kernel registry, table, description, stream, VFS, guest-memory, or host-wait lock.
-- Preserve `FileCloseEvent`, epoll cleanup, mqueue rebinding, dnotify/inotify cleanup, classic-lock release, logical fd-reference hooks, and host-fd ownership ordering.
-- Keep Carrick and Docker oracle phases serialized. Guest execution uses a newly built and signed binary with a scoped `CARRICK_RUN_ID`.
-- The full `just lint-domains` gate is allowed to stop only at the checked-in host-authority positional inventory drift when it reports `changed=[]`; never refresh that unrelated inventory.
+- The production authority core must not allocate, create, copy, or populate a private table or description for this path. Its existing model maps are test-only behavior and remain empty in a production `FileAuthorityRun`.
+- Do not add a canonical/legacy enum, mode switch, read-through fallback, dual write, synchronization copy, observer registry, or lazy semantic snapshot.
+- The exact captured `Arc<FileTable>` is a trusted direct-transport sidecar, never encoded in `Request` and never stored as a second ownership graph. Every outcome-determinant scalar, including host queued-byte accounting, remains value-only in the command so deduplication and a future IPC core see the complete operation.
+- `FileSlotAuthority` is the fd-reuse freshness proof: table ID, fd number, slot generation, and description ID must all be validated before obtaining the canonical description. Never authorize by fd number alone.
+- `ObjectGeneration` remains object-incarnation identity. Do not reinterpret it as a mutation revision.
+- `AuthorityFatal` remains run-fatal and distinct from guest-semantic `AuthorityError`; neither can fall back to direct mutation.
+- Only `F_SETPIPE_SZ` moves in this slice. Do not migrate close, close-range, fork/clone/exec bindings, `ThreadResources`, host-fork, IPC, or the other heterogeneous `slot_description_mutation` entries.
+- Do not reintroduce `OpenDescription::base`, `base_mut`, a generic mutable backing accessor, or any bridge removed by FD seam Task 5.
+- Preserve both in-memory and host-pipe behavior: shared cross-end capacity, page rounding/minimum, `EINVAL`, `EPERM`, `EBUSY`, `EBADF`, buffered-byte checks, and one canonical description revision publication after success only.
+- Keep Carrick and Docker phases serialized. Guest execution uses a newly built and signed binary with a scoped `CARRICK_RUN_ID`.
+- Full `just lint-domains` may stop only at the checked-in host-authority positional inventory drift when it reports `changed=[]`; never refresh that unrelated inventory.
 
 ---
 
-### Task 1: Replace the parallel FileAuthority object store with canonical kernel objects
+### Task 1: Add a direct canonical target without creating production model objects
 
 **Files:**
-- Modify: `crates/carrick-runtime/src/file_authority/core.rs`
-- Modify: `crates/carrick-runtime/src/file_authority/backing.rs`
 - Modify: `crates/carrick-runtime/src/file_authority/types.rs`
+- Modify: `crates/carrick-runtime/src/file_authority/transport.rs`
+- Modify: `crates/carrick-runtime/src/file_authority/core.rs`
+- Modify: `crates/carrick-runtime/src/file_authority/root.rs`
 - Modify: `crates/carrick-runtime/src/file_authority/tests.rs`
-- Modify: `crates/carrick-runtime/src/kernel/objects.rs`
-- Modify: `crates/carrick-runtime/src/dispatch/fd_table.rs`
 
 **Interfaces:**
-- Consumes: `kernel::FileTable`, `kernel::FileDescription`, `kernel::FileSlot`, `DescriptionCommon`, `FileDescriptionBacking`, `FileTable::install`, `FileTable::slot`, and stable kernel IDs.
-- Produces: `FileAuthorityCore::for_run(epoch, root: Arc<FileTable>)`, canonical `tables: BTreeMap<FileTableId, Arc<FileTable>>`, canonical `descriptions: BTreeMap<FileDescriptionId, Arc<FileDescription>>`, and `AuthorityDescriptionBacking` as the sole mutable payload for authority-created descriptions.
+- Consumes: `Arc<kernel::FileTable>`, `kernel::FileSlotAuthority`, existing `AuthorityCall`, and the direct transport serialization lock.
+- Produces: `CanonicalAuthorityTarget`, `DirectFileAuthority::transact_canonical`, `FileAuthorityCore::execute_canonical_call`, and `FileAuthorityRun::launch(root_table: Arc<FileTable>)` with no production `CreateTable` request. `FileAuthorityRun` retains the concrete direct transport plus a `Weak<FileTable>` root identity; this slice does not put Arc-bearing targets on the IPC-shaped transport trait.
 
-- [ ] **Step 1: Add red canonical-identity tests**
+- [ ] **Step 1: Add red production-root and canonical-path isolation tests**
 
-Add tests proving all four properties in `file_authority/tests.rs`:
+Add tests with these exact assertions:
 
 ```rust
 #[test]
-fn canonical_root_is_the_authority_root_without_a_second_slot_map() {
-    let root = canonical_root_with_installed_synthetic_fd(7);
-    let expected_table = root.id();
-    let expected_description = root
-        .slot(FileSlotNumber::for_open_fd(7).expect("fd"))
-        .expect("canonical slot")
-        .description();
-    let mut harness = Harness::with_canonical_root(Arc::clone(&root));
+fn production_root_binding_names_the_kernel_table_without_creating_a_model_table() {
+    let ids = ObjectIdRegistry::new();
+    let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+    let run = FileAuthorityRun::launch(Arc::clone(&table)).expect("authority launch");
 
-    assert_eq!(harness.binding.table, expected_table);
-    let resolved = harness.resolve_slot(7).expect("authority resolve");
-    assert_eq!(resolved.description, expected_description.id());
-    assert!(Arc::ptr_eq(
-        &harness.canonical_description(resolved.description),
-        &expected_description,
-    ));
-    assert_eq!(root.slot_count(), 1);
+    assert_eq!(run.binding().table, table.id());
+    assert_eq!(run.model_table_count_for_test(), 0);
+    assert_eq!(run.model_description_count_for_test(), 0);
 }
 ```
 
 ```rust
 #[test]
-fn authority_mutation_changes_the_same_canonical_description_arc() {
-    let (root, pipe_description) = canonical_root_with_pipe(3);
-    let before = pipe_description.revision_for_test();
-    let mut harness = Harness::with_canonical_root(root);
-
-    let outcome = harness.set_pipe_capacity(3, 131_072).expect("mutation");
-
-    assert!(matches!(outcome, Outcome::PipeCapacitySet { .. }));
-    assert_eq!(pipe_description.pipe_capacity_for_test(), Some(131_072));
-    assert!(pipe_description.revision_for_test() > before);
+fn canonical_path_rejects_a_model_command_without_fallback() {
+    // Construct a valid direct target, then send an existing model-only
+    // command through the canonical entry point.
+    assert!(matches!(fatal, AuthorityFatal::InvariantViolation(_)));
+    assert_eq!(run.model_table_count_for_test(), 0);
 }
 ```
 
-The helper constructors must use the public kernel constructors and install into one real `FileTable`; they must not populate an authority-only table first.
+Also add cross-entry replay-ordering tests: an already completed model request replayed through `transact_canonical` is fatal; an already completed canonical request replayed through ordinary `transact` is fatal; and a duplicate canonical request with a mismatched target sidecar is fatal rather than replaying the cached response.
 
-- [ ] **Step 2: Run the tests red**
-
-Run:
+- [ ] **Step 2: Run both tests red**
 
 ```bash
-RUSTC_WRAPPER= cargo test -p carrick-runtime --lib canonical_root_is_the_authority_root -- --test-threads=1 --nocapture
-RUSTC_WRAPPER= cargo test -p carrick-runtime --lib authority_mutation_changes_the_same_canonical_description_arc -- --test-threads=1 --nocapture
+RUSTC_WRAPPER= cargo test -p carrick-runtime --lib production_root_binding_names_the_kernel_table -- --test-threads=1 --nocapture
+RUSTC_WRAPPER= cargo test -p carrick-runtime --lib canonical_path_rejects_a_model_command_without_fallback -- --test-threads=1 --nocapture
 ```
 
-Expected: FAIL because `FileAuthorityCore::for_run` has no canonical root and still allocates its own `FileTableState`/`FileDescriptionState` store.
+Expected: FAIL because launch creates a private model table and there is no canonical target call.
 
-- [ ] **Step 3: Make authority-created state a canonical backing**
+- [ ] **Step 3: Define the transport-local target**
 
-Replace the authority-only `FileDescriptionState` payload with a concrete backing installed in the canonical `FileDescription`:
+Define in `types.rs` without `Clone`, `Eq`, serialization, or inclusion in `Request`:
 
 ```rust
-#[derive(Debug)]
-pub(super) struct AuthorityDescriptionBacking {
-    state: Mutex<AuthorityDescriptionState>,
-}
-
-#[derive(Debug)]
-struct AuthorityDescriptionState {
-    offset: FileOffset,
-    access_mode: AccessMode,
-    readiness: ReadinessSnapshot,
-    backing: AuthorityBacking,
+pub(crate) struct CanonicalAuthorityTarget {
+    pub(crate) table: Arc<crate::kernel::FileTable>,
+    pub(crate) slot: crate::kernel::FileSlotAuthority,
 }
 ```
 
-Implement `kernel::FileDescriptionBacking` for `AuthorityDescriptionBacking`. Snapshot and readiness read this one mutex. `DescriptionCommon` remains the single authority for status flags, async owner/signal, lease, seals, secretmem, and logical fd references.
+Add a `Debug` implementation that prints typed IDs/generations only, never backing contents or host fds.
 
-- [ ] **Step 4: Convert the core maps without a compatibility representation**
+- [ ] **Step 4: Add the direct canonical transaction path**
 
-Change the core fields to:
+Add:
 
 ```rust
-tables: BTreeMap<FileTableId, Arc<crate::kernel::FileTable>>,
-descriptions: BTreeMap<FileDescriptionId, Arc<crate::kernel::FileDescription>>,
-table_lifecycle: BTreeMap<FileTableId, CanonicalTableLifecycle>,
-description_lifecycle: BTreeMap<FileDescriptionId, CanonicalDescriptionLifecycle>,
+impl DirectFileAuthority {
+    pub(crate) fn transact_canonical(
+        &self,
+        call: AuthorityCall,
+        target: CanonicalAuthorityTarget,
+    ) -> Result<AuthorityReply, AuthorityFatal> {
+        self.core.lock().execute_canonical_call(call, target)
+    }
+}
 ```
 
-`CanonicalTableLifecycle` contains only generation, authority revision, and authenticated client bindings. `CanonicalDescriptionLifecycle` contains only generation, authority revision, and capability-lease count. Neither type may contain slots or mutable open-description semantics.
+Both entry points perform entry-family validation before any dedup lookup: ordinary `execute_call` rejects a canonical command, while `execute_canonical_call` rejects a model command and structurally checks `target.slot == command.slot` plus `target.table.id() == command.slot.table()`. Only after those checks do they share epoch, client, request-order, capability, and dedup handling. This ordering prevents a terminal model response from replaying through the canonical entry, a terminal canonical response from replaying through the model entry, or a cached canonical response from bypassing a mismatched sidecar. Refactor the common authentication/dedup body into one private helper so the paths cannot otherwise drift.
 
-Delete `FileTableState`, `FileSlotState`, and the old semantic fields in `FileDescriptionState`; do not retain them behind an enum or `Option`.
+For a dedup hit, replay the already committed canonical response without re-resolving live slot state; a legitimate retry remains replayable after close/reuse. Only a fresh canonical request calls the single-lock `resolve_slot_authority` and dispatches the mutation. Any entry-family mismatch is `AuthorityFatal::InvariantViolation`; it never selects a fallback path.
 
-- [ ] **Step 5: Convert every core command to the canonical map**
+- [ ] **Step 5: Stop creating the production model root**
 
-For table operations, resolve the exact `Arc<FileTable>` and use typed table methods. For description operations, resolve the exact `Arc<FileDescription>` and either:
+Change production launch to accept the exact already-allocated `Arc<FileTable>`. Register the run client, construct `FileAuthorityBinding { epoch, client, table: root_table.id(), generation: ObjectGeneration::INITIAL }`, retain `Weak<FileTable>` for exact-root authentication, and do not issue `Command::CreateTable` or the model `ListSlots` health check. Retain `Arc<DirectFileAuthority>` in `FileAuthorityRun` for this in-carrier slice rather than erasing it behind `Arc<dyn FileAuthorityTransport>`; the ordinary `execute` path still calls the trait implementation. Add `#[cfg(test)]` count accessors as inherent methods on `DirectFileAuthority`, exposed through `FileAuthorityRun` test helpers. Do not add Arc-bearing methods to `FileAuthorityTransport`, and do not expose the core or its maps to production callers.
 
-- mutate `DescriptionCommon` for common state;
-- downcast `AuthorityDescriptionBacking` for authority-created payloads; or
-- call a typed canonical method implemented on `FileDescription` for an existing dispatch backing.
+Activation upgrades the retained weak root and uses `Arc::ptr_eq` to make repeated activation idempotent only for that same Arc; a different Arc at activation is fatal. Canonical calls deliberately do not compare against the launch root: exec, copied-files clone, and `CLOSE_RANGE_UNSHARE` legitimately publish successor `FileTable` Arcs while this slice omits lifecycle registration. Their table sidecar comes only from the dispatcher's internally captured `KernelContext`, never from guest-controlled data, and is authenticated by matching its typed ID to the complete command slot token before single-lock slot resolution.
 
-A backing/type mismatch returns `Outcome::Rejected(AuthorityError::WrongBacking { .. })`; a missing registered object returns the existing typed missing-object rejection. It must never fall back to a second map.
-
-- [ ] **Step 6: Run the authority model and structural gates**
-
-Run:
+- [ ] **Step 6: Run focused and authority-model gates**
 
 ```bash
+RUSTC_WRAPPER= cargo test -p carrick-runtime --lib production_root_binding_names_the_kernel_table -- --test-threads=1 --nocapture
+RUSTC_WRAPPER= cargo test -p carrick-runtime --lib canonical_path_rejects_a_model_command_without_fallback -- --test-threads=1 --nocapture
 RUSTC_WRAPPER= cargo test -p carrick-runtime --lib file_authority:: -- --test-threads=1 --nocapture
-rg -n 'struct FileTableState|struct FileSlotState|struct FileDescriptionState' crates/carrick-runtime/src/file_authority
 ```
-
-Expected: all authority tests PASS; the structural search returns no matches.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/carrick-runtime/src/file_authority crates/carrick-runtime/src/kernel/objects.rs crates/carrick-runtime/src/dispatch/fd_table.rs
-git commit -m "refactor(runtime): canonicalize FileAuthority objects"
+git add crates/carrick-runtime/src/file_authority
+git commit -m "feat(runtime): add canonical FileAuthority target"
 ```
 
 ---
 
-### Task 2: Bind production activation and preserve the fatal/semantic error boundary
+### Task 2: Add one canonical pipe-capacity mutation without reopening generic backing access
 
 **Files:**
-- Modify: `crates/carrick-runtime/src/file_authority/root.rs`
+- Modify: `crates/carrick-runtime/src/kernel/objects.rs`
+- Modify: `crates/carrick-runtime/src/dispatch/fd_table.rs`
+- Modify: `crates/carrick-runtime/src/file_authority/core.rs`
 - Modify: `crates/carrick-runtime/src/file_authority/types.rs`
+- Test: `crates/carrick-runtime/src/file_authority/tests.rs`
+- Test: `crates/carrick-runtime/src/dispatch/fs/tests.rs`
+
+**Interfaces:**
+- Consumes: a validated `FileSlotAuthority`, the new single-lock `FileTable::resolve_slot_authority`, and the concrete `RwLock<OpenDescription>` backing already owned by the canonical `FileDescription`.
+- Produces: `Command::SetCanonicalPipeCapacity { slot, capacity }` and one narrow `FileDescription::set_pipe_capacity_from_authority` method.
+
+- [ ] **Step 1: Add red semantic and exact-object tests**
+
+Test all outcomes against one canonical table/description graph:
+
+- successful in-memory resize publishes one description revision and changes both pipe ends' shared capacity;
+- host-pipe resize changes the exact installed description;
+- shrink below queued bytes returns `EBUSY` without state/revision change;
+- request above 1 MiB returns `EPERM`;
+- value above `i32::MAX` returns `EINVAL`;
+- a non-pipe or closed backing returns `EBADF`; and
+- replacing the fd after token capture returns `StaleSlot` without touching the replacement.
+- atomic resolution returns one exact description or `StaleSlot` even when a close/reuse writer is queued at the lock boundary; use a held table write guard/barrier in the test so this is an interleaving test, not only a sequential replacement.
+- `F_SETPIPE_SZ` still succeeds through the canonical path after exec or `CLOSE_RANGE_UNSHARE` publishes a legitimate successor table Arc; activation is not repeated and the old root is not used as syscall authorization.
+
+Include the moved sequential fd-reuse test here:
+
+```rust
+#[test]
+fn canonical_target_rejects_a_closed_and_reused_fd_generation() {
+    let fixture = CanonicalPipeFixture::new(3);
+    let stale = fixture.table.capture_slot_authority(fixture.fd).expect("slot token");
+    fixture.replace_fd_with_fresh_pipe();
+
+    let outcome = fixture.call_set_capacity(stale, 131_072);
+
+    assert!(matches!(outcome, Outcome::Rejected(AuthorityError::StaleSlot { .. })));
+    assert_eq!(fixture.current_capacity(), fixture.initial_capacity());
+}
+```
+
+- [ ] **Step 2: Run the focused tests red**
+
+```bash
+RUSTC_WRAPPER= cargo test -p carrick-runtime --lib canonical_pipe_capacity_ -- --test-threads=1 --nocapture
+```
+
+- [ ] **Step 3: Add the value-only command**
+
+Add:
+
+```rust
+SetCanonicalPipeCapacity {
+    slot: crate::kernel::FileSlotAuthority,
+    capacity: PipeCapacity,
+    accounting: crate::kernel::PipeCapacityAccounting,
+},
+```
+
+Define `kernel::PipeCapacityAccounting` as a value-only enum with `InMemory` and `Host { queued_bytes: u64 }` variants, beside the canonical description operation rather than making the kernel depend on FileAuthority types. The command repeats the target token intentionally so request authentication and dedup compare the full value-only operation, including the outcome-determinant host observation. Command/target structural checks occur before dedup as specified in Task 1. The single-lock `resolve_slot_authority` freshness check occurs only for a fresh request after a dedup miss; failure returns `StaleSlot`.
+
+Make `PipeCapacity::MAX` and its checked constructor available to production code. The dispatcher performs Linux errno-specific argument validation first, then constructs the typed nonzero, bounded value; invalid values must not be representable in the authority command.
+
+Add a distinct committed result, for example:
+
+```rust
+CanonicalPipeCapacitySet {
+    description: FileDescriptionId,
+    capacity: PipeCapacity,
+    description_revision: u64,
+}
+```
+
+Do not reuse model-only `Outcome::PipeCapacitySet`, which requires a `PipeId` and stream revision. Advance `Response.authority_revision` exactly as for any accepted command; the returned `description_revision` is the distinct kernel `FileDescription` revision after the one successful publication. Change `FileDescription::publish_mutation()` to return that canonical `u64` (or read it while still under the same lifecycle transition); never wrap it in file-authority `Revision`.
+
+- [ ] **Step 4: Add one narrow typed mutation seam**
+
+Add an object-safe, narrow method to `kernel::FileDescriptionBacking`, with a default unsupported result, for example:
+
+```rust
+fn set_pipe_capacity_from_authority(
+    &self,
+    capacity: i64,
+    accounting: PipeCapacityAccounting,
+) -> Result<i64, PipeCapacityMutationError> {
+    Err(PipeCapacityMutationError::NotPipe)
+}
+```
+
+Define `kernel::PipeCapacityMutationError` beside the operation, with `NotPipe`, `Semantic(LinuxErrno)`, and `AccountingMismatch`; this keeps the canonical object layer independent of FileAuthority. Implement the backing method only for `RwLock<OpenDescription>` in `dispatch/fd_table.rs`, where the concrete dispatch backing is visible. Match only `PipeReader`, `PipeWriter`, and `HostPipe`; do not add `OpenDescription::base`, `base_mut`, or a generic mutable accessor. Add `FileDescription::set_pipe_capacity_from_authority(capacity, accounting)` in `kernel/objects.rs`, where the private lifecycle/mutation lock can legally be acquired; it invokes the backing method once under that lock and publishes exactly once after success. The FileAuthority core translates `NotPipe`/Closed to semantic `EBADF`, preserves semantic `EBUSY`, and treats only an accounting-kind mismatch on a live pipe backing as `AuthorityFatal::InvariantViolation`.
+
+The command's `PipeCapacityAccounting` is `InMemory` for an in-memory pipe; for a host pipe it contains the queued-byte observation produced by the existing dispatcher accounting path, including the opposite read end and staged splice bytes. It is part of `Request` equality/dedup but is not a generic callback or backing accessor. The Arc table remains sidecar-only. Computing the host observation before the authority round trip has the same bounded race as the pre-cutover implementation (queue contents may change between its check and capacity-cell update); this task must not weaken that behavior, and a future stronger reservation protocol is outside this slice.
+
+For in-memory pipe ends, use `PipeInner::set_capacity` so the buffer-length check and shared cross-end capacity remain atomic. For host pipes, perform the exact buffered-byte check and update the existing shared capacity cell. The `FileDescription` method acquires its private lifecycle/mutation lock before invoking the backing method, returns a typed error without publication on rejection, and calls `publish_mutation()` exactly once after success. No extension impl outside `kernel::objects` may access the private lifecycle lock.
+
+- [ ] **Step 5: Resolve the canonical description safely**
+
+Add `FileTable::resolve_slot_authority(FileSlotAuthority) -> Option<Arc<FileDescription>>`. It acquires `open_files.read()` exactly once, checks table ID, fd number, slot generation, and description ID against that one guard, and clones the exact description before releasing the guard. Do not compose `validate_slot_authority()` with `slot()`. Release the table lock before taking the description mutation lock. If close/reuse wins the table lock first, resolution returns `StaleSlot`; if resolution wins first, the retained Arc names the original description even if the fd number is later reused.
+
+- [ ] **Step 6: Run focused and full authority tests**
+
+```bash
+RUSTC_WRAPPER= cargo test -p carrick-runtime --lib canonical_pipe_capacity_ -- --test-threads=1 --nocapture
+RUSTC_WRAPPER= cargo test -p carrick-runtime --lib file_authority:: -- --test-threads=1 --nocapture
+RUSTC_WRAPPER= cargo test -p carrick-runtime --lib --no-run
+```
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add crates/carrick-runtime/src/file_authority crates/carrick-runtime/src/kernel/objects.rs crates/carrick-runtime/src/dispatch/fd_table.rs crates/carrick-runtime/src/dispatch/fs/tests.rs
+git commit -m "feat(runtime): mutate canonical pipe capacity in FileAuthority"
+```
+
+---
+
+### Task 3: Activate on the final bound root and route the production syscall
+
+**Files:**
 - Modify: `crates/carrick-runtime/src/dispatch/mod.rs`
 - Modify: `crates/carrick-runtime/src/threaded_loop.rs`
 - Modify: `crates/carrick-runtime/src/runtime.rs`
-- Test: `crates/carrick-runtime/src/file_authority/tests.rs`
+- Modify: `crates/carrick-runtime/src/hvpatch/mod.rs`
+- Modify: `crates/carrick-runtime/src/dispatch/fs.rs`
 - Test: inline tests in `crates/carrick-runtime/src/dispatch/mod.rs`
+- Test: `crates/carrick-runtime/src/dispatch/fs/tests.rs`
 
 **Interfaces:**
-- Consumes: canonical `FileAuthorityCore::for_run(epoch, root)` from Task 1 and an exact captured `KernelContext.resources().files()`.
-- Produces: `FileAuthorityRun::launch(root: Arc<FileTable>)`, `AuthorityCallError::{Rejected(AuthorityError), Fatal(AuthorityFatal)}`, and the sole `SyscallDispatcher::authority_call` production entry point.
+- Consumes: final captured `KernelContext.resources().files()`, `FileAuthorityRun::launch(Arc<FileTable>)`, and `DirectFileAuthority::transact_canonical`.
+- Produces: one `SyscallDispatcher::authority_call` that takes the exact canonical table/slot target and preserves fatal versus semantic errors.
 
-- [ ] **Step 1: Add red activation and error-boundary tests**
+- [ ] **Step 1: Add red activation/error tests**
 
-Add tests proving:
+Prove that activation after HVPatch binding names `process_context.resources().files().id()`, repeated activation of the same table is idempotent, activation against a different final table is fatal, semantic rejection maps to the exact Linux errno, and an injected `AuthorityFatal` never invokes the old direct mutation.
 
-```rust
-assert_eq!(binding.table, captured_context.resources().files().id());
-assert_eq!(binding.generation, ObjectGeneration::INITIAL);
-```
+- [ ] **Step 2: Move activation to the final binding point**
 
-Add one semantic rejection test expecting `AuthorityCallError::Rejected(_)`, and one injected transport failure expecting `AuthorityCallError::Fatal(AuthorityFatal::TransportUnavailable)`. Assert the fatal case does not invoke a legacy mutation closure.
+Change activation to accept the final captured `Arc<FileTable>` explicitly. Remove the premature top-level activation that observes the constructor bootstrap table. In `hvpatch/mod.rs`, immediately after the root `dispatcher.bind_hvpatch_process(context.clone())` final binding (currently near line 1347), capture the bound one-task kernel context, pass its `resources().files()` Arc to the fallible activation, and propagate failure as `RuntimeError::Configuration`. In the one-task path, activate after its final kernel binding is established and pass that final Arc. Repeated activation is idempotent only when `Arc::ptr_eq` confirms the same retained root; any different Arc, including a foreign same-ID table, is fatal. Do not add a binding to `ThreadResources` in this task.
 
-- [ ] **Step 2: Run the tests red**
-
-```bash
-RUSTC_WRAPPER= cargo test -p carrick-runtime --lib dispatcher_activates_one_authenticated_file_authority_root -- --test-threads=1 --nocapture
-RUSTC_WRAPPER= cargo test -p carrick-runtime --lib authority_call_preserves_fatal_and_semantic_errors -- --test-threads=1 --nocapture
-```
-
-Expected: FAIL because activation still launches an empty private root and the call API does not exist.
-
-- [ ] **Step 3: Pass the exact root into launch**
-
-Change activation to capture the final kernel context first and call:
-
-```rust
-FileAuthorityRun::launch(context.resources().files())
-```
-
-HVPatch activation must occur after `bind_hvpatch_process`; the discarded one-task constructor bootstrap table must never become the authority root. One-task/native activation uses its final bound context. Repeated activation is idempotent only when `Arc::ptr_eq` and the table ID both match; otherwise return `AuthorityFatal::InvariantViolation`.
-
-- [ ] **Step 4: Add the one production call API**
+- [ ] **Step 3: Add the one production entry point**
 
 Define:
 
@@ -215,160 +291,67 @@ pub(crate) enum AuthorityCallError {
 
 pub(crate) fn authority_call(
     &self,
-    binding: FileAuthorityBinding,
+    table: Arc<crate::kernel::FileTable>,
+    slot: crate::kernel::FileSlotAuthority,
     command: Command,
-    expected: ObjectGeneration,
 ) -> Result<Outcome, AuthorityCallError>
 ```
 
-The method authenticates the passed binding against the run, calls the transport once, maps only `Outcome::Rejected(error)` to `Rejected`, maps transport/protocol failure to `Fatal`, and returns every committed outcome unchanged. There is no retry or fallback.
+Treat the supplied table Arc as trusted only because it was captured internally from the current `KernelContext`; authenticate `table.id()` against the command and target token, allocate exactly one request ID, call the retained concrete direct transport's `transact_canonical`, map only `Outcome::Rejected(error)` to `Rejected`, and preserve transport/protocol failure as `Fatal`. Do not compare syscall tables to the launch root: legitimate exec/unshare successor tables must work. There is no retry or direct fallback.
 
-- [ ] **Step 5: Run focused and full host gates**
+- [ ] **Step 4: Route `F_SETPIPE_SZ`**
+
+Keep guest argument parsing and Linux page/max policy at the syscall boundary only where it cannot race. Capture the exact table and `FileSlotAuthority`; for a host pipe, compute the narrow queued-byte accounting observation through the existing `host_pipe_capacity_state` path before issuing `SetCanonicalPipeCapacity`. Then issue the canonical command and remove the old direct backing mutation. `F_GETPIPE_SZ` remains a read in this slice.
+
+Map semantic errors to `EINVAL`, `EPERM`, `EBUSY`, or `EBADF`. Route `Fatal` through the new run-fatal dispatch error below; never map it to guest errno.
+
+Add an explicit non-errno dispatch error variant such as `DispatchError::FileAuthorityFatal(AuthorityFatal)`. `lower_handler_result` must leave this variant run-fatal, just like the existing non-errno fatal path. Do not add a `DispatchOutcome` fatal case, and do not collapse a transport, authentication, dedup, or invariant failure into `LinuxErrno`.
+
+- [ ] **Step 5: Run focused dispatcher gates**
 
 ```bash
-RUSTC_WRAPPER= cargo test -p carrick-runtime --lib file_authority::root::tests -- --test-threads=1 --nocapture
 RUSTC_WRAPPER= cargo test -p carrick-runtime --lib dispatcher_activates_one_authenticated_file_authority_root -- --test-threads=1 --nocapture
-RUSTC_WRAPPER= cargo test -p carrick-runtime --lib --no-run
+RUSTC_WRAPPER= cargo test -p carrick-runtime --lib canonical_pipe_capacity_ -- --test-threads=1 --nocapture
+RUSTC_WRAPPER= cargo test -p carrick-runtime --lib fcntl_pipe -- --test-threads=1 --nocapture
 ```
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/carrick-runtime/src/file_authority crates/carrick-runtime/src/dispatch/mod.rs crates/carrick-runtime/src/threaded_loop.rs crates/carrick-runtime/src/runtime.rs
-git commit -m "feat(runtime): bind FileAuthority to the canonical root"
+git add crates/carrick-runtime/src/dispatch crates/carrick-runtime/src/threaded_loop.rs crates/carrick-runtime/src/runtime.rs crates/carrick-runtime/src/hvpatch/mod.rs
+git commit -m "feat(runtime): route pipe capacity through FileAuthority"
 ```
 
 ---
 
-### Task 3: Prepare and publish canonical authority bindings with kernel lifecycle transactions
+### Task 4: Reconcile measured K1 evidence and run host/signed acceptance
 
 **Files:**
-- Modify: `crates/carrick-runtime/src/file_authority/root.rs`
-- Modify: `crates/carrick-runtime/src/file_authority/core.rs`
-- Modify: `crates/carrick-runtime/src/file_authority/types.rs`
-- Modify: `crates/carrick-runtime/src/kernel/objects.rs`
-- Modify: `crates/carrick-runtime/src/kernel/operations.rs`
-- Modify: `crates/carrick-runtime/src/kernel/exec.rs`
-- Modify: `crates/carrick-runtime/src/dispatch/mod.rs`
-- Test: `crates/carrick-runtime/src/kernel/tests.rs`
-- Test: existing inline tests in `kernel/operations.rs` and `kernel/exec.rs`
-
-**Interfaces:**
-- Consumes: the one `Arc<FileAuthorityRun>` and canonical object maps.
-- Produces: `ThreadResources.file_authority: FileAuthorityBinding`, `PreparedFileTableBinding`, and prepare/commit/abort/retire lifecycle methods.
-
-- [ ] **Step 1: Add red rollback and publication tests**
-
-For fork-copy, thread clone with copied files, exec, host-fork copy, and `close_range(CLOSE_RANGE_UNSHARE)`, assert that the prepared successor binding names the exact successor `FileTable::id()`. For every existing failpoint before publication, assert the successor table is absent from the authority after the preparation drops. After publication, assert the binding is active before a child/thread can dispatch.
-
-- [ ] **Step 2: Run the focused tests red**
-
-```bash
-RUSTC_WRAPPER= cargo test -p carrick-runtime --lib fork_publishes_task_and_independently_selected_resources -- --test-threads=1 --nocapture
-RUSTC_WRAPPER= cargo test -p carrick-runtime --lib thread_clone_keeps_task_shared_but_can_copy_files_and_fs -- --test-threads=1 --nocapture
-RUSTC_WRAPPER= cargo test -p carrick-runtime --lib every_exec_failpoint_preserves_published_generation -- --test-threads=1 --nocapture
-RUSTC_WRAPPER= cargo test -p carrick-runtime --lib hvpatch_close_range_unshare_splits_clone_files_before_closing_child_fd -- --test-threads=1 --nocapture
-```
-
-- [ ] **Step 3: Put the binding in `ThreadResources`**
-
-Add one value field:
-
-```rust
-file_authority: FileAuthorityBinding,
-```
-
-`ThreadResources::new`, `for_clone`, `for_exec`, and `with_files` must receive or derive the binding explicitly. Share copies the exact binding. Copy/exec consumes a committed prepared successor binding. The binding carries no mutable file state.
-
-- [ ] **Step 4: Implement the prepared lifecycle token**
-
-Define a non-`Clone` token:
-
-```rust
-pub(crate) struct PreparedFileTableBinding {
-    run: Arc<FileAuthorityRun>,
-    binding: FileAuthorityBinding,
-    committed: bool,
-}
-```
-
-`prepare_copy`, `prepare_exec`, and `prepare_external_copy` register the exact successor `Arc<FileTable>` in a prepared state and return this token. `commit(mut self)` makes the entry active and returns its binding without allocation or transport. `Drop` aborts an uncommitted entry. `prepare_share` authenticates and returns the already-active binding without creating a table.
-
-- [ ] **Step 5: Attach tokens to existing kernel preparations**
-
-Add the prepared token to `PreparedFork`, prepared thread clone state, and `PreparedExec`. Prepare it after the canonical successor table is constructed and before registry publication. Commit it immediately before the existing infallible kernel publication section; do not call transport while holding the registry lock. Because publication cannot fail after that point, authority and kernel become visible together.
-
-Apply the same prepare/commit sequence to host-fork replacement and close-range unshare. `retain_stdio_only` must abort the superseded prepared binding and prepare the replacement table.
-
-- [ ] **Step 6: Retire only after kernel publication**
-
-Thread/task exit and exec retirement first publish kernel liveness changes, then call `FileAuthorityRun::retire_table_if_unreferenced` with the exact old `Arc<FileTable>`. Preserve the existing `Kernel::retire_file_table_generation` and dispatch `close_draining_file_table` effects. Authority-held `Arc`s are registry ownership, not evidence of a live task alias.
-
-- [ ] **Step 7: Run lifecycle and full host tests**
-
-```bash
-RUSTC_WRAPPER= cargo test -p carrick-runtime --lib every_thread_exit_failpoint_preserves_the_live_thread -- --test-threads=1 --nocapture
-RUSTC_WRAPPER= cargo test -p carrick-runtime --lib every_identity_and_exit_failpoint_restores_registry_state -- --test-threads=1 --nocapture
-RUSTC_WRAPPER= just test
-RUSTC_WRAPPER= just test-integration
-```
-
-- [ ] **Step 8: Commit**
-
-```bash
-git add crates/carrick-runtime/src/file_authority crates/carrick-runtime/src/kernel crates/carrick-runtime/src/dispatch/mod.rs
-git commit -m "feat(runtime): transact FileAuthority lifecycle bindings"
-```
-
----
-
-### Task 4: Route the measured production mutation family and close the Task 9 gates
-
-**Files:**
-- Modify: `crates/carrick-runtime/src/dispatch/fd_helpers.rs`
-- Modify: `crates/carrick-runtime/src/dispatch/fs.rs`
-- Modify: `crates/carrick-runtime/src/dispatch/mqueue.rs`
-- Modify: `crates/carrick-runtime/src/kernel/objects.rs`
-- Modify: `crates/carrick-runtime/src/file_authority/core.rs`
-- Modify: `crates/carrick-runtime/src/file_authority/tests.rs`
-- Modify: `crates/carrick-runtime/src/dispatch/fs/tests.rs`
 - Modify: `scripts/migrate/k1-file-authority-operation-inventory.json`
 - Modify: `scripts/migrate/k1-file-authority-callsite-taxonomy.json`
-- Modify: `scripts/migrate/k1-burndown-ceiling.json`
+- Modify: `scripts/migrate/k1-burndown-ceiling.json` only if the measured family/category count decreases
+- Modify: `.superpowers/sdd/2026-08-27-fd-description-seam/progress.md`
 
-**Interfaces:**
-- Consumes: canonical binding from captured `ThreadResources`, `SyscallDispatcher::authority_call`, canonical slot generation, and typed backing/downcast APIs.
-- Produces: no direct production guard in `slot_description_mutation`, and `SetPipeCapacity` operating on the exact installed description.
+- [ ] **Step 1: Re-measure rather than applying stale counts**
 
-- [ ] **Step 1: Re-measure the family before editing**
+Record that the live taxonomy began with 14 heterogeneous `slot_description_mutation` entries and that `F_SETPIPE_SZ` was classified under `inspect_misc`. Regenerate only the entries whose final source locations or authority shapes changed. Do not claim the 14-entry family is zero and do not set its ceiling to zero.
 
-Run the taxonomy query and record all 14 entries. Classify the ten production entries separately from four test/API entries. Do not use the stale count of nine and do not claim `F_SETPIPE_SZ` belongs to this family until the checker classifies its actual site.
+- [ ] **Step 2: Prove the production path is unique**
 
-- [ ] **Step 2: Add red canonical pipe-capacity tests**
+```bash
+rg -n 'LINUX_F_SETPIPE_SZ' crates/carrick-runtime/src/dispatch/fs.rs
+rg -n 'set_pipe_capacity\(' crates/carrick-runtime/src/dispatch crates/carrick-runtime/src/file_authority
+rg -n 'fn (base|base_mut)\(' crates/carrick-runtime/src/dispatch/fd_table.rs
+```
 
-Add tests proving set/get across opposite pipe ends, shrink-below-buffered `EBUSY`, oversize `EPERM`, invalid signed size `EINVAL`, non-pipe `EBADF`, one canonical revision publication, and no mutation on semantic rejection. Re-run the tests against the pre-route binary/source and preserve the red receipt.
+Expected: the syscall has one authority call and no direct production mutation; capacity mutation exists only in the narrow authority seam and underlying pipe primitive; the generic base-accessor search is empty.
 
-- [ ] **Step 3: Route `SetPipeCapacity` through the authority**
-
-Resolve the slot from the captured canonical table, validate its slot generation and description ID, perform policy checks before mutation, and mutate the actual in-memory or host-pipe backing once. Return `Outcome::PipeCapacitySet` with the new authority and canonical description revisions. Convert `AuthorityCallError::Rejected` to the matching Linux errno at the syscall boundary; propagate `Fatal` to the run-fatal path.
-
-- [ ] **Step 4: Route every measured production family site**
-
-Replace the ten production `slot_description_mutation` guards in `fd_helpers.rs`, `fs.rs`, and `mqueue.rs` with closed authority commands. Delete each direct guard path in the same edit. Reclassify test helpers explicitly; delete the guard-returning production API in `kernel/objects.rs` once no production caller remains.
-
-- [ ] **Step 5: Regenerate only the K1 ledgers affected by the final source**
-
-Use each checker's documented refresh command, inspect stable-key additions/removals, and lower `slot_description_mutation` to zero only if the final taxonomy has no production entries. Do not refresh the host-authority transition inventory.
+- [ ] **Step 3: Run K1 and host gates**
 
 ```bash
 python3 scripts/migrate/check-k1-file-authority-inventory.py
 python3 scripts/migrate/check-k1-file-authority-taxonomy.py
 python3 scripts/migrate/check-k1-burndown.py
-```
-
-- [ ] **Step 6: Run host gates**
-
-```bash
 just fmt
 RUSTC_WRAPPER= just test
 RUSTC_WRAPPER= just test-integration
@@ -379,33 +362,34 @@ git diff --check
 RUSTC_WRAPPER= just lint-domains
 ```
 
-Expected: every gate passes except the known full-lint host-authority positional inventory stop, which must report `changed=[]`.
+Expected: all gates pass except the known host-authority positional inventory stop, which must report `changed=[]`.
 
-- [ ] **Step 7: Run signed acceptance on one exact artifact**
+- [ ] **Step 4: Run exact signed acceptance on one recorded artifact**
 
-Build and sign once, record source HEAD plus binary SHA-256, CDHash, LC_UUID, entitlement, and `__dof_carrick`, then run exact Task 9-sensitive probes:
+Build/sign once and record source HEAD, binary SHA-256, CDHash, LC_UUID, hypervisor entitlement, and `__dof_carrick`. Run:
 
 ```bash
 RUSTC_WRAPPER= just build
 CARRICK_RUN_ID=fd-task9-final CARRICK_PROBE_FILTER=fcntlpipesz,pipeszcrossend,spawnflagmatrix,epollcluster RUSTC_WRAPPER= just conformance-probes
 ```
 
-Run the LTP `fcntl30` and `fcntl37` rows through the canonical harness on the same binary. Run Carrick first and Docker second; never concurrently. Grep binary logs with `grep -a`. Reap only `fd-task9-final` with `scripts/sudo/kill.sh fd-task9-final`.
+Run the LTP `fcntl30` and `fcntl37` rows on the same binary. Run Carrick first and Docker second, never concurrently. Grep binary logs with `grep -a`; reap only `fd-task9-final` with `scripts/sudo/kill.sh fd-task9-final`.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add crates/carrick-runtime/src scripts/migrate/k1-burndown-ceiling.json scripts/migrate/k1-file-authority-operation-inventory.json scripts/migrate/k1-file-authority-callsite-taxonomy.json
-git commit -m "feat(runtime): route canonical description mutations through FileAuthority"
+git add scripts/migrate/k1-burndown-ceiling.json scripts/migrate/k1-file-authority-operation-inventory.json scripts/migrate/k1-file-authority-callsite-taxonomy.json
+git commit -m "chore(runtime): record canonical pipe authority burndown"
 ```
 
 ## Completion audit
 
-- [ ] `FileAuthorityCore` has no private slot or open-description semantic store.
-- [ ] Production activation binds the exact final root table.
-- [ ] Every published task/thread resource bundle carries the matching active authority binding.
-- [ ] Every aborted fork/clone/exec/unshare preparation removes its unpublished authority entry.
-- [ ] Fatal authority errors have no guest-errno or legacy fallback path.
-- [ ] The live `slot_description_mutation` production family is empty and its ceiling was lowered from measured evidence.
-- [ ] Full host tests and exact signed probes pass on one recorded binary.
-
+- [ ] Production launch creates no private authority table or description.
+- [ ] The direct authority call receives the exact captured canonical table and a complete fd-generation token.
+- [ ] Close/reuse cannot redirect a mutation to a replacement description.
+- [ ] Successful capacity mutation publishes once; every rejection leaves state and revision unchanged.
+- [ ] `F_SETPIPE_SZ` has no direct mutation fallback and fatal authority errors remain run-fatal.
+- [ ] No generic backing accessor removed by Task 5 was reintroduced.
+- [ ] Measured K1 ledgers and ceilings reflect only the actual final reduction.
+- [ ] Full host gates and exact signed pipe probes pass on one recorded binary.
+- [ ] This Task 9 slice makes no host-fork, IPC-equivalence, full lifecycle-binding, or close-family completion claim; those remain Wave 3/4 work under the approved migration plan and the later runtime-abstraction controller.
