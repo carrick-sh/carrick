@@ -2448,6 +2448,60 @@ enum HvpatchProductionPhase {
     Complete,
 }
 
+fn enter_guest_executor_then_register<F>(
+    census: &Arc<crate::kernel::GuestExecutorCensus>,
+    thread: Option<crate::kernel::ThreadRef>,
+    register: F,
+) -> (
+    crate::kernel::GuestExecutorParticipation,
+    carrick_hal::VcpuRegistrationEnrollment,
+)
+where
+    F: FnOnce() -> carrick_hal::VcpuRegistrationEnrollment,
+{
+    let participation = census.enter(thread);
+    let enrollment = register();
+    (participation, enrollment)
+}
+
+fn registration_wake_uses_control(
+    phase: &HvpatchProductionPhase,
+    pending_control_quantum: bool,
+) -> bool {
+    if pending_control_quantum {
+        return true;
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        matches!(
+            phase,
+            HvpatchProductionPhase::RetryProcessFork {
+                external_exec: Some(_),
+                ..
+            }
+        )
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        let _ = phase;
+        false
+    }
+}
+
+fn registration_wake_callback(
+    scheduler: Arc<crate::kernel::Scheduler>,
+    thread: crate::kernel::ThreadKey,
+    use_control: bool,
+) -> Arc<dyn Fn() + Send + Sync + 'static> {
+    Arc::new(move || {
+        let _ = if use_control {
+            scheduler.wake_control(thread)
+        } else {
+            scheduler.wake(thread)
+        };
+    })
+}
+
 impl HvpatchProductionPhase {
     fn is_terminal_transition(&self) -> bool {
         matches!(
@@ -2954,6 +3008,7 @@ struct ProductionHvpatchLoopJob<E: ThreadedEngine> {
     kernel: Kernel,
     state: ThreadRuntimeState<E>,
     phase: HvpatchProductionPhase,
+    registration_wait: Option<carrick_hal::VcpuLeaseChangeSubscription>,
     terminal_settlement: HvpatchExternalTerminalSettlement,
     terminal_result: Option<Result<VcpuLoopOutcome, RuntimeError>>,
     completion: continuation::LogicalJobCompletion,
@@ -5559,12 +5614,50 @@ where
             return Ok(executor::ExecutorExit::Exited);
         }
         if self.state.guest_execution.is_none() {
-            self.state.guest_execution = Some(
-                self.kernel
-                    .guest_executors
-                    .enter(self.state.kernel_thread.as_ref().map(Arc::clone)),
+            drop(self.registration_wait.take());
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let pending_control_quantum = self.control_quantum()?.is_some();
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            let pending_control_quantum = false;
+            let registration_wake_mode =
+                registration_wake_uses_control(&self.phase, pending_control_quantum);
+            let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "persistent registration admission lost exact Kernel context".to_owned(),
+                )
+            })?;
+            let runtime = self.kernel.hvpatch_runtime.as_ref().ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "persistent registration admission lost shared scheduler".to_owned(),
+                )
+            })?;
+            let scheduler = runtime.continuation_services(context.kernel()).0;
+            let wake_registration = registration_wake_callback(
+                scheduler,
+                context.thread().key(),
+                registration_wake_mode,
             );
-            self.state.register_vcpu(engine);
+            let (participation, enrollment) = enter_guest_executor_then_register(
+                &self.kernel.guest_executors,
+                self.state.kernel_thread.as_ref().map(Arc::clone),
+                || {
+                    self.state
+                        .subscribe_register_vcpu(engine, wake_registration)
+                },
+            );
+            self.state.guest_execution = Some(participation);
+            match enrollment {
+                carrick_hal::VcpuRegistrationEnrollment::Registered => {}
+                carrick_hal::VcpuRegistrationEnrollment::Waiting { subscription, .. } => {
+                    self.registration_wait = Some(subscription);
+                    return Ok(self.suspend(
+                        HvpatchLoopSuspension::InitialAdmission,
+                        executor::ExecutorExit::Blocked(
+                            crate::kernel::objects::BlockedReason::HostWait,
+                        ),
+                    ));
+                }
+            }
         }
 
         // Exec/exit can force a blocked vfork parent runnable solely so it can
@@ -8102,6 +8195,7 @@ fn prepare_hvpatch_logical_job(
                 child_settid,
             },
         ),
+        registration_wait: None,
         terminal_settlement: terminal_settlement.clone(),
         terminal_result: None,
         completion: completion.clone(),
@@ -9849,6 +9943,7 @@ mod tests {
                 kernel: Arc::clone(&kernel),
                 state,
                 phase: HvpatchProductionPhase::Resident,
+                registration_wait: None,
                 terminal_settlement: HvpatchExternalTerminalSettlement::new(
                     job_result,
                     job_completion.clone(),
@@ -11065,6 +11160,334 @@ mod tests {
                 && source.contains("arm_process_owner()"),
             "the exact terminal CAS winner must arm owner-result authority"
         );
+    }
+
+    #[test]
+    fn production_registration_keeps_census_before_registry_publication() {
+        let source = include_str!("mod.rs");
+        let poll = source.split("fn poll_with_engine(").nth(1).unwrap();
+        assert!(
+            poll.find("guest_executors").unwrap() < poll.find("subscribe_register_vcpu").unwrap()
+        );
+    }
+
+    #[test]
+    fn registration_wait_is_sidecar_not_hvpatch_phase() {
+        let source = include_str!("mod.rs");
+        let job = source
+            .split("struct ProductionHvpatchLoopJob")
+            .nth(1)
+            .unwrap();
+        assert!(
+            job.contains("registration_wait: Option<carrick_hal::VcpuLeaseChangeSubscription>")
+        );
+        let phases = source
+            .split("enum HvpatchProductionPhase")
+            .nth(1)
+            .unwrap()
+            .split("impl HvpatchProductionPhase")
+            .next()
+            .unwrap();
+        assert!(!phases.contains("RegistrationWait"));
+    }
+
+    #[test]
+    fn production_registration_has_no_barrier_precheck_or_phase_replacement() {
+        let source = include_str!("mod.rs");
+        let poll = source
+            .split("fn poll_with_engine(")
+            .nth(1)
+            .expect("production poll body");
+        let registration = poll
+            .split("if self.state.guest_execution.is_none()")
+            .nth(1)
+            .expect("registration admission block")
+            .split("// Exec/exit can force")
+            .next()
+            .expect("bounded registration admission block");
+        assert!(registration.contains("enter_guest_executor_then_register"));
+        assert!(!registration.contains("is_quiescing"));
+        assert!(!registration.contains("try_begin_fork"));
+        assert!(!registration.contains("self.phase ="));
+    }
+
+    struct RegistrationTestKick;
+
+    impl carrick_hal::VcpuKickDyn for RegistrationTestKick {
+        fn kick(&self) {}
+    }
+
+    fn registration_test_handle() -> Box<dyn carrick_hal::VcpuKickDyn> {
+        Box::new(RegistrationTestKick)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn registration_test_exec_work() -> crate::kernel::control::ExecWork {
+        use crate::kernel::control::{
+            CarrierExecAdmission, ControlNonce, ControlTaskKey, ExecAttach, ExecCapability,
+            ExecRequest, ExecRuntime, ExecStatus,
+        };
+
+        let runtime = ExecRuntime::new(1);
+        let capability = ExecCapability::from(ControlNonce::fresh().expect("control nonce"));
+        let submit = runtime.clone();
+        let request = ExecRequest {
+            argv: vec!["/bin/true".to_owned()],
+            env: Vec::new(),
+            workdir: None,
+            user: None,
+            tty: false,
+            attach: ExecAttach::Capture,
+        };
+        let submitter = std::thread::spawn(move || submit.admit(capability, request));
+        while runtime.query(capability) != ExecStatus::Pending {
+            std::thread::yield_now();
+        }
+        let mut work = loop {
+            if let Some(work) = runtime.try_take() {
+                break work;
+            }
+            std::thread::yield_now();
+        };
+        assert!(work.begin_publication());
+        assert!(work.admit(ControlTaskKey {
+            pid: 70_204,
+            serial: 1,
+        }));
+        assert_eq!(submitter.join().expect("exec submitter"), Ok(capability));
+        work
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn registration_test_retry_phase(
+        external_exec: Option<crate::kernel::control::ExecWork>,
+    ) -> HvpatchProductionPhase {
+        HvpatchProductionPhase::RetryProcessFork {
+            frame: None,
+            request: quiesce::ForkRequest {
+                flags: 0,
+                pidfd_out: None,
+                clone_parent: false,
+                parent_tid_addr: None,
+                child_tid_addr: None,
+                exit_signal: 0,
+                child_stack: 0,
+                vfork: None,
+            },
+            coordinator: None,
+            external_exec,
+            deferred_resume_blocked: None,
+            _subscription: quiesce::ProcessForkRetrySubscription::Reservation {
+                _subscription: None,
+            },
+        }
+    }
+
+    #[test]
+    fn page_table_admission_census_precedes_denied_registry_publication() {
+        let registry = Arc::new(carrick_hal::GenericVcpuRegistry::new());
+        let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
+        let first = ThreadId::synthetic_for_tests(70_201);
+        let second = ThreadId::synthetic_for_tests(70_202);
+        let _first_participation = census.enter(None);
+        let freeze = match registry.subscribe_lease_drain(first, Arc::new(|| {})) {
+            carrick_hal::VcpuLeaseDrainEnrollment::Frozen(guard) => guard,
+            _ => panic!("first thread must freeze an empty sibling lease set"),
+        };
+        let second_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
+
+        let (second_participation, attempt) =
+            enter_guest_executor_then_register(&census, None, || {
+                assert!(
+                    census.has_peer_executor(),
+                    "census admission must precede registry publication"
+                );
+                registry.subscribe_register(
+                    second,
+                    registration_test_handle(),
+                    &second_in_guest,
+                    Arc::new(|| {}),
+                )
+            });
+
+        assert!(census.has_peer_executor());
+        assert!(matches!(
+            &attempt,
+            carrick_hal::VcpuRegistrationEnrollment::Waiting { .. }
+        ));
+        assert_eq!(
+            registry.poll_lease_drain(first),
+            carrick_hal::VcpuLeaseDrainPoll::Complete
+        );
+        drop(second_participation);
+        assert_eq!(census.live(), 1);
+        drop(attempt);
+        drop(freeze);
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn fork_owner_registration_ignores_raised_barrier_and_preserves_phase() {
+        let registry = Arc::new(carrick_hal::GenericVcpuRegistry::new());
+        let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
+        let owner = ThreadId::synthetic_for_tests(70_203);
+        let barrier = Arc::new(crate::fork_quiesce::QuiesceBarrier::new());
+        assert!(barrier.try_begin_fork());
+        barrier.set_quiescing();
+        let phase = registration_test_retry_phase(None);
+        let freeze = match registry.subscribe_lease_drain(owner, Arc::new(|| {})) {
+            carrick_hal::VcpuLeaseDrainEnrollment::Frozen(guard) => guard,
+            _ => panic!("owner must freeze an empty sibling lease set"),
+        };
+        let owner_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
+
+        let (participation, enrollment) = enter_guest_executor_then_register(&census, None, || {
+            registry.subscribe_register(
+                owner,
+                registration_test_handle(),
+                &owner_in_guest,
+                Arc::new(|| {}),
+            )
+        });
+
+        assert!(matches!(
+            enrollment,
+            carrick_hal::VcpuRegistrationEnrollment::Registered
+        ));
+        assert!(matches!(
+            phase,
+            HvpatchProductionPhase::RetryProcessFork { .. }
+        ));
+        assert!(barrier.is_quiescing());
+        registry.unregister(owner);
+        drop(participation);
+        barrier.end_quiesce();
+        barrier.end_fork();
+        drop(freeze);
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn registration_thaw_wakes_external_exec_control_quantum() {
+        let (_process, context) = crate::hvpatch::process_context_for_tests(70_204);
+        context
+            .thread()
+            .publish_initial_task_state(executor::tests::task_state(&context, 204))
+            .expect("publish test task state");
+        let scheduler = Arc::new(crate::kernel::Scheduler::new(Arc::clone(context.kernel())));
+        scheduler
+            .make_runnable(context.thread().key())
+            .expect("queue test thread");
+        let registry = Arc::new(carrick_hal::GenericVcpuRegistry::new());
+        let owner = ThreadId::synthetic_for_tests(70_205);
+        let waiter = ThreadId::synthetic_for_tests(70_204);
+        let freeze = match registry.subscribe_lease_drain(owner, Arc::new(|| {})) {
+            carrick_hal::VcpuLeaseDrainEnrollment::Frozen(guard) => guard,
+            _ => panic!("owner must freeze an empty sibling lease set"),
+        };
+        let mut phase = registration_test_retry_phase(Some(registration_test_exec_work()));
+        let wake_mode = registration_wake_uses_control(&phase, false);
+        let wake_registration =
+            registration_wake_callback(Arc::clone(&scheduler), context.thread().key(), wake_mode);
+        let waiter_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
+        let attempt = registry.subscribe_register(
+            waiter,
+            registration_test_handle(),
+            &waiter_in_guest,
+            wake_registration,
+        );
+        assert!(matches!(
+            &attempt,
+            carrick_hal::VcpuRegistrationEnrollment::Waiting { .. }
+        ));
+        assert!(
+            context
+                .thread()
+                .scheduler_control_quantum(context.thread().key())
+                .expect("inspect control quantum")
+                .is_none()
+        );
+
+        phase = HvpatchProductionPhase::Resident;
+        assert!(matches!(phase, HvpatchProductionPhase::Resident));
+        drop(freeze);
+
+        assert!(
+            context
+                .thread()
+                .scheduler_control_quantum(context.thread().key())
+                .expect("registration thaw control quantum")
+                .is_some()
+        );
+        assert_eq!(scheduler.queued_len(), 1);
+        drop(attempt);
+    }
+
+    #[test]
+    fn registration_thaw_wakes_pending_control_quantum_before_phase_transition() {
+        let (_process, context) = crate::hvpatch::process_context_for_tests(70_206);
+        context
+            .thread()
+            .publish_initial_task_state(executor::tests::task_state(&context, 206))
+            .expect("publish test task state");
+        let scheduler = Arc::new(crate::kernel::Scheduler::new(Arc::clone(context.kernel())));
+        scheduler
+            .make_runnable(context.thread().key())
+            .expect("queue test thread");
+        scheduler
+            .wake_control(context.thread().key())
+            .expect("publish pending scheduler control quantum");
+        let pending_control_quantum = context
+            .thread()
+            .scheduler_control_quantum(context.thread().key())
+            .expect("inspect pending control quantum")
+            .is_some();
+        let phase = HvpatchProductionPhase::Resident;
+        let wake_mode = registration_wake_uses_control(&phase, pending_control_quantum);
+        let wake_registration =
+            registration_wake_callback(Arc::clone(&scheduler), context.thread().key(), wake_mode);
+        let registry = Arc::new(carrick_hal::GenericVcpuRegistry::new());
+        let owner = ThreadId::synthetic_for_tests(70_207);
+        let waiter = ThreadId::synthetic_for_tests(70_206);
+        let freeze = match registry.subscribe_lease_drain(owner, Arc::new(|| {})) {
+            carrick_hal::VcpuLeaseDrainEnrollment::Frozen(guard) => guard,
+            _ => panic!("owner must freeze an empty sibling lease set"),
+        };
+        let waiter_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
+        let attempt = registry.subscribe_register(
+            waiter,
+            registration_test_handle(),
+            &waiter_in_guest,
+            wake_registration,
+        );
+        assert!(matches!(
+            &attempt,
+            carrick_hal::VcpuRegistrationEnrollment::Waiting { .. }
+        ));
+        context
+            .thread()
+            .finish_scheduler_control_quantum(context.thread().key())
+            .expect("simulate phase transition after captured wake mode");
+        assert!(
+            context
+                .thread()
+                .scheduler_control_quantum(context.thread().key())
+                .expect("control quantum consumed for transition")
+                .is_none()
+        );
+
+        drop(freeze);
+
+        assert!(matches!(phase, HvpatchProductionPhase::Resident));
+        assert!(
+            context
+                .thread()
+                .scheduler_control_quantum(context.thread().key())
+                .expect("registration thaw restores control quantum")
+                .is_some()
+        );
+        assert_eq!(scheduler.queued_len(), 1);
+        drop(attempt);
     }
 
     #[test]

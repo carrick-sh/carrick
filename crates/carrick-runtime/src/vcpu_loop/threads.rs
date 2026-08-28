@@ -249,18 +249,31 @@ impl<E: ThreadedEngine + 'static> ThreadRuntimeState<E>
 where
     E::SiblingSpec: 'static,
 {
-    /// Publish this thread's live vCPU into the kicker: the fresh kick handle
-    /// AND the thread's lifetime in-guest flag, in one entry.
+    /// Attempt to publish this thread's live vCPU into the kicker: the fresh
+    /// kick handle AND the thread's lifetime in-guest flag, in one entry.
     ///
     /// This is the ONLY production caller of
-    /// [`carrick_hal::VcpuRegistry::register`]. Every rebind path (blocking-wait
-    /// reclaim, fork park, post-fork rebuild) funnels through here, so a
-    /// re-registration cannot restore one facet and silently drop the other.
-    pub(super) fn register_vcpu(&self, engine: &E) {
+    /// [`carrick_hal::VcpuRegistry::subscribe_register`]. Every rebind path
+    /// (blocking-wait reclaim, fork park, post-fork rebuild) funnels through
+    /// here, so a re-registration cannot restore one facet and silently drop
+    /// the other or publish through a sibling lease freeze.
+    pub(super) fn subscribe_register_vcpu(
+        &self,
+        engine: &E,
+        callback: Arc<dyn Fn() + Send + Sync + 'static>,
+    ) -> carrick_hal::VcpuRegistrationEnrollment {
         let handle: Box<dyn carrick_hal::VcpuKickDyn> = Box::new(engine.kick_handle());
-        self.kicker.register(self.this_tid, handle, &self.in_guest);
-        self.registry
-            .record_thread_port(self.this_tid, crate::host_proc::current_thread_port());
+        let enrollment =
+            self.kicker
+                .subscribe_register(self.this_tid, handle, &self.in_guest, callback);
+        if matches!(
+            enrollment,
+            carrick_hal::VcpuRegistrationEnrollment::Registered
+        ) {
+            self.registry
+                .record_thread_port(self.this_tid, crate::host_proc::current_thread_port());
+        }
+        enrollment
     }
 
     pub(super) fn prepare_persistent_sibling_drain(
