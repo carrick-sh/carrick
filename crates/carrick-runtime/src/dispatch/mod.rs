@@ -4962,7 +4962,9 @@ impl SyscallDispatcher {
     {
         let mut authority = self.file_authority.write();
         if authority.is_none() {
-            *authority = Some(crate::file_authority::FileAuthorityRun::launch()?);
+            *authority = Some(crate::file_authority::FileAuthorityRun::launch(
+                self.captured_file_table(),
+            )?);
         }
         authority
             .as_ref()

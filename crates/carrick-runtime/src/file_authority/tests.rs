@@ -4,6 +4,8 @@ use std::sync::Arc;
 
 use carrick_kernel::domains::{HostPid, ProcessGeneration};
 
+use crate::kernel::{FileDescription, FileTable, ObjectIdRegistry};
+
 use super::*;
 
 #[derive(Clone)]
@@ -3250,4 +3252,91 @@ fn capability_lease_purpose_matrix_rejects_mismatched_purposes_and_distinguishes
             Outcome::Rejected(AuthorityError::NotHostBacked)
         );
     }
+}
+
+#[test]
+fn production_root_binding_names_the_kernel_table_without_creating_a_model_table() {
+    let ids = ObjectIdRegistry::new();
+    let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+    let run = FileAuthorityRun::launch(Arc::clone(&table)).expect("authority launch");
+
+    assert_eq!(run.binding().table, table.id());
+    assert_eq!(run.model_table_count_for_test(), 0);
+    assert_eq!(run.model_description_count_for_test(), 0);
+}
+
+#[test]
+fn canonical_path_rejects_a_model_command_without_fallback() {
+    let epoch = AuthorityEpoch::for_run(7).expect("authority epoch");
+    let core = FileAuthorityCore::for_run(epoch);
+    let direct = DirectFileAuthority::for_run(core);
+    let ids = ObjectIdRegistry::new();
+    let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+    let number = FileSlotNumber::for_open_fd(3).expect("fd");
+    let desc = Arc::new(FileDescription::regular(
+        ids.file_description_id().expect("desc id"),
+    ));
+    table.install(number, desc, false);
+    let slot = table.capture_slot_authority(number).expect("slot auth");
+    let target = CanonicalAuthorityTarget {
+        table: Arc::clone(&table),
+        slot,
+    };
+    let client = client(1, 1001, 1);
+    let request = Request {
+        epoch,
+        client,
+        request_id: RequestId::from_client_sequence(1).expect("request id"),
+        expected_generation: ObjectGeneration::INITIAL,
+        command: Command::CreateTable,
+    };
+    let fatal = direct
+        .transact_canonical(AuthorityCall::without_capabilities(request), target)
+        .expect_err("canonical path must reject model command");
+    assert!(matches!(fatal, AuthorityFatal::InvariantViolation(_)));
+    assert_eq!(direct.model_table_count(), 0);
+}
+
+#[test]
+fn completed_model_request_replayed_through_canonical_entry_is_fatal() {
+    let epoch = AuthorityEpoch::for_run(7).expect("authority epoch");
+    let core = FileAuthorityCore::for_run(epoch);
+    let direct = DirectFileAuthority::for_run(core);
+    let client = client(1, 1001, 1);
+
+    // 1. Complete an ordinary model request through the ordinary path.
+    let register_request = Request {
+        epoch,
+        client,
+        request_id: RequestId::from_client_sequence(1).expect("request id"),
+        expected_generation: ObjectGeneration::INITIAL,
+        command: Command::RegisterClient,
+    };
+    let reply = direct
+        .transact(AuthorityCall::without_capabilities(
+            register_request.clone(),
+        ))
+        .expect("register client");
+    assert_eq!(reply.response.outcome, Outcome::ClientRegistered);
+
+    // 2. Replay the same completed model request through the canonical entry point.
+    let ids = ObjectIdRegistry::new();
+    let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+    let number = FileSlotNumber::for_open_fd(3).expect("fd");
+    let desc = Arc::new(FileDescription::regular(
+        ids.file_description_id().expect("desc id"),
+    ));
+    table.install(number, desc, false);
+    let slot = table.capture_slot_authority(number).expect("slot auth");
+    let target = CanonicalAuthorityTarget {
+        table: Arc::clone(&table),
+        slot,
+    };
+    let fatal = direct
+        .transact_canonical(
+            AuthorityCall::without_capabilities(register_request),
+            target,
+        )
+        .expect_err("canonical path must reject replayed model request before dedup");
+    assert!(matches!(fatal, AuthorityFatal::InvariantViolation(_)));
 }

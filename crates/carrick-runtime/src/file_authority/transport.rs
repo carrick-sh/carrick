@@ -3,7 +3,10 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use super::FileAuthorityCore;
-use super::{AuthorityCall, AuthorityFatal, AuthorityReply, Command, Request, Response};
+use super::{
+    AuthorityCall, AuthorityFatal, AuthorityReply, CanonicalAuthorityTarget, Command, Request,
+    Response,
+};
 
 pub(crate) trait FileAuthorityTransport: Send + Sync {
     fn transact(&self, call: AuthorityCall) -> Result<AuthorityReply, AuthorityFatal>;
@@ -35,6 +38,28 @@ impl DirectFileAuthority {
         Self {
             core: Arc::new(Mutex::new(core)),
         }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "consumed by canonical dispatch in the in-carrier cutover"
+    )]
+    pub(crate) fn transact_canonical(
+        &self,
+        call: AuthorityCall,
+        target: CanonicalAuthorityTarget,
+    ) -> Result<AuthorityReply, AuthorityFatal> {
+        self.core.lock().execute_canonical_call(call, target)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn model_table_count(&self) -> usize {
+        self.core.lock().model_table_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn model_description_count(&self) -> usize {
+        self.core.lock().model_description_count()
     }
 }
 

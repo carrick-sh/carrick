@@ -5,8 +5,9 @@ use parking_lot::Mutex;
 use carrick_kernel::domains::{HostPid, ProcessGeneration};
 
 use super::{
-    AuthorityEpoch, AuthorityFatal, Command, FileAuthorityBinding, FileAuthorityCore,
-    FileAuthorityTransport, ObjectGeneration, Outcome, Request, RequestId, Response, SlotPageLimit,
+    AuthorityEpoch, AuthorityFatal, Command, DirectFileAuthority, FileAuthorityBinding,
+    FileAuthorityCore, FileAuthorityTransport, ObjectGeneration, Outcome, Request, RequestId,
+    Response,
 };
 use super::{ClientId, ClientIdentity};
 
@@ -17,7 +18,17 @@ use super::{ClientId, ClientIdentity};
 /// cut over, this object owns no guest-visible backing from that family.
 pub(crate) struct FileAuthorityRun {
     transport: Arc<dyn FileAuthorityTransport>,
+    direct: Arc<DirectFileAuthority>,
+    #[allow(
+        dead_code,
+        reason = "retained for exact-root authentication in the in-carrier dispatch cutover"
+    )]
+    root_table: std::sync::Weak<crate::kernel::FileTable>,
     binding: FileAuthorityBinding,
+    #[allow(
+        dead_code,
+        reason = "retained for serialized client request allocation in the in-carrier cutover"
+    )]
     next_request: Mutex<u64>,
 }
 
@@ -32,37 +43,29 @@ impl std::fmt::Debug for FileAuthorityRun {
 
 impl FileAuthorityRun {
     /// Start the per-run, in-carrier file authority.
-    pub(crate) fn launch() -> Result<Arc<Self>, AuthorityFatal> {
+    pub(crate) fn launch(
+        root_table: Arc<crate::kernel::FileTable>,
+    ) -> Result<Arc<Self>, AuthorityFatal> {
         let epoch = run_epoch()?;
-        let (transport, binding) = direct_root(epoch)?;
-        let transport = Arc::new(transport) as Arc<dyn FileAuthorityTransport>;
-
-        // Root registration and root-table creation consumed requests 1-2.
-        let authority = Self::with_transport(transport, binding, 3);
-        let health = authority.execute(
-            Command::ListSlots {
-                table: binding.table,
-                after: None,
-                maximum: SlotPageLimit::bounded(1)
-                    .map_err(|_| AuthorityFatal::InvariantViolation("invalid root health bound"))?,
-            },
-            binding.generation,
-        )?;
-        if !matches!(health.outcome, Outcome::SlotPage { ref slots, .. } if slots.is_empty()) {
-            return Err(AuthorityFatal::InvariantViolation(
-                "FileAuthority root health check was not empty",
-            ));
-        }
+        let (direct_raw, binding) = direct_root(epoch, &root_table)?;
+        let direct = Arc::new(direct_raw);
+        let transport = Arc::clone(&direct) as Arc<dyn FileAuthorityTransport>;
+        let authority =
+            Self::with_transports(transport, direct, Arc::downgrade(&root_table), binding, 2);
         Ok(authority)
     }
 
-    fn with_transport(
+    fn with_transports(
         transport: Arc<dyn FileAuthorityTransport>,
+        direct: Arc<DirectFileAuthority>,
+        root_table: std::sync::Weak<crate::kernel::FileTable>,
         binding: FileAuthorityBinding,
         next_request: u64,
     ) -> Arc<Self> {
         Arc::new(Self {
             transport,
+            direct,
+            root_table,
             binding,
             next_request: Mutex::new(next_request),
         })
@@ -72,6 +75,34 @@ impl FileAuthorityRun {
         self.binding
     }
 
+    #[allow(
+        dead_code,
+        reason = "retained for the in-carrier canonical dispatch cutover"
+    )]
+    pub(crate) fn transport(&self) -> &Arc<DirectFileAuthority> {
+        &self.direct
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code, reason = "retained for exact-root authentication in test")]
+    pub(crate) fn root_table(&self) -> Option<Arc<crate::kernel::FileTable>> {
+        self.root_table.upgrade()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn model_table_count_for_test(&self) -> usize {
+        self.direct.model_table_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn model_description_count_for_test(&self) -> usize {
+        self.direct.model_description_count()
+    }
+
+    #[allow(
+        dead_code,
+        reason = "retained for ordinary model commands in the in-carrier cutover"
+    )]
     fn execute(
         &self,
         command: Command,
@@ -118,8 +149,9 @@ fn run_epoch() -> Result<AuthorityEpoch, AuthorityFatal> {
 
 fn direct_root(
     epoch: AuthorityEpoch,
-) -> Result<(super::DirectFileAuthority, FileAuthorityBinding), AuthorityFatal> {
-    let transport = super::DirectFileAuthority::for_run(FileAuthorityCore::for_run(epoch));
+    root_table: &Arc<crate::kernel::FileTable>,
+) -> Result<(DirectFileAuthority, FileAuthorityBinding), AuthorityFatal> {
+    let transport = DirectFileAuthority::for_run(FileAuthorityCore::for_run(epoch));
     let client = ClientIdentity::registered(
         ClientId::for_process_client(1).map_err(|_| AuthorityFatal::IdentityExhausted)?,
         HostPid::new(std::process::id()),
@@ -139,29 +171,13 @@ fn direct_root(
             "direct root registration was rejected",
         ));
     }
-    let created = transport.execute(Request {
-        epoch,
-        client,
-        request_id: RequestId::from_client_sequence(2)
-            .map_err(|_| AuthorityFatal::IdentityExhausted)?,
-        expected_generation: ObjectGeneration::INITIAL,
-        command: Command::CreateTable,
-    })?;
-    let Outcome::TableCreated {
-        table, generation, ..
-    } = created.outcome
-    else {
-        return Err(AuthorityFatal::InvariantViolation(
-            "direct root table creation was rejected",
-        ));
-    };
     Ok((
         transport,
         FileAuthorityBinding {
             epoch,
             client,
-            table,
-            generation,
+            table: root_table.id(),
+            generation: ObjectGeneration::INITIAL,
         },
     ))
 }
@@ -173,18 +189,19 @@ mod tests {
 
     use super::super::{AuthorityCall, AuthorityReply};
     use super::*;
+    use crate::kernel::{FileSlotNumber, FileTable, ObjectIdRegistry};
 
     /// Transport that reports the peak number of same-client requests observed
     /// inside one round trip.
     struct OverlapProbe {
-        inner: super::super::DirectFileAuthority,
+        inner: Arc<DirectFileAuthority>,
         in_flight: AtomicUsize,
         peak_in_flight: AtomicUsize,
         arrivals: AtomicUsize,
     }
 
     impl OverlapProbe {
-        fn wrapping(inner: super::super::DirectFileAuthority) -> Arc<Self> {
+        fn wrapping(inner: Arc<DirectFileAuthority>) -> Arc<Self> {
             Arc::new(Self {
                 inner,
                 in_flight: AtomicUsize::new(0),
@@ -215,23 +232,34 @@ mod tests {
     #[test]
     fn same_client_requests_cannot_overtake_an_in_flight_round_trip() {
         let epoch = AuthorityEpoch::for_run(11).expect("authority epoch");
-        let (inner, binding) = direct_root(epoch).expect("direct root");
-        let probe = OverlapProbe::wrapping(inner);
-        let run = FileAuthorityRun::with_transport(probe.clone(), binding, 3);
+        let ids = ObjectIdRegistry::new();
+        let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+        let (inner, binding) = direct_root(epoch, &table).expect("direct root");
+        let direct = Arc::new(inner);
+        let probe = OverlapProbe::wrapping(Arc::clone(&direct));
+        let run = FileAuthorityRun::with_transports(
+            probe.clone(),
+            direct,
+            Arc::downgrade(&table),
+            binding,
+            2,
+        );
 
-        let health = move || Command::ListSlots {
-            table: binding.table,
-            after: None,
-            maximum: SlotPageLimit::bounded(1).expect("root health bound"),
+        let table_id = binding.table;
+        let command = move || Command::ResolveSlot {
+            table: table_id,
+            fd: FileSlotNumber::for_open_fd(3).expect("fd"),
         };
 
         let first = {
             let run = Arc::clone(&run);
-            std::thread::spawn(move || run.execute(health(), binding.generation))
+            let cmd = command();
+            std::thread::spawn(move || run.execute(cmd, binding.generation))
         };
         let second = {
             let run = Arc::clone(&run);
-            std::thread::spawn(move || run.execute(health(), binding.generation))
+            let cmd = command();
+            std::thread::spawn(move || run.execute(cmd, binding.generation))
         };
 
         first.join().expect("first thread").expect("first request");
@@ -254,7 +282,9 @@ mod tests {
 
     #[test]
     fn launch_creates_in_carrier_authority() {
-        let authority = FileAuthorityRun::launch().expect("launch in-carrier authority");
+        let ids = ObjectIdRegistry::new();
+        let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+        let authority = FileAuthorityRun::launch(table).expect("launch in-carrier authority");
         let binding = authority.binding();
         assert_eq!(binding.client.id.raw(), 1);
         assert_eq!(binding.generation, ObjectGeneration::INITIAL);

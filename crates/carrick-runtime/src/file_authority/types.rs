@@ -1,5 +1,6 @@
 use std::num::{NonZeroI32, NonZeroU64};
 use std::os::fd::OwnedFd;
+use std::sync::Arc;
 
 use carrick_abi::LinuxEpollEvents;
 use carrick_kernel::domains::{HostPid, ProcessGeneration};
@@ -500,8 +501,16 @@ pub(crate) enum SlotRangeAction {
 pub(crate) struct SlotPageLimit(u16);
 
 impl SlotPageLimit {
+    #[allow(
+        dead_code,
+        reason = "consumed by slot inspection in the in-carrier cutover"
+    )]
     pub(crate) const MAX: u16 = 256;
 
+    #[allow(
+        dead_code,
+        reason = "consumed by slot inspection in the in-carrier cutover"
+    )]
     pub(crate) fn bounded(raw: u16) -> Result<Self, AuthorityError> {
         if raw == 0 || raw > Self::MAX {
             return Err(AuthorityError::InvalidPageLimit);
@@ -931,6 +940,28 @@ pub(crate) enum Command {
     InspectDescription {
         description: FileDescriptionId,
     },
+}
+
+impl Command {
+    pub(crate) const fn is_canonical(&self) -> bool {
+        let _ = self;
+        false
+    }
+}
+
+pub(crate) struct CanonicalAuthorityTarget {
+    pub(crate) table: Arc<crate::kernel::FileTable>,
+    pub(crate) slot: crate::kernel::objects::FileSlotAuthority,
+}
+
+impl std::fmt::Debug for CanonicalAuthorityTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CanonicalAuthorityTarget")
+            .field("table", &self.table.id())
+            .field("slot", &self.slot)
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -1375,6 +1406,10 @@ pub(crate) enum AuthorityError {
     #[error("host file backing is read-only")]
     BackingReadOnly,
     #[error("slot page limit is zero or exceeds its protocol bound")]
+    #[allow(
+        dead_code,
+        reason = "consumed by slot page validation in the in-carrier cutover"
+    )]
     InvalidPageLimit,
     #[error("operation rejects identical source and target slots")]
     SameSlotRejected,
