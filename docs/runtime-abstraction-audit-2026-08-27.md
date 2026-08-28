@@ -450,6 +450,24 @@ independent of every one of them and can start immediately.
   historical design remains documentation, not scheduled work. See
   [`2026-08-12-per-run-file-authority-atomic-migration.md`](superpowers/plans/2026-08-12-per-run-file-authority-atomic-migration.md#decision-2026-08-28-direct-canonical-core).
 
+## Abort-ledger implementation receipt — 2026-08-28
+
+The `420` in Finding A remains the historical raw-text count at `28a8678c4`;
+it is not a current ceiling. The token-aware, production-capable source census
+now requires three exact shards and classifies **404** current calls:
+
+| Shard | Carrier fault | Typed-error debt | Total |
+|---|---:|---:|---:|
+| `runtime.json` | 118 | 47 | 165 |
+| `hvf.json` | 101 | 0 | 101 |
+| `vcpu-loop.json` | 135 | 3 | 138 |
+| **Total** | **354** | **50** | **404** |
+
+These are machine-counted classifications, not removals. Full `--check` fails
+closed unless all three named ledgers exist, match every current source leaf,
+and keep each shard's typed-error debt ceiling equal to its checked row count.
+`just lint-domains` runs that exact gate after the process-global-state census.
+
 ## The rule to carry forward
 
 [`identity-and-scope-domains.md`](identity-and-scope-domains.md) ends with the

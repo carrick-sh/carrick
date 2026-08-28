@@ -291,6 +291,481 @@ fn outer(_: ty!(fn fake), _: ty![impl fake2], _: ty!{trait fake3}) -> ty!(fn fak
             [("outer", 1)],
         )
 
+    def test_curly_type_macro_does_not_open_function_body(self):
+        source = r'''
+macro_rules! ty { ($($t:tt)*) => { () }; }
+fn outer() -> ty!{fn fake} {
+    std::process::abort();
+}
+'''
+        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+        self.assertEqual(
+            [(r.function, r.ordinal_in_function) for r in rows],
+            [("outer", 1)],
+        )
+
+    def test_attributed_if_let_braced_pattern_keeps_whole_chain_test_only(self):
+        source = r'''
+struct S { f: u8 }
+fn outer(x: Option<S>) {
+    #[cfg(test)]
+    if let Some(S { f: _ }) = x {
+        std::process::abort();
+    } else {
+        std::process::abort();
+    }
+    std::process::abort();
+}
+'''
+        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+        self.assertEqual(
+            [(r.function, r.ordinal_in_function) for r in rows],
+            [("outer", 1)],
+        )
+
+    def test_match_guard_if_is_not_parsed_as_an_if_expression(self):
+        source = r'''
+struct S { value: u8 }
+fn outer(x: S) {
+    match x {
+        S { value } if value > 0 => { consume(value); }
+        _ => { std::process::abort(); }
+    }
+}
+'''
+        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+        self.assertEqual(
+            [(r.function, r.ordinal_in_function) for r in rows],
+            [("outer", 1)],
+        )
+
+    def test_if_body_followed_by_standalone_block_keeps_both_aborts(self):
+        source = r'''
+fn outer(result: Result<(), ()>) {
+    if let Err(_error) = result {
+        std::process::abort();
+    }
+    {
+        cleanup().unwrap_or_else(|_error| { std::process::abort(); });
+    }
+}
+'''
+        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+        self.assertEqual(
+            [(r.function, r.ordinal_in_function) for r in rows],
+            [("outer", 1), ("outer", 2)],
+        )
+
+    def test_production_if_condition_blocks_are_scanned(self):
+        source = r'''
+fn outer() {
+    if { std::process::abort(); true } { consume(); }
+    if let Some(value) = { std::process::abort(); Some(1) } { consume(value); }
+    std::process::abort();
+}
+'''
+        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+        self.assertEqual(
+            [(r.function, r.ordinal_in_function) for r in rows],
+            [("outer", 1), ("outer", 2), ("outer", 3)],
+        )
+
+    def test_nested_if_inside_attributed_condition_preserves_outer_else_scope(self):
+        source = r'''
+fn outer(flag: bool) {
+    #[cfg(test)]
+    if { if flag { consume(); } true } {
+        std::process::abort();
+    } else {
+        std::process::abort();
+    }
+    std::process::abort();
+}
+'''
+        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+        self.assertEqual(
+            [(r.function, r.ordinal_in_function) for r in rows],
+            [("outer", 1)],
+        )
+
+    def test_attributed_let_chain_resets_pattern_state_per_let(self):
+        source = r'''
+struct S { value: u8 }
+fn outer(first: Option<u8>, second: S) {
+    #[cfg(test)]
+    if let Some(_) = first && let S { value: _ } = second {
+        std::process::abort();
+    } else {
+        std::process::abort();
+    }
+    std::process::abort();
+}
+'''
+        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+        self.assertEqual(
+            [(r.function, r.ordinal_in_function) for r in rows],
+            [("outer", 1)],
+        )
+
+    def test_curly_condition_macro_tokens_do_not_create_fake_items(self):
+        source = r'''
+macro_rules! boolify { ($($tokens:tt)*) => { true }; }
+fn outer() {
+    if boolify!{fn fake} { std::process::abort(); }
+    std::process::abort();
+}
+'''
+        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+        self.assertEqual(
+            [(r.function, r.ordinal_in_function) for r in rows],
+            [("outer", 1), ("outer", 2)],
+        )
+
+    def test_curly_body_macro_tokens_do_not_create_fake_items(self):
+        source = r'''
+macro_rules! discard { ($($tokens:tt)*) => {}; }
+fn outer() {
+    discard!{fn fake}
+    { std::process::abort(); }
+}
+'''
+        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+        self.assertEqual(
+            [(r.function, r.ordinal_in_function) for r in rows],
+            [("outer", 1)],
+        )
+
+    def test_curly_item_macro_tokens_preserve_complete_function_definitions(self):
+        source = r'''
+macro_rules! define { ($($tokens:tt)*) => { $($tokens)* }; }
+define! {
+    fn generated() {
+        std::process::abort();
+    }
+}
+'''
+        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+        self.assertEqual(
+            [(r.function, r.ordinal_in_function) for r in rows],
+            [("generated", 1)],
+        )
+
+    def test_attributed_expression_leading_condition_blocks_keep_else_test_only(self):
+        cases = [
+            ("match", r'''
+fn outer(value: bool) {
+    #[cfg(test)]
+    if match value { true => true, false => false } {
+        std::process::abort();
+    } else { std::process::abort(); }
+    std::process::abort();
+}
+'''),
+            ("async", r'''
+async fn outer() {
+    #[cfg(test)]
+    if async { true }.await {
+        std::process::abort();
+    } else { std::process::abort(); }
+    std::process::abort();
+}
+'''),
+            ("loop", r'''
+fn outer() {
+    #[cfg(test)]
+    if loop { break true } {
+        std::process::abort();
+    } else { std::process::abort(); }
+    std::process::abort();
+}
+'''),
+            ("label", r'''
+fn outer() {
+    #[cfg(test)]
+    if 'condition: { break 'condition true } {
+        std::process::abort();
+    } else { std::process::abort(); }
+    std::process::abort();
+}
+'''),
+        ]
+        for name, source in cases:
+            with self.subTest(case=name):
+                rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+                self.assertEqual(
+                    [(r.function, r.ordinal_in_function) for r in rows],
+                    [("outer", 1)],
+                )
+
+    def test_attributed_loop_header_expression_blocks_keep_body_test_only(self):
+        cases = [
+            ("while-match", r'''
+fn outer(value: bool) {
+    #[cfg(test)]
+    while match value { true => true, false => false } {
+        std::process::abort();
+    }
+    std::process::abort();
+}
+'''),
+            ("while-async", r'''
+async fn outer() {
+    #[cfg(test)]
+    while async { false }.await {
+        std::process::abort();
+    }
+    std::process::abort();
+}
+'''),
+            ("for-match", r'''
+fn outer(value: bool) {
+    #[cfg(test)]
+    for item in match value { true => [1], false => [2] } {
+        let _ = item;
+        std::process::abort();
+    }
+    std::process::abort();
+}
+'''),
+            ("for-braced-pattern-and-iterator", r'''
+struct S { value: u8 }
+fn outer(values: [S; 1]) {
+    #[cfg(test)]
+    for S { value: _ } in { values } {
+        std::process::abort();
+    }
+    std::process::abort();
+}
+'''),
+            ("for-range-endpoint-block", r'''
+fn outer() {
+    #[cfg(test)]
+    for item in 0..{ std::process::abort(); 3 } {
+        let _ = item;
+        std::process::abort();
+    }
+    std::process::abort();
+}
+'''),
+            ("labeled-while-match", r'''
+fn outer(value: bool) {
+    #[cfg(test)]
+    'again: while match value { true => true, false => false } {
+        std::process::abort();
+        break 'again;
+    }
+    std::process::abort();
+}
+'''),
+        ]
+        for name, source in cases:
+            with self.subTest(case=name):
+                rows = scan_abort_source(
+                    Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source
+                )
+                self.assertEqual(
+                    [(r.function, r.ordinal_in_function) for r in rows],
+                    [("outer", 1)],
+                )
+
+    def test_distinct_block_local_functions_have_insertion_stable_identities(self):
+        before = r'''
+fn outer() {
+    { fn local() { if first() { std::process::abort(); } } local(); }
+    { fn local() { if second() { std::process::abort(); } } local(); }
+}
+'''
+        after = r'''
+fn outer() {
+    { fn unrelated() { std::process::abort(); } unrelated(); }
+    { fn local() { if first() { std::process::abort(); } } local(); }
+    { fn local() { if second() { std::process::abort(); } } local(); }
+}
+'''
+        before_rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), before)
+        after_rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), after)
+        self.assertEqual(len({row.function for row in before_rows}), 2)
+        before_by_fingerprint = {row.fingerprint: row.function for row in before_rows}
+        after_by_fingerprint = {row.fingerprint: row.function for row in after_rows}
+        for fingerprint, function in before_by_fingerprint.items():
+            self.assertEqual(after_by_fingerprint[fingerprint], function)
+
+    def test_distinct_block_local_item_containers_have_stable_identities(self):
+        before = r'''
+fn outer() {
+    { trait A { fn reset() { if first() { std::process::abort(); } } } }
+    { trait A { fn reset() { if second() { std::process::abort(); } } } }
+    { struct S; impl S { fn reset() { if third() { std::process::abort(); } } } }
+    { struct S; impl S { fn reset() { if fourth() { std::process::abort(); } } } }
+}
+'''
+        after = r'''
+fn outer() {
+    { trait Unrelated { fn reset() { std::process::abort(); } } }
+    { trait A { fn reset() { if first() { std::process::abort(); } } } }
+    { trait A { fn reset() { if second() { std::process::abort(); } } } }
+    { struct S; impl S { fn reset() { if third() { std::process::abort(); } } } }
+    { struct S; impl S { fn reset() { if fourth() { std::process::abort(); } } } }
+}
+'''
+        before_rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), before)
+        after_rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), after)
+        self.assertEqual(len({row.function for row in before_rows}), 4)
+        before_by_fingerprint = {row.fingerprint: row.function for row in before_rows}
+        after_by_fingerprint = {row.fingerprint: row.function for row in after_rows}
+        for fingerprint, function in before_by_fingerprint.items():
+            self.assertEqual(after_by_fingerprint[fingerprint], function)
+
+    def test_byte_identical_local_definitions_are_rejected_as_ambiguous(self):
+        cases = [
+            r'''
+fn outer() {
+    { fn local() { std::process::abort(); } }
+    { fn local() { std::process::abort(); } }
+}
+''',
+            r'''
+fn outer() {
+    { trait A { fn reset() { std::process::abort(); } } }
+    { trait A { fn reset() { std::process::abort(); } } }
+}
+''',
+            r'''
+fn outer() {
+    { struct S; impl S { fn reset() { std::process::abort(); } } }
+    { struct S; impl S { fn reset() { std::process::abort(); } } }
+}
+''',
+        ]
+        for source in cases:
+            with self.subTest(source=source), self.assertRaises(LedgerError):
+                scan_abort_source(
+                    Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source
+                )
+
+    def test_irrelevant_or_test_only_duplicate_local_definitions_are_allowed(self):
+        source = r'''
+fn outer() {
+    { fn local() { consume(); } }
+    { fn local() { consume(); } }
+    #[cfg(test)]
+    fn selected() { std::process::abort(); }
+    #[cfg(not(test))]
+    fn selected() { std::process::abort(); }
+}
+'''
+        rows = scan_abort_source(
+            Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0].function.startswith("outer::selected@"))
+        self.assertEqual(rows[0].ordinal_in_function, 1)
+
+    def test_mutually_exclusive_production_cfg_is_part_of_local_identity(self):
+        source = r'''
+fn outer() {
+    #[cfg(feature = "a")]
+    fn local() { std::process::abort(); }
+    #[cfg(not(feature = "a"))]
+    fn local() { std::process::abort(); }
+}
+'''
+        rows = scan_abort_source(
+            Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source
+        )
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len({row.function for row in rows}), 2)
+        self.assertTrue(all(row.function.startswith("outer::local@") for row in rows))
+        self.assertEqual([row.ordinal_in_function for row in rows], [1, 1])
+
+    def test_mutually_exclusive_cfg_block_is_part_of_nested_local_identity(self):
+        source = r'''
+fn outer() {
+    #[cfg(feature = "a")]
+    { fn local() { std::process::abort(); } }
+    #[cfg(not(feature = "a"))]
+    { fn local() { std::process::abort(); } }
+}
+'''
+        rows = scan_abort_source(
+            Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source
+        )
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len({row.function for row in rows}), 2)
+
+    def test_cfg_item_macro_is_part_of_generated_local_identity(self):
+        source = r'''
+macro_rules! items { ($($tokens:tt)*) => { $($tokens)* }; }
+fn outer() {
+    #[cfg(feature = "a")]
+    items! { fn local() { std::process::abort(); } }
+    #[cfg(not(feature = "a"))]
+    items! { fn local() { std::process::abort(); } }
+}
+'''
+        rows = scan_abort_source(
+            Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source
+        )
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len({row.function for row in rows}), 2)
+
+    def test_hrtb_for_does_not_replace_pending_function_identity(self):
+        source = r'''
+fn outer<F>(_value: F)
+where
+    F: for<'a> Fn(&'a u8),
+{
+    std::process::abort();
+}
+'''
+        rows = scan_abort_source(
+            Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source
+        )
+        self.assertEqual(
+            [(row.function, row.ordinal_in_function) for row in rows],
+            [("outer", 1)],
+        )
+
+    def test_cfg_test_braced_match_pattern_covers_the_arm_body(self):
+        source = r'''
+struct S { value: u8 }
+fn outer(x: S) {
+    match x {
+        #[cfg(test)]
+        S { value } if value > 0 => { std::process::abort(); }
+        _ => {}
+    }
+    std::process::abort();
+}
+'''
+        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+        self.assertEqual(
+            [(r.function, r.ordinal_in_function) for r in rows],
+            [("outer", 1)],
+        )
+
+    def test_local_item_identity_includes_enclosing_function(self):
+        source = r'''
+fn outer() {
+    trait A { fn reset() { std::process::abort(); } }
+    trait B { fn reset() { std::process::abort(); } }
+    struct S;
+    impl S { fn reset() { std::process::abort(); } }
+}
+fn sibling() {
+    trait A { fn reset() { std::process::abort(); } }
+}
+'''
+        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+        identities = [(r.function, r.ordinal_in_function) for r in rows]
+        self.assertEqual(len(identities), 4)
+        self.assertEqual([ordinal for _, ordinal in identities], [1, 1, 1, 1])
+        self.assertTrue(identities[0][0].startswith("outer::A@"))
+        self.assertTrue(identities[1][0].startswith("outer::B@"))
+        self.assertTrue(identities[2][0].startswith("outer::S@"))
+        self.assertTrue(identities[3][0].startswith("sibling::A@"))
+        self.assertTrue(all(function.endswith("::reset") for function, _ in identities))
+
     def test_production_capable_attributes_are_discovered(self):
         source = r'''
 #[cfg(not(test))]
@@ -619,6 +1094,17 @@ impl TypeB {
         with self.assertRaises(LedgerError):
             validate_shards((finding,), ledger_set([row], shard="runtime.json",
                                                    debt_ceiling=0))
+
+    def test_full_gate_requires_exactly_all_named_shards(self):
+        complete = {name: {} for name in CHECKER.REQUIRED_SHARDS}
+        CHECKER.validate_required_shards(complete)
+        for missing in CHECKER.REQUIRED_SHARDS:
+            with self.subTest(missing=missing), self.assertRaises(LedgerError):
+                CHECKER.validate_required_shards(
+                    {name: {} for name in CHECKER.REQUIRED_SHARDS if name != missing}
+                )
+        with self.assertRaises(LedgerError):
+            CHECKER.validate_required_shards({**complete, "surprise.json": {}})
 
     def test_carrier_fault_with_typed_error_is_rejected(self):
         finding = AbortFinding("crates/carrick-runtime/src/vcpu_loop/mod.rs",
