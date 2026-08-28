@@ -9739,7 +9739,7 @@ impl SyscallDispatcher {
                 ..
             } = &mut *open
             else {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
             };
 
             // Trusted lane: materialize entries LAZILY on the first read —
@@ -14580,6 +14580,13 @@ impl SyscallDispatcher {
                 if !exists {
                     return Ok(DispatchOutcome::errno(LINUX_ENOENT));
                 }
+                let resolved = if flags & LINUX_AT_SYMLINK_FOLLOW != 0
+                    && anon_fd_candidate.is_none()
+                {
+                    this.canonicalize_following(&resolved)?
+                } else {
+                    resolved
+                };
                 Some(resolved)
             };
             let resolved_new = this.resolve_at_path(newdirfd, &new_path)?;

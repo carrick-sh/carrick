@@ -162,7 +162,6 @@ pub const SHARD_2_PROBES: &[&str] = &[
 const CACHED_SHARD_2_PROBE_COUNT: usize = 136;
 
 const MUSL_BASELINE_GAPS: &[&str] = &[
-    "archiveflagmatrix",
     "budget_two_proc",
     "cluster10errno",
     "coredumpfile",
@@ -186,7 +185,6 @@ const MUSL_BASELINE_GAPS: &[&str] = &[
 ];
 
 const GNU_BASELINE_GAPS: &[&str] = &[
-    "archiveflagmatrix",
     "budget_two_proc",
     "clonefsumask",
     "cluster10errno",

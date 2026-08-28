@@ -101,7 +101,7 @@ impl SyscallDispatcher {
                 self.fs
                     .rootfs_vfs
                     .overlay
-                    .real_stat(&resolved, true)
+                    .real_stat(&resolved, follow)
                     .map(|real| {
                         let type_bits = real.mode & LINUX_S_IFMT;
                         matches!(real.kind, RootFsEntryKind::Directory)
