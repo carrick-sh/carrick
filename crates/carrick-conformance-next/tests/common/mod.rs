@@ -52,6 +52,72 @@ pub const LIVE_ORACLE_PROBES: &[&str] = &[
 /// these on the old out-of-process lane until the runtime teardown is fixed.
 pub const OUT_OF_PROCESS_PROBES: &[&str] = &["execthreads", "execfromthread", "vforkexecthread"];
 
+/// Complete arm64 baseline mismatch inventory. Every shard derives its local
+/// subset from these global lists so adding a probe cannot silently orphan a
+/// known gap when the deterministic modulo partition moves.
+pub const MUSL_BASELINE_GAPS: &[&str] = &[
+    "budget_two_proc",
+    "childsubreaper",
+    "cluster10errno",
+    "coredumpfile",
+    "eventwaitmatrix",
+    "execfromthread",
+    "execthreads",
+    "futexforkwakegroups",
+    "lifecycleflagmatrix",
+    "mprotectexec",
+    "mqnotifycrossproc",
+    "pidfdprocdir",
+    "pidnsroot",
+    "ppid",
+    "proclife",
+    "procpeerdir",
+    "procpeermem",
+    "ptyflagmatrix",
+    "rlimitnproc",
+    "shmnestedfork",
+    "siginfo",
+    "sigpairrace",
+    "sigtimedwaitintr",
+    "sigwaitblock",
+    "sysinfo",
+    "telemetrymap",
+    "vforkexecthread",
+    "vfs_mount_rw",
+];
+
+pub const GNU_BASELINE_GAPS: &[&str] = &[
+    "budget_two_proc",
+    "childsubreaper",
+    "clonefsumask",
+    "cluster10errno",
+    "coredumpfile",
+    "eventwaitmatrix",
+    "execfromthread",
+    "execthreads",
+    "killchld",
+    "lifecycleflagmatrix",
+    "mmapfileshare_mt",
+    "pidfdprocdir",
+    "pidnsroot",
+    "ppid",
+    "proclife",
+    "procpeerdir",
+    "procpeermem",
+    "ptraceattach",
+    "ptyflagmatrix",
+    "rlimitnproc",
+    "setidthreadchurn",
+    "shmnestedfork",
+    "siginfo",
+    "sigpairrace",
+    "sigwaitblock",
+    "sysinfo",
+    "telemetrymap",
+    "vforkexecthread",
+    "vfs_mount_rw",
+];
+
 pub fn needs_live_oracle(probe: &str) -> bool {
     LIVE_ORACLE_PROBES.contains(&probe)
 }
