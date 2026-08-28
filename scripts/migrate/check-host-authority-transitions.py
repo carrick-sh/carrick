@@ -60,8 +60,13 @@ CATALOG_MANIFEST_PATH = (
 MACOS_CAPTURE_PATH = (
     ROOT / "scripts" / "migrate" / "host-authority-macos-capture.json"
 )
-CATALOG_ENTRY_COUNT = 45
+CATALOG_ENTRY_COUNT = 46
 REQUIRED_ESCAPE_OPERATIONS = {"libc::syscall", "libc::dlopen", "libc::dlsym"}
+REQUIRED_HOST_PID_OPERATIONS = {
+    "libc::getpid",
+    "std::process::id",
+    "libc::proc_listallpids",
+}
 LOCAL_MACOS_PROFILES = (
     "macos-cli-default",
     "macos-hvf-default",
@@ -1442,6 +1447,11 @@ def _validate_complete_catalog(operation_catalog: object) -> dict[str, str]:
     if missing_escape:
         raise InventoryError(
             f"host-authority catalog omits required escape operations: {missing_escape}"
+        )
+    missing_pid = sorted(REQUIRED_HOST_PID_OPERATIONS - set(catalog))
+    if missing_pid:
+        raise InventoryError(
+            f"host-authority catalog omits required host-PID operations: {missing_pid}"
         )
     return catalog
 

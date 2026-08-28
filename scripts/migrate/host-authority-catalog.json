@@ -54,6 +54,10 @@
       "operation": "libc::killpg"
     },
     {
+      "catalog_id": "HA-CATALOG-PROCESS-LIST-ALL-PIDS",
+      "operation": "libc::proc_listallpids"
+    },
+    {
       "catalog_id": "HA-CATALOG-PROCESS-SETRLIMIT",
       "operation": "libc::setrlimit"
     },

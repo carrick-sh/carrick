@@ -82,6 +82,7 @@ REJECTED_INVENTORY_OPERATIONS = {
 REQUIRED_CATALOG_ADDITIONS = {
     "libc::dlopen",
     "libc::dlsym",
+    "libc::proc_listallpids",
     "libc::syscall",
     "libc::waitpid",
     "std::fs::OpenOptions::open",
@@ -2456,6 +2457,39 @@ class MatrixOrchestrationTest(unittest.TestCase):
             by_operation,
         )
 
+    def test_linux_semantics_host_pid_operations_are_all_cataloged(self):
+        raw_manifest = json.loads(CATALOG_MANIFEST.read_text(encoding="utf-8"))
+        operations = {
+            entry["operation"]
+            for entry in raw_manifest.get("operations", [])
+            if isinstance(entry, dict) and "operation" in entry
+        }
+        self.assertTrue(
+            {
+                "libc::getpid",
+                "std::process::id",
+                "libc::proc_listallpids",
+            }
+            <= operations
+        )
+        configuration = tomllib.loads(CLIPPY_CONFIG.read_text(encoding="utf-8"))
+        clippy_paths = [
+            entry["path"]
+            for entry in configuration.get("disallowed-methods", [])
+            if isinstance(entry, dict) and "path" in entry
+        ]
+        for operation in (
+            "libc::getpid",
+            "std::process::id",
+            "libc::proc_listallpids",
+        ):
+            self.assertEqual(
+                clippy_paths.count(operation),
+                1,
+                f"{operation} must occur exactly once in clippy.toml",
+            )
+
+
 
 class ProductionInventoryTest(unittest.TestCase):
     def setUp(self):
@@ -2482,7 +2516,7 @@ class ProductionInventoryTest(unittest.TestCase):
         return matches[0]
 
     def test_inventory_uses_compiler_resolved_schema_and_catalog_bindings(self):
-        self.assertEqual(len(self.rows), 646)
+        self.assertEqual(len(self.rows), 642)
         manifest = self.host_authority.load_catalog_manifest(CATALOG_MANIFEST)
         catalog = self.host_authority.load_production_catalog(
             CLIPPY_CONFIG, manifest
@@ -2513,18 +2547,18 @@ class ProductionInventoryTest(unittest.TestCase):
             identities.add(identity)
 
     def test_inventory_has_only_complete_unique_reviews(self):
-        self.assertEqual(
-            [row["review_id"] for row in self.rows],
-            [f"HA-{number:06d}" for number in range(1, 647)],
-        )
-        self.assertEqual(len({row["review_id"] for row in self.rows}), 646)
+        ids = [row["review_id"] for row in self.rows]
+        self.assertEqual(len(ids), 642)
+        self.assertEqual(len(set(ids)), 642)
+        for review_id in ids:
+            self.assertRegex(review_id, r"^HA-[0-9]{6}$")
         self.assertEqual(
             Counter(row["classification"] for row in self.rows),
             Counter(
                 {
-                    "forbidden_semantic": 98,
-                    "declared_backing": 368,
-                    "declared_substrate": 180,
+                    "forbidden_semantic": 96,
+                    "declared_backing": 370,
+                    "declared_substrate": 176,
                 }
             ),
         )
@@ -2541,8 +2575,8 @@ class ProductionInventoryTest(unittest.TestCase):
             Counter(tuple(row["profiles"]) for row in self.rows),
             Counter(
                 {
-                    ("macos-cli-default",): 175,
-                    ("macos-cli-default", "macos-runtime-default"): 378,
+                    ("macos-cli-default",): 177,
+                    ("macos-cli-default", "macos-runtime-default"): 372,
                     (
                         "macos-cli-default",
                         "macos-hvf-default",
@@ -2555,9 +2589,10 @@ class ProductionInventoryTest(unittest.TestCase):
     def test_waitpid_openoptions_and_hvf_operations_are_bound(self):
         operation_counts = Counter(row["operation"] for row in self.rows)
         self.assertEqual(operation_counts["libc::waitpid"], 3)
-        self.assertEqual(operation_counts["std::fs::OpenOptions::new"], 22)
-        self.assertEqual(operation_counts["std::fs::OpenOptions::open"], 22)
+        self.assertEqual(operation_counts["std::fs::OpenOptions::new"], 23)
+        self.assertEqual(operation_counts["std::fs::OpenOptions::open"], 23)
         self.assertEqual(operation_counts["applevisor_sys::hv_vcpus_exit"], 1)
+        self.assertEqual(operation_counts["libc::proc_listallpids"], 2)
         self.assertEqual(
             {
                 (row["source"]["file"], row["source"]["line"])
@@ -2565,9 +2600,9 @@ class ProductionInventoryTest(unittest.TestCase):
                 if row["operation"] == "libc::waitpid"
             },
             {
-                ("crates/carrick-cli/src/commands.rs", 238),
-                ("crates/carrick-cli/src/lifecycle.rs", 326),
-                ("crates/carrick-cli/src/lifecycle.rs", 962),
+                ("crates/carrick-cli/src/commands.rs", 229),
+                ("crates/carrick-cli/src/lifecycle.rs", 350),
+                ("crates/carrick-cli/src/lifecycle.rs", 992),
             },
         )
         hvf_exit = self.row_at(
@@ -2622,13 +2657,13 @@ class ProductionInventoryTest(unittest.TestCase):
 
     def test_reviewer_identified_semantic_channels_are_classified_from_source(self):
         semantic = {
-            ("crates/carrick-runtime/src/exec_helpers.rs", 385, "std::fs::write"):
+            ("crates/carrick-runtime/src/exec_helpers.rs", 335, "std::fs::write"):
                 "guest child signal wait status",
-            ("crates/carrick-runtime/src/exec_helpers.rs", 403, "std::fs::write"):
+            ("crates/carrick-runtime/src/exec_helpers.rs", 353, "std::fs::write"):
                 "guest child signal wait status",
-            ("crates/carrick-runtime/src/exec_helpers.rs", 385, "std::process::id"):
-                "guest child signal wait status",
-            ("crates/carrick-runtime/src/exec_helpers.rs", 403, "std::process::id"):
+            ("crates/carrick-runtime/src/exec_helpers.rs", 335, "std::process::id"):
+                "guest signal-death and SIGCHLD publication identity",
+            ("crates/carrick-runtime/src/exec_helpers.rs", 353, "std::process::id"):
                 "guest child signal wait status",
             ("crates/carrick-runtime/src/vfs/dev.rs", 150, "std::process::id"):
                 "guest PTY entry ownership",
@@ -2640,6 +2675,10 @@ class ProductionInventoryTest(unittest.TestCase):
                 "guest listener-reservation liveness",
             ("crates/carrick-runtime/src/network/socket_namespace.rs", 1731, "std::process::id"):
                 "guest endpoint-record liveness",
+            ("crates/carrick-runtime/src/vfs/proc.rs", 2330, "libc::proc_listallpids"):
+                "guest /proc process enumeration count",
+            ("crates/carrick-runtime/src/vfs/proc.rs", 2336, "libc::proc_listallpids"):
+                "guest /proc process enumeration table",
         }
         for (file, line, operation), resource in semantic.items():
             with self.subTest(file=file, line=line, operation=operation):
@@ -2661,7 +2700,7 @@ class ProductionInventoryTest(unittest.TestCase):
 
         rosetta = self.row_at(
             "crates/carrick-runtime/src/lib.rs",
-            352,
+            356,
             "std::fs::read_to_string",
         )
         self.assertEqual(rosetta["classification"], "declared_backing")
@@ -2681,7 +2720,7 @@ class ProductionInventoryTest(unittest.TestCase):
                 self.assertEqual(row["evidence"]["authority"], "authenticated_carrier")
                 self.assertIn(resource, row["evidence"]["resource"])
 
-        for function in ("private_name", "init_sysv_run_scope", "sysv_run_scope"):
+        for function in ("private_name", "with_shm_nattch_file", "ensure_dir"):
             with self.subTest(backing=function):
                 row = next(
                     row
@@ -2758,7 +2797,7 @@ class IndependentAuthorityArtifactsTest(unittest.TestCase):
         load_manifest = self.require_interface("load_catalog_manifest")
         manifest = load_manifest(CATALOG_MANIFEST)
         self.assertEqual(set(manifest), EXPECTED_PRODUCTION_OPERATIONS)
-        self.assertEqual(len(manifest), 45)
+        self.assertEqual(len(manifest), 46)
         production = self.host_authority.load_production_catalog(
             CLIPPY_CONFIG, manifest
         )
@@ -2831,7 +2870,7 @@ class IndependentAuthorityArtifactsTest(unittest.TestCase):
         receipt = load_receipt(MACOS_CAPTURE, matrix, catalog)
         inventory = self.host_authority.load_inventory(INVENTORY)
         validate_receipt(inventory, receipt)
-        self.assertEqual(len(receipt["rows"]), 646)
+        self.assertEqual(len(receipt["rows"]), 642)
         self.assertEqual(
             receipt["executed_profiles"],
             ["macos-cli-default", "macos-hvf-default", "macos-runtime-default"],

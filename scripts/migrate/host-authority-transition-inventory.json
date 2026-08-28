@@ -1919,6 +1919,60 @@
     }
   },
   {
+    "catalog_id": "HA-CATALOG-PROCESS-LIST-ALL-PIDS",
+    "classification": "forbidden_semantic",
+    "evidence": {
+      "authority": "guest_answer",
+      "resource": "guest /proc process enumeration count used by `enumerate_guest_pids`"
+    },
+    "expansion": null,
+    "operation": "libc::proc_listallpids",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:2330 in `enumerate_guest_pids`, the host result from `libc::proc_listallpids` determines the guest /proc process enumeration count used by `enumerate_guest_pids`.",
+    "review_id": "HA-000645",
+    "source": {
+      "byte_end": 101417,
+      "byte_start": 101395,
+      "column": 26,
+      "column_end": 48,
+      "column_start": 26,
+      "file": "crates/carrick-runtime/src/vfs/proc.rs",
+      "line": 2330,
+      "line_end": 2330,
+      "line_start": 2330
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-PROCESS-LIST-ALL-PIDS",
+    "classification": "forbidden_semantic",
+    "evidence": {
+      "authority": "guest_answer",
+      "resource": "guest /proc process enumeration table used by `enumerate_guest_pids`"
+    },
+    "expansion": null,
+    "operation": "libc::proc_listallpids",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:2336 in `enumerate_guest_pids`, the host result from `libc::proc_listallpids` determines the guest /proc process enumeration table used by `enumerate_guest_pids`.",
+    "review_id": "HA-000646",
+    "source": {
+      "byte_end": 101668,
+      "byte_start": 101646,
+      "column": 24,
+      "column_end": 46,
+      "column_start": 24,
+      "file": "crates/carrick-runtime/src/vfs/proc.rs",
+      "line": 2336,
+      "line_end": 2336,
+      "line_start": 2336
+    }
+  },
+  {
     "catalog_id": "HA-CATALOG-PROCESS-SETRLIMIT",
     "classification": "declared_substrate",
     "evidence": {
