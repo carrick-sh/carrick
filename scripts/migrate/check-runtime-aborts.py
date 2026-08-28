@@ -191,58 +191,227 @@ def lex_rust(source: str) -> list[Token]:
     return tokens
 
 
+def cfg_possible_values(tokens: list[Token]) -> set[bool]:
+    """Evaluate a cfg predicate with `test = false` and other atoms unknown."""
+
+    def parse_expr(index: int) -> tuple[set[bool], int]:
+        if index >= len(tokens) or tokens[index].kind != "ident":
+            return {False, True}, index + 1
+
+        name = tokens[index].text
+        index += 1
+        if index < len(tokens) and tokens[index].text == "=":
+            return {False, True}, min(index + 2, len(tokens))
+        if index >= len(tokens) or tokens[index].text != "(":
+            return ({False} if name == "test" else {False, True}), index
+
+        index += 1
+        children: list[set[bool]] = []
+        while index < len(tokens) and tokens[index].text != ")":
+            child, index = parse_expr(index)
+            children.append(child)
+            if index < len(tokens) and tokens[index].text == ",":
+                index += 1
+            elif index < len(tokens) and tokens[index].text != ")":
+                return {False, True}, index
+        if index < len(tokens) and tokens[index].text == ")":
+            index += 1
+
+        if name == "all":
+            can_be_true = all(True in child for child in children)
+            can_be_false = any(False in child for child in children)
+            values = ({True} if can_be_true else set()) | (
+                {False} if can_be_false else set()
+            )
+            return values or {True}, index
+        if name == "any":
+            can_be_true = any(True in child for child in children)
+            can_be_false = all(False in child for child in children)
+            values = ({True} if can_be_true else set()) | (
+                {False} if can_be_false else set()
+            )
+            return values or {False}, index
+        if name == "not" and len(children) == 1:
+            return {not value for value in children[0]}, index
+        return {False, True}, index
+
+    values, end = parse_expr(0)
+    return values if end == len(tokens) else {False, True}
+
+
 def is_test_only_attribute(tokens: list[Token]) -> bool:
     if len(tokens) == 1 and tokens[0].text == "test":
         return True
     if len(tokens) >= 3 and tokens[-1].text == "test" and tokens[-2].text == "::":
         return True
-    if len(tokens) == 4 and tokens[0].text == "cfg" and tokens[1].text == "(" and tokens[2].text == "test" and tokens[3].text == ")":
-        return True
+    if (
+        len(tokens) >= 4
+        and tokens[0].text == "cfg"
+        and tokens[1].text == "("
+        and tokens[-1].text == ")"
+    ):
+        return True not in cfg_possible_values(tokens[2:-1])
     return False
 
 
 def normalize_type_tokens(tokens: list[Token]) -> str:
-    result: list[str] = []
-    for t in tokens:
-        if t.text in ("where", ";", "{"):
-            break
-        if t.text not in ("&", "mut", "const"):
-            result.append(t.text)
-    return "".join(result).strip()
+    parts: list[str] = []
+    previous: Token | None = None
+    word_kinds = {"ident", "lifetime", "number"}
+    for token in tokens:
+        if (
+            previous is not None
+            and previous.kind in word_kinds
+            and token.kind in word_kinds
+        ):
+            parts.append(" ")
+        parts.append(token.text)
+        previous = token
+    return "".join(parts).strip()
+
+
+def angle_delta(token: Token) -> int:
+    if token.text == "<":
+        return 1
+    if token.text == "<<":
+        return 2
+    if token.text == ">":
+        return -1
+    if token.text == ">>":
+        return -2
+    return 0
+
+
+def matching_angle_close(tokens: list[Token], start_idx: int) -> int | None:
+    depth = 0
+    for idx in range(start_idx, len(tokens)):
+        depth += angle_delta(tokens[idx])
+        if depth <= 0:
+            return idx
+    return None
+
+
+def looks_like_angle_open(tokens: list[Token], start_idx: int) -> bool:
+    if angle_delta(tokens[start_idx]) <= 0:
+        return False
+    angle_depth = 0
+    paren_depth = 0
+    bracket_depth = 0
+    brace_depth = 0
+    for idx in range(start_idx, len(tokens)):
+        token = tokens[idx]
+        if (
+            idx > start_idx
+            and token.text in ("=>", ";")
+            and paren_depth == 0
+            and bracket_depth == 0
+            and brace_depth == 0
+        ):
+            return False
+        if token.text == "(":
+            paren_depth += 1
+        elif token.text == ")":
+            if paren_depth == 0:
+                return False
+            paren_depth -= 1
+        elif token.text == "[":
+            bracket_depth += 1
+        elif token.text == "]":
+            if bracket_depth == 0:
+                return False
+            bracket_depth -= 1
+        elif token.text == "{":
+            brace_depth += 1
+        elif token.text == "}":
+            if brace_depth == 0:
+                return False
+            brace_depth -= 1
+        elif brace_depth == 0:
+            angle_depth += angle_delta(token)
+            if angle_depth <= 0:
+                return True
+    return False
 
 
 def extract_impl_name(tokens: list[Token], start_idx: int) -> str:
     i = start_idx + 1
     n = len(tokens)
     impl_toks: list[Token] = []
-    while i < n and tokens[i].text != "{":
-        impl_toks.append(tokens[i])
+    angle_depth = 0
+    paren_depth = 0
+    bracket_depth = 0
+    brace_depth = 0
+    while i < n:
+        token = tokens[i]
+        if (
+            token.text in ("{", "where")
+            and angle_depth == 0
+            and paren_depth == 0
+            and bracket_depth == 0
+            and brace_depth == 0
+        ):
+            break
+        impl_toks.append(token)
+        if token.text == "(":
+            paren_depth += 1
+        elif token.text == ")":
+            paren_depth = max(0, paren_depth - 1)
+        elif token.text == "[":
+            bracket_depth += 1
+        elif token.text == "]":
+            bracket_depth = max(0, bracket_depth - 1)
+        elif token.text == "{":
+            brace_depth += 1
+        elif token.text == "}":
+            brace_depth = max(0, brace_depth - 1)
+        elif brace_depth == 0:
+            angle_depth = max(0, angle_depth + angle_delta(token))
         i += 1
 
     toks = impl_toks
     if toks and toks[0].text == "<":
-        depth = 0
-        idx = 0
-        while idx < len(toks):
-            if toks[idx].text == "<":
-                depth += 1
-            elif toks[idx].text == ">":
-                depth -= 1
-                if depth == 0:
-                    toks = toks[idx + 1:]
-                    break
-            idx += 1
+        close_idx = matching_angle_close(toks, 0)
+        if close_idx is not None and (
+            close_idx + 1 >= len(toks) or toks[close_idx + 1].text != "::"
+        ):
+            toks = toks[close_idx + 1:]
 
     for_idx = None
     depth = 0
+    brace_depth = 0
+    paren_depth = 0
+    bracket_depth = 0
     for idx, t in enumerate(toks):
-        if t.text == "<":
-            depth += 1
-        elif t.text == ">":
-            depth = max(0, depth - 1)
-        elif t.text == "for" and depth == 0:
+        if t.text == "(":
+            paren_depth += 1
+        elif t.text == ")":
+            paren_depth = max(0, paren_depth - 1)
+        elif t.text == "[":
+            bracket_depth += 1
+        elif t.text == "]":
+            bracket_depth = max(0, bracket_depth - 1)
+        elif t.text == "{":
+            brace_depth += 1
+        elif t.text == "}":
+            brace_depth = max(0, brace_depth - 1)
+        elif brace_depth == 0:
+            depth = max(0, depth + angle_delta(t))
+        followed_by_hrtb_binder = False
+        if idx + 1 < len(toks) and toks[idx + 1].text == "<":
+            close_idx = matching_angle_close(toks, idx + 1)
+            followed_by_hrtb_binder = close_idx is not None and (
+                close_idx + 1 >= len(toks) or toks[close_idx + 1].text != "::"
+            )
+        if (
+            t.text == "for"
+            and depth == 0
+            and brace_depth == 0
+            and paren_depth == 0
+            and bracket_depth == 0
+            and not followed_by_hrtb_binder
+            and for_idx is None
+        ):
             for_idx = idx
-            break
 
     if for_idx is not None:
         trait_toks = toks[:for_idx]
@@ -349,7 +518,15 @@ def scan_abort_source(
     pending_fn_tok_idx: int = 0
     pending_impl: str | None = None
     pending_mod: str | None = None
+    pending_test_delimiters: tuple[int, int, int] | None = None
+    pending_test_angle_depth = 0
     current_brace_depth = 0
+    current_paren_depth = 0
+    current_bracket_depth = 0
+    declaration_angle_depth = 0
+    declaration_paren_depth = 0
+    declaration_bracket_depth = 0
+    non_scope_brace_depth = 0
 
     findings: list[AbortFinding] = []
     fn_ordinals: dict[str, int] = {}
@@ -383,6 +560,12 @@ def scan_abort_source(
                 else:
                     if is_test:
                         pending_test = True
+                        pending_test_delimiters = (
+                            current_brace_depth,
+                            current_paren_depth,
+                            current_bracket_depth,
+                        )
+                        pending_test_angle_depth = 0
                 i = attr_idx
                 continue
 
@@ -390,16 +573,88 @@ def scan_abort_source(
             if tok.text == "fn" and i + 1 < n and tokens[i + 1].kind == "ident":
                 pending_fn = tokens[i + 1].text
                 pending_fn_tok_idx = i
+                declaration_angle_depth = 0
+                declaration_paren_depth = 0
+                declaration_bracket_depth = 0
             elif tok.text == "impl" and not pending_fn and scopes[-1].kind in ("root", "mod"):
                 pending_impl = extract_impl_name(tokens, i)
+                declaration_angle_depth = 0
+                declaration_paren_depth = 0
+                declaration_bracket_depth = 0
             elif tok.text == "mod" and not pending_fn and scopes[-1].kind in ("root", "mod") and i + 1 < n and tokens[i + 1].kind == "ident":
                 pending_mod = tokens[i + 1].text
 
+        if tok.text == "}" and non_scope_brace_depth > 0:
+            non_scope_brace_depth -= 1
+            i += 1
+            continue
+
+        if non_scope_brace_depth > 0:
+            if tok.text == "{":
+                non_scope_brace_depth += 1
+            i += 1
+            continue
+
+        if non_scope_brace_depth == 0:
+            if pending_fn is not None or pending_impl is not None:
+                if tok.text == "(":
+                    declaration_paren_depth += 1
+                elif tok.text == ")":
+                    declaration_paren_depth = max(0, declaration_paren_depth - 1)
+                elif tok.text == "[":
+                    declaration_bracket_depth += 1
+                elif tok.text == "]":
+                    declaration_bracket_depth = max(0, declaration_bracket_depth - 1)
+                else:
+                    declaration_angle_depth = max(
+                        0, declaration_angle_depth + angle_delta(tok)
+                    )
+
+            if pending_test:
+                delta = angle_delta(tok)
+                if pending_test_angle_depth > 0:
+                    pending_test_angle_depth = max(
+                        0, pending_test_angle_depth + delta
+                    )
+                elif delta > 0 and looks_like_angle_open(tokens, i):
+                    pending_test_angle_depth = delta
+
+        if tok.text == "{" and (
+            declaration_angle_depth > 0
+            or declaration_paren_depth > 0
+            or declaration_bracket_depth > 0
+            or pending_test_angle_depth > 0
+        ):
+            non_scope_brace_depth += 1
+            i += 1
+            continue
+
         if tok.text == ";":
             pending_test = False
+            pending_test_delimiters = None
+            pending_test_angle_depth = 0
             pending_fn = None
             pending_impl = None
             pending_mod = None
+            declaration_angle_depth = 0
+            declaration_paren_depth = 0
+            declaration_bracket_depth = 0
+            i += 1
+            continue
+
+        if (
+            tok.text == ","
+            and pending_test
+            and pending_fn is None
+            and pending_impl is None
+            and pending_mod is None
+            and pending_test_angle_depth == 0
+            and pending_test_delimiters
+            == (current_brace_depth, current_paren_depth, current_bracket_depth)
+        ):
+            pending_test = False
+            pending_test_delimiters = None
+            pending_test_angle_depth = 0
             i += 1
             continue
 
@@ -407,6 +662,11 @@ def scan_abort_source(
             current_brace_depth += 1
             is_test_scope = pending_test or any(s.is_test for s in scopes)
             pending_test = False
+            pending_test_delimiters = None
+            pending_test_angle_depth = 0
+            declaration_angle_depth = 0
+            declaration_paren_depth = 0
+            declaration_bracket_depth = 0
             if pending_fn:
                 scopes.append(Scope("fn", pending_fn, is_test_scope, current_brace_depth, pending_fn_tok_idx))
                 pending_fn = None
@@ -420,6 +680,15 @@ def scan_abort_source(
                 scopes.append(Scope("block", "", is_test_scope, current_brace_depth))
             i += 1
             continue
+
+        if tok.text == "(":
+            current_paren_depth += 1
+        elif tok.text == ")":
+            current_paren_depth = max(0, current_paren_depth - 1)
+        elif tok.text == "[":
+            current_bracket_depth += 1
+        elif tok.text == "]":
+            current_bracket_depth = max(0, current_bracket_depth - 1)
 
         if tok.text == "}":
             if len(scopes) > 1 and scopes[-1].brace_depth == current_brace_depth:

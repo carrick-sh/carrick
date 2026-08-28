@@ -182,6 +182,169 @@ impl Trait<u32> for Type { fn reset(&self) { std::process::abort(); } }
         self.assertEqual(rows_after[2].ordinal_in_function, 1)
         self.assertEqual(rows_before[1], rows_after[2])
 
+    def test_nested_generics_and_qualified_trait_paths_keep_impl_identity(self):
+        source = r'''
+impl Trait<Vec<i32>> for Type {
+    fn reset(&self) { std::process::abort(); }
+}
+impl <T as Meta>::Trait for Type {
+    fn reset(&self) { std::process::abort(); }
+}
+'''
+        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+        self.assertEqual(
+            [(r.function, r.ordinal_in_function) for r in rows],
+            [
+                ("<Type as Trait<Vec<i32>>>::reset", 1),
+                ("<Type as <T as Meta>::Trait>::reset", 1),
+            ],
+        )
+
+    def test_reference_self_types_do_not_share_impl_identity(self):
+        source = r'''
+impl Trait for Type {
+    fn reset(&self) { std::process::abort(); }
+}
+impl Trait for &Type {
+    fn reset(&self) { std::process::abort(); }
+}
+impl Trait for &mut Type {
+    fn reset(&self) { std::process::abort(); }
+}
+'''
+        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+        self.assertEqual(
+            [(r.function, r.ordinal_in_function) for r in rows],
+            [
+                ("<Type as Trait>::reset", 1),
+                ("<&Type as Trait>::reset", 1),
+                ("<&mut Type as Trait>::reset", 1),
+            ],
+        )
+
+    def test_higher_ranked_for_does_not_replace_impl_separator(self):
+        source = r'''
+impl for<'a> Trait<'a> for Type {
+    fn run(&self) { std::process::abort(); }
+}
+impl Trait for for<'a> fn(&'a str) {
+    fn run(&self) { std::process::abort(); }
+}
+'''
+        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+        self.assertEqual(
+            [(r.function, r.ordinal_in_function) for r in rows],
+            [
+                ("<Type as for<'a>Trait<'a>>::run", 1),
+                ("<for<'a>fn(&'a str) as Trait>::run", 1),
+            ],
+        )
+
+    def test_qualified_self_type_after_impl_separator_is_preserved(self):
+        source = r'''
+impl Trait for <T as Meta>::Assoc {
+    fn run(&self) { std::process::abort(); }
+}
+'''
+        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+        self.assertEqual(
+            [(r.function, r.ordinal_in_function) for r in rows],
+            [("<<T as Meta>::Assoc as Trait>::run", 1)],
+        )
+
+    def test_const_generic_braces_do_not_open_declaration_body(self):
+        source = r'''
+impl<const N: usize> Trait<{ N + 1 }> for Type<N> {
+    fn run(&self) { std::process::abort(); }
+}
+
+fn standalone<const N: usize>() -> Array<{ N + 1 }> {
+    std::process::abort();
+}
+'''
+        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+        self.assertEqual(
+            [(r.function, r.ordinal_in_function) for r in rows],
+            [
+                ("<Type<N> as Trait<{N+1}>>::run", 1),
+                ("standalone", 1),
+            ],
+        )
+
+    def test_const_generic_block_tokens_do_not_end_declaration(self):
+        source = r'''
+impl Trait<{ let n = 1; n + 1 }> for Type {
+    fn run(&self) { std::process::abort(); }
+}
+
+fn standalone() -> Array<{ let n = 1; n + 1 }> {
+    std::process::abort();
+}
+'''
+        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+        self.assertEqual(
+            [(r.function, r.ordinal_in_function) for r in rows],
+            [
+                ("<Type as Trait<{let n=1;n+1}>>::run", 1),
+                ("standalone", 1),
+            ],
+        )
+
+    def test_cfg_test_scope_survives_commas_in_generic_arguments(self):
+        source = r'''
+#[cfg(test)]
+const TEST_VALUE: Pair<A, B> = make(|| { std::process::abort(); });
+
+fn production(x: Kind) {
+    match x {
+        #[cfg(test)]
+        Kind::A => foo::<X, Y>(std::process::abort()),
+        Kind::B => std::process::abort(),
+    }
+}
+'''
+        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+        self.assertEqual(
+            [(r.function, r.ordinal_in_function) for r in rows],
+            [("production", 1)],
+        )
+
+    def test_cfg_angle_probe_does_not_cross_match_arm_boundary(self):
+        source = r'''
+fn production(kind: Kind, x: i32, y: i32, z: i32, q: i32) -> bool {
+    match kind {
+        #[cfg(test)]
+        Kind::A => x < y,
+        Kind::B => { std::process::abort(); z } > q,
+        Kind::C => { std::process::abort(); true },
+    }
+}
+'''
+        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+        self.assertEqual(
+            [(r.function, r.ordinal_in_function) for r in rows],
+            [("production", 1), ("production", 2)],
+        )
+
+    def test_cfg_all_requires_test_and_match_arm_scope_ends_at_comma(self):
+        source = r'''
+#[cfg(all(test, feature = "x"))]
+fn test_only() { std::process::abort(); }
+
+fn production(x: Kind) {
+    match x {
+        #[cfg(test)]
+        Kind::A => std::process::abort(),
+        Kind::B => std::process::abort(),
+    }
+}
+'''
+        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+        self.assertEqual(
+            [(r.function, r.ordinal_in_function) for r in rows],
+            [("production", 1)],
+        )
+
     def test_unrelated_method_insertion_does_not_renumber_sibling_type(self):
         before = r'''
 impl TypeA {
