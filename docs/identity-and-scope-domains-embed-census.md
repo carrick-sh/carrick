@@ -134,3 +134,20 @@ Per host thread, never container state: `dispatch/resources.rs:59-63`, `dispatch
 | `crates/carrick-hal/src/signal_pump.rs:68` (`:83` installs) | `SIGCHLD_INSTALLED` and the pump's dispositions | carrier-infra (spec) |
 | `crates/carrick-signal-core/src/host_glue.rs:87` | routed per-signal `sigaction` installs | carrier-infra (spec) |
 | `crates/carrick-runtime/src/dispatch/proctitle.rs:160,170,198,225` | `set_host_process_name` (host argv buffer + `pthread_setname_np` at `:170`) | carrier-infra: names the carrier |
+
+---
+
+## Checked executable ledger — `scripts/migrate/runtime-global-state.json`
+
+Monotone process-global state gate enforced by `scripts/migrate/check-runtime-global-state.py`.
+Current verified census across `crates/carrick-runtime/src`, `crates/carrick-kernel/src`, and `crates/carrick-vmm-hvf/src`:
+
+| Classification | Count | Description |
+|---|---|---|
+| `carrier_infra` | 107 | Host execution infrastructure, thread-locals, VM lifecycle |
+| `config_debug` | 120 | Host-process configuration or diagnostic debug hatches read from environment |
+| `container_debt` | 2 | Per-container state remaining on root namespace statics (`kernel/netns.rs`) |
+| `host_kernel_object` | 8 | Tables keyed by host file descriptor or filesystem path |
+| `monotonic_allocator` | 30 | Monotonic identifier and generation allocators |
+| `test_only` | 18 | Test fixtures, probe tools, or synchronization locks |
+| **Total** | **285** | Exact source-fingerprinted rows |
