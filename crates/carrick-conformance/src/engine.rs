@@ -307,10 +307,12 @@ pub fn carrick_dry_run(
     carrick_bin: &str,
     run_id: &str,
     lane: &crate::lane::Lane,
-    timeout_cap_s: u64,
+    fast_timeout_s: u64,
+    timeout_cap_s: Option<u64>,
 ) -> Vec<String> {
     let mut effective_suite = suite.clone();
-    effective_suite.timeout_s = effective_carrick_timeout_s(suite.timeout_s, timeout_cap_s);
+    effective_suite.timeout_s =
+        effective_carrick_timeout_s(suite.timeout_s, fast_timeout_s, timeout_cap_s, None);
     crate::lane::carrick_invocation_argv(&effective_suite, carrick_bin, run_id, lane)
 }
 pub fn docker_dry_run(
@@ -326,9 +328,16 @@ pub fn run_carrick(
     carrick_bin: &str,
     run_id: &str,
     lane: &crate::lane::Lane,
-    timeout_cap_s: u64,
+    fast_timeout_s: u64,
+    timeout_cap_s: Option<u64>,
+    oracle_elapsed_ms: Option<u64>,
 ) -> anyhow::Result<RunOutput> {
-    let effective_timeout_s = effective_carrick_timeout_s(suite.timeout_s, timeout_cap_s);
+    let effective_timeout_s = effective_carrick_timeout_s(
+        suite.timeout_s,
+        fast_timeout_s,
+        timeout_cap_s,
+        oracle_elapsed_ms,
+    );
     let mut effective_suite = suite.clone();
     effective_suite.timeout_s = effective_timeout_s;
     let argv = crate::lane::carrick_invocation_argv(&effective_suite, carrick_bin, run_id, lane);
@@ -364,13 +373,28 @@ pub fn run_carrick(
 }
 
 /// Apply the operator's Carrick-only diagnostic deadline without changing the
-/// suite declaration or Docker oracle key. A zero cap explicitly preserves the
-/// declared suite budget for a targeted long-run investigation.
-fn effective_carrick_timeout_s(declared_s: u64, timeout_cap_s: u64) -> u64 {
-    if timeout_cap_s == 0 {
+/// suite declaration or Docker oracle key. Routine rows get a short deadline;
+/// a cached Docker duration raises it only far enough to measure the 2x target,
+/// plus two seconds of scheduling grace. An explicit cap remains a hard upper
+/// bound; zero preserves the declared budget for a targeted long-run investigation.
+fn effective_carrick_timeout_s(
+    declared_s: u64,
+    fast_timeout_s: u64,
+    timeout_cap_s: Option<u64>,
+    oracle_elapsed_ms: Option<u64>,
+) -> u64 {
+    if timeout_cap_s == Some(0) {
         declared_s
     } else {
-        declared_s.min(timeout_cap_s)
+        let oracle_budget_s = oracle_elapsed_ms.map_or(0, |elapsed_ms| {
+            elapsed_ms
+                .saturating_mul(2)
+                .saturating_add(999)
+                .saturating_div(1_000)
+                .saturating_add(2)
+        });
+        let adaptive_s = fast_timeout_s.max(oracle_budget_s);
+        declared_s.min(timeout_cap_s.map_or(adaptive_s, |cap_s| adaptive_s.min(cap_s)))
     }
 }
 
@@ -728,10 +752,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn carrick_timeout_cap_shortens_only_long_suite_budgets() {
-        assert_eq!(effective_carrick_timeout_s(300, 20), 20);
-        assert_eq!(effective_carrick_timeout_s(15, 20), 15);
-        assert_eq!(effective_carrick_timeout_s(300, 0), 300);
+    fn carrick_timeout_is_fast_unless_the_oracle_proves_the_case_is_slow() {
+        assert_eq!(effective_carrick_timeout_s(300, 5, None, None), 5);
+        assert_eq!(effective_carrick_timeout_s(300, 5, None, Some(400)), 5);
+        assert_eq!(effective_carrick_timeout_s(300, 5, None, Some(1_600)), 6);
+        assert_eq!(effective_carrick_timeout_s(300, 5, None, Some(20_766)), 44);
+        assert_eq!(effective_carrick_timeout_s(15, 5, None, Some(20_766)), 15);
+        assert_eq!(
+            effective_carrick_timeout_s(300, 5, Some(10), Some(20_766)),
+            10
+        );
+        assert_eq!(effective_carrick_timeout_s(300, 5, Some(0), Some(400)), 300);
     }
 
     #[test]
