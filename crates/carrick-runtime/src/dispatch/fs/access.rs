@@ -40,6 +40,18 @@ impl SyscallDispatcher {
         }
 
         let path = self.resolve_at_path(dirfd, &path)?;
+        // A numeric `/proc/<pid>` can name a logical HVPatch process that has
+        // no host pid.  Resolve that graph-backed synthetic leaf before the
+        // context-free symlink follower asks ProcVfs to lstat it: ProcVfs has
+        // no KernelContext at that boundary, so it must conservatively report
+        // the numeric leaf absent.  LTP's tst_memutils setup performs exactly
+        // this `access("/proc/<peer>/oom_score_adj", F_OK)` check before it
+        // writes the peer's OOM bias; reaching `synthetic_access` only after
+        // `canonicalize_following` made the graph-aware implementation
+        // unreachable.
+        if let Some(outcome) = self.synthetic_access(context, &path, mode) {
+            return Ok(outcome);
+        }
         let path = if flags & LINUX_AT_SYMLINK_NOFOLLOW == 0 {
             self.canonicalize_following(&path)?
         } else {
