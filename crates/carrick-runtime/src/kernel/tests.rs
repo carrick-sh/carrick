@@ -7,9 +7,10 @@ use carrick_hal::threaded::{
     X86_TASK_XSAVE_LEN, X86TaskCpuStateV1,
 };
 
+use super::ids::FileDescriptionId;
 use super::objects::{
-    BlockedReason, ExecutionFailure, ExecutorId, MigratableTaskState, ThreadExecutionError,
-    ThreadExecutionState,
+    AsyncIoOwner, BlockedReason, ExecutionFailure, ExecutorId, FileDescription,
+    MigratableTaskState, ThreadExecutionError, ThreadExecutionState,
 };
 use super::{Kernel, RootBootstrap};
 
@@ -554,4 +555,49 @@ fn thread_execution_cpu_intervals_never_inherit_between_logical_tasks() {
     assert_eq!(context_a.task().self_system_cpu_us(), 13);
     assert_eq!(context_b.task().self_cpu_us(), 17);
     assert_eq!(context_b.task().self_system_cpu_us(), 19);
+}
+
+#[test]
+fn description_common_survives_the_closed_transition_and_counts_fd_refs() {
+    let description = FileDescription::regular(
+        FileDescriptionId::from_raw_u64(1).expect("nonzero file description id"),
+    );
+    let common = description.common();
+
+    assert_eq!(common.status_flags(), 0);
+    assert_eq!(common.fd_refs(), 0);
+    assert_eq!(common.owner(), AsyncIoOwner::default());
+    assert_eq!(common.async_sig(), 0);
+    assert_eq!(common.seals(), None);
+    assert!(!common.secretmem());
+
+    common.set_status_flags(carrick_abi::LINUX_O_NONBLOCK);
+    common.set_owner(AsyncIoOwner {
+        owner_type: 1,
+        owner_pid: 42,
+    });
+    common.set_async_sig(carrick_abi::LINUX_SIGUSR1);
+    common.set_seals(Some(0b0001));
+    common.set_secretmem(true);
+
+    common.retain_fd_ref();
+    common.retain_fd_ref();
+    assert_eq!(common.fd_refs(), 2);
+    assert_eq!(common.release_fd_ref(), 1);
+    assert_eq!(common.fd_refs(), 1);
+
+    // The whole point of hoisting: this state is reachable through the
+    // description identity, so it does not vanish when the backing drains to
+    // its Closed shell — the case `OpenDescription::base()` aborts on today.
+    assert_eq!(common.status_flags(), carrick_abi::LINUX_O_NONBLOCK);
+    assert_eq!(
+        common.owner(),
+        AsyncIoOwner {
+            owner_type: 1,
+            owner_pid: 42,
+        }
+    );
+    assert_eq!(common.async_sig(), carrick_abi::LINUX_SIGUSR1);
+    assert_eq!(common.seals(), Some(0b0001));
+    assert!(common.secretmem());
 }

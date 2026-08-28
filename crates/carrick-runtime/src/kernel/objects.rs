@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -561,15 +561,149 @@ type FileDescriptionObservation = (
     Vec<(FileDescriptionId, i32)>,
 );
 
+/// The async-I/O owner set by `F_SETOWN`/`F_SETOWN_EX`: the SIGIO/SIGURG
+/// target. `(0, 0)` — the `Default` — means no owner. `owner_type` is
+/// `F_OWNER_TID`/`F_OWNER_PID`/`F_OWNER_PGRP`; `owner_pid` is the positive id.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AsyncIoOwner {
+    pub(crate) owner_type: i32,
+    pub(crate) owner_pid: i32,
+}
+
+/// Open-file-description state that is generic across EVERY backing kind.
+///
+/// Linux keeps these on the description, so a `dup`, a `fork`, or a
+/// `CLONE_FILES` sharer observes one value. Carrick used to keep a private copy
+/// inside each of `OpenDescription`'s 25 variants (`OpenDescriptionBase`),
+/// which cost two 25-arm matches to reach (`base`/`base_mut`), forced
+/// `IoUringBacking` to carry a shadow `OpenDescription` purely to answer these
+/// questions, and made the state unreachable — a process abort — once a
+/// description drained to its `Closed` identity shell.
+///
+/// Reads take no description lock: every field is either an atomic or a short
+/// `Mutex`, so the hot syscall prologue (`read(2)` asks seven of these
+/// questions before a byte moves) does not serialize on the backing's `RwLock`.
+#[derive(Debug)]
+pub(crate) struct DescriptionCommon {
+    status_flags: AtomicU64,
+    /// Number of Linux fd-table entries naming this description across every
+    /// process namespace. Deliberately excludes transient Rust `Arc` clones
+    /// held by in-flight syscalls: Linux removes an epoll interest only after
+    /// the last fd referring to the description closes, and `Arc::strong_count`
+    /// cannot express that.
+    fd_refs: AtomicUsize,
+    /// `F_SETLEASE`/`F_GETLEASE`: `F_RDLCK`(0)/`F_WRLCK`(1)/`F_UNLCK`(2).
+    lease: AtomicI32,
+    /// `F_SETSIG`: the signal delivered on async I/O (0 = the default SIGIO).
+    async_sig: AtomicI32,
+    /// True for a `memfd_secret(2)` description.
+    secretmem: AtomicBool,
+    owner: Mutex<AsyncIoOwner>,
+    /// `memfd_create(2)`/`F_ADD_SEALS` seal set. `None` = this description does
+    /// not support sealing (`F_GET_SEALS`/`F_ADD_SEALS` → `EINVAL`).
+    seals: Mutex<Option<u32>>,
+}
+
+#[allow(dead_code)]
+impl DescriptionCommon {
+    pub(crate) fn new(status_flags: u64) -> Self {
+        Self {
+            status_flags: AtomicU64::new(status_flags),
+            fd_refs: AtomicUsize::new(0),
+            lease: AtomicI32::new(crate::linux_abi::LINUX_F_UNLCK),
+            async_sig: AtomicI32::new(0),
+            secretmem: AtomicBool::new(false),
+            owner: Mutex::new(AsyncIoOwner::default()),
+            seals: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn status_flags(&self) -> u64 {
+        self.status_flags.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_status_flags(&self, next: u64) {
+        self.status_flags.store(next, Ordering::Relaxed);
+    }
+
+    pub(crate) fn fd_refs(&self) -> usize {
+        self.fd_refs.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn retain_fd_ref(&self) {
+        self.fd_refs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Returns the count AFTER the release. Aborts on underflow: a negative
+    /// logical fd-reference count means the close accounting has already lost
+    /// track of an epoll interest's lifetime, and continuing would leak or
+    /// double-free a registration.
+    pub(crate) fn release_fd_ref(&self) -> usize {
+        let previous = self.fd_refs.fetch_sub(1, Ordering::Relaxed);
+        if previous == 0 {
+            tracing::error!("logical fd reference count underflow");
+            std::process::abort();
+        }
+        previous - 1
+    }
+
+    pub(crate) fn lease(&self) -> i32 {
+        self.lease.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_lease(&self, lease: i32) {
+        self.lease.store(lease, Ordering::Relaxed);
+    }
+
+    pub(crate) fn async_sig(&self) -> i32 {
+        self.async_sig.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_async_sig(&self, sig: i32) {
+        self.async_sig.store(sig, Ordering::Relaxed);
+    }
+
+    pub(crate) fn secretmem(&self) -> bool {
+        self.secretmem.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_secretmem(&self, on: bool) {
+        self.secretmem.store(on, Ordering::Relaxed);
+    }
+
+    pub(crate) fn owner(&self) -> AsyncIoOwner {
+        *self.owner.lock()
+    }
+
+    pub(crate) fn set_owner(&self, owner: AsyncIoOwner) {
+        *self.owner.lock() = owner;
+    }
+
+    pub(crate) fn seals(&self) -> Option<u32> {
+        *self.seals.lock()
+    }
+
+    pub(crate) fn set_seals(&self, seals: Option<u32>) {
+        *self.seals.lock() = seals;
+    }
+}
+
 #[derive(Debug)]
 pub struct FileDescription {
     id: FileDescriptionId,
     kind: FileDescriptionKind,
+    #[allow(dead_code)] // Task 3 moves the first live consumer onto this field.
+    common: DescriptionCommon,
     epoll_registrations: Mutex<BTreeMap<(FileDescriptionId, i32), Weak<FileDescription>>>,
     revision: ObjectRevision,
 }
 
 impl FileDescription {
+    #[allow(dead_code)] // Task 3 makes this the status-flag authority.
+    pub(crate) fn common(&self) -> &DescriptionCommon {
+        &self.common
+    }
+
     pub(crate) fn concrete<T>(backing: Arc<T>) -> Result<Self, ObjectIdError>
     where
         T: FileDescriptionBacking,
@@ -577,6 +711,7 @@ impl FileDescription {
         Ok(Self {
             id: super::ids::allocate_file_description_id()?,
             kind: FileDescriptionKind::Concrete(OpaqueFileDescriptionBacking::new(backing)),
+            common: DescriptionCommon::new(0),
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
         })
@@ -593,15 +728,17 @@ impl FileDescription {
         Ok(Self {
             id: super::ids::restore_file_description_id(stable_id)?,
             kind: FileDescriptionKind::Concrete(OpaqueFileDescriptionBacking::new(backing)),
+            common: DescriptionCommon::new(0),
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
         })
     }
 
-    pub const fn regular(id: FileDescriptionId) -> Self {
+    pub fn regular(id: FileDescriptionId) -> Self {
         Self {
             id,
             kind: FileDescriptionKind::Regular,
+            common: DescriptionCommon::new(0),
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
         }
@@ -611,6 +748,7 @@ impl FileDescription {
         Self {
             id,
             kind: FileDescriptionKind::Epoll(Mutex::new(BTreeMap::new())),
+            common: DescriptionCommon::new(0),
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
         }
