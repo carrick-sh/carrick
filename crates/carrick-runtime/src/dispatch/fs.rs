@@ -11632,6 +11632,11 @@ impl SyscallDispatcher {
 
         fn copy_file_range(this, cx, fd_in: Fd, off_in: GuestPtr, fd_out: Fd, off_out: GuestPtr, len: u64, flags: u64) {
 
+            // Linux currently defines no copy_file_range flags. Reject unknown
+            // bits before inspecting length or endpoints.
+            if flags != 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
             let tid = cx.tid();
             let in_fd: Fd = fd_in;
             let off_in_addr = off_in.0;

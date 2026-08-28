@@ -8885,7 +8885,18 @@ impl SyscallDispatcher {
                 } else {
                     total
                 };
-                let mut buf = vec![0u8; if zero_len_datagram_read { 1 } else { capped }];
+                // Darwin returns only the host-buffer length for an atomic
+                // recvmsg(MSG_TRUNC). Widen the host-only buffer so the return
+                // value retains the full record length, while the scatter below
+                // still copies no more than the guest iovec capacity.
+                let host_recv_len = if datagram_shaped && !zero_len_datagram_read {
+                    linux_msg_trunc_recv_capacity(host_fd.get(), capped, flags)
+                } else if zero_len_datagram_read {
+                    1
+                } else {
+                    capped
+                };
+                let mut buf = vec![0u8; host_recv_len];
                 let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
                 // A host control buffer sized to hold the guest's requested
                 // controllen (SCM_RIGHTS fd array). CMSG_SPACE for that many fds is
@@ -9012,7 +9023,11 @@ impl SyscallDispatcher {
                 } else {
                     n
                 };
-                guest_msg_flags.set(host_to_linux_msg_flags(hmsg.msg_flags));
+                let mut translated_flags = host_to_linux_msg_flags(hmsg.msg_flags);
+                if datagram_shaped && flags & LINUX_MSG_TRUNC != 0 && n as usize > total {
+                    translated_flags |= LINUX_MSG_TRUNC;
+                }
+                guest_msg_flags.set(translated_flags);
                 if is_sctp_stream {
                     sctp_eor.set(sctp::complete_read(host_fd.get(), n as usize, sctp_peek));
                 }

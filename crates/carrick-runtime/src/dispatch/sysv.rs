@@ -3362,7 +3362,12 @@ fn msg_queue_receive<M: GuestMemory>(
         return Ok(None);
     }
     let (head_message, next_head) = lock.read_record_at(head)?;
-    if selected_msg_index(std::slice::from_ref(&head_message), wanted, flags) == Some(0) {
+    // A negative msgtyp selects the globally-lowest eligible type, not merely
+    // the first eligible record. The head alone is therefore insufficient to
+    // decide that case; load the queue before selecting it.
+    if wanted.raw() >= 0
+        && selected_msg_index(std::slice::from_ref(&head_message), wanted, flags) == Some(0)
+    {
         if head_message.payload.len() > msgsz && !flags.contains(MsgOpFlags::NOERROR) {
             return Err(LINUX_E2BIG);
         }
