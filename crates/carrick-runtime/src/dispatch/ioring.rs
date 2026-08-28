@@ -820,11 +820,14 @@ impl SyscallDispatcher {
             return DispatchOutcome::errno(LINUX_EFAULT);
         }
 
+        let common = Arc::clone(backing.open_metadata.read().base().common());
         let description = Arc::new(
-            crate::kernel::FileDescription::concrete(backing).unwrap_or_else(|error| {
-                tracing::error!(%error, "io_uring description identity allocation failed");
-                std::process::abort();
-            }),
+            crate::kernel::FileDescription::concrete_with_common(backing, common).unwrap_or_else(
+                |error| {
+                    tracing::error!(%error, "io_uring description identity allocation failed");
+                    std::process::abort();
+                },
+            ),
         );
         let Ok(fd) = self.install_fd_at_or_above(3, OpenFile::new(description, 0)) else {
             return DispatchOutcome::errno(linux_errno::EMFILE);
@@ -1628,8 +1631,9 @@ mod tests {
 
     fn test_description() -> (Arc<crate::kernel::FileDescription>, Arc<IoUringBacking>) {
         let backing = IoUringBacking::create(8, 4096).expect("ring backing");
+        let common = Arc::clone(backing.open_metadata.read().base().common());
         let description = Arc::new(
-            crate::kernel::FileDescription::concrete(Arc::clone(&backing))
+            crate::kernel::FileDescription::concrete_with_common(Arc::clone(&backing), common)
                 .expect("ring description"),
         );
         (description, backing)

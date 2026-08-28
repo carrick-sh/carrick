@@ -8074,7 +8074,7 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
                     let self_acc =
-                        open_file.description.read().status_flags() & LINUX_O_ACCMODE;
+                        open_file.description.common().status_flags() & LINUX_O_ACCMODE;
                     match lease {
                         // A write lease demands exclusive access: any other open
                         // file description for the file is a conflict.
@@ -11516,7 +11516,7 @@ impl SyscallDispatcher {
             // caught as EBADF by sendfile_offset below; out_fd writability is
             // enforced on the write path (sendfile03 case 2 already passes).
             if let Some(in_file) = this.open_file(in_fd.0)
-                && in_file.description.read().status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY
+                && in_file.description.common().status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY
             {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }

@@ -1,0 +1,14 @@
+[
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": ".description.read().status_flags()",
+    "new": ".description.common().status_flags()",
+    "count": 2
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+    "old": ".description.read().status_flags()",
+    "new": ".description.common().status_flags()",
+    "count": 1
+  }
+]

@@ -588,7 +588,7 @@ pub(crate) struct DescriptionCommon {
     status_flags: AtomicU64,
     /// Number of Linux fd-table entries naming this description across every
     /// process namespace. Deliberately excludes transient Rust `Arc` clones
-    /// held by in-flight syscalls: Linux removes an epoll interest only after
+    /// held by in-flight syscalls: Linux removes an event-poll interest only after
     /// the last fd referring to the description closes, and `Arc::strong_count`
     /// cannot express that.
     fd_refs: AtomicUsize,
@@ -636,7 +636,7 @@ impl DescriptionCommon {
 
     /// Returns the count AFTER the release. Aborts on underflow: a negative
     /// logical fd-reference count means the close accounting has already lost
-    /// track of an epoll interest's lifetime, and continuing would leak or
+    /// track of an event-poll interest's lifetime, and continuing would leak or
     /// double-free a registration.
     pub(crate) fn release_fd_ref(&self) -> usize {
         let previous = self.fd_refs.fetch_sub(1, Ordering::Relaxed);
@@ -692,29 +692,38 @@ impl DescriptionCommon {
 pub struct FileDescription {
     id: FileDescriptionId,
     kind: FileDescriptionKind,
-    #[allow(dead_code)] // Task 3 moves the first live consumer onto this field.
-    common: DescriptionCommon,
+    common: Arc<DescriptionCommon>,
     epoll_registrations: Mutex<BTreeMap<(FileDescriptionId, i32), Weak<FileDescription>>>,
     revision: ObjectRevision,
 }
 
 impl FileDescription {
-    #[allow(dead_code)] // Task 3 makes this the status-flag authority.
     pub(crate) fn common(&self) -> &DescriptionCommon {
         &self.common
     }
 
-    pub(crate) fn concrete<T>(backing: Arc<T>) -> Result<Self, ObjectIdError>
+    pub(crate) fn concrete_with_common<T>(
+        backing: Arc<T>,
+        common: Arc<DescriptionCommon>,
+    ) -> Result<Self, ObjectIdError>
     where
         T: FileDescriptionBacking,
     {
         Ok(Self {
             id: super::ids::allocate_file_description_id()?,
             kind: FileDescriptionKind::Concrete(OpaqueFileDescriptionBacking::new(backing)),
-            common: DescriptionCommon::new(0),
+            common,
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
         })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn concrete<T>(backing: Arc<T>) -> Result<Self, ObjectIdError>
+    where
+        T: FileDescriptionBacking,
+    {
+        Self::concrete_with_common(backing, Arc::new(DescriptionCommon::new(0)))
     }
 
     #[allow(dead_code)]
@@ -728,7 +737,7 @@ impl FileDescription {
         Ok(Self {
             id: super::ids::restore_file_description_id(stable_id)?,
             kind: FileDescriptionKind::Concrete(OpaqueFileDescriptionBacking::new(backing)),
-            common: DescriptionCommon::new(0),
+            common: Arc::new(DescriptionCommon::new(0)),
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
         })
@@ -738,7 +747,7 @@ impl FileDescription {
         Self {
             id,
             kind: FileDescriptionKind::Regular,
-            common: DescriptionCommon::new(0),
+            common: Arc::new(DescriptionCommon::new(0)),
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
         }
@@ -748,7 +757,7 @@ impl FileDescription {
         Self {
             id,
             kind: FileDescriptionKind::Epoll(Mutex::new(BTreeMap::new())),
-            common: DescriptionCommon::new(0),
+            common: Arc::new(DescriptionCommon::new(0)),
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
         }
