@@ -2308,7 +2308,7 @@ fn bind_mount_rejects_o_directory_for_regular_file() {
 #[test]
 fn f_add_seals_waits_for_alias_dispatch_and_publishes_under_same_exclusion() {
     let dispatcher = std::sync::Arc::new(SyscallDispatcher::new());
-    let mut base = OpenDescriptionBase::new(LINUX_O_RDWR);
+    let base = OpenDescriptionBase::new(LINUX_O_RDWR);
     base.set_seals(Some(0));
     let description = std::sync::Arc::new(RwLock::new(OpenDescription::SyntheticFile {
         base,

@@ -3444,6 +3444,44 @@ mod overlay_dispatch_tests {
         description.write().set_status_flags(0);
         assert_eq!(description.common().status_flags(), 0);
     }
+
+    #[test]
+    fn generic_description_state_outlives_the_backing_close() {
+        let open_file = eventfd_open_file(0);
+        let description = std::sync::Arc::clone(&open_file.description);
+
+        description.common().retain_fd_ref();
+        description.common().set_lease(crate::linux_abi::LINUX_F_WRLCK);
+        assert_eq!(description.read().lease(), crate::linux_abi::LINUX_F_WRLCK);
+        description.common().set_owner(crate::kernel::objects::AsyncIoOwner {
+            owner_type: 2,
+            owner_pid: 77,
+        });
+        assert_eq!(description.read().owner(), (2, 77));
+        description.common().set_async_sig(carrick_abi::LINUX_SIGUSR2);
+        assert_eq!(description.read().async_sig(), carrick_abi::LINUX_SIGUSR2);
+        description.common().set_seals(Some(0b0010));
+        assert_eq!(description.read().seals(), Some(0b0010));
+        description.common().set_secretmem(true);
+        assert!(description.read().is_secretmem());
+
+        // Drain the backing to its Closed identity shell. Reaching this state used
+        // to abort the process through OpenDescription::base().
+        *description.write() = OpenDescription::Closed { was_epoll: false };
+
+        assert_eq!(description.common().fd_refs(), 1);
+        assert_eq!(description.common().lease(), crate::linux_abi::LINUX_F_WRLCK);
+        assert_eq!(
+            description.common().owner(),
+            crate::kernel::objects::AsyncIoOwner {
+                owner_type: 2,
+                owner_pid: 77,
+            }
+        );
+        assert_eq!(description.common().async_sig(), carrick_abi::LINUX_SIGUSR2);
+        assert_eq!(description.common().seals(), Some(0b0010));
+        assert!(description.common().secretmem());
+    }
 }
 
 #[cfg(test)]

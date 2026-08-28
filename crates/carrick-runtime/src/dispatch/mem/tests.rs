@@ -991,7 +991,7 @@ fn private_file_snapshot_computes_identical_bus_tail_for_memfd_synthetic_and_hos
         mode: 0o600,
         size: FILE_LENGTH,
     };
-    let mut memfd_base = OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR);
+    let memfd_base = OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR);
     memfd_base.set_seals(Some(0));
     dispatcher.captured_file_table().write_open_files().insert(
         20,

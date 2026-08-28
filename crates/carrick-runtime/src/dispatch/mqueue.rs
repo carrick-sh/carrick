@@ -988,14 +988,14 @@ impl SyscallDispatcher {
                 let want_nonblock =
                     (new_attr.mq_flags as u64) & LinuxOpenFlags::NONBLOCK.bits() != 0;
                 if let Some(open_file) = this.open_file(mqd as i32) {
-                    let mut open = open_file.description.write();
-                    let cur = open.status_flags();
+                    let common = open_file.description.common();
+                    let cur = common.status_flags();
                     let next = if want_nonblock {
                         cur | LINUX_O_NONBLOCK
                     } else {
                         cur & !LINUX_O_NONBLOCK
                     };
-                    open.set_status_flags(next);
+                    common.set_status_flags(next);
                 }
             }
 

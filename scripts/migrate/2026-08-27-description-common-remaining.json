@@ -1,0 +1,32 @@
+[
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": ".description.read().lease()",
+    "new": ".description.common().lease()",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": ".description.read().seals()",
+    "new": ".description.common().seals()",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": ".description.read().async_sig()",
+    "new": ".description.common().async_sig()",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": ".description.read().is_secretmem()",
+    "new": ".description.common().secretmem()",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+    "old": ".description.read().is_secretmem()",
+    "new": ".description.common().secretmem()",
+    "count": 1
+  }
+]

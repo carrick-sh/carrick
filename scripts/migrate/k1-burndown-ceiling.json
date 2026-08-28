@@ -1,11 +1,11 @@
 {
   "schema": 1,
   "ceiling": {
-    "create_install": 83,
+    "create_install": 80,
     "epoll_wait": 38,
-    "inspect_misc": 162,
+    "inspect_misc": 152,
     "lifecycle": 36,
-    "mapping_ring": 14,
+    "mapping_ring": 13,
     "read_attempt": 13,
     "slot_description_mutation": 17,
     "stream_transfer": 16,
