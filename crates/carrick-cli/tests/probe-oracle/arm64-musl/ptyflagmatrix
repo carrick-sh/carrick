@@ -1,4 +1,4 @@
-c5e6318a031c325b
+f48134e10668ff1d
 openpt_rdwr_cloexec_nonblock_opened=true
 openpt_rdwr_cloexec_nonblock_has_cloexec=true
 openpt_rdwr_cloexec_nonblock_has_nonblock=true
@@ -79,7 +79,7 @@ master_write_ping_rc=4
 master_write_ping_errno=0
 fionread_slave_after_master_write_rc=0
 fionread_slave_after_master_write_errno=0
-fionread_slave_after_master_write_avail=0
+fionread_slave_after_master_write_avail=4
 pty_slave_poll_readable=true
 pty_slave_read_rc=4
 pty_slave_read_errno=0
@@ -98,3 +98,5 @@ fionbio_disabled_cleared_nonblock=true
 pty_hangup_setup_ok=true
 pty_master_read_on_slave_close_rc=-1
 pty_master_read_on_slave_close_errno=5
+pty_master_readv_on_slave_close_rc=-1
+pty_master_readv_on_slave_close_errno=5

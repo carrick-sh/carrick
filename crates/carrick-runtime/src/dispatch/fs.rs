@@ -10303,6 +10303,7 @@ impl SyscallDispatcher {
                     }
                     let host_fd_raw = host_fd.raw();
                     let host_fd_owner = host_fd.clone();
+                    let pty_role = *pty;
                     drop(open);
                     let staged = this.take_staged_splice_pipe_bytes(fd.0, length)?;
                     if !staged.is_empty() {
@@ -10314,7 +10315,7 @@ impl SyscallDispatcher {
                             value: staged.len() as i64,
                         });
                     }
-                    return Ok(read_host_pipe(
+                    let outcome = read_host_pipe(
                         memory,
                         address,
                         length,
@@ -10324,7 +10325,20 @@ impl SyscallDispatcher {
                         WaitFdAuthority::logical(
                             this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
                         ),
-                    ));
+                    );
+                    // Darwin reports EOF when the last pty slave closes;
+                    // Linux's master read contract is EIO after any rescued
+                    // tail has drained. Keep ordinary pipes and slave EOFs
+                    // untouched.
+                    return Ok(match (pty_role, outcome) {
+                        (
+                            Some(crate::vfs::PtyRole {
+                                is_master: true, ..
+                            }),
+                            DispatchOutcome::Returned { value: 0 },
+                        ) => DispatchOutcome::errno(crate::linux_abi::LINUX_EIO),
+                        (_, outcome) => outcome,
+                    });
                 }
                 OpenDescription::Directory { .. } => {
                     return Ok(DispatchOutcome::errno(LINUX_EISDIR));
@@ -10514,6 +10528,7 @@ impl SyscallDispatcher {
                     }
                     let hfd = host_fd.raw();
                     let owner = Some(host_fd.clone());
+                    let pty_role = *pty;
                     drop(open);
                     let staged_capacity = iovecs.iter().try_fold(0usize, |total, iovec| {
                         usize::try_from(iovec.iov_len)
@@ -10536,7 +10551,7 @@ impl SyscallDispatcher {
                             value: read_len as i64,
                         });
                     }
-                    return Ok(Self::read_host_pipe_iovecs(
+                    let outcome = Self::read_host_pipe_iovecs(
                         memory,
                         &iovecs,
                         hfd,
@@ -10545,7 +10560,16 @@ impl SyscallDispatcher {
                         WaitFdAuthority::logical(
                             this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
                         ),
-                    ));
+                    );
+                    return Ok(match (pty_role, outcome) {
+                        (
+                            Some(crate::vfs::PtyRole {
+                                is_master: true, ..
+                            }),
+                            DispatchOutcome::Returned { value: 0 },
+                        ) => DispatchOutcome::errno(crate::linux_abi::LINUX_EIO),
+                        (_, outcome) => outcome,
+                    });
                 }
                 OpenDescription::HostSocket { host_fd, .. } => {
                     let hfd = host_fd.raw();
