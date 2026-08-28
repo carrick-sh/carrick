@@ -45,44 +45,45 @@ pub const SHARD_1_PROBES: &[&str] = &[
     "epollinmemwake",
     "epollpri",
     "etchostnamefile",
-    "execfatalstatus",
-    "execpipe",
-    "execthreads",
-    "exitgroupmainthreads",
-    "expectcontinue",
-    "fchmoddir",
-    "fcntllock",
-    "fcntlpipesz",
-    "fdstat",
-    "fgetflcreate",
-    "fifonode",
-    "forkcow",
-    "forkfiletable",
-    "forkheapalloc",
-    "forksigwalk",
-    "forksplicestage",
-    "fsetfl",
-    "fsx",
-    "futexforkrequeue",
-    "futexpilock",
-    "futexrealtime",
-    "futexsharedalias",
-    "futexwakecount",
-    "getrandomvdso",
-    "getsocknameval",
-    "ioctlcluster",
-    "iouringenterflag",
-    "ipv6recvhoplimit",
-    "itimerprofidle",
-    "killchld",
-    "killreap",
-    "killuidperm",
-    "legacyfs",
-    "linkstat",
-    "ltpcheckpoint",
-    "lxattr",
-    "mapfixed",
-    "mcastjoingroup",
+    "execfailsurvive",
+    "execpermitchurn",
+    "execsocket",
+    "execvereset",
+    "exitstatus127",
+    "faultaddr",
+    "fcntllease",
+    "fcntlowner",
+    "fdio",
+    "fexecveprobe",
+    "fifoforkeof",
+    "forkaltstack",
+    "forkfault",
+    "forkfpregs",
+    "forkshared",
+    "forksnapshot",
+    "fsescapeguard",
+    "fstatatflags",
+    "futexextra",
+    "futexghost",
+    "futexprivatewakeexact",
+    "futexshare",
+    "futexwaiterstates",
+    "getrandomflags",
+    "getrandomvdsoloop",
+    "icmp",
+    "iopriovhangup",
+    "iouringsqpoll",
+    "ipv6sendhoplimit",
+    "kernelidentity",
+    "killfault",
+    "killrt",
+    "lchownsymlink",
+    "lifecycleflagmatrix",
+    "linuxsysinfo",
+    "ltpcheckpointexec",
+    "mailboxregs",
+    "mapfixedfork",
+    "mem",
     "memfdsecret",
     "mincoreedge",
     "mlock2",
@@ -170,7 +171,7 @@ pub const SHARD_1_PROBES: &[&str] = &[
     "xsignal",
 ];
 
-const CACHED_SHARD_1_PROBE_COUNT: usize = 136;
+const CACHED_SHARD_1_PROBE_COUNT: usize = 137;
 
 /// Shard 1 subset of baseline expected oracle mismatches for musl.
 pub const MUSL_SHARD_1_EXPECTED_GAPS: &[&str] = common::MUSL_BASELINE_GAPS;
@@ -256,8 +257,8 @@ pub fn probe_campaign_dir(root: &Path, target: &str) -> PathBuf {
 fn test_shard_1_inventory_count_and_sorted() {
     assert_eq!(
         SHARD_1_PROBES.len(),
-        146,
-        "shard 1 must contain exactly 146 generic probes"
+        147,
+        "shard 1 must contain exactly 147 generic probes"
     );
 
     // Hard assert uniqueness and strictly ascending sort order.
@@ -333,8 +334,8 @@ fn test_shard_1_inventory_count_and_sorted() {
 
         assert_eq!(
             computed_shard_1.len(),
-            146,
-            "computed shard 1 from probe-inventory.json must have 146 items"
+            147,
+            "computed shard 1 from probe-inventory.json must have 147 items"
         );
         assert_eq!(
             SHARD_1_PROBES,

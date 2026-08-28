@@ -399,6 +399,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "eventfdsignalmatrix": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "eventwaitmatrix": {
     "class": "conformance",
     "excluded": false,
@@ -794,6 +799,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "inotifymatrix": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "ioctlcluster": {
     "class": "conformance",
     "excluded": false,
@@ -985,6 +995,11 @@
     "runner": "generic"
   },
   "memfdcreate": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "memfdsealmatrix": {
     "class": "conformance",
     "excluded": false,
     "runner": "generic"
