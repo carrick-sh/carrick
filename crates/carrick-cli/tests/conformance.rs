@@ -2856,9 +2856,10 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 ///
 /// `pathflagmatrix`, `memflagmatrix`, and `netflagmatrix` add table-driven,
 /// exact-oracle coverage for path, memory, and socket flag/error interactions.
-/// The denominator moves 474 -> 477 and the gating rows 896 -> 902 — 451
-/// conformance sources (429 generic, 22 dedicated).
-const PROBE_SOURCE_COUNT: usize = 477;
+/// The authoritative inventory contains 490 probe sources: 464 conformance
+/// sources (442 generic, 22 dedicated), 25 performance sources, and one helper.
+/// Both libc lanes therefore gate 928 conformance rows.
+const PROBE_SOURCE_COUNT: usize = 490;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
@@ -4569,9 +4570,9 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
     let generic = validate_closure_probe_rows(&inventory(), &sources)
         .expect("checked-in closure probe inventory must match the source denominator");
-    assert_eq!(generic.len(), 429);
-    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 451);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 902);
+    assert_eq!(generic.len(), 442);
+    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 464);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 928);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")
