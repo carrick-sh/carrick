@@ -69,35 +69,39 @@ pub(crate) fn register_open(host_fd: i32, access_idx: u32) {
         // writer; otherwise dup an existing write end so the kernel refcount
         // tracks every concurrent writer. carrick keeps NO standalone write
         // anchor, so the read end hits POLLHUP exactly when all writers close.
-        let bw = match st.beacons.get(&id) {
-            Some(b) => {
-                let existing = *b.writer_bw.values().next().unwrap_or(&-1);
-                if existing >= 0 {
-                    unsafe { libc::dup(existing) }
-                } else {
-                    -1
+        let existing_writer = st
+            .beacons
+            .get(&id)
+            .and_then(|beacon| beacon.writer_bw.values().next().copied());
+        let bw = if let Some(existing) = existing_writer {
+            unsafe { libc::dup(existing) }
+        } else {
+            // Either this is the first writer, or every prior writer closed
+            // while a reader stayed open. A pipe whose final writer closed is
+            // permanently hung up, so a reconnect must replace that beacon;
+            // retaining its read end would leave EOF asserted forever.
+            let mut fds = [0i32; 2];
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+                -1
+            } else {
+                // Read end is carrick's beacon; CLOEXEC both so guest execs
+                // don't leak them.
+                unsafe {
+                    libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
+                    libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
                 }
-            }
-            None => {
-                let mut fds = [0i32; 2];
-                if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-                    -1
-                } else {
-                    // Read end is carrick's beacon; CLOEXEC both so guest execs
-                    // don't leak them.
-                    unsafe {
-                        libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
-                        libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
-                    }
-                    st.beacons.insert(
-                        id,
-                        Beacon {
-                            read_fd: fds[0],
-                            writer_bw: HashMap::new(),
-                        },
-                    );
-                    fds[1]
+                let replaced = st.beacons.insert(
+                    id,
+                    Beacon {
+                        read_fd: fds[0],
+                        writer_bw: HashMap::new(),
+                    },
+                );
+                if let Some(replaced) = replaced {
+                    debug_assert!(replaced.writer_bw.is_empty());
+                    unsafe { libc::close(replaced.read_fd) };
                 }
+                fds[1]
             }
         };
         if bw >= 0 {
@@ -188,4 +192,54 @@ pub(crate) fn read_end_at_eof(host_fd: i32) -> bool {
     };
     let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
     rc > 0 && pfd.revents & libc::POLLHUP != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn writer_reopen_rearms_a_live_reader_beacon() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("reopen-fifo");
+        let c_path =
+            std::ffi::CString::new(path.to_str().expect("utf-8 path")).expect("cstring path");
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        let read_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+        assert!(read_fd >= 0, "open read end");
+        register_open(read_fd, 0);
+
+        let first_writer =
+            unsafe { libc::open(c_path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+        assert!(first_writer >= 0, "open first writer");
+        register_open(first_writer, 1);
+        assert!(!read_end_at_eof(read_fd), "live writer keeps beacon armed");
+
+        assert!(register_close(first_writer));
+        unsafe { libc::close(first_writer) };
+        assert!(read_end_at_eof(read_fd), "last writer close reports EOF");
+
+        let second_writer =
+            unsafe { libc::open(c_path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+        assert!(second_writer >= 0, "open replacement writer");
+        register_open(second_writer, 1);
+        assert!(
+            !read_end_at_eof(read_fd),
+            "replacement writer must re-arm the retained reader beacon"
+        );
+
+        assert!(register_close(second_writer));
+        unsafe { libc::close(second_writer) };
+        assert!(
+            read_end_at_eof(read_fd),
+            "replacement writer close must restore EOF"
+        );
+        assert!(!register_close(read_fd));
+        assert!(
+            !has_beacon_for_fd(read_fd),
+            "last reader close must remove the exhausted beacon"
+        );
+        unsafe { libc::close(read_fd) };
+    }
 }
