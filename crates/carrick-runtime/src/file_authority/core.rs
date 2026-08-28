@@ -14,14 +14,15 @@ use super::epoll::{EpollState, ReadinessSnapshot};
 use super::stream::PipeStreamState;
 use super::types::{
     AccessMode, AuthorityCall, AuthorityEpoch, AuthorityError, AuthorityFatal, AuthorityReply,
-    ByteCount, CanonicalPath, CapabilityLeaseDisposition, CapabilityLeaseId,
-    CapabilityLeasePurpose, ClientId, ClientIdentity, Command, DescriptionSnapshot,
-    DescriptorFlags, EpollEventLimit, EpollHostPlan, EpollHostPlanAction, EpollInterestKey,
-    EpollRegistration, FileDescriptionId, FileOffset, FileSlotNumber, FileTableId, HostErrno,
-    HostStreamKind, InterestGeneration, MappingAttachmentId, MappingLeaseDisposition, MappingRange,
-    MappingRelease, NofileAllocationCeiling, ObjectGeneration, Outcome, PipeCapacity, PipeEnd,
-    PipeId, Request, Response, Revision, SameSlotBehavior, SeekWhence, SlotPageLimit,
-    SlotRangeAction, SlotSnapshot, StatusFlags, VfsObjectId,
+    ByteCount, CanonicalAuthorityTarget, CanonicalPath, CapabilityLeaseDisposition,
+    CapabilityLeaseId, CapabilityLeasePurpose, ClientId, ClientIdentity, Command,
+    DescriptionSnapshot, DescriptorFlags, EpollEventLimit, EpollHostPlan, EpollHostPlanAction,
+    EpollInterestKey, EpollRegistration, FileDescriptionId, FileOffset, FileSlotNumber,
+    FileTableId, HostErrno, HostStreamKind, InterestGeneration, MappingAttachmentId,
+    MappingLeaseDisposition, MappingRange, MappingRelease, NofileAllocationCeiling,
+    ObjectGeneration, Outcome, PipeCapacity, PipeEnd, PipeId, Request, Response, Revision,
+    SameSlotBehavior, SeekWhence, SlotPageLimit, SlotRangeAction, SlotSnapshot, StatusFlags,
+    VfsObjectId,
 };
 
 pub(super) const MAX_TERMINAL_DEDUP_ENTRIES: usize = 8_192;
@@ -185,9 +186,64 @@ impl FileAuthorityCore {
         self.revision
     }
 
+    #[cfg(test)]
+    pub(crate) fn model_table_count(&self) -> usize {
+        self.tables.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn model_description_count(&self) -> usize {
+        self.descriptions.len()
+    }
+
     pub(crate) fn execute_call(
         &mut self,
+        call: AuthorityCall,
+    ) -> Result<AuthorityReply, AuthorityFatal> {
+        if call.request.command.is_canonical() {
+            return Err(AuthorityFatal::InvariantViolation(
+                "ordinary path rejected a canonical command",
+            ));
+        }
+        self.execute_call_authenticated(call, None)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "consumed by canonical dispatch in the in-carrier cutover"
+    )]
+    pub(crate) fn execute_canonical_call(
+        &mut self,
+        call: AuthorityCall,
+        target: CanonicalAuthorityTarget,
+    ) -> Result<AuthorityReply, AuthorityFatal> {
+        if !call.request.command.is_canonical() {
+            return Err(AuthorityFatal::InvariantViolation(
+                "canonical path rejected a model command",
+            ));
+        }
+        self.validate_canonical_target(&call.request.command, &target)?;
+        self.execute_call_authenticated(call, Some(target))
+    }
+
+    #[allow(
+        dead_code,
+        reason = "consumed by canonical dispatch in the in-carrier cutover"
+    )]
+    fn validate_canonical_target(
+        &self,
+        _command: &Command,
+        _target: &CanonicalAuthorityTarget,
+    ) -> Result<(), AuthorityFatal> {
+        Err(AuthorityFatal::InvariantViolation(
+            "canonical path rejected a model command",
+        ))
+    }
+
+    fn execute_call_authenticated(
+        &mut self,
         mut call: AuthorityCall,
+        target: Option<CanonicalAuthorityTarget>,
     ) -> Result<AuthorityReply, AuthorityFatal> {
         if call.capabilities.len() != expected_request_capabilities(&call.request.command) {
             return Err(AuthorityFatal::CapabilityMismatch);
@@ -195,7 +251,7 @@ impl FileAuthorityCore {
         for capability in &call.capabilities {
             ensure_cloexec(capability.as_raw_fd())?;
         }
-        let response = self.execute_record(call.request, &mut call.capabilities)?;
+        let response = self.execute_record(call.request, &mut call.capabilities, target)?;
         if !call.capabilities.is_empty() {
             return Err(AuthorityFatal::InvariantViolation(
                 "fresh authority request left inbound capabilities unconsumed",
@@ -254,6 +310,7 @@ impl FileAuthorityCore {
         &mut self,
         request: Request,
         capabilities: &mut Vec<OwnedFd>,
+        target: Option<CanonicalAuthorityTarget>,
     ) -> Result<Response, AuthorityFatal> {
         if request.epoch != self.epoch {
             capabilities.clear();
@@ -290,7 +347,7 @@ impl FileAuthorityCore {
             return Err(AuthorityFatal::DedupExhausted);
         }
 
-        let outcome = match self.execute_fresh(&request, capabilities) {
+        let outcome = match self.execute_fresh(&request, capabilities, target) {
             Ok(outcome) => outcome,
             Err(error) => Outcome::Rejected(error),
         };
@@ -324,6 +381,7 @@ impl FileAuthorityCore {
         &mut self,
         request: &Request,
         capabilities: &mut Vec<OwnedFd>,
+        _target: Option<CanonicalAuthorityTarget>,
     ) -> Result<Outcome, AuthorityError> {
         match &request.command {
             Command::RegisterClient => self.register_client(request),
