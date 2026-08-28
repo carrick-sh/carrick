@@ -1850,6 +1850,16 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 ## Task 9: Route the first production family through the authority
 
+> **Approved correction, 2026-08-28:** The live implementation invalidated the
+> nine-site recipe below: the taxonomy has 14 heterogeneous entries, the actual
+> `F_SETPIPE_SZ` guards are classified elsewhere, and activation creates an
+> empty private authority table beside the canonical kernel `Arc<FileTable>`.
+> The user approved replacing that dual-store recipe with the canonical-object
+> cutover in
+> [`2026-08-28-fd-description-task9-canonical-authority.md`](2026-08-28-fd-description-task9-canonical-authority.md).
+> That replacement plan is authoritative for Task 9; the original text remains
+> below only as an audit record of what was superseded.
+
 `FileAuthorityCore::execute_call` has **zero** production callers. Route the
 smallest K1 family — `slot_description_mutation`, 9 sites — through it, proving
 Wave 2's mechanism end-to-end and lowering the burndown ceiling for the first
