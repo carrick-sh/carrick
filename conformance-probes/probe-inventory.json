@@ -259,6 +259,11 @@
     "excluded": false,
     "runner": "conformance_container_gate"
   },
+  "copyrangeflags": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "coredumpbit": {
     "class": "conformance",
     "excluded": false,
@@ -1085,6 +1090,11 @@
     "runner": "generic"
   },
   "mmapzerofill": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mmsgmatrix": {
     "class": "conformance",
     "excluded": false,
     "runner": "generic"
@@ -2150,6 +2160,11 @@
     "runner": "generic"
   },
   "sysvmsg": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "sysvmsgselect": {
     "class": "conformance",
     "excluded": false,
     "runner": "generic"

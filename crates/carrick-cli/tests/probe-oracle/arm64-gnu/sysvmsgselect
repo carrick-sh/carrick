@@ -1,0 +1,15 @@
+fe3ea093e250f996
+msgget_ok=true
+nowait_empty_rc=-1
+nowait_empty_errno=42
+zero_head_fifo=true
+exact_type_select=true
+exact_type_miss_enomsg=true
+msg_except_select=true
+msg_except_miss_enomsg=true
+negative_miss_enomsg=true
+negative_lowest_type_select=true
+undersized_noerror_e2big=true
+e2big_retained_received_by_noerror=true
+msg_noerror_truncates_and_dequeues=true
+ipc_rmid_ok=true
