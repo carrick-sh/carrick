@@ -4869,6 +4869,42 @@ bitflags! {
         const ET = LINUX_EPOLLET;
     }
 
+    /// `adjtimex(2)` / `clock_adjtime(2)` mode bits. The wire field remains a
+    /// raw `u32` in [`LinuxTimex`], while dispatch converts at the syscall
+    /// boundary and carries this typed domain for every mask operation.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxTimexModes: u32 {
+        const OFFSET = LINUX_ADJ_OFFSET;
+        const FREQUENCY = LINUX_ADJ_FREQUENCY;
+        const MAXERROR = LINUX_ADJ_MAXERROR;
+        const ESTERROR = LINUX_ADJ_ESTERROR;
+        const STATUS = LINUX_ADJ_STATUS;
+        const TIMECONST = LINUX_ADJ_TIMECONST;
+        const TAI = LINUX_ADJ_TAI;
+        const MICRO = LINUX_ADJ_MICRO;
+        const NANO = LINUX_ADJ_NANO;
+        const TICK = LINUX_ADJ_TICK;
+        const OFFSET_SINGLESHOT_FLAG = LINUX_ADJ_OFFSET_SINGLESHOT_FLAG_ONLY;
+        const OFFSET_SINGLESHOT = LINUX_ADJ_OFFSET_SINGLESHOT;
+        const OFFSET_SS_READ = LINUX_ADJ_OFFSET_SS_READ;
+        const IDEMPOTENT_SUPPORTED = LINUX_ADJ_OFFSET
+            | LINUX_ADJ_FREQUENCY
+            | LINUX_ADJ_MAXERROR
+            | LINUX_ADJ_ESTERROR
+            | LINUX_ADJ_STATUS
+            | LINUX_ADJ_TIMECONST
+            | LINUX_ADJ_TAI
+            | LINUX_ADJ_MICRO
+            | LINUX_ADJ_NANO
+            | LINUX_ADJ_TICK;
+    }
+
+    /// `timex.status` state bits consumed by Carrick's clock-discipline seam.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxTimexStatus: i32 {
+        const NANO = LINUX_STA_NANO;
+    }
+
     /// `splice`/`vmsplice`/`tee` flag bits. The full set IS the supported set
     /// (`LINUX_SPLICE_SUPPORTED_FLAGS`), so `from_bits(...)` returning `None`
     /// is exactly the historical `flags & !SUPPORTED != 0` EINVAL rejection.
@@ -6108,6 +6144,23 @@ mod kernel_abi_tests {
         assert_eq!(LinuxMsgFlags::from_bits_retain(-1).bits(), -1);
         assert_eq!(LinuxMsgFlags::CMSG_CLOEXEC.bits(), LINUX_MSG_CMSG_CLOEXEC);
         assert_eq!(LinuxMsgFlags::ERRQUEUE.bits(), LINUX_MSG_ERRQUEUE);
+
+        // adjtimex/clock_adjtime modes and status cross the ABI as raw wire
+        // words, but dispatch must reason about them through typed domains.
+        assert_eq!(LinuxTimexModes::OFFSET.bits(), LINUX_ADJ_OFFSET);
+        assert_eq!(LinuxTimexModes::TICK.bits(), LINUX_ADJ_TICK);
+        assert_eq!(
+            LinuxTimexModes::OFFSET_SINGLESHOT.bits(),
+            LINUX_ADJ_OFFSET_SINGLESHOT
+        );
+        assert_eq!(
+            LinuxTimexModes::OFFSET_SS_READ.bits(),
+            LINUX_ADJ_OFFSET_SS_READ
+        );
+        assert!(LinuxTimexModes::IDEMPOTENT_SUPPORTED.contains(
+            LinuxTimexModes::OFFSET | LinuxTimexModes::FREQUENCY | LinuxTimexModes::TICK
+        ));
+        assert_eq!(LinuxTimexStatus::NANO.bits(), LINUX_STA_NANO);
     }
 
     #[test]
