@@ -2932,3 +2932,322 @@ fn pipe_authority_direction_and_stream_sharing_survives_share_table_and_exec() {
             if actual == pipe && bytes == b"retained"
     ));
 }
+
+#[test]
+fn an_authority_backing_kind_can_be_added_without_editing_the_backing_module() {
+    // The extensibility claim, stated as a test: a backing kind defined
+    // OUTSIDE backing.rs participates fully. If this stops compiling, the
+    // authority has re-closed and the cutover is heading back to a god enum.
+    #[derive(Debug)]
+    struct FictionalBacking {
+        length: u64,
+    }
+
+    impl super::backing::AuthorityBackingKind for FictionalBacking {
+        fn snapshot(&self) -> DescriptionBackingSnapshot {
+            DescriptionBackingSnapshot::Synthetic {
+                length: self.length,
+            }
+        }
+
+        fn host_fd(&self, _purpose: CapabilityLeasePurpose) -> Option<std::os::fd::RawFd> {
+            None
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    }
+
+    let mut backing = super::backing::AuthorityBacking::new(FictionalBacking { length: 9 });
+
+    assert_eq!(
+        backing.snapshot(),
+        DescriptionBackingSnapshot::Synthetic { length: 9 }
+    );
+    assert_eq!(backing.host_fd(CapabilityLeasePurpose::MappingSource), None);
+    assert_eq!(backing.host_fd(CapabilityLeasePurpose::PollSource), None);
+    assert_eq!(backing.host_fd(CapabilityLeasePurpose::IoUringData), None);
+    assert_eq!(backing.host_fd(CapabilityLeasePurpose::IoUringLock), None);
+    assert_eq!(backing.vfs_object(), None);
+    assert_eq!(
+        backing
+            .downcast_ref::<FictionalBacking>()
+            .expect("downcast to the concrete kind")
+            .length,
+        9
+    );
+
+    // downcast_mut followed by a changed snapshot
+    backing
+        .downcast_mut::<FictionalBacking>()
+        .expect("downcast_mut to the concrete kind")
+        .length = 42;
+
+    assert_eq!(
+        backing.snapshot(),
+        DescriptionBackingSnapshot::Synthetic { length: 42 }
+    );
+    assert_eq!(
+        backing
+            .downcast_ref::<FictionalBacking>()
+            .expect("downcast after mut")
+            .length,
+        42
+    );
+}
+
+#[test]
+fn capability_lease_purpose_matrix_rejects_mismatched_purposes_and_distinguishes_descriptors() {
+    fn fd_size(fd: &OwnedFd) -> u64 {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        assert_eq!(unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) }, 0);
+        let stat = unsafe { stat.assume_init() };
+        u64::try_from(stat.st_size).expect("valid size")
+    }
+
+    let mut harness = Harness::new();
+    let table = harness.create_table();
+
+    // 1. HostBacking: only MappingSource is permitted
+    let host_file = tempfile::tempfile().expect("tempfile");
+    host_file.set_len(1024).expect("set len");
+    let adopt_host = harness.request(
+        Command::AdoptHostFileAndInstall {
+            table,
+            minimum: fd(3),
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(32),
+            descriptor_flags: DescriptorFlags::NONE,
+            access_mode: AccessMode::ReadWrite,
+            status_flags: StatusFlags::default(),
+            writable: true,
+            path: None,
+        },
+        ObjectGeneration::INITIAL,
+    );
+    let host_slot = match harness
+        .transact(adopt_host, vec![host_file.into()])
+        .expect("adopt host")
+        .response
+        .outcome
+    {
+        Outcome::Installed { fd, .. } => fd,
+        other => panic!("unexpected install: {other:?}"),
+    };
+
+    let mapping_request = harness.request(
+        Command::AcquireCapabilityLease {
+            table,
+            fd: host_slot,
+            purpose: CapabilityLeasePurpose::MappingSource,
+        },
+        ObjectGeneration::INITIAL,
+    );
+    let mapping_lease = harness
+        .transact(mapping_request, Vec::new())
+        .expect("mapping lease");
+    assert_eq!(mapping_lease.capabilities.len(), 1);
+    assert_eq!(fd_size(&mapping_lease.capabilities[0]), 1024);
+
+    for purpose in [
+        CapabilityLeasePurpose::PollSource,
+        CapabilityLeasePurpose::IoUringData,
+        CapabilityLeasePurpose::IoUringLock,
+    ] {
+        let request = harness.request(
+            Command::AcquireCapabilityLease {
+                table,
+                fd: host_slot,
+                purpose,
+            },
+            ObjectGeneration::INITIAL,
+        );
+        let reply = harness.transact(request, Vec::new()).expect("transact");
+        assert_eq!(
+            reply.response.outcome,
+            Outcome::Rejected(AuthorityError::NotHostBacked)
+        );
+    }
+
+    // 2. HostStreamBacking: only PollSource is permitted
+    let mut pipe_fds = [-1; 2];
+    assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+    let stream_reader = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
+    let stream_writer = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+    let adopt_stream = harness.request(
+        Command::AdoptHostStreamAndInstall {
+            table,
+            minimum: fd(3),
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(32),
+            descriptor_flags: DescriptorFlags::NONE,
+            access_mode: AccessMode::ReadOnly,
+            status_flags: StatusFlags::default(),
+            kind: HostStreamKind::Pipe {
+                end: PipeEnd::Reader,
+                bidirectional: false,
+            },
+            path: None,
+        },
+        ObjectGeneration::INITIAL,
+    );
+    let stream_slot = match harness
+        .transact(adopt_stream, vec![stream_reader])
+        .expect("adopt stream")
+        .response
+        .outcome
+    {
+        Outcome::HostStreamCreated { fd, .. } => fd,
+        other => panic!("unexpected host stream: {other:?}"),
+    };
+
+    let poll_request = harness.request(
+        Command::AcquireCapabilityLease {
+            table,
+            fd: stream_slot,
+            purpose: CapabilityLeasePurpose::PollSource,
+        },
+        ObjectGeneration::INITIAL,
+    );
+    let poll_lease = harness
+        .transact(poll_request, Vec::new())
+        .expect("poll lease");
+    assert_eq!(poll_lease.capabilities.len(), 1);
+
+    for purpose in [
+        CapabilityLeasePurpose::MappingSource,
+        CapabilityLeasePurpose::IoUringData,
+        CapabilityLeasePurpose::IoUringLock,
+    ] {
+        let request = harness.request(
+            Command::AcquireCapabilityLease {
+                table,
+                fd: stream_slot,
+                purpose,
+            },
+            ObjectGeneration::INITIAL,
+        );
+        let reply = harness.transact(request, Vec::new()).expect("transact");
+        assert_eq!(
+            reply.response.outcome,
+            Outcome::Rejected(AuthorityError::NotHostBacked)
+        );
+    }
+    drop(stream_writer);
+
+    // 3. IoUringBacking: IoUringData returns data_fd (4096), IoUringLock returns lock_fd (1)
+    let ring_data = tempfile::tempfile().expect("data file");
+    ring_data.set_len(4096).expect("size data");
+    let ring_lock = tempfile::tempfile().expect("lock file");
+    ring_lock.set_len(1).expect("size lock");
+    let adopt_ring = harness.request(
+        Command::AdoptIoUringAndInstall {
+            table,
+            minimum: fd(3),
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(32),
+            descriptor_flags: DescriptorFlags::NONE,
+            status_flags: StatusFlags::default(),
+            entries: 8,
+            data_length: 4096,
+        },
+        ObjectGeneration::INITIAL,
+    );
+    let ring_slot = match harness
+        .transact(adopt_ring, vec![ring_lock.into(), ring_data.into()])
+        .expect("adopt ring")
+        .response
+        .outcome
+    {
+        Outcome::IoUringCreated { fd, .. } => fd,
+        other => panic!("unexpected ring: {other:?}"),
+    };
+
+    let data_request = harness.request(
+        Command::AcquireCapabilityLease {
+            table,
+            fd: ring_slot,
+            purpose: CapabilityLeasePurpose::IoUringData,
+        },
+        ObjectGeneration::INITIAL,
+    );
+    let data_lease = harness
+        .transact(data_request, Vec::new())
+        .expect("data lease");
+    assert_eq!(data_lease.capabilities.len(), 1);
+    assert_eq!(fd_size(&data_lease.capabilities[0]), 4096);
+
+    let lock_request = harness.request(
+        Command::AcquireCapabilityLease {
+            table,
+            fd: ring_slot,
+            purpose: CapabilityLeasePurpose::IoUringLock,
+        },
+        ObjectGeneration::INITIAL,
+    );
+    let lock_lease = harness
+        .transact(lock_request, Vec::new())
+        .expect("lock lease");
+    assert_eq!(lock_lease.capabilities.len(), 1);
+    assert_eq!(fd_size(&lock_lease.capabilities[0]), 1);
+
+    for purpose in [
+        CapabilityLeasePurpose::MappingSource,
+        CapabilityLeasePurpose::PollSource,
+    ] {
+        let request = harness.request(
+            Command::AcquireCapabilityLease {
+                table,
+                fd: ring_slot,
+                purpose,
+            },
+            ObjectGeneration::INITIAL,
+        );
+        let reply = harness.transact(request, Vec::new()).expect("transact");
+        assert_eq!(
+            reply.response.outcome,
+            Outcome::Rejected(AuthorityError::NotHostBacked)
+        );
+    }
+
+    // 4. Non-host backings reject all four purposes
+    let synthetic_slot = match harness.send(
+        Command::CreateSyntheticAndInstall {
+            table,
+            minimum: fd(3),
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(32),
+            descriptor_flags: DescriptorFlags::NONE,
+            access_mode: AccessMode::ReadOnly,
+            status_flags: StatusFlags::default(),
+            contents: b"hello".to_vec(),
+            path: None,
+        },
+        ObjectGeneration::INITIAL,
+    ) {
+        Outcome::Installed { fd, .. } => fd,
+        other => panic!("unexpected synthetic: {other:?}"),
+    };
+
+    for purpose in [
+        CapabilityLeasePurpose::MappingSource,
+        CapabilityLeasePurpose::PollSource,
+        CapabilityLeasePurpose::IoUringData,
+        CapabilityLeasePurpose::IoUringLock,
+    ] {
+        let request = harness.request(
+            Command::AcquireCapabilityLease {
+                table,
+                fd: synthetic_slot,
+                purpose,
+            },
+            ObjectGeneration::INITIAL,
+        );
+        let reply = harness.transact(request, Vec::new()).expect("transact");
+        assert_eq!(
+            reply.response.outcome,
+            Outcome::Rejected(AuthorityError::NotHostBacked)
+        );
+    }
+}

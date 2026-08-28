@@ -6,7 +6,10 @@ use carrick_abi::LinuxEpollEvents;
 
 use crate::kernel::ObjectIdRegistry;
 
-use super::backing::AuthorityBacking;
+use super::backing::{
+    AuthorityBacking, EpollBacking, EventCounterBacking, HostBacking, HostStreamBacking,
+    IoUringBacking, PipeEndBacking, SignalFdBacking, SyntheticBacking, TimerBacking, VfsBacking,
+};
 use super::epoll::{EpollState, ReadinessSnapshot};
 use super::stream::PipeStreamState;
 use super::types::{
@@ -956,7 +959,7 @@ impl FileAuthorityCore {
                     access_mode,
                     status_flags,
                     readiness: self.pipe_readiness(pipe, end),
-                    backing: AuthorityBacking::PipeEnd { pipe, end },
+                    backing: AuthorityBacking::new(PipeEndBacking { pipe, end }),
                 },
             );
         }
@@ -1041,7 +1044,9 @@ impl FileAuthorityCore {
             AccessMode::PathOnly,
             StatusFlags::default(),
             None,
-            AuthorityBacking::Epoll(EpollState::default()),
+            AuthorityBacking::new(EpollBacking {
+                state: EpollState::default(),
+            }),
             None,
         );
         let Outcome::Installed {
@@ -1087,7 +1092,7 @@ impl FileAuthorityCore {
             AccessMode::ReadOnly,
             status_flags,
             None,
-            AuthorityBacking::SignalFd { mask },
+            AuthorityBacking::new(SignalFdBacking { mask }),
             None,
         );
         let Outcome::Installed {
@@ -1120,13 +1125,14 @@ impl FileAuthorityCore {
         mask: carrick_abi::SigSet,
     ) -> Result<Outcome, AuthorityError> {
         let description = self.slot(client, table, expected, fd)?.description;
-        if !matches!(
-            self.descriptions
-                .get(&description)
-                .ok_or(AuthorityError::DescriptionNotFound)?
-                .backing,
-            AuthorityBacking::SignalFd { .. }
-        ) {
+        if self
+            .descriptions
+            .get(&description)
+            .ok_or(AuthorityError::DescriptionNotFound)?
+            .backing
+            .downcast_ref::<SignalFdBacking>()
+            .is_none()
+        {
             return Err(AuthorityError::NotSignalFd);
         }
         let revision = self.publish_mutation();
@@ -1135,7 +1141,7 @@ impl FileAuthorityCore {
                 "signalfd mask update lost its description",
             ))
         });
-        state.backing = AuthorityBacking::SignalFd { mask };
+        state.backing = AuthorityBacking::new(SignalFdBacking { mask });
         state.revision = revision;
         Ok(Outcome::SignalFdMaskSet {
             description,
@@ -1166,11 +1172,11 @@ impl FileAuthorityCore {
             AccessMode::ReadOnly,
             status_flags,
             None,
-            AuthorityBacking::Timer {
+            AuthorityBacking::new(TimerBacking {
                 interval_ns: 0,
                 initial_ns: 0,
                 pending: 0,
-            },
+            }),
             None,
         );
         let Outcome::Installed {
@@ -1207,7 +1213,7 @@ impl FileAuthorityCore {
             .descriptions
             .get(&description)
             .ok_or(AuthorityError::DescriptionNotFound)?;
-        if !matches!(state.backing, AuthorityBacking::Timer { .. }) {
+        if state.backing.downcast_ref::<TimerBacking>().is_none() {
             return Err(AuthorityError::NotTimer);
         }
         let revision = self.publish_mutation();
@@ -1216,11 +1222,11 @@ impl FileAuthorityCore {
                 "timer set lost its description",
             ))
         });
-        state.backing = AuthorityBacking::Timer {
+        state.backing = AuthorityBacking::new(TimerBacking {
             interval_ns,
             initial_ns,
             pending: 0,
-        };
+        });
         state.readiness = ReadinessSnapshot {
             ready: LinuxEpollEvents::empty(),
             read_available: 0,
@@ -1248,15 +1254,14 @@ impl FileAuthorityCore {
             .get(&description)
             .ok_or(AuthorityError::DescriptionNotFound)?
             .backing
+            .downcast_ref::<TimerBacking>()
         {
-            AuthorityBacking::Timer { pending, .. } => {
-                pending.checked_add(expirations).unwrap_or_else(|| {
-                    abort_fatal(AuthorityFatal::InvariantViolation(
-                        "timer expiration overflow",
-                    ))
-                })
-            }
-            _ => return Err(AuthorityError::NotTimer),
+            Some(timer) => timer.pending.checked_add(expirations).unwrap_or_else(|| {
+                abort_fatal(AuthorityFatal::InvariantViolation(
+                    "timer expiration overflow",
+                ))
+            }),
+            None => return Err(AuthorityError::NotTimer),
         };
         let revision = self.publish_mutation();
         let state = self.descriptions.get_mut(&description).unwrap_or_else(|| {
@@ -1264,13 +1269,13 @@ impl FileAuthorityCore {
                 "timer expiration lost its description",
             ))
         });
-        let AuthorityBacking::Timer {
-            pending: stored, ..
-        } = &mut state.backing
-        else {
-            abort_fatal(AuthorityFatal::InvariantViolation("timer backing changed"));
-        };
-        *stored = pending;
+        let timer = state
+            .backing
+            .downcast_mut::<TimerBacking>()
+            .unwrap_or_else(|| {
+                abort_fatal(AuthorityFatal::InvariantViolation("timer backing changed"));
+            });
+        timer.pending = pending;
         state.readiness = ReadinessSnapshot {
             ready: LinuxEpollEvents::IN,
             read_available: 8,
@@ -1311,10 +1316,10 @@ impl FileAuthorityCore {
             AccessMode::ReadWrite,
             status_flags,
             None,
-            AuthorityBacking::EventCounter {
+            AuthorityBacking::new(EventCounterBacking {
                 counter: initial,
                 semaphore,
-            },
+            }),
             None,
         );
         let Outcome::Installed {
@@ -1596,7 +1601,7 @@ impl FileAuthorityCore {
             access_mode,
             status_flags,
             path,
-            AuthorityBacking::Vfs { object },
+            AuthorityBacking::new(VfsBacking { object }),
             Some(open_description_refs),
         ))
     }
@@ -1627,7 +1632,7 @@ impl FileAuthorityCore {
             access_mode,
             status_flags,
             path,
-            AuthorityBacking::Synthetic { contents },
+            AuthorityBacking::new(SyntheticBacking { contents }),
             None,
         ))
     }
@@ -1672,10 +1677,10 @@ impl FileAuthorityCore {
             access_mode,
             status_flags,
             path,
-            AuthorityBacking::Host {
+            AuthorityBacking::new(HostBacking {
                 fd: host_fd,
                 writable,
-            },
+            }),
             None,
         ))
     }
@@ -1710,7 +1715,7 @@ impl FileAuthorityCore {
             access_mode,
             status_flags,
             path,
-            AuthorityBacking::HostStream { fd: host_fd, kind },
+            AuthorityBacking::new(HostStreamBacking { fd: host_fd, kind }),
             None,
         );
         let Outcome::Installed {
@@ -1770,12 +1775,12 @@ impl FileAuthorityCore {
             AccessMode::ReadWrite,
             status_flags,
             None,
-            AuthorityBacking::IoUring {
+            AuthorityBacking::new(IoUringBacking {
                 data_fd,
                 lock_fd,
                 entries,
                 data_length,
-            },
+            }),
             None,
         );
         let Outcome::Installed {
@@ -2579,12 +2584,12 @@ impl FileAuthorityCore {
                         "epoll collect lost its description",
                     ))
                 });
-            let AuthorityBacking::Epoll(state) = &mut description.backing else {
+            let Some(epoll) = description.backing.downcast_mut::<EpollBacking>() else {
                 abort_fatal(AuthorityFatal::InvariantViolation(
                     "epoll collect backing changed after preparation",
                 ));
             };
-            *state = prepared;
+            epoll.state = prepared;
             description.revision = revision;
         }
         Ok(Outcome::EpollEvents {
@@ -2662,26 +2667,28 @@ impl FileAuthorityCore {
             .descriptions
             .get(&description)
             .ok_or(AuthorityError::DescriptionNotFound)?;
-        let AuthorityBacking::EventCounter { counter, semaphore } = &state.backing else {
+        let Some(event_counter) = state.backing.downcast_ref::<EventCounterBacking>() else {
             return Err(AuthorityError::NotEventCounter);
         };
-        if *counter == 0 {
+        if event_counter.counter == 0 {
             return Err(AuthorityError::WouldBlock);
         }
-        let value = if *semaphore { 1 } else { *counter };
-        let next = if *semaphore { counter - 1 } else { 0 };
+        let counter = event_counter.counter;
+        let semaphore = event_counter.semaphore;
+        let value = if semaphore { 1 } else { counter };
+        let next = if semaphore { counter - 1 } else { 0 };
         let revision = self.publish_mutation();
         let state = self.descriptions.get_mut(&description).unwrap_or_else(|| {
             abort_fatal(AuthorityFatal::InvariantViolation(
                 "event-counter read lost its description",
             ))
         });
-        let AuthorityBacking::EventCounter { counter, .. } = &mut state.backing else {
+        let Some(event_counter) = state.backing.downcast_mut::<EventCounterBacking>() else {
             abort_fatal(AuthorityFatal::InvariantViolation(
                 "event-counter read backing changed after preparation",
             ));
         };
-        *counter = next;
+        event_counter.counter = next;
         let readiness = event_counter_readiness(next);
         state.readiness = readiness;
         state.revision = revision;
@@ -2714,10 +2721,11 @@ impl FileAuthorityCore {
             .descriptions
             .get(&description)
             .ok_or(AuthorityError::DescriptionNotFound)?;
-        let AuthorityBacking::EventCounter { counter, .. } = &state.backing else {
+        let Some(event_counter) = state.backing.downcast_ref::<EventCounterBacking>() else {
             return Err(AuthorityError::NotEventCounter);
         };
-        let next = counter
+        let next = event_counter
+            .counter
             .checked_add(value)
             .filter(|next| *next < u64::MAX)
             .ok_or(AuthorityError::WouldBlock)?;
@@ -2727,12 +2735,12 @@ impl FileAuthorityCore {
                 "event-counter write lost its description",
             ))
         });
-        let AuthorityBacking::EventCounter { counter, .. } = &mut state.backing else {
+        let Some(event_counter) = state.backing.downcast_mut::<EventCounterBacking>() else {
             abort_fatal(AuthorityFatal::InvariantViolation(
                 "event-counter write backing changed after preparation",
             ));
         };
-        *counter = next;
+        event_counter.counter = next;
         state.readiness = event_counter_readiness(next);
         state.revision = revision;
         Ok(Outcome::EventCounterWritten {
@@ -2774,10 +2782,11 @@ impl FileAuthorityCore {
             .descriptions
             .get(&description)
             .ok_or(AuthorityError::DescriptionNotFound)?;
-        match &state.backing {
-            AuthorityBacking::Epoll(epoll) => Ok(epoll),
-            _ => Err(AuthorityError::NotEpoll),
-        }
+        state
+            .backing
+            .downcast_ref::<EpollBacking>()
+            .map(|epoll| &epoll.state)
+            .ok_or(AuthorityError::NotEpoll)
     }
 
     fn epoll_state_mut(
@@ -2788,10 +2797,11 @@ impl FileAuthorityCore {
             .descriptions
             .get_mut(&description)
             .ok_or(AuthorityError::DescriptionNotFound)?;
-        match &mut state.backing {
-            AuthorityBacking::Epoll(epoll) => Ok(epoll),
-            _ => Err(AuthorityError::NotEpoll),
-        }
+        state
+            .backing
+            .downcast_mut::<EpollBacking>()
+            .map(|epoll| &mut epoll.state)
+            .ok_or(AuthorityError::NotEpoll)
     }
 
     fn epoll_path_reaches(
@@ -2929,10 +2939,11 @@ impl FileAuthorityCore {
             .get(&description)
             .ok_or(AuthorityError::DescriptionNotFound)?
             .backing
+            .downcast_ref::<TimerBacking>()
         {
-            AuthorityBacking::Timer { pending, .. } if pending > 0 => pending,
-            AuthorityBacking::Timer { .. } => return Err(AuthorityError::WouldBlock),
-            _ => return Err(AuthorityError::NotTimer),
+            Some(timer) if timer.pending > 0 => timer.pending,
+            Some(_) => return Err(AuthorityError::WouldBlock),
+            None => return Err(AuthorityError::NotTimer),
         };
         let revision = self.publish_mutation();
         let state = self.descriptions.get_mut(&description).unwrap_or_else(|| {
@@ -2940,13 +2951,13 @@ impl FileAuthorityCore {
                 "timer read lost its description",
             ))
         });
-        let AuthorityBacking::Timer {
-            pending: stored, ..
-        } = &mut state.backing
-        else {
-            abort_fatal(AuthorityFatal::InvariantViolation("timer backing changed"));
-        };
-        *stored = 0;
+        let timer = state
+            .backing
+            .downcast_mut::<TimerBacking>()
+            .unwrap_or_else(|| {
+                abort_fatal(AuthorityFatal::InvariantViolation("timer backing changed"));
+            });
+        timer.pending = 0;
         state.readiness = ReadinessSnapshot {
             ready: LinuxEpollEvents::empty(),
             read_available: 0,
@@ -2964,15 +2975,14 @@ impl FileAuthorityCore {
         description: FileDescriptionId,
         maximum: ByteCount,
     ) -> Result<Outcome, AuthorityError> {
-        let fd = match &self
+        let fd = self
             .descriptions
             .get(&description)
             .ok_or(AuthorityError::DescriptionNotFound)?
             .backing
-        {
-            AuthorityBacking::HostStream { fd, .. } => fd.as_raw_fd(),
-            _ => return Err(AuthorityError::WrongOperationFamily),
-        };
+            .downcast_ref::<HostStreamBacking>()
+            .map(|stream| stream.fd.as_raw_fd())
+            .ok_or(AuthorityError::WrongOperationFamily)?;
         let mut bytes = vec![0; usize::try_from(maximum.raw()).unwrap_or(usize::MAX)];
         let read = unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
         if read < 0 {
@@ -3003,15 +3013,14 @@ impl FileAuthorityCore {
         bytes: &[u8],
     ) -> Result<Outcome, AuthorityError> {
         self.validate_payload(bytes)?;
-        let fd = match &self
+        let fd = self
             .descriptions
             .get(&description)
             .ok_or(AuthorityError::DescriptionNotFound)?
             .backing
-        {
-            AuthorityBacking::HostStream { fd, .. } => fd.as_raw_fd(),
-            _ => return Err(AuthorityError::WrongOperationFamily),
-        };
+            .downcast_ref::<HostStreamBacking>()
+            .map(|stream| stream.fd.as_raw_fd())
+            .ok_or(AuthorityError::WrongOperationFamily)?;
         let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
         if written < 0 {
             let error = HostErrno::last();
@@ -3057,10 +3066,11 @@ impl FileAuthorityCore {
             .descriptions
             .get(&description)
             .ok_or(AuthorityError::DescriptionNotFound)?;
-        match state.backing {
-            AuthorityBacking::PipeEnd { pipe, end } => Ok((pipe, end)),
-            _ => Err(AuthorityError::NotPipe),
-        }
+        state
+            .backing
+            .downcast_ref::<PipeEndBacking>()
+            .map(|pipe| (pipe.pipe, pipe.end))
+            .ok_or(AuthorityError::NotPipe)
     }
 
     fn pipe_readiness(&self, pipe: PipeId, end: PipeEnd) -> ReadinessSnapshot {
@@ -3083,11 +3093,17 @@ impl FileAuthorityCore {
         let updates: Vec<(FileDescriptionId, PipeEnd, ReadinessSnapshot)> = self
             .descriptions
             .iter()
-            .filter_map(|(description, state)| match state.backing {
-                AuthorityBacking::PipeEnd { pipe: current, end } if current == pipe => {
-                    Some((*description, end, self.pipe_readiness(pipe, end)))
+            .filter_map(|(description, state)| {
+                let pipe_end = state.backing.downcast_ref::<PipeEndBacking>()?;
+                if pipe_end.pipe == pipe {
+                    Some((
+                        *description,
+                        pipe_end.end,
+                        self.pipe_readiness(pipe, pipe_end.end),
+                    ))
+                } else {
+                    None
                 }
-                _ => None,
             })
             .collect();
         for (description, _, readiness) in updates {
@@ -3117,62 +3133,61 @@ impl FileAuthorityCore {
         if !description.access_mode.readable() {
             return Err(AuthorityError::NotReadable);
         }
-        if matches!(description.backing, AuthorityBacking::PipeEnd { .. }) {
+        if description
+            .backing
+            .downcast_ref::<PipeEndBacking>()
+            .is_some()
+        {
             return self.read_pipe_description(slot.description, maximum);
         }
-        if matches!(description.backing, AuthorityBacking::HostStream { .. }) {
+        if description
+            .backing
+            .downcast_ref::<HostStreamBacking>()
+            .is_some()
+        {
             return self.read_host_stream_description(slot.description, maximum);
         }
-        if matches!(description.backing, AuthorityBacking::Timer { .. }) {
+        if description.backing.downcast_ref::<TimerBacking>().is_some() {
             return self.read_timer_description(slot.description, maximum);
         }
         let offset = description.offset;
         let start = usize::try_from(offset.raw()).map_err(|_| AuthorityError::InvalidOffset)?;
         let maximum =
             usize::try_from(maximum.raw()).map_err(|_| AuthorityError::PayloadTooLarge)?;
-        let bytes: Vec<u8> = match &description.backing {
-            AuthorityBacking::Vfs { object } => {
-                let object = self
-                    .vfs_objects
-                    .get(object)
-                    .ok_or(AuthorityError::VfsNotFound)?;
-                object.contents[start.min(object.contents.len())..]
-                    .iter()
-                    .take(maximum)
-                    .copied()
-                    .collect()
-            }
-            AuthorityBacking::Synthetic { contents } => contents[start.min(contents.len())..]
+        let bytes: Vec<u8> = if let Some(vfs) = description.backing.downcast_ref::<VfsBacking>() {
+            let object = self
+                .vfs_objects
+                .get(&vfs.object)
+                .ok_or(AuthorityError::VfsNotFound)?;
+            object.contents[start.min(object.contents.len())..]
                 .iter()
                 .take(maximum)
                 .copied()
-                .collect(),
-            AuthorityBacking::Host { fd, .. } => {
-                let mut bytes = vec![0; maximum];
-                let read = unsafe {
-                    libc::pread(
-                        fd.as_raw_fd(),
-                        bytes.as_mut_ptr().cast(),
-                        bytes.len(),
-                        libc::off_t::try_from(offset.raw())
-                            .map_err(|_| AuthorityError::InvalidOffset)?,
-                    )
-                };
-                if read < 0 {
-                    return Err(AuthorityError::HostIo(super::HostErrno::last()));
-                }
-                bytes.truncate(usize::try_from(read).map_err(|_| AuthorityError::InvalidOffset)?);
-                bytes
+                .collect()
+        } else if let Some(synthetic) = description.backing.downcast_ref::<SyntheticBacking>() {
+            synthetic.contents[start.min(synthetic.contents.len())..]
+                .iter()
+                .take(maximum)
+                .copied()
+                .collect()
+        } else if let Some(host) = description.backing.downcast_ref::<HostBacking>() {
+            let mut bytes = vec![0; maximum];
+            let read = unsafe {
+                libc::pread(
+                    host.fd.as_raw_fd(),
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len(),
+                    libc::off_t::try_from(offset.raw())
+                        .map_err(|_| AuthorityError::InvalidOffset)?,
+                )
+            };
+            if read < 0 {
+                return Err(AuthorityError::HostIo(super::HostErrno::last()));
             }
-            AuthorityBacking::Epoll(_)
-            | AuthorityBacking::EventCounter { .. }
-            | AuthorityBacking::PipeEnd { .. }
-            | AuthorityBacking::IoUring { .. }
-            | AuthorityBacking::HostStream { .. }
-            | AuthorityBacking::Timer { .. }
-            | AuthorityBacking::SignalFd { .. } => {
-                return Err(AuthorityError::WrongOperationFamily);
-            }
+            bytes.truncate(usize::try_from(read).map_err(|_| AuthorityError::InvalidOffset)?);
+            bytes
+        } else {
+            return Err(AuthorityError::WrongOperationFamily);
         };
         let next = offset
             .raw()
@@ -3213,10 +3228,18 @@ impl FileAuthorityCore {
         if !description.access_mode.writable() {
             return Err(AuthorityError::NotWritable);
         }
-        if matches!(description.backing, AuthorityBacking::PipeEnd { .. }) {
+        if description
+            .backing
+            .downcast_ref::<PipeEndBacking>()
+            .is_some()
+        {
             return self.write_pipe_description(slot.description, bytes);
         }
-        if matches!(description.backing, AuthorityBacking::HostStream { .. }) {
+        if description
+            .backing
+            .downcast_ref::<HostStreamBacking>()
+            .is_some()
+        {
             return self.write_host_stream_description(slot.description, bytes);
         }
         let start =
@@ -3227,35 +3250,32 @@ impl FileAuthorityCore {
                 "write description referenced a missing VFS object",
             ));
         }
-        let written = match &description.backing {
-            AuthorityBacking::Host { fd, writable } => {
-                if !writable {
-                    return Err(AuthorityError::BackingReadOnly);
-                }
-                let written = unsafe {
-                    libc::pwrite(
-                        fd.as_raw_fd(),
-                        bytes.as_ptr().cast(),
-                        bytes.len(),
-                        libc::off_t::try_from(description.offset.raw())
-                            .map_err(|_| AuthorityError::InvalidOffset)?,
-                    )
-                };
-                if written < 0 {
-                    return Err(AuthorityError::HostIo(super::HostErrno::last()));
-                }
-                usize::try_from(written).map_err(|_| AuthorityError::InvalidOffset)?
+        let written = if let Some(host) = description.backing.downcast_ref::<HostBacking>() {
+            if !host.writable {
+                return Err(AuthorityError::BackingReadOnly);
             }
-            AuthorityBacking::Synthetic { .. } | AuthorityBacking::Vfs { .. } => bytes.len(),
-            AuthorityBacking::Epoll(_)
-            | AuthorityBacking::EventCounter { .. }
-            | AuthorityBacking::PipeEnd { .. }
-            | AuthorityBacking::IoUring { .. }
-            | AuthorityBacking::HostStream { .. }
-            | AuthorityBacking::Timer { .. }
-            | AuthorityBacking::SignalFd { .. } => {
-                return Err(AuthorityError::WrongOperationFamily);
+            let written = unsafe {
+                libc::pwrite(
+                    host.fd.as_raw_fd(),
+                    bytes.as_ptr().cast(),
+                    bytes.len(),
+                    libc::off_t::try_from(description.offset.raw())
+                        .map_err(|_| AuthorityError::InvalidOffset)?,
+                )
+            };
+            if written < 0 {
+                return Err(AuthorityError::HostIo(super::HostErrno::last()));
             }
+            usize::try_from(written).map_err(|_| AuthorityError::InvalidOffset)?
+        } else if description
+            .backing
+            .downcast_ref::<SyntheticBacking>()
+            .is_some()
+            || description.backing.downcast_ref::<VfsBacking>().is_some()
+        {
+            bytes.len()
+        } else {
+            return Err(AuthorityError::WrongOperationFamily);
         };
         let count = ByteCount::bounded(
             u32::try_from(written).map_err(|_| AuthorityError::PayloadTooLarge)?,
@@ -3278,36 +3298,28 @@ impl FileAuthorityCore {
                 state.contents[start..end].copy_from_slice(&bytes[..written]);
                 state.revision = revision;
             }
-            None => match &mut self
-                .descriptions
-                .get_mut(&slot.description)
-                .unwrap_or_else(|| {
-                    abort_fatal(AuthorityFatal::InvariantViolation(
-                        "write lost its validated description backing",
-                    ))
-                })
-                .backing
-            {
-                AuthorityBacking::Synthetic { contents } => {
-                    if contents.len() < end {
-                        contents.resize(end, 0);
+            None => {
+                let backing = &mut self
+                    .descriptions
+                    .get_mut(&slot.description)
+                    .unwrap_or_else(|| {
+                        abort_fatal(AuthorityFatal::InvariantViolation(
+                            "write lost its validated description backing",
+                        ))
+                    })
+                    .backing;
+                if let Some(synthetic) = backing.downcast_mut::<SyntheticBacking>() {
+                    if synthetic.contents.len() < end {
+                        synthetic.contents.resize(end, 0);
                     }
-                    contents[start..end].copy_from_slice(&bytes[..written]);
-                }
-                AuthorityBacking::Host { .. } => {}
-                AuthorityBacking::Vfs { .. } => unreachable!(),
-                AuthorityBacking::Epoll(_)
-                | AuthorityBacking::EventCounter { .. }
-                | AuthorityBacking::PipeEnd { .. }
-                | AuthorityBacking::IoUring { .. }
-                | AuthorityBacking::HostStream { .. }
-                | AuthorityBacking::Timer { .. }
-                | AuthorityBacking::SignalFd { .. } => {
+                    synthetic.contents[start..end].copy_from_slice(&bytes[..written]);
+                } else if backing.downcast_ref::<HostBacking>().is_some() {
+                } else {
                     abort_fatal(AuthorityFatal::InvariantViolation(
                         "generic write reached a typed-operation backing",
                     ));
                 }
-            },
+            }
         }
         let description = self
             .descriptions
@@ -3849,10 +3861,8 @@ impl FileAuthorityCore {
         let pipe_end = self
             .descriptions
             .get(&description)
-            .and_then(|state| match state.backing {
-                AuthorityBacking::PipeEnd { pipe, end } => Some((pipe, end)),
-                _ => None,
-            });
+            .and_then(|state| state.backing.downcast_ref::<PipeEndBacking>())
+            .map(|pipe| (pipe.pipe, pipe.end));
         if let Some((pipe, end)) = pipe_end {
             let stream = self.streams.get_mut(&pipe).unwrap_or_else(|| {
                 abort_fatal(AuthorityFatal::InvariantViolation(
@@ -3956,34 +3966,26 @@ impl FileAuthorityCore {
     }
 
     fn backing_len(&self, backing: &AuthorityBacking) -> Result<u64, AuthorityError> {
-        match backing {
-            AuthorityBacking::Synthetic { contents } => {
-                u64::try_from(contents.len()).map_err(|_| AuthorityError::InvalidOffset)
-            }
-            AuthorityBacking::Vfs { object } => self
-                .vfs_objects
-                .get(object)
+        if let Some(synthetic) = backing.downcast_ref::<SyntheticBacking>() {
+            u64::try_from(synthetic.contents.len()).map_err(|_| AuthorityError::InvalidOffset)
+        } else if let Some(vfs) = backing.downcast_ref::<VfsBacking>() {
+            self.vfs_objects
+                .get(&vfs.object)
                 .ok_or(AuthorityError::VfsNotFound)
                 .and_then(|state| {
                     u64::try_from(state.contents.len()).map_err(|_| AuthorityError::InvalidOffset)
-                }),
-            AuthorityBacking::Host { fd, .. } => {
-                // This is an authority-side metadata attempt, not client MM or
-                // guest-memory work. It stays bounded to one nonblocking fstat.
-                let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-                if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
-                    return Err(AuthorityError::HostIo(super::HostErrno::last()));
-                }
-                let stat = unsafe { stat.assume_init() };
-                u64::try_from(stat.st_size).map_err(|_| AuthorityError::InvalidOffset)
+                })
+        } else if let Some(host) = backing.downcast_ref::<HostBacking>() {
+            // This is an authority-side metadata attempt, not client MM or
+            // guest-memory work. It stays bounded to one nonblocking fstat.
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if unsafe { libc::fstat(host.fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+                return Err(AuthorityError::HostIo(super::HostErrno::last()));
             }
-            AuthorityBacking::Epoll(_)
-            | AuthorityBacking::EventCounter { .. }
-            | AuthorityBacking::PipeEnd { .. }
-            | AuthorityBacking::IoUring { .. }
-            | AuthorityBacking::HostStream { .. }
-            | AuthorityBacking::Timer { .. }
-            | AuthorityBacking::SignalFd { .. } => Err(AuthorityError::NotSeekable),
+            let stat = unsafe { stat.assume_init() };
+            u64::try_from(stat.st_size).map_err(|_| AuthorityError::InvalidOffset)
+        } else {
+            Err(AuthorityError::NotSeekable)
         }
     }
 
@@ -4098,12 +4100,9 @@ fn event_counter_readiness(counter: u64) -> ReadinessSnapshot {
 }
 
 fn is_epollable(backing: &AuthorityBacking) -> bool {
-    matches!(
-        backing,
-        AuthorityBacking::Epoll(_)
-            | AuthorityBacking::EventCounter { .. }
-            | AuthorityBacking::PipeEnd { .. }
-    )
+    backing.downcast_ref::<EpollBacking>().is_some()
+        || backing.downcast_ref::<EventCounterBacking>().is_some()
+        || backing.downcast_ref::<PipeEndBacking>().is_some()
 }
 
 fn release_mapping_ranges(

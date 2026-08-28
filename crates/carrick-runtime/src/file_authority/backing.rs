@@ -1,127 +1,303 @@
+use std::any::Any;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
 use super::epoll::EpollState;
 use super::types::{DescriptionBackingSnapshot, VfsObjectId};
 
-/// Actual authority-owned payload for an open file description.
+/// One authority-owned open-file-description payload.
 ///
-/// This deliberately begins with two fully functional backings rather than a
-/// metadata shell. Further host-backed and readiness/transfer variants are
-/// added here as their operation families move behind the same closed API.
-#[derive(Debug)]
-pub(super) enum AuthorityBacking {
-    Synthetic {
-        contents: Vec<u8>,
-    },
-    Vfs {
-        object: VfsObjectId,
-    },
-    Host {
-        fd: OwnedFd,
-        writable: bool,
-    },
-    HostStream {
-        fd: OwnedFd,
-        kind: super::HostStreamKind,
-    },
-    IoUring {
-        data_fd: OwnedFd,
-        lock_fd: OwnedFd,
-        entries: u32,
-        data_length: u64,
-    },
-    Epoll(EpollState),
-    EventCounter {
-        counter: u64,
-        semaphore: bool,
-    },
-    SignalFd {
-        mask: carrick_abi::SigSet,
-    },
-    Timer {
-        interval_ns: u64,
-        initial_ns: u64,
-        pending: u64,
-    },
-    PipeEnd {
-        pipe: super::PipeId,
-        end: super::PipeEnd,
-    },
-}
+/// Open by construction: a new backing kind is a new type implementing this
+/// trait, not a new arm in every match over a closed enum.
+pub(super) trait AuthorityBackingKind: std::fmt::Debug + Send + Sync {
+    fn snapshot(&self) -> DescriptionBackingSnapshot;
 
-impl AuthorityBacking {
-    pub(super) fn snapshot(&self) -> DescriptionBackingSnapshot {
-        match self {
-            Self::Synthetic { contents } => DescriptionBackingSnapshot::Synthetic {
-                length: u64::try_from(contents.len()).unwrap_or(u64::MAX),
-            },
-            Self::Vfs { object } => DescriptionBackingSnapshot::VfsFile { object: *object },
-            Self::Host { writable, .. } => DescriptionBackingSnapshot::HostFile {
-                writable: *writable,
-            },
-            Self::HostStream { kind, .. } => DescriptionBackingSnapshot::HostStream { kind: *kind },
-            Self::IoUring {
-                entries,
-                data_length,
-                ..
-            } => DescriptionBackingSnapshot::IoUring {
-                entries: *entries,
-                data_length: *data_length,
-            },
-            Self::Epoll(state) => DescriptionBackingSnapshot::Epoll {
-                interests: u32::try_from(state.len()).unwrap_or(u32::MAX),
-            },
-            Self::EventCounter { counter, semaphore } => DescriptionBackingSnapshot::EventCounter {
-                counter: *counter,
-                semaphore: *semaphore,
-            },
-            Self::SignalFd { mask } => DescriptionBackingSnapshot::SignalFd { mask: *mask },
-            Self::Timer {
-                interval_ns,
-                initial_ns,
-                pending,
-            } => DescriptionBackingSnapshot::Timer {
-                interval_ns: *interval_ns,
-                initial_ns: *initial_ns,
-                pending: *pending,
-            },
-            Self::PipeEnd { pipe, end } => DescriptionBackingSnapshot::PipeEnd {
-                pipe: *pipe,
-                end: *end,
-            },
-        }
+    /// The host descriptor this backing's readiness and I/O ride on, if any,
+    /// matching the requested capability lease purpose.
+    fn host_fd(&self, _purpose: super::CapabilityLeasePurpose) -> Option<RawFd> {
+        None
     }
 
-    pub(super) const fn vfs_object(&self) -> Option<VfsObjectId> {
-        match self {
-            Self::Synthetic { .. }
-            | Self::Host { .. }
-            | Self::IoUring { .. }
-            | Self::HostStream { .. }
-            | Self::Epoll(_)
-            | Self::EventCounter { .. }
-            | Self::Timer { .. }
-            | Self::SignalFd { .. }
-            | Self::PipeEnd { .. } => None,
-            Self::Vfs { object } => Some(*object),
-        }
+    fn as_any(&self) -> &dyn Any;
+
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+#[derive(Debug)]
+pub(super) struct AuthorityBacking(Box<dyn AuthorityBackingKind>);
+
+impl AuthorityBacking {
+    pub(super) fn new<T>(kind: T) -> Self
+    where
+        T: AuthorityBackingKind + 'static,
+    {
+        Self(Box::new(kind))
+    }
+
+    pub(super) fn snapshot(&self) -> DescriptionBackingSnapshot {
+        self.0.snapshot()
+    }
+
+    pub(super) fn vfs_object(&self) -> Option<VfsObjectId> {
+        self.downcast_ref::<VfsBacking>().map(|vfs| vfs.object)
     }
 
     pub(super) fn host_fd(&self, purpose: super::CapabilityLeasePurpose) -> Option<RawFd> {
-        match (self, purpose) {
-            (Self::Host { fd, .. }, super::CapabilityLeasePurpose::MappingSource) => {
-                Some(fd.as_raw_fd())
-            }
-            (Self::HostStream { fd, .. }, super::CapabilityLeasePurpose::PollSource) => {
-                Some(fd.as_raw_fd())
-            }
-            (Self::IoUring { data_fd, .. }, super::CapabilityLeasePurpose::IoUringData) => {
-                Some(data_fd.as_raw_fd())
-            }
-            (Self::IoUring { lock_fd, .. }, super::CapabilityLeasePurpose::IoUringLock) => {
-                Some(lock_fd.as_raw_fd())
-            }
+        self.0.host_fd(purpose)
+    }
+
+    pub(super) fn downcast_ref<T>(&self) -> Option<&T>
+    where
+        T: AuthorityBackingKind + 'static,
+    {
+        self.0.as_any().downcast_ref()
+    }
+
+    pub(super) fn downcast_mut<T>(&mut self) -> Option<&mut T>
+    where
+        T: AuthorityBackingKind + 'static,
+    {
+        self.0.as_any_mut().downcast_mut()
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct SyntheticBacking {
+    pub(super) contents: Vec<u8>,
+}
+
+impl AuthorityBackingKind for SyntheticBacking {
+    fn snapshot(&self) -> DescriptionBackingSnapshot {
+        DescriptionBackingSnapshot::Synthetic {
+            length: u64::try_from(self.contents.len()).unwrap_or(u64::MAX),
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct VfsBacking {
+    pub(super) object: VfsObjectId,
+}
+
+impl AuthorityBackingKind for VfsBacking {
+    fn snapshot(&self) -> DescriptionBackingSnapshot {
+        DescriptionBackingSnapshot::VfsFile {
+            object: self.object,
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct HostBacking {
+    pub(super) fd: OwnedFd,
+    pub(super) writable: bool,
+}
+
+impl AuthorityBackingKind for HostBacking {
+    fn snapshot(&self) -> DescriptionBackingSnapshot {
+        DescriptionBackingSnapshot::HostFile {
+            writable: self.writable,
+        }
+    }
+
+    fn host_fd(&self, purpose: super::CapabilityLeasePurpose) -> Option<RawFd> {
+        match purpose {
+            super::CapabilityLeasePurpose::MappingSource => Some(self.fd.as_raw_fd()),
             _ => None,
         }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct HostStreamBacking {
+    pub(super) fd: OwnedFd,
+    pub(super) kind: super::HostStreamKind,
+}
+
+impl AuthorityBackingKind for HostStreamBacking {
+    fn snapshot(&self) -> DescriptionBackingSnapshot {
+        DescriptionBackingSnapshot::HostStream { kind: self.kind }
+    }
+
+    fn host_fd(&self, purpose: super::CapabilityLeasePurpose) -> Option<RawFd> {
+        match purpose {
+            super::CapabilityLeasePurpose::PollSource => Some(self.fd.as_raw_fd()),
+            _ => None,
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct IoUringBacking {
+    pub(super) data_fd: OwnedFd,
+    pub(super) lock_fd: OwnedFd,
+    pub(super) entries: u32,
+    pub(super) data_length: u64,
+}
+
+impl AuthorityBackingKind for IoUringBacking {
+    fn snapshot(&self) -> DescriptionBackingSnapshot {
+        DescriptionBackingSnapshot::IoUring {
+            entries: self.entries,
+            data_length: self.data_length,
+        }
+    }
+
+    fn host_fd(&self, purpose: super::CapabilityLeasePurpose) -> Option<RawFd> {
+        match purpose {
+            super::CapabilityLeasePurpose::IoUringData => Some(self.data_fd.as_raw_fd()),
+            super::CapabilityLeasePurpose::IoUringLock => Some(self.lock_fd.as_raw_fd()),
+            _ => None,
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct EpollBacking {
+    pub(super) state: EpollState,
+}
+
+impl AuthorityBackingKind for EpollBacking {
+    fn snapshot(&self) -> DescriptionBackingSnapshot {
+        DescriptionBackingSnapshot::Epoll {
+            interests: u32::try_from(self.state.len()).unwrap_or(u32::MAX),
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct EventCounterBacking {
+    pub(super) counter: u64,
+    pub(super) semaphore: bool,
+}
+
+impl AuthorityBackingKind for EventCounterBacking {
+    fn snapshot(&self) -> DescriptionBackingSnapshot {
+        DescriptionBackingSnapshot::EventCounter {
+            counter: self.counter,
+            semaphore: self.semaphore,
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct SignalFdBacking {
+    pub(super) mask: carrick_abi::SigSet,
+}
+
+impl AuthorityBackingKind for SignalFdBacking {
+    fn snapshot(&self) -> DescriptionBackingSnapshot {
+        DescriptionBackingSnapshot::SignalFd { mask: self.mask }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct TimerBacking {
+    pub(super) interval_ns: u64,
+    pub(super) initial_ns: u64,
+    pub(super) pending: u64,
+}
+
+impl AuthorityBackingKind for TimerBacking {
+    fn snapshot(&self) -> DescriptionBackingSnapshot {
+        DescriptionBackingSnapshot::Timer {
+            interval_ns: self.interval_ns,
+            initial_ns: self.initial_ns,
+            pending: self.pending,
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct PipeEndBacking {
+    pub(super) pipe: super::PipeId,
+    pub(super) end: super::PipeEnd,
+}
+
+impl AuthorityBackingKind for PipeEndBacking {
+    fn snapshot(&self) -> DescriptionBackingSnapshot {
+        DescriptionBackingSnapshot::PipeEnd {
+            pipe: self.pipe,
+            end: self.end,
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
