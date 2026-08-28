@@ -1,14 +1,14 @@
 {
- "schema": 1,
- "ceiling": {
-  "create_install": 83,
-  "epoll_wait": 38,
-  "inspect_misc": 165,
-  "lifecycle": 36,
-  "mapping_ring": 14,
-  "read_attempt": 13,
-  "slot_description_mutation": 17,
-  "stream_transfer": 16,
-  "write_attempt": 21
- }
+  "schema": 1,
+  "ceiling": {
+    "create_install": 83,
+    "epoll_wait": 38,
+    "inspect_misc": 162,
+    "lifecycle": 36,
+    "mapping_ring": 14,
+    "read_attempt": 13,
+    "slot_description_mutation": 17,
+    "stream_transfer": 16,
+    "write_attempt": 21
+  }
 }

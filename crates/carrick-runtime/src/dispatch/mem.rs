@@ -3709,7 +3709,7 @@ impl SyscallDispatcher {
             // EBADF (LTP open13 maps an O_PATH fd and expects failure).
             if !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                 && let Some(open_file) = this.open_file(fd.0)
-                && open_file.description.read().status_flags() & crate::linux_abi::LINUX_O_PATH != 0
+                && open_file.description.common().status_flags() & crate::linux_abi::LINUX_O_PATH != 0
             {
                 return Ok(request.refused(
                     MmapRefusal::Spec("mmap of an O_PATH descriptor"),

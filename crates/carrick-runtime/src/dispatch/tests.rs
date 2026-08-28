@@ -3423,6 +3423,27 @@ mod overlay_dispatch_tests {
         assert_eq!(ETIMEDOUT.get(), 110);
         assert_eq!(ECONNREFUSED.get(), 111);
     }
+
+    #[test]
+    fn status_flags_are_one_value_shared_by_the_description_and_its_backing() {
+        let open_file = eventfd_open_file(0);
+        let description = &open_file.description;
+
+        // The description answers without taking the backing lock...
+        assert_eq!(description.common().status_flags(), 0);
+
+        // ...and it is the SAME storage the enum forwarder reads, not a copy.
+        description
+            .common()
+            .set_status_flags(carrick_abi::LINUX_O_NONBLOCK);
+        assert_eq!(
+            description.read().status_flags(),
+            carrick_abi::LINUX_O_NONBLOCK
+        );
+
+        description.write().set_status_flags(0);
+        assert_eq!(description.common().status_flags(), 0);
+    }
 }
 
 #[cfg(test)]

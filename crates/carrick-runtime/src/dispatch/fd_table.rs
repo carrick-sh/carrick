@@ -240,13 +240,11 @@ pub(super) struct TimerFdInner {
 
 #[derive(Debug, Clone)]
 pub(super) struct OpenDescriptionBase {
-    status_flags: u64,
-    /// Number of Linux fd-table entries that currently name this open file
-    /// description across every HvPatch process namespace. This deliberately
-    /// excludes transient Rust `Arc` clones used by in-flight syscalls. Linux
-    /// removes an epoll interest only after the last fd referring to the open
-    /// description closes; `Arc::strong_count` cannot express that invariant.
-    fd_refs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// The description-level state this backing shares with its owning
+    /// `kernel::FileDescription`. TRANSIENT: `OpenDescriptionBase` stops
+    /// carrying it entirely once every reader goes through the description
+    /// (see the deletion commit in this series).
+    common: std::sync::Arc<crate::kernel::objects::DescriptionCommon>,
     /// Linux file-lease state (F_SETLEASE/F_GETLEASE): F_RDLCK(0)/F_WRLCK(1)/
     /// F_UNLCK(2). Lives on the open-file-description so a dup'd fd shares it,
     /// matching the kernel. Default F_UNLCK = no lease.
@@ -351,8 +349,9 @@ pub(super) struct SocketMulticastMembership {
 impl OpenDescriptionBase {
     pub(super) fn new(status_flags: u64) -> Self {
         Self {
-            status_flags,
-            fd_refs: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            common: std::sync::Arc::new(crate::kernel::objects::DescriptionCommon::new(
+                status_flags,
+            )),
             so_reuseaddr: false,
             so_reuseport: false,
             ipv6_multicast_if: None,
@@ -374,6 +373,10 @@ impl OpenDescriptionBase {
             seals: None,
             secretmem: false,
         }
+    }
+
+    pub(super) fn common(&self) -> &std::sync::Arc<crate::kernel::objects::DescriptionCommon> {
+        &self.common
     }
 
     pub(super) fn seals(&self) -> Option<u32> {
@@ -415,30 +418,30 @@ impl OpenDescriptionBase {
     }
 
     pub(super) fn status_flags(&self) -> u64 {
-        self.status_flags
+        self.common.status_flags()
     }
 
     #[inline]
     pub(super) fn is_append(&self) -> bool {
-        carrick_abi::LinuxOpenFlags::from_bits_truncate(self.status_flags)
+        carrick_abi::LinuxOpenFlags::from_bits_truncate(self.status_flags())
             .contains(carrick_abi::LinuxOpenFlags::APPEND)
     }
 
     #[inline]
     pub(super) fn is_nonblocking(&self) -> bool {
-        carrick_abi::LinuxOpenFlags::from_bits_truncate(self.status_flags)
+        carrick_abi::LinuxOpenFlags::from_bits_truncate(self.status_flags())
             .contains(carrick_abi::LinuxOpenFlags::NONBLOCK)
     }
 
     #[inline]
     pub(super) fn is_async(&self) -> bool {
-        carrick_abi::LinuxOpenFlags::from_bits_truncate(self.status_flags)
+        carrick_abi::LinuxOpenFlags::from_bits_truncate(self.status_flags())
             .contains(carrick_abi::LinuxOpenFlags::ASYNC)
     }
 
     #[inline]
     pub(super) fn access_mode(&self) -> u64 {
-        self.status_flags & carrick_abi::LINUX_O_ACCMODE
+        self.status_flags() & carrick_abi::LINUX_O_ACCMODE
     }
 
     #[inline]
@@ -453,7 +456,7 @@ impl OpenDescriptionBase {
 
     #[inline]
     pub(super) fn is_path(&self) -> bool {
-        carrick_abi::LinuxOpenFlags::from_bits_truncate(self.status_flags)
+        carrick_abi::LinuxOpenFlags::from_bits_truncate(self.status_flags())
             .contains(carrick_abi::LinuxOpenFlags::PATH)
     }
 
@@ -476,8 +479,8 @@ impl OpenDescriptionBase {
         self.async_sig = sig;
     }
 
-    pub(super) fn set_status_flags(&mut self, next: u64) {
-        self.status_flags = next;
+    pub(super) fn set_status_flags(&self, next: u64) {
+        self.common.set_status_flags(next);
     }
 
     pub(super) fn lease(&self) -> i32 {
@@ -1231,11 +1234,14 @@ pub(crate) type OpenFile = crate::kernel::FileSlot;
 pub(super) fn kernel_file_description(
     description: OpenDescriptionRef,
 ) -> Arc<crate::kernel::FileDescription> {
+    let common = std::sync::Arc::clone(description.read().base().common());
     Arc::new(
-        crate::kernel::FileDescription::concrete(description).unwrap_or_else(|error| {
-            tracing::error!(%error, "file-description identity allocation failed");
-            std::process::abort();
-        }),
+        crate::kernel::FileDescription::concrete_with_common(description, common).unwrap_or_else(
+            |error| {
+                tracing::error!(%error, "file-description identity allocation failed");
+                std::process::abort();
+            },
+        ),
     )
 }
 
@@ -1805,27 +1811,15 @@ impl OpenDescription {
     }
 
     pub(super) fn retain_fd_ref(&self) {
-        self.base()
-            .fd_refs
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.base().common().retain_fd_ref();
     }
 
     pub(super) fn release_fd_ref(&self) -> usize {
-        let previous = self
-            .base()
-            .fd_refs
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        if previous == 0 {
-            tracing::error!("logical fd reference count underflow");
-            std::process::abort();
-        }
-        previous - 1
+        self.base().common().release_fd_ref()
     }
 
     pub(super) fn fd_ref_count(&self) -> usize {
-        self.base()
-            .fd_refs
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.base().common().fd_refs()
     }
 
     pub(super) fn status_flags(&self) -> u64 {
