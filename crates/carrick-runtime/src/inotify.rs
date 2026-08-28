@@ -307,6 +307,8 @@ trait InotifyBackend: Send + Sync {
         mask: u32,
         inner: &Mutex<Inner>,
     ) -> Result<i32, LinuxErrno>;
+    /// Replace the backend registration mask for an existing guest watch.
+    fn update_watch(&self, wd: i32, mask: u32, inner: &Mutex<Inner>) -> Result<(), LinuxErrno>;
     /// Tear down the backend-side registration for one watched fd of a wd being
     /// removed. Called by `rm_watch`, which already holds the `inner` lock, so it
     /// takes `&mut Inner`.
@@ -382,6 +384,27 @@ impl InotifyBackend for NativeLinuxInotify {
         }
         inner.watches.insert(wd, Watch { host_fds, mask });
         Ok(wd)
+    }
+
+    fn update_watch(&self, wd: i32, mask: u32, inner: &Mutex<Inner>) -> Result<(), LinuxErrno> {
+        let host_fds = inner
+            .lock()
+            .watches
+            .get(&wd)
+            .map(|watch| watch.host_fds.clone())
+            .ok_or(LINUX_EINVAL)?;
+        let mut native_wds = Vec::with_capacity(host_fds.len());
+        for host_fd in host_fds {
+            native_wds
+                .push(native_add_watch(self.inotify_fd, host_fd, mask).map_err(|()| LINUX_ENOSPC)?);
+        }
+        let mut inner = inner.lock();
+        for native_wd in native_wds {
+            inner.native_wd_to_guest.insert(native_wd, wd);
+        }
+        let watch = inner.watches.get_mut(&wd).ok_or(LINUX_EINVAL)?;
+        watch.mask = mask;
+        Ok(())
     }
 
     fn deregister(&self, _host_fd: RawFd, wd: i32, inner: &mut Inner) {
@@ -541,6 +564,26 @@ impl InotifyBackend for VnodeDiffInotify {
         }
         inner.watches.insert(wd, Watch { host_fds, mask });
         Ok(wd)
+    }
+
+    fn update_watch(&self, wd: i32, mask: u32, inner: &Mutex<Inner>) -> Result<(), LinuxErrno> {
+        let host_fds = inner
+            .lock()
+            .watches
+            .get(&wd)
+            .map(|watch| watch.host_fds.clone())
+            .ok_or(LINUX_EINVAL)?;
+        let events = linux_mask_to_vnode_events(mask);
+        let mut mux = self.mux.lock();
+        for host_fd in host_fds {
+            mux.register_vnode(host_fd, host_fd as u64, events)
+                .map_err(|_| LINUX_ENOSPC)?;
+        }
+        drop(mux);
+        let mut inner = inner.lock();
+        let watch = inner.watches.get_mut(&wd).ok_or(LINUX_EINVAL)?;
+        watch.mask = mask;
+        Ok(())
     }
 
     fn deregister(&self, host_fd: RawFd, _wd: i32, _inner: &mut Inner) {
@@ -768,6 +811,27 @@ impl InotifyState {
         wd
     }
 
+    /// Replace or extend an existing watch mask while preserving its wd.
+    pub(crate) fn update_watch(&self, wd: i32, requested: u32) -> Result<u32, LinuxErrno> {
+        let current = self
+            .inner
+            .lock()
+            .watches
+            .get(&wd)
+            .map(|watch| watch.mask)
+            .ok_or(LINUX_EINVAL)?;
+        let add = requested & carrick_abi::LINUX_IN_MASK_ADD != 0;
+        let requested = requested & !carrick_abi::LINUX_IN_MASK_ADD;
+        let effective = if add { current | requested } else { requested };
+        self.backend.update_watch(wd, effective, &self.inner)?;
+        Ok(effective)
+    }
+
+    /// Number of already-formatted records queued for the next guest read.
+    pub(crate) fn queued_bytes(&self) -> usize {
+        self.inner.lock().pending.iter().map(Vec::len).sum()
+    }
+
     /// Remove a watch by descriptor; closes its fd. Unknown wd → EINVAL.
     pub(crate) fn rm_watch(&self, wd: i32) -> Result<(), LinuxErrno> {
         let mut inner = self.inner.lock();
@@ -942,6 +1006,21 @@ impl std::fmt::Debug for InotifyRegistry {
 }
 
 impl InotifyRegistry {
+    /// Existing wd for this exact path and inotify instance, if any.
+    pub(crate) fn watch_descriptor(
+        &self,
+        path: &str,
+        state: &std::sync::Arc<InotifyState>,
+    ) -> Option<i32> {
+        let key = normalize_watch_path(path);
+        self.by_path.read().get(&key).and_then(|watches| {
+            watches
+                .iter()
+                .find(|watch| std::sync::Arc::ptr_eq(&watch.state, state))
+                .map(|watch| watch.wd)
+        })
+    }
+
     /// Record that `path` is now watched under `wd` of `state` with `mask`.
     /// Called from `inotify_add_watch` after the per-instance watch is added.
     pub(crate) fn register(
