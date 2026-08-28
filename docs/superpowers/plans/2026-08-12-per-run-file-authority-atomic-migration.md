@@ -8,21 +8,31 @@ CLOEXEC/exec commit for the file domain; they do not gate K1 GO. See "Phase
 ownership of the file authority" in
 [`2026-08-09-hvpatch-k1-kernel-object-model.md`](../specs/2026-08-09-hvpatch-k1-kernel-object-model.md).
 
-**Reason for existence:** Carrick's host-process fallback lanes cannot preserve
-Linux `CLONE_FILES`, post-fork open-file-description state, or staged pipe
-bytes with process-local Rust objects. This plan defines the only accepted
-migration to one per-run authority without an intermediate dual-authority
-state.
+**Historical reason for existence:** Carrick's retired host-process fallback
+lanes could not preserve Linux `CLONE_FILES`, post-fork open-file-description
+state, or staged pipe bytes with process-local Rust objects. The surviving
+requirement is still one canonical per-run authority without an intermediate
+dual-authority state.
 
 **Controlling context:** [`hybrid.md`](../../../hybrid.md),
 [`2026-08-09-hvpatch-k1-kernel-object-model.md`](../specs/2026-08-09-hvpatch-k1-kernel-object-model.md).
 
 ## Decision
 
+### Decision 2026-08-28: direct canonical core
+
+The host-helper and IPC production transports are retired with the legacy
+host-process execution backends. `FileAuthorityTransport` remains an internal
+test/direct-call seam, with `DirectFileAuthority` its sole production
+implementation. Completion requires one canonical in-carrier core and must not
+require helper lifecycle, IPC equivalence, or helper-death behavior. The
+transport and helper sections below are retained only as historical design
+record; they schedule no production work.
+
 Create one `FileAuthorityCore` per Carrick run.
 
 - Kernel-first/HVPatch callers invoke the core directly.
-- Native and VMM host-process callers use versioned typed IPC to the same core.
+- Retired native and VMM host-process callers require no production transport.
 - The core exclusively owns every `FileTable`, reachable `FileDescription`,
   mutable open-description state, epoll subordinate state, splice stream state,
   writable in-memory VFS object/content identity and namespace mutations,
@@ -153,7 +163,10 @@ Blocking operations use prepare/attempt/park/revalidate:
 The authority completes already-committed stream transfers if the requester
 dies. Cancellation reports the exact committed partial count.
 
-## Transport
+## Historical transport design — superseded 2026-08-28
+
+This section records the retired helper/IPC design. It is not an implementation
+or completion requirement.
 
 Use `AF_UNIX/SOCK_DGRAM` socket pairs with one bounded frame per `sendmsg`.
 Datagram payload and `SCM_RIGHTS` capabilities are one record.
@@ -174,7 +187,7 @@ Datagram payload and `SCM_RIGHTS` capabilities are one record.
 - Socket loss, helper exit, malformed frames, dedup exhaustion, and invariant
   failure are run-fatal.
 
-### Native self-reexec endpoint inheritance
+### Historical native self-reexec endpoint inheritance
 
 A control fd marked `FD_CLOEXEC` cannot preserve the same FileAuthority across
 host `execve`, while reconnecting or serializing mutable descriptions would
@@ -219,7 +232,7 @@ family-by-family without enabling a second store. `ThreadResources` changes to
 `FileAuthorityBinding` only after every direct call site compiles against the
 closed API. Delete guard-returning APIs in the same wave.
 
-### Wave 3 — helper and IPC equivalence
+### Historical Wave 3 — helper and IPC equivalence (superseded)
 
 Start the helper before guest host forks. Implement protocol validation,
 request deduplication, client death records, capability borrows, mapping
@@ -279,10 +292,10 @@ git diff --check
 ```
 
 Live gates use signed binaries and scoped `CARRICK_RUN_ID`s. Run Carrick and
-the Docker oracle in separate phases. Require direct/IPC equivalence,
-HVPatch/native/VMM fork/exec probes, file-backed mmap and io_uring mapping
-lifetime, epoll close across copied tables, staged splice ordering, requester
-death, and authority-death fail-closed behavior.
+the Docker oracle in separate phases. Require HVPatch fork/exec probes,
+file-backed mmap and io_uring mapping lifetime, epoll close across copied
+tables, staged splice ordering, requester death, and canonical-authority
+fail-closed behavior.
 
 ## Completion criteria
 
@@ -292,8 +305,9 @@ The FileAuthority cutover is complete only when:
 - all sharing, fork, exec, offset, flag, CLOEXEC, epoll, splice, mmap, and
   io_uring differentials match Linux;
 - snapshots join table, description, stream, VFS-object/namespace, and lease revisions coherently;
-- authority/client death tests prove bounded failure without loss or replay;
-- direct and IPC model tests are identical;
-- signed HVPatch, native, and VMM demonstrations pass;
+- caller/canonical-authority failure tests prove bounded failure without loss
+  or replay;
+- direct model tests exercise the sole production implementation;
+- signed HVPatch demonstrations pass;
 - `just ci` passes; and
 - the rejected APIs and fallback paths are deleted, not deprecated.

@@ -169,10 +169,10 @@ makes it mandatory.
 
 Both classes are pure pattern-matching and `just lint-domains` already exists.
 
-- A mutable `static` in a runtime crate is an error unless its type is
-  `CarrierGlobal<T>`, constructed with a **closed** `CarrierScope` enum so the set
-  of admissible excuses is enumerable by `rg` and review argues about a named
-  category rather than free text.
+- A mutable `static` or process-global environment source in a runtime crate is
+  an error unless it is present in the reviewed monotone global-state ledger.
+  Every accepted row names its scope, owner and migration destination; additions
+  and stale rows fail closed.
 - `std::process::id()` / `getpid` / `proc_listallpids` are errors in
   Linux-semantics paths; a legitimately carrier-scoped call says so by calling a
   named `carrier_pid()`.
@@ -181,6 +181,14 @@ Neither is landable as a flat ban — 197 statics exist and ~165 are legitimate.
 a **monotonic baseline**: fail on any finding not in the baseline, *and* fail when
 a baseline entry stops matching, so fixing one forces deleting its entry and the
 file can only shrink. "We will clean it up later" becomes inexpressible.
+
+### Accepted scope implementation — 2026-08-28
+
+The reviewed `carrick-embed` census plus the monotone
+`runtime-global-state.json` gate supersedes the proposed `CarrierGlobal<T>` /
+`CarrierScope` wrapper. Container state is carried by `Container` and
+`LaunchContext`; accepted carrier infrastructure remains explicit ledger debt.
+Do not build both mechanisms.
 
 ### 5. Lock order made structural
 

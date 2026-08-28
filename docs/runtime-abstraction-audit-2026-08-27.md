@@ -440,15 +440,15 @@ files with items 1–5.
 syscall families. Part 1's Tasks 1–5 (the `DescriptionCommon` hoist) are
 independent of every one of them and can start immediately.
 
-Two things must be decided by a person before the work starts, because both
-contradict a committed document:
+## Accepted decisions — 2026-08-28
 
-- whether the `carrick-embed` statics census **supersedes** `CarrierGlobal<T>`
-  (I believe it should — but the accepted answer must be written down, or both
-  get built);
-- whether the file authority's IPC transport is **amended out** of the approved
-  migration plan now that the helper is deleted and the host-process execution
-  backends are retired.
+- The reviewed `carrick-embed` census plus the monotone global-state ledger
+  supersedes `CarrierGlobal<T>` / `CarrierScope`; do not build both. The dated
+  decision is recorded in [`identity-and-scope-domains.md`](identity-and-scope-domains.md#accepted-scope-implementation--2026-08-28).
+- FileAuthority operates as one direct canonical in-carrier core. The retired
+  helper/IPC production transport is amended out of the migration plan; its
+  historical design remains documentation, not scheduled work. See
+  [`2026-08-12-per-run-file-authority-atomic-migration.md`](superpowers/plans/2026-08-12-per-run-file-authority-atomic-migration.md#decision-2026-08-28-direct-canonical-core).
 
 ## The rule to carry forward
 

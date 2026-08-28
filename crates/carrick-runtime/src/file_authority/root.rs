@@ -343,6 +343,13 @@ mod tests {
                 "FileAuthority retained retired host-helper authority `{retired}`"
             );
         }
+
+        let plan = include_str!(
+            "../../../../docs/superpowers/plans/2026-08-12-per-run-file-authority-atomic-migration.md"
+        );
+        assert!(plan.contains("Decision 2026-08-28: direct canonical core"));
+        assert!(plan.contains("host-helper and IPC production transports are retired"));
+        assert!(!plan.contains("direct and IPC model tests are identical;"));
     }
 
     #[test]
