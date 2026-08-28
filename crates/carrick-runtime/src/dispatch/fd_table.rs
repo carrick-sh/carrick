@@ -66,6 +66,10 @@ pub(super) struct EpollInterest {
     /// child, whose close must not auto-remove the parent's shared epoll entry.
     /// Bare inherited stdio has no table-backed description and remains `None`.
     pub(super) target: Option<Arc<crate::kernel::FileDescription>>,
+    /// Registration-time classification. Host-backed entries are already
+    /// represented in the instance multiplexer; only entries without such a
+    /// source need recursive userspace readiness sampling.
+    pub(super) host_poll_source: bool,
     pub(super) event: LinuxEpollEvent,
     /// Readiness bits already REPORTED to the guest for this registration. The
     /// software EPOLLET latch: `raw & !last_ready` is the edge. Cleared on
@@ -815,6 +819,10 @@ pub(super) enum OpenDescription {
     Epoll {
         base: OpenDescriptionBase,
         interest: HashMap<i32, EpollInterest>,
+        /// Number of registrations whose readiness has no host multiplexer
+        /// source. Keeps the overwhelmingly common all-host-backed quiet check
+        /// O(1); the interest map is scanned only when this is nonzero.
+        synthetic_interest_count: usize,
         /// Ready events already observed from the backing kqueue or synthetic
         /// readiness paths but not yet returned to the guest because the last
         /// `epoll_wait` hit `maxevents`. Linux leaves those events queued for
@@ -1366,20 +1374,6 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
         matches!(&*self.read(), OpenDescription::Closed { .. })
     }
 
-    fn has_host_poll_source(&self) -> bool {
-        match &*self.read() {
-            OpenDescription::HostPipe { .. }
-            | OpenDescription::HostFile { .. }
-            | OpenDescription::Pidfd { .. }
-            | OpenDescription::Inotify { .. } => true,
-            OpenDescription::HostSocket { base, .. } => base.pending_socket_error().is_none(),
-            OpenDescription::PipeReader { pipe, .. } => pipe.read_poll_fd().is_some(),
-            OpenDescription::PipeWriter { pipe, .. } => pipe.write_poll_fd().is_some(),
-            OpenDescription::Fanotify { group, .. } => group.poll_fd() >= 0,
-            _ => false,
-        }
-    }
-
     fn readiness(
         &self,
         description_id: crate::kernel::FileDescriptionId,
@@ -1421,6 +1415,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
             }
             OpenDescription::Epoll {
                 interest: epoll_interest,
+                synthetic_interest_count,
                 pending_ready,
                 kqueue,
                 ..
@@ -1440,7 +1435,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
                             && pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
                         {
                             ready |= LinuxEpollEvents::IN;
-                        } else {
+                        } else if *synthetic_interest_count != 0 {
                             // Snapshot synthetic child registrations under the lock so we don't
                             // hold the parent description lock while recursively checking child readiness!
                             let synthetic_children: Vec<(
@@ -1450,7 +1445,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
                                 .values()
                                 .filter_map(|reg| {
                                     let target = reg.target.as_ref()?;
-                                    if !target.has_host_poll_source() {
+                                    if !reg.host_poll_source {
                                         Some((
                                             std::sync::Arc::clone(target),
                                             LinuxEpollEvents::from_bits_retain(reg.event.events),
