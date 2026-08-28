@@ -5795,7 +5795,7 @@ impl SyscallDispatcher {
         // closing) — a dup'd fd sharing the Arc keeps the writer/pty alive.
         let last_ref = open_file.description.fd_ref_count() == 1;
         let mut pty_master_index = None;
-        let mut fifo_host_fd = None;
+        let mut fifo_writer_closed = false;
         let mut closing_inotify = None;
         let mut closing_fanotify = false;
         if last_ref {
@@ -5837,7 +5837,11 @@ impl SyscallDispatcher {
                 }
                 match &*open {
                     OpenDescription::HostPipe { pty, host_fd, .. } => {
-                        fifo_host_fd = Some(host_fd.raw());
+                        // Unregister while the owned host descriptor is still
+                        // alive. Waiting until after `close_open_file` would
+                        // let another thread reuse the raw fd number and turn
+                        // this removal into an ABA against the new owner.
+                        fifo_writer_closed = crate::dispatch::fifo_beacon::register_close(host_fd);
                         if let Some(role) = pty
                             && role.is_master
                         {
@@ -5894,9 +5898,7 @@ impl SyscallDispatcher {
         // A FIFO write-end close drops a beacon writer — wake epoll/poll so FIFO
         // read-ends re-check the (kernel-decided) EOF (see dispatch::fifo_beacon).
         // No-op for non-FIFO host pipes.
-        if let Some(host_fd) = fifo_host_fd
-            && crate::dispatch::fifo_beacon::register_close(host_fd)
-        {
+        if fifo_writer_closed {
             self.notify_inmem_epoll();
         }
     }

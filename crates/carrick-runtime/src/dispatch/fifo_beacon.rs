@@ -28,6 +28,8 @@
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
+use super::fd_table::HostFdRef;
+
 struct Beacon {
     /// Read end of the beacon pipe (carrick-held). `poll`ing it reports POLLHUP
     /// once every writer's beacon-write fd has closed.
@@ -117,10 +119,13 @@ pub(crate) fn register_open(host_fd: i32, access_idx: u32) {
     }
 }
 
-/// Unregister a closing FIFO host fd. Returns `true` if it was a writer (the
-/// caller should then wake epoll/poll so read-ends re-check the beacon — the
-/// close may have dropped the writer count to zero).
-pub(crate) fn register_close(host_fd: i32) -> bool {
+/// Unregister a closing FIFO host fd while its owner is still alive. Returns
+/// `true` if it was a writer (the caller should then wake epoll/poll so
+/// read-ends re-check the beacon — the close may have dropped the writer count
+/// to zero). Borrowing the owner makes raw-fd reuse between unregister and
+/// close impossible.
+pub(crate) fn register_close(host_fd: &HostFdRef) -> bool {
+    let host_fd = host_fd.raw();
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let read_id = st.read_ends.remove(&host_fd);
     // Find which FIFO (if any) this fd was a writer for.
@@ -199,6 +204,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn register_close_requires_a_live_host_fd_owner() {
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let writer = crate::dispatch::fd_table::HostFdRef::new(fds[1]);
+
+        assert!(!register_close(&writer));
+
+        unsafe { libc::close(fds[0]) };
+    }
+
+    #[test]
     fn writer_reopen_rearms_a_live_reader_beacon() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("reopen-fifo");
@@ -208,38 +224,47 @@ mod tests {
 
         let read_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
         assert!(read_fd >= 0, "open read end");
-        register_open(read_fd, 0);
+        let read_fd = HostFdRef::new(read_fd);
+        register_open(read_fd.raw(), 0);
 
         let first_writer =
             unsafe { libc::open(c_path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
         assert!(first_writer >= 0, "open first writer");
-        register_open(first_writer, 1);
-        assert!(!read_end_at_eof(read_fd), "live writer keeps beacon armed");
+        let first_writer = HostFdRef::new(first_writer);
+        register_open(first_writer.raw(), 1);
+        assert!(
+            !read_end_at_eof(read_fd.raw()),
+            "live writer keeps beacon armed"
+        );
 
-        assert!(register_close(first_writer));
-        unsafe { libc::close(first_writer) };
-        assert!(read_end_at_eof(read_fd), "last writer close reports EOF");
+        assert!(register_close(&first_writer));
+        drop(first_writer);
+        assert!(
+            read_end_at_eof(read_fd.raw()),
+            "last writer close reports EOF"
+        );
 
         let second_writer =
             unsafe { libc::open(c_path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
         assert!(second_writer >= 0, "open replacement writer");
-        register_open(second_writer, 1);
+        let second_writer = HostFdRef::new(second_writer);
+        register_open(second_writer.raw(), 1);
         assert!(
-            !read_end_at_eof(read_fd),
+            !read_end_at_eof(read_fd.raw()),
             "replacement writer must re-arm the retained reader beacon"
         );
 
-        assert!(register_close(second_writer));
-        unsafe { libc::close(second_writer) };
+        assert!(register_close(&second_writer));
+        drop(second_writer);
         assert!(
-            read_end_at_eof(read_fd),
+            read_end_at_eof(read_fd.raw()),
             "replacement writer close must restore EOF"
         );
-        assert!(!register_close(read_fd));
+        assert!(!register_close(&read_fd));
         assert!(
-            !has_beacon_for_fd(read_fd),
+            !has_beacon_for_fd(read_fd.raw()),
             "last reader close must remove the exhausted beacon"
         );
-        unsafe { libc::close(read_fd) };
+        drop(read_fd);
     }
 }

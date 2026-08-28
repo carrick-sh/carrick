@@ -4900,9 +4900,11 @@ mod netlink_readiness_tests {
         // Open read end (O_NONBLOCK | O_RDONLY)
         let rfd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
         assert!(rfd >= 0, "open fifo read end");
+        let read_host_fd = HostFdRef::new(rfd);
         // Open write end (O_NONBLOCK | O_WRONLY)
         let wfd = unsafe { libc::open(c_path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
         assert!(wfd >= 0, "open fifo write end");
+        let write_host_fd = HostFdRef::new(wfd);
 
         // Register with fifo_beacon
         crate::dispatch::fifo_beacon::register_open(rfd, 0);
@@ -4911,7 +4913,7 @@ mod netlink_readiness_tests {
         let read_pipe = OpenFile::from_open_description_with_status_flags(
             Arc::new(RwLock::new(OpenDescription::HostPipe {
                 base: OpenDescriptionBase::new(LINUX_O_RDONLY | LINUX_O_NONBLOCK),
-                host_fd: HostFdRef::new(rfd),
+                host_fd: read_host_fd.clone(),
                 is_read_end: true,
                 pipe_id: 601,
                 pty: None,
@@ -4929,9 +4931,9 @@ mod netlink_readiness_tests {
         // Write data into FIFO before writer close so read end has buffered data
         assert_eq!(unsafe { libc::write(wfd, b"data".as_ptr().cast(), 4) }, 4);
 
-        // Close writer and notify beacon (wfd is unmanaged by HostFdRef, so manually close it)
-        assert!(crate::dispatch::fifo_beacon::register_close(wfd));
-        unsafe { libc::close(wfd) };
+        // Unregister while ownership keeps the raw fd live, then close it.
+        assert!(crate::dispatch::fifo_beacon::register_close(&write_host_fd));
+        drop(write_host_fd);
 
         // Buffered data plus EOF: IN interest receives IN | HUP (buffered data does not mask HUP)
         let ready_in = dispatcher.epoll_ready_events(guest_rfd, LINUX_EPOLLIN);
@@ -4963,7 +4965,7 @@ mod netlink_readiness_tests {
         );
 
         // Unregister reader from beacon; HostFdRef will close rfd when dropped
-        assert!(!crate::dispatch::fifo_beacon::register_close(rfd));
+        assert!(!crate::dispatch::fifo_beacon::register_close(&read_host_fd));
 
         // Prove this FIFO's beacon and read end are cleanly removed on full lifecycle completion
         assert!(
