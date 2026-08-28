@@ -182,49 +182,6 @@ pub const SHARD_0_PROBES: &[&str] = &[
 
 const CACHED_SHARD_0_PROBE_COUNT: usize = 136;
 
-/// Complete baseline expected gaps for musl on arm64.
-pub const MUSL_BASELINE_GAPS: &[&str] = &[
-    "budget_two_proc",
-    "childsubreaper",
-    "execfromthread",
-    "execthreads",
-    "futexforkwakegroups",
-    "mqnotifycrossproc",
-    "pidnsroot",
-    "ppid",
-    "procpeerdir",
-    "procpeermem",
-    "ptyflagmatrix",
-    "rlimitnproc",
-    "shmnestedfork",
-    "sysinfo",
-    "telemetrymap",
-    "vforkexecthread",
-    "vfs_mount_rw",
-];
-
-/// Complete baseline expected gaps for gnu on arm64.
-pub const GNU_BASELINE_GAPS: &[&str] = &[
-    "budget_two_proc",
-    "childsubreaper",
-    "execfromthread",
-    "execthreads",
-    "killchld",
-    "pidnsroot",
-    "ppid",
-    "procpeerdir",
-    "procpeermem",
-    "ptraceattach",
-    "ptyflagmatrix",
-    "rlimitnproc",
-    "setidthreadchurn",
-    "shmnestedfork",
-    "sysinfo",
-    "telemetrymap",
-    "vforkexecthread",
-    "vfs_mount_rw",
-];
-
 /// Derive the shard 0 subset from a complete baseline set.
 pub fn expected_shard_gaps(baseline: &[&'static str]) -> BTreeSet<&'static str> {
     let shard_set: BTreeSet<&str> = SHARD_0_PROBES.iter().copied().collect();
@@ -451,23 +408,29 @@ fn test_shard_0_inventory() {
 
 #[test]
 fn test_shard_0_expected_gaps_derivation() {
-    let musl_shard_gaps = expected_shard_gaps(MUSL_BASELINE_GAPS);
-    let gnu_shard_gaps = expected_shard_gaps(GNU_BASELINE_GAPS);
+    let musl_shard_gaps = expected_shard_gaps(common::MUSL_BASELINE_GAPS);
+    let gnu_shard_gaps = expected_shard_gaps(common::GNU_BASELINE_GAPS);
 
     let expected_musl_set = BTreeSet::from([
         "budget_two_proc",
         "childsubreaper",
-        "execthreads",
-        "rlimitnproc",
+        "mprotectexec",
+        "pidnsroot",
+        "procpeerdir",
+        "siginfo",
+        "sigpairrace",
+        "sigtimedwaitintr",
+        "sigwaitblock",
     ]);
 
     let expected_gnu_set = BTreeSet::from([
         "budget_two_proc",
         "childsubreaper",
-        "execthreads",
-        "killchld",
-        "rlimitnproc",
-        "setidthreadchurn",
+        "pidnsroot",
+        "procpeerdir",
+        "siginfo",
+        "sigpairrace",
+        "sigwaitblock",
     ]);
 
     assert_eq!(
@@ -565,8 +528,8 @@ fn test_probe_binary_locator_and_gap_counts() {
     );
 
     // Hard-assert the exact number of derived shard 0 baseline gaps.
-    let musl_shard_gaps = expected_shard_gaps(MUSL_BASELINE_GAPS);
-    let gnu_shard_gaps = expected_shard_gaps(GNU_BASELINE_GAPS);
+    let musl_shard_gaps = expected_shard_gaps(common::MUSL_BASELINE_GAPS);
+    let gnu_shard_gaps = expected_shard_gaps(common::GNU_BASELINE_GAPS);
     assert_eq!(
         musl_shard_gaps.len(),
         9,
@@ -574,8 +537,8 @@ fn test_probe_binary_locator_and_gap_counts() {
     );
     assert_eq!(
         gnu_shard_gaps.len(),
-        9,
-        "gnu shard 0 must contain exactly 9 baseline gaps"
+        7,
+        "gnu shard 0 must contain exactly 7 baseline gaps"
     );
 }
 
@@ -598,8 +561,8 @@ fn generic_probe_shard_0() {
 
     for (target, libc) in targets {
         let expected_gaps: BTreeSet<&str> = match libc {
-            "musl" => expected_shard_gaps(MUSL_BASELINE_GAPS),
-            "gnu" => expected_shard_gaps(GNU_BASELINE_GAPS),
+            "musl" => expected_shard_gaps(common::MUSL_BASELINE_GAPS),
+            "gnu" => expected_shard_gaps(common::GNU_BASELINE_GAPS),
             _ => unreachable!(),
         }
         .intersection(&selected_set)

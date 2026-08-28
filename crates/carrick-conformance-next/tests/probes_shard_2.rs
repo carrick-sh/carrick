@@ -162,52 +162,6 @@ pub const SHARD_2_PROBES: &[&str] = &[
 
 const CACHED_SHARD_2_PROBE_COUNT: usize = 134;
 
-const MUSL_BASELINE_GAPS: &[&str] = &[
-    "budget_two_proc",
-    "cluster10errno",
-    "coredumpfile",
-    "execfromthread",
-    "execthreads",
-    "mprotectexec",
-    "mqnotifycrossproc",
-    "pidfdprocdir",
-    "pidnsroot",
-    "proclife",
-    "procpeerdir",
-    "shmnestedfork",
-    "siginfo",
-    "sigpairrace",
-    "sigtimedwaitintr",
-    "sigwaitblock",
-    "sysinfo",
-    "telemetrymap",
-    "vforkexecthread",
-    "vfs_mount_rw",
-];
-
-const GNU_BASELINE_GAPS: &[&str] = &[
-    "budget_two_proc",
-    "clonefsumask",
-    "cluster10errno",
-    "coredumpfile",
-    "execfromthread",
-    "execthreads",
-    "killchld",
-    "mmapfileshare_mt",
-    "pidfdprocdir",
-    "pidnsroot",
-    "proclife",
-    "procpeerdir",
-    "shmnestedfork",
-    "siginfo",
-    "sigpairrace",
-    "sigwaitblock",
-    "sysinfo",
-    "telemetrymap",
-    "vforkexecthread",
-    "vfs_mount_rw",
-];
-
 /// Launch policy for a probe.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ProbeLaunchPolicy {
@@ -533,12 +487,12 @@ fn generic_probe_shard_2() {
         (
             "aarch64-unknown-linux-musl",
             "musl",
-            expected_gaps_for_shard(MUSL_BASELINE_GAPS),
+            expected_gaps_for_shard(common::MUSL_BASELINE_GAPS),
         ),
         (
             "aarch64-unknown-linux-gnu",
             "gnu",
-            expected_gaps_for_shard(GNU_BASELINE_GAPS),
+            expected_gaps_for_shard(common::GNU_BASELINE_GAPS),
         ),
     ];
 

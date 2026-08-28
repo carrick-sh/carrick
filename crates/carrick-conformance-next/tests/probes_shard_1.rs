@@ -173,12 +173,10 @@ pub const SHARD_1_PROBES: &[&str] = &[
 const CACHED_SHARD_1_PROBE_COUNT: usize = 136;
 
 /// Shard 1 subset of baseline expected oracle mismatches for musl.
-pub const MUSL_SHARD_1_EXPECTED_GAPS: &[&str] =
-    &["eventwaitmatrix", "lifecycleflagmatrix", "vfs_mount_rw"];
+pub const MUSL_SHARD_1_EXPECTED_GAPS: &[&str] = common::MUSL_BASELINE_GAPS;
 
 /// Shard 1 subset of baseline expected oracle mismatches for gnu.
-pub const GNU_SHARD_1_EXPECTED_GAPS: &[&str] =
-    &["eventwaitmatrix", "lifecycleflagmatrix", "vfs_mount_rw"];
+pub const GNU_SHARD_1_EXPECTED_GAPS: &[&str] = common::GNU_BASELINE_GAPS;
 
 /// Drop carrick's scratch warning so output lines up with Docker's.
 pub fn normalize(s: &str) -> String {
