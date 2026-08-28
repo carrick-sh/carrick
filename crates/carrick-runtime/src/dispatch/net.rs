@@ -895,17 +895,9 @@ impl SyscallDispatcher {
         if current_desc.id() == target_id || depth >= 5 || !seen.insert(current_desc.id()) {
             return true;
         }
-        let Some(open) = current_desc.read() else {
+        let Some(children) = current_desc.epoll_targets() else {
             return false;
         };
-        let OpenDescription::Epoll { interest, .. } = &*open else {
-            return false;
-        };
-        let children: Vec<_> = interest
-            .values()
-            .filter_map(|reg| reg.target.clone())
-            .collect();
-        drop(open);
         children
             .into_iter()
             .any(|child| self.epoll_path_reaches_desc(&child, target_id, depth + 1, seen))
@@ -3696,6 +3688,16 @@ mod synthetic_datagram_readiness_tests {
 }
 
 #[cfg(test)]
+fn epoll_kqueue_for_wake_test(dispatcher: &SyscallDispatcher) -> crate::dispatch::EpollKqueue {
+    let mut mux = crate::event_mux::make_event_multiplexer().expect("event multiplexer");
+    mux.register_user(0).expect("register user wake");
+    crate::dispatch::EpollKqueue::new(
+        mux,
+        Arc::clone(dispatcher.captured_file_table().epoll_wake_registry()),
+    )
+}
+
+#[cfg(test)]
 mod dns_gateway_wake_tests {
     use super::*;
     use hickory_proto::op::{Message, Query};
@@ -3746,12 +3748,7 @@ mod dns_gateway_wake_tests {
         // Exactly what `epoll_create1` builds (net.rs:4430-4439): a multiplexer
         // with its user-wake armed, registered in THIS dispatcher's wake
         // registry.
-        let mut mux = crate::event_mux::make_event_multiplexer().expect("event multiplexer");
-        mux.register_user(0).expect("register user wake");
-        let epoll = crate::dispatch::EpollKqueue::new(
-            mux,
-            Arc::clone(dispatcher.captured_file_table().epoll_wake_registry()),
-        );
+        let epoll = epoll_kqueue_for_wake_test(&dispatcher);
         assert!(
             !poll_fd_readable(epoll.poll_fd()),
             "a fresh epoll instance must be quiet"
@@ -4114,6 +4111,16 @@ mod staged_splice_readiness_tests {
 mod netlink_readiness_tests {
     use super::*;
 
+    fn poll_fd_readable(fd: i32) -> bool {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd as *mut _, 1, 0) };
+        rc == 1 && pfd.revents & libc::POLLIN != 0
+    }
+
     #[test]
     fn epoll_and_poll_agree_that_a_queued_netlink_dump_is_readable() {
         let dispatcher = SyscallDispatcher::new();
@@ -4377,6 +4384,77 @@ mod netlink_readiness_tests {
     }
 
     #[test]
+    fn epoll_ctl_rejects_two_description_cycle_with_eloop() {
+        fn epoll_open_file() -> OpenFile {
+            let mut mux = crate::event_mux::make_event_multiplexer().expect("mux");
+            mux.register_user(0).expect("register user wake");
+            OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(OpenDescription::Epoll {
+                    base: OpenDescriptionBase::new(0),
+                    interest: HashMap::new(),
+                    pending_ready: VecDeque::new(),
+                    kqueue: Arc::new(crate::dispatch::EpollKqueue::new(
+                        mux,
+                        crate::dispatch::new_epoll_wake_registry(),
+                    )),
+                })),
+                0,
+                0,
+            )
+        }
+
+        let mut dispatcher = SyscallDispatcher::new();
+        let first = dispatcher
+            .install_fd_at_or_above(3, epoll_open_file())
+            .expect("first epoll");
+        let second = dispatcher
+            .install_fd_at_or_above(4, epoll_open_file())
+            .expect("second epoll");
+        let mut guest_mem = crate::dispatch::LinearMemory::new(0x1000, vec![0; 0x1000]);
+        let event_ptr = 0x1000u64;
+        let mut guest_event = [0u8; 12];
+        guest_event[0..4].copy_from_slice(&LINUX_EPOLLIN.to_le_bytes());
+        guest_mem.write_bytes(event_ptr, &guest_event).unwrap();
+        let kernel = dispatcher.capture_one_task_context().unwrap();
+        let reporter = crate::compat::CompatReporter::default();
+
+        let first_adds_second = SyscallRequest::new(
+            21,
+            SyscallArgs::from([
+                first as u64,
+                LINUX_EPOLL_CTL_ADD,
+                second as u64,
+                event_ptr,
+                0,
+                0,
+            ]),
+        );
+        assert!(matches!(
+            dispatcher.dispatch(&kernel, first_adds_second, &mut guest_mem, &reporter),
+            Ok(DispatchOutcome::Returned { value: 0 })
+        ));
+
+        let second_adds_first = SyscallRequest::new(
+            21,
+            SyscallArgs::from([
+                second as u64,
+                LINUX_EPOLL_CTL_ADD,
+                first as u64,
+                event_ptr,
+                0,
+                0,
+            ]),
+        );
+        assert!(
+            matches!(
+                dispatcher.dispatch(&kernel, second_adds_first, &mut guest_mem, &reporter),
+                Ok(DispatchOutcome::Errno { errno }) if errno == carrick_abi::LINUX_ELOOP
+            ),
+            "adding the reverse description edge must reject the cycle with ELOOP"
+        );
+    }
+
+    #[test]
     fn epoll_readiness_tracks_stored_target_identity_after_fd_close_and_reuse() {
         let dispatcher = SyscallDispatcher::new();
         let child_open_file = OpenFile::from_open_description_with_status_flags(
@@ -4475,9 +4553,44 @@ mod netlink_readiness_tests {
     }
 
     #[test]
-    fn pidfd_and_inotify_readiness_reports_in_when_host_poll_fd_ready() {
+    fn pidfd_readiness_transitions_to_in_when_exit_is_published() {
         let dispatcher = SyscallDispatcher::new();
-        // Create an inotify description with a valid inotify state
+        let mut mux = crate::event_mux::make_event_multiplexer().expect("pidfd multiplexer");
+        mux.register_user(0).expect("register pidfd user wake");
+        let watch = Arc::new(PidfdWatch::new(mux));
+        let pidfd = OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::Pidfd {
+                base: OpenDescriptionBase::new(0),
+                target: PidfdTarget::Host(1234),
+                kqueue: Arc::clone(&watch),
+            })),
+            0,
+            0,
+        );
+
+        assert_eq!(
+            pidfd
+                .description
+                .readiness(carrick_abi::LinuxEpollEvents::IN, &dispatcher),
+            carrick_abi::LinuxEpollEvents::empty(),
+            "a live pidfd target is not readable"
+        );
+
+        watch.publish_exit();
+
+        assert_eq!(
+            pidfd
+                .description
+                .readiness(carrick_abi::LinuxEpollEvents::IN, &dispatcher)
+                & carrick_abi::LinuxEpollEvents::IN,
+            carrick_abi::LinuxEpollEvents::IN,
+            "publishing target exit must make pidfd readable"
+        );
+    }
+
+    #[test]
+    fn queued_dispatch_inotify_event_is_readable_without_a_host_vnode_edge() {
+        let dispatcher = SyscallDispatcher::new();
         let inotify_state = Arc::new(crate::inotify::InotifyState::new().expect("inotify state"));
         let inotify_open_file = OpenFile::from_open_description_with_status_flags(
             Arc::new(RwLock::new(OpenDescription::Inotify {
@@ -4488,22 +4601,20 @@ mod netlink_readiness_tests {
             0,
         );
         let inotify_desc = Arc::clone(&inotify_open_file.description);
-        let inotify_fd = dispatcher
-            .install_fd_at_or_above(5, inotify_open_file)
-            .expect("inotify fd");
-
-        assert!(
-            inotify_desc.has_host_poll_source(),
-            "inotify has host poll source"
-        );
-        // Empty inotify is not ready
         assert_eq!(
             inotify_desc.readiness(carrick_abi::LinuxEpollEvents::IN, &dispatcher),
-            carrick_abi::LinuxEpollEvents::empty()
+            carrick_abi::LinuxEpollEvents::empty(),
+            "an empty inotify instance is not readable"
         );
+
+        let wd = inotify_state.add_virtual_watch(carrick_abi::LINUX_IN_MODIFY);
+        inotify_state.enqueue(wd, carrick_abi::LINUX_IN_MODIFY, 0, None);
+
         assert_eq!(
-            dispatcher.poll_ready_events(inotify_fd, LINUX_POLLIN) & LINUX_POLLIN,
-            0
+            inotify_desc.readiness(carrick_abi::LinuxEpollEvents::IN, &dispatcher)
+                & carrick_abi::LinuxEpollEvents::IN,
+            carrick_abi::LinuxEpollEvents::IN,
+            "dispatch-synthesized inotify records must be readable even when the host poll fd is quiet"
         );
     }
 
@@ -4544,17 +4655,13 @@ mod netlink_readiness_tests {
                 reg_gen: 0,
             },
         );
-        let mut mux = crate::event_mux::make_event_multiplexer().expect("mux");
-        mux.register_user(0).expect("register user wake");
+        let epoll_kqueue = Arc::new(epoll_kqueue_for_wake_test(&dispatcher));
         let epoll_open_file = OpenFile::from_open_description_with_status_flags(
             Arc::new(RwLock::new(OpenDescription::Epoll {
                 base: OpenDescriptionBase::new(0),
                 interest: interest_map,
                 pending_ready: VecDeque::new(),
-                kqueue: Arc::new(crate::dispatch::EpollKqueue::new(
-                    mux,
-                    crate::dispatch::new_epoll_wake_registry(),
-                )),
+                kqueue: Arc::clone(&epoll_kqueue),
             })),
             0,
             0,
@@ -4565,6 +4672,10 @@ mod netlink_readiness_tests {
 
         // Before sending request, epoll is not ready
         assert_eq!(dispatcher.epoll_ready_events(epfd, LINUX_EPOLLIN), 0);
+        assert!(
+            !poll_fd_readable(epoll_kqueue.poll_fd()),
+            "the instance wake fd must be quiet before netlink publishes a reply"
+        );
 
         // Perform netlink_send by sending a dump request
         let mut guest_mem = crate::dispatch::LinearMemory::new(0x1000, vec![0; 0x2000]);
@@ -4589,6 +4700,10 @@ mod netlink_readiness_tests {
             outcome,
             Ok(DispatchOutcome::Returned { value: 16 })
         ));
+        assert!(
+            poll_fd_readable(epoll_kqueue.poll_fd()),
+            "netlink reply publication must pulse the epoll instance wake fd"
+        );
 
         // After netlink_send, epoll must be IN-ready!
         assert_eq!(

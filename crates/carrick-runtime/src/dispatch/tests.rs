@@ -5555,6 +5555,12 @@ fn a_backing_with_no_open_description_answers_generic_questions_without_aborting
             false
         }
 
+        fn epoll_targets(
+            &self,
+        ) -> Option<Vec<std::sync::Arc<crate::kernel::FileDescription>>> {
+            None
+        }
+
         fn snapshot_until(
             &self,
             _deadline: std::time::Instant,

@@ -529,6 +529,11 @@ pub(crate) const NO_READINESS_CONTEXT: &NoReadinessContext = &NoReadinessContext
 pub(crate) trait FileDescriptionBacking: Any + Send + Sync {
     fn is_epoll(&self) -> bool;
 
+    /// Snapshot the description identities registered by an epoll backing.
+    /// `None` means this is not an epoll description. Callers receive owned
+    /// identities so they never hold a backing lock while walking the graph.
+    fn epoll_targets(&self) -> Option<Vec<Arc<FileDescription>>>;
+
     #[allow(dead_code)]
     fn is_closed(&self) -> bool {
         false
@@ -841,6 +846,20 @@ impl FileDescription {
             FileDescriptionKind::Concrete(backing) => backing.0.is_epoll(),
             FileDescriptionKind::Regular => false,
             FileDescriptionKind::Epoll(_) => true,
+        }
+    }
+
+    pub(crate) fn epoll_targets(&self) -> Option<Vec<Arc<Self>>> {
+        match &self.kind {
+            FileDescriptionKind::Concrete(backing) => backing.0.epoll_targets(),
+            FileDescriptionKind::Regular => None,
+            FileDescriptionKind::Epoll(interests) => Some(
+                interests
+                    .lock()
+                    .values()
+                    .filter_map(Weak::upgrade)
+                    .collect(),
+            ),
         }
     }
 
