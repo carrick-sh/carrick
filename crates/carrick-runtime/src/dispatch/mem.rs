@@ -3759,7 +3759,7 @@ impl SyscallDispatcher {
             let secretmem_backed = !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                 && this
                     .open_file(fd.0)
-                    .is_some_and(|open_file| open_file.description.read().is_secretmem());
+                    .is_some_and(|open_file| open_file.description.common().secretmem());
             if secretmem_backed && map_sharing == MmapSharing::Private {
                 return Ok(request.refused(
                     MmapRefusal::Spec("MAP_PRIVATE mapping of a memfd_secret fd"),

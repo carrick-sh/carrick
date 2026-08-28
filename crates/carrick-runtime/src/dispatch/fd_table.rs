@@ -245,21 +245,10 @@ pub(super) struct OpenDescriptionBase {
     /// carrying it entirely once every reader goes through the description
     /// (see the deletion commit in this series).
     common: std::sync::Arc<crate::kernel::objects::DescriptionCommon>,
-    /// Linux file-lease state (F_SETLEASE/F_GETLEASE): F_RDLCK(0)/F_WRLCK(1)/
-    /// F_UNLCK(2). Lives on the open-file-description so a dup'd fd shares it,
-    /// matching the kernel. Default F_UNLCK = no lease.
-    lease: i32,
     /// SO_RCVTIMEO: bounds a blocking recv on this socket. None = block forever.
     recv_timeout: Option<Duration>,
     /// SO_SNDTIMEO: bounds a blocking send on this socket. None = block forever.
     send_timeout: Option<Duration>,
-    /// F_SETOWN/F_SETOWN_EX async-I/O owner (the SIGIO/SIGURG target). `owner_type`
-    /// is F_OWNER_TID/PID/PGRP; `owner_pid` is the positive id. (0, 0) = no owner.
-    /// Stored on the description so a dup'd fd shares it, matching the kernel.
-    owner_type: i32,
-    owner_pid: i32,
-    /// F_SETSIG: the signal delivered on async I/O (0 = the default SIGIO).
-    async_sig: i32,
     /// Pipe capacity reported by F_GETPIPE_SZ and (re)set by F_SETPIPE_SZ.
     /// Lives on the open-file-description so a dup'd fd shares it (matching the
     /// kernel). Only meaningful for pipe ends; default = the Linux pipe buffer
@@ -323,20 +312,6 @@ pub(super) struct OpenDescriptionBase {
     /// after a datagram is sent. Store that errno here and copy it into
     /// `pending_socket_error` after each successful connected send.
     socket_error_after_send: Option<i32>,
-    /// File-sealing state (memfd_create(2)/fcntl F_ADD_SEALS/F_GET_SEALS). `None`
-    /// means this description does not support sealing (F_GET_SEALS/F_ADD_SEALS →
-    /// EINVAL); `Some(bits)` is the current seal set of a sealable memfd (empty
-    /// when created with MFD_ALLOW_SEALING, F_SEAL_SEAL preset otherwise). Lives
-    /// on the open-file description so a dup'd fd shares it, matching the kernel's
-    /// per-inode seal set for the common dup path.
-    seals: Option<u32>,
-    /// True for a `memfd_secret(2)` description. Secret memory has no file
-    /// read/write methods (read(2)/write(2)/pread/readv/… → EINVAL, and it can
-    /// never be a splice/sendfile endpoint), must be mapped MAP_SHARED (a
-    /// MAP_PRIVATE mmap → EINVAL), and its mapped pages are hidden from
-    /// `/proc/<pid>/mem`. Lives on the open-file description so a dup'd fd
-    /// shares it, matching the kernel's per-inode secretmem state.
-    secretmem: bool,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -362,16 +337,10 @@ impl OpenDescriptionBase {
             connect_in_progress: false,
             pending_socket_error: None,
             socket_error_after_send: None,
-            lease: crate::linux_abi::LINUX_F_UNLCK,
             recv_timeout: None,
             send_timeout: None,
-            owner_type: 0,
-            owner_pid: 0,
-            async_sig: 0,
             pipe_capacity: crate::linux_abi::LINUX_PIPE_BUF_SIZE,
             pipe_capacity_shared: None,
-            seals: None,
-            secretmem: false,
         }
     }
 
@@ -380,19 +349,19 @@ impl OpenDescriptionBase {
     }
 
     pub(super) fn seals(&self) -> Option<u32> {
-        self.seals
+        self.common.seals()
     }
 
-    pub(super) fn set_seals(&mut self, seals: Option<u32>) {
-        self.seals = seals;
+    pub(super) fn set_seals(&self, seals: Option<u32>) {
+        self.common.set_seals(seals);
     }
 
     pub(super) fn secretmem(&self) -> bool {
-        self.secretmem
+        self.common.secretmem()
     }
 
-    pub(super) fn set_secretmem(&mut self, secretmem: bool) {
-        self.secretmem = secretmem;
+    pub(super) fn set_secretmem(&self, secretmem: bool) {
+        self.common.set_secretmem(secretmem);
     }
 
     /// Route pipe capacity through a cell shared with the pipe's other end.
@@ -461,34 +430,43 @@ impl OpenDescriptionBase {
     }
 
     /// F_GETOWN_EX returns the (type, pid); (0, 0) means no owner set.
+    #[allow(dead_code)]
     pub(super) fn owner(&self) -> (i32, i32) {
-        (self.owner_type, self.owner_pid)
+        let owner = self.common.owner();
+        (owner.owner_type, owner.owner_pid)
     }
 
-    pub(super) fn set_owner(&mut self, owner_type: i32, owner_pid: i32) {
-        self.owner_type = owner_type;
-        self.owner_pid = owner_pid;
+    #[allow(dead_code)]
+    pub(super) fn set_owner(&self, owner_type: i32, owner_pid: i32) {
+        self.common.set_owner(crate::kernel::objects::AsyncIoOwner {
+            owner_type,
+            owner_pid,
+        });
     }
 
     /// F_GETSIG: 0 = the default SIGIO.
+    #[allow(dead_code)]
     pub(super) fn async_sig(&self) -> i32 {
-        self.async_sig
+        self.common.async_sig()
     }
 
-    pub(super) fn set_async_sig(&mut self, sig: i32) {
-        self.async_sig = sig;
+    #[allow(dead_code)]
+    pub(super) fn set_async_sig(&self, sig: i32) {
+        self.common.set_async_sig(sig);
     }
 
     pub(super) fn set_status_flags(&self, next: u64) {
         self.common.set_status_flags(next);
     }
 
+    #[allow(dead_code)]
     pub(super) fn lease(&self) -> i32 {
-        self.lease
+        self.common.lease()
     }
 
-    pub(super) fn set_lease(&mut self, lease: i32) {
-        self.lease = lease;
+    #[allow(dead_code)]
+    pub(super) fn set_lease(&self, lease: i32) {
+        self.common.set_lease(lease);
     }
 
     pub(super) fn recv_timeout(&self) -> Option<Duration> {
@@ -1509,11 +1487,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
     }
 
     fn fd_ref_count(&self) -> usize {
-        let description = self.read();
-        match &*description {
-            OpenDescription::Closed { .. } => 0,
-            _ => description.fd_ref_count(),
-        }
+        self.read().fd_ref_count()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -1811,15 +1785,24 @@ impl OpenDescription {
     }
 
     pub(super) fn retain_fd_ref(&self) {
-        self.base().common().retain_fd_ref();
+        match self {
+            OpenDescription::Closed { .. } => {}
+            _ => self.base().common().retain_fd_ref(),
+        }
     }
 
     pub(super) fn release_fd_ref(&self) -> usize {
-        self.base().common().release_fd_ref()
+        match self {
+            OpenDescription::Closed { .. } => 0,
+            _ => self.base().common().release_fd_ref(),
+        }
     }
 
     pub(super) fn fd_ref_count(&self) -> usize {
-        self.base().common().fd_refs()
+        match self {
+            OpenDescription::Closed { .. } => 0,
+            _ => self.base().common().fd_refs(),
+        }
     }
 
     pub(super) fn status_flags(&self) -> u64 {
@@ -1859,45 +1842,54 @@ impl OpenDescription {
     /// True for a `memfd_secret(2)` description: no file read/write methods
     /// (the read/write/splice family is EINVAL), MAP_SHARED-only mmap, and
     /// mapped pages hidden from `/proc/<pid>/mem`.
+    #[allow(dead_code)]
     #[inline]
     pub(super) fn is_secretmem(&self) -> bool {
         self.base().secretmem()
     }
 
-    pub(super) fn set_status_flags(&mut self, next: u64) {
-        self.base_mut().set_status_flags(next);
+    pub(super) fn set_status_flags(&self, next: u64) {
+        self.base().set_status_flags(next);
     }
 
+    #[allow(dead_code)]
     pub(super) fn lease(&self) -> i32 {
         self.base().lease()
     }
 
-    pub(super) fn set_lease(&mut self, lease: i32) {
-        self.base_mut().set_lease(lease);
+    #[allow(dead_code)]
+    pub(super) fn set_lease(&self, lease: i32) {
+        self.base().set_lease(lease);
     }
 
+    #[allow(dead_code)]
     pub(super) fn seals(&self) -> Option<u32> {
         self.base().seals()
     }
 
-    pub(super) fn set_seals(&mut self, seals: Option<u32>) {
-        self.base_mut().set_seals(seals);
+    #[allow(dead_code)]
+    pub(super) fn set_seals(&self, seals: Option<u32>) {
+        self.base().set_seals(seals);
     }
 
+    #[allow(dead_code)]
     pub(super) fn owner(&self) -> (i32, i32) {
         self.base().owner()
     }
 
-    pub(super) fn set_owner(&mut self, owner_type: i32, owner_pid: i32) {
-        self.base_mut().set_owner(owner_type, owner_pid);
+    #[allow(dead_code)]
+    pub(super) fn set_owner(&self, owner_type: i32, owner_pid: i32) {
+        self.base().set_owner(owner_type, owner_pid);
     }
 
+    #[allow(dead_code)]
     pub(super) fn async_sig(&self) -> i32 {
         self.base().async_sig()
     }
 
-    pub(super) fn set_async_sig(&mut self, sig: i32) {
-        self.base_mut().set_async_sig(sig);
+    #[allow(dead_code)]
+    pub(super) fn set_async_sig(&self, sig: i32) {
+        self.base().set_async_sig(sig);
     }
 
     pub(super) fn pipe_capacity(&self) -> i64 {

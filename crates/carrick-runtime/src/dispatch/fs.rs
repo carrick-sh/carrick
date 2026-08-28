@@ -1693,7 +1693,7 @@ impl SyscallDispatcher {
     /// "memfd secret" rows.)
     pub(super) fn fd_is_secretmem(&self, fd: i32) -> bool {
         self.open_file(fd)
-            .is_some_and(|of| of.description.read().is_secretmem())
+            .is_some_and(|of| of.description.common().secretmem())
     }
 
     /// Build a [`StatRecord`] from a real backing stat, applying the `mknod(2)`
@@ -5124,14 +5124,14 @@ impl SyscallDispatcher {
             registry.retain(|entry| entry.fd != fd);
             return Ok(());
         }
-        {
-            let mut desc = open_file.description.write();
-            if desc.owner().1 == 0 {
-                desc.set_owner(
-                    LINUX_F_OWNER_PID,
-                    crate::namespace::pid::self_ns_pid() as i32,
-                );
-            }
+        if open_file.description.common().owner().owner_pid == 0 {
+            open_file
+                .description
+                .common()
+                .set_owner(crate::kernel::objects::AsyncIoOwner {
+                    owner_type: LINUX_F_OWNER_PID,
+                    owner_pid: crate::namespace::pid::self_ns_pid() as i32,
+                });
         }
         let effective_mask = mask - LinuxDnotifyMask::MULTISHOT;
         if let Some(entry) = registry.iter_mut().find(|entry| entry.fd == fd) {
@@ -8102,14 +8102,14 @@ impl SyscallDispatcher {
                         // F_UNLCK: removing a lease never conflicts.
                         _ => {}
                     }
-                    open_file.description.write().set_lease(lease);
+                    open_file.description.common().set_lease(lease);
                     DispatchOutcome::Returned { value: 0 }
                 }
                 LINUX_F_GETLEASE => {
                     let Some(open_file) = this.open_file(fd.0) else {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     };
-                    let lease = open_file.description.read().lease();
+                    let lease = open_file.description.common().lease();
                     DispatchOutcome::Returned { value: lease as i64 }
                 }
                 // File sealing (memfd_create01). The seal set lives on the
@@ -8119,7 +8119,7 @@ impl SyscallDispatcher {
                     let Some(open_file) = this.open_file(fd.0) else {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     };
-                    match open_file.description.read().seals() {
+                    match open_file.description.common().seals() {
                         Some(seals) => DispatchOutcome::Returned {
                             value: i64::from(seals),
                         },
@@ -8141,14 +8141,14 @@ impl SyscallDispatcher {
                     let Some(open_file) = this.open_file(fd.0) else {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     };
-                    let mut open = open_file.description.write();
-                    let Some(current_raw) = open.seals() else {
+                    let common = open_file.description.common();
+                    let Some(current_raw) = common.seals() else {
                         // Not a sealable fd (regular file, socket, …).
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     };
                     let current = carrick_abi::LinuxMemfdSeals::from_bits_retain(current_raw);
                     // F_ADD_SEALS needs the fd open for writing.
-                    if open.status_flags() & LINUX_O_ACCMODE == LINUX_O_RDONLY {
+                    if common.status_flags() & LINUX_O_ACCMODE == LINUX_O_RDONLY {
                         return Ok(DispatchOutcome::errno(LINUX_EPERM));
                     }
                     // Already fully sealed → no further seals may be added.
@@ -8163,7 +8163,7 @@ impl SyscallDispatcher {
                     {
                         return Ok(DispatchOutcome::errno(LINUX_EBUSY));
                     }
-                    open.set_seals(Some((current | new_seals).bits()));
+                    common.set_seals(Some((current | new_seals).bits()));
                     DispatchOutcome::Returned { value: 0 }
                 }
                 // Async-I/O owner + signal (F_SETOWN/F_GETOWN, F_SETOWN_EX/
@@ -8184,7 +8184,13 @@ impl SyscallDispatcher {
                     } else {
                         (LINUX_F_OWNER_PID, a)
                     };
-                    open_file.description.write().set_owner(owner_type, owner_pid);
+                    open_file
+                        .description
+                        .common()
+                        .set_owner(crate::kernel::objects::AsyncIoOwner {
+                            owner_type,
+                            owner_pid,
+                        });
                     // Refresh the FASYNC registry if O_ASYNC is already armed on
                     // this fd (the owner can be set after O_ASYNC — LTP fcntl31).
                     this.sync_fasync_registration(fd.0);
@@ -8194,12 +8200,12 @@ impl SyscallDispatcher {
                     let Some(open_file) = this.open_file(fd.0) else {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     };
-                    let (owner_type, owner_pid) = open_file.description.read().owner();
+                    let owner = open_file.description.common().owner();
                     // A process-group owner reads back as a negative id.
-                    let val = if owner_type == LINUX_F_OWNER_PGRP {
-                        -owner_pid
+                    let val = if owner.owner_type == LINUX_F_OWNER_PGRP {
+                        -owner.owner_pid
                     } else {
-                        owner_pid
+                        owner.owner_pid
                     };
                     DispatchOutcome::Returned { value: val as i64 }
                 }
@@ -8216,8 +8222,11 @@ impl SyscallDispatcher {
                     }
                     open_file
                         .description
-                        .write()
-                        .set_owner(owner.owner_type, owner.owner_pid);
+                        .common()
+                        .set_owner(crate::kernel::objects::AsyncIoOwner {
+                            owner_type: owner.owner_type,
+                            owner_pid: owner.owner_pid,
+                        });
                     this.sync_fasync_registration(fd.0);
                     DispatchOutcome::Returned { value: 0 }
                 }
@@ -8225,10 +8234,10 @@ impl SyscallDispatcher {
                     let Some(open_file) = this.open_file(fd.0) else {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     };
-                    let (owner_type, owner_pid) = open_file.description.read().owner();
+                    let owner_info = open_file.description.common().owner();
                     let owner = LinuxFOwnerEx {
-                        owner_type,
-                        owner_pid,
+                        owner_type: owner_info.owner_type,
+                        owner_pid: owner_info.owner_pid,
                     };
                     cx.memory.write_struct(arg, &owner)?;
                     DispatchOutcome::Returned { value: 0 }
@@ -8242,7 +8251,7 @@ impl SyscallDispatcher {
                     if !(0..=64).contains(&sig) {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
-                    open_file.description.write().set_async_sig(sig);
+                    open_file.description.common().set_async_sig(sig);
                     // Refresh the registry: F_SETSIG can follow O_ASYNC + F_SETOWN
                     // (LTP fcntl31 sets the signal last), so the armed entry must
                     // pick up the new signal.
@@ -8253,7 +8262,7 @@ impl SyscallDispatcher {
                     let Some(open_file) = this.open_file(fd.0) else {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     };
-                    let sig = open_file.description.read().async_sig();
+                    let sig = open_file.description.common().async_sig();
                     DispatchOutcome::Returned { value: sig as i64 }
                 }
                 _ => DispatchOutcome::errno(LINUX_EINVAL),
@@ -8542,14 +8551,14 @@ impl SyscallDispatcher {
                         let enable =
                             i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) != 0;
                         if let Some(open_file) = this.open_file(fd.0) {
-                            let mut open = open_file.description.write();
-                            let mut status_flags = open.status_flags();
+                            let common = open_file.description.common();
+                            let mut status_flags = common.status_flags();
                             if enable {
                                 status_flags |= LINUX_O_NONBLOCK;
                             } else {
                                 status_flags &= !LINUX_O_NONBLOCK;
                             }
-                            open.set_status_flags(status_flags);
+                            common.set_status_flags(status_flags);
                         }
                         crate::dispatch::net::set_host_nonblocking(host_fd);
                         DispatchOutcome::Returned { value: 0 }
@@ -8910,14 +8919,15 @@ impl SyscallDispatcher {
                     };
                     let enable = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) != 0;
                     if let Some(open_file) = this.open_file(fd.0) {
-                        let mut open = open_file.description.write();
-                        let mut status_flags = open.status_flags();
+                        let common = open_file.description.common();
+                        let mut status_flags = common.status_flags();
                         if enable {
                             status_flags |= LINUX_O_NONBLOCK;
                         } else {
                             status_flags &= !LINUX_O_NONBLOCK;
                         }
-                        open.set_status_flags(status_flags);
+                        common.set_status_flags(status_flags);
+                        let open = open_file.description.read();
                         let host_fd = match &*open {
                             OpenDescription::HostPipe { host_fd, .. }
                             | OpenDescription::HostSocket { host_fd, .. }
@@ -14928,7 +14938,7 @@ impl SyscallDispatcher {
             };
             // A memfd is opened O_RDWR (memfd_create(2)); F_ADD_SEALS requires
             // the description carry write access (FMODE_WRITE).
-            let mut base = OpenDescriptionBase::new(LINUX_O_RDWR);
+            let base = OpenDescriptionBase::new(LINUX_O_RDWR);
             base.set_seals(Some(initial_seals));
             let description = OpenDescription::File {
                 metadata: RootFsMetadata {
@@ -14978,7 +14988,7 @@ impl SyscallDispatcher {
             let path = "/secretmem".to_string();
             // No sealing support: seals stay None (F_GET_SEALS/F_ADD_SEALS →
             // EINVAL), unlike memfd_create.
-            let mut base = OpenDescriptionBase::new(LINUX_O_RDWR);
+            let base = OpenDescriptionBase::new(LINUX_O_RDWR);
             base.set_secretmem(true);
             let description = OpenDescription::File {
                 metadata: RootFsMetadata {
