@@ -524,6 +524,10 @@ impl crate::kernel::FileDescriptionBacking for IoUringBacking {
         false
     }
 
+    fn epoll_targets(&self) -> Option<Vec<std::sync::Arc<crate::kernel::FileDescription>>> {
+        None
+    }
+
     fn snapshot_until(
         &self,
         _deadline: std::time::Instant,

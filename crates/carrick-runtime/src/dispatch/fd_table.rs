@@ -1266,6 +1266,19 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
         )
     }
 
+    fn epoll_targets(&self) -> Option<Vec<std::sync::Arc<crate::kernel::FileDescription>>> {
+        let description = self.read();
+        let OpenDescription::Epoll { interest, .. } = &*description else {
+            return None;
+        };
+        Some(
+            interest
+                .values()
+                .filter_map(|registration| registration.target.clone())
+                .collect(),
+        )
+    }
+
     fn snapshot_until(
         &self,
         deadline: std::time::Instant,
@@ -1479,13 +1492,16 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
                 ready & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP)
             }
             OpenDescription::Inotify { state, .. } => {
+                let mut ready = LinuxEpollEvents::empty();
+                if state.queued_bytes() > 0 {
+                    ready |= LinuxEpollEvents::IN;
+                }
                 let mut pfd = libc::pollfd {
                     fd: state.poll_fd(),
                     events: libc::POLLIN,
                     revents: 0,
                 };
                 let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
-                let mut ready = LinuxEpollEvents::empty();
                 if rc > 0 && pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
                     ready |= LinuxEpollEvents::IN;
                 }
