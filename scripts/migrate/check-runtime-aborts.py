@@ -12,6 +12,7 @@ import sys
 from typing import Sequence
 
 SHARD_NAMES = ("runtime.json", "hvf.json", "vcpu-loop.json")
+REQUIRED_SHARDS = frozenset(SHARD_NAMES)
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,19 @@ class Scope:
     fn_start_token_idx: int = 0
     body_brace_token_idx: int = 0
     is_if_then: bool = False
+    is_if_condition: bool = False
+    restore_pending_test: bool = False
+    restore_test_delimiters: tuple[int, int, int] | None = None
+    restore_pending_if: bool = False
+    restore_pending_if_is_let: bool = False
+    restore_pending_if_let_has_equal: bool = False
+    restore_pending_if_is_for: bool = False
+    restore_pending_if_for_has_in: bool = False
+    restore_pending_if_paren_depth: int = 0
+    restore_pending_if_bracket_depth: int = 0
+    restore_pending_if_expression_brace: bool = False
+    is_macro_tokens: bool = False
+    identity_salt: str = ""
 
 
 def lex_rust(source: str) -> list[Token]:
@@ -558,6 +572,120 @@ def extract_statement_context(tokens: list[Token], abort_idx: int, fn_body_brace
     return tokens[start:end]
 
 
+def is_match_guard_if(tokens: list[Token], if_idx: int) -> bool:
+    """Distinguish `pattern if guard =>` from an `if` expression."""
+
+    paren_depth = 0
+    bracket_depth = 0
+    idx = if_idx + 1
+    expression_prefix = {
+        "if", "=", "&&", "||", "!", "+", "-", "*", "/", "%", "&", "|",
+        "^", "<", ">", "<=", ">=", "==", "!=", "(", "[", ",", "=>",
+        "unsafe", "const",
+    }
+    while idx < len(tokens):
+        text = tokens[idx].text
+        if text == "(":
+            paren_depth += 1
+        elif text == ")":
+            paren_depth = max(0, paren_depth - 1)
+        elif text == "[":
+            bracket_depth += 1
+        elif text == "]":
+            bracket_depth = max(0, bracket_depth - 1)
+        elif paren_depth == 0 and bracket_depth == 0:
+            if text == "=>":
+                return True
+            if text in (";", ","):
+                return False
+            if text == "{":
+                previous = tokens[idx - 1].text if idx > if_idx + 1 else "if"
+                if previous not in expression_prefix:
+                    return False
+                depth = 1
+                idx += 1
+                while idx < len(tokens) and depth > 0:
+                    if tokens[idx].text == "{":
+                        depth += 1
+                    elif tokens[idx].text == "}":
+                        depth -= 1
+                    idx += 1
+                continue
+        idx += 1
+    return False
+
+
+def matching_brace_index(tokens: list[Token], open_idx: int) -> int | None:
+    depth = 0
+    for idx in range(open_idx, len(tokens)):
+        if tokens[idx].text == "{":
+            depth += 1
+        elif tokens[idx].text == "}":
+            depth -= 1
+            if depth == 0:
+                return idx
+    return None
+
+
+def definition_identity(
+    tokens: list[Token],
+    name: str,
+    start_idx: int,
+    body_open_idx: int,
+    scope_salts: Sequence[str] = (),
+) -> str:
+    close_idx = matching_brace_index(tokens, body_open_idx)
+    if close_idx is None:
+        return name
+    definition = "|".join(scope_salts) + "|" + "".join(
+        token.text for token in tokens[start_idx:close_idx + 1]
+    )
+    definition_id = hashlib.sha256(definition.encode("utf-8")).hexdigest()[:12]
+    return f"{name}@{definition_id}"
+
+
+def lexical_salt(tokens: list[Token], start_idx: int | None, end_idx: int) -> str:
+    if start_idx is None:
+        return ""
+    text = "".join(token.text for token in tokens[start_idx:end_idx])
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+def is_cfg_match_pattern_brace(tokens: list[Token], open_idx: int) -> bool:
+    """Whether an attributed brace belongs to a match pattern before `=>`."""
+
+    close_idx = matching_brace_index(tokens, open_idx)
+    if close_idx is None:
+        return False
+    paren_depth = 0
+    bracket_depth = 0
+    brace_depth = 0
+    idx = close_idx + 1
+    while idx < len(tokens):
+        text = tokens[idx].text
+        if text == "(":
+            paren_depth += 1
+        elif text == ")":
+            paren_depth = max(0, paren_depth - 1)
+        elif text == "[":
+            bracket_depth += 1
+        elif text == "]":
+            bracket_depth = max(0, bracket_depth - 1)
+        elif text == "{":
+            brace_depth += 1
+        elif text == "}":
+            if brace_depth == 0:
+                return False
+            brace_depth -= 1
+        elif paren_depth == 0 and bracket_depth == 0 and brace_depth == 0:
+            if text == "=>":
+                return True
+            if text in (",", ";"):
+                return False
+        idx += 1
+    return False
+
+
 def scan_abort_source(
     path: Path | str, source: str
 ) -> Sequence[AbortFinding]:
@@ -567,15 +695,26 @@ def scan_abort_source(
     scopes: list[Scope] = [Scope("root", "<root>", False, 0, 0, 0)]
     pending_test = False
     pending_if = False
+    pending_if_is_let = False
+    pending_if_let_has_equal = False
+    pending_if_is_for = False
+    pending_if_for_has_in = False
+    pending_if_paren_depth = 0
+    pending_if_bracket_depth = 0
+    pending_if_expression_brace = False
     pending_fn: str | None = None
     pending_fn_tok_idx: int = 0
     pending_fn_is_test = False
     pending_impl: str | None = None
+    pending_impl_tok_idx = 0
     pending_impl_is_test = False
     pending_trait: str | None = None
+    pending_trait_tok_idx = 0
     pending_trait_is_test = False
     pending_mod: str | None = None
+    pending_mod_tok_idx = 0
     pending_mod_is_test = False
+    pending_item_start_idx: int | None = None
     pending_test_delimiters: tuple[int, int, int] | None = None
     pending_test_angle_depth = 0
     current_brace_depth = 0
@@ -587,7 +726,8 @@ def scan_abort_source(
     non_scope_brace_depth = 0
 
     findings: list[AbortFinding] = []
-    fn_ordinals: dict[str, int] = {}
+    fn_ordinals: dict[tuple[str, int], int] = {}
+    finding_identities: set[AbortFinding] = set()
 
     i = 0
     n = len(tokens)
@@ -616,6 +756,8 @@ def scan_abort_source(
                     if is_test:
                         scopes[-1].is_test = True
                 else:
+                    if pending_item_start_idx is None:
+                        pending_item_start_idx = i
                     if is_test:
                         pending_test = True
                         pending_test_delimiters = (
@@ -634,39 +776,106 @@ def scan_abort_source(
             and declaration_angle_depth == 0
             and non_scope_brace_depth == 0
         ):
-            if tok.text == "if":
+            if (
+                tok.text in ("if", "while", "for")
+                and not any((pending_fn, pending_impl, pending_trait, pending_mod))
+                and (
+                    i == 0
+                    or (pending_test and i > 0 and tokens[i - 1].text == "]")
+                    or tokens[i - 1].text in {
+                        "{", "}", ";", "=", "=>", "(", "[", ",", "else",
+                        "return", "break", "yield", "&&", "||", "!", "if",
+                        ":",
+                    }
+                )
+                and (tok.text != "if" or not is_match_guard_if(tokens, i))
+            ):
+                pending_item_start_idx = None
                 pending_if = True
-            elif tok.text == "fn" and pending_fn is None and i + 1 < n and tokens[i + 1].kind == "ident":
+                pending_if_is_let = False
+                pending_if_let_has_equal = False
+                pending_if_is_for = tok.text == "for"
+                pending_if_for_has_in = False
+                pending_if_paren_depth = current_paren_depth
+                pending_if_bracket_depth = current_bracket_depth
+                pending_if_expression_brace = False
+            elif pending_if and tok.text == "let":
+                pending_if_is_let = True
+                pending_if_let_has_equal = False
+            elif (
+                pending_if
+                and pending_if_is_for
+                and tok.text == "in"
+                and current_paren_depth == pending_if_paren_depth
+                and current_bracket_depth == pending_if_bracket_depth
+            ):
+                pending_if_for_has_in = True
+            elif pending_if and tok.text in ("match", "async", "loop"):
+                pending_if_expression_brace = True
+            elif (
+                current_paren_depth == 0
+                and current_bracket_depth == 0
+                and tok.text == "fn"
+                and pending_fn is None
+                and i + 1 < n
+                and tokens[i + 1].kind == "ident"
+            ):
                 pending_fn = tokens[i + 1].text
-                pending_fn_tok_idx = i
+                pending_fn_tok_idx = pending_item_start_idx if pending_item_start_idx is not None else i
                 pending_fn_is_test = pending_test
+                pending_item_start_idx = None
                 pending_test = False
                 pending_test_delimiters = None
                 pending_test_angle_depth = 0
                 declaration_angle_depth = 0
                 declaration_paren_depth = 0
                 declaration_bracket_depth = 0
-            elif tok.text == "impl" and pending_fn is None and scopes[-1].kind in ("root", "mod"):
+            elif (
+                current_paren_depth == 0
+                and current_bracket_depth == 0
+                and tok.text == "impl"
+                and pending_fn is None
+            ):
                 pending_impl = extract_impl_name(tokens, i)
+                pending_impl_tok_idx = pending_item_start_idx if pending_item_start_idx is not None else i
                 pending_impl_is_test = pending_test
+                pending_item_start_idx = None
                 pending_test = False
                 pending_test_delimiters = None
                 pending_test_angle_depth = 0
                 declaration_angle_depth = 0
                 declaration_paren_depth = 0
                 declaration_bracket_depth = 0
-            elif tok.text == "trait" and pending_fn is None and scopes[-1].kind in ("root", "mod") and i + 1 < n and tokens[i + 1].kind == "ident":
+            elif (
+                current_paren_depth == 0
+                and current_bracket_depth == 0
+                and tok.text == "trait"
+                and pending_fn is None
+                and i + 1 < n
+                and tokens[i + 1].kind == "ident"
+            ):
                 pending_trait = tokens[i + 1].text
+                pending_trait_tok_idx = pending_item_start_idx if pending_item_start_idx is not None else i
                 pending_trait_is_test = pending_test
+                pending_item_start_idx = None
                 pending_test = False
                 pending_test_delimiters = None
                 pending_test_angle_depth = 0
                 declaration_angle_depth = 0
                 declaration_paren_depth = 0
                 declaration_bracket_depth = 0
-            elif tok.text == "mod" and pending_fn is None and scopes[-1].kind in ("root", "mod") and i + 1 < n and tokens[i + 1].kind == "ident":
+            elif (
+                current_paren_depth == 0
+                and current_bracket_depth == 0
+                and tok.text == "mod"
+                and pending_fn is None
+                and i + 1 < n
+                and tokens[i + 1].kind == "ident"
+            ):
                 pending_mod = tokens[i + 1].text
+                pending_mod_tok_idx = pending_item_start_idx if pending_item_start_idx is not None else i
                 pending_mod_is_test = pending_test
+                pending_item_start_idx = None
                 pending_test = False
                 pending_test_delimiters = None
                 pending_test_angle_depth = 0
@@ -723,11 +932,121 @@ def scan_abort_source(
                 elif delta > 0 and looks_like_angle_open(tokens, i):
                     pending_test_angle_depth = delta
 
+        if (
+            pending_if
+            and pending_if_is_let
+            and tok.text == "="
+            and current_paren_depth == pending_if_paren_depth
+            and current_bracket_depth == pending_if_bracket_depth
+        ):
+            pending_if_let_has_equal = True
+
+        brace_starts_macro_tokens = (
+            tok.text == "{"
+            and i > 1
+            and tokens[i - 1].text == "!"
+            and tokens[i - 2].kind == "ident"
+        )
+        brace_is_macro_delimiter = brace_starts_macro_tokens and any(
+            (pending_fn, pending_impl, pending_trait, pending_mod)
+        )
+        brace_is_cfg_match_pattern = (
+            tok.text == "{"
+            and pending_test
+            and is_cfg_match_pattern_brace(tokens, i)
+        )
+        brace_is_if_condition_group = False
+        if tok.text == "{" and pending_if:
+            nested_delimiter = (
+                current_paren_depth > pending_if_paren_depth
+                or current_bracket_depth > pending_if_bracket_depth
+            )
+            pattern_before_equal = (
+                (pending_if_is_let and not pending_if_let_has_equal)
+                or (pending_if_is_for and not pending_if_for_has_in)
+            )
+            previous_requires_expression = i > 0 and tokens[i - 1].text in {
+                "if", "=", "&&", "||", "!", "+", "-", "*", "/", "%",
+                "&", "|", "^", "<", ">", "<=", ">=", "==", "!=", "(",
+                "[", ",", "=>", "unsafe", "const", ":", "while", "for", "in",
+                "..", "..=",
+            }
+            brace_is_if_condition_group = (
+                any(scope.is_if_condition for scope in scopes)
+                or brace_starts_macro_tokens
+                or pending_if_expression_brace
+                or nested_delimiter
+                or pattern_before_equal
+                or previous_requires_expression
+            )
+
+        if tok.text == "{" and brace_is_if_condition_group:
+            is_macro_tokens = (
+                brace_starts_macro_tokens
+                or any(scope.is_macro_tokens for scope in scopes)
+            )
+            consume_expression_brace = (
+                pending_if_expression_brace
+                and not nested_delimiter
+                and not pattern_before_equal
+                and not brace_starts_macro_tokens
+            )
+            current_brace_depth += 1
+            scopes.append(
+                Scope(
+                    "block",
+                    "",
+                    pending_test or any(scope.is_test for scope in scopes),
+                    current_brace_depth,
+                    is_if_condition=True,
+                    restore_pending_test=pending_test,
+                    restore_test_delimiters=pending_test_delimiters,
+                    restore_pending_if=pending_if,
+                    restore_pending_if_is_let=pending_if_is_let,
+                    restore_pending_if_let_has_equal=pending_if_let_has_equal,
+                    restore_pending_if_is_for=pending_if_is_for,
+                    restore_pending_if_for_has_in=pending_if_for_has_in,
+                    restore_pending_if_paren_depth=pending_if_paren_depth,
+                    restore_pending_if_bracket_depth=pending_if_bracket_depth,
+                    restore_pending_if_expression_brace=(
+                        False if consume_expression_brace else pending_if_expression_brace
+                    ),
+                    is_macro_tokens=is_macro_tokens,
+                )
+            )
+            pending_test = False
+            pending_test_delimiters = None
+            pending_test_angle_depth = 0
+            i += 1
+            continue
+
+        if tok.text == "{" and brace_starts_macro_tokens and not brace_is_macro_delimiter:
+            macro_identity_salt = lexical_salt(tokens, pending_item_start_idx, i)
+            pending_item_start_idx = None
+            current_brace_depth += 1
+            scopes.append(
+                Scope(
+                    "block",
+                    "",
+                    pending_test or any(scope.is_test for scope in scopes),
+                    current_brace_depth,
+                    is_macro_tokens=True,
+                    identity_salt=macro_identity_salt,
+                )
+            )
+            pending_test = False
+            pending_test_delimiters = None
+            pending_test_angle_depth = 0
+            i += 1
+            continue
+
         if tok.text == "{" and (
             declaration_angle_depth > 0
             or declaration_paren_depth > 0
             or declaration_bracket_depth > 0
             or pending_test_angle_depth > 0
+            or brace_is_macro_delimiter
+            or brace_is_cfg_match_pattern
         ):
             non_scope_brace_depth += 1
             i += 1
@@ -746,6 +1065,7 @@ def scan_abort_source(
                 )
             )
         ):
+            pending_item_start_idx = None
             pending_test = False
             pending_test_delimiters = None
             pending_test_angle_depth = 0
@@ -757,6 +1077,12 @@ def scan_abort_source(
             pending_trait_is_test = False
             pending_mod = None
             pending_mod_is_test = False
+            pending_if = False
+            pending_if_is_let = False
+            pending_if_let_has_equal = False
+            pending_if_is_for = False
+            pending_if_for_has_in = False
+            pending_if_expression_brace = False
             declaration_angle_depth = 0
             declaration_paren_depth = 0
             declaration_bracket_depth = 0
@@ -770,6 +1096,7 @@ def scan_abort_source(
             and pending_test_delimiters
             == (current_brace_depth, current_paren_depth, current_bracket_depth)
         ):
+            pending_item_start_idx = None
             pending_test = False
             pending_test_delimiters = None
             pending_test_angle_depth = 0
@@ -777,32 +1104,86 @@ def scan_abort_source(
             continue
 
         if tok.text == "{":
+            scope_salts = tuple(
+                scope.identity_salt for scope in scopes if scope.identity_salt
+            )
+            block_identity_salt = ""
+            if not any((pending_fn, pending_impl, pending_trait, pending_mod)):
+                block_identity_salt = lexical_salt(tokens, pending_item_start_idx, i)
+            pending_item_start_idx = None
             current_brace_depth += 1
             if pending_fn:
                 is_test_scope = pending_fn_is_test or any(s.is_test for s in scopes)
-                scopes.append(Scope("fn", pending_fn, is_test_scope, current_brace_depth, pending_fn_tok_idx, i))
+                function_name = pending_fn
+                outer_fn_indices = [
+                    scope_idx for scope_idx, scope in enumerate(scopes) if scope.kind == "fn"
+                ]
+                if outer_fn_indices:
+                    outer_fn_idx = outer_fn_indices[-1]
+                    has_named_item_container = any(
+                        scope.kind in ("impl", "trait", "mod")
+                        for scope in scopes[outer_fn_idx + 1:]
+                    )
+                    if not has_named_item_container or scope_salts:
+                        function_name = definition_identity(
+                            tokens,
+                            pending_fn,
+                            pending_fn_tok_idx,
+                            i,
+                            scope_salts,
+                        )
+                scopes.append(Scope("fn", function_name, is_test_scope, current_brace_depth, pending_fn_tok_idx, i))
                 pending_fn = None
                 pending_fn_is_test = False
             elif pending_impl:
                 is_test_scope = pending_impl_is_test or any(s.is_test for s in scopes)
-                scopes.append(Scope("impl", pending_impl, is_test_scope, current_brace_depth))
+                impl_name = pending_impl
+                if any(scope.kind == "fn" for scope in scopes) or scope_salts:
+                    impl_name = definition_identity(
+                        tokens, pending_impl, pending_impl_tok_idx, i, scope_salts
+                    )
+                scopes.append(Scope("impl", impl_name, is_test_scope, current_brace_depth))
                 pending_impl = None
                 pending_impl_is_test = False
             elif pending_trait:
                 is_test_scope = pending_trait_is_test or any(s.is_test for s in scopes)
-                scopes.append(Scope("trait", pending_trait, is_test_scope, current_brace_depth))
+                trait_name = pending_trait
+                if any(scope.kind == "fn" for scope in scopes) or scope_salts:
+                    trait_name = definition_identity(
+                        tokens, pending_trait, pending_trait_tok_idx, i, scope_salts
+                    )
+                scopes.append(Scope("trait", trait_name, is_test_scope, current_brace_depth))
                 pending_trait = None
                 pending_trait_is_test = False
             elif pending_mod:
                 is_test_scope = pending_mod_is_test or any(s.is_test for s in scopes)
-                scopes.append(Scope("mod", pending_mod, is_test_scope, current_brace_depth))
+                mod_name = pending_mod
+                if any(scope.kind == "fn" for scope in scopes) or scope_salts:
+                    mod_name = definition_identity(
+                        tokens, pending_mod, pending_mod_tok_idx, i, scope_salts
+                    )
+                scopes.append(Scope("mod", mod_name, is_test_scope, current_brace_depth))
                 pending_mod = None
                 pending_mod_is_test = False
             else:
                 is_test_scope = pending_test or any(s.is_test for s in scopes)
                 is_if_block = pending_if
-                scopes.append(Scope("block", "", is_test_scope, current_brace_depth, is_if_then=is_if_block))
+                scopes.append(
+                    Scope(
+                        "block",
+                        "",
+                        is_test_scope,
+                        current_brace_depth,
+                        is_if_then=is_if_block,
+                        identity_salt=block_identity_salt,
+                    )
+                )
             pending_if = False
+            pending_if_is_let = False
+            pending_if_let_has_equal = False
+            pending_if_is_for = False
+            pending_if_for_has_in = False
+            pending_if_expression_brace = False
             pending_test = False
             pending_test_delimiters = None
             pending_test_angle_depth = 0
@@ -814,10 +1195,69 @@ def scan_abort_source(
 
         if tok.text == "}":
             is_test_branch = False
+            closed_if_condition = False
+            closed_macro_tokens = False
+            restore_pending_test = False
+            restore_test_delimiters: tuple[int, int, int] | None = None
+            restore_pending_if = False
+            restore_pending_if_is_let = False
+            restore_pending_if_let_has_equal = False
+            restore_pending_if_is_for = False
+            restore_pending_if_for_has_in = False
+            restore_pending_if_paren_depth = 0
+            restore_pending_if_bracket_depth = 0
+            restore_pending_if_expression_brace = False
             if len(scopes) > 1 and scopes[-1].brace_depth == current_brace_depth:
                 is_test_branch = scopes[-1].is_test and scopes[-1].is_if_then
+                closed_if_condition = scopes[-1].is_if_condition
+                closed_macro_tokens = scopes[-1].is_macro_tokens
+                restore_pending_test = scopes[-1].restore_pending_test
+                restore_test_delimiters = scopes[-1].restore_test_delimiters
+                restore_pending_if = scopes[-1].restore_pending_if
+                restore_pending_if_is_let = scopes[-1].restore_pending_if_is_let
+                restore_pending_if_let_has_equal = scopes[-1].restore_pending_if_let_has_equal
+                restore_pending_if_is_for = scopes[-1].restore_pending_if_is_for
+                restore_pending_if_for_has_in = scopes[-1].restore_pending_if_for_has_in
+                restore_pending_if_paren_depth = scopes[-1].restore_pending_if_paren_depth
+                restore_pending_if_bracket_depth = scopes[-1].restore_pending_if_bracket_depth
+                restore_pending_if_expression_brace = scopes[-1].restore_pending_if_expression_brace
                 scopes.pop()
             current_brace_depth = max(0, current_brace_depth - 1)
+
+            # Curly macro arguments are ambiguous before expansion: some are
+            # item-generating token lists (`define_syscall! { fn ... }`), while
+            # others merely contain tokens that resemble an incomplete item
+            # (`discard! { fn fake }`). Parse complete item bodies so generated
+            # source retains its lexical identity, but never let an unfinished
+            # declaration escape the macro argument and capture the following
+            # production block.
+            if closed_macro_tokens:
+                pending_fn = None
+                pending_fn_is_test = False
+                pending_impl = None
+                pending_impl_is_test = False
+                pending_trait = None
+                pending_trait_is_test = False
+                pending_mod = None
+                pending_mod_is_test = False
+                declaration_angle_depth = 0
+                declaration_paren_depth = 0
+                declaration_bracket_depth = 0
+
+            if closed_if_condition:
+                pending_test = restore_pending_test
+                pending_test_delimiters = restore_test_delimiters
+                pending_test_angle_depth = 0
+                pending_if = restore_pending_if
+                pending_if_is_let = restore_pending_if_is_let
+                pending_if_let_has_equal = restore_pending_if_let_has_equal
+                pending_if_is_for = restore_pending_if_is_for
+                pending_if_for_has_in = restore_pending_if_for_has_in
+                pending_if_paren_depth = restore_pending_if_paren_depth
+                pending_if_bracket_depth = restore_pending_if_bracket_depth
+                pending_if_expression_brace = restore_pending_if_expression_brace
+                i += 1
+                continue
 
             # If this was an if/else if test branch and next token is else, continue test scope
             if is_test_branch and i + 1 < n and tokens[i + 1].text == "else":
@@ -848,34 +1288,46 @@ def scan_abort_source(
             if not is_in_test:
                 fn_name = "<module>"
                 fn_body_brace_idx = 0
-                for s in reversed(scopes):
+                fn_scope_idx: int | None = None
+                for scope_idx in range(len(scopes) - 1, -1, -1):
+                    s = scopes[scope_idx]
                     if s.kind == "fn":
                         fn_name = s.name
                         fn_body_brace_idx = s.body_brace_token_idx
+                        fn_scope_idx = scope_idx
                         break
 
                 container_parts = [
-                    s.name for s in scopes if s.kind in ("mod", "impl", "trait")
+                    s.name
+                    for scope_idx, s in enumerate(scopes)
+                    if s.kind in ("mod", "impl", "trait")
+                    or (s.kind == "fn" and fn_scope_idx is not None and scope_idx < fn_scope_idx)
                 ]
                 if container_parts:
                     qualified_fn = "::".join(container_parts + [fn_name])
                 else:
                     qualified_fn = fn_name
 
-                ord_val = fn_ordinals.get(qualified_fn, 0) + 1
-                fn_ordinals[qualified_fn] = ord_val
+                ordinal_key = (qualified_fn, fn_body_brace_idx)
+                ord_val = fn_ordinals.get(ordinal_key, 0) + 1
+                fn_ordinals[ordinal_key] = ord_val
 
                 context_tokens = extract_statement_context(tokens, i, fn_body_brace_idx)
                 fp = compute_fingerprint(context_tokens)
 
-                findings.append(
-                    AbortFinding(
-                        file=posix_path,
-                        function=qualified_fn,
-                        ordinal_in_function=ord_val,
-                        fingerprint=fp,
-                    )
+                finding = AbortFinding(
+                    file=posix_path,
+                    function=qualified_fn,
+                    ordinal_in_function=ord_val,
+                    fingerprint=fp,
                 )
+                if finding in finding_identities:
+                    raise LedgerError(
+                        f"{posix_path}: ambiguous duplicate abort identity in "
+                        f"{qualified_fn}; add distinguishing lexical structure"
+                    )
+                finding_identities.add(finding)
+                findings.append(finding)
 
             i += 7
             continue
@@ -920,6 +1372,17 @@ def load_shard(path: Path) -> dict:
     except Exception as e:
         raise LedgerError(f"malformed JSON in {path}: {e}") from e
     return data
+
+
+def validate_required_shards(ledgers: dict[str, dict]) -> None:
+    actual = set(ledgers)
+    if actual != REQUIRED_SHARDS:
+        missing = sorted(REQUIRED_SHARDS - actual)
+        unexpected = sorted(actual - REQUIRED_SHARDS)
+        raise LedgerError(
+            f"required abort shards mismatch: missing={missing}, "
+            f"unexpected={unexpected}"
+        )
 
 
 def validate_shards(
@@ -1082,30 +1545,22 @@ def main() -> int:
         print(f"OK: shard {target_shard} valid ({len(ledger['rows'])} aborts: {cf_count} carrier_fault, {td_count} typed_error_debt)")
         return 0
 
-    # Validate all existing shards (or filtered by --only)
+    # Validate the exact required shard set, or one explicitly focused shard.
     ledgers: dict[str, dict] = {}
-    pending_shards: list[str] = []
     shards_to_inspect = [only_shard] if only_shard else list(SHARD_NAMES)
 
     for s in shards_to_inspect:
         p = shards_dir / s
-        if p.is_file():
-            ledgers[s] = load_shard(p)
-        else:
-            pending_shards.append(s)
+        if not p.is_file():
+            print(f"FAIL: required shard file not found: {p}", file=sys.stderr)
+            return 1
+        ledgers[s] = load_shard(p)
 
     if "--check" in args:
-        if pending_shards:
-            for p_shard in pending_shards:
-                p_findings = [f for f in all_findings if route_shard(f.file) == p_shard]
-                print(f"[pending] {p_shard}: {len(p_findings)} abort calls unclassified (pending Task 5)")
-
-        if not ledgers:
-            print("ERROR: No shards available to validate", file=sys.stderr)
-            return 1
-
         active_findings = [f for f in all_findings if route_shard(f.file) in ledgers]
         try:
+            if only_shard is None:
+                validate_required_shards(ledgers)
             validate_shards(active_findings, ledgers)
         except LedgerError as e:
             print(f"FAIL: {e}", file=sys.stderr)
