@@ -1883,6 +1883,7 @@ struct SpliceTestRig {
 }
 
 impl SpliceTestRig {
+    const SYS_FCNTL: u64 = 25;
     const SYS_OPENAT: u64 = 56;
     const SYS_CLOSE: u64 = 57;
     const SYS_PIPE2: u64 = 59;
@@ -4427,4 +4428,217 @@ fn cross_mount_rename_and_link_boundary_semantics() {
         .unwrap();
     assert_eq!(res, DispatchOutcome::Returned { value: 0 });
     assert!(mount1_linked.load(Ordering::SeqCst));
+}
+
+#[test]
+fn fcntl_pipe_set_capacity_routes_through_canonical_authority() {
+    let mut rig = SpliceTestRig::new(0x10000);
+    rig.dispatcher
+        .activate_file_authority(rig.dispatcher.captured_file_table())
+        .expect("activate authority");
+    let (read_fd, write_fd) = rig.pipe2(0x4200);
+
+    // Initial capacity is default (65536)
+    let get_res = rig.run(
+        SpliceTestRig::SYS_FCNTL,
+        [read_fd, LINUX_F_GETPIPE_SZ, 0, 0, 0, 0],
+    );
+    assert_eq!(get_res, DispatchOutcome::Returned { value: 65536 });
+
+    // Resize to 131072
+    let set_res = rig.run(
+        SpliceTestRig::SYS_FCNTL,
+        [read_fd, LINUX_F_SETPIPE_SZ, 131072, 0, 0, 0],
+    );
+    assert_eq!(set_res, DispatchOutcome::Returned { value: 131072 });
+
+    // Both reader and writer ends reflect the new capacity
+    assert_eq!(
+        rig.run(
+            SpliceTestRig::SYS_FCNTL,
+            [read_fd, LINUX_F_GETPIPE_SZ, 0, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 131072 }
+    );
+    assert_eq!(
+        rig.run(
+            SpliceTestRig::SYS_FCNTL,
+            [write_fd, LINUX_F_GETPIPE_SZ, 0, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 131072 }
+    );
+}
+
+#[test]
+fn fcntl_pipe_set_capacity_semantic_errors() {
+    let mut rig = SpliceTestRig::new(0x10000);
+    rig.dispatcher
+        .activate_file_authority(rig.dispatcher.captured_file_table())
+        .expect("activate authority");
+    let (read_fd, write_fd) = rig.pipe2(0x4200);
+
+    // Valid pipe: request > i32::MAX returns EINVAL
+    let res = rig.run(
+        SpliceTestRig::SYS_FCNTL,
+        [read_fd, LINUX_F_SETPIPE_SZ, (i32::MAX as u64) + 1, 0, 0, 0],
+    );
+    assert_eq!(res, DispatchOutcome::errno(LINUX_EINVAL));
+
+    // Valid pipe: request > 1 MiB returns EPERM
+    let res = rig.run(
+        SpliceTestRig::SYS_FCNTL,
+        [read_fd, LINUX_F_SETPIPE_SZ, 1024 * 1024 + 4096, 0, 0, 0],
+    );
+    assert_eq!(res, DispatchOutcome::errno(LINUX_EPERM));
+
+    // Valid pipe: write data to pipe then try to shrink below queued bytes -> EBUSY
+    rig.memory.write_bytes(0x5000, &[0x42; 8192]).unwrap();
+    let write_res = rig.run(SpliceTestRig::SYS_WRITE, [write_fd, 0x5000, 8192, 0, 0, 0]);
+    assert_eq!(write_res, DispatchOutcome::Returned { value: 8192 });
+
+    // Shrinking to 4096 (< 8192 queued) returns EBUSY
+    let res = rig.run(
+        SpliceTestRig::SYS_FCNTL,
+        [read_fd, LINUX_F_SETPIPE_SZ, 4096, 0, 0, 0],
+    );
+    assert_eq!(res, DispatchOutcome::errno(LINUX_EBUSY));
+
+    // Invalid / closed fd returns EBADF regardless of size argument (Linux error precedence)
+    let res = rig.run(
+        SpliceTestRig::SYS_FCNTL,
+        [99, LINUX_F_SETPIPE_SZ, 65536, 0, 0, 0],
+    );
+    assert_eq!(res, DispatchOutcome::errno(LINUX_EBADF));
+
+    let res = rig.run(
+        SpliceTestRig::SYS_FCNTL,
+        [99, LINUX_F_SETPIPE_SZ, (i32::MAX as u64) + 1, 0, 0, 0],
+    );
+    assert_eq!(res, DispatchOutcome::errno(LINUX_EBADF));
+
+    let res = rig.run(
+        SpliceTestRig::SYS_FCNTL,
+        [99, LINUX_F_SETPIPE_SZ, 1024 * 1024 + 4096, 0, 0, 0],
+    );
+    assert_eq!(res, DispatchOutcome::errno(LINUX_EBADF));
+
+    // Non-pipe open fd (regular /proc file) returns EBADF regardless of size argument
+    let file_fd = rig.open(0x6000, b"/proc/version\0", LINUX_O_RDONLY);
+    let res = rig.run(
+        SpliceTestRig::SYS_FCNTL,
+        [file_fd, LINUX_F_SETPIPE_SZ, 65536, 0, 0, 0],
+    );
+    assert_eq!(res, DispatchOutcome::errno(LINUX_EBADF));
+
+    let res = rig.run(
+        SpliceTestRig::SYS_FCNTL,
+        [file_fd, LINUX_F_SETPIPE_SZ, (i32::MAX as u64) + 1, 0, 0, 0],
+    );
+    assert_eq!(res, DispatchOutcome::errno(LINUX_EBADF));
+
+    let res = rig.run(
+        SpliceTestRig::SYS_FCNTL,
+        [file_fd, LINUX_F_SETPIPE_SZ, 1024 * 1024 + 4096, 0, 0, 0],
+    );
+    assert_eq!(res, DispatchOutcome::errno(LINUX_EBADF));
+}
+
+#[test]
+fn fcntl_pipe_set_capacity_preserves_authority_fatal_without_direct_fallback() {
+    let mut rig = SpliceTestRig::new(0x10000);
+    // Deliberately do NOT activate FileAuthority on the dispatcher
+    let (read_fd, _write_fd) = rig.pipe2(0x4200);
+
+    let ctx = rig.dispatcher.capture_one_task_context().unwrap();
+    let res = rig.dispatcher.dispatch(
+        &ctx,
+        SyscallRequest::new(
+            SpliceTestRig::SYS_FCNTL,
+            SyscallArgs::from([read_fd, LINUX_F_SETPIPE_SZ, 131072, 0, 0, 0]),
+        ),
+        &mut rig.memory,
+        &rig.reporter,
+    );
+
+    // Authority is unavailable -> fatal error, NOT lowered to errno, and no direct mutation
+    assert!(matches!(
+        res,
+        Err(DispatchError::FileAuthorityFatal(
+            crate::file_authority::AuthorityFatal::TransportUnavailable
+        ))
+    ));
+}
+
+#[test]
+fn fcntl_pipe_host_pipe_accounting_and_set_capacity() {
+    let mut host_fds = [-1; 2];
+    assert_eq!(unsafe { libc::pipe(host_fds.as_mut_ptr()) }, 0);
+
+    let mut dispatcher = SyscallDispatcher::new();
+    let root_table = dispatcher.captured_file_table();
+    dispatcher
+        .activate_file_authority(Arc::clone(&root_table))
+        .expect("activate authority");
+
+    let read_open = OpenFile::from_open_description_with_status_flags(
+        Arc::new(RwLock::new(OpenDescription::HostPipe {
+            host_fd: HostFdRef::new(host_fds[0]),
+            is_read_end: true,
+            pipe_id: 1042,
+            base: OpenDescriptionBase::new(0),
+            pty: None,
+            bidirectional: false,
+            write_kind: HostWriteKind::PipeLike,
+            stdio_stream: None,
+        })),
+        LINUX_O_RDONLY,
+        0,
+    );
+    let write_open = OpenFile::from_open_description_with_status_flags(
+        Arc::new(RwLock::new(OpenDescription::HostPipe {
+            host_fd: HostFdRef::new(host_fds[1]),
+            is_read_end: false,
+            pipe_id: 1042,
+            base: OpenDescriptionBase::new(0),
+            pty: None,
+            bidirectional: false,
+            write_kind: HostWriteKind::PipeLike,
+            stdio_stream: None,
+        })),
+        LINUX_O_WRONLY,
+        0,
+    );
+    let (read_fd, _write_fd) = dispatcher
+        .install_fd_pair_at_or_above(3, read_open, write_open)
+        .expect("install host pipe pair");
+
+    let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
+    let reporter = CompatReporter::default();
+    let ctx = dispatcher.capture_one_task_context().unwrap();
+
+    let resize_res = dispatcher
+        .dispatch(
+            &ctx,
+            SyscallRequest::new(
+                25,
+                SyscallArgs::from([read_fd as u64, LINUX_F_SETPIPE_SZ, 131072, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .expect("fcntl dispatch");
+    assert_eq!(resize_res, DispatchOutcome::Returned { value: 131072 });
+
+    let get_res = dispatcher
+        .dispatch(
+            &ctx,
+            SyscallRequest::new(
+                25,
+                SyscallArgs::from([read_fd as u64, LINUX_F_GETPIPE_SZ, 0, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .expect("fcntl get");
+    assert_eq!(get_res, DispatchOutcome::Returned { value: 131072 });
 }

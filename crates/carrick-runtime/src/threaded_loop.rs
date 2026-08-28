@@ -213,9 +213,6 @@ where
     E::SiblingSpec: 'static,
     H: HostBackend,
 {
-    dispatcher.activate_file_authority().map_err(|error| {
-        RuntimeError::Configuration(format!("activate per-run FileAuthority: {error}"))
-    })?;
     use crate::thread::{FutexTable, ThreadId, ThreadRegistry};
     use crate::vcpu_loop::{KernelState, PlatformFutexFactory, VcpuLoopOutcome};
     use std::sync::Arc;
@@ -306,6 +303,14 @@ where
                 ))
             })?;
         drop(inherited_context);
+        let final_context = dispatcher.capture_one_task_context().map_err(|error| {
+            RuntimeError::Configuration(format!("capture mature VMM final Kernel context: {error}"))
+        })?;
+        dispatcher
+            .activate_file_authority(final_context.resources().files())
+            .map_err(|error| {
+                RuntimeError::Configuration(format!("activate per-run FileAuthority: {error}"))
+            })?;
     }
     let root_linux_tid = if let Some(process) = hvpatch_process.as_ref() {
         crate::kernel::LinuxTid::for_task_leader(process.task_id())
