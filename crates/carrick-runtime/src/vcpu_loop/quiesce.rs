@@ -315,8 +315,8 @@ pub(super) enum ProcessForkRetrySubscription {
     Barrier {
         _subscription: carrick_thread::fork_quiesce::QuiesceSubscription,
     },
-    Progress {
-        _subscription: carrick_thread::fork_quiesce::QuiesceProgressSubscription,
+    Lease {
+        _subscription: carrick_hal::VcpuLeaseChangeSubscription,
     },
     Topology {
         _subscription: carrick_thread::fork_quiesce::TopologyReleaseSubscription,
@@ -326,10 +326,61 @@ pub(super) enum ProcessForkRetrySubscription {
     },
 }
 
+struct ProcessForkRelease {
+    barrier: Arc<crate::fork_quiesce::QuiesceBarrier>,
+    quiesced: bool,
+    drain: Option<carrick_hal::VcpuLeaseDrainGuard>,
+    active: bool,
+}
+
+impl ProcessForkRelease {
+    fn new(
+        barrier: Arc<crate::fork_quiesce::QuiesceBarrier>,
+        quiesced: bool,
+        drain: carrick_hal::VcpuLeaseDrainGuard,
+    ) -> Self {
+        Self {
+            barrier,
+            quiesced,
+            drain: Some(drain),
+            active: true,
+        }
+    }
+
+    fn release(&mut self) {
+        if !self.active {
+            return;
+        }
+        if self.quiesced {
+            self.barrier.end_quiesce();
+        }
+        self.barrier.end_fork();
+        drop(self.drain.take());
+        self.active = false;
+    }
+
+    // Temporary Step-4 bridge: the repetitive Step-5 migration still calls
+    // `end_quiesce` followed immediately by `end_fork` on every legacy exit.
+    // Defer both operations to `end_fork` so this single authority preserves
+    // barrier-before-thaw order without double-publishing either release.
+    fn end_quiesce(&mut self) {}
+
+    fn end_fork(&mut self) {
+        self.release();
+    }
+}
+
+impl Drop for ProcessForkRelease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 pub(super) struct ProcessForkCoordinator {
     barrier: Arc<crate::fork_quiesce::QuiesceBarrier>,
     process_admission: Option<CloneAdmissionPermit>,
     clone_admission: Option<ForkCloneAdmission>,
+    drain: Option<carrick_hal::VcpuLeaseDrainGuard>,
     quiesced: bool,
     active: bool,
 }
@@ -343,12 +394,25 @@ impl ProcessForkCoordinator {
             barrier,
             process_admission: Some(process_admission),
             clone_admission: None,
+            drain: None,
             quiesced: false,
             active: true,
         }
     }
 
-    fn into_parts(mut self) -> (CloneAdmissionPermit, ForkCloneAdmission, bool) {
+    fn into_parts(
+        mut self,
+    ) -> (
+        CloneAdmissionPermit,
+        ForkCloneAdmission,
+        bool,
+        ProcessForkRelease,
+    ) {
+        let release = ProcessForkRelease::new(
+            Arc::clone(&self.barrier),
+            self.quiesced,
+            self.drain.take().unwrap_or_else(|| std::process::abort()),
+        );
         self.active = false;
         (
             self.process_admission
@@ -358,6 +422,7 @@ impl ProcessForkCoordinator {
                 .take()
                 .unwrap_or_else(|| std::process::abort()),
             self.quiesced,
+            release,
         )
     }
 }
@@ -371,6 +436,7 @@ impl Drop for ProcessForkCoordinator {
             self.barrier.end_quiesce();
         }
         self.barrier.end_fork();
+        drop(self.drain.take());
     }
 }
 
@@ -457,29 +523,6 @@ where
                 carrick_thread::fork_quiesce::QuiesceEnrollment::Ready(_) => continue,
                 carrick_thread::fork_quiesce::QuiesceEnrollment::Subscribed(subscription) => {
                     break ProcessForkRetrySubscription::Barrier {
-                        _subscription: subscription,
-                    };
-                }
-            }
-        };
-        let subscribe_progress = || loop {
-            let observed = process_barrier.progress_generation();
-            let wake_scheduler = Arc::clone(&scheduler);
-            match process_barrier.subscribe_quiesced_progress(
-                observed,
-                Arc::new(move |_| {
-                    let _ = if is_external_exec {
-                        wake_scheduler.wake_control(wake_thread)
-                    } else {
-                        wake_scheduler.wake(wake_thread)
-                    };
-                }),
-            ) {
-                carrick_thread::fork_quiesce::QuiesceProgressEnrollment::Ready(_) => continue,
-                carrick_thread::fork_quiesce::QuiesceProgressEnrollment::Subscribed(
-                    subscription,
-                ) => {
-                    break ProcessForkRetrySubscription::Progress {
                         _subscription: subscription,
                     };
                 }
@@ -599,56 +642,90 @@ where
             };
         let fork_total_started = Instant::now();
         let mut fork_stage_started = fork_total_started;
-        let mut quiesced = coordinator.quiesced;
         // Raise the barrier whenever this process has ANOTHER thread that can
-        // execute guest code. `kicker.count()` counts live vCPU LEASES, so
-        // every sibling parked in a futex / epoll / fd wait had already
-        // unregistered and this read 0 — and the transaction below then ran
-        // with NO BARRIER AT ALL, against siblings whose wake does not require
-        // this thread (a host fd readying, an `EVFILT_TIMER`, a cross-process
-        // shared-futex wake, or the signal pump). Their run-loop-top quiesce
-        // check passed for the same reason: nobody had set `quiescing`.
+        // execute guest code. Live vCPU leases omit every sibling parked in a
+        // futex / epoll / fd wait, so lease membership cannot authorize
+        // skipping the barrier: those siblings may wake independently through
+        // a host fd, `EVFILT_TIMER`, cross-process shared-futex wake, or the
+        // signal pump. The identity-aware drain below separately freezes lease
+        // registration once all current sibling leases have withdrawn.
         //
-        // The DRAIN below still keys on the kicker, which is the right question
-        // for its own purpose ("has every sibling given its vCPU up yet?") and
-        // is satisfied immediately when the siblings were already parked. What
-        // matters is that `quiescing` is now RAISED, so a sibling woken
-        // mid-transaction parks at the barrier instead of resuming into it.
+        // What matters here is that `quiescing` is RAISED from durable task
+        // membership, so a lease-less sibling woken mid-transaction parks at
+        // the barrier instead of resuming into it.
         // Kernel thread membership is durable across block/preempt/queue
         // boundaries. The executor census is deliberately transient and can be
         // zero while a same-task sibling is wakeable, so it cannot authorize
         // skipping the COW barrier.
         let initial_siblings = parent_context.task().threads().len().saturating_sub(1);
         let quiesce_poll_iterations = 0_u64;
-        if initial_siblings > 0 && !quiesced {
+        if initial_siblings > 0 && !coordinator.quiesced {
             process_barrier.set_quiescing();
             coordinator.quiesced = true;
-            quiesced = true;
             self.kicker.kick_all_except(self.this_tid);
             self.futex.notify_signal_pending();
             self.platform_futex.notify_signal_pending();
             kernel.signal_arrival.wake_all_waiters();
         }
-        let progress_subscription = quiesced.then(&subscribe_progress);
-        if quiesced && self.kicker.count() > 1 {
-            if process_fork_admission.is_cancelled() {
-                return Ok(PreparedInProcessFork::Complete(Some(
-                    crate::linux_abi::LINUX_EAGAIN.guest_retval(),
-                )));
+        let wake_scheduler = Arc::clone(&scheduler);
+        match self.kicker.subscribe_lease_drain(
+            self.this_tid,
+            Arc::new(move || {
+                let _ = if is_external_exec {
+                    wake_scheduler.wake_control(wake_thread)
+                } else {
+                    wake_scheduler.wake(wake_thread)
+                };
+            }),
+        ) {
+            carrick_hal::VcpuLeaseDrainEnrollment::Frozen(guard) => {
+                if coordinator.drain.is_some() {
+                    std::process::abort();
+                }
+                coordinator.drain = Some(guard);
             }
-            self.kicker.kick_all_except(self.this_tid);
-            self.futex.notify_signal_pending();
-            self.platform_futex.notify_signal_pending();
-            kernel.signal_arrival.wake_all_waiters();
-            return Ok(PreparedInProcessFork::Retry {
-                request,
-                coordinator: Some(coordinator),
-                external_exec,
-                _subscription: progress_subscription.unwrap_or_else(|| std::process::abort()),
-            });
+            carrick_hal::VcpuLeaseDrainEnrollment::Waiting { subscription, .. } => {
+                if process_fork_admission.is_cancelled() {
+                    return Ok(PreparedInProcessFork::Complete(Some(
+                        crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+                    )));
+                }
+                self.kicker.kick_all_except(self.this_tid);
+                self.futex.notify_signal_pending();
+                self.platform_futex.notify_signal_pending();
+                kernel.signal_arrival.wake_all_waiters();
+                return Ok(PreparedInProcessFork::Retry {
+                    request,
+                    coordinator: Some(coordinator),
+                    external_exec,
+                    _subscription: ProcessForkRetrySubscription::Lease {
+                        _subscription: subscription,
+                    },
+                });
+            }
+            carrick_hal::VcpuLeaseDrainEnrollment::Busy { subscription, .. } => {
+                if process_fork_admission.is_cancelled() {
+                    return Ok(PreparedInProcessFork::Complete(Some(
+                        crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+                    )));
+                }
+                return Ok(PreparedInProcessFork::Retry {
+                    request,
+                    coordinator: Some(coordinator),
+                    external_exec,
+                    _subscription: ProcessForkRetrySubscription::Lease {
+                        _subscription: subscription,
+                    },
+                });
+            }
         }
-        drop(progress_subscription);
-        let (process_fork_admission, fork_clone_admission, quiesced) = coordinator.into_parts();
+        let (process_fork_admission, fork_clone_admission, quiesced, mut process_fork_release) =
+            coordinator.into_parts();
+        // Step 5 replaces the repetitive legacy names with direct ownership of
+        // `process_fork_release`. Until then, shadowing keeps every existing
+        // exit path compile-clean while routing it through the unique RAII
+        // release authority rather than the raw barrier.
+        let process_barrier = &mut process_fork_release;
         let quiesce_elapsed_ns = fork_stage_started
             .elapsed()
             .as_nanos()
@@ -1501,6 +1578,122 @@ mod pt_pause_tests {
         ThreadId::synthetic_for_tests(raw)
     }
 
+    fn register_for_test(
+        registry: &GenericVcpuRegistry,
+        tid: ThreadId,
+        flag: &carrick_hal::InGuestFlag,
+    ) {
+        assert!(matches!(
+            registry.subscribe_register(tid, Box::new(NoopKick), flag, Arc::new(|| {})),
+            carrick_hal::VcpuRegistrationEnrollment::Registered
+        ));
+    }
+
+    #[test]
+    fn process_fork_uses_identity_lease_subscription() {
+        let source = include_str!("quiesce.rs");
+        let prepare = source
+            .split("pub(super) fn prepare_in_process_fork")
+            .nth(1)
+            .unwrap_or_else(|| std::process::abort())
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap_or_else(|| std::process::abort());
+
+        assert!(prepare.contains("subscribe_lease_drain"));
+        assert!(prepare.contains("ProcessForkRetrySubscription::Lease"));
+        assert!(!prepare.contains("kicker.count()"));
+        assert!(!prepare.contains("subscribe_quiesced_progress"));
+        assert!(!prepare.contains("ProcessForkRetrySubscription::Progress"));
+    }
+
+    #[test]
+    fn fork_lease_wait_wakes_on_terminal_unregister_without_barrier_progress() {
+        let registry = GenericVcpuRegistry::new();
+        let owner = tid(10);
+        let sibling = tid(20);
+        let owner_flag = carrick_hal::InGuestFlag::for_guest_thread();
+        let sibling_flag = carrick_hal::InGuestFlag::for_guest_thread();
+        register_for_test(&registry, owner, &owner_flag);
+        register_for_test(&registry, sibling, &sibling_flag);
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wake = Arc::clone(&wakes);
+        let enrollment = registry.subscribe_lease_drain(
+            owner,
+            Arc::new(move || {
+                wake.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        assert!(matches!(
+            enrollment,
+            carrick_hal::VcpuLeaseDrainEnrollment::Waiting { tid: waiting, .. }
+                if waiting == sibling
+        ));
+        registry.unregister(sibling);
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn fork_owner_can_retry_while_its_barrier_remains_raised() {
+        let registry = GenericVcpuRegistry::new();
+        let barrier = crate::fork_quiesce::QuiesceBarrier::new();
+        let owner = tid(10);
+        let sibling = tid(20);
+        let owner_flag = carrick_hal::InGuestFlag::for_guest_thread();
+        let sibling_flag = carrick_hal::InGuestFlag::for_guest_thread();
+        register_for_test(&registry, owner, &owner_flag);
+        register_for_test(&registry, sibling, &sibling_flag);
+        barrier.set_quiescing();
+        registry.unregister(owner);
+        registry.unregister(sibling);
+        assert!(barrier.is_quiescing());
+        assert!(matches!(
+            registry.subscribe_register(owner, Box::new(NoopKick), &owner_flag, Arc::new(|| {})),
+            carrick_hal::VcpuRegistrationEnrollment::Registered
+        ));
+        assert!(matches!(
+            registry.subscribe_lease_drain(owner, Arc::new(|| {})),
+            carrick_hal::VcpuLeaseDrainEnrollment::Frozen(_)
+        ));
+        barrier.end_quiesce();
+    }
+
+    #[test]
+    fn fork_release_lowers_barriers_before_thaw_callback() {
+        let registry = GenericVcpuRegistry::new();
+        let barrier = Arc::new(crate::fork_quiesce::QuiesceBarrier::new());
+        let owner = tid(10);
+        let sibling = tid(20);
+        let owner_flag = carrick_hal::InGuestFlag::for_guest_thread();
+        register_for_test(&registry, owner, &owner_flag);
+        assert!(barrier.try_begin_fork());
+        barrier.set_quiescing();
+        let guard = match registry.subscribe_lease_drain(owner, Arc::new(|| {})) {
+            carrick_hal::VcpuLeaseDrainEnrollment::Frozen(guard) => guard,
+            _ => panic!("owner must freeze"),
+        };
+        let saw_quiescing = Arc::new(AtomicBool::new(true));
+        let observed = Arc::clone(&saw_quiescing);
+        let sibling_flag = carrick_hal::InGuestFlag::for_guest_thread();
+        let registration_wait = registry.subscribe_register(
+            sibling,
+            Box::new(NoopKick),
+            &sibling_flag,
+            Arc::new({
+                let barrier = Arc::clone(&barrier);
+                move || observed.store(barrier.is_quiescing(), Ordering::SeqCst)
+            }),
+        );
+        assert!(matches!(
+            &registration_wait,
+            carrick_hal::VcpuRegistrationEnrollment::Waiting { .. }
+        ));
+        let mut release = ProcessForkRelease::new(Arc::clone(&barrier), true, guard);
+        release.release();
+        assert!(!saw_quiescing.load(Ordering::SeqCst));
+        drop(registration_wait);
+    }
+
     #[test]
     fn losing_hvpatch_fork_does_not_enroll_clone_admission() {
         let barrier: &'static crate::fork_quiesce::QuiesceBarrier =
@@ -1574,8 +1767,8 @@ mod pt_pause_tests {
         let coordinator_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
         let sibling_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
         sibling_in_guest.enter_guest();
-        registry.register(coordinator, Box::new(NoopKick), &coordinator_in_guest);
-        registry.register(sibling, Box::new(NoopKick), &sibling_in_guest);
+        register_for_test(&registry, coordinator, &coordinator_in_guest);
+        register_for_test(&registry, sibling, &sibling_in_guest);
 
         let resumed = Arc::new(AtomicBool::new(false));
         let sibling_resumed = Arc::clone(&resumed);
@@ -1629,7 +1822,7 @@ mod pt_pause_tests {
         let census = crate::kernel::GuestExecutorCensus::default();
         let waiter = tid(1521);
         let waiter_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
-        registry.register(waiter, Box::new(NoopKick), &waiter_in_guest);
+        register_for_test(&registry, waiter, &waiter_in_guest);
 
         // A stuck coordinator: holds the flags and never calls `end()`.
         assert!(barrier.try_become_coordinator());
@@ -1678,12 +1871,16 @@ mod pt_pause_tests {
         let coordinator_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
         let sibling_in_guest = Arc::new(carrick_hal::InGuestFlag::for_guest_thread());
         sibling_in_guest.enter_guest();
-        registry.register(coordinator, Box::new(NoopKick), &coordinator_in_guest);
-        registry.register(
-            sibling,
-            Box::new(LeaveGuestOnKick(Arc::clone(&sibling_in_guest))),
-            &sibling_in_guest,
-        );
+        register_for_test(&registry, coordinator, &coordinator_in_guest);
+        assert!(matches!(
+            registry.subscribe_register(
+                sibling,
+                Box::new(LeaveGuestOnKick(Arc::clone(&sibling_in_guest))),
+                &sibling_in_guest,
+                Arc::new(|| {}),
+            ),
+            carrick_hal::VcpuRegistrationEnrollment::Registered
+        ));
 
         assert!(!current_thread_holds_pt_pause());
         let guard = acquire_pt_pause(
@@ -1735,14 +1932,14 @@ mod pt_pause_tests {
         let coordinator_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
         // The sibling's ONE lifetime flag, as `ThreadRuntimeState` holds it.
         let sibling_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
-        registry.register(coordinator, Box::new(NoopKick), &coordinator_in_guest);
-        registry.register(sibling, Box::new(NoopKick), &sibling_in_guest);
+        register_for_test(&registry, coordinator, &coordinator_in_guest);
+        register_for_test(&registry, sibling, &sibling_in_guest);
 
         // The sibling blocks in a futex: HVF destroys its vCPU, so the runtime
         // unregisters the dead kick handle...
         registry.unregister(sibling);
         // ...and re-registers the rebound vCPU on wake (`register_vcpu`).
-        registry.register(sibling, Box::new(NoopKick), &sibling_in_guest);
+        register_for_test(&registry, sibling, &sibling_in_guest);
         // It then re-enters guest code through the flag it has held all along.
         sibling_in_guest.enter_guest();
 

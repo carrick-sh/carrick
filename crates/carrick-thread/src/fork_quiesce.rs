@@ -1002,6 +1002,7 @@ impl Drop for PtPauseGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
@@ -1136,17 +1137,16 @@ mod tests {
     /// fork()/os-exec (the Go deadlock; sample: all siblings parked in
     /// `release_and_park_vcpu_for_fork -> park_if_quiescing -> pthread_cond_wait`,
     /// never released, one thread spinning). It mirrors the runtime EXACTLY:
-    ///   * a fake kicker COUNT (vcpu_loop drains `kicker.count()` to 1, not the
-    ///     `paused` count — so a `paused`-only stress would miss the skew);
-    ///   * each sibling, on seeing `is_quiescing()`, UNREGISTERS from the count
+    ///   * a fake identity registry (the runtime drains every identity other
+    ///     than the exact fork owner, so a `paused`-only stress misses skew);
+    ///   * each sibling, on seeing `is_quiescing()`, UNREGISTERS its identity
     ///     THEN parks (the order `release_and_park_vcpu_for_fork` uses), and
-    ///     re-registers on resume;
+    ///     re-registers only after the owner's freeze thaws;
     ///   * a forker that loses `try_begin_fork` also unregisters+parks at the
     ///     in-flight barrier (vcpu_loop.rs:1501-1506) before retrying;
-    ///   * the winner `set_quiescing`, spins the drain until only it remains
-    ///     (mirrors the unbounded drain at vcpu_loop.rs:1528-1565), holds
-    ///     `lock_paused_across_fork` across a no-op "fork", then
-    ///     `end_quiesce`/`end_fork`.
+    ///   * the winner `set_quiescing`, atomically freezes once no different
+    ///     identity remains, holds `lock_paused_across_fork` across a no-op
+    ///     "fork", then lowers both barriers before thawing registration.
     ///
     /// A lost `end_quiesce` wake (the flag is lowered OUTSIDE the `paused` lock)
     /// would leave a parker in `cv.wait` forever; a watchdog deadline turns that
@@ -1158,33 +1158,80 @@ mod tests {
         const SIBLINGS: usize = 8;
         const ROUNDS: usize = 20_000;
 
+        #[derive(Default)]
+        struct IdentityLeases {
+            members: BTreeSet<carrick_hal::ThreadId>,
+            freeze_owner: Option<carrick_hal::ThreadId>,
+        }
+
+        impl IdentityLeases {
+            fn unregister(&mut self, tid: carrick_hal::ThreadId) {
+                assert!(self.members.remove(&tid), "identity must be registered");
+            }
+
+            fn try_register(&mut self, tid: carrick_hal::ThreadId) -> bool {
+                if self.freeze_owner.is_some_and(|owner| owner != tid) {
+                    return false;
+                }
+                assert!(self.members.insert(tid), "identity must be absent");
+                true
+            }
+
+            fn try_freeze(&mut self, owner: carrick_hal::ThreadId) -> bool {
+                if self.freeze_owner.is_some() || self.members.iter().any(|member| *member != owner)
+                {
+                    return false;
+                }
+                self.freeze_owner = Some(owner);
+                true
+            }
+
+            fn thaw(&mut self, owner: carrick_hal::ThreadId) {
+                assert_eq!(self.freeze_owner, Some(owner));
+                self.freeze_owner = None;
+            }
+        }
+
         let barrier = Arc::new(QuiesceBarrier::new());
-        // Registered-thread count: the forkers + the live siblings. A thread
-        // unregisters before parking and re-registers on resume — exactly the
-        // kicker count the runtime drains to 1.
-        let kicker = Arc::new(AtomicUsize::new(forkers + SIBLINGS));
+        let sibling_tids: Vec<_> = (0..SIBLINGS)
+            .map(|index| carrick_hal::ThreadId::synthetic_for_tests(10_000 + index as i32))
+            .collect();
+        let forker_tids: Vec<_> = (0..forkers)
+            .map(|index| carrick_hal::ThreadId::synthetic_for_tests(20_000 + index as i32))
+            .collect();
+        let mut initial_members = BTreeSet::new();
+        initial_members.extend(sibling_tids.iter().copied());
+        initial_members.extend(forker_tids.iter().copied());
+        let leases = Arc::new(Mutex::new(IdentityLeases {
+            members: initial_members,
+            freeze_owner: None,
+        }));
         let stop = Arc::new(AtomicBool::new(false));
         let rounds = Arc::new(AtomicUsize::new(0));
         let mut handles = Vec::new();
 
-        for _ in 0..SIBLINGS {
-            let (b, k, s) = (Arc::clone(&barrier), Arc::clone(&kicker), Arc::clone(&stop));
+        for tid in sibling_tids {
+            let (b, leases, s) = (Arc::clone(&barrier), Arc::clone(&leases), Arc::clone(&stop));
             handles.push(std::thread::spawn(move || {
                 while !s.load(Ordering::Relaxed) {
                     if b.is_quiescing() {
-                        k.fetch_sub(1, Ordering::SeqCst);
+                        leases.lock().unwrap().unregister(tid);
                         b.park_if_quiescing();
-                        k.fetch_add(1, Ordering::SeqCst);
+                        while !leases.lock().unwrap().try_register(tid)
+                            && !s.load(Ordering::Relaxed)
+                        {
+                            std::thread::yield_now();
+                        }
                     }
                     std::thread::yield_now();
                 }
             }));
         }
 
-        for _ in 0..forkers {
-            let (b, k, s, r) = (
+        for tid in forker_tids {
+            let (b, leases, s, r) = (
                 Arc::clone(&barrier),
-                Arc::clone(&kicker),
+                Arc::clone(&leases),
                 Arc::clone(&stop),
                 Arc::clone(&rounds),
             );
@@ -1194,23 +1241,41 @@ mod tests {
                         // Lost the token: park at the in-flight barrier (like the
                         // runtime) so the winner can count us as quiesced.
                         if b.is_quiescing() {
-                            k.fetch_sub(1, Ordering::SeqCst);
+                            leases.lock().unwrap().unregister(tid);
                             b.park_if_quiescing();
-                            k.fetch_add(1, Ordering::SeqCst);
+                            while !leases.lock().unwrap().try_register(tid)
+                                && !s.load(Ordering::Relaxed)
+                            {
+                                std::thread::yield_now();
+                            }
                         }
                         std::thread::yield_now();
                         continue;
                     }
                     b.set_quiescing();
-                    // Drain until only this winner remains registered.
-                    while k.load(Ordering::SeqCst) > 1 && !s.load(Ordering::Relaxed) {
+                    // Observation and registration closure are one locked
+                    // transaction: only the exact owner remains, then a unique
+                    // freeze blocks every non-owner publication.
+                    let frozen = loop {
+                        if leases.lock().unwrap().try_freeze(tid) {
+                            break true;
+                        }
+                        if s.load(Ordering::Relaxed) {
+                            break false;
+                        }
                         std::thread::yield_now();
+                    };
+                    if !frozen {
+                        b.end_quiesce();
+                        b.end_fork();
+                        break;
                     }
                     {
                         let _g = b.lock_paused_across_fork(); // no-op "fork" window
                     }
                     b.end_quiesce();
                     b.end_fork();
+                    leases.lock().unwrap().thaw(tid);
                     r.fetch_add(1, Ordering::Relaxed);
                 }
             }));
@@ -1274,12 +1339,12 @@ mod tests {
     }
 
     #[test]
-    fn fork_quiesce_no_lost_wakeup_single_forker() {
+    fn fork_quiesce_stress_no_lost_wakeup_single_forker() {
         fork_quiesce_stress(1);
     }
 
     #[test]
-    fn fork_quiesce_no_lost_wakeup_concurrent_forkers() {
+    fn fork_quiesce_stress_no_lost_wakeup_concurrent_forkers() {
         fork_quiesce_stress(2);
     }
 }
