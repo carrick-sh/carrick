@@ -84,10 +84,9 @@
 //! dispatcher struct and the normalized dispatch table. Socket/netlink/fd-set
 //! helper routines and the AF_UNIX registry live in the `support` submodule.
 use super::*;
-use crate::kernel::FileDescriptionBacking;
 use crate::linux_abi::{
     LINUX_ICMP_ECHO_REPLY, LINUX_ICMP_ECHO_REQUEST, LINUX_IPPROTO_ICMP, LINUX_IPPROTO_TCP,
-    LINUX_MSG_NOSIGNAL, LINUX_POLLRDHUP, LinuxPollEvents,
+    LINUX_MSG_NOSIGNAL, LINUX_POLLRDHUP,
 };
 use crate::network::{BindTarget, ConnectTarget, GuestSocketAddr, HostSocketAddr};
 use carrick_spec::PortProtocol;
@@ -648,6 +647,12 @@ fn guest_unix_pathname(memory: &impl GuestMemory, addr: u64, addrlen: u32) -> Op
         })
 }
 
+#[cfg(not(any(
+    feature = "platform-macos",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd",
+    target_os = "linux"
+)))]
 fn host_stream_socket_read_eof(host_fd: i32) -> bool {
     let mut byte = [0u8; 1];
     let rc = unsafe {
@@ -1070,295 +1075,8 @@ impl SyscallDispatcher {
         let Some(open_file) = self.open_file(fd) else {
             return 0;
         };
-        if let Some(ring) = open_file
-            .description
-            .concrete_backing::<crate::dispatch::ioring::IoUringBacking>()
-        {
-            return ring
-                .readiness(
-                    open_file.description.id(),
-                    carrick_abi::LinuxEpollEvents::from_bits_retain(requested_events),
-                    self,
-                )
-                .bits();
-        }
-        let Some(open) = open_file.description.read() else {
-            return 0;
-        };
-        match &*open {
-            OpenDescription::SyntheticDevice { .. } => {
-                let mut ready = 0;
-                if requested_events & LINUX_EPOLLIN != 0 {
-                    ready |= LINUX_EPOLLIN;
-                }
-                if requested_events & LINUX_EPOLLOUT != 0 {
-                    ready |= LINUX_EPOLLOUT;
-                }
-                ready
-            }
-            OpenDescription::EventFd { state, .. }
-                if state.counter_value() > 0 && requested_events & LINUX_EPOLLIN != 0 =>
-            {
-                LINUX_EPOLLIN
-            }
-            OpenDescription::PipeReader { pipe, .. } => {
-                let state = pipe.state.lock();
-                let mut ready = 0;
-                if requested_events & LINUX_EPOLLIN != 0 && !state.buffer.is_empty() {
-                    ready |= LINUX_EPOLLIN;
-                }
-                if state.writers == 0 {
-                    ready |= LINUX_EPOLLHUP;
-                    if requested_events & LINUX_EPOLLIN != 0 {
-                        ready |= LINUX_EPOLLIN;
-                    }
-                }
-                ready
-            }
-            OpenDescription::PipeWriter { pipe, .. } => {
-                let state = pipe.state.lock();
-                let mut ready = 0;
-                if state.readers == 0 {
-                    ready |= LINUX_EPOLLERR | LINUX_EPOLLHUP;
-                } else if requested_events & LINUX_EPOLLOUT != 0
-                    && crate::dispatch::fs::pipe::pipe_writer_is_writable(&state)
-                {
-                    ready |= LINUX_EPOLLOUT;
-                }
-                ready
-            }
-            OpenDescription::TimerFd { state, .. }
-                if requested_events & LINUX_EPOLLIN != 0 && timerfd_ready_count(state) > 0 =>
-            {
-                LINUX_EPOLLIN
-            }
-            OpenDescription::Mqueue { queue, .. } => {
-                let state = queue.state.lock();
-                let mut ready = 0;
-                if requested_events & LINUX_EPOLLIN != 0 && !state.messages.is_empty() {
-                    ready |= LINUX_EPOLLIN;
-                }
-                if requested_events & LINUX_EPOLLOUT != 0 && state.messages.len() < state.max_msg {
-                    ready |= LINUX_EPOLLOUT;
-                }
-                ready
-            }
-            OpenDescription::InMemorySocket { socket, .. } => {
-                socket.poll_mask()
-                    & (requested_events | LINUX_EPOLLERR | LINUX_EPOLLHUP | LINUX_EPOLLRDHUP)
-            }
-            OpenDescription::Epoll {
-                interest,
-                pending_ready,
-                kqueue,
-                ..
-            } => {
-                let mut ready = 0;
-                if requested_events & LINUX_EPOLLIN != 0 {
-                    if !pending_ready.is_empty() {
-                        ready |= LINUX_EPOLLIN;
-                    } else {
-                        let mut pfd = libc::pollfd {
-                            fd: kqueue.poll_fd(),
-                            events: libc::POLLIN,
-                            revents: 0,
-                        };
-                        let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
-                        if (rc > 0
-                            && pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0)
-                            || interest.iter().any(|(fd, interest)| {
-                                self.host_fd_for_poll(*fd).is_none()
-                                    && self.epoll_ready_events(*fd, interest.event.events) != 0
-                            })
-                        {
-                            ready |= LINUX_EPOLLIN;
-                        }
-                    }
-                }
-                ready
-            }
-            OpenDescription::HostSocket { base, .. } if base.pending_socket_error().is_some() => {
-                let mut ready = LINUX_EPOLLERR;
-                if requested_events & LINUX_EPOLLOUT != 0 {
-                    ready |= LINUX_EPOLLOUT;
-                }
-                ready
-            }
-            OpenDescription::Netlink { recv_queue, .. } => {
-                let mut ready = 0;
-                if requested_events & LINUX_EPOLLIN != 0 && !recv_queue.is_empty() {
-                    ready |= LINUX_EPOLLIN;
-                }
-                if requested_events & LINUX_EPOLLOUT != 0 {
-                    ready |= LINUX_EPOLLOUT;
-                }
-                ready
-            }
-            _ => {
-                // For host-backed descriptions (HostPipe/HostSocket/HostFile/
-                // stdio) the in-memory arms above don't apply: readiness lives
-                // in the real kernel object. Mirror what poll()/ppoll() do —
-                // map the guest fd to its host fd and do a non-blocking
-                // libc::poll(timeout 0), then translate revents → epoll events.
-                // A one-way pipe/FIFO read end is never writable under Linux;
-                // FreeBSD's poll(2) wrongly reports POLLOUT on it (see
-                // host_fd_is_oneway_pipe_read_end), so drop EPOLLOUT for it.
-                let suppress_pollout = match &*open {
-                    OpenDescription::HostPipe {
-                        base,
-                        host_fd,
-                        is_read_end,
-                        bidirectional,
-                        pty,
-                        pipe_id,
-                        ..
-                    } => {
-                        let one_way_read_end = *is_read_end && !*bidirectional && pty.is_none();
-                        let pipe_full = self
-                            .host_pipe_capacity_state(
-                                base,
-                                *pipe_id,
-                                *is_read_end,
-                                *bidirectional,
-                                host_fd.raw(),
-                            )
-                            .and_then(|(capacity, queued)| host_pipe_write_room(capacity, queued))
-                            .is_some_and(|room| room < 4096);
-                        one_way_read_end || pipe_full
-                    }
-                    _ => false,
-                };
-                // A datagram carrick itself queued (the bridge DNS gateway's
-                // answer, a loopback ICMP echo reply) sits in `synthetic_recv`,
-                // invisible to the host poll below: it is readable to the
-                // guest, so it is EPOLLIN here too. `poll_ready_events` already
-                // does this; `epoll_pwait` recomputes host-backed readiness
-                // through THIS function, so it must as well.
-                let (stream_socket_fd, synthetic_datagram_ready) = match &*open {
-                    OpenDescription::HostSocket {
-                        host_fd,
-                        synthetic_recv,
-                        ..
-                    } => (Some(host_fd.raw()), !synthetic_recv.is_empty()),
-                    _ => (None, false),
-                };
-                drop(open);
-                let Some(host_fd) = self.host_fd_for_poll(fd) else {
-                    return 0;
-                };
-                let mut interest: i16 = 0;
-                if requested_events & LINUX_EPOLLIN != 0 {
-                    interest |= libc::POLLIN;
-                }
-                if requested_events & LINUX_EPOLLOUT != 0 && !suppress_pollout {
-                    interest |= libc::POLLOUT;
-                }
-                if requested_events & LINUX_EPOLLPRI != 0 {
-                    interest |= libc::POLLPRI;
-                }
-                let mut pfd = libc::pollfd {
-                    fd: host_fd.get(),
-                    events: interest,
-                    revents: 0,
-                };
-                let rc = unsafe { libc::poll(&mut pfd as *mut _, 1, 0) };
-                let mut ready = 0u32;
-                if rc > 0 {
-                    if pfd.revents & libc::POLLIN != 0 {
-                        ready |= LINUX_EPOLLIN;
-                    }
-                    // FreeBSD's poll(2) sets POLLOUT on a pipe read end even when
-                    // it was not requested; a one-way read end is never writable
-                    // on Linux, so never surface EPOLLOUT for it.
-                    if pfd.revents & libc::POLLOUT != 0 && !suppress_pollout {
-                        ready |= LINUX_EPOLLOUT;
-                    }
-                    if pfd.revents & libc::POLLPRI != 0 {
-                        ready |= LINUX_EPOLLPRI;
-                    }
-                    if pfd.revents & libc::POLLHUP != 0 {
-                        ready |= LINUX_EPOLLHUP;
-                    }
-                    if pfd.revents & libc::POLLERR != 0 {
-                        ready |= LINUX_EPOLLERR;
-                    }
-                }
-                // SO_REUSEPORT readability is a GROUP property. Darwin parks
-                // all incoming work on the last binder, so a member's own host
-                // socket is usually quiet while the group has plenty; and the
-                // member whose turn it is not must stay quiet even when its own
-                // socket does hold something, or two workers race for one
-                // connection instead of alternating. Both directions are
-                // corrected here. `is_shared` is false for every ordinary
-                // socket, which keeps them on the untouched path.
-                // A modelled Linux error queue makes the socket both readable
-                // AND in error, which is what drives libuv to run its plain read
-                // and then its MSG_ERRQUEUE read — `uv__udp_io` only calls the
-                // latter on POLLERR.
-                if recverr::is_enabled(host_fd.get()) {
-                    recverr::poll_errors(host_fd.get());
-                    if recverr::has_pending(host_fd.get()) {
-                        ready |= LINUX_EPOLLIN | LINUX_EPOLLERR;
-                    }
-                }
-                if requested_events & LINUX_EPOLLIN != 0 && reuseport::is_shared(host_fd.get()) {
-                    let group_has_work = ready & LINUX_EPOLLIN != 0
-                        || reuseport::siblings(host_fd.get())
-                            .into_iter()
-                            .any(host_fd_has_pending_input);
-                    if group_has_work && reuseport::is_turn(host_fd.get()) {
-                        ready |= LINUX_EPOLLIN;
-                    } else {
-                        ready &= !LINUX_EPOLLIN;
-                    }
-                }
-                // macOS `poll(2)` does NOT surface TCP urgent/out-of-band data
-                // through `POLLPRI` (it stays clear even with a pending urgent
-                // byte), so the recompute above can never assert EPOLLPRI on
-                // Darwin. The instance kqueue's `EVFILT_EXCEPT`/`NOTE_OOB` filter
-                // detects the OOB edge correctly, but this level-readiness probe
-                // (which the epoll_pwait re-poll trusts over the drained bits)
-                // must answer EPOLLPRI the Darwin-native way too — otherwise the
-                // edge is drained then dropped and EPOLLPRI is never delivered
-                // (probe `epollpri`). Check it via a one-shot kqueue OOB probe
-                // whenever the caller is interested in EPOLLPRI; `host_fd_has_oob`
-                // is a no-op on hosts whose native poll already handled POLLPRI.
-                if requested_events & LINUX_EPOLLPRI != 0
-                    && ready & LINUX_EPOLLPRI == 0
-                    && host_fd_has_oob(host_fd.get())
-                {
-                    ready |= LINUX_EPOLLPRI;
-                }
-                // macOS doesn't report a named-FIFO read-end ready when its last
-                // writer closed — the kernel-decided beacon does (dispatch::
-                // fifo_beacon). Check it REGARDLESS of the host poll result: a
-                // read-end registered for EPOLLOUT (Go's netpoller watches both
-                // directions) makes the host poll return rc>0 with a spurious
-                // POLLOUT, which must NOT mask the EOF (POLLIN|HUP) Linux delivers.
-                if crate::dispatch::fifo_beacon::read_end_at_eof(host_fd.get()) {
-                    ready |= LINUX_EPOLLIN | LINUX_EPOLLHUP;
-                }
-                if requested_events & LINUX_EPOLLIN != 0 && self.staged_splice_pipe_bytes(fd) != 0 {
-                    ready |= LINUX_EPOLLIN;
-                }
-                if requested_events & LINUX_EPOLLRDHUP != 0
-                    && let Some(socket_fd) = stream_socket_fd
-                    && host_stream_socket_read_eof(socket_fd)
-                {
-                    ready |= LINUX_EPOLLIN | LINUX_EPOLLRDHUP;
-                }
-                // Asserted AFTER the SO_REUSEPORT turn-taking above: a synthetic
-                // datagram is addressed to this exact socket (it answered this
-                // socket's query), never to the group, so the group mask must
-                // not hide it.
-                if requested_events & LINUX_EPOLLIN != 0 && synthetic_datagram_ready {
-                    ready |= LINUX_EPOLLIN;
-                }
-                // Only report events the caller is watching, plus the
-                // always-reported HUP/ERR conditions Linux delivers regardless.
-                ready & (requested_events | LINUX_EPOLLHUP | LINUX_EPOLLERR)
-            }
-        }
+        let interest = carrick_abi::LinuxEpollEvents::from_bits_retain(requested_events);
+        open_file.description.readiness(interest, self).bits()
     }
 
     fn host_read_avail_for_poll(&self, fd: i32) -> u64 {
@@ -2038,348 +1756,63 @@ impl SyscallDispatcher {
         })
     }
 
+    /// Poll readiness for bare standard I/O file descriptors (0, 1, 2) when no
+    /// description is installed in the file table.
+    ///
+    /// This special case stays outside the `FileDescription::readiness` authority
+    /// because fds 0/1/2 with no installed description have no backing description
+    /// object to query. Absent non-stdio descriptors report `POLLNVAL`.
+    fn bare_stdio_poll_ready_events(&self, fd: i32, requested_events: i16) -> i16 {
+        if is_stdio_fd(fd) {
+            // fd 1/2 are always writable (we either buffer or stream
+            // straight to host write). For fd 0 we have to actually
+            // poll the host because the guest's read(0,...) ultimately
+            // calls libc::read(0,...); without a real readiness check,
+            // ppoll would always return POLLOUT only and never POLLIN,
+            // breaking interactive shells that ppoll(stdin) before
+            // each prompt.
+            let mut revents = requested_events & LINUX_POLLOUT;
+            if fd == 0 && (requested_events & LINUX_POLLIN) != 0 {
+                let mut pfd = libc::pollfd {
+                    fd: 0,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let n = unsafe { libc::poll(&mut pfd as *mut _, 1, 0) };
+                if n > 0 {
+                    if pfd.revents & libc::POLLIN != 0 {
+                        revents |= LINUX_POLLIN;
+                    }
+                    if pfd.revents & libc::POLLHUP != 0 {
+                        revents |= LINUX_POLLHUP;
+                    }
+                    if pfd.revents & libc::POLLERR != 0 {
+                        revents |= LINUX_POLLERR;
+                    }
+                }
+            }
+            revents
+        } else {
+            LINUX_POLLNVAL
+        }
+    }
+
     fn poll_ready_events(&self, fd: i32, requested_events: i16) -> i16 {
         if fd < 0 {
             return 0;
         }
         let Some(open_file) = self.open_file(fd) else {
-            return if is_stdio_fd(fd) {
-                // fd 1/2 are always writable (we either buffer or stream
-                // straight to host write). For fd 0 we have to actually
-                // poll the host because the guest's read(0,...) ultimately
-                // calls libc::read(0,...); without a real readiness check,
-                // ppoll would always return POLLOUT only and never POLLIN,
-                // breaking interactive shells that ppoll(stdin) before
-                // each prompt.
-                let mut revents = requested_events & LINUX_POLLOUT;
-                if fd == 0 && (requested_events & LINUX_POLLIN) != 0 {
-                    let mut pfd = libc::pollfd {
-                        fd: 0,
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
-                    let n = unsafe { libc::poll(&mut pfd as *mut _, 1, 0) };
-                    if n > 0 {
-                        if pfd.revents & libc::POLLIN != 0 {
-                            revents |= LINUX_POLLIN;
-                        }
-                        if pfd.revents & libc::POLLHUP != 0 {
-                            revents |= LINUX_POLLHUP;
-                        }
-                    }
-                }
-                revents
-            } else {
-                LINUX_POLLNVAL
-            };
+            return self.bare_stdio_poll_ready_events(fd, requested_events);
         };
         if open_file.description.is_closed() {
             return LINUX_POLLNVAL;
         }
-        if let Some(ring) = open_file
+        let interest = carrick_abi::LinuxPollEvents::from_bits_truncate(requested_events);
+        open_file
             .description
-            .concrete_backing::<crate::dispatch::ioring::IoUringBacking>()
-        {
-            return ring
-                .readiness(
-                    open_file.description.id(),
-                    carrick_abi::LinuxPollEvents::from_bits_truncate(requested_events).to_epoll(),
-                    self,
-                )
-                .to_poll()
-                .bits();
-        }
-        let Some(open) = open_file.description.read() else {
-            return LINUX_POLLNVAL;
-        };
-        let mut ready = 0;
-        match &*open {
-            OpenDescription::Closed { .. } => ready |= LINUX_POLLNVAL,
-            OpenDescription::File { .. }
-            | OpenDescription::InMemoryFile { .. }
-            | OpenDescription::SyntheticFile { .. } => {
-                if requested_events & LINUX_POLLIN != 0 {
-                    ready |= LINUX_POLLIN;
-                }
-            }
-            OpenDescription::SyntheticDevice { .. } => {
-                if requested_events & LINUX_POLLIN != 0 {
-                    ready |= LINUX_POLLIN;
-                }
-                if requested_events & LINUX_POLLOUT != 0 {
-                    ready |= LINUX_POLLOUT;
-                }
-            }
-            // Regular files are always ready for read and write.
-            OpenDescription::HostFile { .. } => {
-                if requested_events & LINUX_POLLIN != 0 {
-                    ready |= LINUX_POLLIN;
-                }
-                if requested_events & LINUX_POLLOUT != 0 {
-                    ready |= LINUX_POLLOUT;
-                }
-            }
-            OpenDescription::Directory { .. } => {}
-            OpenDescription::EventFd { state, .. } => {
-                let counter = state.counter_value();
-                if requested_events & LINUX_POLLIN != 0 && counter > 0 {
-                    ready |= LINUX_POLLIN;
-                }
-                // POLLOUT iff a write of 1 wouldn't overflow the counter — Linux
-                // reports an eventfd unwritable once it reaches 0xFFFF…FFFE
-                // (test_os EventfdTests.test_eventfd_select checks both states).
-                if requested_events & LINUX_POLLOUT != 0 && counter < u64::MAX - 1 {
-                    ready |= LINUX_POLLOUT;
-                }
-            }
-            OpenDescription::TimerFd { state, .. } => {
-                if requested_events & LINUX_POLLIN != 0 && timerfd_ready_count(state) > 0 {
-                    ready |= LINUX_POLLIN;
-                }
-            }
-            OpenDescription::Epoll {
-                interest,
-                pending_ready,
-                kqueue,
-                ..
-            } => {
-                if requested_events & LINUX_POLLIN != 0 {
-                    if !pending_ready.is_empty() {
-                        ready |= LINUX_POLLIN;
-                    } else {
-                        let mut pfd = libc::pollfd {
-                            fd: kqueue.poll_fd(),
-                            events: libc::POLLIN,
-                            revents: 0,
-                        };
-                        let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
-                        if (rc > 0
-                            && pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0)
-                            || interest.iter().any(|(fd, interest)| {
-                                self.host_fd_for_poll(*fd).is_none()
-                                    && self.epoll_ready_events(*fd, interest.event.events) != 0
-                            })
-                        {
-                            ready |= LINUX_POLLIN;
-                        }
-                    }
-                }
-            }
-            // Pidfd readiness is the kqueue's job (host_fd_for_poll returns the
-            // EVFILT_PROC kqueue fd), so there's no in-memory readiness here.
-            OpenDescription::Pidfd { .. } => {}
-            // Inotify readiness is likewise the backing kqueue's job
-            // (host_fd_for_poll returns its fd); no in-memory readiness here.
-            OpenDescription::Inotify { .. } => {}
-            // fanotify normally reports readiness through its readiness pipe
-            // (`host_fd_for_poll`). This in-memory answer is the degraded path
-            // for a group whose pipe could not be created: without it such a
-            // group would never poll readable even with events queued.
-            OpenDescription::Fanotify { group, .. } => {
-                if requested_events & LINUX_POLLIN != 0 && group.has_events() {
-                    ready |= LINUX_POLLIN;
-                }
-            }
-            // signalfd readiness would track pending masked signals; delivery is
-            // a tracked follow-up, so there is no in-memory readiness here.
-            OpenDescription::SignalFd { .. } => {}
-            // A counting perf event fd never becomes readable: readability is
-            // overflow-sample delivery, and carrick refuses sampling events at
-            // open (see dispatch::perf module docs).
-            OpenDescription::PerfEvent { .. } => {}
-            // An fs context fd carries no readiness events in carrick (its
-            // read channel — the fsconfig error log — is unimplemented).
-            OpenDescription::FsContext { .. } => {}
-            OpenDescription::PipeReader { pipe, .. } => {
-                let state = pipe.state.lock();
-                if requested_events & LINUX_POLLIN != 0 && !state.buffer.is_empty() {
-                    ready |= LINUX_POLLIN;
-                }
-                if state.writers == 0 {
-                    ready |= LINUX_POLLHUP;
-                }
-            }
-            OpenDescription::PipeWriter { pipe, .. } => {
-                let state = pipe.state.lock();
-                if state.readers == 0 {
-                    ready |= LINUX_POLLERR;
-                } else if requested_events & LINUX_POLLOUT != 0
-                    && crate::dispatch::fs::pipe::pipe_writer_is_writable(&state)
-                {
-                    ready |= LINUX_POLLOUT;
-                }
-            }
-            OpenDescription::InMemorySocket { socket, .. } => {
-                ready |= (socket.poll_mask() as i16)
-                    & (requested_events | LINUX_POLLERR | LINUX_POLLHUP | LINUX_POLLRDHUP);
-            }
-            OpenDescription::HostPipe {
-                host_fd,
-                is_read_end,
-                bidirectional,
-                pty,
-                ..
-            } => {
-                // Poll the real host pipe fd so the guest's poll loop reflects
-                // actual kernel readiness: a read end with buffered data is
-                // POLLIN-ready, a write end with buffer space is POLLOUT-ready,
-                // and a hung-up peer surfaces POLLHUP/POLLERR. Reporting
-                // nothing here made poll/ppoll/pselect6 undercount ready fds
-                // for pipe ends.
-                // A one-way pipe/FIFO read end is never writable under Linux, but
-                // FreeBSD's poll(2) reports POLLOUT on it — drop that spurious
-                // writability so poll/ppoll/select agree with Linux (and with the
-                // epoll path's host_fd_is_oneway_pipe_read_end suppression).
-                let suppress_pollout = *is_read_end && !*bidirectional && pty.is_none();
-                let mut pfd = libc::pollfd {
-                    fd: host_fd.raw(),
-                    events: 0,
-                    revents: 0,
-                };
-                if requested_events & LINUX_POLLIN != 0 {
-                    pfd.events |= libc::POLLIN;
-                }
-                if requested_events & LINUX_POLLOUT != 0 && !suppress_pollout {
-                    pfd.events |= libc::POLLOUT;
-                }
-                let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
-                if rc > 0 {
-                    if pfd.revents & libc::POLLIN != 0 {
-                        ready |= LINUX_POLLIN;
-                    }
-                    if pfd.revents & libc::POLLOUT != 0 && !suppress_pollout {
-                        ready |= LINUX_POLLOUT;
-                    }
-                    if pfd.revents & libc::POLLERR != 0 {
-                        ready |= LINUX_POLLERR;
-                    }
-                    if pfd.revents & libc::POLLHUP != 0 {
-                        ready |= LINUX_POLLHUP;
-                    }
-                }
-                // macOS won't report a named-FIFO read-end ready when its last
-                // writer closed; the kernel-decided beacon does (dispatch::
-                // fifo_beacon). Surface the POLLIN|POLLHUP (read→EOF) Linux gives.
-                if requested_events & LINUX_POLLIN != 0
-                    && ready & LINUX_POLLIN == 0
-                    && crate::dispatch::fifo_beacon::read_end_at_eof(host_fd.raw())
-                {
-                    ready |= LINUX_POLLIN | LINUX_POLLHUP;
-                }
-                if requested_events & LINUX_POLLIN != 0 && self.staged_splice_pipe_bytes(fd) != 0 {
-                    ready |= LINUX_POLLIN;
-                }
-            }
-            OpenDescription::HostSocket {
-                host_fd,
-                base,
-                synthetic_recv,
-                ..
-            } => {
-                if base.pending_socket_error().is_some() {
-                    let mut ready = LINUX_POLLERR;
-                    if requested_events & LINUX_POLLOUT != 0 {
-                        ready |= LINUX_POLLOUT;
-                    }
-                    return ready;
-                }
-                if requested_events & LINUX_POLLIN != 0 && !synthetic_recv.is_empty() {
-                    ready |= LINUX_POLLIN;
-                }
-                // Poll the real host fd so the guest's poll loop reflects
-                // actual kernel readiness for the socket.
-                let mut pfd = libc::pollfd {
-                    fd: host_fd.raw(),
-                    events: 0,
-                    revents: 0,
-                };
-                if requested_events & LINUX_POLLIN != 0 {
-                    pfd.events |= libc::POLLIN;
-                }
-                if requested_events & LINUX_POLLOUT != 0 {
-                    pfd.events |= libc::POLLOUT;
-                }
-                let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
-                if rc > 0 {
-                    if pfd.revents & libc::POLLIN != 0 {
-                        ready |= LINUX_POLLIN;
-                    }
-                    if pfd.revents & libc::POLLOUT != 0 {
-                        ready |= LINUX_POLLOUT;
-                    }
-                    if pfd.revents & libc::POLLERR != 0 {
-                        ready |= LINUX_POLLERR;
-                    }
-                    if pfd.revents & libc::POLLHUP != 0 {
-                        ready |= LINUX_POLLHUP;
-                    }
-                }
-                if LinuxPollEvents::from_bits_retain(requested_events)
-                    .contains(LinuxPollEvents::RDHUP)
-                    && host_stream_socket_rdhup(host_fd.raw())
-                {
-                    ready |= LINUX_POLLIN | LINUX_POLLRDHUP;
-                }
-                // Same as the epoll path: a queued error-queue entry is both
-                // readable and an error condition.
-                if recverr::is_enabled(host_fd.raw()) {
-                    recverr::poll_errors(host_fd.raw());
-                    if recverr::has_pending(host_fd.raw()) {
-                        ready |= LINUX_POLLIN | LINUX_POLLERR;
-                    }
-                }
-                // SO_REUSEPORT readability is a GROUP property — see the
-                // matching block in `epoll_ready_events`. No-op for any socket
-                // that is not in a multi-member group.
-                if requested_events & LINUX_POLLIN != 0 && reuseport::is_shared(host_fd.raw()) {
-                    let group_has_work = ready & LINUX_POLLIN != 0
-                        || reuseport::siblings(host_fd.raw())
-                            .into_iter()
-                            .any(host_fd_has_pending_input);
-                    if group_has_work && reuseport::is_turn(host_fd.raw()) {
-                        ready |= LINUX_POLLIN;
-                    } else {
-                        ready &= !LINUX_POLLIN;
-                    }
-                }
-            }
-            OpenDescription::Netlink { recv_queue, .. } => {
-                // A netlink socket is "readable" once a dump response has
-                // been queued (by a prior sendto/sendmsg), and always
-                // writable (the kernel never blocks rtnetlink requests).
-                if requested_events & LINUX_POLLIN != 0 && !recv_queue.is_empty() {
-                    ready |= LINUX_POLLIN;
-                }
-                if requested_events & LINUX_POLLOUT != 0 {
-                    ready |= LINUX_POLLOUT;
-                }
-            }
-            // A bpf map/prog fd implements no poll operation; Linux's poll
-            // core then reports the default mask (readable + writable).
-            OpenDescription::BpfMap { .. } | OpenDescription::BpfProg { .. } => {
-                if requested_events & LINUX_POLLIN != 0 {
-                    ready |= LINUX_POLLIN;
-                }
-                if requested_events & LINUX_POLLOUT != 0 {
-                    ready |= LINUX_POLLOUT;
-                }
-            }
-            // A POSIX message queue is readable iff it holds at least one
-            // message and writable iff it has room — read the backing file's
-            // header (under its OFD lock) to decide. (mq_overview(7)/poll(2).)
-            OpenDescription::Mqueue { queue, .. } => {
-                let state = queue.state.lock();
-                let readable = !state.messages.is_empty();
-                let writable = state.messages.len() < state.max_msg;
-                if requested_events & LINUX_POLLIN != 0 && readable {
-                    ready |= LINUX_POLLIN;
-                }
-                if requested_events & LINUX_POLLOUT != 0 && writable {
-                    ready |= LINUX_POLLOUT;
-                }
-            }
-        }
-        ready
+            .readiness(interest.to_epoll(), self)
+            .to_poll()
+            .bits()
     }
 
     /// Create a synthetic AF_NETLINK socket. Linux accepts SOCK_RAW and
@@ -4922,11 +4355,704 @@ mod netlink_readiness_tests {
             0
         );
     }
+
+    fn every_description_kind_fixture() -> Vec<OpenFile> {
+        let mut fixtures = Vec::with_capacity(25);
+
+        // 1. Closed
+        fixtures.push(OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::Closed { was_epoll: false })),
+            0,
+            0,
+        ));
+
+        // 2. File
+        fixtures.push(OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::File {
+                base: OpenDescriptionBase::new(0),
+                path: "/fixture/file".to_string(),
+                metadata: crate::rootfs::RootFsMetadata {
+                    path: std::path::PathBuf::from("/fixture/file"),
+                    kind: crate::rootfs::RootFsEntryKind::File,
+                    mode: 0o644,
+                    size: 12,
+                },
+                contents: FileContents::dense(b"fixture data".to_vec()),
+                offset: 0,
+                writable: true,
+            })),
+            LINUX_O_RDWR,
+            0,
+        ));
+
+        // 3. Directory
+        fixtures.push(OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::Directory {
+                base: OpenDescriptionBase::new(0),
+                path: "/fixture/dir".to_string(),
+                metadata: crate::rootfs::RootFsMetadata {
+                    path: std::path::PathBuf::from("/fixture/dir"),
+                    kind: crate::rootfs::RootFsEntryKind::Directory,
+                    mode: 0o755,
+                    size: 0,
+                },
+                entries: Vec::new(),
+                offset: 0,
+                trusted_host_dir: None,
+            })),
+            LINUX_O_RDONLY,
+            0,
+        ));
+
+        // 4. SyntheticFile
+        fixtures.push(OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::SyntheticFile {
+                base: OpenDescriptionBase::new(0),
+                path: "/fixture/synthetic".to_string(),
+                contents: b"synthetic content".to_vec(),
+                offset: 0,
+            })),
+            LINUX_O_RDONLY,
+            0,
+        ));
+
+        // 5. InMemoryFile
+        fixtures.push(OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::InMemoryFile {
+                base: OpenDescriptionBase::new(0),
+                path: "/fixture/inmem".to_string(),
+                contents: Arc::new(parking_lot::RwLock::new(b"inmem content".to_vec())),
+                offset: 0,
+                writable: true,
+                max_size: 4096,
+            })),
+            LINUX_O_RDWR,
+            0,
+        ));
+
+        // 6. SyntheticDevice
+        fixtures.push(OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::SyntheticDevice {
+                base: OpenDescriptionBase::new(0),
+                kind: crate::vfs::SyntheticDeviceKind::Null,
+            })),
+            LINUX_O_RDWR,
+            0,
+        ));
+
+        // 7. EventFd
+        fixtures.push(OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::EventFd {
+                base: OpenDescriptionBase::new(0),
+                state: Arc::new(crate::dispatch::EventFdState::new(1)),
+                semaphore: false,
+            })),
+            LINUX_O_RDWR,
+            0,
+        ));
+
+        // 8. TimerFd
+        fixtures.push(OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::TimerFd {
+                base: OpenDescriptionBase::new(0),
+                state: Arc::new(crate::dispatch::TimerFdState::new(
+                    Arc::new(crate::kernel::container::ClockDomain::system()),
+                    1,
+                )),
+            })),
+            LINUX_O_RDWR,
+            0,
+        ));
+
+        // 9. Multiplexed instance
+        {
+            let mut mux = crate::event_mux::make_event_multiplexer().expect("multiplexer");
+            mux.register_user(0).expect("register user wake");
+            fixtures.push(OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(OpenDescription::Epoll {
+                    base: OpenDescriptionBase::new(0),
+                    interest: HashMap::new(),
+                    synthetic_interest_count: 0,
+                    pending_ready: VecDeque::new(),
+                    kqueue: Arc::new(crate::dispatch::EpollKqueue::new(
+                        mux,
+                        crate::dispatch::new_epoll_wake_registry(),
+                    )),
+                })),
+                0,
+                0,
+            ));
+        }
+
+        // 10. Pidfd
+        {
+            let mut mux = crate::event_mux::make_event_multiplexer().expect("pidfd mux");
+            mux.register_user(0).expect("register pidfd user wake");
+            fixtures.push(OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(OpenDescription::Pidfd {
+                    base: OpenDescriptionBase::new(0),
+                    target: PidfdTarget::Host(1234),
+                    kqueue: Arc::new(PidfdWatch::new(mux)),
+                })),
+                0,
+                0,
+            ));
+        }
+
+        // 11. Inotify
+        fixtures.push(OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::Inotify {
+                base: OpenDescriptionBase::new(0),
+                state: Arc::new(crate::inotify::InotifyState::new().expect("inotify state")),
+            })),
+            0,
+            0,
+        ));
+
+        // 12. Fanotify
+        fixtures.push(OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::Fanotify {
+                base: OpenDescriptionBase::new(0),
+                group: Arc::new(crate::fanotify::FanotifyGroup::new(
+                    carrick_abi::LinuxFanotifyInitFlags::empty(),
+                    0,
+                )),
+            })),
+            0,
+            0,
+        ));
+
+        // 13. SignalFd
+        fixtures.push(OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::SignalFd {
+                base: OpenDescriptionBase::new(0),
+                mask: carrick_abi::SigSet::from_raw(0),
+            })),
+            0,
+            0,
+        ));
+
+        // 14. OpenDescription::PerfEvent is omitted because PerfEventState constructor and fields are private to dispatch::perf.
+
+        // 15. FsContext
+        fixtures.push(OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::FsContext {
+                base: OpenDescriptionBase::new(0),
+                state: Arc::new(parking_lot::Mutex::new(
+                    crate::dispatch::mount_api::FsContextState::new_superblock("tmpfs"),
+                )),
+            })),
+            0,
+            0,
+        ));
+
+        // 16. PipeReader
+        {
+            let pipe = Arc::new(crate::dispatch::fs::PipeInner::new(50, 65536));
+            let mut read_base = OpenDescriptionBase::new(LINUX_O_RDONLY);
+            read_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+            fixtures.push(OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(OpenDescription::PipeReader {
+                    base: read_base,
+                    pipe,
+                })),
+                LINUX_O_RDONLY,
+                0,
+            ));
+        }
+
+        // 17. PipeWriter
+        {
+            let pipe = Arc::new(crate::dispatch::fs::PipeInner::new(51, 65536));
+            let mut write_base = OpenDescriptionBase::new(LINUX_O_WRONLY);
+            write_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+            fixtures.push(OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(OpenDescription::PipeWriter {
+                    base: write_base,
+                    pipe,
+                })),
+                LINUX_O_WRONLY,
+                0,
+            ));
+        }
+
+        // 18. HostPipe
+        {
+            let mut host_fds = [-1i32; 2];
+            assert_eq!(unsafe { libc::pipe(host_fds.as_mut_ptr()) }, 0);
+            let _write_ref = HostFdRef::new(host_fds[1]);
+            fixtures.push(OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(OpenDescription::HostPipe {
+                    base: OpenDescriptionBase::new(LINUX_O_RDONLY),
+                    host_fd: HostFdRef::new(host_fds[0]),
+                    is_read_end: true,
+                    pipe_id: 201,
+                    pty: None,
+                    bidirectional: false,
+                    write_kind: HostWriteKind::PipeLike,
+                    stdio_stream: None,
+                })),
+                LINUX_O_RDONLY,
+                0,
+            ));
+        }
+
+        // 19. HostSocket
+        {
+            let mut pair = [-1i32; 2];
+            assert_eq!(
+                unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, pair.as_mut_ptr()) },
+                0
+            );
+            let _peer_ref = HostFdRef::new(pair[1]);
+            fixtures.push(OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(OpenDescription::HostSocket {
+                    base: OpenDescriptionBase::new(LINUX_O_RDWR),
+                    host_fd: HostFdRef::new(pair[0]),
+                    family: LINUX_AF_UNIX,
+                    type_: LINUX_SOCK_STREAM,
+                    protocol: 0,
+                    mcast_memberships: Vec::new(),
+                    synthetic_recv: VecDeque::new(),
+                })),
+                LINUX_O_RDWR,
+                0,
+            ));
+        }
+
+        // 20. HostFile
+        {
+            let mut pair = [-1i32; 2];
+            assert_eq!(unsafe { libc::pipe(pair.as_mut_ptr()) }, 0);
+            let _write_ref = HostFdRef::new(pair[1]);
+            fixtures.push(OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(OpenDescription::HostFile {
+                    base: OpenDescriptionBase::new(LINUX_O_RDWR),
+                    host_fd: HostFdRef::new(pair[0]),
+                    metadata: crate::rootfs::RootFsMetadata {
+                        path: std::path::PathBuf::from("/fixture/hostfile"),
+                        kind: crate::rootfs::RootFsEntryKind::File,
+                        mode: 0o644,
+                        size: 0,
+                    },
+                    writable: true,
+                })),
+                LINUX_O_RDWR,
+                0,
+            ));
+        }
+
+        // 21. Netlink
+        fixtures.push(OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::Netlink {
+                base: OpenDescriptionBase::new(0),
+                protocol: 0,
+                sock_type: LINUX_SOCK_DGRAM,
+                pid: 0,
+                groups: 0,
+                recv_queue: VecDeque::new(),
+            })),
+            0,
+            0,
+        ));
+
+        // 22. OpenDescription::BpfMap is omitted because BpfMap constructor and fields are private to dispatch::bpf.
+
+        // 23. OpenDescription::BpfProg is omitted because BpfProg fields are private to dispatch::bpf and it has no in-process constructor without guest memory.
+
+        // 24. Mqueue
+        fixtures.push(OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::Mqueue {
+                base: OpenDescriptionBase::new(0),
+                queue: Arc::new(crate::dispatch::mqueue::MqueueInner::new(10, 1024, 0)),
+            })),
+            LINUX_O_RDWR,
+            0,
+        ));
+
+        // 25. InMemorySocket
+        {
+            let creds1 = crate::dispatch::net::unix_pure::LinuxUcred {
+                pid: 100,
+                uid: 1000,
+                gid: 1000,
+            };
+            let creds2 = crate::dispatch::net::unix_pure::LinuxUcred {
+                pid: 200,
+                uid: 1000,
+                gid: 1000,
+            };
+            let (s1, _s2) = crate::dispatch::net::unix_pure::PureSocketInner::pair(
+                LINUX_SOCK_STREAM,
+                creds1,
+                creds2,
+            );
+            fixtures.push(OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(OpenDescription::InMemorySocket {
+                    base: OpenDescriptionBase::new(0),
+                    socket: s1,
+                })),
+                LINUX_O_RDWR,
+                0,
+            ));
+        }
+
+        fixtures
+    }
+
+    #[test]
+    fn poll_and_epoll_readiness_agree_for_every_installed_description_kind() {
+        let dispatcher = SyscallDispatcher::new();
+        for open_file in every_description_kind_fixture() {
+            let fd = dispatcher
+                .install_fd_at_or_above(3, open_file)
+                .expect("install fixture fd");
+            let ready_events = dispatcher.epoll_ready_events(fd, LINUX_EPOLLIN | LINUX_EPOLLOUT);
+            let poll = dispatcher.poll_ready_events(fd, LINUX_POLLIN | LINUX_POLLOUT);
+            assert_eq!(
+                carrick_abi::LinuxEpollEvents::from_bits_retain(ready_events)
+                    .to_poll()
+                    .bits()
+                    & (LINUX_POLLIN | LINUX_POLLOUT),
+                poll & (LINUX_POLLIN | LINUX_POLLOUT),
+                "readiness translators must agree for fd {fd}"
+            );
+        }
+    }
+
+    #[test]
+    fn poll_and_epoll_negative_and_absent_fd_semantics() {
+        let dispatcher = SyscallDispatcher::new();
+
+        // Negative fds return 0 on both query surfaces
+        assert_eq!(
+            dispatcher.poll_ready_events(-1, LINUX_POLLIN | LINUX_POLLOUT),
+            0
+        );
+        assert_eq!(
+            dispatcher.epoll_ready_events(-1, LINUX_EPOLLIN | LINUX_EPOLLOUT),
+            0
+        );
+
+        // Absent stdio fds (0, 1, 2) without an installed OpenDescription:
+        // fd 1 and 2 are always writable
+        assert_eq!(
+            dispatcher.poll_ready_events(1, LINUX_POLLOUT) & LINUX_POLLOUT,
+            LINUX_POLLOUT
+        );
+        assert_eq!(
+            dispatcher.poll_ready_events(2, LINUX_POLLOUT) & LINUX_POLLOUT,
+            LINUX_POLLOUT
+        );
+
+        // Absent non-stdio fd returns POLLNVAL in poll, 0 in event query
+        assert_eq!(
+            dispatcher.poll_ready_events(99, LINUX_POLLIN | LINUX_POLLOUT),
+            LINUX_POLLNVAL
+        );
+        assert_eq!(
+            dispatcher.epoll_ready_events(99, LINUX_EPOLLIN | LINUX_EPOLLOUT),
+            0
+        );
+    }
+
+    #[test]
+    fn host_pipe_readiness_suppresses_out_below_pipe_buf_threshold() {
+        let dispatcher = SyscallDispatcher::new();
+
+        // 1. Below threshold: capacity 8192, 4097 bytes queued -> 4095 room (< 4096).
+        let mut fds1 = [-1i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds1.as_mut_ptr()) }, 0);
+        let mut read_base1 = OpenDescriptionBase::new(LINUX_O_RDONLY);
+        read_base1.set_pipe_capacity(8192);
+        let read_pipe1 = OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::HostPipe {
+                base: read_base1,
+                host_fd: HostFdRef::new(fds1[0]),
+                is_read_end: true,
+                pipe_id: 501,
+                pty: None,
+                bidirectional: false,
+                write_kind: HostWriteKind::PipeLike,
+                stdio_stream: None,
+            })),
+            LINUX_O_RDONLY,
+            0,
+        );
+        let _read_fd1 = dispatcher
+            .install_fd_at_or_above(3, read_pipe1)
+            .expect("install read pipe 1");
+
+        let mut write_base1 = OpenDescriptionBase::new(LINUX_O_WRONLY);
+        write_base1.set_pipe_capacity(8192);
+        let write_pipe1 = OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::HostPipe {
+                base: write_base1,
+                host_fd: HostFdRef::new(fds1[1]),
+                is_read_end: false,
+                pipe_id: 501,
+                pty: None,
+                bidirectional: false,
+                write_kind: HostWriteKind::PipeLike,
+                stdio_stream: None,
+            })),
+            LINUX_O_WRONLY,
+            0,
+        );
+        let write_fd1 = dispatcher
+            .install_fd_at_or_above(3, write_pipe1)
+            .expect("install write pipe 1");
+
+        // Write 4097 bytes into the pipe to leave 8192 - 4097 = 4095 room (< 4096 LINUX_PIPE_BUF).
+        let payload1 = vec![0x41u8; 4097];
+        assert_eq!(
+            unsafe { libc::write(fds1[1], payload1.as_ptr().cast(), payload1.len()) },
+            4097
+        );
+
+        // Host fd is natively writable, but modeled room is 4095 (< 4096).
+        // OUT must be suppressed on both query surfaces.
+        let ready_events1 = dispatcher.epoll_ready_events(write_fd1, LINUX_EPOLLOUT);
+        assert_eq!(
+            ready_events1 & LINUX_EPOLLOUT,
+            0,
+            "query must suppress OUT when modeled pipe room is < 4096"
+        );
+        let poll_events1 = dispatcher.poll_ready_events(write_fd1, LINUX_POLLOUT);
+        assert_eq!(
+            poll_events1 & LINUX_POLLOUT,
+            0,
+            "poll must suppress OUT when modeled pipe room is < 4096"
+        );
+
+        // 2. Threshold boundary: separate pipe pair with capacity 8192, 4096 queued -> 4096 room.
+        let mut fds2 = [-1i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds2.as_mut_ptr()) }, 0);
+        let mut read_base2 = OpenDescriptionBase::new(LINUX_O_RDONLY);
+        read_base2.set_pipe_capacity(8192);
+        let read_pipe2 = OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::HostPipe {
+                base: read_base2,
+                host_fd: HostFdRef::new(fds2[0]),
+                is_read_end: true,
+                pipe_id: 502,
+                pty: None,
+                bidirectional: false,
+                write_kind: HostWriteKind::PipeLike,
+                stdio_stream: None,
+            })),
+            LINUX_O_RDONLY,
+            0,
+        );
+        let _read_fd2 = dispatcher
+            .install_fd_at_or_above(3, read_pipe2)
+            .expect("install read pipe 2");
+
+        let mut write_base2 = OpenDescriptionBase::new(LINUX_O_WRONLY);
+        write_base2.set_pipe_capacity(8192);
+        let write_pipe2 = OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::HostPipe {
+                base: write_base2,
+                host_fd: HostFdRef::new(fds2[1]),
+                is_read_end: false,
+                pipe_id: 502,
+                pty: None,
+                bidirectional: false,
+                write_kind: HostWriteKind::PipeLike,
+                stdio_stream: None,
+            })),
+            LINUX_O_WRONLY,
+            0,
+        );
+        let write_fd2 = dispatcher
+            .install_fd_at_or_above(3, write_pipe2)
+            .expect("install write pipe 2");
+
+        // Write 4096 bytes into the pipe to leave exactly 8192 - 4096 = 4096 room.
+        let payload2 = vec![0x42u8; 4096];
+        assert_eq!(
+            unsafe { libc::write(fds2[1], payload2.as_ptr().cast(), payload2.len()) },
+            4096
+        );
+
+        let ready_events2 = dispatcher.epoll_ready_events(write_fd2, LINUX_EPOLLOUT);
+        assert_eq!(
+            ready_events2 & LINUX_EPOLLOUT,
+            LINUX_EPOLLOUT,
+            "query must report OUT when modeled pipe room is >= 4096"
+        );
+        let poll_events2 = dispatcher.poll_ready_events(write_fd2, LINUX_POLLOUT);
+        assert_eq!(
+            poll_events2 & LINUX_POLLOUT,
+            LINUX_POLLOUT,
+            "poll must report OUT when modeled pipe room is >= 4096"
+        );
+    }
+
+    #[test]
+    fn named_fifo_terminal_readiness_reports_implicit_hup() {
+        let dispatcher = SyscallDispatcher::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fifo_path = dir.path().join("test_fifo");
+        let c_path = std::ffi::CString::new(fifo_path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        // Open read end (O_NONBLOCK | O_RDONLY)
+        let rfd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+        assert!(rfd >= 0, "open fifo read end");
+        // Open write end (O_NONBLOCK | O_WRONLY)
+        let wfd = unsafe { libc::open(c_path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+        assert!(wfd >= 0, "open fifo write end");
+
+        // Register with fifo_beacon
+        crate::dispatch::fifo_beacon::register_open(rfd, 0);
+        crate::dispatch::fifo_beacon::register_open(wfd, 1);
+
+        let read_pipe = OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::HostPipe {
+                base: OpenDescriptionBase::new(LINUX_O_RDONLY | LINUX_O_NONBLOCK),
+                host_fd: HostFdRef::new(rfd),
+                is_read_end: true,
+                pipe_id: 601,
+                pty: None,
+                bidirectional: false,
+                write_kind: HostWriteKind::PipeLike,
+                stdio_stream: None,
+            })),
+            LINUX_O_RDONLY | LINUX_O_NONBLOCK,
+            0,
+        );
+        let guest_rfd = dispatcher
+            .install_fd_at_or_above(3, read_pipe)
+            .expect("install fifo read end");
+
+        // Write data into FIFO before writer close so read end has buffered data
+        assert_eq!(unsafe { libc::write(wfd, b"data".as_ptr().cast(), 4) }, 4);
+
+        // Close writer and notify beacon (wfd is unmanaged by HostFdRef, so manually close it)
+        assert!(crate::dispatch::fifo_beacon::register_close(wfd));
+        unsafe { libc::close(wfd) };
+
+        // Buffered data plus EOF: IN interest receives IN | HUP (buffered data does not mask HUP)
+        let ready_in = dispatcher.epoll_ready_events(guest_rfd, LINUX_EPOLLIN);
+        assert_eq!(
+            ready_in & (LINUX_EPOLLIN | LINUX_EPOLLHUP),
+            LINUX_EPOLLIN | LINUX_EPOLLHUP,
+            "buffered data plus EOF must report both IN and HUP"
+        );
+        let poll_in = dispatcher.poll_ready_events(guest_rfd, LINUX_POLLIN);
+        assert_eq!(
+            poll_in & (LINUX_POLLIN | LINUX_POLLHUP),
+            LINUX_POLLIN | LINUX_POLLHUP,
+            "buffered data plus EOF poll must report both IN and HUP"
+        );
+
+        // Query OUT only: even though IN was not requested and OUT is not ready on a read end,
+        // HUP must be delivered implicitly.
+        let ready_events = dispatcher.epoll_ready_events(guest_rfd, LINUX_EPOLLOUT);
+        assert_eq!(
+            ready_events & LINUX_EPOLLHUP,
+            LINUX_EPOLLHUP,
+            "OUT-only registration must receive implicit HUP after writer closes"
+        );
+        let poll_events = dispatcher.poll_ready_events(guest_rfd, LINUX_POLLOUT);
+        assert_eq!(
+            poll_events & LINUX_POLLHUP,
+            LINUX_POLLHUP,
+            "OUT-only poll must receive implicit HUP after writer closes"
+        );
+
+        // Unregister reader from beacon; HostFdRef will close rfd when dropped
+        assert!(!crate::dispatch::fifo_beacon::register_close(rfd));
+
+        // Prove this FIFO's beacon and read end are cleanly removed on full lifecycle completion
+        assert!(
+            !crate::dispatch::fifo_beacon::has_beacon_for_fd(rfd),
+            "beacon and read-end registration must be cleaned up after last reader unregisters"
+        );
+    }
+
+    #[test]
+    fn in_memory_socket_rdhup_is_not_implicit() {
+        let dispatcher = SyscallDispatcher::new();
+        let creds1 = crate::dispatch::net::unix_pure::LinuxUcred {
+            pid: 100,
+            uid: 1000,
+            gid: 1000,
+        };
+        let creds2 = crate::dispatch::net::unix_pure::LinuxUcred {
+            pid: 200,
+            uid: 1000,
+            gid: 1000,
+        };
+        let (s1, s2) = crate::dispatch::net::unix_pure::PureSocketInner::pair(
+            LINUX_SOCK_STREAM,
+            creds1,
+            creds2,
+        );
+
+        // Shutdown peer write end so s1 observes peer close (RDHUP)
+        s2.shutdown(crate::dispatch::net::unix_pure::LINUX_SHUT_WR)
+            .expect("shutdown peer write");
+
+        let sock_file = OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::InMemorySocket {
+                base: OpenDescriptionBase::new(0),
+                socket: s1,
+            })),
+            LINUX_O_RDWR,
+            0,
+        );
+        let sock_fd = dispatcher
+            .install_fd_at_or_above(3, sock_file)
+            .expect("install in-memory socket");
+
+        // IN-only interest: must NOT report RDHUP implicitly
+        let ready_events = dispatcher.epoll_ready_events(sock_fd, LINUX_EPOLLIN);
+        assert_eq!(
+            ready_events & LINUX_EPOLLRDHUP,
+            0,
+            "RDHUP must not be implicit for IN-only interest"
+        );
+        let poll_events = dispatcher.poll_ready_events(sock_fd, LINUX_POLLIN);
+        assert_eq!(
+            poll_events & LINUX_POLLRDHUP,
+            0,
+            "RDHUP must not be implicit for IN-only poll"
+        );
+
+        // Explicit RDHUP interest: must report RDHUP
+        let ready_events_rdhup =
+            dispatcher.epoll_ready_events(sock_fd, LINUX_EPOLLIN | LINUX_EPOLLRDHUP);
+        assert_eq!(
+            ready_events_rdhup & LINUX_EPOLLRDHUP,
+            LINUX_EPOLLRDHUP,
+            "explicit RDHUP interest must report RDHUP"
+        );
+        let poll_events_rdhup =
+            dispatcher.poll_ready_events(sock_fd, LINUX_POLLIN | LINUX_POLLRDHUP);
+        assert_eq!(
+            poll_events_rdhup & LINUX_POLLRDHUP,
+            LINUX_POLLRDHUP,
+            "explicit RDHUP poll must report RDHUP"
+        );
+    }
 }
 
 impl crate::kernel::ReadinessContext for SyscallDispatcher {
     fn staged_splice_bytes(&self, id: crate::kernel::FileDescriptionId) -> usize {
         self.staged_splice_description_bytes(id)
+    }
+
+    fn host_pipe_write_room(
+        &self,
+        pipe_capacity: i64,
+        pipe_id: u64,
+        is_read_end: bool,
+        bidirectional: bool,
+        host_fd: i32,
+    ) -> Option<usize> {
+        self.host_pipe_capacity_room(pipe_capacity, pipe_id, is_read_end, bidirectional, host_fd)
     }
 
     fn description_readiness(

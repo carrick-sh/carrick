@@ -1549,13 +1549,25 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
                 ready & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP)
             }
             OpenDescription::HostPipe {
+                base,
                 host_fd,
                 is_read_end,
                 bidirectional,
                 pty,
+                pipe_id,
                 ..
             } => {
-                let suppress_pollout = *is_read_end && !*bidirectional && pty.is_none();
+                let one_way_read_end = *is_read_end && !*bidirectional && pty.is_none();
+                let pipe_full = cx
+                    .host_pipe_write_room(
+                        base.pipe_capacity(),
+                        *pipe_id,
+                        *is_read_end,
+                        *bidirectional,
+                        host_fd.raw(),
+                    )
+                    .is_some_and(|room| room < 4096);
+                let suppress_pollout = one_way_read_end || pipe_full;
                 let mut pfd = libc::pollfd {
                     fd: host_fd.raw(),
                     events: 0,
@@ -1583,11 +1595,11 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
                         ready |= LinuxEpollEvents::HUP;
                     }
                 }
-                if interest.contains(LinuxEpollEvents::IN)
-                    && !ready.contains(LinuxEpollEvents::IN)
-                    && crate::dispatch::fifo_beacon::read_end_at_eof(host_fd.raw())
-                {
-                    ready |= LinuxEpollEvents::IN | LinuxEpollEvents::HUP;
+                if crate::dispatch::fifo_beacon::read_end_at_eof(host_fd.raw()) {
+                    if interest.contains(LinuxEpollEvents::IN) {
+                        ready |= LinuxEpollEvents::IN;
+                    }
+                    ready |= LinuxEpollEvents::HUP;
                 }
                 if interest.contains(LinuxEpollEvents::IN)
                     && cx.staged_splice_bytes(description_id) > 0
@@ -1702,10 +1714,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
             }
             OpenDescription::InMemorySocket { socket, .. } => {
                 let mask = LinuxEpollEvents::from_bits_retain(socket.poll_mask());
-                mask & (interest
-                    | LinuxEpollEvents::ERR
-                    | LinuxEpollEvents::HUP
-                    | LinuxEpollEvents::RDHUP)
+                mask & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP)
             }
         }
     }

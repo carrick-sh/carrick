@@ -2,7 +2,7 @@
   "schema": 1,
   "ceiling": {
     "create_install": 80,
-    "epoll_wait": 38,
+    "epoll_wait": 33,
     "inspect_misc": 149,
     "lifecycle": 35,
     "mapping_ring": 11,

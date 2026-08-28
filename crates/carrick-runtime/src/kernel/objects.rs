@@ -501,6 +501,18 @@ impl FileDescriptionBackingSnapshot {
 pub(crate) trait ReadinessContext {
     fn staged_splice_bytes(&self, id: FileDescriptionId) -> usize;
 
+    fn host_pipe_write_room(
+        &self,
+        pipe_capacity: i64,
+        pipe_id: u64,
+        is_read_end: bool,
+        bidirectional: bool,
+        host_fd: i32,
+    ) -> Option<usize> {
+        let _ = (pipe_capacity, pipe_id, is_read_end, bidirectional, host_fd);
+        None
+    }
+
     fn description_readiness(
         &self,
         description: &Arc<FileDescription>,
@@ -513,6 +525,17 @@ pub(crate) struct NoReadinessContext;
 impl ReadinessContext for NoReadinessContext {
     fn staged_splice_bytes(&self, _id: FileDescriptionId) -> usize {
         0
+    }
+
+    fn host_pipe_write_room(
+        &self,
+        _pipe_capacity: i64,
+        _pipe_id: u64,
+        _is_read_end: bool,
+        _bidirectional: bool,
+        _host_fd: i32,
+    ) -> Option<usize> {
+        None
     }
 
     fn description_readiness(
