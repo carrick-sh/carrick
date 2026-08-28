@@ -42,7 +42,7 @@ use futures_util::StreamExt;
 static CONFORMANCE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Per-case wall-clock deadline.
-const CASE_DEADLINE: Duration = Duration::from_secs(45);
+const CASE_DEADLINE: Duration = Duration::from_secs(8);
 
 #[derive(Clone, Copy)]
 struct Lane {
@@ -231,14 +231,12 @@ const EXIT_CASES: &[ExitCase] = &[
 /// Run a snippet under carrick on the DEFAULT path: returns
 /// `(host_exit_code, stdout, stderr)` with the streams captured separately.
 fn run_carrick_default(bin: &PathBuf, snippet: &str) -> (i32, String, String) {
-    use std::os::unix::process::CommandExt;
     let run_id = case_run_id();
     let child = Command::new(bin)
         .args(["run", ARM64.image, "--fs", "host", "/bin/sh", "-c", snippet])
         .env("CARRICK_RUN_ID", &run_id)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .process_group(0)
         .spawn()
         .expect("spawn carrick");
     let pid = child.id() as i32;
@@ -250,7 +248,7 @@ fn run_carrick_default(bin: &PathBuf, snippet: &str) -> (i32, String, String) {
             let start = Instant::now();
             while !done.load(Ordering::Relaxed) {
                 if start.elapsed() > CASE_DEADLINE {
-                    unsafe { libc::kill(-pid, libc::SIGKILL) };
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
                     scoped_kill_guests(&run_id);
                     return true;
                 }
