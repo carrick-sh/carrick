@@ -358,16 +358,6 @@ impl ProcessForkRelease {
         drop(self.drain.take());
         self.active = false;
     }
-
-    // Temporary Step-4 bridge: the repetitive Step-5 migration still calls
-    // `end_quiesce` followed immediately by `end_fork` on every legacy exit.
-    // Defer both operations to `end_fork` so this single authority preserves
-    // barrier-before-thaw order without double-publishing either release.
-    fn end_quiesce(&mut self) {}
-
-    fn end_fork(&mut self) {
-        self.release();
-    }
 }
 
 impl Drop for ProcessForkRelease {
@@ -400,14 +390,7 @@ impl ProcessForkCoordinator {
         }
     }
 
-    fn into_parts(
-        mut self,
-    ) -> (
-        CloneAdmissionPermit,
-        ForkCloneAdmission,
-        bool,
-        ProcessForkRelease,
-    ) {
+    fn into_parts(mut self) -> (CloneAdmissionPermit, ForkCloneAdmission, ProcessForkRelease) {
         let release = ProcessForkRelease::new(
             Arc::clone(&self.barrier),
             self.quiesced,
@@ -421,7 +404,6 @@ impl ProcessForkCoordinator {
             self.clone_admission
                 .take()
                 .unwrap_or_else(|| std::process::abort()),
-            self.quiesced,
             release,
         )
     }
@@ -719,13 +701,8 @@ where
                 });
             }
         }
-        let (process_fork_admission, fork_clone_admission, quiesced, mut process_fork_release) =
+        let (process_fork_admission, fork_clone_admission, mut process_fork_release) =
             coordinator.into_parts();
-        // Step 5 replaces the repetitive legacy names with direct ownership of
-        // `process_fork_release`. Until then, shadowing keeps every existing
-        // exit path compile-clean while routing it through the unique RAII
-        // release authority rather than the raw barrier.
-        let process_barrier = &mut process_fork_release;
         let quiesce_elapsed_ns = fork_stage_started
             .elapsed()
             .as_nanos()
@@ -751,10 +728,6 @@ where
 
         fork_stage_started = Instant::now();
         if process_fork_admission.is_cancelled() {
-            if quiesced {
-                process_barrier.end_quiesce();
-            }
-            process_barrier.end_fork();
             return Ok(PreparedInProcessFork::Complete(Some(
                 crate::linux_abi::LINUX_EAGAIN.guest_retval(),
             )));
@@ -783,10 +756,6 @@ where
         let reservation = match reservation_result {
             Ok(reservation) => reservation,
             Err(error) => {
-                if quiesced {
-                    process_barrier.end_quiesce();
-                }
-                process_barrier.end_fork();
                 tracing::warn!(%error, "hvpatch kernel child reservation failed; fork(2) = EAGAIN");
                 return Ok(PreparedInProcessFork::Complete(Some(
                     crate::linux_abi::LINUX_EAGAIN.guest_retval(),
@@ -801,10 +770,6 @@ where
             match parent_process.mm_resources().lease(parent_task) {
                 Ok(lease) => PreparedHvpatchProcessMm::Shared { parent_task, lease },
                 Err(error) => {
-                    if quiesced {
-                        process_barrier.end_quiesce();
-                    }
-                    process_barrier.end_fork();
                     return Err(RuntimeError::Configuration(format!(
                         "retain exact shared HVPatch MM for vfork: {error}"
                     )));
@@ -814,10 +779,6 @@ where
             match parent_process.mm_resources().prepare_child() {
                 Ok(prepared) => PreparedHvpatchProcessMm::Copied(prepared),
                 Err(error) => {
-                    if quiesced {
-                        process_barrier.end_quiesce();
-                    }
-                    process_barrier.end_fork();
                     tracing::warn!(%error, "hvpatch stage-1 root-slot preparation failed; fork(2) = EAGAIN");
                     return Ok(PreparedInProcessFork::Complete(Some(
                         crate::linux_abi::LINUX_EAGAIN.guest_retval(),
@@ -829,10 +790,6 @@ where
         let root_slot = match &prepared_mm {
             PreparedHvpatchProcessMm::Copied(prepared) => {
                 let Some(root_slot) = prepared.root_slot() else {
-                    if quiesced {
-                        process_barrier.end_quiesce();
-                    }
-                    process_barrier.end_fork();
                     return Err(RuntimeError::Configuration(
                         "hvpatch prepared child has no stage-1 root slot".to_owned(),
                     ));
@@ -857,10 +814,6 @@ where
         let mut prepared_fork = match prepared_result {
             Ok(prepared) => prepared,
             Err(error) => {
-                if quiesced {
-                    process_barrier.end_quiesce();
-                }
-                process_barrier.end_fork();
                 return Err(RuntimeError::Configuration(format!(
                     "prepare authoritative hvpatch child: {error}"
                 )));
@@ -925,12 +878,6 @@ where
                 carrick_thread::fork_quiesce::TopologyReleaseEnrollment::Subscribed(
                     subscription,
                 ) => {
-                    if quiesced {
-                        process_barrier.end_quiesce();
-                    }
-                    process_barrier.end_fork();
-                    drop(fork_clone_admission);
-                    drop(process_fork_admission);
                     return Ok(PreparedInProcessFork::Retry {
                         request,
                         coordinator: None,
@@ -951,29 +898,17 @@ where
 
         let Some(parent_tid_original) = read_optional_fork_output(memory, request.parent_tid_addr)
         else {
-            if quiesced {
-                process_barrier.end_quiesce();
-            }
-            process_barrier.end_fork();
             return Ok(PreparedInProcessFork::Complete(Some(
                 crate::linux_abi::LINUX_EFAULT.guest_retval(),
             )));
         };
         let Some(pidfd_original) = read_optional_fork_output(memory, request.pidfd_out) else {
-            if quiesced {
-                process_barrier.end_quiesce();
-            }
-            process_barrier.end_fork();
             return Ok(PreparedInProcessFork::Complete(Some(
                 crate::linux_abi::LINUX_EFAULT.guest_retval(),
             )));
         };
         let Some(_child_tid_original) = read_optional_fork_output(memory, request.child_tid_addr)
         else {
-            if quiesced {
-                process_barrier.end_quiesce();
-            }
-            process_barrier.end_fork();
             return Ok(PreparedInProcessFork::Complete(Some(
                 crate::linux_abi::LINUX_EFAULT.guest_retval(),
             )));
@@ -986,10 +921,6 @@ where
             {
                 Ok(fd) => Some(fd),
                 Err(errno) => {
-                    if quiesced {
-                        process_barrier.end_quiesce();
-                    }
-                    process_barrier.end_fork();
                     return Ok(PreparedInProcessFork::Complete(Some(errno.guest_retval())));
                 }
             }
@@ -1034,10 +965,6 @@ where
                     "dispatcher fork preparation rejected semantic MM projection; fork(2) = EAGAIN"
                 );
                 rollback_pidfd(installed_pidfd);
-                if quiesced {
-                    process_barrier.end_quiesce();
-                }
-                process_barrier.end_fork();
                 return Ok(PreparedInProcessFork::Complete(Some(
                     crate::linux_abi::LINUX_EAGAIN.guest_retval(),
                 )));
@@ -1066,10 +993,6 @@ where
             Ok(prepared) => prepared,
             Err(error) => {
                 rollback_pidfd(installed_pidfd);
-                if quiesced {
-                    process_barrier.end_quiesce();
-                }
-                process_barrier.end_fork();
                 return Err(error);
             }
         };
@@ -1083,10 +1006,6 @@ where
                 return Err(ops.fail_stop(error));
             }
             rollback_pidfd(installed_pidfd);
-            if quiesced {
-                process_barrier.end_quiesce();
-            }
-            process_barrier.end_fork();
             return Ok(PreparedInProcessFork::Complete(Some(
                 crate::linux_abi::LINUX_EAGAIN.guest_retval(),
             )));
@@ -1119,10 +1038,6 @@ where
                     return Err(ops.fail_stop(error));
                 }
                 rollback_pidfd(installed_pidfd);
-                if quiesced {
-                    process_barrier.end_quiesce();
-                }
-                process_barrier.end_fork();
                 return Ok(PreparedInProcessFork::Complete(Some(
                     crate::linux_abi::LINUX_EAGAIN.guest_retval(),
                 )));
@@ -1176,10 +1091,6 @@ where
                 return Err(ops.fail_stop(cleanup_error));
             }
             rollback_pidfd(installed_pidfd);
-            if quiesced {
-                process_barrier.end_quiesce();
-            }
-            process_barrier.end_fork();
             return Err(error);
         }
         if let Err(error) = check_hvpatch_process_failpoint(HvpatchProcessFailpoint::BackendCommit)
@@ -1202,10 +1113,6 @@ where
                 return Err(ops.fail_stop(cleanup_error));
             }
             rollback_pidfd(installed_pidfd);
-            if quiesced {
-                process_barrier.end_quiesce();
-            }
-            process_barrier.end_fork();
             return Err(error);
         }
         if let Err(error) = check_hvpatch_process_failpoint(HvpatchProcessFailpoint::KernelCommit) {
@@ -1227,10 +1134,6 @@ where
                 return Err(ops.fail_stop(cleanup_error));
             }
             rollback_pidfd(installed_pidfd);
-            if quiesced {
-                process_barrier.end_quiesce();
-            }
-            process_barrier.end_fork();
             return Err(error);
         }
         if !shares_mm {
@@ -1497,10 +1400,7 @@ where
             }
             None
         };
-        if quiesced {
-            process_barrier.end_quiesce();
-        }
-        process_barrier.end_fork();
+        process_fork_release.release();
         // Publication is now authoritative and the child has its execution
         // owner. Reopen clone admission and release the process-fork permit
         // before a possible vfork parent wait: a sibling exec must be able to
