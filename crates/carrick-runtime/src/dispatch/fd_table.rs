@@ -1759,6 +1759,46 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
         *description = OpenDescription::Closed { was_epoll };
     }
 
+    fn set_pipe_capacity_from_authority(
+        &self,
+        capacity: i64,
+        accounting: crate::kernel::objects::PipeCapacityAccounting,
+    ) -> Result<i64, crate::kernel::objects::PipeCapacityMutationError> {
+        let mut open = self.write();
+        match &mut *open {
+            OpenDescription::PipeReader { pipe, .. } | OpenDescription::PipeWriter { pipe, .. } => {
+                if accounting != crate::kernel::objects::PipeCapacityAccounting::InMemory {
+                    return Err(
+                        crate::kernel::objects::PipeCapacityMutationError::AccountingMismatch,
+                    );
+                }
+                match pipe.set_capacity(capacity as usize) {
+                    Ok(new_cap) => Ok(new_cap as i64),
+                    Err(errno) => Err(crate::kernel::objects::PipeCapacityMutationError::Semantic(
+                        errno,
+                    )),
+                }
+            }
+            OpenDescription::HostPipe { base, .. } => {
+                let crate::kernel::objects::PipeCapacityAccounting::Host { queued_bytes } =
+                    accounting
+                else {
+                    return Err(
+                        crate::kernel::objects::PipeCapacityMutationError::AccountingMismatch,
+                    );
+                };
+                if (capacity as u64) < queued_bytes {
+                    return Err(crate::kernel::objects::PipeCapacityMutationError::Semantic(
+                        carrick_abi::LINUX_EBUSY,
+                    ));
+                }
+                base.set_pipe_capacity(capacity);
+                Ok(capacity)
+            }
+            _ => Err(crate::kernel::objects::PipeCapacityMutationError::NotPipe),
+        }
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -2123,4 +2163,139 @@ impl OpenDescription {
             )),
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) struct InMemoryPipeTestFixture {
+    pub(crate) read: Arc<crate::kernel::FileDescription>,
+    pub(crate) write: Arc<crate::kernel::FileDescription>,
+    pipe: Arc<super::fs::pipe::PipeInner>,
+}
+
+#[cfg(test)]
+impl InMemoryPipeTestFixture {
+    pub(crate) fn new(pipe_id: u64, capacity: usize) -> Self {
+        let pipe = Arc::new(super::fs::pipe::PipeInner::new_connected(pipe_id, capacity));
+        let mut read_base = OpenDescriptionBase::new(0);
+        read_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+        let read_desc = OpenDescription::PipeReader {
+            base: read_base,
+            pipe: Arc::clone(&pipe),
+        };
+        let mut write_base = OpenDescriptionBase::new(0);
+        write_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+        let write_desc = OpenDescription::PipeWriter {
+            base: write_base,
+            pipe: Arc::clone(&pipe),
+        };
+        let read = Arc::new(
+            crate::kernel::FileDescription::concrete_with_status_flags(
+                Arc::new(parking_lot::RwLock::new(read_desc)),
+                0,
+            )
+            .expect("in-memory pipe reader description"),
+        );
+        let write = Arc::new(
+            crate::kernel::FileDescription::concrete_with_status_flags(
+                Arc::new(parking_lot::RwLock::new(write_desc)),
+                0,
+            )
+            .expect("in-memory pipe writer description"),
+        );
+        Self { read, write, pipe }
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.pipe.get_capacity()
+    }
+
+    pub(crate) fn read_base_capacity(&self) -> i64 {
+        let guard = self.read.read().expect("read description");
+        match &*guard {
+            OpenDescription::PipeReader { base, .. } => base.pipe_capacity(),
+            _ => panic!("expected PipeReader"),
+        }
+    }
+
+    pub(crate) fn write_base_capacity(&self) -> i64 {
+        let guard = self.write.read().expect("write description");
+        match &*guard {
+            OpenDescription::PipeWriter { base, .. } => base.pipe_capacity(),
+            _ => panic!("expected PipeWriter"),
+        }
+    }
+
+    pub(crate) fn enqueue_bytes(&self, bytes: &[u8]) {
+        let mut state = self.pipe.state.lock();
+        state.buffer.extend(bytes);
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct HostPipeTestFixture {
+    pub(crate) read: Arc<crate::kernel::FileDescription>,
+    _peer_write_end: std::os::fd::OwnedFd,
+    shared_capacity: Arc<std::sync::atomic::AtomicI64>,
+}
+
+#[cfg(test)]
+impl HostPipeTestFixture {
+    pub(crate) fn new(pipe_id: u64, initial_capacity: i64) -> Self {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0i32; 2];
+        let res = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(res, 0, "libc::pipe failed in test fixture");
+        let host_fd = HostFdRef::new(fds[0]);
+        let peer_write_end = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) };
+        let shared_capacity = Arc::new(std::sync::atomic::AtomicI64::new(initial_capacity));
+        let mut base = OpenDescriptionBase::new(0);
+        base.set_pipe_capacity_cell(Arc::clone(&shared_capacity));
+        let host_desc = OpenDescription::HostPipe {
+            base,
+            host_fd,
+            is_read_end: true,
+            pipe_id,
+            pty: None,
+            bidirectional: false,
+            write_kind: HostWriteKind::PipeLike,
+            stdio_stream: None,
+        };
+        let read = Arc::new(
+            crate::kernel::FileDescription::concrete_with_status_flags(
+                Arc::new(parking_lot::RwLock::new(host_desc)),
+                0,
+            )
+            .expect("host pipe description"),
+        );
+        Self {
+            read,
+            _peer_write_end: peer_write_end,
+            shared_capacity,
+        }
+    }
+
+    pub(crate) fn capacity(&self) -> i64 {
+        self.shared_capacity
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn read_base_capacity(&self) -> i64 {
+        let guard = self.read.read().expect("host pipe read description");
+        match &*guard {
+            OpenDescription::HostPipe { base, .. } => base.pipe_capacity(),
+            _ => panic!("expected HostPipe"),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn closed_test_description() -> Arc<crate::kernel::FileDescription> {
+    let closed = OpenDescription::Closed { was_epoll: false };
+    Arc::new(
+        crate::kernel::FileDescription::concrete_with_status_flags(
+            Arc::new(parking_lot::RwLock::new(closed)),
+            0,
+        )
+        .expect("closed description"),
+    )
 }

@@ -53,10 +53,12 @@ impl ObjectRevision {
         self.0.load(Ordering::Acquire)
     }
 
-    fn publish(&self) {
-        if self.0.fetch_add(1, Ordering::Release) == u64::MAX {
+    fn publish(&self) -> u64 {
+        let prev = self.0.fetch_add(1, Ordering::Release);
+        if prev == u64::MAX {
             std::process::abort();
         }
+        prev + 1
     }
 }
 
@@ -549,6 +551,20 @@ impl ReadinessContext for NoReadinessContext {
 #[allow(dead_code)]
 pub(crate) const NO_READINESS_CONTEXT: &NoReadinessContext = &NoReadinessContext;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum PipeCapacityAccounting {
+    InMemory,
+    Host { queued_bytes: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PipeCapacityMutationError {
+    NotPipe,
+    Semantic(carrick_abi::LinuxErrno),
+    AccountingMismatch,
+}
+
 pub(crate) trait FileDescriptionBacking: Any + Send + Sync {
     fn is_epoll(&self) -> bool;
 
@@ -584,6 +600,15 @@ pub(crate) trait FileDescriptionBacking: Any + Send + Sync {
     fn on_first_fd_ref(&self) {}
 
     fn on_last_fd_ref(&self) {}
+
+    fn set_pipe_capacity_from_authority(
+        &self,
+        capacity: i64,
+        accounting: PipeCapacityAccounting,
+    ) -> Result<i64, PipeCapacityMutationError> {
+        let _ = (capacity, accounting);
+        Err(PipeCapacityMutationError::NotPipe)
+    }
 
     fn as_any(&self) -> &dyn Any;
 }
@@ -946,8 +971,24 @@ impl FileDescription {
         backing.downcast_ref()
     }
 
-    pub(crate) fn publish_mutation(&self) {
-        self.revision.publish();
+    pub(crate) fn publish_mutation(&self) -> u64 {
+        self.revision.publish()
+    }
+
+    pub(crate) fn set_pipe_capacity_from_authority(
+        &self,
+        capacity: i64,
+        accounting: PipeCapacityAccounting,
+    ) -> Result<u64, PipeCapacityMutationError> {
+        let _guard = self.lifecycle_transition.lock();
+        let FileDescriptionKind::Concrete(backing) = &self.kind else {
+            return Err(PipeCapacityMutationError::NotPipe);
+        };
+        backing
+            .0
+            .set_pipe_capacity_from_authority(capacity, accounting)?;
+        let revision = self.revision.publish();
+        Ok(revision)
     }
 
     pub(crate) fn retain_fd_ref(&self) {
@@ -1064,6 +1105,11 @@ impl FileDescription {
 
     pub(super) fn revision(&self) -> u64 {
         self.revision.load()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn revision_for_test(&self) -> u64 {
+        self.revision()
     }
 
     #[cfg(test)]
@@ -1506,6 +1552,48 @@ impl FileTable {
                     slot.generation == authority.slot_generation
                         && slot.description.id() == authority.description
                 })
+    }
+
+    fn resolve_slot_from_guard(
+        open_files: &HashMap<i32, FileSlot>,
+        authority: FileSlotAuthority,
+    ) -> Option<Arc<FileDescription>> {
+        let slot = open_files.get(&authority.number.raw())?;
+        if slot.generation == authority.slot_generation
+            && slot.description.id() == authority.description
+        {
+            Some(Arc::clone(&slot.description))
+        } else {
+            None
+        }
+    }
+
+    pub fn resolve_slot_authority(
+        &self,
+        authority: FileSlotAuthority,
+    ) -> Option<Arc<FileDescription>> {
+        if authority.table != self.id {
+            return None;
+        }
+        let open_files = self.open_files.read();
+        Self::resolve_slot_from_guard(&open_files, authority)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resolve_slot_authority_with_hook<F>(
+        &self,
+        authority: FileSlotAuthority,
+        on_guard_acquired: F,
+    ) -> Option<Arc<FileDescription>>
+    where
+        F: FnOnce(),
+    {
+        if authority.table != self.id {
+            return None;
+        }
+        let open_files = self.open_files.read();
+        on_guard_acquired();
+        Self::resolve_slot_from_guard(&open_files, authority)
     }
 
     pub fn subscribe_slot_authority(
@@ -7862,5 +7950,172 @@ mod tests {
         assert!(ids.is_reserved_number(task_id.raw()));
         drop(session);
         assert!(!ids.is_reserved_number(task_id.raw()));
+    }
+
+    #[test]
+    fn resolve_slot_authority_returns_exact_arc_or_stale_across_lock_boundary_never_replacement() {
+        let ids = ObjectIdRegistry::new();
+        let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+        let number = FileSlotNumber::for_open_fd(3).expect("fd 3");
+
+        let desc1 = Arc::new(FileDescription::regular(
+            ids.file_description_id().expect("desc 1"),
+        ));
+        table.install(number, Arc::clone(&desc1), false);
+        let token1 = table.capture_slot_authority(number).expect("token 1");
+
+        // 1. Initial resolution returns exact original Arc.
+        let resolved = table
+            .resolve_slot_authority(token1)
+            .expect("resolve token 1");
+        assert!(Arc::ptr_eq(&resolved, &desc1));
+
+        // 2. Lock boundary test: hold write lock, queue reader on thread, replace with desc2.
+        let desc2 = Arc::new(FileDescription::regular(
+            ids.file_description_id().expect("desc 2"),
+        ));
+
+        // Acquire write guard FIRST, guaranteeing that the reader thread must block
+        // on open_files.read() and cannot observe the pre-replacement slot.
+        let mut write_guard = table.open_files.write();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+        // Spawn reader thread that attempts resolution while write guard is held.
+        let table_clone = Arc::clone(&table);
+        let reader_thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = table_clone.resolve_slot_authority(token1);
+            done_tx.send(result).unwrap();
+        });
+
+        // Ensure the reader thread has started.
+        started_rx.recv().unwrap();
+
+        // Replace slot 3 under the held write lock.
+        write_guard.insert(number.raw(), FileSlot::new(Arc::clone(&desc2), 0));
+        // Release write guard, allowing the blocked reader thread to proceed.
+        drop(write_guard);
+
+        let result = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("reader completed");
+        reader_thread.join().unwrap();
+
+        // Reader must receive None (stale), never Some(desc2).
+        assert!(
+            result.is_none(),
+            "stale token must resolve to None, not replacement Arc"
+        );
+
+        // Sequential resolution with stale token is also None.
+        assert!(table.resolve_slot_authority(token1).is_none());
+
+        // Fresh token for desc2 resolves to desc2.
+        let token2 = table.capture_slot_authority(number).expect("token 2");
+        let resolved2 = table
+            .resolve_slot_authority(token2)
+            .expect("resolve token 2");
+        assert!(Arc::ptr_eq(&resolved2, &desc2));
+    }
+
+    #[test]
+    fn resolve_slot_authority_rejects_mismatched_table_id_or_generation() {
+        let ids = ObjectIdRegistry::new();
+        let table1 = Arc::new(FileTable::new(ids.file_table_id().expect("table 1")));
+        let table2 = Arc::new(FileTable::new(ids.file_table_id().expect("table 2")));
+        let number = FileSlotNumber::for_open_fd(3).expect("fd 3");
+
+        let desc = Arc::new(FileDescription::regular(
+            ids.file_description_id().expect("desc 1"),
+        ));
+        table1.install(number, Arc::clone(&desc), false);
+        let token1 = table1.capture_slot_authority(number).expect("token 1");
+
+        // Resolving on table2 with table1's token returns None.
+        assert!(table2.resolve_slot_authority(token1).is_none());
+    }
+
+    #[test]
+    fn resolve_slot_authority_resolver_wins_returns_exact_arc_before_queued_writer_replaces_slot() {
+        let ids = ObjectIdRegistry::new();
+        let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+        let number = FileSlotNumber::for_open_fd(3).expect("fd 3");
+
+        let desc1 = Arc::new(FileDescription::regular(
+            ids.file_description_id().expect("desc 1"),
+        ));
+        table.install(number, Arc::clone(&desc1), false);
+        let token1 = table.capture_slot_authority(number).expect("token 1");
+
+        let desc2 = Arc::new(FileDescription::regular(
+            ids.file_description_id().expect("desc 2"),
+        ));
+
+        let (resolver_holding_read_guard_tx, resolver_holding_read_guard_rx) =
+            std::sync::mpsc::channel();
+        let (writer_queued_tx, writer_queued_rx) = std::sync::mpsc::channel();
+        let (resolver_done_tx, resolver_done_rx) = std::sync::mpsc::channel();
+
+        // 1. Spawn reader thread that acquires read guard first.
+        let table_reader = Arc::clone(&table);
+        let reader_thread = std::thread::spawn(move || {
+            let result = table_reader.resolve_slot_authority_with_hook(token1, || {
+                // Signal that read guard is currently held.
+                resolver_holding_read_guard_tx.send(()).unwrap();
+                // Wait until writer has attempted/queued write acquisition.
+                writer_queued_rx.recv().unwrap();
+            });
+            resolver_done_tx.send(result).unwrap();
+        });
+
+        // Ensure reader has acquired read guard.
+        resolver_holding_read_guard_rx.recv().unwrap();
+
+        // 2. Spawn writer thread that attempts to acquire write guard.
+        let (writer_started_tx, writer_started_rx) = std::sync::mpsc::channel();
+        let (writer_done_tx, writer_done_rx) = std::sync::mpsc::channel();
+        let table_writer = Arc::clone(&table);
+        let desc2_clone = Arc::clone(&desc2);
+        let writer_thread = std::thread::spawn(move || {
+            writer_started_tx.send(()).unwrap();
+            // This write lock acquisition must block until the reader thread drops its read guard.
+            let mut write_guard = table_writer.open_files.write();
+            write_guard.insert(number.raw(), FileSlot::new(desc2_clone, 0));
+            drop(write_guard);
+            writer_done_tx.send(()).unwrap();
+        });
+
+        // Ensure writer thread has started and is attempting to acquire write lock.
+        writer_started_rx.recv().unwrap();
+
+        // 3. Release resolver hook so resolver clones and returns desc1 under its read guard.
+        writer_queued_tx.send(()).unwrap();
+
+        // Resolver finishes first and returns original Arc.
+        let resolved = resolver_done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("resolver finished");
+        reader_thread.join().unwrap();
+
+        let resolved_desc = resolved.expect("resolver succeeded");
+        assert!(Arc::ptr_eq(&resolved_desc, &desc1));
+
+        // Writer unblocks and completes replacement.
+        writer_done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("writer finished");
+        writer_thread.join().unwrap();
+
+        // Now sequential resolution of stale token1 returns None.
+        assert!(table.resolve_slot_authority(token1).is_none());
+
+        // Sequential resolution with fresh token returns desc2.
+        let token2 = table.capture_slot_authority(number).expect("token 2");
+        let resolved2 = table
+            .resolve_slot_authority(token2)
+            .expect("resolve token 2");
+        assert!(Arc::ptr_eq(&resolved2, &desc2));
     }
 }
