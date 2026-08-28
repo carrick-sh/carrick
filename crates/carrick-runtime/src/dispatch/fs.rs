@@ -8894,6 +8894,9 @@ impl SyscallDispatcher {
                                     unsafe { libc::ioctl(host_fd.raw(), libc::FIONREAD, &mut n) };
                                 if rc == 0 { n as i32 } else { 0 }
                             }
+                            OpenDescription::Inotify { state, .. } => {
+                                i32::try_from(state.queued_bytes()).unwrap_or(i32::MAX)
+                            }
                             _ => 0,
                         },
                         // stdio fd (already validated above) or any other valid fd: 0.
@@ -12462,6 +12465,9 @@ impl SyscallDispatcher {
         }
 
         fn inotify_add_watch(this, cx, fd: Fd, pathname: GuestPtr, mask: u64) {
+            if !this.fd_is_valid(fd.0) {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            }
             let Some(state) = this.inotify_state(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
@@ -12471,6 +12477,13 @@ impl SyscallDispatcher {
             }
             let path = this.resolve_at_path(LINUX_AT_FDCWD, &path)?;
             let mask = mask as u32;
+            if let Some(wd) = this.fs.inotify_registry.watch_descriptor(&path, &state) {
+                let effective = state.update_watch(wd, mask)?;
+                this.fs
+                    .inotify_registry
+                    .register(&path, &state, wd, effective);
+                return Ok(DispatchOutcome::Returned { value: wd as i64 });
+            }
             // Try the per-instance backend first (kqueue host-vnode watch on
             // macOS/BSD, native inotify on Linux) so cross-process directory
             // changes — a forked guest child mutating a watched dir — still
@@ -12531,6 +12544,9 @@ impl SyscallDispatcher {
         }
 
         fn inotify_rm_watch(this, cx, fd: Fd, wd: u64) {
+            if !this.fd_is_valid(fd.0) {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            }
             let Some(state) = this.inotify_state(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
@@ -12539,6 +12555,9 @@ impl SyscallDispatcher {
             // the same `watches` table with no host fds, so it finds them too).
             // Drop the dispatch-registry entry to match.
             let result = state.rm_watch(wd);
+            if result.is_ok() {
+                state.enqueue(wd, carrick_abi::LINUX_IN_IGNORED, 0, None);
+            }
             this.fs.inotify_registry.unregister(&state, wd);
             Ok(match result {
                 Ok(()) => DispatchOutcome::Returned { value: 0 },
