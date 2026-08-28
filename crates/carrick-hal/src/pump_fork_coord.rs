@@ -77,30 +77,66 @@ mod tests {
         }
     }
 
-    struct InertRegistry;
+    #[derive(Default)]
+    struct InertRegistry {
+        inner: crate::GenericVcpuRegistry,
+    }
+
     impl VcpuRegistry for InertRegistry {
         fn register(
             &self,
-            _t: crate::ThreadId,
-            _h: Box<dyn crate::VcpuKickDyn>,
-            _in_guest: &crate::InGuestFlag,
+            t: crate::ThreadId,
+            h: Box<dyn crate::VcpuKickDyn>,
+            in_guest: &crate::InGuestFlag,
         ) {
+            self.inner.register(t, h, in_guest);
         }
-        fn unregister(&self, _t: crate::ThreadId) {}
-        fn kick(&self, _t: crate::ThreadId) {}
-        fn kick_if_in_guest(&self, _t: crate::ThreadId) -> bool {
-            false
+        fn poll_lease_drain(&self, except: crate::ThreadId) -> crate::VcpuLeaseDrainPoll {
+            self.inner.poll_lease_drain(except)
         }
-        fn kick_all(&self) {}
+        fn subscribe_lease_drain(
+            &self,
+            except: crate::ThreadId,
+            callback: Arc<dyn Fn() + Send + Sync + 'static>,
+        ) -> crate::VcpuLeaseDrainEnrollment {
+            self.inner.subscribe_lease_drain(except, callback)
+        }
+        fn subscribe_register(
+            &self,
+            tid: crate::ThreadId,
+            handle: Box<dyn crate::VcpuKickDyn>,
+            in_guest: &crate::InGuestFlag,
+            callback: Arc<dyn Fn() + Send + Sync + 'static>,
+        ) -> crate::VcpuRegistrationEnrollment {
+            self.inner
+                .subscribe_register(tid, handle, in_guest, callback)
+        }
+        fn unregister(&self, t: crate::ThreadId) {
+            self.inner.unregister(t);
+        }
+        fn kick(&self, t: crate::ThreadId) {
+            self.inner.kick(t);
+        }
+        fn kick_if_in_guest(&self, t: crate::ThreadId) -> bool {
+            self.inner.kick_if_in_guest(t)
+        }
+        fn kick_all(&self) {
+            self.inner.kick_all();
+        }
         fn kick_all_in_guest(&self) -> bool {
-            false
+            self.inner.kick_all_in_guest()
         }
-        fn kick_all_except(&self, _e: crate::ThreadId) {}
-        fn any_other_in_guest(&self, _e: crate::ThreadId) -> bool {
-            false
+        fn kick_all_except(&self, except: crate::ThreadId) {
+            self.inner.kick_all_except(except);
+        }
+        fn any_other_in_guest(&self, except: crate::ThreadId) -> bool {
+            self.inner.any_other_in_guest(except)
         }
         fn count(&self) -> usize {
-            0
+            self.inner.count()
+        }
+        fn debug_registered_vcpus(&self) -> Vec<(crate::ThreadId, bool)> {
+            self.inner.debug_registered_vcpus()
         }
     }
 
@@ -141,7 +177,7 @@ mod tests {
     }
 
     fn ctx() -> (Arc<dyn VcpuRegistry>, Arc<dyn PlatformFutex>) {
-        (Arc::new(InertRegistry), Arc::new(InertFutex))
+        (Arc::new(InertRegistry::default()), Arc::new(InertFutex))
     }
 
     #[test]
