@@ -517,10 +517,19 @@ unsafe fn test_fionread_hangup_matrix() {
         pty_master_read_payload_matches = r1 == 5 && &rbuf[..5] == msg1,
     );
 
-    // 6.3 Master writes 4 bytes -> FIONREAD on slave sees 4 bytes
+    // 6.3 Master writes 4 bytes -> once the slave is readable, FIONREAD sees 4 bytes.
+    // Linux queues master input through the line discipline asynchronously, so
+    // querying before readiness races that publication and can transiently
+    // report zero. Poll first to assert the stable queue contract instead.
     let msg2 = b"ping";
     let w2 = libc::write(pty.master, msg2.as_ptr().cast(), msg2.len());
     let err_w2 = if w2 == -1 { errno() } else { 0 };
+    let mut pfd_s = libc::pollfd {
+        fd: pty.slave,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let prc_s = libc::poll(&mut pfd_s, 1, 500);
     let mut n_slave: libc::c_int = -1;
     let r_fn2 = libc::ioctl(pty.slave, FIONREAD as _, &mut n_slave);
     let err_fn2 = if r_fn2 == -1 { errno() } else { 0 };
@@ -532,12 +541,6 @@ unsafe fn test_fionread_hangup_matrix() {
         fionread_slave_after_master_write_avail = n_slave,
     );
 
-    let mut pfd_s = libc::pollfd {
-        fd: pty.slave,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let prc_s = libc::poll(&mut pfd_s, 1, 500);
     let mut sbuf = [0u8; 16];
     let r2 = if prc_s > 0 {
         libc::read(pty.slave, sbuf.as_mut_ptr().cast(), sbuf.len())
@@ -606,6 +609,24 @@ unsafe fn test_fionread_hangup_matrix() {
     report!(
         pty_master_read_on_slave_close_rc = r_eio,
         pty_master_read_on_slave_close_errno = err_eio,
+    );
+    let mut iov_buf_a = [0u8; 4];
+    let mut iov_buf_b = [0u8; 4];
+    let iov = [
+        libc::iovec {
+            iov_base: iov_buf_a.as_mut_ptr().cast(),
+            iov_len: iov_buf_a.len(),
+        },
+        libc::iovec {
+            iov_base: iov_buf_b.as_mut_ptr().cast(),
+            iov_len: iov_buf_b.len(),
+        },
+    ];
+    let r_eio_v = libc::readv(pty2.master, iov.as_ptr(), iov.len() as libc::c_int);
+    let err_eio_v = if r_eio_v == -1 { errno() } else { 0 };
+    report!(
+        pty_master_readv_on_slave_close_rc = r_eio_v,
+        pty_master_readv_on_slave_close_errno = err_eio_v,
     );
     libc::close(pty2.master);
     // Avoid double close in drop
