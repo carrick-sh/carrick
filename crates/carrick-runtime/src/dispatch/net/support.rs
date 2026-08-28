@@ -567,7 +567,10 @@ const HOST_STREAM_BUF_REQUIRED: libc::c_int = 8 * 1024 * 1024;
 // only real caller is `#[cfg(test)]`-gated, so a plain (non-test) lib build
 // on macOS is ALSO callerless — gate on `not(test)` too, not just non-macOS.
 #[cfg_attr(not(all(test, target_os = "macos")), allow(dead_code))]
-fn host_socket_buffer_size(host_fd: i32, opt: libc::c_int) -> Result<libc::c_int, LinuxErrno> {
+pub(super) fn host_socket_buffer_size(
+    host_fd: i32,
+    opt: libc::c_int,
+) -> Result<libc::c_int, LinuxErrno> {
     let mut size: libc::c_int = 0;
     let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
     // SAFETY: host_fd is a live socket fd; size/len point to writable storage.

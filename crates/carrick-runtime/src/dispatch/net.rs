@@ -649,6 +649,135 @@ fn host_stream_socket_read_eof(host_fd: i32) -> bool {
     rc == 0
 }
 
+#[cfg(any(
+    feature = "platform-macos",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
+fn host_stream_socket_rdhup(host_fd: i32) -> bool {
+    use carrick_host_bsd::Kqueue;
+    use carrick_host_bsd::kqueue::Kevent;
+
+    let Some(kq) = Kqueue::new_internal() else {
+        return false;
+    };
+    let add = Kevent::read(
+        host_fd,
+        carrick_portable::EV_ADD | carrick_portable::EV_ENABLE | carrick_portable::EV_CLEAR,
+    );
+    if kq.apply(&[add]).is_err() {
+        return false;
+    }
+    let mut out = [Kevent::empty(); 1];
+    let zero = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    matches!(
+        kq.wait(&[], &mut out, Some(&zero)),
+        Ok(n) if n >= 1
+            && out[0].filter() == libc::EVFILT_READ
+            && out[0].flags() & libc::EV_EOF != 0
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn host_stream_socket_rdhup(host_fd: i32) -> bool {
+    let mut pfd = libc::pollfd {
+        fd: host_fd,
+        events: libc::POLLRDHUP,
+        revents: 0,
+    };
+    unsafe { libc::poll(&mut pfd, 1, 0) > 0 && pfd.revents & libc::POLLRDHUP != 0 }
+}
+
+#[cfg(not(any(
+    feature = "platform-macos",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd",
+    target_os = "linux"
+)))]
+fn host_stream_socket_rdhup(host_fd: i32) -> bool {
+    host_stream_socket_read_eof(host_fd)
+}
+
+fn linux_msg_trunc_recv_capacity(host_fd: i32, guest_len: usize, flags: i32) -> usize {
+    if flags & LINUX_MSG_TRUNC == 0 {
+        return guest_len;
+    }
+    host_socket_buffer_size(host_fd, libc::SO_RCVBUF)
+        .ok()
+        .and_then(|size| usize::try_from(size).ok())
+        .unwrap_or(guest_len)
+        .max(guest_len)
+        .min(crate::dispatch::MAX_RW_COUNT)
+}
+
+#[cfg(test)]
+mod host_stream_socket_read_eof_tests {
+    use super::host_stream_socket_rdhup;
+
+    #[test]
+    fn detects_peer_half_close_while_payload_remains_buffered() {
+        let mut sockets = [-1; 2];
+        // SAFETY: socketpair initializes both descriptors on success; every
+        // descriptor is closed before returning from the test.
+        unsafe {
+            assert_eq!(
+                libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sockets.as_mut_ptr()),
+                0
+            );
+            assert_eq!(libc::write(sockets[0], b"payload".as_ptr().cast(), 7), 7);
+            assert_eq!(libc::shutdown(sockets[0], libc::SHUT_WR), 0);
+
+            assert!(
+                host_stream_socket_rdhup(sockets[1]),
+                "RDHUP must be visible before the queued payload is drained"
+            );
+
+            libc::close(sockets[0]);
+            libc::close(sockets[1]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod host_dgram_msg_trunc_tests {
+    use super::{LINUX_MSG_TRUNC, linux_msg_trunc_recv_capacity};
+
+    #[test]
+    fn widens_the_host_receive_without_widening_the_guest_copy() {
+        let mut sockets = [-1; 2];
+        // SAFETY: socketpair initializes both descriptors on success; every
+        // descriptor is closed before returning from the test.
+        unsafe {
+            assert_eq!(
+                libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, sockets.as_mut_ptr()),
+                0
+            );
+            assert_eq!(
+                libc::send(sockets[0], b"twelve-bytes".as_ptr().cast(), 12, 0),
+                12
+            );
+
+            let capacity = linux_msg_trunc_recv_capacity(sockets[1], 4, LINUX_MSG_TRUNC);
+            assert!(capacity >= 12, "host buffer must fit the queued datagram");
+            let mut host = vec![0u8; capacity];
+            let received = libc::recv(
+                sockets[1],
+                host.as_mut_ptr().cast(),
+                host.len(),
+                libc::MSG_TRUNC | libc::MSG_DONTWAIT,
+            );
+            assert_eq!(received, 12);
+            assert_eq!(&host[..4], b"twel");
+
+            libc::close(sockets[0]);
+            libc::close(sockets[1]);
+        }
+    }
+}
+
 fn decode_accept4_flags(flags: i32) -> Option<LinuxSocketTypeFlags> {
     LinuxSocketTypeFlags::from_bits(flags)
 }
@@ -2089,6 +2218,11 @@ impl SyscallDispatcher {
                     if pfd.revents & libc::POLLHUP != 0 {
                         ready |= LINUX_POLLHUP;
                     }
+                }
+                if requested_events & LINUX_POLLRDHUP != 0
+                    && host_stream_socket_rdhup(host_fd.raw())
+                {
+                    ready |= LINUX_POLLIN | LINUX_POLLRDHUP;
                 }
                 // Same as the epoll path: a queued error-queue entry is both
                 // readable and an error condition.
@@ -4090,7 +4224,13 @@ impl SyscallDispatcher {
                             )) = gfd_info.get(&gfd)
                             {
                                 host_ready_sampled.insert(gfd);
-                                let raw = this.epoll_ready_events(gfd, requested);
+                                let mut raw = this.epoll_ready_events(gfd, requested);
+                                let terminal_edge = edge_bits
+                                    & (LINUX_EPOLLRDHUP | LINUX_EPOLLHUP | LINUX_EPOLLERR);
+                                raw |= terminal_edge;
+                                if terminal_edge & LINUX_EPOLLRDHUP != 0 {
+                                    raw |= LINUX_EPOLLIN;
+                                }
                                 let read_avail = if raw & READ_READY_BITS != 0 {
                                     this.host_read_avail_for_poll(gfd)
                                 } else {
@@ -5853,6 +5993,16 @@ impl SyscallDispatcher {
                     } else {
                         pollfd.revents = p.revents;
                     }
+                    // Darwin poll(2) has no POLLRDHUP bit. Reconstruct Linux's
+                    // socket half-close readiness from kqueue EV_EOF before
+                    // returning the all-host fast-path result; the per-fd path
+                    // does the same in poll_ready_events.
+                    if pollfd.events & LINUX_POLLRDHUP != 0
+                        && this.socket_guest_type(pollfd.fd).is_some()
+                        && host_stream_socket_rdhup(p.fd)
+                    {
+                        pollfd.revents |= LINUX_POLLIN | LINUX_POLLRDHUP;
+                    }
                     // macOS poll() on a regular file returns POLLPRI whenever the
                     // caller requested it (the BSD vnode "always ready" default);
                     // Linux only ever sets POLLPRI on a genuine out-of-band
@@ -7321,13 +7471,33 @@ impl SyscallDispatcher {
             let nonblocking = this.io_is_nonblocking(fd, flags);
             let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;
             let len = len.min(crate::dispatch::MAX_RW_COUNT);
+            let atomic_record = matches!(
+                this.socket_guest_type(fd),
+                Some(LINUX_SOCK_DGRAM) | Some(LINUX_SOCK_SEQPACKET)
+            );
+            let host_recv_len = if atomic_record {
+                linux_msg_trunc_recv_capacity(host_fd.get(), len, flags)
+            } else {
+                len
+            };
             // Zero-copy recv straight INTO guest memory when the destination is
             // one contiguous, guest-writable region; else recv into a bounce and
             // copy. host_ptr_for_write enforces guest-writability (a read-only
             // mapping returns None → checked write path → EFAULT).
-            let zc_dst = memory.host_ptr_for_write(buf_addr, len);
+            // Linux MSG_TRUNC on an atomic record returns the full record length
+            // while copying at most `len`; Darwin returns only the host buffer
+            // length. Widen that host-only bounce to SO_RCVBUF, then copy only
+            // the guest-requested prefix. Stream reads never widen: doing so
+            // would consume bytes the guest did not request.
+            let zc_dst = (host_recv_len == len)
+                .then(|| memory.host_ptr_for_write(buf_addr, len))
+                .flatten();
             let zero_copy = zc_dst.is_some();
-            let mut recv_copy: Option<Vec<u8>> = if zero_copy { None } else { Some(vec![0u8; len]) };
+            let mut recv_copy: Option<Vec<u8>> = if zero_copy {
+                None
+            } else {
+                Some(vec![0u8; host_recv_len])
+            };
             let dst_ptr: *mut u8 = match (zc_dst, recv_copy.as_mut()) {
                 (Some(p), _) => p,
                 (None, Some(b)) => b.as_mut_ptr(),
@@ -7369,7 +7539,7 @@ impl SyscallDispatcher {
                             libc::recvfrom(
                                 *target,
                                 dst_ptr as *mut _,
-                                len,
+                                host_recv_len,
                                 host_flags,
                                 sa.as_mut_ptr() as *mut _,
                                 &mut sa_len as *mut _,
@@ -7380,7 +7550,7 @@ impl SyscallDispatcher {
                             libc::recvfrom(
                                 *target,
                                 dst_ptr as *mut _,
-                                len,
+                                host_recv_len,
                                 host_flags,
                                 std::ptr::null_mut(),
                                 std::ptr::null_mut(),
@@ -7416,7 +7586,9 @@ impl SyscallDispatcher {
                 if !zero_copy
                     && n > 0
                     && let Some(b) = recv_copy.as_ref()
-                    && memory.write_bytes(buf_addr, &b[..n as usize]).is_err()
+                    && memory
+                        .write_bytes(buf_addr, &b[..(n as usize).min(len)])
+                        .is_err()
                 {
                     return Err(LINUX_EFAULT);
                 }
