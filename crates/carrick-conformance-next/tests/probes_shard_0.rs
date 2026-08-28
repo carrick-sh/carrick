@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use carrick_conformance_next::{PullPolicy, TestContainer};
 
-/// Exact materialized list of 146 sorted unique probe names for generic shard 0.
+/// Exact materialized list of 148 sorted unique probe names for generic shard 0.
 ///
 /// Conceptually defined as:
 /// - class: "conformance"
@@ -54,45 +54,46 @@ pub const SHARD_0_PROBES: &[&str] = &[
     "epollforkeventfd",
     "epolloutxthread",
     "epollstaledel",
-    "execfailsurvive",
-    "execpermitchurn",
-    "execsocket",
-    "execvereset",
-    "exitstatus127",
-    "faultaddr",
-    "fcntllease",
-    "fcntlowner",
-    "fdio",
-    "fexecveprobe",
-    "fifoforkeof",
-    "forkaltstack",
-    "forkfault",
-    "forkfpregs",
-    "forkshared",
-    "forksnapshot",
-    "fsescapeguard",
-    "fstatatflags",
-    "futexextra",
-    "futexghost",
-    "futexprivatewakeexact",
-    "futexshare",
-    "futexwaiterstates",
-    "getrandomflags",
-    "getrandomvdsoloop",
-    "icmp",
-    "iouring",
-    "iovecedge",
-    "itimer",
-    "keydeny",
-    "killgroup",
-    "killtarget",
-    "legacyaio",
-    "linkatflag",
-    "loopbacksubnet",
-    "lutimesym",
-    "manythreads",
-    "maskfork",
-    "memfdcreate",
+    "eventwaitmatrix",
+    "execfromthread",
+    "execsig",
+    "execvenonutf8",
+    "exitgroupthreads",
+    "fallocatebig",
+    "fcntlgetlk",
+    "fcntlofdlock",
+    "fcntlstdio",
+    "fdstatus",
+    "fifoepolleof",
+    "flocklock",
+    "forkexecpthread",
+    "forkfpreclaim",
+    "forkhighva",
+    "forksleepfork",
+    "forkstackstorm",
+    "fsmeta",
+    "futexdeadline",
+    "futexforkwakegroups",
+    "futexpingpong",
+    "futexrequeue",
+    "futexsharedto",
+    "futexwakeexact",
+    "getrandomvdsofork",
+    "hugepage",
+    "ioctlcluster",
+    "iouringenterflag",
+    "ipv6recvhoplimit",
+    "itimerprofidle",
+    "killchld",
+    "killreap",
+    "killuidperm",
+    "legacyfs",
+    "linkstat",
+    "ltpcheckpoint",
+    "lxattr",
+    "mapfixed",
+    "mcastjoingroup",
+    "memfdsealmatrix",
     "memmap",
     "mknoddevnode",
     "mmapcluster",
@@ -180,7 +181,7 @@ pub const SHARD_0_PROBES: &[&str] = &[
     "zerolenio",
 ];
 
-const CACHED_SHARD_0_PROBE_COUNT: usize = 136;
+const CACHED_SHARD_0_PROBE_COUNT: usize = 139;
 
 /// Derive the shard 0 subset from a complete baseline set.
 pub fn expected_shard_gaps(baseline: &[&'static str]) -> BTreeSet<&'static str> {
@@ -301,11 +302,11 @@ pub fn find_probe_binary_dir(repo_root: &Path, target: &str) -> Option<PathBuf> 
 
 #[test]
 fn test_shard_0_inventory() {
-    // Hard-assert exactly 147 sorted unique names.
+    // Hard-assert exactly 148 sorted unique names.
     assert_eq!(
         SHARD_0_PROBES.len(),
-        147,
-        "shard 0 must have exactly 147 probes"
+        148,
+        "shard 0 must have exactly 148 probes"
     );
 
     let mut sorted_probes = SHARD_0_PROBES.to_vec();
@@ -319,8 +320,8 @@ fn test_shard_0_inventory() {
     let unique_probes: BTreeSet<_> = SHARD_0_PROBES.iter().copied().collect();
     assert_eq!(
         unique_probes.len(),
-        147,
-        "SHARD_0_PROBES must contain 147 unique names"
+        148,
+        "SHARD_0_PROBES must contain 148 unique names"
     );
     assert_eq!(
         SHARD_0_PROBES
@@ -384,8 +385,8 @@ fn test_shard_0_inventory() {
     selected_names.sort();
     assert_eq!(
         selected_names.len(),
-        439,
-        "expected exactly 439 conformance generic probes in inventory"
+        442,
+        "expected exactly 442 conformance generic probes in inventory"
     );
 
     let derived_shard_0: Vec<&str> = selected_names
@@ -396,8 +397,8 @@ fn test_shard_0_inventory() {
 
     assert_eq!(
         derived_shard_0.len(),
-        147,
-        "derived shard 0 must have exactly 147 items"
+        148,
+        "derived shard 0 must have exactly 148 items"
     );
     assert_eq!(
         SHARD_0_PROBES,
@@ -414,6 +415,10 @@ fn test_shard_0_expected_gaps_derivation() {
     let expected_musl_set = BTreeSet::from([
         "budget_two_proc",
         "childsubreaper",
+        "eventwaitmatrix",
+        "execfromthread",
+        "futexforkwakegroups",
+        "memfdsealmatrix",
         "mprotectexec",
         "pidnsroot",
         "procpeerdir",
@@ -426,6 +431,10 @@ fn test_shard_0_expected_gaps_derivation() {
     let expected_gnu_set = BTreeSet::from([
         "budget_two_proc",
         "childsubreaper",
+        "eventwaitmatrix",
+        "execfromthread",
+        "killchld",
+        "memfdsealmatrix",
         "pidnsroot",
         "procpeerdir",
         "siginfo",

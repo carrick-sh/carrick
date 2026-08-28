@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use carrick_conformance_next::{PullPolicy, TestContainer};
 
 /// Exact materialized list of generic conformance probes for shard 2 (index % 3 == 2).
-/// Hard-asserted to have exactly 146 sorted unique names.
+/// Hard-asserted to have exactly 147 sorted unique names.
 pub const SHARD_2_PROBES: &[&str] = &[
     "accessx",
     "alarmretval",
@@ -34,45 +34,46 @@ pub const SHARD_2_PROBES: &[&str] = &[
     "epollexclusive",
     "epolloutrearm",
     "epollpwait",
-    "eventwaitmatrix",
-    "execfromthread",
-    "execsig",
-    "execvenonutf8",
-    "exitgroupthreads",
-    "fallocatebig",
-    "fcntlgetlk",
-    "fcntlofdlock",
-    "fcntlstdio",
-    "fdstatus",
-    "fifoepolleof",
-    "flocklock",
-    "forkexecpthread",
-    "forkfpreclaim",
-    "forkhighva",
-    "forksleepfork",
-    "forkstackstorm",
-    "fsmeta",
-    "futexdeadline",
-    "futexforkwakegroups",
-    "futexpingpong",
-    "futexrequeue",
-    "futexsharedto",
-    "futexwakeexact",
-    "getrandomvdsofork",
-    "hugepage",
-    "iopriovhangup",
-    "iouringsqpoll",
-    "ipv6sendhoplimit",
-    "kernelidentity",
-    "killfault",
-    "killrt",
-    "lchownsymlink",
-    "lifecycleflagmatrix",
-    "linuxsysinfo",
-    "ltpcheckpointexec",
-    "mailboxregs",
-    "mapfixedfork",
-    "mem",
+    "eventfdsignalmatrix",
+    "execfatalstatus",
+    "execpipe",
+    "execthreads",
+    "exitgroupmainthreads",
+    "expectcontinue",
+    "fchmoddir",
+    "fcntllock",
+    "fcntlpipesz",
+    "fdstat",
+    "fgetflcreate",
+    "fifonode",
+    "forkcow",
+    "forkfiletable",
+    "forkheapalloc",
+    "forksigwalk",
+    "forksplicestage",
+    "fsetfl",
+    "fsx",
+    "futexforkrequeue",
+    "futexpilock",
+    "futexrealtime",
+    "futexsharedalias",
+    "futexwakecount",
+    "getrandomvdso",
+    "getsocknameval",
+    "inotifymatrix",
+    "iouring",
+    "iovecedge",
+    "itimer",
+    "keydeny",
+    "killgroup",
+    "killtarget",
+    "legacyaio",
+    "linkatflag",
+    "loopbacksubnet",
+    "lutimesym",
+    "manythreads",
+    "maskfork",
+    "memfdcreate",
     "memflagmatrix",
     "mkdirsetgid",
     "mmapcage",
@@ -160,7 +161,7 @@ pub const SHARD_2_PROBES: &[&str] = &[
     "xthreadsig",
 ];
 
-const CACHED_SHARD_2_PROBE_COUNT: usize = 134;
+const CACHED_SHARD_2_PROBE_COUNT: usize = 133;
 
 /// Launch policy for a probe.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -271,16 +272,16 @@ pub fn probe_campaign_dir(repo_root: &Path, target: &str) -> Option<PathBuf> {
 
 #[test]
 fn test_shard_2_inventory_definition() {
-    // 1. Hard-assert 146 sorted unique names.
+    // 1. Hard-assert 147 sorted unique names.
     assert_eq!(
         SHARD_2_PROBES.len(),
-        146,
-        "shard 2 must contain exactly 146 probes"
+        147,
+        "shard 2 must contain exactly 147 probes"
     );
     let probe_set: BTreeSet<&str> = SHARD_2_PROBES.iter().copied().collect();
     assert_eq!(
         probe_set.len(),
-        146,
+        147,
         "shard 2 probes list must contain no duplicate entries"
     );
     for window in SHARD_2_PROBES.windows(2) {
@@ -329,8 +330,8 @@ fn test_shard_2_inventory_definition() {
     generic_conformance_probes.dedup();
     assert_eq!(
         generic_conformance_probes.len(),
-        439,
-        "expected exactly 439 generic conformance probes across all shards"
+        442,
+        "expected exactly 442 generic conformance probes across all shards"
     );
 
     let derived_shard_2: Vec<&str> = generic_conformance_probes
@@ -342,8 +343,8 @@ fn test_shard_2_inventory_definition() {
 
     assert_eq!(
         derived_shard_2.len(),
-        146,
-        "derived shard 2 must have 146 items"
+        147,
+        "derived shard 2 must have 147 items"
     );
     assert_eq!(
         derived_shard_2.as_slice(),
