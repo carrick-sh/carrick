@@ -111,7 +111,10 @@ pub type KvmKicker = carrick_hal::GenericVcpuRegistry;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carrick_hal::{InGuestFlag, VcpuKick, VcpuRegistry};
+    use carrick_hal::{
+        InGuestFlag, VcpuKick, VcpuLeaseDrainPoll, VcpuRegistrationEnrollment, VcpuRegistry,
+    };
+    use std::sync::Arc;
 
     /// A pure-data stand-in for a real `KvmKickHandle`: it records nothing and
     /// kicks nothing, so the registry bookkeeping tests run on ANY host (no
@@ -131,18 +134,34 @@ mod tests {
         Box::new(InertHandle)
     }
 
-    /// register / unregister / count bookkeeping: `count` reflects the number of
-    /// registered vCPUs, and unregister removes the whole entry (both facets).
+    /// register / unregister / lease-drain bookkeeping: `poll_lease_drain` reflects
+    /// registered vCPUs relative to a synthetic observer, and unregister removes the
+    /// whole entry (both facets).
     #[test]
-    fn register_unregister_count() {
+    fn register_unregister_lease_drain() {
         let k = KvmKicker::new();
+        let observer = t(99);
         let f10 = InGuestFlag::for_guest_thread();
         let f11 = InGuestFlag::for_guest_thread();
-        assert_eq!(k.count(), 0, "fresh kicker is empty");
+        assert_eq!(
+            k.poll_lease_drain(observer),
+            VcpuLeaseDrainPoll::Complete,
+            "fresh kicker is empty"
+        );
 
-        k.register(t(10), boxed(), &f10);
-        k.register(t(11), boxed(), &f11);
-        assert_eq!(k.count(), 2, "two vCPUs registered");
+        assert!(matches!(
+            k.subscribe_register(t(10), boxed(), &f10, Arc::new(|| {})),
+            VcpuRegistrationEnrollment::Registered
+        ));
+        assert!(matches!(
+            k.subscribe_register(t(11), boxed(), &f11, Arc::new(|| {})),
+            VcpuRegistrationEnrollment::Registered
+        ));
+        assert_eq!(
+            k.poll_lease_drain(observer),
+            VcpuLeaseDrainPoll::Waiting(t(10)),
+            "two vCPUs registered"
+        );
 
         // Kicking an unknown tid, kick_all, kick_all_except are harmless no-ops
         // on inert handles (no pthread_kill fires).
@@ -151,12 +170,20 @@ mod tests {
         k.kick_all_except(t(10));
 
         k.unregister(t(10));
-        assert_eq!(k.count(), 1, "one vCPU after unregister");
+        assert_eq!(
+            k.poll_lease_drain(observer),
+            VcpuLeaseDrainPoll::Waiting(t(11)),
+            "one vCPU after unregister"
+        );
         k.unregister(t(11));
-        assert_eq!(k.count(), 0, "empty after unregistering both");
+        assert_eq!(
+            k.poll_lease_drain(observer),
+            VcpuLeaseDrainPoll::Complete,
+            "empty after unregistering both"
+        );
         // Unregistering an absent tid is a no-op.
         k.unregister(t(11));
-        assert_eq!(k.count(), 0);
+        assert_eq!(k.poll_lease_drain(observer), VcpuLeaseDrainPoll::Complete);
     }
 
     /// `InGuestFlag` + `any_other_in_guest` SeqCst bookkeeping (the Dekker
@@ -167,8 +194,14 @@ mod tests {
         // Two threads register their vCPUs, each with its lifetime flag.
         let f1 = InGuestFlag::for_guest_thread();
         let f2 = InGuestFlag::for_guest_thread();
-        k.register(t(1), boxed(), &f1);
-        k.register(t(2), boxed(), &f2);
+        assert!(matches!(
+            k.subscribe_register(t(1), boxed(), &f1, Arc::new(|| {})),
+            VcpuRegistrationEnrollment::Registered
+        ));
+        assert!(matches!(
+            k.subscribe_register(t(2), boxed(), &f2, Arc::new(|| {})),
+            VcpuRegistrationEnrollment::Registered
+        ));
 
         // Nobody in guest yet.
         assert!(!k.any_other_in_guest(t(1)), "no other thread in guest");
@@ -205,8 +238,14 @@ mod tests {
         let k = KvmKicker::new();
         let flag = InGuestFlag::for_guest_thread();
         let observer = InGuestFlag::for_guest_thread();
-        k.register(t(7), boxed(), &flag);
-        k.register(t(8), boxed(), &observer);
+        assert!(matches!(
+            k.subscribe_register(t(7), boxed(), &flag, Arc::new(|| {})),
+            VcpuRegistrationEnrollment::Registered
+        ));
+        assert!(matches!(
+            k.subscribe_register(t(8), boxed(), &observer, Arc::new(|| {})),
+            VcpuRegistrationEnrollment::Registered
+        ));
         assert!(!k.any_other_in_guest(t(8)));
 
         flag.enter_guest();
@@ -218,7 +257,10 @@ mod tests {
         // Blocking-wait reclaim: unregister, then re-register the same thread.
         flag.leave_guest();
         k.unregister(t(7));
-        k.register(t(7), boxed(), &flag);
+        assert!(matches!(
+            k.subscribe_register(t(7), boxed(), &flag, Arc::new(|| {})),
+            VcpuRegistrationEnrollment::Registered
+        ));
         flag.enter_guest();
         assert!(
             k.any_other_in_guest(t(8)),

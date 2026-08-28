@@ -642,9 +642,9 @@ pub fn spawn_signal_wake_pump(
 #[cfg(test)]
 mod tests {
     use super::*;
-    // VcpuKicker is now the shared GenericVcpuRegistry; its register/kick/… are
+    // VcpuKicker is now the shared GenericVcpuRegistry; its subscribe_register/kick/… are
     // VcpuRegistry trait methods, so bring the trait into scope.
-    use carrick_hal::VcpuRegistry;
+    use carrick_hal::{VcpuRegistrationEnrollment, VcpuRegistry};
 
     #[derive(Clone)]
     struct CountingKick(std::sync::Arc<std::sync::atomic::AtomicUsize>);
@@ -664,11 +664,15 @@ mod tests {
         let registry = std::sync::Arc::new(VcpuKicker::new());
         let kicks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let in_guest = carrick_hal::InGuestFlag::for_guest_thread();
-        registry.register(
-            carrick_hal::ThreadId::synthetic_for_tests(0x7055),
-            Box::new(CountingKick(std::sync::Arc::clone(&kicks))),
-            &in_guest,
-        );
+        assert!(matches!(
+            registry.subscribe_register(
+                carrick_hal::ThreadId::synthetic_for_tests(0x7055),
+                Box::new(CountingKick(std::sync::Arc::clone(&kicks))),
+                &in_guest,
+                std::sync::Arc::new(|| {}),
+            ),
+            VcpuRegistrationEnrollment::Registered
+        ));
         let futex: std::sync::Arc<dyn carrick_hal::PlatformFutex> = std::sync::Arc::new(
             crate::threaded_impl::hvf_futex(std::sync::Arc::new(crate::thread::FutexTable::new())),
         );
@@ -812,16 +816,24 @@ mod tests {
         let parked = carrick_hal::InGuestFlag::for_guest_thread();
         let running = carrick_hal::InGuestFlag::for_guest_thread();
         running.enter_guest();
-        registry.register(
-            carrick_hal::ThreadId::synthetic_for_tests(0x7055),
-            Box::new(CountingKick(std::sync::Arc::clone(&parked_kicks))),
-            &parked,
-        );
-        registry.register(
-            carrick_hal::ThreadId::synthetic_for_tests(0x7056),
-            Box::new(CountingKick(std::sync::Arc::clone(&running_kicks))),
-            &running,
-        );
+        assert!(matches!(
+            registry.subscribe_register(
+                carrick_hal::ThreadId::synthetic_for_tests(0x7055),
+                Box::new(CountingKick(std::sync::Arc::clone(&parked_kicks))),
+                &parked,
+                std::sync::Arc::new(|| {}),
+            ),
+            VcpuRegistrationEnrollment::Registered
+        ));
+        assert!(matches!(
+            registry.subscribe_register(
+                carrick_hal::ThreadId::synthetic_for_tests(0x7056),
+                Box::new(CountingKick(std::sync::Arc::clone(&running_kicks))),
+                &running,
+                std::sync::Arc::new(|| {}),
+            ),
+            VcpuRegistrationEnrollment::Registered
+        ));
         let futex: std::sync::Arc<dyn carrick_hal::PlatformFutex> = std::sync::Arc::new(
             crate::threaded_impl::hvf_futex(std::sync::Arc::new(crate::thread::FutexTable::new())),
         );
