@@ -454,10 +454,10 @@ pub(crate) enum HostStreamKind {
 pub(crate) struct PipeCapacity(u32);
 
 impl PipeCapacity {
-    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) const MAX: u32 = 1024 * 1024;
 
-    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn bounded(raw: u32) -> Result<Self, AuthorityError> {
         if raw == 0 || raw > Self::MAX {
             return Err(AuthorityError::InvalidPipeCapacity);
@@ -940,12 +940,16 @@ pub(crate) enum Command {
     InspectDescription {
         description: FileDescriptionId,
     },
+    SetCanonicalPipeCapacity {
+        slot: crate::kernel::objects::FileSlotAuthority,
+        capacity: PipeCapacity,
+        accounting: crate::kernel::objects::PipeCapacityAccounting,
+    },
 }
 
 impl Command {
     pub(crate) const fn is_canonical(&self) -> bool {
-        let _ = self;
-        false
+        matches!(self, Self::SetCanonicalPipeCapacity { .. })
     }
 }
 
@@ -1016,6 +1020,11 @@ pub(crate) enum Outcome {
         pipe: PipeId,
         capacity: PipeCapacity,
         stream_revision: Revision,
+    },
+    CanonicalPipeCapacitySet {
+        description: FileDescriptionId,
+        capacity: PipeCapacity,
+        description_revision: u64,
     },
     HostStreamCreated {
         table: FileTableId,
@@ -1460,6 +1469,12 @@ pub(crate) enum AuthorityError {
     MappingAttachmentNotFound,
     #[error("mapping release does not overlap the attachment")]
     MappingReleaseOutsideAttachment,
+    #[error("file descriptor slot authority token is stale")]
+    StaleSlot {
+        slot: crate::kernel::objects::FileSlotAuthority,
+    },
+    #[error("pipe operation failed with errno {0:?}")]
+    PipeErrno(carrick_abi::LinuxErrno),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]

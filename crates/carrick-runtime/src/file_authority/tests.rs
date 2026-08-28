@@ -4,6 +4,10 @@ use std::sync::Arc;
 
 use carrick_kernel::domains::{HostPid, ProcessGeneration};
 
+use crate::dispatch::fd_table::{
+    HostPipeTestFixture, InMemoryPipeTestFixture, closed_test_description,
+};
+use crate::kernel::objects::PipeCapacityAccounting;
 use crate::kernel::{FileDescription, FileTable, ObjectIdRegistry};
 
 use super::*;
@@ -3266,7 +3270,7 @@ fn production_root_binding_names_the_kernel_table_without_creating_a_model_table
 }
 
 #[test]
-fn canonical_path_rejects_a_model_command_without_fallback() {
+fn canonical_entry_rejects_model_command_fatally() {
     let epoch = AuthorityEpoch::for_run(7).expect("authority epoch");
     let core = FileAuthorityCore::for_run(epoch);
     let direct = DirectFileAuthority::for_run(core);
@@ -3298,7 +3302,7 @@ fn canonical_path_rejects_a_model_command_without_fallback() {
 }
 
 #[test]
-fn completed_model_request_replayed_through_canonical_entry_is_fatal() {
+fn canonical_entry_completed_model_replayed_through_canonical_is_fatal() {
     let epoch = AuthorityEpoch::for_run(7).expect("authority epoch");
     let core = FileAuthorityCore::for_run(epoch);
     let direct = DirectFileAuthority::for_run(core);
@@ -3339,4 +3343,814 @@ fn completed_model_request_replayed_through_canonical_entry_is_fatal() {
         )
         .expect_err("canonical path must reject replayed model request before dedup");
     assert!(matches!(fatal, AuthorityFatal::InvariantViolation(_)));
+}
+
+#[test]
+fn canonical_entry_completed_canonical_replayed_through_ordinary_is_fatal() {
+    let epoch = AuthorityEpoch::for_run(7).expect("authority epoch");
+    let core = FileAuthorityCore::for_run(epoch);
+    let direct = DirectFileAuthority::for_run(core);
+    let client = client(1, 1001, 1);
+
+    // Register client first.
+    let register_request = Request {
+        epoch,
+        client,
+        request_id: RequestId::from_client_sequence(1).expect("request id"),
+        expected_generation: ObjectGeneration::INITIAL,
+        command: Command::RegisterClient,
+    };
+    direct
+        .transact(AuthorityCall::without_capabilities(register_request))
+        .expect("register client");
+
+    // Install in-memory pipe in kernel table.
+    let ids = ObjectIdRegistry::new();
+    let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+    let number = FileSlotNumber::for_open_fd(3).expect("fd");
+    let fixture = InMemoryPipeTestFixture::new(10, 65536);
+    table.install(number, fixture.read, false);
+    let slot = table.capture_slot_authority(number).expect("slot auth");
+    let target = CanonicalAuthorityTarget {
+        table: Arc::clone(&table),
+        slot,
+    };
+
+    // 1. Complete a canonical request via transact_canonical.
+    let canonical_request = Request {
+        epoch,
+        client,
+        request_id: RequestId::from_client_sequence(2).expect("request id"),
+        expected_generation: ObjectGeneration::INITIAL,
+        command: Command::SetCanonicalPipeCapacity {
+            slot,
+            capacity: PipeCapacity::bounded(131_072).expect("capacity"),
+            accounting: PipeCapacityAccounting::InMemory,
+        },
+    };
+    let reply = direct
+        .transact_canonical(
+            AuthorityCall::without_capabilities(canonical_request.clone()),
+            target,
+        )
+        .expect("canonical call");
+    assert!(matches!(
+        reply.response.outcome,
+        Outcome::CanonicalPipeCapacitySet { .. }
+    ));
+
+    // 2. Replay the same canonical request through ordinary transact.
+    let fatal = direct
+        .transact(AuthorityCall::without_capabilities(canonical_request))
+        .expect_err("ordinary path must reject canonical command");
+    assert!(matches!(fatal, AuthorityFatal::InvariantViolation(_)));
+}
+
+#[test]
+fn canonical_entry_duplicate_with_mismatched_target_sidecar_is_fatal() {
+    let epoch = AuthorityEpoch::for_run(7).expect("authority epoch");
+    let core = FileAuthorityCore::for_run(epoch);
+    let direct = DirectFileAuthority::for_run(core);
+    let client = client(1, 1001, 1);
+
+    // Register client first.
+    let register_request = Request {
+        epoch,
+        client,
+        request_id: RequestId::from_client_sequence(1).expect("request id"),
+        expected_generation: ObjectGeneration::INITIAL,
+        command: Command::RegisterClient,
+    };
+    direct
+        .transact(AuthorityCall::without_capabilities(register_request))
+        .expect("register client");
+
+    // Install in-memory pipe in kernel table.
+    let ids = ObjectIdRegistry::new();
+    let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+    let number = FileSlotNumber::for_open_fd(3).expect("fd");
+    let fixture = InMemoryPipeTestFixture::new(10, 65536);
+    table.install(number, fixture.read, false);
+    let slot = table.capture_slot_authority(number).expect("slot auth");
+    let target = CanonicalAuthorityTarget {
+        table: Arc::clone(&table),
+        slot,
+    };
+
+    // 1. Complete canonical request.
+    let canonical_request = Request {
+        epoch,
+        client,
+        request_id: RequestId::from_client_sequence(2).expect("request id"),
+        expected_generation: ObjectGeneration::INITIAL,
+        command: Command::SetCanonicalPipeCapacity {
+            slot,
+            capacity: PipeCapacity::bounded(131_072).expect("capacity"),
+            accounting: PipeCapacityAccounting::InMemory,
+        },
+    };
+    let reply = direct
+        .transact_canonical(
+            AuthorityCall::without_capabilities(canonical_request.clone()),
+            target,
+        )
+        .expect("canonical call");
+    assert!(matches!(
+        reply.response.outcome,
+        Outcome::CanonicalPipeCapacitySet { .. }
+    ));
+
+    // 2. Duplicate with mismatched table sidecar (e.g. different table Arc).
+    let table_mismatched = Arc::new(FileTable::new(ids.file_table_id().expect("table id 2")));
+    let mismatched_target = CanonicalAuthorityTarget {
+        table: table_mismatched,
+        slot,
+    };
+    let fatal = direct
+        .transact_canonical(
+            AuthorityCall::without_capabilities(canonical_request),
+            mismatched_target,
+        )
+        .expect_err("mismatched target sidecar must fail fatally before dedup");
+    assert!(matches!(fatal, AuthorityFatal::InvariantViolation(_)));
+}
+
+#[test]
+fn canonical_entry_identical_retry_after_close_and_reuse_replays_committed_result() {
+    let epoch = AuthorityEpoch::for_run(7).expect("authority epoch");
+    let core = FileAuthorityCore::for_run(epoch);
+    let direct = DirectFileAuthority::for_run(core);
+    let client = client(1, 1001, 1);
+
+    // Register client.
+    let register_request = Request {
+        epoch,
+        client,
+        request_id: RequestId::from_client_sequence(1).expect("request id"),
+        expected_generation: ObjectGeneration::INITIAL,
+        command: Command::RegisterClient,
+    };
+    direct
+        .transact(AuthorityCall::without_capabilities(register_request))
+        .expect("register client");
+
+    // Install pipe in table.
+    let ids = ObjectIdRegistry::new();
+    let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+    let number = FileSlotNumber::for_open_fd(3).expect("fd");
+    let fixture1 = InMemoryPipeTestFixture::new(10, 65536);
+    table.install(number, fixture1.read, false);
+    let slot = table.capture_slot_authority(number).expect("slot auth");
+    let target = CanonicalAuthorityTarget {
+        table: Arc::clone(&table),
+        slot,
+    };
+
+    // 1. Initial canonical request succeeds.
+    let canonical_request = Request {
+        epoch,
+        client,
+        request_id: RequestId::from_client_sequence(2).expect("request id"),
+        expected_generation: ObjectGeneration::INITIAL,
+        command: Command::SetCanonicalPipeCapacity {
+            slot,
+            capacity: PipeCapacity::bounded(131_072).expect("capacity"),
+            accounting: PipeCapacityAccounting::InMemory,
+        },
+    };
+    let reply1 = direct
+        .transact_canonical(
+            AuthorityCall::without_capabilities(canonical_request.clone()),
+            target,
+        )
+        .expect("initial call succeeds");
+    let Outcome::CanonicalPipeCapacitySet {
+        description: desc_id1,
+        capacity: cap1,
+        description_revision: rev1,
+    } = reply1.response.outcome
+    else {
+        panic!("expected CanonicalPipeCapacitySet");
+    };
+    assert_eq!(cap1.raw(), 131_072);
+
+    // 2. Close / replace fd 3 with a new description.
+    let fixture2 = InMemoryPipeTestFixture::new(20, 65536);
+    table.install(number, Arc::clone(&fixture2.read), false);
+
+    // 3. Retry the identical canonical request with matching target sidecar (same slot token & table).
+    let target_retry = CanonicalAuthorityTarget {
+        table: Arc::clone(&table),
+        slot,
+    };
+    let reply2 = direct
+        .transact_canonical(
+            AuthorityCall::without_capabilities(canonical_request),
+            target_retry,
+        )
+        .expect("identical retry must hit dedup and replay committed response");
+    assert_eq!(reply2.response.request_id, reply1.response.request_id);
+    assert_eq!(
+        reply2.response.authority_revision,
+        reply1.response.authority_revision
+    );
+    assert_eq!(reply2.response.outcome, reply1.response.outcome);
+    let Outcome::CanonicalPipeCapacitySet {
+        description: desc_id2,
+        capacity: cap2,
+        description_revision: rev2,
+    } = reply2.response.outcome
+    else {
+        panic!("expected CanonicalPipeCapacitySet");
+    };
+    assert_eq!(desc_id2, desc_id1);
+    assert_eq!(cap2, cap1);
+    assert_eq!(rev2, rev1);
+    // And replacement pipe 2 was not modified:
+    assert_eq!(fixture2.capacity(), 65536);
+}
+
+#[test]
+fn canonical_pipe_capacity_in_memory_updates_both_ends_and_publishes_one_revision() {
+    let epoch = AuthorityEpoch::for_run(7).expect("authority epoch");
+    let core = FileAuthorityCore::for_run(epoch);
+    let direct = DirectFileAuthority::for_run(core);
+    let client = client(1, 1001, 1);
+
+    let reg_reply = direct
+        .transact(AuthorityCall::without_capabilities(Request {
+            epoch,
+            client,
+            request_id: RequestId::from_client_sequence(1).expect("req 1"),
+            expected_generation: ObjectGeneration::INITIAL,
+            command: Command::RegisterClient,
+        }))
+        .expect("register");
+    let initial_auth_rev = reg_reply.response.authority_revision;
+
+    let ids = ObjectIdRegistry::new();
+    let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+    let read_fd = FileSlotNumber::for_open_fd(3).expect("read fd");
+    let write_fd = FileSlotNumber::for_open_fd(4).expect("write fd");
+    let fixture = InMemoryPipeTestFixture::new(10, 65536);
+    let read_file_desc = Arc::clone(&fixture.read);
+    let write_file_desc = Arc::clone(&fixture.write);
+    table.install(read_fd, Arc::clone(&read_file_desc), false);
+    table.install(write_fd, Arc::clone(&write_file_desc), false);
+
+    let slot = table.capture_slot_authority(read_fd).expect("slot auth");
+    let target = CanonicalAuthorityTarget {
+        table: Arc::clone(&table),
+        slot,
+    };
+
+    let initial_read_rev = read_file_desc.revision_for_test();
+    let initial_write_rev = write_file_desc.revision_for_test();
+
+    let reply = direct
+        .transact_canonical(
+            AuthorityCall::without_capabilities(Request {
+                epoch,
+                client,
+                request_id: RequestId::from_client_sequence(2).expect("req 2"),
+                expected_generation: ObjectGeneration::INITIAL,
+                command: Command::SetCanonicalPipeCapacity {
+                    slot,
+                    capacity: PipeCapacity::bounded(131_072).expect("cap"),
+                    accounting: PipeCapacityAccounting::InMemory,
+                },
+            }),
+            target,
+        )
+        .expect("canonical call");
+
+    assert_eq!(
+        reply.response.outcome,
+        Outcome::CanonicalPipeCapacitySet {
+            description: read_file_desc.id(),
+            capacity: PipeCapacity::bounded(131_072).expect("cap"),
+            description_revision: initial_read_rev + 1,
+        }
+    );
+    assert_eq!(
+        reply.response.authority_revision,
+        initial_auth_rev.next().expect("next auth rev")
+    );
+    assert_eq!(fixture.capacity(), 131_072);
+    assert_eq!(fixture.read_base_capacity(), 131_072);
+    assert_eq!(fixture.write_base_capacity(), 131_072);
+    assert_eq!(read_file_desc.revision_for_test(), initial_read_rev + 1);
+    assert_eq!(write_file_desc.revision_for_test(), initial_write_rev);
+}
+
+#[test]
+fn canonical_pipe_capacity_host_pipe_updates_exact_description_and_shared_capacity() {
+    let epoch = AuthorityEpoch::for_run(7).expect("authority epoch");
+    let core = FileAuthorityCore::for_run(epoch);
+    let direct = DirectFileAuthority::for_run(core);
+    let client = client(1, 1001, 1);
+
+    let reg_reply = direct
+        .transact(AuthorityCall::without_capabilities(Request {
+            epoch,
+            client,
+            request_id: RequestId::from_client_sequence(1).expect("req 1"),
+            expected_generation: ObjectGeneration::INITIAL,
+            command: Command::RegisterClient,
+        }))
+        .expect("register");
+    let initial_auth_rev = reg_reply.response.authority_revision;
+
+    let ids = ObjectIdRegistry::new();
+    let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+    let fd = FileSlotNumber::for_open_fd(3).expect("fd");
+    let fixture = HostPipeTestFixture::new(100, 65536);
+    let host_file_desc = Arc::clone(&fixture.read);
+    table.install(fd, Arc::clone(&host_file_desc), false);
+
+    let slot = table.capture_slot_authority(fd).expect("slot auth");
+    let target = CanonicalAuthorityTarget {
+        table: Arc::clone(&table),
+        slot,
+    };
+
+    let initial_rev = host_file_desc.revision_for_test();
+
+    let reply = direct
+        .transact_canonical(
+            AuthorityCall::without_capabilities(Request {
+                epoch,
+                client,
+                request_id: RequestId::from_client_sequence(2).expect("req 2"),
+                expected_generation: ObjectGeneration::INITIAL,
+                command: Command::SetCanonicalPipeCapacity {
+                    slot,
+                    capacity: PipeCapacity::bounded(131_072).expect("cap"),
+                    accounting: PipeCapacityAccounting::Host { queued_bytes: 0 },
+                },
+            }),
+            target,
+        )
+        .expect("canonical call");
+
+    assert_eq!(
+        reply.response.outcome,
+        Outcome::CanonicalPipeCapacitySet {
+            description: host_file_desc.id(),
+            capacity: PipeCapacity::bounded(131_072).expect("cap"),
+            description_revision: initial_rev + 1,
+        }
+    );
+    assert_eq!(
+        reply.response.authority_revision,
+        initial_auth_rev.next().expect("next auth rev")
+    );
+    assert_eq!(fixture.capacity(), 131_072);
+    assert_eq!(fixture.read_base_capacity(), 131_072);
+    assert_eq!(host_file_desc.revision_for_test(), initial_rev + 1);
+}
+
+#[test]
+fn canonical_pipe_capacity_in_memory_ebusy_leaves_state_and_revisions_unchanged() {
+    let epoch = AuthorityEpoch::for_run(7).expect("authority epoch");
+    let core = FileAuthorityCore::for_run(epoch);
+    let direct = DirectFileAuthority::for_run(core);
+    let client = client(1, 1001, 1);
+
+    let reg_reply = direct
+        .transact(AuthorityCall::without_capabilities(Request {
+            epoch,
+            client,
+            request_id: RequestId::from_client_sequence(1).expect("req 1"),
+            expected_generation: ObjectGeneration::INITIAL,
+            command: Command::RegisterClient,
+        }))
+        .expect("register");
+    let initial_auth_rev = reg_reply.response.authority_revision;
+
+    let ids = ObjectIdRegistry::new();
+    let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+    let fd = FileSlotNumber::for_open_fd(3).expect("fd");
+    let fixture = InMemoryPipeTestFixture::new(10, 65536);
+    fixture.enqueue_bytes(&[0x42; 5000]);
+    let desc = Arc::clone(&fixture.read);
+    table.install(fd, Arc::clone(&desc), false);
+
+    let slot = table.capture_slot_authority(fd).expect("slot auth");
+    let target = CanonicalAuthorityTarget {
+        table: Arc::clone(&table),
+        slot,
+    };
+
+    let initial_desc_rev = desc.revision_for_test();
+
+    let reply = direct
+        .transact_canonical(
+            AuthorityCall::without_capabilities(Request {
+                epoch,
+                client,
+                request_id: RequestId::from_client_sequence(2).expect("req 2"),
+                expected_generation: ObjectGeneration::INITIAL,
+                command: Command::SetCanonicalPipeCapacity {
+                    slot,
+                    capacity: PipeCapacity::bounded(4096).expect("cap"),
+                    accounting: PipeCapacityAccounting::InMemory,
+                },
+            }),
+            target,
+        )
+        .expect("call completes");
+
+    assert_eq!(
+        reply.response.outcome,
+        Outcome::Rejected(AuthorityError::PipeErrno(carrick_abi::LINUX_EBUSY))
+    );
+    assert_eq!(reply.response.authority_revision, initial_auth_rev);
+    assert_eq!(fixture.capacity(), 65536);
+    assert_eq!(desc.revision_for_test(), initial_desc_rev);
+}
+
+#[test]
+fn canonical_pipe_capacity_host_pipe_ebusy_leaves_state_and_revisions_unchanged() {
+    let epoch = AuthorityEpoch::for_run(7).expect("authority epoch");
+    let core = FileAuthorityCore::for_run(epoch);
+    let direct = DirectFileAuthority::for_run(core);
+    let client = client(1, 1001, 1);
+
+    let reg_reply = direct
+        .transact(AuthorityCall::without_capabilities(Request {
+            epoch,
+            client,
+            request_id: RequestId::from_client_sequence(1).expect("req 1"),
+            expected_generation: ObjectGeneration::INITIAL,
+            command: Command::RegisterClient,
+        }))
+        .expect("register");
+    let initial_auth_rev = reg_reply.response.authority_revision;
+
+    let ids = ObjectIdRegistry::new();
+    let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+    let fd = FileSlotNumber::for_open_fd(3).expect("fd");
+    let fixture = HostPipeTestFixture::new(100, 65536);
+    let host_file_desc = Arc::clone(&fixture.read);
+    table.install(fd, Arc::clone(&host_file_desc), false);
+
+    let slot = table.capture_slot_authority(fd).expect("slot auth");
+    let target = CanonicalAuthorityTarget {
+        table: Arc::clone(&table),
+        slot,
+    };
+
+    let initial_desc_rev = host_file_desc.revision_for_test();
+
+    let reply = direct
+        .transact_canonical(
+            AuthorityCall::without_capabilities(Request {
+                epoch,
+                client,
+                request_id: RequestId::from_client_sequence(2).expect("req 2"),
+                expected_generation: ObjectGeneration::INITIAL,
+                command: Command::SetCanonicalPipeCapacity {
+                    slot,
+                    capacity: PipeCapacity::bounded(4096).expect("cap"),
+                    accounting: PipeCapacityAccounting::Host { queued_bytes: 5000 },
+                },
+            }),
+            target,
+        )
+        .expect("call completes");
+
+    assert_eq!(
+        reply.response.outcome,
+        Outcome::Rejected(AuthorityError::PipeErrno(carrick_abi::LINUX_EBUSY))
+    );
+    assert_eq!(reply.response.authority_revision, initial_auth_rev);
+    assert_eq!(fixture.capacity(), 65536);
+    assert_eq!(host_file_desc.revision_for_test(), initial_desc_rev);
+}
+
+#[test]
+fn canonical_pipe_capacity_rejects_non_pipe_as_not_pipe() {
+    let epoch = AuthorityEpoch::for_run(7).expect("authority epoch");
+    let core = FileAuthorityCore::for_run(epoch);
+    let direct = DirectFileAuthority::for_run(core);
+    let client = client(1, 1001, 1);
+
+    let reg_reply = direct
+        .transact(AuthorityCall::without_capabilities(Request {
+            epoch,
+            client,
+            request_id: RequestId::from_client_sequence(1).expect("req 1"),
+            expected_generation: ObjectGeneration::INITIAL,
+            command: Command::RegisterClient,
+        }))
+        .expect("register");
+    let initial_auth_rev = reg_reply.response.authority_revision;
+
+    let ids = ObjectIdRegistry::new();
+    let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+    let fd = FileSlotNumber::for_open_fd(3).expect("fd");
+    let regular_desc = Arc::new(FileDescription::regular(
+        ids.file_description_id().expect("desc id"),
+    ));
+    table.install(fd, Arc::clone(&regular_desc), false);
+
+    let slot = table.capture_slot_authority(fd).expect("slot auth");
+    let target = CanonicalAuthorityTarget {
+        table: Arc::clone(&table),
+        slot,
+    };
+
+    let initial_desc_rev = regular_desc.revision_for_test();
+
+    let reply = direct
+        .transact_canonical(
+            AuthorityCall::without_capabilities(Request {
+                epoch,
+                client,
+                request_id: RequestId::from_client_sequence(2).expect("req 2"),
+                expected_generation: ObjectGeneration::INITIAL,
+                command: Command::SetCanonicalPipeCapacity {
+                    slot,
+                    capacity: PipeCapacity::bounded(131_072).expect("cap"),
+                    accounting: PipeCapacityAccounting::InMemory,
+                },
+            }),
+            target,
+        )
+        .expect("call completes");
+
+    assert_eq!(
+        reply.response.outcome,
+        Outcome::Rejected(AuthorityError::NotPipe)
+    );
+    assert_eq!(reply.response.authority_revision, initial_auth_rev);
+    assert_eq!(regular_desc.revision_for_test(), initial_desc_rev);
+}
+
+#[test]
+fn canonical_pipe_capacity_rejects_closed_slot_as_not_pipe() {
+    let epoch = AuthorityEpoch::for_run(7).expect("authority epoch");
+    let core = FileAuthorityCore::for_run(epoch);
+    let direct = DirectFileAuthority::for_run(core);
+    let client = client(1, 1001, 1);
+
+    let reg_reply = direct
+        .transact(AuthorityCall::without_capabilities(Request {
+            epoch,
+            client,
+            request_id: RequestId::from_client_sequence(1).expect("req 1"),
+            expected_generation: ObjectGeneration::INITIAL,
+            command: Command::RegisterClient,
+        }))
+        .expect("register");
+    let initial_auth_rev = reg_reply.response.authority_revision;
+
+    let ids = ObjectIdRegistry::new();
+    let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+    let fd = FileSlotNumber::for_open_fd(3).expect("fd");
+    let desc = closed_test_description();
+    let initial_desc_rev = desc.revision_for_test();
+    table.install(fd, Arc::clone(&desc), false);
+
+    let slot = table.capture_slot_authority(fd).expect("slot auth");
+    let target = CanonicalAuthorityTarget {
+        table: Arc::clone(&table),
+        slot,
+    };
+
+    let reply = direct
+        .transact_canonical(
+            AuthorityCall::without_capabilities(Request {
+                epoch,
+                client,
+                request_id: RequestId::from_client_sequence(2).expect("req 2"),
+                expected_generation: ObjectGeneration::INITIAL,
+                command: Command::SetCanonicalPipeCapacity {
+                    slot,
+                    capacity: PipeCapacity::bounded(131_072).expect("cap"),
+                    accounting: PipeCapacityAccounting::InMemory,
+                },
+            }),
+            target,
+        )
+        .expect("call completes");
+
+    assert_eq!(
+        reply.response.outcome,
+        Outcome::Rejected(AuthorityError::NotPipe)
+    );
+    assert_eq!(reply.response.authority_revision, initial_auth_rev);
+    assert_eq!(desc.revision_for_test(), initial_desc_rev);
+}
+
+#[test]
+fn canonical_pipe_capacity_accounting_mismatch_is_fatal_invariant_violation() {
+    let epoch = AuthorityEpoch::for_run(7).expect("authority epoch");
+    let core = FileAuthorityCore::for_run(epoch);
+    let direct = DirectFileAuthority::for_run(core);
+    let client = client(1, 1001, 1);
+
+    direct
+        .transact(AuthorityCall::without_capabilities(Request {
+            epoch,
+            client,
+            request_id: RequestId::from_client_sequence(1).expect("req 1"),
+            expected_generation: ObjectGeneration::INITIAL,
+            command: Command::RegisterClient,
+        }))
+        .expect("register");
+
+    let ids = ObjectIdRegistry::new();
+    let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+    let fd3 = FileSlotNumber::for_open_fd(3).expect("fd 3");
+    let fd4 = FileSlotNumber::for_open_fd(4).expect("fd 4");
+
+    // In-memory pipe at fd 3.
+    let inmem_fixture = InMemoryPipeTestFixture::new(10, 65536);
+    table.install(fd3, inmem_fixture.read, false);
+
+    // Host pipe at fd 4.
+    let host_fixture = HostPipeTestFixture::new(100, 65536);
+    table.install(fd4, host_fixture.read, false);
+
+    // 1. In-memory pipe with Host accounting is fatal.
+    let slot3 = table.capture_slot_authority(fd3).expect("slot 3");
+    let fatal1 = direct
+        .transact_canonical(
+            AuthorityCall::without_capabilities(Request {
+                epoch,
+                client,
+                request_id: RequestId::from_client_sequence(2).expect("req 2"),
+                expected_generation: ObjectGeneration::INITIAL,
+                command: Command::SetCanonicalPipeCapacity {
+                    slot: slot3,
+                    capacity: PipeCapacity::bounded(131_072).expect("cap"),
+                    accounting: PipeCapacityAccounting::Host { queued_bytes: 0 },
+                },
+            }),
+            CanonicalAuthorityTarget {
+                table: Arc::clone(&table),
+                slot: slot3,
+            },
+        )
+        .expect_err("accounting mismatch must be fatal");
+    assert!(matches!(fatal1, AuthorityFatal::InvariantViolation(_)));
+
+    // 2. Host pipe with InMemory accounting is fatal.
+    let slot4 = table.capture_slot_authority(fd4).expect("slot 4");
+    let fatal2 = direct
+        .transact_canonical(
+            AuthorityCall::without_capabilities(Request {
+                epoch,
+                client,
+                request_id: RequestId::from_client_sequence(3).expect("req 3"),
+                expected_generation: ObjectGeneration::INITIAL,
+                command: Command::SetCanonicalPipeCapacity {
+                    slot: slot4,
+                    capacity: PipeCapacity::bounded(131_072).expect("cap"),
+                    accounting: PipeCapacityAccounting::InMemory,
+                },
+            }),
+            CanonicalAuthorityTarget {
+                table: Arc::clone(&table),
+                slot: slot4,
+            },
+        )
+        .expect_err("accounting mismatch must be fatal");
+    assert!(matches!(fatal2, AuthorityFatal::InvariantViolation(_)));
+}
+
+#[test]
+fn canonical_pipe_capacity_stale_slot_token_does_not_mutate_replacement() {
+    let epoch = AuthorityEpoch::for_run(7).expect("authority epoch");
+    let core = FileAuthorityCore::for_run(epoch);
+    let direct = DirectFileAuthority::for_run(core);
+    let client = client(1, 1001, 1);
+
+    let reg_reply = direct
+        .transact(AuthorityCall::without_capabilities(Request {
+            epoch,
+            client,
+            request_id: RequestId::from_client_sequence(1).expect("req 1"),
+            expected_generation: ObjectGeneration::INITIAL,
+            command: Command::RegisterClient,
+        }))
+        .expect("register");
+    let initial_auth_rev = reg_reply.response.authority_revision;
+
+    let ids = ObjectIdRegistry::new();
+    let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+    let fd = FileSlotNumber::for_open_fd(3).expect("fd");
+
+    let fixture1 = InMemoryPipeTestFixture::new(10, 65536);
+    table.install(fd, fixture1.read, false);
+
+    // Capture stale token.
+    let stale_slot = table.capture_slot_authority(fd).expect("slot auth 1");
+
+    // Replace fd 3 with pipe 2.
+    let fixture2 = InMemoryPipeTestFixture::new(20, 65536);
+    let desc2 = Arc::clone(&fixture2.read);
+    table.install(fd, Arc::clone(&desc2), false);
+
+    let initial_desc_rev2 = desc2.revision_for_test();
+
+    let reply = direct
+        .transact_canonical(
+            AuthorityCall::without_capabilities(Request {
+                epoch,
+                client,
+                request_id: RequestId::from_client_sequence(2).expect("req 2"),
+                expected_generation: ObjectGeneration::INITIAL,
+                command: Command::SetCanonicalPipeCapacity {
+                    slot: stale_slot,
+                    capacity: PipeCapacity::bounded(131_072).expect("cap"),
+                    accounting: PipeCapacityAccounting::InMemory,
+                },
+            }),
+            CanonicalAuthorityTarget {
+                table: Arc::clone(&table),
+                slot: stale_slot,
+            },
+        )
+        .expect("call completes");
+
+    assert_eq!(
+        reply.response.outcome,
+        Outcome::Rejected(AuthorityError::StaleSlot { slot: stale_slot })
+    );
+    assert_eq!(reply.response.authority_revision, initial_auth_rev);
+    assert_eq!(fixture2.capacity(), 65536);
+    assert_eq!(desc2.revision_for_test(), initial_desc_rev2);
+}
+
+#[test]
+fn canonical_pipe_capacity_outcome_carries_exact_description_id_and_published_revision() {
+    let epoch = AuthorityEpoch::for_run(7).expect("authority epoch");
+    let core = FileAuthorityCore::for_run(epoch);
+    let direct = DirectFileAuthority::for_run(core);
+    let client = client(1, 1001, 1);
+
+    let reg_reply = direct
+        .transact(AuthorityCall::without_capabilities(Request {
+            epoch,
+            client,
+            request_id: RequestId::from_client_sequence(1).expect("req 1"),
+            expected_generation: ObjectGeneration::INITIAL,
+            command: Command::RegisterClient,
+        }))
+        .expect("register");
+    let initial_auth_rev = reg_reply.response.authority_revision;
+
+    let ids = ObjectIdRegistry::new();
+    let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+    let fd = FileSlotNumber::for_open_fd(5).expect("fd");
+    let fixture = InMemoryPipeTestFixture::new(42, 65536);
+    let desc = Arc::clone(&fixture.read);
+    let expected_desc_id = desc.id();
+    let initial_desc_rev = desc.revision_for_test();
+    table.install(fd, Arc::clone(&desc), false);
+
+    let slot = table.capture_slot_authority(fd).expect("slot auth");
+    let target = CanonicalAuthorityTarget {
+        table: Arc::clone(&table),
+        slot,
+    };
+
+    let reply = direct
+        .transact_canonical(
+            AuthorityCall::without_capabilities(Request {
+                epoch,
+                client,
+                request_id: RequestId::from_client_sequence(2).expect("req 2"),
+                expected_generation: ObjectGeneration::INITIAL,
+                command: Command::SetCanonicalPipeCapacity {
+                    slot,
+                    capacity: PipeCapacity::bounded(262_144).expect("cap"),
+                    accounting: PipeCapacityAccounting::InMemory,
+                },
+            }),
+            target,
+        )
+        .expect("call completes");
+
+    let Outcome::CanonicalPipeCapacitySet {
+        description,
+        capacity,
+        description_revision,
+    } = reply.response.outcome
+    else {
+        panic!("expected CanonicalPipeCapacitySet");
+    };
+
+    assert_eq!(description, expected_desc_id);
+    assert_eq!(capacity.raw(), 262_144);
+    assert_eq!(description_revision, initial_desc_rev + 1);
+    assert_eq!(
+        reply.response.authority_revision,
+        initial_auth_rev.next().expect("next auth rev")
+    );
+    assert_eq!(desc.revision_for_test(), description_revision);
+    assert_eq!(fixture.capacity(), 262_144);
 }

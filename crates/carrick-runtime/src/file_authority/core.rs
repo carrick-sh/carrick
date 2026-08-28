@@ -119,6 +119,24 @@ struct MappingAttachmentState {
     ranges: Vec<MappingRange>,
 }
 
+#[derive(Debug)]
+enum AuthorityExecutionError {
+    Rejected(AuthorityError),
+    Fatal(AuthorityFatal),
+}
+
+impl From<AuthorityError> for AuthorityExecutionError {
+    fn from(error: AuthorityError) -> Self {
+        Self::Rejected(error)
+    }
+}
+
+impl From<AuthorityFatal> for AuthorityExecutionError {
+    fn from(fatal: AuthorityFatal) -> Self {
+        Self::Fatal(fatal)
+    }
+}
+
 /// One run's mutable file and writable-memory-VFS authority.
 ///
 /// `execute` is the sole mutation boundary used by both direct and IPC
@@ -232,12 +250,22 @@ impl FileAuthorityCore {
     )]
     fn validate_canonical_target(
         &self,
-        _command: &Command,
-        _target: &CanonicalAuthorityTarget,
+        command: &Command,
+        target: &CanonicalAuthorityTarget,
     ) -> Result<(), AuthorityFatal> {
-        Err(AuthorityFatal::InvariantViolation(
-            "canonical path rejected a model command",
-        ))
+        match command {
+            Command::SetCanonicalPipeCapacity { slot, .. } => {
+                if target.slot != *slot || target.table.id() != slot.table() {
+                    return Err(AuthorityFatal::InvariantViolation(
+                        "canonical target did not match command slot authority",
+                    ));
+                }
+                Ok(())
+            }
+            _ => Err(AuthorityFatal::InvariantViolation(
+                "canonical path rejected a model command",
+            )),
+        }
     }
 
     fn execute_call_authenticated(
@@ -349,7 +377,8 @@ impl FileAuthorityCore {
 
         let outcome = match self.execute_fresh(&request, capabilities, target) {
             Ok(outcome) => outcome,
-            Err(error) => Outcome::Rejected(error),
+            Err(AuthorityExecutionError::Rejected(error)) => Outcome::Rejected(error),
+            Err(AuthorityExecutionError::Fatal(fatal)) => return Err(fatal),
         };
         // Rejections and duplicate terminal requests must close any transferred
         // rights that the operation did not adopt.
@@ -381,489 +410,543 @@ impl FileAuthorityCore {
         &mut self,
         request: &Request,
         capabilities: &mut Vec<OwnedFd>,
-        _target: Option<CanonicalAuthorityTarget>,
-    ) -> Result<Outcome, AuthorityError> {
+        target: Option<CanonicalAuthorityTarget>,
+    ) -> Result<Outcome, AuthorityExecutionError> {
         match &request.command {
-            Command::RegisterClient => self.register_client(request),
+            Command::RegisterClient => self.register_client(request).map_err(Into::into),
+            Command::SetCanonicalPipeCapacity {
+                slot,
+                capacity,
+                accounting,
+            } => self.set_canonical_pipe_capacity(
+                request.client,
+                *slot,
+                *capacity,
+                *accounting,
+                target,
+            ),
             _ => {
                 self.require_registered(request.client)?;
-                match &request.command {
-                    Command::RegisterClient => unreachable!(),
-                    Command::ExitClient => self.exit_client(request.client),
-                    Command::CreateTable => self.create_table(request.client),
-                    Command::CreatePipeAndInstall {
-                        table,
-                        minimum,
-                        ceiling,
-                        descriptor_flags,
-                        status_flags,
-                        capacity,
-                    } => self.create_pipe_and_install(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        *minimum,
-                        *ceiling,
-                        *descriptor_flags,
-                        *status_flags,
-                        *capacity,
-                    ),
-                    Command::SetPipeCapacity {
-                        table,
-                        fd,
-                        capacity,
-                    } => self.set_pipe_capacity(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        *fd,
-                        *capacity,
-                    ),
-                    Command::CreateEpollAndInstall {
-                        table,
-                        minimum,
-                        ceiling,
-                        descriptor_flags,
-                    } => self.create_epoll_and_install(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        *minimum,
-                        *ceiling,
-                        *descriptor_flags,
-                    ),
-                    Command::CreateSignalFdAndInstall {
-                        table,
-                        minimum,
-                        ceiling,
-                        descriptor_flags,
-                        status_flags,
-                        mask,
-                    } => self.create_signalfd_and_install(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        *minimum,
-                        *ceiling,
-                        *descriptor_flags,
-                        *status_flags,
-                        *mask,
-                    ),
-                    Command::SetSignalFdMask { table, fd, mask } => self.set_signalfd_mask(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        *fd,
-                        *mask,
-                    ),
-                    Command::CreateTimerAndInstall {
-                        table,
-                        minimum,
-                        ceiling,
-                        descriptor_flags,
-                        status_flags,
-                    } => self.create_timer_and_install(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        *minimum,
-                        *ceiling,
-                        *descriptor_flags,
-                        *status_flags,
-                    ),
-                    Command::SetTimer {
-                        table,
-                        fd,
-                        interval_ns,
-                        initial_ns,
-                    } => self.set_timer(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        *fd,
-                        *interval_ns,
-                        *initial_ns,
-                    ),
-                    Command::ExpireTimer {
-                        table,
-                        fd,
-                        expirations,
-                    } => self.expire_timer(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        *fd,
-                        *expirations,
-                    ),
-                    Command::CreateEventCounterAndInstall {
-                        table,
-                        initial,
-                        semaphore,
-                        minimum,
-                        ceiling,
-                        descriptor_flags,
-                        status_flags,
-                    } => self.create_event_counter_and_install(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        *initial,
-                        *semaphore,
-                        *minimum,
-                        *ceiling,
-                        *descriptor_flags,
-                        *status_flags,
-                    ),
-                    Command::CreateVfsFile {
-                        path,
-                        mode,
-                        contents,
-                    } => self.create_vfs_file(
-                        path.clone(),
-                        *mode,
-                        contents.clone(),
-                        request.expected_generation,
-                    ),
-                    Command::ResolveVfs { path } => self.resolve_vfs(path),
-                    Command::LinkVfs { object, path } => {
-                        self.link_vfs(*object, path.clone(), request.expected_generation)
-                    }
-                    Command::UnlinkVfs { path } => self.unlink_vfs(path),
-                    Command::RenameVfs { from, to } => self.rename_vfs(from, to.clone()),
-                    Command::OpenVfsAndInstall {
-                        table,
-                        object,
-                        object_generation,
-                        minimum,
-                        ceiling,
-                        descriptor_flags,
-                        access_mode,
-                        status_flags,
-                        path,
-                    } => self.open_vfs_and_install(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        *object,
-                        *object_generation,
-                        *minimum,
-                        *ceiling,
-                        *descriptor_flags,
-                        *access_mode,
-                        *status_flags,
-                        path.clone(),
-                    ),
-                    Command::CreateSyntheticAndInstall {
-                        table,
-                        contents,
-                        minimum,
-                        ceiling,
-                        descriptor_flags,
-                        access_mode,
-                        status_flags,
-                        path,
-                    } => self.create_synthetic_and_install(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        contents.clone(),
-                        *minimum,
-                        *ceiling,
-                        *descriptor_flags,
-                        *access_mode,
-                        *status_flags,
-                        path.clone(),
-                    ),
-                    Command::AdoptHostStreamAndInstall {
-                        table,
-                        minimum,
-                        ceiling,
-                        descriptor_flags,
-                        access_mode,
-                        status_flags,
-                        kind,
-                        path,
-                    } => self.adopt_host_stream_and_install(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        *minimum,
-                        *ceiling,
-                        *descriptor_flags,
-                        *access_mode,
-                        *status_flags,
-                        *kind,
-                        path.clone(),
-                        capabilities,
-                    ),
-                    Command::AdoptIoUringAndInstall {
-                        table,
-                        minimum,
-                        ceiling,
-                        descriptor_flags,
-                        status_flags,
-                        entries,
-                        data_length,
-                    } => self.adopt_io_uring_and_install(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        *minimum,
-                        *ceiling,
-                        *descriptor_flags,
-                        *status_flags,
-                        *entries,
-                        *data_length,
-                        capabilities,
-                    ),
-                    Command::AdoptHostFileAndInstall {
-                        table,
-                        minimum,
-                        ceiling,
-                        descriptor_flags,
-                        access_mode,
-                        status_flags,
-                        writable,
-                        path,
-                    } => self.adopt_host_file_and_install(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        *minimum,
-                        *ceiling,
-                        *descriptor_flags,
-                        *access_mode,
-                        *status_flags,
-                        *writable,
-                        path.clone(),
-                        capabilities,
-                    ),
-                    Command::AcquireCapabilityLease { table, fd, purpose } => self
-                        .acquire_capability_lease(
-                            request.client,
-                            *table,
-                            request.expected_generation,
-                            *fd,
-                            *purpose,
-                        ),
-                    Command::ReleaseCapabilityLease { lease, disposition } => {
-                        self.release_capability_lease(request.client, *lease, *disposition)
-                    }
-                    Command::FinalizeMappingLease { lease, disposition } => {
-                        self.finalize_mapping_lease(request.client, *lease, *disposition)
-                    }
-                    Command::ReleaseMappingAttachment {
-                        attachment,
-                        release,
-                    } => self.release_mapping_attachment(request.client, *attachment, *release),
-                    Command::ResolveSlot { table, fd } => {
-                        self.resolve_slot(request.client, *table, request.expected_generation, *fd)
-                    }
-                    Command::ListSlots {
-                        table,
-                        after,
-                        maximum,
-                    } => self.list_slots(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        *after,
-                        *maximum,
-                    ),
-                    Command::SetDescriptorFlags { table, fd, flags } => self.set_descriptor_flags(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        *fd,
-                        *flags,
-                    ),
-                    Command::ReplaceSlot {
-                        table,
-                        source,
-                        target,
-                        ceiling,
-                        flags,
-                        same_slot,
-                    } => self.replace_slot(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        *source,
-                        *target,
-                        *ceiling,
-                        *flags,
-                        *same_slot,
-                    ),
-                    Command::MutateSlotRange {
-                        table,
-                        first,
-                        last,
-                        action,
-                    } => self.mutate_slot_range(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        *first,
-                        *last,
-                        *action,
-                    ),
-                    Command::EpollCtlAdd {
-                        table,
-                        epoll_fd,
-                        target_fd,
-                        registration,
-                    } => self.epoll_ctl_add(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        *epoll_fd,
-                        *target_fd,
-                        *registration,
-                    ),
-                    Command::EpollCtlModify {
-                        table,
-                        epoll_fd,
-                        target_fd,
-                        registration,
-                    } => self.epoll_ctl_modify(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        *epoll_fd,
-                        *target_fd,
-                        *registration,
-                    ),
-                    Command::EpollCtlDelete {
-                        table,
-                        epoll_fd,
-                        target_fd,
-                    } => self.epoll_ctl_delete(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        *epoll_fd,
-                        *target_fd,
-                    ),
-                    Command::EpollRevalidateHostPlan { plan } => {
-                        self.epoll_revalidate_host_plan(*plan)
-                    }
-                    Command::ObserveReadiness {
-                        table,
-                        fd,
-                        ready,
-                        read_available,
-                    } => self.observe_readiness(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        *fd,
-                        *ready,
-                        *read_available,
-                    ),
-                    Command::EpollCollect {
-                        table,
-                        epoll_fd,
-                        maximum,
-                    } => self.epoll_collect(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        *epoll_fd,
-                        *maximum,
-                    ),
-                    Command::EpollAcknowledgeIo {
-                        table,
-                        fd,
-                        consumed,
-                        read_available,
-                        write_backpressured,
-                    } => self.epoll_acknowledge_io(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        *fd,
-                        *consumed,
-                        *read_available,
-                        *write_backpressured,
-                    ),
-                    Command::EventCounterRead { table, fd } => self.event_counter_read(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        *fd,
-                    ),
-                    Command::EventCounterWrite { table, fd, value } => self.event_counter_write(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        *fd,
-                        *value,
-                    ),
-                    Command::Read { table, fd, maximum } => self.read(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        *fd,
-                        *maximum,
-                    ),
-                    Command::Write { table, fd, bytes } => self.write(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        *fd,
-                        bytes,
-                    ),
-                    Command::Seek {
-                        table,
-                        fd,
-                        offset,
-                        whence,
-                    } => self.seek(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        *fd,
-                        *offset,
-                        *whence,
-                    ),
-                    Command::Close { table, fd } => {
-                        self.close(request.client, *table, request.expected_generation, *fd)
-                    }
-                    Command::Dup {
-                        table,
-                        source,
-                        minimum,
-                        ceiling,
-                        flags,
-                    } => self.duplicate(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        *source,
-                        *minimum,
-                        *ceiling,
-                        *flags,
-                    ),
-                    Command::ForkCopy { source, owner } => {
-                        self.fork_copy(request.client, *source, request.expected_generation, *owner)
-                    }
-                    Command::ForkCopyMappings {
-                        source_owner,
-                        owner,
-                    } => self.fork_copy_mappings(request.client, *source_owner, *owner),
-                    Command::ShareTable { table, owner } => self.share_table(
-                        request.client,
-                        *table,
-                        request.expected_generation,
-                        *owner,
-                    ),
-                    Command::ExecSuccessor { source } => {
-                        self.exec_successor(request.client, *source, request.expected_generation)
-                    }
-                    Command::InspectDescription { description } => {
-                        self.inspect_description(*description, request.expected_generation)
-                    }
-                }
+                self.execute_model_command(request, capabilities)
+                    .map_err(Into::into)
+            }
+        }
+    }
+
+    fn set_canonical_pipe_capacity(
+        &mut self,
+        client: ClientIdentity,
+        slot: crate::kernel::objects::FileSlotAuthority,
+        capacity: PipeCapacity,
+        accounting: crate::kernel::objects::PipeCapacityAccounting,
+        target: Option<CanonicalAuthorityTarget>,
+    ) -> Result<Outcome, AuthorityExecutionError> {
+        self.require_registered(client)?;
+        let Some(target) = target else {
+            return Err(AuthorityFatal::InvariantViolation(
+                "canonical command was missing direct target sidecar",
+            )
+            .into());
+        };
+        let Some(description) = target.table.resolve_slot_authority(slot) else {
+            return Err(AuthorityError::StaleSlot { slot }.into());
+        };
+        match description.set_pipe_capacity_from_authority(capacity.raw() as i64, accounting) {
+            Ok(description_revision) => {
+                self.publish_mutation();
+                Ok(Outcome::CanonicalPipeCapacitySet {
+                    description: description.id(),
+                    capacity,
+                    description_revision,
+                })
+            }
+            Err(crate::kernel::objects::PipeCapacityMutationError::NotPipe) => {
+                Err(AuthorityError::NotPipe.into())
+            }
+            Err(crate::kernel::objects::PipeCapacityMutationError::Semantic(errno)) => {
+                Err(AuthorityError::PipeErrno(errno).into())
+            }
+            Err(crate::kernel::objects::PipeCapacityMutationError::AccountingMismatch) => {
+                Err(AuthorityFatal::InvariantViolation(
+                    "pipe capacity accounting kind did not match description backing",
+                )
+                .into())
+            }
+        }
+    }
+
+    fn execute_model_command(
+        &mut self,
+        request: &Request,
+        capabilities: &mut Vec<OwnedFd>,
+    ) -> Result<Outcome, AuthorityError> {
+        match &request.command {
+            Command::RegisterClient | Command::SetCanonicalPipeCapacity { .. } => unreachable!(),
+            Command::ExitClient => self.exit_client(request.client),
+            Command::CreateTable => self.create_table(request.client),
+            Command::CreatePipeAndInstall {
+                table,
+                minimum,
+                ceiling,
+                descriptor_flags,
+                status_flags,
+                capacity,
+            } => self.create_pipe_and_install(
+                request.client,
+                *table,
+                request.expected_generation,
+                *minimum,
+                *ceiling,
+                *descriptor_flags,
+                *status_flags,
+                *capacity,
+            ),
+            Command::SetPipeCapacity {
+                table,
+                fd,
+                capacity,
+            } => self.set_pipe_capacity(
+                request.client,
+                *table,
+                request.expected_generation,
+                *fd,
+                *capacity,
+            ),
+            Command::CreateEpollAndInstall {
+                table,
+                minimum,
+                ceiling,
+                descriptor_flags,
+            } => self.create_epoll_and_install(
+                request.client,
+                *table,
+                request.expected_generation,
+                *minimum,
+                *ceiling,
+                *descriptor_flags,
+            ),
+            Command::CreateSignalFdAndInstall {
+                table,
+                minimum,
+                ceiling,
+                descriptor_flags,
+                status_flags,
+                mask,
+            } => self.create_signalfd_and_install(
+                request.client,
+                *table,
+                request.expected_generation,
+                *minimum,
+                *ceiling,
+                *descriptor_flags,
+                *status_flags,
+                *mask,
+            ),
+            Command::SetSignalFdMask { table, fd, mask } => self.set_signalfd_mask(
+                request.client,
+                *table,
+                request.expected_generation,
+                *fd,
+                *mask,
+            ),
+            Command::CreateTimerAndInstall {
+                table,
+                minimum,
+                ceiling,
+                descriptor_flags,
+                status_flags,
+            } => self.create_timer_and_install(
+                request.client,
+                *table,
+                request.expected_generation,
+                *minimum,
+                *ceiling,
+                *descriptor_flags,
+                *status_flags,
+            ),
+            Command::SetTimer {
+                table,
+                fd,
+                interval_ns,
+                initial_ns,
+            } => self.set_timer(
+                request.client,
+                *table,
+                request.expected_generation,
+                *fd,
+                *interval_ns,
+                *initial_ns,
+            ),
+            Command::ExpireTimer {
+                table,
+                fd,
+                expirations,
+            } => self.expire_timer(
+                request.client,
+                *table,
+                request.expected_generation,
+                *fd,
+                *expirations,
+            ),
+            Command::CreateEventCounterAndInstall {
+                table,
+                initial,
+                semaphore,
+                minimum,
+                ceiling,
+                descriptor_flags,
+                status_flags,
+            } => self.create_event_counter_and_install(
+                request.client,
+                *table,
+                request.expected_generation,
+                *initial,
+                *semaphore,
+                *minimum,
+                *ceiling,
+                *descriptor_flags,
+                *status_flags,
+            ),
+            Command::CreateVfsFile {
+                path,
+                mode,
+                contents,
+            } => self.create_vfs_file(
+                path.clone(),
+                *mode,
+                contents.clone(),
+                request.expected_generation,
+            ),
+            Command::ResolveVfs { path } => self.resolve_vfs(path),
+            Command::LinkVfs { object, path } => {
+                self.link_vfs(*object, path.clone(), request.expected_generation)
+            }
+            Command::UnlinkVfs { path } => self.unlink_vfs(path),
+            Command::RenameVfs { from, to } => self.rename_vfs(from, to.clone()),
+            Command::OpenVfsAndInstall {
+                table,
+                object,
+                object_generation,
+                minimum,
+                ceiling,
+                descriptor_flags,
+                access_mode,
+                status_flags,
+                path,
+            } => self.open_vfs_and_install(
+                request.client,
+                *table,
+                request.expected_generation,
+                *object,
+                *object_generation,
+                *minimum,
+                *ceiling,
+                *descriptor_flags,
+                *access_mode,
+                *status_flags,
+                path.clone(),
+            ),
+            Command::CreateSyntheticAndInstall {
+                table,
+                contents,
+                minimum,
+                ceiling,
+                descriptor_flags,
+                access_mode,
+                status_flags,
+                path,
+            } => self.create_synthetic_and_install(
+                request.client,
+                *table,
+                request.expected_generation,
+                contents.clone(),
+                *minimum,
+                *ceiling,
+                *descriptor_flags,
+                *access_mode,
+                *status_flags,
+                path.clone(),
+            ),
+            Command::AdoptHostStreamAndInstall {
+                table,
+                minimum,
+                ceiling,
+                descriptor_flags,
+                access_mode,
+                status_flags,
+                kind,
+                path,
+            } => self.adopt_host_stream_and_install(
+                request.client,
+                *table,
+                request.expected_generation,
+                *minimum,
+                *ceiling,
+                *descriptor_flags,
+                *access_mode,
+                *status_flags,
+                *kind,
+                path.clone(),
+                capabilities,
+            ),
+            Command::AdoptIoUringAndInstall {
+                table,
+                minimum,
+                ceiling,
+                descriptor_flags,
+                status_flags,
+                entries,
+                data_length,
+            } => self.adopt_io_uring_and_install(
+                request.client,
+                *table,
+                request.expected_generation,
+                *minimum,
+                *ceiling,
+                *descriptor_flags,
+                *status_flags,
+                *entries,
+                *data_length,
+                capabilities,
+            ),
+            Command::AdoptHostFileAndInstall {
+                table,
+                minimum,
+                ceiling,
+                descriptor_flags,
+                access_mode,
+                status_flags,
+                writable,
+                path,
+            } => self.adopt_host_file_and_install(
+                request.client,
+                *table,
+                request.expected_generation,
+                *minimum,
+                *ceiling,
+                *descriptor_flags,
+                *access_mode,
+                *status_flags,
+                *writable,
+                path.clone(),
+                capabilities,
+            ),
+            Command::AcquireCapabilityLease { table, fd, purpose } => self
+                .acquire_capability_lease(
+                    request.client,
+                    *table,
+                    request.expected_generation,
+                    *fd,
+                    *purpose,
+                ),
+            Command::ReleaseCapabilityLease { lease, disposition } => {
+                self.release_capability_lease(request.client, *lease, *disposition)
+            }
+            Command::FinalizeMappingLease { lease, disposition } => {
+                self.finalize_mapping_lease(request.client, *lease, *disposition)
+            }
+            Command::ReleaseMappingAttachment {
+                attachment,
+                release,
+            } => self.release_mapping_attachment(request.client, *attachment, *release),
+            Command::ResolveSlot { table, fd } => {
+                self.resolve_slot(request.client, *table, request.expected_generation, *fd)
+            }
+            Command::ListSlots {
+                table,
+                after,
+                maximum,
+            } => self.list_slots(
+                request.client,
+                *table,
+                request.expected_generation,
+                *after,
+                *maximum,
+            ),
+            Command::SetDescriptorFlags { table, fd, flags } => self.set_descriptor_flags(
+                request.client,
+                *table,
+                request.expected_generation,
+                *fd,
+                *flags,
+            ),
+            Command::ReplaceSlot {
+                table,
+                source,
+                target,
+                ceiling,
+                flags,
+                same_slot,
+            } => self.replace_slot(
+                request.client,
+                *table,
+                request.expected_generation,
+                *source,
+                *target,
+                *ceiling,
+                *flags,
+                *same_slot,
+            ),
+            Command::MutateSlotRange {
+                table,
+                first,
+                last,
+                action,
+            } => self.mutate_slot_range(
+                request.client,
+                *table,
+                request.expected_generation,
+                *first,
+                *last,
+                *action,
+            ),
+            Command::EpollCtlAdd {
+                table,
+                epoll_fd,
+                target_fd,
+                registration,
+            } => self.epoll_ctl_add(
+                request.client,
+                *table,
+                request.expected_generation,
+                *epoll_fd,
+                *target_fd,
+                *registration,
+            ),
+            Command::EpollCtlModify {
+                table,
+                epoll_fd,
+                target_fd,
+                registration,
+            } => self.epoll_ctl_modify(
+                request.client,
+                *table,
+                request.expected_generation,
+                *epoll_fd,
+                *target_fd,
+                *registration,
+            ),
+            Command::EpollCtlDelete {
+                table,
+                epoll_fd,
+                target_fd,
+            } => self.epoll_ctl_delete(
+                request.client,
+                *table,
+                request.expected_generation,
+                *epoll_fd,
+                *target_fd,
+            ),
+            Command::EpollRevalidateHostPlan { plan } => self.epoll_revalidate_host_plan(*plan),
+            Command::ObserveReadiness {
+                table,
+                fd,
+                ready,
+                read_available,
+            } => self.observe_readiness(
+                request.client,
+                *table,
+                request.expected_generation,
+                *fd,
+                *ready,
+                *read_available,
+            ),
+            Command::EpollCollect {
+                table,
+                epoll_fd,
+                maximum,
+            } => self.epoll_collect(
+                request.client,
+                *table,
+                request.expected_generation,
+                *epoll_fd,
+                *maximum,
+            ),
+            Command::EpollAcknowledgeIo {
+                table,
+                fd,
+                consumed,
+                read_available,
+                write_backpressured,
+            } => self.epoll_acknowledge_io(
+                request.client,
+                *table,
+                request.expected_generation,
+                *fd,
+                *consumed,
+                *read_available,
+                *write_backpressured,
+            ),
+            Command::EventCounterRead { table, fd } => {
+                self.event_counter_read(request.client, *table, request.expected_generation, *fd)
+            }
+            Command::EventCounterWrite { table, fd, value } => self.event_counter_write(
+                request.client,
+                *table,
+                request.expected_generation,
+                *fd,
+                *value,
+            ),
+            Command::Read { table, fd, maximum } => self.read(
+                request.client,
+                *table,
+                request.expected_generation,
+                *fd,
+                *maximum,
+            ),
+            Command::Write { table, fd, bytes } => self.write(
+                request.client,
+                *table,
+                request.expected_generation,
+                *fd,
+                bytes,
+            ),
+            Command::Seek {
+                table,
+                fd,
+                offset,
+                whence,
+            } => self.seek(
+                request.client,
+                *table,
+                request.expected_generation,
+                *fd,
+                *offset,
+                *whence,
+            ),
+            Command::Close { table, fd } => {
+                self.close(request.client, *table, request.expected_generation, *fd)
+            }
+            Command::Dup {
+                table,
+                source,
+                minimum,
+                ceiling,
+                flags,
+            } => self.duplicate(
+                request.client,
+                *table,
+                request.expected_generation,
+                *source,
+                *minimum,
+                *ceiling,
+                *flags,
+            ),
+            Command::ForkCopy { source, owner } => {
+                self.fork_copy(request.client, *source, request.expected_generation, *owner)
+            }
+            Command::ForkCopyMappings {
+                source_owner,
+                owner,
+            } => self.fork_copy_mappings(request.client, *source_owner, *owner),
+            Command::ShareTable { table, owner } => {
+                self.share_table(request.client, *table, request.expected_generation, *owner)
+            }
+            Command::ExecSuccessor { source } => {
+                self.exec_successor(request.client, *source, request.expected_generation)
+            }
+            Command::InspectDescription { description } => {
+                self.inspect_description(*description, request.expected_generation)
             }
         }
     }
