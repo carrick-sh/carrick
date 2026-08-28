@@ -5305,6 +5305,63 @@ impl LinuxFallocateFlags {
     pub const SUPPORTED_MASK: u64 = LINUX_FALLOC_FL_SUPPORTED;
 }
 
+impl LinuxPollEvents {
+    /// The epoll spelling of the same readiness. Linux gives POLL* and EPOLL*
+    /// the same numeric values for the bits both define, but they are different
+    /// domains — poll is `i16`, epoll is `u32` and carries ET/ONESHOT bits poll
+    /// has no encoding for — so the conversion is explicit and bit-by-bit.
+    /// Bits with no epoll encoding (POLLNVAL) are dropped.
+    pub const fn to_epoll(self) -> LinuxEpollEvents {
+        let mut epoll = LinuxEpollEvents::empty();
+        if self.contains(Self::IN) {
+            epoll = epoll.union(LinuxEpollEvents::IN);
+        }
+        if self.contains(Self::PRI) {
+            epoll = epoll.union(LinuxEpollEvents::PRI);
+        }
+        if self.contains(Self::OUT) {
+            epoll = epoll.union(LinuxEpollEvents::OUT);
+        }
+        if self.contains(Self::ERR) {
+            epoll = epoll.union(LinuxEpollEvents::ERR);
+        }
+        if self.contains(Self::HUP) {
+            epoll = epoll.union(LinuxEpollEvents::HUP);
+        }
+        if self.contains(Self::RDHUP) {
+            epoll = epoll.union(LinuxEpollEvents::RDHUP);
+        }
+        epoll
+    }
+}
+
+impl LinuxEpollEvents {
+    /// The poll spelling of this readiness. Bits with no poll encoding
+    /// (ET, ONESHOT, EXCLUSIVE, WAKEUP) are dropped.
+    pub const fn to_poll(self) -> LinuxPollEvents {
+        let mut poll = LinuxPollEvents::empty();
+        if self.contains(Self::IN) {
+            poll = poll.union(LinuxPollEvents::IN);
+        }
+        if self.contains(Self::PRI) {
+            poll = poll.union(LinuxPollEvents::PRI);
+        }
+        if self.contains(Self::OUT) {
+            poll = poll.union(LinuxPollEvents::OUT);
+        }
+        if self.contains(Self::ERR) {
+            poll = poll.union(LinuxPollEvents::ERR);
+        }
+        if self.contains(Self::HUP) {
+            poll = poll.union(LinuxPollEvents::HUP);
+        }
+        if self.contains(Self::RDHUP) {
+            poll = poll.union(LinuxPollEvents::RDHUP);
+        }
+        poll
+    }
+}
+
 /// Which kind of object a `fanotify_mark(2)` call marks. This is a FIELD of the
 /// mark flags word, not a bit — `FAN_MARK_INODE` is 0, so a `flags &
 /// FAN_MARK_INODE` test is always false. Decode through
@@ -6184,5 +6241,61 @@ mod kernel_abi_tests {
         let a = LinuxUtsname::carrick_aarch64();
         assert_eq!(u.sysname, a.sysname);
         assert_eq!(u.release, a.release);
+    }
+
+    #[test]
+    fn poll_and_epoll_events_convert_losslessly_for_shared_bits_and_drop_epoll_only_bits() {
+        let shared_poll = [
+            (LinuxPollEvents::IN, LinuxEpollEvents::IN),
+            (LinuxPollEvents::OUT, LinuxEpollEvents::OUT),
+            (LinuxPollEvents::PRI, LinuxEpollEvents::PRI),
+            (LinuxPollEvents::ERR, LinuxEpollEvents::ERR),
+            (LinuxPollEvents::HUP, LinuxEpollEvents::HUP),
+            (LinuxPollEvents::RDHUP, LinuxEpollEvents::RDHUP),
+        ];
+        for (poll, epoll) in shared_poll {
+            assert_eq!(poll.to_epoll(), epoll);
+            assert_eq!(epoll.to_poll(), poll);
+            assert_eq!(poll.to_epoll().to_poll(), poll);
+            assert_eq!(epoll.to_poll().to_epoll(), epoll);
+        }
+
+        let all_shared_poll = LinuxPollEvents::IN
+            | LinuxPollEvents::OUT
+            | LinuxPollEvents::PRI
+            | LinuxPollEvents::ERR
+            | LinuxPollEvents::HUP
+            | LinuxPollEvents::RDHUP;
+        let all_shared_epoll = LinuxEpollEvents::IN
+            | LinuxEpollEvents::OUT
+            | LinuxEpollEvents::PRI
+            | LinuxEpollEvents::ERR
+            | LinuxEpollEvents::HUP
+            | LinuxEpollEvents::RDHUP;
+        assert_eq!(all_shared_poll.to_epoll(), all_shared_epoll);
+        assert_eq!(all_shared_epoll.to_poll(), all_shared_poll);
+
+        // Poll-only bits drop on conversion to epoll.
+        assert_eq!(LinuxPollEvents::NVAL.to_epoll(), LinuxEpollEvents::empty());
+        assert_eq!(
+            (LinuxPollEvents::IN | LinuxPollEvents::NVAL).to_epoll(),
+            LinuxEpollEvents::IN
+        );
+
+        // Epoll-only bits drop on conversion to poll.
+        assert_eq!(LinuxEpollEvents::ET.to_poll(), LinuxPollEvents::empty());
+        assert_eq!(
+            LinuxEpollEvents::ONESHOT.to_poll(),
+            LinuxPollEvents::empty()
+        );
+        assert_eq!(
+            LinuxEpollEvents::EXCLUSIVE.to_poll(),
+            LinuxPollEvents::empty()
+        );
+        assert_eq!(LinuxEpollEvents::WAKEUP.to_poll(), LinuxPollEvents::empty());
+        assert_eq!(
+            (LinuxEpollEvents::IN | LinuxEpollEvents::ET | LinuxEpollEvents::ONESHOT).to_poll(),
+            LinuxPollEvents::IN
+        );
     }
 }

@@ -1349,6 +1349,356 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
         ))
     }
 
+    fn is_closed(&self) -> bool {
+        matches!(&*self.read(), OpenDescription::Closed { .. })
+    }
+
+    fn has_host_poll_source(&self) -> bool {
+        match &*self.read() {
+            OpenDescription::HostPipe { .. }
+            | OpenDescription::HostFile { .. }
+            | OpenDescription::Pidfd { .. }
+            | OpenDescription::Inotify { .. } => true,
+            OpenDescription::HostSocket { base, .. } => base.pending_socket_error().is_none(),
+            OpenDescription::PipeReader { pipe, .. } => pipe.read_poll_fd().is_some(),
+            OpenDescription::PipeWriter { pipe, .. } => pipe.write_poll_fd().is_some(),
+            OpenDescription::Fanotify { group, .. } => group.poll_fd() >= 0,
+            _ => false,
+        }
+    }
+
+    fn readiness(
+        &self,
+        description_id: crate::kernel::FileDescriptionId,
+        interest: carrick_abi::LinuxEpollEvents,
+        cx: &dyn crate::kernel::ReadinessContext,
+    ) -> carrick_abi::LinuxEpollEvents {
+        use carrick_abi::LinuxEpollEvents;
+
+        let open = self.read();
+        match &*open {
+            OpenDescription::Closed { .. } => LinuxEpollEvents::empty(),
+            OpenDescription::File { .. }
+            | OpenDescription::InMemoryFile { .. }
+            | OpenDescription::SyntheticFile { .. } => interest & LinuxEpollEvents::IN,
+            OpenDescription::SyntheticDevice { .. } => {
+                interest & (LinuxEpollEvents::IN | LinuxEpollEvents::OUT)
+            }
+            OpenDescription::HostFile { .. } => {
+                interest & (LinuxEpollEvents::IN | LinuxEpollEvents::OUT)
+            }
+            OpenDescription::Directory { .. } => LinuxEpollEvents::empty(),
+            OpenDescription::EventFd { state, .. } => {
+                let counter = state.counter_value();
+                let mut ready = LinuxEpollEvents::empty();
+                if counter > 0 {
+                    ready |= LinuxEpollEvents::IN;
+                }
+                if counter < u64::MAX - 1 {
+                    ready |= LinuxEpollEvents::OUT;
+                }
+                ready & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP)
+            }
+            OpenDescription::TimerFd { state, .. } => {
+                let mut ready = LinuxEpollEvents::empty();
+                if super::timerfd_ready_count(state) > 0 {
+                    ready |= LinuxEpollEvents::IN;
+                }
+                ready & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP)
+            }
+            OpenDescription::Epoll {
+                interest: epoll_interest,
+                pending_ready,
+                kqueue,
+                ..
+            } => {
+                let mut ready = LinuxEpollEvents::empty();
+                if interest.contains(LinuxEpollEvents::IN) {
+                    if !pending_ready.is_empty() {
+                        ready |= LinuxEpollEvents::IN;
+                    } else {
+                        let mut pfd = libc::pollfd {
+                            fd: kqueue.poll_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        };
+                        let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+                        if rc > 0
+                            && pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
+                        {
+                            ready |= LinuxEpollEvents::IN;
+                        } else {
+                            // Snapshot synthetic child registrations under the lock so we don't
+                            // hold the parent description lock while recursively checking child readiness!
+                            let synthetic_children: Vec<(
+                                std::sync::Arc<crate::kernel::FileDescription>,
+                                LinuxEpollEvents,
+                            )> = epoll_interest
+                                .values()
+                                .filter_map(|reg| {
+                                    let target = reg.target.as_ref()?;
+                                    if !target.has_host_poll_source() {
+                                        Some((
+                                            std::sync::Arc::clone(target),
+                                            LinuxEpollEvents::from_bits_retain(reg.event.events),
+                                        ))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            drop(open);
+                            let synthetic_child_ready =
+                                synthetic_children
+                                    .into_iter()
+                                    .any(|(target, child_interest)| {
+                                        !cx.description_readiness(&target, child_interest)
+                                            .is_empty()
+                                    });
+                            if synthetic_child_ready {
+                                ready |= LinuxEpollEvents::IN;
+                            }
+                            return ready
+                                & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP);
+                        }
+                    }
+                }
+                ready & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP)
+            }
+            OpenDescription::Pidfd { kqueue, .. } => {
+                let mut pfd = libc::pollfd {
+                    fd: kqueue.poll_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+                let mut ready = LinuxEpollEvents::empty();
+                if rc > 0 && pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                    ready |= LinuxEpollEvents::IN;
+                }
+                ready & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP)
+            }
+            OpenDescription::Inotify { state, .. } => {
+                let mut pfd = libc::pollfd {
+                    fd: state.poll_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+                let mut ready = LinuxEpollEvents::empty();
+                if rc > 0 && pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                    ready |= LinuxEpollEvents::IN;
+                }
+                ready & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP)
+            }
+            OpenDescription::Fanotify { group, .. } => {
+                let mut ready = LinuxEpollEvents::empty();
+                if group.has_events() {
+                    ready |= LinuxEpollEvents::IN;
+                } else {
+                    let poll_fd = group.poll_fd();
+                    if poll_fd >= 0 {
+                        let mut pfd = libc::pollfd {
+                            fd: poll_fd,
+                            events: libc::POLLIN,
+                            revents: 0,
+                        };
+                        let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+                        if rc > 0
+                            && pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
+                        {
+                            ready |= LinuxEpollEvents::IN;
+                        }
+                    }
+                }
+                ready & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP)
+            }
+            OpenDescription::SignalFd { .. } => LinuxEpollEvents::empty(),
+            OpenDescription::PerfEvent { .. } => LinuxEpollEvents::empty(),
+            OpenDescription::FsContext { .. } => LinuxEpollEvents::empty(),
+            OpenDescription::PipeReader { pipe, .. } => {
+                let state = pipe.state.lock();
+                let mut ready = LinuxEpollEvents::empty();
+                if !state.buffer.is_empty() {
+                    ready |= LinuxEpollEvents::IN;
+                }
+                if state.writers == 0 {
+                    ready |= LinuxEpollEvents::HUP;
+                }
+                ready & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP)
+            }
+            OpenDescription::PipeWriter { pipe, .. } => {
+                let state = pipe.state.lock();
+                let mut ready = LinuxEpollEvents::empty();
+                if state.readers == 0 {
+                    ready |= LinuxEpollEvents::ERR;
+                } else if crate::dispatch::fs::pipe::pipe_writer_is_writable(&state) {
+                    ready |= LinuxEpollEvents::OUT;
+                }
+                ready & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP)
+            }
+            OpenDescription::HostPipe {
+                host_fd,
+                is_read_end,
+                bidirectional,
+                pty,
+                ..
+            } => {
+                let suppress_pollout = *is_read_end && !*bidirectional && pty.is_none();
+                let mut pfd = libc::pollfd {
+                    fd: host_fd.raw(),
+                    events: 0,
+                    revents: 0,
+                };
+                if interest.contains(LinuxEpollEvents::IN) {
+                    pfd.events |= libc::POLLIN;
+                }
+                if interest.contains(LinuxEpollEvents::OUT) && !suppress_pollout {
+                    pfd.events |= libc::POLLOUT;
+                }
+                let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+                let mut ready = LinuxEpollEvents::empty();
+                if rc > 0 {
+                    if pfd.revents & libc::POLLIN != 0 {
+                        ready |= LinuxEpollEvents::IN;
+                    }
+                    if pfd.revents & libc::POLLOUT != 0 && !suppress_pollout {
+                        ready |= LinuxEpollEvents::OUT;
+                    }
+                    if pfd.revents & libc::POLLERR != 0 {
+                        ready |= LinuxEpollEvents::ERR;
+                    }
+                    if pfd.revents & libc::POLLHUP != 0 {
+                        ready |= LinuxEpollEvents::HUP;
+                    }
+                }
+                if interest.contains(LinuxEpollEvents::IN)
+                    && !ready.contains(LinuxEpollEvents::IN)
+                    && crate::dispatch::fifo_beacon::read_end_at_eof(host_fd.raw())
+                {
+                    ready |= LinuxEpollEvents::IN | LinuxEpollEvents::HUP;
+                }
+                if interest.contains(LinuxEpollEvents::IN)
+                    && cx.staged_splice_bytes(description_id) > 0
+                {
+                    ready |= LinuxEpollEvents::IN;
+                }
+                ready & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP)
+            }
+            OpenDescription::HostSocket {
+                host_fd,
+                base,
+                synthetic_recv,
+                ..
+            } => {
+                if base.pending_socket_error().is_some() {
+                    let mut ready = LinuxEpollEvents::ERR;
+                    if interest.contains(LinuxEpollEvents::OUT) {
+                        ready |= LinuxEpollEvents::OUT;
+                    }
+                    return ready & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP);
+                }
+                let synthetic_datagram_ready = !synthetic_recv.is_empty();
+                let mut pfd = libc::pollfd {
+                    fd: host_fd.raw(),
+                    events: 0,
+                    revents: 0,
+                };
+                if interest.contains(LinuxEpollEvents::IN) {
+                    pfd.events |= libc::POLLIN;
+                }
+                if interest.contains(LinuxEpollEvents::OUT) {
+                    pfd.events |= libc::POLLOUT;
+                }
+                if interest.contains(LinuxEpollEvents::PRI) {
+                    pfd.events |= libc::POLLPRI;
+                }
+                let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+                let mut ready = LinuxEpollEvents::empty();
+                if rc > 0 {
+                    if pfd.revents & libc::POLLIN != 0 {
+                        ready |= LinuxEpollEvents::IN;
+                    }
+                    if pfd.revents & libc::POLLOUT != 0 {
+                        ready |= LinuxEpollEvents::OUT;
+                    }
+                    if pfd.revents & libc::POLLPRI != 0 {
+                        ready |= LinuxEpollEvents::PRI;
+                    }
+                    if pfd.revents & libc::POLLERR != 0 {
+                        ready |= LinuxEpollEvents::ERR;
+                    }
+                    if pfd.revents & libc::POLLHUP != 0 {
+                        ready |= LinuxEpollEvents::HUP;
+                    }
+                }
+                if super::net::recverr::is_enabled(host_fd.raw()) {
+                    super::net::recverr::poll_errors(host_fd.raw());
+                    if super::net::recverr::has_pending(host_fd.raw()) {
+                        ready |= LinuxEpollEvents::IN | LinuxEpollEvents::ERR;
+                    }
+                }
+                if interest.contains(LinuxEpollEvents::IN)
+                    && super::net::reuseport::is_shared(host_fd.raw())
+                {
+                    let group_has_work = ready.contains(LinuxEpollEvents::IN)
+                        || super::net::reuseport::siblings(host_fd.raw())
+                            .into_iter()
+                            .any(super::net::host_fd_has_pending_input);
+                    if group_has_work && super::net::reuseport::is_turn(host_fd.raw()) {
+                        ready |= LinuxEpollEvents::IN;
+                    } else {
+                        ready.remove(LinuxEpollEvents::IN);
+                    }
+                }
+                if interest.contains(LinuxEpollEvents::PRI)
+                    && !ready.contains(LinuxEpollEvents::PRI)
+                    && super::net::support::host_fd_has_oob(host_fd.raw())
+                {
+                    ready |= LinuxEpollEvents::PRI;
+                }
+                if interest.contains(LinuxEpollEvents::RDHUP)
+                    && super::net::host_stream_socket_rdhup(host_fd.raw())
+                {
+                    ready |= LinuxEpollEvents::IN | LinuxEpollEvents::RDHUP;
+                }
+                if interest.contains(LinuxEpollEvents::IN) && synthetic_datagram_ready {
+                    ready |= LinuxEpollEvents::IN;
+                }
+                ready & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP)
+            }
+            OpenDescription::Netlink { recv_queue, .. } => {
+                let mut ready = LinuxEpollEvents::empty();
+                if !recv_queue.is_empty() {
+                    ready |= LinuxEpollEvents::IN;
+                }
+                ready |= LinuxEpollEvents::OUT;
+                ready & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP)
+            }
+            OpenDescription::BpfMap { .. } | OpenDescription::BpfProg { .. } => {
+                interest & (LinuxEpollEvents::IN | LinuxEpollEvents::OUT)
+            }
+            OpenDescription::Mqueue { queue, .. } => {
+                let state = queue.state.lock();
+                let mut ready = LinuxEpollEvents::empty();
+                if !state.messages.is_empty() {
+                    ready |= LinuxEpollEvents::IN;
+                }
+                if state.messages.len() < state.max_msg {
+                    ready |= LinuxEpollEvents::OUT;
+                }
+                ready & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP)
+            }
+            OpenDescription::InMemorySocket { socket, .. } => {
+                let mask = LinuxEpollEvents::from_bits_retain(socket.poll_mask());
+                mask & (interest
+                    | LinuxEpollEvents::ERR
+                    | LinuxEpollEvents::HUP
+                    | LinuxEpollEvents::RDHUP)
+            }
+        }
+    }
+
     fn on_first_fd_ref(&self) {
         let description = self.read();
         match &*description {

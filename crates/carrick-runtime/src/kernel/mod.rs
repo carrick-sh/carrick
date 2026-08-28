@@ -81,8 +81,10 @@ pub use objects::{
     TaskRef, TaskRusage, TaskShared, TaskSharedCloneError, TaskWaker, Thread, ThreadKey, ThreadRef,
     ThreadResources, ThreadRunner, ThreadSignalState, Zombie,
 };
+#[allow(unused_imports)]
 pub(crate) use objects::{
     DescriptionCommon, FileDescriptionBacking, JobControlStopInvalidationGeneration,
+    NO_READINESS_CONTEXT, NoReadinessContext, ReadinessContext,
 };
 pub use operations::{
     ChildStartOutcome, ChildStartWait, ForkReservation, KernelFailpoint, KernelOperationError,

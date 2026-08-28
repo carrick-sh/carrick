@@ -94,7 +94,7 @@ pub(super) fn enable(host_fd: i32, is_ipv6: bool) {
 }
 
 /// Whether this socket opted into the error queue.
-pub(super) fn is_enabled(host_fd: i32) -> bool {
+pub(in crate::dispatch) fn is_enabled(host_fd: i32) -> bool {
     lock().get(&host_fd).is_some_and(|s| s.enabled)
 }
 
@@ -252,7 +252,7 @@ fn set_nonblocking(fd: i32) {
 
 /// Drain any ICMP error Darwin has reported on the shadow into the queue.
 /// Cheap and idempotent; callers run it before answering readiness or a recv.
-pub(super) fn poll_errors(host_fd: i32) {
+pub(in crate::dispatch) fn poll_errors(host_fd: i32) {
     let mut state = lock();
     let Some(entry) = state.get_mut(&host_fd) else {
         return;
@@ -296,7 +296,7 @@ pub(super) fn poll_errors(host_fd: i32) {
 
 /// Whether anything is waiting — used to report `EPOLLIN | EPOLLERR`, which is
 /// what makes libuv run both its plain and its `MSG_ERRQUEUE` read.
-pub(super) fn has_pending(host_fd: i32) -> bool {
+pub(in crate::dispatch) fn has_pending(host_fd: i32) -> bool {
     lock().get(&host_fd).is_some_and(|s| !s.queue.is_empty())
 }
 
