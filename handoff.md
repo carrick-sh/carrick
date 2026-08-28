@@ -1,6 +1,6 @@
 # Carrick exact conformance closure handoff
 
-**Updated:** 2026-08-27 (session 15 — pathflagmatrix closes 64/64 on both libc lanes; both renameat2 LTP suites now MATCH)
+**Updated:** 2026-08-27 (session 16 — routine ecosystem deadlines are now 5s and oracle-relative; explicit caps remain hard)
 
 **Canonical host/lane:** macOS, Apple Silicon, HVF/HVPatch, Linux arm64 guest
 
@@ -56,6 +56,34 @@ Execution is a directed-worker model:
 Complete only when fail-closed gate integrity, exact correctness, and the <=2x
 performance gate pass together on the final integrated signed artifact. Do not
 push unless explicitly asked. Preserve unrelated worktree changes.
+
+## SESSION 16 — 2026-08-27: timeout feedback loop tightened
+
+`8ff15ef72` replaces the blunt 20-second Carrick-side timeout with an adaptive
+deadline tied to the committed Docker timing evidence. Routine rows now get
+five seconds. A cached slow Linux row receives only `2x oracle + 2s`, bounded
+by its declared suite timeout, so intentional sleeps remain measurable without
+giving fast workloads tens or hundreds of seconds to hang. On the current
+2,127-row receipt, 1,927 rows receive exactly five seconds and the mean derived
+budget is 6.00 seconds; only 37 exceed 20 seconds because their Linux oracle
+itself justifies that duration.
+
+The interface preserves operator intent:
+
+- `--carrick-fast-timeout-s` / `CARRICK_CONFORMANCE_FAST_TIMEOUT_S` controls
+  the ordinary adaptive floor and defaults to five seconds;
+- `--carrick-timeout-cap-s N` remains a true hard ceiling even when the oracle
+  would derive a larger budget; and
+- `--carrick-timeout-cap-s 0` remains the explicit targeted uncapped mode.
+
+Prior cached elapsed evidence survives `--refresh-oracle` invalidation, so a
+refresh does not falsely squeeze a known slow Linux case to five seconds while
+its verdict bytes are being replaced. The policy was witnessed red before the
+implementation. All 176 `carrick-conformance` unit tests, warnings-denied
+clippy, formatting, and diff checks pass. No guest or Docker run was needed for
+this harness-only correction. Resume the `netflagmatrix` MSG_TRUNC/RDHUP
+cluster next; its embedded reducer should finish well inside the five-second
+ordinary budget.
 
 ## SESSION 15 — 2026-08-27: atomic path-flag cluster closed
 
