@@ -86,7 +86,7 @@
 use super::*;
 use crate::linux_abi::{
     LINUX_ICMP_ECHO_REPLY, LINUX_ICMP_ECHO_REQUEST, LINUX_IPPROTO_ICMP, LINUX_IPPROTO_TCP,
-    LINUX_MSG_NOSIGNAL, LINUX_POLLRDHUP,
+    LINUX_MSG_NOSIGNAL, LINUX_POLLRDHUP, LinuxPollEvents,
 };
 use crate::network::{BindTarget, ConnectTarget, GuestSocketAddr, HostSocketAddr};
 use carrick_spec::PortProtocol;
@@ -2219,7 +2219,8 @@ impl SyscallDispatcher {
                         ready |= LINUX_POLLHUP;
                     }
                 }
-                if requested_events & LINUX_POLLRDHUP != 0
+                if LinuxPollEvents::from_bits_retain(requested_events)
+                    .contains(LinuxPollEvents::RDHUP)
                     && host_stream_socket_rdhup(host_fd.raw())
                 {
                     ready |= LINUX_POLLIN | LINUX_POLLRDHUP;
