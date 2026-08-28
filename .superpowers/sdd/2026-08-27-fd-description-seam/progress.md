@@ -58,13 +58,33 @@ Task 9 changed the measured ledger as follows:
 - `create_install`: 75 -> 72;
 - `inspect_misc`: 146 -> 144;
 - `slot_description_mutation`: unchanged at 14; and
-- ceilings tightened to `create_install = 72` and `inspect_misc = 144`.
+- ceilings tightened to `create_install = 72`, `inspect_misc = 144`, and—after
+  independent completion review—`slot_description_mutation = 14`.
 
 The later access-path prerequisite moved two `access.rs` inventory positions by
 12 lines without changing any count or classification. The checked-in inventory
 and taxonomy record only those deterministic location changes.
 
 All three K1 checkers pass.
+
+## Independent completion review
+
+Two read-only reviewers re-audited the current tree against the original
+Tasks 1-8 and the replacement Task 9 controller. Task 9 was READY/CLEAN with
+15/15 focused canonical-authority tests and 5/5 dispatcher tests. The Tasks 1-8
+review found two actionable residuals:
+
+- the measured `slot_description_mutation` family was 14 while its ceiling
+  still allowed 16; and
+- Task 3 had left Task 2's temporary `#[allow(dead_code)]` on the now-live
+  `DescriptionCommon` implementation.
+
+Commit `be4aca0a7` lowers the ceiling to 14 and removes the suppression.
+`python3 scripts/migrate/check-k1-burndown.py`, its `--self-test`, and
+`RUSTC_WRAPPER= cargo check -p carrick-runtime` pass after the fixes. The K1
+finding was also sent back to the original `task9-ledgers` Antigravity
+conversation; its third turn independently made the same one-line correction
+and passed the burndown, inventory, taxonomy, and diff checks.
 
 ## Host-gate receipts
 
