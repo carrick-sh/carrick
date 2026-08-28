@@ -1,6 +1,6 @@
 # Carrick exact conformance closure handoff
 
-**Updated:** 2026-08-27 (session 18 — archiveflagmatrix closes both libc lanes; path errno/follow semantics corrected)
+**Updated:** 2026-08-27 (session 19 — three missing-interface probes added; all newly exposed gaps closed)
 
 **Canonical host/lane:** macOS, Apple Silicon, HVF/HVPatch, Linux arm64 guest
 
@@ -56,6 +56,57 @@ Execution is a directed-worker model:
 Complete only when fail-closed gate integrity, exact correctness, and the <=2x
 performance gate pass together on the final integrated signed artifact. Do not
 push unless explicitly asked. Preserve unrelated worktree changes.
+
+## SESSION 19 — 2026-08-27: three new probe families added and closed
+
+Three read-only Antigravity audits independently checked filesystem,
+process/signal, and network/event interfaces against the runtime handlers and
+the 484-source pre-change probe inventory. Codex reviewed the candidates, then
+three isolated write workers each created exactly one file-disjoint probe. Each
+worker took one review round for timeout/cleanup quality; Codex read the final
+diffs and independently cross-compiled every source before integration:
+
+- `copyrangeflags` covers `copy_file_range` flag rejection, NULL versus explicit
+  offsets, fd-position effects, zero length, and same-file overlap;
+- `sysvmsgselect` covers SysV queue-head, exact, negative-lowest, `MSG_EXCEPT`,
+  `MSG_NOERROR`, E2BIG retention, and nonblocking no-match semantics; and
+- `mmsgmatrix` covers batched `sendmmsg`/`recvmmsg`, partial completion,
+  per-message lengths, EFAULT precedence, nonblocking empty receive, and
+  datagram `MSG_TRUNC` length reporting.
+
+The source additions landed as `27689b0a5`, `267fb4c38`, and `7a2ea44b9`.
+`6148f58e7` wires them into the canonical inventory and regenerated exact
+three-way conformance-next partition (439 cached generic probes, split
+147/146/146). A deliberate Docker-only phase built just these three binaries
+for arm64 musl and glibc and wrote exactly six source-hash-validated oracle
+entries; Docker execution for the bless itself took 0.94 seconds. Routine runs
+are cached and Docker-independent again.
+
+The first embedded run failed closed in 0.65 seconds and exposed exactly three
+atomic gaps: nonzero `copy_file_range` flags were accepted, negative `msgrcv`
+used the head fast path instead of selecting the globally-lowest eligible type,
+and `recvmmsg(MSG_TRUNC)` reported copied length rather than full datagram
+length. `6e9d25646` closes those local seams. The final committed-source matrix
+executes all six libc/probe rows in 1.06 seconds under a 15-second hard outer
+bound; the unsigned entitlement negative control passes. Focused warnings-
+denied clippy, all three host-only partition gates, inventory validation, and
+the conformance-next strategy enforcement gate pass.
+
+Authoritative signed artifact:
+
+| field | value |
+|---|---|
+| source HEAD | `6e9d25646357b509713e4203bd2518d3e8198b75` |
+| binary SHA-256 | `a6c5c6979229c33afd36277d3ecc4690fc3028afd5ff69307a97ac8c93f40fe4` |
+| CDHash | `b780b9bdda9855d676e7395a592a9b85013ff6c3` |
+| LC_UUID | `0CA61BDD-BA07-3C50-948F-EEE918330CEF` |
+| hypervisor entitlement | present |
+| `__dof_carrick` | present |
+
+The next short reducer can be `ptyflagmatrix`: it reproduces its expected gap
+for both libc lanes in 0.45 seconds. Do not infer full conformance closure from
+the six new green rows; the ecosystem denominator and <=2x performance gate
+remain open.
 
 ## SESSION 18 — 2026-08-27: archiveflagmatrix closed on both libc lanes
 
