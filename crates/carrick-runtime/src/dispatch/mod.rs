@@ -2051,6 +2051,7 @@ impl GuestMemory for LinearMemory {
 }
 
 #[derive(Debug, Error)]
+#[allow(private_interfaces)]
 pub enum DispatchError {
     #[error("guest memory read length does not fit this host: {0}")]
     LengthTooLarge(u64),
@@ -2063,6 +2064,14 @@ pub enum DispatchError {
     /// boilerplate. The guest observes exactly the same `-errno` either way.
     #[error("guest-visible errno: {}", .0.get())]
     Errno(LinuxErrno),
+    #[error("fatal file authority error: {0:?}")]
+    FileAuthorityFatal(crate::file_authority::AuthorityFatal),
+}
+
+impl From<crate::file_authority::AuthorityFatal> for DispatchError {
+    fn from(fatal: crate::file_authority::AuthorityFatal) -> Self {
+        DispatchError::FileAuthorityFatal(fatal)
+    }
 }
 
 impl From<LinuxErrno> for DispatchError {
@@ -2725,6 +2734,12 @@ impl Drop for HostAliasDispatchGuard {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum AuthorityCallError {
+    Rejected(crate::file_authority::AuthorityError),
+    Fatal(crate::file_authority::AuthorityFatal),
+}
+
 pub struct SyscallDispatcher {
     /// Generation-safe task adapter used to capture the mandatory kernel
     /// context at each backend dispatch boundary. HVPatch replaces the initial
@@ -2741,11 +2756,11 @@ pub struct SyscallDispatcher {
     /// here; VMM/native leave it empty and use their established run-global
     /// backend registered in `crate::timer_delivery`.
     timer_delivery: RwLock<Option<Arc<dyn carrick_hal::TimerDelivery>>>,
-    /// One helper-backed FileAuthority root for this run. Run-loop entry
-    /// activates it before any guest host fork; constructors remain side-effect
-    /// free so library fixtures never fork from a test-harness worker thread.
-    /// It remains dormant for a syscall family until that family's complete
-    /// legacy state is replaced and deleted.
+    /// The direct in-carrier FileAuthority endpoint for this run. Activated
+    /// immediately after the final root process binding (in HVPatch or the
+    /// mature VMM one-task loop) on the captured root `FileTable`. Syscall
+    /// families route through canonical authority transactions; in this
+    /// slice, only `F_SETPIPE_SZ` capacity mutation is migrated.
     file_authority: RwLock<Option<Arc<crate::file_authority::FileAuthorityRun>>>,
     /// Process-local output buffering/streaming only. Linux descriptor state is
     /// owned exclusively by each captured Kernel [`crate::kernel::FileTable`].
@@ -4958,20 +4973,22 @@ impl SyscallDispatcher {
 
     pub(crate) fn activate_file_authority(
         &self,
+        root_table: Arc<crate::kernel::FileTable>,
     ) -> Result<crate::file_authority::FileAuthorityBinding, crate::file_authority::AuthorityFatal>
     {
         let mut authority = self.file_authority.write();
-        if authority.is_none() {
-            *authority = Some(crate::file_authority::FileAuthorityRun::launch(
-                self.captured_file_table(),
-            )?);
+        if let Some(active) = authority.as_ref() {
+            if active.is_root_table(&root_table) {
+                return Ok(active.binding());
+            }
+            return Err(crate::file_authority::AuthorityFatal::InvariantViolation(
+                "FileAuthority root table mismatch across activations",
+            ));
         }
-        authority
-            .as_ref()
-            .map(|authority| authority.binding())
-            .ok_or(crate::file_authority::AuthorityFatal::InvariantViolation(
-                "active FileAuthority root disappeared",
-            ))
+        let run = crate::file_authority::FileAuthorityRun::launch(root_table)?;
+        let binding = run.binding();
+        *authority = Some(run);
+        Ok(binding)
     }
 
     #[cfg(test)]
@@ -4981,7 +4998,41 @@ impl SyscallDispatcher {
         self.file_authority
             .read()
             .as_ref()
-            .map(|authority| authority.binding())
+            .map(|active| active.binding())
+    }
+
+    pub(crate) fn authority_call(
+        &self,
+        table: Arc<crate::kernel::FileTable>,
+        slot: crate::kernel::objects::FileSlotAuthority,
+        command: crate::file_authority::Command,
+    ) -> Result<crate::file_authority::Outcome, AuthorityCallError> {
+        let authority_guard = self.file_authority.read();
+        let Some(active) = authority_guard.as_ref() else {
+            return Err(AuthorityCallError::Fatal(
+                crate::file_authority::AuthorityFatal::TransportUnavailable,
+            ));
+        };
+
+        if slot.table() != table.id() {
+            return Err(AuthorityCallError::Fatal(
+                crate::file_authority::AuthorityFatal::InvariantViolation(
+                    "slot table ID does not match target table ID",
+                ),
+            ));
+        }
+
+        let target = crate::file_authority::CanonicalAuthorityTarget { table, slot };
+        let response = active
+            .execute_canonical(target, command)
+            .map_err(AuthorityCallError::Fatal)?;
+
+        match response.outcome {
+            crate::file_authority::Outcome::Rejected(error) => {
+                Err(AuthorityCallError::Rejected(error))
+            }
+            outcome => Ok(outcome),
+        }
     }
 
     #[allow(dead_code)]
@@ -10476,9 +10527,10 @@ mod routing_tests {
     #[test]
     fn dispatcher_activates_one_authenticated_file_authority_root() {
         let dispatcher = SyscallDispatcher::new();
+        let root_table = dispatcher.captured_file_table();
         assert_eq!(dispatcher.file_authority_binding(), None);
         let binding = dispatcher
-            .activate_file_authority()
+            .activate_file_authority(Arc::clone(&root_table))
             .expect("activate FileAuthority");
         assert_eq!(binding.epoch.raw(), 1);
         assert_eq!(binding.client.id.raw(), 1);
@@ -10488,11 +10540,123 @@ mod routing_tests {
         );
         assert_eq!(
             dispatcher
-                .activate_file_authority()
+                .activate_file_authority(Arc::clone(&root_table))
                 .expect("idempotent FileAuthority activation"),
             binding
         );
         assert_eq!(dispatcher.file_authority_binding(), Some(binding));
+
+        // Different Arc with same table ID is fatal
+        let foreign_table_same_id = Arc::new(crate::kernel::FileTable::new(root_table.id()));
+        let res = dispatcher.activate_file_authority(foreign_table_same_id);
+        assert!(matches!(
+            res,
+            Err(crate::file_authority::AuthorityFatal::InvariantViolation(_))
+        ));
+
+        // Different Arc with different table ID is fatal
+        let ids = crate::kernel::ObjectIdRegistry::new();
+        let foreign_table = Arc::new(crate::kernel::FileTable::new(
+            ids.file_table_id().expect("table id"),
+        ));
+        let res = dispatcher.activate_file_authority(foreign_table);
+        assert!(matches!(
+            res,
+            Err(crate::file_authority::AuthorityFatal::InvariantViolation(_))
+        ));
+
+        // Dropping all external strong Arcs allows the root table to be dropped
+        let weak = Arc::downgrade(&root_table);
+        drop(root_table);
+        // Note: dispatcher's one_task kernel context also holds a strong reference in its initial state,
+        // so if we drop the dispatcher context or check the weak reference when only dispatcher holds it:
+        assert_eq!(weak.strong_count(), 1); // Only the dispatcher's captured one-task kernel context
+    }
+
+    #[test]
+    fn authority_call_operates_on_successor_table_without_launch_root_comparison() {
+        let dispatcher = SyscallDispatcher::new();
+        let root_table = dispatcher.captured_file_table();
+        dispatcher
+            .activate_file_authority(Arc::clone(&root_table))
+            .expect("activate FileAuthority");
+
+        let ids = crate::kernel::ObjectIdRegistry::new();
+        let successor_table = Arc::new(crate::kernel::FileTable::new(
+            ids.file_table_id().expect("table id"),
+        ));
+        let number = crate::kernel::FileSlotNumber::for_open_fd(3).expect("fd");
+        let fixture = crate::dispatch::fd_table::InMemoryPipeTestFixture::new(10, 65536);
+        successor_table.install(number, fixture.read, false);
+        let slot = successor_table
+            .capture_slot_authority(number)
+            .expect("slot token");
+
+        let command = crate::file_authority::Command::SetCanonicalPipeCapacity {
+            slot,
+            capacity: crate::file_authority::PipeCapacity::bounded(65536).expect("capacity"),
+            accounting: crate::kernel::objects::PipeCapacityAccounting::InMemory,
+        };
+
+        let outcome = dispatcher
+            .authority_call(successor_table, slot, command)
+            .expect("authority call on successor table");
+        assert!(matches!(
+            outcome,
+            crate::file_authority::Outcome::CanonicalPipeCapacitySet { .. }
+        ));
+    }
+
+    #[test]
+    fn authority_call_rejects_table_id_mismatch_as_fatal() {
+        let dispatcher = SyscallDispatcher::new();
+        let root_table = dispatcher.captured_file_table();
+        dispatcher
+            .activate_file_authority(Arc::clone(&root_table))
+            .expect("activate FileAuthority");
+
+        let ids = crate::kernel::ObjectIdRegistry::new();
+        let table_a = Arc::new(crate::kernel::FileTable::new(
+            ids.file_table_id().expect("table a id"),
+        ));
+        let table_b = Arc::new(crate::kernel::FileTable::new(
+            ids.file_table_id().expect("table b id"),
+        ));
+        let number = crate::kernel::FileSlotNumber::for_open_fd(3).expect("fd");
+        let fixture = crate::dispatch::fd_table::InMemoryPipeTestFixture::new(10, 65536);
+        table_a.install(number, fixture.read, false);
+        let slot_a = table_a
+            .capture_slot_authority(number)
+            .expect("slot a token");
+
+        let command = crate::file_authority::Command::SetCanonicalPipeCapacity {
+            slot: slot_a,
+            capacity: crate::file_authority::PipeCapacity::bounded(65536).expect("capacity"),
+            accounting: crate::kernel::objects::PipeCapacityAccounting::InMemory,
+        };
+
+        // Passing table_b with slot_a (which belongs to table_a) is fatal
+        let err = dispatcher
+            .authority_call(table_b, slot_a, command)
+            .expect_err("mismatched table and slot token");
+        assert!(matches!(
+            err,
+            AuthorityCallError::Fatal(crate::file_authority::AuthorityFatal::InvariantViolation(_))
+        ));
+    }
+
+    #[test]
+    fn dispatch_error_file_authority_fatal_lowers_to_run_fatal() {
+        let fatal_err = DispatchError::FileAuthorityFatal(
+            crate::file_authority::AuthorityFatal::InvariantViolation("injected test fatal"),
+        );
+        let lowered = lower_handler_result(Err(fatal_err));
+        assert!(matches!(
+            lowered,
+            Err(DispatchError::FileAuthorityFatal(
+                crate::file_authority::AuthorityFatal::InvariantViolation(_)
+            ))
+        ));
     }
 
     #[test]

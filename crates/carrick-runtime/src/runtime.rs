@@ -605,9 +605,6 @@ fn run_address_space_with_hvf_and_dispatcher(
     let container_id = std::env::var("CARRICK_CONTAINER_ID").ok();
     let mut exact_control_installed = false;
     let mut run = (|| -> Result<RunResult, RuntimeError> {
-        dispatcher.activate_file_authority().map_err(|error| {
-            RuntimeError::Configuration(format!("activate per-run FileAuthority: {error}"))
-        })?;
         // Build the engine (create VM + vCPU, map the address space, park at the EL0
         // trampoline) — the shared `Aarch64EngineCore<HvfAarch64Vmm>` bring-up.
         let mut trap = crate::trap::new_hvf_trap_engine(&image)?;

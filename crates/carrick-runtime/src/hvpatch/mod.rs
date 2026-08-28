@@ -1345,16 +1345,21 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
         0,
     );
     dispatcher.bind_hvpatch_process(context.clone());
-    dispatcher
-        .initialize_bound_controlling_tty()
-        .map_err(|error| {
-            RuntimeError::Configuration(format!("initialize controlling tty authority: {error}"))
-        })?;
     let root_context = dispatcher.capture_one_task_context().map_err(|error| {
         RuntimeError::Configuration(format!(
             "capture HVPatch root identity Kernel context: {error}"
         ))
     })?;
+    dispatcher
+        .activate_file_authority(root_context.resources().files())
+        .map_err(|error| {
+            RuntimeError::Configuration(format!("activate per-run FileAuthority: {error}"))
+        })?;
+    dispatcher
+        .initialize_bound_controlling_tty()
+        .map_err(|error| {
+            RuntimeError::Configuration(format!("initialize controlling tty authority: {error}"))
+        })?;
     crate::vcpu_loop::stamp_identity_page(engine, dispatcher, &root_context).map_err(|error| {
         RuntimeError::Configuration(format!("stamp HVPatch root identity page: {error}"))
     })?;

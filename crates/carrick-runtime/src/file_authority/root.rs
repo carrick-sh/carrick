@@ -89,6 +89,12 @@ impl FileAuthorityRun {
         self.root_table.upgrade()
     }
 
+    pub(crate) fn is_root_table(&self, candidate: &Arc<crate::kernel::FileTable>) -> bool {
+        self.root_table
+            .upgrade()
+            .is_some_and(|root| Arc::ptr_eq(&root, candidate))
+    }
+
     #[cfg(test)]
     pub(crate) fn model_table_count_for_test(&self) -> usize {
         self.direct.model_table_count()
@@ -97,6 +103,35 @@ impl FileAuthorityRun {
     #[cfg(test)]
     pub(crate) fn model_description_count_for_test(&self) -> usize {
         self.direct.model_description_count()
+    }
+
+    pub(crate) fn execute_canonical(
+        &self,
+        target: super::CanonicalAuthorityTarget,
+        command: Command,
+    ) -> Result<Response, AuthorityFatal> {
+        // Allocation and the complete canonical round trip are one serialized
+        // critical section on `self.next_request`, sharing sequence numbers
+        // with ordinary calls so request IDs do not collide or overtake.
+        let mut next_request = self.next_request.lock();
+        let sequence = *next_request;
+        *next_request = sequence
+            .checked_add(1)
+            .ok_or(AuthorityFatal::IdentityExhausted)?;
+        let request_id = RequestId::from_client_sequence(sequence)
+            .map_err(|_| AuthorityFatal::IdentityExhausted)?;
+        let call = super::AuthorityCall::without_capabilities(Request {
+            epoch: self.binding.epoch,
+            client: self.binding.client,
+            request_id,
+            expected_generation: self.binding.generation,
+            command,
+        });
+        let reply = self.direct.transact_canonical(call, target)?;
+        if !reply.capabilities.is_empty() {
+            return Err(AuthorityFatal::CapabilityMismatch);
+        }
+        Ok(reply.response)
     }
 
     #[allow(
@@ -308,5 +343,93 @@ mod tests {
                 "FileAuthority retained retired host-helper authority `{retired}`"
             );
         }
+    }
+
+    #[test]
+    fn file_authority_run_does_not_keep_launch_root_alive() {
+        let ids = ObjectIdRegistry::new();
+        let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+        let run = FileAuthorityRun::launch(Arc::clone(&table)).expect("launch");
+        assert!(run.is_root_table(&table));
+        drop(table);
+        let foreign_table = Arc::new(FileTable::new(
+            ids.file_table_id().expect("foreign table id"),
+        ));
+        assert!(!run.is_root_table(&foreign_table));
+        assert!(run.root_table().is_none());
+    }
+
+    #[test]
+    fn mixed_ordinary_and_canonical_requests_share_sequence_without_collision() {
+        let epoch = AuthorityEpoch::for_run(12).expect("authority epoch");
+        let ids = ObjectIdRegistry::new();
+        let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+        let number = FileSlotNumber::for_open_fd(3).expect("fd");
+        table.install(
+            number,
+            crate::dispatch::fd_table::InMemoryPipeTestFixture::new(10, 65536).read,
+            false,
+        );
+        let slot = table.capture_slot_authority(number).expect("slot token");
+
+        let (inner, binding) = direct_root(epoch, &table).expect("direct root");
+        let direct = Arc::new(inner);
+        let run = FileAuthorityRun::with_transports(
+            Arc::clone(&direct) as Arc<dyn FileAuthorityTransport>,
+            direct,
+            Arc::downgrade(&table),
+            binding,
+            2,
+        );
+
+        // 1. Ordinary call (uses request sequence 2)
+        let ord_resp = run
+            .execute(
+                Command::ResolveSlot {
+                    table: binding.table,
+                    fd: number,
+                },
+                binding.generation,
+            )
+            .expect("ordinary resolve_slot");
+        assert!(matches!(
+            ord_resp.outcome,
+            Outcome::Rejected(super::super::AuthorityError::TableNotFound)
+        ));
+
+        // 2. Canonical call (must use request sequence 3; if separate allocator existed starting at 2, it would collide)
+        let target = super::super::CanonicalAuthorityTarget {
+            table: Arc::clone(&table),
+            slot,
+        };
+        let canon_resp = run
+            .execute_canonical(
+                target,
+                Command::SetCanonicalPipeCapacity {
+                    slot,
+                    capacity: super::super::PipeCapacity::bounded(131072).unwrap(),
+                    accounting: crate::kernel::objects::PipeCapacityAccounting::InMemory,
+                },
+            )
+            .expect("canonical set pipe capacity");
+        assert!(matches!(
+            canon_resp.outcome,
+            Outcome::CanonicalPipeCapacitySet { .. }
+        ));
+
+        // 3. Another ordinary call (must use request sequence 4)
+        let ord_resp2 = run
+            .execute(
+                Command::ResolveSlot {
+                    table: binding.table,
+                    fd: number,
+                },
+                binding.generation,
+            )
+            .expect("second ordinary resolve_slot");
+        assert!(matches!(
+            ord_resp2.outcome,
+            Outcome::Rejected(super::super::AuthorityError::TableNotFound)
+        ));
     }
 }

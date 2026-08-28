@@ -4416,62 +4416,6 @@ impl SyscallDispatcher {
         (ino != 0).then_some(ino)
     }
 
-    fn pipe_buffered_bytes(&self, fd: i32) -> Result<Option<usize>, LinuxErrno> {
-        let Some(open_file) = self.open_file(fd) else {
-            return if is_stdio_fd(fd) {
-                Ok(None)
-            } else {
-                Err(LINUX_EBADF)
-            };
-        };
-
-        let Some(open) = open_file.description.read() else {
-            return Ok(None);
-        };
-        match &*open {
-            OpenDescription::PipeReader { pipe, .. } | OpenDescription::PipeWriter { pipe, .. } => {
-                Ok(Some(pipe.buffered_bytes()))
-            }
-            OpenDescription::HostPipe {
-                host_fd,
-                is_read_end: true,
-                ..
-            } => host_pipe_readable_bytes(host_fd.raw())
-                .map(|bytes| Some(bytes + self.staged_splice_pipe_bytes(fd))),
-            OpenDescription::HostPipe {
-                pipe_id,
-                bidirectional,
-                host_fd,
-                ..
-            } => {
-                if *bidirectional {
-                    return host_pipe_readable_bytes(host_fd.raw()).map(Some);
-                }
-                let pipe_id = *pipe_id;
-                drop(open);
-                let files = self.captured_file_table();
-                let table = files.read_open_files();
-                for other in table.values() {
-                    let Some(other_open) = other.description.read() else {
-                        continue;
-                    };
-                    if let OpenDescription::HostPipe {
-                        host_fd,
-                        is_read_end: true,
-                        pipe_id: other_pipe_id,
-                        ..
-                    } = &*other_open
-                        && *other_pipe_id == pipe_id
-                    {
-                        return host_pipe_readable_bytes(host_fd.raw()).map(Some);
-                    }
-                }
-                Ok(Some(0))
-            }
-            _ => Ok(None),
-        }
-    }
-
     fn host_pipe_read_end_for_pipe_id(&self, pipe_id: u64) -> Option<(i32, HostFd)> {
         let files = self.captured_file_table();
         let table = files.read_open_files();
@@ -7805,30 +7749,53 @@ impl SyscallDispatcher {
                     }
                 }
                 LINUX_F_SETPIPE_SZ => {
-                    let Some(open_file) = this.open_file(fd.0) else {
+                    let table = this.captured_file_table();
+                    let Ok(slot_num) = crate::kernel::FileSlotNumber::for_open_fd(fd.0) else {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     };
-                    // Only pipe ends have a capacity; everything else is EBADF
-                    // (Linux: F_SETPIPE_SZ on a non-pipe fd is EBADF, mirroring
-                    // F_GETPIPE_SZ above).
-                    let is_pipe = matches!(
-                        open_file.description.read().as_deref(),
-                        Some(
-                            OpenDescription::PipeReader { .. }
-                                | OpenDescription::PipeWriter { .. }
-                                | OpenDescription::HostPipe { .. }
-                        )
-                    );
-                    if !is_pipe {
+                    let Some(slot) = table.capture_slot_authority(slot_num) else {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                    }
-                    // Linux rounds the requested size up to a whole number of
-                    // pages, enforces a one-page minimum, rejects impossible
-                    // signed-int sizes, rejects growth above
-                    // /proc/sys/fs/pipe-max-size without CAP_SYS_RESOURCE, and
-                    // refuses to shrink below the bytes already queued in the
-                    // pipe (fcntl37). Carrick does not model capabilities here,
-                    // so guest root does not bypass the per-user pipe ceiling.
+                    };
+
+                    let accounting = {
+                        let Some(open_file) = this.open_file(fd.0) else {
+                            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                        };
+                        let Some(open) = open_file.description.read() else {
+                            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                        };
+                        match &*open {
+                            OpenDescription::PipeReader { .. }
+                            | OpenDescription::PipeWriter { .. } => {
+                                crate::kernel::objects::PipeCapacityAccounting::InMemory
+                            }
+                            OpenDescription::HostPipe {
+                                base,
+                                pipe_id,
+                                is_read_end,
+                                bidirectional,
+                                host_fd,
+                                ..
+                            } => {
+                                let Some((_, queued)) = this.host_pipe_capacity_state(
+                                    base,
+                                    *pipe_id,
+                                    *is_read_end,
+                                    *bidirectional,
+                                    host_fd.raw(),
+                                ) else {
+                                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                                };
+                                let queued_with_staged =
+                                    queued + this.staged_splice_pipe_bytes(fd.0);
+                                crate::kernel::objects::PipeCapacityAccounting::Host {
+                                    queued_bytes: queued_with_staged as u64,
+                                }
+                            }
+                            _ => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
+                        }
+                    };
+
                     const PIPE_MAX_SIZE: u64 = 1 << 20; // 1 MiB, Linux default
                     if arg > i32::MAX as u64 {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
@@ -7839,31 +7806,58 @@ impl SyscallDispatcher {
                     if rounded > PIPE_MAX_SIZE {
                         return Ok(DispatchOutcome::errno(LINUX_EPERM));
                     }
-                    let Some(buffered) = this.pipe_buffered_bytes(fd.0)? else {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    let capacity = match crate::file_authority::PipeCapacity::bounded(
+                        rounded.max(page) as u32,
+                    ) {
+                        Ok(cap) => cap,
+                        Err(_) => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
                     };
-                    if rounded < buffered as u64 {
-                        return Ok(DispatchOutcome::errno(LINUX_EBUSY));
-                    }
-                    let capacity = rounded.max(page) as i64;
-                    let is_inmem_pipe = match open_file.description.read().as_deref() {
-                        Some(
-                            OpenDescription::PipeReader { pipe, .. }
-                            | OpenDescription::PipeWriter { pipe, .. }
-                        ) => {
-                            pipe.set_capacity(capacity as usize)?;
-                            true
-                        }
-                        _ => false,
+
+                    let command = crate::file_authority::Command::SetCanonicalPipeCapacity {
+                        slot,
+                        capacity,
+                        accounting,
                     };
-                    if !is_inmem_pipe {
-                        if let Some(mut open) = open_file.description.write()
-                            && let OpenDescription::HostPipe { base, .. } = &mut *open
-                        {
-                            base.set_pipe_capacity(capacity);
+
+                    match this.authority_call(table, slot, command) {
+                        Ok(crate::file_authority::Outcome::CanonicalPipeCapacitySet {
+                            capacity,
+                            ..
+                        }) => DispatchOutcome::Returned {
+                            value: capacity.raw() as i64,
+                        },
+                        Ok(_) => {
+                            return Err(DispatchError::FileAuthorityFatal(
+                                crate::file_authority::AuthorityFatal::InvariantViolation(
+                                    "unexpected outcome for SetCanonicalPipeCapacity",
+                                ),
+                            ));
+                        }
+                        Err(AuthorityCallError::Rejected(
+                            crate::file_authority::AuthorityError::InvalidPipeCapacity,
+                        )) => DispatchOutcome::errno(LINUX_EINVAL),
+                        Err(AuthorityCallError::Rejected(
+                            crate::file_authority::AuthorityError::PipeErrno(errno),
+                        )) => DispatchOutcome::errno(errno),
+                        Err(AuthorityCallError::Rejected(
+                            crate::file_authority::AuthorityError::NotPipe
+                            | crate::file_authority::AuthorityError::StaleSlot { .. }
+                            | crate::file_authority::AuthorityError::SlotNotFound
+                            | crate::file_authority::AuthorityError::TableNotFound
+                            | crate::file_authority::AuthorityError::DescriptionNotFound
+                            | crate::file_authority::AuthorityError::TableNotBound,
+                        )) => DispatchOutcome::errno(LINUX_EBADF),
+                        Err(AuthorityCallError::Rejected(_)) => {
+                            return Err(DispatchError::FileAuthorityFatal(
+                                crate::file_authority::AuthorityFatal::InvariantViolation(
+                                    "unexpected authority rejection for SetCanonicalPipeCapacity",
+                                ),
+                            ));
+                        }
+                        Err(AuthorityCallError::Fatal(fatal)) => {
+                            return Err(DispatchError::FileAuthorityFatal(fatal));
                         }
                     }
-                    DispatchOutcome::Returned { value: capacity }
                 }
                 // Directory-change notification (dnotify). It is obsolete, but
                 // LTP still asserts create/delete/rename SIGIO delivery for

@@ -3677,6 +3677,177 @@ mod hvpatch_in_process_fork_tests {
     }
 
     #[test]
+    fn fcntl_pipe_set_capacity_works_on_successor_table_after_close_range_unshare() {
+        let mut parent = SyscallDispatcher::new();
+        let parent_context = parent.capture_one_task_context().unwrap();
+        let parent_files = parent_context.resources().files();
+        parent
+            .activate_file_authority(Arc::clone(&parent_files))
+            .expect("activate FileAuthority on launch root");
+
+        let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
+        let reporter = CompatReporter::default();
+
+        // 1. Create a pipe on the parent.
+        let pipe_res = parent
+            .dispatch(
+                &parent_context,
+                SyscallRequest::new(59, SyscallArgs::from([0x10200, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .expect("pipe2 dispatch");
+        assert_eq!(pipe_res, DispatchOutcome::Returned { value: 0 });
+        let pair = memory.read_bytes(0x10200, 8).unwrap();
+        let read_fd = i32::from_ne_bytes(pair[0..4].try_into().unwrap()) as u64;
+        let write_fd = i32::from_ne_bytes(pair[4..8].try_into().unwrap()) as u64;
+
+        // Verify initial capacity is default 65536
+        let get_init = parent
+            .dispatch(
+                &parent_context,
+                SyscallRequest::new(
+                    25,
+                    SyscallArgs::from([read_fd, carrick_abi::LINUX_F_GETPIPE_SZ, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("getpipe_sz dispatch");
+        assert_eq!(get_init, DispatchOutcome::Returned { value: 65536 });
+
+        // 2. Fork a child sharing the file table (CLONE_FILES).
+        let parent_tid = parent_context.thread().registry_id();
+        let child_tid = crate::thread::ThreadId::synthetic_for_tests(4199);
+        let (mut child, child_context) = fork_dispatcher_with_clone_flags(
+            &parent,
+            parent_tid,
+            child_tid,
+            41,
+            42,
+            carrick_abi::LinuxCloneFlags::FILES,
+        );
+        assert!(Arc::ptr_eq(
+            &parent_files,
+            &child_context.resources().files()
+        ));
+
+        // 3. Child unshares file table via close_range with CLOSE_RANGE_UNSHARE on an unrelated fd.
+        let unshare_res = child
+            .dispatch(
+                &child_context,
+                SyscallRequest::new(
+                    436,
+                    SyscallArgs::from([
+                        99,
+                        99,
+                        carrick_abi::LINUX_CLOSE_RANGE_UNSHARE as u64,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("close_range unshare dispatch");
+        assert_eq!(unshare_res, DispatchOutcome::Returned { value: 0 });
+
+        let child_successor_context = child.capture_one_task_context().unwrap();
+        let child_successor_files = child_successor_context.resources().files();
+        assert!(!Arc::ptr_eq(&parent_files, &child_successor_files));
+
+        // Activation must not repeat: attempting to activate authority with successor table is rejected
+        let repeat_activation = child.activate_file_authority(Arc::clone(&child_successor_files));
+        assert!(matches!(
+            repeat_activation,
+            Err(crate::file_authority::AuthorityFatal::InvariantViolation(_))
+        ));
+
+        // Old launch root must not authorize calls on successor slot
+        let successor_slot = child_successor_files
+            .capture_slot_authority(
+                crate::kernel::FileSlotNumber::for_open_fd(read_fd as i32).unwrap(),
+            )
+            .expect("slot authority on successor table");
+        let command = crate::file_authority::Command::SetCanonicalPipeCapacity {
+            slot: successor_slot,
+            capacity: crate::file_authority::PipeCapacity::bounded(131072).unwrap(),
+            accounting: crate::kernel::objects::PipeCapacityAccounting::InMemory,
+        };
+        let mismatched_auth_call =
+            child.authority_call(Arc::clone(&parent_files), successor_slot, command);
+        assert!(matches!(
+            mismatched_auth_call,
+            Err(crate::dispatch::AuthorityCallError::Fatal(
+                crate::file_authority::AuthorityFatal::InvariantViolation(_)
+            ))
+        ));
+
+        // 4. F_SETPIPE_SZ succeeds on the published successor table through normal dispatch!
+        let set_res = child
+            .dispatch(
+                &child_successor_context,
+                SyscallRequest::new(
+                    25,
+                    SyscallArgs::from([
+                        read_fd,
+                        carrick_abi::LINUX_F_SETPIPE_SZ,
+                        131072,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("fcntl setpipe_sz dispatch on successor");
+        assert_eq!(set_res, DispatchOutcome::Returned { value: 131072 });
+
+        // Both ends reflect new capacity on successor
+        let get_read = child
+            .dispatch(
+                &child_successor_context,
+                SyscallRequest::new(
+                    25,
+                    SyscallArgs::from([
+                        read_fd,
+                        carrick_abi::LINUX_F_GETPIPE_SZ,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("getpipe_sz read");
+        assert_eq!(get_read, DispatchOutcome::Returned { value: 131072 });
+
+        let get_write = child
+            .dispatch(
+                &child_successor_context,
+                SyscallRequest::new(
+                    25,
+                    SyscallArgs::from([
+                        write_fd,
+                        carrick_abi::LINUX_F_GETPIPE_SZ,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("getpipe_sz write");
+        assert_eq!(get_write, DispatchOutcome::Returned { value: 131072 });
+    }
+
+    #[test]
     fn hvpatch_pi_futex_owner_uses_kernel_linux_tid() {
         let parent = SyscallDispatcher::new();
         let parent_context = parent.capture_one_task_context().unwrap();
