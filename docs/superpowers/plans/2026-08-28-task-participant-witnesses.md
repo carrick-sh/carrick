@@ -289,7 +289,10 @@ pub(crate) fn required_note_count_for_probe(&self) -> u64 {
 }
 ```
 
-This is the only numeric Task-population projection.
+The only other numeric Task-population projection is
+`ForkBarrierParticipants::initial_sibling_count_for_probe() -> u32`, required
+to preserve the existing `hvpatch-fork-quiesce` USDT slot. Both names end in
+`_for_probe`, and neither may authorize behavior.
 
 - [ ] **Step 2: Implement one-lock Task minting**
 
@@ -566,7 +569,8 @@ The brief must state:
 
 - read `/Volumes/CaseSensitive/carrick/AGENTS.md` first;
 - replace only the fork barrier's raw sibling arithmetic with the approved
-  witness and typed error propagation;
+  witness and typed error propagation; use `requires_quiesce()` for control and
+  `initial_sibling_count_for_probe()` only for the existing probe slot;
 - preserve durable membership semantics, barrier-before-drain order, and every
   wake/retry path;
 - update only the retired source-contract assertion in `continuation.rs`;

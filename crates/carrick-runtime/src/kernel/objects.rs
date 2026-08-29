@@ -2840,6 +2840,10 @@ pub enum TaskParticipantError {
     UnknownThread { task: TaskKey, thread: ThreadKey },
 }
 
+fn saturating_fork_sibling_count_for_probe(count: usize) -> u32 {
+    u32::try_from(count).unwrap_or(u32::MAX)
+}
+
 #[derive(Debug)]
 pub(crate) struct ForkBarrierParticipants {
     siblings: BTreeSet<ThreadKey>,
@@ -2852,6 +2856,12 @@ impl ForkBarrierParticipants {
 
     pub(crate) fn contains_sibling(&self, key: ThreadKey) -> bool {
         self.siblings.contains(&key)
+    }
+
+    /// Exact durable sibling cardinality solely for the existing USDT probe.
+    /// Fork admission and barrier control must use [`Self::requires_quiesce`].
+    pub(crate) fn initial_sibling_count_for_probe(&self) -> u32 {
+        saturating_fork_sibling_count_for_probe(self.siblings.iter().count())
     }
 }
 
@@ -7982,6 +7992,16 @@ mod tests {
         std::mem::forget(first);
         drop(second);
         assert!(!fixture.leader.is_crash_safe_point_participant());
+    }
+
+    #[test]
+    fn fork_probe_sibling_count_saturates_at_u32_max() {
+        let max = usize::try_from(u32::MAX).expect("u32 max fits usize");
+        assert_eq!(saturating_fork_sibling_count_for_probe(max), u32::MAX);
+        assert_eq!(
+            saturating_fork_sibling_count_for_probe(max.saturating_add(1)),
+            u32::MAX
+        );
     }
 
     #[test]

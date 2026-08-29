@@ -4529,6 +4529,7 @@ mod tests {
     fn task_mints_distinct_fork_and_crash_sibling_witnesses() {
         let (kernel, leader) = bootstrap(19_410);
         let sibling = clone_sibling(&kernel, &leader, 19_411);
+        let second_sibling = clone_sibling(&kernel, &leader, 19_412);
 
         let fork = leader
             .task()
@@ -4541,14 +4542,17 @@ mod tests {
 
         assert!(fork.requires_quiesce());
         assert!(fork.contains_sibling(sibling.thread().key()));
+        assert!(fork.contains_sibling(second_sibling.thread().key()));
+        assert_eq!(fork.initial_sibling_count_for_probe(), 2);
         assert!(crash.requires_quiesce());
         assert!(crash.contains_sibling(sibling.thread().key()));
+        assert!(crash.contains_sibling(second_sibling.thread().key()));
         assert_eq!(
             leader
                 .task()
                 .core_note_participants()
                 .required_note_count_for_probe(),
-            2
+            3
         );
     }
 
