@@ -4675,8 +4675,9 @@ impl SyscallDispatcher {
 
                         // Acquire target MM's real mutation authority for the staged compound.
                         // No cx.memory access or allocation occurs while mutation_guard is live.
-                        let commit_res =
-                            authority.with_foreign_mutation(&foreign, cx.tid(), |mutation_guard| {
+                        let mutation_tid = cx.tid();
+                        let commit_res = self.with_current_mm_executor_released(cx, || {
+                            authority.with_foreign_mutation(&foreign, mutation_tid, |mutation_guard| {
                                 let mut witness: Option<crate::kernel::CowBroken<'_, '_, '_>> = None;
                                 let mut committed_chunks = 0usize;
 
@@ -4708,8 +4709,11 @@ impl SyscallDispatcher {
                                             Err(_) => break,
                                         };
                                         witness = Some(new_witness);
+                                        let Some(current_witness) = witness.as_mut() else {
+                                            break;
+                                        };
                                         match authority.prepare_foreign_write_range(
-                                            witness.as_mut().unwrap(),
+                                            current_witness,
                                             chunk.range,
                                             src_chunk,
                                         ) {
@@ -4728,7 +4732,8 @@ impl SyscallDispatcher {
                                 }
 
                                 Ok(committed_chunks)
-                            });
+                            })
+                        })?;
 
                         let committed_chunks = match commit_res {
                             Ok(count) => count,
