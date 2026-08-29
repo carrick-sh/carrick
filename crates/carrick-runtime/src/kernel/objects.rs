@@ -2833,6 +2833,79 @@ pub enum TaskLifecycle {
 pub type TaskRef = Arc<Task>;
 pub type ThreadRef = Arc<Thread>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum TaskParticipantError {
+    #[error("thread {thread:?} is not a current member of task {task:?}")]
+    UnknownThread { task: TaskKey, thread: ThreadKey },
+}
+
+#[derive(Debug)]
+pub(crate) struct ForkBarrierParticipants {
+    siblings: BTreeSet<ThreadKey>,
+}
+
+impl ForkBarrierParticipants {
+    pub(crate) fn requires_quiesce(&self) -> bool {
+        self.siblings.iter().next().is_some()
+    }
+
+    pub(crate) fn contains_sibling(&self, key: ThreadKey) -> bool {
+        self.siblings.contains(&key)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CrashBarrierParticipants {
+    siblings: BTreeSet<ThreadKey>,
+}
+
+impl CrashBarrierParticipants {
+    pub(crate) fn requires_quiesce(&self) -> bool {
+        self.siblings.iter().next().is_some()
+    }
+
+    pub(crate) fn contains_sibling(&self, key: ThreadKey) -> bool {
+        self.siblings.contains(&key)
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct ThreadExitParticipants {
+    survivors: BTreeSet<ThreadKey>,
+}
+
+impl ThreadExitParticipants {
+    pub(super) fn permits_nonfinal_exit(&self) -> bool {
+        self.survivors.iter().next().is_some()
+    }
+
+    pub(super) fn contains_survivor(&self, key: ThreadKey) -> bool {
+        self.survivors.contains(&key)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CrashCaptureParticipants {
+    members: BTreeMap<ThreadKey, ThreadRef>,
+}
+
+impl CrashCaptureParticipants {
+    pub(crate) fn into_threads(self) -> impl Iterator<Item = ThreadRef> {
+        self.members.into_values()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CoreNoteParticipants {
+    members: BTreeSet<ThreadKey>,
+}
+
+impl CoreNoteParticipants {
+    pub(crate) fn required_note_count_for_probe(&self) -> u64 {
+        u64::try_from(self.members.iter().count()).unwrap_or(u64::MAX)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TaskIdentity {
     process_group: ProcessGroupId,
@@ -4329,6 +4402,92 @@ impl Task {
             .collect()
     }
 
+    pub(crate) fn fork_barrier_participants(
+        &self,
+        owner: ThreadKey,
+    ) -> Result<ForkBarrierParticipants, TaskParticipantError> {
+        let threads = self.threads.lock();
+        if threads
+            .get(&owner.tid)
+            .is_none_or(|(published, _)| *published != owner)
+        {
+            return Err(TaskParticipantError::UnknownThread {
+                task: self.key,
+                thread: owner,
+            });
+        }
+        Ok(ForkBarrierParticipants {
+            siblings: threads
+                .values()
+                .map(|(key, _)| *key)
+                .filter(|key| *key != owner)
+                .collect(),
+        })
+    }
+
+    pub(crate) fn crash_barrier_participants(
+        &self,
+        fatal_owner: ThreadKey,
+    ) -> Result<CrashBarrierParticipants, TaskParticipantError> {
+        let threads = self.threads.lock();
+        if threads
+            .get(&fatal_owner.tid)
+            .is_none_or(|(published, _)| *published != fatal_owner)
+        {
+            return Err(TaskParticipantError::UnknownThread {
+                task: self.key,
+                thread: fatal_owner,
+            });
+        }
+        Ok(CrashBarrierParticipants {
+            siblings: threads
+                .values()
+                .map(|(key, _)| *key)
+                .filter(|key| *key != fatal_owner)
+                .collect(),
+        })
+    }
+
+    pub(super) fn thread_exit_participants(
+        &self,
+        departing: ThreadKey,
+    ) -> Result<ThreadExitParticipants, TaskParticipantError> {
+        let threads = self.threads.lock();
+        if threads
+            .get(&departing.tid)
+            .is_none_or(|(published, _)| *published != departing)
+        {
+            return Err(TaskParticipantError::UnknownThread {
+                task: self.key,
+                thread: departing,
+            });
+        }
+        Ok(ThreadExitParticipants {
+            survivors: threads
+                .values()
+                .map(|(key, _)| *key)
+                .filter(|key| *key != departing)
+                .collect(),
+        })
+    }
+
+    pub(crate) fn crash_capture_participants(&self) -> CrashCaptureParticipants {
+        CrashCaptureParticipants {
+            members: self
+                .threads
+                .lock()
+                .values()
+                .map(|(key, thread)| (*key, Arc::clone(thread)))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn core_note_participants(&self) -> CoreNoteParticipants {
+        CoreNoteParticipants {
+            members: self.threads.lock().values().map(|(key, _)| *key).collect(),
+        }
+    }
+
     pub(crate) fn accepts_unhandled_signal(&self, signal: super::ids::LinuxSignal) -> bool {
         let threads = self.threads.lock();
         for (_, thread) in threads.values() {
@@ -4371,7 +4530,8 @@ impl Task {
         retired
     }
 
-    pub(super) fn live_thread_count(&self) -> usize {
+    #[cfg(test)]
+    pub(super) fn thread_count_for_test(&self) -> usize {
         self.threads.lock().len()
     }
 
@@ -7715,7 +7875,7 @@ mod tests {
         let weak_task = Arc::downgrade(&task);
         let leader = Arc::clone(&fixture.leader);
         drop(fixture);
-        assert_eq!(task.live_thread_count(), 1);
+        assert_eq!(task.thread_count_for_test(), 1);
         drop(task);
 
         assert!(weak_task.upgrade().is_none());

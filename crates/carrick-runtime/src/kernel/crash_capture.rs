@@ -240,8 +240,21 @@ mod tests {
     fn crash_quorum_refreshes_membership_after_retirement() {
         let (kernel, leader) = bootstrap(19_440);
         let sibling = clone_sibling(&kernel, &leader, 19_441);
+        let leader_key = leader.thread().key();
+        let sibling_key = sibling.thread().key();
         let sibling_tid = sibling.thread().key().tid;
         sibling.thread().enter_crash_safe_point_participation();
+
+        let initial_keys = leader
+            .task()
+            .crash_capture_participants()
+            .into_threads()
+            .map(|thread| thread.key())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            initial_keys,
+            std::collections::BTreeSet::from([leader_key, sibling_key])
+        );
 
         let authority = CrashCaptureAuthority::default();
         let generation = authority.issue().expect("capture generation");
@@ -252,6 +265,16 @@ mod tests {
         ));
 
         kernel.exit_thread(&sibling, None).expect("retire sibling");
+        let refreshed_keys = leader
+            .task()
+            .crash_capture_participants()
+            .into_threads()
+            .map(|thread| thread.key())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            refreshed_keys,
+            std::collections::BTreeSet::from([leader_key])
+        );
         assert!(matches!(
             quorum.poll(),
             CrashQuorumPoll::Complete(registers) if registers.is_empty()
