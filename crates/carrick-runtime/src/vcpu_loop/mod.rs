@@ -12086,6 +12086,9 @@ mod tests {
     fn census_admission_precedes_registry_publication() {
         let registry = Arc::new(carrick_hal::GenericVcpuRegistry::new());
         let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().expect("task context");
+        let thread = context.thread().clone();
         let first = ThreadId::synthetic_for_tests(70_201);
         let second = ThreadId::synthetic_for_tests(70_202);
         let _first_participation = census.enter(None).expect("first participation");
@@ -12096,10 +12099,14 @@ mod tests {
         let second_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
 
         let (second_participation, attempt) =
-            enter_guest_executor_then_register(&census, None, || {
+            enter_guest_executor_then_register(&census, Some(thread.clone()), || {
                 assert!(
                     census.has_peer_executor(),
                     "census admission must precede registry publication"
+                );
+                assert!(
+                    thread.is_crash_safe_point_participant(),
+                    "crash participation must precede registry publication"
                 );
                 registry.subscribe_register(
                     second,
@@ -12123,6 +12130,30 @@ mod tests {
         assert_eq!(census.participant_count_for_probe(), 1);
         drop(attempt);
         drop(freeze);
+    }
+
+    #[test]
+    fn failed_crash_admission_suppresses_registry_publication() {
+        let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().expect("task context");
+        let thread = context.thread().clone();
+        let _outside = thread
+            .enter_crash_safe_point_participation()
+            .expect("outside crash participation");
+        let register_called = std::sync::atomic::AtomicBool::new(false);
+
+        assert!(matches!(
+            enter_guest_executor_then_register(&census, Some(thread.clone()), || {
+                register_called.store(true, std::sync::atomic::Ordering::Release);
+                panic!("failed admission must not invoke registry publication")
+            }),
+            Err(crate::kernel::GuestExecutorCensusError::CrashParticipationAlreadyActive {
+                thread: rejected
+            }) if rejected == thread.key()
+        ));
+        assert!(!register_called.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(census.participant_count_for_probe(), 0);
     }
 
     #[test]
