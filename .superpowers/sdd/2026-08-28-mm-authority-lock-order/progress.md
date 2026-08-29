@@ -196,3 +196,14 @@ RED and review-pending commits remain on `codex/fd-description-seam`; no push.
   17 positive, format, and diff checks. The production checker remains
   intentionally RED with exactly the Task 8 `dispatch/proc.rs:4425` consumer
   finding. Report: `task-7-report.md`.
+- Task 8 clean-room reset, 2026-08-29: the first process-vm implementation
+  stream and one permission-review stream are abandoned because Linux kernel
+  source was consulted during their reasoning. No Task 8 candidate reached
+  `main`; reviewed `main` remains the Task 7 milestone `a8c3e1864`. Work restarts
+  from that exact commit on `codex/fd-description-cleanroom`. From this point,
+  no agent may open, search, quote, cite, or rely on Linux kernel source or on
+  findings from the abandoned streams. Linux-visible behavior must be derived
+  only from Carrick's checked-in contracts, public ABI documentation, and
+  controlled Docker-oracle measurements. Old branches/worktrees are retained
+  as non-integrable evidence so their commits cannot be mistaken for clean-room
+  candidates.
