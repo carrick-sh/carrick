@@ -6627,7 +6627,7 @@ impl SyscallDispatcher {
     }
 
     /// Single-threaded dispatch accepting an explicitly borrowed `ThreadExecutionLease`.
-    pub fn dispatch_with_lease(
+    pub(crate) fn dispatch_with_lease(
         &mut self,
         kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
@@ -6869,7 +6869,7 @@ impl SyscallDispatcher {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn dispatch_threaded_with_lease(
+    pub(crate) fn dispatch_threaded_with_lease(
         &self,
         kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
