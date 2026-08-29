@@ -133,9 +133,12 @@ no `usize`, no `Sub`, and no `PartialOrd<usize>`, so every `count() > 1` and
 `count().saturating_sub(1)` must be rewritten and each author must decide which
 population they actually mean.
 
-Add an explicit run state to the kernel `Thread`, and mint **per-purpose**
-participant sets from the `Task` — not one "safe-point-reachable" set, since that
-conflation is precisely the `exit_group01` bug.
+The explicit run-state requirement is already satisfied by the scheduler-owned
+`ThreadExecutionState` on kernel `Thread`. Keep it as the sole lifecycle
+authority; adding a second run-state enum would duplicate transitions and
+recreate drift. Mint **per-purpose** participant sets from the `Task` — not one
+"safe-point-reachable" set, since that conflation is precisely the
+`exit_group01` bug.
 
 The pattern already exists and works: `kernel/crash_capture.rs` (2026-08-16)
 replaced a three-population predicate with a **quorum value** plus a
@@ -199,8 +202,11 @@ thaw wakes are one-shot, registry-owned publications, and production admission
 preserves census-before-registry ordering plus the existing logical phase.
 
 This is a partial closure of population/lifecycle item 1 (runtime-audit Part 2
-item 3). Per-purpose participant sets minted from `Task` and explicit kernel
-thread run-state typing remain open and are not claimed complete here.
+item 3). The pre-existing `ThreadExecutionState` satisfies the explicit
+run-state half, and purpose-specific Task witness types now retain exact
+identities. Their fork/crash/core consumer migration and final source closure
+remain open until the participant-witness milestone's completion gate; this
+receipt does not claim population closure early.
 
 The closing verification applies to code head `a6579a511`; `209522268` adds only
 this receipt. The HAL registry (13 tests), runtime lease drain (7), process fork
