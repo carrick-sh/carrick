@@ -5397,6 +5397,21 @@ impl Thread {
             .map(|state| (state.mm, state.asid_generation))
     }
 
+    /// Authenticate one exact live execution lease before exposing the MM
+    /// identity carried by its architectural task snapshot.
+    pub(crate) fn authenticate_task_state_authority(
+        &self,
+        lease: &ThreadExecutionLease,
+    ) -> Result<(MmId, u64), ThreadExecutionError> {
+        self.validate_execution_lease_owner(lease)?;
+        let execution = self.execution.lock();
+        if !Self::execution_state_matches_lease(execution.state, lease) {
+            return Err(Self::stale_lease_error(lease));
+        }
+        drop(execution);
+        lease.task_state_authority()
+    }
+
     pub const fn key(&self) -> ThreadKey {
         self.key
     }

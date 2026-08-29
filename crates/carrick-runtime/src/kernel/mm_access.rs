@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use carrick_guest_mem::GuestVa;
 
+use super::objects::{ThreadExecutionError, ThreadExecutionLease};
 use super::{
     Kernel, KernelContext, Mm, MmBackendSnapshot, MmId, SnapshotError, TaskKey, TaskLifecycle,
 };
@@ -20,22 +21,16 @@ const MM_SNAPSHOT_TIMEOUT: Duration = Duration::from_millis(50);
 /// retaining or following the task itself.
 #[derive(Clone, Debug)]
 pub struct MmToken {
+    #[allow(dead_code)]
+    // retained for later live-task reauthentication without exposing a raw accessor
     task: TaskKey,
     mm: Arc<Mm>,
     snapshot: MmBackendSnapshot,
 }
 
 impl MmToken {
-    pub const fn task_key(&self) -> TaskKey {
-        self.task
-    }
-
     pub fn mm_id(&self) -> MmId {
         self.mm.id()
-    }
-
-    pub fn mm(&self) -> &Arc<Mm> {
-        &self.mm
     }
 
     pub fn read_range(
@@ -224,10 +219,6 @@ impl ForeignMm {
     pub fn mm_id(&self) -> MmId {
         self.token.mm_id()
     }
-
-    pub fn mm(&self) -> &Arc<Mm> {
-        self.token.mm()
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -242,6 +233,10 @@ pub enum MmAccessError {
     UnknownTask(TaskKey),
     #[error("kernel context for task {0:?} no longer names its exact live task/MM binding")]
     StaleContext(TaskKey),
+    #[error(transparent)]
+    ExecutionAuthority(#[from] ThreadExecutionError),
+    #[error("execution authority does not name the exact scheduler MM for task {task:?}")]
+    StaleExecutionAuthority { task: TaskKey },
     #[error("MM {0:?} has no backend snapshot authority")]
     MissingBackendAuthority(MmId),
     #[error(transparent)]
@@ -261,8 +256,11 @@ pub enum MmAccessError {
 }
 
 impl KernelContext {
-    pub fn current_mm(&self) -> Result<CurrentMm<'_>, MmAccessError> {
-        let mm = self.authenticate_current_mm()?;
+    pub fn current_mm(
+        &self,
+        execution: &ThreadExecutionLease,
+    ) -> Result<CurrentMm<'_>, MmAccessError> {
+        let mm = self.authenticate_current_mm(execution)?;
         let token = snapshot_token(self.task.key(), mm)?;
         Ok(CurrentMm {
             token,
@@ -270,7 +268,10 @@ impl KernelContext {
         })
     }
 
-    fn authenticate_current_mm(&self) -> Result<Arc<Mm>, MmAccessError> {
+    fn authenticate_current_mm(
+        &self,
+        execution: &ThreadExecutionLease,
+    ) -> Result<Arc<Mm>, MmAccessError> {
         let key = self.task.key();
         if self.task.lifecycle() != TaskLifecycle::Live || self.thread.task_key() != key {
             return Err(MmAccessError::StaleContext(key));
@@ -293,6 +294,11 @@ impl KernelContext {
         {
             return Err(MmAccessError::StaleContext(key));
         }
+        let (scheduler_mm, _scheduler_asid_generation) =
+            self.thread.authenticate_task_state_authority(execution)?;
+        if scheduler_mm != context_mm.id() {
+            return Err(MmAccessError::StaleExecutionAuthority { task: key });
+        }
         Ok(context_mm)
     }
 }
@@ -301,12 +307,13 @@ impl Kernel {
     pub fn foreign_mm<'context>(
         &self,
         caller: &'context KernelContext,
+        execution: &ThreadExecutionLease,
         target: TaskKey,
     ) -> Result<MmRelation<'context>, MmAccessError> {
         if !std::ptr::eq(self, caller.kernel.as_ref()) {
             return Err(MmAccessError::StaleContext(caller.task.key()));
         }
-        let caller_mm = caller.authenticate_current_mm()?;
+        let caller_mm = caller.authenticate_current_mm(execution)?;
         let Some(task) = self.registry().task(target.id) else {
             return Err(MmAccessError::UnknownTask(target));
         };
@@ -315,7 +322,7 @@ impl Kernel {
         }
         let target_mm = task.shared().mm();
         let token = snapshot_token(target, target_mm)?;
-        if token.mm_id() == caller_mm.id() && Arc::ptr_eq(token.mm(), &caller_mm) {
+        if token.mm_id() == caller_mm.id() && Arc::ptr_eq(&token.mm, &caller_mm) {
             Ok(MmRelation::Current(CurrentMm {
                 token,
                 context: PhantomData,
@@ -366,10 +373,14 @@ mod tests {
     use carrick_abi::LinuxCloneFlags;
     use carrick_guest_mem::{Gpa, GuestVa};
     use carrick_hal::ThreadId;
+    use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
 
+    use super::super::objects::{
+        ExecutorId, MigratableTaskState, ThreadExecutionError, ThreadExecutionLease,
+    };
     use super::super::{
         Asid, ClonePlan, Kernel, KernelContext, LinuxWaitStatus, MmAccessError, MmBackend,
-        MmBackendSnapshot, MmBinding, MmReadRange, MmRelation, MmToken, MmWriteRange,
+        MmBackendSnapshot, MmBinding, MmId, MmReadRange, MmRelation, MmToken, MmWriteRange,
         RootBootstrap, SnapshotError, Stage1Root, TaskKey, VmaAccess, VmaRevision, VmaSummary,
     };
 
@@ -483,6 +494,67 @@ mod tests {
         Kernel::bootstrap_root(input).expect("root kernel")
     }
 
+    fn task_state_for_mm(mm: MmId, marker: u64) -> MigratableTaskState {
+        MigratableTaskState {
+            cpu: GuestCpuState::from_aarch64_v1(Aarch64TaskCpuStateV1 {
+                gprs: [marker; 31],
+                pc: marker,
+                pstate: marker,
+                trap_pc: marker,
+                trap_pstate: marker,
+                sp_el0: marker,
+                elr_el1: marker,
+                spsr_el1: marker,
+                ttbr0: marker,
+                ttbr1: marker,
+                tcr: marker,
+                sctlr_el1: marker,
+                mair_el1: marker,
+                vbar_el1: marker,
+                cpacr_el1: marker,
+                cntkctl_el1: marker,
+                tpidr_el1: marker,
+                actlr_el1: marker,
+                tpidr_el0: marker,
+                tpidrro_el0: marker,
+                contextidr_el1: marker,
+                vregs: [u128::from(marker); 32],
+                fpsr: marker as u32,
+                fpcr: marker as u32,
+                pending_resume_pc: None,
+                last_syscall_nr: None,
+                last_syscall_orig_x0: marker,
+                last_fault_esr: marker,
+                last_exit_class: marker,
+                is_forked_child: false,
+                syscall_continuation: None,
+                mm_generation: mm.raw(),
+                asid_generation: mm.raw(),
+            }),
+            mm,
+            asid_generation: mm.raw(),
+        }
+    }
+
+    fn execution_lease_for_mm(
+        context: &KernelContext,
+        mm: MmId,
+        marker: u64,
+    ) -> ThreadExecutionLease {
+        context
+            .thread()
+            .publish_initial_task_state(task_state_for_mm(mm, marker))
+            .expect("publish scheduler task-state authority");
+        context
+            .thread()
+            .claim_runnable(ExecutorId::synthetic_for_tests(marker as u32))
+            .expect("claim exact execution authority")
+    }
+
+    fn execution_lease(context: &KernelContext, marker: u64) -> ThreadExecutionLease {
+        execution_lease_for_mm(context, context.shared().mm().id(), marker)
+    }
+
     fn fork_with_backend(
         kernel: &Arc<Kernel>,
         parent: &KernelContext,
@@ -510,10 +582,11 @@ mod tests {
     fn foreign_mm(
         kernel: &Arc<Kernel>,
         caller: &KernelContext,
+        execution: &ThreadExecutionLease,
         target: TaskKey,
     ) -> super::super::ForeignMm {
         match kernel
-            .foreign_mm(caller, target)
+            .foreign_mm(caller, execution, target)
             .expect("foreign MM authority")
         {
             MmRelation::Foreign(foreign) => foreign,
@@ -524,6 +597,7 @@ mod tests {
     #[test]
     fn retained_foreign_token_keeps_the_exact_mm_across_target_exec_and_retirement() {
         let (kernel, root) = bootstrap(31_100);
+        let execution = execution_lease(&root, 101);
         let child = fork_with_backend(
             &kernel,
             &root,
@@ -534,7 +608,7 @@ mod tests {
         let old_mm_arc = child.shared().mm();
         let old_mm_weak = Arc::downgrade(&old_mm_arc);
         let old_mm = old_mm_arc.id();
-        let token = foreign_mm(&kernel, &root, child.task().key());
+        let token = foreign_mm(&kernel, &root, &execution, child.task().key());
 
         let replacement = kernel
             .commit_exec(
@@ -553,7 +627,7 @@ mod tests {
         let retained_after_exec = old_mm_weak
             .upgrade()
             .expect("foreign token must retain the pre-exec MM");
-        assert!(Arc::ptr_eq(token.mm(), &retained_after_exec));
+        assert!(Arc::ptr_eq(&token.token.mm, &retained_after_exec));
         drop(retained_after_exec);
 
         kernel
@@ -572,12 +646,19 @@ mod tests {
         let retained_after_retirement = old_mm_weak
             .upgrade()
             .expect("foreign token must retain the retired MM");
-        assert!(Arc::ptr_eq(token.mm(), &retained_after_retirement));
+        assert!(Arc::ptr_eq(&token.token.mm, &retained_after_retirement));
+        drop(retained_after_retirement);
+        drop(token);
+        assert!(
+            old_mm_weak.upgrade().is_none(),
+            "the token must be the old MM's final owner after exec and retirement"
+        );
     }
 
     #[test]
     fn stale_task_key_is_rejected_after_pid_reuse() {
         let (kernel, root) = bootstrap(31_110);
+        let execution = execution_lease(&root, 111);
         let root_binding = root.task_binding();
         let root_tid = root.thread().key().tid;
         let child = fork_with_backend(&kernel, &root, 31_111, "stale-mm child", fixture_backend());
@@ -609,16 +690,81 @@ mod tests {
         assert_ne!(replacement.task().key(), stale_key);
 
         assert!(matches!(
-            kernel.foreign_mm(&fresh_root, stale_key),
+            kernel.foreign_mm(&fresh_root, &execution, stale_key),
             Err(MmAccessError::UnknownTask(key)) if key == stale_key
+        ));
+    }
+
+    #[test]
+    fn an_uninitialized_context_cannot_supply_execution_authority() {
+        let (_kernel, root) = bootstrap(31_115);
+
+        assert!(matches!(
+            root.thread()
+                .claim_runnable(ExecutorId::synthetic_for_tests(115)),
+            Err(super::super::objects::ThreadExecutionError::InvalidTransition { .. })
+        ));
+    }
+
+    #[test]
+    fn current_mm_rejects_scheduler_authority_for_a_different_mm() {
+        let (kernel, root) = bootstrap(31_116);
+        let child = fork_with_backend(
+            &kernel,
+            &root,
+            31_117,
+            "different-mm child",
+            fixture_backend(),
+        );
+        let execution = execution_lease_for_mm(&root, child.shared().mm().id(), 116);
+
+        assert!(matches!(
+            root.current_mm(&execution),
+            Err(MmAccessError::StaleExecutionAuthority { .. })
+        ));
+    }
+
+    #[test]
+    fn current_mm_rejects_another_threads_execution_lease() {
+        let (_kernel, root) = bootstrap(31_118);
+        let (_other_kernel, other) = bootstrap(31_119);
+        let execution = execution_lease(&other, 119);
+
+        assert!(matches!(
+            root.current_mm(&execution),
+            Err(MmAccessError::ExecutionAuthority(
+                ThreadExecutionError::LeaseOwnerMismatch { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn foreign_mm_rejects_another_threads_execution_lease() {
+        let (kernel, root) = bootstrap(31_122);
+        let child = fork_with_backend(
+            &kernel,
+            &root,
+            31_123,
+            "foreign-authority child",
+            fixture_backend(),
+        );
+        let (_other_kernel, other) = bootstrap(31_124);
+        let execution = execution_lease(&other, 124);
+
+        assert!(matches!(
+            kernel.foreign_mm(&root, &execution, child.task().key()),
+            Err(MmAccessError::ExecutionAuthority(
+                ThreadExecutionError::LeaseOwnerMismatch { .. }
+            ))
         ));
     }
 
     #[test]
     fn token_bound_ranges_require_permissions_and_complete_vma_coverage() {
         let (kernel, root) = bootstrap(31_120);
+        let execution = execution_lease(&root, 121);
         let child = fork_with_backend(&kernel, &root, 31_121, "range-mm child", fixture_backend());
-        let foreign = foreign_mm(&kernel, &root, child.task().key());
+        let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
         let token: &MmToken = &foreign.token;
 
         assert_eq!(foreign.token.snapshot.revision, 17);
@@ -665,6 +811,7 @@ mod tests {
     #[test]
     fn foreign_mm_rejects_a_churning_backend_snapshot() {
         let (kernel, root) = bootstrap(31_130);
+        let execution = execution_lease(&root, 131);
         let child = fork_with_backend(
             &kernel,
             &root,
@@ -676,7 +823,7 @@ mod tests {
         );
 
         assert!(matches!(
-            kernel.foreign_mm(&root, child.task().key()),
+            kernel.foreign_mm(&root, &execution, child.task().key()),
             Err(MmAccessError::Snapshot(
                 SnapshotError::ChangedDuringObservation
             ))
