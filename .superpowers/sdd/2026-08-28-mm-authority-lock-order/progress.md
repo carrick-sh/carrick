@@ -237,3 +237,13 @@ RED and review-pending commits remain on `codex/fd-description-seam`; no push.
   foreign writes still fail closed pending the separately reviewed
   prepare/commit+COW slice. Clean-room provenance was reconfirmed by every
   surviving agent; no Linux kernel source or abandoned Task 8 output was used.
+- Task 8 foreign-write transaction RED is `604612221`. Three deterministic
+  Carrick-only fixtures prove the same forbidden state through independent
+  failure channels: the carrier returns an error after copying, the returned
+  write receipt fails authentication after copying, or the backend revision
+  advances before the runtime's post-copy recheck. All three currently report
+  an error while target bytes have changed from `same` to `edit` (3/3 RED).
+  Acceptance requires a fallible prepare phase followed by a consuming,
+  infallible commit whose byte copy is the final operation; no snapshot, lock,
+  allocation, transport error, receipt validation, or revision check may occur
+  after commit begins. This RED remains feature-only and is not on `main`.
