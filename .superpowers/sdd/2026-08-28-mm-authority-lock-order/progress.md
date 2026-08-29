@@ -141,6 +141,16 @@ RED and review-pending commits remain on `codex/fd-description-seam`; no push.
   generation check; the rejected alternatives either deadlock at one vCPU,
   consume product capacity, or defer the entire syscall through a new scheduler
   continuation architecture.
+- Task 7: review round 0 rejected `1bef8eb51` on six load-bearing findings:
+  production snapshot reacquisition under alias mutation, recoverable failure
+  after irreversible inventory publication, a mutex on ordinary guest re-entry,
+  raw invalidation identity domains, incomplete mapping/frame/owner receipt
+  authentication, and tests that bypass production authority composition. Fix
+  round 1 resumed the original implementer from base `1bef8eb51`.
+- Task 7: minor (deferred): the new stage-1 and pause invalidation generation
+  counters use wrapping increment and can eventually reuse stale identity; the
+  final whole-branch review must decide whether checked fail-closed exhaustion
+  is required before integration.
 - Task 7: implementation complete and awaiting independent approval. The
   canonical facade acquires a real exact-target mutation guard, mints a
   single-use opaque `CowBroken`, revalidates token/range/three revisions and
@@ -155,3 +165,34 @@ RED and review-pending commits remain on `codex/fd-description-seam`; no push.
   checks. Production checker remains intentionally RED with exactly the one
   Task 8 `foreign-current-memory` finding in untouched `dispatch/proc.rs`.
   Report: `task-7-report.md`.
+- Task 7: fix round 1 commit `021e8df0b` addressed review findings 1-4 and the
+  deferred generation-wrap concern, but scoped re-review rejected findings 5
+  and 6. The transport's public live-inventory trait still self-attests both
+  sides of the receipt comparison rather than carrying an independently sealed
+  kernel-authority proof, and the production/topology coverage still composes
+  mock transport and an unrelated local scheduler instead of driving the real
+  carrier COW path through budget-one/full-occupancy and concurrent target
+  exec/retirement. Fix round 2 resumed the original implementer from
+  `021e8df0b`; scope is limited to those two findings and fix-introduced
+  breakage.
+- Task 7: fix round 2 commit `ff97d9a95` addressed the production-composition
+  finding, including the real carrier transport, capacity-one scheduler,
+  active/inactive invalidation paths, CLONE_VM, and concurrent exec/retirement.
+  Scoped re-review retained one authority defect: the kernel proof issuer
+  independently authenticates MM/revision/mapping/frame/extent but embeds an
+  owner generation supplied by the transport, so the transport can use the
+  issuer as a signing oracle for an internally consistent wrong owner. Fix
+  round 3 resumed the original implementer from `ff97d9a95` and is limited to
+  independent current-owner authentication plus its regression and gates.
+- Task 7: complete and independently approved at canonical `d7688a2e5`.
+  Review round 3 accepted the engine-bound canonical owner-directory view: the
+  transport-callable proof issuer no longer accepts owner generation, retains
+  and rechecks the exact existing owner `Arc`, and embeds only the independently
+  authenticated generation. The final signing-oracle and self-consistent
+  wrong-owner regressions are green, with no new review breakage. Final fresh
+  gates: runtime 2,104/2,104, HVF 280/280, thread 54/54, HAL 111 unit plus two
+  compile-fail doctests, AArch64 32/32, focused production-carrier and foreign
+  COW suites, workspace check, targeted clippy, checker self-test 20 negative/
+  17 positive, format, and diff checks. The production checker remains
+  intentionally RED with exactly the Task 8 `dispatch/proc.rs:4425` consumer
+  finding. Report: `task-7-report.md`.
