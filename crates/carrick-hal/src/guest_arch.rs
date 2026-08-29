@@ -124,8 +124,8 @@ pub trait GuestArch: Copy + 'static {
     /// Build the `rt_sigframe` for a delivered signal: push it onto the guest
     /// user stack and redirect the vCPU to the handler. ISA-specific frame
     /// layout (aarch64 `CarrickSigframe` today; x86_64 in Phase 2). Generic over
-    /// the engine because a trap engine impls both `RegAccess` and `GuestMemory`
-    /// on one type, and the shared builder needs both.
+    /// the engine because a trap engine impls both `RegAccess` and `CurrentMmMemory`
+    /// on one type, referring to the caller's current MM, and the shared builder needs both.
     fn build_sigframe<E: RegAccess + CurrentMmMemory>(
         engine: &mut E,
         params: InjectParams,

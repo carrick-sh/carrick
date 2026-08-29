@@ -1333,9 +1333,9 @@ pub fn aarch64_signal_pstate_source(
 }
 
 /// The bound the shared threaded loop is generic over. A backend is its own
-/// trap vehicle + register access + guest memory + per-thread/fork lifecycle.
-/// `GuestMemory` is a supertrait so the shared loop can `write_bytes` to the
-/// guest (tid stamps, clone parent/child-tid writes) through the engine.
+/// trap vehicle + register access + current guest memory + per-thread/fork lifecycle.
+/// `CurrentMmMemory` is a supertrait so the shared loop can `write_bytes` to the
+/// caller's current MM (tid stamps, clone parent/child-tid writes) through the engine.
 /// ISA-neutral entry register deltas for a freshly-created guest execution
 /// context — a `clone(CLONE_THREAD)` sibling thread or a `fork(2)` child.
 ///

@@ -231,6 +231,8 @@ def scan_source(source: str, relative_path: str) -> list[Finding]:
     production = production_mask(tokens)
     findings: set[Finding] = set()
 
+    is_guest_mem_crate = "guest-mem" in relative_path or relative_path.startswith("crates/carrick-guest-mem")
+
     def add(index: int, category: str, detail: str) -> None:
         if production[index]:
             findings.add(Finding(category, relative_path, tokens[index].line, detail))
@@ -268,7 +270,8 @@ def scan_source(source: str, relative_path: str) -> list[Finding]:
                     )
                     if function is not None:
                         signature_end = function_signature_end(tokens, function)
-                        if "GuestMemory" in [item.text for item in tokens[function:signature_end]]:
+                        sig_tokens = [item.text for item in tokens[function:signature_end]]
+                        if "GuestMemory" in sig_tokens or "CurrentMmMemory" in sig_tokens:
                             add(index, "foreign-current-memory", "OtherGuest arm remains inside current GuestMemory dispatch")
 
         if token.text == "fn" and index > 0 and tokens[index - 1].text == "pub":
@@ -284,17 +287,30 @@ def scan_source(source: str, relative_path: str) -> list[Finding]:
                 if "ForeignMmAccess" in signature or relative_path.endswith("kernel/foreign_mm.rs"):
                     add(index + 1, "public-mm-token-construction", "ForeignMmAccess::for_task is public")
 
-        if token.text == "fn":
-            end = function_signature_end(tokens, index)
-            signature = [item.text for item in tokens[index:end]]
-            if "GuestMemory" in signature and "CurrentMmMemory" not in signature and "<" in signature:
-                add(index, "untyped-current-bound", "GuestMemory generic lacks CurrentMmMemory")
+        if not is_guest_mem_crate:
+            if token.text == "fn":
+                end = function_signature_end(tokens, index)
+                signature = [item.text for item in tokens[index:end]]
+                if "GuestMemory" in signature and "CurrentMmMemory" not in signature:
+                    add(index, "untyped-current-bound", "GuestMemory generic lacks CurrentMmMemory")
 
-        if token.text in {"struct", "enum", "trait", "type", "impl"}:
-            end = function_signature_end(tokens, index)
-            header = [item.text for item in tokens[index:end]]
-            if "GuestMemory" in header and "CurrentMmMemory" not in header and "<" in header:
-                add(index, "untyped-current-bound", "GuestMemory generic lacks CurrentMmMemory")
+            if token.text in {"struct", "enum", "trait", "type"}:
+                end = function_signature_end(tokens, index)
+                header = [item.text for item in tokens[index:end]]
+                if "GuestMemory" in header and "CurrentMmMemory" not in header and "<" in header:
+                    add(index, "untyped-current-bound", "GuestMemory generic lacks CurrentMmMemory")
+
+            if token.text == "impl":
+                end = function_signature_end(tokens, index)
+                header = [item.text for item in tokens[index:end]]
+                if "GuestMemory" in header and "CurrentMmMemory" not in header:
+                    if "for" in header:
+                        for_idx = header.index("for")
+                        trait_part = header[1:for_idx]
+                        if "<" in trait_part or trait_part not in (["GuestMemory"], ["carrick_guest_mem", "::", "GuestMemory"]):
+                            add(index, "untyped-current-bound", "GuestMemory generic lacks CurrentMmMemory")
+                    elif "<" in header:
+                        add(index, "untyped-current-bound", "GuestMemory generic lacks CurrentMmMemory")
 
         if sequence_at(tokens, index, [".", "begin_dispatch", "(", ")"]):
             if _has_host_alias_context(tokens, index):
@@ -356,6 +372,10 @@ def self_test() -> None:
             "foreign-current-memory",
             "match target { MmRelation::OtherGuest => { memory.read_bytes(0, 1); } }",
         ),
+        "foreign-current-mm.rs": (
+            "foreign-current-memory",
+            "fn f<M: CurrentMmMemory>(m: &M) { match target { MmRelation::OtherGuest => { todo!() } } }",
+        ),
         "raw-tuple.rs": (
             "raw-mm-authority",
             "pub fn access(pid: u64, mm: u64, ttbr: u64, va: u64) {}",
@@ -363,6 +383,14 @@ def self_test() -> None:
         "generic-current.rs": (
             "untyped-current-bound",
             "fn dispatch<M: GuestMemory>(memory: &M) {}",
+        ),
+        "impl-param-current.rs": (
+            "untyped-current-bound",
+            "fn dispatch(memory: &impl GuestMemory) {}",
+        ),
+        "dyn-param-current.rs": (
+            "untyped-current-bound",
+            "fn dispatch(memory: &dyn GuestMemory) {}",
         ),
         "type-generic-current.rs": (
             "untyped-current-bound",
@@ -407,6 +435,8 @@ def self_test() -> None:
         "current-relation.rs": "match target { MmRelation::Current => memory.read_bytes(0, 1) }",
         "foreign-facade.rs": "fn f(access: ForeignMmAccess) { access.read_foreign(0, 1); }",
         "permitted-host-alias.rs": "fn f(t: &HostAliasTransactions, permit: &HostAliasPermit) { t.begin_dispatch(&permit); }",
+        "guest-mem-guard.rs": "pub struct HostWriteGuard<'a, M: GuestMemory + ?Sized> { memory: &'a mut M }",
+        "guest-mem-fn.rs": "pub fn zero_range(memory: &mut impl GuestMemory) {}",
     }
 
     with tempfile.TemporaryDirectory(prefix="carrick-mm-authority-") as directory:
