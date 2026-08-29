@@ -207,3 +207,16 @@ RED and review-pending commits remain on `codex/fd-description-seam`; no push.
   controlled Docker-oracle measurements. Old branches/worktrees are retained
   as non-integrable evidence so their commits cannot be mistaken for clean-room
   candidates.
+- Task 8 clean-room read slice: native-arm64 Docker receipt `c65ad4234`
+  established intra-iovec 4096-byte prefix behavior and zero-transfer/error
+  ordering without Linux kernel source. Codex-owned RED commit `ca7ab5b5d`
+  distinguishes caller bytes `SELF` from exact foreign bytes `PEER` and records
+  the oracle ordering. Focused pre-fix result is 4 green / 2 RED: foreign read
+  returns EFAULT instead of four target bytes, and zero-local input imports the
+  invalid remote vector instead of returning zero. Antigravity worker
+  `process-vm-read-cleanroom` was dispatched from that exact commit in isolated
+  worktree `.worktrees/agy-process-vm-read-cleanroom`, run id
+  `mm-authority-cleanroom-20260829-task8-read`, conversation
+  `7af91b24-43aa-483b-9ecf-e60854fdcabf`. Scope is borrowed exact execution
+  authority, ordering, and foreign reads only; writes, permissions expansion,
+  ptrace, and proc-mem are excluded.
