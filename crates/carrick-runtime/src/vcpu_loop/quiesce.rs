@@ -1455,7 +1455,7 @@ where
 #[cfg(test)]
 mod pt_pause_tests {
     use super::*;
-    use carrick_hal::{GenericVcpuRegistry, VcpuKickDyn, VcpuRegistry};
+    use carrick_hal::{GenericVcpuRegistry, VcpuKickDyn, VcpuLeaseDrainPoll, VcpuRegistry};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct NoopKick;
@@ -1487,6 +1487,25 @@ mod pt_pause_tests {
             registry.subscribe_register(tid, Box::new(NoopKick), flag, Arc::new(|| {})),
             carrick_hal::VcpuRegistrationEnrollment::Registered
         ));
+    }
+
+    #[test]
+    fn waiting_vcpu_tid_maps_only_complete_to_zero() {
+        assert_eq!(waiting_vcpu_tid(VcpuLeaseDrainPoll::Complete), 0);
+        assert_eq!(
+            waiting_vcpu_tid(VcpuLeaseDrainPoll::Waiting(ThreadId::synthetic_for_tests(
+                27
+            ),)),
+            27,
+        );
+    }
+
+    #[test]
+    fn pt_pause_probe_uses_identity_mapper_not_scalar_count() {
+        let source = include_str!("quiesce.rs");
+        let pause = source.split("fn acquire_pt_pause").nth(1).unwrap();
+        assert!(pause.contains("waiting_vcpu_tid(kicker.poll_lease_drain(tid))"));
+        assert!(!pause.contains("kicker.count()"));
     }
 
     #[test]
