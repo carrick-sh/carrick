@@ -11,7 +11,19 @@ mod overlay_dispatch_tests {
     //! Keep these tests minimal — there's no need to exercise every
     //! flag combination here, just the four scenarios called out in the
     //! task spec.
-    use super::*;
+use super::*;
+
+#[test]
+fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
+    for number in 0..=512 {
+        assert_eq!(
+            syscall_requires_mm_mutation(number, SyscallArgs::from([0; 6])),
+            resolve_mutation_handler::<LinearMemory>(number).is_some(),
+            "mutation classifier drift for syscall {number}"
+        );
+    }
+    assert_eq!(MM_MUTATION_SYSCALLS.len(), 17);
+}
     use crate::compat::CompatReporter;
     use crate::rootfs::LayerSource;
     use tar::{Builder, EntryType, Header};
@@ -825,7 +837,7 @@ mod overlay_dispatch_tests {
             dispatcher.host_alias_transactions()
                 .next_id
                 .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
-            let guard = dispatcher.begin_host_alias_dispatch();
+            let guard = dispatcher.begin_host_alias_dispatch_for_test();
             let _ = guard.publish(HostAliasCommit::mmap(mem::HostAliasMmapCommit {
                 start: crate::memory::LINUX_HIGH_VA_THRESHOLD,
                 len: LINUX_PAGE_SIZE,
@@ -4836,7 +4848,7 @@ mod container_policy_dispatch_tests {
                         let acquired_tx = acquired_tx.clone();
                         peer = Some(std::thread::spawn(move || {
                             attempted_tx.send(()).unwrap();
-                            let _vma = peer_dispatcher.begin_vma_dispatch();
+                            let _vma = peer_dispatcher.begin_vma_dispatch_for_test();
                             acquired_tx
                                 .send(peer_complete.load(std::sync::atomic::Ordering::Acquire))
                                 .unwrap();
@@ -5066,7 +5078,7 @@ mod container_policy_dispatch_tests {
         let heap_base = dispatcher.mem().lock().layout.heap_base;
         let initial_revision = dispatcher.mem().vma_revision();
         {
-            let _vma = dispatcher.begin_vma_dispatch();
+            let _vma = dispatcher.begin_vma_dispatch_for_test();
             let authority = dispatcher.mem();
             let mut state = authority.lock();
             mem::update_semantic_heap_pages(&mut state, heap_base, heap_base + 0x3000);
@@ -5093,7 +5105,7 @@ mod container_policy_dispatch_tests {
         );
 
         {
-            let _vma = dispatcher.begin_vma_dispatch();
+            let _vma = dispatcher.begin_vma_dispatch_for_test();
             let authority = dispatcher.mem();
             let mut state = authority.lock();
             mem::update_semantic_heap_pages(

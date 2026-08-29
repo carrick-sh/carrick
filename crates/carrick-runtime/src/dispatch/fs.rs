@@ -70,7 +70,6 @@ syscall_table! {
     carrick_abi::CARRICK_PRIVATE_X86_FSTAT => x86_fstat,
     carrick_abi::CARRICK_PRIVATE_X86_LSTAT => x86_lstat,
     carrick_abi::CARRICK_PRIVATE_X86_NEWFSTATAT => x86_newfstatat,
-    25 => fcntl,
     26 => inotify_init1,
     27 => inotify_add_watch,
     28 => inotify_rm_watch,
@@ -153,6 +152,11 @@ syscall_table! {
     44 => sys_fstatfs,
     45 => sys_truncate,
     77 => tee,
+}
+
+mutation_syscall_table! {
+    pub(crate) fn dispatch_fs_mutation;
+    25 => fcntl,
 }
 
 /// Canonical (AArch64) numbers of the syscalls that STRUCTURALLY mutate the path
@@ -433,9 +437,12 @@ fn prepare_readv_targets(
 ///   l_len:i64@16, l_pid:i32@24. l_type: RDLCK=0, WRLCK=1, UNLCK=2.
 /// macOS flock (`libc::flock`): l_start:i64, l_len:i64, l_pid:i32, l_type:i16,
 ///   l_whence:i16. l_type: RDLCK=1, UNLCK=2, WRLCK=3. cmd: GETLK=7/SETLK=8/SETLKW=9.
+#[allow(clippy::too_many_arguments)]
 fn forward_record_lock<M: CurrentMmMemory>(
     this: &SyscallDispatcher,
-    cx: &mut SyscallCtx<'_, M>,
+    kernel: &crate::kernel::KernelContext,
+    memory: &mut M,
+    tid: crate::thread::ThreadId,
     host_fd: i32,
     desc_ptr: usize,
     linux_cmd: u64,
@@ -450,7 +457,7 @@ fn forward_record_lock<M: CurrentMmMemory>(
         LINUX_F_OFD_GETLK | LINUX_F_OFD_SETLK | LINUX_F_OFD_SETLKW
     );
 
-    let flock: LinuxFlock64 = match cx.memory.read_struct(arg) {
+    let flock: LinuxFlock64 = match memory.read_struct(arg) {
         Ok(f) => f,
         Err(_) => return DispatchOutcome::errno(LINUX_EFAULT),
     };
@@ -498,7 +505,7 @@ fn forward_record_lock<M: CurrentMmMemory>(
         let owner = if is_ofd {
             LogicalRecordLockOwner::Ofd(desc_ptr)
         } else {
-            LogicalRecordLockOwner::from(cx.kernel.task().key())
+            LogicalRecordLockOwner::from(kernel.task().key())
         };
         if l_type_linux == LINUX_F_UNLCK as i16 {
             if matches!(linux_cmd, LINUX_F_GETLK | LINUX_F_OFD_GETLK) {
@@ -515,7 +522,7 @@ fn forward_record_lock<M: CurrentMmMemory>(
         };
         if matches!(linux_cmd, LINUX_F_GETLK | LINUX_F_OFD_GETLK) {
             let conflict = this.fs.classic_record_locks.conflict(&request);
-            return write_logical_record_lock_conflict(&mut *cx.memory, arg, conflict, is_ofd);
+            return write_logical_record_lock_conflict(memory, arg, conflict, is_ofd);
         }
         match this.fs.classic_record_locks.try_set(request.clone()) {
             Ok(()) => DispatchOutcome::Returned { value: 0 },
@@ -527,7 +534,7 @@ fn forward_record_lock<M: CurrentMmMemory>(
                 let wait = LogicalRecordLockWait::new(
                     Arc::clone(&this.fs.classic_record_locks),
                     request,
-                    cx.tid(),
+                    tid,
                 );
                 DispatchOutcome::BlockingRecordLock(BlockingRecordLock::logical(wait))
             }
@@ -3994,8 +4001,6 @@ impl SyscallDispatcher {
         // `/proc` and other synthetic mounts render address-space state. Hold
         // alias exclusion across the complete snapshot so it cannot describe
         // stale VMA metadata while a host replacement is installing.
-        let _host_alias_dispatch = self.begin_host_alias_dispatch();
-
         // Build the OpenContext only after a mount claims the path. Rootfs and
         // overlay fallthrough opens are the hot path and do not need proc, fd,
         // signal, or memory snapshots for VFS mounts.
@@ -7707,7 +7712,7 @@ impl SyscallDispatcher {
 
         }
 
-        fn fcntl(this, cx, fd: Fd, cmd: u64, arg: u64) {
+        mm_mutation fn fcntl(this, cx, fd: Fd, cmd: u64, arg: u64) {
 
             let fd: Fd = fd;
             let command = cmd;
@@ -8089,7 +8094,17 @@ impl SyscallDispatcher {
                         .map_or(0, |of| Arc::as_ptr(&of.description) as usize);
                     match this.host_file_fd_for_flush(fd.0) {
                         Ok(Some(host_fd)) => {
-                            forward_record_lock(this, cx, host_fd, desc_ptr, command, arg)
+                            let tid = cx.tid();
+                            forward_record_lock(
+                                this,
+                                cx.kernel,
+                                &mut *cx.memory,
+                                tid,
+                                host_fd,
+                                desc_ptr,
+                                command,
+                                arg,
+                            )
                         }
                         // Not host-backed → preserve the single-tenant no-op,
                         // but still do the kernel's front-door flock validation
@@ -8110,7 +8125,17 @@ impl SyscallDispatcher {
                         .map_or(0, |of| Arc::as_ptr(&of.description) as usize);
                     match this.host_file_fd_for_flush(fd.0) {
                         Ok(Some(host_fd)) => {
-                            forward_record_lock(this, cx, host_fd, desc_ptr, command, arg)
+                            let tid = cx.tid();
+                            forward_record_lock(
+                                this,
+                                cx.kernel,
+                                &mut *cx.memory,
+                                tid,
+                                host_fd,
+                                desc_ptr,
+                                command,
+                                arg,
+                            )
                         }
                         // Not host-backed → "no lock present": leave the
                         // caller's struct flock untouched (l_type=F_UNLCK is
@@ -8134,7 +8159,17 @@ impl SyscallDispatcher {
                         .map_or(0, |of| Arc::as_ptr(&of.description) as usize);
                     match this.host_file_fd_for_flush(fd.0) {
                         Ok(Some(host_fd)) => {
-                            forward_record_lock(this, cx, host_fd, desc_ptr, command, arg)
+                            let tid = cx.tid();
+                            forward_record_lock(
+                                this,
+                                cx.kernel,
+                                &mut *cx.memory,
+                                tid,
+                                host_fd,
+                                desc_ptr,
+                                command,
+                                arg,
+                            )
                         }
                         Ok(None) => match validate_flock_arg(&*cx.memory, arg) {
                             Ok(()) => DispatchOutcome::Returned { value: 0 },
@@ -8230,7 +8265,10 @@ impl SyscallDispatcher {
                     // publication, so a sibling cannot race between the seal
                     // check and the new seal becoming visible. Acquire it before
                     // any subsystem locks so we never wait while holding them.
-                    let _host_alias_dispatch = this.begin_host_alias_dispatch();
+                    let _host_alias_dispatch = {
+                        let permit = cx.mm_mutation.host_alias_permit();
+                        this.begin_host_alias_dispatch(&permit)
+                    };
                     let Some(open_file) = this.open_file(fd.0) else {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     };

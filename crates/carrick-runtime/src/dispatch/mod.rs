@@ -637,12 +637,26 @@ use serde::Serialize;
 use thiserror::Error;
 use zerocopy::{FromBytes, IntoBytes};
 
-macro_rules! define_syscall {
-    ( $(
-        $(#[$meta:meta])*
-        fn $name:ident ( $this:ident, $cx:ident $(, $arg:ident : $argty:ty )* $(,)? ) $body:block
-    )* ) => {
-        $(
+macro_rules! define_syscall_one {
+    (mm_mutation $(#[$meta:meta])* fn $name:ident ( $this:ident, $cx:ident $(, $arg:ident : $argty:ty )* $(,)? ) $body:block) => {
+            $(#[$meta])*
+            #[allow(unused_variables)]
+            pub(super) fn $name<M: CurrentMmMemory>(
+                &self,
+                ctx: &mut MutationSyscallCtx<M>,
+            ) -> Result<DispatchOutcome, DispatchError> {
+                let $this = self;
+                let $cx = ctx;
+                let mut __arg_index = 0usize;
+                $(
+                    let $arg: $argty = $cx.typed_arg(__arg_index);
+                    __arg_index += 1;
+                )*
+                let _ = __arg_index;
+                $body
+            }
+    };
+    ($(#[$meta:meta])* fn $name:ident ( $this:ident, $cx:ident $(, $arg:ident : $argty:ty )* $(,)? ) $body:block) => {
             $(#[$meta])*
             #[allow(unused_variables)]
             pub(super) fn $name<M: CurrentMmMemory>(
@@ -661,7 +675,18 @@ macro_rules! define_syscall {
                 let _ = __arg_index;
                 $body
             }
-        )*
+    };
+}
+
+macro_rules! define_syscall {
+    () => {};
+    ($(#[$meta:meta])* mm_mutation fn $name:ident ( $this:ident, $cx:ident $(, $arg:ident : $argty:ty )* $(,)? ) $body:block $($rest:tt)*) => {
+        define_syscall_one! { mm_mutation $(#[$meta])* fn $name($this, $cx $(, $arg: $argty)*) $body }
+        define_syscall! { $($rest)* }
+    };
+    ($(#[$meta:meta])* fn $name:ident ( $this:ident, $cx:ident $(, $arg:ident : $argty:ty )* $(,)? ) $body:block $($rest:tt)*) => {
+        define_syscall_one! { $(#[$meta])* fn $name($this, $cx $(, $arg: $argty)*) $body }
+        define_syscall! { $($rest)* }
     };
 }
 
@@ -680,6 +705,19 @@ macro_rules! syscall_table {
         // not-yet-populated module table, so allow it.
         #[allow(unreachable_code)]
         $vis fn $name<M: CurrentMmMemory>(number: u64) -> Option<SyscallHandler<M>> {
+            Some(match number {
+                $( $num => SyscallDispatcher::$handler, )*
+                _ => return None,
+            })
+        }
+    };
+}
+
+macro_rules! mutation_syscall_table {
+    ( $(#[$meta:meta])* $vis:vis fn $name:ident ; $( $num:pat => $handler:ident ),* $(,)? ) => {
+        $(#[$meta])*
+        #[allow(unreachable_code)]
+        $vis fn $name<M: CurrentMmMemory>(number: u64) -> Option<MutationSyscallHandler<M>> {
             Some(match number {
                 $( $num => SyscallDispatcher::$handler, )*
                 _ => return None,
@@ -725,7 +763,7 @@ pub(crate) mod resources;
 #[macro_use]
 mod signal;
 mod bpf;
-pub(crate) mod lock_order;
+pub mod mm_mutation;
 mod mount_api;
 mod mqueue;
 mod sysv;
@@ -1071,6 +1109,40 @@ pub struct SyscallCtx<'a, M: CurrentMmMemory> {
     pub thread: Option<ThreadCtx<'a>>,
 }
 
+/// Context available only after the outer run loop has established structural
+/// page-table mutation authority for this exact syscall and MM.
+pub struct MutationSyscallCtx<'a, 'mutation, 'authority, M: CurrentMmMemory> {
+    pub kernel: &'a crate::kernel::KernelContext,
+    pub request: SyscallRequest,
+    pub memory: &'a mut M,
+    pub reporter: &'a CompatReporter,
+    pub thread: Option<ThreadCtx<'a>>,
+    pub(crate) mm_mutation: &'mutation mut mm_mutation::MmMutationGuard<'authority>,
+}
+
+impl<M: CurrentMmMemory> MutationSyscallCtx<'_, '_, '_, M> {
+    #[inline]
+    pub fn number(&self) -> u64 {
+        self.request.number.raw()
+    }
+
+    #[inline]
+    pub fn raw_args(&self) -> SyscallArgs {
+        self.request.args
+    }
+
+    #[inline]
+    pub fn guest_abi(&self) -> LinuxGuestAbi {
+        self.request.guest_abi
+    }
+
+    pub fn tid(&self) -> crate::thread::ThreadId {
+        self.thread
+            .map(|thread| thread.tid)
+            .unwrap_or_else(crate::thread::ThreadId::main_from_host_pid)
+    }
+}
+
 impl<M: CurrentMmMemory> SyscallCtx<'_, M> {
     #[inline]
     pub fn number(&self) -> u64 {
@@ -1394,6 +1466,7 @@ struct HostAliasTransactionId(u64);
 pub struct HostAliasTransaction {
     authority: Arc<DispatchMmAuthority>,
     transactions: Arc<HostAliasTransactions>,
+    structural: Option<mm_mutation::HostAliasCoordinatorGuard>,
     id: HostAliasTransactionId,
     armed: bool,
 }
@@ -1425,7 +1498,13 @@ impl Serialize for HostAliasTransaction {
 }
 
 impl HostAliasTransaction {
-    pub(crate) fn claim(mut self) -> Option<HostAliasInstallGuard> {
+    pub(crate) fn claim(
+        mut self,
+        permit: &mm_mutation::HostAliasPermit<'_>,
+    ) -> Option<HostAliasInstallGuard> {
+        if !permit.authorizes(&self.authority.mutation_coordinator) {
+            return None;
+        }
         let mut phase = self.transactions.phase.lock();
         let HostAliasPhase::Pending { id, commit } = &mut *phase else {
             return None;
@@ -1442,9 +1521,16 @@ impl HostAliasTransaction {
         Some(HostAliasInstallGuard {
             authority: Arc::clone(&self.authority),
             transactions: Arc::clone(&self.transactions),
+            _structural: self.structural.take(),
             id: self.id,
             armed: true,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn claim_for_test(self) -> Option<HostAliasInstallGuard> {
+        let coordinator = Arc::clone(&self.authority.mutation_coordinator);
+        mm_mutation::test_support::with_permit(coordinator, |permit| self.claim(permit))
     }
 }
 
@@ -1459,6 +1545,7 @@ impl Drop for HostAliasTransaction {
 pub(crate) struct HostAliasInstallGuard {
     authority: Arc<DispatchMmAuthority>,
     transactions: Arc<HostAliasTransactions>,
+    _structural: Option<mm_mutation::HostAliasCoordinatorGuard>,
     id: HostAliasTransactionId,
     armed: bool,
 }
@@ -2214,8 +2301,6 @@ struct HostAliasTransactions {
     phase: parking_lot::Mutex<HostAliasPhase>,
     idle: parking_lot::Condvar,
     next_id: std::sync::atomic::AtomicU64,
-    #[cfg(test)]
-    waiting_dispatchers: std::sync::atomic::AtomicUsize,
 }
 
 impl HostAliasTransactions {
@@ -2224,70 +2309,27 @@ impl HostAliasTransactions {
             phase: parking_lot::Mutex::new(HostAliasPhase::Idle),
             idle: parking_lot::Condvar::new(),
             next_id: std::sync::atomic::AtomicU64::new(1),
-            #[cfg(test)]
-            waiting_dispatchers: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
-    fn begin_dispatch(self: &Arc<Self>) -> HostAliasDispatchGuard {
+    fn begin_dispatch(
+        self: &Arc<Self>,
+        permit: &mm_mutation::HostAliasPermit<'_>,
+        coordinator: &Arc<mm_mutation::MmMutationCoordinator>,
+    ) -> HostAliasDispatchGuard {
+        let structural = coordinator.begin_alias(permit);
         let mut phase = self.phase.lock();
-        #[cfg(test)]
-        let registered_waiter = if matches!(*phase, HostAliasPhase::Idle) {
-            false
-        } else {
-            self.waiting_dispatchers
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
-            true
-        };
         while !matches!(*phase, HostAliasPhase::Idle) {
             self.idle.wait(&mut phase);
         }
-        #[cfg(test)]
-        if registered_waiter {
-            self.waiting_dispatchers
-                .fetch_sub(1, std::sync::atomic::Ordering::Release);
-        }
         *phase = HostAliasPhase::Dispatching;
         HostAliasDispatchGuard {
+            structural: Some(structural),
             authority: None,
             transactions: Arc::clone(self),
             active: true,
             vma_revision: None,
         }
-    }
-
-    fn begin_dispatch_until(
-        self: &Arc<Self>,
-        deadline: std::time::Instant,
-    ) -> Option<HostAliasDispatchGuard> {
-        let mut phase = self.phase.lock();
-        while !matches!(*phase, HostAliasPhase::Idle) {
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                return None;
-            }
-            if self
-                .idle
-                .wait_for(&mut phase, deadline.saturating_duration_since(now))
-                .timed_out()
-                && !matches!(*phase, HostAliasPhase::Idle)
-            {
-                return None;
-            }
-        }
-        *phase = HostAliasPhase::Dispatching;
-        Some(HostAliasDispatchGuard {
-            authority: None,
-            transactions: Arc::clone(self),
-            active: true,
-            vma_revision: None,
-        })
-    }
-
-    #[cfg(test)]
-    fn waiting_dispatchers(&self) -> usize {
-        self.waiting_dispatchers
-            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn abort_matching(&self, id: HostAliasTransactionId) {
@@ -2324,6 +2366,7 @@ impl HostAliasTransactions {
 pub(crate) struct DispatchMmAuthority {
     mem: Arc<mem::MemAuthority>,
     host_alias_transactions: Arc<HostAliasTransactions>,
+    mutation_coordinator: Arc<mm_mutation::MmMutationCoordinator>,
     /// The `guest_realtime_epoch()` under which THIS MM's vvar
     /// `VVAR_OFF_REALTIME_OFF_NS` word was last stamped by the dispatcher
     /// (`SyscallDispatcher::sync_vvar_realtime_offset`). The vvar page is per
@@ -2346,6 +2389,7 @@ impl DispatchMmAuthority {
         Self {
             mem: Arc::new(mem::MemAuthority::new(mem::MemState::new())),
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
+            mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new()),
             vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
@@ -2354,6 +2398,7 @@ impl DispatchMmAuthority {
         Self {
             mem: self.mem.fork_private(),
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
+            mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new()),
             vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
@@ -2373,6 +2418,7 @@ impl DispatchMmAuthority {
             Self {
                 mem: Arc::new(forked_mem),
                 host_alias_transactions: Arc::new(HostAliasTransactions::new()),
+                mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new()),
                 // Never stamped: the child inherits the parent's vvar content
                 // through the COW split, and re-stamps on its next syscall
                 // only once a `clock_settime` has moved the global epoch.
@@ -2415,6 +2461,7 @@ impl DispatchMmAuthority {
                 revision,
             )),
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
+            mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new()),
             vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
@@ -2478,15 +2525,10 @@ impl DispatchMmBinding {
     }
 
     fn stage_private_exec(self: &Arc<Self>) -> PreparedDispatchMmExec {
-        // Hold the dispatcher selection stable while joining that authority's
-        // alias exclusion, then copy the exact quiescent generation. Exec
-        // promotion takes the same binding lock exclusively.
-        let dispatch = self.begin_dispatch(false);
-        let current = Arc::clone(dispatch.authority.as_ref().unwrap_or_else(|| {
-            tracing::error!("exec staging guard lacks MM authority");
-            std::process::abort();
-        }));
-        let _dispatch = dispatch;
+        // The replacement stays private until promotion. Snapshot the current
+        // authority; the exec transaction validates its source revision before
+        // publication, so this read-only preparation is not host-alias work.
+        let current = self.current.load_full();
         let staged = Arc::new(current.fork_private());
         let mut slot = self.staged_exec.lock();
         if slot.is_some() {
@@ -2502,12 +2544,16 @@ impl DispatchMmBinding {
         }
     }
 
-    fn begin_dispatch(&self, marks_vma: bool) -> HostAliasDispatchGuard {
+    fn begin_dispatch(
+        &self,
+        permit: &mm_mutation::HostAliasPermit<'_>,
+        marks_vma: bool,
+    ) -> HostAliasDispatchGuard {
         loop {
             let authority = self.current.load_full();
             let guard = authority
                 .host_alias_transactions
-                .begin_dispatch()
+                .begin_dispatch(permit, &authority.mutation_coordinator)
                 .with_authority(Arc::clone(&authority));
             if Arc::ptr_eq(&self.current.load_full(), &authority) {
                 return if marks_vma {
@@ -2520,27 +2566,6 @@ impl DispatchMmBinding {
             // the stale guard and retrying prevents an old transaction from
             // ever pairing with the new authority's memory.
             drop(guard);
-        }
-    }
-
-    #[cfg(all(
-        any(target_os = "freebsd", target_os = "netbsd"),
-        target_arch = "x86_64"
-    ))]
-    fn begin_dispatch_until(&self, deadline: std::time::Instant) -> Option<HostAliasDispatchGuard> {
-        loop {
-            let authority = self.current.load_full();
-            let guard = authority
-                .host_alias_transactions
-                .begin_dispatch_until(deadline)?
-                .with_authority(Arc::clone(&authority));
-            if Arc::ptr_eq(&self.current.load_full(), &authority) {
-                return Some(guard);
-            }
-            drop(guard);
-            if std::time::Instant::now() >= deadline {
-                return None;
-            }
         }
     }
 }
@@ -2609,9 +2634,9 @@ impl crate::kernel::VmaSnapshotSource for DispatchMmAuthority {
         &self,
         deadline: std::time::Instant,
     ) -> Result<crate::kernel::OwnedVmaSnapshot, crate::kernel::SnapshotError> {
-        let _dispatch = self
-            .host_alias_transactions
-            .begin_dispatch_until(deadline)
+        let _snapshot = self
+            .mutation_coordinator
+            .begin_snapshot_until(deadline)
             .ok_or_else(|| {
                 if std::time::Instant::now() >= deadline {
                     crate::kernel::SnapshotError::TimedOut
@@ -2632,9 +2657,9 @@ impl crate::kernel::VmaSnapshotSource for DispatchMmAuthority {
         deadline: std::time::Instant,
         publish: &mut dyn FnMut() -> Result<(), crate::kernel::SnapshotError>,
     ) -> Result<(), crate::kernel::SnapshotError> {
-        let _dispatch = self
-            .host_alias_transactions
-            .begin_dispatch_until(deadline)
+        let _snapshot = self
+            .mutation_coordinator
+            .begin_snapshot_until(deadline)
             .ok_or_else(|| {
                 if std::time::Instant::now() >= deadline {
                     crate::kernel::SnapshotError::TimedOut
@@ -2650,6 +2675,7 @@ impl crate::kernel::VmaSnapshotSource for DispatchMmAuthority {
 }
 
 pub(crate) struct HostAliasDispatchGuard {
+    structural: Option<mm_mutation::HostAliasCoordinatorGuard>,
     authority: Option<Arc<DispatchMmAuthority>>,
     transactions: Arc<HostAliasTransactions>,
     active: bool,
@@ -2712,6 +2738,7 @@ impl HostAliasDispatchGuard {
         HostAliasTransaction {
             authority,
             transactions: Arc::clone(&self.transactions),
+            structural: self.structural.take(),
             id,
             armed: true,
         }
@@ -3850,6 +3877,8 @@ mod kernel_context_tests {
 /// (Task A1). See [[plan-concurrent-fanout-lanes]] Part A.
 pub(crate) type SyscallHandler<M> =
     fn(&SyscallDispatcher, &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError>;
+pub(crate) type MutationSyscallHandler<M> =
+    fn(&SyscallDispatcher, &mut MutationSyscallCtx<M>) -> Result<DispatchOutcome, DispatchError>;
 
 /// Resolve a syscall number to its handler by chaining every dispatch module's
 /// own routing table. This is the single source of truth for "is this number
@@ -3872,6 +3901,65 @@ fn resolve_handler<M: CurrentMmMemory>(number: u64) -> Option<SyscallHandler<M>>
         .or_else(|| bpf::dispatch_bpf(number))
         .or_else(|| perf::dispatch_perf(number))
         .or_else(|| mount_api::dispatch_mount_api(number))
+}
+
+fn resolve_mutation_handler<M: CurrentMmMemory>(number: u64) -> Option<MutationSyscallHandler<M>> {
+    fs::dispatch_fs_mutation(number)
+        .or_else(|| mem::dispatch_mem_mutation(number))
+        .or_else(|| sysv::dispatch_sysv_mutation(number))
+}
+
+pub(crate) const MM_MUTATION_SYSCALLS: &[u64] = &[
+    25, 196, 197, 214, 215, 216, 222, 226, 227, 228, 229, 230, 231, 232, 233, 234, 284,
+];
+
+pub(crate) fn syscall_requires_mm_mutation(number: u64, _args: SyscallArgs) -> bool {
+    MM_MUTATION_SYSCALLS.contains(&number)
+}
+
+trait NormalizedDispatchRoute {
+    fn dispatch<M: CurrentMmMemory>(
+        &mut self,
+        dispatcher: &SyscallDispatcher,
+        kernel: &crate::kernel::KernelContext,
+        request: SyscallRequest,
+        memory: &mut M,
+        reporter: &CompatReporter,
+        thread: Option<ThreadCtx>,
+    ) -> Option<Result<DispatchOutcome, DispatchError>>;
+}
+
+struct OrdinaryDispatchRoute;
+impl NormalizedDispatchRoute for OrdinaryDispatchRoute {
+    fn dispatch<M: CurrentMmMemory>(
+        &mut self,
+        dispatcher: &SyscallDispatcher,
+        kernel: &crate::kernel::KernelContext,
+        request: SyscallRequest,
+        memory: &mut M,
+        reporter: &CompatReporter,
+        thread: Option<ThreadCtx>,
+    ) -> Option<Result<DispatchOutcome, DispatchError>> {
+        dispatcher.dispatch_normalized(kernel, request, memory, reporter, thread)
+    }
+}
+
+struct MutationDispatchRoute<'guard, 'authority> {
+    guard: &'guard mut mm_mutation::MmMutationGuard<'authority>,
+}
+impl NormalizedDispatchRoute for MutationDispatchRoute<'_, '_> {
+    fn dispatch<M: CurrentMmMemory>(
+        &mut self,
+        dispatcher: &SyscallDispatcher,
+        kernel: &crate::kernel::KernelContext,
+        request: SyscallRequest,
+        memory: &mut M,
+        reporter: &CompatReporter,
+        thread: Option<ThreadCtx>,
+    ) -> Option<Result<DispatchOutcome, DispatchError>> {
+        dispatcher
+            .dispatch_normalized_mutation(kernel, request, memory, reporter, thread, self.guard)
+    }
 }
 
 /// True once the kernel lane's first process has bound. On that lane a Linux
@@ -4408,11 +4496,10 @@ impl SyscallDispatcher {
             }
             _ => {}
         }
-        let vma_snapshot = self.mm_binding.begin_dispatch(false);
-        let parent_mm = Arc::clone(vma_snapshot.authority.as_ref().unwrap_or_else(|| {
-            tracing::error!("fork guard lacks MM authority");
-            std::process::abort();
-        }));
+        // Fork preparation reads an exact revision and produces a private
+        // projection. Publication validates the revision below; no host alias
+        // is acquired while taking this snapshot.
+        let parent_mm = self.mm_binding.current.load_full();
         let (parent_revision, child_mm, backend_plan) = match mode {
             crate::kernel::CloneObjectMode::Share => {
                 let (revision, ranges) = parent_mm.fork_projection_with_revision()?;
@@ -4423,7 +4510,6 @@ impl SyscallDispatcher {
                 (revision, Arc::new(forked), ranges)
             }
         };
-        drop(vma_snapshot);
         Ok(PreparedDispatchMmFork {
             parent_mm_id,
             child_mm_id,
@@ -4467,12 +4553,8 @@ impl SyscallDispatcher {
         {
             return Err(crate::kernel::SnapshotError::ChangedDuringObservation);
         }
-        let dispatch = self.mm_binding.begin_dispatch(false);
-        let current_authority = dispatch.authority.as_ref().unwrap_or_else(|| {
-            tracing::error!("fork install guard lacks MM authority");
-            std::process::abort();
-        });
-        if !Arc::ptr_eq(current_authority, &prepared_mm.parent_mm) {
+        let current_authority = self.mm_binding.current.load_full();
+        if !Arc::ptr_eq(&current_authority, &prepared_mm.parent_mm) {
             return Err(crate::kernel::SnapshotError::ChangedDuringObservation);
         }
         if current_authority.vma_revision() != prepared_mm.parent_revision {
@@ -4505,7 +4587,6 @@ impl SyscallDispatcher {
             exec_host_fs_fallback: self.exec_host_fs_fallback,
         };
         observe_install(true);
-        drop(dispatch);
         Ok(child_dispatcher)
     }
 
@@ -4621,12 +4702,36 @@ impl SyscallDispatcher {
         Some(outcome)
     }
 
+    fn dispatch_normalized_mutation<'authority>(
+        &self,
+        kernel: &crate::kernel::KernelContext,
+        request: SyscallRequest,
+        memory: &mut impl CurrentMmMemory,
+        reporter: &CompatReporter,
+        thread: Option<ThreadCtx>,
+        mm_mutation: &mut mm_mutation::MmMutationGuard<'authority>,
+    ) -> Option<Result<DispatchOutcome, DispatchError>> {
+        let handler = resolve_mutation_handler(request.number.raw())?;
+        let mut ctx = MutationSyscallCtx {
+            kernel,
+            request,
+            memory,
+            reporter,
+            thread,
+            mm_mutation,
+        };
+        Some(resources::with_captured_resources(kernel, || {
+            handler(self, &mut ctx)
+        }))
+    }
+
     /// Membership test: is `number` claimed by some dispatch module? Mirrors
     /// `dispatch_normalized` exactly (both go through `resolve_handler`), so the
     /// two can never drift. Uses `LinearMemory` as the concrete memory type —
     /// the claimed set is independent of `M`.
     fn dispatch_normalized_known(number: u64) -> bool {
         resolve_handler::<LinearMemory>(number).is_some()
+            || resolve_mutation_handler::<LinearMemory>(number).is_some()
     }
 
     /// Characterization seam for the per-module routing refactor (Task A1).
@@ -4820,16 +4925,51 @@ impl SyscallDispatcher {
         Ok(())
     }
 
-    pub(crate) fn begin_host_alias_dispatch(&self) -> HostAliasDispatchGuard {
-        self.mm_binding.begin_dispatch(false)
+    pub(crate) fn begin_host_alias_dispatch(
+        &self,
+        permit: &mm_mutation::HostAliasPermit<'_>,
+    ) -> HostAliasDispatchGuard {
+        self.mm_binding.begin_dispatch(permit, false)
     }
 
-    pub(crate) fn begin_vma_dispatch(&self) -> HostAliasDispatchGuard {
-        self.mm_binding.begin_dispatch(true)
+    #[allow(dead_code)]
+    pub(crate) fn begin_vma_dispatch(
+        &self,
+        permit: &mm_mutation::HostAliasPermit<'_>,
+    ) -> HostAliasDispatchGuard {
+        self.mm_binding.begin_dispatch(permit, true)
     }
 
-    pub(crate) fn begin_conditional_vma_dispatch(&self) -> HostAliasDispatchGuard {
-        self.mm_binding.begin_dispatch(false)
+    pub(crate) fn begin_conditional_vma_dispatch(
+        &self,
+        permit: &mm_mutation::HostAliasPermit<'_>,
+    ) -> HostAliasDispatchGuard {
+        self.mm_binding.begin_dispatch(permit, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_host_alias_dispatch_for_test(&self) -> HostAliasDispatchGuard {
+        mm_mutation::test_support::with_permit(self.mm_mutation_coordinator(), |permit| {
+            self.begin_host_alias_dispatch(permit)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_vma_dispatch_for_test(&self) -> HostAliasDispatchGuard {
+        mm_mutation::test_support::with_permit(self.mm_mutation_coordinator(), |permit| {
+            self.begin_vma_dispatch(permit)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_conditional_vma_dispatch_for_test(&self) -> HostAliasDispatchGuard {
+        mm_mutation::test_support::with_permit(self.mm_mutation_coordinator(), |permit| {
+            self.begin_conditional_vma_dispatch(permit)
+        })
+    }
+
+    pub(crate) fn mm_mutation_coordinator(&self) -> Arc<mm_mutation::MmMutationCoordinator> {
+        Arc::clone(&self.mm_authority().mutation_coordinator)
     }
 
     pub(crate) fn mark_vma_dispatch(&self, guard: &mut HostAliasDispatchGuard) {
@@ -4838,17 +4978,6 @@ impl SyscallDispatcher {
             std::process::abort();
         });
         guard.mark_vma_revision(authority.mem.revision_publisher());
-    }
-
-    #[cfg(all(
-        any(target_os = "freebsd", target_os = "netbsd"),
-        target_arch = "x86_64"
-    ))]
-    pub(crate) fn begin_host_alias_dispatch_until(
-        &self,
-        deadline: std::time::Instant,
-    ) -> Option<HostAliasDispatchGuard> {
-        self.mm_binding.begin_dispatch_until(deadline)
     }
 
     pub(super) fn owns_host_alias_dispatch(&self, guard: &HostAliasDispatchGuard) -> bool {
@@ -5098,7 +5227,6 @@ impl SyscallDispatcher {
     /// summary. Called once after `HvfTrapEngine::map_address_space`
     /// succeeds.
     pub fn set_address_space_regions(&self, regions: Vec<ProcMapsEntry>) {
-        let _vma_dispatch = self.begin_vma_dispatch();
         let mem_authority = self.mem();
         let mut mem = mem_authority.lock();
         let layout = mem.layout;
@@ -5113,7 +5241,6 @@ impl SyscallDispatcher {
         &self,
         mappings: Vec<crate::core_dump::FileMapping>,
     ) {
-        let _vma_dispatch = self.begin_vma_dispatch();
         let mem_authority = self.mem();
         let mut mem = mem_authority.lock();
         let layout = mem.layout;
@@ -5140,10 +5267,6 @@ impl SyscallDispatcher {
         // the live authority until the existing successful publication seam.
         let prepared = self.mm_binding.stage_private_exec();
         let authority = Arc::clone(&prepared.staged);
-        let _vma_dispatch = authority
-            .host_alias_transactions
-            .begin_dispatch()
-            .with_vma_revision(authority.mem.revision_publisher());
         let mut mem = authority.mem.lock();
         mem.reset_for_execve();
         let layout = mem.layout;
@@ -6177,7 +6300,46 @@ impl SyscallDispatcher {
     ) -> Result<DispatchOutcome, DispatchError> {
         // Tree-wide forward-progress beat for the deadlock watchdog.
         crate::deadlock_watchdog::tick();
-        self.dispatch_inner(kernel, request, memory, reporter, None)
+        if syscall_requires_mm_mutation(request.number.raw(), request.args) {
+            let mut issuer = mm_mutation::single_executor_boundary(
+                self.mm_mutation_coordinator(),
+                kernel.shared().mm().id(),
+            );
+            let mut guard = issuer.guard();
+            self.dispatch_inner(
+                kernel,
+                request,
+                memory,
+                reporter,
+                None,
+                MutationDispatchRoute { guard: &mut guard },
+            )
+        } else {
+            self.dispatch_inner(
+                kernel,
+                request,
+                memory,
+                reporter,
+                None,
+                OrdinaryDispatchRoute,
+            )
+        }
+    }
+
+    /// Run a non-threaded completion under the same sealed authority used by
+    /// the non-threaded dispatch boundary. Requiring `&mut self` keeps this
+    /// unavailable to normalized handlers, which receive only `&self`.
+    pub(crate) fn with_single_executor_mm_mutation<T>(
+        &mut self,
+        kernel: &crate::kernel::KernelContext,
+        run: impl FnOnce(&mut Self, &mut mm_mutation::MmMutationGuard<'_>) -> T,
+    ) -> T {
+        let mut issuer = mm_mutation::single_executor_boundary(
+            self.mm_mutation_coordinator(),
+            kernel.shared().mm().id(),
+        );
+        let mut guard = issuer.guard();
+        run(self, &mut guard)
     }
 
     /// Apply a launch-time container syscall policy (the `carrick run` /
@@ -6348,12 +6510,86 @@ impl SyscallDispatcher {
     pub fn dispatch_threaded(
         &self,
         kernel: &crate::kernel::KernelContext,
+        request: SyscallRequest,
+        memory: &mut impl CurrentMmMemory,
+        reporter: &CompatReporter,
+        tid: crate::thread::ThreadId,
+        registry: &crate::thread::ThreadRegistry,
+        futex: &crate::thread::FutexTable,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        self.dispatch_threaded_with_route(
+            kernel,
+            request,
+            memory,
+            reporter,
+            tid,
+            registry,
+            futex,
+            OrdinaryDispatchRoute,
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_threaded_for_test(
+        &self,
+        kernel: &crate::kernel::KernelContext,
+        request: SyscallRequest,
+        memory: &mut impl CurrentMmMemory,
+        reporter: &CompatReporter,
+        tid: crate::thread::ThreadId,
+        registry: &crate::thread::ThreadRegistry,
+        futex: &crate::thread::FutexTable,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        if syscall_requires_mm_mutation(request.number.raw(), request.args) {
+            let mut issuer = mm_mutation::test_support::single_executor(
+                self.mm_mutation_coordinator(),
+                kernel.shared().mm().id(),
+            );
+            let mut guard = issuer.guard();
+            self.dispatch_threaded_mutation(
+                kernel, request, memory, reporter, tid, registry, futex, &mut guard,
+            )
+        } else {
+            self.dispatch_threaded(kernel, request, memory, reporter, tid, registry, futex)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_threaded_mutation(
+        &self,
+        kernel: &crate::kernel::KernelContext,
+        request: SyscallRequest,
+        memory: &mut impl CurrentMmMemory,
+        reporter: &CompatReporter,
+        tid: crate::thread::ThreadId,
+        registry: &crate::thread::ThreadRegistry,
+        futex: &crate::thread::FutexTable,
+        guard: &mut mm_mutation::MmMutationGuard<'_>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        self.dispatch_threaded_with_route(
+            kernel,
+            request,
+            memory,
+            reporter,
+            tid,
+            registry,
+            futex,
+            MutationDispatchRoute { guard },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_threaded_with_route<R: NormalizedDispatchRoute>(
+        &self,
+        kernel: &crate::kernel::KernelContext,
         mut request: SyscallRequest,
         memory: &mut impl CurrentMmMemory,
         reporter: &CompatReporter,
         tid: crate::thread::ThreadId,
         registry: &crate::thread::ThreadRegistry,
         futex: &crate::thread::FutexTable,
+        mut route: R,
     ) -> Result<DispatchOutcome, DispatchError> {
         let p = crate::observe::ProcessInfo::new(kernel);
 
@@ -6436,12 +6672,14 @@ impl SyscallDispatcher {
             return result;
         }
         resources::with_captured_resources(kernel, || {
-            self.dispatch_threaded_captured(kernel, request, memory, reporter, tid, registry, futex)
+            self.dispatch_threaded_captured(
+                kernel, request, memory, reporter, tid, registry, futex, &mut route,
+            )
         })
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn dispatch_threaded_captured(
+    fn dispatch_threaded_captured<R: NormalizedDispatchRoute>(
         &self,
         kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
@@ -6450,10 +6688,11 @@ impl SyscallDispatcher {
         tid: crate::thread::ThreadId,
         registry: &crate::thread::ThreadRegistry,
         futex: &crate::thread::FutexTable,
+        route: &mut R,
     ) -> Result<DispatchOutcome, DispatchError> {
-        if let Some(result) =
-            self.dispatch_threaded_shared(kernel, request, memory, reporter, tid, registry, futex)
-        {
+        if let Some(result) = self.dispatch_threaded_shared(
+            kernel, request, memory, reporter, tid, registry, futex, route,
+        ) {
             return result;
         }
 
@@ -6490,7 +6729,7 @@ impl SyscallDispatcher {
     /// Shared threaded dispatch path for subsystems already moved behind
     /// interior locks.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn dispatch_threaded_shared(
+    fn dispatch_threaded_shared<R: NormalizedDispatchRoute>(
         &self,
         kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
@@ -6499,6 +6738,7 @@ impl SyscallDispatcher {
         tid: crate::thread::ThreadId,
         registry: &crate::thread::ThreadRegistry,
         futex: &crate::thread::FutexTable,
+        route: &mut R,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
         if request.number.raw() == 64
             && !resources::with_captured_resources(kernel, || {
@@ -6550,7 +6790,7 @@ impl SyscallDispatcher {
             futex,
         });
 
-        let result = self.dispatch_normalized(kernel, request, memory, reporter, thread);
+        let result = route.dispatch(self, kernel, request, memory, reporter, thread);
         let outcome = match result {
             Some(r) => match lower_handler_result(r) {
                 Ok(outcome) => outcome,
@@ -6736,13 +6976,14 @@ impl SyscallDispatcher {
         Some(Ok(outcome))
     }
 
-    fn dispatch_inner(
+    fn dispatch_inner<R: NormalizedDispatchRoute>(
         &mut self,
         kernel: &crate::kernel::KernelContext,
         mut request: SyscallRequest,
         memory: &mut impl CurrentMmMemory,
         reporter: &CompatReporter,
         thread: Option<ThreadCtx>,
+        mut route: R,
     ) -> Result<DispatchOutcome, DispatchError> {
         let syscall = lookup_aarch64(request.number.raw());
         let name = syscall.map_or("unknown", |syscall| syscall.name);
@@ -6886,7 +7127,7 @@ impl SyscallDispatcher {
         // Syscalls migrated to the normalized SyscallCtx handler contract are
         // dispatched here first; the borrow of memory/reporter is scoped to
         // the call, so the legacy match below can still use them for the rest.
-        if let Some(result) = self.dispatch_normalized(kernel, request, memory, reporter, thread) {
+        if let Some(result) = route.dispatch(self, kernel, request, memory, reporter, thread) {
             let outcome = lower_handler_result(result)?;
             // Consumption-based EPOLLET re-arm (see `epoll_rearm_after_io`).
             resources::with_captured_resources(kernel, || {
@@ -8594,10 +8835,6 @@ impl SyscallDispatcher {
         &self,
         context: &crate::kernel::KernelContext,
     ) -> crate::vfs::SyntheticProcContext {
-        // Acquire before signal/proc/sysv/memory locks: callers may need to wait
-        // for an installing alias, and `/proc/*maps` must snapshot one coherent
-        // host+dispatcher address-space generation.
-        let _host_alias_dispatch = self.begin_host_alias_dispatch();
         // /proc/<pid>/status renders hex words; escape the typed sets at the
         // render boundary.
         let (sig_ignored, sig_caught, sig_shdpnd) = self.proc_status_signal_masks(context);

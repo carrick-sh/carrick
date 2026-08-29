@@ -639,7 +639,7 @@ fn threaded_memory_call(
     request: SyscallRequest,
 ) -> DispatchOutcome {
     dispatcher
-        .dispatch_threaded(
+        .dispatch_threaded_for_test(
             &dispatcher.capture_one_task_context().unwrap(),
             request,
             memory,
@@ -667,7 +667,7 @@ where
     F: FnOnce(std::sync::Arc<SyscallDispatcher>) + Send + 'static,
 {
     let dispatcher = std::sync::Arc::new(SyscallDispatcher::new());
-    let guard = dispatcher.begin_host_alias_dispatch();
+    let guard = dispatcher.begin_host_alias_dispatch_for_test();
     let transaction = guard.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
         start: crate::memory::LINUX_HIGH_VA_THRESHOLD,
         len: LINUX_PAGE_SIZE,
@@ -687,7 +687,7 @@ where
         shared_file_alias: None,
     }));
     let install = transaction
-        .claim()
+        .claim_for_test()
         .expect("claim pending host alias install");
     let sibling = std::sync::Arc::clone(&dispatcher);
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
@@ -4852,7 +4852,7 @@ fn vma_projection_preserves_adjacency_and_removes_unmapped_boot_ranges() {
         .expect("adjacent VMA snapshot");
     assert_eq!(before.vmas.len(), 2);
 
-    let vma_dispatch = dispatcher.begin_vma_dispatch();
+    let vma_dispatch = dispatcher.begin_vma_dispatch_for_test();
     dispatcher.remove_mapping_metadata(0x1000, 0x1000);
     drop(vma_dispatch);
     let after = dispatcher
@@ -4884,10 +4884,10 @@ fn mem_authority_revises_once_per_published_vma_transaction() {
     assert_eq!(dispatcher.mem().vma_revision(), initial);
 
     // Failed/no-op mapping paths take exclusion but never arm publication.
-    drop(dispatcher.begin_conditional_vma_dispatch());
+    drop(dispatcher.begin_conditional_vma_dispatch_for_test());
     assert_eq!(dispatcher.mem().vma_revision(), initial);
 
-    let vma_dispatch = dispatcher.begin_vma_dispatch();
+    let vma_dispatch = dispatcher.begin_vma_dispatch_for_test();
     dispatcher.mem().lock().brk_current += LINUX_PAGE_SIZE;
     drop(vma_dispatch);
     assert_eq!(
@@ -4895,7 +4895,7 @@ fn mem_authority_revises_once_per_published_vma_transaction() {
         initial.next().expect("revision")
     );
 
-    let mut conditional = dispatcher.begin_conditional_vma_dispatch();
+    let mut conditional = dispatcher.begin_conditional_vma_dispatch_for_test();
     dispatcher.mark_vma_dispatch(&mut conditional);
     drop(conditional);
     assert_eq!(
@@ -4921,7 +4921,7 @@ fn revision_checked_publication_excludes_concurrent_vma_mutation() {
     let worker = std::thread::spawn(move || {
         worker_barrier.wait();
         attempting_tx.send(()).expect("announce mutation attempt");
-        let _guard = worker_dispatcher.begin_conditional_vma_dispatch();
+        let _guard = worker_dispatcher.begin_conditional_vma_dispatch_for_test();
         worker_acquired.store(true, std::sync::atomic::Ordering::Release);
     });
 
@@ -4935,7 +4935,7 @@ fn revision_checked_publication_excludes_concurrent_vma_mutation() {
                     .recv_timeout(std::time::Duration::from_secs(1))
                     .expect("mutation waiter reached acquisition");
                 let waiter_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-                while dispatcher.host_alias_transactions().waiting_dispatchers() == 0 {
+                while dispatcher.mm_mutation_coordinator().alias_waiters() == 0 {
                     assert!(
                         std::time::Instant::now() < waiter_deadline,
                         "mutation thread never blocked on VMA exclusion"
@@ -4965,11 +4965,11 @@ fn growdown_metadata_is_trimmed_with_mapping_teardown() {
     );
     dispatcher.record_growdown_mapping(start, page * 4);
     let plan = dispatcher
-        .mmap_growdown_fault_plan(start - page)
+        .mmap_growdown_fault_plan_for_test(start - page)
         .expect("grow-down plan");
     dispatcher.commit_mmap_growdown(plan);
 
-    let vma_dispatch = dispatcher.begin_vma_dispatch();
+    let vma_dispatch = dispatcher.begin_vma_dispatch_for_test();
     dispatcher.remove_mapping_metadata(start + page, page);
     drop(vma_dispatch);
     let split = dispatcher
@@ -5002,12 +5002,12 @@ fn growdown_metadata_is_trimmed_with_mapping_teardown() {
         ]
     );
 
-    let vma_dispatch = dispatcher.begin_vma_dispatch();
+    let vma_dispatch = dispatcher.begin_vma_dispatch_for_test();
     dispatcher.remove_mapping_metadata(start - page, page * 2);
     drop(vma_dispatch);
     assert!(
         dispatcher
-            .mmap_growdown_fault_plan(start - page * 2)
+            .mmap_growdown_fault_plan_for_test(start - page * 2)
             .is_none()
     );
     let retired = dispatcher
@@ -5033,7 +5033,7 @@ fn growdown_metadata_is_trimmed_with_mapping_teardown() {
 fn mem_authority_fork_is_independent_after_one_existing_state_clone() {
     let parent = SyscallDispatcher::new();
     let layout = parent.mem().lock().layout;
-    let parent_vma_dispatch = parent.begin_vma_dispatch();
+    let parent_vma_dispatch = parent.begin_vma_dispatch_for_test();
     parent.mem().lock().brk_current = layout.heap_base + LINUX_PAGE_SIZE;
     drop(parent_vma_dispatch);
     let parent_revision = parent.mem().vma_revision();
@@ -5046,7 +5046,7 @@ fn mem_authority_fork_is_independent_after_one_existing_state_clone() {
 
     assert!(!std::sync::Arc::ptr_eq(&parent.mem(), &child.mem()));
     assert_eq!(child.mem().vma_revision(), parent_revision);
-    let child_vma_dispatch = child.begin_vma_dispatch();
+    let child_vma_dispatch = child.begin_vma_dispatch_for_test();
     child.mem().lock().brk_current += LINUX_PAGE_SIZE;
     drop(child_vma_dispatch);
     assert_eq!(
@@ -5068,7 +5068,7 @@ fn mem_authority_snapshot_honors_deadline_contention() {
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
     let worker_barrier = std::sync::Arc::clone(&barrier);
     let worker = std::thread::spawn(move || {
-        let _dispatch = held.begin_vma_dispatch();
+        let _dispatch = held.begin_vma_dispatch_for_test();
         worker_barrier.wait();
         std::thread::sleep(std::time::Duration::from_millis(40));
     });
@@ -6152,7 +6152,7 @@ fn host_alias_inventory_commits_trims_and_fork_clones_exact_ranges() {
     let start = crate::memory::LINUX_HIGH_VA_THRESHOLD;
     let page = LINUX_PAGE_SIZE;
     let len = 3 * page;
-    let guard = parent.begin_host_alias_dispatch();
+    let guard = parent.begin_host_alias_dispatch_for_test();
     let transaction = guard.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
         start,
         len,
@@ -6175,7 +6175,9 @@ fn host_alias_inventory_commits_trims_and_fork_clones_exact_ranges() {
         !parent.range_has_host_alias_backing(start, len),
         "a pending transaction must not predict physical backing"
     );
-    let install = transaction.claim().expect("claim host-alias install");
+    let install = transaction
+        .claim_for_test()
+        .expect("claim host-alias install");
     assert!(
         !parent.range_has_host_alias_backing(start, len),
         "an installing transaction must not publish before backend success"
@@ -6244,7 +6246,7 @@ fn host_alias_abort_preserves_replaced_vma_lock_residency_bus_and_seal_metadata(
     let before = dispatcher.mem().lock().clone();
     assert!(!dispatcher.range_has_host_alias_backing(start, len));
     let vma_source = dispatcher.vma_snapshot_source();
-    let guard = dispatcher.begin_host_alias_dispatch();
+    let guard = dispatcher.begin_host_alias_dispatch_for_test();
     let transaction = guard.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
         start,
         len,
@@ -6284,7 +6286,7 @@ fn host_alias_abort_preserves_replaced_vma_lock_residency_bus_and_seal_metadata(
         &writable_memfd
     ));
     let install = transaction
-        .claim()
+        .claim_for_test()
         .expect("claim pending host alias install");
     drop(install);
 
@@ -6311,7 +6313,7 @@ fn host_alias_abort_preserves_replaced_vma_lock_residency_bus_and_seal_metadata(
 #[test]
 fn pending_host_alias_transaction_drop_aborts_and_notifies_waiters() {
     let dispatcher = std::sync::Arc::new(SyscallDispatcher::new());
-    let guard = dispatcher.begin_host_alias_dispatch();
+    let guard = dispatcher.begin_host_alias_dispatch_for_test();
     let transaction = guard.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
         start: crate::memory::LINUX_HIGH_VA_THRESHOLD,
         len: LINUX_PAGE_SIZE,
@@ -6335,7 +6337,7 @@ fn pending_host_alias_transaction_drop_aborts_and_notifies_waiters() {
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let thread = std::thread::spawn(move || {
         started_tx.send(()).expect("report pending waiter start");
-        let _guard = sibling.begin_host_alias_dispatch();
+        let _guard = sibling.begin_host_alias_dispatch_for_test();
         entered_tx
             .send(())
             .expect("report pending waiter admission");
@@ -6359,7 +6361,7 @@ fn pending_host_alias_transaction_drop_aborts_and_notifies_waiters() {
 #[test]
 fn dropping_unconsumed_host_alias_outcome_closes_fd_and_aborts_transaction() {
     let dispatcher = SyscallDispatcher::new();
-    let guard = dispatcher.begin_host_alias_dispatch();
+    let guard = dispatcher.begin_host_alias_dispatch_for_test();
     let transaction = guard.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
         start: crate::memory::LINUX_HIGH_VA_THRESHOLD,
         len: LINUX_PAGE_SIZE,
@@ -6407,13 +6409,13 @@ fn dropping_unconsumed_host_alias_outcome_closes_fd_and_aborts_transaction() {
     );
     assert_eq!(unsafe { libc::close(pipe[1]) }, 0);
     // Drop of the transaction handle also returned the exclusion to Idle.
-    drop(dispatcher.begin_host_alias_dispatch());
+    drop(dispatcher.begin_host_alias_dispatch_for_test());
 }
 
 #[test]
 fn installing_host_alias_blocks_sibling_mapping_dispatch_until_resolution() {
     let dispatcher = std::sync::Arc::new(SyscallDispatcher::new());
-    let guard = dispatcher.begin_host_alias_dispatch();
+    let guard = dispatcher.begin_host_alias_dispatch_for_test();
     let transaction = guard.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
         start: crate::memory::LINUX_HIGH_VA_THRESHOLD,
         len: LINUX_PAGE_SIZE,
@@ -6433,14 +6435,14 @@ fn installing_host_alias_blocks_sibling_mapping_dispatch_until_resolution() {
         shared_file_alias: None,
     }));
     let install = transaction
-        .claim()
+        .claim_for_test()
         .expect("claim pending host alias install");
     let sibling = std::sync::Arc::clone(&dispatcher);
     let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let thread = std::thread::spawn(move || {
         started_tx.send(()).expect("report install waiter start");
-        let _guard = sibling.begin_host_alias_dispatch();
+        let _guard = sibling.begin_host_alias_dispatch_for_test();
         entered_tx.send(()).expect("report mapping admission");
     });
     started_rx
@@ -6468,7 +6470,7 @@ fn brk_waits_for_host_alias_idle() {
             crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1300));
         let mut memory = LinearMemory::new(LINUX_HEAP_BASE, vec![0; LINUX_PAGE_SIZE as usize]);
         dispatcher
-            .dispatch_threaded(
+            .dispatch_threaded_for_test(
                 &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(SYS_BRK, SyscallArgs([0, 0, 0, 0, 0, 0])),
                 &mut memory,
@@ -6490,7 +6492,7 @@ fn msync_waits_for_host_alias_idle() {
             crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1301));
         let mut memory = LinearMemory::new(LINUX_MMAP_BASE, vec![0; LINUX_PAGE_SIZE as usize]);
         dispatcher
-            .dispatch_threaded(
+            .dispatch_threaded_for_test(
                 &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     SYS_MSYNC,
@@ -6516,7 +6518,7 @@ fn mincore_waits_for_host_alias_idle() {
         let mut memory =
             LinearMemory::new(LINUX_MMAP_BASE, vec![0; (2 * LINUX_PAGE_SIZE) as usize]);
         dispatcher
-            .dispatch_threaded(
+            .dispatch_threaded_for_test(
                 &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     SYS_MINCORE,
@@ -6791,7 +6793,9 @@ fn lazy_high_va_commit_preserves_shared_reservation_provenance() {
         !dispatcher.range_has_host_alias_backing(address, LINUX_PAGE_SIZE),
         "dispatch alone must not predict backend publication"
     );
-    let install = transaction.claim().expect("claim lazy host-alias install");
+    let install = transaction
+        .claim_for_test()
+        .expect("claim lazy host-alias install");
     dispatcher
         .commit_host_alias_install(install)
         .expect("publish successful lazy host-alias install");

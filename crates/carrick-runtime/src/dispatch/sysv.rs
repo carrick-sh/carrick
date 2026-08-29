@@ -46,6 +46,10 @@ syscall_table! {
     193 => semop,
     194 => shmget,
     195 => shmctl,
+}
+
+mutation_syscall_table! {
+    pub(crate) fn dispatch_sysv_mutation;
     196 => shmat,
     197 => shmdt,
 }
@@ -2495,8 +2499,11 @@ impl SyscallDispatcher {
         /// mapping the alias read-only so a guest STORE faults SIGSEGV, and
         /// SHM_RND rounds an unaligned requested address down to a page
         /// boundary. SHM_REMAP remains unsupported.
-        fn shmat(this, cx, shmid: u64, addr: u64, flag: u64) {
-            let host_alias_dispatch = this.begin_host_alias_dispatch();
+        mm_mutation fn shmat(this, cx, shmid: u64, addr: u64, flag: u64) {
+            let host_alias_dispatch = {
+                let permit = cx.mm_mutation.host_alias_permit();
+                this.begin_host_alias_dispatch(&permit)
+            };
             let shmid = shmid as i32;
             let attach_flags = ShmAttachFlags::from_bits_retain(flag);
             let linux_page_size = this.linux_page_size();
@@ -2662,8 +2669,11 @@ impl SyscallDispatcher {
         /// shmdt(addr). Decrement the segment's nattch, drop the addr→shmid
         /// mapping, and tear down the dynamic alias leaves so repeated SysV shm
         /// attach/detach cycles reclaim the backend's per-alias page-table pool.
-        fn shmdt(this, cx, addr: u64) {
-            let mut host_alias_dispatch = this.begin_conditional_vma_dispatch();
+        mm_mutation fn shmdt(this, cx, addr: u64) {
+            let mut host_alias_dispatch = {
+                let permit = cx.mm_mutation.host_alias_permit();
+                this.begin_conditional_vma_dispatch(&permit)
+            };
             let (shmid, len) = {
                 let process = this.sysv_process.lock();
                 let state = this.sysv.state.lock();
@@ -2728,7 +2738,6 @@ impl SyscallDispatcher {
         ///              shm_ctime) in carrick's owned segment bookkeeping so a
         ///              following IPC_STAT reads them back.
         fn shmctl(this, cx, shmid: u64, cmd: u64, buf: u64) {
-            let _host_alias_dispatch = this.begin_host_alias_dispatch();
             let shmid = shmid as i32;
             let creds = this.cred_snapshot();
             match cmd {
@@ -5241,7 +5250,7 @@ mod ipc_set_tests {
             },
         );
         let va = crate::memory::LINUX_HIGH_VA_THRESHOLD;
-        let guard = dispatcher.begin_host_alias_dispatch();
+        let guard = dispatcher.begin_host_alias_dispatch_for_test();
         let transaction = guard.publish(HostAliasCommit::shmat(
             crate::dispatch::mem::HostAliasMmapCommit {
                 start: va,
@@ -5281,7 +5290,7 @@ mod ipc_set_tests {
             assert_eq!((segment.nattch, segment.atime, segment.lpid), (7, 2, 5));
         }
         let install = transaction
-            .claim()
+            .claim_for_test()
             .expect("claim pending host alias install");
         drop(install);
         assert!(!dispatcher.sysv_process.lock().attachments.contains_key(&va));

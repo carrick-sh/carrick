@@ -2336,7 +2336,7 @@ fn f_add_seals_waits_for_alias_dispatch_and_publishes_under_same_exclusion() {
         )
         .expect("install sealable fd");
 
-    let guard = dispatcher.begin_host_alias_dispatch();
+    let guard = dispatcher.begin_host_alias_dispatch_for_test();
     let sibling = std::sync::Arc::clone(&dispatcher);
     let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
     let (outcome_tx, outcome_rx) = std::sync::mpsc::sync_channel(1);

@@ -106,14 +106,10 @@ fn syscall_takes_pre_dispatch_pt_pause(number: u64, arg2: u64, multi_vcpu: bool)
 /// should claim stage-1 EXCLUSIVITY for the dispatch — which it holds either
 /// way, since with no peer executor there is nobody to be exclusive against.
 fn syscall_edits_stage1(number: u64, arg2: u64) -> bool {
-    match number {
-        // munmap, mremap, mmap, mprotect: they edit the stage-1 descriptors.
-        215 | 216 | 222 | 226 => true,
-        // madvise: only MADV_DONTNEED reaches `zero_backing`, the one path that
-        // would otherwise request the pause AFTER the host-alias phase.
-        233 => arg2 == carrick_abi::LINUX_MADV_DONTNEED,
-        _ => false,
-    }
+    crate::dispatch::syscall_requires_mm_mutation(
+        number,
+        crate::compat::SyscallArgs::from([0, 0, arg2, 0, 0, 0]),
+    )
 }
 
 /// Restores the guest-visible `Running` state when a guest-blocking wait ends.
@@ -540,7 +536,7 @@ use macos_helper_stubs::{
 // resolving unchanged.
 // ===================================================================
 mod exec;
-mod quiesce;
+pub(crate) mod quiesce;
 mod signal;
 mod threads;
 
@@ -6302,6 +6298,20 @@ where
                             "capture synchronous-fault signal context: {error}"
                         ))
                     })?;
+                if self.kernel.dispatcher.fault_requires_mm_mutation(si_addr)
+                    && self
+                        .state
+                        .with_mm_mutation_authority(&self.kernel, |mutation| {
+                            signal::resolve_mutating_fault(
+                                &self.kernel.dispatcher,
+                                engine,
+                                si_addr,
+                                mutation,
+                            )
+                        })?
+                {
+                    return Ok(executor::ExecutorExit::Syscall);
+                }
                 if let Some(outcome) = deliver_fault_signal(
                     &self.kernel,
                     &fault_context,
@@ -6339,6 +6349,23 @@ where
                             "capture guest-fault signal context: {error}"
                         ))
                     })?;
+                if self
+                    .kernel
+                    .dispatcher
+                    .fault_requires_mm_mutation(fault_addr)
+                    && self
+                        .state
+                        .with_mm_mutation_authority(&self.kernel, |mutation| {
+                            signal::resolve_mutating_fault(
+                                &self.kernel.dispatcher,
+                                engine,
+                                fault_addr,
+                                mutation,
+                            )
+                        })?
+                {
+                    return Ok(executor::ExecutorExit::Syscall);
+                }
                 if let Some(outcome) = deliver_fault_signal(
                     &self.kernel,
                     &fault_context,
@@ -7672,6 +7699,37 @@ where
         })
     }
 
+    fn with_mm_mutation_authority<T>(
+        &mut self,
+        kernel: &Kernel,
+        run: impl FnOnce(&mut crate::dispatch::mm_mutation::MmMutationGuard<'_>) -> T,
+    ) -> Result<T, RuntimeError> {
+        let context = kernel
+            .dispatcher
+            .capture_kernel_context(self.linux_tid)
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        let coordinator = kernel.dispatcher.mm_mutation_coordinator();
+        let mm = context.shared().mm().id();
+        if kernel.has_peer_guest_executor() {
+            let mut pause = self.pt_pause(&kernel.guest_executors).map_err(|error| {
+                RuntimeError::Configuration(format!(
+                    "fault page-table pause failed before mutation: {error:?}"
+                ))
+            })?;
+            let mut mutation =
+                crate::dispatch::mm_mutation::from_pt_pause(&mut pause, coordinator, mm);
+            Ok(run(&mut mutation))
+        } else {
+            let mut exclusive = quiesce::Stage1Exclusive::claim();
+            let mut mutation = crate::dispatch::mm_mutation::from_stage1_exclusive(
+                &mut exclusive,
+                coordinator,
+                mm,
+            );
+            Ok(run(&mut mutation))
+        }
+    }
+
     fn service_threaded_syscall(
         &mut self,
         kernel: &Kernel,
@@ -7720,9 +7778,9 @@ where
         // different reasons, and the backend page-table manager needs to know
         // that so it can reclaim the spare sub-tables an alias teardown empties
         // (`carrick_hal::stage1_exclusive` documents what leaks when it cannot).
-        let _stage1_exclusive = syscall_edits_stage1(frame.number.raw(), frame.args[2])
+        let mut stage1_exclusive = syscall_edits_stage1(frame.number.raw(), frame.args[2])
             .then(quiesce::Stage1Exclusive::claim);
-        let _pt_pause = if syscall_takes_pre_dispatch_pt_pause(
+        let mut pt_pause = if syscall_takes_pre_dispatch_pt_pause(
             frame.number.raw(),
             frame.args[2],
             kernel.has_peer_guest_executor(),
@@ -7794,15 +7852,59 @@ where
             self.current_syscall_request = Some(request);
             let outcome =
                 dispatch_with_panic_backstop(request.number.raw(), self.this_tid, || {
-                    kernel.dispatcher.dispatch_threaded(
-                        &kernel_context,
-                        request,
-                        engine,
-                        &kernel.reporter,
-                        self.this_tid,
-                        &self.registry,
-                        &self.futex,
-                    )
+                    if crate::dispatch::syscall_requires_mm_mutation(
+                        request.number.raw(),
+                        request.args,
+                    ) {
+                        let coordinator = kernel.dispatcher.mm_mutation_coordinator();
+                        if let Some(authority) = pt_pause.as_mut() {
+                            let mut mutation = crate::dispatch::mm_mutation::from_pt_pause(
+                                authority,
+                                coordinator,
+                                kernel_context.shared().mm().id(),
+                            );
+                            kernel.dispatcher.dispatch_threaded_mutation(
+                                &kernel_context,
+                                request,
+                                engine,
+                                &kernel.reporter,
+                                self.this_tid,
+                                &self.registry,
+                                &self.futex,
+                                &mut mutation,
+                            )
+                        } else {
+                            let authority = stage1_exclusive.as_mut().unwrap_or_else(|| {
+                                tracing::error!("mutation dispatch lacks outer stage-1 authority");
+                                std::process::abort();
+                            });
+                            let mut mutation = crate::dispatch::mm_mutation::from_stage1_exclusive(
+                                authority,
+                                coordinator,
+                                kernel_context.shared().mm().id(),
+                            );
+                            kernel.dispatcher.dispatch_threaded_mutation(
+                                &kernel_context,
+                                request,
+                                engine,
+                                &kernel.reporter,
+                                self.this_tid,
+                                &self.registry,
+                                &self.futex,
+                                &mut mutation,
+                            )
+                        }
+                    } else {
+                        kernel.dispatcher.dispatch_threaded(
+                            &kernel_context,
+                            request,
+                            engine,
+                            &kernel.reporter,
+                            self.this_tid,
+                            &self.registry,
+                            &self.futex,
+                        )
+                    }
                 })?;
             if continuation::is_blocking_dispatch_outcome(&outcome) {
                 // The persistent executor converts this exact owned outcome into
@@ -7845,7 +7947,29 @@ where
                     prot_none,
                 } if kernel.hvpatch_process.is_some() => {
                     let file = file.map(|(fd, offset, prot)| (fd.into_owned_fd(), offset, prot));
-                    let Some(install) = transaction.claim() else {
+                    let coordinator = kernel.dispatcher.mm_mutation_coordinator();
+                    let install = if let Some(authority) = pt_pause.as_mut() {
+                        let mut mutation = crate::dispatch::mm_mutation::from_pt_pause(
+                            authority,
+                            coordinator,
+                            kernel_context.shared().mm().id(),
+                        );
+                        let permit = mutation.host_alias_permit();
+                        transaction.claim(&permit)
+                    } else {
+                        let authority = stage1_exclusive.as_mut().unwrap_or_else(|| {
+                            tracing::error!("host-alias install lacks outer stage-1 authority");
+                            std::process::abort();
+                        });
+                        let mut mutation = crate::dispatch::mm_mutation::from_stage1_exclusive(
+                            authority,
+                            coordinator,
+                            kernel_context.shared().mm().id(),
+                        );
+                        let permit = mutation.host_alias_permit();
+                        transaction.claim(&permit)
+                    };
+                    let Some(install) = install else {
                         drop(file);
                         break 'service Ok(DispatchOutcome::Returned {
                             value: crate::linux_abi::LINUX_ENOMEM.guest_retval(),
@@ -10970,23 +11094,17 @@ mod tests {
     /// `mmap(MAP_SHARED, fd)` until the pool hit `OutOfTables`.
     #[test]
     fn stage1_editors_are_claimed_regardless_of_peers() {
-        let dontneed = carrick_abi::LINUX_MADV_DONTNEED;
-        for editor in [215u64, 216, 222, 226] {
+        for &editor in crate::dispatch::MM_MUTATION_SYSCALLS {
             assert!(
                 syscall_edits_stage1(editor, 0),
                 "{editor} edits stage-1 whether or not a peer exists"
             );
-        }
-        assert!(syscall_edits_stage1(233, dontneed));
-        assert!(!syscall_edits_stage1(233, 0), "only MADV_DONTNEED");
-        assert!(!syscall_edits_stage1(63, 0), "read edits no descriptors");
-        // The pause predicate is the same set, narrowed by the peer population.
-        for editor in [215u64, 216, 222, 226] {
             assert_eq!(
                 syscall_takes_pre_dispatch_pt_pause(editor, 0, true),
                 syscall_edits_stage1(editor, 0)
             );
         }
+        assert!(!syscall_edits_stage1(63, 0), "read edits no descriptors");
     }
 
     /// The pre-dispatch page-table pause exists to keep ONE global lock order
@@ -10996,27 +11114,13 @@ mod tests {
     /// crossed and deadlocked a whole guest at ~0% CPU.
     #[test]
     fn pre_dispatch_pt_pause_covers_madvise_dontneed() {
-        let dontneed = carrick_abi::LINUX_MADV_DONTNEED;
-        for editor in [215u64, 216, 222, 226] {
+        for &editor in crate::dispatch::MM_MUTATION_SYSCALLS {
             assert!(syscall_takes_pre_dispatch_pt_pause(editor, 0, true));
             assert!(
                 !syscall_takes_pre_dispatch_pt_pause(editor, 0, false),
                 "a single-vCPU process has no sibling to pause"
             );
         }
-        assert!(syscall_takes_pre_dispatch_pt_pause(233, dontneed, true));
-        assert!(
-            !syscall_takes_pre_dispatch_pt_pause(233, dontneed, false),
-            "single-vCPU madvise keeps the plain fast path"
-        );
-        for other_advice in [0u64, 1, 2, 3, 8] {
-            assert_ne!(other_advice, dontneed);
-            assert!(
-                !syscall_takes_pre_dispatch_pt_pause(233, other_advice, true),
-                "only MADV_DONTNEED reaches zero_backing"
-            );
-        }
-        assert!(!syscall_takes_pre_dispatch_pt_pause(214, dontneed, true));
         assert!(!syscall_takes_pre_dispatch_pt_pause(63, 0, true));
     }
 
