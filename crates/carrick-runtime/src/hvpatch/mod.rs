@@ -1678,6 +1678,12 @@ mod tests {
         write: false,
         execute: true,
     };
+    const VMA_RX_ACCESS: crate::kernel::VmaAccess = crate::kernel::VmaAccess {
+        readable: true,
+        writable: false,
+        executable: true,
+        kernel_visible: true,
+    };
 
     #[test]
     fn hvpatch_root_bootstrap_identity_is_linux_init() {
@@ -2125,6 +2131,7 @@ mod tests {
             vec![crate::kernel::VmaSummary {
                 start: carrick_guest_mem::GuestVa(0x9000),
                 end: carrick_guest_mem::GuestVa(0xa000),
+                access: VMA_RX_ACCESS,
             }],
         );
 
@@ -2157,6 +2164,7 @@ mod tests {
             vec![crate::kernel::VmaSummary {
                 start: carrick_guest_mem::GuestVa(0x7000),
                 end: carrick_guest_mem::GuestVa(0x8000),
+                access: VMA_RX_ACCESS,
             }],
             "shared-child exec must not freeze the backend retained by the surviving parent",
         );
@@ -2176,6 +2184,7 @@ mod tests {
                 crate::kernel::VmaSummary {
                     start: carrick_guest_mem::GuestVa(0x1000),
                     end: carrick_guest_mem::GuestVa(0x2000),
+                    access: VMA_RX_ACCESS,
                 },
             ]));
         process.bind_vma_source(source);
@@ -2363,6 +2372,7 @@ mod tests {
             vec![crate::kernel::VmaSummary {
                 start: carrick_guest_mem::GuestVa(0x9000),
                 end: carrick_guest_mem::GuestVa(0xa000),
+                access: VMA_RX_ACCESS,
             }],
             "a private exec replacement must accept its later dispatcher authority",
         );
@@ -2422,10 +2432,12 @@ mod tests {
                 vec![crate::kernel::VmaSummary {
                     start: carrick_guest_mem::GuestVa(0x3000),
                     end: carrick_guest_mem::GuestVa(0x4000),
+                    access: VMA_RX_ACCESS,
                 }],
                 vec![crate::kernel::VmaSummary {
                     start: carrick_guest_mem::GuestVa(0x5000),
                     end: carrick_guest_mem::GuestVa(0x6000),
+                    access: VMA_RX_ACCESS,
                 }],
             ),
         );
@@ -2473,10 +2485,12 @@ mod tests {
                 vec![crate::kernel::VmaSummary {
                     start: carrick_guest_mem::GuestVa(0x1000),
                     end: carrick_guest_mem::GuestVa(0x2000),
+                    access: VMA_RX_ACCESS,
                 }],
                 vec![crate::kernel::VmaSummary {
                     start: carrick_guest_mem::GuestVa(0x3000),
                     end: carrick_guest_mem::GuestVa(0x4000),
+                    access: VMA_RX_ACCESS,
                 }],
             ),
         );
@@ -2524,6 +2538,7 @@ mod tests {
             vec![crate::kernel::VmaSummary {
                 start: carrick_guest_mem::GuestVa(0x1000),
                 end: carrick_guest_mem::GuestVa(0x2000),
+                access: VMA_RX_ACCESS,
             }],
         );
         assert_eq!(
@@ -2535,6 +2550,7 @@ mod tests {
             vec![crate::kernel::VmaSummary {
                 start: carrick_guest_mem::GuestVa(0x3000),
                 end: carrick_guest_mem::GuestVa(0x4000),
+                access: VMA_RX_ACCESS,
             }],
         );
         drop(abandoned);
@@ -2547,6 +2563,7 @@ mod tests {
             vec![crate::kernel::VmaSummary {
                 start: carrick_guest_mem::GuestVa(0x1000),
                 end: carrick_guest_mem::GuestVa(0x2000),
+                access: VMA_RX_ACCESS,
             }],
         );
     }
@@ -2603,6 +2620,7 @@ mod tests {
             vec![crate::kernel::VmaSummary {
                 start: carrick_guest_mem::GuestVa(0x3000),
                 end: carrick_guest_mem::GuestVa(0x4000),
+                access: VMA_RX_ACCESS,
             }],
         );
         assert_eq!(
@@ -2614,6 +2632,7 @@ mod tests {
             vec![crate::kernel::VmaSummary {
                 start: carrick_guest_mem::GuestVa(0x5000),
                 end: carrick_guest_mem::GuestVa(0x6000),
+                access: VMA_RX_ACCESS,
             }],
         );
     }
@@ -2678,6 +2697,7 @@ mod tests {
             vec![crate::kernel::VmaSummary {
                 start: carrick_guest_mem::GuestVa(0x3000),
                 end: carrick_guest_mem::GuestVa(0x4000),
+                access: VMA_RX_ACCESS,
             }],
         );
         assert_eq!(
@@ -2689,6 +2709,7 @@ mod tests {
             vec![crate::kernel::VmaSummary {
                 start: carrick_guest_mem::GuestVa(0x1000),
                 end: carrick_guest_mem::GuestVa(0x2000),
+                access: VMA_RX_ACCESS,
             }],
         );
     }
@@ -2861,18 +2882,22 @@ mod tests {
                 vec![crate::kernel::VmaSummary {
                     start: carrick_guest_mem::GuestVa(0x3000),
                     end: carrick_guest_mem::GuestVa(0x4000),
+                    access: VMA_RX_ACCESS,
                 }],
                 vec![crate::kernel::VmaSummary {
                     start: carrick_guest_mem::GuestVa(0x5000),
                     end: carrick_guest_mem::GuestVa(0x6000),
+                    access: VMA_RX_ACCESS,
                 }],
                 vec![crate::kernel::VmaSummary {
                     start: carrick_guest_mem::GuestVa(0x7000),
                     end: carrick_guest_mem::GuestVa(0x8000),
+                    access: VMA_RX_ACCESS,
                 }],
                 vec![crate::kernel::VmaSummary {
                     start: carrick_guest_mem::GuestVa(0x9000),
                     end: carrick_guest_mem::GuestVa(0xa000),
+                    access: VMA_RX_ACCESS,
                 }],
             ),
             "CLONE_VM VMA authority must be shared before exec and isolated afterward",
@@ -3272,6 +3297,7 @@ mod tests {
             vec![crate::kernel::VmaSummary {
                 start: carrick_guest_mem::GuestVa(0x3000),
                 end: carrick_guest_mem::GuestVa(0x4000),
+                access: VMA_RX_ACCESS,
             }]
         );
     }
@@ -3320,6 +3346,7 @@ mod tests {
             vec![crate::kernel::VmaSummary {
                 start: carrick_guest_mem::GuestVa(0x5000),
                 end: carrick_guest_mem::GuestVa(0x6000),
+                access: VMA_RX_ACCESS,
             }]
         );
     }
@@ -3361,6 +3388,7 @@ mod tests {
             vec![crate::kernel::VmaSummary {
                 start: carrick_guest_mem::GuestVa(0x5000),
                 end: carrick_guest_mem::GuestVa(0x6000),
+                access: VMA_RX_ACCESS,
             }]
         );
     }

@@ -3,6 +3,60 @@ use crate::linux_abi::LINUX_PROT_EXEC;
 use crate::memory::{LINUX_HEAP_BASE, LINUX_MMAP_BASE};
 use std::cell::Cell;
 
+#[test]
+fn vma_snapshot_projects_permissions_and_splits_kernel_hidden_coverage() {
+    let mut mem = MemState::new_with_layout(MemoryLayout::hvf_default());
+    mem.address_space_regions = Some(vec![ProcMapsEntry {
+        start: 0x1000,
+        end: 0x5000,
+        read: true,
+        write: false,
+        execute: true,
+        sharing: ProcMapSharing::Private,
+        path: "/fixture".to_owned(),
+    }]);
+    locked_ranges_insert(
+        &mut mem.secretmem_maps,
+        crate::vfs::GuestMemoryRange::new(GuestVa(0x2000), GuestVa(0x3000)).expect("secret range"),
+    );
+
+    assert_eq!(
+        project_vma_summaries(&mem),
+        vec![
+            crate::kernel::VmaSummary {
+                start: GuestVa(0x1000),
+                end: GuestVa(0x2000),
+                access: crate::kernel::VmaAccess {
+                    readable: true,
+                    writable: false,
+                    executable: true,
+                    kernel_visible: true,
+                },
+            },
+            crate::kernel::VmaSummary {
+                start: GuestVa(0x2000),
+                end: GuestVa(0x3000),
+                access: crate::kernel::VmaAccess {
+                    readable: true,
+                    writable: false,
+                    executable: true,
+                    kernel_visible: false,
+                },
+            },
+            crate::kernel::VmaSummary {
+                start: GuestVa(0x3000),
+                end: GuestVa(0x5000),
+                access: crate::kernel::VmaAccess {
+                    readable: true,
+                    writable: false,
+                    executable: true,
+                    kernel_visible: true,
+                },
+            },
+        ]
+    );
+}
+
 /// The Darwin constraint behind [`host_fd_can_back_shared_alias`], asserted
 /// against the live host kernel rather than trusted as folklore: a
 /// `MAP_SHARED` mapping of an `O_RDONLY` fd is capped at a read-only
@@ -4661,14 +4715,32 @@ fn guest_vma_occupancy_excludes_hidden_arenas_but_includes_live_ranges() {
     assert!(snapshot.vmas.contains(&crate::kernel::VmaSummary {
         start: GuestVa(layout.heap_base),
         end: GuestVa(layout.heap_base + LINUX_PAGE_SIZE),
+        access: crate::kernel::VmaAccess {
+            readable: true,
+            writable: true,
+            executable: false,
+            kernel_visible: true,
+        },
     }));
     assert!(snapshot.vmas.contains(&crate::kernel::VmaSummary {
         start: GuestVa(layout.mmap_base + (2 * LINUX_PAGE_SIZE)),
         end: GuestVa(layout.mmap_base + (3 * LINUX_PAGE_SIZE)),
+        access: crate::kernel::VmaAccess {
+            readable: true,
+            writable: true,
+            executable: false,
+            kernel_visible: true,
+        },
     }));
     assert!(snapshot.vmas.contains(&crate::kernel::VmaSummary {
         start: GuestVa(BOOT),
         end: GuestVa(BOOT + LINUX_PAGE_SIZE),
+        access: crate::kernel::VmaAccess {
+            readable: true,
+            writable: false,
+            executable: true,
+            kernel_visible: true,
+        },
     }));
     assert!(!snapshot.vmas.iter().any(|vma| {
         vma.start == GuestVa(layout.mmap_base)
@@ -4778,6 +4850,12 @@ fn vma_projection_preserves_adjacency_and_removes_unmapped_boot_ranges() {
         vec![crate::kernel::VmaSummary {
             start: GuestVa(0x2000),
             end: GuestVa(0x3000),
+            access: crate::kernel::VmaAccess {
+                readable: true,
+                writable: false,
+                executable: false,
+                kernel_visible: true,
+            },
         }]
     );
 }
@@ -4890,10 +4968,22 @@ fn growdown_metadata_is_trimmed_with_mapping_teardown() {
             crate::kernel::VmaSummary {
                 start: GuestVa(start - page),
                 end: GuestVa(start + page),
+                access: crate::kernel::VmaAccess {
+                    readable: true,
+                    writable: true,
+                    executable: false,
+                    kernel_visible: true,
+                },
             },
             crate::kernel::VmaSummary {
                 start: GuestVa(start + page * 2),
                 end: GuestVa(start + page * 4),
+                access: crate::kernel::VmaAccess {
+                    readable: true,
+                    writable: true,
+                    executable: false,
+                    kernel_visible: true,
+                },
             },
         ]
     );
@@ -4915,6 +5005,12 @@ fn growdown_metadata_is_trimmed_with_mapping_teardown() {
         vec![crate::kernel::VmaSummary {
             start: GuestVa(start + page * 2),
             end: GuestVa(start + page * 4),
+            access: crate::kernel::VmaAccess {
+                readable: true,
+                writable: true,
+                executable: false,
+                kernel_visible: true,
+            },
         }]
     );
 }

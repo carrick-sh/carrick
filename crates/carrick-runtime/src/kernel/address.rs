@@ -63,9 +63,18 @@ impl MmBinding {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmaAccess {
+    pub readable: bool,
+    pub writable: bool,
+    pub executable: bool,
+    pub kernel_visible: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VmaSummary {
     pub start: GuestVa,
     pub end: GuestVa,
+    pub access: VmaAccess,
 }
 
 /// Revision of the dispatcher-owned Linux VMA authority.

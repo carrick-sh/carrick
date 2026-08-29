@@ -1814,6 +1814,12 @@ mod tests {
                     vmas: vec![VmaSummary {
                         start: GuestVa(0x2000),
                         end: GuestVa(0x1000),
+                        access: crate::kernel::VmaAccess {
+                            readable: true,
+                            writable: false,
+                            executable: false,
+                            kernel_visible: true,
+                        },
                     }],
                     vma_revision: None,
                     mapping_ids: Vec::new(),
@@ -1869,16 +1875,34 @@ mod tests {
                             VmaSummary {
                                 start: GuestVa(0x1000),
                                 end: GuestVa(0x2000),
+                                access: crate::kernel::VmaAccess {
+                                    readable: true,
+                                    writable: true,
+                                    executable: false,
+                                    kernel_visible: true,
+                                },
                             },
                             VmaSummary {
                                 start: GuestVa(0x3000),
                                 end: GuestVa(0x4000),
+                                access: crate::kernel::VmaAccess {
+                                    readable: true,
+                                    writable: true,
+                                    executable: false,
+                                    kernel_visible: true,
+                                },
                             },
                         ]
                     } else {
                         vec![VmaSummary {
                             start: GuestVa(0x1000),
                             end: GuestVa(0x2000),
+                            access: crate::kernel::VmaAccess {
+                                readable: true,
+                                writable: true,
+                                executable: false,
+                                kernel_visible: true,
+                            },
                         }]
                     },
                     vma_revision: None,

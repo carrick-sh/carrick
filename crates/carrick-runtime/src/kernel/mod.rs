@@ -15,7 +15,6 @@ pub mod foreign_mm;
 pub mod frame_inventory;
 pub mod guest_execution;
 pub mod ids;
-#[cfg(test)]
 mod mm_access;
 pub mod mm_transaction;
 pub mod netns;
@@ -31,7 +30,7 @@ mod tests;
 
 pub use address::{
     Asid, MmBackend, MmBackendSnapshot, MmBinding, OwnedVmaSnapshot, SharedVmaSnapshotSource,
-    SnapshotError, SnapshotTable, Stage1Root, Stage1RootError, Ttbr0, VmaRevision,
+    SnapshotError, SnapshotTable, Stage1Root, Stage1RootError, Ttbr0, VmaAccess, VmaRevision,
     VmaSnapshotSource, VmaSummary,
 };
 pub use clone_plan::{
@@ -47,6 +46,9 @@ pub use crash_capture::{
     CrashQuorumPoll, CrashRegisterFile, CrashRegisterVote,
 };
 pub use foreign_mm::ForeignMmAccess;
+pub use mm_access::{
+    CurrentMm, ForeignMm, MmAccessError, MmReadRange, MmRelation, MmToken, MmWriteRange,
+};
 pub use mm_transaction::{MmTransaction, StagedMmOp};
 
 pub(crate) use core::ReservationChangeSubscription;
