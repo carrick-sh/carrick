@@ -243,7 +243,10 @@ mod tests {
         let leader_key = leader.thread().key();
         let sibling_key = sibling.thread().key();
         let sibling_tid = sibling.thread().key().tid;
-        sibling.thread().enter_crash_safe_point_participation();
+        let _participation = sibling
+            .thread()
+            .enter_crash_safe_point_participation()
+            .expect("crash safe-point participation");
 
         let initial_keys = leader
             .task()

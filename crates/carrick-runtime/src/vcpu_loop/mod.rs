@@ -2461,16 +2461,19 @@ fn enter_guest_executor_then_register<F>(
     census: &Arc<crate::kernel::GuestExecutorCensus>,
     thread: Option<crate::kernel::ThreadRef>,
     register: F,
-) -> (
-    crate::kernel::GuestExecutorParticipation,
-    carrick_hal::VcpuRegistrationEnrollment,
-)
+) -> Result<
+    (
+        crate::kernel::GuestExecutorParticipation,
+        carrick_hal::VcpuRegistrationEnrollment,
+    ),
+    crate::kernel::GuestExecutorCensusError,
+>
 where
     F: FnOnce() -> carrick_hal::VcpuRegistrationEnrollment,
 {
-    let participation = census.enter(thread);
+    let participation = census.enter(thread)?;
     let enrollment = register();
-    (participation, enrollment)
+    Ok((participation, enrollment))
 }
 
 fn registration_wake_uses_control(
@@ -5653,7 +5656,8 @@ where
                     self.state
                         .subscribe_register_vcpu(engine, wake_registration)
                 },
-            );
+            )
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
             self.state.guest_execution = Some(participation);
             match enrollment {
                 carrick_hal::VcpuRegistrationEnrollment::Registered => {}
@@ -11197,7 +11201,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(runtime.guest_executors.live(), 0);
+        assert_eq!(runtime.guest_executors.participant_count_for_probe(), 0);
         assert_eq!(root.task().threads().len(), 2);
         assert_eq!(sibling.task().key(), root.task().key());
         assert!(
@@ -12079,12 +12083,12 @@ mod tests {
     }
 
     #[test]
-    fn page_table_admission_census_precedes_denied_registry_publication() {
+    fn census_admission_precedes_registry_publication() {
         let registry = Arc::new(carrick_hal::GenericVcpuRegistry::new());
         let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
         let first = ThreadId::synthetic_for_tests(70_201);
         let second = ThreadId::synthetic_for_tests(70_202);
-        let _first_participation = census.enter(None);
+        let _first_participation = census.enter(None).expect("first participation");
         let freeze = match registry.subscribe_lease_drain(first, Arc::new(|| {})) {
             carrick_hal::VcpuLeaseDrainEnrollment::Frozen(guard) => guard,
             _ => panic!("first thread must freeze an empty sibling lease set"),
@@ -12103,7 +12107,8 @@ mod tests {
                     &second_in_guest,
                     Arc::new(|| {}),
                 )
-            });
+            })
+            .expect("second participation");
 
         assert!(census.has_peer_executor());
         assert!(matches!(
@@ -12115,7 +12120,7 @@ mod tests {
             carrick_hal::VcpuLeaseDrainPoll::Complete
         );
         drop(second_participation);
-        assert_eq!(census.live(), 1);
+        assert_eq!(census.participant_count_for_probe(), 1);
         drop(attempt);
         drop(freeze);
     }
@@ -12143,7 +12148,8 @@ mod tests {
                 &owner_in_guest,
                 Arc::new(|| {}),
             )
-        });
+        })
+        .expect("owner participation");
 
         assert!(matches!(
             enrollment,
