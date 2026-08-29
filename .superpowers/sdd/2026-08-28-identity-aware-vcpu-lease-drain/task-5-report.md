@@ -4,6 +4,8 @@ Date: 2026-08-28
 
 Base: `261247bff3a4b035b986335fb2c994765d9227cd`
 
+Review-fix base: `44e49acda5f1212e701f689035a895ab3c25a823`
+
 Scope: Task 5 only. The sole production/test source change is
 `crates/carrick-runtime/src/vcpu_loop/mod.rs`; Task 6 was not started.
 
@@ -34,11 +36,34 @@ RUSTC_WRAPPER= cargo test -p carrick-runtime core_publication --lib -- --nocaptu
 exit 0; 9 passed; 0 failed
 ```
 
+The independent acceptance review found one important coverage gap: the
+timeout cleanup test assembled the authority/barrier/helper manually instead
+of forcing the failure through `capture_core_for_publication`. The repaired
+test was written against the real capture entry point before its test-only
+budget setter existed:
+
+```text
+RUSTC_WRAPPER= cargo test -p carrick-runtime crash_lease_drain_timeout_releases_collection_and_barriers --lib -- --nocapture
+exit 101; E0599: no method named install_crash_lease_drain_budget_for_test
+```
+
+The new callback-before-park test also first failed closed at its 250 ms guard.
+Investigation showed its `mpsc::recv_timeout` release barrier could itself park
+the worker and consume the exact `Thread::unpark` token under test. Replacing
+the worker-side synchronization with atomic/yield handshakes kept the worker
+out of any other park. The test now proves callback delivery with synchronized
+state; the 250 ms timeout is only a fail-closed bound against the configured
+one-second poll interval.
+
 ## Implementation
 
 - `CrashLeaseDrainBudget` carries the ten-second production timeout and the
-  existing 200-microsecond poll interval; tests inject zero/short budgets
-  without sleeping for production time.
+  existing 200-microsecond poll interval. Production builds still obtain the
+  exact `DEFAULT`; only `cfg(test)` state carries an override. The real capture
+  cleanup test installs a zero budget on its `ThreadRuntimeState`, enters
+  `capture_core_for_publication`, acquires fork exclusion, advertises crash
+  authority, raises task quiescing, then times out on the exact waiting sibling
+  lease.
 - `CrashLeaseDrainTimeout::{Waiting, Busy}` preserves the exact final sibling
   or conflicting freeze-owner `ThreadId`. `Display` converts each identity to
   an explicit runtime diagnostic, and the crash boundary deliberately maps it
@@ -73,7 +98,10 @@ exit 0; 9 passed; 0 failed
    registration cannot appear after an apparently empty observation.
 4. A membership/thaw callback may fire before `park_timeout`; the thread's
    unpark token preserves that wake. Keeping the subscription alive through
-   the park prevents cancellation from opening a lost-wakeup interval.
+   the park prevents cancellation from opening a lost-wakeup interval. The
+   nonzero-budget race test synchronizes callback delivery while the nudge is
+   still active and proves acquisition completes without waiting the full poll
+   interval.
 5. Early wake drops the obsolete subscription and re-enrolls against live
    registry state. Deadline wake also drops it and performs one final atomic
    enrollment, closing waiting-member removal and re-registration races.
@@ -98,10 +126,13 @@ Fresh final runs on the formatted source:
 
 ```text
 RUSTC_WRAPPER= cargo test -p carrick-runtime 'vcpu_loop::tests::crash_' --lib -- --nocapture
-exit 0; 8 passed; 0 failed
+exit 0; 9 passed; 0 failed
 
 RUSTC_WRAPPER= cargo test -p carrick-runtime crash_lease_drain --lib -- --nocapture
-exit 0; 6 passed; 0 failed
+exit 0; 7 passed; 0 failed
+
+RUSTC_WRAPPER= cargo test -p carrick-runtime crash_lease_drain_callback_before_park_completes_without_poll_interval --lib -- --nocapture
+exit 0; 1 passed; 0 failed
 
 RUSTC_WRAPPER= cargo test -p carrick-runtime crash_lease_drain_timeout_releases_collection_and_barriers --lib -- --nocapture
 exit 0; 1 passed; 0 failed
