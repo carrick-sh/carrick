@@ -4819,13 +4819,26 @@ mod hvpatch_identity_tests {
 #[cfg(test)]
 mod kernel_process_dispatch_tests {
     use super::*;
+    use std::num::{NonZeroU16, NonZeroU64};
+    use std::sync::Arc;
+    use std::time::Instant;
+
     use crate::compat::CompatReporter;
-    use crate::kernel::{ClonePlan, KernelContext, LinuxWaitStatus};
+    use crate::kernel::{
+        Asid, ClonePlan, KernelContext, LinuxWaitStatus, MmBackend, MmBackendSnapshot, MmBinding,
+        SnapshotError, Stage1Root, VmaAccess, VmaRevision, VmaSummary,
+    };
     use crate::thread::ThreadId;
+    use carrick_guest_mem::{Gpa, GuestVa};
+    use carrick_hal::{
+        ForeignMmReadLease, ForeignMmReadReceipt, ForeignMmSnapshot, ForeignMmTransport,
+        ForeignMmTransportError,
+    };
 
     const INFO_ADDR: u64 = 0x4000;
     const SYS_WAITID: u64 = 95;
     const SYS_PTRACE: u64 = 117;
+    const SYS_PROCESS_VM_READV: u64 = 270;
     const SYS_WAIT4: u64 = 260;
     const LINUX_P_ALL: u64 = 0;
     const LINUX_P_PID: u64 = 1;
@@ -4834,6 +4847,105 @@ mod kernel_process_dispatch_tests {
     const LINUX_WSTOPPED: u64 = 2;
     const LINUX_WEXITED: u64 = 4;
     const LINUX_WNOWAIT: u64 = 0x0100_0000;
+    const LOCAL_IOV: u64 = 0x1800;
+    const REMOTE_IOV: u64 = 0x1810;
+    const LOCAL_BUF: u64 = 0x2000;
+    const TARGET_VA: u64 = 0x3000;
+
+    #[derive(Debug)]
+    struct ProcessVmBackend {
+        binding: MmBinding,
+    }
+
+    impl MmBackend for ProcessVmBackend {
+        fn snapshot(&self, _deadline: Instant) -> Result<MmBackendSnapshot, SnapshotError> {
+            Ok(MmBackendSnapshot {
+                revision: 17,
+                binding: self.binding,
+                vmas: vec![VmaSummary {
+                    start: GuestVa(TARGET_VA),
+                    end: GuestVa(TARGET_VA + 0x1000),
+                    access: VmaAccess {
+                        readable: true,
+                        writable: true,
+                        executable: false,
+                        kernel_visible: true,
+                    },
+                }],
+                vma_revision: Some(VmaRevision::from_authority_raw(19)),
+                mapping_ids: Vec::new(),
+                frame_inventory_revision: Some(23),
+            })
+        }
+
+        fn revision(&self) -> u64 {
+            17
+        }
+
+        fn vma_revision(&self, _deadline: Instant) -> Result<Option<VmaRevision>, SnapshotError> {
+            Ok(Some(VmaRevision::from_authority_raw(19)))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ProcessVmReadTransport;
+
+    #[derive(Debug)]
+    struct ProcessVmReadLease;
+
+    #[derive(Debug)]
+    struct ProcessVmReadReceipt {
+        bytes: usize,
+        owners: [carrick_hal::ForeignOwnerGeneration; 1],
+    }
+
+    impl ForeignMmReadReceipt for ProcessVmReadReceipt {
+        fn bytes_read(&self) -> usize {
+            self.bytes
+        }
+
+        fn owner_generations(&self) -> &[carrick_hal::ForeignOwnerGeneration] {
+            &self.owners
+        }
+
+        fn authenticates(&self, _snapshot: &dyn ForeignMmSnapshot) -> bool {
+            true
+        }
+    }
+
+    impl ForeignMmReadLease for ProcessVmReadLease {
+        fn read(
+            &self,
+            _invocation: &carrick_hal::ForeignMmInvocation,
+            _authority: &dyn carrick_hal::ForeignMmLiveAuthority,
+            _snapshot: &dyn ForeignMmSnapshot,
+            va: GuestVa,
+            dst: &mut [u8],
+            _deadline: Instant,
+        ) -> Result<Box<dyn ForeignMmReadReceipt>, ForeignMmTransportError> {
+            if va != GuestVa(TARGET_VA) || dst.len() != 4 {
+                return Err(ForeignMmTransportError::Translation(va));
+            }
+            dst.copy_from_slice(b"PEER");
+            Ok(Box::new(ProcessVmReadReceipt {
+                bytes: dst.len(),
+                owners: [carrick_hal::ForeignOwnerGeneration::from_backend_counter(
+                    NonZeroU64::MIN,
+                )],
+            }))
+        }
+    }
+
+    impl ForeignMmTransport for ProcessVmReadTransport {
+        fn retain(
+            &self,
+            _invocation: &carrick_hal::ForeignMmInvocation,
+            _snapshot: &dyn ForeignMmSnapshot,
+            _deadline: Instant,
+        ) -> Result<Arc<dyn ForeignMmReadLease>, ForeignMmTransportError> {
+            Ok(Arc::new(ProcessVmReadLease))
+        }
+    }
 
     fn bound_dispatcher(
         root_pid: i32,
@@ -4844,7 +4956,8 @@ mod kernel_process_dispatch_tests {
         KernelContext,
     ) {
         let lane = HvpatchLaneScope::force(false);
-        let (process, _) = crate::hvpatch::process_context_for_tests(root_pid);
+        let (mut process, _) = crate::hvpatch::process_context_for_tests(root_pid);
+        process.enable_mm_access_for_tests();
         let dispatcher = SyscallDispatcher::new();
         dispatcher.bind_hvpatch_process(process.clone());
         let root = dispatcher
@@ -4879,6 +4992,43 @@ mod kernel_process_dispatch_tests {
             .0
     }
 
+    fn process_vm_target(parent: &KernelContext, registry_id: i32) -> KernelContext {
+        let asid = Asid::from_registry_allocation(
+            NonZeroU16::new((registry_id as u16).max(1)).expect("nonzero ASID"),
+        );
+        let root = Stage1Root::for_aarch64_4k(Gpa(0x8000)).expect("aligned stage-1 root");
+        let backend: Arc<dyn MmBackend> = Arc::new(ProcessVmBackend {
+            binding: MmBinding::for_aarch64(asid, root),
+        });
+        let child = parent
+            .kernel()
+            .reserve_fork(
+                parent,
+                ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty()).unwrap(),
+                format!("process-vm-child-{registry_id}"),
+                None,
+            )
+            .unwrap()
+            .prepare_with_mm_backend(backend, ThreadId::synthetic_for_tests(registry_id))
+            .unwrap()
+            .commit()
+            .unwrap()
+            .into_parts()
+            .unwrap()
+            .0;
+        child.shared().mm().install_foreign_mm_endpoint_for_test(
+            carrick_hal::ForeignMmEndpoint::for_carrier(Arc::new(ProcessVmReadTransport)),
+        );
+        child
+    }
+
+    fn write_iovec(memory: &mut LinearMemory, address: u64, base: u64, len: u64) {
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&base.to_le_bytes());
+        bytes[8..].copy_from_slice(&len.to_le_bytes());
+        memory.write_bytes(address, &bytes).unwrap();
+    }
+
     fn dispatch(
         dispatcher: &mut SyscallDispatcher,
         context: &KernelContext,
@@ -4904,6 +5054,85 @@ mod kernel_process_dispatch_tests {
                 .try_into()
                 .unwrap(),
         )
+    }
+
+    #[test]
+    fn process_vm_readv_reads_the_exact_foreign_mm() {
+        let (_lane, mut dispatcher, _process, root) = bound_dispatcher(61_090);
+        let target = process_vm_target(&root, 61_091);
+        let root = refreshed(&root);
+        let target_pid = target.task().key().id.raw();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+        write_iovec(&mut memory, LOCAL_IOV, LOCAL_BUF, 4);
+        write_iovec(&mut memory, REMOTE_IOV, TARGET_VA, 4);
+        memory.write_bytes(TARGET_VA, b"SELF").unwrap();
+
+        assert_eq!(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PROCESS_VM_READV,
+                [target_pid as u64, LOCAL_IOV, 1, REMOTE_IOV, 1, 0],
+            ),
+            DispatchOutcome::Returned { value: 4 },
+        );
+        assert_eq!(memory.read_bytes(LOCAL_BUF, 4).unwrap(), b"PEER");
+    }
+
+    #[test]
+    fn process_vm_zero_length_ordering_matches_clean_room_oracle() {
+        let (_lane, mut dispatcher, _process, root) = bound_dispatcher(61_092);
+        let missing_pid = 2_000_000_000u64;
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x3000]);
+        write_iovec(&mut memory, LOCAL_IOV, LOCAL_BUF, 0);
+        write_iovec(&mut memory, REMOTE_IOV, TARGET_VA, 0);
+
+        assert_eq!(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PROCESS_VM_READV,
+                [missing_pid, LOCAL_IOV, 1, 1, 1, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+            "zero local total must not import the remote array or resolve pid",
+        );
+        write_iovec(&mut memory, LOCAL_IOV, LOCAL_BUF, 4);
+        assert_eq!(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PROCESS_VM_READV,
+                [missing_pid, LOCAL_IOV, 1, REMOTE_IOV, 1, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+            "zero remote total must not resolve pid",
+        );
+        assert_eq!(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PROCESS_VM_READV,
+                [missing_pid, 1, 1, 0, 0, 0],
+            ),
+            DispatchOutcome::errno(LINUX_EFAULT),
+            "a nonempty invalid local vector faults before remote zero",
+        );
+        assert_eq!(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PROCESS_VM_READV,
+                [missing_pid, 0, 0, 0, 0, 1],
+            ),
+            DispatchOutcome::errno(LINUX_EINVAL),
+            "invalid flags win over a zero-byte transfer",
+        );
     }
 
     #[test]
