@@ -247,3 +247,22 @@ RED and review-pending commits remain on `codex/fd-description-seam`; no push.
   infallible commit whose byte copy is the final operation; no snapshot, lock,
   allocation, transport error, receipt validation, or revision check may occur
   after commit begins. This RED remains feature-only and is not on `main`.
+- Task 8 foreign-write prepare/commit milestone accepted at `9cd36aa7c`
+  (RED/ledger commits `604612221`, `f978a4098`; delegated candidate originally
+  `61cbb2626`). Antigravity worker `foreign-write-prepare-cleanroom`, run id
+  `mm-authority-cleanroom-20260829-task8-write-boundary`, conversation
+  `42237aa4-901e-464f-bee4-bda5e342db8c`, required two implementation rounds.
+  Round one was rejected for unsafe `Send`/`Sync`, overlap-unsafe copying,
+  receipt identity drift, a phantom rather than retained mutation guard, and
+  incomplete exact-counter controls. Round two binds a private single-use
+  prepared capability to the real mutation guard, COW witness, exact borrowed
+  source, and retained host owner; validates every fallible condition before
+  commit; and makes production commit an infallible consuming `ptr::copy` with
+  no post-copy error path. Independent clean-room review: APPROVE, no findings.
+  Controller gates: 4/4 transaction regressions, 33/33 runtime MM-access tests,
+  HAL foreign-MM 1/1, HVF foreign-MM 13/13, full serialized runtime library
+  2,122/2,122, MM-authority checker over 253 Rust leaves, targeted all-target
+  clippy with warnings denied, formatting, and diff hygiene all pass. Every
+  participating stream explicitly attested that it did not access Linux kernel
+  source or abandoned Task 8 artifacts; any stream violating that rule remains
+  wholly non-integrable and must be restarted from a clean accepted base.
