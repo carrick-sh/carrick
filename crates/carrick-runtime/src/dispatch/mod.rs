@@ -2163,6 +2163,10 @@ pub enum DispatchError {
     Errno(LinuxErrno),
     #[error("fatal file authority error: {0:?}")]
     FileAuthorityFatal(crate::file_authority::AuthorityFatal),
+    #[error("MM executor admission failed: {0}")]
+    MmExecutorAdmission(crate::kernel::GuestExecutorCensusError),
+    #[error("MM mutation requires a page-table pause while a peer executor is active")]
+    MmMutationPeerExecutor,
 }
 
 impl From<crate::file_authority::AuthorityFatal> for DispatchError {
@@ -2376,6 +2380,7 @@ pub(crate) struct DispatchMmAuthority {
     mem: Arc<mem::MemAuthority>,
     host_alias_transactions: Arc<HostAliasTransactions>,
     mutation_coordinator: Arc<mm_mutation::MmMutationCoordinator>,
+    guest_executors: Arc<crate::kernel::GuestExecutorCensus>,
     /// The `guest_realtime_epoch()` under which THIS MM's vvar
     /// `VVAR_OFF_REALTIME_OFF_NS` word was last stamped by the dispatcher
     /// (`SyscallDispatcher::sync_vvar_realtime_offset`). The vvar page is per
@@ -2400,6 +2405,7 @@ impl DispatchMmAuthority {
             mem: Arc::new(mem::MemAuthority::new(mem::MemState::new())),
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
             mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
+            guest_executors: Arc::new(crate::kernel::GuestExecutorCensus::default()),
             vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
@@ -2410,6 +2416,7 @@ impl DispatchMmAuthority {
             mem: self.mem.fork_private(),
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
             mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
+            guest_executors: Arc::new(crate::kernel::GuestExecutorCensus::default()),
             vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
@@ -2432,6 +2439,7 @@ impl DispatchMmAuthority {
                 mem: Arc::new(forked_mem),
                 host_alias_transactions: Arc::new(HostAliasTransactions::new()),
                 mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
+                guest_executors: Arc::new(crate::kernel::GuestExecutorCensus::default()),
                 // Never stamped: the child inherits the parent's vvar content
                 // through the COW split, and re-stamps on its next syscall
                 // only once a `clock_settime` has moved the global epoch.
@@ -2477,6 +2485,7 @@ impl DispatchMmAuthority {
             )),
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
             mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
+            guest_executors: Arc::new(crate::kernel::GuestExecutorCensus::default()),
             vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
@@ -2487,6 +2496,38 @@ impl DispatchMmAuthority {
         deadline: std::time::Instant,
     ) -> Result<crate::kernel::OwnedVmaSnapshot, crate::kernel::SnapshotError> {
         self.mem.snapshot_until(deadline)
+    }
+}
+
+/// Opaque participation in the executor census owned by one exact dispatch MM.
+///
+/// CLONE_VM dispatchers share the same [`DispatchMmAuthority`] and therefore
+/// the same census. Holding this token says the caller may execute on that MM;
+/// it does not itself grant mutation authority while a peer token exists.
+pub struct MmExecutorParticipation {
+    authority: Arc<DispatchMmAuthority>,
+    participation: crate::kernel::GuestExecutorParticipation,
+}
+
+impl MmExecutorParticipation {
+    pub(crate) fn claim_sole(&self) -> Option<crate::kernel::SoleGuestExecutor<'_>> {
+        self.participation.claim_sole()
+    }
+
+    pub(crate) fn mm_id(&self) -> crate::kernel::MmId {
+        self.authority.mm_id
+    }
+
+    pub(crate) fn mutation_coordinator(&self) -> Arc<mm_mutation::MmMutationCoordinator> {
+        Arc::clone(&self.authority.mutation_coordinator)
+    }
+
+    pub(crate) fn executor_census(&self) -> &crate::kernel::GuestExecutorCensus {
+        &self.authority.guest_executors
+    }
+
+    fn authorizes(&self, authority: &Arc<DispatchMmAuthority>) -> bool {
+        Arc::ptr_eq(&self.authority, authority)
     }
 }
 
@@ -5000,6 +5041,45 @@ impl SyscallDispatcher {
         Arc::clone(&self.mm_authority().mutation_coordinator)
     }
 
+    pub(crate) fn mm_executor_census(&self) -> Arc<crate::kernel::GuestExecutorCensus> {
+        Arc::clone(&self.mm_authority().guest_executors)
+    }
+
+    /// Enter the executor census owned by the exact current dispatch MM.
+    ///
+    /// A CLONE_VM dispatcher shares this census even though its dispatcher
+    /// binding object is distinct. If exec promotion changes the selected MM
+    /// during admission, the stale participation is dropped and selection is
+    /// retried.
+    pub fn enter_mm_executor(
+        &self,
+    ) -> Result<MmExecutorParticipation, crate::kernel::GuestExecutorCensusError> {
+        self.enter_mm_executor_inner(None)
+    }
+
+    pub(crate) fn enter_mm_executor_for_thread(
+        &self,
+        thread: Option<crate::kernel::ThreadRef>,
+    ) -> Result<MmExecutorParticipation, crate::kernel::GuestExecutorCensusError> {
+        self.enter_mm_executor_inner(thread)
+    }
+
+    fn enter_mm_executor_inner(
+        &self,
+        thread: Option<crate::kernel::ThreadRef>,
+    ) -> Result<MmExecutorParticipation, crate::kernel::GuestExecutorCensusError> {
+        loop {
+            let authority = self.mm_binding.current.load_full();
+            let participation = authority.guest_executors.enter(thread.clone())?;
+            if Arc::ptr_eq(&self.mm_binding.current.load_full(), &authority) {
+                return Ok(MmExecutorParticipation {
+                    authority,
+                    participation,
+                });
+            }
+        }
+    }
+
     pub(crate) fn mark_vma_dispatch(&self, guard: &mut HostAliasDispatchGuard) {
         let authority = guard.authority.as_ref().unwrap_or_else(|| {
             tracing::error!("VMA dispatch guard lacks MM authority");
@@ -6318,8 +6398,9 @@ impl SyscallDispatcher {
         Ok(())
     }
 
-    /// Single-threaded dispatch (legacy + unit tests + the fork-based
-    /// runtime path). Tid-aware handlers see `thread: None`.
+    /// Single-threaded dispatch (legacy + unit tests + the fork-based runtime
+    /// path). Tid-aware handlers see `thread: None`. The exact current MM's
+    /// executor census, not `&mut self`, proves mutation exclusivity.
     pub fn dispatch(
         &mut self,
         kernel: &crate::kernel::KernelContext,
@@ -6329,14 +6410,17 @@ impl SyscallDispatcher {
     ) -> Result<DispatchOutcome, DispatchError> {
         // Tree-wide forward-progress beat for the deadlock watchdog.
         crate::deadlock_watchdog::tick();
+        let executor = self
+            .enter_mm_executor()
+            .map_err(DispatchError::MmExecutorAdmission)?;
         if syscall_requires_mm_mutation(request.number.raw(), request.args) {
-            crate::vcpu_loop::with_single_executor_stage1(self, |dispatcher, authority| {
-                let mut guard = mm_mutation::from_stage1_exclusive(
+            crate::vcpu_loop::with_sole_mm_stage1(&executor, |authority| {
+                let mut guard = mm_mutation::from_sole_executor(
                     authority,
-                    dispatcher.mm_mutation_coordinator(),
+                    executor.mutation_coordinator(),
                     kernel.shared().mm().id(),
                 );
-                dispatcher.dispatch_inner(
+                self.dispatch_inner(
                     kernel,
                     request,
                     memory,
@@ -6345,6 +6429,7 @@ impl SyscallDispatcher {
                     MutationDispatchRoute { guard: &mut guard },
                 )
             })
+            .ok_or(DispatchError::MmMutationPeerExecutor)?
         } else {
             self.dispatch_inner(
                 kernel,
@@ -6357,22 +6442,24 @@ impl SyscallDispatcher {
         }
     }
 
-    /// Run a non-threaded completion under the same sealed authority used by
-    /// the non-threaded dispatch boundary. Requiring `&mut self` keeps this
-    /// unavailable to normalized handlers, which receive only `&self`.
-    pub(crate) fn with_single_executor_mm_mutation<T>(
+    /// Run a non-threaded completion under a fresh exact-MM census admission.
+    pub(crate) fn with_mm_executor_mutation<T>(
         &mut self,
         kernel: &crate::kernel::KernelContext,
         run: impl FnOnce(&mut Self, &mut mm_mutation::MmMutationGuard<'_>) -> T,
-    ) -> T {
-        crate::vcpu_loop::with_single_executor_stage1(self, |dispatcher, authority| {
-            let mut guard = mm_mutation::from_stage1_exclusive(
+    ) -> Result<T, DispatchError> {
+        let executor = self
+            .enter_mm_executor()
+            .map_err(DispatchError::MmExecutorAdmission)?;
+        crate::vcpu_loop::with_sole_mm_stage1(&executor, |authority| {
+            let mut guard = mm_mutation::from_sole_executor(
                 authority,
-                dispatcher.mm_mutation_coordinator(),
+                executor.mutation_coordinator(),
                 kernel.shared().mm().id(),
             );
-            run(dispatcher, &mut guard)
+            run(self, &mut guard)
         })
+        .ok_or(DispatchError::MmMutationPeerExecutor)
     }
 
     /// Apply a launch-time container syscall policy (the `carrick run` /
@@ -6562,15 +6649,14 @@ impl SyscallDispatcher {
         )
     }
 
-    /// Shared-dispatch semantics at a caller-proven sole-executor boundary.
-    ///
-    /// The exclusive `&mut self` is the unforgeable witness: ordinary
-    /// normalized handlers only have `&self` and therefore cannot mint stage-1
-    /// mutation authority. Multi-vCPU production uses the explicit
-    /// `PtPauseGuard`/`Stage1Exclusive` route in the vCPU loop instead.
+    /// Shared-dispatch semantics under an exact-MM executor participation.
+    /// Mutation is admitted only while that participation can lock a real
+    /// sole-executor census election. Production multi-vCPU dispatch uses the
+    /// same participation and takes a real page-table pause when a peer exists.
     #[allow(clippy::too_many_arguments)]
-    pub fn dispatch_threaded_single_executor(
-        &mut self,
+    pub fn dispatch_threaded_with_mm_executor(
+        &self,
+        executor: &MmExecutorParticipation,
         kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
         memory: &mut impl CurrentMmMemory,
@@ -6579,17 +6665,22 @@ impl SyscallDispatcher {
         registry: &crate::thread::ThreadRegistry,
         futex: &crate::thread::FutexTable,
     ) -> Result<DispatchOutcome, DispatchError> {
+        let authority = self.mm_binding.current.load_full();
+        if !executor.authorizes(&authority) || executor.mm_id() != kernel.shared().mm().id() {
+            return Err(DispatchError::MmMutationPeerExecutor);
+        }
         if syscall_requires_mm_mutation(request.number.raw(), request.args) {
-            crate::vcpu_loop::with_single_executor_stage1(self, |dispatcher, authority| {
-                let mut guard = mm_mutation::from_stage1_exclusive(
-                    authority,
-                    dispatcher.mm_mutation_coordinator(),
+            crate::vcpu_loop::with_sole_mm_stage1(executor, |outer| {
+                let mut guard = mm_mutation::from_sole_executor(
+                    outer,
+                    executor.mutation_coordinator(),
                     kernel.shared().mm().id(),
                 );
-                dispatcher.dispatch_threaded_mutation(
+                self.dispatch_threaded_mutation(
                     kernel, request, memory, reporter, tid, registry, futex, &mut guard,
                 )
             })
+            .ok_or(DispatchError::MmMutationPeerExecutor)?
         } else {
             self.dispatch_threaded(kernel, request, memory, reporter, tid, registry, futex)
         }

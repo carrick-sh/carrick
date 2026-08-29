@@ -468,14 +468,18 @@ fn shared_dispatcher_services_execve_request_without_serialized_fallback() {
 
 #[test]
 fn shared_dispatcher_services_memory_state() {
-    let mut dispatcher = SyscallDispatcher::new();
+    let dispatcher = SyscallDispatcher::new();
+    let executor = dispatcher
+        .enter_mm_executor()
+        .expect("admit exact MM executor");
     let reporter = CompatReporter::default();
     let registry = ThreadRegistry::new(t(10));
     let futex = FutexTable::new();
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
 
     let initial = dispatcher
-        .dispatch_threaded_single_executor(
+        .dispatch_threaded_with_mm_executor(
+            &executor,
             &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(214, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
             &mut memory,
@@ -494,7 +498,8 @@ fn shared_dispatcher_services_memory_state() {
 
     let next = LINUX_HEAP_BASE + 0x1000;
     let updated = dispatcher
-        .dispatch_threaded_single_executor(
+        .dispatch_threaded_with_mm_executor(
+            &executor,
             &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(214, SyscallArgs::from([next, 0, 0, 0, 0, 0])),
             &mut memory,
