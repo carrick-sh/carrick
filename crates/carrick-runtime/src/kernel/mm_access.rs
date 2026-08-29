@@ -265,16 +265,46 @@ pub struct CowBroken<'mm> {
     transport: Box<dyn carrick_hal::ForeignCowReceipt>,
 }
 
+/// Single-use runtime authority for one prepared foreign copy. Commit consumes
+/// the prepared state and performs the write infallibly.
+#[allow(dead_code)] // Minted and consumed by the canonical Task 8 syscall path.
+pub(crate) struct PreparedForeignWrite<'mm, 'src, 'guard, 'authority> {
+    witness: CowBroken<'mm>,
+    src: &'src [u8],
+    transport: Box<dyn carrick_hal::ForeignMmPreparedWrite + 'src>,
+    guard: &'guard mut crate::dispatch::mm_mutation::MmMutationGuard<'authority>,
+    receipt: ForeignWriteReceipt,
+}
+
+impl std::fmt::Debug for PreparedForeignWrite<'_, '_, '_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedForeignWrite")
+            .field("witness", &self.witness)
+            .field("src_len", &self.src.len())
+            .field("transport", &self.transport)
+            .field("receipt", &self.receipt)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedForeignWrite<'_, '_, '_, '_> {
+    #[allow(dead_code)] // Process_vm consumer in Task 8.
+    pub(crate) fn commit(self) -> ForeignWriteReceipt {
+        self.transport.commit();
+        self.receipt
+    }
+}
+
 /// Authenticated completion of one foreign copy through a consumed COW
 /// witness.
 #[derive(Debug)]
 pub struct ForeignWriteReceipt {
-    transport: Box<dyn carrick_hal::ForeignMmWriteReceipt>,
+    bytes_written: usize,
 }
 
 impl ForeignWriteReceipt {
     pub fn bytes_written(&self) -> usize {
-        self.transport.bytes_written()
+        self.bytes_written
     }
 }
 
@@ -503,19 +533,29 @@ impl MmAccessAuthority {
     }
 
     #[allow(dead_code)] // Canonical process_vm consumer lands in Task 8.
-    pub fn write_foreign(
+    pub(crate) fn prepare_foreign_write<'mm, 'src, 'guard, 'authority>(
         &self,
-        witness: CowBroken<'_>,
-        src: &[u8],
-    ) -> Result<ForeignWriteReceipt, MmAccessError> {
+        mutation: &'guard mut crate::dispatch::mm_mutation::MmMutationGuard<'authority>,
+        witness: CowBroken<'mm>,
+        src: &'src [u8],
+    ) -> Result<PreparedForeignWrite<'mm, 'src, 'guard, 'authority>, MmAccessError> {
         if src.len() != witness.range.len.get() {
             return Err(MmAccessError::SourceLengthMismatch {
                 range: witness.range.len.get(),
                 source_len: src.len(),
             });
         }
-        let deadline = Instant::now() + Self::OVERALL_DEADLINE;
         let mm = &witness.range.token.mm;
+        let target_mutation = witness
+            .range
+            .token
+            .foreign_mutation
+            .as_ref()
+            .ok_or(MmAccessError::MissingForeignMutationAuthority(mm.id()))?;
+        if !target_mutation.authorizes(mutation) {
+            return Err(MmAccessError::ForeignMutationAuthorityMismatch);
+        }
+        let deadline = Instant::now() + Self::OVERALL_DEADLINE;
         let before = snapshot_backend(mm, deadline)?;
         validate_snapshot_vmas(&before)?;
         validate_range_in_snapshot(
@@ -556,7 +596,7 @@ impl MmAccessAuthority {
             .as_ref()
             .ok_or(MmAccessError::MissingForeignTransport(mm.id()))?;
         let live = RetainedMmLiveAuthority { mm: Arc::clone(mm) };
-        let receipt = match lease.write(
+        let prepared_transport = match lease.prepare_write(
             &live,
             &snapshot,
             witness.transport.as_ref(),
@@ -564,7 +604,7 @@ impl MmAccessAuthority {
             src,
             deadline,
         ) {
-            Ok(receipt) => receipt,
+            Ok(prepared) => prepared,
             Err(carrick_hal::ForeignMmTransportError::TimedOut) => {
                 return Err(MmAccessError::ForeignWriteTimedOut);
             }
@@ -575,6 +615,7 @@ impl MmAccessAuthority {
         if after != snapshot {
             return Err(MmAccessError::StaleCowBroken);
         }
+        let receipt = prepared_transport.receipt();
         if receipt.mm() != snapshot.mm
             || receipt.range_start() != witness.range.start
             || receipt.range_len() != witness.range.len.get()
@@ -588,7 +629,24 @@ impl MmAccessAuthority {
         {
             return Err(MmAccessError::ForeignWriteReceiptMismatch);
         }
-        Ok(ForeignWriteReceipt { transport: receipt })
+        let receipt = ForeignWriteReceipt {
+            bytes_written: receipt.bytes_written(),
+        };
+        Ok(PreparedForeignWrite {
+            witness,
+            src,
+            transport: prepared_transport,
+            guard: mutation,
+            receipt,
+        })
+    }
+
+    #[allow(dead_code)] // Canonical process_vm consumer lands in Task 8.
+    pub(crate) fn commit_foreign_write(
+        &self,
+        prepared: PreparedForeignWrite<'_, '_, '_, '_>,
+    ) -> ForeignWriteReceipt {
+        prepared.commit()
     }
 }
 
@@ -917,9 +975,9 @@ mod tests {
     use carrick_guest_mem::{Gpa, GuestVa};
     use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
     use carrick_hal::{
-        ForeignCowReceipt, ForeignMmReadLease, ForeignMmReadReceipt, ForeignMmSnapshot,
-        ForeignMmTransport, ForeignMmTransportError, ForeignMmWriteReceipt, ThreadId, VcpuKickDyn,
-        VcpuRegistry,
+        ForeignCowReceipt, ForeignMmPreparedWrite, ForeignMmReadLease, ForeignMmReadReceipt,
+        ForeignMmSnapshot, ForeignMmTransport, ForeignMmTransportError, ForeignMmWriteReceipt,
+        ThreadId, VcpuKickDyn, VcpuRegistry,
     };
 
     use super::ProjectedForeignMmSnapshot;
@@ -1213,10 +1271,17 @@ mod tests {
         AdvancedBackendAfterWrite,
     }
 
+    #[derive(Clone, Debug, Default)]
+    struct MockCowCounters {
+        prepare_calls: Arc<AtomicUsize>,
+        commit_calls: Arc<AtomicUsize>,
+    }
+
     #[derive(Debug)]
     struct MockCowTransport {
         owner_generation: Arc<AtomicU64>,
         bytes: Arc<parking_lot::Mutex<Vec<u8>>>,
+        counters: MockCowCounters,
         fault: MockCowFault,
         proof: crate::vcpu_loop::KernelForeignCowProof,
         mapping: carrick_hal::MappingId,
@@ -1265,6 +1330,7 @@ mod tests {
     struct MockCowLease {
         owner_generation: Arc<AtomicU64>,
         bytes: Arc<parking_lot::Mutex<Vec<u8>>>,
+        counters: MockCowCounters,
         fault: MockCowFault,
         proof: crate::vcpu_loop::KernelForeignCowProof,
         mapping: carrick_hal::MappingId,
@@ -1362,6 +1428,25 @@ mod tests {
         }
         fn owner_generation(&self) -> carrick_hal::ForeignOwnerGeneration {
             self.0.owner_generation()
+        }
+    }
+
+    #[derive(Debug)]
+    struct MockPreparedWrite<'a> {
+        bytes: Arc<parking_lot::Mutex<Vec<u8>>>,
+        counters: MockCowCounters,
+        src: &'a [u8],
+        receipt: Box<MockWriteReceipt>,
+    }
+
+    impl ForeignMmPreparedWrite for MockPreparedWrite<'_> {
+        fn commit(self: Box<Self>) {
+            self.counters.commit_calls.fetch_add(1, Ordering::SeqCst);
+            self.bytes.lock()[..self.src.len()].copy_from_slice(self.src);
+        }
+
+        fn receipt(&self) -> &dyn ForeignMmWriteReceipt {
+            self.receipt.as_ref()
         }
     }
 
@@ -1469,16 +1554,18 @@ mod tests {
             }))
         }
 
-        fn write(
+        fn prepare_write<'a>(
             &self,
             _invocation: &carrick_hal::ForeignMmInvocation,
             _authority: &dyn carrick_hal::ForeignMmLiveAuthority,
             snapshot: &dyn ForeignMmSnapshot,
             cow: &dyn ForeignCowReceipt,
             va: GuestVa,
-            src: &[u8],
+            src: &'a [u8],
             _deadline: Instant,
-        ) -> Result<Box<dyn ForeignMmWriteReceipt>, ForeignMmTransportError> {
+        ) -> Result<Box<dyn carrick_hal::ForeignMmPreparedWrite + 'a>, ForeignMmTransportError>
+        {
+            self.counters.prepare_calls.fetch_add(1, Ordering::SeqCst);
             if cow.owner_generation().raw_for_probe()
                 != self.owner_generation.load(Ordering::Acquire)
             {
@@ -1493,7 +1580,6 @@ mod tests {
             {
                 return Err(ForeignMmTransportError::Retry);
             }
-            self.bytes.lock()[..src.len()].copy_from_slice(src);
             if self.fault == MockCowFault::PostCopyError {
                 return Err(ForeignMmTransportError::OwnerStale);
             }
@@ -1510,7 +1596,7 @@ mod tests {
             } else {
                 cow.owner_generation()
             };
-            Ok(Box::new(MockWriteReceipt(MockCowReceipt {
+            let receipt = Box::new(MockWriteReceipt(MockCowReceipt {
                 mm: cow.mm(),
                 start: va,
                 len: src.len(),
@@ -1525,7 +1611,13 @@ mod tests {
                 kernel_proof: carrick_hal::ForeignCowKernelProof::from_runtime_authority(Box::new(
                     self.proof.clone(),
                 )),
-            })))
+            }));
+            Ok(Box::new(MockPreparedWrite {
+                bytes: Arc::clone(&self.bytes),
+                counters: self.counters.clone(),
+                src,
+                receipt,
+            }))
         }
     }
 
@@ -1539,6 +1631,7 @@ mod tests {
             Ok(Arc::new(MockCowLease {
                 owner_generation: Arc::clone(&self.owner_generation),
                 bytes: Arc::clone(&self.bytes),
+                counters: self.counters.clone(),
                 fault: self.fault,
                 proof: self.proof.clone(),
                 mapping: self.mapping,
@@ -1804,6 +1897,7 @@ mod tests {
         Arc<MutableFixtureBackend>,
         Arc<AtomicU64>,
         Arc<parking_lot::Mutex<Vec<u8>>>,
+        MockCowCounters,
     ) {
         let backend = MutableFixtureBackend::new();
         let child = fork_with_backend(
@@ -1815,6 +1909,7 @@ mod tests {
         );
         let owner_generation = Arc::new(AtomicU64::new(61));
         let bytes = Arc::new(parking_lot::Mutex::new(b"same".to_vec()));
+        let counters = MockCowCounters::default();
         let mm = child.shared().mm().id();
         let physical_base = Gpa(0xb000);
         let physical_len = 0x4000;
@@ -1838,6 +1933,7 @@ mod tests {
             carrick_hal::ForeignMmEndpoint::for_carrier(Arc::new(MockCowTransport {
                 owner_generation: Arc::clone(&owner_generation),
                 bytes: Arc::clone(&bytes),
+                counters: counters.clone(),
                 fault,
                 proof,
                 mapping,
@@ -1861,7 +1957,7 @@ mod tests {
                     stage1,
                 ),
             );
-        (child, backend, owner_generation, bytes)
+        (child, backend, owner_generation, bytes, counters)
     }
 
     fn production_composition_cow_fixture(
@@ -1912,6 +2008,7 @@ mod tests {
             carrick_hal::ForeignMmEndpoint::for_carrier(Arc::new(MockCowTransport {
                 owner_generation: Arc::new(AtomicU64::new(61)),
                 bytes: Arc::new(parking_lot::Mutex::new(b"same".to_vec())),
+                counters: MockCowCounters::default(),
                 fault: MockCowFault::ReacquireSnapshot,
                 proof,
                 mapping,
@@ -2054,7 +2151,7 @@ mod tests {
         let (kernel, root) = bootstrap(31_080);
         let execution = execution_lease(&root, 80);
         let parent_bytes = b"same".to_vec();
-        let (child, _backend, _owner, child_bytes) =
+        let (child, _backend, _owner, child_bytes, _counters) =
             cow_fixture(&kernel, &root, 31_081, MockCowFault::None);
         let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
         let range = foreign.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
@@ -2063,9 +2160,10 @@ mod tests {
             let cow = super::MmAccessAuthority::new()
                 .break_foreign_cow(mutation, &foreign, range)
                 .expect("break exact child COW");
-            let receipt = super::MmAccessAuthority::new()
-                .write_foreign(cow, b"edit")
+            let prepared = super::MmAccessAuthority::new()
+                .prepare_foreign_write(mutation, cow, b"edit")
                 .expect("copy through authenticated child owner");
+            let receipt = super::MmAccessAuthority::new().commit_foreign_write(prepared);
             assert_eq!(receipt.bytes_written(), 4);
         });
 
@@ -2128,9 +2226,10 @@ mod tests {
             let cow = super::MmAccessAuthority::new()
                 .break_foreign_cow(mutation, &foreign, range)
                 .expect("production carrier COW transaction");
-            super::MmAccessAuthority::new()
-                .write_foreign(cow, b"edit")
-                .expect("production carrier authenticated write")
+            let prepared = super::MmAccessAuthority::new()
+                .prepare_foreign_write(mutation, cow, b"edit")
+                .expect("production carrier authenticated write");
+            super::MmAccessAuthority::new().commit_foreign_write(prepared)
         });
 
         assert_eq!(write.bytes_written(), 4);
@@ -2514,7 +2613,7 @@ mod tests {
     fn foreign_cow_rejects_wrong_mm_guard_range_and_backend_receipt_identity() {
         let (kernel, root) = bootstrap(31_082);
         let execution = execution_lease(&root, 82);
-        let (child, _backend, _owner, _bytes) =
+        let (child, _backend, _owner, _bytes, _counters) =
             cow_fixture(&kernel, &root, 31_083, MockCowFault::None);
         let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
         let range = foreign.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
@@ -2527,7 +2626,7 @@ mod tests {
             ));
         });
 
-        let (other, _backend, _owner, _bytes) =
+        let (other, _backend, _owner, _bytes, _counters) =
             cow_fixture(&kernel, &root, 31_084, MockCowFault::None);
         let other_foreign = foreign_mm(&kernel, &root, &execution, other.task().key());
         let other_range = other_foreign
@@ -2542,7 +2641,7 @@ mod tests {
         });
 
         for fault in [MockCowFault::WrongMm, MockCowFault::WrongRange] {
-            let (target, _backend, _owner, _bytes) =
+            let (target, _backend, _owner, _bytes, _counters) =
                 cow_fixture(&kernel, &root, 31_085 + fault as i32, fault);
             let target = foreign_mm(&kernel, &root, &execution, target.task().key());
             let target_range = target.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
@@ -2573,7 +2672,7 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let (target, _backend, _owner, _bytes) =
+            let (target, _backend, _owner, _bytes, _counters) =
                 cow_fixture(&kernel, &root, 31_087 + index as i32, fault);
             let target = foreign_mm(&kernel, &root, &execution, target.task().key());
             let range = target.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
@@ -2599,7 +2698,7 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let (target, _backend, _owner, _bytes) =
+            let (target, _backend, _owner, _bytes, _counters) =
                 cow_fixture(&kernel, &root, 31_097 + index as i32, fault);
             let target = foreign_mm(&kernel, &root, &execution, target.task().key());
             let range = target.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
@@ -2705,7 +2804,7 @@ mod tests {
     fn foreign_cow_runtime_rejects_transport_owner_after_independent_proof_issuance() {
         let (kernel, root) = bootstrap(31_129);
         let execution = execution_lease(&root, 129);
-        let (child, _backend, owner_generation, _bytes) =
+        let (child, _backend, owner_generation, _bytes, _counters) =
             cow_fixture(&kernel, &root, 31_130, MockCowFault::None);
         let mm = child.shared().mm().id();
         let current_owner = carrick_hal::ForeignOwnerGeneration::from_backend_counter(
@@ -2790,7 +2889,7 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let (child, _backend, _owner, _bytes) =
+            let (child, _backend, _owner, _bytes, _counters) =
                 cow_fixture(&kernel, &root, 31_091 + index as i32, fault);
             let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
             let range = foreign.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
@@ -2808,7 +2907,7 @@ mod tests {
         for domain in 0..3 {
             let (kernel, root) = bootstrap(31_100 + domain as i32 * 10);
             let execution = execution_lease(&root, 100 + domain as u64);
-            let (child, backend, _owner, bytes) = cow_fixture(
+            let (child, backend, _owner, bytes, _counters) = cow_fixture(
                 &kernel,
                 &root,
                 31_101 + domain as i32 * 10,
@@ -2822,7 +2921,7 @@ mod tests {
                     .unwrap();
                 backend.advance(domain);
                 assert!(matches!(
-                    super::MmAccessAuthority::new().write_foreign(cow, b"edit"),
+                    super::MmAccessAuthority::new().prepare_foreign_write(mutation, cow, b"edit"),
                     Err(MmAccessError::StaleCowBroken)
                 ));
             });
@@ -2831,7 +2930,7 @@ mod tests {
 
         let (kernel, root) = bootstrap(31_140);
         let execution = execution_lease(&root, 140);
-        let (child, _backend, owner, bytes) =
+        let (child, _backend, owner, bytes, _counters) =
             cow_fixture(&kernel, &root, 31_141, MockCowFault::None);
         let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
         let range = foreign.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
@@ -2841,7 +2940,7 @@ mod tests {
                 .unwrap();
             owner.fetch_add(1, Ordering::AcqRel);
             assert!(matches!(
-                super::MmAccessAuthority::new().write_foreign(cow, b"edit"),
+                super::MmAccessAuthority::new().prepare_foreign_write(mutation, cow, b"edit"),
                 Err(MmAccessError::ForeignTransport(
                     ForeignMmTransportError::OwnerStale
                 ))
@@ -2850,47 +2949,133 @@ mod tests {
         assert_eq!(&*bytes.lock(), b"same");
     }
 
-    fn assert_foreign_write_failure_is_atomic(pid: i32, marker: u64, fault: MockCowFault) {
-        let (kernel, root) = bootstrap(pid);
-        let execution = execution_lease(&root, marker);
-        let (child, _backend, _owner, bytes) = cow_fixture(&kernel, &root, pid + 1, fault);
+    #[test]
+    fn foreign_write_no_fault_control_commits_exact_bytes_and_records_phase_counters() {
+        let (kernel, root) = bootstrap(31_145);
+        let execution = execution_lease(&root, 145);
+        let (child, _backend, _owner, bytes, counters) =
+            cow_fixture(&kernel, &root, 31_146, MockCowFault::None);
         let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
         let range = foreign.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
 
-        let result = with_foreign_mutation(&foreign, |mutation| {
+        let receipt = with_foreign_mutation(&foreign, |mutation| {
             let cow = super::MmAccessAuthority::new()
                 .break_foreign_cow(mutation, &foreign, range)
-                .expect("prepare exact child COW");
-            super::MmAccessAuthority::new().write_foreign(cow, b"edit")
+                .expect("break exact child COW");
+            let prepared = super::MmAccessAuthority::new()
+                .prepare_foreign_write(mutation, cow, b"edit")
+                .expect("prepare foreign write");
+            super::MmAccessAuthority::new().commit_foreign_write(prepared)
         });
 
-        assert!(
-            result.is_err(),
-            "fault fixture must report failure: {fault:?}"
-        );
-        assert_eq!(
-            &*bytes.lock(),
-            b"same",
-            "a reported failure must leave target bytes unchanged: {fault:?}",
-        );
+        assert_eq!(receipt.bytes_written(), 4);
+        assert_eq!(counters.prepare_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.commit_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(&*bytes.lock(), b"edit");
     }
 
     #[test]
     fn foreign_write_transport_error_cannot_follow_target_mutation() {
-        assert_foreign_write_failure_is_atomic(31_150, 150, MockCowFault::PostCopyError);
+        let (kernel, root) = bootstrap(31_150);
+        let execution = execution_lease(&root, 150);
+        let (child, _backend, _owner, bytes, counters) =
+            cow_fixture(&kernel, &root, 31_151, MockCowFault::PostCopyError);
+        let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
+        let range = foreign.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
+
+        let result: Result<super::ForeignWriteReceipt, super::MmAccessError> =
+            with_foreign_mutation(&foreign, |mutation| {
+                let cow = super::MmAccessAuthority::new()
+                    .break_foreign_cow(mutation, &foreign, range)
+                    .expect("prepare exact child COW");
+                let prepared = super::MmAccessAuthority::new()
+                    .prepare_foreign_write(mutation, cow, b"edit")?;
+                Ok(super::MmAccessAuthority::new().commit_foreign_write(prepared))
+            });
+
+        assert!(
+            matches!(
+                result,
+                Err(MmAccessError::ForeignTransport(
+                    ForeignMmTransportError::OwnerStale
+                ))
+            ),
+            "expected OwnerStale transport error, got {result:?}"
+        );
+        assert_eq!(counters.prepare_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.commit_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            &*bytes.lock(),
+            b"same",
+            "a reported transport failure must leave target bytes unchanged",
+        );
     }
 
     #[test]
     fn foreign_write_receipt_rejection_cannot_follow_target_mutation() {
-        assert_foreign_write_failure_is_atomic(31_160, 160, MockCowFault::WrongWriteReceipt);
+        let (kernel, root) = bootstrap(31_160);
+        let execution = execution_lease(&root, 160);
+        let (child, _backend, _owner, bytes, counters) =
+            cow_fixture(&kernel, &root, 31_161, MockCowFault::WrongWriteReceipt);
+        let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
+        let range = foreign.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
+
+        let result: Result<super::ForeignWriteReceipt, super::MmAccessError> =
+            with_foreign_mutation(&foreign, |mutation| {
+                let cow = super::MmAccessAuthority::new()
+                    .break_foreign_cow(mutation, &foreign, range)
+                    .expect("prepare exact child COW");
+                let prepared = super::MmAccessAuthority::new()
+                    .prepare_foreign_write(mutation, cow, b"edit")?;
+                Ok(super::MmAccessAuthority::new().commit_foreign_write(prepared))
+            });
+
+        assert!(
+            matches!(result, Err(MmAccessError::ForeignWriteReceiptMismatch)),
+            "expected ForeignWriteReceiptMismatch error, got {result:?}"
+        );
+        assert_eq!(counters.prepare_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.commit_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            &*bytes.lock(),
+            b"same",
+            "a reported receipt rejection must leave target bytes unchanged",
+        );
     }
 
     #[test]
     fn foreign_write_revision_recheck_cannot_follow_target_mutation() {
-        assert_foreign_write_failure_is_atomic(
-            31_170,
-            170,
+        let (kernel, root) = bootstrap(31_170);
+        let execution = execution_lease(&root, 170);
+        let (child, _backend, _owner, bytes, counters) = cow_fixture(
+            &kernel,
+            &root,
+            31_171,
             MockCowFault::AdvancedBackendAfterWrite,
+        );
+        let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
+        let range = foreign.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
+
+        let result: Result<super::ForeignWriteReceipt, super::MmAccessError> =
+            with_foreign_mutation(&foreign, |mutation| {
+                let cow = super::MmAccessAuthority::new()
+                    .break_foreign_cow(mutation, &foreign, range)
+                    .expect("prepare exact child COW");
+                let prepared = super::MmAccessAuthority::new()
+                    .prepare_foreign_write(mutation, cow, b"edit")?;
+                Ok(super::MmAccessAuthority::new().commit_foreign_write(prepared))
+            });
+
+        assert!(
+            matches!(result, Err(MmAccessError::StaleCowBroken)),
+            "expected StaleCowBroken error, got {result:?}"
+        );
+        assert_eq!(counters.prepare_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.commit_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            &*bytes.lock(),
+            b"same",
+            "a reported revision recheck failure must leave target bytes unchanged",
         );
     }
 

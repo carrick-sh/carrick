@@ -822,8 +822,8 @@ mod foreign_mm_tests {
         .expect("read shared parent owner");
         assert_eq!(&parent_bytes, b"old!");
         let post = child.live.0.read().clone();
-        let write = lease
-            .write(
+        let prepared = lease
+            .prepare_write(
                 &child.live,
                 &post,
                 cow.as_ref(),
@@ -831,8 +831,9 @@ mod foreign_mm_tests {
                 b"new!",
                 deadline,
             )
-            .expect("write authenticated child owner");
-        assert_eq!(write.bytes_written(), 4);
+            .expect("prepare authenticated child owner write");
+        assert_eq!(prepared.receipt().bytes_written(), 4);
+        prepared.commit();
         assert_eq!(&parent_bytes, b"old!");
         let new_key = (cow.physical_base().raw(), cow.physical_len());
         let new_owner = global_frame_host_owners().lock()[&new_key].clone();
@@ -7031,6 +7032,36 @@ impl carrick_hal::ForeignMmWriteReceipt for CarrierForeignWriteReceipt {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct CarrierForeignPreparedWrite<'a> {
+    _owner: std::sync::Arc<GlobalFrameHostOwner>,
+    dst_ptr: *mut u8,
+    src: &'a [u8],
+    receipt: Box<CarrierForeignWriteReceipt>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl std::fmt::Debug for CarrierForeignPreparedWrite<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CarrierForeignPreparedWrite")
+            .field("receipt", &self.receipt)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl carrick_hal::ForeignMmPreparedWrite for CarrierForeignPreparedWrite<'_> {
+    fn commit(self: Box<Self>) {
+        unsafe {
+            std::ptr::copy(self.src.as_ptr(), self.dst_ptr, self.src.len());
+        }
+    }
+
+    fn receipt(&self) -> &dyn carrick_hal::ForeignMmWriteReceipt {
+        self.receipt.as_ref()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl carrick_hal::ForeignMmReadReceipt for CarrierForeignMmReceipt {
     fn bytes_read(&self) -> usize {
         self.bytes_read
@@ -7632,17 +7663,19 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
             .map(|receipt| Box::new(receipt) as Box<dyn carrick_hal::ForeignCowReceipt>)
     }
 
-    fn write(
+    fn prepare_write<'a>(
         &self,
         _invocation: &carrick_hal::ForeignMmInvocation,
         authority: &dyn carrick_hal::ForeignMmLiveAuthority,
         snapshot: &dyn carrick_hal::ForeignMmSnapshot,
         cow: &dyn carrick_hal::ForeignCowReceipt,
         va: carrick_guest_mem::GuestVa,
-        src: &[u8],
+        src: &'a [u8],
         deadline: std::time::Instant,
-    ) -> Result<Box<dyn carrick_hal::ForeignMmWriteReceipt>, carrick_hal::ForeignMmTransportError>
-    {
+    ) -> Result<
+        Box<dyn carrick_hal::ForeignMmPreparedWrite + 'a>,
+        carrick_hal::ForeignMmTransportError,
+    > {
         let requested = CarrierForeignMmSnapshot::capture(snapshot);
         if !live_snapshot_matches(authority, &requested, deadline)?
             || requested.mm != self.retained.mm
@@ -7717,14 +7750,8 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
         {
             return Err(carrick_hal::ForeignMmTransportError::Retry);
         }
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                src.as_ptr(),
-                owner._mapping.as_ptr().add(offset),
-                src.len(),
-            );
-        }
-        Ok(Box::new(CarrierForeignWriteReceipt {
+        let dst_ptr = unsafe { owner._mapping.as_ptr().add(offset) };
+        let receipt = Box::new(CarrierForeignWriteReceipt {
             snapshot: requested,
             start: va,
             len: src.len(),
@@ -7732,6 +7759,12 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
             frame: cow.frame(),
             owner_generation: cow.owner_generation(),
             bytes_written: src.len(),
+        });
+        Ok(Box::new(CarrierForeignPreparedWrite {
+            _owner: owner,
+            dst_ptr,
+            src,
+            receipt,
         }))
     }
 }

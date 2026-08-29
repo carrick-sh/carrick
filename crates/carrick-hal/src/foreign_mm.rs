@@ -275,6 +275,13 @@ pub trait ForeignMmWriteReceipt: Debug + Send + Sync {
     fn owner_generation(&self) -> ForeignOwnerGeneration;
 }
 
+/// Single-use transport witness for one prepared foreign copy. Commit consumes
+/// the prepared state and performs the write infallibly.
+pub trait ForeignMmPreparedWrite: Debug {
+    fn commit(self: Box<Self>);
+    fn receipt(&self) -> &dyn ForeignMmWriteReceipt;
+}
+
 /// Strong lease for one exact carrier MM access state.
 pub trait ForeignMmReadLease: Debug + Send + Sync {
     fn read(
@@ -302,16 +309,16 @@ pub trait ForeignMmReadLease: Debug + Send + Sync {
     }
 
     #[allow(clippy::too_many_arguments)] // Object-safe transport carries exact mutation domains.
-    fn write(
+    fn prepare_write<'a>(
         &self,
         invocation: &ForeignMmInvocation,
         authority: &dyn ForeignMmLiveAuthority,
         snapshot: &dyn ForeignMmSnapshot,
         cow: &dyn ForeignCowReceipt,
         va: GuestVa,
-        src: &[u8],
+        src: &'a [u8],
         deadline: Instant,
-    ) -> Result<Box<dyn ForeignMmWriteReceipt>, ForeignMmTransportError> {
+    ) -> Result<Box<dyn ForeignMmPreparedWrite + 'a>, ForeignMmTransportError> {
         let _ = (invocation, authority, snapshot, cow, va, src, deadline);
         Err(ForeignMmTransportError::AuthorityUnavailable)
     }
@@ -430,18 +437,18 @@ impl ForeignMmLeaseEndpoint {
             .break_cow(&invocation, invalidator, snapshot, va, len, deadline)
     }
 
-    pub fn write(
+    pub fn prepare_write<'a>(
         &self,
         authority: &dyn ForeignMmLiveAuthority,
         snapshot: &dyn ForeignMmSnapshot,
         cow: &dyn ForeignCowReceipt,
         va: GuestVa,
-        src: &[u8],
+        src: &'a [u8],
         deadline: Instant,
-    ) -> Result<Box<dyn ForeignMmWriteReceipt>, ForeignMmTransportError> {
+    ) -> Result<Box<dyn ForeignMmPreparedWrite + 'a>, ForeignMmTransportError> {
         let invocation = ForeignMmInvocation { _private: () };
         self.lease
-            .write(&invocation, authority, snapshot, cow, va, src, deadline)
+            .prepare_write(&invocation, authority, snapshot, cow, va, src, deadline)
     }
 }
 
@@ -558,30 +565,45 @@ mod tests {
             }))
         }
 
-        fn write(
+        fn prepare_write<'a>(
             &self,
             _invocation: &ForeignMmInvocation,
             _authority: &dyn ForeignMmLiveAuthority,
             snapshot: &dyn ForeignMmSnapshot,
             cow: &dyn ForeignCowReceipt,
             va: GuestVa,
-            src: &[u8],
+            src: &'a [u8],
             _deadline: Instant,
-        ) -> Result<Box<dyn ForeignMmWriteReceipt>, ForeignMmTransportError> {
+        ) -> Result<Box<dyn ForeignMmPreparedWrite + 'a>, ForeignMmTransportError> {
             assert_eq!(cow.mm(), snapshot.mm());
             assert_eq!(cow.range_start(), va);
             assert_eq!(cow.range_len(), src.len());
-            Ok(Box::new(WriteReceipt {
-                mm: snapshot.mm(),
-                start: va,
-                len: src.len(),
-                backend_revision: snapshot.backend_revision(),
-                vma_revision: snapshot.vma_revision(),
-                frame_inventory_revision: snapshot.frame_inventory_revision(),
-                mapping: cow.mapping(),
-                frame: cow.frame(),
-                owner_generation: cow.owner_generation(),
+            Ok(Box::new(PreparedWrite {
+                receipt: Box::new(WriteReceipt {
+                    mm: snapshot.mm(),
+                    start: va,
+                    len: src.len(),
+                    backend_revision: snapshot.backend_revision(),
+                    vma_revision: snapshot.vma_revision(),
+                    frame_inventory_revision: snapshot.frame_inventory_revision(),
+                    mapping: cow.mapping(),
+                    frame: cow.frame(),
+                    owner_generation: cow.owner_generation(),
+                }),
             }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct PreparedWrite {
+        receipt: Box<WriteReceipt>,
+    }
+
+    impl ForeignMmPreparedWrite for PreparedWrite {
+        fn commit(self: Box<Self>) {}
+
+        fn receipt(&self) -> &dyn ForeignMmWriteReceipt {
+            self.receipt.as_ref()
         }
     }
 
@@ -765,8 +787,8 @@ mod tests {
         assert_eq!(cow.physical_len(), 0x4000);
         assert_eq!(cow.owner_generation().raw_for_probe(), 41);
 
-        let written = lease
-            .write(
+        let prepared = lease
+            .prepare_write(
                 &Live,
                 snapshot.as_ref(),
                 cow.as_ref(),
@@ -775,18 +797,25 @@ mod tests {
                 deadline,
             )
             .unwrap();
-        assert_eq!(written.mm(), snapshot.mm());
-        assert_eq!(written.range_start(), GuestVa(0x4000));
-        assert_eq!(written.range_len(), 6);
-        assert_eq!(written.bytes_written(), 6);
-        assert_eq!(written.backend_revision(), snapshot.backend_revision());
-        assert_eq!(written.vma_revision(), snapshot.vma_revision());
+        assert_eq!(prepared.receipt().mm(), snapshot.mm());
+        assert_eq!(prepared.receipt().range_start(), GuestVa(0x4000));
+        assert_eq!(prepared.receipt().range_len(), 6);
+        assert_eq!(prepared.receipt().bytes_written(), 6);
         assert_eq!(
-            written.frame_inventory_revision(),
+            prepared.receipt().backend_revision(),
+            snapshot.backend_revision()
+        );
+        assert_eq!(prepared.receipt().vma_revision(), snapshot.vma_revision());
+        assert_eq!(
+            prepared.receipt().frame_inventory_revision(),
             snapshot.frame_inventory_revision()
         );
-        assert_eq!(written.mapping(), cow.mapping());
-        assert_eq!(written.frame(), cow.frame());
-        assert_eq!(written.owner_generation(), cow.owner_generation());
+        assert_eq!(prepared.receipt().mapping(), cow.mapping());
+        assert_eq!(prepared.receipt().frame(), cow.frame());
+        assert_eq!(
+            prepared.receipt().owner_generation(),
+            cow.owner_generation()
+        );
+        prepared.commit();
     }
 }
