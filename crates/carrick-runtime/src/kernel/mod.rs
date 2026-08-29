@@ -45,6 +45,8 @@ pub use crash_capture::{
     CrashQuorumPoll, CrashRegisterFile, CrashRegisterVote,
 };
 pub(crate) use mm_access::MmAccessAuthority;
+#[cfg(test)]
+pub(crate) use mm_access::tests::consumer_cow_fixture;
 pub use mm_access::{
     CowBroken, CurrentMm, ForeignMm, ForeignWriteReceipt, MmAccessError, MmReadRange, MmRelation,
     MmToken, MmWriteRange,

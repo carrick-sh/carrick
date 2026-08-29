@@ -5592,14 +5592,118 @@ mod kernel_process_dispatch_tests {
     }
 
     #[test]
-    fn process_vm_writev_foreign_returns_efault() {
+    fn process_vm_writev_changes_only_the_exact_foreign_target() {
         let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_096);
-        let target = process_vm_target(&root, 61_097);
+        let mut initial = vec![b'_'; 0x4000];
+        initial[..4].copy_from_slice(b"same");
+        let target = crate::kernel::consumer_cow_fixture(root.kernel(), &root, 61_097, initial);
         let root = refreshed(&root);
-        let target_pid = target.task().key().id.raw();
+        let target_pid = target.target().task().key().id.raw();
         let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
         write_iovec(&mut memory, LOCAL_IOV, LOCAL_BUF, 4);
         write_iovec(&mut memory, REMOTE_IOV, TARGET_VA, 4);
+        memory.write_bytes(LOCAL_BUF, b"EDIT").unwrap();
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PROCESS_VM_WRITEV,
+                [target_pid as u64, LOCAL_IOV, 1, REMOTE_IOV, 1, 0],
+                Some(&lease),
+            ),
+            DispatchOutcome::Returned { value: 4 },
+        );
+        assert_eq!(target.child_bytes(0, 4), b"EDIT");
+        assert_eq!(&target.peer_bytes()[..4], b"same");
+        assert_eq!(memory.read_bytes(LOCAL_BUF, 4).unwrap(), b"EDIT");
+        assert_eq!(memory.read_bytes(TARGET_VA, 4).unwrap(), b"\0\0\0\0");
+        assert_eq!(target.break_calls(), 1);
+        assert_eq!(target.prepare_calls(), 1);
+        assert_eq!(target.commit_calls(), 1);
+    }
+
+    #[test]
+    fn process_vm_writev_reuses_one_compound_for_two_remote_subranges() {
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_100);
+        let mut initial = vec![b'_'; 0x4000];
+        initial[..16].copy_from_slice(b"same_old_data___");
+        let target = crate::kernel::consumer_cow_fixture(root.kernel(), &root, 61_101, initial);
+        let root = refreshed(&root);
+        let target_pid = target.target().task().key().id.raw();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x5000]);
+        const LOCAL_IOVS: u64 = 0x1400;
+        const REMOTE_IOVS: u64 = 0x1440;
+        write_iovec(&mut memory, LOCAL_IOVS, LOCAL_BUF, 4);
+        write_iovec(&mut memory, LOCAL_IOVS + 16, LOCAL_BUF + 4, 4);
+        write_iovec(&mut memory, REMOTE_IOVS, TARGET_VA, 4);
+        write_iovec(&mut memory, REMOTE_IOVS + 16, TARGET_VA + 8, 4);
+        memory.write_bytes(LOCAL_BUF, b"ONE1TWO2").unwrap();
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PROCESS_VM_WRITEV,
+                [target_pid as u64, LOCAL_IOVS, 2, REMOTE_IOVS, 2, 0],
+                Some(&lease),
+            ),
+            DispatchOutcome::Returned { value: 8 },
+        );
+        assert_eq!(target.child_bytes(0, 12), b"ONE1_oldTWO2");
+        assert_eq!(&target.peer_bytes()[..16], b"same_old_data___");
+        assert_eq!(target.break_calls(), 1);
+        assert_eq!(target.prepare_calls(), 2);
+        assert_eq!(target.commit_calls(), 2);
+    }
+
+    #[test]
+    fn process_vm_writev_later_foreign_fault_returns_completed_prefix() {
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_102);
+        let mut initial = vec![b'_'; 0x4000];
+        initial[..8].copy_from_slice(b"samepeer");
+        let target = crate::kernel::consumer_cow_fixture(root.kernel(), &root, 61_103, initial);
+        let root = refreshed(&root);
+        let target_pid = target.target().task().key().id.raw();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+        const REMOTE_IOV_SECOND: u64 = REMOTE_IOV + 16;
+        write_iovec(&mut memory, LOCAL_IOV, LOCAL_BUF, 8);
+        write_iovec(&mut memory, REMOTE_IOV, TARGET_VA, 4);
+        write_iovec(&mut memory, REMOTE_IOV_SECOND, 0x9999_0000, 4);
+        memory.write_bytes(LOCAL_BUF, b"EDITTAIL").unwrap();
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PROCESS_VM_WRITEV,
+                [target_pid as u64, LOCAL_IOV, 1, REMOTE_IOV, 2, 0],
+                Some(&lease),
+            ),
+            DispatchOutcome::Returned { value: 4 },
+        );
+        assert_eq!(target.child_bytes(0, 8), b"EDITpeer");
+        assert_eq!(&target.peer_bytes()[..8], b"samepeer");
+        assert_eq!(target.break_calls(), 1);
+        assert_eq!(target.prepare_calls(), 1);
+        assert_eq!(target.commit_calls(), 1);
+    }
+
+    #[test]
+    fn process_vm_writev_first_foreign_fault_is_efault_without_mutation() {
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_104);
+        let mut initial = vec![b'_'; 0x4000];
+        initial[..4].copy_from_slice(b"same");
+        let target = crate::kernel::consumer_cow_fixture(root.kernel(), &root, 61_105, initial);
+        let root = refreshed(&root);
+        let target_pid = target.target().task().key().id.raw();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+        write_iovec(&mut memory, LOCAL_IOV, LOCAL_BUF, 4);
+        write_iovec(&mut memory, REMOTE_IOV, 0x9999_0000, 4);
+        memory.write_bytes(LOCAL_BUF, b"EDIT").unwrap();
 
         assert_eq!(
             dispatch_with_lease(
@@ -5612,6 +5716,11 @@ mod kernel_process_dispatch_tests {
             ),
             DispatchOutcome::errno(LINUX_EFAULT),
         );
+        assert_eq!(target.child_bytes(0, 4), b"same");
+        assert_eq!(&target.peer_bytes()[..4], b"same");
+        assert_eq!(target.break_calls(), 0);
+        assert_eq!(target.prepare_calls(), 0);
+        assert_eq!(target.commit_calls(), 0);
     }
 
     #[test]
@@ -5712,6 +5821,19 @@ mod kernel_process_dispatch_tests {
                 "syscall {ordinary} must not require execution lease"
             );
         }
+    }
+
+    #[test]
+    fn process_vm_writev_resolves_ordinary_then_acquires_only_target_mm_mutation() {
+        let args = SyscallArgs::from([0; 6]);
+        assert!(crate::dispatch::resolve_handler::<LinearMemory>(271).is_some());
+        assert!(
+            crate::dispatch::resolve_mutation_handler::<LinearMemory>(271).is_none(),
+            "process_vm_writev must not acquire caller/current-MM mutation authority",
+        );
+        assert!(!crate::dispatch::syscall_requires_mm_mutation(271, args));
+        assert!(crate::dispatch::syscall_requires_execution_lease(271));
+        assert_eq!(crate::dispatch::MM_MUTATION_SYSCALLS.len(), 17);
     }
 
     #[test]
