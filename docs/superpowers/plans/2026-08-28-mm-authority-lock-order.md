@@ -22,6 +22,10 @@
 - Page-table exclusion precedes host-alias mutation. No operation waits for page-table exclusion while holding the host-alias phase.
 - Preserve the current-MM hot path: no new allocation, vtable call, global lookup, or lock for ordinary syscall guest-pointer access.
 - Preserve Linux partial-transfer and syscall-specific errno semantics.
+- Never read, search, quote, cite, or rely on Linux kernel source. Derive
+  Linux-visible behavior only from Carrick's checked-in contracts, public ABI
+  documentation, and controlled Docker-oracle measurements. Abandon and retry
+  any work or review stream that violates this clean-room boundary.
 - Every behavior change is red-first. Record the exact expected failure against the pre-fix code/artifact before implementation.
 - Do not run Carrick and Docker concurrently. Oracle and Carrick phases are serialized.
 - Guest execution on macOS uses `just build`, `just run`, or `just test-embed`; unsigned `cargo build` artifacts are compile-only.
