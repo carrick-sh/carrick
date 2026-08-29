@@ -739,6 +739,27 @@ mod tests {
     }
 
     #[test]
+    fn current_mm_rejects_same_identity_lease_from_another_kernel() {
+        let (_kernel, root) = bootstrap(31_125);
+        let (_other_kernel, other) = bootstrap(31_125);
+        let _local_execution = execution_lease(&root, 125);
+        let foreign_execution = execution_lease(&other, 125);
+
+        assert_eq!(root.thread().key(), other.thread().key());
+        assert_eq!(root.shared().mm().id(), other.shared().mm().id());
+        assert_eq!(
+            root.thread().execution_state(),
+            other.thread().execution_state()
+        );
+        assert!(matches!(
+            root.current_mm(&foreign_execution),
+            Err(MmAccessError::ExecutionAuthority(
+                ThreadExecutionError::LeaseOwnerMismatch { .. }
+            ))
+        ));
+    }
+
+    #[test]
     fn foreign_mm_rejects_another_threads_execution_lease() {
         let (kernel, root) = bootstrap(31_122);
         let child = fork_with_backend(
@@ -753,6 +774,34 @@ mod tests {
 
         assert!(matches!(
             kernel.foreign_mm(&root, &execution, child.task().key()),
+            Err(MmAccessError::ExecutionAuthority(
+                ThreadExecutionError::LeaseOwnerMismatch { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn foreign_mm_rejects_same_identity_lease_from_another_kernel() {
+        let (kernel, root) = bootstrap(31_126);
+        let child = fork_with_backend(
+            &kernel,
+            &root,
+            31_127,
+            "same-identity foreign-authority child",
+            fixture_backend(),
+        );
+        let (_other_kernel, other) = bootstrap(31_126);
+        let _local_execution = execution_lease(&root, 126);
+        let foreign_execution = execution_lease(&other, 126);
+
+        assert_eq!(root.thread().key(), other.thread().key());
+        assert_eq!(root.shared().mm().id(), other.shared().mm().id());
+        assert_eq!(
+            root.thread().execution_state(),
+            other.thread().execution_state()
+        );
+        assert!(matches!(
+            kernel.foreign_mm(&root, &foreign_execution, child.task().key()),
             Err(MmAccessError::ExecutionAuthority(
                 ThreadExecutionError::LeaseOwnerMismatch { .. }
             ))

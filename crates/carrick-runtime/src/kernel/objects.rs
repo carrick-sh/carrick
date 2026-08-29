@@ -6349,7 +6349,11 @@ impl Thread {
         &self,
         lease: &ThreadExecutionLease,
     ) -> Result<(), ThreadExecutionError> {
-        if lease.owner_key != self.key {
+        let exact_owner = lease
+            .owner
+            .upgrade()
+            .is_some_and(|owner| std::ptr::eq(self, owner.as_ref()));
+        if lease.owner_key != self.key || !exact_owner {
             return Err(ThreadExecutionError::LeaseOwnerMismatch {
                 expected: self.key,
                 actual: lease.owner_key,

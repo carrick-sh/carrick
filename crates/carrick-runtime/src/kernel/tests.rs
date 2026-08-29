@@ -148,6 +148,48 @@ fn thread_execution_claims_exact_generation_and_parks() {
 }
 
 #[test]
+fn thread_execution_rejects_same_key_lease_from_another_kernel() {
+    let (_kernel, context) = bootstrap(9108);
+    let (_other_kernel, other) = bootstrap(9108);
+    let state = GuestCpuState::from_aarch64_v1(aarch64_test_task_state());
+    context
+        .thread()
+        .publish_initial_task_state(migratable(&context, state.clone()))
+        .unwrap();
+    other
+        .thread()
+        .publish_initial_task_state(migratable(&other, state))
+        .unwrap();
+    let executor = ExecutorId::synthetic_for_tests(10);
+    let local_lease = context.thread().claim_runnable(executor).unwrap();
+    let foreign_lease = other.thread().claim_runnable(executor).unwrap();
+
+    assert_eq!(context.thread().key(), other.thread().key());
+    assert_eq!(context.shared().mm().id(), other.shared().mm().id());
+    assert_eq!(
+        context.thread().execution_state(),
+        other.thread().execution_state()
+    );
+    let (error, foreign_lease) = context
+        .thread()
+        .park_from_executor(foreign_lease, BlockedReason::ChildState)
+        .expect_err("a numerically identical foreign owner must be rejected");
+    assert!(matches!(
+        error,
+        ThreadExecutionError::LeaseOwnerMismatch { .. }
+    ));
+
+    context
+        .thread()
+        .park_from_executor(local_lease, BlockedReason::ChildState)
+        .unwrap();
+    other
+        .thread()
+        .park_from_executor(foreign_lease, BlockedReason::ChildState)
+        .unwrap();
+}
+
+#[test]
 fn thread_execution_switching_out_preserves_exact_owner() {
     let (_kernel, context) = bootstrap(9107);
     let thread = context.thread();
