@@ -97,6 +97,7 @@ pub(crate) fn fork_barrier_participants(
 impl ForkBarrierParticipants {
     pub(crate) fn requires_quiesce(&self) -> bool;
     pub(crate) fn contains_sibling(&self, key: ThreadKey) -> bool;
+    pub(crate) fn initial_sibling_count_for_probe(&self) -> u32;
 }
 ```
 
@@ -104,6 +105,8 @@ The exact owner must be a current task member. The witness contains every other
 current `ThreadKey`, regardless of execution state. `requires_quiesce()` is true
 exactly when that identity set is non-empty. The witness is consumed only by
 the process-fork barrier decision; it is not reused by crash or exit.
+`initial_sibling_count_for_probe()` is the existing fork-quiesce USDT slot's
+named observability-only projection and may not authorize control flow.
 
 ### `CrashBarrierParticipants`
 
@@ -272,7 +275,9 @@ census.live()
 
 The required replacements are:
 
-- `vcpu_loop/quiesce.rs`: `ForkBarrierParticipants::requires_quiesce`;
+- `vcpu_loop/quiesce.rs`: `ForkBarrierParticipants::requires_quiesce` for
+  control and `initial_sibling_count_for_probe` only at the existing USDT
+  observability boundary;
 - `vcpu_loop/mod.rs`: `CrashBarrierParticipants::requires_quiesce`,
   `CoreNoteParticipants::required_note_count_for_probe`, identity-census entry,
   and the named probe-only census projection;
