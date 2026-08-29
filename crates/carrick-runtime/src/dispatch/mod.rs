@@ -1169,6 +1169,42 @@ impl<M: CurrentMmMemory> SyscallCtx<'_, M> {
             .map(|t| t.tid)
             .unwrap_or_else(crate::thread::ThreadId::main_from_host_pid)
     }
+
+    pub(crate) fn with_execution_lease<R>(
+        &self,
+        operation: impl FnOnce(&crate::kernel::objects::ThreadExecutionLease) -> R,
+    ) -> Option<R> {
+        with_active_execution_lease(operation)
+    }
+}
+
+thread_local! {
+    static ACTIVE_EXECUTION_LEASE: std::cell::Cell<Option<*const crate::kernel::objects::ThreadExecutionLease>> =
+        const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn with_execution_lease<R>(
+    lease: Option<&crate::kernel::objects::ThreadExecutionLease>,
+    operation: impl FnOnce() -> R,
+) -> R {
+    let previous = ACTIVE_EXECUTION_LEASE.with(|cell| cell.replace(lease.map(|l| l as *const _)));
+    struct ResetExecutionLease(Option<*const crate::kernel::objects::ThreadExecutionLease>);
+    impl Drop for ResetExecutionLease {
+        fn drop(&mut self) {
+            ACTIVE_EXECUTION_LEASE.with(|cell| cell.set(self.0));
+        }
+    }
+    let _reset = ResetExecutionLease(previous);
+    operation()
+}
+
+pub(crate) fn with_active_execution_lease<R>(
+    operation: impl FnOnce(&crate::kernel::objects::ThreadExecutionLease) -> R,
+) -> Option<R> {
+    ACTIVE_EXECUTION_LEASE.with(|cell| {
+        let ptr = cell.get()?;
+        Some(operation(unsafe { &*ptr }))
+    })
 }
 
 /// Per-thread coordination handles handed to tid-aware syscall handlers
@@ -6582,32 +6618,44 @@ impl SyscallDispatcher {
         let executor = self
             .enter_mm_executor()
             .map_err(DispatchError::MmExecutorAdmission)?;
-        if syscall_requires_mm_mutation(request.number.raw(), request.args) {
-            let mut executor = executor;
-            let coordinator = executor.mutation_coordinator();
-            let mm = executor.mm_id();
-            crate::vcpu_loop::with_sole_mm_stage1(&mut executor, |authority| {
-                let mut guard = mm_mutation::from_sole_executor(authority, coordinator, mm);
+        #[cfg(test)]
+        let test_lease_holder = self
+            .hvpatch_process()
+            .and_then(|p| p.test_execution_lease_holder());
+        #[cfg(test)]
+        let test_lease_guard = test_lease_holder.as_ref().map(|h| h.lock());
+        #[cfg(test)]
+        let test_lease = test_lease_guard.as_deref();
+        #[cfg(not(test))]
+        let test_lease = None;
+        with_execution_lease(test_lease, || {
+            if syscall_requires_mm_mutation(request.number.raw(), request.args) {
+                let mut executor = executor;
+                let coordinator = executor.mutation_coordinator();
+                let mm = executor.mm_id();
+                crate::vcpu_loop::with_sole_mm_stage1(&mut executor, |authority| {
+                    let mut guard = mm_mutation::from_sole_executor(authority, coordinator, mm);
+                    self.dispatch_inner(
+                        kernel,
+                        request,
+                        memory,
+                        reporter,
+                        None,
+                        MutationDispatchRoute { guard: &mut guard },
+                    )
+                })
+                .ok_or(DispatchError::MmMutationPeerExecutor)?
+            } else {
                 self.dispatch_inner(
                     kernel,
                     request,
                     memory,
                     reporter,
                     None,
-                    MutationDispatchRoute { guard: &mut guard },
+                    OrdinaryDispatchRoute,
                 )
-            })
-            .ok_or(DispatchError::MmMutationPeerExecutor)?
-        } else {
-            self.dispatch_inner(
-                kernel,
-                request,
-                memory,
-                reporter,
-                None,
-                OrdinaryDispatchRoute,
-            )
-        }
+            }
+        })
     }
 
     /// Run a non-threaded completion under a fresh exact-MM census admission.

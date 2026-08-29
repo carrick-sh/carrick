@@ -53,6 +53,19 @@ impl ForeignMmInstallPermit {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+struct TestExecutionLease(
+    std::sync::Arc<parking_lot::Mutex<crate::kernel::objects::ThreadExecutionLease>>,
+);
+
+#[cfg(test)]
+impl std::fmt::Debug for TestExecutionLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TestExecutionLease")
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ProcessContext {
     resources: std::sync::Arc<MmResources>,
@@ -60,6 +73,8 @@ pub(crate) struct ProcessContext {
     mm_backend: std::sync::Arc<parking_lot::RwLock<std::sync::Arc<stage1_mm::Stage1MmBackend>>>,
     mm_access: Option<crate::kernel::MmAccessAuthority>,
     foreign_mm_endpoint: Option<carrick_hal::ForeignMmEndpoint>,
+    #[cfg(test)]
+    test_execution_lease: Option<TestExecutionLease>,
 }
 
 /// Build a real HVPatch process binding for cross-subsystem unit tests. This
@@ -97,6 +112,28 @@ impl ProcessContext {
     /// unit fixture without exposing a production authority constructor.
     pub(crate) fn enable_mm_access_for_tests(&mut self) {
         self.mm_access = Some(crate::kernel::MmAccessAuthority::new());
+    }
+
+    pub(crate) fn set_test_execution_lease(
+        &mut self,
+        lease: crate::kernel::objects::ThreadExecutionLease,
+    ) {
+        self.test_execution_lease = Some(TestExecutionLease(std::sync::Arc::new(
+            parking_lot::Mutex::new(lease),
+        )));
+    }
+
+    pub(crate) fn clear_test_execution_lease(&mut self) {
+        self.test_execution_lease = None;
+    }
+
+    pub(crate) fn test_execution_lease_holder(
+        &self,
+    ) -> Option<std::sync::Arc<parking_lot::Mutex<crate::kernel::objects::ThreadExecutionLease>>>
+    {
+        self.test_execution_lease
+            .as_ref()
+            .map(|l| std::sync::Arc::clone(&l.0))
     }
 }
 
@@ -513,6 +550,8 @@ impl ProcessContext {
             mm_backend: std::sync::Arc::new(parking_lot::RwLock::new(mm_backend)),
             mm_access: None,
             foreign_mm_endpoint: None,
+            #[cfg(test)]
+            test_execution_lease: None,
         }
     }
 
