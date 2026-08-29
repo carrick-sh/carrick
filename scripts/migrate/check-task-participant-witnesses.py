@@ -27,7 +27,24 @@ RAW_TASK_PROJECTION = "generic task membership projection"
 RAW_TASK_CARDINALITY = "raw task cardinality"
 SCALAR_CENSUS_STORAGE = "scalar executor census storage"
 SCALAR_CENSUS_API = "scalar executor census API"
+SCALAR_WITNESS_API = "scalar participant witness API"
 RAW_CRASH_PARTICIPATION = "raw crash-safe-point mutation"
+
+SCALAR_COLLECTION_METHODS = frozenset({"count", "is_empty", "len"})
+PARTICIPANT_WITNESS_TYPES = frozenset(
+    {
+        "ForkBarrierParticipants",
+        "CrashBarrierParticipants",
+        "ThreadExitParticipants",
+        "CrashCaptureParticipants",
+        "CoreNoteParticipants",
+        "GuestExecutorCensus",
+    }
+)
+NUMERIC_RETURN_TYPES = frozenset(
+    {"i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize"}
+)
+ALLOWED_NUMERIC_METHOD_SUFFIX = "_for_probe"
 
 CRASH_MUTATION_OWNERS = frozenset(
     {
@@ -292,6 +309,100 @@ def _find_block(tokens: Sequence[Token], start: int) -> tuple[int, int] | None:
     return None
 
 
+def _expression_end(tokens: Sequence[Token], start: int) -> int:
+    """Find the enclosing statement boundary without interpreting Rust types."""
+    parens = 0
+    brackets = 0
+    braces = 0
+    for index in range(start, len(tokens)):
+        text = tokens[index].text
+        if text == "(":
+            parens += 1
+        elif text == ")":
+            parens = max(0, parens - 1)
+        elif text == "[":
+            brackets += 1
+        elif text == "]":
+            brackets = max(0, brackets - 1)
+        elif text == "{":
+            braces += 1
+        elif text == "}":
+            if braces == 0 and parens == 0 and brackets == 0:
+                return index
+            braces = max(0, braces - 1)
+        elif text == ";" and parens == 0 and brackets == 0 and braces == 0:
+            return index
+    return len(tokens)
+
+
+def _scalar_method_in_chain(
+    tokens: Sequence[Token], start: int, end: int
+) -> tuple[int, str] | None:
+    """Inspect only methods whose receiver is the preceding chain value."""
+    cursor = start
+    while cursor + 3 < end and tokens[cursor].text == ".":
+        method = tokens[cursor + 1]
+        if method.kind != "ident" or tokens[cursor + 2].text != "(":
+            return None
+        close = _matching_delimiter(tokens, cursor + 2, "(", ")")
+        if close >= end:
+            return None
+        if method.text in SCALAR_COLLECTION_METHODS and close == cursor + 3:
+            return cursor, method.text
+        cursor = close + 1
+    return None
+
+
+def _enclosing_block_end(tokens: Sequence[Token], index: int) -> int:
+    nested_closes = 0
+    for cursor in range(index - 1, -1, -1):
+        if tokens[cursor].text == "}":
+            nested_closes += 1
+        elif tokens[cursor].text == "{":
+            if nested_closes:
+                nested_closes -= 1
+            else:
+                return _matching_delimiter(tokens, cursor, "{", "}")
+    return len(tokens)
+
+
+def _task_membership_aliases(
+    tokens: Sequence[Token], is_production: Sequence[bool]
+) -> list[tuple[str, int, int]]:
+    """Return simple lexical `let alias = ...threads();` bindings."""
+    aliases: list[tuple[str, int, int]] = []
+    for index, token in enumerate(tokens):
+        if not is_production[index] or token.text != "let":
+            continue
+        alias_index = index + 1
+        if alias_index < len(tokens) and tokens[alias_index].text == "mut":
+            alias_index += 1
+        if alias_index >= len(tokens) or tokens[alias_index].kind != "ident":
+            continue
+        statement_end = _expression_end(tokens, index)
+        equals = next(
+            (
+                cursor
+                for cursor in range(alias_index + 1, statement_end)
+                if tokens[cursor].text == "="
+            ),
+            None,
+        )
+        if equals is None or statement_end <= equals + 4:
+            continue
+        call = statement_end - 4
+        if not _sequence_at(tokens, call, [".", "threads", "(", ")"]):
+            continue
+        aliases.append(
+            (
+                tokens[alias_index].text,
+                statement_end + 1,
+                _enclosing_block_end(tokens, index),
+            )
+        )
+    return aliases
+
+
 def scan_source(source: str, relative_path: str) -> list[Finding]:
     tokens = lex_rust(source)
     is_production = production_mask(tokens)
@@ -305,14 +416,16 @@ def scan_source(source: str, relative_path: str) -> list[Finding]:
         if not is_production[index] or token.kind in {"string", "char"}:
             continue
 
-        if _sequence_at(tokens, index, [".", "threads", "(", ")", ".", "len", "(", ")"]):
-            add(index, RAW_TASK_MEMBERSHIP, "threads().len()")
-        if _sequence_at(
-            tokens,
-            index,
-            [".", "threads", "(", ")", ".", "iter", "(", ")", ".", "count", "(", ")"],
-        ):
-            add(index, RAW_TASK_MEMBERSHIP, "threads().iter().count()")
+        if _sequence_at(tokens, index, [".", "threads", "(", ")"]):
+            end = _expression_end(tokens, index + 4)
+            scalar = _scalar_method_in_chain(tokens, index + 4, end)
+            if scalar is not None:
+                scalar_index, method = scalar
+                add(
+                    scalar_index,
+                    RAW_TASK_MEMBERSHIP,
+                    f"threads() scalar method {method}()",
+                )
         if (
             relative_path == "crates/carrick-runtime/src/kernel/crash_capture.rs"
             and _sequence_at(tokens, index, [".", "threads", "(", ")"])
@@ -358,9 +471,71 @@ def scan_source(source: str, relative_path: str) -> list[Finding]:
                         fn_block = _find_block(tokens, cursor + 2)
                         signature_end = fn_block[0] if fn_block is not None else end
                         signature = [item.text for item in tokens[cursor:signature_end]]
-                        if "->" in signature and "usize" in signature:
+                        arrow = signature.index("->") if "->" in signature else None
+                        returns = signature[arrow + 1 :] if arrow is not None else []
+                        if any(item in NUMERIC_RETURN_TYPES for item in returns):
                             add(cursor, SCALAR_CENSUS_API, "GuestExecutorCensus::live() -> usize")
                     cursor += 1
+
+        if (
+            _sequence_at(tokens, index, ["impl"])
+            and index + 1 < len(tokens)
+            and tokens[index + 1].text in PARTICIPANT_WITNESS_TYPES
+        ):
+            witness = tokens[index + 1].text
+            block = _find_block(tokens, index + 2)
+            if block is not None:
+                start, end = block
+                cursor = start + 1
+                while cursor < end - 1:
+                    if tokens[cursor].text == "fn" and tokens[cursor + 1].kind == "ident":
+                        method = tokens[cursor + 1].text
+                        fn_block = _find_block(tokens, cursor + 2)
+                        signature_end = fn_block[0] if fn_block is not None else end
+                        signature = [item.text for item in tokens[cursor:signature_end]]
+                        arrow = signature.index("->") if "->" in signature else None
+                        returns = signature[arrow + 1 :] if arrow is not None else []
+                        if (
+                            any(item in NUMERIC_RETURN_TYPES for item in returns)
+                            and not method.endswith(ALLOWED_NUMERIC_METHOD_SUFFIX)
+                            and not (witness == "GuestExecutorCensus" and method == "live")
+                        ):
+                            add(
+                                cursor,
+                                SCALAR_WITNESS_API,
+                                f"{witness}::{method} numeric API lacks {ALLOWED_NUMERIC_METHOD_SUFFIX}",
+                            )
+                    cursor += 1
+
+    for alias, start, end in _task_membership_aliases(tokens, is_production):
+        cursor = start
+        while cursor < end:
+            if (
+                tokens[cursor].text == "let"
+                and cursor + 1 < end
+                and tokens[cursor + 1].text in {"mut", alias}
+            ):
+                rebound = cursor + 2 if tokens[cursor + 1].text == "mut" else cursor + 1
+                if rebound < end and tokens[rebound].text == alias:
+                    shadow_end = _enclosing_block_end(tokens, cursor)
+                    if shadow_end < end:
+                        cursor = shadow_end + 1
+                        continue
+                    break
+            if tokens[cursor].kind == "ident" and tokens[cursor].text == alias:
+                scalar = _scalar_method_in_chain(
+                    tokens,
+                    cursor + 1,
+                    _expression_end(tokens, cursor + 1),
+                )
+                if scalar is not None:
+                    scalar_index, method = scalar
+                    add(
+                        scalar_index,
+                        RAW_TASK_MEMBERSHIP,
+                        f"Task::threads() alias {alias}.{method}()",
+                    )
+            cursor += 1
 
     return sorted(findings)
 
@@ -383,10 +558,34 @@ def scan_paths(paths: Iterable[Path]) -> list[Finding]:
 
 def self_test() -> None:
     negative = {
-        "raw_len.rs": (RAW_TASK_MEMBERSHIP, "fn f(task: &Task) { if task.threads().len() > 1 {} }"),
+        "raw_len.rs": (
+            RAW_TASK_MEMBERSHIP,
+            "fn f(task: &Task) { if task.threads().len() > 1 {} }",
+        ),
         "raw_iter_count.rs": (
             RAW_TASK_MEMBERSHIP,
             "fn f(task: &Task) { if task.threads().iter().count() > 1 {} }",
+        ),
+        "raw_into_iter_count.rs": (
+            RAW_TASK_MEMBERSHIP,
+            "fn f(task: &Task) { if task.threads().into_iter().count() > 1 {} }",
+        ),
+        "raw_is_empty.rs": (
+            RAW_TASK_MEMBERSHIP,
+            "fn f(task: &Task) { if !task.threads().is_empty() {} }",
+        ),
+        "raw_alias_len.rs": (
+            RAW_TASK_MEMBERSHIP,
+            "fn f(task: &Task) { let members = task.threads(); if members.len() > 1 {} }",
+        ),
+        "numeric_witness.rs": (
+            SCALAR_WITNESS_API,
+            "impl CoreNoteParticipants { fn participant_count(&self) -> usize { 1 } }",
+        ),
+        "outer_alias_after_nested_shadow.rs": (
+            RAW_TASK_MEMBERSHIP,
+            "fn f(task: &Task, xs: Vec<u8>) { let members = task.threads(); "
+            "{ let members = xs; consume(members.len()); } if members.len() > 1 {} }",
         ),
         "raw_task_count.rs": (
             RAW_TASK_CARDINALITY,
@@ -399,6 +598,10 @@ def self_test() -> None:
         "scalar_census_api.rs": (
             SCALAR_CENSUS_API,
             "impl GuestExecutorCensus { pub fn live(&self) -> usize { 1 } }",
+        ),
+        "scalar_census_u64.rs": (
+            SCALAR_CENSUS_API,
+            "impl GuestExecutorCensus { pub fn live(&self) -> u64 { 1 } }",
         ),
         "raw_crash.rs": (
             RAW_CRASH_PARTICIPATION,
@@ -416,6 +619,20 @@ def self_test() -> None:
         "roster.rs": "fn f(w: CrashCaptureParticipants) { for t in w.into_threads() {} }",
         "probe.rs": "fn f(w: &CoreNoteParticipants) { probe(w.required_note_count_for_probe()); }",
         "census_probe.rs": "fn f(c: &GuestExecutorCensus) { probe(c.participant_count_for_probe()); }",
+        "unrelated_alias_scope.rs": (
+            "fn a(task: &Task) { let members = task.threads(); consume(members); } "
+            "fn b(xs: Vec<u8>) { let members = xs; consume(members.len()); }"
+        ),
+        "unrelated_tuple_scalar.rs": (
+            "fn f(task: &Task, xs: Vec<u8>) { let pair = (task.threads(), xs.len()); }"
+        ),
+        "numeric_argument_bool_return.rs": (
+            "impl CoreNoteParticipants { fn contains(&self, key: u64) -> bool { true } }"
+        ),
+        "nested_unrelated_shadow.rs": (
+            "fn f(task: &Task, xs: Vec<u8>) { let members = task.threads(); "
+            "{ let members = xs; consume(members.len()); } consume(members); }"
+        ),
     }
 
     with tempfile.TemporaryDirectory(prefix="carrick-participant-gate-") as directory:
@@ -427,9 +644,19 @@ def self_test() -> None:
 
         for name, (expected_category, _) in negative.items():
             findings = scan_paths([root / name])
-            categories = [finding.category for finding in findings]
-            if categories != [expected_category]:
-                raise AssertionError(f"{name}: expected {[expected_category]!r}, got {categories!r}")
+            if len(findings) != 1:
+                raise AssertionError(f"{name}: expected one finding, got {findings!r}")
+            finding = findings[0]
+            if (finding.category, finding.path, finding.line) != (
+                expected_category,
+                name,
+                1,
+            ):
+                raise AssertionError(
+                    f"{name}: expected category/path/line "
+                    f"{(expected_category, name, 1)!r}, got "
+                    f"{(finding.category, finding.path, finding.line)!r}"
+                )
         for name in positive:
             findings = scan_paths([root / name])
             if findings:
@@ -439,7 +666,10 @@ def self_test() -> None:
             "fn poll(&self) { for thread in self.task.threads() {} }\n",
             "crates/carrick-runtime/src/kernel/crash_capture.rs",
         )
-        if [finding.category for finding in crash_projection] != [RAW_TASK_PROJECTION]:
+        if [
+            (finding.category, finding.path, finding.line)
+            for finding in crash_projection
+        ] != [(RAW_TASK_PROJECTION, "crates/carrick-runtime/src/kernel/crash_capture.rs", 1)]:
             raise AssertionError(
                 "crash projection: expected generic task membership finding, "
                 f"got {crash_projection!r}"
@@ -449,7 +679,9 @@ def self_test() -> None:
             "fn pause(census: &GuestExecutorCensus) { probe(census.live()); }\n",
             "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
         )
-        if [finding.category for finding in census_call] != [SCALAR_CENSUS_API]:
+        if [
+            (finding.category, finding.path, finding.line) for finding in census_call
+        ] != [(SCALAR_CENSUS_API, "crates/carrick-runtime/src/vcpu_loop/quiesce.rs", 1)]:
             raise AssertionError(
                 "census call: expected scalar executor census finding, "
                 f"got {census_call!r}"
@@ -463,7 +695,7 @@ def self_test() -> None:
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    mode = parser.add_mutually_exclusive_group(required=True)
+    mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--self-test", action="store_true")
     mode.add_argument("--check", action="store_true")
     parser.add_argument(
@@ -472,7 +704,10 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         default=[],
         help="scan one repository-relative Rust file or directory (repeatable)",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if not args.self_test and not args.check and not args.path:
+        parser.error("one of --self-test, --check, or --path is required")
+    return args
 
 
 def requested_paths(raw_paths: Sequence[str]) -> list[Path]:
