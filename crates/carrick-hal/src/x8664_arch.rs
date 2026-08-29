@@ -148,7 +148,7 @@ pub trait SegmentBaseRegs {
 /// tracked separately, not introduced here). Source: arch_prctl(2) man7.org.
 pub fn service_arch_prctl<E>(engine: &mut E, code: u64, addr: u64) -> Result<i64, TrapError>
 where
-    E: SegmentBaseRegs + carrick_guest_mem::GuestMemory,
+    E: SegmentBaseRegs + carrick_guest_mem::CurrentMmMemory,
 {
     /// `ARCH_SET_GS` (arch_prctl(2)).
     const ARCH_SET_GS: u64 = 0x1001;

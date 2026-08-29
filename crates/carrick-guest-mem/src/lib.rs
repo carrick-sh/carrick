@@ -883,19 +883,19 @@ pub trait CurrentMmMemory: GuestMemory {}
 /// Panic-safe lifetime bracket for a host syscall that may write through raw
 /// guest-memory pointers. Construction marks every exposed range in progress;
 /// Drop always closes the bracket, including `?`, early return, and unwind paths.
-pub struct HostWriteGuard<'a, M: CurrentMmMemory + ?Sized> {
+pub struct HostWriteGuard<'a, M: GuestMemory + ?Sized> {
     memory: &'a mut M,
     ranges: &'a [(u64, usize)],
 }
 
-impl<'a, M: CurrentMmMemory + ?Sized> HostWriteGuard<'a, M> {
+impl<'a, M: GuestMemory + ?Sized> HostWriteGuard<'a, M> {
     pub fn new(memory: &'a mut M, ranges: &'a [(u64, usize)]) -> Self {
         memory.begin_host_write(ranges);
         Self { memory, ranges }
     }
 }
 
-impl<M: CurrentMmMemory + ?Sized> Drop for HostWriteGuard<'_, M> {
+impl<M: GuestMemory + ?Sized> Drop for HostWriteGuard<'_, M> {
     fn drop(&mut self) {
         self.memory.finish_host_write(self.ranges);
     }
@@ -962,8 +962,6 @@ mod zero_tests {
             }
         }
     }
-
-    impl CurrentMmMemory for MockMem {}
 
     #[test]
     fn zero_range_chunked_streams_contiguous_chunks_without_full_alloc() {

@@ -8,12 +8,12 @@
 //! x86 trampoline) reads/writes these exact bytes, so the logic here must stay
 //! identical across backends.
 //!
-//! It is written once over the [`crate::RegAccess`] + [`carrick_guest_mem::GuestMemory`]
+//! It is written once over the [`crate::RegAccess`] + [`carrick_guest_mem::CurrentMmMemory`]
 //! traits so every backend (HVF on macOS, KVM on Linux) reuses it byte-for-byte.
-//! The single combined `E: RegAccess + GuestMemory` bound matches reality: a
-//! trap engine impls BOTH traits on the SAME type, and every access here is
-//! sequential, so one `&mut E` supplies both register and memory access without
-//! aliasing.
+//! The single combined `E: RegAccess + CurrentMmMemory` bound matches reality: a
+//! trap engine impls BOTH traits on the SAME type, guest pointers refer to the
+//! caller's current MM, and every access here is sequential, so one `&mut E` supplies
+//! both register and memory access without aliasing.
 //!
 //! The engine supplies four values the shared builder must not recompute
 //! ([`InjectParams::pstate_source`], `orig_x0`, `fault_esr`, `fpsimd_enabled`)
@@ -25,7 +25,7 @@ use zerocopy::{FromBytes, IntoBytes};
 use crate::{Reg, RegAccess, TrapError};
 
 /// All inputs to [`build_sigframe`]: the 10 `inject_signal` arguments plus the
-/// engine-supplied values that are NOT reachable through `RegAccess`/`GuestMemory`.
+/// engine-supplied values that are NOT reachable through `RegAccess`/`CurrentMmMemory`.
 pub struct InjectParams {
     pub signum: i32,
     pub handler: u64,
