@@ -2549,9 +2549,6 @@ impl SyscallDispatcher {
                         }
                     }
                     LINUX_PTRACE_PEEKTEXT | LINUX_PTRACE_PEEKDATA => {
-                        if ptrace_text_data_addr_is_invalid(addr) {
-                            return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
-                        }
                         let Ok(target_task_id) =
                             crate::kernel::TaskId::from_abi_positive(pid.0)
                         else {
@@ -2563,11 +2560,9 @@ impl SyscallDispatcher {
                         if !kernel.task_key_is_live(target_task.key()) {
                             return Ok(DispatchOutcome::errno(LINUX_ESRCH));
                         }
-                        if !target_task.is_ptrace_stopped_by(process.task_key()) {
-                            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
-                        }
+                        let target_key = target_task.key();
                         let relation = cx.with_execution_lease(|lease| {
-                            kernel.foreign_mm(cx.kernel, lease, target_task.key())
+                            kernel.foreign_mm(cx.kernel, lease, target_key)
                         });
                         let relation = match relation {
                             Some(Ok(r)) => r,
@@ -2576,35 +2571,61 @@ impl SyscallDispatcher {
                             }
                             None => return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO)),
                         };
-                        let foreign = match relation {
-                            crate::kernel::MmRelation::Foreign(foreign) => foreign,
-                            crate::kernel::MmRelation::Current(_) => {
-                                return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
-                            }
+                        let expected_mm_id = match &relation {
+                            crate::kernel::MmRelation::Current(current) => current.mm_id(),
+                            crate::kernel::MmRelation::Foreign(foreign) => foreign.mm_id(),
                         };
-                        let Some(authority) = process.mm_access_authority() else {
-                            return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
-                        };
-                        let remote_va = carrick_guest_mem::GuestVa(addr.0);
-                        let range = match foreign.read_range(remote_va, 8) {
-                            Ok(Some(r)) => r,
-                            _ => return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO)),
-                        };
-                        let mut buf = [0u8; 8];
-                        match authority.read_foreign(&foreign, range, &mut buf) {
-                            Ok(receipt) if receipt.bytes_read() == 8 => {
-                                let word = u64::from_le_bytes(buf);
-                                DispatchOutcome::Returned {
-                                    value: word as i64,
+                        match kernel.with_ptrace_stopped_task(
+                            process.task_key(),
+                            target_key,
+                            expected_mm_id,
+                            || -> Result<DispatchOutcome, LinuxErrno> {
+                                if !addr.0.is_multiple_of(8)
+                                    || ptrace_text_data_addr_is_invalid(addr)
+                                {
+                                    return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
                                 }
-                            }
-                            _ => DispatchOutcome::errno(crate::linux_abi::LINUX_EIO),
+                                match relation {
+                                    crate::kernel::MmRelation::Foreign(foreign) => {
+                                        let Some(authority) = process.mm_access_authority() else {
+                                            return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
+                                        };
+                                        let remote_va = carrick_guest_mem::GuestVa(addr.0);
+                                        let range = match foreign.read_range(remote_va, 8) {
+                                            Ok(Some(r)) => r,
+                                            _ => return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO)),
+                                        };
+                                        let mut buf = [0u8; 8];
+                                        match authority.read_foreign(&foreign, range, &mut buf) {
+                                            Ok(receipt) if receipt.bytes_read() == 8 => {
+                                                let word = u64::from_le_bytes(buf);
+                                                Ok(DispatchOutcome::Returned {
+                                                    value: word as i64,
+                                                })
+                                            }
+                                            _ => Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO)),
+                                        }
+                                    }
+                                    crate::kernel::MmRelation::Current(_) => {
+                                        let mut buf = [0u8; 8];
+                                        match cx.memory.read_into(addr.0, &mut buf) {
+                                            Ok(()) => {
+                                                let word = u64::from_le_bytes(buf);
+                                                Ok(DispatchOutcome::Returned {
+                                                    value: word as i64,
+                                                })
+                                            }
+                                            Err(_) => Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO)),
+                                        }
+                                    }
+                                }
+                            },
+                        ) {
+                            Ok(Ok(outcome)) => outcome,
+                            Ok(Err(errno)) | Err(errno) => DispatchOutcome::errno(errno),
                         }
                     }
                     LINUX_PTRACE_POKETEXT | LINUX_PTRACE_POKEDATA => {
-                        if ptrace_text_data_addr_is_invalid(addr) {
-                            return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
-                        }
                         let Ok(target_task_id) =
                             crate::kernel::TaskId::from_abi_positive(pid.0)
                         else {
@@ -2616,12 +2637,9 @@ impl SyscallDispatcher {
                         if !kernel.task_key_is_live(target_task.key()) {
                             return Ok(DispatchOutcome::errno(LINUX_ESRCH));
                         }
-                        if !target_task.is_ptrace_stopped_by(process.task_key()) {
-                            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
-                        }
-                        let staged_data = data.to_le_bytes();
+                        let target_key = target_task.key();
                         let relation = cx.with_execution_lease(|lease| {
-                            kernel.foreign_mm(cx.kernel, lease, target_task.key())
+                            kernel.foreign_mm(cx.kernel, lease, target_key)
                         });
                         let relation = match relation {
                             Some(Ok(r)) => r,
@@ -2630,41 +2648,65 @@ impl SyscallDispatcher {
                             }
                             None => return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO)),
                         };
-                        let foreign = match relation {
-                            crate::kernel::MmRelation::Foreign(foreign) => foreign,
-                            crate::kernel::MmRelation::Current(_) => {
-                                return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
-                            }
+                        let expected_mm_id = match &relation {
+                            crate::kernel::MmRelation::Current(current) => current.mm_id(),
+                            crate::kernel::MmRelation::Foreign(foreign) => foreign.mm_id(),
                         };
-                        let Some(authority) = process.mm_access_authority() else {
-                            return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
-                        };
-                        let remote_va = carrick_guest_mem::GuestVa(addr.0);
-                        let write_range = match foreign.write_range(remote_va, 8) {
-                            Ok(Some(r)) => r,
-                            _ => return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO)),
-                        };
-                        let mutation_tid = cx.tid();
-                        let commit_res = this.with_current_mm_executor_released(cx, || {
-                            authority.with_foreign_mutation(
-                                &foreign,
-                                mutation_tid,
-                                |mutation_guard| {
-                                    let mut witness = authority
-                                        .break_foreign_cow(mutation_guard, &foreign, write_range)?;
-                                    let prepared = authority.prepare_foreign_write_range(
-                                        &mut witness,
-                                        write_range,
-                                        &staged_data,
-                                    )?;
-                                    let _receipt = prepared.commit();
-                                    Ok(())
-                                },
-                            )
-                        })?;
-                        match commit_res {
-                            Ok(()) => DispatchOutcome::Returned { value: 0 },
-                            Err(_) => DispatchOutcome::errno(crate::linux_abi::LINUX_EIO),
+                        let staged_data = data.to_le_bytes();
+                        match kernel.with_ptrace_stopped_task(
+                            process.task_key(),
+                            target_key,
+                            expected_mm_id,
+                            || -> Result<DispatchOutcome, LinuxErrno> {
+                                if !addr.0.is_multiple_of(8)
+                                    || ptrace_text_data_addr_is_invalid(addr)
+                                {
+                                    return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
+                                }
+                                match relation {
+                                    crate::kernel::MmRelation::Foreign(foreign) => {
+                                        let Some(authority) = process.mm_access_authority() else {
+                                            return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
+                                        };
+                                        let remote_va = carrick_guest_mem::GuestVa(addr.0);
+                                        let write_range = match foreign.write_range(remote_va, 8) {
+                                            Ok(Some(r)) => r,
+                                            _ => return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO)),
+                                        };
+                                        let mutation_tid = cx.tid();
+                                        let commit_res = this.with_current_mm_executor_released(cx, || {
+                                            authority.with_foreign_mutation(
+                                                &foreign,
+                                                mutation_tid,
+                                                |mutation_guard| {
+                                                    let mut witness = authority
+                                                        .break_foreign_cow(mutation_guard, &foreign, write_range)?;
+                                                    let prepared = authority.prepare_foreign_write_range(
+                                                        &mut witness,
+                                                        write_range,
+                                                        &staged_data,
+                                                    )?;
+                                                    let _receipt = prepared.commit();
+                                                    Ok(())
+                                                },
+                                            )
+                                        });
+                                        match commit_res {
+                                            Ok(Ok(())) => Ok(DispatchOutcome::Returned { value: 0 }),
+                                            _ => Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO)),
+                                        }
+                                    }
+                                    crate::kernel::MmRelation::Current(_) => {
+                                        match cx.memory.write_bytes(addr.0, &staged_data) {
+                                            Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+                                            Err(_) => Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO)),
+                                        }
+                                    }
+                                }
+                            },
+                        ) {
+                            Ok(Ok(outcome)) => outcome,
+                            Ok(Err(errno)) | Err(errno) => DispatchOutcome::errno(errno),
                         }
                     }
                     LINUX_PTRACE_PEEKUSER | LINUX_PTRACE_POKEUSER => {
@@ -5482,6 +5524,25 @@ mod kernel_process_dispatch_tests {
             .0
     }
 
+    fn clone_vm_child(parent: &KernelContext, registry_id: i32) -> KernelContext {
+        parent
+            .kernel()
+            .reserve_fork(
+                parent,
+                ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::VM).unwrap(),
+                format!("clone-vm-child-{registry_id}"),
+                None,
+            )
+            .unwrap()
+            .prepare_reference(ThreadId::synthetic_for_tests(registry_id))
+            .unwrap()
+            .commit()
+            .unwrap()
+            .into_parts()
+            .unwrap()
+            .0
+    }
+
     fn process_vm_target(parent: &KernelContext, registry_id: i32) -> KernelContext {
         process_vm_target_with_payload_and_pages(parent, registry_id, b"PEER", 1)
     }
@@ -6766,7 +6827,7 @@ mod kernel_process_dispatch_tests {
     }
 
     #[test]
-    fn hvpatch_ptrace_poketext_and_pokedata_are_equivalent() {
+    fn hvpatch_ptrace_poketext_and_pokedata_are_equivalent_for_writable_mapping() {
         let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_128);
         let mut initial = vec![b'_'; 0x4000];
         initial[..8].copy_from_slice(b"initword");
@@ -6896,6 +6957,354 @@ mod kernel_process_dispatch_tests {
             DispatchOutcome::errno(crate::linux_abi::LINUX_EIO),
             "wrong execution lease on ptrace memory write fails closed with EIO",
         );
+    }
+
+    #[test]
+    fn hvpatch_ptrace_memory_rejects_traced_but_running_target() {
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_134);
+        let target = process_vm_target_with_payload(&root, 61_135, b"RUNNING1");
+        assert!(root.kernel().claim_ptrace_traceme(&target));
+        let root = refreshed(&root);
+        let target_pid = target.task().key().id.raw();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [LINUX_PTRACE_PEEKDATA, target_pid as u64, TARGET_VA, 0, 0, 0],
+                Some(&lease),
+            ),
+            DispatchOutcome::errno(LINUX_ESRCH),
+            "traced but running target must return ESRCH on peek",
+        );
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [
+                    LINUX_PTRACE_POKEDATA,
+                    target_pid as u64,
+                    TARGET_VA,
+                    0x1234,
+                    0,
+                    0,
+                ],
+                Some(&lease),
+            ),
+            DispatchOutcome::errno(LINUX_ESRCH),
+            "traced but running target must return ESRCH on poke",
+        );
+    }
+
+    #[test]
+    fn hvpatch_ptrace_memory_rejects_unaligned_word_address() {
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_136);
+        let target = process_vm_target_with_payload(&root, 61_137, b"ALIGNWRD");
+        arm_ptrace_memory_access(&root, &target);
+        let root = refreshed(&root);
+        let target_pid = target.task().key().id.raw();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+
+        for offset in 1..8 {
+            assert_eq!(
+                dispatch_with_lease(
+                    &mut dispatcher,
+                    &root,
+                    &mut memory,
+                    SYS_PTRACE,
+                    [
+                        LINUX_PTRACE_PEEKDATA,
+                        target_pid as u64,
+                        TARGET_VA + offset,
+                        0,
+                        0,
+                        0,
+                    ],
+                    Some(&lease),
+                ),
+                DispatchOutcome::errno(crate::linux_abi::LINUX_EIO),
+                "unaligned peek address must return EIO",
+            );
+            assert_eq!(
+                dispatch_with_lease(
+                    &mut dispatcher,
+                    &root,
+                    &mut memory,
+                    SYS_PTRACE,
+                    [
+                        LINUX_PTRACE_POKEDATA,
+                        target_pid as u64,
+                        TARGET_VA + offset,
+                        0x5678,
+                        0,
+                        0,
+                    ],
+                    Some(&lease),
+                ),
+                DispatchOutcome::errno(crate::linux_abi::LINUX_EIO),
+                "unaligned poke address must return EIO",
+            );
+        }
+    }
+
+    #[test]
+    fn hvpatch_ptrace_memory_enforces_target_authority_before_address_validation() {
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_138);
+        let target = process_vm_target(&root, 61_139);
+        let target_pid = target.task().key().id.raw();
+        let root = refreshed(&root);
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [LINUX_PTRACE_PEEKDATA, target_pid as u64, 1, 0, 0, 0],
+                Some(&lease),
+            ),
+            DispatchOutcome::errno(LINUX_ESRCH),
+            "untraced target with unaligned address must return ESRCH before address validation",
+        );
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [LINUX_PTRACE_PEEKDATA, 99_999, 1, 0, 0, 0],
+                Some(&lease),
+            ),
+            DispatchOutcome::errno(LINUX_ESRCH),
+            "nonexistent target with unaligned address must return ESRCH",
+        );
+    }
+
+    #[test]
+    fn hvpatch_ptrace_cont_immediately_revokes_memory_access_before_settlement() {
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_140);
+        let target = process_vm_target_with_payload(&root, 61_141, b"CONTTEST");
+        arm_ptrace_memory_access(&root, &target);
+        let root = refreshed(&root);
+        let target_pid = target.task().key().id.raw();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [LINUX_PTRACE_PEEKDATA, target_pid as u64, TARGET_VA, 0, 0, 0],
+                Some(&lease),
+            ),
+            DispatchOutcome::Returned {
+                value: u64::from_le_bytes(*b"CONTTEST") as i64,
+            },
+        );
+
+        assert_eq!(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [7, target_pid as u64, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [LINUX_PTRACE_PEEKDATA, target_pid as u64, TARGET_VA, 0, 0, 0],
+                Some(&lease),
+            ),
+            DispatchOutcome::errno(LINUX_ESRCH),
+            "resumed tracee before settlement must reject peek with ESRCH",
+        );
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [
+                    LINUX_PTRACE_POKEDATA,
+                    target_pid as u64,
+                    TARGET_VA,
+                    0x1234,
+                    0,
+                    0,
+                ],
+                Some(&lease),
+            ),
+            DispatchOutcome::errno(LINUX_ESRCH),
+            "resumed tracee before settlement must reject poke with ESRCH",
+        );
+    }
+
+    #[test]
+    fn hvpatch_ptrace_peek_preserves_high_bit_and_all_ones_word() {
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_142);
+        let target = process_vm_target_with_payload(&root, 61_143, &[0xff; 8]);
+        arm_ptrace_memory_access(&root, &target);
+        let root = refreshed(&root);
+        let target_pid = target.task().key().id.raw();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [LINUX_PTRACE_PEEKDATA, target_pid as u64, TARGET_VA, 0, 0, 0],
+                Some(&lease),
+            ),
+            DispatchOutcome::Returned { value: -1 },
+            "all-ones word must return -1 as i64",
+        );
+
+        let high_bit_word: u64 = 0x8000_0000_0000_0000;
+        let mut payload = [0u8; 8];
+        payload.copy_from_slice(&high_bit_word.to_le_bytes());
+        let target2 = process_vm_target_with_payload(&root, 61_144, &payload);
+        arm_ptrace_memory_access(&root, &target2);
+        let root = refreshed(&root);
+        let target2_pid = target2.task().key().id.raw();
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [
+                    LINUX_PTRACE_PEEKDATA,
+                    target2_pid as u64,
+                    TARGET_VA,
+                    0,
+                    0,
+                    0
+                ],
+                Some(&lease),
+            ),
+            DispatchOutcome::Returned {
+                value: high_bit_word as i64,
+            },
+            "high-bit word must be preserved as i64",
+        );
+    }
+
+    #[test]
+    fn hvpatch_ptrace_memory_supports_clone_vm_distinct_task_same_mm() {
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_145);
+        let child = clone_vm_child(&root, 61_146);
+        arm_ptrace_memory_access(&root, &child);
+        let root = refreshed(&root);
+        let child_pid = child.task().key().id.raw();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+
+        memory.write_bytes(0x2000, b"CLONEVM1").unwrap();
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [LINUX_PTRACE_PEEKDATA, child_pid as u64, 0x2000, 0, 0, 0],
+                Some(&lease),
+            ),
+            DispatchOutcome::Returned {
+                value: u64::from_le_bytes(*b"CLONEVM1") as i64,
+            },
+            "peek on CLONE_VM shared memory child must read shared bytes",
+        );
+
+        let new_word = u64::from_le_bytes(*b"CLONEVM2");
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [
+                    LINUX_PTRACE_POKEDATA,
+                    child_pid as u64,
+                    0x2000,
+                    new_word,
+                    0,
+                    0,
+                ],
+                Some(&lease),
+            ),
+            DispatchOutcome::Returned { value: 0 },
+            "poke on CLONE_VM shared memory child must succeed",
+        );
+
+        assert_eq!(
+            memory.read_bytes(0x2000, 8).unwrap(),
+            b"CLONEVM2",
+            "poked word must be visible in shared memory",
+        );
+    }
+
+    #[test]
+    fn hvpatch_ptrace_scoped_guard_blocks_concurrent_cont_and_detach() {
+        let (_lane, _dispatcher, _process, root, _lease) = bound_dispatcher(61_147);
+        let target = process_vm_target_with_payload(&root, 61_148, b"BLOCKING");
+        arm_ptrace_memory_access(&root, &target);
+        let root = refreshed(&root);
+        let target_key = target.task().key();
+        let expected_mm = target.shared().mm().id();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let kernel_clone = Arc::clone(root.kernel());
+        let tracer_key = root.task().key();
+        let handle = std::thread::spawn(move || {
+            kernel_clone
+                .with_ptrace_stopped_task(tracer_key, target_key, expected_mm, || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+                .unwrap();
+        });
+
+        entered_rx.recv().unwrap();
+
+        let (resumed_tx, resumed_rx) = std::sync::mpsc::channel();
+        let kernel_clone2 = Arc::clone(root.kernel());
+        let resume_thread = std::thread::spawn(move || {
+            let res = kernel_clone2.resume_task_from_ptrace(tracer_key, target_key.id, None);
+            resumed_tx.send(res).unwrap();
+        });
+
+        assert_eq!(
+            resumed_rx.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "resume must be blocked while scoped memory guard is live",
+        );
+
+        release_tx.send(()).unwrap();
+        handle.join().unwrap();
+
+        assert!(resume_thread.join().is_ok());
+        assert!(resumed_rx.recv().unwrap());
     }
 
     #[test]

@@ -3918,13 +3918,32 @@ impl Task {
         self.job_control.lock().stopped_by.is_some()
     }
 
-    pub(crate) fn is_ptrace_stopped_by(&self, tracer: TaskKey) -> bool {
+    pub(super) fn with_ptrace_stopped_task<T>(
+        &self,
+        tracer: TaskKey,
+        expected_mm: MmId,
+        operation: impl FnOnce() -> T,
+    ) -> Result<T, carrick_abi::LinuxErrno> {
         let lifecycle = self.lifecycle.lock();
         if *lifecycle != TaskLifecycle::Live {
-            return false;
+            return Err(carrick_abi::LINUX_ESRCH);
         }
-        let state = self.job_control.lock();
-        state.ptrace_tracer == Some(tracer) && state.stopped_by_ptrace
+        let job_control = self.job_control.lock();
+        if job_control.ptrace_tracer != Some(tracer)
+            || !job_control.stopped_by_ptrace
+            || job_control.stopped_by.is_none()
+            || job_control.ptrace_resume_command.is_some()
+        {
+            return Err(carrick_abi::LINUX_ESRCH);
+        }
+        let target_mm = self.shared().mm();
+        if target_mm.id() != expected_mm {
+            return Err(carrick_abi::LINUX_ESRCH);
+        }
+        let result = operation();
+        drop(job_control);
+        drop(lifecycle);
+        Ok(result)
     }
 
     pub(super) fn claim_ptrace_traceme(&self, tracer: TaskKey) -> bool {
