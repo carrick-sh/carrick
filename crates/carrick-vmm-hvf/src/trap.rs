@@ -223,7 +223,7 @@ pub enum TrapBackend {
 mod foreign_mm_tests {
     use std::num::{NonZeroU16, NonZeroU64};
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
 
     use carrick_guest_mem::{Gpa, GuestVa};
     use carrick_hal::ForeignMmTransport as _;
@@ -234,16 +234,71 @@ mod foreign_mm_tests {
     const OWNER_LEN: usize = 0x4000;
     static FOREIGN_MM_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
-    struct InstalledMm {
-        snapshot: carrick_hal::ForeignMmSnapshot,
-        state: Arc<MmAccessState>,
-        owner_keys: Vec<(u64, u64)>,
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct TestSnapshot {
+        mm: NonZeroU64,
+        asid: NonZeroU16,
+        stage1_root: Gpa,
+        backend_revision: carrick_hal::ForeignBackendRevision,
+        vma_revision: carrick_hal::ForeignVmaRevision,
+        frame_inventory_revision: carrick_hal::ForeignFrameInventoryRevision,
+        mapping_ids: Vec<carrick_hal::MappingId>,
     }
 
-    impl Drop for InstalledMm {
+    impl carrick_hal::ForeignMmSnapshot for TestSnapshot {
+        fn mm(&self) -> carrick_hal::ForeignMmId {
+            carrick_hal::ForeignMmId::from_kernel_allocation(self.mm)
+        }
+        fn binding(&self) -> carrick_hal::ForeignMmBinding {
+            carrick_hal::ForeignMmBinding::for_aarch64(
+                carrick_hal::ForeignAsid::from_kernel_allocation(self.asid),
+                self.stage1_root,
+            )
+        }
+        fn backend_revision(&self) -> carrick_hal::ForeignBackendRevision {
+            self.backend_revision
+        }
+        fn vma_revision(&self) -> carrick_hal::ForeignVmaRevision {
+            self.vma_revision
+        }
+        fn frame_inventory_revision(&self) -> carrick_hal::ForeignFrameInventoryRevision {
+            self.frame_inventory_revision
+        }
+        fn mapping_ids(&self) -> &[carrick_hal::MappingId] {
+            &self.mapping_ids
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestLiveAuthority(parking_lot::RwLock<TestSnapshot>);
+
+    impl carrick_hal::ForeignMmLiveAuthority for TestLiveAuthority {
+        fn snapshot(
+            &self,
+            deadline: Instant,
+        ) -> Result<Box<dyn carrick_hal::ForeignMmSnapshot>, carrick_hal::ForeignMmTransportError>
+        {
+            let observed = self
+                .0
+                .try_read_until(deadline)
+                .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?;
+            Ok(Box::new(observed.clone()))
+        }
+    }
+
+    struct InstalledMm {
+        snapshot: TestSnapshot,
+        live: TestLiveAuthority,
+        state: Arc<MmAccessState>,
+        owners: OwnerCleanup,
+    }
+
+    struct OwnerCleanup(Vec<(u64, u64)>);
+
+    impl Drop for OwnerCleanup {
         fn drop(&mut self) {
             let mut owners = global_frame_host_owners().lock();
-            for key in self.owner_keys.drain(..) {
+            for key in self.0.drain(..) {
                 owners.remove(&key);
             }
         }
@@ -340,15 +395,15 @@ mod foreign_mm_tests {
                 },
             },
         );
-        let binding = carrick_hal::ForeignMmBinding::for_aarch64(
-            carrick_hal::ForeignAsid::from_kernel_allocation(
-                NonZeroU16::new(ordinal as u16).expect("nonzero test ASID"),
-            ),
-            Gpa(root),
-        );
-        let snapshot = carrick_hal::ForeignMmSnapshot {
-            mm: carrick_hal::ForeignMmId::from_kernel_allocation(nonzero(ordinal)),
-            binding,
+        let asid = NonZeroU16::new(ordinal as u16).expect("nonzero test ASID");
+        let binding = CarrierForeignMmBinding {
+            asid: carrick_hal::ForeignAsid::from_kernel_allocation(asid),
+            stage1_root: Gpa(root),
+        };
+        let snapshot = TestSnapshot {
+            mm: nonzero(ordinal),
+            asid,
+            stage1_root: Gpa(root),
             backend_revision: carrick_hal::ForeignBackendRevision::from_authority_raw(17),
             vma_revision: carrick_hal::ForeignVmaRevision::from_authority_raw(19),
             frame_inventory_revision:
@@ -364,13 +419,31 @@ mod foreign_mm_tests {
         );
         transport.register(&snapshot, &state);
         InstalledMm {
+            live: TestLiveAuthority(parking_lot::RwLock::new(snapshot.clone())),
             snapshot,
             state,
-            owner_keys: vec![
+            owners: OwnerCleanup(vec![
                 (root, table_bytes.len() as u64),
                 (data_ipa, OWNER_LEN as u64),
-            ],
+            ]),
         }
+    }
+
+    fn read_installed(
+        transport: &CarrierForeignMmTransport,
+        installed: &InstalledMm,
+        dst: &mut [u8],
+    ) -> Result<Box<dyn carrick_hal::ForeignMmReadReceipt>, carrick_hal::ForeignMmTransportError>
+    {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let lease = transport.retain(&installed.snapshot, deadline)?;
+        lease.read(
+            &installed.live,
+            &installed.snapshot,
+            GuestVa(TEST_VA),
+            dst,
+            deadline,
+        )
     }
 
     #[test]
@@ -393,14 +466,14 @@ mod foreign_mm_tests {
         );
         let mut bytes = [0_u8; 4];
 
-        let receipt = transport
-            .read(&target.snapshot, GuestVa(TEST_VA), &mut bytes)
-            .expect("target-root foreign read");
+        let receipt =
+            read_installed(&transport, &target, &mut bytes).expect("target-root foreign read");
 
         assert_eq!(&bytes, b"targ");
         assert_ne!(&bytes, b"call");
-        assert_eq!(receipt.mm, target.snapshot.mm);
-        assert_eq!(receipt.bytes_read, bytes.len());
+        assert!(receipt.authenticates(&target.snapshot));
+        assert_eq!(receipt.bytes_read(), bytes.len());
+        assert!(!receipt.owner_generations().is_empty());
         drop(caller);
     }
 
@@ -416,18 +489,29 @@ mod foreign_mm_tests {
             *b"live",
         );
 
-        for revision in [
-            &installed.state.backend_revision,
-            &installed.state.vma_revision,
-            &installed.state.frame_inventory_revision,
-        ] {
-            revision.fetch_add(1, Ordering::AcqRel);
+        for domain in 0..3 {
+            {
+                let mut live = installed.live.0.write();
+                match domain {
+                    0 => {
+                        live.backend_revision =
+                            carrick_hal::ForeignBackendRevision::from_authority_raw(18)
+                    }
+                    1 => {
+                        live.vma_revision = carrick_hal::ForeignVmaRevision::from_authority_raw(20)
+                    }
+                    _ => {
+                        live.frame_inventory_revision =
+                            carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(24)
+                    }
+                }
+            }
             let mut bytes = [0_u8; 4];
-            assert_eq!(
-                transport.read(&installed.snapshot, GuestVa(TEST_VA), &mut bytes),
+            assert!(matches!(
+                read_installed(&transport, &installed, &mut bytes),
                 Err(carrick_hal::ForeignMmTransportError::Retry)
-            );
-            revision.fetch_sub(1, Ordering::AcqRel);
+            ));
+            *installed.live.0.write() = installed.snapshot.clone();
         }
     }
 
@@ -442,14 +526,14 @@ mod foreign_mm_tests {
             0x9b00_0600_0000,
             *b"live",
         );
-        let table_key = installed.owner_keys[0];
+        let table_key = installed.owners.0[0];
         global_frame_host_owners().lock().remove(&table_key);
         let mut bytes = [0_u8; 4];
 
-        assert_eq!(
-            transport.read(&installed.snapshot, GuestVa(TEST_VA), &mut bytes),
+        assert!(matches!(
+            read_installed(&transport, &installed, &mut bytes),
             Err(carrick_hal::ForeignMmTransportError::OwnerStale)
-        );
+        ));
     }
 
     #[test]
@@ -463,17 +547,60 @@ mod foreign_mm_tests {
             0x9b00_0800_0000,
             *b"old!",
         );
-        let data_key = installed.owner_keys[1];
+        let data_key = installed.owners.0[1];
         global_frame_host_owners().lock().remove(&data_key);
         let replacement = vec![b'n'; data_key.1 as usize];
         let _ = install_owner(data_key.0, &replacement);
         let mut bytes = [0_u8; 4];
 
-        assert_eq!(
-            transport.read(&installed.snapshot, GuestVa(TEST_VA), &mut bytes),
+        assert!(matches!(
+            read_installed(&transport, &installed, &mut bytes),
             Err(carrick_hal::ForeignMmTransportError::OwnerStale)
-        );
+        ));
         assert_ne!(&bytes, b"nnnn");
+    }
+
+    #[test]
+    fn retained_old_token_reads_after_retirement_and_binding_reuse() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let transport = CarrierForeignMmTransport::new();
+        let InstalledMm {
+            snapshot,
+            live,
+            state,
+            owners: _owners,
+        } = install_mm(
+            &transport,
+            106,
+            0x9a00_0a00_0000,
+            0x9b00_0a00_0000,
+            *b"old!",
+        );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let lease = transport
+            .retain(&snapshot, deadline)
+            .expect("retain old MM");
+        drop(state);
+
+        let replacement_snapshot = TestSnapshot {
+            mm: nonzero(107),
+            ..snapshot.clone()
+        };
+        let replacement_state = MmAccessState::new(
+            Arc::new(parking_lot::Mutex::new(None)),
+            Arc::new(MemoryProtections::default()),
+            Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
+            Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
+            Arc::new(parking_lot::Mutex::new(Vec::new())),
+        );
+        transport.register(&replacement_snapshot, &replacement_state);
+
+        let mut bytes = [0_u8; 4];
+        let receipt = lease
+            .read(&live, &snapshot, GuestVa(TEST_VA), &mut bytes, deadline)
+            .expect("old retained token must keep exact carrier state readable");
+        assert_eq!(&bytes, b"old!");
+        assert!(receipt.authenticates(&snapshot));
     }
 }
 
@@ -5264,7 +5391,6 @@ impl HvpatchFrameInventory {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 struct HvpatchFrameInventoryState {
     ledger: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
-    fail_next_begin_exec_inventory: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -5448,10 +5574,7 @@ fn cow_source_has_retained_sibling(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvpatchFrameInventoryState {
     fn new(ledger: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>) -> Self {
-        Self {
-            ledger,
-            fail_next_begin_exec_inventory: std::sync::atomic::AtomicBool::new(false),
-        }
+        Self { ledger }
     }
 
     fn lock(&self) -> parking_lot::MutexGuard<'_, HvpatchFrameInventory> {
@@ -5460,11 +5583,6 @@ impl HvpatchFrameInventoryState {
 
     fn shared_ledger(&self) -> std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>> {
         std::sync::Arc::clone(&self.ledger)
-    }
-
-    fn inject_next_begin_exec_inventory_failure(&self) {
-        self.fail_next_begin_exec_inventory
-            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     fn begin_process_inventory(
@@ -5551,14 +5669,6 @@ impl HvpatchFrameInventoryState {
         retired: Option<carrick_hal::FrameInventoryReservation>,
         replacement: carrick_hal::FrameInventoryReservation,
     ) -> Result<(), TrapError> {
-        if self
-            .fail_next_begin_exec_inventory
-            .swap(false, std::sync::atomic::Ordering::AcqRel)
-        {
-            return Err(TrapError::Hypervisor(
-                "injected HVPatch begin_exec_inventory failure".to_owned(),
-            ));
-        }
         let mut inventory = self.ledger.lock();
         if inventory.retired_reservation.is_some()
             || inventory.replacement_reservation.is_some()
@@ -5688,6 +5798,7 @@ pub(crate) struct HvfVmState {
     _vm:
         std::mem::ManuallyDrop<applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>>,
     pub(crate) task: HvfTaskState,
+    carrier_foreign_mm_transport: std::sync::Arc<CarrierForeignMmTransport>,
     /// VM-global Carrick control mappings owned by the persistent carrier.
     /// This is executor-local authority: load/save swaps it with the worker,
     /// while a logical task binding always carries `None`.
@@ -5711,31 +5822,68 @@ pub(crate) struct HvfVmState {
 /// operations. Entries retain only weak references: the kernel token keeps the
 /// MM alive, while backend teardown remains the owner of its access state.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Default)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct CarrierForeignMmBinding {
+    asid: carrick_hal::ForeignAsid,
+    stage1_root: carrick_guest_mem::Gpa,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CarrierForeignMmSnapshot {
+    mm: carrick_hal::ForeignMmId,
+    binding: CarrierForeignMmBinding,
+    backend_revision: carrick_hal::ForeignBackendRevision,
+    vma_revision: carrick_hal::ForeignVmaRevision,
+    frame_inventory_revision: carrick_hal::ForeignFrameInventoryRevision,
+    mapping_ids: Vec<carrick_hal::MappingId>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl CarrierForeignMmSnapshot {
+    fn capture(snapshot: &dyn carrick_hal::ForeignMmSnapshot) -> Self {
+        Self {
+            mm: snapshot.mm(),
+            binding: CarrierForeignMmBinding {
+                asid: snapshot.binding().asid(),
+                stage1_root: snapshot.binding().stage1_root(),
+            },
+            backend_revision: snapshot.backend_revision(),
+            vma_revision: snapshot.vma_revision(),
+            frame_inventory_revision: snapshot.frame_inventory_revision(),
+            mapping_ids: snapshot.mapping_ids().to_vec(),
+        }
+    }
+
+    fn matches(&self, snapshot: &dyn carrick_hal::ForeignMmSnapshot) -> bool {
+        *self == Self::capture(snapshot)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Default, Debug)]
 pub(crate) struct CarrierForeignMmTransport {
     states: std::sync::Arc<
         parking_lot::RwLock<
-            std::collections::HashMap<
-                carrick_hal::ForeignMmBinding,
-                std::sync::Weak<MmAccessState>,
-            >,
+            std::collections::HashMap<CarrierForeignMmBinding, std::sync::Weak<MmAccessState>>,
         >,
     >,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl CarrierForeignMmTransport {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self::default()
     }
 
     #[cfg(test)]
     fn register(
         &self,
-        snapshot: &carrick_hal::ForeignMmSnapshot,
+        snapshot: &dyn carrick_hal::ForeignMmSnapshot,
         state: &std::sync::Arc<MmAccessState>,
     ) {
-        state.install_snapshot(snapshot);
+        let snapshot = CarrierForeignMmSnapshot::capture(snapshot);
+        state.install_identity(snapshot.mm, snapshot.binding);
         self.states
             .write()
             .insert(snapshot.binding, std::sync::Arc::downgrade(state));
@@ -5744,7 +5892,7 @@ impl CarrierForeignMmTransport {
     fn register_identity(
         &self,
         mm: carrick_hal::ForeignMmId,
-        binding: carrick_hal::ForeignMmBinding,
+        binding: CarrierForeignMmBinding,
         state: &std::sync::Arc<MmAccessState>,
     ) {
         state.install_identity(mm, binding);
@@ -5755,7 +5903,7 @@ impl CarrierForeignMmTransport {
 
     fn state_for(
         &self,
-        snapshot: &carrick_hal::ForeignMmSnapshot,
+        snapshot: &CarrierForeignMmSnapshot,
     ) -> Result<std::sync::Arc<MmAccessState>, carrick_hal::ForeignMmTransportError> {
         let state = self
             .states
@@ -5770,24 +5918,14 @@ impl CarrierForeignMmTransport {
     }
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn carrier_foreign_mm_transport() -> &'static CarrierForeignMmTransport {
-    static TRANSPORT: std::sync::OnceLock<CarrierForeignMmTransport> = std::sync::OnceLock::new();
-    TRANSPORT.get_or_init(CarrierForeignMmTransport::new)
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn foreign_mm_transport() -> std::sync::Arc<dyn carrick_hal::ForeignMmTransport> {
-    std::sync::Arc::new(carrier_foreign_mm_transport().clone())
-}
-
 /// Shared backend state whose lifetime and identity belong to one Linux MM,
 /// never to whichever persistent worker currently executes one of its tasks.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct MmAccessState {
-    identity:
-        parking_lot::RwLock<Option<(carrick_hal::ForeignMmId, carrick_hal::ForeignMmBinding)>>,
-    page_tables: std::sync::Arc<parking_lot::Mutex<Option<crate::page_table::PageTableManager>>>,
+    identity: parking_lot::RwLock<Option<(carrick_hal::ForeignMmId, CarrierForeignMmBinding)>>,
+    page_tables: parking_lot::RwLock<
+        std::sync::Arc<parking_lot::Mutex<Option<crate::page_table::PageTableManager>>>,
+    >,
     protections: std::sync::Arc<MemoryProtections>,
     frame_inventory: HvpatchFrameInventoryState,
     cow_armed: std::sync::Arc<parking_lot::Mutex<CowArmedRanges>>,
@@ -5796,9 +5934,6 @@ pub(crate) struct MmAccessState {
     /// non-cloneable mutation guard. Keeping it MM-owned now prevents a later
     /// lock authority from following an executor by accident.
     mutation_coordinator: parking_lot::Mutex<()>,
-    backend_revision: std::sync::atomic::AtomicU64,
-    vma_revision: std::sync::atomic::AtomicU64,
-    frame_inventory_revision: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -5816,29 +5951,30 @@ impl MmAccessState {
     ) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             identity: parking_lot::RwLock::new(None),
-            page_tables,
+            page_tables: parking_lot::RwLock::new(page_tables),
             protections,
             frame_inventory: HvpatchFrameInventoryState::new(frame_inventory),
             cow_armed,
             cow_deferred_publications,
             mutation_coordinator: parking_lot::Mutex::new(()),
-            backend_revision: std::sync::atomic::AtomicU64::new(0),
-            vma_revision: std::sync::atomic::AtomicU64::new(0),
-            frame_inventory_revision: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
     #[cfg(test)]
     fn for_foreign_read_test(
-        binding: carrick_hal::ForeignMmBinding,
+        binding: CarrierForeignMmBinding,
         page_tables: std::sync::Arc<
             parking_lot::Mutex<Option<crate::page_table::PageTableManager>>,
         >,
         protections: std::sync::Arc<MemoryProtections>,
         frame_inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
-        snapshot: &carrick_hal::ForeignMmSnapshot,
+        snapshot: &dyn carrick_hal::ForeignMmSnapshot,
     ) -> std::sync::Arc<Self> {
-        assert_eq!(binding, snapshot.binding);
+        assert_eq!(
+            binding.asid.raw_for_probe(),
+            snapshot.binding().asid().raw_for_probe()
+        );
+        assert_eq!(binding.stage1_root, snapshot.binding().stage1_root());
         let state = Self::new(
             page_tables,
             protections,
@@ -5846,73 +5982,33 @@ impl MmAccessState {
             std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
         );
-        state.install_snapshot(snapshot);
+        let snapshot = CarrierForeignMmSnapshot::capture(snapshot);
+        state.install_identity(snapshot.mm, snapshot.binding);
         state
     }
 
-    #[cfg(test)]
-    fn install_snapshot(&self, snapshot: &carrick_hal::ForeignMmSnapshot) {
-        self.install_identity(snapshot.mm, snapshot.binding);
-        self.backend_revision.store(
-            snapshot.backend_revision.raw_for_probe(),
-            std::sync::atomic::Ordering::Release,
-        );
-        self.vma_revision.store(
-            snapshot.vma_revision.raw_for_probe(),
-            std::sync::atomic::Ordering::Release,
-        );
-        self.frame_inventory_revision.store(
-            snapshot.frame_inventory_revision.raw_for_probe(),
-            std::sync::atomic::Ordering::Release,
-        );
-    }
-
-    fn install_identity(
-        &self,
-        mm: carrick_hal::ForeignMmId,
-        binding: carrick_hal::ForeignMmBinding,
-    ) {
+    fn install_identity(&self, mm: carrick_hal::ForeignMmId, binding: CarrierForeignMmBinding) {
         *self.identity.write() = Some((mm, binding));
     }
 
-    fn authenticate_or_advance_revisions(&self, snapshot: &carrick_hal::ForeignMmSnapshot) -> bool {
-        let backend = snapshot.backend_revision.raw_for_probe();
-        let vma = snapshot.vma_revision.raw_for_probe();
-        let inventory = snapshot.frame_inventory_revision.raw_for_probe();
-        let current_backend = self
-            .backend_revision
-            .load(std::sync::atomic::Ordering::Acquire);
-        let current_vma = self.vma_revision.load(std::sync::atomic::Ordering::Acquire);
-        let current_inventory = self
-            .frame_inventory_revision
-            .load(std::sync::atomic::Ordering::Acquire);
-        if backend < current_backend || vma < current_vma || inventory < current_inventory {
-            return false;
-        }
-        self.backend_revision
-            .store(backend, std::sync::atomic::Ordering::Release);
-        self.vma_revision
-            .store(vma, std::sync::atomic::Ordering::Release);
-        self.frame_inventory_revision
-            .store(inventory, std::sync::atomic::Ordering::Release);
-        true
+    fn page_tables_authority(
+        &self,
+    ) -> std::sync::Arc<parking_lot::Mutex<Option<crate::page_table::PageTableManager>>> {
+        std::sync::Arc::clone(&self.page_tables.read())
     }
 
-    fn revisions_match(&self, snapshot: &carrick_hal::ForeignMmSnapshot) -> bool {
-        self.backend_revision
-            .load(std::sync::atomic::Ordering::Acquire)
-            == snapshot.backend_revision.raw_for_probe()
-            && self.vma_revision.load(std::sync::atomic::Ordering::Acquire)
-                == snapshot.vma_revision.raw_for_probe()
-            && self
-                .frame_inventory_revision
-                .load(std::sync::atomic::Ordering::Acquire)
-                == snapshot.frame_inventory_revision.raw_for_probe()
+    fn bind_page_tables_authority(
+        &self,
+        page_tables: std::sync::Arc<
+            parking_lot::Mutex<Option<crate::page_table::PageTableManager>>,
+        >,
+    ) {
+        *self.page_tables.write() = page_tables;
     }
 
     fn extent_for(
         &self,
-        snapshot: &carrick_hal::ForeignMmSnapshot,
+        snapshot: &CarrierForeignMmSnapshot,
         ipa: u64,
         len: usize,
     ) -> Result<((u64, u64), InventoryStage2OwnerIdentity), carrick_hal::ForeignMmTransportError>
@@ -5936,7 +6032,7 @@ impl MmAccessState {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn copy_from_pinned_owner(
     state: &MmAccessState,
-    snapshot: &carrick_hal::ForeignMmSnapshot,
+    snapshot: &CarrierForeignMmSnapshot,
     ipa: u64,
     dst: &mut [u8],
 ) -> Result<carrick_hal::ForeignOwnerGeneration, carrick_hal::ForeignMmTransportError> {
@@ -5965,17 +6061,15 @@ fn copy_from_pinned_owner(
             dst.len(),
         );
     }
-    let generation = std::num::NonZeroU64::new(owner.generation)
-        .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)?;
-    Ok(carrick_hal::ForeignOwnerGeneration::from_backend_counter(
-        generation,
-    ))
+    std::num::NonZeroU64::new(owner.generation)
+        .map(carrick_hal::ForeignOwnerGeneration::from_backend_counter)
+        .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn foreign_stage1_translate(
     state: &MmAccessState,
-    snapshot: &carrick_hal::ForeignMmSnapshot,
+    snapshot: &CarrierForeignMmSnapshot,
     va: carrick_guest_mem::GuestVa,
     owner_generations: &mut Vec<carrick_hal::ForeignOwnerGeneration>,
 ) -> Result<u64, carrick_hal::ForeignMmTransportError> {
@@ -6019,40 +6113,98 @@ fn foreign_stage1_translate(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl carrick_hal::ForeignMmTransport for CarrierForeignMmTransport {
+#[derive(Debug)]
+struct CarrierForeignMmReceipt {
+    snapshot: CarrierForeignMmSnapshot,
+    bytes_read: usize,
+    owner_generations: Vec<carrick_hal::ForeignOwnerGeneration>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl carrick_hal::ForeignMmReadReceipt for CarrierForeignMmReceipt {
+    fn bytes_read(&self) -> usize {
+        self.bytes_read
+    }
+
+    fn owner_generations(&self) -> &[carrick_hal::ForeignOwnerGeneration] {
+        &self.owner_generations
+    }
+
+    fn authenticates(&self, snapshot: &dyn carrick_hal::ForeignMmSnapshot) -> bool {
+        self.snapshot.matches(snapshot)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct CarrierForeignMmReadLease {
+    state: std::sync::Arc<MmAccessState>,
+    retained: CarrierForeignMmSnapshot,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl std::fmt::Debug for CarrierForeignMmReadLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CarrierForeignMmReadLease")
+            .field("retained", &self.retained)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn live_snapshot_matches(
+    authority: &dyn carrick_hal::ForeignMmLiveAuthority,
+    expected: &CarrierForeignMmSnapshot,
+    deadline: std::time::Instant,
+) -> Result<bool, carrick_hal::ForeignMmTransportError> {
+    if std::time::Instant::now() >= deadline {
+        return Err(carrick_hal::ForeignMmTransportError::TimedOut);
+    }
+    let observed = authority.snapshot(deadline)?;
+    Ok(expected.matches(observed.as_ref()))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
     fn read(
         &self,
-        snapshot: &carrick_hal::ForeignMmSnapshot,
+        authority: &dyn carrick_hal::ForeignMmLiveAuthority,
+        snapshot: &dyn carrick_hal::ForeignMmSnapshot,
         va: carrick_guest_mem::GuestVa,
         dst: &mut [u8],
-    ) -> Result<carrick_hal::ForeignMmReadReceipt, carrick_hal::ForeignMmTransportError> {
-        let state = self.state_for(snapshot)?;
-        // The MM-owned coordinator serializes revision adoption with the
-        // complete owner-pinned walk. Task 6 will replace this private lock
-        // with the structural pause/mutation guard.
-        let _read_coordinator = state.mutation_coordinator.lock();
-        if !state.authenticate_or_advance_revisions(snapshot) {
+        deadline: std::time::Instant,
+    ) -> Result<Box<dyn carrick_hal::ForeignMmReadReceipt>, carrick_hal::ForeignMmTransportError>
+    {
+        let requested = CarrierForeignMmSnapshot::capture(snapshot);
+        if requested != self.retained {
+            return Err(carrick_hal::ForeignMmTransportError::MissingBinding);
+        }
+        let _read_coordinator = self.state.mutation_coordinator.lock();
+        if !live_snapshot_matches(authority, &requested, deadline)? {
             return Err(carrick_hal::ForeignMmTransportError::Retry);
         }
         let mut cursor = va.raw();
         let mut completed = 0_usize;
         let mut owner_generations = Vec::new();
         while completed < dst.len() {
-            if !state.revisions_match(snapshot) {
+            if !live_snapshot_matches(authority, &requested, deadline)? {
                 return Err(carrick_hal::ForeignMmTransportError::Retry);
             }
             let current_va = carrick_guest_mem::GuestVa(cursor);
-            let ipa =
-                foreign_stage1_translate(&state, snapshot, current_va, &mut owner_generations)?;
+            let ipa = foreign_stage1_translate(
+                &self.state,
+                &requested,
+                current_va,
+                &mut owner_generations,
+            )?;
             let page_remaining = 0x1000_usize - (current_va.raw() as usize & 0xfff);
             let chunk = page_remaining.min(dst.len() - completed);
             owner_generations.push(copy_from_pinned_owner(
-                &state,
-                snapshot,
+                &self.state,
+                &requested,
                 ipa,
                 &mut dst[completed..completed + chunk],
             )?);
-            if !state.revisions_match(snapshot) {
+            if !live_snapshot_matches(authority, &requested, deadline)? {
                 return Err(carrick_hal::ForeignMmTransportError::Retry);
             }
             completed += chunk;
@@ -6062,11 +6214,33 @@ impl carrick_hal::ForeignMmTransport for CarrierForeignMmTransport {
         }
         owner_generations.sort_unstable();
         owner_generations.dedup();
-        Ok(carrick_hal::ForeignMmReadReceipt::complete(
-            snapshot,
-            completed,
+        Ok(Box::new(CarrierForeignMmReceipt {
+            snapshot: requested,
+            bytes_read: completed,
             owner_generations,
-        ))
+        }))
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl carrick_hal::ForeignMmTransport for CarrierForeignMmTransport {
+    fn retain(
+        &self,
+        snapshot: &dyn carrick_hal::ForeignMmSnapshot,
+        deadline: std::time::Instant,
+    ) -> Result<
+        std::sync::Arc<dyn carrick_hal::ForeignMmReadLease>,
+        carrick_hal::ForeignMmTransportError,
+    > {
+        if std::time::Instant::now() >= deadline {
+            return Err(carrick_hal::ForeignMmTransportError::TimedOut);
+        }
+        let retained = CarrierForeignMmSnapshot::capture(snapshot);
+        let state = self.state_for(&retained)?;
+        Ok(std::sync::Arc::new(CarrierForeignMmReadLease {
+            state,
+            retained,
+        }))
     }
 }
 
@@ -6152,6 +6326,9 @@ pub(crate) struct HvfTaskState {
     pending_fork_frame_receipts: Vec<PendingForkFrameReceipt>,
     /// Child aliases withheld until fresh-vCPU register restoration succeeds.
     pending_process_aliases: Vec<AliasBacking>,
+    /// Test-only diagnostic arm owned by this executor projection. It must not
+    /// move into the shared MM access state or a sibling can consume it.
+    fail_next_begin_exec_inventory: bool,
     /// Recycled buffer for the frame-COW rollback pre-image.
     ///
     /// `perform_frame_cow` snapshots the whole stage-1 manager before it edits,
@@ -6341,6 +6518,10 @@ pub(crate) fn swap_hvpatch_task_state(live: &mut HvfTaskState, parked: &mut HvfT
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfTaskState {
+    pub(crate) fn mm_access_authority(&self) -> std::sync::Arc<MmAccessState> {
+        std::sync::Arc::clone(&self.mm_access)
+    }
+
     fn take_exec_predecessor_identity(
         &mut self,
         predecessor_cow_identity: carrick_hal::FrameCowIdentity,
@@ -6381,17 +6562,19 @@ impl HvfTaskState {
 
     pub(crate) fn runtime_authorities_match(
         &self,
+        mm_access: &std::sync::Arc<MmAccessState>,
         page_tables: &std::sync::Arc<
             parking_lot::Mutex<Option<crate::page_table::PageTableManager>>,
         >,
         protections: &std::sync::Arc<MemoryProtections>,
     ) -> bool {
-        carrick_aarch64::Aarch64TaskRuntimeProjection {
-            page_tables: std::sync::Arc::clone(page_tables),
-            protections: std::sync::Arc::clone(protections),
-            process_asid: None,
-        }
-        .shares_exact_mm_authority(&self.page_tables, &self.protections)
+        std::sync::Arc::ptr_eq(&self.mm_access, mm_access)
+            && carrick_aarch64::Aarch64TaskRuntimeProjection {
+                page_tables: std::sync::Arc::clone(page_tables),
+                protections: std::sync::Arc::clone(protections),
+                process_asid: None,
+            }
+            .shares_exact_mm_authority(&self.page_tables_authority(), &self.protections)
     }
 
     fn publish_pending_fork_frame_receipts_with(
@@ -6475,20 +6658,6 @@ impl HvfTaskState {
     ) {
         self.cow_authority = Some(std::sync::Arc::clone(&authority));
         self.cow_identity = Some(identity);
-        if let (Some(mm), Some(asid), Some((stage1_root, _))) = (
-            std::num::NonZeroU64::new(identity.mm),
-            std::num::NonZeroU16::new(identity.asid),
-            self.mm_root_slot,
-        ) {
-            carrier_foreign_mm_transport().register_identity(
-                carrick_hal::ForeignMmId::from_kernel_allocation(mm),
-                carrick_hal::ForeignMmBinding::for_aarch64(
-                    carrick_hal::ForeignAsid::from_kernel_allocation(asid),
-                    carrick_guest_mem::Gpa(stage1_root),
-                ),
-                &self.mm_access,
-            );
-        }
         self.publish_pending_fork_frame_receipts();
         if let Some(ref mut reg) = self.registration {
             reg.cow_authority = Some(authority);
@@ -6592,6 +6761,7 @@ impl HvfTaskState {
             cow_identity: None,
             pending_fork_frame_receipts: Vec::new(),
             pending_process_aliases: Vec::new(),
+            fail_next_begin_exec_inventory: false,
             cow_rollback_scratch: None,
             registration: None,
         }
@@ -6617,7 +6787,7 @@ impl HvfTaskState {
             && protections.executable.is_empty()
             && protections.bus_fault.is_empty()
             && protections.mutable_shared_backing.is_empty()
-            && self.page_tables.lock().is_none()
+            && self.page_tables_authority().lock().is_none()
             && self.last_syscall_nr.is_none()
             && self.last_syscall_orig_x0 == 0
             && !self.persistent_vm_lifecycle
@@ -6680,6 +6850,11 @@ impl HvfTaskState {
         retired: Option<carrick_hal::FrameInventoryReservation>,
         replacement: carrick_hal::FrameInventoryReservation,
     ) -> Result<(), TrapError> {
+        if std::mem::take(&mut self.fail_next_begin_exec_inventory) {
+            return Err(TrapError::Hypervisor(
+                "injected HVPatch begin_exec_inventory failure".to_owned(),
+            ));
+        }
         if self.shared_process_mm {
             // The parent still owns this ledger. Exec starts a fresh backend
             // ledger for the replacement MM so it cannot remove the parent's
@@ -6688,7 +6863,7 @@ impl HvfTaskState {
             // ledger, and the Kernel authority rejects a zero-event commit.
             let frames = self.frame_inventory.lock().frames.clone();
             self.mm_access = MmAccessState::new(
-                std::sync::Arc::clone(&self.page_tables),
+                self.page_tables_authority(),
                 std::sync::Arc::clone(&self.protections),
                 std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::with_frames(
                     frames,
@@ -6834,6 +7009,7 @@ pub(crate) fn hvpatch_task_state_test_fixture(
         }),
         pending_fork_frame_receipts: Vec::new(),
         pending_process_aliases: Vec::new(),
+        fail_next_begin_exec_inventory: false,
         cow_rollback_scratch: None,
         registration: None,
     }
@@ -6866,7 +7042,7 @@ pub(crate) fn hvpatch_task_state_test_identity(
         mm_root_slot: state.mm_root_slot,
         first_mapping: state.mappings.first().map_or(0, |mapping| mapping.start),
         linux_tid: state.cow_identity.map_or(0, |identity| identity.linux_tid),
-        page_tables: std::sync::Arc::as_ptr(&state.page_tables) as usize,
+        page_tables: std::sync::Arc::as_ptr(&state.page_tables_authority()) as usize,
         frame_inventory: std::sync::Arc::as_ptr(&state.frame_inventory.ledger) as usize,
         cow_authority: authority,
         mm_access: std::sync::Arc::as_ptr(&state.mm_access) as usize,
@@ -6914,6 +7090,34 @@ fn bind_exec_predecessor_identity_slot(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfVmState {
+    pub(crate) fn foreign_mm_transport(
+        &self,
+    ) -> std::sync::Arc<dyn carrick_hal::ForeignMmTransport> {
+        self.carrier_foreign_mm_transport.clone()
+    }
+
+    pub(crate) fn bind_frame_cow(
+        &mut self,
+        authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
+        identity: carrick_hal::FrameCowIdentity,
+    ) {
+        self.task.bind_frame_cow(authority, identity);
+        if let (Some(mm), Some(asid), Some((stage1_root, _))) = (
+            std::num::NonZeroU64::new(identity.mm),
+            std::num::NonZeroU16::new(identity.asid),
+            self.task.mm_root_slot,
+        ) {
+            self.carrier_foreign_mm_transport.register_identity(
+                carrick_hal::ForeignMmId::from_kernel_allocation(mm),
+                CarrierForeignMmBinding {
+                    asid: carrick_hal::ForeignAsid::from_kernel_allocation(asid),
+                    stage1_root: carrick_guest_mem::Gpa(stage1_root),
+                },
+                &self.task.mm_access,
+            );
+        }
+    }
+
     pub(crate) fn prepare_exec_address_space(
         &mut self,
         root_slot_base: u64,
@@ -6951,6 +7155,12 @@ impl HvfVmState {
     }
 
     pub(crate) fn swap_persistent_executor_local(&mut self, other: &mut Self) {
+        if !std::sync::Arc::ptr_eq(
+            &self.carrier_foreign_mm_transport,
+            &other.carrier_foreign_mm_transport,
+        ) {
+            std::process::abort();
+        }
         std::mem::swap(&mut self._vm, &mut other._vm);
         std::mem::swap(&mut self.carrier_mappings, &mut other.carrier_mappings);
         std::mem::swap(&mut self.reclaim_authority, &mut other.reclaim_authority);
@@ -7939,6 +8149,7 @@ pub struct ThreadSpec {
     /// Sibling threads retain the exact MM authority; no per-MM field is
     /// copied independently into an executor specification.
     mm_access: std::sync::Arc<MmAccessState>,
+    carrier_foreign_mm_transport: std::sync::Arc<CarrierForeignMmTransport>,
     mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
     syscall_transport: HvfSyscallTransport,
     persistent_vm_lifecycle: bool,
@@ -7964,6 +8175,7 @@ pub(crate) struct PersistentExecutorSpec {
     carrier_mappings: std::sync::Arc<PersistentCarrierMappings>,
     mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
     syscall_transport: HvfSyscallTransport,
+    carrier_foreign_mm_transport: std::sync::Arc<CarrierForeignMmTransport>,
 }
 
 // SAFETY: PersistentCarrierMappings owns immutable VM-global MAP_SHARED
@@ -8231,6 +8443,7 @@ pub struct ProcessSpec {
     container_root: ContainerRootToken,
     frame_inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
     cow_armed: std::sync::Arc<parking_lot::Mutex<CowArmedRanges>>,
+    carrier_foreign_mm_transport: std::sync::Arc<CarrierForeignMmTransport>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -9954,6 +10167,7 @@ impl HvpatchTaskRegistration {
                 &mut *task_mm.pending_publication_receipts.lock(),
             ),
             pending_process_aliases: Vec::new(),
+            fail_next_begin_exec_inventory: false,
             cow_rollback_scratch: None,
             registration: None,
         })
@@ -10167,6 +10381,7 @@ impl HvpatchPreparedCarrierTaskState {
             vm,
             mappings,
             mm_access,
+            carrier_foreign_mm_transport: _,
             mailbox_slots: _,
             syscall_transport: _,
             persistent_vm_lifecycle: _,
@@ -12300,8 +12515,7 @@ impl HvfVmState {
     }
 
     pub(crate) fn inject_next_begin_exec_inventory_failure(&mut self) {
-        self.frame_inventory
-            .inject_next_begin_exec_inventory_failure();
+        self.task.fail_next_begin_exec_inventory = true;
     }
 
     pub(crate) fn frame_inventory_exec_extent_counts(
@@ -12421,7 +12635,7 @@ impl HvfVmState {
     }
 
     pub(crate) fn page_tables_snapshot(&self) -> Option<crate::page_table::PageTableManager> {
-        self.page_tables.lock().clone()
+        self.page_tables_authority().lock().clone()
     }
 
     pub(crate) fn bind_stage1_page_tables(
@@ -12430,24 +12644,23 @@ impl HvfVmState {
             parking_lot::Mutex<Option<crate::page_table::PageTableManager>>,
         >,
     ) {
-        self.mm_access = MmAccessState::new(
-            page_tables,
-            std::sync::Arc::clone(&self.protections),
-            self.frame_inventory.shared_ledger(),
-            std::sync::Arc::clone(&self.cow_armed),
-            std::sync::Arc::clone(&self.cow_deferred_publications),
-        );
+        self.mm_access.bind_page_tables_authority(page_tables);
     }
 
     pub(crate) fn task_runtime_authorities_match(
         &self,
+        mm_access: &std::sync::Arc<MmAccessState>,
         page_tables: &std::sync::Arc<
             parking_lot::Mutex<Option<crate::page_table::PageTableManager>>,
         >,
         protections: &std::sync::Arc<MemoryProtections>,
     ) -> bool {
         self.task
-            .runtime_authorities_match(page_tables, protections)
+            .runtime_authorities_match(mm_access, page_tables, protections)
+    }
+
+    pub(crate) fn task_mm_access_authority(&self) -> std::sync::Arc<MmAccessState> {
+        self.task.mm_access_authority()
     }
 
     pub(crate) fn task_protections_authority(&self) -> std::sync::Arc<MemoryProtections> {
@@ -12901,6 +13114,10 @@ impl HvfVmState {
 
         let mut state = HvfVmState {
             _vm: std::mem::ManuallyDrop::new(vm),
+            carrier_foreign_mm_transport: carrier.as_ref().map_or_else(
+                || std::sync::Arc::new(CarrierForeignMmTransport::new()),
+                |spec| std::sync::Arc::clone(&spec.carrier_foreign_mm_transport),
+            ),
             task: HvfTaskState {
                 mappings: Vec::new(),
                 mm_root_slot: None,
@@ -12928,6 +13145,7 @@ impl HvfVmState {
                 cow_identity: None,
                 pending_fork_frame_receipts: Vec::new(),
                 pending_process_aliases: Vec::new(),
+                fail_next_begin_exec_inventory: false,
                 cow_rollback_scratch: None,
                 registration: None,
             },
@@ -13825,7 +14043,7 @@ impl HvfVmState {
             .ok_or_else(|| {
                 TrapError::Hypervisor("sparse HVPatch mmap has no page-table backing".to_owned())
             })?;
-        if self.page_tables.lock().is_none() {
+        if self.page_tables_authority().lock().is_none() {
             return Err(TrapError::Hypervisor(
                 "sparse HVPatch mmap page tables are absent".to_owned(),
             ));
@@ -13911,7 +14129,8 @@ impl HvfVmState {
         let mut rollback_scratch = self.cow_rollback_scratch.take();
         let mut rollback_page_tables = None;
         let publication = (|| {
-            let mut page_tables = self.page_tables.lock();
+            let page_tables_authority = self.page_tables_authority();
+            let mut page_tables = page_tables_authority.lock();
             let manager = page_tables.as_mut().ok_or_else(|| {
                 TrapError::Hypervisor("sparse HVPatch mmap page tables are absent".to_owned())
             })?;
@@ -13989,7 +14208,8 @@ impl HvfVmState {
         if let Err(error) = publication {
             if let Some(snapshot) = rollback_page_tables {
                 {
-                    let mut page_tables = self.page_tables.lock();
+                    let page_tables_authority = self.page_tables_authority();
+                    let mut page_tables = page_tables_authority.lock();
                     unsafe { snapshot.restore_quiesced_snapshot_to_host(page_table_host) };
                     *page_tables = Some(snapshot);
                 }
@@ -14181,7 +14401,7 @@ impl HvfVmState {
         }
         let page_va = align_down(va, PAGE_SIZE);
         let retained_ipa = self
-            .page_tables
+            .page_tables_authority()
             .lock()
             .as_ref()
             .and_then(|manager| manager.translate_retained_output(page_va));
@@ -14216,7 +14436,7 @@ impl HvfVmState {
 
         // Another sibling may have repaired the leaf while this thread waited.
         let retained_ipa = self
-            .page_tables
+            .page_tables_authority()
             .lock()
             .as_ref()
             .and_then(|manager| manager.translate_retained_output(page_va));
@@ -14264,7 +14484,7 @@ impl HvfVmState {
         let mut probe = page_va.saturating_add(PAGE_SIZE);
         while probe < span_end {
             let retained = self
-                .page_tables
+                .page_tables_authority()
                 .lock()
                 .as_ref()
                 .and_then(|manager| manager.translate_retained_output(probe));
@@ -14371,7 +14591,8 @@ impl HvfVmState {
         let mut rollback_scratch = self.cow_rollback_scratch.take();
         let mut rollback_page_tables = None;
         let publication = (|| {
-            let mut page_tables = self.page_tables.lock();
+            let page_tables_authority = self.page_tables_authority();
+            let mut page_tables = page_tables_authority.lock();
             let manager = page_tables.as_mut().ok_or_else(|| {
                 TrapError::Hypervisor("HVPatch retained reuse page tables are absent".to_owned())
             })?;
@@ -14427,7 +14648,8 @@ impl HvfVmState {
         if let Err(error) = publication {
             if let Some(snapshot) = rollback_page_tables {
                 {
-                    let mut page_tables = self.page_tables.lock();
+                    let page_tables_authority = self.page_tables_authority();
+                    let mut page_tables = page_tables_authority.lock();
                     unsafe { snapshot.restore_quiesced_snapshot_to_host(page_table_host) };
                     *page_tables = Some(snapshot);
                 }
@@ -14576,7 +14798,8 @@ impl HvfVmState {
             .ok_or_else(|| {
                 TrapError::Hypervisor("HVPatch winner PTE page-table backing is absent".to_owned())
             })?;
-        let page_tables = self.page_tables.lock();
+        let page_tables_authority = self.page_tables_authority();
+        let page_tables = page_tables_authority.lock();
         let manager = page_tables.as_ref().ok_or_else(|| {
             TrapError::Hypervisor("HVPatch winner PTE manager is absent".to_owned())
         })?;
@@ -14755,7 +14978,8 @@ impl HvfVmState {
             TrapError::Hypervisor("HVPatch COW physical offset underflow".to_owned())
         })?;
         let retain_old_compound = {
-            let page_tables = self.page_tables.lock();
+            let page_tables_authority = self.page_tables_authority();
+            let page_tables = page_tables_authority.lock();
             let manager = page_tables.as_ref().ok_or_else(|| {
                 TrapError::Hypervisor("HVPatch COW page-table manager is absent".to_owned())
             })?;
@@ -14951,7 +15175,8 @@ impl HvfVmState {
             const VALID: u64 = 1;
             const TYPE_TABLE_OR_PAGE: u64 = 0b11;
             const NON_GLOBAL: u64 = 1 << 11;
-            let mut page_tables = self.page_tables.lock();
+            let page_tables_authority = self.page_tables_authority();
+            let mut page_tables = page_tables_authority.lock();
             let manager = page_tables.as_mut().ok_or_else(|| {
                 TrapError::Hypervisor("HVPatch COW page-table manager is absent".to_owned())
             })?;
@@ -15065,7 +15290,8 @@ impl HvfVmState {
         if let Err(error) = page_table_result {
             if let Some(snapshot) = rollback_page_tables {
                 {
-                    let mut page_tables = self.page_tables.lock();
+                    let page_tables_authority = self.page_tables_authority();
+                    let mut page_tables = page_tables_authority.lock();
                     // SAFETY: the COW quiesce and topology guards remain held;
                     // no vCPU can walk or edit this mm while the complete
                     // pre-transaction image replaces its live backing.
@@ -15312,7 +15538,7 @@ impl HvfVmState {
                     && self.persistent_vm_lifecycle
                 {
                     match self
-                        .page_tables
+                        .page_tables_authority()
                         .lock()
                         .as_ref()
                         .and_then(|manager| manager.translate_retained_output(current))
@@ -15522,7 +15748,8 @@ impl HvfVmState {
                 (AP_USER_RO, 6, false)
             };
 
-        let page_tables = self.page_tables.lock();
+        let page_tables_authority = self.page_tables_authority();
+        let page_tables = page_tables_authority.lock();
         let manager = page_tables.as_ref().ok_or_else(|| {
             TrapError::Hypervisor("deferred COW protection has no page-table manager".to_owned())
         })?;
@@ -16557,7 +16784,7 @@ impl HvfVmState {
             // through the typed invalid-leaf seam and scrub each page-bounded
             // physical fragment independently.
             let retained_ipa = self
-                .page_tables
+                .page_tables_authority()
                 .lock()
                 .as_ref()
                 .and_then(|manager| manager.translate_retained_output(chunk_va));
@@ -17404,7 +17631,7 @@ impl HvfVmState {
     /// address carrick `hv_vm_map`'d). `None` if unmapped. Used to disambiguate
     /// overlapping high-VA alias regions in `mapping_for_range[_mut]`.
     fn translate_va(&self, va: u64) -> Option<u64> {
-        self.page_tables.lock().as_ref()?.translate(va)
+        self.page_tables_authority().lock().as_ref()?.translate(va)
     }
 
     pub(crate) fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
@@ -17801,6 +18028,7 @@ impl HvfVmState {
             carrier_mappings,
             mailbox_slots: std::sync::Arc::clone(&self.mailbox_slots),
             syscall_transport: self.syscall_transport,
+            carrier_foreign_mm_transport: std::sync::Arc::clone(&self.carrier_foreign_mm_transport),
         };
         // First root of this carrier: publish the VM-global bundle for every
         // later container's root bring-up and wake any root parked on it. The
@@ -17860,6 +18088,7 @@ impl HvfVmState {
         enable_el0_counter_access(vcpu.id());
         let state = HvfVmState {
             _vm: std::mem::ManuallyDrop::new(vm),
+            carrier_foreign_mm_transport: std::sync::Arc::clone(&spec.carrier_foreign_mm_transport),
             task: HvfTaskState::neutral(),
             carrier_mappings: Some(std::sync::Arc::clone(&spec.carrier_mappings)),
             reclaim_authority: ReclaimParkAuthority::Live,
@@ -17976,6 +18205,7 @@ impl HvfVmState {
             vm: (*self._vm).clone(),
             mappings,
             mm_access: std::sync::Arc::clone(&self.mm_access),
+            carrier_foreign_mm_transport: std::sync::Arc::clone(&self.carrier_foreign_mm_transport),
             mailbox_slots: std::sync::Arc::clone(&self.mailbox_slots),
             syscall_transport: self.syscall_transport,
             persistent_vm_lifecycle: self.persistent_vm_lifecycle,
@@ -17998,6 +18228,7 @@ impl HvfVmState {
             vm,
             mappings,
             mm_access,
+            carrier_foreign_mm_transport,
             mailbox_slots,
             syscall_transport,
             persistent_vm_lifecycle,
@@ -18020,6 +18251,7 @@ impl HvfVmState {
 
         let mut state = HvfVmState {
             _vm: std::mem::ManuallyDrop::new(vm),
+            carrier_foreign_mm_transport,
             task: HvfTaskState {
                 mappings: Vec::with_capacity(mappings.len()),
                 mm_root_slot,
@@ -18041,6 +18273,7 @@ impl HvfVmState {
                 cow_identity,
                 pending_fork_frame_receipts: Vec::new(),
                 pending_process_aliases: Vec::new(),
+                fail_next_begin_exec_inventory: false,
                 cow_rollback_scratch: None,
                 registration: None,
             },
@@ -18332,7 +18565,7 @@ impl HvfVmState {
                     // divergence the child will inherit.
                     let expected_ipa = mapping.physical_ipa + frame_offset;
                     let walk = self
-                        .page_tables
+                        .page_tables_authority()
                         .lock()
                         .as_ref()
                         .map(|manager| manager.debug_walk(debug_va));
@@ -18801,6 +19034,7 @@ impl HvfVmState {
             container_root: self.container_root,
             frame_inventory,
             cow_armed: std::sync::Arc::new(parking_lot::Mutex::new(child_cow_armed)),
+            carrier_foreign_mm_transport: std::sync::Arc::clone(&self.carrier_foreign_mm_transport),
         };
         // Zero bytes: this stage no longer copies the page-table image (see the
         // `ProcessSpec` field comment). Reporting the old
@@ -19218,6 +19452,7 @@ impl HvfVmState {
         let process_transaction = process_reservation.transaction();
         let mut state = HvfVmState {
             _vm: std::mem::ManuallyDrop::new(spec.vm),
+            carrier_foreign_mm_transport: std::sync::Arc::clone(&spec.carrier_foreign_mm_transport),
             task: HvfTaskState {
                 mappings: mapped,
                 mm_root_slot: Some(spec.mm_root_slot),
@@ -19247,6 +19482,7 @@ impl HvfVmState {
                 cow_identity: None,
                 pending_fork_frame_receipts: Vec::new(),
                 pending_process_aliases: aliases_to_publish,
+                fail_next_begin_exec_inventory: false,
                 cow_rollback_scratch: None,
                 registration: None,
             },
@@ -25439,12 +25675,53 @@ mod frame_inventory_backend_tests {
     }
 
     #[test]
-    fn begin_exec_injection_is_owned_and_consumed_by_only_the_armed_engine_state() {
-        let ledger = std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
-        let engine_a = HvpatchFrameInventoryState::new(std::sync::Arc::clone(&ledger));
-        let engine_b = HvpatchFrameInventoryState::new(std::sync::Arc::clone(&ledger));
+    fn foreign_mm_binding_stage1_tables_preserves_the_exact_shared_mm_access_arc() {
+        let owner = HvfTaskState::neutral();
+        let sibling_mm_access = std::sync::Arc::clone(&owner.mm_access);
+        let before = std::sync::Arc::as_ptr(&owner.mm_access);
+        let page_tables = std::sync::Arc::new(parking_lot::Mutex::new(None));
 
-        engine_a.inject_next_begin_exec_inventory_failure();
+        owner
+            .mm_access
+            .bind_page_tables_authority(std::sync::Arc::clone(&page_tables));
+
+        assert_eq!(std::sync::Arc::as_ptr(&owner.mm_access), before);
+        assert!(std::sync::Arc::ptr_eq(&owner.mm_access, &sibling_mm_access));
+        assert!(std::sync::Arc::ptr_eq(
+            &owner.page_tables_authority(),
+            &page_tables
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &sibling_mm_access.page_tables_authority(),
+            &page_tables
+        ));
+        assert!(owner.runtime_authorities_match(
+            &sibling_mm_access,
+            &page_tables,
+            &owner.protections,
+        ));
+
+        let distinct_state = MmAccessState::new(
+            std::sync::Arc::clone(&page_tables),
+            std::sync::Arc::clone(&owner.protections),
+            owner.frame_inventory.shared_ledger(),
+            std::sync::Arc::clone(&owner.cow_armed),
+            std::sync::Arc::clone(&owner.cow_deferred_publications),
+        );
+        assert!(
+            !owner.runtime_authorities_match(&distinct_state, &page_tables, &owner.protections,),
+            "matching component Arcs must not authenticate a distinct MM access state",
+        );
+    }
+
+    #[test]
+    fn foreign_mm_shared_state_keeps_exec_injection_executor_local() {
+        let mut engine_a = HvfTaskState::neutral();
+        let mut engine_b = HvfTaskState::neutral();
+        engine_b.mm_access = std::sync::Arc::clone(&engine_a.mm_access);
+        let ledger = engine_a.frame_inventory.shared_ledger();
+
+        engine_a.fail_next_begin_exec_inventory = true;
 
         let (b_retired, b_replacement) = inventory_pair(1);
         engine_b

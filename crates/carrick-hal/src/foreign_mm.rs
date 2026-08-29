@@ -1,12 +1,14 @@
-//! Dependency-neutral transport values for carrier-owned foreign-MM reads.
+//! Dependency-neutral, object-safe contracts for carrier-owned foreign-MM reads.
 
+use std::fmt::Debug;
 use std::num::{NonZeroU16, NonZeroU64};
+use std::sync::Arc;
+use std::time::Instant;
 
 use carrick_guest_mem::{Gpa, GuestVa};
 
 use crate::{ForeignBackendRevision, ForeignFrameInventoryRevision, ForeignVmaRevision, MappingId};
 
-/// Never-reused kernel identity of one exact Linux MM incarnation.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
 pub struct ForeignMmId(NonZeroU64);
@@ -15,13 +17,11 @@ impl ForeignMmId {
     pub const fn from_kernel_allocation(raw: NonZeroU64) -> Self {
         Self(raw)
     }
-
     pub const fn raw_for_probe(self) -> u64 {
         self.0.get()
     }
 }
 
-/// AArch64 address-space identifier carried as transport data.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
 pub struct ForeignAsid(NonZeroU16);
@@ -30,26 +30,29 @@ impl ForeignAsid {
     pub const fn from_kernel_allocation(raw: NonZeroU16) -> Self {
         Self(raw)
     }
-
     pub const fn raw_for_probe(self) -> u16 {
         self.0.get()
     }
 }
 
-/// Coherent backend binding for one foreign-MM observation.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ForeignMmBinding {
-    pub asid: ForeignAsid,
-    pub stage1_root: Gpa,
+    asid: ForeignAsid,
+    stage1_root: Gpa,
 }
 
 impl ForeignMmBinding {
     pub const fn for_aarch64(asid: ForeignAsid, stage1_root: Gpa) -> Self {
         Self { asid, stage1_root }
     }
+    pub const fn asid(self) -> ForeignAsid {
+        self.asid
+    }
+    pub const fn stage1_root(self) -> Gpa {
+        self.stage1_root
+    }
 }
 
-/// Exact incarnation of one live global-frame host owner.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
 pub struct ForeignOwnerGeneration(NonZeroU64);
@@ -58,60 +61,49 @@ impl ForeignOwnerGeneration {
     pub const fn from_backend_counter(raw: NonZeroU64) -> Self {
         Self(raw)
     }
-
     pub const fn raw_for_probe(self) -> u64 {
         self.0.get()
     }
 }
 
-/// Validated kernel observation projected into dependency-neutral transport data.
-///
-/// This is not authority: only the private runtime facade may construct it from
-/// a retained kernel token, and the carrier reauthenticates every field.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ForeignMmSnapshot {
-    pub mm: ForeignMmId,
-    pub binding: ForeignMmBinding,
-    pub backend_revision: ForeignBackendRevision,
-    pub vma_revision: ForeignVmaRevision,
-    pub frame_inventory_revision: ForeignFrameInventoryRevision,
-    pub mapping_ids: Vec<MappingId>,
+/// Coherent kernel projection of one exact Linux MM incarnation.
+/// Implementations stay private to the kernel authority layer.
+pub trait ForeignMmSnapshot: Debug + Send + Sync {
+    fn mm(&self) -> ForeignMmId;
+    fn binding(&self) -> ForeignMmBinding;
+    fn backend_revision(&self) -> ForeignBackendRevision;
+    fn vma_revision(&self) -> ForeignVmaRevision;
+    fn frame_inventory_revision(&self) -> ForeignFrameInventoryRevision;
+    fn mapping_ids(&self) -> &[MappingId];
 }
 
-/// Authenticated outcome of one carrier-owned foreign read.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ForeignMmReadReceipt {
-    pub mm: ForeignMmId,
-    pub binding: ForeignMmBinding,
-    pub backend_revision: ForeignBackendRevision,
-    pub vma_revision: ForeignVmaRevision,
-    pub frame_inventory_revision: ForeignFrameInventoryRevision,
-    pub bytes_read: usize,
-    pub owner_generations: Vec<ForeignOwnerGeneration>,
+/// Exact live backend used to re-observe real mutation authorities.
+pub trait ForeignMmLiveAuthority: Send + Sync {
+    fn snapshot(
+        &self,
+        deadline: Instant,
+    ) -> Result<Box<dyn ForeignMmSnapshot>, ForeignMmTransportError>;
 }
 
-impl ForeignMmReadReceipt {
-    /// Construct a receipt after the backend has reauthenticated the complete
-    /// snapshot and every owner-pinned chunk.
-    pub fn complete(
-        snapshot: &ForeignMmSnapshot,
-        bytes_read: usize,
-        owner_generations: Vec<ForeignOwnerGeneration>,
-    ) -> Self {
-        Self {
-            mm: snapshot.mm,
-            binding: snapshot.binding,
-            backend_revision: snapshot.backend_revision,
-            vma_revision: snapshot.vma_revision,
-            frame_inventory_revision: snapshot.frame_inventory_revision,
-            bytes_read,
-            owner_generations,
-        }
-    }
+/// Authenticated completion. Concrete receipts stay private to transports.
+pub trait ForeignMmReadReceipt: Debug + Send + Sync {
+    fn bytes_read(&self) -> usize;
+    fn owner_generations(&self) -> &[ForeignOwnerGeneration];
+    fn authenticates(&self, snapshot: &dyn ForeignMmSnapshot) -> bool;
 }
 
-/// Backend-domain failure. Syscall-specific Linux errno lowering belongs to
-/// the runtime consumer, not this transport layer.
+/// Strong lease for one exact carrier MM access state.
+pub trait ForeignMmReadLease: Debug + Send + Sync {
+    fn read(
+        &self,
+        authority: &dyn ForeignMmLiveAuthority,
+        snapshot: &dyn ForeignMmSnapshot,
+        va: GuestVa,
+        dst: &mut [u8],
+        deadline: Instant,
+    ) -> Result<Box<dyn ForeignMmReadReceipt>, ForeignMmTransportError>;
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ForeignMmTransportError {
     #[error("foreign MM state changed during observation")]
@@ -122,87 +114,140 @@ pub enum ForeignMmTransportError {
     Translation(GuestVa),
     #[error("foreign MM binding is unavailable in this carrier")]
     MissingBinding,
+    #[error("foreign MM read deadline expired")]
+    TimedOut,
+    #[error("foreign MM live authority is unavailable")]
+    AuthorityUnavailable,
 }
 
-/// Object-safe carrier transport over an already validated foreign-MM snapshot.
-pub trait ForeignMmTransport: Send + Sync {
-    fn read(
+/// Object-safe endpoint privately installed by one exact carrier.
+pub trait ForeignMmTransport: Debug + Send + Sync {
+    fn retain(
         &self,
-        snapshot: &ForeignMmSnapshot,
-        va: GuestVa,
-        dst: &mut [u8],
-    ) -> Result<ForeignMmReadReceipt, ForeignMmTransportError>;
+        snapshot: &dyn ForeignMmSnapshot,
+        deadline: Instant,
+    ) -> Result<Arc<dyn ForeignMmReadLease>, ForeignMmTransportError>;
 }
 
 #[cfg(test)]
 mod tests {
-    use std::num::{NonZeroU16, NonZeroU64};
-
-    use carrick_guest_mem::{Gpa, GuestVa};
-
     use super::*;
 
     #[derive(Debug)]
-    struct MockTransport;
+    struct Snapshot(Vec<MappingId>);
+    impl ForeignMmSnapshot for Snapshot {
+        fn mm(&self) -> ForeignMmId {
+            ForeignMmId::from_kernel_allocation(NonZeroU64::new(11).unwrap())
+        }
+        fn binding(&self) -> ForeignMmBinding {
+            ForeignMmBinding::for_aarch64(
+                ForeignAsid::from_kernel_allocation(NonZeroU16::new(13).unwrap()),
+                Gpa(0x1234_5000),
+            )
+        }
+        fn backend_revision(&self) -> ForeignBackendRevision {
+            ForeignBackendRevision::from_authority_raw(17)
+        }
+        fn vma_revision(&self) -> ForeignVmaRevision {
+            ForeignVmaRevision::from_authority_raw(19)
+        }
+        fn frame_inventory_revision(&self) -> ForeignFrameInventoryRevision {
+            ForeignFrameInventoryRevision::from_authority_raw(23)
+        }
+        fn mapping_ids(&self) -> &[MappingId] {
+            &self.0
+        }
+    }
 
-    impl ForeignMmTransport for MockTransport {
+    #[derive(Debug)]
+    struct Receipt;
+    impl ForeignMmReadReceipt for Receipt {
+        fn bytes_read(&self) -> usize {
+            6
+        }
+        fn owner_generations(&self) -> &[ForeignOwnerGeneration] {
+            const OWNERS: [ForeignOwnerGeneration; 1] =
+                [ForeignOwnerGeneration::from_backend_counter(
+                    NonZeroU64::MIN,
+                )];
+            &OWNERS
+        }
+        fn authenticates(&self, snapshot: &dyn ForeignMmSnapshot) -> bool {
+            snapshot.mm().raw_for_probe() == 11
+                && snapshot.binding().asid().raw_for_probe() == 13
+                && snapshot.binding().stage1_root() == Gpa(0x1234_5000)
+                && snapshot.backend_revision().raw_for_probe() == 17
+                && snapshot.vma_revision().raw_for_probe() == 19
+                && snapshot.frame_inventory_revision().raw_for_probe() == 23
+                && snapshot.mapping_ids().len() == 1
+        }
+    }
+
+    #[derive(Debug)]
+    struct Live;
+    impl ForeignMmLiveAuthority for Live {
+        fn snapshot(
+            &self,
+            _deadline: Instant,
+        ) -> Result<Box<dyn ForeignMmSnapshot>, ForeignMmTransportError> {
+            Ok(Box::new(Snapshot(vec![MappingId::from_kernel_allocation(
+                NonZeroU64::new(29).unwrap(),
+            )])))
+        }
+    }
+
+    #[derive(Debug)]
+    struct Lease;
+    impl ForeignMmReadLease for Lease {
         fn read(
             &self,
-            snapshot: &ForeignMmSnapshot,
+            _authority: &dyn ForeignMmLiveAuthority,
+            _snapshot: &dyn ForeignMmSnapshot,
             _va: GuestVa,
             dst: &mut [u8],
-        ) -> Result<ForeignMmReadReceipt, ForeignMmTransportError> {
+            deadline: Instant,
+        ) -> Result<Box<dyn ForeignMmReadReceipt>, ForeignMmTransportError> {
+            if Instant::now() >= deadline {
+                return Err(ForeignMmTransportError::TimedOut);
+            }
             dst.copy_from_slice(b"target");
-            Ok(ForeignMmReadReceipt::complete(
-                snapshot,
-                dst.len(),
-                vec![ForeignOwnerGeneration::from_backend_counter(
-                    NonZeroU64::new(47).expect("nonzero owner generation"),
-                )],
-            ))
+            Ok(Box::new(Receipt))
+        }
+    }
+
+    #[derive(Debug)]
+    struct Transport;
+    impl ForeignMmTransport for Transport {
+        fn retain(
+            &self,
+            snapshot: &dyn ForeignMmSnapshot,
+            deadline: Instant,
+        ) -> Result<Arc<dyn ForeignMmReadLease>, ForeignMmTransportError> {
+            assert!(Instant::now() < deadline);
+            assert_eq!(snapshot.mm().raw_for_probe(), 11);
+            Ok(Arc::new(Lease))
         }
     }
 
     #[test]
-    fn foreign_mm_transport_round_trips_distinct_snapshot_domains() {
-        let snapshot = ForeignMmSnapshot {
-            mm: ForeignMmId::from_kernel_allocation(
-                NonZeroU64::new(11).expect("nonzero MM identity"),
-            ),
-            binding: ForeignMmBinding::for_aarch64(
-                ForeignAsid::from_kernel_allocation(NonZeroU16::new(13).expect("nonzero ASID")),
-                Gpa(0x1234_5000),
-            ),
-            backend_revision: ForeignBackendRevision::from_authority_raw(17),
-            vma_revision: ForeignVmaRevision::from_authority_raw(19),
-            frame_inventory_revision: ForeignFrameInventoryRevision::from_authority_raw(23),
-            mapping_ids: vec![MappingId::from_kernel_allocation(
-                NonZeroU64::new(29).expect("nonzero mapping identity"),
-            )],
-        };
-        let transport: &dyn ForeignMmTransport = &MockTransport;
-        let mut bytes = [0_u8; 6];
-
-        let receipt = transport
-            .read(&snapshot, GuestVa(0x4000), &mut bytes)
-            .expect("mock foreign read");
-
+    fn object_safe_transport_retains_and_authenticates_distinct_domains() {
+        let snapshot = Live.snapshot(Instant::now()).unwrap();
+        let transport: Arc<dyn ForeignMmTransport> = Arc::new(Transport);
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        let lease = transport.retain(snapshot.as_ref(), deadline).unwrap();
+        let mut bytes = [0; 6];
+        let receipt = lease
+            .read(
+                &Live,
+                snapshot.as_ref(),
+                GuestVa(0x4000),
+                &mut bytes,
+                deadline,
+            )
+            .unwrap();
         assert_eq!(&bytes, b"target");
-        assert_eq!(receipt.mm, snapshot.mm);
-        assert_eq!(receipt.binding, snapshot.binding);
-        assert_eq!(receipt.backend_revision, snapshot.backend_revision);
-        assert_eq!(receipt.vma_revision, snapshot.vma_revision);
-        assert_eq!(
-            receipt.frame_inventory_revision,
-            snapshot.frame_inventory_revision
-        );
-        assert_eq!(receipt.bytes_read, bytes.len());
-        assert_eq!(
-            receipt.owner_generations,
-            [ForeignOwnerGeneration::from_backend_counter(
-                NonZeroU64::new(47).expect("nonzero owner generation")
-            )]
-        );
-        assert_eq!(snapshot.mapping_ids.len(), 1);
+        assert_eq!(receipt.bytes_read(), 6);
+        assert_eq!(receipt.owner_generations().len(), 1);
+        assert!(receipt.authenticates(snapshot.as_ref()));
     }
 }

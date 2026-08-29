@@ -26,6 +26,7 @@ pub struct MmToken {
     task: TaskKey,
     mm: Arc<Mm>,
     snapshot: MmBackendSnapshot,
+    foreign_lease: Option<Arc<dyn carrick_hal::ForeignMmReadLease>>,
 }
 
 impl MmToken {
@@ -87,62 +88,69 @@ impl MmToken {
         len: NonZeroUsize,
         requested: RangeAccess,
     ) -> Result<(), MmAccessError> {
-        let len_u64 = u64::try_from(len.get()).map_err(|_| MmAccessError::RangeOverflow {
+        validate_range_in_snapshot(&self.snapshot, start, len, requested)
+    }
+}
+
+fn validate_range_in_snapshot(
+    snapshot: &MmBackendSnapshot,
+    start: GuestVa,
+    len: NonZeroUsize,
+    requested: RangeAccess,
+) -> Result<(), MmAccessError> {
+    let len_u64 = u64::try_from(len.get()).map_err(|_| MmAccessError::RangeOverflow {
+        start,
+        len: len.get(),
+    })?;
+    let end = start
+        .raw()
+        .checked_add(len_u64)
+        .ok_or(MmAccessError::RangeOverflow {
             start,
             len: len.get(),
         })?;
-        let end = start
-            .raw()
-            .checked_add(len_u64)
-            .ok_or(MmAccessError::RangeOverflow {
-                start,
-                len: len.get(),
-            })?;
-        let mut cursor = start.raw();
+    let mut cursor = start.raw();
 
-        for vma in &self.snapshot.vmas {
-            if vma.end.raw() <= cursor {
-                continue;
-            }
-            if vma.start.raw() > cursor {
-                return Err(MmAccessError::Unmapped {
-                    address: GuestVa(cursor),
-                });
-            }
-
-            let access_error = match requested {
-                RangeAccess::Read if !vma.access.readable => Some(MmAccessError::ReadDenied {
-                    address: GuestVa(cursor),
-                }),
-                RangeAccess::Write if !vma.access.writable => Some(MmAccessError::WriteDenied {
-                    address: GuestVa(cursor),
-                }),
-                RangeAccess::KernelRead if !vma.access.kernel_visible => {
-                    Some(MmAccessError::KernelHidden {
-                        address: GuestVa(cursor),
-                    })
-                }
-                RangeAccess::KernelRead if !vma.access.readable => {
-                    Some(MmAccessError::ReadDenied {
-                        address: GuestVa(cursor),
-                    })
-                }
-                _ => None,
-            };
-            if let Some(error) = access_error {
-                return Err(error);
-            }
-
-            cursor = vma.end.raw().min(end);
-            if cursor == end {
-                return Ok(());
-            }
+    for vma in &snapshot.vmas {
+        if vma.end.raw() <= cursor {
+            continue;
+        }
+        if vma.start.raw() > cursor {
+            return Err(MmAccessError::Unmapped {
+                address: GuestVa(cursor),
+            });
         }
 
-        Err(MmAccessError::Unmapped {
-            address: GuestVa(cursor),
-        })
+        let access_error = match requested {
+            RangeAccess::Read if !vma.access.readable => Some(MmAccessError::ReadDenied {
+                address: GuestVa(cursor),
+            }),
+            RangeAccess::Write if !vma.access.writable => Some(MmAccessError::WriteDenied {
+                address: GuestVa(cursor),
+            }),
+            RangeAccess::KernelRead if !vma.access.kernel_visible => {
+                Some(MmAccessError::KernelHidden {
+                    address: GuestVa(cursor),
+                })
+            }
+            RangeAccess::KernelRead if !vma.access.readable => Some(MmAccessError::ReadDenied {
+                address: GuestVa(cursor),
+            }),
+            _ => None,
+        };
+        if let Some(error) = access_error {
+            return Err(error);
+        }
+
+        cursor = vma.end.raw().min(end);
+        if cursor == end {
+            return Ok(());
+        }
     }
+
+    Err(MmAccessError::Unmapped {
+        address: GuestVa(cursor),
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -230,39 +238,33 @@ impl ForeignMm {
 }
 
 /// Authenticated completion of a private runtime foreign read.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 #[allow(dead_code)] // Task 8 is the first syscall consumer.
 pub(crate) struct ForeignReadReceipt {
-    transport: carrick_hal::ForeignMmReadReceipt,
+    transport: Box<dyn carrick_hal::ForeignMmReadReceipt>,
 }
 
 impl ForeignReadReceipt {
     #[allow(dead_code)] // Task 8 is the first syscall consumer.
-    pub(crate) const fn bytes_read(&self) -> usize {
-        self.transport.bytes_read
+    pub(crate) fn bytes_read(&self) -> usize {
+        self.transport.bytes_read()
     }
 }
 
 /// Private runtime facade over the carrier transport. Syscall handlers receive
 /// only token-bound ranges and never transport snapshots or constructors.
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug, Default)]
 #[allow(dead_code)] // Installed in Task 5; consumed by process_vm in Task 8.
-pub(crate) struct MmAccessAuthority {
-    transport: Arc<dyn carrick_hal::ForeignMmTransport>,
-}
-
-impl std::fmt::Debug for MmAccessAuthority {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MmAccessAuthority").finish_non_exhaustive()
-    }
-}
+pub(crate) struct MmAccessAuthority;
 
 impl MmAccessAuthority {
     #[allow(dead_code)] // Task 8 is the first syscall consumer.
     const MAX_ATTEMPTS: usize = 3;
 
-    pub(crate) fn new(transport: Arc<dyn carrick_hal::ForeignMmTransport>) -> Self {
-        Self { transport }
+    const OVERALL_DEADLINE: Duration = Duration::from_millis(50);
+
+    pub(crate) fn new() -> Self {
+        Self
     }
 
     #[allow(dead_code)] // Task 8 is the first syscall consumer.
@@ -282,28 +284,47 @@ impl MmAccessAuthority {
             });
         }
 
+        let deadline = Instant::now() + Self::OVERALL_DEADLINE;
+        let lease = mm
+            .token
+            .foreign_lease
+            .as_ref()
+            .ok_or(MmAccessError::MissingForeignTransport(mm.mm_id()))?;
+        let live = RetainedMmLiveAuthority {
+            mm: Arc::clone(&mm.token.mm),
+        };
         for _ in 0..Self::MAX_ATTEMPTS {
-            let before = snapshot_token(mm.token.task, Arc::clone(&mm.token.mm))?;
-            before.validate_range(range.start, range.len, RangeAccess::Read)?;
-            let snapshot = project_foreign_snapshot(&before)?;
-            let receipt = match self.transport.read(&snapshot, range.start, dst) {
+            if Instant::now() >= deadline {
+                return Err(MmAccessError::ForeignReadTimedOut);
+            }
+            let before_snapshot = snapshot_backend(&mm.token.mm, deadline)?;
+            validate_snapshot_vmas(&before_snapshot)?;
+            validate_range_in_snapshot(
+                &before_snapshot,
+                range.start,
+                range.len,
+                RangeAccess::Read,
+            )?;
+            let snapshot =
+                ProjectedForeignMmSnapshot::from_backend(mm.token.mm_id(), &before_snapshot)?;
+            let receipt = match lease.read(&live, &snapshot, range.start, dst, deadline) {
                 Ok(receipt) => receipt,
                 Err(carrick_hal::ForeignMmTransportError::Retry) => continue,
+                Err(carrick_hal::ForeignMmTransportError::TimedOut) => {
+                    return Err(MmAccessError::ForeignReadTimedOut);
+                }
                 Err(error) => return Err(MmAccessError::ForeignTransport(error)),
             };
-            let after = project_foreign_snapshot(&snapshot_token(
-                mm.token.task,
-                Arc::clone(&mm.token.mm),
-            )?)?;
+            let after = ProjectedForeignMmSnapshot::from_backend(
+                mm.token.mm_id(),
+                &snapshot_backend(&mm.token.mm, deadline)?,
+            )?;
             if after != snapshot {
                 continue;
             }
-            if receipt.mm != snapshot.mm
-                || receipt.binding != snapshot.binding
-                || receipt.backend_revision != snapshot.backend_revision
-                || receipt.vma_revision != snapshot.vma_revision
-                || receipt.frame_inventory_revision != snapshot.frame_inventory_revision
-                || receipt.bytes_read != dst.len()
+            if !receipt.authenticates(&snapshot)
+                || receipt.bytes_read() != dst.len()
+                || (!dst.is_empty() && receipt.owner_generations().is_empty())
             {
                 return Err(MmAccessError::ForeignReceiptMismatch);
             }
@@ -314,36 +335,98 @@ impl MmAccessAuthority {
 }
 
 #[allow(dead_code)] // Task 8 is the first syscall consumer.
-fn project_foreign_snapshot(
-    token: &MmToken,
-) -> Result<carrick_hal::ForeignMmSnapshot, MmAccessError> {
-    let vma_revision = token
-        .snapshot
-        .vma_revision
-        .ok_or(MmAccessError::IncompleteForeignSnapshot(token.mm_id()))?;
-    let frame_inventory_revision = token
-        .snapshot
-        .frame_inventory_revision
-        .ok_or(MmAccessError::IncompleteForeignSnapshot(token.mm_id()))?;
-    let mm = NonZeroU64::new(token.mm_id().raw())
-        .ok_or(MmAccessError::IncompleteForeignSnapshot(token.mm_id()))?;
-    let asid = NonZeroU16::new(token.snapshot.binding.asid.raw())
-        .ok_or(MmAccessError::IncompleteForeignSnapshot(token.mm_id()))?;
-    Ok(carrick_hal::ForeignMmSnapshot {
-        mm: carrick_hal::ForeignMmId::from_kernel_allocation(mm),
-        binding: carrick_hal::ForeignMmBinding::for_aarch64(
-            carrick_hal::ForeignAsid::from_kernel_allocation(asid),
-            token.snapshot.binding.stage1_root.gpa(),
-        ),
-        backend_revision: carrick_hal::ForeignBackendRevision::from_authority_raw(
-            token.snapshot.revision,
-        ),
-        vma_revision: carrick_hal::ForeignVmaRevision::from_authority_raw(vma_revision.raw()),
-        frame_inventory_revision: carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(
-            frame_inventory_revision,
-        ),
-        mapping_ids: token.snapshot.mapping_ids.clone(),
-    })
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProjectedForeignMmSnapshot {
+    mm: carrick_hal::ForeignMmId,
+    binding: carrick_hal::ForeignMmBinding,
+    backend_revision: carrick_hal::ForeignBackendRevision,
+    vma_revision: carrick_hal::ForeignVmaRevision,
+    frame_inventory_revision: carrick_hal::ForeignFrameInventoryRevision,
+    mapping_ids: Vec<carrick_hal::MappingId>,
+}
+
+impl ProjectedForeignMmSnapshot {
+    fn from_backend(mm_id: MmId, snapshot: &MmBackendSnapshot) -> Result<Self, MmAccessError> {
+        let vma_revision = snapshot
+            .vma_revision
+            .ok_or(MmAccessError::IncompleteForeignSnapshot(mm_id))?;
+        let frame_inventory_revision = snapshot
+            .frame_inventory_revision
+            .ok_or(MmAccessError::IncompleteForeignSnapshot(mm_id))?;
+        Ok(Self {
+            mm: carrick_hal::ForeignMmId::from_kernel_allocation(
+                NonZeroU64::new(mm_id.raw())
+                    .ok_or(MmAccessError::IncompleteForeignSnapshot(mm_id))?,
+            ),
+            binding: carrick_hal::ForeignMmBinding::for_aarch64(
+                carrick_hal::ForeignAsid::from_kernel_allocation(
+                    NonZeroU16::new(snapshot.binding.asid.raw())
+                        .ok_or(MmAccessError::IncompleteForeignSnapshot(mm_id))?,
+                ),
+                snapshot.binding.stage1_root.gpa(),
+            ),
+            backend_revision: carrick_hal::ForeignBackendRevision::from_authority_raw(
+                snapshot.revision,
+            ),
+            vma_revision: carrick_hal::ForeignVmaRevision::from_authority_raw(vma_revision.raw()),
+            frame_inventory_revision:
+                carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(
+                    frame_inventory_revision,
+                ),
+            mapping_ids: snapshot.mapping_ids.clone(),
+        })
+    }
+}
+
+impl carrick_hal::ForeignMmSnapshot for ProjectedForeignMmSnapshot {
+    fn mm(&self) -> carrick_hal::ForeignMmId {
+        self.mm
+    }
+    fn binding(&self) -> carrick_hal::ForeignMmBinding {
+        self.binding
+    }
+    fn backend_revision(&self) -> carrick_hal::ForeignBackendRevision {
+        self.backend_revision
+    }
+    fn vma_revision(&self) -> carrick_hal::ForeignVmaRevision {
+        self.vma_revision
+    }
+    fn frame_inventory_revision(&self) -> carrick_hal::ForeignFrameInventoryRevision {
+        self.frame_inventory_revision
+    }
+    fn mapping_ids(&self) -> &[carrick_hal::MappingId] {
+        &self.mapping_ids
+    }
+}
+
+#[derive(Debug)]
+struct RetainedMmLiveAuthority {
+    mm: Arc<Mm>,
+}
+
+impl carrick_hal::ForeignMmLiveAuthority for RetainedMmLiveAuthority {
+    fn snapshot(
+        &self,
+        deadline: Instant,
+    ) -> Result<Box<dyn carrick_hal::ForeignMmSnapshot>, carrick_hal::ForeignMmTransportError> {
+        let snapshot =
+            snapshot_backend(&self.mm, deadline).map_err(snapshot_error_for_transport)?;
+        let projected = ProjectedForeignMmSnapshot::from_backend(self.mm.id(), &snapshot)
+            .map_err(|_| carrick_hal::ForeignMmTransportError::AuthorityUnavailable)?;
+        Ok(Box::new(projected))
+    }
+}
+
+fn snapshot_error_for_transport(error: MmAccessError) -> carrick_hal::ForeignMmTransportError {
+    match error {
+        MmAccessError::Snapshot(SnapshotError::TimedOut) => {
+            carrick_hal::ForeignMmTransportError::TimedOut
+        }
+        MmAccessError::Snapshot(SnapshotError::ChangedDuringObservation | SnapshotError::Busy) => {
+            carrick_hal::ForeignMmTransportError::Retry
+        }
+        _ => carrick_hal::ForeignMmTransportError::AuthorityUnavailable,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -384,12 +467,16 @@ pub enum MmAccessError {
     DestinationLengthMismatch { range: usize, destination: usize },
     #[error("MM {0:?} lacks typed HVPatch foreign-read snapshot domains")]
     IncompleteForeignSnapshot(MmId),
+    #[error("MM {0:?} has no carrier foreign-read transport")]
+    MissingForeignTransport(MmId),
     #[error(transparent)]
     ForeignTransport(carrick_hal::ForeignMmTransportError),
     #[error("foreign MM transport receipt does not authenticate the requested snapshot")]
     ForeignReceiptMismatch,
     #[error("foreign MM changed throughout the bounded read retry budget")]
     ForeignReadRetryExhausted,
+    #[error("foreign MM read exceeded its overall deadline budget")]
+    ForeignReadTimedOut,
 }
 
 impl KernelContext {
@@ -398,7 +485,7 @@ impl KernelContext {
         execution: &ThreadExecutionLease,
     ) -> Result<CurrentMm<'_>, MmAccessError> {
         let mm = self.authenticate_current_mm(execution)?;
-        let token = snapshot_token(self.task.key(), mm)?;
+        let token = snapshot_token(self.task.key(), mm, false)?;
         Ok(CurrentMm {
             token,
             context: PhantomData,
@@ -458,7 +545,8 @@ impl Kernel {
             return Err(MmAccessError::UnknownTask(target));
         }
         let target_mm = task.shared().mm();
-        let token = snapshot_token(target, target_mm)?;
+        let is_foreign = target_mm.id() != caller_mm.id() || !Arc::ptr_eq(&target_mm, &caller_mm);
+        let token = snapshot_token(target, target_mm, is_foreign)?;
         if token.mm_id() == caller_mm.id() && Arc::ptr_eq(&token.mm, &caller_mm) {
             Ok(MmRelation::Current(CurrentMm {
                 token,
@@ -470,11 +558,42 @@ impl Kernel {
     }
 }
 
-fn snapshot_token(task: TaskKey, mm: Arc<Mm>) -> Result<MmToken, MmAccessError> {
+fn snapshot_token(
+    task: TaskKey,
+    mm: Arc<Mm>,
+    retain_foreign: bool,
+) -> Result<MmToken, MmAccessError> {
+    let deadline = Instant::now() + MM_SNAPSHOT_TIMEOUT;
+    let snapshot = snapshot_backend(&mm, deadline)?;
+    validate_snapshot_vmas(&snapshot)?;
     let backend = mm
         .backend()
         .ok_or(MmAccessError::MissingBackendAuthority(mm.id()))?;
-    let deadline = Instant::now() + MM_SNAPSHOT_TIMEOUT;
+    let foreign_lease = if retain_foreign {
+        let transport = backend
+            .foreign_mm_transport()
+            .ok_or(MmAccessError::MissingForeignTransport(mm.id()))?;
+        let projected = ProjectedForeignMmSnapshot::from_backend(mm.id(), &snapshot)?;
+        Some(
+            transport
+                .retain(&projected, deadline)
+                .map_err(MmAccessError::ForeignTransport)?,
+        )
+    } else {
+        None
+    };
+    Ok(MmToken {
+        task,
+        mm,
+        snapshot,
+        foreign_lease,
+    })
+}
+
+fn snapshot_backend(mm: &Arc<Mm>, deadline: Instant) -> Result<MmBackendSnapshot, MmAccessError> {
+    let backend = mm
+        .backend()
+        .ok_or(MmAccessError::MissingBackendAuthority(mm.id()))?;
     let mut snapshot = backend.snapshot(deadline)?;
     if backend.revision() != snapshot.revision
         || backend.vma_revision(deadline)? != snapshot.vma_revision
@@ -486,6 +605,10 @@ fn snapshot_token(task: TaskKey, mm: Arc<Mm>) -> Result<MmToken, MmAccessError> 
     snapshot
         .vmas
         .sort_unstable_by_key(|vma| (vma.start.raw(), vma.end.raw()));
+    Ok(snapshot)
+}
+
+fn validate_snapshot_vmas(snapshot: &MmBackendSnapshot) -> Result<(), MmAccessError> {
     let mut previous_end = None;
     for vma in &snapshot.vmas {
         if vma.start.raw() >= vma.end.raw() || previous_end.is_some_and(|end| vma.start.raw() < end)
@@ -497,7 +620,7 @@ fn snapshot_token(task: TaskKey, mm: Arc<Mm>) -> Result<MmToken, MmAccessError> 
         }
         previous_end = Some(vma.end.raw());
     }
-    Ok(MmToken { task, mm, snapshot })
+    Ok(())
 }
 
 #[cfg(test)]
@@ -511,8 +634,8 @@ mod tests {
     use carrick_guest_mem::{Gpa, GuestVa};
     use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
     use carrick_hal::{
-        ForeignMmReadReceipt, ForeignMmSnapshot, ForeignMmTransport, ForeignMmTransportError,
-        ThreadId,
+        ForeignMmReadLease, ForeignMmReadReceipt, ForeignMmSnapshot, ForeignMmTransport,
+        ForeignMmTransportError, ThreadId,
     };
 
     use super::super::objects::{
@@ -596,42 +719,107 @@ mod tests {
         backend_revision: AtomicU64,
     }
 
-    struct RetryOnceForeignTransport {
-        calls: std::sync::atomic::AtomicUsize,
+    #[derive(Clone, Copy, Debug)]
+    enum MockReadMode {
+        RetryOnce,
+        AlwaysRetry,
+        EmptyOwners,
+        Deadline,
     }
 
-    struct AlwaysRetryForeignTransport {
-        calls: std::sync::atomic::AtomicUsize,
+    #[derive(Debug)]
+    struct MockForeignTransport {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        mode: MockReadMode,
     }
 
-    impl ForeignMmTransport for RetryOnceForeignTransport {
-        fn read(
-            &self,
-            snapshot: &ForeignMmSnapshot,
-            _va: GuestVa,
-            dst: &mut [u8],
-        ) -> Result<ForeignMmReadReceipt, ForeignMmTransportError> {
-            if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
-                return Err(ForeignMmTransportError::Retry);
-            }
-            dst.copy_from_slice(b"root");
-            Ok(ForeignMmReadReceipt::complete(
-                snapshot,
-                dst.len(),
-                Vec::new(),
-            ))
+    #[derive(Debug)]
+    struct MockForeignLease {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        mode: MockReadMode,
+    }
+
+    #[derive(Debug)]
+    struct MockForeignReceipt {
+        bytes: usize,
+        owners: Vec<carrick_hal::ForeignOwnerGeneration>,
+    }
+
+    impl ForeignMmReadReceipt for MockForeignReceipt {
+        fn bytes_read(&self) -> usize {
+            self.bytes
+        }
+        fn owner_generations(&self) -> &[carrick_hal::ForeignOwnerGeneration] {
+            &self.owners
+        }
+        fn authenticates(&self, _snapshot: &dyn ForeignMmSnapshot) -> bool {
+            true
         }
     }
 
-    impl ForeignMmTransport for AlwaysRetryForeignTransport {
+    impl ForeignMmReadLease for MockForeignLease {
         fn read(
             &self,
-            _snapshot: &ForeignMmSnapshot,
+            _authority: &dyn carrick_hal::ForeignMmLiveAuthority,
+            _snapshot: &dyn ForeignMmSnapshot,
             _va: GuestVa,
-            _dst: &mut [u8],
-        ) -> Result<ForeignMmReadReceipt, ForeignMmTransportError> {
-            self.calls.fetch_add(1, Ordering::AcqRel);
-            Err(ForeignMmTransportError::Retry)
+            dst: &mut [u8],
+            _deadline: Instant,
+        ) -> Result<Box<dyn ForeignMmReadReceipt>, ForeignMmTransportError> {
+            let call = self.calls.fetch_add(1, Ordering::AcqRel);
+            if matches!(self.mode, MockReadMode::Deadline) {
+                while Instant::now() < _deadline {
+                    std::hint::spin_loop();
+                }
+                return Err(ForeignMmTransportError::TimedOut);
+            }
+            if matches!(self.mode, MockReadMode::AlwaysRetry) || call == 0 {
+                return Err(ForeignMmTransportError::Retry);
+            }
+            dst.copy_from_slice(b"root");
+            Ok(Box::new(MockForeignReceipt {
+                bytes: dst.len(),
+                owners: (!matches!(self.mode, MockReadMode::EmptyOwners))
+                    .then_some(carrick_hal::ForeignOwnerGeneration::from_backend_counter(
+                        std::num::NonZeroU64::MIN,
+                    ))
+                    .into_iter()
+                    .collect(),
+            }))
+        }
+    }
+
+    impl ForeignMmTransport for MockForeignTransport {
+        fn retain(
+            &self,
+            _snapshot: &dyn ForeignMmSnapshot,
+            _deadline: Instant,
+        ) -> Result<Arc<dyn ForeignMmReadLease>, ForeignMmTransportError> {
+            Ok(Arc::new(MockForeignLease {
+                calls: Arc::clone(&self.calls),
+                mode: self.mode,
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ForeignFixtureBackend {
+        base: FixtureBackend,
+        transport: Arc<dyn ForeignMmTransport>,
+    }
+
+    impl MmBackend for ForeignFixtureBackend {
+        fn snapshot(&self, deadline: Instant) -> Result<MmBackendSnapshot, SnapshotError> {
+            self.base.snapshot(deadline)
+        }
+        fn revision(&self) -> u64 {
+            self.base.revision()
+        }
+        fn vma_revision(&self, deadline: Instant) -> Result<Option<VmaRevision>, SnapshotError> {
+            self.base.vma_revision(deadline)
+        }
+        fn foreign_mm_transport(&self) -> Option<Arc<dyn ForeignMmTransport>> {
+            Some(Arc::clone(&self.transport))
         }
     }
 
@@ -659,6 +847,19 @@ mod tests {
         let root = Stage1Root::for_aarch64_4k(Gpa(0x8000)).expect("aligned stage-1 root");
         Arc::new(FixtureBackend {
             binding: MmBinding::for_aarch64(asid, root),
+        })
+    }
+
+    fn fixture_backend_with_transport(
+        transport: Arc<dyn ForeignMmTransport>,
+    ) -> Arc<dyn MmBackend> {
+        let asid = Asid::from_registry_allocation(NonZeroU16::new(7).expect("nonzero ASID"));
+        let root = Stage1Root::for_aarch64_4k(Gpa(0x8000)).expect("aligned stage-1 root");
+        Arc::new(ForeignFixtureBackend {
+            base: FixtureBackend {
+                binding: MmBinding::for_aarch64(asid, root),
+            },
+            transport,
         })
     }
 
@@ -777,12 +978,17 @@ mod tests {
     fn retained_foreign_token_keeps_the_exact_mm_across_target_exec_and_retirement() {
         let (kernel, root) = bootstrap(31_100);
         let execution = execution_lease(&root, 101);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let transport: Arc<dyn ForeignMmTransport> = Arc::new(MockForeignTransport {
+            calls: Arc::clone(&calls),
+            mode: MockReadMode::RetryOnce,
+        });
         let child = fork_with_backend(
             &kernel,
             &root,
             31_101,
             "retained-mm child",
-            fixture_backend(),
+            fixture_backend_with_transport(transport),
         );
         let old_mm_arc = child.shared().mm();
         let old_mm_weak = Arc::downgrade(&old_mm_arc);
@@ -827,6 +1033,16 @@ mod tests {
             .expect("foreign token must retain the retired MM");
         assert!(Arc::ptr_eq(&token.token.mm, &retained_after_retirement));
         drop(retained_after_retirement);
+        let range = token
+            .read_range(GuestVa(0x1000), 4)
+            .expect("retained old-MM range")
+            .expect("nonempty retained old-MM range");
+        let mut bytes = [0_u8; 4];
+        super::MmAccessAuthority::new()
+            .read_foreign(&token, range, &mut bytes)
+            .expect("read old token after exec, retirement, and numeric binding reuse");
+        assert_eq!(&bytes, b"root");
+        assert_eq!(calls.load(Ordering::Acquire), 2);
         drop(token);
         assert!(
             old_mm_weak.upgrade().is_none(),
@@ -991,7 +1207,16 @@ mod tests {
     fn token_bound_ranges_require_permissions_and_complete_vma_coverage() {
         let (kernel, root) = bootstrap(31_120);
         let execution = execution_lease(&root, 121);
-        let child = fork_with_backend(&kernel, &root, 31_121, "range-mm child", fixture_backend());
+        let child = fork_with_backend(
+            &kernel,
+            &root,
+            31_121,
+            "range-mm child",
+            fixture_backend_with_transport(Arc::new(MockForeignTransport {
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                mode: MockReadMode::RetryOnce,
+            })),
+        );
         let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
         let token: &MmToken = &foreign.token;
 
@@ -1062,22 +1287,24 @@ mod tests {
     fn mm_access_authority_retries_from_a_fresh_snapshot_and_authenticates_receipt() {
         let (kernel, root) = bootstrap(31_140);
         let execution = execution_lease(&root, 141);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let transport: Arc<dyn ForeignMmTransport> = Arc::new(MockForeignTransport {
+            calls: Arc::clone(&calls),
+            mode: MockReadMode::RetryOnce,
+        });
         let child = fork_with_backend(
             &kernel,
             &root,
             31_141,
             "foreign-read child",
-            fixture_backend(),
+            fixture_backend_with_transport(transport),
         );
         let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
         let range = foreign
             .read_range(GuestVa(0x1000), 4)
             .expect("validated read range")
             .expect("nonempty read range");
-        let transport = Arc::new(RetryOnceForeignTransport {
-            calls: std::sync::atomic::AtomicUsize::new(0),
-        });
-        let authority = super::MmAccessAuthority::new(transport.clone());
+        let authority = super::MmAccessAuthority::new();
         let mut bytes = [0_u8; 4];
 
         let receipt = authority
@@ -1086,35 +1313,92 @@ mod tests {
 
         assert_eq!(&bytes, b"root");
         assert_eq!(receipt.bytes_read(), bytes.len());
-        assert_eq!(transport.calls.load(Ordering::Acquire), 2);
+        assert_eq!(calls.load(Ordering::Acquire), 2);
     }
 
     #[test]
     fn mm_access_authority_exhausts_a_fixed_retry_budget() {
         let (kernel, root) = bootstrap(31_142);
         let execution = execution_lease(&root, 143);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let transport: Arc<dyn ForeignMmTransport> = Arc::new(MockForeignTransport {
+            calls: Arc::clone(&calls),
+            mode: MockReadMode::AlwaysRetry,
+        });
         let child = fork_with_backend(
             &kernel,
             &root,
             31_143,
             "churning foreign-read child",
-            fixture_backend(),
+            fixture_backend_with_transport(transport),
         );
         let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
         let range = foreign
             .read_range(GuestVa(0x1000), 4)
             .expect("validated read range")
             .expect("nonempty read range");
-        let transport = Arc::new(AlwaysRetryForeignTransport {
-            calls: std::sync::atomic::AtomicUsize::new(0),
-        });
-        let authority = super::MmAccessAuthority::new(transport.clone());
+        let authority = super::MmAccessAuthority::new();
         let mut bytes = [0_u8; 4];
 
-        assert_eq!(
+        assert!(matches!(
             authority.read_foreign(&foreign, range, &mut bytes),
             Err(MmAccessError::ForeignReadRetryExhausted)
+        ));
+        assert_eq!(calls.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn mm_access_authority_rejects_nonempty_reads_without_owner_generations() {
+        let (kernel, root) = bootstrap(31_144);
+        let execution = execution_lease(&root, 145);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let transport: Arc<dyn ForeignMmTransport> = Arc::new(MockForeignTransport {
+            calls,
+            mode: MockReadMode::EmptyOwners,
+        });
+        let child = fork_with_backend(
+            &kernel,
+            &root,
+            31_145,
+            "ownerless foreign-read child",
+            fixture_backend_with_transport(transport),
         );
-        assert_eq!(transport.calls.load(Ordering::Acquire), 3);
+        let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
+        let range = foreign.read_range(GuestVa(0x1000), 4).unwrap().unwrap();
+        let mut bytes = [0_u8; 4];
+
+        assert!(matches!(
+            super::MmAccessAuthority::new().read_foreign(&foreign, range, &mut bytes),
+            Err(MmAccessError::ForeignReceiptMismatch)
+        ));
+    }
+
+    #[test]
+    fn mm_access_authority_enforces_one_overall_deadline_across_attempts() {
+        let (kernel, root) = bootstrap(31_146);
+        let execution = execution_lease(&root, 147);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let transport: Arc<dyn ForeignMmTransport> = Arc::new(MockForeignTransport {
+            calls: Arc::clone(&calls),
+            mode: MockReadMode::Deadline,
+        });
+        let child = fork_with_backend(
+            &kernel,
+            &root,
+            31_147,
+            "deadline foreign-read child",
+            fixture_backend_with_transport(transport),
+        );
+        let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
+        let range = foreign.read_range(GuestVa(0x1000), 4).unwrap().unwrap();
+        let mut bytes = [0_u8; 4];
+        let started = Instant::now();
+
+        assert!(matches!(
+            super::MmAccessAuthority::new().read_foreign(&foreign, range, &mut bytes),
+            Err(MmAccessError::ForeignReadTimedOut)
+        ));
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert!(started.elapsed() < std::time::Duration::from_millis(250));
     }
 }

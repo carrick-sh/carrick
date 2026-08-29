@@ -642,6 +642,7 @@ pub(crate) struct Stage1MmBackend {
     inventory: RwLock<Option<InventoryBinding>>,
     vma_source: RwLock<Option<SharedVmaSnapshotSource>>,
     revision: AtomicU64,
+    foreign_mm_transport: RwLock<Option<Arc<dyn carrick_hal::ForeignMmTransport>>>,
 }
 
 #[derive(Debug)]
@@ -662,6 +663,7 @@ impl Stage1MmBackend {
             inventory: RwLock::new(None),
             vma_source: RwLock::new(None),
             revision: AtomicU64::new(1),
+            foreign_mm_transport: RwLock::new(None),
         }
     }
 
@@ -691,6 +693,19 @@ impl Stage1MmBackend {
     pub(crate) fn bind_vma_source(&self, source: SharedVmaSnapshotSource) {
         *self.vma_source.write() = Some(source);
         self.bump_revision();
+    }
+
+    pub(crate) fn bind_foreign_mm_transport(
+        &self,
+        transport: Arc<dyn carrick_hal::ForeignMmTransport>,
+    ) {
+        *self.foreign_mm_transport.write() = Some(transport);
+    }
+
+    pub(crate) fn cloned_foreign_mm_transport(
+        &self,
+    ) -> Option<Arc<dyn carrick_hal::ForeignMmTransport>> {
+        self.foreign_mm_transport.read().clone()
     }
 
     /// Capture the old image without detaching the still-live backend. The
@@ -886,6 +901,10 @@ impl MmBackend for Stage1MmBackend {
             .ok_or_else(|| deadline_error(deadline))?
             .as_ref()
             .map(|source| source.revision()))
+    }
+
+    fn foreign_mm_transport(&self) -> Option<Arc<dyn carrick_hal::ForeignMmTransport>> {
+        self.foreign_mm_transport.read().clone()
     }
 }
 

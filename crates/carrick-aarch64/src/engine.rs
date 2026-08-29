@@ -2425,6 +2425,10 @@ fn seed_sibling_snapshot(
 }
 
 impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
+    fn foreign_mm_transport(&self) -> Option<std::sync::Arc<dyn carrick_hal::ForeignMmTransport>> {
+        self.vm.foreign_mm_transport()
+    }
+
     fn audit_executor_boundary(&mut self) -> Result<(), TrapError> {
         self.vm.audit_executor_boundary(&mut self.vcpu)
     }

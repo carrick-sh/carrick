@@ -2061,6 +2061,12 @@ impl HvpatchVerifiedChildKernelBinding {
 }
 
 pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
+    /// Exact carrier endpoint for retaining foreign-MM access state. Only the
+    /// HVPatch root bootstrap consumes this; syscall handlers never receive it.
+    fn foreign_mm_transport(&self) -> Option<std::sync::Arc<dyn crate::ForeignMmTransport>> {
+        None
+    }
+
     /// Fail-closed backend-owned executor boundary audit. Transitional M:N
     /// workers call this only while the task is fully saved and owns no live
     /// executor/vCPU authority.
