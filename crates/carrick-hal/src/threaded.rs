@@ -1926,13 +1926,16 @@ pub trait FrameCowAuthority: Send + Sync {
     }
 
     /// Atomically apply one foreign-COW inventory commit and mint an opaque
-    /// runtime-private proof binding its exact mapping, physical extent, and
-    /// host-owner generation. The backend may carry this proof but cannot
-    /// construct the private payload accepted by the runtime facade.
+    /// runtime-private proof binding its exact semantic COW span, mapping,
+    /// physical extent, and host-owner generation. The backend may carry this
+    /// proof but cannot construct the private payload accepted by the runtime
+    /// facade.
     #[allow(clippy::too_many_arguments)]
     fn apply_foreign_cow(
         &self,
         _commit: crate::FrameInventoryCommit<()>,
+        _semantic_start: carrick_guest_mem::GuestVa,
+        _semantic_len: std::num::NonZeroUsize,
         _mapping: crate::MappingId,
         _frame: crate::FrameId,
         _gpa: carrick_guest_mem::Gpa,

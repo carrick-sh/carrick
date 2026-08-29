@@ -147,6 +147,8 @@ struct KernelFrameCowAuthority {
 pub(crate) struct KernelForeignCowProof {
     kernel: Arc<crate::kernel::Kernel>,
     mm: crate::kernel::MmId,
+    semantic_start: carrick_guest_mem::GuestVa,
+    semantic_len: std::num::NonZeroUsize,
     inventory_revision: u64,
     mapping: carrick_hal::MappingId,
     frame: carrick_hal::FrameId,
@@ -160,6 +162,8 @@ impl KernelForeignCowProof {
     pub(crate) fn new(
         kernel: Arc<crate::kernel::Kernel>,
         mm: crate::kernel::MmId,
+        semantic_start: carrick_guest_mem::GuestVa,
+        semantic_len: std::num::NonZeroUsize,
         inventory_revision: u64,
         mapping: carrick_hal::MappingId,
         frame: carrick_hal::FrameId,
@@ -170,6 +174,8 @@ impl KernelForeignCowProof {
         Self {
             kernel,
             mm,
+            semantic_start,
+            semantic_len,
             inventory_revision,
             mapping,
             frame,
@@ -184,6 +190,8 @@ impl KernelForeignCowProof {
         &self,
         kernel: &Arc<crate::kernel::Kernel>,
         mm: crate::kernel::MmId,
+        semantic_start: carrick_guest_mem::GuestVa,
+        semantic_len: usize,
         inventory_revision: u64,
         mapping: carrick_hal::MappingId,
         frame: carrick_hal::FrameId,
@@ -191,6 +199,9 @@ impl KernelForeignCowProof {
         physical_len: u64,
         owner_generation: carrick_hal::ForeignOwnerGeneration,
     ) -> bool {
+        let Some(semantic_len) = std::num::NonZeroUsize::new(semantic_len) else {
+            return false;
+        };
         let Some(physical_len) = std::num::NonZeroU64::new(physical_len)
             .map(carrick_hal::FrameLength::from_mapping_extent)
         else {
@@ -198,6 +209,8 @@ impl KernelForeignCowProof {
         };
         Arc::ptr_eq(&self.kernel, kernel)
             && self.mm == mm
+            && self.semantic_start == semantic_start
+            && self.semantic_len == semantic_len
             && self.inventory_revision == inventory_revision
             && self.mapping == mapping
             && self.frame == frame
@@ -373,6 +386,8 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
     fn apply_foreign_cow(
         &self,
         commit: carrick_hal::FrameInventoryCommit<()>,
+        semantic_start: carrick_guest_mem::GuestVa,
+        semantic_len: std::num::NonZeroUsize,
         mapping: carrick_hal::MappingId,
         frame: carrick_hal::FrameId,
         gpa: carrick_guest_mem::Gpa,
@@ -386,9 +401,9 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         Box<dyn std::error::Error + Send + Sync>,
     > {
         // This endpoint is bound from the concrete owner engine when the
-        // Kernel COW authority is constructed. The foreign transport can name
-        // only the physical extent; it cannot choose the retained incarnation
-        // or the generation that will be signed.
+        // Kernel COW authority is constructed. It seals the transport's exact
+        // semantic and physical publication tuple while independently choosing
+        // the retained owner incarnation and generation that will be signed.
         let owner = self.owner_inventory.retain_current(gpa, length)?;
         let owner_generation = owner.generation();
         let ((), receipt) = self
@@ -418,6 +433,8 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         let proof = KernelForeignCowProof::new(
             Arc::clone(&self.kernel),
             self.mm,
+            semantic_start,
+            semantic_len,
             receipt.revision(),
             mapping,
             frame,
