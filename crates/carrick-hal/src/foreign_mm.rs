@@ -85,11 +85,54 @@ pub trait ForeignMmLiveAuthority: Send + Sync {
     ) -> Result<Box<dyn ForeignMmSnapshot>, ForeignMmTransportError>;
 }
 
+/// Borrowed runtime-owned exact-target invalidation capability. Backends can
+/// request publication at the transaction boundary but cannot retain or mint
+/// the page-table authority behind it.
+pub trait ForeignMmInvalidator {
+    fn invalidate_exact_asid(
+        &mut self,
+        binding: ForeignMmBinding,
+        deadline: Instant,
+    ) -> Result<(), ForeignMmTransportError>;
+}
+
 /// Authenticated completion. Concrete receipts stay private to transports.
 pub trait ForeignMmReadReceipt: Debug + Send + Sync {
     fn bytes_read(&self) -> usize;
     fn owner_generations(&self) -> &[ForeignOwnerGeneration];
     fn authenticates(&self, snapshot: &dyn ForeignMmSnapshot) -> bool;
+}
+
+/// Backend completion data for one exact post-COW compound. Implementations
+/// are transport-private; the runtime may only inspect the values required to
+/// validate them against its kernel-minted MM authority.
+pub trait ForeignCowReceipt: Debug + Send + Sync {
+    fn mm(&self) -> ForeignMmId;
+    fn range_start(&self) -> GuestVa;
+    fn range_len(&self) -> usize;
+    fn backend_revision(&self) -> ForeignBackendRevision;
+    fn vma_revision(&self) -> ForeignVmaRevision;
+    fn frame_inventory_revision(&self) -> ForeignFrameInventoryRevision;
+    fn mapping(&self) -> MappingId;
+    fn frame(&self) -> crate::FrameId;
+    fn physical_base(&self) -> Gpa;
+    fn physical_len(&self) -> u64;
+    fn owner_generation(&self) -> ForeignOwnerGeneration;
+}
+
+/// Backend completion data for a copy through one authenticated post-COW
+/// owner. Implementations are transport-private and confer no safe authority.
+pub trait ForeignMmWriteReceipt: Debug + Send + Sync {
+    fn mm(&self) -> ForeignMmId;
+    fn range_start(&self) -> GuestVa;
+    fn range_len(&self) -> usize;
+    fn bytes_written(&self) -> usize;
+    fn backend_revision(&self) -> ForeignBackendRevision;
+    fn vma_revision(&self) -> ForeignVmaRevision;
+    fn frame_inventory_revision(&self) -> ForeignFrameInventoryRevision;
+    fn mapping(&self) -> MappingId;
+    fn frame(&self) -> crate::FrameId;
+    fn owner_generation(&self) -> ForeignOwnerGeneration;
 }
 
 /// Strong lease for one exact carrier MM access state.
@@ -103,6 +146,44 @@ pub trait ForeignMmReadLease: Debug + Send + Sync {
         dst: &mut [u8],
         deadline: Instant,
     ) -> Result<Box<dyn ForeignMmReadReceipt>, ForeignMmTransportError>;
+
+    #[allow(clippy::too_many_arguments)] // Object-safe transport carries exact mutation domains.
+    fn break_cow(
+        &self,
+        invocation: &ForeignMmInvocation,
+        authority: &dyn ForeignMmLiveAuthority,
+        invalidator: &mut dyn ForeignMmInvalidator,
+        snapshot: &dyn ForeignMmSnapshot,
+        va: GuestVa,
+        len: usize,
+        deadline: Instant,
+    ) -> Result<Box<dyn ForeignCowReceipt>, ForeignMmTransportError> {
+        let _ = (
+            invocation,
+            authority,
+            invalidator,
+            snapshot,
+            va,
+            len,
+            deadline,
+        );
+        Err(ForeignMmTransportError::AuthorityUnavailable)
+    }
+
+    #[allow(clippy::too_many_arguments)] // Object-safe transport carries exact mutation domains.
+    fn write(
+        &self,
+        invocation: &ForeignMmInvocation,
+        authority: &dyn ForeignMmLiveAuthority,
+        snapshot: &dyn ForeignMmSnapshot,
+        cow: &dyn ForeignCowReceipt,
+        va: GuestVa,
+        src: &[u8],
+        deadline: Instant,
+    ) -> Result<Box<dyn ForeignMmWriteReceipt>, ForeignMmTransportError> {
+        let _ = (invocation, authority, snapshot, cow, va, src, deadline);
+        Err(ForeignMmTransportError::AuthorityUnavailable)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -119,6 +200,8 @@ pub enum ForeignMmTransportError {
     TimedOut,
     #[error("foreign MM live authority is unavailable")]
     AuthorityUnavailable,
+    #[error("foreign MM mutation failed before commit")]
+    MutationFailed,
 }
 
 /// Object-safe endpoint privately installed by one exact carrier.
@@ -201,6 +284,41 @@ impl ForeignMmLeaseEndpoint {
         let invocation = ForeignMmInvocation { _private: () };
         self.lease
             .read(&invocation, authority, snapshot, va, dst, deadline)
+    }
+
+    pub fn break_cow(
+        &self,
+        authority: &dyn ForeignMmLiveAuthority,
+        invalidator: &mut dyn ForeignMmInvalidator,
+        snapshot: &dyn ForeignMmSnapshot,
+        va: GuestVa,
+        len: usize,
+        deadline: Instant,
+    ) -> Result<Box<dyn ForeignCowReceipt>, ForeignMmTransportError> {
+        let invocation = ForeignMmInvocation { _private: () };
+        self.lease.break_cow(
+            &invocation,
+            authority,
+            invalidator,
+            snapshot,
+            va,
+            len,
+            deadline,
+        )
+    }
+
+    pub fn write(
+        &self,
+        authority: &dyn ForeignMmLiveAuthority,
+        snapshot: &dyn ForeignMmSnapshot,
+        cow: &dyn ForeignCowReceipt,
+        va: GuestVa,
+        src: &[u8],
+        deadline: Instant,
+    ) -> Result<Box<dyn ForeignMmWriteReceipt>, ForeignMmTransportError> {
+        let invocation = ForeignMmInvocation { _private: () };
+        self.lease
+            .write(&invocation, authority, snapshot, cow, va, src, deadline)
     }
 }
 
@@ -289,6 +407,156 @@ mod tests {
             dst.copy_from_slice(b"target");
             Ok(Box::new(Receipt))
         }
+
+        fn break_cow(
+            &self,
+            _invocation: &ForeignMmInvocation,
+            _authority: &dyn ForeignMmLiveAuthority,
+            _invalidator: &mut dyn ForeignMmInvalidator,
+            snapshot: &dyn ForeignMmSnapshot,
+            va: GuestVa,
+            len: usize,
+            _deadline: Instant,
+        ) -> Result<Box<dyn ForeignCowReceipt>, ForeignMmTransportError> {
+            Ok(Box::new(CowReceipt {
+                mm: snapshot.mm(),
+                start: va,
+                len,
+                backend_revision: snapshot.backend_revision(),
+                vma_revision: snapshot.vma_revision(),
+                frame_inventory_revision: snapshot.frame_inventory_revision(),
+                mapping: MappingId::from_kernel_allocation(NonZeroU64::new(31).unwrap()),
+                frame: crate::FrameId::from_kernel_allocation(NonZeroU64::new(37).unwrap()),
+                physical_base: Gpa(0x9000),
+                physical_len: 0x4000,
+                owner_generation: ForeignOwnerGeneration::from_backend_counter(
+                    NonZeroU64::new(41).unwrap(),
+                ),
+            }))
+        }
+
+        fn write(
+            &self,
+            _invocation: &ForeignMmInvocation,
+            _authority: &dyn ForeignMmLiveAuthority,
+            snapshot: &dyn ForeignMmSnapshot,
+            cow: &dyn ForeignCowReceipt,
+            va: GuestVa,
+            src: &[u8],
+            _deadline: Instant,
+        ) -> Result<Box<dyn ForeignMmWriteReceipt>, ForeignMmTransportError> {
+            assert_eq!(cow.mm(), snapshot.mm());
+            assert_eq!(cow.range_start(), va);
+            assert_eq!(cow.range_len(), src.len());
+            Ok(Box::new(WriteReceipt {
+                mm: snapshot.mm(),
+                start: va,
+                len: src.len(),
+                backend_revision: snapshot.backend_revision(),
+                vma_revision: snapshot.vma_revision(),
+                frame_inventory_revision: snapshot.frame_inventory_revision(),
+                mapping: cow.mapping(),
+                frame: cow.frame(),
+                owner_generation: cow.owner_generation(),
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct CowReceipt {
+        mm: ForeignMmId,
+        start: GuestVa,
+        len: usize,
+        backend_revision: ForeignBackendRevision,
+        vma_revision: ForeignVmaRevision,
+        frame_inventory_revision: ForeignFrameInventoryRevision,
+        mapping: MappingId,
+        frame: crate::FrameId,
+        physical_base: Gpa,
+        physical_len: u64,
+        owner_generation: ForeignOwnerGeneration,
+    }
+
+    impl ForeignCowReceipt for CowReceipt {
+        fn mm(&self) -> ForeignMmId {
+            self.mm
+        }
+        fn range_start(&self) -> GuestVa {
+            self.start
+        }
+        fn range_len(&self) -> usize {
+            self.len
+        }
+        fn backend_revision(&self) -> ForeignBackendRevision {
+            self.backend_revision
+        }
+        fn vma_revision(&self) -> ForeignVmaRevision {
+            self.vma_revision
+        }
+        fn frame_inventory_revision(&self) -> ForeignFrameInventoryRevision {
+            self.frame_inventory_revision
+        }
+        fn mapping(&self) -> MappingId {
+            self.mapping
+        }
+        fn frame(&self) -> crate::FrameId {
+            self.frame
+        }
+        fn physical_base(&self) -> Gpa {
+            self.physical_base
+        }
+        fn physical_len(&self) -> u64 {
+            self.physical_len
+        }
+        fn owner_generation(&self) -> ForeignOwnerGeneration {
+            self.owner_generation
+        }
+    }
+
+    #[derive(Debug)]
+    struct WriteReceipt {
+        mm: ForeignMmId,
+        start: GuestVa,
+        len: usize,
+        backend_revision: ForeignBackendRevision,
+        vma_revision: ForeignVmaRevision,
+        frame_inventory_revision: ForeignFrameInventoryRevision,
+        mapping: MappingId,
+        frame: crate::FrameId,
+        owner_generation: ForeignOwnerGeneration,
+    }
+
+    impl ForeignMmWriteReceipt for WriteReceipt {
+        fn mm(&self) -> ForeignMmId {
+            self.mm
+        }
+        fn range_start(&self) -> GuestVa {
+            self.start
+        }
+        fn range_len(&self) -> usize {
+            self.len
+        }
+        fn bytes_written(&self) -> usize {
+            self.len
+        }
+        fn backend_revision(&self) -> ForeignBackendRevision {
+            self.backend_revision
+        }
+        fn vma_revision(&self) -> ForeignVmaRevision {
+            self.vma_revision
+        }
+        fn frame_inventory_revision(&self) -> ForeignFrameInventoryRevision {
+            self.frame_inventory_revision
+        }
+        fn mapping(&self) -> MappingId {
+            self.mapping
+        }
+        fn frame(&self) -> crate::FrameId {
+            self.frame
+        }
+        fn owner_generation(&self) -> ForeignOwnerGeneration {
+            self.owner_generation
+        }
     }
 
     #[derive(Debug)]
@@ -303,6 +571,18 @@ mod tests {
             assert!(Instant::now() < deadline);
             assert_eq!(snapshot.mm().raw_for_probe(), 11);
             Ok(Arc::new(Lease))
+        }
+    }
+
+    struct Invalidator;
+    impl ForeignMmInvalidator for Invalidator {
+        fn invalidate_exact_asid(
+            &mut self,
+            binding: ForeignMmBinding,
+            _deadline: Instant,
+        ) -> Result<(), ForeignMmTransportError> {
+            assert_eq!(binding, Snapshot(Vec::new()).binding());
+            Ok(())
         }
     }
 
@@ -326,5 +606,61 @@ mod tests {
         assert_eq!(receipt.bytes_read(), 6);
         assert_eq!(receipt.owner_generations().len(), 1);
         assert!(receipt.authenticates(snapshot.as_ref()));
+
+        let mut invalidator = Invalidator;
+        let cow = lease
+            .break_cow(
+                &Live,
+                &mut invalidator,
+                snapshot.as_ref(),
+                GuestVa(0x4000),
+                bytes.len(),
+                deadline,
+            )
+            .unwrap();
+        assert_eq!(cow.mm(), snapshot.mm());
+        assert_eq!(cow.range_start(), GuestVa(0x4000));
+        assert_eq!(cow.range_len(), bytes.len());
+        assert_eq!(cow.backend_revision(), snapshot.backend_revision());
+        assert_eq!(cow.vma_revision(), snapshot.vma_revision());
+        assert_eq!(
+            cow.frame_inventory_revision(),
+            snapshot.frame_inventory_revision()
+        );
+        assert_eq!(
+            cow.mapping(),
+            MappingId::from_kernel_allocation(NonZeroU64::new(31).unwrap())
+        );
+        assert_eq!(
+            cow.frame(),
+            crate::FrameId::from_kernel_allocation(NonZeroU64::new(37).unwrap())
+        );
+        assert_eq!(cow.physical_base(), Gpa(0x9000));
+        assert_eq!(cow.physical_len(), 0x4000);
+        assert_eq!(cow.owner_generation().raw_for_probe(), 41);
+
+        let written = lease
+            .write(
+                &Live,
+                snapshot.as_ref(),
+                cow.as_ref(),
+                GuestVa(0x4000),
+                b"target",
+                deadline,
+            )
+            .unwrap();
+        assert_eq!(written.mm(), snapshot.mm());
+        assert_eq!(written.range_start(), GuestVa(0x4000));
+        assert_eq!(written.range_len(), 6);
+        assert_eq!(written.bytes_written(), 6);
+        assert_eq!(written.backend_revision(), snapshot.backend_revision());
+        assert_eq!(written.vma_revision(), snapshot.vma_revision());
+        assert_eq!(
+            written.frame_inventory_revision(),
+            snapshot.frame_inventory_revision()
+        );
+        assert_eq!(written.mapping(), cow.mapping());
+        assert_eq!(written.frame(), cow.frame());
+        assert_eq!(written.owner_generation(), cow.owner_generation());
     }
 }

@@ -60,6 +60,7 @@ thread_local! {
 /// and exact in-guest reads, this is the other half of the Dekker handshake:
 /// either the executor observes the pause and parks, or the coordinator
 /// observes the executor and kicks/drains it before editing.
+#[cfg_attr(all(target_os = "macos", target_arch = "aarch64"), allow(dead_code))]
 pub(super) fn enter_guest_or_park(
     in_guest: &carrick_hal::InGuestFlag,
     barrier: &'static crate::fork_quiesce::PtQuiesce,
@@ -71,6 +72,102 @@ pub(super) fn enter_guest_or_park(
     in_guest.leave_guest();
     barrier.park();
     false
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(super) fn enter_hvpatch_guest_or_service_invalidation(
+    in_guest: &carrick_hal::InGuestFlag,
+    barrier: &'static crate::fork_quiesce::PtQuiesce,
+    tid: carrick_hal::ThreadId,
+    engine: &mut dyn std::any::Any,
+    control: &crate::vcpu_loop::executor::HvpatchQuantumControl<'_, '_>,
+) -> Result<bool, carrick_hal::TrapError> {
+    in_guest.enter_guest();
+    // A resident executor can have been inactive when a foreign COW was
+    // published, so task-load service alone is insufficient. Marking in_guest
+    // first closes the race with a new pause: a coordinator must now drain us
+    // before it can edit/publish, while an older deferred generation can be
+    // serviced immediately on this exact loaded owner vCPU.
+    if !barrier.is_quiescing() {
+        if let Some((executor, binding)) = control.cow_invalidation_binding() {
+            binding.service_pending_cow_invalidation(executor, |generation| {
+                let engine = engine
+                    .downcast_mut::<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Engine>()
+                    .ok_or_else(|| {
+                        carrick_hal::TrapError::Hypervisor(
+                            "foreign COW pre-entry reached a non-HVF owner engine".to_owned(),
+                        )
+                    })?;
+                carrick_vmm_hvf::hvf_aarch64_engine::invalidate_loaded_asid(
+                    engine,
+                    generation.raw(),
+                )
+            })?;
+        } else {
+            #[cfg(not(test))]
+            return Err(carrick_hal::TrapError::Hypervisor(
+                "HVPatch guest entry lacks exact executor/MM invalidation binding".to_owned(),
+            ));
+        }
+        if !barrier.is_quiescing() {
+            return Ok(true);
+        }
+    }
+    in_guest.leave_guest();
+    let (executor, binding) = control.cow_invalidation_binding().ok_or_else(|| {
+        carrick_hal::TrapError::Hypervisor(
+            "quiesced HVPatch executor lacks exact invalidation binding".to_owned(),
+        )
+    })?;
+    let identity = binding.identity();
+    let mut failure = None;
+    barrier.park_servicing_scoped_invalidation(identity.mm.raw(), tid, |request| {
+        let result = (|| {
+            if request.mm_scope() != identity.mm.raw()
+                || request.asid_generation() != identity.asid_generation
+            {
+                return Err(carrick_hal::TrapError::Hypervisor(
+                    "foreign COW invalidation named another MM/ASID generation".to_owned(),
+                ));
+            }
+            let ticket = binding.pending_cow_invalidation(executor).ok_or_else(|| {
+                carrick_hal::TrapError::Hypervisor(
+                    "active target executor lacked its foreign COW invalidation ticket".to_owned(),
+                )
+            })?;
+            if ticket.asid_generation().raw() != request.asid()
+                || ticket.asid_generation().generation() != request.asid_generation()
+                || ticket.generation() != request.invalidation_generation()
+            {
+                return Err(carrick_hal::TrapError::Hypervisor(
+                    "active target executor observed a stale foreign COW invalidation phase"
+                        .to_owned(),
+                ));
+            }
+            let engine = engine
+                .downcast_mut::<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Engine>()
+                .ok_or_else(|| {
+                    carrick_hal::TrapError::Hypervisor(
+                        "foreign COW invalidation reached a non-HVF owner engine".to_owned(),
+                    )
+                })?;
+            carrick_vmm_hvf::hvf_aarch64_engine::invalidate_loaded_asid(engine, request.asid())?;
+            binding
+                .acknowledge_cow_invalidation(executor, ticket)
+                .map_err(|error| carrick_hal::TrapError::Hypervisor(error.to_string()))
+        })();
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                failure = Some(error);
+                Err(())
+            }
+        }
+    });
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    Ok(false)
 }
 
 /// Holds this thread's stage-1 exclusivity claim for a mapping syscall's whole
@@ -97,7 +194,7 @@ enum ExactMmStage1LeaseKind {
 
 /// Shareable only within the current host service thread. A nested frame-COW
 /// borrow clones this exact lease rather than trusting ambient thread state.
-pub(super) struct ExactMmStage1Lease {
+pub(crate) struct ExactMmStage1Lease {
     mm: crate::kernel::MmId,
     _kind: ExactMmStage1LeaseKind,
     _not_send_or_sync: std::marker::PhantomData<std::rc::Rc<()>>,
@@ -534,17 +631,110 @@ pub(super) fn with_real_mutation_pause_for_test<T>(
     run(&mut authority)
 }
 
-pub(super) enum FrameCowExactMmGuard {
+#[allow(dead_code)] // Foreign variants are consumed by the canonical Task 8 syscall path.
+pub(crate) enum FrameCowExactMmGuard {
     Nested {
         _lease: std::rc::Rc<ExactMmStage1Lease>,
+        mutation_coordinator: Option<Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>>,
+        foreign_stage1: Option<Arc<crate::hvpatch::Stage1MmLease>>,
     },
     Sole {
         _stage1: Stage1Exclusive,
         _census: crate::kernel::ExactMmCensusGuard,
+        mm: crate::kernel::MmId,
+        mutation_coordinator: Option<Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>>,
+        foreign_stage1: Option<Arc<crate::hvpatch::Stage1MmLease>>,
     },
     Paused {
         _guard: PtPauseGuard<'static>,
+        foreign_stage1: Option<Arc<crate::hvpatch::Stage1MmLease>>,
     },
+}
+
+impl FrameCowExactMmGuard {
+    #[allow(dead_code)] // Canonical process_vm consumer lands in Task 8.
+    pub(crate) fn mutation_identity(
+        &self,
+    ) -> Option<(
+        Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>,
+        crate::kernel::MmId,
+    )> {
+        match self {
+            Self::Nested {
+                _lease,
+                mutation_coordinator,
+                ..
+            } => mutation_coordinator
+                .as_ref()
+                .map(|coordinator| (Arc::clone(coordinator), _lease.mm)),
+            Self::Sole {
+                mm,
+                mutation_coordinator,
+                ..
+            } => mutation_coordinator
+                .as_ref()
+                .map(|coordinator| (Arc::clone(coordinator), *mm)),
+            Self::Paused { _guard, .. } => _guard.mutation_identity(),
+        }
+    }
+
+    pub(crate) fn publish_foreign_cow_invalidation(
+        &mut self,
+        expected_binding: carrick_hal::ForeignMmBinding,
+        deadline: Instant,
+    ) -> Result<(), ForeignCowInvalidationError> {
+        let stage1 = match self {
+            Self::Nested { foreign_stage1, .. }
+            | Self::Sole { foreign_stage1, .. }
+            | Self::Paused { foreign_stage1, .. } => foreign_stage1
+                .as_ref()
+                .ok_or(ForeignCowInvalidationError::MissingStage1Lease)?,
+        };
+        let binding = stage1.binding();
+        if binding.asid.raw() != expected_binding.asid().raw_for_probe()
+            || binding.stage1_root.gpa() != expected_binding.stage1_root()
+        {
+            return Err(ForeignCowInvalidationError::BindingMismatch);
+        }
+        let publication = stage1.publish_cow_invalidation();
+        let Self::Paused { _guard, .. } = self else {
+            return Ok(());
+        };
+        let (inner, expected) = match &_guard._lease._kind {
+            ExactMmStage1LeaseKind::Paused {
+                _inner, _census, ..
+            } => (_inner, _census.pause_endpoint_tids()),
+            ExactMmStage1LeaseKind::Sole { .. } => {
+                return Err(ForeignCowInvalidationError::MissingPause);
+            }
+        };
+        let phase = inner
+            .publish_scoped_invalidation(
+                _guard._lease.mm.raw(),
+                publication.asid_generation().raw(),
+                publication.asid_generation().generation(),
+                publication.ticket().generation(),
+                expected,
+            )
+            .map_err(ForeignCowInvalidationError::Pause)?;
+        let result = inner.wait_invalidation(&phase, deadline);
+        inner
+            .finish_invalidation(&phase)
+            .map_err(ForeignCowInvalidationError::Pause)?;
+        result.map_err(ForeignCowInvalidationError::Pause)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ForeignCowInvalidationError {
+    #[error("foreign COW mutation has no exact stage-1 lease")]
+    MissingStage1Lease,
+    #[error("foreign COW mutation with active target executors has no pause")]
+    MissingPause,
+    #[error("foreign COW invalidation binding does not match the exact stage-1 lease")]
+    BindingMismatch,
+    #[error("foreign COW exact-ASID invalidation failed: {0}")]
+    Pause(#[from] crate::fork_quiesce::PtInvalidationError),
 }
 
 pub(super) fn acquire_frame_cow_quiesce(
@@ -554,21 +744,81 @@ pub(super) fn acquire_frame_cow_quiesce(
     tid: ThreadId,
     budget: PtPauseBudget,
 ) -> Result<FrameCowExactMmGuard, PtPauseError> {
+    acquire_frame_cow_quiesce_inner(barrier, mm, census, None, tid, budget)
+}
+
+#[allow(dead_code)] // Canonical process_vm consumer lands in Task 8.
+pub(super) fn acquire_foreign_mm_mutation_quiesce(
+    barrier: &'static crate::fork_quiesce::PtQuiesce,
+    mm: crate::kernel::MmId,
+    census: &crate::kernel::GuestExecutorCensus,
+    coordinator: Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>,
+    stage1: Arc<crate::hvpatch::Stage1MmLease>,
+    tid: ThreadId,
+    budget: PtPauseBudget,
+) -> Result<FrameCowExactMmGuard, PtPauseError> {
     if let Some(lease) = borrow_current_exact_mm_stage1(mm) {
-        return Ok(FrameCowExactMmGuard::Nested { _lease: lease });
+        return Ok(FrameCowExactMmGuard::Nested {
+            _lease: lease,
+            mutation_coordinator: Some(coordinator),
+            foreign_stage1: Some(stage1),
+        });
+    }
+    let sole = census.lock_for_frame_cow();
+    if sole.participant_count() == 0 {
+        return Ok(FrameCowExactMmGuard::Sole {
+            _stage1: Stage1Exclusive::claim(),
+            _census: sole,
+            mm,
+            mutation_coordinator: Some(coordinator),
+            foreign_stage1: Some(stage1),
+        });
+    }
+    drop(sole);
+    begin_pt_pause(barrier, tid, budget)?;
+    let census = census.lock_for_frame_cow();
+    drain_exact_mm(barrier, mm, Some(coordinator), census, tid, budget).map(|guard| {
+        FrameCowExactMmGuard::Paused {
+            _guard: guard,
+            foreign_stage1: Some(stage1),
+        }
+    })
+}
+
+fn acquire_frame_cow_quiesce_inner(
+    barrier: &'static crate::fork_quiesce::PtQuiesce,
+    mm: crate::kernel::MmId,
+    census: &crate::kernel::GuestExecutorCensus,
+    mutation_coordinator: Option<Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>>,
+    tid: ThreadId,
+    budget: PtPauseBudget,
+) -> Result<FrameCowExactMmGuard, PtPauseError> {
+    if let Some(lease) = borrow_current_exact_mm_stage1(mm) {
+        return Ok(FrameCowExactMmGuard::Nested {
+            _lease: lease,
+            mutation_coordinator,
+            foreign_stage1: None,
+        });
     }
     let sole = census.lock_for_frame_cow();
     if sole.participant_count() <= 1 && !sole.any_in_guest() {
         return Ok(FrameCowExactMmGuard::Sole {
             _stage1: Stage1Exclusive::claim(),
             _census: sole,
+            mm,
+            mutation_coordinator,
+            foreign_stage1: None,
         });
     }
     drop(sole);
     begin_pt_pause(barrier, tid, budget)?;
     let census = census.lock_for_frame_cow();
-    drain_exact_mm(barrier, mm, None, census, tid, budget)
-        .map(|guard| FrameCowExactMmGuard::Paused { _guard: guard })
+    drain_exact_mm(barrier, mm, mutation_coordinator, census, tid, budget).map(|guard| {
+        FrameCowExactMmGuard::Paused {
+            _guard: guard,
+            foreign_stage1: None,
+        }
+    })
 }
 
 #[derive(Clone, Copy)]

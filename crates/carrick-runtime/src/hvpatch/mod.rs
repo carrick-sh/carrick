@@ -32,12 +32,14 @@ mod patcher;
 mod stage1_mm;
 
 pub(crate) use asid::{AsidGeneration, AsidLoad, InvalidationAck};
-#[cfg(test)]
-pub(crate) use stage1_mm::Stage1MmPool;
-pub(crate) use stage1_mm::{PreparedStage1Mm, Stage1MmLease, Stage1MmRetirement};
-
 use mm_resources::MmResources;
 pub(crate) use mm_resources::{ExecMmDispositionKind, ExecMmReservation, RetiredStage1Mm};
+#[cfg(test)]
+pub(crate) use stage1_mm::Stage1MmPool;
+pub(crate) use stage1_mm::{
+    CowInvalidationError, CowInvalidationTicket, PreparedStage1Mm, Stage1MmLease,
+    Stage1MmRetirement,
+};
 
 /// Installation permission kept private to the HVPatch bootstrap/lifecycle
 /// module. Syscall handlers cannot replace the carrier endpoint on an MM.
@@ -603,6 +605,19 @@ impl ProcessContext {
     pub(crate) fn bind_vma_source(&self, source: crate::kernel::SharedVmaSnapshotSource) {
         let backend = std::sync::Arc::clone(&self.mm_backend.read());
         backend.bind_vma_source(source);
+    }
+
+    pub(crate) fn bind_mm_mutation_authority(
+        &self,
+        authority: crate::dispatch::mm_mutation::ForeignMmMutationAuthority,
+    ) {
+        let context = self
+            .context_for_linux_tid(crate::kernel::LinuxTid::for_task_leader(self.task_id()))
+            .unwrap_or_else(|_| std::process::abort());
+        context
+            .shared()
+            .mm()
+            .install_foreign_mm_mutation_authority(authority, &ForeignMmInstallPermit::new());
     }
 
     pub(crate) fn live_process_count(&self) -> usize {

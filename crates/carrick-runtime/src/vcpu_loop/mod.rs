@@ -1714,6 +1714,36 @@ pub(crate) fn with_real_pt_pause_for_test<T>(
     quiesce::with_real_mutation_pause_for_test(coordinator, run)
 }
 
+#[allow(dead_code)] // Canonical process_vm consumer lands in Task 8.
+pub(crate) fn with_foreign_mm_mutation_guard<T>(
+    mm: crate::kernel::MmId,
+    coordinator: Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>,
+    census: &crate::kernel::GuestExecutorCensus,
+    stage1: Arc<crate::hvpatch::Stage1MmLease>,
+    tid: carrick_hal::ThreadId,
+    run: impl FnOnce(&mut crate::dispatch::mm_mutation::MmMutationGuard<'_>) -> T,
+) -> Result<T, crate::dispatch::mm_mutation::ForeignMmMutationError> {
+    let mut authority = quiesce::acquire_foreign_mm_mutation_quiesce(
+        quiesce::pt_barrier(),
+        mm,
+        census,
+        coordinator,
+        stage1,
+        tid,
+        quiesce::PtPauseBudget::DEFAULT,
+    )
+    .map_err(|error| match error {
+        quiesce::PtPauseError::TimedOut => {
+            crate::dispatch::mm_mutation::ForeignMmMutationError::TimedOut
+        }
+        quiesce::PtPauseError::UnkickableExecutor => {
+            crate::dispatch::mm_mutation::ForeignMmMutationError::UnkickableExecutor
+        }
+    })?;
+    let mut mutation = crate::dispatch::mm_mutation::from_frame_cow(&mut authority);
+    Ok(run(&mut mutation))
+}
+
 /// Hand the dispatcher the loaded image's region list + auxv so /proc/self/maps
 /// and /proc/self/auxv reflect it (refreshed on each execve).
 pub(crate) fn apply_image_proc_state(
@@ -6087,7 +6117,18 @@ where
             }
         }
         self.traps = self.traps.saturating_add(1);
-        if !quiesce::enter_guest_or_park(&self.state.in_guest, quiesce::pt_barrier()) {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let entered_guest = quiesce::enter_hvpatch_guest_or_service_invalidation(
+            &self.state.in_guest,
+            quiesce::pt_barrier(),
+            self.state.this_tid,
+            engine,
+            control,
+        )?;
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let entered_guest =
+            quiesce::enter_guest_or_park(&self.state.in_guest, quiesce::pt_barrier());
+        if !entered_guest {
             return Ok(executor::ExecutorExit::Syscall);
         }
         self.state
@@ -10259,10 +10300,8 @@ mod tests {
                 lease: None,
                 exec_replacement: None,
             };
-            let mut control = executor::HvpatchQuantumControl {
-                need_resched: &need_resched,
-                submission: &mut submission,
-            };
+            let mut control =
+                executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
             install_hvpatch_clone_failpoint(phase);
             assert!(
                 job.spawn_persistent_hvpatch_clone_thread(
@@ -10689,10 +10728,8 @@ mod tests {
                 lease: None,
                 exec_replacement: None,
             };
-            let mut control = executor::HvpatchQuantumControl {
-                need_resched: &need_resched,
-                submission: &mut submission,
-            };
+            let mut control =
+                executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
             let mut ops = FakeBackendOps::default();
             if let Some(phase) = phase {
                 install_hvpatch_process_failpoint(phase);
@@ -10809,10 +10846,7 @@ mod tests {
             lease: None,
             exec_replacement: None,
         };
-        let mut control = executor::HvpatchQuantumControl {
-            need_resched: &need_resched,
-            submission: &mut submission,
-        };
+        let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
         let mut ops = FakeBackendOps {
             prepare_fails: true,
             ..Default::default()
@@ -10891,10 +10925,7 @@ mod tests {
             lease: None,
             exec_replacement: None,
         };
-        let mut control = executor::HvpatchQuantumControl {
-            need_resched: &need_resched,
-            submission: &mut submission,
-        };
+        let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
 
         let kernel_clone = Arc::clone(&kernel);
         let mut ops = FakeBackendOps {

@@ -65,6 +65,58 @@ pub(crate) struct Stage1MmLease {
     residency: AsidResidency,
     root_slot: Option<Stage1RootSlot>,
     lifecycle: Mutex<Stage1MmLeaseLifecycle>,
+    cow_invalidation: Mutex<CowInvalidationState>,
+}
+
+#[derive(Debug, Default)]
+struct CowInvalidationState {
+    generation: u64,
+    pending: BTreeSet<crate::kernel::objects::ExecutorId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CowInvalidationTicket {
+    asid: AsidGeneration,
+    generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CowInvalidationPublication {
+    ticket: CowInvalidationTicket,
+    pending: Vec<crate::kernel::objects::ExecutorId>,
+}
+
+impl CowInvalidationPublication {
+    pub(crate) const fn asid_generation(&self) -> AsidGeneration {
+        self.ticket.asid
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending(&self) -> Vec<crate::kernel::objects::ExecutorId> {
+        self.pending.clone()
+    }
+
+    pub(crate) const fn ticket(&self) -> CowInvalidationTicket {
+        self.ticket
+    }
+}
+
+impl CowInvalidationTicket {
+    pub(crate) const fn asid_generation(self) -> AsidGeneration {
+        self.asid
+    }
+
+    pub(crate) const fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum CowInvalidationError {
+    #[error("stale COW ASID invalidation generation")]
+    StaleGeneration,
+    #[error("executor was not pending for COW ASID invalidation")]
+    UnexpectedExecutor,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,6 +157,7 @@ impl Stage1MmLease {
             residency: AsidResidency::new(asid),
             root_slot,
             lifecycle: Mutex::new(Stage1MmLeaseLifecycle::Live),
+            cow_invalidation: Mutex::new(CowInvalidationState::default()),
         }
     }
 
@@ -133,6 +186,66 @@ impl Stage1MmLease {
             return Err(AsidResidencyError::Retiring);
         }
         self.residency.begin_load(executor)
+    }
+
+    pub(crate) fn publish_cow_invalidation(&self) -> CowInvalidationPublication {
+        let pending = self.residency.residents();
+        let mut state = self.cow_invalidation.lock();
+        state.generation = state.generation.wrapping_add(1).max(1);
+        state.pending = pending.iter().copied().collect();
+        CowInvalidationPublication {
+            ticket: CowInvalidationTicket {
+                asid: self.asid,
+                generation: state.generation,
+            },
+            pending,
+        }
+    }
+
+    pub(crate) fn pending_cow_invalidation(
+        &self,
+        executor: crate::kernel::objects::ExecutorId,
+    ) -> Option<CowInvalidationTicket> {
+        let state = self.cow_invalidation.lock();
+        state
+            .pending
+            .contains(&executor)
+            .then_some(CowInvalidationTicket {
+                asid: self.asid,
+                generation: state.generation,
+            })
+    }
+
+    pub(crate) fn acknowledge_cow_invalidation(
+        &self,
+        executor: crate::kernel::objects::ExecutorId,
+        ticket: CowInvalidationTicket,
+    ) -> Result<(), CowInvalidationError> {
+        let mut state = self.cow_invalidation.lock();
+        if ticket.asid != self.asid || ticket.generation != state.generation {
+            return Err(CowInvalidationError::StaleGeneration);
+        }
+        if !state.pending.remove(&executor) {
+            return Err(CowInvalidationError::UnexpectedExecutor);
+        }
+        Ok(())
+    }
+
+    /// Mandatory exact-binding pre-entry service. A failed hardware operation
+    /// leaves the ticket pending, so this executor cannot silently cross into
+    /// guest with stale translations.
+    pub(crate) fn service_pending_cow_invalidation<E>(
+        &self,
+        executor: crate::kernel::objects::ExecutorId,
+        invalidate: impl FnOnce(AsidGeneration) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let Some(ticket) = self.pending_cow_invalidation(executor) else {
+            return Ok(());
+        };
+        invalidate(ticket.asid_generation())?;
+        self.acknowledge_cow_invalidation(executor, ticket)
+            .unwrap_or_else(|_| std::process::abort());
+        Ok(())
     }
 
     pub(crate) fn publish_stage1_root(&self, stage1_root: u64) -> Result<MmBinding, Stage1MmError> {
@@ -1516,6 +1629,87 @@ mod tests {
         let retirement = pool.retire(&lease).expect("retirement");
         assert_eq!(retirement.pending(), vec![executor(21)]);
         assert_eq!(retirement.asid_generation(), generation);
+    }
+
+    #[test]
+    fn cow_invalidation_tracks_exact_generation_and_defers_inactive_residents() {
+        let (_pool, lease) = Stage1MmPool::new_root_for_tests(0x8000, 4).expect("root pool");
+        let active = executor(31);
+        let inactive = executor(32);
+        lease
+            .begin_asid_load(active)
+            .expect("active load")
+            .mark_resident()
+            .expect("active resident");
+        lease
+            .begin_asid_load(inactive)
+            .expect("inactive load")
+            .mark_resident()
+            .expect("inactive resident");
+
+        let publication = lease.publish_cow_invalidation();
+        assert_eq!(publication.asid_generation(), lease.asid_generation());
+        assert_eq!(publication.pending(), vec![active, inactive]);
+        let active_ticket = lease
+            .pending_cow_invalidation(active)
+            .expect("active pending ticket");
+        lease
+            .acknowledge_cow_invalidation(active, active_ticket)
+            .expect("active acknowledgement");
+        assert!(lease.pending_cow_invalidation(active).is_none());
+        assert_eq!(
+            lease.pending_cow_invalidation(inactive),
+            Some(publication.ticket())
+        );
+    }
+
+    #[test]
+    fn cow_invalidation_rejects_stale_or_wrong_executor_acknowledgement() {
+        let (_pool, lease) = Stage1MmPool::new_root_for_tests(0x8000, 4).expect("root pool");
+        let resident = executor(41);
+        lease
+            .begin_asid_load(resident)
+            .expect("load")
+            .mark_resident()
+            .expect("resident");
+        let first = lease.publish_cow_invalidation();
+        let second = lease.publish_cow_invalidation();
+        assert_eq!(
+            lease.acknowledge_cow_invalidation(resident, first.ticket()),
+            Err(CowInvalidationError::StaleGeneration)
+        );
+        assert_eq!(
+            lease.acknowledge_cow_invalidation(executor(42), second.ticket()),
+            Err(CowInvalidationError::UnexpectedExecutor)
+        );
+    }
+
+    #[test]
+    fn pre_entry_service_is_exact_and_acknowledges_only_after_hardware_success() {
+        let (_pool, lease) = Stage1MmPool::new_root_for_tests(0x8000, 4).expect("root pool");
+        let resident = executor(51);
+        lease
+            .begin_asid_load(resident)
+            .expect("load")
+            .mark_resident()
+            .expect("resident");
+        let publication = lease.publish_cow_invalidation();
+        let mut invalidated = Vec::new();
+        lease
+            .service_pending_cow_invalidation(resident, |asid| {
+                invalidated.push(asid);
+                Ok::<(), &'static str>(())
+            })
+            .expect("pre-entry service");
+        assert_eq!(invalidated, vec![publication.asid_generation()]);
+        assert!(lease.pending_cow_invalidation(resident).is_none());
+
+        lease.publish_cow_invalidation();
+        assert_eq!(
+            lease.service_pending_cow_invalidation(resident, |_| Err("hardware failed")),
+            Err("hardware failed")
+        );
+        assert!(lease.pending_cow_invalidation(resident).is_some());
     }
 
     #[test]

@@ -16,9 +16,10 @@ pub mod error;
 pub use error::{MemPerms, OsError, Reg, SysReg};
 pub mod foreign_mm;
 pub use foreign_mm::{
-    ForeignAsid, ForeignMmBinding, ForeignMmEndpoint, ForeignMmId, ForeignMmInvocation,
-    ForeignMmLeaseEndpoint, ForeignMmLiveAuthority, ForeignMmReadLease, ForeignMmReadReceipt,
-    ForeignMmSnapshot, ForeignMmTransport, ForeignMmTransportError, ForeignOwnerGeneration,
+    ForeignAsid, ForeignCowReceipt, ForeignMmBinding, ForeignMmEndpoint, ForeignMmId,
+    ForeignMmInvalidator, ForeignMmInvocation, ForeignMmLeaseEndpoint, ForeignMmLiveAuthority,
+    ForeignMmReadLease, ForeignMmReadReceipt, ForeignMmSnapshot, ForeignMmTransport,
+    ForeignMmTransportError, ForeignMmWriteReceipt, ForeignOwnerGeneration,
 };
 pub mod stage1_exclusive;
 

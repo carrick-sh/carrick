@@ -46,7 +46,7 @@
 // invariant; a per-line allow would be pure noise.
 #![allow(clippy::unwrap_used)]
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, TryLockError, Weak};
@@ -896,9 +896,91 @@ pub fn pt_barrier() -> &'static PtQuiesce {
 pub struct PtQuiesce {
     coordinator: AtomicBool,
     quiescing: AtomicBool,
-    lock: Mutex<()>,
+    lock: Mutex<PtQuiesceState>,
     cv: Condvar,
 }
+
+#[derive(Debug, Default)]
+struct PtQuiesceState {
+    next_invalidation: u64,
+    invalidation: Option<PtInvalidationState>,
+}
+
+#[derive(Debug)]
+struct PtInvalidationState {
+    phase: PtInvalidationPhase,
+    request: PtInvalidationRequest,
+    expected: BTreeSet<PtInvalidationParticipant>,
+    acknowledged: BTreeSet<PtInvalidationParticipant>,
+    failed: BTreeSet<PtInvalidationParticipant>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PtInvalidationParticipant {
+    mm_scope: u64,
+    tid: carrick_hal::ThreadId,
+}
+
+/// Data-only exact-ASID request published after a quiesced stage-1 edit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PtInvalidationRequest {
+    mm_scope: u64,
+    asid: u16,
+    asid_generation: u64,
+    invalidation_generation: u64,
+}
+
+impl PtInvalidationRequest {
+    pub const fn mm_scope(self) -> u64 {
+        self.mm_scope
+    }
+
+    pub const fn asid(self) -> u16 {
+        self.asid
+    }
+
+    pub const fn asid_generation(self) -> u64 {
+        self.asid_generation
+    }
+
+    pub const fn invalidation_generation(self) -> u64 {
+        self.invalidation_generation
+    }
+}
+
+/// Opaque identity of one invalidation phase within a held pause.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PtInvalidationPhase(u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PtInvalidationError {
+    PauseNotActive,
+    AlreadyPublished,
+    StalePhase,
+    ServiceFailed(carrick_hal::ThreadId),
+    TimedOut(carrick_hal::ThreadId),
+}
+
+impl std::fmt::Display for PtInvalidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PauseNotActive => formatter.write_str("page-table pause is not active"),
+            Self::AlreadyPublished => {
+                formatter.write_str("another exact-ASID invalidation phase is already active")
+            }
+            Self::StalePhase => formatter.write_str("exact-ASID invalidation phase is stale"),
+            Self::ServiceFailed(tid) => {
+                write!(formatter, "executor {tid:?} failed exact-ASID invalidation")
+            }
+            Self::TimedOut(tid) => write!(
+                formatter,
+                "timed out waiting for executor {tid:?} to invalidate the exact ASID"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PtInvalidationError {}
 
 impl Default for PtQuiesce {
     fn default() -> Self {
@@ -911,7 +993,7 @@ impl PtQuiesce {
         Self {
             coordinator: AtomicBool::new(false),
             quiescing: AtomicBool::new(false),
-            lock: Mutex::new(()),
+            lock: Mutex::new(PtQuiesceState::default()),
             cv: Condvar::new(),
         }
     }
@@ -936,6 +1018,58 @@ impl PtQuiesce {
     pub fn park(&self) {
         let mut g = self.lock.lock().unwrap();
         while self.quiescing.load(Ordering::SeqCst) {
+            g = self.cv.wait(g).unwrap();
+        }
+    }
+
+    /// Park an out-of-guest owner vCPU, servicing at most the exact phase that
+    /// names this logical executor. The callback runs without the barrier lock
+    /// and the executor remains parked after acknowledgement until the pause
+    /// guard drops.
+    pub fn park_servicing_invalidation(
+        &self,
+        tid: carrick_hal::ThreadId,
+        mut service: impl FnMut(PtInvalidationRequest) -> Result<(), ()>,
+    ) {
+        self.park_servicing_scoped_invalidation(0, tid, &mut service);
+    }
+
+    pub fn park_servicing_scoped_invalidation(
+        &self,
+        mm_scope: u64,
+        tid: carrick_hal::ThreadId,
+        mut service: impl FnMut(PtInvalidationRequest) -> Result<(), ()>,
+    ) {
+        let participant = PtInvalidationParticipant { mm_scope, tid };
+        let mut serviced_phase = 0;
+        let mut g = self.lock.lock().unwrap();
+        while self.quiescing.load(Ordering::SeqCst) {
+            let work = g.invalidation.as_ref().and_then(|state| {
+                (state.phase.0 > serviced_phase && state.expected.contains(&participant))
+                    .then_some((state.phase, state.request))
+            });
+            if let Some((phase, request)) = work {
+                drop(g);
+                let result = service(request);
+                g = self.lock.lock().unwrap();
+                serviced_phase = phase.0;
+                if let Some(state) = g
+                    .invalidation
+                    .as_mut()
+                    .filter(|state| state.phase == phase && state.expected.contains(&participant))
+                {
+                    match result {
+                        Ok(()) => {
+                            state.acknowledged.insert(participant);
+                        }
+                        Err(()) => {
+                            state.failed.insert(participant);
+                        }
+                    }
+                    self.cv.notify_all();
+                }
+                continue;
+            }
             g = self.cv.wait(g).unwrap();
         }
     }
@@ -969,7 +1103,8 @@ impl PtQuiesce {
 
     /// Coordinator: end the pause, wake parked threads, drop coordinator.
     pub fn end(&self) {
-        let _g = self.lock.lock().unwrap();
+        let mut g = self.lock.lock().unwrap();
+        g.invalidation = None;
         self.quiescing.store(false, Ordering::SeqCst);
         self.coordinator.store(false, Ordering::SeqCst);
         self.cv.notify_all();
@@ -996,6 +1131,103 @@ impl Drop for PtPauseGuard {
     fn drop(&mut self) {
         self.barrier.end();
         probes::pt_pause_end(self.tid.raw());
+    }
+}
+
+impl PtPauseGuard {
+    pub fn publish_invalidation(
+        &self,
+        asid: u16,
+        asid_generation: u64,
+        expected: impl IntoIterator<Item = carrick_hal::ThreadId>,
+    ) -> Result<PtInvalidationPhase, PtInvalidationError> {
+        self.publish_scoped_invalidation(0, asid, asid_generation, asid_generation, expected)
+    }
+
+    pub fn publish_scoped_invalidation(
+        &self,
+        mm_scope: u64,
+        asid: u16,
+        asid_generation: u64,
+        invalidation_generation: u64,
+        expected: impl IntoIterator<Item = carrick_hal::ThreadId>,
+    ) -> Result<PtInvalidationPhase, PtInvalidationError> {
+        if !self.barrier.quiescing.load(Ordering::SeqCst) {
+            return Err(PtInvalidationError::PauseNotActive);
+        }
+        let mut state = self.barrier.lock.lock().unwrap();
+        if state.invalidation.is_some() {
+            return Err(PtInvalidationError::AlreadyPublished);
+        }
+        state.next_invalidation = state.next_invalidation.wrapping_add(1).max(1);
+        let phase = PtInvalidationPhase(state.next_invalidation);
+        state.invalidation = Some(PtInvalidationState {
+            phase,
+            request: PtInvalidationRequest {
+                mm_scope,
+                asid,
+                asid_generation,
+                invalidation_generation,
+            },
+            expected: expected
+                .into_iter()
+                .map(|tid| PtInvalidationParticipant { mm_scope, tid })
+                .collect(),
+            acknowledged: BTreeSet::new(),
+            failed: BTreeSet::new(),
+        });
+        self.barrier.cv.notify_all();
+        Ok(phase)
+    }
+
+    pub fn wait_invalidation(
+        &self,
+        phase: &PtInvalidationPhase,
+        deadline: Instant,
+    ) -> Result<(), PtInvalidationError> {
+        let mut guard = self.barrier.lock.lock().unwrap();
+        loop {
+            let state = guard
+                .invalidation
+                .as_ref()
+                .filter(|state| state.phase == *phase)
+                .ok_or(PtInvalidationError::StalePhase)?;
+            if let Some(participant) = state.failed.iter().next().copied() {
+                return Err(PtInvalidationError::ServiceFailed(participant.tid));
+            }
+            if state.acknowledged == state.expected {
+                return Ok(());
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                let missing = state
+                    .expected
+                    .difference(&state.acknowledged)
+                    .next()
+                    .copied()
+                    .ok_or(PtInvalidationError::StalePhase)?;
+                return Err(PtInvalidationError::TimedOut(missing.tid));
+            };
+            let (next, _) = self.barrier.cv.wait_timeout(guard, remaining).unwrap();
+            guard = next;
+        }
+    }
+
+    /// Retire one completed or failed phase while keeping the admission
+    /// barrier raised. This permits rollback to publish a second exact-ASID
+    /// generation to the same parked owners before the pause guard releases.
+    pub fn finish_invalidation(
+        &self,
+        phase: &PtInvalidationPhase,
+    ) -> Result<(), PtInvalidationError> {
+        let mut guard = self.barrier.lock.lock().unwrap();
+        match guard.invalidation.as_ref() {
+            Some(state) if state.phase == *phase => {
+                guard.invalidation = None;
+                self.barrier.cv.notify_all();
+                Ok(())
+            }
+            _ => Err(PtInvalidationError::StalePhase),
+        }
     }
 }
 
@@ -1336,6 +1568,95 @@ mod tests {
             "the claim is reusable after end_exec_replacement"
         );
         end_exec_replacement();
+    }
+
+    #[test]
+    fn pt_pause_publishes_exact_invalidation_and_waits_for_owner_ack() {
+        let barrier: &'static PtQuiesce = Box::leak(Box::new(PtQuiesce::new()));
+        let tid = carrick_hal::ThreadId::synthetic_for_tests(801);
+        assert!(barrier.try_become_coordinator());
+        barrier.set_quiescing();
+        let guard = barrier.pause_guard(carrick_hal::ThreadId::synthetic_for_tests(800));
+        let serviced = Arc::new(AtomicBool::new(false));
+        let worker_serviced = Arc::clone(&serviced);
+        let worker = std::thread::spawn(move || {
+            barrier.park_servicing_invalidation(tid, |request| {
+                assert_eq!(request.asid(), 17);
+                assert_eq!(request.asid_generation(), 23);
+                worker_serviced.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+
+        let phase = guard
+            .publish_invalidation(17, 23, [tid])
+            .expect("publish exact-ASID invalidation phase");
+        guard
+            .wait_invalidation(&phase, Instant::now() + Duration::from_secs(1))
+            .expect("owner vCPU acknowledgement");
+        assert!(serviced.load(Ordering::SeqCst));
+        assert!(
+            !worker.is_finished(),
+            "owner remains excluded through commit"
+        );
+        drop(guard);
+        worker.join().expect("parked owner resumes");
+    }
+
+    #[test]
+    fn pt_pause_invalidation_fails_closed_on_owner_failure_or_timeout() {
+        let failed_barrier: &'static PtQuiesce = Box::leak(Box::new(PtQuiesce::new()));
+        let failed_tid = carrick_hal::ThreadId::synthetic_for_tests(811);
+        assert!(failed_barrier.try_become_coordinator());
+        failed_barrier.set_quiescing();
+        let failed_guard =
+            failed_barrier.pause_guard(carrick_hal::ThreadId::synthetic_for_tests(810));
+        let service_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_calls = Arc::clone(&service_calls);
+        let worker = std::thread::spawn(move || {
+            failed_barrier.park_servicing_invalidation(failed_tid, |_| {
+                (worker_calls.fetch_add(1, Ordering::SeqCst) != 0)
+                    .then_some(())
+                    .ok_or(())
+            })
+        });
+        let phase = failed_guard
+            .publish_invalidation(19, 29, [failed_tid])
+            .expect("publish failure phase");
+        assert_eq!(
+            failed_guard.wait_invalidation(&phase, Instant::now() + Duration::from_secs(1)),
+            Err(PtInvalidationError::ServiceFailed(failed_tid))
+        );
+        failed_guard
+            .finish_invalidation(&phase)
+            .expect("retire failed publication while pause remains held");
+        let rollback = failed_guard
+            .publish_invalidation(19, 30, [failed_tid])
+            .expect("publish rollback invalidation");
+        failed_guard
+            .wait_invalidation(&rollback, Instant::now() + Duration::from_secs(1))
+            .expect("parked owner services rollback generation");
+        failed_guard
+            .finish_invalidation(&rollback)
+            .expect("retire rollback publication");
+        assert_eq!(service_calls.load(Ordering::SeqCst), 2);
+        drop(failed_guard);
+        worker.join().expect("failed worker resumes after rollback");
+
+        let timeout_barrier: &'static PtQuiesce = Box::leak(Box::new(PtQuiesce::new()));
+        let missing_tid = carrick_hal::ThreadId::synthetic_for_tests(821);
+        assert!(timeout_barrier.try_become_coordinator());
+        timeout_barrier.set_quiescing();
+        let timeout_guard =
+            timeout_barrier.pause_guard(carrick_hal::ThreadId::synthetic_for_tests(820));
+        let phase = timeout_guard
+            .publish_invalidation(31, 37, [missing_tid])
+            .expect("publish timeout phase");
+        assert_eq!(
+            timeout_guard.wait_invalidation(&phase, Instant::now() + Duration::from_millis(10)),
+            Err(PtInvalidationError::TimedOut(missing_tid))
+        );
+        drop(timeout_guard);
     }
 
     #[test]

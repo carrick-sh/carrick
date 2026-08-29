@@ -441,6 +441,17 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             .as_mut()
             .ok_or_else(|| TrapError::Hypervisor("HVPatch load lost attached engine".into()))?
             .overlay_task_state_on_live_executor(cpu)?;
+        task.binding()
+            .service_pending_cow_invalidation(self.executor_id, |generation| {
+                carrick_vmm_hvf::hvf_aarch64_engine::invalidate_loaded_asid(
+                    self.current.as_mut().ok_or_else(|| {
+                        TrapError::Hypervisor(
+                            "HVPatch pre-entry invalidation lost loaded engine".into(),
+                        )
+                    })?,
+                    generation.raw(),
+                )
+            })?;
         self.current
             .as_mut()
             .ok_or_else(|| TrapError::Hypervisor("HVPatch load lost barrier engine".into()))?
@@ -466,6 +477,12 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         let mut control = HvpatchQuantumControl {
             need_resched,
             submission,
+            executor_id: Some(self.executor_id),
+            binding: Some(
+                self.binding
+                    .as_ref()
+                    .unwrap_or_else(|| std::process::abort()),
+            ),
         };
         let engine = self
             .current
@@ -783,9 +800,32 @@ pub(crate) struct PendingExecReplacement {
 pub(crate) struct HvpatchQuantumControl<'a, 'lease> {
     pub(super) need_resched: &'a AtomicBool,
     pub(super) submission: &'a mut ExecutorSubmissionContext<'lease>,
+    pub(super) executor_id: Option<ExecutorId>,
+    pub(super) binding: Option<&'a Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>>,
 }
 
-impl HvpatchQuantumControl<'_, '_> {
+impl<'a, 'lease> HvpatchQuantumControl<'a, 'lease> {
+    pub(crate) fn cow_invalidation_binding(
+        &self,
+    ) -> Option<(
+        ExecutorId,
+        &Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>,
+    )> {
+        Some((self.executor_id?, self.binding?))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        need_resched: &'a AtomicBool,
+        submission: &'a mut ExecutorSubmissionContext<'lease>,
+    ) -> Self {
+        Self {
+            need_resched,
+            submission,
+            executor_id: None,
+            binding: None,
+        }
+    }
     pub(crate) fn need_resched(&self) -> bool {
         self.need_resched.load(Ordering::Acquire)
     }
@@ -5507,10 +5547,7 @@ pub(crate) mod tests {
             exec_replacement: None,
         };
         let need_resched = AtomicBool::new(false);
-        let mut control = HvpatchQuantumControl {
-            need_resched: &need_resched,
-            submission: &mut submission,
-        };
+        let mut control = HvpatchQuantumControl::for_test(&need_resched, &mut submission);
 
         for (index, expected) in expected_discriminants.into_iter().enumerate() {
             // This value represents the executor-owned engine after load. It is

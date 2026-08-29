@@ -4189,6 +4189,11 @@ impl SyscallDispatcher {
         }
         HVPATCH_LANE.store(true, std::sync::atomic::Ordering::Release);
         process.bind_vma_source(self.vma_snapshot_source());
+        let stage1 = process.stage1_mm_lease().unwrap_or_else(|error| {
+            tracing::error!(%error, "cannot bind exact HVPatch stage-1 mutation authority");
+            std::process::abort();
+        });
+        process.bind_mm_mutation_authority(self.foreign_mm_mutation_authority(stage1));
         *self.kernel_binding.write() = process.task_binding();
         *self.timer_delivery.write() = Some(process.process_timer_delivery());
         self.commit_sysv_fork_inheritance();
@@ -5106,6 +5111,19 @@ impl SyscallDispatcher {
 
     pub(crate) fn mm_mutation_coordinator(&self) -> Arc<mm_mutation::MmMutationCoordinator> {
         Arc::clone(&self.mm_authority().mutation_coordinator)
+    }
+
+    fn foreign_mm_mutation_authority(
+        &self,
+        stage1: Arc<crate::hvpatch::Stage1MmLease>,
+    ) -> mm_mutation::ForeignMmMutationAuthority {
+        let authority = self.mm_authority();
+        mm_mutation::ForeignMmMutationAuthority::new(
+            authority.mm_id,
+            Arc::clone(&authority.mutation_coordinator),
+            Arc::clone(&authority.guest_executors),
+            stage1,
+        )
     }
 
     pub(crate) fn mm_executor_census(&self) -> Arc<crate::kernel::GuestExecutorCensus> {
