@@ -5143,14 +5143,16 @@ mod real {
         ///    boolean (1 if any sibling is still walking tables at entry, 0
         ///    otherwise), `waiting_sibling_tid` exact waiting sibling tid or zero
         ///    when complete, `executor_census` live executor census.
-        ///    The last two are different populations and the difference is the
-        ///    point: a sibling parked in a futex / epoll / fd wait has released
-        ///    its lease and left the registry, so `waiting_sibling_tid` can read 0
-        ///    while `executor_census` reads 2. `executor_census` is what the RAISE
-        ///    decision is keyed on (`kernel::guest_execution`); `waiting_sibling_tid`
-        ///    is what the drain observes at coordinator entry. A row with
-        ///    `waiting_sibling_tid == 0` and `executor_census > 1` is a pause with
-        ///    peer executor and no sibling lease.
+        ///    `executor_census` is what the RAISE decision is keyed on
+        ///    (`kernel::guest_execution`); `waiting_sibling_tid` is the exact
+        ///    waiting sibling lease identity observed at coordinator entry.
+        ///    A row with `waiting_sibling_tid == 0` and `executor_census > 1`
+        ///    represents a pause with a transient active executor participant
+        ///    without a sibling registration (for example, during
+        ///    census-before-registry admission or when registration admission
+        ///    was denied). Suspension drops both lease and census
+        ///    participation; parked suspended loops do not remain counted in
+        ///    the census.
         ///  * `pt__pause__ready`: all siblings left guest; the edit may proceed.
         ///    `spins` wait iterations, `wait_us` microseconds waited.
         ///  * `pt__pause__timeout`: the convergence deadline was hit. MUST never

@@ -1,14 +1,19 @@
-//! Who can execute guest code: the population a stop-the-world barrier must
+//! Who can execute guest code: the population a stage-1 page-table pause must
 //! account for.
 //!
-//! Carrick raises a process-wide barrier before mutating shared guest state —
-//! the stage-1 page-table Pause-Modify-Resume, and the fork transaction that
-//! rewrites process topology. The question that decision rests on is
+//! Carrick coordinates mutations of shared guest state through distinct
+//! authorities:
+//! - Stage-1 page-table Pause-Modify-Resume uses [`GuestExecutorCensus`]
+//!   (`has_peer_executor`) to decide whether to pause sibling execution.
+//! - Process fork and crash snapshot raise their quiesce barriers from durable
+//!   `Task::threads()` membership (`Task::threads().len().saturating_sub(1)`),
+//!   not this census.
 //!
-//! > is any OTHER thread able to run guest instructions before my mutation
-//! > completes?
-//!
-//! and that is a MEMBERSHIP question about active guest execution.
+//! A raised quiesce barrier parks admitted executors at the run-loop safe point,
+//! but does not itself deny vCPU registration. Registration admission is
+//! governed by the identity-aware vCPU registry lease freeze: only a non-owner
+//! lease drain freeze denies registration; the exact freeze owner may
+//! re-register through its own raised fork barrier.
 //!
 //! [`GuestExecutorCensus`] tracks live guest executor participation for one
 //! Linux process. When a thread suspends (for example on a futex, `epoll_wait`,
@@ -18,18 +23,14 @@
 //!
 //! Upon waking and seeking initial admission or re-admission to execute guest
 //! code, a thread enters [`GuestExecutorCensus`] before attempting vCPU
-//! registration (`enter_guest_executor_then_register`). If a barrier or lease
-//! drain freeze is active, registration admission is denied, and the thread
-//! suspends again (dropping its participation). This ordering guarantees that
-//! any peer thread attempting to enter guest execution is visible in the census
-//! before its registration can be published.
-//!
-//! Stop-the-world barriers use [`GuestExecutorCensus::has_peer_executor`] to
-//! decide whether to raise the barrier, while drain convergence uses
-//! identity-aware vCPU lease drain polling and `any_other_in_guest`.
+//! registration (`enter_guest_executor_then_register`). If a lease drain freeze
+//! is held by another owner, registration admission returns `Waiting`, and the
+//! thread suspends again (dropping its participation). This ordering guarantees
+//! that any peer thread attempting to enter guest execution is visible in the
+//! census before its registration can be published.
 //!
 //! Membership is maintained by [`GuestExecutorParticipation`], an RAII guard
-//! held for the lifetime of active guest execution participation, in the same
+//! held for the lifetime of an admitted guest executor quantum, in the same
 //! spirit as the crash-capture quorum's participant flag: a thread published
 //! into the task graph whose host loop was cancelled before it started, and a
 //! thread that has suspended or returned, are both outside the population. The
@@ -37,12 +38,12 @@
 //! are one fact ("this thread actively participates in guest execution") read by
 //! two subsystems.
 //!
-//! Residual window, stated plainly: participation begins when the vCPU loop
-//! enters execution, not when `clone` publishes the thread into the task graph.
-//! A thread between publication and loop start is not yet counted. It also cannot
-//! yet execute guest code, and the fork lane separately closes clone admission
-//! (`close_for_fork`) before it quiesces, but the page-table lane has no such
-//! closure.
+//! Residual window, stated plainly: participation begins when an admitted
+//! executor enters its execution quantum, not when `clone` publishes the thread
+//! into the task graph. A thread between publication and execution entry is not
+//! yet counted. It also cannot yet execute guest code, and the fork lane
+//! separately closes clone admission (`close_for_fork`) before it quiesces, but
+//! the page-table lane has no such closure.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -64,7 +65,8 @@ pub struct GuestExecutorCensus {
 
 impl GuestExecutorCensus {
     /// Join the population for as long as the returned guard lives. Call this
-    /// once at the top of a vCPU loop, before the thread registers a vCPU.
+    /// upon entering an admitted guest execution quantum, before the thread
+    /// registers a vCPU.
     ///
     /// `thread` is the same thread's Kernel object when the lane has one
     /// (HVPatch); passing it makes this guard carry the crash-safe-point facet
@@ -81,28 +83,30 @@ impl GuestExecutorCensus {
         }
     }
 
-    /// How many vCPU loops are live for this Linux process.
+    /// How many admitted guest executors are actively participating for this
+    /// Linux process.
     pub fn live(&self) -> usize {
         self.live.load(Ordering::SeqCst)
     }
 
-    /// Must a stop-the-world barrier be raised before mutating shared guest
-    /// state?
+    /// Must a stop-the-world page-table pause be raised before mutating shared
+    /// stage-1 descriptors?
     ///
     /// Call ONLY from a thread that itself holds a
-    /// [`GuestExecutorParticipation`] — every vCPU loop does — since the
-    /// caller counts itself.
+    /// [`GuestExecutorParticipation`] — every admitted guest executor does —
+    /// since the caller counts itself.
     pub fn has_peer_executor(&self) -> bool {
         self.live() > 1
     }
 }
 
-/// Membership in a [`GuestExecutorCensus`], held for exactly one vCPU loop.
+/// Membership in a [`GuestExecutorCensus`], held for the duration of an
+/// admitted guest executor quantum.
 ///
-/// Released on every exit path — normal return, error, unwind — because that is
-/// the whole point: an abandoned membership makes a mutator raise a barrier
-/// forever for a thread that will never park, and makes a crash quorum wait out
-/// its deadline on a thread that can never answer.
+/// Released on every exit path — suspension, normal return, error, unwind —
+/// because that is the whole point: an abandoned membership makes a page-table
+/// mutator pause forever for a thread that will never park, and makes a crash
+/// quorum wait out its deadline on a thread that can never answer.
 pub struct GuestExecutorParticipation {
     census: Arc<GuestExecutorCensus>,
     thread: Option<ThreadRef>,
@@ -150,13 +154,13 @@ mod tests {
             move || {
                 let _doomed = census.enter(None);
                 assert!(census.has_peer_executor());
-                panic!("vCPU loop unwound");
+                panic!("admitted executor quantum unwound");
             }
         });
         assert!(result.is_err());
         assert!(
             !census.has_peer_executor(),
-            "an unwound loop must leave the population"
+            "an unwound executor must leave the population"
         );
     }
 }
