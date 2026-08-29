@@ -91,9 +91,25 @@ pub(super) struct MmIoStateSnapshot {
     pub(super) next_legacy_aio_context: u64,
 }
 
+/// Kernel-owned Linux address-space identity.
+///
+/// The installed backend and foreign carrier capability are not public API:
+/// callers must obtain a typed current/foreign MM authority from the kernel.
+///
+/// ```compile_fail
+/// fn bypass(mm: &carrick_runtime::kernel::objects::Mm) {
+///     let transport = mm
+///         .backend()
+///         .expect("raw MM backend")
+///         .foreign_mm_transport()
+///         .expect("raw foreign transport");
+///     let _ = transport;
+/// }
+/// ```
 pub struct Mm {
     id: MmId,
     backend: Option<Arc<dyn MmBackend>>,
+    foreign_mm_endpoint: RwLock<Option<carrick_hal::ForeignMmEndpoint>>,
     io_uring_mappings: RwLock<Vec<crate::dispatch::ioring::IoUringMapping>>,
     legacy_aio_contexts: RwLock<BTreeSet<crate::dispatch::LegacyAioContextId>>,
     next_legacy_aio_context: AtomicU64,
@@ -108,6 +124,7 @@ impl Mm {
         Self {
             id,
             backend: None,
+            foreign_mm_endpoint: RwLock::new(None),
             io_uring_mappings: RwLock::new(Vec::new()),
             legacy_aio_contexts: RwLock::new(BTreeSet::new()),
             next_legacy_aio_context: AtomicU64::new(1),
@@ -119,6 +136,7 @@ impl Mm {
         Self {
             id,
             backend: Some(backend),
+            foreign_mm_endpoint: RwLock::new(None),
             io_uring_mappings: RwLock::new(Vec::new()),
             legacy_aio_contexts: RwLock::new(BTreeSet::new()),
             next_legacy_aio_context: AtomicU64::new(1),
@@ -131,6 +149,7 @@ impl Mm {
         Self {
             id,
             backend: None,
+            foreign_mm_endpoint: RwLock::new(None),
             io_uring_mappings: RwLock::new(parent.io_uring_mappings.read().clone()),
             legacy_aio_contexts: RwLock::new(BTreeSet::new()),
             next_legacy_aio_context: AtomicU64::new(1),
@@ -142,6 +161,7 @@ impl Mm {
         Self {
             id,
             backend: Some(backend),
+            foreign_mm_endpoint: RwLock::new(None),
             io_uring_mappings: RwLock::new(parent.io_uring_mappings.read().clone()),
             legacy_aio_contexts: RwLock::new(BTreeSet::new()),
             next_legacy_aio_context: AtomicU64::new(1),
@@ -261,8 +281,34 @@ impl Mm {
         self.id
     }
 
-    pub fn backend(&self) -> Option<&Arc<dyn MmBackend>> {
+    pub(crate) fn backend(&self) -> Option<&Arc<dyn MmBackend>> {
         self.backend.as_ref()
+    }
+
+    pub(crate) fn install_foreign_mm_endpoint(
+        &self,
+        endpoint: carrick_hal::ForeignMmEndpoint,
+        _permit: &crate::hvpatch::ForeignMmInstallPermit,
+    ) {
+        *self.foreign_mm_endpoint.write() = Some(endpoint);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_foreign_mm_endpoint_for_test(
+        &self,
+        endpoint: carrick_hal::ForeignMmEndpoint,
+    ) {
+        *self.foreign_mm_endpoint.write() = Some(endpoint);
+    }
+
+    pub(super) fn foreign_mm_endpoint(
+        &self,
+        _permit: &super::mm_access::ForeignEndpointPermit,
+        deadline: std::time::Instant,
+    ) -> Option<Option<carrick_hal::ForeignMmEndpoint>> {
+        self.foreign_mm_endpoint
+            .try_read_until(deadline)
+            .map(|endpoint| endpoint.clone())
     }
 
     pub(super) fn revision(&self) -> u64 {
@@ -276,6 +322,10 @@ impl std::fmt::Debug for Mm {
             .debug_struct("Mm")
             .field("id", &self.id)
             .field("has_backend", &self.backend.is_some())
+            .field(
+                "has_foreign_mm_endpoint",
+                &self.foreign_mm_endpoint.read().is_some(),
+            )
             .field(
                 "legacy_aio_contexts",
                 &self.legacy_aio_contexts.read().len(),

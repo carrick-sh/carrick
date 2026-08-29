@@ -1063,8 +1063,8 @@ impl GuestVmBackend for HvfAarch64Vmm {
 }
 
 impl Aarch64Vmm for HvfAarch64Vmm {
-    fn foreign_mm_transport(&self) -> Option<Arc<dyn carrick_hal::ForeignMmTransport>> {
-        Some(self.state.foreign_mm_transport())
+    fn foreign_mm_endpoint(&self) -> Option<carrick_hal::ForeignMmEndpoint> {
+        Some(self.state.foreign_mm_endpoint())
     }
 
     fn audit_executor_boundary(&mut self, vcpu: &mut Self::Vcpu) -> Result<(), TrapError> {

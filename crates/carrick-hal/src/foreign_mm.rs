@@ -96,6 +96,7 @@ pub trait ForeignMmReadReceipt: Debug + Send + Sync {
 pub trait ForeignMmReadLease: Debug + Send + Sync {
     fn read(
         &self,
+        invocation: &ForeignMmInvocation,
         authority: &dyn ForeignMmLiveAuthority,
         snapshot: &dyn ForeignMmSnapshot,
         va: GuestVa,
@@ -124,9 +125,83 @@ pub enum ForeignMmTransportError {
 pub trait ForeignMmTransport: Debug + Send + Sync {
     fn retain(
         &self,
+        invocation: &ForeignMmInvocation,
         snapshot: &dyn ForeignMmSnapshot,
         deadline: Instant,
     ) -> Result<Arc<dyn ForeignMmReadLease>, ForeignMmTransportError>;
+}
+
+/// Unforgeable call-site witness. Raw transport traits stay object-safe for
+/// cross-crate backend implementations, but only an opaque endpoint can mint
+/// the witness needed to invoke them.
+///
+/// ```compile_fail
+/// let _ = carrick_hal::ForeignMmInvocation { _private: () };
+/// ```
+#[derive(Debug)]
+pub struct ForeignMmInvocation {
+    _private: (),
+}
+
+/// Cloneable capability for one exact carrier transport. Runtime stores this
+/// only in the kernel MM object; raw backend observation never exposes it.
+#[derive(Clone)]
+pub struct ForeignMmEndpoint {
+    transport: Arc<dyn ForeignMmTransport>,
+}
+
+impl Debug for ForeignMmEndpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ForeignMmEndpoint")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ForeignMmEndpoint {
+    pub fn for_carrier(transport: Arc<dyn ForeignMmTransport>) -> Self {
+        Self { transport }
+    }
+
+    pub fn retain(
+        &self,
+        snapshot: &dyn ForeignMmSnapshot,
+        deadline: Instant,
+    ) -> Result<ForeignMmLeaseEndpoint, ForeignMmTransportError> {
+        let invocation = ForeignMmInvocation { _private: () };
+        self.transport
+            .retain(&invocation, snapshot, deadline)
+            .map(|lease| ForeignMmLeaseEndpoint { lease })
+    }
+}
+
+/// Token-held half of the carrier capability. Its raw lease is never exposed.
+#[derive(Clone)]
+pub struct ForeignMmLeaseEndpoint {
+    lease: Arc<dyn ForeignMmReadLease>,
+}
+
+impl Debug for ForeignMmLeaseEndpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ForeignMmLeaseEndpoint")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ForeignMmLeaseEndpoint {
+    pub fn read(
+        &self,
+        authority: &dyn ForeignMmLiveAuthority,
+        snapshot: &dyn ForeignMmSnapshot,
+        va: GuestVa,
+        dst: &mut [u8],
+        deadline: Instant,
+    ) -> Result<Box<dyn ForeignMmReadReceipt>, ForeignMmTransportError> {
+        let invocation = ForeignMmInvocation { _private: () };
+        self.lease
+            .read(&invocation, authority, snapshot, va, dst, deadline)
+    }
 }
 
 #[cfg(test)]
@@ -201,6 +276,7 @@ mod tests {
     impl ForeignMmReadLease for Lease {
         fn read(
             &self,
+            _invocation: &ForeignMmInvocation,
             _authority: &dyn ForeignMmLiveAuthority,
             _snapshot: &dyn ForeignMmSnapshot,
             _va: GuestVa,
@@ -220,6 +296,7 @@ mod tests {
     impl ForeignMmTransport for Transport {
         fn retain(
             &self,
+            _invocation: &ForeignMmInvocation,
             snapshot: &dyn ForeignMmSnapshot,
             deadline: Instant,
         ) -> Result<Arc<dyn ForeignMmReadLease>, ForeignMmTransportError> {
@@ -232,9 +309,9 @@ mod tests {
     #[test]
     fn object_safe_transport_retains_and_authenticates_distinct_domains() {
         let snapshot = Live.snapshot(Instant::now()).unwrap();
-        let transport: Arc<dyn ForeignMmTransport> = Arc::new(Transport);
+        let endpoint = ForeignMmEndpoint::for_carrier(Arc::new(Transport));
         let deadline = Instant::now() + std::time::Duration::from_secs(1);
-        let lease = transport.retain(snapshot.as_ref(), deadline).unwrap();
+        let lease = endpoint.retain(snapshot.as_ref(), deadline).unwrap();
         let mut bytes = [0; 6];
         let receipt = lease
             .read(

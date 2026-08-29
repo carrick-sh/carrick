@@ -39,12 +39,25 @@ pub(crate) use stage1_mm::{PreparedStage1Mm, Stage1MmLease, Stage1MmRetirement};
 use mm_resources::MmResources;
 pub(crate) use mm_resources::{ExecMmDispositionKind, ExecMmReservation, RetiredStage1Mm};
 
+/// Installation permission kept private to the HVPatch bootstrap/lifecycle
+/// module. Syscall handlers cannot replace the carrier endpoint on an MM.
+pub(crate) struct ForeignMmInstallPermit {
+    _private: (),
+}
+
+impl ForeignMmInstallPermit {
+    const fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ProcessContext {
     resources: std::sync::Arc<MmResources>,
     binding: crate::kernel::KernelTaskBinding,
     mm_backend: std::sync::Arc<parking_lot::RwLock<std::sync::Arc<stage1_mm::Stage1MmBackend>>>,
     mm_access: Option<crate::kernel::MmAccessAuthority>,
+    foreign_mm_endpoint: Option<carrick_hal::ForeignMmEndpoint>,
 }
 
 /// Build a real HVPatch process binding for cross-subsystem unit tests. This
@@ -488,15 +501,16 @@ impl ProcessContext {
             binding,
             mm_backend: std::sync::Arc::new(parking_lot::RwLock::new(mm_backend)),
             mm_access: None,
+            foreign_mm_endpoint: None,
         }
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn with_foreign_mm_transport(
-        mut self,
-        transport: std::sync::Arc<dyn carrick_hal::ForeignMmTransport>,
-    ) -> Self {
-        self.mm_backend.read().bind_foreign_mm_transport(transport);
+    fn with_foreign_mm_endpoint(mut self, endpoint: carrick_hal::ForeignMmEndpoint) -> Self {
+        self.binding
+            .install_foreign_mm_endpoint(endpoint.clone(), &ForeignMmInstallPermit::new())
+            .unwrap_or_else(|_| std::process::abort());
+        self.foreign_mm_endpoint = Some(endpoint);
         self.mm_access = Some(crate::kernel::MmAccessAuthority::new());
         self
     }
@@ -568,8 +582,11 @@ impl ProcessContext {
         mm_backend: std::sync::Arc<stage1_mm::Stage1MmBackend>,
     ) -> Self {
         mm_backend.bind_inventory(context.kernel(), context.shared().mm().id());
-        if let Some(transport) = self.mm_backend.read().cloned_foreign_mm_transport() {
-            mm_backend.bind_foreign_mm_transport(transport);
+        if let Some(endpoint) = self.foreign_mm_endpoint.clone() {
+            context
+                .shared()
+                .mm()
+                .install_foreign_mm_endpoint(endpoint, &ForeignMmInstallPermit::new());
         }
         let mut child = Self::new(
             std::sync::Arc::clone(&self.resources),
@@ -577,6 +594,9 @@ impl ProcessContext {
             mm_backend,
         );
         child.mm_access.clone_from(&self.mm_access);
+        child
+            .foreign_mm_endpoint
+            .clone_from(&self.foreign_mm_endpoint);
         child
     }
 
@@ -766,9 +786,6 @@ impl ProcessContext {
     ) -> Result<(PreparedProcessExec, crate::kernel::KernelContext), String> {
         let predecessor_backend = reservation.predecessor_backend();
         let backend = reservation.replacement_backend();
-        if let Some(transport) = predecessor_backend.cloned_foreign_mm_transport() {
-            backend.bind_foreign_mm_transport(transport);
-        }
         let kernel_backend: std::sync::Arc<dyn crate::kernel::MmBackend> = backend.clone();
         let (kernel, context) = match self
             .kernel_graph()
@@ -784,6 +801,12 @@ impl ProcessContext {
                 return Err(error);
             }
         };
+        if let Some(endpoint) = self.foreign_mm_endpoint.clone() {
+            context
+                .shared()
+                .mm()
+                .install_foreign_mm_endpoint(endpoint, &ForeignMmInstallPermit::new());
+        }
         let old_vmas = match reservation.disposition() {
             mm_resources::ExecMmDispositionKind::RetainOldMm => None,
             mm_resources::ExecMmDispositionKind::RetireOldMm => {
@@ -1356,8 +1379,8 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
     let context = ProcessContext::new(table, root.task_binding(), mm_backend);
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let context = match engine.foreign_mm_transport() {
-        Some(transport) => context.with_foreign_mm_transport(transport),
+    let context = match engine.foreign_mm_endpoint() {
+        Some(endpoint) => context.with_foreign_mm_endpoint(endpoint),
         None => context,
     };
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

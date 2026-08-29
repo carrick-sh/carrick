@@ -194,9 +194,6 @@ pub trait MmBackend: Send + Sync {
     fn vma_revision(&self, _deadline: Instant) -> Result<Option<VmaRevision>, SnapshotError> {
         Ok(None)
     }
-    fn foreign_mm_transport(&self) -> Option<Arc<dyn carrick_hal::ForeignMmTransport>> {
-        None
-    }
 }
 
 pub type SharedVmaSnapshotSource = Arc<dyn VmaSnapshotSource>;

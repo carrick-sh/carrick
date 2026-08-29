@@ -2425,8 +2425,8 @@ fn seed_sibling_snapshot(
 }
 
 impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
-    fn foreign_mm_transport(&self) -> Option<std::sync::Arc<dyn carrick_hal::ForeignMmTransport>> {
-        self.vm.foreign_mm_transport()
+    fn foreign_mm_endpoint(&self) -> Option<carrick_hal::ForeignMmEndpoint> {
+        self.vm.foreign_mm_endpoint()
     }
 
     fn audit_executor_boundary(&mut self) -> Result<(), TrapError> {
