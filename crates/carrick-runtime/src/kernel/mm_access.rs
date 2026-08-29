@@ -31,6 +31,7 @@ pub struct MmToken {
     #[allow(dead_code)]
     // retained for later live-task reauthentication without exposing a raw accessor
     task: TaskKey,
+    kernel: Arc<Kernel>,
     mm: Arc<Mm>,
     snapshot: MmBackendSnapshot,
     foreign_lease: Option<carrick_hal::ForeignMmLeaseEndpoint>,
@@ -457,25 +458,32 @@ impl MmAccessAuthority {
             Err(error) => return Err(MmAccessError::ForeignTransport(error)),
         };
         let validates = || {
-            let inventory = receipt.live_inventory();
             receipt.mm() == requested.mm
                 && receipt.range_start() == range.start
                 && receipt.range_len() == range.len.get()
                 && receipt.backend_revision() == requested.backend_revision
                 && receipt.vma_revision() == requested.vma_revision
-                && receipt.frame_inventory_revision() == inventory.frame_inventory_revision()
-                && receipt.mm() == inventory.mm()
-                && receipt.mapping() == inventory.mapping()
-                && receipt.frame() == inventory.frame()
-                && receipt.physical_base() == inventory.physical_base()
-                && receipt.physical_len() == inventory.physical_len()
-                && receipt.owner_generation() == inventory.owner_generation()
                 && receipt.physical_len() >= range.len.get() as u64
                 && receipt
                     .physical_base()
                     .raw()
                     .checked_add(receipt.physical_len())
                     .is_some()
+                && receipt
+                    .kernel_proof()
+                    .downcast_ref::<crate::vcpu_loop::KernelForeignCowProof>()
+                    .is_some_and(|proof| {
+                        proof.authenticates(
+                            &mm.token.kernel,
+                            mm.mm_id(),
+                            receipt.frame_inventory_revision().raw_for_probe(),
+                            receipt.mapping(),
+                            receipt.frame(),
+                            receipt.physical_base(),
+                            receipt.physical_len(),
+                            receipt.owner_generation(),
+                        )
+                    })
         };
         // Test-only reblocking makes any post-commit snapshot reader time out
         // against the exact production mutation coordinator. Receipt-only
@@ -517,19 +525,27 @@ impl MmAccessAuthority {
             RangeAccess::Write,
         )?;
         let snapshot = ProjectedForeignMmSnapshot::from_backend(mm.id(), &before)?;
-        let inventory = witness.transport.live_inventory();
         if snapshot.mm != witness.transport.mm()
             || snapshot.backend_revision != witness.transport.backend_revision()
             || snapshot.vma_revision != witness.transport.vma_revision()
             || snapshot.frame_inventory_revision != witness.transport.frame_inventory_revision()
             || !snapshot.mapping_ids.contains(&witness.transport.mapping())
-            || inventory.mm() != witness.transport.mm()
-            || inventory.frame_inventory_revision() != witness.transport.frame_inventory_revision()
-            || inventory.mapping() != witness.transport.mapping()
-            || inventory.frame() != witness.transport.frame()
-            || inventory.physical_base() != witness.transport.physical_base()
-            || inventory.physical_len() != witness.transport.physical_len()
-            || inventory.owner_generation() != witness.transport.owner_generation()
+            || !witness
+                .transport
+                .kernel_proof()
+                .downcast_ref::<crate::vcpu_loop::KernelForeignCowProof>()
+                .is_some_and(|proof| {
+                    proof.authenticates(
+                        &witness.range.token.kernel,
+                        mm.id(),
+                        witness.transport.frame_inventory_revision().raw_for_probe(),
+                        witness.transport.mapping(),
+                        witness.transport.frame(),
+                        witness.transport.physical_base(),
+                        witness.transport.physical_len(),
+                        witness.transport.owner_generation(),
+                    )
+                })
         {
             return Err(MmAccessError::StaleCowBroken);
         }
@@ -743,7 +759,7 @@ impl KernelContext {
         execution: &ThreadExecutionLease,
     ) -> Result<CurrentMm<'_>, MmAccessError> {
         let mm = self.authenticate_current_mm(execution)?;
-        let token = snapshot_token(self.task.key(), mm, false)?;
+        let token = snapshot_token(self.task.key(), Arc::clone(&self.kernel), mm, false)?;
         Ok(CurrentMm {
             token,
             context: PhantomData,
@@ -804,7 +820,7 @@ impl Kernel {
         }
         let target_mm = task.shared().mm();
         let is_foreign = target_mm.id() != caller_mm.id() || !Arc::ptr_eq(&target_mm, &caller_mm);
-        let token = snapshot_token(target, target_mm, is_foreign)?;
+        let token = snapshot_token(target, Arc::clone(&caller.kernel), target_mm, is_foreign)?;
         if token.mm_id() == caller_mm.id() && Arc::ptr_eq(&token.mm, &caller_mm) {
             Ok(MmRelation::Current(CurrentMm {
                 token,
@@ -818,6 +834,7 @@ impl Kernel {
 
 fn snapshot_token(
     task: TaskKey,
+    kernel: Arc<Kernel>,
     mm: Arc<Mm>,
     retain_foreign: bool,
 ) -> Result<MmToken, MmAccessError> {
@@ -848,6 +865,7 @@ fn snapshot_token(
     };
     Ok(MmToken {
         task,
+        kernel,
         mm,
         snapshot,
         foreign_lease,
@@ -892,16 +910,27 @@ fn validate_snapshot_vmas(snapshot: &MmBackendSnapshot) -> Result<(), MmAccessEr
 mod tests {
     use std::num::{NonZeroU16, NonZeroU64};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Instant;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
     use carrick_abi::LinuxCloneFlags;
     use carrick_guest_mem::{Gpa, GuestVa};
     use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
     use carrick_hal::{
         ForeignCowReceipt, ForeignMmReadLease, ForeignMmReadReceipt, ForeignMmSnapshot,
-        ForeignMmTransport, ForeignMmTransportError, ForeignMmWriteReceipt, ThreadId,
+        ForeignMmTransport, ForeignMmTransportError, ForeignMmWriteReceipt, ThreadId, VcpuKickDyn,
+        VcpuRegistry,
     };
+
+    use super::ProjectedForeignMmSnapshot;
+
+    struct LeaveGuestOnKick(Arc<carrick_hal::InGuestFlag>);
+
+    impl VcpuKickDyn for LeaveGuestOnKick {
+        fn kick(&self) {
+            self.0.leave_guest();
+        }
+    }
 
     use super::super::objects::{
         ExecutorId, MigratableTaskState, ThreadExecutionError, ThreadExecutionLease,
@@ -1094,6 +1123,7 @@ mod tests {
         backend_revision: AtomicU64,
         vma_revision: AtomicU64,
         inventory_revision: AtomicU64,
+        mapping: parking_lot::RwLock<carrick_hal::MappingId>,
     }
 
     impl MutableFixtureBackend {
@@ -1105,7 +1135,15 @@ mod tests {
                 backend_revision: AtomicU64::new(41),
                 vma_revision: AtomicU64::new(43),
                 inventory_revision: AtomicU64::new(47),
+                mapping: parking_lot::RwLock::new(carrick_hal::MappingId::from_kernel_allocation(
+                    NonZeroU64::new(53).unwrap(),
+                )),
             })
+        }
+
+        fn bind_inventory_mapping(&self, mapping: carrick_hal::MappingId, revision: u64) {
+            *self.mapping.write() = mapping;
+            self.inventory_revision.store(revision, Ordering::Release);
         }
 
         fn advance(&self, domain: usize) {
@@ -1136,9 +1174,7 @@ mod tests {
                 vma_revision: Some(VmaRevision::from_authority_raw(
                     self.vma_revision.load(Ordering::Acquire),
                 )),
-                mapping_ids: vec![carrick_hal::MappingId::from_kernel_allocation(
-                    NonZeroU64::new(53).unwrap(),
-                )],
+                mapping_ids: vec![*self.mapping.read()],
                 frame_inventory_revision: Some(self.inventory_revision.load(Ordering::Acquire)),
             })
         }
@@ -1165,6 +1201,10 @@ mod tests {
         WrongPhysical,
         WrongPhysicalLength,
         WrongOwner,
+        ForgedConsistentMapping,
+        ForgedConsistentFrame,
+        ForgedConsistentPhysical,
+        ForgedConsistentOwner,
         AdvancedBackend,
         AdvancedVma,
         AdvancedInventory,
@@ -1175,6 +1215,11 @@ mod tests {
         owner_generation: Arc<AtomicU64>,
         bytes: Arc<parking_lot::Mutex<Vec<u8>>>,
         fault: MockCowFault,
+        proof: crate::vcpu_loop::KernelForeignCowProof,
+        mapping: carrick_hal::MappingId,
+        frame: carrick_hal::FrameId,
+        physical_base: Gpa,
+        physical_len: u64,
     }
 
     #[derive(Debug)]
@@ -1182,6 +1227,11 @@ mod tests {
         owner_generation: Arc<AtomicU64>,
         bytes: Arc<parking_lot::Mutex<Vec<u8>>>,
         fault: MockCowFault,
+        proof: crate::vcpu_loop::KernelForeignCowProof,
+        mapping: carrick_hal::MappingId,
+        frame: carrick_hal::FrameId,
+        physical_base: Gpa,
+        physical_len: u64,
     }
 
     #[derive(Debug)]
@@ -1197,18 +1247,7 @@ mod tests {
         physical_base: Gpa,
         physical_len: u64,
         owner: carrick_hal::ForeignOwnerGeneration,
-        live: MockCowLiveReceipt,
-    }
-
-    #[derive(Debug)]
-    struct MockCowLiveReceipt {
-        mm: carrick_hal::ForeignMmId,
-        inventory: carrick_hal::ForeignFrameInventoryRevision,
-        mapping: carrick_hal::MappingId,
-        frame: carrick_hal::FrameId,
-        physical_base: Gpa,
-        physical_len: u64,
-        owner: carrick_hal::ForeignOwnerGeneration,
+        kernel_proof: carrick_hal::ForeignCowKernelProof,
     }
 
     impl ForeignCowReceipt for MockCowReceipt {
@@ -1245,32 +1284,8 @@ mod tests {
         fn owner_generation(&self) -> carrick_hal::ForeignOwnerGeneration {
             self.owner
         }
-        fn live_inventory(&self) -> &dyn carrick_hal::ForeignCowLiveInventoryReceipt {
-            &self.live
-        }
-    }
-
-    impl carrick_hal::ForeignCowLiveInventoryReceipt for MockCowLiveReceipt {
-        fn mm(&self) -> carrick_hal::ForeignMmId {
-            self.mm
-        }
-        fn frame_inventory_revision(&self) -> carrick_hal::ForeignFrameInventoryRevision {
-            self.inventory
-        }
-        fn mapping(&self) -> carrick_hal::MappingId {
-            self.mapping
-        }
-        fn frame(&self) -> carrick_hal::FrameId {
-            self.frame
-        }
-        fn physical_base(&self) -> Gpa {
-            self.physical_base
-        }
-        fn physical_len(&self) -> u64 {
-            self.physical_len
-        }
-        fn owner_generation(&self) -> carrick_hal::ForeignOwnerGeneration {
-            self.owner
+        fn kernel_proof(&self) -> &carrick_hal::ForeignCowKernelProof {
+            &self.kernel_proof
         }
     }
 
@@ -1333,7 +1348,6 @@ mod tests {
             _deadline: Instant,
         ) -> Result<Box<dyn ForeignCowReceipt>, ForeignMmTransportError> {
             let next = |raw| NonZeroU64::new(raw + 1).unwrap();
-            let live_mm = snapshot.mm();
             let mm = if self.fault == MockCowFault::WrongMm {
                 carrick_hal::ForeignMmId::from_kernel_allocation(next(
                     snapshot.mm().raw_for_probe(),
@@ -1358,30 +1372,39 @@ mod tests {
                 snapshot.frame_inventory_revision().raw_for_probe()
                     + u64::from(self.fault == MockCowFault::AdvancedInventory),
             );
-            let mapping_raw = if self.fault == MockCowFault::WrongMapping {
-                55
+            let mapping = if matches!(
+                self.fault,
+                MockCowFault::WrongMapping | MockCowFault::ForgedConsistentMapping
+            ) {
+                carrick_hal::MappingId::from_kernel_allocation(
+                    NonZeroU64::new(self.mapping.raw().checked_add(1).unwrap()).unwrap(),
+                )
             } else {
-                53
+                self.mapping
             };
-            let frame_raw = if self.fault == MockCowFault::WrongFrame {
-                61
+            let frame = if matches!(
+                self.fault,
+                MockCowFault::WrongFrame | MockCowFault::ForgedConsistentFrame
+            ) {
+                carrick_hal::FrameId::from_kernel_allocation(
+                    NonZeroU64::new(self.frame.raw().checked_add(1).unwrap()).unwrap(),
+                )
             } else {
-                59
+                self.frame
             };
-            let physical_base = if self.fault == MockCowFault::WrongPhysical {
-                Gpa(0xc000)
+            let physical_base = if matches!(
+                self.fault,
+                MockCowFault::WrongPhysical | MockCowFault::ForgedConsistentPhysical
+            ) {
+                Gpa(self.physical_base.raw().checked_add(0x4000).unwrap())
             } else {
-                Gpa(0xb000)
+                self.physical_base
             };
             let owner_raw = self.owner_generation.load(Ordering::Acquire)
-                + u64::from(self.fault == MockCowFault::WrongOwner);
-            let live_mapping =
-                carrick_hal::MappingId::from_kernel_allocation(NonZeroU64::new(53).unwrap());
-            let live_frame =
-                carrick_hal::FrameId::from_kernel_allocation(NonZeroU64::new(59).unwrap());
-            let live_owner = carrick_hal::ForeignOwnerGeneration::from_backend_counter(
-                NonZeroU64::new(self.owner_generation.load(Ordering::Acquire)).unwrap(),
-            );
+                + u64::from(matches!(
+                    self.fault,
+                    MockCowFault::WrongOwner | MockCowFault::ForgedConsistentOwner
+                ));
             Ok(Box::new(MockCowReceipt {
                 mm,
                 start,
@@ -1389,30 +1412,20 @@ mod tests {
                 backend,
                 vma,
                 inventory,
-                mapping: carrick_hal::MappingId::from_kernel_allocation(
-                    NonZeroU64::new(mapping_raw).unwrap(),
-                ),
-                frame: carrick_hal::FrameId::from_kernel_allocation(
-                    NonZeroU64::new(frame_raw).unwrap(),
-                ),
+                mapping,
+                frame,
                 physical_base,
                 physical_len: if self.fault == MockCowFault::WrongPhysicalLength {
-                    0x2000
+                    self.physical_len / 2
                 } else {
-                    0x4000
+                    self.physical_len
                 },
                 owner: carrick_hal::ForeignOwnerGeneration::from_backend_counter(
                     NonZeroU64::new(owner_raw).unwrap(),
                 ),
-                live: MockCowLiveReceipt {
-                    mm: live_mm,
-                    inventory: snapshot.frame_inventory_revision(),
-                    mapping: live_mapping,
-                    frame: live_frame,
-                    physical_base: Gpa(0xb000),
-                    physical_len: 0x4000,
-                    owner: live_owner,
-                },
+                kernel_proof: carrick_hal::ForeignCowKernelProof::from_runtime_authority(Box::new(
+                    self.proof.clone(),
+                )),
             }))
         }
 
@@ -1453,15 +1466,9 @@ mod tests {
                 physical_base: cow.physical_base(),
                 physical_len: cow.physical_len(),
                 owner: cow.owner_generation(),
-                live: MockCowLiveReceipt {
-                    mm: cow.live_inventory().mm(),
-                    inventory: cow.live_inventory().frame_inventory_revision(),
-                    mapping: cow.live_inventory().mapping(),
-                    frame: cow.live_inventory().frame(),
-                    physical_base: cow.live_inventory().physical_base(),
-                    physical_len: cow.live_inventory().physical_len(),
-                    owner: cow.live_inventory().owner_generation(),
-                },
+                kernel_proof: carrick_hal::ForeignCowKernelProof::from_runtime_authority(Box::new(
+                    self.proof.clone(),
+                )),
             })))
         }
     }
@@ -1477,6 +1484,11 @@ mod tests {
                 owner_generation: Arc::clone(&self.owner_generation),
                 bytes: Arc::clone(&self.bytes),
                 fault: self.fault,
+                proof: self.proof.clone(),
+                mapping: self.mapping,
+                frame: self.frame,
+                physical_base: self.physical_base,
+                physical_len: self.physical_len,
             }))
         }
     }
@@ -1614,6 +1626,49 @@ mod tests {
         }
     }
 
+    fn publish_cow_mapping(
+        kernel: &Arc<Kernel>,
+        mm: MmId,
+        gpa: Gpa,
+        len: u64,
+    ) -> (carrick_hal::MappingId, carrick_hal::FrameId, u64) {
+        let capacity = carrick_hal::FrameEventCapacity::for_event_count(2).unwrap();
+        let mut reservation = kernel.reserve_frame_inventory(1, 1, capacity).unwrap();
+        let transaction = reservation.transaction();
+        let frame = reservation.claim_frame().unwrap();
+        let mapping = reservation.claim_mapping().unwrap();
+        let generation =
+            carrick_hal::MappingGeneration::from_backend_counter(NonZeroU64::new(1).unwrap());
+        let length = carrick_hal::FrameLength::from_mapping_extent(NonZeroU64::new(len).unwrap());
+        reservation
+            .push(carrick_hal::FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation,
+                gpa,
+                length,
+                permissions: carrick_hal::MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(carrick_hal::FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation,
+            })
+            .unwrap();
+        let (_, revision) = kernel
+            .frame_inventory()
+            .apply(mm, reservation.commit(()))
+            .unwrap();
+        (mapping, frame, revision)
+    }
+
     #[allow(clippy::type_complexity)]
     fn cow_fixture(
         kernel: &Arc<Kernel>,
@@ -1636,14 +1691,37 @@ mod tests {
         );
         let owner_generation = Arc::new(AtomicU64::new(61));
         let bytes = Arc::new(parking_lot::Mutex::new(b"same".to_vec()));
+        let mm = child.shared().mm().id();
+        let physical_base = Gpa(0xb000);
+        let physical_len = 0x4000;
+        let (mapping, frame, inventory_revision) =
+            publish_cow_mapping(kernel, mm, physical_base, physical_len);
+        backend.bind_inventory_mapping(mapping, inventory_revision);
+        let owner = carrick_hal::ForeignOwnerGeneration::from_backend_counter(
+            NonZeroU64::new(owner_generation.load(Ordering::Acquire)).unwrap(),
+        );
+        let proof = crate::vcpu_loop::KernelForeignCowProof::new(
+            Arc::clone(kernel),
+            mm,
+            inventory_revision,
+            mapping,
+            frame,
+            physical_base,
+            carrick_hal::FrameLength::from_mapping_extent(NonZeroU64::new(physical_len).unwrap()),
+            owner,
+        );
         child.shared().mm().install_foreign_mm_endpoint_for_test(
             carrick_hal::ForeignMmEndpoint::for_carrier(Arc::new(MockCowTransport {
                 owner_generation: Arc::clone(&owner_generation),
                 bytes: Arc::clone(&bytes),
                 fault,
+                proof,
+                mapping,
+                frame,
+                physical_base,
+                physical_len,
             })),
         );
-        let mm = child.shared().mm().id();
         let (_stage1_pool, stage1) = crate::hvpatch::Stage1MmPool::new_root_for_tests(0x8000, 4)
             .expect("foreign mutation test stage-1 lease");
         child
@@ -1688,11 +1766,32 @@ mod tests {
             );
         backend.bind_inventory(kernel, mm);
         backend.bind_vma_source(dispatch_mm);
+        let physical_base = Gpa(0xb000);
+        let physical_len = 0x4000;
+        let (mapping, frame, inventory_revision) =
+            publish_cow_mapping(kernel, mm, physical_base, physical_len);
+        let owner =
+            carrick_hal::ForeignOwnerGeneration::from_backend_counter(NonZeroU64::new(61).unwrap());
+        let proof = crate::vcpu_loop::KernelForeignCowProof::new(
+            Arc::clone(kernel),
+            mm,
+            inventory_revision,
+            mapping,
+            frame,
+            physical_base,
+            carrick_hal::FrameLength::from_mapping_extent(NonZeroU64::new(physical_len).unwrap()),
+            owner,
+        );
         child.shared().mm().install_foreign_mm_endpoint_for_test(
             carrick_hal::ForeignMmEndpoint::for_carrier(Arc::new(MockCowTransport {
                 owner_generation: Arc::new(AtomicU64::new(61)),
                 bytes: Arc::new(parking_lot::Mutex::new(b"same".to_vec())),
                 fault: MockCowFault::ReacquireSnapshot,
+                proof,
+                mapping,
+                frame,
+                physical_base,
+                physical_len,
             })),
         );
         child
@@ -1700,6 +1799,104 @@ mod tests {
             .mm()
             .install_foreign_mm_mutation_authority_for_test(mutation);
         child
+    }
+
+    struct RealProductionCowFixture {
+        child: KernelContext,
+        stage1: Arc<crate::hvpatch::Stage1MmLease>,
+        dispatch_mm: Arc<crate::dispatch::DispatchMmAuthority>,
+        carrier:
+            carrick_vmm_hvf::trap::foreign_cow_test_support::ProductionCarrierForeignCowHarness,
+    }
+
+    fn real_production_cow_fixture(
+        kernel: &Arc<Kernel>,
+        parent: &KernelContext,
+        registry_id: i32,
+        stage1_root: u64,
+        data_ipa: u64,
+        caller_tid: ThreadId,
+    ) -> RealProductionCowFixture {
+        use carrick_vmm_hvf::trap::foreign_cow_test_support::{
+            FixtureShape, InitialInventoryIdentity, ProductionCarrierForeignCowHarness, TEST_VA,
+        };
+
+        let (_stage1_pool, stage1) =
+            crate::hvpatch::Stage1MmPool::new_root_for_tests(stage1_root, 4)
+                .expect("real production foreign COW stage-1 lease");
+        let backend = stage1.backend();
+        let child = fork_with_backend(
+            kernel,
+            parent,
+            registry_id,
+            "real production carrier foreign COW",
+            Arc::clone(&backend) as Arc<dyn MmBackend>,
+        );
+        let mm = child.shared().mm().id();
+        let shape = FixtureShape::new(Gpa(stage1_root), Gpa(data_ipa))
+            .expect("real production carrier fixture shape");
+        let (dispatch_mm, mutation) =
+            crate::dispatch::DispatchMmAuthority::foreign_cow_composition_for_test(
+                mm,
+                Arc::clone(&stage1),
+                TEST_VA,
+                TEST_VA + shape.data_len,
+            );
+        backend.bind_inventory(kernel, mm);
+        let vma_source: crate::kernel::SharedVmaSnapshotSource = dispatch_mm.clone();
+        backend.bind_vma_source(vma_source);
+        let (root_mapping, root_frame, _) =
+            publish_cow_mapping(kernel, mm, shape.stage1_root, shape.page_table_len);
+        let (data_mapping, data_frame, _) =
+            publish_cow_mapping(kernel, mm, shape.data_ipa, shape.data_len);
+        let backend_snapshot = backend
+            .snapshot(Instant::now() + std::time::Duration::from_secs(1))
+            .expect("real production carrier snapshot");
+        let projected = ProjectedForeignMmSnapshot::from_backend(mm, &backend_snapshot)
+            .expect("typed real production carrier snapshot");
+        let census = dispatch_mm.foreign_cow_executor_census_for_test();
+        let authority = crate::vcpu_loop::kernel_frame_cow_authority_for_test(
+            Arc::clone(kernel),
+            mm,
+            census,
+            caller_tid,
+            projected.binding.asid().raw_for_probe(),
+        );
+        let identity = carrick_hal::FrameCowIdentity {
+            linux_pid: caller_tid.raw(),
+            linux_tid: caller_tid.raw(),
+            mm: mm.raw(),
+            asid: projected.binding.asid().raw_for_probe(),
+        };
+        let carrier = ProductionCarrierForeignCowHarness::install(
+            &projected,
+            shape,
+            InitialInventoryIdentity {
+                root_mapping,
+                root_frame,
+                data_mapping,
+                data_frame,
+            },
+            authority,
+            identity,
+            registry_id as u64,
+            *b"same",
+        )
+        .expect("install production carrier foreign COW transport");
+        child
+            .shared()
+            .mm()
+            .install_foreign_mm_endpoint_for_test(carrier.endpoint());
+        child
+            .shared()
+            .mm()
+            .install_foreign_mm_mutation_authority_for_test(mutation);
+        RealProductionCowFixture {
+            child,
+            stage1,
+            dispatch_mm,
+            carrier,
+        }
     }
 
     fn with_mm_mutation<T>(
@@ -1783,13 +1980,270 @@ mod tests {
     }
 
     #[test]
-    fn production_composition_clone_vm_target_reuses_exact_cow_authority() {
+    fn production_carrier_foreign_cow_runs_end_to_end_through_runtime_facade() {
+        use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
+
+        let (kernel, root) = bootstrap(31_110);
+        let execution = execution_lease(&root, 110);
+        let fixture = real_production_cow_fixture(
+            &kernel,
+            &root,
+            31_111,
+            0x9a00_3000_0000,
+            0x9b00_3000_0000,
+            ThreadId::synthetic_for_tests(31_079),
+        );
+        let foreign = foreign_mm(&kernel, &root, &execution, fixture.child.task().key());
+        let range = foreign.write_range(GuestVa(TEST_VA), 4).unwrap().unwrap();
+
+        let write = with_foreign_mutation(&foreign, |mutation| {
+            let cow = super::MmAccessAuthority::new()
+                .break_foreign_cow(mutation, &foreign, range)
+                .expect("production carrier COW transaction");
+            super::MmAccessAuthority::new()
+                .write_foreign(cow, b"edit")
+                .expect("production carrier authenticated write")
+        });
+
+        assert_eq!(write.bytes_written(), 4);
+        assert_eq!(
+            fixture.stage1.binding().stage1_root.gpa(),
+            Gpa(0x9a00_3000_0000)
+        );
+        assert_ne!(fixture.dispatch_mm.vma_revision().raw(), 0);
+        let _keep_carrier_live = &fixture.carrier;
+    }
+
+    #[test]
+    fn production_carrier_budget_one_full_occupancy_defers_caller_self_ack_to_entry() {
+        use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
+
+        const ISOLATED_ENV: &str = "CARRICK_TASK7_BUDGET_ONE_CHILD";
+        if std::env::var_os(ISOLATED_ENV).is_none() {
+            let status = std::process::Command::new(
+                std::env::current_exe().expect("locate runtime unit-test executable"),
+            )
+            .arg("--exact")
+            .arg(
+                "kernel::mm_access::tests::production_carrier_budget_one_full_occupancy_defers_caller_self_ack_to_entry",
+            )
+            .arg("--nocapture")
+            .env(ISOLATED_ENV, "1")
+            .status()
+            .expect("run isolated production vCPU-budget test");
+            assert!(
+                status.success(),
+                "isolated production vCPU-budget test failed"
+            );
+            return;
+        }
+        let _handshake = crate::vcpu_loop::quiesce::foreign_cow_handshake_test_lock();
+        let (kernel, root) = bootstrap(31_112);
+        let execution = execution_lease(&root, 112);
+        let caller_tid = ThreadId::synthetic_for_tests(31_079);
+        let fixture = real_production_cow_fixture(
+            &kernel,
+            &root,
+            31_113,
+            0x9a00_3100_0000,
+            0x9b00_3100_0000,
+            caller_tid,
+        );
+        let mm = fixture.child.shared().mm().id();
+        let caller_executor = ExecutorId::for_transitional_thread(caller_tid)
+            .expect("production caller executor identity");
+        fixture
+            .stage1
+            .begin_asid_load(caller_executor)
+            .expect("publish caller target-MM load")
+            .mark_resident()
+            .expect("publish caller target-MM residency");
+        let binding = crate::vcpu_loop::quiesce::foreign_cow_task_binding_for_test(
+            Arc::clone(&fixture.stage1),
+            mm,
+        )
+        .expect("construct caller foreign-COW task binding");
+        let observer = binding.cow_invalidation_observer(caller_executor);
+        carrick_hal::vcpu_sched::install_for_budget(1);
+        let scheduler = carrick_hal::vcpu_sched::global();
+        let occupied = scheduler.acquire(caller_tid.raw() as u64);
+        assert!(
+            !scheduler.has_spare_capacity(),
+            "the caller owns the sole vCPU"
+        );
+        let foreign = foreign_mm(&kernel, &root, &execution, fixture.child.task().key());
+        let range = foreign.write_range(GuestVa(TEST_VA), 4).unwrap().unwrap();
+
+        let cow = with_foreign_mutation(&foreign, |mutation| {
+            super::MmAccessAuthority::new()
+                .break_foreign_cow(mutation, &foreign, range)
+                .expect("full-occupancy carrier COW must not acquire a maintenance vCPU")
+        });
+        assert!(
+            fixture
+                .stage1
+                .pending_cow_invalidation(caller_executor)
+                .is_some(),
+            "foreign caller resident must not be awaited as its own command"
+        );
+        assert!(
+            !scheduler.has_waiters(),
+            "COW attempted a second vCPU acquisition"
+        );
+
+        let in_guest = carrick_hal::InGuestFlag::for_guest_thread();
+        let hardware_calls = AtomicUsize::new(0);
+        let entered =
+            crate::vcpu_loop::quiesce::enter_hvpatch_guest_or_service_invalidation_for_test(
+                &in_guest,
+                caller_tid,
+                caller_executor,
+                &binding,
+                &observer,
+                |_| {
+                    hardware_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .expect("mandatory production pre-entry invalidation service");
+        assert!(
+            entered,
+            "inactive resident should continue into guest after service"
+        );
+        in_guest.leave_guest();
+        assert_eq!(hardware_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            fixture
+                .stage1
+                .pending_cow_invalidation(caller_executor)
+                .is_none()
+        );
+        drop(cow);
+        scheduler.release(occupied, carrick_hal::vcpu_sched::Yield::Exited);
+    }
+
+    #[test]
+    fn production_carrier_active_target_services_publication_on_owner_entry_path() {
+        use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
+
+        let _handshake = crate::vcpu_loop::quiesce::foreign_cow_handshake_test_lock();
+        let (kernel, root) = bootstrap(31_114);
+        let execution = execution_lease(&root, 114);
+        let caller_tid = ThreadId::synthetic_for_tests(31_079);
+        let fixture = real_production_cow_fixture(
+            &kernel,
+            &root,
+            31_115,
+            0x9a00_3200_0000,
+            0x9b00_3200_0000,
+            caller_tid,
+        );
+        let mm = fixture.child.shared().mm().id();
+        let active_tid = ThreadId::synthetic_for_tests(31_116);
+        let active_executor = ExecutorId::for_transitional_thread(active_tid)
+            .expect("production active executor identity");
+        fixture
+            .stage1
+            .begin_asid_load(active_executor)
+            .expect("publish active target-MM load")
+            .mark_resident()
+            .expect("publish active target-MM residency");
+        let binding = crate::vcpu_loop::quiesce::foreign_cow_task_binding_for_test(
+            Arc::clone(&fixture.stage1),
+            mm,
+        )
+        .expect("construct active foreign-COW task binding");
+        let observer = binding.cow_invalidation_observer(active_executor);
+        let registry = Arc::new(carrick_hal::GenericVcpuRegistry::new());
+        let in_guest = Arc::new(carrick_hal::InGuestFlag::for_guest_thread());
+        assert!(matches!(
+            registry.subscribe_register(
+                active_tid,
+                Box::new(LeaveGuestOnKick(Arc::clone(&in_guest))),
+                &in_guest,
+                Arc::new(|| {}),
+            ),
+            carrick_hal::VcpuRegistrationEnrollment::Registered
+        ));
+        let census = fixture.dispatch_mm.foreign_cow_executor_census_for_test();
+        let endpoint: Arc<dyn VcpuRegistry> = registry.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+        let hardware_calls = Arc::new(AtomicUsize::new(0));
+        let worker_calls = Arc::clone(&hardware_calls);
+        let worker = std::thread::spawn(move || {
+            let _participation = census
+                .enter_with_pause_endpoint(None, endpoint, active_tid)
+                .expect("production active target census participation");
+            in_guest.enter_guest();
+            ready_tx.send(()).expect("publish active target entry");
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !crate::vcpu_loop::quiesce::pt_barrier().is_quiescing() {
+                assert!(
+                    Instant::now() < deadline,
+                    "production target pause was never raised"
+                );
+                std::thread::yield_now();
+            }
+            let entered =
+                crate::vcpu_loop::quiesce::enter_hvpatch_guest_or_service_invalidation_for_test(
+                    &in_guest,
+                    active_tid,
+                    active_executor,
+                    &binding,
+                    &observer,
+                    |_| {
+                        worker_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
+                .expect("active target production entry service");
+            assert!(
+                !entered,
+                "paused target returns to the outer execution loop"
+            );
+        });
+        ready_rx.recv().expect("active target is in guest");
+        let foreign = foreign_mm(&kernel, &root, &execution, fixture.child.task().key());
+        let range = foreign.write_range(GuestVa(TEST_VA), 4).unwrap().unwrap();
+
+        let result = with_foreign_mutation(&foreign, |mutation| {
+            super::MmAccessAuthority::new().break_foreign_cow(mutation, &foreign, range)
+        });
+        worker
+            .join()
+            .expect("active target resumes after COW commit");
+
+        assert!(
+            result.is_ok(),
+            "active target carrier COW failed: {result:?}"
+        );
+        assert_eq!(hardware_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            fixture
+                .stage1
+                .pending_cow_invalidation(active_executor)
+                .is_none()
+        );
+        registry.unregister(active_tid);
+    }
+
+    #[test]
+    fn production_carrier_clone_vm_target_reuses_exact_cow_authority() {
+        use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
+
         let (kernel, root) = bootstrap(31_079);
         let execution = execution_lease(&root, 79);
-        let target = production_composition_cow_fixture(&kernel, &root, 31_080);
+        let target = real_production_cow_fixture(
+            &kernel,
+            &root,
+            31_080,
+            0x9a00_3300_0000,
+            0x9b00_3300_0000,
+            ThreadId::synthetic_for_tests(31_079),
+        );
         let shared = kernel
             .reserve_fork(
-                &target,
+                &target.child,
                 ClonePlan::from_flags(LinuxCloneFlags::VM).expect("CLONE_VM plan"),
                 "production foreign COW CLONE_VM peer".to_owned(),
                 None,
@@ -1802,9 +2256,12 @@ mod tests {
             .into_parts()
             .expect("start CLONE_VM peer")
             .0;
-        assert!(Arc::ptr_eq(&target.shared().mm(), &shared.shared().mm()));
+        assert!(Arc::ptr_eq(
+            &target.child.shared().mm(),
+            &shared.shared().mm()
+        ));
         let foreign = foreign_mm(&kernel, &root, &execution, shared.task().key());
-        let range = foreign.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
+        let range = foreign.write_range(GuestVa(TEST_VA), 4).unwrap().unwrap();
 
         let result = with_foreign_mutation(&foreign, |mutation| {
             super::MmAccessAuthority::new().break_foreign_cow(mutation, &foreign, range)
@@ -1817,44 +2274,112 @@ mod tests {
     }
 
     #[test]
-    fn production_composition_retained_target_cow_survives_exec_and_retirement() {
-        let (kernel, root) = bootstrap(31_082);
-        let execution = execution_lease(&root, 82);
-        let target = production_composition_cow_fixture(&kernel, &root, 31_083);
-        let foreign = foreign_mm(&kernel, &root, &execution, target.task().key());
-        let retained_mm = foreign.mm_id();
+    fn production_carrier_target_exec_and_retirement_race_foreign_acquisition() {
+        use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
 
-        let replacement = kernel
-            .commit_exec(
-                kernel
-                    .prepare_exec_with_mm_backend(&target, fixture_backend(), None)
-                    .expect("prepare target exec"),
-                None,
-            )
-            .expect("commit target exec");
-        assert_ne!(replacement.shared().mm().id(), retained_mm);
-        let replacement_key = replacement.task().key();
-        kernel
-            .exit_task_key_eventually(replacement_key, LinuxWaitStatus::from_wait_encoding(0))
-            .expect("retire exec replacement");
-        drop(replacement);
-        let _ = kernel
-            .wait_child_key(
-                root.task().key().id,
-                replacement_key,
-                super::super::WaitMode::Consume,
-            )
-            .expect("reap retired replacement");
-        kernel.sweep_retired_threads();
+        fn finish_acquisition(acquired: Result<MmRelation<'_>, MmAccessError>, expected_mm: MmId) {
+            match acquired {
+                Ok(MmRelation::Foreign(foreign)) => {
+                    assert_eq!(foreign.mm_id(), expected_mm, "race selected the wrong MM");
+                    let range = foreign
+                        .write_range(GuestVa(TEST_VA), 4)
+                        .expect("race target range validation")
+                        .expect("race target has writable production VMA");
+                    let result = super::MmAccessAuthority::new().with_foreign_mutation(
+                        &foreign,
+                        ThreadId::synthetic_for_tests(31_079),
+                        |mutation| {
+                            super::MmAccessAuthority::new()
+                                .break_foreign_cow(mutation, &foreign, range)
+                        },
+                    );
+                    assert!(
+                        result.is_ok(),
+                        "retained race winner failed COW: {result:?}"
+                    );
+                }
+                Err(MmAccessError::UnknownTask(_) | MmAccessError::StaleContext(_)) => {}
+                Err(MmAccessError::Snapshot(SnapshotError::TimedOut)) => {}
+                Ok(MmRelation::Current(_)) => panic!("foreign race selected caller MM"),
+                Err(error) => panic!("unexpected foreign acquisition race outcome: {error:?}"),
+            }
+        }
 
-        let range = foreign.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
-        let result = with_foreign_mutation(&foreign, |mutation| {
-            super::MmAccessAuthority::new().break_foreign_cow(mutation, &foreign, range)
-        });
-        assert!(
-            result.is_ok(),
-            "retained exact target MM lost COW authority after exec/retirement: {result:?}"
-        );
+        {
+            let (kernel, root) = bootstrap(31_117);
+            let execution = execution_lease(&root, 117);
+            let target = real_production_cow_fixture(
+                &kernel,
+                &root,
+                31_118,
+                0x9a00_3400_0000,
+                0x9b00_3400_0000,
+                ThreadId::synthetic_for_tests(31_079),
+            );
+            let target_key = target.child.task().key();
+            let expected_mm = target.child.shared().mm().id();
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let (acquired, replacement) = std::thread::scope(|scope| {
+                let worker_start = Arc::clone(&start);
+                let worker_kernel = &kernel;
+                let worker_target = &target.child;
+                let worker = scope.spawn(move || {
+                    worker_start.wait();
+                    worker_kernel
+                        .commit_exec(
+                            worker_kernel
+                                .prepare_exec_with_mm_backend(
+                                    worker_target,
+                                    fixture_backend(),
+                                    None,
+                                )
+                                .expect("prepare racing target exec"),
+                            None,
+                        )
+                        .expect("commit racing target exec")
+                });
+                start.wait();
+                let acquired = kernel.foreign_mm(&root, &execution, target_key);
+                let replacement = worker.join().expect("racing exec worker");
+                (acquired, replacement)
+            });
+            finish_acquisition(acquired, expected_mm);
+            assert_ne!(replacement.shared().mm().id(), expected_mm);
+        }
+
+        {
+            let (kernel, root) = bootstrap(31_119);
+            let execution = execution_lease(&root, 119);
+            let target = real_production_cow_fixture(
+                &kernel,
+                &root,
+                31_120,
+                0x9a00_3500_0000,
+                0x9b00_3500_0000,
+                ThreadId::synthetic_for_tests(31_079),
+            );
+            let target_key = target.child.task().key();
+            let expected_mm = target.child.shared().mm().id();
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let acquired = std::thread::scope(|scope| {
+                let worker_start = Arc::clone(&start);
+                let worker_kernel = &kernel;
+                let worker = scope.spawn(move || {
+                    worker_start.wait();
+                    worker_kernel
+                        .exit_task_key_eventually(
+                            target_key,
+                            LinuxWaitStatus::from_wait_encoding(0),
+                        )
+                        .expect("racing target retirement")
+                });
+                start.wait();
+                let acquired = kernel.foreign_mm(&root, &execution, target_key);
+                worker.join().expect("racing retirement worker");
+                acquired
+            });
+            finish_acquisition(acquired, expected_mm);
+        }
     }
 
     #[test]
@@ -1922,6 +2447,32 @@ mod tests {
         {
             let (target, _backend, _owner, _bytes) =
                 cow_fixture(&kernel, &root, 31_087 + index as i32, fault);
+            let target = foreign_mm(&kernel, &root, &execution, target.task().key());
+            let range = target.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
+            with_foreign_mutation(&target, |mutation| {
+                assert!(matches!(
+                    super::MmAccessAuthority::new().break_foreign_cow(mutation, &target, range,),
+                    Err(MmAccessError::ForeignCowReceiptMismatch)
+                ));
+            });
+        }
+    }
+
+    #[test]
+    fn foreign_cow_rejects_internally_consistent_transport_forgery() {
+        let (kernel, root) = bootstrap(31_096);
+        let execution = execution_lease(&root, 96);
+        for (index, fault) in [
+            MockCowFault::ForgedConsistentMapping,
+            MockCowFault::ForgedConsistentFrame,
+            MockCowFault::ForgedConsistentPhysical,
+            MockCowFault::ForgedConsistentOwner,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (target, _backend, _owner, _bytes) =
+                cow_fixture(&kernel, &root, 31_097 + index as i32, fault);
             let target = foreign_mm(&kernel, &root, &execution, target.task().key());
             let range = target.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
             with_foreign_mutation(&target, |mutation| {

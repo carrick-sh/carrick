@@ -1925,6 +1925,32 @@ pub trait FrameCowAuthority: Send + Sync {
         )))
     }
 
+    /// Atomically apply one foreign-COW inventory commit and mint an opaque
+    /// runtime-private proof binding its exact mapping, physical extent, and
+    /// host-owner generation. The backend may carry this proof but cannot
+    /// construct the private payload accepted by the runtime facade.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_foreign_cow(
+        &self,
+        _commit: crate::FrameInventoryCommit<()>,
+        _mapping: crate::MappingId,
+        _frame: crate::FrameId,
+        _gpa: carrick_guest_mem::Gpa,
+        _length: crate::FrameLength,
+        _owner_generation: crate::ForeignOwnerGeneration,
+    ) -> Result<
+        (
+            crate::FrameInventoryApplyReceipt,
+            crate::ForeignCowKernelProof,
+        ),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "frame COW authority does not issue foreign-COW proofs",
+        )))
+    }
+
     /// Authenticate that the just-published physical mapping is visible in
     /// the bound mm's kernel-owned graph before the backend advertises a COW
     /// commit or disarms the permission fault.

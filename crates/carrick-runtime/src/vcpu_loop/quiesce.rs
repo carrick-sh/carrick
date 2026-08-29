@@ -82,6 +82,36 @@ pub(super) fn enter_hvpatch_guest_or_service_invalidation(
     engine: &mut dyn std::any::Any,
     control: &crate::vcpu_loop::executor::HvpatchQuantumControl<'_, '_>,
 ) -> Result<bool, carrick_hal::TrapError> {
+    enter_hvpatch_guest_or_service_invalidation_inner(
+        in_guest,
+        barrier,
+        tid,
+        control.cow_invalidation_binding(),
+        |asid| {
+            let engine = engine
+                .downcast_mut::<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Engine>()
+                .ok_or_else(|| {
+                    carrick_hal::TrapError::Hypervisor(
+                        "foreign COW invalidation reached a non-HVF owner engine".to_owned(),
+                    )
+                })?;
+            carrick_vmm_hvf::hvf_aarch64_engine::invalidate_loaded_asid(engine, asid)
+        },
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn enter_hvpatch_guest_or_service_invalidation_inner(
+    in_guest: &carrick_hal::InGuestFlag,
+    barrier: &'static crate::fork_quiesce::PtQuiesce,
+    tid: carrick_hal::ThreadId,
+    cow_binding: Option<(
+        crate::kernel::objects::ExecutorId,
+        &Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>,
+        &crate::hvpatch::CowInvalidationObserver,
+    )>,
+    mut invalidate: impl FnMut(u16) -> Result<(), carrick_hal::TrapError>,
+) -> Result<bool, carrick_hal::TrapError> {
     in_guest.enter_guest();
     // A resident executor can have been inactive when a foreign COW was
     // published, so task-load service alone is insufficient. Marking in_guest
@@ -89,19 +119,9 @@ pub(super) fn enter_hvpatch_guest_or_service_invalidation(
     // before it can edit/publish, while an older deferred generation can be
     // serviced immediately on this exact loaded owner vCPU.
     if !barrier.is_quiescing() {
-        if let Some((_executor, binding, observer)) = control.cow_invalidation_binding() {
+        if let Some((_executor, binding, observer)) = cow_binding {
             binding.service_pending_cow_invalidation(observer, |generation| {
-                let engine = engine
-                    .downcast_mut::<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Engine>()
-                    .ok_or_else(|| {
-                        carrick_hal::TrapError::Hypervisor(
-                            "foreign COW pre-entry reached a non-HVF owner engine".to_owned(),
-                        )
-                    })?;
-                carrick_vmm_hvf::hvf_aarch64_engine::invalidate_loaded_asid(
-                    engine,
-                    generation.raw(),
-                )
+                invalidate(generation.raw())
             })?;
         } else {
             #[cfg(not(test))]
@@ -114,7 +134,7 @@ pub(super) fn enter_hvpatch_guest_or_service_invalidation(
         }
     }
     in_guest.leave_guest();
-    let (executor, binding, _observer) = control.cow_invalidation_binding().ok_or_else(|| {
+    let (executor, binding, _observer) = cow_binding.ok_or_else(|| {
         carrick_hal::TrapError::Hypervisor(
             "quiesced HVPatch executor lacks exact invalidation binding".to_owned(),
         )
@@ -141,17 +161,7 @@ pub(super) fn enter_hvpatch_guest_or_service_invalidation(
                         .to_owned(),
                 ));
             }
-            let engine = engine
-                .downcast_mut::<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Engine>()
-                .ok_or_else(|| {
-                    carrick_hal::TrapError::Hypervisor(
-                        "foreign COW invalidation reached a non-HVF owner engine".to_owned(),
-                    )
-                })?;
-            carrick_vmm_hvf::hvf_aarch64_engine::invalidate_loaded_asid(
-                engine,
-                request.identity().stage1().binding().asid().raw_for_probe(),
-            )?;
+            invalidate(request.identity().stage1().binding().asid().raw_for_probe())?;
             binding
                 .acknowledge_cow_invalidation(executor, ticket)
                 .map_err(|error| carrick_hal::TrapError::Hypervisor(error.to_string()))
@@ -168,6 +178,64 @@ pub(super) fn enter_hvpatch_guest_or_service_invalidation(
         return Err(error);
     }
     Ok(false)
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn enter_hvpatch_guest_or_service_invalidation_for_test(
+    in_guest: &carrick_hal::InGuestFlag,
+    tid: carrick_hal::ThreadId,
+    executor: crate::kernel::objects::ExecutorId,
+    binding: &Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>,
+    observer: &crate::hvpatch::CowInvalidationObserver,
+    invalidate: impl FnMut(u16) -> Result<(), carrick_hal::TrapError>,
+) -> Result<bool, carrick_hal::TrapError> {
+    enter_hvpatch_guest_or_service_invalidation_inner(
+        in_guest,
+        pt_barrier(),
+        tid,
+        Some((executor, binding, observer)),
+        invalidate,
+    )
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn foreign_cow_task_binding_for_test(
+    stage1: Arc<crate::hvpatch::Stage1MmLease>,
+    mm: crate::kernel::MmId,
+) -> Result<Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>, carrick_hal::TrapError> {
+    struct ExitJob;
+
+    impl crate::vcpu_loop::continuation::PersistentQuantumJob for ExitJob {
+        fn poll_quantum_with_engine(
+            &mut self,
+            _engine: &mut dyn std::any::Any,
+            _control: &mut crate::vcpu_loop::executor::HvpatchQuantumControl<'_, '_>,
+        ) -> crate::vcpu_loop::executor::ExecutorExit {
+            crate::vcpu_loop::executor::ExecutorExit::Exited
+        }
+    }
+
+    crate::vcpu_loop::continuation::HvpatchTaskBinding::new_with_stage1_mm(
+        crate::vcpu_loop::executor::TaskLoadIdentity {
+            abi: carrick_abi::LinuxGuestAbi::Aarch64,
+            version: 1,
+            mm,
+            asid_generation: stage1.asid_generation().generation(),
+        },
+        Arc::new(crate::vcpu_loop::continuation::HvpatchTaskQuantum::new(
+            Box::new(ExitJob),
+            crate::vcpu_loop::continuation::LogicalJobCompletion::pending(),
+        )),
+        Box::new(()),
+        stage1,
+    )
+    .map(Arc::new)
+}
+
+#[cfg(test)]
+pub(crate) fn foreign_cow_handshake_test_lock() -> parking_lot::MutexGuard<'static, ()> {
+    static LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    LOCK.lock()
 }
 
 /// Holds this thread's stage-1 exclusivity claim for a mapping syscall's whole
@@ -2046,8 +2114,6 @@ mod pt_pause_tests {
     use carrick_hal::{GenericVcpuRegistry, VcpuKickDyn, VcpuRegistry};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    static FOREIGN_COW_HANDSHAKE_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
     struct NoopKick;
 
     impl VcpuKickDyn for NoopKick {
@@ -2113,7 +2179,7 @@ mod pt_pause_tests {
 
     #[test]
     fn foreign_cow_active_target_acks_then_inactive_caller_resident_defers_to_reentry() {
-        let _test_lock = FOREIGN_COW_HANDSHAKE_TEST_LOCK.lock();
+        let _test_lock = foreign_cow_handshake_test_lock();
         let barrier = pt_barrier();
         assert!(!barrier.is_quiescing());
         let registry = Arc::new(GenericVcpuRegistry::new());

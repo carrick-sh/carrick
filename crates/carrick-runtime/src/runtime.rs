@@ -2274,6 +2274,10 @@ mod tests {
             ("dispatch/tests.rs", [3, 0, 0]),
             ("exec_stamps.rs", [1, 0, 0]),
             ("fs_backend.rs", [1, 0, 0]),
+            // Task 7's budget-one proof self-spawns this exact unit test in an
+            // isolated process so it can install the process-global vCPU
+            // scheduler before any sibling test initializes the OnceLock.
+            ("kernel/mm_access.rs", [0, 0, 1]),
             ("network/socket_namespace.rs", [7, 0, 0]),
             ("run_state.rs", [1, 0, 0]),
             ("vcpu_loop/signal.rs", [1, 0, 0]),

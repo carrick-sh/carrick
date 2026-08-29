@@ -2524,6 +2524,13 @@ impl DispatchMmAuthority {
     }
 
     #[cfg(test)]
+    pub(crate) fn foreign_cow_executor_census_for_test(
+        &self,
+    ) -> Arc<crate::kernel::GuestExecutorCensus> {
+        Arc::clone(&self.guest_executors)
+    }
+
+    #[cfg(test)]
     fn snapshot_until(
         &self,
         deadline: std::time::Instant,

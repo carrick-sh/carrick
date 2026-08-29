@@ -232,21 +232,32 @@ pub trait ForeignCowReceipt: Debug + Send + Sync {
     fn physical_base(&self) -> Gpa;
     fn physical_len(&self) -> u64;
     fn owner_generation(&self) -> ForeignOwnerGeneration;
-    fn live_inventory(&self) -> &dyn ForeignCowLiveInventoryReceipt;
+    fn kernel_proof(&self) -> &ForeignCowKernelProof;
 }
 
-/// Sealed carrier proof that the COW receipt's complete physical identity is
-/// live in the exact post-commit inventory. Concrete values remain private to
-/// the transport and are data only; runtime compares every domain before
-/// minting safe write authority.
-pub trait ForeignCowLiveInventoryReceipt: Debug + Send + Sync {
-    fn mm(&self) -> ForeignMmId;
-    fn frame_inventory_revision(&self) -> ForeignFrameInventoryRevision;
-    fn mapping(&self) -> MappingId;
-    fn frame(&self) -> crate::FrameId;
-    fn physical_base(&self) -> Gpa;
-    fn physical_len(&self) -> u64;
-    fn owner_generation(&self) -> ForeignOwnerGeneration;
+/// Opaque carrier for a runtime-private kernel-authority proof. Transports can
+/// retain and return the value but cannot construct the private payload type
+/// that the runtime accepts when minting safe write authority.
+pub struct ForeignCowKernelProof {
+    payload: Box<dyn std::any::Any + Send + Sync>,
+}
+
+impl ForeignCowKernelProof {
+    #[doc(hidden)]
+    pub fn from_runtime_authority(payload: Box<dyn std::any::Any + Send + Sync>) -> Self {
+        Self { payload }
+    }
+
+    pub fn downcast_ref<T: std::any::Any>(&self) -> Option<&T> {
+        self.payload.downcast_ref()
+    }
+}
+
+impl Debug for ForeignCowKernelProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ForeignCowKernelProof")
+            .finish_non_exhaustive()
+    }
 }
 
 /// Backend completion data for a copy through one authenticated post-COW
@@ -543,6 +554,7 @@ mod tests {
                 owner_generation: ForeignOwnerGeneration::from_backend_counter(
                     NonZeroU64::new(41).unwrap(),
                 ),
+                kernel_proof: ForeignCowKernelProof::from_runtime_authority(Box::new(())),
             }))
         }
 
@@ -586,6 +598,7 @@ mod tests {
         physical_base: Gpa,
         physical_len: u64,
         owner_generation: ForeignOwnerGeneration,
+        kernel_proof: ForeignCowKernelProof,
     }
 
     impl ForeignCowReceipt for CowReceipt {
@@ -622,32 +635,8 @@ mod tests {
         fn owner_generation(&self) -> ForeignOwnerGeneration {
             self.owner_generation
         }
-        fn live_inventory(&self) -> &dyn ForeignCowLiveInventoryReceipt {
-            self
-        }
-    }
-
-    impl ForeignCowLiveInventoryReceipt for CowReceipt {
-        fn mm(&self) -> ForeignMmId {
-            self.mm
-        }
-        fn frame_inventory_revision(&self) -> ForeignFrameInventoryRevision {
-            self.frame_inventory_revision
-        }
-        fn mapping(&self) -> MappingId {
-            self.mapping
-        }
-        fn frame(&self) -> crate::FrameId {
-            self.frame
-        }
-        fn physical_base(&self) -> Gpa {
-            self.physical_base
-        }
-        fn physical_len(&self) -> u64 {
-            self.physical_len
-        }
-        fn owner_generation(&self) -> ForeignOwnerGeneration {
-            self.owner_generation
+        fn kernel_proof(&self) -> &ForeignCowKernelProof {
+            &self.kernel_proof
         }
     }
 
