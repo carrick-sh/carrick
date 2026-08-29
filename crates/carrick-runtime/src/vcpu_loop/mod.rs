@@ -8108,15 +8108,20 @@ where
         // different reasons, and the backend page-table manager needs to know
         // that so it can reclaim the spare sub-tables an alias teardown empties
         // (`carrick_hal::stage1_exclusive` documents what leaks when it cannot).
+        enum SyscallMmPhase<'executor> {
+            Ordinary(&'executor mut crate::dispatch::MmExecutorParticipation),
+            Mutation(quiesce::MmStage1Authority<'executor>),
+        }
+
         let edits_stage1 =
             syscall_takes_pre_dispatch_pt_pause(frame.number.raw(), frame.args[2], true);
-        let mut stage1_authority = if edits_stage1 {
+        let mut mm_phase = if edits_stage1 {
             match quiesce::acquire_mm_stage1_authority(
                 mm_executor,
                 self.this_tid,
                 quiesce::PtPauseBudget::DEFAULT,
             ) {
-                Ok(authority) => Some(authority),
+                Ok(authority) => SyscallMmPhase::Mutation(authority),
                 Err(
                     quiesce::PtPauseError::TimedOut | quiesce::PtPauseError::UnkickableExecutor,
                 ) => {
@@ -8138,7 +8143,7 @@ where
                 }
             }
         } else {
-            None
+            SyscallMmPhase::Ordinary(mm_executor)
         };
         // The parked-slice, sleep/poll deadline and child-wait trace state that
         // used to live here belonged to the in-loop compatibility wait arms.
@@ -8192,10 +8197,14 @@ where
                         request.args,
                     ) {
                         let coordinator = kernel.dispatcher.mm_mutation_coordinator();
-                        match stage1_authority.as_mut().unwrap_or_else(|| {
-                            tracing::error!("mutation dispatch lacks outer stage-1 authority");
-                            std::process::abort();
-                        }) {
+                        let stage1_authority = match &mut mm_phase {
+                            SyscallMmPhase::Mutation(authority) => authority,
+                            SyscallMmPhase::Ordinary(_) => {
+                                tracing::error!("mutation dispatch lacks outer stage-1 authority");
+                                std::process::abort()
+                            }
+                        };
+                        match stage1_authority {
                             quiesce::MmStage1Authority::Sole(authority) => {
                                 let mut mutation = crate::dispatch::mm_mutation::from_sole_executor(
                                     authority,
@@ -8231,16 +8240,28 @@ where
                             }
                         }
                     } else {
-                        kernel.dispatcher.dispatch_threaded_with_lease(
-                            &kernel_context,
-                            request,
-                            engine,
-                            &kernel.reporter,
-                            self.this_tid,
-                            &self.registry,
-                            &self.futex,
-                            lease,
-                        )
+                        let mm_executor = match &mut mm_phase {
+                            SyscallMmPhase::Ordinary(executor) => &mut **executor,
+                            SyscallMmPhase::Mutation(_) => {
+                                tracing::error!(
+                                    "ordinary dispatch unexpectedly owns stage-1 authority"
+                                );
+                                std::process::abort()
+                            }
+                        };
+                        kernel
+                            .dispatcher
+                            .dispatch_threaded_with_mm_executor_and_lease(
+                                mm_executor,
+                                &kernel_context,
+                                request,
+                                engine,
+                                &kernel.reporter,
+                                self.this_tid,
+                                &self.registry,
+                                &self.futex,
+                                lease,
+                            )
                     }
                 })?;
             if continuation::is_blocking_dispatch_outcome(&outcome) {
@@ -8414,10 +8435,14 @@ where
                                 value: success_retval,
                             })
                         };
-                    let installed = match stage1_authority.as_mut().unwrap_or_else(|| {
-                        tracing::error!("host-alias install lacks outer stage-1 authority");
-                        std::process::abort();
-                    }) {
+                    let stage1_authority = match &mut mm_phase {
+                        SyscallMmPhase::Mutation(authority) => authority,
+                        SyscallMmPhase::Ordinary(_) => {
+                            tracing::error!("host-alias install lacks outer stage-1 authority");
+                            std::process::abort()
+                        }
+                    };
+                    let installed = match stage1_authority {
                         quiesce::MmStage1Authority::Sole(authority) => {
                             let mutation = crate::dispatch::mm_mutation::from_sole_executor(
                                 authority,

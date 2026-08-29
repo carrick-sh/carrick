@@ -4759,6 +4759,7 @@ mod ipc_set_tests {
             reporter: &reporter,
             thread: None,
             execution_lease: None,
+            mm_executor: None,
         };
         let (watch_semnum, watch_kind) = watch;
         let consultations = std::cell::Cell::new(0usize);
