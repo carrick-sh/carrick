@@ -64,6 +64,7 @@ impl ForeignMmAccess {
 
 #[cfg(test)]
 mod tests {
+    use super::super::VmaAccess;
     use super::*;
     use carrick_guest_mem::GuestVa;
 
@@ -75,10 +76,22 @@ mod tests {
                 VmaSummary {
                     start: GuestVa(0x1000),
                     end: GuestVa(0x3000),
+                    access: VmaAccess {
+                        readable: true,
+                        writable: false,
+                        executable: false,
+                        kernel_visible: true,
+                    },
                 },
                 VmaSummary {
                     start: GuestVa(0x4000),
                     end: GuestVa(0x5000),
+                    access: VmaAccess {
+                        readable: true,
+                        writable: true,
+                        executable: false,
+                        kernel_visible: true,
+                    },
                 },
             ],
         };
