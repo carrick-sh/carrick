@@ -220,9 +220,15 @@ pub trait ForeignMmReadReceipt: Debug + Send + Sync {
 /// Backend completion data for one exact post-COW compound. Implementations
 /// are transport-private; the runtime may only inspect the values required to
 /// validate them against its kernel-minted MM authority.
+///
+/// `range_start` and `range_len` define the entire backend-proven semantic COW
+/// span (e.g. 16 KiB compound) that was repointed and unshared.
 pub trait ForeignCowReceipt: Debug + Send + Sync {
     fn mm(&self) -> ForeignMmId;
+    /// Guest virtual address of the start of the exact backend-proven semantic
+    /// COW span (e.g. 16 KiB compound) that was unshared/repointed.
     fn range_start(&self) -> GuestVa;
+    /// Length in bytes of the exact backend-proven semantic COW span.
     fn range_len(&self) -> usize;
     fn backend_revision(&self) -> ForeignBackendRevision;
     fn vma_revision(&self) -> ForeignVmaRevision;
@@ -262,9 +268,14 @@ impl Debug for ForeignCowKernelProof {
 
 /// Backend completion data for a copy through one authenticated post-COW
 /// owner. Implementations are transport-private and confer no safe authority.
+///
+/// `range_start` and `range_len` define the exact requested subrange that was
+/// prepared and written within the authenticated compound COW span.
 pub trait ForeignMmWriteReceipt: Debug + Send + Sync {
     fn mm(&self) -> ForeignMmId;
+    /// Guest virtual address of the start of the exact requested subrange.
     fn range_start(&self) -> GuestVa;
+    /// Length in bytes of the exact requested subrange.
     fn range_len(&self) -> usize;
     fn bytes_written(&self) -> usize;
     fn backend_revision(&self) -> ForeignBackendRevision;
@@ -275,8 +286,10 @@ pub trait ForeignMmWriteReceipt: Debug + Send + Sync {
     fn owner_generation(&self) -> ForeignOwnerGeneration;
 }
 
-/// Single-use transport witness for one prepared foreign copy. Commit consumes
-/// the prepared state and performs the write infallibly.
+/// Single-use transport witness for one prepared foreign copy within an
+/// authenticated compound COW span. Commit consumes the prepared state and
+/// performs the write infallibly with zero post-copy allocation or fallible
+/// operations.
 pub trait ForeignMmPreparedWrite: Debug {
     fn commit(self: Box<Self>);
     fn receipt(&self) -> &dyn ForeignMmWriteReceipt;
@@ -308,6 +321,12 @@ pub trait ForeignMmReadLease: Debug + Send + Sync {
         Err(ForeignMmTransportError::AuthorityUnavailable)
     }
 
+    /// Prepares an infallible write into an authenticated compound COW span.
+    ///
+    /// The transport validates that the subrange `[va, va + src.len())` is
+    /// strictly contained within the compound `[cow.range_start(), cow.range_start() + cow.range_len())`
+    /// and that every crossed 4 KiB leaf translates contiguously to the
+    /// authenticated physical owner.
     #[allow(clippy::too_many_arguments)] // Object-safe transport carries exact mutation domains.
     fn prepare_write<'a>(
         &self,

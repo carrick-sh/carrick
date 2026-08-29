@@ -1078,6 +1078,314 @@ mod foreign_mm_tests {
     }
 
     #[test]
+    fn concurrent_foreign_cow_from_same_snapshot_allows_exactly_one_commit() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let transport = CarrierForeignMmTransport::new();
+        let mut child = install_mm(
+            &transport,
+            128,
+            0x9a00_1f00_0000,
+            0x9b00_1f00_0000,
+            *b"old!",
+        );
+        let (_authority, lease, _invalidator) = prepare_foreign_cow(&child);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let snapshot = child.snapshot.clone();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let lease_clone1 = lease.clone();
+        let lease_clone2 = lease.clone();
+        let barrier1 = std::sync::Arc::clone(&barrier);
+        let barrier2 = std::sync::Arc::clone(&barrier);
+        let snap1 = snapshot.clone();
+        let snap2 = snapshot.clone();
+        let expected_binding = carrick_hal::ForeignMmSnapshot::binding(&snapshot);
+
+        let handle1 = std::thread::spawn(move || {
+            barrier1.wait();
+            let mut invalidator = TestInvalidator {
+                expected: expected_binding,
+                calls: 0,
+                fail_call: None,
+            };
+            lease_clone1.break_cow(&mut invalidator, &snap1, GuestVa(TEST_VA), 4, deadline)
+        });
+        let handle2 = std::thread::spawn(move || {
+            barrier2.wait();
+            let mut invalidator = TestInvalidator {
+                expected: expected_binding,
+                calls: 0,
+                fail_call: None,
+            };
+            lease_clone2.break_cow(&mut invalidator, &snap2, GuestVa(TEST_VA), 4, deadline)
+        });
+
+        let res1 = handle1.join().expect("thread 1 panic");
+        let res2 = handle2.join().expect("thread 2 panic");
+
+        let (winner, loser) = match (res1, res2) {
+            (Ok(cow), Err(err)) => (cow, err),
+            (Err(err), Ok(cow)) => (cow, err),
+            (r1, r2) => {
+                panic!("expected exactly one winner and one loser, got: r1={r1:?}, r2={r2:?}")
+            }
+        };
+        assert!(
+            matches!(loser, carrick_hal::ForeignMmTransportError::MissingBinding),
+            "loser from stale S_n must fail with MissingBinding: {loser:?}"
+        );
+        let winner_key = (winner.physical_base().raw(), winner.physical_len());
+        assert_eq!(winner.range_len(), CowArmedRanges::COMPOUND_SIZE as usize);
+        let owners = global_frame_host_owners().lock();
+        assert!(owners.contains_key(&winner_key));
+        drop(owners);
+        child.owners.0.push(winner_key);
+    }
+
+    #[test]
+    fn foreign_cow_failpoint_leaves_lease_at_sn_and_retry_succeeds() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let transport = CarrierForeignMmTransport::new();
+        let mut child = install_mm(
+            &transport,
+            129,
+            0x9a00_2800_0000,
+            0x9b00_2800_0000,
+            *b"old!",
+        );
+        let (_authority, lease, mut invalidator) = prepare_foreign_cow(&child);
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        // Set failpoint at phase 2 (after allocation, before commit)
+        child.state.set_foreign_cow_failpoint(2);
+        let failed = lease.break_cow(
+            &mut invalidator,
+            &child.snapshot,
+            GuestVa(TEST_VA),
+            4,
+            deadline,
+        );
+        assert!(
+            matches!(
+                failed,
+                Err(carrick_hal::ForeignMmTransportError::MutationFailed)
+            ),
+            "failpoint must fail the COW: {failed:?}"
+        );
+
+        // Clear failpoint and retry on the SAME lease from S_n
+        child.state.set_foreign_cow_failpoint(0);
+        let succeeded = lease
+            .break_cow(
+                &mut invalidator,
+                &child.snapshot,
+                GuestVa(TEST_VA),
+                4,
+                deadline,
+            )
+            .expect("retry from unchanged S_n must succeed");
+
+        let post = child.live.0.read().clone();
+        lease
+            .prepare_write(
+                &child.live,
+                &post,
+                succeeded.as_ref(),
+                GuestVa(TEST_VA),
+                b"new!",
+                deadline,
+            )
+            .expect("prepare write after retry")
+            .commit();
+
+        let new_key = (succeeded.physical_base().raw(), succeeded.physical_len());
+        let owners = global_frame_host_owners().lock();
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(owners[&new_key]._mapping.as_ptr(), 4) },
+            b"new!"
+        );
+        drop(owners);
+        child.owners.0.push(new_key);
+    }
+
+    #[test]
+    fn foreign_cow_prepare_write_rejects_in_span_leaf_discontinuity() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let transport = CarrierForeignMmTransport::new();
+        let mut child = install_mm(
+            &transport,
+            130,
+            0x9a00_2900_0000,
+            0x9b00_2900_0000,
+            *b"old!",
+        );
+        let (_authority, lease, mut invalidator) = prepare_foreign_cow(&child);
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        let cow = lease
+            .break_cow(
+                &mut invalidator,
+                &child.snapshot,
+                GuestVa(TEST_VA),
+                4,
+                deadline,
+            )
+            .expect("break compound COW");
+        let after_cow = child.live.0.read().clone();
+
+        // Repoint the 2nd leaf in stage-1 tables to create a discontinuity across the 4 KiB boundary
+        {
+            let table_owner = global_frame_host_owners().lock()[&child.owners.0[0]].clone();
+            let page_tables = child.state.page_tables_authority();
+            let mut tables = page_tables.lock();
+            let tables = tables.as_mut().unwrap();
+            tables
+                .repoint_preserving_attributes(TEST_VA + 0x1000, 0x9900_0000_0000, 0x1000)
+                .unwrap();
+            unsafe { tables.sync_to_host(table_owner._mapping.as_ptr()) };
+        }
+
+        // An 8 KiB write from TEST_VA crosses the 4 KiB leaf boundary into the discontinuous leaf
+        let crossed_src = vec![0x42u8; 0x2000];
+        let rejected = lease.prepare_write(
+            &child.live,
+            &after_cow,
+            cow.as_ref(),
+            GuestVa(TEST_VA),
+            &crossed_src,
+            deadline,
+        );
+        assert!(
+            matches!(
+                rejected,
+                Err(carrick_hal::ForeignMmTransportError::OwnerStale)
+            ),
+            "crossing into discontinuous leaf must be rejected: {rejected:?}"
+        );
+
+        let cow_key = (cow.physical_base().raw(), cow.physical_len());
+        let owners = global_frame_host_owners().lock();
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(owners[&cow_key]._mapping.as_ptr(), 4) },
+            b"old!"
+        );
+        drop(owners);
+        child.owners.0.push(cow_key);
+    }
+
+    #[test]
+    fn foreign_cow_prepare_write_rejects_semantic_span_end_plus_one() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let transport = CarrierForeignMmTransport::new();
+        let mut child = install_mm(
+            &transport,
+            131,
+            0x9a00_2a00_0000,
+            0x9b00_2a00_0000,
+            *b"old!",
+        );
+        let (_authority, lease, mut invalidator) = prepare_foreign_cow(&child);
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        let cow = lease
+            .break_cow(
+                &mut invalidator,
+                &child.snapshot,
+                GuestVa(TEST_VA),
+                4,
+                deadline,
+            )
+            .expect("break compound COW");
+        let after_cow = child.live.0.read().clone();
+
+        // Attempt write extending 1 byte past 16 KiB span: start at TEST_VA + 0x3fff with len 2
+        let end_plus_one_va = TEST_VA + CowArmedRanges::COMPOUND_SIZE - 1;
+        let rejected = lease.prepare_write(
+            &child.live,
+            &after_cow,
+            cow.as_ref(),
+            GuestVa(end_plus_one_va),
+            b"ab",
+            deadline,
+        );
+        assert!(
+            matches!(
+                rejected,
+                Err(carrick_hal::ForeignMmTransportError::MutationFailed)
+            ),
+            "write extending past span end must be rejected: {rejected:?}"
+        );
+
+        // Attempt write starting exactly at span end
+        let at_end_va = TEST_VA + CowArmedRanges::COMPOUND_SIZE;
+        let rejected_at_end = lease.prepare_write(
+            &child.live,
+            &after_cow,
+            cow.as_ref(),
+            GuestVa(at_end_va),
+            b"a",
+            deadline,
+        );
+        assert!(
+            matches!(
+                rejected_at_end,
+                Err(carrick_hal::ForeignMmTransportError::MutationFailed)
+            ),
+            "write at span end must be rejected: {rejected_at_end:?}"
+        );
+
+        let cow_key = (cow.physical_base().raw(), cow.physical_len());
+        child.owners.0.push(cow_key);
+    }
+
+    #[test]
+    fn foreign_cow_prepare_write_rejects_out_of_span_alias() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let transport = CarrierForeignMmTransport::new();
+        let mut child = install_mm(
+            &transport,
+            132,
+            0x9a00_2b00_0000,
+            0x9b00_2b00_0000,
+            *b"old!",
+        );
+        let (_authority, lease, mut invalidator) = prepare_foreign_cow(&child);
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        let cow = lease
+            .break_cow(
+                &mut invalidator,
+                &child.snapshot,
+                GuestVa(TEST_VA),
+                4,
+                deadline,
+            )
+            .expect("break compound COW");
+        let after_cow = child.live.0.read().clone();
+
+        // Write to address before compound span
+        let before_span_va = TEST_VA - 0x1000;
+        let rejected = lease.prepare_write(
+            &child.live,
+            &after_cow,
+            cow.as_ref(),
+            GuestVa(before_span_va),
+            b"test",
+            deadline,
+        );
+        assert!(
+            matches!(
+                rejected,
+                Err(carrick_hal::ForeignMmTransportError::MutationFailed)
+            ),
+            "out-of-span alias before span must be rejected: {rejected:?}"
+        );
+
+        let cow_key = (cow.physical_base().raw(), cow.physical_len());
+        child.owners.0.push(cow_key);
+    }
+
+    #[test]
     fn foreign_cow_each_reversible_boundary_restores_exact_stage1_inventory_and_owner_set() {
         let _guard = FOREIGN_MM_TEST_LOCK.lock();
         for phase in 1..=5 {
@@ -7310,17 +7618,22 @@ impl carrick_hal::ForeignMmReadReceipt for CarrierForeignMmReceipt {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct CarrierLeaseState {
+    retained: CarrierForeignMmSnapshot,
+    backing: RetainedForeignMmBacking,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 struct CarrierForeignMmReadLease {
     state: std::sync::Arc<MmAccessState>,
-    retained: parking_lot::Mutex<CarrierForeignMmSnapshot>,
-    backing: parking_lot::Mutex<RetainedForeignMmBacking>,
+    inner: parking_lot::Mutex<CarrierLeaseState>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl std::fmt::Debug for CarrierForeignMmReadLease {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CarrierForeignMmReadLease")
-            .field("retained", &*self.retained.lock())
+            .field("retained", &self.inner.lock().retained)
             .finish_non_exhaustive()
     }
 }
@@ -7358,6 +7671,7 @@ fn foreign_cow_failpoint(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn perform_foreign_cow_transaction(
     lease: &CarrierForeignMmReadLease,
+    lease_guard: &mut CarrierLeaseState,
     invalidator: &mut dyn carrick_hal::ForeignMmInvalidator,
     requested: &CarrierForeignMmSnapshot,
     va: carrick_guest_mem::GuestVa,
@@ -7411,12 +7725,10 @@ fn perform_foreign_cow_transaction(
             .ok_or(carrick_hal::ForeignMmTransportError::Translation(va))?
     };
     let old_physical_ipa = align_down(old_ipa, CowArmedRanges::COMPOUND_SIZE);
-    let old_host = {
-        let backing = lease.backing.lock();
-        let old_extent =
-            backing.extent_for(old_physical_ipa, CowArmedRanges::COMPOUND_SIZE as usize)?;
-        old_extent.owner._mapping.as_ptr()
-    };
+    let old_extent = lease_guard
+        .backing
+        .extent_for(old_physical_ipa, CowArmedRanges::COMPOUND_SIZE as usize)?;
+    let old_host = old_extent.owner._mapping.as_ptr();
     let old_offset = old_ipa
         .checked_sub(old_physical_ipa)
         .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
@@ -7481,6 +7793,7 @@ fn perform_foreign_cow_transaction(
         .authority
         .reserve(1, mapping_candidates, event_count)
         .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
+    lease_guard.backing.extents.reserve(1);
     foreign_cow_failpoint(&lease.state, 1)?;
     let new_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
         CowArmedRanges::COMPOUND_SIZE as usize,
@@ -7549,8 +7862,9 @@ fn perform_foreign_cow_transaction(
     };
     foreign_cow_failpoint(&lease.state, 5)?;
     let page_table_host = {
-        let backing = lease.backing.lock();
-        let page_table_extent = backing.extent_for(requested.binding.stage1_root.raw(), 1)?;
+        let page_table_extent = lease_guard
+            .backing
+            .extent_for(requested.binding.stage1_root.raw(), 1)?;
         let offset = usize::try_from(
             requested
                 .binding
@@ -7759,30 +8073,8 @@ fn perform_foreign_cow_transaction(
         shared_key_offset: 0,
         owner_generation,
     });
-    match runtime.authority.mapping_is_live(
-        split.new_extent.mapping,
-        split.new_extent.frame,
-        carrick_guest_mem::Gpa(new_physical_ipa),
-        cow_length,
-    ) {
-        Ok(true) => {}
-        Ok(false) | Err(_) => std::process::abort(),
-    }
-    let owner_is_live = global_frame_host_owners()
-        .lock()
-        .get(&(new_physical_ipa, CowArmedRanges::COMPOUND_SIZE))
-        .is_some_and(|owner| {
-            owner.generation == owner_generation
-                && std::ptr::eq(owner._mapping.as_ptr(), new_host_ptr)
-        });
-    if !owner_is_live {
-        std::process::abort();
-    }
     owner_rollback.commit();
     lease.state.cow_armed.lock().disarm(span);
-    if !committed_mapping_ids.contains(&split.new_extent.mapping) {
-        std::process::abort();
-    }
     let committed = CarrierForeignMmSnapshot {
         mm: requested.mm,
         binding: requested.binding,
@@ -7793,16 +8085,16 @@ fn perform_foreign_cow_transaction(
         ),
         mapping_ids: committed_mapping_ids,
     };
-    *lease.retained.lock() = committed.clone();
     let new_owner_arc = global_frame_host_owners()
         .lock()
         .get(&(new_physical_ipa, CowArmedRanges::COMPOUND_SIZE))
         .cloned()
         .unwrap_or_else(|| std::process::abort());
-    lease.backing.lock().extents.push(RetainedForeignExtent {
+    lease_guard.backing.extents.push(RetainedForeignExtent {
         key: (new_physical_ipa, CowArmedRanges::COMPOUND_SIZE),
         owner: new_owner_arc,
     });
+    lease_guard.retained = committed.clone();
     Ok(CarrierForeignCowReceipt {
         snapshot: committed,
         start: carrick_guest_mem::GuestVa(span.va),
@@ -7829,7 +8121,11 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
     ) -> Result<Box<dyn carrick_hal::ForeignMmReadReceipt>, carrick_hal::ForeignMmTransportError>
     {
         let requested = CarrierForeignMmSnapshot::capture(snapshot);
-        if requested != *self.retained.lock() {
+        let inner = self
+            .inner
+            .try_lock_until(deadline)
+            .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?;
+        if requested != inner.retained {
             return Err(carrick_hal::ForeignMmTransportError::MissingBinding);
         }
         let _read_coordinator = self
@@ -7843,14 +8139,13 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
         let mut cursor = va.raw();
         let mut completed = 0_usize;
         let mut owner_generations = Vec::new();
-        let backing = self.backing.lock();
         while completed < dst.len() {
             if !live_snapshot_matches(authority, &requested, deadline)? {
                 return Err(carrick_hal::ForeignMmTransportError::Retry);
             }
             let current_va = carrick_guest_mem::GuestVa(cursor);
             let ipa = foreign_stage1_translate(
-                &backing,
+                &inner.backing,
                 requested.binding.stage1_root,
                 current_va,
                 &mut owner_generations,
@@ -7858,7 +8153,7 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
             let page_remaining = 0x1000_usize - (current_va.raw() as usize & 0xfff);
             let chunk = page_remaining.min(dst.len() - completed);
             owner_generations.push(copy_from_pinned_owner(
-                &backing,
+                &inner.backing,
                 ipa,
                 &mut dst[completed..completed + chunk],
             )?);
@@ -7889,11 +8184,23 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
         deadline: std::time::Instant,
     ) -> Result<Box<dyn carrick_hal::ForeignCowReceipt>, carrick_hal::ForeignMmTransportError> {
         let requested = CarrierForeignMmSnapshot::capture(snapshot);
-        if requested != *self.retained.lock() {
+        let mut lease_guard = self
+            .inner
+            .try_lock_until(deadline)
+            .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?;
+        if requested != lease_guard.retained {
             return Err(carrick_hal::ForeignMmTransportError::MissingBinding);
         }
-        perform_foreign_cow_transaction(self, invalidator, &requested, va, len, deadline)
-            .map(|receipt| Box::new(receipt) as Box<dyn carrick_hal::ForeignCowReceipt>)
+        perform_foreign_cow_transaction(
+            self,
+            &mut lease_guard,
+            invalidator,
+            &requested,
+            va,
+            len,
+            deadline,
+        )
+        .map(|receipt| Box::new(receipt) as Box<dyn carrick_hal::ForeignCowReceipt>)
     }
 
     fn prepare_write<'a>(
@@ -7910,8 +8217,12 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
         carrick_hal::ForeignMmTransportError,
     > {
         let requested = CarrierForeignMmSnapshot::capture(snapshot);
+        let inner = self
+            .inner
+            .try_lock_until(deadline)
+            .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?;
         if !live_snapshot_matches(authority, &requested, deadline)?
-            || requested != *self.retained.lock()
+            || requested != inner.retained
             || cow.mm() != requested.mm
             || cow.backend_revision() != requested.backend_revision
             || cow.vma_revision() != requested.vma_revision
@@ -7969,14 +8280,38 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
             })
             .cloned()
             .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)?;
+
         let mut owner_generations = Vec::new();
-        let physical = foreign_stage1_translate(
-            &self.backing.lock(),
+        let initial_physical = foreign_stage1_translate(
+            &inner.backing,
             requested.binding.stage1_root,
             va,
             &mut owner_generations,
         )?;
-        let offset = physical
+        let mut cursor = va.raw();
+        let mut expected_physical = initial_physical;
+        while cursor < va_end {
+            let current_va = carrick_guest_mem::GuestVa(cursor);
+            let leaf_physical = foreign_stage1_translate(
+                &inner.backing,
+                requested.binding.stage1_root,
+                current_va,
+                &mut owner_generations,
+            )?;
+            if leaf_physical != expected_physical {
+                return Err(carrick_hal::ForeignMmTransportError::OwnerStale);
+            }
+            let bytes_in_page = 0x1000_u64 - (cursor & 0xfff);
+            let step = bytes_in_page.min(va_end - cursor);
+            cursor = cursor
+                .checked_add(step)
+                .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
+            expected_physical = expected_physical
+                .checked_add(step)
+                .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
+        }
+
+        let offset = initial_physical
             .checked_sub(extent_key.0)
             .and_then(|offset| usize::try_from(offset).ok())
             .filter(|offset| {
@@ -8033,8 +8368,7 @@ impl carrick_hal::ForeignMmTransport for CarrierForeignMmTransport {
         let backing = state.retain_physical_backing(&retained, deadline)?;
         Ok(std::sync::Arc::new(CarrierForeignMmReadLease {
             state,
-            retained: parking_lot::Mutex::new(retained),
-            backing: parking_lot::Mutex::new(backing),
+            inner: parking_lot::Mutex::new(CarrierLeaseState { retained, backing }),
         }))
     }
 }
