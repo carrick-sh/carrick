@@ -4454,8 +4454,8 @@ mod tests {
     use super::*;
     use crate::kernel::{
         Asid, Credentials, FileDescription, FileSlotNumber, FileTable, FsContext, LinuxSignal, Mm,
-        MmBackendSnapshot, MmBinding, RootBootstrap, Sighand, SignalDisposition, SnapshotError,
-        Stage1Root, TaskParticipantError, ThreadSignalState,
+        MmBackendSnapshot, MmBinding, MmRelation, RootBootstrap, Sighand, SignalDisposition,
+        SnapshotError, Stage1Root, TaskParticipantError, ThreadSignalState,
     };
 
     #[derive(Debug, Default)]
@@ -4504,6 +4504,77 @@ mod tests {
         )
         .expect("bootstrap input");
         Kernel::bootstrap_root(input).expect("kernel")
+    }
+
+    fn bootstrap_with_mm_backend(pid: i32) -> (Arc<Kernel>, KernelContext) {
+        let input = RootBootstrap::with_mm_backend(
+            pid,
+            ThreadId::synthetic_for_tests(pid),
+            Arc::new(TestMmBackend(test_binding())),
+            "root".to_string(),
+        )
+        .expect("bootstrap input");
+        Kernel::bootstrap_root(input).expect("kernel")
+    }
+
+    fn fork_with_mm_backend(
+        kernel: &Arc<Kernel>,
+        parent: &KernelContext,
+        registry_id: i32,
+        diagnostic_name: &str,
+    ) -> KernelContext {
+        kernel
+            .reserve_fork(
+                parent,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                diagnostic_name.to_owned(),
+                None,
+            )
+            .expect("reserve fork")
+            .prepare_with_mm_backend(
+                Arc::new(TestMmBackend(test_binding())),
+                ThreadId::synthetic_for_tests(registry_id),
+            )
+            .expect("prepare fork mm")
+            .commit()
+            .expect("publish fork")
+            .into_parts()
+            .expect("start child")
+            .0
+    }
+
+    #[test]
+    fn mm_authority_relation_distinguishes_copied_and_shared_clone_vm_tasks() {
+        let (kernel, root) = bootstrap_with_mm_backend(19_400);
+
+        let current = root.current_mm().expect("current MM authority");
+        assert_eq!(current.mm_id(), root.shared().mm().id());
+
+        let copied = fork_with_mm_backend(&kernel, &root, 19_401, "copied-mm child");
+        let foreign = kernel
+            .foreign_mm(&root, copied.task().key())
+            .expect("foreign MM authority");
+        assert!(matches!(foreign, MmRelation::Foreign(_)));
+
+        let shared = kernel
+            .reserve_fork(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::VM).expect("shared-mm fork plan"),
+                "shared-mm child".to_owned(),
+                None,
+            )
+            .expect("reserve shared-mm fork")
+            .prepare_shared_mm(ThreadId::synthetic_for_tests(19_402))
+            .expect("prepare shared-mm fork")
+            .commit()
+            .expect("publish shared-mm fork")
+            .into_parts()
+            .expect("start shared-mm child")
+            .0;
+        let relation = kernel
+            .foreign_mm(&root, shared.task().key())
+            .expect("shared MM authority");
+        assert!(matches!(relation, MmRelation::Current(_)));
     }
 
     fn clone_sibling(

@@ -15,6 +15,8 @@ pub mod foreign_mm;
 pub mod frame_inventory;
 pub mod guest_execution;
 pub mod ids;
+#[cfg(test)]
+mod mm_access;
 pub mod mm_transaction;
 pub mod netns;
 pub mod objects;
