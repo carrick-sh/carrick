@@ -175,7 +175,7 @@ impl GuestExecutorCensus {
 
     /// Numeric projection solely for the fixed-width probe ABI.
     pub(crate) fn participant_count_for_probe(&self) -> i32 {
-        saturating_participant_count_for_probe(self.state.lock().participants.iter().count())
+        saturating_participant_count_for_probe(self.state.lock().participants.len())
     }
 }
 
