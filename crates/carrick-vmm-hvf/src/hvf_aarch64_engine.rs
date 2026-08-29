@@ -59,6 +59,13 @@ pub use crate::trap::{
 /// (runtime.rs `run_threaded_hvf_loop`, the vcpu loop) is unchanged.
 pub type HvfAarch64Engine = Aarch64EngineCore<HvfAarch64Vmm>;
 
+/// Clone the carrier-owned foreign-MM transport installed for this HVPatch VM.
+/// The runtime stores the trait object privately; syscall consumers never see
+/// the concrete backend authority.
+pub fn foreign_mm_transport() -> Arc<dyn carrick_hal::ForeignMmTransport> {
+    crate::trap::foreign_mm_transport()
+}
+
 pub fn persistent_vcpu_identity(vcpu: &HvfAarch64Vcpu) -> u64 {
     vcpu.inner.id()
 }

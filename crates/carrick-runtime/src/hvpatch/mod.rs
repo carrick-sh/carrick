@@ -44,6 +44,7 @@ pub(crate) struct ProcessContext {
     resources: std::sync::Arc<MmResources>,
     binding: crate::kernel::KernelTaskBinding,
     mm_backend: std::sync::Arc<parking_lot::RwLock<std::sync::Arc<stage1_mm::Stage1MmBackend>>>,
+    mm_access: Option<crate::kernel::MmAccessAuthority>,
 }
 
 /// Build a real HVPatch process binding for cross-subsystem unit tests. This
@@ -486,7 +487,20 @@ impl ProcessContext {
             resources,
             binding,
             mm_backend: std::sync::Arc::new(parking_lot::RwLock::new(mm_backend)),
+            mm_access: None,
         }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn with_foreign_mm_transport(mut self) -> Self {
+        self.mm_access = Some(crate::kernel::MmAccessAuthority::new(
+            carrick_vmm_hvf::hvf_aarch64_engine::foreign_mm_transport(),
+        ));
+        self
+    }
+
+    pub(crate) fn mm_access_authority(&self) -> Option<&crate::kernel::MmAccessAuthority> {
+        self.mm_access.as_ref()
     }
 
     pub(crate) fn pid(&self) -> i32 {
@@ -552,11 +566,13 @@ impl ProcessContext {
         mm_backend: std::sync::Arc<stage1_mm::Stage1MmBackend>,
     ) -> Self {
         mm_backend.bind_inventory(context.kernel(), context.shared().mm().id());
-        Self::new(
+        let mut child = Self::new(
             std::sync::Arc::clone(&self.resources),
             context.task_binding(),
             mm_backend,
-        )
+        );
+        child.mm_access.clone_from(&self.mm_access);
+        child
     }
 
     pub(crate) fn bind_vma_source(&self, source: crate::kernel::SharedVmaSnapshotSource) {
@@ -1331,6 +1347,10 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
         .publish_root(root.task().key())
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
     let context = ProcessContext::new(table, root.task_binding(), mm_backend);
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let context = context.with_foreign_mm_transport();
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    debug_assert!(context.mm_access_authority().is_some());
     let binding = context.mm_binding().ok_or_else(|| {
         RuntimeError::Configuration("hvpatch root mm backend disappeared".to_owned())
     })?;

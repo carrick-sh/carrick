@@ -6,16 +6,18 @@ use super::core::Kernel;
 use super::ids::TaskId;
 use carrick_abi::{LINUX_EFAULT, LINUX_ESRCH, LinuxErrno};
 
-/// A validated reference to another process's address space.
+/// Temporary crate-private VMA-only compatibility view for the not-yet-migrated
+/// process_vm consumer. It carries no read authority; Task 8 removes it when
+/// that consumer switches to `ForeignMm` plus `MmAccessAuthority`.
 #[derive(Clone, Debug)]
-pub struct ForeignMmAccess {
-    target_pid: TaskId,
+pub(crate) struct ForeignMmAccess {
+    _target_pid: TaskId,
     vmas: Vec<VmaSummary>,
 }
 
 impl ForeignMmAccess {
     /// Authenticates and creates a foreign MM access handle for `target_pid`.
-    pub fn for_task(kernel: &Kernel, target_pid: TaskId) -> Result<Self, LinuxErrno> {
+    pub(crate) fn for_task(kernel: &Kernel, target_pid: TaskId) -> Result<Self, LinuxErrno> {
         let task = kernel.registry().task(target_pid).ok_or(LINUX_ESRCH)?;
         let mm = task.shared().mm();
         let backend = mm.backend().ok_or(LINUX_EFAULT)?;
@@ -24,13 +26,13 @@ impl ForeignMmAccess {
             .map_err(|_| LINUX_EFAULT)?;
 
         Ok(Self {
-            target_pid,
+            _target_pid: target_pid,
             vmas: snapshot.vmas,
         })
     }
 
     /// Checks if a guest virtual address range is mapped in the target address space.
-    pub fn is_range_mapped(&self, va: u64, len: usize) -> bool {
+    pub(crate) fn is_range_mapped(&self, va: u64, len: usize) -> bool {
         if len == 0 {
             return true;
         }
@@ -52,14 +54,6 @@ impl ForeignMmAccess {
         }
         true
     }
-
-    pub fn target_pid(&self) -> TaskId {
-        self.target_pid
-    }
-
-    pub fn vmas(&self) -> &[VmaSummary] {
-        &self.vmas
-    }
 }
 
 #[cfg(test)]
@@ -71,7 +65,7 @@ mod tests {
     #[test]
     fn mapped_range_validation() {
         let access = ForeignMmAccess {
-            target_pid: TaskId::from_abi_positive(1).expect("positive task id"),
+            _target_pid: TaskId::from_abi_positive(1).expect("positive task id"),
             vmas: vec![
                 VmaSummary {
                     start: GuestVa(0x1000),
