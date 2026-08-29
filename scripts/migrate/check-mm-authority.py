@@ -29,6 +29,29 @@ FORBIDDEN = {
     "blanket-current-impl": "CurrentMmMemory has a blanket implementation",
 }
 
+CURRENT_MEMORY_BYTE_METHODS = frozenset(
+    {
+        "host_ptr_for_read",
+        "host_ptr_for_write",
+        "read_bytes",
+        "read_bytes_raw",
+        "read_into",
+        "read_into_raw",
+        "read_struct",
+        "read_struct_va",
+        "read_va",
+        "write_bytes",
+        "write_bytes_raw",
+        "write_bytes_unchecked",
+        "write_struct",
+        "write_struct_va",
+        "write_va",
+        "zero_anonymous_reuse",
+        "zero_backing",
+        "zero_guest_range",
+    }
+)
+
 
 @dataclass(frozen=True, order=True)
 class Finding:
@@ -241,6 +264,29 @@ def scan_source(source: str, relative_path: str) -> list[Finding]:
         if not any(finding.category == category for finding in findings):
             add(index, category, detail)
 
+    def implements_guest_memory(header: Sequence[str]) -> bool:
+        """Whether an `impl` header defines GuestMemory rather than consumes it."""
+        cursor = 1
+        if cursor < len(header) and header[cursor] == "<":
+            depth = 0
+            while cursor < len(header):
+                if header[cursor] == "<":
+                    depth += 1
+                elif header[cursor] == ">":
+                    depth -= 1
+                    if depth == 0:
+                        cursor += 1
+                        break
+                cursor += 1
+        while cursor < len(header) and header[cursor] in {"const", "unsafe"}:
+            cursor += 1
+        try:
+            for_index = header.index("for", cursor)
+        except ValueError:
+            return False
+        trait_path = header[cursor:for_index]
+        return bool(trait_path) and trait_path[-1] == "GuestMemory"
+
     for index, token in enumerate(tokens):
         if not production[index] or token.kind == "literal":
             continue
@@ -258,12 +304,22 @@ def scan_source(source: str, relative_path: str) -> list[Finding]:
                 body_start = arrow + 1
                 body_end = matching(tokens, body_start, "{", "}") if body_start < len(tokens) and tokens[body_start].text == "{" else body_start
                 direct_current_access = False
+                foreign_transfer = False
                 for cursor in range(body_start, body_end + 1):
-                    forbidden_memory = tokens[cursor].text == "process_vm_copy_self" or sequence_at(tokens, cursor, [".", "read_bytes", "("])
+                    forbidden_memory = tokens[cursor].text == "process_vm_copy_self" or (
+                        tokens[cursor].text == "."
+                        and cursor + 2 < len(tokens)
+                        and tokens[cursor + 1].text in CURRENT_MEMORY_BYTE_METHODS
+                        and tokens[cursor + 2].text == "("
+                    )
                     if forbidden_memory:
                         direct_current_access = True
                         add(cursor, "foreign-current-memory", tokens[cursor].text)
-                if not direct_current_access:
+                    if sequence_at(tokens, cursor, [".", "read_foreign", "("]) or sequence_at(
+                        tokens, cursor, [".", "write_foreign", "("]
+                    ):
+                        foreign_transfer = True
+                if not direct_current_access and not foreign_transfer:
                     function = next(
                         (cursor for cursor in range(index - 1, -1, -1) if tokens[cursor].text == "fn"),
                         None,
@@ -304,12 +360,7 @@ def scan_source(source: str, relative_path: str) -> list[Finding]:
                 end = function_signature_end(tokens, index)
                 header = [item.text for item in tokens[index:end]]
                 if "GuestMemory" in header and "CurrentMmMemory" not in header:
-                    if "for" in header:
-                        for_idx = header.index("for")
-                        trait_part = header[1:for_idx]
-                        if "<" in trait_part or trait_part not in (["GuestMemory"], ["carrick_guest_mem", "::", "GuestMemory"]):
-                            add(index, "untyped-current-bound", "GuestMemory generic lacks CurrentMmMemory")
-                    elif "<" in header:
+                    if not implements_guest_memory(header):
                         add(index, "untyped-current-bound", "GuestMemory generic lacks CurrentMmMemory")
 
         if sequence_at(tokens, index, [".", "begin_dispatch", "(", ")"]):
@@ -376,6 +427,30 @@ def self_test() -> None:
             "foreign-current-memory",
             "fn f<M: CurrentMmMemory>(m: &M) { match target { MmRelation::OtherGuest => { todo!() } } }",
         ),
+        "foreign-mixed-access.rs": (
+            "foreign-current-memory",
+            "fn f<M: CurrentMmMemory>(memory: &M, authority: &MmAccessAuthority) { "
+            "match target { MmRelation::OtherGuest => { authority.read_foreign(mm, range, dst); "
+            "memory.read_bytes(0, 1); } } }",
+        ),
+        "foreign-mixed-write.rs": (
+            "foreign-current-memory",
+            "fn f<M: CurrentMmMemory>(memory: &mut M, authority: &MmAccessAuthority) { "
+            "match target { MmRelation::OtherGuest => { authority.read_foreign(mm, range, dst); "
+            "memory.write_bytes(0, src); } } }",
+        ),
+        "foreign-mixed-raw.rs": (
+            "foreign-current-memory",
+            "fn f<M: CurrentMmMemory>(memory: &M, authority: &MmAccessAuthority) { "
+            "match target { MmRelation::OtherGuest => { authority.read_foreign(mm, range, dst); "
+            "memory.read_into_raw(0, dst); } } }",
+        ),
+        "foreign-mixed-va.rs": (
+            "foreign-current-memory",
+            "fn f<M: CurrentMmMemory>(memory: &mut M, authority: &MmAccessAuthority) { "
+            "match target { MmRelation::OtherGuest => { authority.write_foreign(mm, range, src); "
+            "memory.write_va(va, src); } } }",
+        ),
         "raw-tuple.rs": (
             "raw-mm-authority",
             "pub fn access(pid: u64, mm: u64, ttbr: u64, va: u64) {}",
@@ -403,6 +478,10 @@ def self_test() -> None:
         "impl-generic-current.rs": (
             "untyped-current-bound",
             "impl<M: GuestMemory> Dispatcher<M> {}",
+        ),
+        "trait-impl-generic-current.rs": (
+            "untyped-current-bound",
+            "impl<M: GuestMemory> Dispatch for Dispatcher<M> {}",
         ),
         "host-alias.rs": (
             "unpermitted-host-alias",
@@ -438,6 +517,14 @@ def self_test() -> None:
         "current-impl-bound.rs": "impl<M: GuestMemory + CurrentMmMemory> Dispatcher<M> {}",
         "current-relation.rs": "match target { MmRelation::Current => memory.read_bytes(0, 1) }",
         "foreign-facade.rs": "fn f(access: ForeignMmAccess) { access.read_foreign(0, 1); }",
+        "foreign-current-facade.rs": (
+            "fn f<M: CurrentMmMemory>(memory: &mut M, authority: &MmAccessAuthority) { "
+            "match target { MmRelation::OtherGuest => { authority.read_foreign(mm, range, dst); } } }"
+        ),
+        "generic-engine-memory.rs": (
+            "impl<V: Vmm> GuestMemory for Engine<V> {}\n"
+            "impl<V: Vmm> CurrentMmMemory for Engine<V> {}"
+        ),
         "permitted-host-alias.rs": "fn f(t: &HostAliasTransactions, permit: &HostAliasPermit) { t.begin_dispatch(&permit); }",
         "crates/carrick-guest-mem/src/guard.rs": "pub struct HostWriteGuard<'a, M: GuestMemory + ?Sized> { memory: &'a mut M }",
         "crates/carrick-guest-mem/src/zero.rs": "pub fn zero_range(memory: &mut impl GuestMemory) {}",
