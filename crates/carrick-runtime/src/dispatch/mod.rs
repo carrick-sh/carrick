@@ -1108,6 +1108,12 @@ pub struct SyscallCtx<'a, M: CurrentMmMemory> {
     /// tid-aware handlers fall back to pid-based answers.
     pub thread: Option<ThreadCtx<'a>>,
     pub execution_lease: Option<&'a crate::kernel::objects::ThreadExecutionLease>,
+    /// The caller's exact-MM executor census token. Present on the ordinary
+    /// single-threaded and production HVPatch routes so a handler can cross a
+    /// typed boundary that temporarily removes only this caller from its MM's
+    /// executor population. Mutation handlers deliberately do not receive it:
+    /// they already execute under a stronger stage-1 authority.
+    pub(crate) mm_executor: Option<&'a mut MmExecutorParticipation>,
 }
 
 /// Context available only after the outer run loop has established structural
@@ -2187,6 +2193,26 @@ pub enum DispatchError {
     MmExecutorAdmission(crate::kernel::GuestExecutorCensusError),
     #[error("MM mutation requires a page-table pause while a peer executor is active")]
     MmMutationPeerExecutor,
+    #[error("caller-MM executor release requires an active executor participation")]
+    MmExecutorParticipationUnavailable,
+    #[error("caller-MM executor release requires an exact running execution lease")]
+    MmExecutorExecutionLeaseUnavailable,
+    #[error("caller-MM executor is bound to a different dispatch MM")]
+    MmExecutorBindingDrift,
+    #[error("caller-MM executor authority {executor:?} does not match kernel MM {kernel:?}")]
+    MmExecutorKernelMmMismatch {
+        executor: crate::kernel::MmId,
+        kernel: crate::kernel::MmId,
+    },
+    #[error("caller-MM executor thread identity does not match the syscall context")]
+    MmExecutorThreadIdentityMismatch,
+    #[error("caller-MM execution lease is not the exact running lease: {0}")]
+    MmExecutorExecutionLease(crate::kernel::objects::ThreadExecutionError),
+    #[error("caller-MM execution lease names MM {lease:?}, expected {executor:?}")]
+    MmExecutorExecutionMmMismatch {
+        executor: crate::kernel::MmId,
+        lease: crate::kernel::MmId,
+    },
 }
 
 impl From<crate::file_authority::AuthorityFatal> for DispatchError {
@@ -2566,12 +2592,54 @@ impl DispatchMmAuthority {
 /// it does not itself grant mutation authority while a peer token exists.
 pub struct MmExecutorParticipation {
     authority: Arc<DispatchMmAuthority>,
-    participation: crate::kernel::GuestExecutorParticipation,
+    admission: MmExecutorAdmissionRecipe,
+    participation: Option<crate::kernel::GuestExecutorParticipation>,
+}
+
+#[derive(Clone)]
+enum MmExecutorAdmissionRecipe {
+    Anonymous,
+    AnonymousWithPauseEndpoint {
+        registry: Arc<dyn carrick_hal::VcpuRegistry>,
+        tid: carrick_hal::ThreadId,
+    },
+    Thread {
+        thread: crate::kernel::ThreadRef,
+        registry: Arc<dyn carrick_hal::VcpuRegistry>,
+        tid: carrick_hal::ThreadId,
+    },
+}
+
+impl MmExecutorAdmissionRecipe {
+    fn enter(
+        &self,
+        authority: &Arc<DispatchMmAuthority>,
+    ) -> Result<crate::kernel::GuestExecutorParticipation, crate::kernel::GuestExecutorCensusError>
+    {
+        match self {
+            Self::Anonymous => authority.guest_executors.enter(None),
+            Self::AnonymousWithPauseEndpoint { registry, tid } => authority
+                .guest_executors
+                .enter_with_pause_endpoint(None, Arc::clone(registry), *tid),
+            Self::Thread {
+                thread,
+                registry,
+                tid,
+            } => authority.guest_executors.enter_with_pause_endpoint(
+                Some(thread.clone()),
+                Arc::clone(registry),
+                *tid,
+            ),
+        }
+    }
 }
 
 impl MmExecutorParticipation {
     pub(crate) fn participation_mut(&mut self) -> &mut crate::kernel::GuestExecutorParticipation {
-        &mut self.participation
+        self.participation.as_mut().unwrap_or_else(|| {
+            tracing::error!("MM executor participation used while temporarily released");
+            std::process::abort()
+        })
     }
 
     pub(crate) fn mm_id(&self) -> crate::kernel::MmId {
@@ -2584,6 +2652,262 @@ impl MmExecutorParticipation {
 
     fn authorizes(&self, authority: &Arc<DispatchMmAuthority>) -> bool {
         Arc::ptr_eq(&self.authority, authority)
+    }
+
+    fn validates_thread_identity(&self, thread: &crate::kernel::ThreadRef) -> bool {
+        match &self.admission {
+            MmExecutorAdmissionRecipe::Anonymous
+            | MmExecutorAdmissionRecipe::AnonymousWithPauseEndpoint { .. } => true,
+            MmExecutorAdmissionRecipe::Thread {
+                thread: admitted, ..
+            } => Arc::ptr_eq(admitted, thread),
+        }
+    }
+
+    fn leave_temporarily(&mut self) -> Result<(), DispatchError> {
+        let participation = self
+            .participation
+            .take()
+            .ok_or(DispatchError::MmExecutorParticipationUnavailable)?;
+        drop(participation);
+        Ok(())
+    }
+
+    fn reenter_exact(&mut self) -> Result<(), crate::kernel::GuestExecutorCensusError> {
+        if self.participation.is_some() {
+            tracing::error!("MM executor re-entry attempted while participation is present");
+            std::process::abort();
+        }
+        self.participation = Some(self.admission.enter(&self.authority)?);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod mm_executor_release_tests {
+    use std::sync::Arc;
+
+    use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
+
+    use super::*;
+    use crate::kernel::objects::{ExecutorId, MigratableTaskState, ThreadExecutionLease};
+
+    fn running_lease(context: &crate::kernel::KernelContext) -> ThreadExecutionLease {
+        let mm = context.shared().mm().id();
+        context
+            .thread()
+            .publish_initial_task_state(MigratableTaskState {
+                cpu: GuestCpuState::from_aarch64_v1(Aarch64TaskCpuStateV1 {
+                    gprs: [0; 31],
+                    pc: 0,
+                    pstate: 0,
+                    trap_pc: 0,
+                    trap_pstate: 0,
+                    sp_el0: 0,
+                    elr_el1: 0,
+                    spsr_el1: 0,
+                    ttbr0: 0,
+                    ttbr1: 0,
+                    tcr: 0,
+                    sctlr_el1: 0,
+                    mair_el1: 0,
+                    vbar_el1: 0,
+                    cpacr_el1: 0,
+                    cntkctl_el1: 0,
+                    tpidr_el1: 0,
+                    actlr_el1: 0,
+                    tpidr_el0: 0,
+                    tpidrro_el0: 0,
+                    contextidr_el1: 0,
+                    vregs: [0; 32],
+                    fpsr: 0,
+                    fpcr: 0,
+                    pending_resume_pc: None,
+                    last_syscall_nr: Some(271),
+                    last_syscall_orig_x0: 0,
+                    last_fault_esr: 0,
+                    last_exit_class: 0,
+                    is_forked_child: false,
+                    syscall_continuation: None,
+                    mm_generation: mm.raw(),
+                    asid_generation: mm.raw(),
+                }),
+                mm,
+                asid_generation: mm.raw(),
+            })
+            .expect("publish task state");
+        context
+            .thread()
+            .claim_runnable(
+                ExecutorId::for_transitional_thread(carrick_hal::ThreadId::synthetic_for_tests(41))
+                    .expect("transitional executor"),
+            )
+            .expect("claim running lease")
+    }
+
+    fn boundary_fixture() -> (
+        SyscallDispatcher,
+        crate::kernel::KernelContext,
+        ThreadExecutionLease,
+        MmExecutorParticipation,
+        Arc<crate::kernel::GuestExecutorCensus>,
+        carrick_hal::ThreadId,
+    ) {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher
+            .capture_one_task_context()
+            .expect("capture dispatcher task");
+        let lease = running_lease(&context);
+        let tid = carrick_hal::ThreadId::synthetic_for_tests(41);
+        let registry = Arc::new(carrick_hal::GenericVcpuRegistry::new());
+        let endpoint: Arc<dyn carrick_hal::VcpuRegistry> = registry;
+        let executor = dispatcher
+            .enter_mm_executor_for_thread(Some(context.thread().clone()), endpoint, tid)
+            .expect("admit exact MM executor");
+        let census = dispatcher.mm_executor_census();
+        (dispatcher, context, lease, executor, census, tid)
+    }
+
+    fn settle_fixture(
+        context: &crate::kernel::KernelContext,
+        lease: ThreadExecutionLease,
+        executor: MmExecutorParticipation,
+    ) {
+        drop(executor);
+        context
+            .thread()
+            .yield_from_executor(lease)
+            .expect("settle execution lease");
+    }
+
+    #[test]
+    fn caller_mm_executor_is_absent_during_operation_and_exact_identity_is_restored() {
+        let (dispatcher, context, lease, mut executor, census, tid) = boundary_fixture();
+        let reporter = CompatReporter::default();
+        let mut memory = LinearMemory::new(0x1_0000, vec![0; 0x1000]);
+        let mut syscall = SyscallCtx {
+            kernel: &context,
+            request: SyscallRequest::new(271, SyscallArgs::from([0; 6])),
+            memory: &mut memory,
+            reporter: &reporter,
+            thread: None,
+            execution_lease: Some(&lease),
+            mm_executor: Some(&mut executor),
+        };
+
+        let value = dispatcher
+            .with_current_mm_executor_released(&mut syscall, || {
+                assert_eq!(census.participant_count_for_probe(), 0);
+                0x5eed_u64
+            })
+            .expect("release and restore exact caller MM executor");
+        assert_eq!(value, 0x5eed);
+        drop(syscall);
+        assert_eq!(census.participant_count_for_probe(), 1);
+        let exact = executor.participation_mut().lock_exact_mm();
+        assert_eq!(exact.pause_endpoint_tids(), vec![tid]);
+        drop(exact);
+        context
+            .thread()
+            .validate_running_execution_lease(&lease)
+            .expect("same execution lease remains running");
+
+        settle_fixture(&context, lease, executor);
+    }
+
+    #[test]
+    fn caller_mm_executor_is_restored_when_operation_returns_error() {
+        let (dispatcher, context, lease, mut executor, census, _) = boundary_fixture();
+        let reporter = CompatReporter::default();
+        let mut memory = LinearMemory::new(0x1_0000, vec![0; 0x1000]);
+        let mut syscall = SyscallCtx {
+            kernel: &context,
+            request: SyscallRequest::new(271, SyscallArgs::from([0; 6])),
+            memory: &mut memory,
+            reporter: &reporter,
+            thread: None,
+            execution_lease: Some(&lease),
+            mm_executor: Some(&mut executor),
+        };
+
+        let operation = dispatcher
+            .with_current_mm_executor_released(&mut syscall, || {
+                assert_eq!(census.participant_count_for_probe(), 0);
+                Err::<(), LinuxErrno>(crate::linux_abi::LINUX_EFAULT)
+            })
+            .expect("boundary itself succeeds");
+        assert_eq!(operation, Err(crate::linux_abi::LINUX_EFAULT));
+        drop(syscall);
+        assert_eq!(census.participant_count_for_probe(), 1);
+        context
+            .thread()
+            .validate_running_execution_lease(&lease)
+            .expect("same execution lease remains running");
+        settle_fixture(&context, lease, executor);
+    }
+
+    #[test]
+    fn caller_mm_executor_is_restored_before_operation_panic_resumes() {
+        let (dispatcher, context, lease, mut executor, census, _) = boundary_fixture();
+        let reporter = CompatReporter::default();
+        let mut memory = LinearMemory::new(0x1_0000, vec![0; 0x1000]);
+        let mut syscall = SyscallCtx {
+            kernel: &context,
+            request: SyscallRequest::new(271, SyscallArgs::from([0; 6])),
+            memory: &mut memory,
+            reporter: &reporter,
+            thread: None,
+            execution_lease: Some(&lease),
+            mm_executor: Some(&mut executor),
+        };
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = dispatcher.with_current_mm_executor_released(&mut syscall, || -> () {
+                assert_eq!(census.participant_count_for_probe(), 0);
+                panic!("injected operation panic");
+            });
+        }));
+        assert!(panic.is_err(), "operation panic must resume after re-entry");
+        drop(syscall);
+        assert_eq!(census.participant_count_for_probe(), 1);
+        context
+            .thread()
+            .validate_running_execution_lease(&lease)
+            .expect("same execution lease remains running");
+        settle_fixture(&context, lease, executor);
+    }
+
+    #[test]
+    fn caller_mm_executor_reports_dispatcher_binding_drift_after_reentry() {
+        let (dispatcher, context, lease, mut executor, census, _) = boundary_fixture();
+        let original = dispatcher.mm_binding.current.load_full();
+        let replacement = Arc::new(DispatchMmAuthority::new_for_test_with_revision(
+            original.vma_revision(),
+        ));
+        let reporter = CompatReporter::default();
+        let mut memory = LinearMemory::new(0x1_0000, vec![0; 0x1000]);
+        let mut syscall = SyscallCtx {
+            kernel: &context,
+            request: SyscallRequest::new(271, SyscallArgs::from([0; 6])),
+            memory: &mut memory,
+            reporter: &reporter,
+            thread: None,
+            execution_lease: Some(&lease),
+            mm_executor: Some(&mut executor),
+        };
+
+        let error = dispatcher
+            .with_current_mm_executor_released(&mut syscall, || {
+                assert_eq!(census.participant_count_for_probe(), 0);
+                dispatcher.replace_current_mm_for_test(replacement);
+            })
+            .expect_err("post-operation dispatcher binding drift must fail typed");
+        assert!(matches!(error, DispatchError::MmExecutorBindingDrift));
+        drop(syscall);
+        assert_eq!(census.participant_count_for_probe(), 1);
+
+        dispatcher.replace_current_mm_for_test(original);
+        settle_fixture(&context, lease, executor);
     }
 }
 
@@ -4044,11 +4368,12 @@ trait NormalizedDispatchRoute {
     ) -> Option<Result<DispatchOutcome, DispatchError>>;
 }
 
-struct OrdinaryDispatchRoute<'lease> {
+struct OrdinaryDispatchRoute<'lease, 'executor> {
     lease: Option<&'lease crate::kernel::objects::ThreadExecutionLease>,
+    mm_executor: Option<&'executor mut MmExecutorParticipation>,
 }
 
-impl NormalizedDispatchRoute for OrdinaryDispatchRoute<'_> {
+impl NormalizedDispatchRoute for OrdinaryDispatchRoute<'_, '_> {
     fn dispatch<M: CurrentMmMemory>(
         &mut self,
         dispatcher: &SyscallDispatcher,
@@ -4058,8 +4383,15 @@ impl NormalizedDispatchRoute for OrdinaryDispatchRoute<'_> {
         reporter: &CompatReporter,
         thread: Option<ThreadCtx>,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
-        dispatcher
-            .dispatch_normalized_with_lease(kernel, request, memory, reporter, thread, self.lease)
+        dispatcher.dispatch_normalized_with_lease(
+            kernel,
+            request,
+            memory,
+            reporter,
+            thread,
+            self.lease,
+            self.mm_executor.take(),
+        )
     }
 }
 
@@ -4861,9 +5193,10 @@ impl SyscallDispatcher {
         reporter: &CompatReporter,
         thread: Option<ThreadCtx>,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
-        self.dispatch_normalized_with_lease(kernel, request, memory, reporter, thread, None)
+        self.dispatch_normalized_with_lease(kernel, request, memory, reporter, thread, None, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_normalized_with_lease(
         &self,
         kernel: &crate::kernel::KernelContext,
@@ -4872,6 +5205,7 @@ impl SyscallDispatcher {
         reporter: &CompatReporter,
         thread: Option<ThreadCtx>,
         execution_lease: Option<&crate::kernel::objects::ThreadExecutionLease>,
+        mm_executor: Option<&mut MmExecutorParticipation>,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
         let handler = resolve_handler(request.number.raw())?;
         let canonical_nr = request.number.raw();
@@ -4882,6 +5216,7 @@ impl SyscallDispatcher {
             reporter,
             thread,
             execution_lease,
+            mm_executor,
         };
         let outcome = resources::with_captured_resources(kernel, || handler(self, &mut ctx));
         // Single choke point for the fork-coherent resolve cache: a structural
@@ -5244,19 +5579,120 @@ impl SyscallDispatcher {
     ) -> Result<MmExecutorParticipation, crate::kernel::GuestExecutorCensusError> {
         loop {
             let authority = self.mm_binding.current.load_full();
-            let participation = match pause_endpoint.as_ref() {
-                Some((registry, tid)) => authority.guest_executors.enter_with_pause_endpoint(
-                    thread.clone(),
-                    Arc::clone(registry),
-                    *tid,
-                )?,
-                None => authority.guest_executors.enter(thread.clone())?,
+            let admission = match (&thread, &pause_endpoint) {
+                (None, None) => MmExecutorAdmissionRecipe::Anonymous,
+                (None, Some((registry, tid))) => {
+                    MmExecutorAdmissionRecipe::AnonymousWithPauseEndpoint {
+                        registry: Arc::clone(registry),
+                        tid: *tid,
+                    }
+                }
+                (Some(thread), Some((registry, tid))) => MmExecutorAdmissionRecipe::Thread {
+                    thread: thread.clone(),
+                    registry: Arc::clone(registry),
+                    tid: *tid,
+                },
+                _ => {
+                    tracing::error!(
+                        "MM executor admission must be anonymous or carry an exact thread pause endpoint"
+                    );
+                    std::process::abort()
+                }
             };
+            let participation = admission.enter(&authority)?;
             if Arc::ptr_eq(&self.mm_binding.current.load_full(), &authority) {
                 return Ok(MmExecutorParticipation {
                     authority,
-                    participation,
+                    admission,
+                    participation: Some(participation),
                 });
+            }
+        }
+    }
+
+    fn validate_current_mm_executor(
+        &self,
+        executor: &MmExecutorParticipation,
+        kernel: &crate::kernel::KernelContext,
+        execution_lease: &crate::kernel::objects::ThreadExecutionLease,
+    ) -> Result<(), DispatchError> {
+        let current = self.mm_binding.current.load_full();
+        if !executor.authorizes(&current) {
+            return Err(DispatchError::MmExecutorBindingDrift);
+        }
+        let kernel_mm = kernel.shared().mm().id();
+        if executor.mm_id() != kernel_mm {
+            return Err(DispatchError::MmExecutorKernelMmMismatch {
+                executor: executor.mm_id(),
+                kernel: kernel_mm,
+            });
+        }
+        if !executor.validates_thread_identity(kernel.thread()) {
+            return Err(DispatchError::MmExecutorThreadIdentityMismatch);
+        }
+        kernel
+            .thread()
+            .validate_running_execution_lease(execution_lease)
+            .map_err(DispatchError::MmExecutorExecutionLease)?;
+        let (lease_mm, _) = kernel
+            .thread()
+            .authenticate_task_state_authority(execution_lease)
+            .map_err(DispatchError::MmExecutorExecutionLease)?;
+        if lease_mm != executor.mm_id() {
+            return Err(DispatchError::MmExecutorExecutionMmMismatch {
+                executor: executor.mm_id(),
+                lease: lease_mm,
+            });
+        }
+        Ok(())
+    }
+
+    /// Temporarily remove the caller from its exact MM's executor population,
+    /// run `operation`, then re-enter with the same admission recipe.
+    ///
+    /// This is the narrow phase boundary needed by a foreign-MM operation:
+    /// the target-MM pause must not count the caller as a target executor while
+    /// the caller is synchronously performing that pause. The dispatcher/MM,
+    /// exact thread identity, and running execution lease are authenticated on
+    /// both sides. Re-entry failure is fatal because returning to guest code
+    /// without census membership would make a later page-table pause unsound.
+    pub(crate) fn with_current_mm_executor_released<M: CurrentMmMemory, T>(
+        &self,
+        syscall: &mut SyscallCtx<'_, M>,
+        operation: impl FnOnce() -> T,
+    ) -> Result<T, DispatchError> {
+        let execution_lease = syscall
+            .execution_lease
+            .ok_or(DispatchError::MmExecutorExecutionLeaseUnavailable)?;
+        let executor = syscall
+            .mm_executor
+            .as_deref_mut()
+            .ok_or(DispatchError::MmExecutorParticipationUnavailable)?;
+        self.validate_current_mm_executor(executor, syscall.kernel, execution_lease)?;
+        executor.leave_temporarily()?;
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
+        if let Err(error) = executor.reenter_exact() {
+            tracing::error!(?error, "failed to re-enter exact caller-MM executor census");
+            std::process::abort();
+        }
+
+        match result {
+            Ok(value) => {
+                self.validate_current_mm_executor(executor, syscall.kernel, execution_lease)?;
+                Ok(value)
+            }
+            Err(payload) => {
+                if let Err(error) =
+                    self.validate_current_mm_executor(executor, syscall.kernel, execution_lease)
+                {
+                    tracing::error!(
+                        ?error,
+                        "caller-MM executor identity drifted while unwinding released operation"
+                    );
+                    std::process::abort();
+                }
+                std::panic::resume_unwind(payload)
             }
         }
     }
@@ -6637,11 +7073,10 @@ impl SyscallDispatcher {
     ) -> Result<DispatchOutcome, DispatchError> {
         // Tree-wide forward-progress beat for the deadlock watchdog.
         crate::deadlock_watchdog::tick();
-        let executor = self
+        let mut executor = self
             .enter_mm_executor()
             .map_err(DispatchError::MmExecutorAdmission)?;
         if syscall_requires_mm_mutation(request.number.raw(), request.args) {
-            let mut executor = executor;
             let coordinator = executor.mutation_coordinator();
             let mm = executor.mm_id();
             crate::vcpu_loop::with_sole_mm_stage1(&mut executor, |authority| {
@@ -6666,7 +7101,10 @@ impl SyscallDispatcher {
                 memory,
                 reporter,
                 None,
-                OrdinaryDispatchRoute { lease },
+                OrdinaryDispatchRoute {
+                    lease,
+                    mm_executor: Some(&mut executor),
+                },
             )
         }
     }
@@ -6880,6 +7318,50 @@ impl SyscallDispatcher {
         futex: &crate::thread::FutexTable,
         lease: Option<&crate::kernel::objects::ThreadExecutionLease>,
     ) -> Result<DispatchOutcome, DispatchError> {
+        self.dispatch_threaded_with_executor_and_lease(
+            kernel, request, memory, reporter, tid, registry, futex, lease, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_threaded_with_mm_executor_and_lease(
+        &self,
+        executor: &mut MmExecutorParticipation,
+        kernel: &crate::kernel::KernelContext,
+        request: SyscallRequest,
+        memory: &mut impl CurrentMmMemory,
+        reporter: &CompatReporter,
+        tid: crate::thread::ThreadId,
+        registry: &crate::thread::ThreadRegistry,
+        futex: &crate::thread::FutexTable,
+        lease: Option<&crate::kernel::objects::ThreadExecutionLease>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        self.dispatch_threaded_with_executor_and_lease(
+            kernel,
+            request,
+            memory,
+            reporter,
+            tid,
+            registry,
+            futex,
+            lease,
+            Some(executor),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_threaded_with_executor_and_lease(
+        &self,
+        kernel: &crate::kernel::KernelContext,
+        request: SyscallRequest,
+        memory: &mut impl CurrentMmMemory,
+        reporter: &CompatReporter,
+        tid: crate::thread::ThreadId,
+        registry: &crate::thread::ThreadRegistry,
+        futex: &crate::thread::FutexTable,
+        lease: Option<&crate::kernel::objects::ThreadExecutionLease>,
+        mm_executor: Option<&mut MmExecutorParticipation>,
+    ) -> Result<DispatchOutcome, DispatchError> {
         self.dispatch_threaded_with_route(
             kernel,
             request,
@@ -6888,7 +7370,7 @@ impl SyscallDispatcher {
             tid,
             registry,
             futex,
-            OrdinaryDispatchRoute { lease },
+            OrdinaryDispatchRoute { lease, mm_executor },
         )
     }
 
@@ -6923,7 +7405,9 @@ impl SyscallDispatcher {
             })
             .ok_or(DispatchError::MmMutationPeerExecutor)?
         } else {
-            self.dispatch_threaded(kernel, request, memory, reporter, tid, registry, futex)
+            self.dispatch_threaded_with_mm_executor_and_lease(
+                executor, kernel, request, memory, reporter, tid, registry, futex, None,
+            )
         }
     }
 
