@@ -21,6 +21,10 @@ trace-syscalls = []
 # Alias-remap + signal-kick stat dumps to stderr. The atomic counters and the
 # USDT probes stay always-on; only the stderr dump is gated.
 debug-stats = []
+# Narrow host-test seam for composing the real carrier foreign-MM transport
+# with carrick-runtime's private kernel authority. It exports no production
+# constructors and is enabled only by the runtime's dev-dependency.
+foreign-cow-test-support = []
 
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }

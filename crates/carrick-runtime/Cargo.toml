@@ -190,3 +190,6 @@ static_assertions = "1"
 # consumers (carrick-cli) never enable it. See `test-hooks` in [features].
 carrick-dsr = { path = "../carrick-dsr", features = ["test-hooks"] }
 carrick-dsr-aarch64 = { path = "../carrick-dsr-aarch64", features = ["test-hooks"] }
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dev-dependencies]
+carrick-vmm-hvf = { path = "../carrick-vmm-hvf", features = ["foreign-cow-test-support"] }

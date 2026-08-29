@@ -138,6 +138,82 @@ struct KernelFrameCowAuthority {
     identity: carrick_hal::FrameCowIdentity,
 }
 
+/// Runtime-private payload carried opaquely through the HAL receipt. A
+/// transport can return only a proof that this exact Kernel authority minted;
+/// an internally consistent transport-owned tuple has the wrong `TypeId` and
+/// cannot authorize `CowBroken`.
+#[derive(Clone, Debug)]
+pub(crate) struct KernelForeignCowProof {
+    kernel: Arc<crate::kernel::Kernel>,
+    mm: crate::kernel::MmId,
+    inventory_revision: u64,
+    mapping: carrick_hal::MappingId,
+    frame: carrick_hal::FrameId,
+    physical_base: carrick_guest_mem::Gpa,
+    physical_len: carrick_hal::FrameLength,
+    owner_generation: carrick_hal::ForeignOwnerGeneration,
+}
+
+impl KernelForeignCowProof {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        kernel: Arc<crate::kernel::Kernel>,
+        mm: crate::kernel::MmId,
+        inventory_revision: u64,
+        mapping: carrick_hal::MappingId,
+        frame: carrick_hal::FrameId,
+        physical_base: carrick_guest_mem::Gpa,
+        physical_len: carrick_hal::FrameLength,
+        owner_generation: carrick_hal::ForeignOwnerGeneration,
+    ) -> Self {
+        Self {
+            kernel,
+            mm,
+            inventory_revision,
+            mapping,
+            frame,
+            physical_base,
+            physical_len,
+            owner_generation,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn authenticates(
+        &self,
+        kernel: &Arc<crate::kernel::Kernel>,
+        mm: crate::kernel::MmId,
+        inventory_revision: u64,
+        mapping: carrick_hal::MappingId,
+        frame: carrick_hal::FrameId,
+        physical_base: carrick_guest_mem::Gpa,
+        physical_len: u64,
+        owner_generation: carrick_hal::ForeignOwnerGeneration,
+    ) -> bool {
+        let Some(physical_len) = std::num::NonZeroU64::new(physical_len)
+            .map(carrick_hal::FrameLength::from_mapping_extent)
+        else {
+            return false;
+        };
+        Arc::ptr_eq(&self.kernel, kernel)
+            && self.mm == mm
+            && self.inventory_revision == inventory_revision
+            && self.mapping == mapping
+            && self.frame == frame
+            && self.physical_base == physical_base
+            && self.physical_len == physical_len
+            && self.owner_generation == owner_generation
+            && kernel.frame_inventory().mapping_is_live_exact_at_revision(
+                mm,
+                inventory_revision,
+                mapping,
+                frame,
+                physical_base,
+                physical_len,
+            )
+    }
+}
+
 impl KernelFrameCowAuthority {
     #[allow(dead_code)] // consumed by the HVPatch child publication slice
     fn issue_hvpatch_child_token(
@@ -167,6 +243,28 @@ impl KernelFrameCowAuthority {
             .issue_hvpatch_child_token(authority, identity, authority_identity)
             .map_err(|error| format!("issue exact HVPatch child token: {error}"))
     }
+}
+
+#[cfg(test)]
+pub(crate) fn kernel_frame_cow_authority_for_test(
+    kernel: Arc<crate::kernel::Kernel>,
+    mm: crate::kernel::MmId,
+    guest_executors: Arc<crate::kernel::GuestExecutorCensus>,
+    tid: carrick_hal::ThreadId,
+    asid: u16,
+) -> Arc<dyn carrick_hal::FrameCowAuthority> {
+    Arc::new(KernelFrameCowAuthority {
+        kernel,
+        mm,
+        guest_executors,
+        tid,
+        identity: carrick_hal::FrameCowIdentity {
+            linux_pid: tid.raw(),
+            linux_tid: tid.raw(),
+            mm: mm.raw(),
+            asid,
+        },
+    })
 }
 
 impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
@@ -223,6 +321,60 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
             .apply_with_receipt(self.mm, commit)
             .map(|(_, receipt)| receipt)
             .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
+    }
+
+    fn apply_foreign_cow(
+        &self,
+        commit: carrick_hal::FrameInventoryCommit<()>,
+        mapping: carrick_hal::MappingId,
+        frame: carrick_hal::FrameId,
+        gpa: carrick_guest_mem::Gpa,
+        length: carrick_hal::FrameLength,
+        owner_generation: carrick_hal::ForeignOwnerGeneration,
+    ) -> Result<
+        (
+            carrick_hal::FrameInventoryApplyReceipt,
+            carrick_hal::ForeignCowKernelProof,
+        ),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let ((), receipt) = self
+            .kernel
+            .frame_inventory()
+            .apply_with_receipt(self.mm, commit)
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
+        let expected_mm =
+            std::num::NonZeroU64::new(self.mm.raw()).unwrap_or_else(|| std::process::abort());
+        if receipt.mm() != expected_mm
+            || !receipt.authorizes(mapping, frame)
+            || !self
+                .kernel
+                .frame_inventory()
+                .mapping_is_live_exact_at_revision(
+                    self.mm,
+                    receipt.revision(),
+                    mapping,
+                    frame,
+                    gpa,
+                    length,
+                )
+        {
+            std::process::abort();
+        }
+        let proof = KernelForeignCowProof::new(
+            Arc::clone(&self.kernel),
+            self.mm,
+            receipt.revision(),
+            mapping,
+            frame,
+            gpa,
+            length,
+            owner_generation,
+        );
+        Ok((
+            receipt,
+            carrick_hal::ForeignCowKernelProof::from_runtime_authority(Box::new(proof)),
+        ))
     }
 
     fn mapping_is_live(

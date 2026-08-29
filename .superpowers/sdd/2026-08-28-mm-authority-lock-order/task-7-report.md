@@ -651,3 +651,216 @@ permissions. These are execution-environment restrictions, not retained test
 failures. `progress.md` remained controller-owned and unchanged by this round;
 its SHA-256 stayed
 `1e7b55a97c617ca4603aecd943aa883e32cf8059203cba147e4ec20f354bcb4a`.
+
+## Fix Round 2 (scoped review of `021e8df0b30e8f64a01c95eb9e0308493f8df5af`)
+
+This round changes only rejected findings 5 and 6 plus the test-inventory entry
+required by the new budget-one subprocess. Findings 1-4 remain unchanged. The
+controller-owned `progress.md` was neither edited nor staged; its current
+controller revision remained SHA-256
+`dba00e46561d888848713dc9807e737fa6c524d3959a7d058693131d6e84714f`.
+`dispatch/proc.rs` was not edited.
+
+### Finding 5 — the transport's self-described receipt was not authority
+
+#### RED
+
+The new internally-consistent-forgery test was added before the proof change
+and run against the rejected receipt-comparison implementation:
+
+```text
+RUSTC_WRAPPER= cargo test -p carrick-runtime \
+  foreign_cow_rejects_internally_consistent_transport_forgery -- --nocapture
+FAILED: expected ForeignCowReceiptMismatch, but the internally consistent
+transport tuple minted CowBroken
+0 passed; 1 failed
+```
+
+The transport could previously choose both compared getter sets. The test
+varies a self-consistent mapping, frame, physical extent, and current/recycled
+owner tuple; disagreement between an outer and inner copy is no longer the
+test oracle.
+
+#### GREEN and implementation
+
+`ForeignCowLiveInventoryReceipt` is removed. `FrameCowAuthority`, which is the
+runtime's exact kernel-owner binding already retained by the carrier COW
+runtime, now atomically applies the inventory commit and mints an opaque
+`ForeignCowKernelProof`. Its accepted payload is the runtime-private
+`KernelForeignCowProof`; external transports may carry an opaque value but
+cannot name or construct the accepted payload type. The payload binds the
+exact `Arc<Kernel>`, MM, inventory revision, mapping, frame, physical base and
+length, and owner generation.
+
+Before minting `CowBroken`, and again before the copy, the runtime downcasts to
+that private payload, checks all domains, and performs a guard-bound O(1)
+lookup in the independent kernel frame inventory at the exact recorded global
+revision. Replaying a valid proof with altered transport fields, another
+kernel, another MM, or after any inventory publication fails closed. An
+internally consistent transport-owned `Any` value has a different private
+`TypeId` and is rejected. This is one extension of the existing
+`FrameCowAuthority`; it does not add a parallel authority path.
+
+```text
+RUSTC_WRAPPER= cargo test -p carrick-runtime \
+  foreign_cow_rejects_internally_consistent_transport_forgery -- --nocapture
+1 passed; 2101 filtered out
+
+RUSTC_WRAPPER= cargo test -p carrick-runtime kernel::mm_access
+27 passed; 2075 filtered out
+```
+
+### Finding 6 — production-composed carrier/topology coverage
+
+#### RED/sensitivity evidence
+
+The rejected revision contained no `production_carrier_*` test or exported
+carrier test-support seam. After installing the tests, a deliberate sensitivity
+run disconnected `ProductionCarrierForeignCowHarness::endpoint` from its
+registered production transport state while leaving the runtime fixture,
+scheduler, and assertions unchanged:
+
+```text
+RUSTC_WRAPPER= cargo test -p carrick-runtime \
+  production_carrier_foreign_cow_runs_end_to_end_through_runtime_facade \
+  -- --nocapture
+FAILED at kernel/mm_access.rs:1622:
+foreign MM authority: ForeignTransport(MissingBinding)
+0 passed; 1 failed; 2101 filtered out
+```
+
+Restoring the endpoint to the registered `CarrierForeignMmTransport` made the
+same test green:
+
+```text
+RUSTC_WRAPPER= cargo test -p carrick-runtime \
+  production_carrier_foreign_cow_runs_end_to_end_through_runtime_facade \
+  -- --nocapture
+1 passed; 2101 filtered out
+```
+
+This sensitivity run was temporary and fully reverted before the final gates.
+
+#### Production composition and bounded outcomes
+
+The feature-gated host harness owns the real `CarrierForeignMmTransport`,
+`MmAccessState`, page-table image, carrier frame inventory, host-owner
+directory, COW-arm ledger, aliases, and production COW transaction. Runtime
+supplies the real `Stage1MmBackend`, `DispatchMmAuthority`, VMA and three-domain
+snapshot sources, `KernelFrameCowAuthority`, target-MM mutation coordinator,
+executor census, and facade. The carrier therefore receives the kernel-minted
+mapping identities and opaque proof through the same production trait calls;
+no `MockCowTransport` participates in these five tests.
+
+The invalidation tests also use the actual process-global budgeted scheduler,
+global `PtQuiesce`, exact target census, `GenericVcpuRegistry`, real
+`HvpatchTaskBinding`/stage-1 resident observer, and the shared private core of
+`enter_hvpatch_guest_or_service_invalidation`. The production entry wrapper
+uses that same core with `invalidate_loaded_asid`; the host test wrapper changes
+only the final hardware leaf to a counted callback. Consequently the automatic
+inactive-resident pre-entry service and the active target acknowledgement do
+not manually substitute an independent scheduler or ledger.
+
+`vcpu_budget=1` is isolated in a child instance of the real unit-test process
+so it can install the actual process-global scheduler before its `OnceLock` is
+claimed. It holds the sole lease throughout the real facade/carrier COW, proves
+there is no waiter or maintenance-vCPU acquisition, observes the foreign
+caller resident's deferred ticket, and services it automatically on the next
+exact-binding guest-entry check. The child spawn is inventoried in the existing
+exact host-process-creation test.
+
+The active target enters the real exact-MM census and registry, leaves guest on
+the production kick, services and acknowledges the published generation on its
+owner entry path, and stays excluded until release. CLONE_VM reaches the same
+MM authority. Exec and retirement use a barrier to race actual target graph
+mutation with `Kernel::foreign_mm`; the acquisition either retains the exact old
+MM and completes the real carrier COW, or returns only `UnknownTask`,
+`StaleContext`, or the bounded snapshot timeout. Current/wrong-MM success and
+any other error panic, while scoped joins make deadlock a test failure rather
+than an accepted outcome.
+
+```text
+RUSTC_WRAPPER= cargo test -p carrick-runtime production_carrier_ -- --nocapture
+5 passed; 2097 filtered out
+
+Covered scenarios:
+- real facade/carrier success and authenticated write
+- vCPU budget one/full occupancy and caller-worker self-ack avoidance
+- active target owner acknowledgement through the shared entry core
+- inactive resident mandatory automatic pre-entry service
+- CLONE_VM exact authority reuse
+- target exec and retirement concurrent with acquisition
+```
+
+No guest, Docker, async continuation, reserved maintenance vCPU, caller-engine
+fallback, or HostAlias-to-PtPause acquisition was used.
+
+### Round 2 files and architectural cost
+
+- `crates/carrick-hal/src/{foreign_mm,lib,threaded}.rs`: replace the forgeable
+  getter trait with an opaque proof carrier and extend the existing kernel COW
+  authority's atomic apply result.
+- `crates/carrick-runtime/src/kernel/{frame_inventory,mm_access}.rs`: exact
+  live-at-revision lookup, retained exact kernel binding, proof validation,
+  forged-tuple regression, and production-composed topology tests.
+- `crates/carrick-runtime/src/vcpu_loop/{mod,quiesce}.rs`: private proof issuer
+  on the existing `KernelFrameCowAuthority`, plus extraction of the production
+  guest-entry core so host tests drive the exact scheduler/invalidator path.
+- `crates/carrick-runtime/src/dispatch/mod.rs`: narrow test-only accessor to the
+  existing dispatch MM census used by the production fixture.
+- `crates/carrick-vmm-hvf/{Cargo.toml,src/trap.rs}`: opt-in host-test feature and
+  real carrier transport/page-table/owner harness. The feature suppresses only
+  real HVF stage-2 calls in this explicit host-test composition.
+- `crates/carrick-runtime/Cargo.toml`: macOS/aarch64 dev-dependency enabling the
+  VMM host-test seam; production dependency features are unchanged.
+- `crates/carrick-runtime/src/runtime.rs`: exact inventory entry for the one
+  isolated budget-one unit-test subprocess.
+
+There is no new production hot-path work beyond Fix Round 1. The entry-core
+extraction preserves the existing two-atomic fast path and the production
+hardware leaf. Proof authentication occurs only on foreign COW/write, adds one
+O(1) locked kernel-inventory point lookup, and intentionally invalidates the
+witness after any intervening global inventory publication. The test-only VMM
+feature and process spawn are absent from shipped consumers.
+
+### Round 2 final verification
+
+```text
+RUSTC_WRAPPER= cargo test -p carrick-vmm-hvf foreign_cow
+4 passed; 276 filtered out
+RUSTC_WRAPPER= cargo test -p carrick-vmm-hvf frame_cow
+1 passed; 279 filtered out
+RUSTC_WRAPPER= cargo test -p carrick-runtime kernel::mm_access
+27 passed; 2075 filtered out
+RUSTC_WRAPPER= RUST_TEST_THREADS=1 cargo test -p carrick-runtime hvpatch::
+110 passed; 1992 filtered out
+RUSTC_WRAPPER= cargo test -p carrick-thread --lib
+54 passed
+RUSTC_WRAPPER= cargo test -p carrick-hal
+111 unit tests and 2 compile-fail doctests passed
+
+RUSTC_WRAPPER= RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib
+2102 passed; 0 failed (normal host permissions)
+RUSTC_WRAPPER= RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf --lib
+280 passed; 0 failed (normal host permissions)
+
+RUSTC_WRAPPER= cargo check --workspace --all-targets
+green
+RUSTC_WRAPPER= cargo clippy -p carrick-hal -p carrick-thread \
+  -p carrick-runtime -p carrick-vmm-hvf --all-targets -- -D warnings
+green
+python3 scripts/migrate/check-mm-authority.py --self-test
+20 negative and 17 positive fixtures passed
+python3 scripts/migrate/check-mm-authority.py --check
+exit 1 with exactly the intentional Task 8 finding at
+crates/carrick-runtime/src/dispatch/proc.rs:4425
+cargo fmt --all -- --check
+green
+git diff --check
+green
+```
+
+Self-review found no recoverable work after the irreversible carrier inventory
+commit, no second snapshot acquisition under host alias, no raw invalidation
+domain tuple, and no `proc.rs` diff. The only retained concern is the explicit
+Task 8 production-checker finding above.

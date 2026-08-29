@@ -455,6 +455,27 @@ mod foreign_mm_tests {
             )
         }
 
+        fn apply_foreign_cow(
+            &self,
+            commit: carrick_hal::FrameInventoryCommit<()>,
+            _mapping: carrick_hal::MappingId,
+            _frame: carrick_hal::FrameId,
+            _gpa: Gpa,
+            _length: carrick_hal::FrameLength,
+            _owner_generation: carrick_hal::ForeignOwnerGeneration,
+        ) -> Result<
+            (
+                carrick_hal::FrameInventoryApplyReceipt,
+                carrick_hal::ForeignCowKernelProof,
+            ),
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok((
+                self.apply_with_receipt(commit)?,
+                carrick_hal::ForeignCowKernelProof::from_runtime_authority(Box::new(())),
+            ))
+        }
+
         fn mapping_is_live(
             &self,
             mapping: carrick_hal::MappingId,
@@ -6520,7 +6541,7 @@ impl CarrierForeignMmTransport {
         Self::default()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "foreign-cow-test-support"))]
     fn register(
         &self,
         snapshot: &dyn carrick_hal::ForeignMmSnapshot,
@@ -6858,6 +6879,7 @@ struct CarrierForeignCowReceipt {
     physical_base: carrick_guest_mem::Gpa,
     physical_len: u64,
     owner_generation: carrick_hal::ForeignOwnerGeneration,
+    kernel_proof: carrick_hal::ForeignCowKernelProof,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -6895,15 +6917,42 @@ impl carrick_hal::ForeignCowReceipt for CarrierForeignCowReceipt {
     fn owner_generation(&self) -> carrick_hal::ForeignOwnerGeneration {
         self.owner_generation
     }
-    fn live_inventory(&self) -> &dyn carrick_hal::ForeignCowLiveInventoryReceipt {
-        self
+    fn kernel_proof(&self) -> &carrick_hal::ForeignCowKernelProof {
+        &self.kernel_proof
     }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl carrick_hal::ForeignCowLiveInventoryReceipt for CarrierForeignCowReceipt {
+#[derive(Debug)]
+struct CarrierForeignWriteReceipt {
+    snapshot: CarrierForeignMmSnapshot,
+    start: carrick_guest_mem::GuestVa,
+    len: usize,
+    mapping: carrick_hal::MappingId,
+    frame: carrick_hal::FrameId,
+    owner_generation: carrick_hal::ForeignOwnerGeneration,
+    bytes_written: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl carrick_hal::ForeignMmWriteReceipt for CarrierForeignWriteReceipt {
     fn mm(&self) -> carrick_hal::ForeignMmId {
         self.snapshot.mm
+    }
+    fn range_start(&self) -> carrick_guest_mem::GuestVa {
+        self.start
+    }
+    fn range_len(&self) -> usize {
+        self.len
+    }
+    fn bytes_written(&self) -> usize {
+        self.bytes_written
+    }
+    fn backend_revision(&self) -> carrick_hal::ForeignBackendRevision {
+        self.snapshot.backend_revision
+    }
+    fn vma_revision(&self) -> carrick_hal::ForeignVmaRevision {
+        self.snapshot.vma_revision
     }
     fn frame_inventory_revision(&self) -> carrick_hal::ForeignFrameInventoryRevision {
         self.snapshot.frame_inventory_revision
@@ -6914,55 +6963,8 @@ impl carrick_hal::ForeignCowLiveInventoryReceipt for CarrierForeignCowReceipt {
     fn frame(&self) -> carrick_hal::FrameId {
         self.frame
     }
-    fn physical_base(&self) -> carrick_guest_mem::Gpa {
-        self.physical_base
-    }
-    fn physical_len(&self) -> u64 {
-        self.physical_len
-    }
     fn owner_generation(&self) -> carrick_hal::ForeignOwnerGeneration {
         self.owner_generation
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
-struct CarrierForeignWriteReceipt {
-    cow: CarrierForeignCowReceipt,
-    bytes_written: usize,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl carrick_hal::ForeignMmWriteReceipt for CarrierForeignWriteReceipt {
-    fn mm(&self) -> carrick_hal::ForeignMmId {
-        self.cow.snapshot.mm
-    }
-    fn range_start(&self) -> carrick_guest_mem::GuestVa {
-        self.cow.start
-    }
-    fn range_len(&self) -> usize {
-        self.cow.len
-    }
-    fn bytes_written(&self) -> usize {
-        self.bytes_written
-    }
-    fn backend_revision(&self) -> carrick_hal::ForeignBackendRevision {
-        self.cow.snapshot.backend_revision
-    }
-    fn vma_revision(&self) -> carrick_hal::ForeignVmaRevision {
-        self.cow.snapshot.vma_revision
-    }
-    fn frame_inventory_revision(&self) -> carrick_hal::ForeignFrameInventoryRevision {
-        self.cow.snapshot.frame_inventory_revision
-    }
-    fn mapping(&self) -> carrick_hal::MappingId {
-        self.cow.mapping
-    }
-    fn frame(&self) -> carrick_hal::FrameId {
-        self.cow.frame
-    }
-    fn owner_generation(&self) -> carrick_hal::ForeignOwnerGeneration {
-        self.cow.owner_generation
     }
 }
 
@@ -7175,7 +7177,7 @@ fn perform_foreign_cow_transaction(
         .checked_add(old_offset)
         .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
     let stage2_perms = applevisor::memory::MemPerms::ReadWriteExec;
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "foreign-cow-test-support")))]
     {
         let map_result = unsafe {
             inventory_hv_vm_map(
@@ -7190,7 +7192,7 @@ fn perform_foreign_cow_transaction(
         }
         new_lease.mark_mapped();
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "foreign-cow-test-support"))]
     new_lease.mark_test_mapped_without_backend();
     let owner_generation =
         register_global_frame_host_owner(new_lease, new_host, u64::from(stage2_perms))
@@ -7335,8 +7337,32 @@ fn perform_foreign_cow_transaction(
     committed_mapping_ids.sort_unstable();
     committed_mapping_ids.dedup();
     let challenge = commit.receipt_challenge();
-    let apply_receipt = match runtime.authority.apply_with_receipt(commit) {
-        Ok(receipt) => receipt,
+    let cow_length = carrick_hal::FrameLength::from_mapping_extent(
+        std::num::NonZeroU64::new(CowArmedRanges::COMPOUND_SIZE)
+            .unwrap_or_else(|| std::process::abort()),
+    );
+    let owner_generation_token = std::num::NonZeroU64::new(owner_generation)
+        .map(carrick_hal::ForeignOwnerGeneration::from_backend_counter)
+        .unwrap_or_else(|| std::process::abort());
+    let owner_is_live = global_frame_host_owners()
+        .lock()
+        .get(&(new_physical_ipa, CowArmedRanges::COMPOUND_SIZE))
+        .is_some_and(|owner| {
+            owner.generation == owner_generation
+                && std::ptr::eq(owner._mapping.as_ptr(), new_host_ptr)
+        });
+    if !owner_is_live {
+        std::process::abort();
+    }
+    let (apply_receipt, kernel_proof) = match runtime.authority.apply_foreign_cow(
+        commit,
+        split.new_extent.mapping,
+        split.new_extent.frame,
+        carrick_guest_mem::Gpa(new_physical_ipa),
+        cow_length,
+        owner_generation_token,
+    ) {
+        Ok(publication) => publication,
         Err(_error) => {
             let rollback = lease
                 .state
@@ -7407,10 +7433,6 @@ fn perform_foreign_cow_transaction(
         shared_key_offset: 0,
         owner_generation,
     });
-    let cow_length = carrick_hal::FrameLength::from_mapping_extent(
-        std::num::NonZeroU64::new(CowArmedRanges::COMPOUND_SIZE)
-            .unwrap_or_else(|| std::process::abort()),
-    );
     match runtime.authority.mapping_is_live(
         split.new_extent.mapping,
         split.new_extent.frame,
@@ -7445,9 +7467,6 @@ fn perform_foreign_cow_transaction(
         ),
         mapping_ids: committed_mapping_ids,
     };
-    let owner_generation = std::num::NonZeroU64::new(owner_generation)
-        .map(carrick_hal::ForeignOwnerGeneration::from_backend_counter)
-        .unwrap_or_else(|| std::process::abort());
     Ok(CarrierForeignCowReceipt {
         snapshot: committed,
         start: va,
@@ -7456,7 +7475,8 @@ fn perform_foreign_cow_transaction(
         frame: split.new_extent.frame,
         physical_base: carrick_guest_mem::Gpa(new_physical_ipa),
         physical_len: CowArmedRanges::COMPOUND_SIZE,
-        owner_generation,
+        owner_generation: owner_generation_token,
+        kernel_proof,
     })
 }
 
@@ -7639,18 +7659,13 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
                 src.len(),
             );
         }
-        let cow = CarrierForeignCowReceipt {
+        Ok(Box::new(CarrierForeignWriteReceipt {
             snapshot: requested,
             start: va,
             len: src.len(),
             mapping: cow.mapping(),
             frame: cow.frame(),
-            physical_base: cow.physical_base(),
-            physical_len: cow.physical_len(),
             owner_generation: cow.owner_generation(),
-        };
-        Ok(Box::new(CarrierForeignWriteReceipt {
-            cow,
             bytes_written: src.len(),
         }))
     }
@@ -7678,6 +7693,272 @@ impl carrick_hal::ForeignMmTransport for CarrierForeignMmTransport {
             retained,
             backing,
         }))
+    }
+}
+
+/// Test-only composition seam for exercising the production carrier foreign-MM
+/// transport from the runtime crate. The harness owns real carrier page tables,
+/// physical owners, inventory, alias metadata, and the private transport; the
+/// caller must supply kernel-minted mapping/frame identities and the real
+/// [`carrick_hal::FrameCowAuthority`].
+#[cfg(all(
+    target_os = "macos",
+    target_arch = "aarch64",
+    feature = "foreign-cow-test-support"
+))]
+pub mod foreign_cow_test_support {
+    use super::*;
+
+    pub const TEST_VA: u64 = 0x6000_2000_0000;
+    pub const OWNER_LEN: u64 = CowArmedRanges::COMPOUND_SIZE;
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct InitialInventoryIdentity {
+        pub root_mapping: carrick_hal::MappingId,
+        pub root_frame: carrick_hal::FrameId,
+        pub data_mapping: carrick_hal::MappingId,
+        pub data_frame: carrick_hal::FrameId,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct FixtureShape {
+        pub stage1_root: carrick_guest_mem::Gpa,
+        pub page_table_len: u64,
+        pub data_ipa: carrick_guest_mem::Gpa,
+        pub data_len: u64,
+    }
+
+    impl FixtureShape {
+        pub fn new(
+            stage1_root: carrick_guest_mem::Gpa,
+            data_ipa: carrick_guest_mem::Gpa,
+        ) -> Result<Self, String> {
+            let tables = make_page_tables(stage1_root, data_ipa)?;
+            Ok(Self {
+                stage1_root,
+                page_table_len: tables.as_bytes().len() as u64,
+                data_ipa,
+                data_len: OWNER_LEN,
+            })
+        }
+    }
+
+    pub struct ProductionCarrierForeignCowHarness {
+        transport: CarrierForeignMmTransport,
+        state: std::sync::Arc<MmAccessState>,
+        original_extents: Vec<(u64, u64)>,
+    }
+
+    impl ProductionCarrierForeignCowHarness {
+        #[allow(clippy::too_many_arguments)]
+        pub fn install(
+            snapshot: &dyn carrick_hal::ForeignMmSnapshot,
+            shape: FixtureShape,
+            inventory: InitialInventoryIdentity,
+            authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
+            identity: carrick_hal::FrameCowIdentity,
+            ordinal: u64,
+            initial_bytes: [u8; 4],
+        ) -> Result<Self, String> {
+            if snapshot.binding().stage1_root() != shape.stage1_root
+                || snapshot.mapping_ids().len() != 2
+                || !snapshot.mapping_ids().contains(&inventory.root_mapping)
+                || !snapshot.mapping_ids().contains(&inventory.data_mapping)
+                || identity.mm != snapshot.mm().raw_for_probe()
+                || identity.asid != snapshot.binding().asid().raw_for_probe()
+            {
+                return Err("carrier fixture rejected mismatched kernel snapshot identity".into());
+            }
+            let tables = make_page_tables(shape.stage1_root, shape.data_ipa)?;
+            if tables.as_bytes().len() as u64 != shape.page_table_len {
+                return Err("carrier fixture page-table shape changed".into());
+            }
+            let table_bytes = tables.as_bytes().to_vec();
+            let (table_generation, table_host) = install_owner(shape.stage1_root.0, &table_bytes)?;
+            let mut data_bytes = vec![0_u8; shape.data_len as usize];
+            data_bytes[..initial_bytes.len()].copy_from_slice(&initial_bytes);
+            let (data_generation, data_host) = install_owner(shape.data_ipa.0, &data_bytes)?;
+
+            let root_key = (shape.stage1_root.0, shape.page_table_len);
+            let data_key = (shape.data_ipa.0, shape.data_len);
+            let root_backing = InventoryBackingIdentity::Private(
+                ordinal
+                    .checked_mul(2)
+                    .ok_or_else(|| "carrier fixture backing identity exhausted".to_owned())?,
+            );
+            let data_backing = InventoryBackingIdentity::Private(
+                ordinal
+                    .checked_mul(2)
+                    .and_then(|value| value.checked_add(1))
+                    .ok_or_else(|| "carrier fixture backing identity exhausted".to_owned())?,
+            );
+            let mut ledger = HvpatchFrameInventory {
+                initialized: true,
+                ..HvpatchFrameInventory::default()
+            };
+            ledger.extents.insert(
+                root_key,
+                InventoryExtent {
+                    frame: inventory.root_frame,
+                    mapping: inventory.root_mapping,
+                    backing: root_backing,
+                    stage2_base: root_key.0,
+                    stage2_length: root_key.1,
+                    stage2_owner: InventoryStage2OwnerIdentity {
+                        host_addr: table_host,
+                        generation: table_generation,
+                    },
+                },
+            );
+            ledger.extents.insert(
+                data_key,
+                InventoryExtent {
+                    frame: inventory.data_frame,
+                    mapping: inventory.data_mapping,
+                    backing: data_backing,
+                    stage2_base: data_key.0,
+                    stage2_length: data_key.1,
+                    stage2_owner: InventoryStage2OwnerIdentity {
+                        host_addr: data_host,
+                        generation: data_generation,
+                    },
+                },
+            );
+            {
+                let mut frames = ledger.frames.lock();
+                for (frame, key) in [
+                    (inventory.root_frame, root_key),
+                    (inventory.data_frame, data_key),
+                ] {
+                    frames.references.insert(frame, 1);
+                    frames.extent_references.insert((frame, key.0, key.1), 1);
+                    frames.stage2_references.insert(key, 1);
+                }
+            }
+            let state = MmAccessState::new(
+                std::sync::Arc::new(parking_lot::Mutex::new(Some(tables))),
+                std::sync::Arc::new(MemoryProtections::default()),
+                std::sync::Arc::new(parking_lot::Mutex::new(ledger)),
+                std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
+                std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            );
+            let transport = CarrierForeignMmTransport::new();
+            transport.register(snapshot, &state);
+            register_shared_alias(AliasBacking {
+                start: TEST_VA,
+                ipa: data_key.0,
+                host_addr: data_host,
+                size: shape.data_len as usize,
+                physical_ipa: data_key.0,
+                physical_host_addr: data_host,
+                physical_size: shape.data_len as usize,
+                perms: u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+                guest_writable: true,
+                sharing: GuestMappingSharing::Private,
+                ownership_scope: alias_ownership_scope(
+                    GuestMappingSharing::Private,
+                    Some(root_key),
+                    ContainerRootToken::ROOT,
+                ),
+                inventory_backing: data_backing,
+                shared_key_base: 0,
+                shared_key_offset: 0,
+                owner_generation: data_generation,
+            });
+            state
+                .cow_armed
+                .lock()
+                .arm(&[carrick_aarch64::vmm::ForkCowRange {
+                    va: TEST_VA,
+                    len: shape.data_len as usize,
+                    executable: false,
+                    kernel_only: false,
+                }]);
+            state.bind_cow_runtime(MmCowRuntimeBinding {
+                authority,
+                identity,
+                mm_root_slot: Some(root_key),
+                container_root: ContainerRootToken::ROOT,
+                persistent_vm_lifecycle: true,
+            });
+            Ok(Self {
+                transport,
+                state,
+                original_extents: vec![root_key, data_key],
+            })
+        }
+
+        pub fn endpoint(&self) -> carrick_hal::ForeignMmEndpoint {
+            carrick_hal::ForeignMmEndpoint::for_carrier(std::sync::Arc::new(self.transport.clone()))
+        }
+    }
+
+    impl Drop for ProductionCarrierForeignCowHarness {
+        fn drop(&mut self) {
+            let mut extents = self.original_extents.clone();
+            extents.extend(
+                self.state
+                    .frame_inventory
+                    .ledger
+                    .lock()
+                    .extents
+                    .keys()
+                    .copied(),
+            );
+            extents.sort_unstable();
+            extents.dedup();
+            alias_registry().lock().retain(|alias| {
+                !extents.contains(&(alias.physical_ipa, alias.physical_size as u64))
+            });
+            let mut owners = global_frame_host_owners().lock();
+            for extent in extents {
+                owners.remove(&extent);
+            }
+        }
+    }
+
+    fn make_page_tables(
+        stage1_root: carrick_guest_mem::Gpa,
+        data_ipa: carrick_guest_mem::Gpa,
+    ) -> Result<crate::page_table::PageTableManager, String> {
+        let mut tables = carrick_mem::page_table::PageTableManager::new(
+            carrick_mem::memory::stage1_hvpatch_page_tables(),
+            carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+        );
+        tables
+            .rebase(stage1_root.0)
+            .map_err(|error| format!("rebase carrier fixture page tables: {error:?}"))?;
+        tables
+            .map_aliased(TEST_VA, data_ipa.0, OWNER_LEN, false)
+            .map_err(|error| format!("map carrier fixture COW leaf: {error:?}"))?;
+        Ok(tables)
+    }
+
+    fn install_owner(ipa: u64, bytes: &[u8]) -> Result<(u64, usize), String> {
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            bytes.len(),
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .map_err(|error| format!("map carrier fixture physical owner: {error}"))?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapping.as_ptr(), bytes.len());
+        }
+        let host_addr = mapping.as_ptr() as usize;
+        let generation = next_global_frame_owner_generation();
+        let owner = GlobalFrameHostOwner {
+            _mapping: mapping,
+            _lease: GlobalFrameStage2Lease::fixed(ipa, bytes.len() as u64),
+            perms: u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+            generation,
+        };
+        if global_frame_host_owners()
+            .lock()
+            .insert((ipa, bytes.len() as u64), std::sync::Arc::new(owner))
+            .is_some()
+        {
+            return Err("carrier fixture physical owner collided".into());
+        }
+        Ok((generation, host_addr))
     }
 }
 
@@ -9131,9 +9412,9 @@ struct GlobalFrameStage2Lease {
     mapped: bool,
     active: bool,
     release_ipa: bool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "foreign-cow-test-support"))]
     drop_backing_audit: Option<(usize, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "foreign-cow-test-support"))]
     backend_map_installed: bool,
 }
 
@@ -9147,9 +9428,9 @@ impl GlobalFrameStage2Lease {
             mapped: false,
             active: true,
             release_ipa: true,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "foreign-cow-test-support"))]
             drop_backing_audit: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "foreign-cow-test-support"))]
             backend_map_installed: false,
         })
     }
@@ -9161,22 +9442,22 @@ impl GlobalFrameStage2Lease {
             mapped: false,
             active: true,
             release_ipa: false,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "foreign-cow-test-support"))]
             drop_backing_audit: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "foreign-cow-test-support"))]
             backend_map_installed: false,
         }
     }
 
     fn mark_mapped(&mut self) {
         self.mapped = true;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "foreign-cow-test-support"))]
         {
             self.backend_map_installed = true;
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "foreign-cow-test-support"))]
     fn mark_test_mapped_without_backend(&mut self) {
         self.mapped = true;
     }
@@ -9189,7 +9470,7 @@ impl GlobalFrameStage2Lease {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl Drop for GlobalFrameStage2Lease {
     fn drop(&mut self) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "foreign-cow-test-support"))]
         if let Some((host_addr, observed)) = &self.drop_backing_audit {
             observed.store(
                 alias_backing_is_live(*host_addr),
@@ -9199,9 +9480,9 @@ impl Drop for GlobalFrameStage2Lease {
         if !self.active {
             return;
         }
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "foreign-cow-test-support")))]
         let unmap_backend = self.mapped;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "foreign-cow-test-support"))]
         let unmap_backend = self.backend_map_installed;
         if unmap_backend {
             let size = usize::try_from(self.length).unwrap_or_else(|_| {

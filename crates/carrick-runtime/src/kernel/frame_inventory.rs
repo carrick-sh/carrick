@@ -406,6 +406,29 @@ impl FrameInventoryAuthority {
         })
     }
 
+    /// Exact point query tied to the same global inventory revision carried by
+    /// a kernel-issued foreign-COW proof. Any intervening inventory publication
+    /// makes the proof stale even if the mapping row itself is unchanged.
+    pub(crate) fn mapping_is_live_exact_at_revision(
+        &self,
+        mm: MmId,
+        revision: u64,
+        mapping: MappingId,
+        frame: FrameId,
+        gpa: Gpa,
+        length: FrameLength,
+    ) -> bool {
+        let state = self.state.lock();
+        state.revision == revision
+            && state.mappings.get(&mapping).is_some_and(|entry| {
+                entry.state == MappingState::Published
+                    && entry.mm == mm
+                    && entry.frame == frame
+                    && entry.gpa == gpa
+                    && entry.length == length
+            })
+    }
+
     /// Live mappings naming `frame`, across every mm; `None` once the frame
     /// is retired or was never inserted.
     ///
