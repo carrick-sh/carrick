@@ -4571,6 +4571,7 @@ mod tests {
             .into_parts()
             .expect("start shared-mm child")
             .0;
+        assert_ne!(shared.task().key(), root.task().key());
         let relation = kernel
             .foreign_mm(&root, shared.task().key())
             .expect("shared MM authority");
