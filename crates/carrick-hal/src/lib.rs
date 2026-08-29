@@ -19,9 +19,9 @@ pub use foreign_mm::{
     ForeignAsid, ForeignAsidGeneration, ForeignCowInvalidationGeneration,
     ForeignCowInvalidationIdentity, ForeignCowKernelProof, ForeignCowReceipt, ForeignMmBinding,
     ForeignMmEndpoint, ForeignMmId, ForeignMmInvalidator, ForeignMmInvocation,
-    ForeignMmLeaseEndpoint, ForeignMmLiveAuthority, ForeignMmReadLease, ForeignMmReadReceipt,
-    ForeignMmSnapshot, ForeignMmTransport, ForeignMmTransportError, ForeignMmWriteReceipt,
-    ForeignOwnerGeneration, ForeignStage1Identity,
+    ForeignMmLeaseEndpoint, ForeignMmLiveAuthority, ForeignMmPreparedWrite, ForeignMmReadLease,
+    ForeignMmReadReceipt, ForeignMmSnapshot, ForeignMmTransport, ForeignMmTransportError,
+    ForeignMmWriteReceipt, ForeignOwnerGeneration, ForeignStage1Identity,
 };
 pub mod stage1_exclusive;
 
