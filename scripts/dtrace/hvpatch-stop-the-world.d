@@ -9,10 +9,12 @@
  *       pt-pause-*            the stage-1 page-table Pause-Modify-Resume.
  *                             `pt-pause-begin` fires only when an editor
  *                             actually became coordinator, so its COUNT is the
- *                             raise decision. arg1 (`others_in_guest`) and arg2
- *                             (`leases`) are the drain's inputs; arg3
- *                             (`executors`) is the population the raise is
- *                             keyed on.
+ *                             raise decision. arg0 is coordinator tid, arg1
+ *                             (`other_in_guest`) is other-in-guest boolean,
+ *                             arg2 (`waiting_sibling_tid`) is exact waiting
+ *                             sibling tid or zero when complete; arg3
+ *                             (`executor_census`) is the live executor census
+ *                             the raise is keyed on.
  *       hvpatch-fork-quiesce  fires UNCONDITIONALLY at the end of the HVPatch
  *                             in-process fork quiesce phase, whether or not the
  *                             barrier went up. arg2 is `initial_siblings`, the
@@ -49,10 +51,16 @@
  *         `carrick run` it launched; `progenyof` follows the carrier and any
  *         helper it forks.
  *       * `pt-pause-begin` args are
- *         (tid, others_in_guest, leases, executors) as i32. `leases` is the
- *         vCPU-registry count and `executors` the guest-executor census; a row
- *         with leases == 1 and executors > 1 is a pause the historical
- *         lease-keyed predicate would have skipped.
+ *         (coordinator_tid, other_in_guest, waiting_sibling_tid, executor_census)
+ *         as i32: arg0 coordinator tid, arg1 other-in-guest boolean, arg2 exact
+ *         waiting sibling tid or zero when complete, arg3 live executor census.
+ *         A row with arg2 == 0 and arg3 > 1 is a pause with peer executor and no
+ *         sibling lease (`pt-raised-with-peer-executor-and-no-sibling-lease`).
+ *         Explicitly note this new predicate (`arg2 == 0 && arg3 > 1`) is
+ *         narrower and not equivalent to the retired scalar-count predicate
+ *         (which tested for at most one lease and multiple executors),
+ *         because arg2 carries the exact waiting sibling tid (or zero when
+ *         complete) rather than a scalar lease count.
  *       * `hvpatch-fork-quiesce` args are
  *         (parent_pid i32, forking_tid i32, initial_siblings u32,
  *          poll_iterations u64, elapsed_ns u64).
@@ -114,15 +122,16 @@ carrick*:::pt-pause-begin
 }
 
 /*
- * THE DEFECT, made positive: a pause taken while the vCPU registry held only
- * this thread's lease. Every one of these is an edit the lease-keyed predicate
- * would have run with the barrier down, against a sibling parked in a futex /
- * epoll / fd wait that a host wake can return to guest at any moment.
+ * A pause taken when no sibling held a registered lease at coordinator entry
+ * even though peer executors were live. Note that `arg2 == 0 && arg3 > 1` is
+ * narrower and not equivalent to the retired scalar-count predicate, because
+ * `arg2` carries the exact waiting sibling tid (or 0 when complete) rather
+ * than a scalar lease count.
  */
 carrick*:::pt-pause-begin
-/(pid == $target || progenyof($target)) && arg2 <= 1 && arg3 > 1/
+/(pid == $target || progenyof($target)) && arg2 == 0 && arg3 > 1/
 {
-	@c["pt-raised-LEASES-WOULD-HAVE-MISSED"] = count();
+	@c["pt-raised-with-peer-executor-and-no-sibling-lease"] = count();
 }
 
 carrick*:::pt-pause-ready

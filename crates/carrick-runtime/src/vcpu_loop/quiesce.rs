@@ -202,10 +202,21 @@ impl PtPauseBudget {
     };
 }
 
+/// Pure mapper from [`carrick_hal::VcpuLeaseDrainPoll`] to diagnostic thread ID.
+///
+/// Maps [`carrick_hal::VcpuLeaseDrainPoll::Complete`] to 0 and
+/// [`carrick_hal::VcpuLeaseDrainPoll::Waiting`] to its exact raw `ThreadId`.
+pub(super) fn waiting_vcpu_tid(poll: carrick_hal::VcpuLeaseDrainPoll) -> i32 {
+    match poll {
+        carrick_hal::VcpuLeaseDrainPoll::Complete => 0,
+        carrick_hal::VcpuLeaseDrainPoll::Waiting(tid) => tid.raw(),
+    }
+}
+
 /// `census` is recorded, not consulted: whether to pause at all is decided by
 /// the caller (`KernelState::has_peer_guest_executor`). Carrying it into
-/// `pt-pause-begin` beside `kicker.count()` keeps the two populations visible
-/// side by side, so a reader can never again mistake the lease count for the
+/// `pt-pause-begin` beside `waiting_vcpu_tid(kicker.poll_lease_drain(tid))` keeps the two populations visible
+/// side by side, so a reader can never again mistake the waiting lease identity for the
 /// set of threads that can execute guest code.
 pub(super) fn acquire_pt_pause(
     barrier: &'static crate::fork_quiesce::PtQuiesce,
@@ -250,7 +261,7 @@ pub(super) fn acquire_pt_pause(
     crate::probes::pt_pause_begin(
         tid.raw(),
         i32::from(kicker.any_other_in_guest(tid)),
-        kicker.count() as i32,
+        waiting_vcpu_tid(kicker.poll_lease_drain(tid)),
         census.live() as i32,
     );
 
@@ -1678,7 +1689,7 @@ mod pt_pause_tests {
         let barrier: &'static crate::fork_quiesce::PtQuiesce =
             Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
         let registry = Arc::new(GenericVcpuRegistry::new());
-        // Recorded into `pt-pause-begin` beside the lease count; these
+        // Recorded into `pt-pause-begin` beside the waiting lease identity; these
         // tests exercise the DRAIN, which reads the registry.
         let census = crate::kernel::GuestExecutorCensus::default();
         let coordinator = tid(1501);
@@ -1736,7 +1747,7 @@ mod pt_pause_tests {
         let barrier: &'static crate::fork_quiesce::PtQuiesce =
             Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
         let registry = Arc::new(GenericVcpuRegistry::new());
-        // Recorded into `pt-pause-begin` beside the lease count; these
+        // Recorded into `pt-pause-begin` beside the waiting lease identity; these
         // tests exercise the DRAIN, which reads the registry.
         let census = crate::kernel::GuestExecutorCensus::default();
         let waiter = tid(1521);
@@ -1782,7 +1793,7 @@ mod pt_pause_tests {
         let barrier: &'static crate::fork_quiesce::PtQuiesce =
             Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
         let registry = Arc::new(GenericVcpuRegistry::new());
-        // Recorded into `pt-pause-begin` beside the lease count; these
+        // Recorded into `pt-pause-begin` beside the waiting lease identity; these
         // tests exercise the DRAIN, which reads the registry.
         let census = crate::kernel::GuestExecutorCensus::default();
         let coordinator = tid(1511);
@@ -1843,7 +1854,7 @@ mod pt_pause_tests {
         let barrier: &'static crate::fork_quiesce::PtQuiesce =
             Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
         let registry = Arc::new(GenericVcpuRegistry::new());
-        // Recorded into `pt-pause-begin` beside the lease count; these
+        // Recorded into `pt-pause-begin` beside the waiting lease identity; these
         // tests exercise the DRAIN, which reads the registry.
         let census = crate::kernel::GuestExecutorCensus::default();
         let coordinator = tid(1531);

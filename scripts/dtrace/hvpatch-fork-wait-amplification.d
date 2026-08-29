@@ -23,7 +23,9 @@
  *   carrick*:::hvpatch-guest-fault fires per guest-visible stage-1 fault.
  *   carrick*:::vcpu-trap fires per host-dispatched guest syscall.
  *   carrick*:::vcpu-kick fires per cross-thread vCPU kick.
- *   carrick*:::pt-pause-begin fires per stop-the-world page-table pause.
+ *   carrick*:::pt-pause-begin fires per stop-the-world page-table pause
+ *     (arg0 coordinator tid, arg1 other-in-guest boolean, arg2 exact waiting
+ *     sibling tid or zero when complete, arg3 live executor census).
  * The predicate follows Carrick descendants: a raw HVPatch run may place the
  * VM carrier in a child of the launched process.
  *
