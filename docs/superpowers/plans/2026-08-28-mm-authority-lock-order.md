@@ -55,12 +55,14 @@ FORBIDDEN = {
     "unpermitted-host-alias": "host-alias acquisition lacks HostAliasPermit",
     "legacy-lock-order": "debug-only LockLevel authority remains",
     "public-mm-token-construction": "opaque MM authority is externally constructible",
+    "blanket-current-impl": "CurrentMmMemory has a blanket implementation",
 }
 ```
 
 Fixtures must reject `process_vm_copy_self` or `memory.read_bytes` in an
 `OtherGuest` arm, `LockOrderGuard::acquire`, `LockLevel`, and a
-`HostAliasTransactions::begin_dispatch()` call without a permit argument.
+`HostAliasTransactions::begin_dispatch()` call without a permit argument, plus
+`impl<T: GuestMemory> CurrentMmMemory for T` and its unconstrained equivalent.
 Fixtures must accept comments, strings, `#[cfg(test)]`, `CurrentMmMemory`,
 `MmRelation::Current`, runtime-facade `read_foreign`, and
 `begin_dispatch(&permit)`.
@@ -300,17 +302,17 @@ Request independent review before integration.
 - Consumes: `GuestMemory` and the approved explicit marker name.
 - Produces: `CurrentMmMemory: GuestMemory` with no blanket impl, explicit production/test implementations, and current-pointer dispatch bounds.
 
-- [ ] **Step 1: Add a source assertion proving no blanket impl can land**
+- [ ] **Step 1: Prove the behavioral source gate rejects blanket authority**
 
-Add a test in `carrick-guest-mem` that inspects its source and rejects:
+Run the Task 1 checker self-test and confirm its controlled negative fixtures
+reject both blanket shapes while explicit implementations pass:
 
-```rust
-assert!(!source.contains("impl<T: GuestMemory> CurrentMmMemory for T"));
-assert!(!source.contains("impl<T> CurrentMmMemory for T"));
+```bash
+python3 scripts/migrate/check-mm-authority.py --self-test
 ```
 
-Add a compile fixture whose `OnlyGuestMemory` cannot satisfy
-`fn needs_current(_: &impl CurrentMmMemory)`.
+Expected: the `blanket-current-impl` negative fixtures are reported internally
+and the self-test exits 0. Do not add a Rust test that greps its own source.
 
 - [ ] **Step 2: Launch one isolated Antigravity worker**
 
