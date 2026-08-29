@@ -14,6 +14,13 @@ use super::{
 
 const MM_SNAPSHOT_TIMEOUT: Duration = Duration::from_millis(50);
 
+/// Unforgeable permission for the MM-access module to retrieve the carrier
+/// endpoint installed on an exact kernel MM. Other kernel modules may name the
+/// type where required by signatures, but cannot construct it.
+pub(super) struct ForeignEndpointPermit {
+    _private: (),
+}
+
 /// A retained, coherent observation of one exact `mm` incarnation.
 ///
 /// Construction is confined to the kernel graph. The retained [`Arc`] keeps
@@ -26,7 +33,7 @@ pub struct MmToken {
     task: TaskKey,
     mm: Arc<Mm>,
     snapshot: MmBackendSnapshot,
-    foreign_lease: Option<Arc<dyn carrick_hal::ForeignMmReadLease>>,
+    foreign_lease: Option<carrick_hal::ForeignMmLeaseEndpoint>,
 }
 
 impl MmToken {
@@ -566,16 +573,15 @@ fn snapshot_token(
     let deadline = Instant::now() + MM_SNAPSHOT_TIMEOUT;
     let snapshot = snapshot_backend(&mm, deadline)?;
     validate_snapshot_vmas(&snapshot)?;
-    let backend = mm
-        .backend()
-        .ok_or(MmAccessError::MissingBackendAuthority(mm.id()))?;
     let foreign_lease = if retain_foreign {
-        let transport = backend
-            .foreign_mm_transport()
+        let permit = ForeignEndpointPermit { _private: () };
+        let endpoint = mm
+            .foreign_mm_endpoint(&permit, deadline)
+            .ok_or(MmAccessError::ForeignReadTimedOut)?
             .ok_or(MmAccessError::MissingForeignTransport(mm.id()))?;
         let projected = ProjectedForeignMmSnapshot::from_backend(mm.id(), &snapshot)?;
         Some(
-            transport
+            endpoint
                 .retain(&projected, deadline)
                 .map_err(MmAccessError::ForeignTransport)?,
         )
@@ -760,6 +766,7 @@ mod tests {
     impl ForeignMmReadLease for MockForeignLease {
         fn read(
             &self,
+            _invocation: &carrick_hal::ForeignMmInvocation,
             _authority: &dyn carrick_hal::ForeignMmLiveAuthority,
             _snapshot: &dyn ForeignMmSnapshot,
             _va: GuestVa,
@@ -792,6 +799,7 @@ mod tests {
     impl ForeignMmTransport for MockForeignTransport {
         fn retain(
             &self,
+            _invocation: &carrick_hal::ForeignMmInvocation,
             _snapshot: &dyn ForeignMmSnapshot,
             _deadline: Instant,
         ) -> Result<Arc<dyn ForeignMmReadLease>, ForeignMmTransportError> {
@@ -799,27 +807,6 @@ mod tests {
                 calls: Arc::clone(&self.calls),
                 mode: self.mode,
             }))
-        }
-    }
-
-    #[derive(Debug)]
-    struct ForeignFixtureBackend {
-        base: FixtureBackend,
-        transport: Arc<dyn ForeignMmTransport>,
-    }
-
-    impl MmBackend for ForeignFixtureBackend {
-        fn snapshot(&self, deadline: Instant) -> Result<MmBackendSnapshot, SnapshotError> {
-            self.base.snapshot(deadline)
-        }
-        fn revision(&self) -> u64 {
-            self.base.revision()
-        }
-        fn vma_revision(&self, deadline: Instant) -> Result<Option<VmaRevision>, SnapshotError> {
-            self.base.vma_revision(deadline)
-        }
-        fn foreign_mm_transport(&self) -> Option<Arc<dyn ForeignMmTransport>> {
-            Some(Arc::clone(&self.transport))
         }
     }
 
@@ -847,19 +834,6 @@ mod tests {
         let root = Stage1Root::for_aarch64_4k(Gpa(0x8000)).expect("aligned stage-1 root");
         Arc::new(FixtureBackend {
             binding: MmBinding::for_aarch64(asid, root),
-        })
-    }
-
-    fn fixture_backend_with_transport(
-        transport: Arc<dyn ForeignMmTransport>,
-    ) -> Arc<dyn MmBackend> {
-        let asid = Asid::from_registry_allocation(NonZeroU16::new(7).expect("nonzero ASID"));
-        let root = Stage1Root::for_aarch64_4k(Gpa(0x8000)).expect("aligned stage-1 root");
-        Arc::new(ForeignFixtureBackend {
-            base: FixtureBackend {
-                binding: MmBinding::for_aarch64(asid, root),
-            },
-            transport,
         })
     }
 
@@ -959,6 +933,20 @@ mod tests {
             .0
     }
 
+    fn fork_with_transport(
+        kernel: &Arc<Kernel>,
+        parent: &KernelContext,
+        registry_id: i32,
+        name: &str,
+        transport: Arc<dyn ForeignMmTransport>,
+    ) -> KernelContext {
+        let child = fork_with_backend(kernel, parent, registry_id, name, fixture_backend());
+        child.shared().mm().install_foreign_mm_endpoint_for_test(
+            carrick_hal::ForeignMmEndpoint::for_carrier(transport),
+        );
+        child
+    }
+
     fn foreign_mm(
         kernel: &Arc<Kernel>,
         caller: &KernelContext,
@@ -983,13 +971,7 @@ mod tests {
             calls: Arc::clone(&calls),
             mode: MockReadMode::RetryOnce,
         });
-        let child = fork_with_backend(
-            &kernel,
-            &root,
-            31_101,
-            "retained-mm child",
-            fixture_backend_with_transport(transport),
-        );
+        let child = fork_with_transport(&kernel, &root, 31_101, "retained-mm child", transport);
         let old_mm_arc = child.shared().mm();
         let old_mm_weak = Arc::downgrade(&old_mm_arc);
         let old_mm = old_mm_arc.id();
@@ -1207,15 +1189,15 @@ mod tests {
     fn token_bound_ranges_require_permissions_and_complete_vma_coverage() {
         let (kernel, root) = bootstrap(31_120);
         let execution = execution_lease(&root, 121);
-        let child = fork_with_backend(
+        let child = fork_with_transport(
             &kernel,
             &root,
             31_121,
             "range-mm child",
-            fixture_backend_with_transport(Arc::new(MockForeignTransport {
+            Arc::new(MockForeignTransport {
                 calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 mode: MockReadMode::RetryOnce,
-            })),
+            }),
         );
         let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
         let token: &MmToken = &foreign.token;
@@ -1292,13 +1274,7 @@ mod tests {
             calls: Arc::clone(&calls),
             mode: MockReadMode::RetryOnce,
         });
-        let child = fork_with_backend(
-            &kernel,
-            &root,
-            31_141,
-            "foreign-read child",
-            fixture_backend_with_transport(transport),
-        );
+        let child = fork_with_transport(&kernel, &root, 31_141, "foreign-read child", transport);
         let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
         let range = foreign
             .read_range(GuestVa(0x1000), 4)
@@ -1325,12 +1301,12 @@ mod tests {
             calls: Arc::clone(&calls),
             mode: MockReadMode::AlwaysRetry,
         });
-        let child = fork_with_backend(
+        let child = fork_with_transport(
             &kernel,
             &root,
             31_143,
             "churning foreign-read child",
-            fixture_backend_with_transport(transport),
+            transport,
         );
         let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
         let range = foreign
@@ -1356,12 +1332,12 @@ mod tests {
             calls,
             mode: MockReadMode::EmptyOwners,
         });
-        let child = fork_with_backend(
+        let child = fork_with_transport(
             &kernel,
             &root,
             31_145,
             "ownerless foreign-read child",
-            fixture_backend_with_transport(transport),
+            transport,
         );
         let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
         let range = foreign.read_range(GuestVa(0x1000), 4).unwrap().unwrap();
@@ -1382,12 +1358,12 @@ mod tests {
             calls: Arc::clone(&calls),
             mode: MockReadMode::Deadline,
         });
-        let child = fork_with_backend(
+        let child = fork_with_transport(
             &kernel,
             &root,
             31_147,
             "deadline foreign-read child",
-            fixture_backend_with_transport(transport),
+            transport,
         );
         let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
         let range = foreign.read_range(GuestVa(0x1000), 4).unwrap().unwrap();

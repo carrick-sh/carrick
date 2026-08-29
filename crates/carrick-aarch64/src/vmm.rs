@@ -342,7 +342,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     type SiblingBuilder: Send;
     type ProcessBuilder: Send;
 
-    fn foreign_mm_transport(&self) -> Option<std::sync::Arc<dyn carrick_hal::ForeignMmTransport>> {
+    fn foreign_mm_endpoint(&self) -> Option<carrick_hal::ForeignMmEndpoint> {
         None
     }
 

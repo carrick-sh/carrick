@@ -223,12 +223,12 @@ pub enum TrapBackend {
 mod foreign_mm_tests {
     use std::num::{NonZeroU16, NonZeroU64};
     use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::thread;
     use std::time::{Duration, Instant};
 
-    use carrick_guest_mem::{Gpa, GuestVa};
-    use carrick_hal::ForeignMmTransport as _;
-
     use super::*;
+    use carrick_guest_mem::{Gpa, GuestVa};
 
     const TEST_VA: u64 = 0x6000_2000_0000;
     const OWNER_LEN: usize = 0x4000;
@@ -329,7 +329,7 @@ mod foreign_mm_tests {
         assert!(
             global_frame_host_owners()
                 .lock()
-                .insert((ipa, length as u64), owner)
+                .insert((ipa, length as u64), Arc::new(owner))
                 .is_none(),
             "fixture IPA must be unique"
         );
@@ -436,7 +436,8 @@ mod foreign_mm_tests {
     ) -> Result<Box<dyn carrick_hal::ForeignMmReadReceipt>, carrick_hal::ForeignMmTransportError>
     {
         let deadline = Instant::now() + Duration::from_secs(1);
-        let lease = transport.retain(&installed.snapshot, deadline)?;
+        let endpoint = carrick_hal::ForeignMmEndpoint::for_carrier(Arc::new(transport.clone()));
+        let lease = endpoint.retain(&installed.snapshot, deadline)?;
         lease.read(
             &installed.live,
             &installed.snapshot,
@@ -561,14 +562,14 @@ mod foreign_mm_tests {
     }
 
     #[test]
-    fn retained_old_token_reads_after_retirement_and_binding_reuse() {
+    fn retained_old_token_keeps_physical_backing_after_production_retirement_and_binding_reuse() {
         let _guard = FOREIGN_MM_TEST_LOCK.lock();
         let transport = CarrierForeignMmTransport::new();
         let InstalledMm {
             snapshot,
             live,
             state,
-            owners: _owners,
+            owners,
         } = install_mm(
             &transport,
             106,
@@ -577,9 +578,47 @@ mod foreign_mm_tests {
             *b"old!",
         );
         let deadline = Instant::now() + Duration::from_secs(1);
-        let lease = transport
-            .retain(&snapshot, deadline)
-            .expect("retain old MM");
+        let endpoint = carrick_hal::ForeignMmEndpoint::for_carrier(Arc::new(transport.clone()));
+        let lease = endpoint.retain(&snapshot, deadline).expect("retain old MM");
+        let extents = owners
+            .0
+            .iter()
+            .map(|&(ipa, length)| {
+                (
+                    (ipa, usize::try_from(length).expect("fixture extent length")),
+                    global_frame_host_owner_generation(ipa, length),
+                )
+            })
+            .collect();
+        let mut cleanup = PendingExecStage2Cleanup {
+            mappings: Vec::new(),
+            extents,
+            frames: Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default())),
+            mm_root_slot: None,
+            container_root: ContainerRootToken::ROOT,
+            predecessor_identity: carrick_hal::ExecPredecessorIdentity {
+                task_serial: 106,
+                thread_serial: 106,
+                linux_pid: 106,
+                linux_tid: 106,
+                mm: snapshot.mm.get(),
+                asid: snapshot.asid.get(),
+            },
+            predecessor_mm: snapshot.mm.get(),
+            shared_projection: false,
+            armed: true,
+        };
+        cleanup
+            .retire_with(&mut |_| {})
+            .expect("production exec predecessor cleanup");
+        for &(ipa, length) in &owners.0 {
+            assert_eq!(
+                global_frame_host_owner_generation(ipa, length),
+                0,
+                "production cleanup must remove each old owner from the live directory",
+            );
+        }
+        drop(owners);
         drop(state);
 
         let replacement_snapshot = TestSnapshot {
@@ -601,6 +640,136 @@ mod foreign_mm_tests {
             .expect("old retained token must keep exact carrier state readable");
         assert_eq!(&bytes, b"old!");
         assert!(receipt.authenticates(&snapshot));
+    }
+
+    const CONTENDED_HOLD: Duration = Duration::from_millis(250);
+    const TEST_DEADLINE: Duration = Duration::from_millis(25);
+    const MAX_BOUNDED_RETURN: Duration = Duration::from_millis(150);
+
+    fn hold_lock_then_signal(
+        hold: impl FnOnce(mpsc::Sender<()>) + Send + 'static,
+    ) -> (mpsc::Receiver<()>, thread::JoinHandle<()>) {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let holder = thread::spawn(move || hold(ready_tx));
+        (ready_rx, holder)
+    }
+
+    fn assert_bounded_timeout<T>(
+        result: Result<T, carrick_hal::ForeignMmTransportError>,
+        elapsed: Duration,
+        lock_name: &str,
+    ) {
+        assert!(
+            matches!(result, Err(carrick_hal::ForeignMmTransportError::TimedOut)),
+            "{lock_name} contention must fail closed with TimedOut",
+        );
+        assert!(
+            elapsed < MAX_BOUNDED_RETURN,
+            "{lock_name} contention exceeded the overall bound: {elapsed:?}",
+        );
+    }
+
+    #[test]
+    fn foreign_mm_retain_deadline_bounds_directory_inventory_and_owner_contention() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let transport = CarrierForeignMmTransport::new();
+        let installed = install_mm(
+            &transport,
+            108,
+            0x9a00_0e00_0000,
+            0x9b00_0e00_0000,
+            *b"lock",
+        );
+        let endpoint = carrick_hal::ForeignMmEndpoint::for_carrier(Arc::new(transport.clone()));
+
+        let states = Arc::clone(&transport.states);
+        let (ready, holder) = hold_lock_then_signal(move |ready| {
+            let _guard = states.write();
+            ready.send(()).expect("signal directory lock acquisition");
+            thread::sleep(CONTENDED_HOLD);
+        });
+        ready.recv().expect("directory lock holder ready");
+        let started = Instant::now();
+        let result = endpoint.retain(&installed.snapshot, started + TEST_DEADLINE);
+        let elapsed = started.elapsed();
+        holder.join().expect("directory lock holder");
+        assert_bounded_timeout(result, elapsed, "carrier directory");
+
+        let state = Arc::clone(&installed.state);
+        let (ready, holder) = hold_lock_then_signal(move |ready| {
+            let _guard = state.identity.write();
+            ready.send(()).expect("signal MM identity lock acquisition");
+            thread::sleep(CONTENDED_HOLD);
+        });
+        ready.recv().expect("MM identity lock holder ready");
+        let started = Instant::now();
+        let result = endpoint.retain(&installed.snapshot, started + TEST_DEADLINE);
+        let elapsed = started.elapsed();
+        holder.join().expect("MM identity lock holder");
+        assert_bounded_timeout(result, elapsed, "MM identity");
+
+        let ledger = installed.state.frame_inventory.shared_ledger();
+        let (ready, holder) = hold_lock_then_signal(move |ready| {
+            let _guard = ledger.lock();
+            ready.send(()).expect("signal inventory lock acquisition");
+            thread::sleep(CONTENDED_HOLD);
+        });
+        ready.recv().expect("inventory lock holder ready");
+        let started = Instant::now();
+        let result = endpoint.retain(&installed.snapshot, started + TEST_DEADLINE);
+        let elapsed = started.elapsed();
+        holder.join().expect("inventory lock holder");
+        assert_bounded_timeout(result, elapsed, "frame inventory");
+
+        let (ready, holder) = hold_lock_then_signal(|ready| {
+            let _guard = global_frame_host_owners().lock();
+            ready.send(()).expect("signal owner lock acquisition");
+            thread::sleep(CONTENDED_HOLD);
+        });
+        ready.recv().expect("owner lock holder ready");
+        let started = Instant::now();
+        let result = endpoint.retain(&installed.snapshot, started + TEST_DEADLINE);
+        let elapsed = started.elapsed();
+        holder.join().expect("owner lock holder");
+        assert_bounded_timeout(result, elapsed, "global owners");
+    }
+
+    #[test]
+    fn foreign_mm_read_deadline_bounds_mutation_coordinator_contention() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let transport = CarrierForeignMmTransport::new();
+        let installed = install_mm(
+            &transport,
+            109,
+            0x9a00_1000_0000,
+            0x9b00_1000_0000,
+            *b"lock",
+        );
+        let endpoint = carrick_hal::ForeignMmEndpoint::for_carrier(Arc::new(transport.clone()));
+        let lease = endpoint
+            .retain(&installed.snapshot, Instant::now() + Duration::from_secs(1))
+            .expect("retain contended MM");
+        let state = Arc::clone(&installed.state);
+        let (ready, holder) = hold_lock_then_signal(move |ready| {
+            let _guard = state.mutation_coordinator.lock();
+            ready
+                .send(())
+                .expect("signal mutation coordinator acquisition");
+            thread::sleep(CONTENDED_HOLD);
+        });
+        ready.recv().expect("mutation coordinator holder ready");
+        let started = Instant::now();
+        let mut bytes = [0_u8; 4];
+        let result = lease.read(
+            &installed.live,
+            &installed.snapshot,
+            GuestVa(TEST_VA),
+            &mut bytes,
+            started + TEST_DEADLINE,
+        );
+        let elapsed = started.elapsed();
+        holder.join().expect("mutation coordinator holder");
+        assert_bounded_timeout(result, elapsed, "mutation coordinator");
     }
 }
 
@@ -2993,12 +3162,20 @@ fn global_frame_host_owner_identity(ipa: u64, length: u64) -> Option<(usize, u64
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe impl Send for GlobalFrameHostOwner {}
 
+// SAFETY: all owner fields are immutable after publication. Reads hold an Arc
+// to the exact mapping/lease incarnation, and final Drop cannot run until the
+// last reader releases that Arc.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn global_frame_host_owners()
--> &'static parking_lot::Mutex<std::collections::BTreeMap<(u64, u64), GlobalFrameHostOwner>> {
-    static CELL: std::sync::OnceLock<
-        parking_lot::Mutex<std::collections::BTreeMap<(u64, u64), GlobalFrameHostOwner>>,
-    > = std::sync::OnceLock::new();
+unsafe impl Sync for GlobalFrameHostOwner {}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+type GlobalFrameHostOwnerDirectory = parking_lot::Mutex<
+    std::collections::BTreeMap<(u64, u64), std::sync::Arc<GlobalFrameHostOwner>>,
+>;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn global_frame_host_owners() -> &'static GlobalFrameHostOwnerDirectory {
+    static CELL: std::sync::OnceLock<GlobalFrameHostOwnerDirectory> = std::sync::OnceLock::new();
     CELL.get_or_init(|| parking_lot::Mutex::new(std::collections::BTreeMap::new()))
 }
 
@@ -3152,12 +3329,12 @@ fn register_global_frame_host_owner(
     let generation = next_global_frame_owner_generation();
     owners.insert(
         key,
-        GlobalFrameHostOwner {
+        std::sync::Arc::new(GlobalFrameHostOwner {
             _mapping: mapping,
             _lease: lease,
             perms,
             generation,
-        },
+        }),
     );
     Ok(generation)
 }
@@ -5904,16 +6081,25 @@ impl CarrierForeignMmTransport {
     fn state_for(
         &self,
         snapshot: &CarrierForeignMmSnapshot,
+        deadline: std::time::Instant,
     ) -> Result<std::sync::Arc<MmAccessState>, carrick_hal::ForeignMmTransportError> {
-        let state = self
+        let states = self
             .states
-            .read()
+            .try_read_until(deadline)
+            .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?;
+        let state = states
             .get(&snapshot.binding)
             .and_then(std::sync::Weak::upgrade)
             .ok_or(carrick_hal::ForeignMmTransportError::MissingBinding)?;
-        if state.identity.read().as_ref() != Some(&(snapshot.mm, snapshot.binding)) {
+        drop(states);
+        let identity = state
+            .identity
+            .try_read_until(deadline)
+            .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?;
+        if identity.as_ref() != Some(&(snapshot.mm, snapshot.binding)) {
             return Err(carrick_hal::ForeignMmTransportError::MissingBinding);
         }
+        drop(identity);
         Ok(state)
     }
 }
@@ -6006,48 +6192,99 @@ impl MmAccessState {
         *self.page_tables.write() = page_tables;
     }
 
-    fn extent_for(
+    fn retain_physical_backing(
         &self,
         snapshot: &CarrierForeignMmSnapshot,
+        deadline: std::time::Instant,
+    ) -> Result<RetainedForeignMmBacking, carrick_hal::ForeignMmTransportError> {
+        let inventory = self
+            .frame_inventory
+            .ledger
+            .try_lock_until(deadline)
+            .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?;
+        let retained_extents: Vec<_> = inventory
+            .extents
+            .iter()
+            .filter(|(_, extent)| snapshot.mapping_ids.contains(&extent.mapping))
+            .map(|(&key, extent)| (key, extent.mapping, extent.stage2_owner))
+            .collect();
+        drop(inventory);
+        let retained_mapping_ids: std::collections::BTreeSet<_> = retained_extents
+            .iter()
+            .map(|(_, mapping, _)| *mapping)
+            .collect();
+        if snapshot
+            .mapping_ids
+            .iter()
+            .any(|mapping| !retained_mapping_ids.contains(mapping))
+        {
+            return Err(carrick_hal::ForeignMmTransportError::OwnerStale);
+        }
+        let owners = global_frame_host_owners()
+            .try_lock_until(deadline)
+            .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?;
+        let mut extents = Vec::with_capacity(retained_extents.len());
+        for (key, _, expected) in retained_extents {
+            let owner = owners
+                .get(&key)
+                .filter(|owner| {
+                    owner.generation != 0
+                        && owner.generation == expected.generation
+                        && owner._mapping.as_ptr() as usize == expected.host_addr
+                        && owner._mapping.len() as u64 == key.1
+                })
+                .cloned()
+                .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)?;
+            extents.push(RetainedForeignExtent { key, owner });
+        }
+        Ok(RetainedForeignMmBacking { extents })
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct RetainedForeignExtent {
+    key: (u64, u64),
+    owner: std::sync::Arc<GlobalFrameHostOwner>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct RetainedForeignMmBacking {
+    extents: Vec<RetainedForeignExtent>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl RetainedForeignMmBacking {
+    fn extent_for(
+        &self,
         ipa: u64,
         len: usize,
-    ) -> Result<((u64, u64), InventoryStage2OwnerIdentity), carrick_hal::ForeignMmTransportError>
-    {
+    ) -> Result<&RetainedForeignExtent, carrick_hal::ForeignMmTransportError> {
         let end = ipa
             .checked_add(len as u64)
             .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)?;
-        let inventory = self.frame_inventory.ledger.lock();
-        inventory
-            .extents
+        self.extents
             .iter()
-            .find_map(|(&(base, length), extent)| {
-                let extent_end = base.checked_add(length)?;
-                (base <= ipa && end <= extent_end && snapshot.mapping_ids.contains(&extent.mapping))
-                    .then_some(((base, length), extent.stage2_owner))
-            })
+            .find(|extent| extent.key.0 <= ipa && end <= extent.key.0.saturating_add(extent.key.1))
             .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)
     }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn copy_from_pinned_owner(
-    state: &MmAccessState,
-    snapshot: &CarrierForeignMmSnapshot,
+    backing: &RetainedForeignMmBacking,
     ipa: u64,
     dst: &mut [u8],
 ) -> Result<carrick_hal::ForeignOwnerGeneration, carrick_hal::ForeignMmTransportError> {
-    let (key, expected_owner) = state.extent_for(snapshot, ipa, dst.len())?;
+    let extent = backing.extent_for(ipa, dst.len())?;
+    let key = extent.key;
     let offset = ipa
         .checked_sub(key.0)
         .and_then(|offset| usize::try_from(offset).ok())
         .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)?;
-    let owners = global_frame_host_owners().lock();
-    let owner = owners
-        .get(&key)
-        .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)?;
+    let owner = &extent.owner;
     if owner.generation == 0
-        || owner.generation != expected_owner.generation
-        || owner._mapping.as_ptr() as usize != expected_owner.host_addr
         || offset
             .checked_add(dst.len())
             .is_none_or(|end| end > owner._mapping.len())
@@ -6068,8 +6305,8 @@ fn copy_from_pinned_owner(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn foreign_stage1_translate(
-    state: &MmAccessState,
-    snapshot: &CarrierForeignMmSnapshot,
+    backing: &RetainedForeignMmBacking,
+    stage1_root: carrick_guest_mem::Gpa,
     va: carrick_guest_mem::GuestVa,
     owner_generations: &mut Vec<carrick_hal::ForeignOwnerGeneration>,
 ) -> Result<u64, carrick_hal::ForeignMmTransportError> {
@@ -6078,19 +6315,14 @@ fn foreign_stage1_translate(
     const ADDRESS_MASK: u64 = 0x0000_ffff_ffff_f000;
     const SHIFTS: [u32; 4] = [39, 30, 21, 12];
 
-    let mut table = snapshot.binding.stage1_root.raw();
+    let mut table = stage1_root.raw();
     for (level, shift) in SHIFTS.into_iter().enumerate() {
         let index = (va.raw() >> shift) & 0x1ff;
         let descriptor_ipa = table
             .checked_add(index * 8)
             .ok_or(carrick_hal::ForeignMmTransportError::Translation(va))?;
         let mut bytes = [0_u8; 8];
-        owner_generations.push(copy_from_pinned_owner(
-            state,
-            snapshot,
-            descriptor_ipa,
-            &mut bytes,
-        )?);
+        owner_generations.push(copy_from_pinned_owner(backing, descriptor_ipa, &mut bytes)?);
         let descriptor = u64::from_le_bytes(bytes);
         if descriptor & VALID == 0 {
             return Err(carrick_hal::ForeignMmTransportError::Translation(va));
@@ -6139,6 +6371,7 @@ impl carrick_hal::ForeignMmReadReceipt for CarrierForeignMmReceipt {
 struct CarrierForeignMmReadLease {
     state: std::sync::Arc<MmAccessState>,
     retained: CarrierForeignMmSnapshot,
+    backing: RetainedForeignMmBacking,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -6167,6 +6400,7 @@ fn live_snapshot_matches(
 impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
     fn read(
         &self,
+        _invocation: &carrick_hal::ForeignMmInvocation,
         authority: &dyn carrick_hal::ForeignMmLiveAuthority,
         snapshot: &dyn carrick_hal::ForeignMmSnapshot,
         va: carrick_guest_mem::GuestVa,
@@ -6178,7 +6412,11 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
         if requested != self.retained {
             return Err(carrick_hal::ForeignMmTransportError::MissingBinding);
         }
-        let _read_coordinator = self.state.mutation_coordinator.lock();
+        let _read_coordinator = self
+            .state
+            .mutation_coordinator
+            .try_lock_until(deadline)
+            .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?;
         if !live_snapshot_matches(authority, &requested, deadline)? {
             return Err(carrick_hal::ForeignMmTransportError::Retry);
         }
@@ -6191,16 +6429,15 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
             }
             let current_va = carrick_guest_mem::GuestVa(cursor);
             let ipa = foreign_stage1_translate(
-                &self.state,
-                &requested,
+                &self.backing,
+                requested.binding.stage1_root,
                 current_va,
                 &mut owner_generations,
             )?;
             let page_remaining = 0x1000_usize - (current_va.raw() as usize & 0xfff);
             let chunk = page_remaining.min(dst.len() - completed);
             owner_generations.push(copy_from_pinned_owner(
-                &self.state,
-                &requested,
+                &self.backing,
                 ipa,
                 &mut dst[completed..completed + chunk],
             )?);
@@ -6226,6 +6463,7 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
 impl carrick_hal::ForeignMmTransport for CarrierForeignMmTransport {
     fn retain(
         &self,
+        _invocation: &carrick_hal::ForeignMmInvocation,
         snapshot: &dyn carrick_hal::ForeignMmSnapshot,
         deadline: std::time::Instant,
     ) -> Result<
@@ -6236,10 +6474,12 @@ impl carrick_hal::ForeignMmTransport for CarrierForeignMmTransport {
             return Err(carrick_hal::ForeignMmTransportError::TimedOut);
         }
         let retained = CarrierForeignMmSnapshot::capture(snapshot);
-        let state = self.state_for(&retained)?;
+        let state = self.state_for(&retained, deadline)?;
+        let backing = state.retain_physical_backing(&retained, deadline)?;
         Ok(std::sync::Arc::new(CarrierForeignMmReadLease {
             state,
             retained,
+            backing,
         }))
     }
 }
@@ -7090,10 +7330,8 @@ fn bind_exec_predecessor_identity_slot(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfVmState {
-    pub(crate) fn foreign_mm_transport(
-        &self,
-    ) -> std::sync::Arc<dyn carrick_hal::ForeignMmTransport> {
-        self.carrier_foreign_mm_transport.clone()
+    pub(crate) fn foreign_mm_endpoint(&self) -> carrick_hal::ForeignMmEndpoint {
+        carrick_hal::ForeignMmEndpoint::for_carrier(self.carrier_foreign_mm_transport.clone())
     }
 
     pub(crate) fn bind_frame_cow(
@@ -23020,7 +23258,10 @@ mod frame_inventory_backend_tests {
         assert!(
             global_frame_host_owners()
                 .lock()
-                .insert((lease_key.0, lease_key.1 as u64), successor)
+                .insert(
+                    (lease_key.0, lease_key.1 as u64),
+                    std::sync::Arc::new(successor),
+                )
                 .is_none()
         );
 
@@ -23525,7 +23766,7 @@ mod frame_inventory_backend_tests {
         assert!(
             global_frame_host_owners()
                 .lock()
-                .insert((LIVE_IPA, LENGTH), owner)
+                .insert((LIVE_IPA, LENGTH), std::sync::Arc::new(owner))
                 .is_none()
         );
 
@@ -23572,7 +23813,7 @@ mod frame_inventory_backend_tests {
         let successor_generation = successor.generation;
         global_frame_host_owners()
             .lock()
-            .insert((LIVE_IPA, LENGTH), successor);
+            .insert((LIVE_IPA, LENGTH), std::sync::Arc::new(successor));
         assert_ne!(successor_generation, generation);
         assert!(
             !global_frame_host_owner_matches(LIVE_IPA, LENGTH, reused_addr, generation),
@@ -23738,6 +23979,8 @@ mod frame_inventory_backend_tests {
         let owner = owners
             .get_mut(&key)
             .expect("test owner must remain published before retirement");
+        let owner = std::sync::Arc::get_mut(owner)
+            .expect("test owner must not have a retained foreign-MM lease");
         assert_eq!(
             owner.generation, generation,
             "test seam must not disarm a recycled owner generation"
@@ -23830,7 +24073,7 @@ mod frame_inventory_backend_tests {
         assert!(
             global_frame_host_owners()
                 .lock()
-                .insert(key, owner)
+                .insert(key, std::sync::Arc::new(owner))
                 .is_none(),
             "publication must displace no predecessor"
         );
@@ -24013,7 +24256,9 @@ mod frame_inventory_backend_tests {
         };
         let successor_generation = successor.generation;
         assert_ne!(stale_generation, successor_generation);
-        global_frame_host_owners().lock().insert(key, successor);
+        global_frame_host_owners()
+            .lock()
+            .insert(key, std::sync::Arc::new(successor));
 
         let alias = |start, host_addr, owner_generation| AliasBacking {
             start,
@@ -24244,7 +24489,7 @@ mod frame_inventory_backend_tests {
         assert!(
             global_frame_host_owners()
                 .lock()
-                .insert(key, live)
+                .insert(key, std::sync::Arc::new(live))
                 .is_none()
         );
 
@@ -24313,7 +24558,7 @@ mod frame_inventory_backend_tests {
         assert!(
             global_frame_host_owners()
                 .lock()
-                .insert(key, owner)
+                .insert(key, std::sync::Arc::new(owner))
                 .is_none()
         );
 
@@ -25926,7 +26171,7 @@ mod frame_inventory_backend_tests {
         assert!(
             global_frame_host_owners()
                 .lock()
-                .insert((lease_ipa, lease_length), owner)
+                .insert((lease_ipa, lease_length), std::sync::Arc::new(owner))
                 .is_none()
         );
         let _guard = TestGlobalFrameOwnerGuard {
@@ -28717,7 +28962,10 @@ mod tag_strip_tests {
         assert!(
             super::global_frame_host_owners()
                 .lock()
-                .insert((physical_ipa, physical_len as u64), owner)
+                .insert(
+                    (physical_ipa, physical_len as u64),
+                    std::sync::Arc::new(owner),
+                )
                 .is_none()
         );
 

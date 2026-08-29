@@ -224,6 +224,27 @@ impl KernelTaskBinding {
         Ok(context)
     }
 
+    pub(crate) fn install_foreign_mm_endpoint(
+        &self,
+        endpoint: carrick_hal::ForeignMmEndpoint,
+        permit: &crate::hvpatch::ForeignMmInstallPermit,
+    ) -> Result<(), KernelError> {
+        let state = self.kernel.registry.state.read();
+        let record = state
+            .tasks
+            .get(&self.task.id)
+            .ok_or(KernelError::UnknownTask(self.task.id))?;
+        if record.task.key() != self.task {
+            return Err(KernelError::StaleTaskBinding(self.task.id));
+        }
+        record
+            .task
+            .shared()
+            .mm()
+            .install_foreign_mm_endpoint(endpoint, permit);
+        Ok(())
+    }
+
     /// Capture current signal authority for this exact task generation.
     ///
     /// The registry read lock spans task-generation validation, live-thread
