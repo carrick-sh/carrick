@@ -17,7 +17,9 @@ use std::process::Command;
 // `Aarch64SyscallFrame` comes from the leaf crate directly: the dispatch
 // re-export is gone (the dispatcher is ISA-neutral; this harness scripts
 // aarch64 frames and decodes them the way a backend's `GuestArch` would).
-use carrick_guest_mem::{Aarch64SyscallFrame, MappingSharing, MemoryError, RepointPrivateError};
+use carrick_guest_mem::{
+    Aarch64SyscallFrame, CurrentMmMemory, MappingSharing, MemoryError, RepointPrivateError,
+};
 use carrick_runtime::dispatch::{GuestMemory, LinearMemory, SyscallDispatcher};
 use carrick_runtime::memory::AddressSpace;
 use carrick_runtime::rootfs::{LayerSource, RootFs};
