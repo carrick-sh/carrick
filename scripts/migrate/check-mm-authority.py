@@ -167,22 +167,31 @@ def production_mask(tokens: Sequence[Token]) -> list[bool]:
                 production[attribute_index] = not current_test
             index = end + 1
             continue
-        if pending_test_item and token.text in {"fn", "mod", "impl", "trait", "struct", "enum"}:
+        if pending_test_item and token.text in {
+            "fn",
+            "mod",
+            "impl",
+            "trait",
+            "struct",
+            "enum",
+            "type",
+            "use",
+        }:
             pending_test_item = False
-            if token.text == "fn":
-                production[index] = False
-                cursor = index + 1
-                while cursor < len(tokens) and tokens[cursor].text != "{":
-                    production[cursor] = False
-                    cursor += 1
-                if cursor < len(tokens):
-                    end = matching(tokens, cursor, "{", "}")
-                    for body_index in range(cursor, end + 1):
-                        production[body_index] = False
-                    index = end + 1
-                    continue
-            else:
-                pending_test_item = True
+            cursor = index
+            while cursor < len(tokens) and tokens[cursor].text not in {"{", ";"}:
+                production[cursor] = False
+                cursor += 1
+            if cursor < len(tokens) and tokens[cursor].text == "{":
+                end = matching(tokens, cursor, "{", "}")
+                for body_index in range(cursor, end + 1):
+                    production[body_index] = False
+                index = end + 1
+                continue
+            if cursor < len(tokens):
+                production[cursor] = False
+                index = cursor + 1
+                continue
         if token.text == "{":
             stack.append(current_test or pending_test_item)
             production[index] = not stack[-1]
@@ -279,6 +288,12 @@ def scan_source(source: str, relative_path: str) -> list[Finding]:
             if "GuestMemory" in signature and "CurrentMmMemory" not in signature and "<" in signature:
                 add(index, "untyped-current-bound", "GuestMemory generic lacks CurrentMmMemory")
 
+        if token.text in {"struct", "enum", "trait", "type", "impl"}:
+            end = function_signature_end(tokens, index)
+            header = [item.text for item in tokens[index:end]]
+            if "GuestMemory" in header and "CurrentMmMemory" not in header and "<" in header:
+                add(index, "untyped-current-bound", "GuestMemory generic lacks CurrentMmMemory")
+
         if sequence_at(tokens, index, [".", "begin_dispatch", "(", ")"]):
             if _has_host_alias_context(tokens, index):
                 add(index + 1, "unpermitted-host-alias", "HostAliasTransactions::begin_dispatch()")
@@ -347,6 +362,14 @@ def self_test() -> None:
             "untyped-current-bound",
             "fn dispatch<M: GuestMemory>(memory: &M) {}",
         ),
+        "type-generic-current.rs": (
+            "untyped-current-bound",
+            "struct SyscallCtx<'a, M: GuestMemory> { memory: &'a M }",
+        ),
+        "impl-generic-current.rs": (
+            "untyped-current-bound",
+            "impl<M: GuestMemory> Dispatcher<M> {}",
+        ),
         "host-alias.rs": (
             "unpermitted-host-alias",
             "fn f(t: &HostAliasTransactions) { t.begin_dispatch(); }",
@@ -372,7 +395,11 @@ def self_test() -> None:
         "comment.rs": "// LockOrderGuard::acquire(LockLevel::Proc)",
         "string.rs": 'const EXAMPLE: &str = "memory.read_bytes(0, 1)";',
         "test.rs": "#[cfg(test)] fn f<M: GuestMemory>(memory: &M) { memory.read_bytes(0, 1); }",
+        "test-impl.rs": "#[cfg(test)] impl<T: GuestMemory> CurrentMmMemory for T {}",
+        "test-use.rs": "#[cfg(test)] use crate::dispatch::lock_order::LockLevel;",
         "current-bound.rs": "fn dispatch<M: GuestMemory + CurrentMmMemory>(memory: &M) {}",
+        "current-type-bound.rs": "struct SyscallCtx<M: GuestMemory + CurrentMmMemory> { memory: M }",
+        "current-impl-bound.rs": "impl<M: GuestMemory + CurrentMmMemory> Dispatcher<M> {}",
         "current-relation.rs": "match target { MmRelation::Current => memory.read_bytes(0, 1) }",
         "foreign-facade.rs": "fn f(access: ForeignMmAccess) { access.read_foreign(0, 1); }",
         "permitted-host-alias.rs": "fn f(t: &HostAliasTransactions, permit: &HostAliasPermit) { t.begin_dispatch(&permit); }",
