@@ -131,6 +131,7 @@ lint-domains:
     ./scripts/lint-domains.sh
     python3 scripts/migrate/check-runtime-global-state.py --check
     python3 scripts/migrate/check-runtime-aborts.py --check
+    python3 scripts/migrate/check-task-participant-witnesses.py --check
     python3 scripts/migrate/check-host-authority-transitions.py --check
     python3 scripts/migrate/check-k1-file-authority-inventory.py
     python3 scripts/migrate/check-k1-file-authority-taxonomy.py
