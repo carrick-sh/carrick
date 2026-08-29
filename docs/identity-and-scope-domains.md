@@ -190,6 +190,29 @@ The reviewed `carrick-embed` census plus the monotone
 `LaunchContext`; accepted carrier infrastructure remains explicit ledger debt.
 Do not build both mechanisms.
 
+### Identity-aware vCPU lease drain — 2026-08-28
+
+`VcpuRegistry::count() -> usize` is deleted. Fork and crash protected work now
+requires a unique identity-aware `VcpuLeaseDrainGuard`; the same registry
+atomically denies non-owner registration until barrier release. Membership and
+thaw wakes are one-shot, registry-owned publications, and production admission
+preserves census-before-registry ordering plus the existing logical phase.
+
+This is a partial closure of population/lifecycle item 1 (runtime-audit Part 2
+item 3). Per-purpose participant sets minted from `Task` and explicit kernel
+thread run-state typing remain open and are not claimed complete here.
+
+The closing verification covered the HAL registry (13 tests), runtime lease
+drain (7), process fork (17), core publication (9), fork quiesce (10), and
+observability ABI (76). `just clippy`, `just lint-domains`, `just deny`,
+`just check-matrix`, `just check --workspace`, `just doc`, `just test`, and
+`just test-integration` all passed; the runtime unit arm alone ran 2,050 tests,
+and the unrestricted runtime integration arm ran 302. The aggregate `just ci`
+stopped only at the documented compiler host-authority inventory position drift
+with `changed=[]`; the post-stop recipes were therefore run explicitly. The
+exact abort ledger closes at 405 sites: 355 carrier-invariant aborts and 50
+typed-error debts.
+
 ### 5. Lock order made structural
 
 The page-table pause and the host-alias phase must be taken in one order. The
