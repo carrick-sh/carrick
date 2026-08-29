@@ -169,9 +169,9 @@ impl CrashQuorum {
     /// loop — the registers were read at a valid safe point and stay valid.
     /// A missing vote is only owed by a live participant.
     pub fn poll(&self) -> CrashQuorumPoll {
-        let members = self.task.threads();
-        let mut collected = Vec::with_capacity(members.len());
-        for thread in members {
+        let members = self.task.crash_capture_participants();
+        let mut collected = Vec::new();
+        for thread in members.into_threads() {
             match thread.crash_vote(self.generation) {
                 Some(CrashRegisterVote::Published(registers)) => {
                     collected.push(CrashRegisterFile {
