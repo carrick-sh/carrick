@@ -1329,6 +1329,9 @@ pub(crate) mod tests {
         break_calls: Arc<AtomicUsize>,
         prepare_calls: Arc<AtomicUsize>,
         commit_calls: Arc<AtomicUsize>,
+        caller_census_probe:
+            Arc<parking_lot::Mutex<Option<Arc<crate::kernel::GuestExecutorCensus>>>>,
+        break_observed_caller_executor: Arc<std::sync::atomic::AtomicBool>,
     }
 
     #[derive(Debug)]
@@ -1535,6 +1538,17 @@ pub(crate) mod tests {
             _deadline: Instant,
         ) -> Result<Box<dyn ForeignCowReceipt>, ForeignMmTransportError> {
             self.counters.break_calls.fetch_add(1, Ordering::SeqCst);
+            if self
+                .counters
+                .caller_census_probe
+                .lock()
+                .as_ref()
+                .is_some_and(|census| census.participant_count_for_probe() != 0)
+            {
+                self.counters
+                    .break_observed_caller_executor
+                    .store(true, Ordering::SeqCst);
+            }
             let next = |raw| NonZeroU64::new(raw + 1).unwrap();
             let mm = if self.fault == MockCowFault::WrongMm {
                 carrick_hal::ForeignMmId::from_kernel_allocation(next(
@@ -2079,6 +2093,19 @@ pub(crate) mod tests {
 
         pub(crate) fn commit_calls(&self) -> usize {
             self.counters.commit_calls.load(Ordering::SeqCst)
+        }
+
+        pub(crate) fn observe_caller_executor_census(
+            &self,
+            census: Arc<crate::kernel::GuestExecutorCensus>,
+        ) {
+            *self.counters.caller_census_probe.lock() = Some(census);
+        }
+
+        pub(crate) fn break_observed_caller_executor(&self) -> bool {
+            self.counters
+                .break_observed_caller_executor
+                .load(Ordering::SeqCst)
         }
     }
 
