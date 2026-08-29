@@ -83,14 +83,6 @@ mod tests {
     }
 
     impl VcpuRegistry for InertRegistry {
-        fn register(
-            &self,
-            t: crate::ThreadId,
-            h: Box<dyn crate::VcpuKickDyn>,
-            in_guest: &crate::InGuestFlag,
-        ) {
-            self.inner.register(t, h, in_guest);
-        }
         fn poll_lease_drain(&self, except: crate::ThreadId) -> crate::VcpuLeaseDrainPoll {
             self.inner.poll_lease_drain(except)
         }
@@ -131,9 +123,6 @@ mod tests {
         }
         fn any_other_in_guest(&self, except: crate::ThreadId) -> bool {
             self.inner.any_other_in_guest(except)
-        }
-        fn count(&self) -> usize {
-            self.inner.count()
         }
         fn debug_registered_vcpus(&self) -> Vec<(crate::ThreadId, bool)> {
             self.inner.debug_registered_vcpus()

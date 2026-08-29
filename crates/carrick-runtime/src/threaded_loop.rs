@@ -17,9 +17,9 @@ use crate::run_result::{RunResult, RuntimeError};
 /// never a lowest-common-denominator.
 ///
 /// The kicker is `Arc<dyn VcpuRegistry>` and the engine's `KickHandle` is
-/// type-erased into `Box<dyn VcpuKickDyn>` at registration
-/// (`subscribe_register_vcpu`),
-/// so `run_threaded_loop` is generic over any `E: ThreadedEngine` with NO
+/// type-erased into `Box<dyn VcpuKickDyn>` through `ThreadRuntimeState`'s typed
+/// `subscribe_register_vcpu` enrollment wrapper, so `run_threaded_loop` is
+/// generic over any `E: ThreadedEngine` with NO
 /// `KickHandle =` binding to thread through — the backend↔engine pair agree via
 /// the type-erased registry, not a generic associated-type clause.
 ///
