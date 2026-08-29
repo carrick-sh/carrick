@@ -196,3 +196,65 @@ impl CrashQuorum {
         CrashQuorumPoll::Complete(collected)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use carrick_abi::LinuxCloneFlags;
+    use carrick_hal::ThreadId;
+
+    use super::*;
+    use crate::kernel::{ClonePlan, Kernel, KernelContext, RootBootstrap};
+
+    fn bootstrap(pid: i32) -> (Arc<Kernel>, KernelContext) {
+        let input = RootBootstrap::for_reference_model(
+            pid,
+            ThreadId::synthetic_for_tests(pid),
+            "root".to_string(),
+        )
+        .expect("bootstrap input");
+        Kernel::bootstrap_root(input).expect("kernel")
+    }
+
+    fn clone_sibling(
+        kernel: &Arc<Kernel>,
+        leader: &KernelContext,
+        registry_id: i32,
+    ) -> KernelContext {
+        let plan = ClonePlan::from_flags(
+            LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+        )
+        .expect("thread clone plan");
+        kernel
+            .clone_thread(
+                leader,
+                plan,
+                ThreadId::synthetic_for_tests(registry_id),
+                None,
+            )
+            .expect("clone sibling")
+    }
+
+    #[test]
+    fn crash_quorum_refreshes_membership_after_retirement() {
+        let (kernel, leader) = bootstrap(19_440);
+        let sibling = clone_sibling(&kernel, &leader, 19_441);
+        let sibling_tid = sibling.thread().key().tid;
+        sibling.thread().enter_crash_safe_point_participation();
+
+        let authority = CrashCaptureAuthority::default();
+        let generation = authority.issue().expect("capture generation");
+        let quorum = CrashQuorum::open(leader.task().clone(), generation);
+        assert!(matches!(
+            quorum.poll(),
+            CrashQuorumPoll::Waiting(tid) if tid == sibling_tid
+        ));
+
+        kernel.exit_thread(&sibling, None).expect("retire sibling");
+        assert!(matches!(
+            quorum.poll(),
+            CrashQuorumPoll::Complete(registers) if registers.is_empty()
+        ));
+    }
+}
