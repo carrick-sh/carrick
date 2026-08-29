@@ -4542,121 +4542,219 @@ impl SyscallDispatcher {
                         })
                     }
                 } else {
-                    let write_res = authority.with_foreign_mutation(&foreign, cx.tid(), |mutation_guard| {
-                        let mut chunk_buf = vec![0u8; CHUNK_SIZE];
-                        let mut witness: Option<crate::kernel::CowBroken<'_, '_, '_>> = None;
+                    const COMPOUND_SIZE: u64 = 16 * 1024;
+                    let mut stage_buf = Vec::with_capacity(COMPOUND_SIZE as usize);
+                    let mut staged_chunks: Vec<(
+                        crate::kernel::MmWriteRange<'_>,
+                        usize,
+                        usize,
+                        u64,
+                    )> = Vec::new();
 
-                        while ri < remote.len() && li < local.len() {
-                            while ri < remote.len() && ro >= remote[ri].iov_len {
-                                ri += 1;
-                                ro = 0;
+                    while ri < remote.len() && li < local.len() {
+                        while ri < remote.len() && ro >= remote[ri].iov_len {
+                            ri += 1;
+                            ro = 0;
+                        }
+                        while li < local.len() && lo >= local[li].iov_len {
+                            li += 1;
+                            lo = 0;
+                        }
+                        if ri >= remote.len() || li >= local.len() {
+                            break;
+                        }
+
+                        let remote_va_raw = match remote[ri].iov_base.checked_add(ro) {
+                            Some(va) => va,
+                            None => break,
+                        };
+                        let compound_base = remote_va_raw & !(COMPOUND_SIZE - 1);
+                        let compound_end = match compound_base.checked_add(COMPOUND_SIZE) {
+                            Some(end) => end,
+                            None => break,
+                        };
+
+                        // Stage consecutive chunks within this 16 KiB compound before acquiring target mutation authority.
+                        stage_buf.clear();
+                        staged_chunks.clear();
+
+                        let mut stage_ri = ri;
+                        let mut stage_ro = ro;
+                        let mut stage_li = li;
+                        let mut stage_lo = lo;
+
+                        while stage_ri < remote.len() && stage_li < local.len() {
+                            while stage_ri < remote.len() && stage_ro >= remote[stage_ri].iov_len {
+                                stage_ri += 1;
+                                stage_ro = 0;
                             }
-                            while li < local.len() && lo >= local[li].iov_len {
-                                li += 1;
-                                lo = 0;
+                            while stage_li < local.len() && stage_lo >= local[stage_li].iov_len {
+                                stage_li += 1;
+                                stage_lo = 0;
                             }
-                            if ri >= remote.len() || li >= local.len() {
+                            if stage_ri >= remote.len() || stage_li >= local.len() {
                                 break;
                             }
-                            let rem_remote = remote[ri].iov_len - ro;
-                            let rem_local = local[li].iov_len - lo;
 
-                            let remote_va_raw = match remote[ri].iov_base.checked_add(ro) {
-                                Some(va) => va,
-                                None => break,
-                            };
-                            let local_va_raw = match local[li].iov_base.checked_add(lo) {
-                                Some(va) => va,
-                                None => break,
-                            };
+                            let cur_remote_va_raw =
+                                match remote[stage_ri].iov_base.checked_add(stage_ro) {
+                                    Some(va) => va,
+                                    None => break,
+                                };
+                            if cur_remote_va_raw < compound_base
+                                || cur_remote_va_raw >= compound_end
+                            {
+                                break;
+                            }
+                            let cur_local_va_raw =
+                                match local[stage_li].iov_base.checked_add(stage_lo) {
+                                    Some(va) => va,
+                                    None => break,
+                                };
 
-                            let page_rem_remote = PAGE_SIZE - (remote_va_raw % PAGE_SIZE);
-                            let page_rem_local = PAGE_SIZE - (local_va_raw % PAGE_SIZE);
+                            let rem_remote = remote[stage_ri].iov_len - stage_ro;
+                            let rem_local = local[stage_li].iov_len - stage_lo;
+                            let page_rem_remote = PAGE_SIZE - (cur_remote_va_raw % PAGE_SIZE);
+                            let page_rem_local = PAGE_SIZE - (cur_local_va_raw % PAGE_SIZE);
+                            let compound_rem = compound_end - cur_remote_va_raw;
 
                             let want = rem_remote
                                 .min(rem_local)
                                 .min(page_rem_remote)
                                 .min(page_rem_local)
+                                .min(compound_rem)
                                 .min(CHUNK_SIZE as u64);
                             let want_len = want as usize;
                             if want_len == 0 {
                                 break;
                             }
 
-                            let src_buf = &mut chunk_buf[..want_len];
-                            if cx.memory.read_into(local_va_raw, src_buf).is_err() {
+                            let buf_offset = stage_buf.len();
+                            stage_buf.resize(buf_offset + want_len, 0);
+                            if cx
+                                .memory
+                                .read_into(
+                                    cur_local_va_raw,
+                                    &mut stage_buf[buf_offset..buf_offset + want_len],
+                                )
+                                .is_err()
+                            {
+                                stage_buf.truncate(buf_offset);
                                 break;
                             }
 
-                            let remote_va = carrick_guest_mem::GuestVa(remote_va_raw);
+                            let remote_va = carrick_guest_mem::GuestVa(cur_remote_va_raw);
                             let write_range = match foreign.write_range(remote_va, want_len) {
                                 Ok(Some(r)) => r,
-                                _ => break,
+                                _ => {
+                                    stage_buf.truncate(buf_offset);
+                                    break;
+                                }
                             };
 
-                            let (need_new_witness, prep_result) = match witness.as_mut() {
-                                Some(w) => {
-                                    match authority.prepare_foreign_write_range(w, write_range, src_buf) {
-                                        Ok(prep) => (false, Some(prep)),
-                                        Err(crate::kernel::MmAccessError::ForeignRangeAuthorityMismatch) => {
-                                            (true, None)
+                            staged_chunks.push((write_range, buf_offset, want_len, want));
+                            stage_ro += want;
+                            stage_lo += want;
+                        }
+
+                        if staged_chunks.is_empty() {
+                            break;
+                        }
+
+                        // Acquire target MM's real mutation authority for the staged compound.
+                        // No cx.memory access or allocation occurs while mutation_guard is live.
+                        let commit_res =
+                            authority.with_foreign_mutation(&foreign, cx.tid(), |mutation_guard| {
+                                let mut witness: Option<crate::kernel::CowBroken<'_, '_, '_>> = None;
+                                let mut committed_chunks = 0usize;
+
+                                for (write_range, buf_offset, len, _) in &staged_chunks {
+                                    let src_chunk = &stage_buf[*buf_offset..*buf_offset + *len];
+
+                                    let (need_new_witness, prep_result) = match witness.as_mut() {
+                                        Some(w) => match authority
+                                            .prepare_foreign_write_range(w, *write_range, src_chunk)
+                                        {
+                                            Ok(prep) => (false, Some(prep)),
+                                            Err(
+                                                crate::kernel::MmAccessError::ForeignRangeAuthorityMismatch,
+                                            ) => (true, None),
+                                            Err(_) => (false, None),
+                                        },
+                                        None => (true, None),
+                                    };
+
+                                    let prepared = if need_new_witness {
+                                        drop(witness.take());
+                                        let new_witness = match authority.break_foreign_cow(
+                                            mutation_guard,
+                                            &foreign,
+                                            *write_range,
+                                        ) {
+                                            Ok(w) => w,
+                                            Err(_) => break,
+                                        };
+                                        witness = Some(new_witness);
+                                        match authority.prepare_foreign_write_range(
+                                            witness.as_mut().unwrap(),
+                                            *write_range,
+                                            src_chunk,
+                                        ) {
+                                            Ok(prep) => prep,
+                                            Err(_) => break,
                                         }
-                                        Err(_) => (false, None),
-                                    }
-                                }
-                                None => (true, None),
-                            };
+                                    } else {
+                                        match prep_result {
+                                            Some(prep) => prep,
+                                            None => break,
+                                        }
+                                    };
 
-                            let prepared = if need_new_witness {
-                                drop(witness.take());
-                                let new_witness = match authority
-                                    .break_foreign_cow(mutation_guard, &foreign, write_range)
-                                {
-                                    Ok(w) => w,
-                                    Err(_) => break,
-                                };
-                                witness = Some(new_witness);
-                                match authority.prepare_foreign_write_range(
-                                    witness.as_mut().unwrap(),
-                                    write_range,
-                                    src_buf,
-                                ) {
-                                    Ok(prep) => prep,
-                                    Err(_) => break,
+                                    let _receipt = prepared.commit();
+                                    committed_chunks += 1;
                                 }
-                            } else {
-                                match prep_result {
-                                    Some(prep) => prep,
-                                    None => break,
-                                }
-                            };
 
-                            let receipt = prepared.commit();
-                            if receipt.bytes_written() != want_len {
+                                Ok(committed_chunks)
+                            });
+
+                        let committed_chunks = match commit_res {
+                            Ok(count) => count,
+                            Err(error) => {
+                                if copied == 0 {
+                                    return Ok(DispatchOutcome::errno(
+                                        process_vm_foreign_mm_errno(&error),
+                                    ));
+                                }
                                 break;
                             }
+                        };
 
+                        for (_, _, _, advance_len) in staged_chunks.iter().take(committed_chunks) {
+                            let want = *advance_len;
                             copied += want;
                             ro += want;
                             lo += want;
-                        }
-
-                        Ok(copied)
-                    });
-
-                    match write_res {
-                        Ok(copied) => {
-                            if copied == 0 {
-                                Ok(DispatchOutcome::errno(LINUX_EFAULT))
-                            } else {
-                                Ok(DispatchOutcome::Returned {
-                                    value: copied as i64,
-                                })
+                            if ro >= remote[ri].iov_len {
+                                ri += 1;
+                                ro = 0;
+                            }
+                            if lo >= local[li].iov_len {
+                                li += 1;
+                                lo = 0;
                             }
                         }
-                        Err(error) => {
-                            Ok(DispatchOutcome::errno(process_vm_foreign_mm_errno(&error)))
+
+                        if committed_chunks < staged_chunks.len() {
+                            break;
                         }
+                    }
+
+                    if copied == 0 {
+                        Ok(DispatchOutcome::errno(LINUX_EFAULT))
+                    } else {
+                        Ok(DispatchOutcome::Returned {
+                            value: copied as i64,
+                        })
                     }
                 }
             }
@@ -5838,6 +5936,43 @@ mod kernel_process_dispatch_tests {
         assert_eq!(target.break_calls(), 0);
         assert_eq!(target.prepare_calls(), 0);
         assert_eq!(target.commit_calls(), 0);
+    }
+
+    #[test]
+    fn process_vm_writev_local_single_iovec_mid_fault_returns_completed_prefix() {
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_106);
+        let mut initial = vec![b'_'; 0x4000];
+        initial[..8].copy_from_slice(b"samepeer");
+        let target = crate::kernel::consumer_cow_fixture(root.kernel(), &root, 61_107, initial);
+        let root = refreshed(&root);
+        let target_pid = target.target().task().key().id.raw();
+        // Memory has only 0x2000 total size starting at 0x1000, so LOCAL_BUF (0x2000) has capacity 0x1000 (4096 bytes).
+        // Reading at LOCAL_BUF + 4096 (0x3000) faults.
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x2000]);
+        let input_bytes = (0..4096).map(|i| b"EDIT"[i % 4]).collect::<Vec<_>>();
+        memory.write_bytes(LOCAL_BUF, &input_bytes).unwrap();
+
+        // Single remote iovec of 8192 bytes, single local iovec of 8192 bytes
+        write_iovec(&mut memory, LOCAL_IOV, LOCAL_BUF, 8192);
+        write_iovec(&mut memory, REMOTE_IOV, TARGET_VA, 8192);
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PROCESS_VM_WRITEV,
+                [target_pid as u64, LOCAL_IOV, 1, REMOTE_IOV, 1, 0],
+                Some(&lease),
+            ),
+            DispatchOutcome::Returned { value: 4096 },
+            "single local iovec mid-fault must return exact completed prefix",
+        );
+        assert_eq!(target.child_bytes(0, 4096), input_bytes);
+        assert_eq!(&target.peer_bytes()[..8], b"samepeer");
+        assert_eq!(target.break_calls(), 1);
+        assert_eq!(target.prepare_calls(), 1);
+        assert_eq!(target.commit_calls(), 1);
     }
 
     #[test]
