@@ -1603,6 +1603,11 @@ where
         // authority makes a structurally valid COW MappingId belong to
         // the retired mm and fail closed at replacement-mm teardown.
         if let Some(process) = kernel.hvpatch_process.as_ref() {
+            let owner_inventory = engine.frame_cow_owner_inventory().ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "committed HVPatch exec has no carrier host-owner inventory".to_owned(),
+                )
+            })?;
             let binding = process.mm_binding().ok_or_else(|| {
                 RuntimeError::Configuration(
                     "committed HVPatch exec has no replacement mm binding".to_owned(),
@@ -1612,6 +1617,7 @@ where
                 std::sync::Arc::new(super::KernelFrameCowAuthority {
                     kernel: std::sync::Arc::clone(committed_context.kernel()),
                     mm: committed_mm,
+                    owner_inventory,
                     guest_executors: kernel.dispatcher.mm_executor_census(),
                     tid: self.this_tid,
                     identity: carrick_hal::FrameCowIdentity {

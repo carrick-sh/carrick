@@ -460,19 +460,24 @@ mod foreign_mm_tests {
             commit: carrick_hal::FrameInventoryCommit<()>,
             _mapping: carrick_hal::MappingId,
             _frame: carrick_hal::FrameId,
-            _gpa: Gpa,
-            _length: carrick_hal::FrameLength,
-            _owner_generation: carrick_hal::ForeignOwnerGeneration,
+            gpa: Gpa,
+            length: carrick_hal::FrameLength,
         ) -> Result<
             (
                 carrick_hal::FrameInventoryApplyReceipt,
                 carrick_hal::ForeignCowKernelProof,
+                carrick_hal::ForeignOwnerGeneration,
             ),
             Box<dyn std::error::Error + Send + Sync>,
         > {
+            let owner_generation = global_frame_host_owner_generation(gpa.raw(), length.raw());
+            let owner_generation = std::num::NonZeroU64::new(owner_generation)
+                .map(carrick_hal::ForeignOwnerGeneration::from_backend_counter)
+                .ok_or_else(|| std::io::Error::other("test foreign COW owner is not live"))?;
             Ok((
                 self.apply_with_receipt(commit)?,
                 carrick_hal::ForeignCowKernelProof::from_runtime_authority(Box::new(())),
+                owner_generation,
             ))
         }
 
@@ -3665,6 +3670,63 @@ type GlobalFrameHostOwnerDirectory = parking_lot::Mutex<
 fn global_frame_host_owners() -> &'static GlobalFrameHostOwnerDirectory {
     static CELL: std::sync::OnceLock<GlobalFrameHostOwnerDirectory> = std::sync::OnceLock::new();
     CELL.get_or_init(|| parking_lot::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct CarrierFrameCowOwnerLease {
+    key: (u64, u64),
+    owner: std::sync::Arc<GlobalFrameHostOwner>,
+    generation: carrick_hal::ForeignOwnerGeneration,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl carrick_hal::FrameCowOwnerLease for CarrierFrameCowOwnerLease {
+    fn generation(&self) -> carrick_hal::ForeignOwnerGeneration {
+        self.generation
+    }
+
+    fn is_current(&self) -> bool {
+        global_frame_host_owners()
+            .lock()
+            .get(&self.key)
+            .is_some_and(|current| std::sync::Arc::ptr_eq(current, &self.owner))
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct CarrierFrameCowOwnerInventory;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl carrick_hal::FrameCowOwnerInventory for CarrierFrameCowOwnerInventory {
+    fn retain_current(
+        &self,
+        gpa: carrick_guest_mem::Gpa,
+        length: carrick_hal::FrameLength,
+    ) -> Result<Box<dyn carrick_hal::FrameCowOwnerLease>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        let key = (gpa.raw(), length.raw());
+        let owner = global_frame_host_owners()
+            .lock()
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| std::io::Error::other("foreign COW extent has no current host owner"))?;
+        let generation = std::num::NonZeroU64::new(owner.generation)
+            .map(carrick_hal::ForeignOwnerGeneration::from_backend_counter)
+            .ok_or_else(|| std::io::Error::other("foreign COW host owner generation is zero"))?;
+        Ok(Box::new(CarrierFrameCowOwnerLease {
+            key,
+            owner,
+            generation,
+        }))
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn carrier_frame_cow_owner_inventory()
+-> std::sync::Arc<dyn carrick_hal::FrameCowOwnerInventory> {
+    std::sync::Arc::new(CarrierFrameCowOwnerInventory)
 }
 
 /// Global-frame stage-2 leases owned by a CARRIER MM rather than by a mapping
@@ -7354,37 +7416,40 @@ fn perform_foreign_cow_transaction(
     if !owner_is_live {
         std::process::abort();
     }
-    let (apply_receipt, kernel_proof) = match runtime.authority.apply_foreign_cow(
-        commit,
-        split.new_extent.mapping,
-        split.new_extent.frame,
-        carrick_guest_mem::Gpa(new_physical_ipa),
-        cow_length,
-        owner_generation_token,
-    ) {
-        Ok(publication) => publication,
-        Err(_error) => {
-            let rollback = lease
-                .state
-                .cow_rollback_scratch
-                .lock()
-                .take()
-                .unwrap_or_else(|| std::process::abort());
-            let recycled_manager = {
-                let mut tables = page_tables_authority.lock();
-                unsafe { rollback.restore_quiesced_snapshot_to_host(page_table_host) };
-                tables.replace(rollback)
-            };
-            *lease.state.cow_rollback_scratch.lock() = recycled_manager;
-            if invalidator
-                .invalidate_exact_asid(binding, deadline)
-                .is_err()
-            {
-                std::process::abort();
+    let (apply_receipt, kernel_proof, authenticated_owner_generation) =
+        match runtime.authority.apply_foreign_cow(
+            commit,
+            split.new_extent.mapping,
+            split.new_extent.frame,
+            carrick_guest_mem::Gpa(new_physical_ipa),
+            cow_length,
+        ) {
+            Ok(publication) => publication,
+            Err(_error) => {
+                let rollback = lease
+                    .state
+                    .cow_rollback_scratch
+                    .lock()
+                    .take()
+                    .unwrap_or_else(|| std::process::abort());
+                let recycled_manager = {
+                    let mut tables = page_tables_authority.lock();
+                    unsafe { rollback.restore_quiesced_snapshot_to_host(page_table_host) };
+                    tables.replace(rollback)
+                };
+                *lease.state.cow_rollback_scratch.lock() = recycled_manager;
+                if invalidator
+                    .invalidate_exact_asid(binding, deadline)
+                    .is_err()
+                {
+                    std::process::abort();
+                }
+                return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
             }
-            return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
-        }
-    };
+        };
+    if authenticated_owner_generation != owner_generation_token {
+        std::process::abort();
+    }
     let expected_mm = std::num::NonZeroU64::new(requested.mm.raw_for_probe())
         .unwrap_or_else(|| std::process::abort());
     if !challenge.authenticate_apply(&apply_receipt, expected_mm)
@@ -7475,7 +7540,7 @@ fn perform_foreign_cow_transaction(
         frame: split.new_extent.frame,
         physical_base: carrick_guest_mem::Gpa(new_physical_ipa),
         physical_len: CowArmedRanges::COMPOUND_SIZE,
-        owner_generation: owner_generation_token,
+        owner_generation: authenticated_owner_generation,
         kernel_proof,
     })
 }
@@ -7711,6 +7776,10 @@ pub mod foreign_cow_test_support {
 
     pub const TEST_VA: u64 = 0x6000_2000_0000;
     pub const OWNER_LEN: u64 = CowArmedRanges::COMPOUND_SIZE;
+
+    pub fn owner_inventory() -> std::sync::Arc<dyn carrick_hal::FrameCowOwnerInventory> {
+        carrier_frame_cow_owner_inventory()
+    }
 
     #[derive(Clone, Copy, Debug)]
     pub struct InitialInventoryIdentity {

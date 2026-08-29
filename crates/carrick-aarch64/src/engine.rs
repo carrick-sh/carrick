@@ -2429,6 +2429,12 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         self.vm.foreign_mm_endpoint()
     }
 
+    fn frame_cow_owner_inventory(
+        &self,
+    ) -> Option<std::sync::Arc<dyn carrick_hal::FrameCowOwnerInventory>> {
+        self.vm.frame_cow_owner_inventory()
+    }
+
     fn audit_executor_boundary(&mut self) -> Result<(), TrapError> {
         self.vm.audit_executor_boundary(&mut self.vcpu)
     }

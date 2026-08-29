@@ -1886,6 +1886,7 @@ where
         let cow_authority = Arc::new(KernelFrameCowAuthority {
             kernel: Arc::clone(child_context.kernel()),
             mm: child_mm_id,
+            owner_inventory: ops.frame_cow_owner_inventory(&task_backend),
             guest_executors: child_kernel.dispatcher.mm_executor_census(),
             tid: child_tid,
             identity: cow_identity,

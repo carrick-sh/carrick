@@ -1937,11 +1937,11 @@ pub trait FrameCowAuthority: Send + Sync {
         _frame: crate::FrameId,
         _gpa: carrick_guest_mem::Gpa,
         _length: crate::FrameLength,
-        _owner_generation: crate::ForeignOwnerGeneration,
     ) -> Result<
         (
             crate::FrameInventoryApplyReceipt,
             crate::ForeignCowKernelProof,
+            crate::ForeignOwnerGeneration,
         ),
         Box<dyn std::error::Error + Send + Sync>,
     > {
@@ -1974,6 +1974,25 @@ pub trait FrameCowAuthority: Send + Sync {
         &self,
         frame: crate::FrameId,
     ) -> Result<Option<usize>, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// One pinned incarnation from the carrier's existing host-owner directory.
+/// The kernel COW proof issuer retains this across its inventory commit and
+/// rechecks that the same incarnation is still current before signing it.
+pub trait FrameCowOwnerLease: Send + Sync {
+    fn generation(&self) -> crate::ForeignOwnerGeneration;
+    fn is_current(&self) -> bool;
+}
+
+/// Read-only endpoint to the carrier's canonical host-owner directory. The
+/// engine binds this independently of any foreign-MM transport, so a transport
+/// cannot select the owner generation that the kernel proof issuer signs.
+pub trait FrameCowOwnerInventory: Send + Sync {
+    fn retain_current(
+        &self,
+        gpa: carrick_guest_mem::Gpa,
+        length: crate::FrameLength,
+    ) -> Result<Box<dyn FrameCowOwnerLease>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2113,6 +2132,13 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
     /// Exact carrier endpoint for retaining foreign-MM access state. Only the
     /// HVPatch root bootstrap consumes this; syscall handlers never receive it.
     fn foreign_mm_endpoint(&self) -> Option<crate::ForeignMmEndpoint> {
+        None
+    }
+
+    /// Independent read-only view of the carrier's existing host-owner
+    /// directory. HVPatch binds it into the kernel COW proof issuer; foreign-MM
+    /// transports never provide or replace this endpoint.
+    fn frame_cow_owner_inventory(&self) -> Option<Arc<dyn FrameCowOwnerInventory>> {
         None
     }
 

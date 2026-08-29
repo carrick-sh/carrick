@@ -1222,6 +1222,41 @@ mod tests {
         physical_len: u64,
     }
 
+    struct OwnerSigningOracleTransport {
+        lease: Arc<OwnerSigningOracleLease>,
+    }
+
+    impl std::fmt::Debug for OwnerSigningOracleTransport {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("OwnerSigningOracleTransport")
+                .finish_non_exhaustive()
+        }
+    }
+
+    struct OwnerSigningOracleLease {
+        authority: Arc<dyn carrick_hal::FrameCowAuthority>,
+        commit: parking_lot::Mutex<Option<carrick_hal::FrameInventoryCommit<()>>>,
+        mapping: carrick_hal::MappingId,
+        frame: carrick_hal::FrameId,
+        physical_base: Gpa,
+        physical_len: carrick_hal::FrameLength,
+        transport_chosen_owner: carrick_hal::ForeignOwnerGeneration,
+    }
+
+    impl std::fmt::Debug for OwnerSigningOracleLease {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("OwnerSigningOracleLease")
+                .field("mapping", &self.mapping)
+                .field("frame", &self.frame)
+                .field("physical_base", &self.physical_base)
+                .field("physical_len", &self.physical_len)
+                .field("transport_chosen_owner", &self.transport_chosen_owner)
+                .finish_non_exhaustive()
+        }
+    }
+
     #[derive(Debug)]
     struct MockCowLease {
         owner_generation: Arc<AtomicU64>,
@@ -1490,6 +1525,73 @@ mod tests {
                 physical_base: self.physical_base,
                 physical_len: self.physical_len,
             }))
+        }
+    }
+
+    impl ForeignMmReadLease for OwnerSigningOracleLease {
+        fn read(
+            &self,
+            _invocation: &carrick_hal::ForeignMmInvocation,
+            _authority: &dyn carrick_hal::ForeignMmLiveAuthority,
+            _snapshot: &dyn ForeignMmSnapshot,
+            _va: GuestVa,
+            _dst: &mut [u8],
+            _deadline: Instant,
+        ) -> Result<Box<dyn ForeignMmReadReceipt>, ForeignMmTransportError> {
+            Err(ForeignMmTransportError::AuthorityUnavailable)
+        }
+
+        fn break_cow(
+            &self,
+            _invocation: &carrick_hal::ForeignMmInvocation,
+            _invalidator: &mut dyn carrick_hal::ForeignMmInvalidator,
+            snapshot: &dyn ForeignMmSnapshot,
+            va: GuestVa,
+            len: usize,
+            _deadline: Instant,
+        ) -> Result<Box<dyn ForeignCowReceipt>, ForeignMmTransportError> {
+            let commit = self
+                .commit
+                .lock()
+                .take()
+                .ok_or(ForeignMmTransportError::MutationFailed)?;
+            let (apply, kernel_proof, _independent_owner) = self
+                .authority
+                .apply_foreign_cow(
+                    commit,
+                    self.mapping,
+                    self.frame,
+                    self.physical_base,
+                    self.physical_len,
+                )
+                .map_err(|_| ForeignMmTransportError::MutationFailed)?;
+            Ok(Box::new(MockCowReceipt {
+                mm: snapshot.mm(),
+                start: va,
+                len,
+                backend: snapshot.backend_revision(),
+                vma: snapshot.vma_revision(),
+                inventory: carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(
+                    apply.revision(),
+                ),
+                mapping: self.mapping,
+                frame: self.frame,
+                physical_base: self.physical_base,
+                physical_len: self.physical_len.raw(),
+                owner: self.transport_chosen_owner,
+                kernel_proof,
+            }))
+        }
+    }
+
+    impl ForeignMmTransport for OwnerSigningOracleTransport {
+        fn retain(
+            &self,
+            _invocation: &carrick_hal::ForeignMmInvocation,
+            _snapshot: &dyn ForeignMmSnapshot,
+            _deadline: Instant,
+        ) -> Result<Arc<dyn ForeignMmReadLease>, ForeignMmTransportError> {
+            Ok(self.lease.clone())
         }
     }
 
@@ -1861,6 +1963,7 @@ mod tests {
             census,
             caller_tid,
             projected.binding.asid().raw_for_probe(),
+            carrick_vmm_hvf::trap::foreign_cow_test_support::owner_inventory(),
         );
         let identity = carrick_hal::FrameCowIdentity {
             linux_pid: caller_tid.raw(),
@@ -2482,6 +2585,172 @@ mod tests {
                 ));
             });
         }
+    }
+
+    #[test]
+    fn foreign_cow_proof_issuer_does_not_sign_transport_chosen_owner_generation() {
+        let (kernel, root) = bootstrap(31_128);
+        let mm = root.shared().mm().id();
+        let tid = ThreadId::synthetic_for_tests(31_128);
+        let capacity = carrick_hal::FrameEventCapacity::for_event_count(2).unwrap();
+        let mut reservation = kernel.reserve_frame_inventory(1, 1, capacity).unwrap();
+        let transaction = reservation.transaction();
+        let frame = reservation.claim_frame().unwrap();
+        let mapping = reservation.claim_mapping().unwrap();
+        let generation =
+            carrick_hal::MappingGeneration::from_backend_counter(NonZeroU64::new(1).unwrap());
+        let gpa = Gpa(0xd000);
+        let length =
+            carrick_hal::FrameLength::from_mapping_extent(NonZeroU64::new(0x4000).unwrap());
+        reservation
+            .push(carrick_hal::FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation,
+                gpa,
+                length,
+                permissions: carrick_hal::MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(carrick_hal::FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation,
+            })
+            .unwrap();
+        let current_owner =
+            carrick_hal::ForeignOwnerGeneration::from_backend_counter(NonZeroU64::new(61).unwrap());
+        let transport_chosen_owner =
+            carrick_hal::ForeignOwnerGeneration::from_backend_counter(NonZeroU64::new(62).unwrap());
+        let authority = crate::vcpu_loop::kernel_frame_cow_authority_for_test(
+            Arc::clone(&kernel),
+            mm,
+            Arc::new(crate::kernel::GuestExecutorCensus::default()),
+            tid,
+            7,
+            crate::vcpu_loop::fixed_frame_cow_owner_inventory_for_test(current_owner),
+        );
+
+        let (receipt, proof, authenticated_owner) = authority
+            .apply_foreign_cow(reservation.commit(()), mapping, frame, gpa, length)
+            .expect("apply foreign COW inventory transaction");
+        let proof = proof
+            .downcast_ref::<crate::vcpu_loop::KernelForeignCowProof>()
+            .expect("runtime-private kernel proof");
+
+        assert!(
+            authenticated_owner == current_owner,
+            "proof issuer returned a transport-selected owner generation"
+        );
+        assert!(
+            proof.authenticates(
+                &kernel,
+                mm,
+                receipt.revision(),
+                mapping,
+                frame,
+                gpa,
+                length.raw(),
+                current_owner,
+            ),
+            "proof issuer signed a transport-chosen owner instead of the independent current owner"
+        );
+        assert!(
+            !proof.authenticates(
+                &kernel,
+                mm,
+                receipt.revision(),
+                mapping,
+                frame,
+                gpa,
+                length.raw(),
+                transport_chosen_owner,
+            ),
+            "transport-selected owner generation was accepted by the kernel proof issuer"
+        );
+    }
+
+    #[test]
+    fn foreign_cow_runtime_rejects_transport_owner_after_independent_proof_issuance() {
+        let (kernel, root) = bootstrap(31_129);
+        let execution = execution_lease(&root, 129);
+        let (child, _backend, owner_generation, _bytes) =
+            cow_fixture(&kernel, &root, 31_130, MockCowFault::None);
+        let mm = child.shared().mm().id();
+        let current_owner = carrick_hal::ForeignOwnerGeneration::from_backend_counter(
+            NonZeroU64::new(owner_generation.load(Ordering::Acquire)).unwrap(),
+        );
+        let transport_chosen_owner = carrick_hal::ForeignOwnerGeneration::from_backend_counter(
+            NonZeroU64::new(current_owner.raw_for_probe().checked_add(1).unwrap()).unwrap(),
+        );
+        let capacity = carrick_hal::FrameEventCapacity::for_event_count(2).unwrap();
+        let mut reservation = kernel.reserve_frame_inventory(1, 1, capacity).unwrap();
+        let transaction = reservation.transaction();
+        let frame = reservation.claim_frame().unwrap();
+        let mapping = reservation.claim_mapping().unwrap();
+        let generation =
+            carrick_hal::MappingGeneration::from_backend_counter(NonZeroU64::new(1).unwrap());
+        let physical_base = Gpa(0x20_000);
+        let physical_len =
+            carrick_hal::FrameLength::from_mapping_extent(NonZeroU64::new(0x4000).unwrap());
+        reservation
+            .push(carrick_hal::FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation,
+                gpa: physical_base,
+                length: physical_len,
+                permissions: carrick_hal::MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(carrick_hal::FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation,
+            })
+            .unwrap();
+        let proof_issuer = crate::vcpu_loop::kernel_frame_cow_authority_for_test(
+            Arc::clone(&kernel),
+            mm,
+            Arc::new(crate::kernel::GuestExecutorCensus::default()),
+            ThreadId::synthetic_for_tests(31_130),
+            9,
+            crate::vcpu_loop::fixed_frame_cow_owner_inventory_for_test(current_owner),
+        );
+        child.shared().mm().install_foreign_mm_endpoint_for_test(
+            carrick_hal::ForeignMmEndpoint::for_carrier(Arc::new(OwnerSigningOracleTransport {
+                lease: Arc::new(OwnerSigningOracleLease {
+                    authority: proof_issuer,
+                    commit: parking_lot::Mutex::new(Some(reservation.commit(()))),
+                    mapping,
+                    frame,
+                    physical_base,
+                    physical_len,
+                    transport_chosen_owner,
+                }),
+            })),
+        );
+        let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
+        let range = foreign.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
+
+        with_foreign_mutation(&foreign, |mutation| {
+            assert!(matches!(
+                super::MmAccessAuthority::new().break_foreign_cow(mutation, &foreign, range,),
+                Err(MmAccessError::ForeignCowReceiptMismatch)
+            ));
+        });
     }
 
     #[test]

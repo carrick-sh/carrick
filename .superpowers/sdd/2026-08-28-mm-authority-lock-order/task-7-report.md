@@ -864,3 +864,144 @@ Self-review found no recoverable work after the irreversible carrier inventory
 commit, no second snapshot acquisition under host alias, no raw invalidation
 domain tuple, and no `proc.rs` diff. The only retained concern is the explicit
 Task 8 production-checker finding above.
+
+## Fix Round 3 (scoped review of `ff97d9a95ae6aa927b0e586fc5ad1d4fa0b94e77`)
+
+This final original-implementer round changes only the retained owner-generation
+signing-oracle defect and the narrow engine/VMM forwarding needed to bind the
+proof issuer to the carrier's canonical host-owner directory. The
+controller-owned `progress.md` was already dirty and was neither edited nor
+staged. Its final observed controller revision is SHA-256
+`21255b96c62fa50ddacc95148c27ca838e4d51ea4cc1a07631211ace0c56a437`.
+`dispatch/proc.rs` was not edited.
+
+### RED — transport-selected owner generation was signed
+
+The proof-issuer test was first added while the rejected
+`FrameCowAuthority::apply_foreign_cow` still accepted the owner generation as
+an argument from its transport caller. It passed a current independently known
+generation of 61 but asked the issuer to sign 62. The inventory, mapping,
+frame, physical base, and physical length were otherwise exact and the returned
+receipt was internally consistent:
+
+```text
+RUSTC_WRAPPER= cargo test -p carrick-runtime \
+  foreign_cow_proof_issuer_does_not_sign_transport_chosen_owner_generation \
+  -- --nocapture
+FAILED at kernel/mm_access.rs:2553:
+proof issuer signed a transport-chosen owner instead of the independent current owner
+0 passed; 1 failed; 2102 filtered out
+```
+
+That is the rejected signing-oracle shape: the private proof/downcast protected
+all other domains, but the transport chose the owner domain embedded by the
+proof issuer.
+
+### GREEN — independently retained canonical owner incarnation
+
+`apply_foreign_cow` no longer accepts an owner-generation argument. Before the
+kernel inventory publication, the private `KernelFrameCowAuthority` asks its
+engine-bound `FrameCowOwnerInventory` for the exact `(physical GPA, length)`
+incarnation. The production endpoint is a read-only view over the existing
+`global_frame_host_owners` directory; it is not a second owner store and it is
+not supplied by `ForeignMmTransport`.
+
+The returned lease retains the exact existing `Arc<GlobalFrameHostOwner>`,
+derives the typed nonzero generation from that object, and rechecks
+`Arc::ptr_eq` against the same canonical directory entry after the irreversible
+kernel inventory apply. Thus replacement of the same IPA/length by a recycled
+owner is distinguishable even if a host address is reused. A missing owner is
+recoverable only before inventory publication; replacement after publication
+is an impossible postcondition and fail-stops. The authenticated generation is
+then embedded in the private proof and returned to the carrier transaction.
+The carrier's local generation is retained only as an independent consistency
+check and can no longer select what the kernel proof signs.
+
+The full facade regression uses a transport that performs real proof issuance
+and then returns its own chosen owner generation in every public receipt field.
+All public fields are internally consistent, but the runtime compares them to
+the independently minted private proof and rejects before `CowBroken`:
+
+```text
+RUSTC_WRAPPER= cargo test -p carrick-runtime \
+  foreign_cow_proof_issuer_does_not_sign_transport_chosen_owner_generation \
+  -- --nocapture
+1 passed; 2102 filtered out
+
+RUSTC_WRAPPER= cargo test -p carrick-runtime \
+  foreign_cow_runtime_rejects_transport_owner_after_independent_proof_issuance \
+  -- --nocapture
+1 passed; 2103 filtered out
+```
+
+### Round 3 files and architectural cost
+
+- `crates/carrick-hal/src/{lib,threaded}.rs`: remove owner generation from the
+  transport-callable apply method, return the issuer-authenticated typed value,
+  and add the read-only canonical-owner lease/inventory contracts.
+- `crates/carrick-aarch64/src/{engine,vmm}.rs`: forward the trusted concrete
+  VMM's existing-owner-directory view through the engine boundary.
+- `crates/carrick-vmm-hvf/src/{hvf_aarch64_engine,trap}.rs`: implement the
+  zero-sized view over `global_frame_host_owners`, retain and recheck the exact
+  owner incarnation, wire both full and task-only engines, and consume only the
+  issuer-returned generation in the production COW receipt.
+- `crates/carrick-runtime/src/vcpu_loop/{mod,exec,quiesce}.rs`: bind the
+  existing exact-MM proof authority to the engine's owner view for initial,
+  exec-replacement, copied-fork, and `CLONE_VM` paths, and fail closed when a
+  full HVPatch engine omits it.
+- `crates/carrick-runtime/src/kernel/mm_access.rs`: RED-first issuer and full
+  facade signing-oracle regressions plus production-composition fixture wiring.
+
+This adds no ordinary guest-entry work, no new owner directory, and no
+ordinary-hot-path allocation or global lookup. The new lookup and retained
+`Arc` occur only in the foreign-COW commit path already under exact target-MM
+exclusion. Runtime remains dependent only on HAL contracts rather than HVF
+concrete state. The foreign transport cannot install, replace, or pass this
+endpoint and has no owner-generation parameter at proof issuance.
+
+### Round 3 final verification
+
+```text
+RUSTC_WRAPPER= cargo test -p carrick-vmm-hvf foreign_cow
+4 passed; 276 filtered out
+RUSTC_WRAPPER= cargo test -p carrick-vmm-hvf frame_cow
+1 passed; 279 filtered out
+RUSTC_WRAPPER= cargo test -p carrick-runtime kernel::mm_access
+29 passed; 2075 filtered out
+RUSTC_WRAPPER= RUST_TEST_THREADS=1 cargo test -p carrick-runtime hvpatch::
+110 passed; 1994 filtered out
+RUSTC_WRAPPER= cargo test -p carrick-runtime production_carrier_
+5 passed; 2099 filtered out
+RUSTC_WRAPPER= cargo test -p carrick-thread --lib
+54 passed
+RUSTC_WRAPPER= cargo test -p carrick-hal
+111 unit tests and 2 compile-fail doctests passed
+
+RUSTC_WRAPPER= RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib
+2104 passed; 0 failed (normal host permissions)
+RUSTC_WRAPPER= cargo test -p carrick-vmm-hvf --lib
+280 passed; 0 failed (normal host permissions)
+RUSTC_WRAPPER= cargo test -p carrick-aarch64
+32 passed; 0 failed
+
+RUSTC_WRAPPER= cargo check --workspace --all-targets
+green
+RUSTC_WRAPPER= cargo clippy -p carrick-hal -p carrick-aarch64 \
+  -p carrick-thread -p carrick-runtime -p carrick-vmm-hvf \
+  --all-targets -- -D warnings
+green
+python3 scripts/migrate/check-mm-authority.py --self-test
+20 negative and 17 positive fixtures passed
+python3 scripts/migrate/check-mm-authority.py --check
+exit 1 with exactly the intentional Task 8 finding at
+crates/carrick-runtime/src/dispatch/proc.rs:4425
+cargo fmt --all -- --check
+green
+git diff --check
+green
+```
+
+Final self-review found no remaining transport input to proof owner generation,
+no parallel owner store, no recoverable operation after the inventory commit,
+no `proc.rs` diff, and no staged `progress.md`. The only retained concern is
+the explicit Task 8 production-checker finding above.
