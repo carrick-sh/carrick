@@ -11,7 +11,6 @@ pub mod core;
 pub mod crash_capture;
 pub mod debug;
 pub mod exec;
-pub mod foreign_mm;
 pub mod frame_inventory;
 pub mod guest_execution;
 pub mod ids;
