@@ -247,18 +247,21 @@ pub(super) fn acquire_mm_stage1_authority<'participant>(
     drop(census);
     begin_pt_pause(pt_barrier(), tid, budget)?;
     let census = participation.participation_mut().lock_exact_mm();
-    drain_exact_mm(pt_barrier(), mm, census, tid, budget).map(MmStage1Authority::Paused)
+    drain_exact_mm(pt_barrier(), mm, Some(coordinator), census, tid, budget)
+        .map(MmStage1Authority::Paused)
 }
 
 pub(crate) struct PtPauseGuard<'mm> {
     _scope: ExactMmStage1Scope,
     _lease: std::rc::Rc<ExactMmStage1Lease>,
+    mutation_coordinator: Option<Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>>,
     _authority: std::marker::PhantomData<&'mm mut ()>,
 }
 
 impl<'mm> PtPauseGuard<'mm> {
     fn new(
         mm: crate::kernel::MmId,
+        mutation_coordinator: Option<Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>>,
         census: crate::kernel::ExactMmCensusGuard,
         inner: crate::fork_quiesce::PtPauseGuard,
     ) -> Self {
@@ -274,8 +277,20 @@ impl<'mm> PtPauseGuard<'mm> {
         Self {
             _scope: ExactMmStage1Scope::enter(&lease),
             _lease: lease,
+            mutation_coordinator,
             _authority: std::marker::PhantomData,
         }
+    }
+
+    pub(crate) fn mutation_identity(
+        &self,
+    ) -> Option<(
+        Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>,
+        crate::kernel::MmId,
+    )> {
+        self.mutation_coordinator
+            .as_ref()
+            .map(|coordinator| (Arc::clone(coordinator), self._lease.mm))
     }
 }
 
@@ -432,6 +447,7 @@ fn begin_pt_pause(
 fn drain_exact_mm<'mm>(
     barrier: &'static crate::fork_quiesce::PtQuiesce,
     mm: crate::kernel::MmId,
+    mutation_coordinator: Option<Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>>,
     census: crate::kernel::ExactMmCensusGuard,
     tid: ThreadId,
     budget: PtPauseBudget,
@@ -464,7 +480,12 @@ fn drain_exact_mm<'mm>(
         std::thread::yield_now();
     }
     crate::probes::pt_pause_ready(tid.raw(), spins, start.elapsed().as_micros() as i64);
-    Ok(PtPauseGuard::new(mm, census, barrier.pause_guard(tid)))
+    Ok(PtPauseGuard::new(
+        mm,
+        mutation_coordinator,
+        census,
+        barrier.pause_guard(tid),
+    ))
 }
 
 #[cfg(test)]
@@ -480,7 +501,37 @@ pub(super) fn acquire_pt_pause<'participant>(
             .unwrap_or_else(|| std::num::NonZeroU64::new(1).unwrap()),
     );
     let census = participation.lock_exact_mm();
-    drain_exact_mm(barrier, mm, census, tid, budget)
+    drain_exact_mm(barrier, mm, None, census, tid, budget)
+}
+
+#[cfg(test)]
+pub(super) fn with_real_mutation_pause_for_test<T>(
+    coordinator: Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>,
+    run: impl FnOnce(&mut PtPauseGuard<'_>) -> T,
+) -> T {
+    let barrier: &'static crate::fork_quiesce::PtQuiesce =
+        Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
+    let registry: Arc<dyn carrick_hal::VcpuRegistry> =
+        Arc::new(carrick_hal::GenericVcpuRegistry::new());
+    let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
+    let tid = ThreadId::synthetic_for_tests(20_900);
+    let mut participation = census
+        .enter_with_pause_endpoint(None, registry, tid)
+        .expect("test exact-MM participation");
+    begin_pt_pause(barrier, tid, PtPauseBudget::DEFAULT)
+        .expect("test must elect a real page-table pause");
+    let mm = coordinator.mm();
+    let census = participation.lock_exact_mm();
+    let mut authority = drain_exact_mm(
+        barrier,
+        mm,
+        Some(coordinator),
+        census,
+        tid,
+        PtPauseBudget::DEFAULT,
+    )
+    .expect("test must acquire a real page-table pause");
+    run(&mut authority)
 }
 
 pub(super) enum FrameCowExactMmGuard {
@@ -516,7 +567,7 @@ pub(super) fn acquire_frame_cow_quiesce(
     drop(sole);
     begin_pt_pause(barrier, tid, budget)?;
     let census = census.lock_for_frame_cow();
-    drain_exact_mm(barrier, mm, census, tid, budget)
+    drain_exact_mm(barrier, mm, None, census, tid, budget)
         .map(|guard| FrameCowExactMmGuard::Paused { _guard: guard })
 }
 
@@ -1787,6 +1838,19 @@ mod pt_pause_tests {
             .expect("test exact-MM participation")
     }
 
+    fn acquire_mutation_pause_for_test<'participant>(
+        barrier: &'static crate::fork_quiesce::PtQuiesce,
+        participation: &'participant mut crate::kernel::GuestExecutorParticipation,
+        tid: ThreadId,
+        mm: crate::kernel::MmId,
+        coordinator: Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>,
+        budget: PtPauseBudget,
+    ) -> Result<PtPauseGuard<'participant>, PtPauseError> {
+        begin_pt_pause(barrier, tid, budget)?;
+        let census = participation.lock_exact_mm();
+        drain_exact_mm(barrier, mm, Some(coordinator), census, tid, budget)
+    }
+
     #[test]
     fn mm_mutation_alias_waiter_cannot_enter_inner_before_real_pt_pause() {
         let barrier: &'static crate::fork_quiesce::PtQuiesce =
@@ -1798,18 +1862,19 @@ mod pt_pause_tests {
         let mm = crate::kernel::MmId::from_raw_u64(91).expect("test MM");
         let coordinator = Arc::new(crate::dispatch::mm_mutation::MmMutationCoordinator::new(mm));
 
-        let mut outer = acquire_pt_pause(
+        let mut outer = acquire_mutation_pause_for_test(
             barrier,
             &mut first_executor,
             tid(1591),
+            mm,
+            Arc::clone(&coordinator),
             PtPauseBudget {
                 election: Duration::from_secs(1),
                 drain: Duration::from_secs(1),
             },
         )
         .expect("first real page-table pause");
-        let mutation =
-            crate::dispatch::mm_mutation::from_pt_pause(&mut outer, Arc::clone(&coordinator), mm);
+        let mutation = crate::dispatch::mm_mutation::from_pt_pause(&mut outer);
         let permit = mutation.host_alias_permit();
         let alias = coordinator.begin_alias(&permit);
 
@@ -1818,21 +1883,19 @@ mod pt_pause_tests {
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
         let worker = std::thread::spawn(move || {
             attempted_tx.send(()).expect("announce outer acquisition");
-            let mut outer = acquire_pt_pause(
+            let mut outer = acquire_mutation_pause_for_test(
                 barrier,
                 &mut second_executor,
                 tid(1592),
+                mm,
+                Arc::clone(&worker_coordinator),
                 PtPauseBudget {
                     election: Duration::from_secs(1),
                     drain: Duration::from_secs(1),
                 },
             )
             .expect("second real page-table pause");
-            let mutation = crate::dispatch::mm_mutation::from_pt_pause(
-                &mut outer,
-                Arc::clone(&worker_coordinator),
-                mm,
-            );
+            let mutation = crate::dispatch::mm_mutation::from_pt_pause(&mut outer);
             let permit = mutation.host_alias_permit();
             let alias = worker_coordinator.begin_alias(&permit);
             entered_tx.send(()).expect("announce inner alias entry");
