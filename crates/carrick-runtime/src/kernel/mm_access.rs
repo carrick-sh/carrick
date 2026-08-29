@@ -1017,7 +1017,7 @@ fn validate_snapshot_vmas(snapshot: &MmBackendSnapshot) -> Result<(), MmAccessEr
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::num::{NonZeroU16, NonZeroU64};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -1326,6 +1326,7 @@ mod tests {
 
     #[derive(Clone, Debug, Default)]
     struct MockCowCounters {
+        break_calls: Arc<AtomicUsize>,
         prepare_calls: Arc<AtomicUsize>,
         commit_calls: Arc<AtomicUsize>,
     }
@@ -1533,6 +1534,7 @@ mod tests {
             len: usize,
             _deadline: Instant,
         ) -> Result<Box<dyn ForeignCowReceipt>, ForeignMmTransportError> {
+            self.counters.break_calls.fetch_add(1, Ordering::SeqCst);
             let next = |raw| NonZeroU64::new(raw + 1).unwrap();
             let mm = if self.fault == MockCowFault::WrongMm {
                 carrick_hal::ForeignMmId::from_kernel_allocation(next(
@@ -2041,6 +2043,66 @@ mod tests {
                 ),
             );
         (child, backend, owner_generation, bytes, counters)
+    }
+
+    /// Authenticated foreign-COW fixture shared by syscall-consumer tests.
+    /// The retained peer bytes model the pre-COW source while `child_bytes`
+    /// are the exact backing mutated only after the runtime validates a
+    /// genuine kernel proof and commits a prepared write.
+    pub(crate) struct ConsumerCowFixture {
+        target: KernelContext,
+        peer_bytes: Vec<u8>,
+        child_bytes: Arc<parking_lot::Mutex<Vec<u8>>>,
+        counters: MockCowCounters,
+    }
+
+    impl ConsumerCowFixture {
+        pub(crate) fn target(&self) -> &KernelContext {
+            &self.target
+        }
+
+        pub(crate) fn peer_bytes(&self) -> &[u8] {
+            &self.peer_bytes
+        }
+
+        pub(crate) fn child_bytes(&self, offset: usize, len: usize) -> Vec<u8> {
+            self.child_bytes.lock()[offset..offset + len].to_vec()
+        }
+
+        pub(crate) fn break_calls(&self) -> usize {
+            self.counters.break_calls.load(Ordering::SeqCst)
+        }
+
+        pub(crate) fn prepare_calls(&self) -> usize {
+            self.counters.prepare_calls.load(Ordering::SeqCst)
+        }
+
+        pub(crate) fn commit_calls(&self) -> usize {
+            self.counters.commit_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    pub(crate) fn consumer_cow_fixture(
+        kernel: &Arc<Kernel>,
+        parent: &KernelContext,
+        registry_id: i32,
+        initial_bytes: Vec<u8>,
+    ) -> ConsumerCowFixture {
+        assert_eq!(
+            initial_bytes.len(),
+            0x4000,
+            "consumer fixture covers one exact 16 KiB COW compound",
+        );
+        let peer_bytes = initial_bytes.clone();
+        let (target, _backend, _owner, child_bytes, counters) =
+            cow_fixture(kernel, parent, registry_id, MockCowFault::None);
+        *child_bytes.lock() = initial_bytes;
+        ConsumerCowFixture {
+            target,
+            peer_bytes,
+            child_bytes,
+            counters,
+        }
     }
 
     fn production_composition_cow_fixture(
