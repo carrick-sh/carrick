@@ -1388,10 +1388,11 @@ pub(crate) struct KernelState {
     /// Issues crash-capture generations and broadcasts the one currently
     /// collecting. Sibling loops read it at their quiesce safe point.
     crash_capture: Option<Arc<crate::kernel::CrashCaptureAuthority>>,
-    /// The threads that can execute guest code for this Linux process — the
-    /// population every stop-the-world barrier's RAISE decision is keyed on,
-    /// and the one thread-group teardown waits out. Deliberately NOT
-    /// the vCPU lease registry: see `kernel::guest_execution`.
+    /// Active guest executors for this Linux process. This population decides
+    /// only whether a stage-1 page-table pause must be raised. Process fork and
+    /// crash snapshot instead use durable `Task::threads()` membership because
+    /// futex, epoll, and fd suspension drops census participation without
+    /// removing the logical thread. See `kernel::guest_execution`.
     guest_executors: Arc<crate::kernel::GuestExecutorCensus>,
     /// Cross-layer thread-clone admission spans Kernel reservation through
     /// runtime registration, handle visibility, and child start.
@@ -1655,16 +1656,18 @@ impl KernelState {
         self.clone_admission.close_for_exec(owner)
     }
 
-    /// Must this thread raise a stop-the-world barrier before it mutates state
-    /// the guest shares — stage-1 descriptors, or process topology?
+    /// Must this thread raise the stage-1 page-table Pause-Modify-Resume
+    /// barrier before it mutates shared descriptors?
     ///
-    /// Answered from the guest-executor census rather than the vCPU registry.
-    /// The registry counts LEASES, so a sibling parked in a futex / epoll / fd
-    /// wait has already unregistered and a two-thread process reads 1 — while
-    /// that sibling can still be woken back into guest by a host fd readying,
-    /// an `EVFILT_TIMER`, a cross-process futex wake or the signal pump, with
-    /// nothing in its path to stop it walking a half-edited structure. Callers
-    /// are all inside a vCPU loop and therefore count themselves.
+    /// This uses the guest-executor census rather than vCPU registry membership
+    /// because registration can be transiently absent while an admitted loop
+    /// acquires or rebinds its lease. `enter_guest_executor_then_register`
+    /// enters the census before attempting registry publication, so admitted
+    /// execution is visible throughout that gap. Callers hold participation
+    /// and therefore count themselves. Suspended futex, epoll, and fd loops
+    /// have dropped participation and are intentionally absent. Process fork
+    /// and crash do not use this predicate; their barrier raise decisions use
+    /// durable `Task::threads()` membership.
     fn has_peer_guest_executor(&self) -> bool {
         self.guest_executors.has_peer_executor()
     }
@@ -7690,12 +7693,14 @@ where
         // `current_thread_holds_pt_pause()` — so the only new cost is a pause
         // on a `MADV_DONTNEED` whose backing needed no COW. The advice check
         // keeps it off every other advice, which never reaches `zero_backing`.
-        // The population this decision needs is "who can execute guest code",
-        // NOT "who holds a vCPU lease right now" — see
-        // `KernelState::has_peer_guest_executor`. A sibling parked in
-        // `epoll_wait` is absent from the kicker and present here, and it is
-        // exactly the thread a lease-keyed predicate let walk a half-edited
-        // descriptor tree.
+        // The population this decision needs is active or admitted guest
+        // execution, NOT current vCPU lease publication — see
+        // `KernelState::has_peer_guest_executor`. Registration can be
+        // transiently absent while an admitted loop acquires or rebinds its
+        // lease, so census participation is published first. A sibling
+        // suspended in `epoll_wait` has dropped participation and is absent
+        // from this page-table RAISE population; fork/crash use durable task
+        // membership for their distinct barriers.
         // Claim stage-1 exclusivity for the whole dispatch of any syscall that
         // edits stage-1 descriptors. Both arms below are exclusive, for
         // different reasons, and the backend page-table manager needs to know
