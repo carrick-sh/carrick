@@ -5426,6 +5426,16 @@ mod kernel_process_dispatch_tests {
         child
     }
 
+    fn arm_ptrace_memory_access(tracer: &KernelContext, tracee: &KernelContext) {
+        assert!(tracer.kernel().claim_ptrace_traceme(tracee));
+        let stop = crate::kernel::LinuxSignal::for_signal_number(12).unwrap();
+        assert!(
+            tracer
+                .kernel()
+                .stop_task_for_ptrace(tracee.task().key().id, stop)
+        );
+    }
+
     fn write_iovec(memory: &mut LinearMemory, address: u64, base: u64, len: u64) {
         let mut bytes = [0u8; 16];
         bytes[..8].copy_from_slice(&base.to_le_bytes());
@@ -6448,6 +6458,132 @@ mod kernel_process_dispatch_tests {
                 [7, child_pid as u64, 0, 0, 0, 0],
             ),
             DispatchOutcome::Returned { value: 0 },
+        );
+    }
+
+    #[test]
+    fn hvpatch_ptrace_peekdata_reads_exact_foreign_word_for_exact_tracer() {
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_120);
+        let target = process_vm_target_with_payload(&root, 61_121, b"PEEKWORD");
+        arm_ptrace_memory_access(&root, &target);
+        let root = refreshed(&root);
+        let target_pid = target.task().key().id.raw();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [LINUX_PTRACE_PEEKDATA, target_pid as u64, TARGET_VA, 0, 0, 0,],
+                Some(&lease),
+            ),
+            DispatchOutcome::Returned {
+                value: u64::from_le_bytes(*b"PEEKWORD") as i64,
+            },
+        );
+    }
+
+    #[test]
+    fn hvpatch_ptrace_pokedata_changes_only_exact_target_under_cow() {
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_122);
+        let mut initial = vec![b'_'; 0x4000];
+        initial[..8].copy_from_slice(b"sameword");
+        let target = crate::kernel::consumer_cow_fixture(root.kernel(), &root, 61_123, initial);
+        target.observe_caller_executor_census(dispatcher.mm_executor_census());
+        arm_ptrace_memory_access(&root, target.target());
+        let root = refreshed(&root);
+        let target_pid = target.target().task().key().id.raw();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+        let replacement = u64::from_le_bytes(*b"EDITWORD");
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [
+                    LINUX_PTRACE_POKEDATA,
+                    target_pid as u64,
+                    TARGET_VA,
+                    replacement,
+                    0,
+                    0,
+                ],
+                Some(&lease),
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        assert_eq!(target.child_bytes(0, 8), b"EDITWORD");
+        assert_eq!(&target.peer_bytes()[..8], b"sameword");
+        assert_eq!(target.break_calls(), 1);
+        assert_eq!(target.prepare_calls(), 1);
+        assert_eq!(target.commit_calls(), 1);
+        assert!(!target.break_observed_caller_executor());
+    }
+
+    #[test]
+    fn hvpatch_ptrace_memory_rejects_holes_stale_targets_and_non_tracers() {
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_124);
+        let target = process_vm_target(&root, 61_125);
+        let target_pid = target.task().key().id.raw();
+        let root = refreshed(&root);
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [LINUX_PTRACE_PEEKDATA, target_pid as u64, TARGET_VA, 0, 0, 0],
+                Some(&lease),
+            ),
+            DispatchOutcome::errno(LINUX_ESRCH),
+            "a live target without the exact tracer relation is not ptrace-accessible",
+        );
+
+        arm_ptrace_memory_access(&root, &target);
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [
+                    LINUX_PTRACE_PEEKDATA,
+                    target_pid as u64,
+                    TARGET_VA + 0x1000,
+                    0,
+                    0,
+                    0,
+                ],
+                Some(&lease),
+            ),
+            DispatchOutcome::errno(crate::linux_abi::LINUX_EIO),
+            "an unmapped foreign word lowers to EIO",
+        );
+
+        target
+            .kernel()
+            .exit_task(
+                target.task().key().id,
+                LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .expect("exit test task");
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [LINUX_PTRACE_PEEKDATA, target_pid as u64, TARGET_VA, 0, 0, 0],
+                Some(&lease),
+            ),
+            DispatchOutcome::errno(LINUX_ESRCH),
         );
     }
 
