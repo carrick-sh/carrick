@@ -2106,6 +2106,8 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// `Some` only for a process multiplexed in the shared HvPatch VM.
     process_fork_barrier: Option<Arc<crate::fork_quiesce::QuiesceBarrier>>,
     crash_capture: Option<Arc<crate::kernel::CrashCaptureAuthority>>,
+    #[cfg(test)]
+    crash_lease_drain_budget: CrashLeaseDrainBudget,
     kernel_thread: Option<crate::kernel::ThreadRef>,
     guest_execution: Option<crate::kernel::GuestExecutorParticipation>,
     /// Exact Task 1 execution authority while this logical thread is running.
@@ -6809,6 +6811,8 @@ where
             platform_futex_factory,
             process_fork_barrier,
             crash_capture,
+            #[cfg(test)]
+            crash_lease_drain_budget: CrashLeaseDrainBudget::DEFAULT,
             kernel_thread,
             guest_execution: None,
             execution_lease: ExecutionLeaseCell::owned(),
@@ -6832,6 +6836,22 @@ where
             thread_exit_withdrawn: false,
             thread_exit_retry_subscription: None,
             _engine: std::marker::PhantomData,
+        }
+    }
+
+    #[cfg(test)]
+    fn install_crash_lease_drain_budget_for_test(&mut self, budget: CrashLeaseDrainBudget) {
+        self.crash_lease_drain_budget = budget;
+    }
+
+    fn crash_lease_drain_budget(&self) -> CrashLeaseDrainBudget {
+        #[cfg(test)]
+        {
+            self.crash_lease_drain_budget
+        }
+        #[cfg(not(test))]
+        {
+            CrashLeaseDrainBudget::DEFAULT
         }
     }
 
@@ -7076,7 +7096,7 @@ where
                 acquire_crash_lease_drain(
                     &*self.kicker,
                     self.this_tid,
-                    CrashLeaseDrainBudget::DEFAULT,
+                    self.crash_lease_drain_budget(),
                     || {
                         self.kicker.kick_all_except(self.this_tid);
                         self.futex.notify_signal_pending();
@@ -11314,7 +11334,7 @@ mod tests {
     }
 
     fn register_crash_test_vcpu(
-        registry: &carrick_hal::GenericVcpuRegistry,
+        registry: &dyn VcpuRegistry,
         tid: ThreadId,
         in_guest: &carrick_hal::InGuestFlag,
     ) {
@@ -11323,6 +11343,271 @@ mod tests {
                 .subscribe_register(tid, registration_test_handle(), in_guest, Arc::new(|| {}),),
             carrick_hal::VcpuRegistrationEnrollment::Registered
         ));
+    }
+
+    #[derive(Clone)]
+    struct CrashCaptureTestKick;
+
+    impl carrick_hal::VcpuKick for CrashCaptureTestKick {
+        fn kick(&self) {}
+    }
+
+    struct CrashCaptureTestEngine;
+
+    impl carrick_guest_mem::GuestMemory for CrashCaptureTestEngine {
+        fn read_bytes_raw(
+            &self,
+            _address: u64,
+            length: usize,
+        ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
+            Ok(vec![0; length])
+        }
+
+        fn write_bytes_raw(
+            &mut self,
+            _address: u64,
+            _bytes: &[u8],
+        ) -> Result<(), carrick_guest_mem::MemoryError> {
+            Ok(())
+        }
+    }
+
+    impl carrick_hal::RegAccess for CrashCaptureTestEngine {
+        fn get_reg(&self, _register: carrick_hal::Reg) -> Result<u64, carrick_hal::OsError> {
+            Ok(0)
+        }
+
+        fn set_reg(
+            &mut self,
+            _register: carrick_hal::Reg,
+            _value: u64,
+        ) -> Result<(), carrick_hal::OsError> {
+            Ok(())
+        }
+
+        fn get_sys_reg(&self, _register: carrick_hal::SysReg) -> Result<u64, carrick_hal::OsError> {
+            Ok(0)
+        }
+
+        fn set_sys_reg(
+            &mut self,
+            _register: carrick_hal::SysReg,
+            _value: u64,
+        ) -> Result<(), carrick_hal::OsError> {
+            Ok(())
+        }
+
+        fn get_vreg(&self, _register: u32) -> Result<u128, carrick_hal::OsError> {
+            Ok(0)
+        }
+
+        fn set_vreg(&mut self, _register: u32, _value: u128) -> Result<(), carrick_hal::OsError> {
+            Ok(())
+        }
+
+        fn get_fpcr(&self) -> Result<u64, carrick_hal::OsError> {
+            Ok(0)
+        }
+
+        fn set_fpcr(&mut self, _value: u64) -> Result<(), carrick_hal::OsError> {
+            Ok(())
+        }
+
+        fn get_fpsr(&self) -> Result<u64, carrick_hal::OsError> {
+            Ok(0)
+        }
+
+        fn set_fpsr(&mut self, _value: u64) -> Result<(), carrick_hal::OsError> {
+            Ok(())
+        }
+    }
+
+    impl carrick_hal::SyscallTrap for CrashCaptureTestEngine {
+        fn next_syscall(&mut self) -> Result<Option<carrick_hal::RawSyscall>, TrapError> {
+            Ok(None)
+        }
+
+        fn current_pc(&self) -> Result<u64, TrapError> {
+            Ok(0)
+        }
+
+        fn complete_syscall(&mut self, _return_value: i64) -> Result<(), TrapError> {
+            Ok(())
+        }
+
+        fn execve_into(&mut self, _new_image: &AddressSpace) -> Result<(), TrapError> {
+            Ok(())
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn inject_signal(
+            &mut self,
+            _signum: i32,
+            _handler: u64,
+            _sa_restorer: u64,
+            _pending_syscall_retval: Option<i64>,
+            _interrupted_pc: Option<u64>,
+            _altstack: Option<(u64, u64)>,
+            _saved_sigmask: u64,
+            _fault_siginfo: Option<(i32, u64)>,
+            _queued_siginfo: Option<carrick_abi::LinuxSiginfo>,
+            _restart_syscall: bool,
+        ) -> Result<(), TrapError> {
+            Ok(())
+        }
+
+        fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
+            Ok(0)
+        }
+    }
+
+    impl ThreadedEngine for CrashCaptureTestEngine {
+        type Arch = carrick_hal::Aarch64GuestArch;
+        type KickHandle = CrashCaptureTestKick;
+        type SiblingSpec = ();
+        type ProcessSpec = ();
+
+        fn take_guest_run_receipt_ns(&mut self) -> u64 {
+            0
+        }
+
+        fn snapshot_guest_state_for_publication(
+            &mut self,
+        ) -> Result<carrick_hal::threaded::GuestCpuState, TrapError> {
+            Err(TrapError::Hypervisor(
+                "crash timeout test does not snapshot executor state".to_owned(),
+            ))
+        }
+
+        fn aarch64_core_registers(
+            &self,
+        ) -> Result<Option<carrick_hal::Aarch64CoreRegisters>, TrapError> {
+            Ok(Some(carrick_hal::Aarch64CoreRegisters::default()))
+        }
+
+        fn kick_handle(&self) -> Self::KickHandle {
+            CrashCaptureTestKick
+        }
+
+        fn wait_for_vcpu_slot() {}
+
+        fn build_sibling_spec(
+            &self,
+            _entry: carrick_hal::GuestEntryRegs,
+        ) -> Result<Self::SiblingSpec, TrapError> {
+            Ok(())
+        }
+
+        fn materialize_sibling(_spec: Self::SiblingSpec) -> Result<Self, TrapError> {
+            Ok(Self)
+        }
+
+        fn program_counter(&self) -> Result<u64, TrapError> {
+            Ok(0)
+        }
+
+        fn set_guest_sp_el0(&self, _sp: u64) -> Result<(), TrapError> {
+            Ok(())
+        }
+
+        fn set_guest_thread_id(&self, _tid: u64) -> Result<(), TrapError> {
+            Ok(())
+        }
+
+        fn fresh_fork_kicker(&self) -> Arc<dyn VcpuRegistry> {
+            Arc::new(carrick_hal::GenericVcpuRegistry::new())
+        }
+    }
+
+    struct CrashCallbackRegistry {
+        inner: carrick_hal::GenericVcpuRegistry,
+        callback_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CrashCallbackRegistry {
+        fn new(callback_calls: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+            Self {
+                inner: carrick_hal::GenericVcpuRegistry::new(),
+                callback_calls,
+            }
+        }
+    }
+
+    impl VcpuRegistry for CrashCallbackRegistry {
+        fn register(
+            &self,
+            tid: ThreadId,
+            handle: Box<dyn carrick_hal::VcpuKickDyn>,
+            in_guest: &carrick_hal::InGuestFlag,
+        ) {
+            self.inner.register(tid, handle, in_guest);
+        }
+
+        fn poll_lease_drain(&self, except: ThreadId) -> carrick_hal::VcpuLeaseDrainPoll {
+            self.inner.poll_lease_drain(except)
+        }
+
+        fn subscribe_lease_drain(
+            &self,
+            except: ThreadId,
+            callback: Arc<dyn Fn() + Send + Sync + 'static>,
+        ) -> carrick_hal::VcpuLeaseDrainEnrollment {
+            let callback_calls = Arc::clone(&self.callback_calls);
+            self.inner.subscribe_lease_drain(
+                except,
+                Arc::new(move || {
+                    callback_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    callback();
+                }),
+            )
+        }
+
+        fn subscribe_register(
+            &self,
+            tid: ThreadId,
+            handle: Box<dyn carrick_hal::VcpuKickDyn>,
+            in_guest: &carrick_hal::InGuestFlag,
+            callback: Arc<dyn Fn() + Send + Sync + 'static>,
+        ) -> carrick_hal::VcpuRegistrationEnrollment {
+            self.inner
+                .subscribe_register(tid, handle, in_guest, callback)
+        }
+
+        fn unregister(&self, tid: ThreadId) {
+            self.inner.unregister(tid);
+        }
+
+        fn kick(&self, tid: ThreadId) {
+            self.inner.kick(tid);
+        }
+
+        fn kick_if_in_guest(&self, tid: ThreadId) -> bool {
+            self.inner.kick_if_in_guest(tid)
+        }
+
+        fn kick_all(&self) {
+            self.inner.kick_all();
+        }
+
+        fn kick_all_in_guest(&self) -> bool {
+            self.inner.kick_all_in_guest()
+        }
+
+        fn kick_all_except(&self, except: ThreadId) {
+            self.inner.kick_all_except(except);
+        }
+
+        fn any_other_in_guest(&self, except: ThreadId) -> bool {
+            self.inner.any_other_in_guest(except)
+        }
+
+        fn count(&self) -> usize {
+            self.inner.count()
+        }
+
+        fn debug_registered_vcpus(&self) -> Vec<(ThreadId, bool)> {
+            self.inner.debug_registered_vcpus()
+        }
     }
 
     #[test]
@@ -11430,21 +11715,44 @@ mod tests {
             .nth(1)
             .and_then(|tail| tail.split("fn trace_syscall(").next())
             .expect("bounded crash publication body");
+        let barrier_acquire = capture.find("while !barrier.try_begin_fork()").unwrap();
+        let advertise = capture.find("authority.advertise(generation)").unwrap();
         let envelope = capture.find("let result = (|| {").unwrap();
-        let acquire = capture.find("acquire_crash_lease_drain(").unwrap();
-        let prepare = capture.find("engine.prepare_core_snapshot()").unwrap();
-        let quorum = capture.find("quorum.poll()").unwrap();
-        let read = capture.find("engine.read_core_bytes").unwrap();
+        let envelope_end = capture
+            .rfind("})();")
+            .expect("exact protected crash publication closure end")
+            + "})();".len();
         let finish = capture.rfind("finish_crash_collection(").unwrap();
-        assert!(envelope < acquire);
+        assert!(envelope < envelope_end);
+        assert!(envelope_end < finish);
+        assert!(barrier_acquire < advertise);
+        assert!(advertise < envelope);
+
+        let protected = &capture[envelope..envelope_end];
+        let barrier_raise = protected.find("barrier.set_quiescing()").unwrap();
+        let acquire = protected.find("acquire_crash_lease_drain(").unwrap();
+        let prepare = protected.find("engine.prepare_core_snapshot()").unwrap();
+        let quorum = protected.find("quorum.poll()").unwrap();
+        let read = protected.find("engine.read_core_bytes").unwrap();
+        let serialize = protected.find(".to_bytes_bounded(").unwrap();
+        let publication = protected.find("PreparedCorePublication {").unwrap();
+        assert!(barrier_raise < acquire);
         assert!(acquire < prepare);
         assert!(prepare < quorum);
         assert!(quorum < read);
-        assert!(read < finish);
+        assert!(read < serialize);
+        assert!(serialize < publication);
+        assert_eq!(
+            protected.matches("engine.read_core_bytes").count(),
+            capture.matches("engine.read_core_bytes").count(),
+            "every live engine read must remain inside the drain-guard closure"
+        );
         assert!(
-            capture
+            protected
                 .contains(".map_err(|timeout| RuntimeError::Configuration(timeout.to_string()))?")
         );
+        assert!(!protected.contains("finish_crash_collection("));
+        assert!(!capture[..finish].contains("drop(lease_drain_guard)"));
         assert!(!capture.contains("kicker.count()"));
 
         let cleanup = source
@@ -11511,40 +11819,157 @@ mod tests {
 
     #[test]
     fn crash_lease_drain_timeout_releases_collection_and_barriers() {
-        let registry = carrick_hal::GenericVcpuRegistry::new();
-        let barrier = crate::fork_quiesce::QuiesceBarrier::new();
-        let authority = crate::kernel::CrashCaptureAuthority::default();
-        let generation = authority.issue().expect("test crash generation");
-        authority.advertise(generation);
-        assert!(barrier.try_begin_fork());
-        barrier.set_quiescing();
+        let (process, root) = crate::hvpatch::process_context_for_tests(70_229);
+        let plan = crate::kernel::ClonePlan::from_flags(
+            carrick_abi::LinuxCloneFlags::THREAD
+                | carrick_abi::LinuxCloneFlags::SIGHAND
+                | carrick_abi::LinuxCloneFlags::VM,
+        )
+        .expect("thread clone plan");
+        let sibling = process
+            .kernel_graph()
+            .reserve_thread_clone(&root, plan, None)
+            .expect("reserve crash sibling")
+            .prepare(ThreadId::synthetic_for_tests(70_230))
+            .expect("prepare crash sibling")
+            .commit()
+            .expect("publish crash sibling")
+            .start_thread()
+            .expect("start crash sibling")
+            .into_context();
+        let dispatcher = SyscallDispatcher::new();
+        dispatcher.bind_hvpatch_process(process.clone());
+        let kernel = Arc::new(KernelState::new(
+            dispatcher,
+            Arc::new(EndpointTestSignalPump),
+            Arc::new(EndpointTestSignalArrival),
+            Some(process.clone()),
+            None,
+            None,
+        ));
+        let barrier = kernel
+            .process_fork_barrier
+            .clone()
+            .expect("HVPatch crash barrier");
+        let authority = kernel
+            .crash_capture
+            .clone()
+            .expect("HVPatch crash authority");
         let owner = ThreadId::synthetic_for_tests(70_229);
-        let sibling = ThreadId::synthetic_for_tests(70_230);
+        let sibling_tid = ThreadId::synthetic_for_tests(70_230);
         let owner_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
         let sibling_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
-        register_crash_test_vcpu(&registry, owner, &owner_in_guest);
-        register_crash_test_vcpu(&registry, sibling, &sibling_in_guest);
-        let result = acquire_crash_lease_drain(
-            &registry,
+        let kicker = Arc::new(carrick_hal::GenericVcpuRegistry::new());
+        register_crash_test_vcpu(kicker.as_ref(), owner, &owner_in_guest);
+        register_crash_test_vcpu(kicker.as_ref(), sibling_tid, &sibling_in_guest);
+        let kicker: Arc<dyn VcpuRegistry> = kicker;
+        let platform: Arc<dyn PlatformFutex> = Arc::new(NoopPlatformFutex);
+        let platform_factory: PlatformFutexFactory = Arc::new(|_| Arc::new(NoopPlatformFutex));
+        let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+            Arc::new(ThreadRegistry::new(owner)),
+            Arc::new(FutexTable::new()),
+            platform,
+            platform_factory,
+            Some(Arc::clone(&barrier)),
+            Some(Arc::clone(&authority)),
+            Some(Arc::clone(root.thread())),
+            Some(process.pid()),
+            root.thread().key().tid,
+            kernel.fatal_signal.current_generation(),
             owner,
-            CrashLeaseDrainBudget {
-                timeout: Duration::ZERO,
-                poll_interval: Duration::from_micros(1),
+            Arc::new(Mutex::new(Vec::new())),
+            kicker,
+            owner_in_guest,
+            1_000,
+        );
+        state.install_crash_lease_drain_budget_for_test(CrashLeaseDrainBudget {
+            timeout: Duration::ZERO,
+            poll_interval: Duration::from_micros(1),
+        });
+        let mut engine = CrashCaptureTestEngine;
+
+        let result = state.capture_core_for_publication(
+            &kernel,
+            &mut engine,
+            FatalSignalRecord {
+                image_generation: kernel.fatal_signal.current_generation(),
+                tid: root.thread().key().tid,
+                signo: 11,
+                code: 1,
+                addr: 0xdead,
             },
-            || {},
-        )
-        .map(|guard| {
-            drop(guard);
-        })
-        .map_err(|timeout| RuntimeError::Configuration(timeout.to_string()));
+        );
 
-        let result = finish_crash_collection(&authority, &barrier, true, None, result);
-
-        assert!(result.is_err());
+        let error = match result {
+            Ok(_) => panic!("a live waiting lease must time out real crash capture"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains(&sibling_tid.raw().to_string()),
+            "timeout must report the exact waiting sibling: {error}"
+        );
+        assert_eq!(root.task().key(), sibling.task().key());
         assert!(authority.collecting().is_none());
         assert!(!barrier.is_quiescing());
         assert!(barrier.try_begin_fork());
         barrier.end_fork();
+    }
+
+    #[test]
+    fn crash_lease_drain_callback_before_park_completes_without_poll_interval() {
+        let callback_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let registry = Arc::new(CrashCallbackRegistry::new(Arc::clone(&callback_calls)));
+        let owner = ThreadId::synthetic_for_tests(70_233);
+        let sibling = ThreadId::synthetic_for_tests(70_234);
+        let owner_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
+        let sibling_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
+        register_crash_test_vcpu(registry.as_ref(), owner, &owner_in_guest);
+        register_crash_test_vcpu(registry.as_ref(), sibling, &sibling_in_guest);
+        let nudge_entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release_nudge = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(0);
+        let worker_registry = Arc::clone(&registry);
+        let worker_nudge_entered = Arc::clone(&nudge_entered);
+        let worker_release_nudge = Arc::clone(&release_nudge);
+        let worker = std::thread::spawn(move || {
+            let result = acquire_crash_lease_drain(
+                worker_registry.as_ref(),
+                owner,
+                CrashLeaseDrainBudget {
+                    timeout: Duration::from_secs(2),
+                    poll_interval: Duration::from_secs(1),
+                },
+                || {
+                    worker_nudge_entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                    while !worker_release_nudge.load(std::sync::atomic::Ordering::SeqCst) {
+                        std::thread::yield_now();
+                    }
+                },
+            )
+            .map(drop);
+            done_tx.send(result).expect("publish drain result");
+        });
+
+        let nudge_deadline = Instant::now() + Duration::from_secs(1);
+        while !nudge_entered.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                Instant::now() < nudge_deadline,
+                "worker must subscribe before parking"
+            );
+            std::thread::yield_now();
+        }
+        registry.unregister(sibling);
+        assert_eq!(
+            callback_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "membership change must exercise the subscribed unpark callback"
+        );
+        release_nudge.store(true, std::sync::atomic::Ordering::SeqCst);
+        done_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("an unpark token published before park must avoid the one-second poll")
+            .expect("membership removal must complete acquisition");
+        worker.join().expect("crash-drain worker");
     }
 
     #[test]
