@@ -261,7 +261,6 @@ impl ForeignMm {
 #[allow(dead_code)] // Minted and consumed by the canonical Task 8 syscall path.
 pub struct CowBroken<'mm> {
     range: MmWriteRange<'mm>,
-    snapshot: ProjectedForeignMmSnapshot,
     transport: Box<dyn carrick_hal::ForeignCowReceipt>,
 }
 
@@ -400,6 +399,26 @@ impl MmAccessAuthority {
         mm: &'mm ForeignMm,
         range: MmWriteRange<'mm>,
     ) -> Result<CowBroken<'mm>, MmAccessError> {
+        self.break_foreign_cow_inner(mutation, mm, range, false)
+    }
+
+    #[cfg(test)]
+    fn break_foreign_cow_with_final_snapshot_contended_for_test<'mm>(
+        &self,
+        mutation: &mut crate::dispatch::mm_mutation::MmMutationGuard<'_>,
+        mm: &'mm ForeignMm,
+        range: MmWriteRange<'mm>,
+    ) -> Result<CowBroken<'mm>, MmAccessError> {
+        self.break_foreign_cow_inner(mutation, mm, range, true)
+    }
+
+    fn break_foreign_cow_inner<'mm>(
+        &self,
+        mutation: &mut crate::dispatch::mm_mutation::MmMutationGuard<'_>,
+        mm: &'mm ForeignMm,
+        range: MmWriteRange<'mm>,
+        contend_final_snapshot: bool,
+    ) -> Result<CowBroken<'mm>, MmAccessError> {
         if !Arc::ptr_eq(&range.token.mm, &mm.token.mm) || range.token.task != mm.token.task {
             return Err(MmAccessError::ForeignRangeAuthorityMismatch);
         }
@@ -417,16 +436,12 @@ impl MmAccessAuthority {
             .foreign_lease
             .as_ref()
             .ok_or(MmAccessError::MissingForeignTransport(mm.mm_id()))?;
-        let live = RetainedMmLiveAuthority {
-            mm: Arc::clone(&mm.token.mm),
-        };
         let before = snapshot_backend(&mm.token.mm, deadline)?;
         validate_snapshot_vmas(&before)?;
         validate_range_in_snapshot(&before, range.start, range.len, RangeAccess::Write)?;
         let requested = ProjectedForeignMmSnapshot::from_backend(mm.mm_id(), &before)?;
         let receipt = mutation.with_host_alias(|invalidator| {
             lease.break_cow(
-                &live,
                 invalidator,
                 &requested,
                 range.start,
@@ -441,24 +456,40 @@ impl MmAccessAuthority {
             }
             Err(error) => return Err(MmAccessError::ForeignTransport(error)),
         };
-        let after = ProjectedForeignMmSnapshot::from_backend(
-            mm.mm_id(),
-            &snapshot_backend(&mm.token.mm, deadline)?,
-        )?;
-        if receipt.mm() != after.mm
-            || receipt.range_start() != range.start
-            || receipt.range_len() != range.len.get()
-            || receipt.backend_revision() != after.backend_revision
-            || receipt.vma_revision() != after.vma_revision
-            || receipt.frame_inventory_revision() != after.frame_inventory_revision
-            || receipt.physical_len() == 0
-            || receipt.owner_generation().raw_for_probe() == 0
-        {
+        let validates = || {
+            let inventory = receipt.live_inventory();
+            receipt.mm() == requested.mm
+                && receipt.range_start() == range.start
+                && receipt.range_len() == range.len.get()
+                && receipt.backend_revision() == requested.backend_revision
+                && receipt.vma_revision() == requested.vma_revision
+                && receipt.frame_inventory_revision() == inventory.frame_inventory_revision()
+                && receipt.mm() == inventory.mm()
+                && receipt.mapping() == inventory.mapping()
+                && receipt.frame() == inventory.frame()
+                && receipt.physical_base() == inventory.physical_base()
+                && receipt.physical_len() == inventory.physical_len()
+                && receipt.owner_generation() == inventory.owner_generation()
+                && receipt.physical_len() >= range.len.get() as u64
+                && receipt
+                    .physical_base()
+                    .raw()
+                    .checked_add(receipt.physical_len())
+                    .is_some()
+        };
+        // Test-only reblocking makes any post-commit snapshot reader time out
+        // against the exact production mutation coordinator. Receipt-only
+        // authentication must remain independent of that reader.
+        let valid = if contend_final_snapshot {
+            mutation.with_host_alias(|_| validates())
+        } else {
+            validates()
+        };
+        if !valid {
             return Err(MmAccessError::ForeignCowReceiptMismatch);
         }
         Ok(CowBroken {
             range,
-            snapshot: after,
             transport: receipt,
         })
     }
@@ -486,7 +517,20 @@ impl MmAccessAuthority {
             RangeAccess::Write,
         )?;
         let snapshot = ProjectedForeignMmSnapshot::from_backend(mm.id(), &before)?;
-        if snapshot != witness.snapshot {
+        let inventory = witness.transport.live_inventory();
+        if snapshot.mm != witness.transport.mm()
+            || snapshot.backend_revision != witness.transport.backend_revision()
+            || snapshot.vma_revision != witness.transport.vma_revision()
+            || snapshot.frame_inventory_revision != witness.transport.frame_inventory_revision()
+            || !snapshot.mapping_ids.contains(&witness.transport.mapping())
+            || inventory.mm() != witness.transport.mm()
+            || inventory.frame_inventory_revision() != witness.transport.frame_inventory_revision()
+            || inventory.mapping() != witness.transport.mapping()
+            || inventory.frame() != witness.transport.frame()
+            || inventory.physical_base() != witness.transport.physical_base()
+            || inventory.physical_len() != witness.transport.physical_len()
+            || inventory.owner_generation() != witness.transport.owner_generation()
+        {
             return Err(MmAccessError::StaleCowBroken);
         }
         let lease = witness
@@ -1113,8 +1157,14 @@ mod tests {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum MockCowFault {
         None,
+        ReacquireSnapshot,
         WrongMm,
         WrongRange,
+        WrongMapping,
+        WrongFrame,
+        WrongPhysical,
+        WrongPhysicalLength,
+        WrongOwner,
         AdvancedBackend,
         AdvancedVma,
         AdvancedInventory,
@@ -1144,6 +1194,20 @@ mod tests {
         inventory: carrick_hal::ForeignFrameInventoryRevision,
         mapping: carrick_hal::MappingId,
         frame: carrick_hal::FrameId,
+        physical_base: Gpa,
+        physical_len: u64,
+        owner: carrick_hal::ForeignOwnerGeneration,
+        live: MockCowLiveReceipt,
+    }
+
+    #[derive(Debug)]
+    struct MockCowLiveReceipt {
+        mm: carrick_hal::ForeignMmId,
+        inventory: carrick_hal::ForeignFrameInventoryRevision,
+        mapping: carrick_hal::MappingId,
+        frame: carrick_hal::FrameId,
+        physical_base: Gpa,
+        physical_len: u64,
         owner: carrick_hal::ForeignOwnerGeneration,
     }
 
@@ -1173,10 +1237,37 @@ mod tests {
             self.frame
         }
         fn physical_base(&self) -> Gpa {
-            Gpa(0xb000)
+            self.physical_base
         }
         fn physical_len(&self) -> u64 {
-            0x4000
+            self.physical_len
+        }
+        fn owner_generation(&self) -> carrick_hal::ForeignOwnerGeneration {
+            self.owner
+        }
+        fn live_inventory(&self) -> &dyn carrick_hal::ForeignCowLiveInventoryReceipt {
+            &self.live
+        }
+    }
+
+    impl carrick_hal::ForeignCowLiveInventoryReceipt for MockCowLiveReceipt {
+        fn mm(&self) -> carrick_hal::ForeignMmId {
+            self.mm
+        }
+        fn frame_inventory_revision(&self) -> carrick_hal::ForeignFrameInventoryRevision {
+            self.inventory
+        }
+        fn mapping(&self) -> carrick_hal::MappingId {
+            self.mapping
+        }
+        fn frame(&self) -> carrick_hal::FrameId {
+            self.frame
+        }
+        fn physical_base(&self) -> Gpa {
+            self.physical_base
+        }
+        fn physical_len(&self) -> u64 {
+            self.physical_len
         }
         fn owner_generation(&self) -> carrick_hal::ForeignOwnerGeneration {
             self.owner
@@ -1235,7 +1326,6 @@ mod tests {
         fn break_cow(
             &self,
             _invocation: &carrick_hal::ForeignMmInvocation,
-            _authority: &dyn carrick_hal::ForeignMmLiveAuthority,
             _invalidator: &mut dyn carrick_hal::ForeignMmInvalidator,
             snapshot: &dyn ForeignMmSnapshot,
             va: GuestVa,
@@ -1243,6 +1333,7 @@ mod tests {
             _deadline: Instant,
         ) -> Result<Box<dyn ForeignCowReceipt>, ForeignMmTransportError> {
             let next = |raw| NonZeroU64::new(raw + 1).unwrap();
+            let live_mm = snapshot.mm();
             let mm = if self.fault == MockCowFault::WrongMm {
                 carrick_hal::ForeignMmId::from_kernel_allocation(next(
                     snapshot.mm().raw_for_probe(),
@@ -1267,6 +1358,30 @@ mod tests {
                 snapshot.frame_inventory_revision().raw_for_probe()
                     + u64::from(self.fault == MockCowFault::AdvancedInventory),
             );
+            let mapping_raw = if self.fault == MockCowFault::WrongMapping {
+                55
+            } else {
+                53
+            };
+            let frame_raw = if self.fault == MockCowFault::WrongFrame {
+                61
+            } else {
+                59
+            };
+            let physical_base = if self.fault == MockCowFault::WrongPhysical {
+                Gpa(0xc000)
+            } else {
+                Gpa(0xb000)
+            };
+            let owner_raw = self.owner_generation.load(Ordering::Acquire)
+                + u64::from(self.fault == MockCowFault::WrongOwner);
+            let live_mapping =
+                carrick_hal::MappingId::from_kernel_allocation(NonZeroU64::new(53).unwrap());
+            let live_frame =
+                carrick_hal::FrameId::from_kernel_allocation(NonZeroU64::new(59).unwrap());
+            let live_owner = carrick_hal::ForeignOwnerGeneration::from_backend_counter(
+                NonZeroU64::new(self.owner_generation.load(Ordering::Acquire)).unwrap(),
+            );
             Ok(Box::new(MockCowReceipt {
                 mm,
                 start,
@@ -1275,12 +1390,29 @@ mod tests {
                 vma,
                 inventory,
                 mapping: carrick_hal::MappingId::from_kernel_allocation(
-                    NonZeroU64::new(53).unwrap(),
+                    NonZeroU64::new(mapping_raw).unwrap(),
                 ),
-                frame: carrick_hal::FrameId::from_kernel_allocation(NonZeroU64::new(59).unwrap()),
+                frame: carrick_hal::FrameId::from_kernel_allocation(
+                    NonZeroU64::new(frame_raw).unwrap(),
+                ),
+                physical_base,
+                physical_len: if self.fault == MockCowFault::WrongPhysicalLength {
+                    0x2000
+                } else {
+                    0x4000
+                },
                 owner: carrick_hal::ForeignOwnerGeneration::from_backend_counter(
-                    NonZeroU64::new(self.owner_generation.load(Ordering::Acquire)).unwrap(),
+                    NonZeroU64::new(owner_raw).unwrap(),
                 ),
+                live: MockCowLiveReceipt {
+                    mm: live_mm,
+                    inventory: snapshot.frame_inventory_revision(),
+                    mapping: live_mapping,
+                    frame: live_frame,
+                    physical_base: Gpa(0xb000),
+                    physical_len: 0x4000,
+                    owner: live_owner,
+                },
             }))
         }
 
@@ -1318,7 +1450,18 @@ mod tests {
                 inventory: cow.frame_inventory_revision(),
                 mapping: cow.mapping(),
                 frame: cow.frame(),
+                physical_base: cow.physical_base(),
+                physical_len: cow.physical_len(),
                 owner: cow.owner_generation(),
+                live: MockCowLiveReceipt {
+                    mm: cow.live_inventory().mm(),
+                    inventory: cow.live_inventory().frame_inventory_revision(),
+                    mapping: cow.live_inventory().mapping(),
+                    frame: cow.live_inventory().frame(),
+                    physical_base: cow.live_inventory().physical_base(),
+                    physical_len: cow.live_inventory().physical_len(),
+                    owner: cow.live_inventory().owner_generation(),
+                },
             })))
         }
     }
@@ -1517,6 +1660,48 @@ mod tests {
         (child, backend, owner_generation, bytes)
     }
 
+    fn production_composition_cow_fixture(
+        kernel: &Arc<Kernel>,
+        parent: &KernelContext,
+        registry_id: i32,
+    ) -> KernelContext {
+        let (_stage1_pool, stage1) = crate::hvpatch::Stage1MmPool::new_root_for_tests(
+            0x20_0000 + (registry_id as u64 & 0xff) * 0x1000,
+            4,
+        )
+        .expect("production composition stage-1 lease");
+        let backend = stage1.backend();
+        let child = fork_with_backend(
+            kernel,
+            parent,
+            registry_id,
+            "production foreign COW composition",
+            Arc::clone(&backend) as Arc<dyn MmBackend>,
+        );
+        let mm = child.shared().mm().id();
+        let (dispatch_mm, mutation) =
+            crate::dispatch::DispatchMmAuthority::foreign_cow_composition_for_test(
+                mm,
+                Arc::clone(&stage1),
+                0x3000,
+                0x4000,
+            );
+        backend.bind_inventory(kernel, mm);
+        backend.bind_vma_source(dispatch_mm);
+        child.shared().mm().install_foreign_mm_endpoint_for_test(
+            carrick_hal::ForeignMmEndpoint::for_carrier(Arc::new(MockCowTransport {
+                owner_generation: Arc::new(AtomicU64::new(61)),
+                bytes: Arc::new(parking_lot::Mutex::new(b"same".to_vec())),
+                fault: MockCowFault::ReacquireSnapshot,
+            })),
+        );
+        child
+            .shared()
+            .mm()
+            .install_foreign_mm_mutation_authority_for_test(mutation);
+        child
+    }
+
     fn with_mm_mutation<T>(
         mm: MmId,
         run: impl FnOnce(&mut crate::dispatch::mm_mutation::MmMutationGuard<'_>) -> T,
@@ -1564,6 +1749,115 @@ mod tests {
     }
 
     #[test]
+    fn production_composition_foreign_cow_does_not_reacquire_snapshot_under_alias() {
+        let (kernel, root) = bootstrap(31_075);
+        let execution = execution_lease(&root, 75);
+        let child = production_composition_cow_fixture(&kernel, &root, 31_076);
+        let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
+        let range = foreign.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
+
+        let result = with_foreign_mutation(&foreign, |mutation| {
+            super::MmAccessAuthority::new().break_foreign_cow(mutation, &foreign, range)
+        });
+
+        assert!(result.is_ok(), "production composition failed: {result:?}");
+    }
+
+    #[test]
+    fn production_composition_committed_cow_ignores_final_snapshot_contention() {
+        let (kernel, root) = bootstrap(31_077);
+        let execution = execution_lease(&root, 77);
+        let child = production_composition_cow_fixture(&kernel, &root, 31_078);
+        let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
+        let range = foreign.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
+
+        let result = with_foreign_mutation(&foreign, |mutation| {
+            super::MmAccessAuthority::new()
+                .break_foreign_cow_with_final_snapshot_contended_for_test(mutation, &foreign, range)
+        });
+
+        assert!(
+            result.is_ok(),
+            "post-commit receipt validation reacquired a contended snapshot: {result:?}"
+        );
+    }
+
+    #[test]
+    fn production_composition_clone_vm_target_reuses_exact_cow_authority() {
+        let (kernel, root) = bootstrap(31_079);
+        let execution = execution_lease(&root, 79);
+        let target = production_composition_cow_fixture(&kernel, &root, 31_080);
+        let shared = kernel
+            .reserve_fork(
+                &target,
+                ClonePlan::from_flags(LinuxCloneFlags::VM).expect("CLONE_VM plan"),
+                "production foreign COW CLONE_VM peer".to_owned(),
+                None,
+            )
+            .expect("reserve CLONE_VM peer")
+            .prepare_shared_mm(ThreadId::synthetic_for_tests(31_081))
+            .expect("prepare shared target MM")
+            .commit()
+            .expect("publish CLONE_VM peer")
+            .into_parts()
+            .expect("start CLONE_VM peer")
+            .0;
+        assert!(Arc::ptr_eq(&target.shared().mm(), &shared.shared().mm()));
+        let foreign = foreign_mm(&kernel, &root, &execution, shared.task().key());
+        let range = foreign.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
+
+        let result = with_foreign_mutation(&foreign, |mutation| {
+            super::MmAccessAuthority::new().break_foreign_cow(mutation, &foreign, range)
+        });
+
+        assert!(
+            result.is_ok(),
+            "CLONE_VM lost exact COW authority: {result:?}"
+        );
+    }
+
+    #[test]
+    fn production_composition_retained_target_cow_survives_exec_and_retirement() {
+        let (kernel, root) = bootstrap(31_082);
+        let execution = execution_lease(&root, 82);
+        let target = production_composition_cow_fixture(&kernel, &root, 31_083);
+        let foreign = foreign_mm(&kernel, &root, &execution, target.task().key());
+        let retained_mm = foreign.mm_id();
+
+        let replacement = kernel
+            .commit_exec(
+                kernel
+                    .prepare_exec_with_mm_backend(&target, fixture_backend(), None)
+                    .expect("prepare target exec"),
+                None,
+            )
+            .expect("commit target exec");
+        assert_ne!(replacement.shared().mm().id(), retained_mm);
+        let replacement_key = replacement.task().key();
+        kernel
+            .exit_task_key_eventually(replacement_key, LinuxWaitStatus::from_wait_encoding(0))
+            .expect("retire exec replacement");
+        drop(replacement);
+        let _ = kernel
+            .wait_child_key(
+                root.task().key().id,
+                replacement_key,
+                super::super::WaitMode::Consume,
+            )
+            .expect("reap retired replacement");
+        kernel.sweep_retired_threads();
+
+        let range = foreign.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
+        let result = with_foreign_mutation(&foreign, |mutation| {
+            super::MmAccessAuthority::new().break_foreign_cow(mutation, &foreign, range)
+        });
+        assert!(
+            result.is_ok(),
+            "retained exact target MM lost COW authority after exec/retirement: {result:?}"
+        );
+    }
+
+    #[test]
     fn foreign_cow_rejects_wrong_mm_guard_range_and_backend_receipt_identity() {
         let (kernel, root) = bootstrap(31_082);
         let execution = execution_lease(&root, 82);
@@ -1606,6 +1900,33 @@ mod tests {
                         &target,
                         target_range,
                     ),
+                    Err(MmAccessError::ForeignCowReceiptMismatch)
+                ));
+            });
+        }
+    }
+
+    #[test]
+    fn foreign_cow_rejects_wrong_mapping_frame_physical_range_and_current_owner() {
+        let (kernel, root) = bootstrap(31_086);
+        let execution = execution_lease(&root, 86);
+        for (index, fault) in [
+            MockCowFault::WrongMapping,
+            MockCowFault::WrongFrame,
+            MockCowFault::WrongPhysical,
+            MockCowFault::WrongPhysicalLength,
+            MockCowFault::WrongOwner,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (target, _backend, _owner, _bytes) =
+                cow_fixture(&kernel, &root, 31_087 + index as i32, fault);
+            let target = foreign_mm(&kernel, &root, &execution, target.task().key());
+            let range = target.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
+            with_foreign_mutation(&target, |mutation| {
+                assert!(matches!(
+                    super::MmAccessAuthority::new().break_foreign_cow(mutation, &target, range,),
                     Err(MmAccessError::ForeignCowReceiptMismatch)
                 ));
             });

@@ -89,8 +89,8 @@ pub(super) fn enter_hvpatch_guest_or_service_invalidation(
     // before it can edit/publish, while an older deferred generation can be
     // serviced immediately on this exact loaded owner vCPU.
     if !barrier.is_quiescing() {
-        if let Some((executor, binding)) = control.cow_invalidation_binding() {
-            binding.service_pending_cow_invalidation(executor, |generation| {
+        if let Some((_executor, binding, observer)) = control.cow_invalidation_binding() {
+            binding.service_pending_cow_invalidation(observer, |generation| {
                 let engine = engine
                     .downcast_mut::<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Engine>()
                     .ok_or_else(|| {
@@ -114,18 +114,16 @@ pub(super) fn enter_hvpatch_guest_or_service_invalidation(
         }
     }
     in_guest.leave_guest();
-    let (executor, binding) = control.cow_invalidation_binding().ok_or_else(|| {
+    let (executor, binding, _observer) = control.cow_invalidation_binding().ok_or_else(|| {
         carrick_hal::TrapError::Hypervisor(
             "quiesced HVPatch executor lacks exact invalidation binding".to_owned(),
         )
     })?;
-    let identity = binding.identity();
+    let identity = binding.foreign_stage1_identity();
     let mut failure = None;
-    barrier.park_servicing_scoped_invalidation(identity.mm.raw(), tid, |request| {
+    barrier.park_servicing_exact_invalidation(identity, tid, |request| {
         let result = (|| {
-            if request.mm_scope() != identity.mm.raw()
-                || request.asid_generation() != identity.asid_generation
-            {
+            if request.identity().stage1() != identity {
                 return Err(carrick_hal::TrapError::Hypervisor(
                     "foreign COW invalidation named another MM/ASID generation".to_owned(),
                 ));
@@ -135,10 +133,9 @@ pub(super) fn enter_hvpatch_guest_or_service_invalidation(
                     "active target executor lacked its foreign COW invalidation ticket".to_owned(),
                 )
             })?;
-            if ticket.asid_generation().raw() != request.asid()
-                || ticket.asid_generation().generation() != request.asid_generation()
-                || ticket.generation() != request.invalidation_generation()
-            {
+            let ticket_identity =
+                carrick_hal::ForeignCowInvalidationIdentity::new(identity, ticket.generation());
+            if ticket_identity != request.identity() {
                 return Err(carrick_hal::TrapError::Hypervisor(
                     "active target executor observed a stale foreign COW invalidation phase"
                         .to_owned(),
@@ -151,7 +148,10 @@ pub(super) fn enter_hvpatch_guest_or_service_invalidation(
                         "foreign COW invalidation reached a non-HVF owner engine".to_owned(),
                     )
                 })?;
-            carrick_vmm_hvf::hvf_aarch64_engine::invalidate_loaded_asid(engine, request.asid())?;
+            carrick_vmm_hvf::hvf_aarch64_engine::invalidate_loaded_asid(
+                engine,
+                request.identity().stage1().binding().asid().raw_for_probe(),
+            )?;
             binding
                 .acknowledge_cow_invalidation(executor, ticket)
                 .map_err(|error| carrick_hal::TrapError::Hypervisor(error.to_string()))
@@ -652,6 +652,14 @@ pub(crate) enum FrameCowExactMmGuard {
 }
 
 impl FrameCowExactMmGuard {
+    fn exact_mm(&self) -> crate::kernel::MmId {
+        match self {
+            Self::Nested { _lease, .. } => _lease.mm,
+            Self::Sole { mm, .. } => *mm,
+            Self::Paused { _guard, .. } => _guard._lease.mm,
+        }
+    }
+
     #[allow(dead_code)] // Canonical process_vm consumer lands in Task 8.
     pub(crate) fn mutation_identity(
         &self,
@@ -683,6 +691,7 @@ impl FrameCowExactMmGuard {
         expected_binding: carrick_hal::ForeignMmBinding,
         deadline: Instant,
     ) -> Result<(), ForeignCowInvalidationError> {
+        let exact_mm = self.exact_mm();
         let stage1 = match self {
             Self::Nested { foreign_stage1, .. }
             | Self::Sole { foreign_stage1, .. }
@@ -697,6 +706,10 @@ impl FrameCowExactMmGuard {
             return Err(ForeignCowInvalidationError::BindingMismatch);
         }
         let publication = stage1.publish_cow_invalidation();
+        let identity = carrick_hal::ForeignCowInvalidationIdentity::new(
+            stage1.foreign_stage1_identity(exact_mm),
+            publication.ticket().generation(),
+        );
         let Self::Paused { _guard, .. } = self else {
             return Ok(());
         };
@@ -709,13 +722,7 @@ impl FrameCowExactMmGuard {
             }
         };
         let phase = inner
-            .publish_scoped_invalidation(
-                _guard._lease.mm.raw(),
-                publication.asid_generation().raw(),
-                publication.asid_generation().generation(),
-                publication.ticket().generation(),
-                expected,
-            )
+            .publish_exact_invalidation(identity, expected)
             .map_err(ForeignCowInvalidationError::Pause)?;
         let result = inner.wait_invalidation(&phase, deadline);
         inner
@@ -2035,8 +2042,11 @@ where
 #[cfg(test)]
 mod pt_pause_tests {
     use super::*;
+    use carrick_hal::vcpu_sched::VcpuScheduler;
     use carrick_hal::{GenericVcpuRegistry, VcpuKickDyn, VcpuRegistry};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    static FOREIGN_COW_HANDSHAKE_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     struct NoopKick;
 
@@ -2099,6 +2109,150 @@ mod pt_pause_tests {
         begin_pt_pause(barrier, tid, budget)?;
         let census = participation.lock_exact_mm();
         drain_exact_mm(barrier, mm, Some(coordinator), census, tid, budget)
+    }
+
+    #[test]
+    fn foreign_cow_active_target_acks_then_inactive_caller_resident_defers_to_reentry() {
+        let _test_lock = FOREIGN_COW_HANDSHAKE_TEST_LOCK.lock();
+        let barrier = pt_barrier();
+        assert!(!barrier.is_quiescing());
+        let registry = Arc::new(GenericVcpuRegistry::new());
+        let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
+        let active_tid = tid(1_701);
+        let caller_tid = tid(1_702);
+        let active_flag = carrick_hal::InGuestFlag::for_guest_thread();
+        register_for_test(&registry, active_tid, &active_flag);
+        let _active_participation = enter_for_test(&census, &registry, active_tid);
+
+        let (_pool, stage1) = crate::hvpatch::Stage1MmPool::new_root_for_tests(0x8000, 1)
+            .expect("one-slot target stage-1 pool");
+        let active_executor =
+            crate::kernel::objects::ExecutorId::for_transitional_thread(active_tid)
+                .expect("active executor identity");
+        let caller_executor =
+            crate::kernel::objects::ExecutorId::for_transitional_thread(caller_tid)
+                .expect("caller executor identity");
+        for executor in [active_executor, caller_executor] {
+            stage1
+                .begin_asid_load(executor)
+                .expect("record exact target residency")
+                .mark_resident()
+                .expect("publish exact target residency");
+        }
+        let caller_observer = stage1.cow_invalidation_observer(caller_executor);
+        let mm = crate::kernel::MmId::from_raw_u64(1_703).expect("test MM");
+        let coordinator = Arc::new(crate::dispatch::mm_mutation::MmMutationCoordinator::new(mm));
+        let authority = crate::dispatch::mm_mutation::ForeignMmMutationAuthority::new(
+            mm,
+            coordinator,
+            Arc::clone(&census),
+            Arc::clone(&stage1),
+        );
+        let identity = stage1.foreign_stage1_identity(mm);
+        let worker_stage1 = Arc::clone(&stage1);
+        let worker = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !barrier.is_quiescing() {
+                assert!(Instant::now() < deadline, "target pause was never raised");
+                std::thread::yield_now();
+            }
+            barrier.park_servicing_exact_invalidation(identity, active_tid, |request| {
+                let ticket = worker_stage1
+                    .pending_cow_invalidation(active_executor)
+                    .expect("active owner has exact target ticket");
+                assert_eq!(
+                    request.identity(),
+                    carrick_hal::ForeignCowInvalidationIdentity::new(identity, ticket.generation(),)
+                );
+                worker_stage1
+                    .acknowledge_cow_invalidation(active_executor, ticket)
+                    .map_err(|_| ())
+            });
+        });
+
+        authority
+            .with_guard(caller_tid, |mutation| {
+                mutation.with_host_alias(|invalidator| {
+                    carrick_hal::ForeignMmInvalidator::invalidate_exact_asid(
+                        invalidator,
+                        identity.binding(),
+                        Instant::now() + Duration::from_secs(1),
+                    )
+                })
+            })
+            .expect("acquire exact foreign-MM pause")
+            .expect("active target owner acknowledges while remaining paused");
+        worker.join().expect("active target owner resumes");
+
+        assert!(stage1.pending_cow_invalidation(active_executor).is_none());
+        assert!(
+            stage1.pending_cow_invalidation(caller_executor).is_some(),
+            "foreign caller must not be awaited as an active target self-command"
+        );
+        let preentry_calls = AtomicUsize::new(0);
+        stage1
+            .service_pending_cow_invalidation(&caller_observer, |_| {
+                preentry_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), ()>(())
+            })
+            .expect("inactive caller-resident services before next target entry");
+        assert_eq!(preentry_calls.load(Ordering::SeqCst), 1);
+        assert!(stage1.pending_cow_invalidation(caller_executor).is_none());
+    }
+
+    #[test]
+    fn foreign_cow_vcpu_budget_one_full_occupancy_never_waits_on_caller_worker_self_ack() {
+        let scheduler = carrick_hal::vcpu_sched::HostCondvarScheduler::new(1);
+        let occupied = scheduler.acquire(1_711);
+        assert_eq!(scheduler.budget(), 1);
+        assert!(!scheduler.has_spare_capacity(), "the only vCPU is occupied");
+
+        let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
+        let (_pool, stage1) = crate::hvpatch::Stage1MmPool::new_root_for_tests(0x8000, 1)
+            .expect("one-slot target stage-1 pool");
+        let caller_tid = tid(1_711);
+        let caller_executor =
+            crate::kernel::objects::ExecutorId::for_transitional_thread(caller_tid)
+                .expect("caller executor identity");
+        stage1
+            .begin_asid_load(caller_executor)
+            .expect("record inactive target residency on caller worker")
+            .mark_resident()
+            .expect("publish inactive target residency");
+        let observer = stage1.cow_invalidation_observer(caller_executor);
+        let mm = crate::kernel::MmId::from_raw_u64(1_712).expect("test MM");
+        let coordinator = Arc::new(crate::dispatch::mm_mutation::MmMutationCoordinator::new(mm));
+        let authority = crate::dispatch::mm_mutation::ForeignMmMutationAuthority::new(
+            mm,
+            coordinator,
+            census,
+            Arc::clone(&stage1),
+        );
+        let identity = stage1.foreign_stage1_identity(mm);
+
+        authority
+            .with_guard(caller_tid, |mutation| {
+                mutation.with_host_alias(|invalidator| {
+                    carrick_hal::ForeignMmInvalidator::invalidate_exact_asid(
+                        invalidator,
+                        identity.binding(),
+                        Instant::now() + Duration::from_secs(1),
+                    )
+                })
+            })
+            .expect("sole target-MM exclusion")
+            .expect("full-occupancy caller must not wait on its own target command");
+        assert!(stage1.pending_cow_invalidation(caller_executor).is_some());
+
+        let hardware_calls = AtomicUsize::new(0);
+        stage1
+            .service_pending_cow_invalidation(&observer, |_| {
+                hardware_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), ()>(())
+            })
+            .expect("mandatory exact-target pre-entry service");
+        assert_eq!(hardware_calls.load(Ordering::SeqCst), 1);
+        scheduler.release(occupied, carrick_hal::vcpu_sched::Yield::Exited);
     }
 
     #[test]

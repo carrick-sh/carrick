@@ -46,6 +46,7 @@ pub(crate) struct HvpatchPersistentExecutor {
     vcpu: Option<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Vcpu>,
     current: Option<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Engine>,
     binding: Option<Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>>,
+    cow_invalidation_observer: Option<crate::hvpatch::CowInvalidationObserver>,
     loaded_task_only: Option<carrick_vmm_hvf::hvf_aarch64_engine::HvpatchTaskOnlyEngineState>,
     receipt: ExecutorCpuReceipt,
     raw_vcpu_id: u64,
@@ -210,6 +211,7 @@ impl PersistentExecutorFactory for HvpatchPersistentExecutorFactory {
             vcpu: Some(vcpu),
             current: None,
             binding: None,
+            cow_invalidation_observer: None,
             loaded_task_only: None,
             receipt: ExecutorCpuReceipt::default(),
             raw_vcpu_id,
@@ -391,6 +393,7 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 state.preflight_runtime_projection(cpu)
             })?;
         let mut asid_load = task.binding().begin_asid_load(self.executor_id)?;
+        let cow_invalidation_observer = task.binding().cow_invalidation_observer(self.executor_id);
         asid_load.arm_hardware_dirty().map_err(|error| {
             TrapError::Hypervisor(format!("HVPatch ASID hardware arm failed: {error}"))
         })?;
@@ -441,8 +444,9 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             .as_mut()
             .ok_or_else(|| TrapError::Hypervisor("HVPatch load lost attached engine".into()))?
             .overlay_task_state_on_live_executor(cpu)?;
-        task.binding()
-            .service_pending_cow_invalidation(self.executor_id, |generation| {
+        task.binding().service_pending_cow_invalidation(
+            &cow_invalidation_observer,
+            |generation| {
                 carrick_vmm_hvf::hvf_aarch64_engine::invalidate_loaded_asid(
                     self.current.as_mut().ok_or_else(|| {
                         TrapError::Hypervisor(
@@ -451,7 +455,9 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                     })?,
                     generation.raw(),
                 )
-            })?;
+            },
+        )?;
+        self.cow_invalidation_observer = Some(cow_invalidation_observer);
         self.current
             .as_mut()
             .ok_or_else(|| TrapError::Hypervisor("HVPatch load lost barrier engine".into()))?
@@ -483,6 +489,7 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                     .as_ref()
                     .unwrap_or_else(|| std::process::abort()),
             ),
+            cow_invalidation_observer: self.cow_invalidation_observer.as_ref(),
         };
         let engine = self
             .current
@@ -581,6 +588,7 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 lease,
             ));
         };
+        self.cow_invalidation_observer = None;
         let (backend, vcpu) = if let Some(task_only) = self.loaded_task_only.take() {
             let (lifecycle, vcpu) =
                 carrick_vmm_hvf::hvf_aarch64_engine::detach_task_only_engine(&task_only, engine);
@@ -673,6 +681,7 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 (HvpatchTaskEngineBindingState::initial(state), vcpu)
             };
             if let Some(binding) = self.binding.take() {
+                self.cow_invalidation_observer = None;
                 let _ = binding.put_backend(backend);
             }
             self.vcpu = Some(vcpu);
@@ -802,6 +811,7 @@ pub(crate) struct HvpatchQuantumControl<'a, 'lease> {
     pub(super) submission: &'a mut ExecutorSubmissionContext<'lease>,
     pub(super) executor_id: Option<ExecutorId>,
     pub(super) binding: Option<&'a Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>>,
+    pub(super) cow_invalidation_observer: Option<&'a crate::hvpatch::CowInvalidationObserver>,
 }
 
 impl<'a, 'lease> HvpatchQuantumControl<'a, 'lease> {
@@ -810,8 +820,13 @@ impl<'a, 'lease> HvpatchQuantumControl<'a, 'lease> {
     ) -> Option<(
         ExecutorId,
         &Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>,
+        &crate::hvpatch::CowInvalidationObserver,
     )> {
-        Some((self.executor_id?, self.binding?))
+        Some((
+            self.executor_id?,
+            self.binding?,
+            self.cow_invalidation_observer?,
+        ))
     }
 
     #[cfg(test)]
@@ -824,6 +839,7 @@ impl<'a, 'lease> HvpatchQuantumControl<'a, 'lease> {
             submission,
             executor_id: None,
             binding: None,
+            cow_invalidation_observer: None,
         }
     }
     pub(crate) fn need_resched(&self) -> bool {
