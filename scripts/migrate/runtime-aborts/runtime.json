@@ -579,6 +579,24 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "function": "MmExecutorParticipation::participation_mut",
+      "ordinal_in_function": 1,
+      "fingerprint": "b1477e4159bdbf95462d6d7fe36c57fc8db3f1d3250719e267d1ca710ec0af53",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mm_executor_participation",
+      "rationale": "Stage-1 authority attempted to use an executor token while its exact-MM census participation was temporarily absent; continuing would authorize mutation without accounting for the running caller."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "function": "MmExecutorParticipation::reenter_exact",
+      "ordinal_in_function": 1,
+      "fingerprint": "bf34c7c182c2eabdbb53270b21a75809f1a46f360259e0c75da144a6fa3de082",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mm_executor_participation",
+      "rationale": "Exact-MM executor re-entry was attempted while the token still owned live participation; this is a corrupted release/re-entry state transition that could duplicate census identity."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
       "function": "DispatchMmBinding::stage_private_exec",
       "ordinal_in_function": 1,
       "fingerprint": "8edc1640f3b9b9700c5d035bc01c5fffd8971223c4d0845b0d351675529c28b5",
@@ -705,6 +723,33 @@
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mm_binding",
       "rationale": "Active MM authority missing from fork install guard during fork_clone_with_prepared_mm_observed; cannot validate parent MM state."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "function": "SyscallDispatcher::enter_mm_executor_inner",
+      "ordinal_in_function": 1,
+      "fingerprint": "33847525eef86c7dff8b8ffd4923ec2610ca6a03f679a5e3457811b797a0065c",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mm_executor_admission",
+      "rationale": "Internal executor admission supplied a thread identity without its exact pause endpoint recipe; admitting that malformed identity would make page-table pause accounting incomplete."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "function": "SyscallDispatcher::with_current_mm_executor_released",
+      "ordinal_in_function": 1,
+      "fingerprint": "0bb1aa9f47d871902f9e5a2fd55de6071b62bb0784a59ffc47570618b4a5e57f",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mm_executor_reentry",
+      "rationale": "Caller-MM participation could not be re-admitted after the scoped foreign-MM operation; returning to guest execution without census membership would make subsequent page-table pauses unsound."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "function": "SyscallDispatcher::with_current_mm_executor_released",
+      "ordinal_in_function": 2,
+      "fingerprint": "9fc3fb1ead3686f916316d9c0e760aedf8a01d17b612f08564582edfb4776269",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mm_executor_reentry",
+      "rationale": "Dispatcher, MM, thread, or running-lease identity drifted while unwinding a released operation; continuing the unwind after failed exact re-entry authentication could leave a live executor outside its authoritative census."
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
