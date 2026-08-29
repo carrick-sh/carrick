@@ -181,21 +181,25 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         &self,
     ) -> Result<Box<dyn carrick_hal::FrameCowQuiesce>, Box<dyn std::error::Error + Send + Sync>>
     {
-        // Frame COW rewrites backing the guest can be reading. Raise the pause
-        // whenever another thread could reach guest code before the copy
-        // completes — a parked sibling included. Keying this on the kicker's
-        // lease count skipped the pause for exactly that sibling.
+        // Frame COW rewrites backing an active guest executor can be reading.
+        // This census names active or admitting stage-1 executors and is
+        // published before vCPU registration, covering the transient interval
+        // in which admitted execution has no registry lease. Suspended futex,
+        // epoll, and fd loops have dropped participation and are absent.
         if quiesce::current_thread_holds_pt_pause() {
             // An outer transaction already owns the exclusivity marker; a
             // nested claim would only deepen it for no one's benefit.
             return Ok(Box::new(()));
         }
         if !self.guest_executors.has_peer_executor() {
-            // No peer can execute guest code, which is exactly why no pause is
-            // needed — and equally why this edit is EXCLUSIVE. Say so for the
-            // duration of the copy, the same way `service_threaded_syscall`
-            // does for a mapping syscall that skips the pause: the COW
-            // publication edits stage-1 and its spare sub-tables are only
+            // No peer active or admitting stage-1 executor is represented by
+            // this census, so this branch does not raise the page-table pause.
+            // Suspended logical siblings may still exist; they have dropped
+            // participation, and fork/crash use durable `Task::threads()`
+            // membership for their distinct barriers. Record this branch's
+            // stage-1 exclusivity claim for the duration of the copy, the same
+            // way `service_threaded_syscall` does when it skips the pause: the
+            // COW publication edits stage-1 and its spare sub-tables are only
             // reclaimable while the marker is up.
             return Ok(Box::new(quiesce::Stage1Exclusive::claim()));
         }
@@ -7734,8 +7738,11 @@ where
                 }
             }
         } else {
-            // No peer can execute guest code, which is exactly why no pause is
-            // needed — and equally why the edit is exclusive.
+            // No peer active or admitting stage-1 executor is represented by
+            // this census, so this branch does not raise the page-table pause.
+            // Suspended logical siblings may still exist after dropping census
+            // participation; fork/crash use durable `Task::threads()`
+            // membership for their distinct barrier decisions.
             None
         };
         // The parked-slice, sleep/poll deadline and child-wait trace state that
