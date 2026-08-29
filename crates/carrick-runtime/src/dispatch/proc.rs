@@ -204,7 +204,7 @@ fn sched_priority_for(policy: i32, max: bool) -> DispatchOutcome {
 /// the host pid as the guest process pid, plus `LINUX_BOOTSTRAP_PID` (the stable
 /// guest-init alias used elsewhere); threaded dispatch also carries the current
 /// guest tid.
-pub(super) fn sched_pid_is_self<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u64) -> bool {
+pub(super) fn sched_pid_is_self<M: CurrentMmMemory>(cx: &SyscallCtx<'_, M>, pid: u64) -> bool {
     // 0 and the caller's own thread tid are self for sched_*; the process-level
     // self cases (host pid, bootstrap, ns-pid) are the canonical
     // NsPid::names_self (which the old body lacked the ns-pid arm of).
@@ -216,7 +216,7 @@ pub(super) fn sched_pid_is_self<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u64
 }
 
 /// True when `pid` names a live sibling thread in this Carrick guest process.
-pub(super) fn sched_pid_is_live_guest_thread<M: GuestMemory>(
+pub(super) fn sched_pid_is_live_guest_thread<M: CurrentMmMemory>(
     cx: &SyscallCtx<'_, M>,
     pid: u64,
 ) -> bool {
@@ -265,7 +265,7 @@ pub(super) enum SchedTarget {
 /// against the host would spuriously match an unrelated host process/kthread
 /// sharing the numeric value (over-inclusive), and a valid sibling's ns-pid
 /// would never be recognised as a peer guest (under-inclusive).
-pub(super) fn resolve_sched_target<M: GuestMemory>(
+pub(super) fn resolve_sched_target<M: CurrentMmMemory>(
     this: &SyscallDispatcher,
     cx: &SyscallCtx<'_, M>,
     pid: u64,
@@ -289,7 +289,7 @@ pub(super) fn resolve_sched_target<M: GuestMemory>(
 /// live carrick guest). Used by the sched_get*/policy queries, which answer the
 /// same for every valid pid under our uniform SCHED_OTHER + prio 0 model; only
 /// the "does it exist?" check varies. Backed by [`resolve_sched_target`].
-fn sched_pid_exists<M: GuestMemory>(
+fn sched_pid_exists<M: CurrentMmMemory>(
     this: &SyscallDispatcher,
     cx: &SyscallCtx<'_, M>,
     pid: u64,
@@ -529,7 +529,7 @@ fn child_is_terminally_waitable(pid: u32) -> bool {
 /// is non-canonical and can never be a valid mapping.
 const NONCANONICAL_USER_VA: u64 = 0x0000_8000_0000_0000;
 
-fn sched_read_param_priority<M: GuestMemory>(
+fn sched_read_param_priority<M: CurrentMmMemory>(
     cx: &mut SyscallCtx<M>,
     address: GuestPtr,
 ) -> Result<i32, LinuxErrno> {
@@ -936,7 +936,7 @@ impl SyscallDispatcher {
     /// as a seccomp filter. Shared by `seccomp(SECCOMP_SET_MODE_FILTER)` and the
     /// legacy `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, prog)` entry point.
     /// Returns 0 on success, EFAULT/EINVAL on a bad program.
-    fn install_seccomp_filter<M: GuestMemory>(
+    fn install_seccomp_filter<M: CurrentMmMemory>(
         &self,
         task: &crate::kernel::Task,
         memory: &mut M,
@@ -992,7 +992,7 @@ impl SyscallDispatcher {
         }
     }
 
-    fn disable_identity_syscall_shim<M: GuestMemory>(&self, memory: &mut M) {
+    fn disable_identity_syscall_shim<M: CurrentMmMemory>(&self, memory: &mut M) {
         if crate::syscall_shim_enabled() {
             let _ = memory.write_bytes(
                 crate::memory::LINUX_IDENTITY_PAGE_BASE + crate::memory::IDENTITY_OFF_SHIM_ENABLED,
@@ -1001,7 +1001,7 @@ impl SyscallDispatcher {
         }
     }
 
-    fn install_seccomp_strict<M: GuestMemory>(&self, memory: &mut M) -> DispatchOutcome {
+    fn install_seccomp_strict<M: CurrentMmMemory>(&self, memory: &mut M) -> DispatchOutcome {
         self.seccomp.install_strict();
         self.disable_identity_syscall_shim(memory);
         DispatchOutcome::Returned { value: 0 }
@@ -1253,7 +1253,7 @@ impl SyscallDispatcher {
         &self,
         args_ptr: GuestPtr,
         args_size: u64,
-        memory: &impl GuestMemory,
+        memory: &impl CurrentMmMemory,
     ) -> DispatchOutcome {
         let args_ptr = args_ptr.0;
         const CLONE_ARGS_SIZE_VER0: u64 = 64;
@@ -4273,7 +4273,7 @@ impl SyscallDispatcher {
 /// enforce PROT_NONE / out-of-bounds, so a bad `iov_base` faults here. Returns
 /// the byte count copied, or `EFAULT` when the FIRST access faults (once any
 /// byte has moved Linux returns the partial count, not an error).
-fn process_vm_copy_self<M: GuestMemory>(
+fn process_vm_copy_self<M: CurrentMmMemory>(
     memory: &mut M,
     src: &[LinuxIovec],
     dst: &[LinuxIovec],
@@ -4378,7 +4378,7 @@ impl SyscallDispatcher {
     /// names errno 1. `carrick trace` shows that call returning `errno=14`,
     /// the same EFAULT as the other two.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn process_vm_rw<M: GuestMemory>(
+    pub(super) fn process_vm_rw<M: CurrentMmMemory>(
         &self,
         cx: &mut SyscallCtx<M>,
         pid: Pid,

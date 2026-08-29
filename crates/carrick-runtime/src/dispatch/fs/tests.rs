@@ -167,6 +167,8 @@ impl GuestMemory for HostWriteEvents {
     }
 }
 
+impl CurrentMmMemory for HostWriteEvents {}
+
 fn fail_with_readv_host_write_guard(memory: &mut HostWriteEvents) -> Result<(), LinuxErrno> {
     let ranges = [(0x1000, 0x1000), (0x5000, 0x1000)];
     let _guard = carrick_guest_mem::HostWriteGuard::new(memory, &ranges);

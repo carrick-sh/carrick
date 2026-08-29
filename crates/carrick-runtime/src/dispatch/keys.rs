@@ -57,7 +57,7 @@ struct KeyScope<'a> {
 }
 
 impl<'a> KeyScope<'a> {
-    fn capture<M: GuestMemory>(cx: &'a SyscallCtx<'_, M>) -> Self {
+    fn capture<M: CurrentMmMemory>(cx: &'a SyscallCtx<'_, M>) -> Self {
         let credentials = cx.kernel.resources().credentials();
         Self {
             kernel: cx.kernel.kernel(),
@@ -198,7 +198,7 @@ impl<'a> KeyScope<'a> {
 /// [`read_guest_c_string`] runs the bytes through `pathcodec`, which is right
 /// for filenames and wrong for a key description: a key's description is opaque
 /// bytes that must round-trip to the search unchanged.
-fn read_key_string<M: GuestMemory>(
+fn read_key_string<M: CurrentMmMemory>(
     memory: &M,
     address: GuestPtr,
 ) -> Result<Vec<u8>, DispatchError> {
@@ -210,7 +210,7 @@ fn read_key_string<M: GuestMemory>(
 /// A zero length never touches memory (Linux does not fault a NULL payload of
 /// length zero), and a NULL pointer with a non-zero length is the `EFAULT`
 /// `add_key02` is written to catch.
-fn read_payload<M: GuestMemory>(
+fn read_payload<M: CurrentMmMemory>(
     memory: &M,
     address: GuestPtr,
     length: usize,
@@ -230,7 +230,7 @@ fn read_payload<M: GuestMemory>(
 /// The return value is the FULL length, even when the buffer was too small to
 /// hold it — `keyctl06` fails an implementation that reports the truncated
 /// count instead, and fails one that overruns the buffer.
-fn write_truncated<M: GuestMemory>(
+fn write_truncated<M: CurrentMmMemory>(
     memory: &mut M,
     address: GuestPtr,
     buffer_len: usize,
@@ -384,7 +384,7 @@ impl SyscallDispatcher {
 }
 
 /// The `keyctl(2)` command switch, split out so each arm stays readable.
-fn keyctl_op<M: GuestMemory>(
+fn keyctl_op<M: CurrentMmMemory>(
     cx: &mut SyscallCtx<'_, M>,
     op: KeyctlOp,
     args: [u64; 4],

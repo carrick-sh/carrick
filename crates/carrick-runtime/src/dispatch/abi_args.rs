@@ -1,7 +1,7 @@
 //! Typed wrappers for raw syscall arguments, so handlers stop doing
 //! `ctx.arg(0) as i32` by hand and the compiler distinguishes an fd from
 //! a guest address. Zero-cost newtypes.
-use super::{DispatchError, GuestMemory, SyscallCtx};
+use super::{CurrentMmMemory, DispatchError, SyscallCtx};
 
 /// A **GUEST** file descriptor — a number in the guest's fd table (what the
 /// guest passed as a syscall argument), NOT a host kernel fd. Resolve it
@@ -255,7 +255,7 @@ impl GuestLen {
     }
 }
 
-impl<M: GuestMemory> SyscallCtx<'_, M> {
+impl<M: CurrentMmMemory> SyscallCtx<'_, M> {
     /// Typed argument extraction: `let fd: Fd = ctx.typed_arg(0);`
     #[inline]
     pub fn typed_arg<T: FromGuestArg>(&self, index: usize) -> T {

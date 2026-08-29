@@ -13,8 +13,8 @@
 
 pub use carrick_runtime::compat::{CompatReporter, SyscallArgs};
 pub use carrick_runtime::dispatch::{
-    DispatchOutcome, GuestMemory, LinearMemory, ProcMapSharing, ProcMapsEntry, SyscallDispatcher,
-    SyscallRequest,
+    CurrentMmMemory, DispatchOutcome, GuestMemory, LinearMemory, ProcMapSharing, ProcMapsEntry,
+    SyscallDispatcher, SyscallRequest,
 };
 pub use carrick_runtime::elf::SegmentPerms;
 pub use carrick_runtime::linux_abi::{
@@ -110,7 +110,7 @@ pub const LINUX_STATX_BASIC_STATS: u32 = 0x7ff;
 pub const LINUX_STATX_RESERVED: u64 = 0x8000_0000;
 pub const LINUX_SPLICE_F_MORE: u64 = 4;
 
-pub fn read_stat(memory: &impl GuestMemory, address: u64) -> LinuxStat {
+pub fn read_stat(memory: &impl CurrentMmMemory, address: u64) -> LinuxStat {
     let bytes = memory
         .read_bytes(address, std::mem::size_of::<LinuxStat>())
         .unwrap();
@@ -118,7 +118,7 @@ pub fn read_stat(memory: &impl GuestMemory, address: u64) -> LinuxStat {
     stat
 }
 
-pub fn read_x8664_stat(memory: &impl GuestMemory, address: u64) -> LinuxX8664Stat {
+pub fn read_x8664_stat(memory: &impl CurrentMmMemory, address: u64) -> LinuxX8664Stat {
     let bytes = memory
         .read_bytes(address, std::mem::size_of::<LinuxX8664Stat>())
         .unwrap();
@@ -126,7 +126,7 @@ pub fn read_x8664_stat(memory: &impl GuestMemory, address: u64) -> LinuxX8664Sta
     stat
 }
 
-pub fn read_statx(memory: &impl GuestMemory, address: u64) -> LinuxStatx {
+pub fn read_statx(memory: &impl CurrentMmMemory, address: u64) -> LinuxStatx {
     let bytes = memory
         .read_bytes(address, std::mem::size_of::<LinuxStatx>())
         .unwrap();
@@ -134,7 +134,7 @@ pub fn read_statx(memory: &impl GuestMemory, address: u64) -> LinuxStatx {
     statx
 }
 
-pub fn read_statfs(memory: &impl GuestMemory, address: u64) -> LinuxStatfs {
+pub fn read_statfs(memory: &impl CurrentMmMemory, address: u64) -> LinuxStatfs {
     let bytes = memory
         .read_bytes(address, std::mem::size_of::<LinuxStatfs>())
         .unwrap();
@@ -142,42 +142,42 @@ pub fn read_statfs(memory: &impl GuestMemory, address: u64) -> LinuxStatfs {
     statfs
 }
 
-pub fn read_i32_le(memory: &impl GuestMemory, address: u64) -> i32 {
+pub fn read_i32_le(memory: &impl CurrentMmMemory, address: u64) -> i32 {
     let bytes = memory.read_bytes(address, 4).unwrap();
     let mut buf = [0u8; 4];
     buf.copy_from_slice(&bytes);
     i32::from_le_bytes(buf)
 }
 
-pub fn read_winsize(memory: &impl GuestMemory, address: u64) -> LinuxWinsize {
+pub fn read_winsize(memory: &impl CurrentMmMemory, address: u64) -> LinuxWinsize {
     let bytes = memory
         .read_bytes(address, std::mem::size_of::<LinuxWinsize>())
         .unwrap();
     LinuxWinsize::read_from_bytes(&bytes).unwrap()
 }
 
-pub fn read_termios(memory: &impl GuestMemory, address: u64) -> LinuxTermios {
+pub fn read_termios(memory: &impl CurrentMmMemory, address: u64) -> LinuxTermios {
     let bytes = memory
         .read_bytes(address, std::mem::size_of::<LinuxTermios>())
         .unwrap();
     LinuxTermios::read_from_bytes(&bytes).unwrap()
 }
 
-pub fn read_fd_pair(memory: &impl GuestMemory, address: u64) -> LinuxFdPair {
+pub fn read_fd_pair(memory: &impl CurrentMmMemory, address: u64) -> LinuxFdPair {
     let bytes = memory
         .read_bytes(address, std::mem::size_of::<LinuxFdPair>())
         .unwrap();
     LinuxFdPair::read_from_bytes(&bytes).unwrap()
 }
 
-pub fn read_itimerspec(memory: &impl GuestMemory, address: u64) -> LinuxItimerspec {
+pub fn read_itimerspec(memory: &impl CurrentMmMemory, address: u64) -> LinuxItimerspec {
     let bytes = memory
         .read_bytes(address, std::mem::size_of::<LinuxItimerspec>())
         .unwrap();
     LinuxItimerspec::read_from_bytes(&bytes).unwrap()
 }
 
-pub fn read_itimerval(memory: &impl GuestMemory, address: u64) -> LinuxItimerval {
+pub fn read_itimerval(memory: &impl CurrentMmMemory, address: u64) -> LinuxItimerval {
     let bytes = memory
         .read_bytes(address, std::mem::size_of::<LinuxItimerval>())
         .unwrap();
@@ -185,7 +185,7 @@ pub fn read_itimerval(memory: &impl GuestMemory, address: u64) -> LinuxItimerval
 }
 
 pub fn read_timerfd_expirations(
-    memory: &impl GuestMemory,
+    memory: &impl CurrentMmMemory,
     address: u64,
 ) -> LinuxTimerfdExpirations {
     let bytes = memory
@@ -194,21 +194,21 @@ pub fn read_timerfd_expirations(
     LinuxTimerfdExpirations::read_from_bytes(&bytes).unwrap()
 }
 
-pub fn read_eventfd_value(memory: &impl GuestMemory, address: u64) -> LinuxEventfdValue {
+pub fn read_eventfd_value(memory: &impl CurrentMmMemory, address: u64) -> LinuxEventfdValue {
     let bytes = memory
         .read_bytes(address, std::mem::size_of::<LinuxEventfdValue>())
         .unwrap();
     LinuxEventfdValue::read_from_bytes(&bytes).unwrap()
 }
 
-pub fn read_epoll_event(memory: &impl GuestMemory, address: u64) -> LinuxEpollEvent {
+pub fn read_epoll_event(memory: &impl CurrentMmMemory, address: u64) -> LinuxEpollEvent {
     let bytes = memory
         .read_bytes(address, std::mem::size_of::<LinuxEpollEvent>())
         .unwrap();
     LinuxEpollEvent::read_from_bytes(&bytes).unwrap()
 }
 
-pub fn read_utsname(memory: &impl GuestMemory, address: u64) -> LinuxUtsname {
+pub fn read_utsname(memory: &impl CurrentMmMemory, address: u64) -> LinuxUtsname {
     let bytes = memory
         .read_bytes(address, std::mem::size_of::<LinuxUtsname>())
         .unwrap();
@@ -216,7 +216,7 @@ pub fn read_utsname(memory: &impl GuestMemory, address: u64) -> LinuxUtsname {
     utsname
 }
 
-pub fn read_rlimit(memory: &impl GuestMemory, address: u64) -> LinuxRlimit {
+pub fn read_rlimit(memory: &impl CurrentMmMemory, address: u64) -> LinuxRlimit {
     let bytes = memory
         .read_bytes(address, std::mem::size_of::<LinuxRlimit>())
         .unwrap();
@@ -224,7 +224,7 @@ pub fn read_rlimit(memory: &impl GuestMemory, address: u64) -> LinuxRlimit {
     rlimit
 }
 
-pub fn read_tms(memory: &impl GuestMemory, address: u64) -> LinuxTms {
+pub fn read_tms(memory: &impl CurrentMmMemory, address: u64) -> LinuxTms {
     let bytes = memory
         .read_bytes(address, std::mem::size_of::<LinuxTms>())
         .unwrap();
@@ -232,7 +232,7 @@ pub fn read_tms(memory: &impl GuestMemory, address: u64) -> LinuxTms {
     tms
 }
 
-pub fn read_rusage(memory: &impl GuestMemory, address: u64) -> LinuxRusage {
+pub fn read_rusage(memory: &impl CurrentMmMemory, address: u64) -> LinuxRusage {
     let bytes = memory
         .read_bytes(address, std::mem::size_of::<LinuxRusage>())
         .unwrap();
@@ -240,7 +240,7 @@ pub fn read_rusage(memory: &impl GuestMemory, address: u64) -> LinuxRusage {
     rusage
 }
 
-pub fn read_timespec(memory: &impl GuestMemory, address: u64) -> LinuxTimespec {
+pub fn read_timespec(memory: &impl CurrentMmMemory, address: u64) -> LinuxTimespec {
     let bytes = memory
         .read_bytes(address, std::mem::size_of::<LinuxTimespec>())
         .unwrap();
@@ -248,7 +248,7 @@ pub fn read_timespec(memory: &impl GuestMemory, address: u64) -> LinuxTimespec {
     timespec
 }
 
-pub fn read_timeval(memory: &impl GuestMemory, address: u64) -> LinuxTimeval {
+pub fn read_timeval(memory: &impl CurrentMmMemory, address: u64) -> LinuxTimeval {
     let bytes = memory
         .read_bytes(address, std::mem::size_of::<LinuxTimeval>())
         .unwrap();
@@ -256,7 +256,7 @@ pub fn read_timeval(memory: &impl GuestMemory, address: u64) -> LinuxTimeval {
     timeval
 }
 
-pub fn read_timezone(memory: &impl GuestMemory, address: u64) -> LinuxTimezone {
+pub fn read_timezone(memory: &impl CurrentMmMemory, address: u64) -> LinuxTimezone {
     let bytes = memory
         .read_bytes(address, std::mem::size_of::<LinuxTimezone>())
         .unwrap();
@@ -270,7 +270,7 @@ pub fn linux_c_string<const N: usize>(field: [u8; N]) -> String {
 }
 
 pub fn write_iovecs<const N: usize>(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     address: u64,
     iovecs: [LinuxIovec; N],
 ) {
@@ -282,7 +282,7 @@ pub fn write_iovecs<const N: usize>(
 }
 
 pub fn write_pollfds<const N: usize>(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     address: u64,
     pollfds: [LinuxPollFd; N],
 ) {
@@ -293,7 +293,11 @@ pub fn write_pollfds<const N: usize>(
     memory.write_bytes(address, &bytes).unwrap();
 }
 
-pub fn read_pollfds(memory: &impl GuestMemory, address: u64, count: usize) -> Vec<(i32, i16, i16)> {
+pub fn read_pollfds(
+    memory: &impl CurrentMmMemory,
+    address: u64,
+    count: usize,
+) -> Vec<(i32, i16, i16)> {
     let bytes = memory
         .read_bytes(address, count * std::mem::size_of::<LinuxPollFd>())
         .unwrap();
@@ -310,7 +314,7 @@ pub fn read_pollfds(memory: &impl GuestMemory, address: u64, count: usize) -> Ve
 }
 
 pub fn write_fd_set<const N: usize>(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     address: u64,
     nfds: usize,
     fds: [i32; N],
@@ -323,7 +327,7 @@ pub fn write_fd_set<const N: usize>(
     memory.write_bytes(address, &bytes).unwrap();
 }
 
-pub fn read_fd_set(memory: &impl GuestMemory, address: u64, nfds: usize) -> Vec<i32> {
+pub fn read_fd_set(memory: &impl CurrentMmMemory, address: u64, nfds: usize) -> Vec<i32> {
     let bytes = memory.read_bytes(address, linux_fd_set_len(nfds)).unwrap();
     (0..nfds)
         .filter(|fd| bytes[*fd / 8] & (1 << (*fd % 8)) != 0)
@@ -336,7 +340,7 @@ pub fn linux_fd_set_len(nfds: usize) -> usize {
 }
 
 pub fn write_capability_header(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     address: u64,
     version: u32,
     pid: i32,
@@ -347,7 +351,7 @@ pub fn write_capability_header(
 }
 
 pub fn write_capability_data<const N: usize>(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     address: u64,
     data: [(u32, u32, u32); N],
 ) {
@@ -366,7 +370,7 @@ pub fn write_capability_data<const N: usize>(
 }
 
 pub fn read_capability_data(
-    memory: &impl GuestMemory,
+    memory: &impl CurrentMmMemory,
     address: u64,
     count: usize,
 ) -> Vec<(u32, u32, u32)> {
@@ -384,7 +388,7 @@ pub fn read_capability_data(
 }
 
 pub fn write_linux_timespec(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     address: u64,
     tv_sec: i64,
     tv_nsec: i64,
@@ -393,12 +397,12 @@ pub fn write_linux_timespec(
     memory.write_bytes(address, timespec.as_bytes()).unwrap();
 }
 
-pub fn write_u64(memory: &mut impl GuestMemory, address: u64, value: u64) {
+pub fn write_u64(memory: &mut impl CurrentMmMemory, address: u64, value: u64) {
     memory.write_bytes(address, &value.to_ne_bytes()).unwrap();
 }
 
 pub fn write_open_how(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     address: u64,
     flags: u64,
     mode: u64,
@@ -409,7 +413,7 @@ pub fn write_open_how(
     write_u64(memory, address + 16, resolve);
 }
 
-pub fn read_u64(memory: &impl GuestMemory, address: u64) -> u64 {
+pub fn read_u64(memory: &impl CurrentMmMemory, address: u64) -> u64 {
     let bytes = memory.read_bytes(address, 8).unwrap();
     u64::from_ne_bytes(bytes.try_into().unwrap())
 }

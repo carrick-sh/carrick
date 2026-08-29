@@ -782,7 +782,7 @@ fn range_len_usize(range: crate::vfs::GuestMemoryRange) -> Result<usize, LinuxEr
 }
 
 fn validate_mlock_range(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     range: crate::vfs::GuestMemoryRange,
     populate: bool,
     page_size: u64,
@@ -933,7 +933,7 @@ fn fault_range_intersections(
         .collect()
 }
 
-fn mincore_page_is_mapped(memory: &impl GuestMemory, page: u64) -> bool {
+fn mincore_page_is_mapped(memory: &impl CurrentMmMemory, page: u64) -> bool {
     memory.host_ptr_for_read(page, 1).is_some() || memory.read_bytes(page, 1).is_ok()
 }
 
@@ -2109,7 +2109,7 @@ fn snapshot_private_host_file(
     Ok(())
 }
 
-fn mark_range_unmapped(memory: &mut impl GuestMemory, address: u64, len: usize) {
+fn mark_range_unmapped(memory: &mut impl CurrentMmMemory, address: u64, len: usize) {
     // `no_write` describes a live read-only VMA. It must not survive unmap:
     // fault delivery uses this metadata to distinguish Linux ACCERR from
     // MAPERR, and a reused VA must start without its prior owner's permission.
@@ -2516,7 +2516,7 @@ impl SyscallDispatcher {
 
     fn native16k_write_exec_rejection(
         &self,
-        memory: &dyn GuestMemory,
+        memory: &dyn CurrentMmMemory,
         thread: Option<ThreadCtx<'_>>,
         shared: bool,
         alias: bool,
@@ -2542,7 +2542,7 @@ impl SyscallDispatcher {
 
     fn native16k_exec_transition_rejection(
         &self,
-        memory: &dyn GuestMemory,
+        memory: &dyn CurrentMmMemory,
         thread: Option<ThreadCtx<'_>>,
     ) -> Option<&'static str> {
         if memory.supports_concurrent_exec_protection() {
@@ -2835,7 +2835,7 @@ impl SyscallDispatcher {
     /// state, matching Linux's `EFAULT` for an invalid old mapping range.
     fn mremap_mapping_metadata(
         &self,
-        memory: &impl GuestMemory,
+        memory: &impl CurrentMmMemory,
         start: u64,
         len: u64,
     ) -> Result<MremapMappingMetadata, LinuxErrno> {
@@ -3216,7 +3216,7 @@ impl SyscallDispatcher {
     /// Snapshot one `SharedFile` fragment while its old guest translation is
     /// still live. The snapshot is committed only after backend mutation
     /// succeeds, so a clean failure cannot produce duplicate writeback.
-    fn snapshot_shared_writeback<M: GuestMemory>(
+    fn snapshot_shared_writeback<M: CurrentMmMemory>(
         &self,
         memory: &mut M,
         alloc: &crate::shared_aperture::SharedAlloc,
@@ -3269,7 +3269,7 @@ impl SyscallDispatcher {
         }
     }
 
-    fn writeback_shared<M: GuestMemory>(
+    fn writeback_shared<M: CurrentMmMemory>(
         &self,
         memory: &mut M,
         alloc: &crate::shared_aperture::SharedAlloc,
@@ -7047,7 +7047,7 @@ impl SyscallDispatcher {
     /// stay resident, matching the prior conservative default.
     fn mincore_residency_vector(
         &self,
-        memory: &impl GuestMemory,
+        memory: &impl CurrentMmMemory,
         address: u64,
         pages: u64,
         page_size: u64,
@@ -7167,7 +7167,7 @@ impl SyscallDispatcher {
 
     fn populate_resident_range(
         &self,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
         range: crate::vfs::GuestMemoryRange,
     ) -> Result<(), LinuxErrno> {
         let faults = {
@@ -7315,7 +7315,7 @@ impl SyscallDispatcher {
 
     fn commit_mmap_locked_range(
         &self,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
         range: Option<crate::vfs::GuestMemoryRange>,
     ) -> Result<(), LinuxErrno> {
         let Some(range) = range else {
@@ -7340,7 +7340,7 @@ impl SyscallDispatcher {
 
     fn rollback_shared_anon_mapping(
         &self,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
         address: u64,
         guest_length: u64,
         mapped_length: usize,
@@ -7387,7 +7387,7 @@ impl SyscallDispatcher {
     /// is the final ownership backstop.
     fn rollback_fresh_arena_mapping(
         &self,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
         address: u64,
         len: u64,
     ) -> Result<(), MemoryError> {
@@ -7423,7 +7423,7 @@ impl SyscallDispatcher {
 
     fn lock_current_mappings(
         &self,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
         onfault: bool,
     ) -> Result<(), LinuxErrno> {
         let mem_authority_40 = self.mem();

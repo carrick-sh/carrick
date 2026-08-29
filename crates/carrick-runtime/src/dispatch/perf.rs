@@ -439,7 +439,7 @@ impl SyscallDispatcher {
     /// The perf caller identity for owner checks: this host process plus the
     /// calling guest thread (`ThreadId::NONE` on the single-threaded path,
     /// where it is stable per process).
-    fn perf_caller<M: GuestMemory>(cx: &SyscallCtx<M>) -> PerfOwner {
+    fn perf_caller<M: CurrentMmMemory>(cx: &SyscallCtx<M>) -> PerfOwner {
         PerfOwner {
             thread: Arc::downgrade(cx.kernel.thread()),
         }
@@ -448,7 +448,7 @@ impl SyscallDispatcher {
     /// `read(2)` on a perf event fd: report the counter in the `read_format`
     /// layout; a buffer smaller than the format needs is ENOSPC (verified
     /// against the oracle). Reads never drain — a counting fd re-reports.
-    pub(super) fn read_perf_event<M: GuestMemory>(
+    pub(super) fn read_perf_event<M: CurrentMmMemory>(
         &self,
         memory: &mut M,
         address: u64,
@@ -482,7 +482,7 @@ impl SyscallDispatcher {
     /// perf event ioctls. Called from the `ioctl` handler once the fd is known
     /// to be a perf event; unknown requests report unhandled and ENOTTY like
     /// every other fd kind.
-    pub(super) fn perf_event_ioctl<M: GuestMemory>(
+    pub(super) fn perf_event_ioctl<M: CurrentMmMemory>(
         &self,
         cx: &mut SyscallCtx<M>,
         fd: i32,
@@ -659,7 +659,7 @@ impl SyscallDispatcher {
 /// Build the caller identity from the calling thread id.
 /// Perf's notion of "the caller's own task": 0, the calling thread's tid, or
 /// the caller's pid aliases. Mirrors `sched_pid_is_self` in `proc.rs`.
-fn sched_pid_is_self_for_perf<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u64) -> bool {
+fn sched_pid_is_self_for_perf<M: CurrentMmMemory>(cx: &SyscallCtx<'_, M>, pid: u64) -> bool {
     super::proc::sched_pid_is_self(cx, pid)
 }
 
@@ -669,7 +669,7 @@ fn sched_pid_is_self_for_perf<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u64) 
 /// (where a Linux process is a THREAD of the VM carrier and libproc knows
 /// nothing about it) answers from carrick's kernel graph rather than the Darwin
 /// ppid chain.
-fn sched_pid_names_live_task<M: GuestMemory>(
+fn sched_pid_names_live_task<M: CurrentMmMemory>(
     this: &SyscallDispatcher,
     cx: &SyscallCtx<'_, M>,
     pid: u64,

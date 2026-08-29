@@ -169,6 +169,8 @@ impl GuestMemory for SplitForwardMemory {
     }
 }
 
+impl CurrentMmMemory for SplitForwardMemory {}
+
 #[test]
 fn split_runtime_loop_forwards_private_repoint_and_provenance_publication() {
     const LENGTH: u64 = 0x4000;

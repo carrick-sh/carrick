@@ -627,7 +627,7 @@ fn connect_success_or_pending_error(host_fd: i32) -> DispatchOutcome {
     DispatchOutcome::Returned { value: 0 }
 }
 
-fn guest_unix_pathname(memory: &impl GuestMemory, addr: u64, addrlen: u32) -> Option<String> {
+fn guest_unix_pathname(memory: &impl CurrentMmMemory, addr: u64, addrlen: u32) -> Option<String> {
     memory
         .read_bytes(addr, addrlen as usize)
         .ok()
@@ -1385,7 +1385,7 @@ impl SyscallDispatcher {
 
     fn read_optional_fd_set(
         &self,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
         address: u64,
         nfds: usize,
     ) -> Result<Result<Option<Vec<u8>>, LinuxErrno>, DispatchError> {
@@ -2405,7 +2405,7 @@ impl SyscallDispatcher {
         buf_addr: u64,
         len: usize,
         flags: i32,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
     ) -> DispatchOutcome {
         if len == 0 {
             return DispatchOutcome::Returned { value: 0 };
@@ -2593,7 +2593,7 @@ impl SyscallDispatcher {
         fd: Fd,
         addr: GuestPtr,
         addrlen: GuestPtr,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
         accept4_flags: i32,
     ) -> DispatchOutcome {
         let Some(socket_flags) = decode_accept4_flags(accept4_flags) else {
@@ -2827,7 +2827,7 @@ impl SyscallDispatcher {
         fd: i32,
         addr_addr: u64,
         addrlen: u32,
-        memory: &impl GuestMemory,
+        memory: &impl CurrentMmMemory,
     ) -> DispatchOutcome {
         let (host_fd, family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
@@ -2889,7 +2889,7 @@ impl SyscallDispatcher {
         msgvec: GuestPtr,
         vlen: u64,
         flags: u64,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
     ) -> DispatchOutcome {
         let fd = fd.0;
         let msgvec = msgvec.0;
@@ -2963,7 +2963,7 @@ impl SyscallDispatcher {
         vlen: u64,
         flags: u64,
         timeout: GuestPtr,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
     ) -> DispatchOutcome {
         let fd = fd.0;
         let msgvec = msgvec.0;
@@ -5095,7 +5095,7 @@ impl SyscallDispatcher {
     // applies this same lenience to every handler body; preserved so the wait
     // core stays byte-for-byte identical (one pre-existing unused destructure).
     #[allow(unused_variables)]
-    fn epoll_pwait_wait_core<M: GuestMemory>(
+    fn epoll_pwait_wait_core<M: CurrentMmMemory>(
         &self,
         memory: &mut M,
         open_file: OpenFile,
@@ -9503,7 +9503,7 @@ impl SyscallDispatcher {
         fd: i32,
         msg_addr: u64,
         flags: i32,
-        memory: &impl GuestMemory,
+        memory: &impl CurrentMmMemory,
     ) -> Result<DispatchOutcome, DispatchError> {
         let is_netlink = self.fd_is_netlink(fd);
         if let Some(open_file) = self.open_file(fd)
@@ -9706,7 +9706,7 @@ impl SyscallDispatcher {
         fd: i32,
         msg_addr: u64,
         msg: &LinuxMsghdr,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
     ) -> Result<DispatchOutcome, DispatchError> {
         let Ok((host_fd, _family)) = self.host_socket_lookup(fd) else {
             return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
@@ -9768,7 +9768,7 @@ impl SyscallDispatcher {
         fd: i32,
         msg_addr: u64,
         flags: i32,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
     ) -> Result<DispatchOutcome, DispatchError> {
         let is_netlink = self.fd_is_netlink(fd);
         if let Some(open_file) = self.open_file(fd)

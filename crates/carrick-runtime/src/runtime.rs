@@ -99,7 +99,7 @@ use carrick_guest_mem::{Gpa, GuestVa, HostVa};
 
 use crate::compat::CompatReporter;
 use crate::dispatch::{
-    DispatchOutcome, GuestMemory, MemoryError, SyscallDispatcher, SyscallRequest,
+    CurrentMmMemory, DispatchOutcome, GuestMemory, MemoryError, SyscallDispatcher, SyscallRequest,
 };
 use crate::linux_abi::LinuxErrno;
 use crate::memory::{AddressSpace, AddressSpaceError};
@@ -734,7 +734,7 @@ pub fn run_syscall_loop<M, T>(
     max_traps: usize,
 ) -> Result<RunResult, RuntimeError>
 where
-    M: GuestMemory,
+    M: CurrentMmMemory,
     T: SyscallTrap,
 {
     run_syscall_loop_with_dispatcher(memory, trap, SyscallDispatcher::new(), max_traps)
@@ -747,7 +747,7 @@ pub fn run_syscall_loop_with_dispatcher<M, T>(
     max_traps: usize,
 ) -> Result<RunResult, RuntimeError>
 where
-    M: GuestMemory,
+    M: CurrentMmMemory,
     T: SyscallTrap,
 {
     run_split_loop(memory, trap, dispatcher, max_traps)
@@ -758,7 +758,7 @@ pub fn run_combined_syscall_loop<R>(
     max_traps: usize,
 ) -> Result<RunResult, RuntimeError>
 where
-    R: GuestMemory + SyscallTrap,
+    R: CurrentMmMemory + SyscallTrap,
 {
     run_combined_syscall_loop_with_dispatcher(runtime, SyscallDispatcher::new(), max_traps)
 }
@@ -769,7 +769,7 @@ pub fn run_combined_syscall_loop_with_dispatcher<R>(
     max_traps: usize,
 ) -> Result<RunResult, RuntimeError>
 where
-    R: GuestMemory + SyscallTrap,
+    R: CurrentMmMemory + SyscallTrap,
 {
     let reporter = CompatReporter::default();
     crate::host_signal::install_default_handlers();
@@ -1306,7 +1306,7 @@ where
 // `partial_write_interrupt_outcome` were hoisted into `crate::vcpu_loop` (shared
 // with the threaded loop); imported above and called unchanged here.
 
-fn dispatch_single_threaded_syscall<M: GuestMemory>(
+fn dispatch_single_threaded_syscall<M: CurrentMmMemory>(
     dispatcher: &mut SyscallDispatcher,
     kernel_context: &crate::kernel::KernelContext,
     request: SyscallRequest,
@@ -2004,15 +2004,15 @@ fn rosetta_unavailable(errno: LinuxErrno, path: &str) -> RuntimeError {
 }
 
 /// Adapter presenting a separate (`memory`, `trap`) pair as one
-/// `GuestMemory + SyscallTrap` object, so `run_split_loop` reuses the combined
+/// `CurrentMmMemory + SyscallTrap` object, so `run_split_loop` reuses the combined
 /// run loop instead of duplicating its ~200-line body. `GuestMemory` delegates
 /// to `mem`, `SyscallTrap` to `trap`.
-struct SplitView<'a, M: GuestMemory, T: SyscallTrap> {
+struct SplitView<'a, M: CurrentMmMemory, T: SyscallTrap> {
     mem: &'a mut M,
     trap: &'a mut T,
 }
 
-impl<M: GuestMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
+impl<M: CurrentMmMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
     // This adapter must be transparent. In particular, inheriting a modelless
     // default here silently bypasses the wrapped backend's physical repoint and
     // provenance publication while `run_syscall_loop` uses this split shape.
@@ -2147,7 +2147,9 @@ impl<M: GuestMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
     }
 }
 
-impl<M: GuestMemory, T: SyscallTrap> SyscallTrap for SplitView<'_, M, T> {
+impl<M: CurrentMmMemory, T: SyscallTrap> CurrentMmMemory for SplitView<'_, M, T> {}
+
+impl<M: CurrentMmMemory, T: SyscallTrap> SyscallTrap for SplitView<'_, M, T> {
     fn next_syscall(&mut self) -> Result<Option<carrick_hal::RawSyscall>, TrapError> {
         self.trap.next_syscall()
     }
@@ -2224,7 +2226,7 @@ fn run_split_loop<M, T>(
     max_traps: usize,
 ) -> Result<RunResult, RuntimeError>
 where
-    M: GuestMemory,
+    M: CurrentMmMemory,
     T: SyscallTrap,
 {
     let mut view = SplitView { mem: memory, trap };

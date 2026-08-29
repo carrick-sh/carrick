@@ -40,7 +40,7 @@ impl SyscallDispatcher {
         &self,
         fd: i32,
         statbuf: u64,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
     ) -> DispatchOutcome {
         match self.fd_stat_record(fd) {
             Ok(record) => write_stat_record(memory, statbuf, &record),
@@ -52,7 +52,7 @@ impl SyscallDispatcher {
         &self,
         fd: i32,
         statxbuf: u64,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
     ) -> DispatchOutcome {
         match self.fd_stat_record(fd) {
             Ok(record) => write_statx_record(memory, statxbuf, &record),

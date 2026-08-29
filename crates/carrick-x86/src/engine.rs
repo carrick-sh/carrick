@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Once, OnceLock};
 
 use carrick_guest_mem::{
-    Gpa, GuestMemory, GuestVa, MappingSharing, MemoryError, RepointPrivateError,
+    CurrentMmMemory, Gpa, GuestMemory, GuestVa, MappingSharing, MemoryError, RepointPrivateError,
     SharedFutexLocation,
 };
 use carrick_hal::guest_arch::GuestArch as _;
@@ -746,6 +746,8 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
         Ok(())
     }
 }
+
+impl<V: X86Vmm> CurrentMmMemory for X86EngineCore<V> {}
 
 // ─── RegAccess ───────────────────────────────────────────────────────────────
 //

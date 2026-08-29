@@ -19,7 +19,7 @@
 //! ([`InjectParams::pstate_source`], `orig_x0`, `fault_esr`, `fpsimd_enabled`)
 //! plus the backend's sigreturn trampoline base — see [`InjectParams`].
 
-use carrick_guest_mem::GuestMemory;
+use carrick_guest_mem::CurrentMmMemory;
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::{Reg, RegAccess, TrapError};
@@ -75,7 +75,7 @@ pub struct SigframeRestore {
 /// register state in the frame so [`restore_sigframe`] recovers it on
 /// `rt_sigreturn`. Returns the new SP and the frame's saved PC for the caller's
 /// telemetry. See `SyscallTrap::inject_signal` for the full per-field contract.
-pub fn build_sigframe<E: RegAccess + GuestMemory>(
+pub fn build_sigframe<E: RegAccess + CurrentMmMemory>(
     engine: &mut E,
     p: InjectParams,
 ) -> Result<SigframeInject, TrapError> {
@@ -346,7 +346,7 @@ fn restore_fpsimd<E: RegAccess>(
 /// `rt_sigreturn(2)`. Returns the restored sigmask plus the values the caller's
 /// `signal_restore` probe needs. Does NOT advance PC the way `complete_syscall`
 /// does — the restored PC IS the next PC.
-pub fn restore_sigframe<E: RegAccess + GuestMemory>(
+pub fn restore_sigframe<E: RegAccess + CurrentMmMemory>(
     engine: &mut E,
     fpsimd_enabled: bool,
 ) -> Result<SigframeRestore, TrapError> {

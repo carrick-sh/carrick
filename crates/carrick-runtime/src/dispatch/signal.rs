@@ -981,7 +981,7 @@ impl SyscallDispatcher {
     /// an empty queue → EAGAIN (signalfd is overwhelmingly used non-blocking +
     /// epoll; a true blocking wait on the backing readiness is a tracked
     /// follow-up). (audit H4)
-    pub fn read_signalfd<M: GuestMemory>(
+    pub fn read_signalfd<M: CurrentMmMemory>(
         &self,
         context: &crate::kernel::KernelContext,
         memory: &mut M,
@@ -1123,7 +1123,7 @@ impl SyscallDispatcher {
     }
 
     /// The calling guest thread's tid (or `0` if no thread context).
-    pub(crate) fn ctx_tid<M: GuestMemory>(ctx: &SyscallCtx<M>) -> crate::thread::ThreadId {
+    pub(crate) fn ctx_tid<M: CurrentMmMemory>(ctx: &SyscallCtx<M>) -> crate::thread::ThreadId {
         ctx.thread
             .as_ref()
             .map(|thread| thread.tid)
@@ -1160,7 +1160,7 @@ impl SyscallDispatcher {
     /// signum 0 is the null probe: it resolves membership and reports whether
     /// anything is there WITHOUT delivering, which is what `kill(pgid, 0)`
     /// liveness checks depend on.
-    fn hvpatch_group_signal<M: GuestMemory>(
+    fn hvpatch_group_signal<M: CurrentMmMemory>(
         &self,
         ctx: &SyscallCtx<M>,
         pid: i32,
@@ -1176,7 +1176,7 @@ impl SyscallDispatcher {
     /// kernel graph. Kept separate from the carrier-lane discriminator so unit
     /// tests can exercise the authority itself without mutating the
     /// process-global HVPATCH_LANE flag and contaminating parallel tests.
-    fn kernel_group_signal<M: GuestMemory>(
+    fn kernel_group_signal<M: CurrentMmMemory>(
         &self,
         ctx: &SyscallCtx<M>,
         pid: i32,
@@ -1254,7 +1254,7 @@ impl SyscallDispatcher {
     /// Route every positive HVPatch task target through the kernel, including
     /// self. Falling through for self would reach host `raise(3)`/global
     /// pending state even though all HVPatch tasks share one carrier process.
-    fn hvpatch_specific_process_signal<M: GuestMemory>(
+    fn hvpatch_specific_process_signal<M: CurrentMmMemory>(
         &self,
         ctx: &SyscallCtx<M>,
         pid: i32,
@@ -1411,7 +1411,7 @@ impl SyscallDispatcher {
         )
     }
 
-    fn raise_process_directed<M: GuestMemory>(
+    fn raise_process_directed<M: CurrentMmMemory>(
         &self,
         ctx: &SyscallCtx<M>,
         caller_tid: crate::thread::ThreadId,
@@ -2131,7 +2131,7 @@ impl SyscallDispatcher {
     /// kicks. Returns `None` (so the caller falls back to the pid/bootstrap
     /// path) when there's no thread context (single-threaded) or `tid` isn't a
     /// live sibling.
-    fn route_thread_signal<M: GuestMemory>(
+    fn route_thread_signal<M: CurrentMmMemory>(
         &self,
         ctx: &SyscallCtx<M>,
         tid: i64,
@@ -2207,7 +2207,7 @@ impl SyscallDispatcher {
     /// thread (`route_target` carries that tid through the ring), while
     /// `rt_sigqueueinfo` targets the whole thread group (ring entry stays
     /// process-directed, `target_ns_tid = 0`).
-    fn sigqueueinfo_common<M: GuestMemory>(
+    fn sigqueueinfo_common<M: CurrentMmMemory>(
         &self,
         ctx: &SyscallCtx<M>,
         route_target: i64,
@@ -2426,7 +2426,7 @@ fn install_host_handlers_for_wait_set(wait_set: SigSet) {
 /// rt_sigqueueinfo payload supplies si_code/si_pid/si_uid/si_value; otherwise a
 /// zeroed siginfo carrying just si_signo. The kernel re-stamps si_signo. (M9)
 fn rt_sigtimedwait_deliver(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     info_ptr: u64,
     signum: i32,
     queued: Option<LinuxSiginfo>,

@@ -5,7 +5,7 @@
 
 use super::*;
 
-pub(super) fn clear_persistent_child_tid_and_wake<M: carrick_guest_mem::GuestMemory>(
+pub(super) fn clear_persistent_child_tid_and_wake<M: carrick_guest_mem::CurrentMmMemory>(
     memory: &mut M,
     registry: &ThreadRegistry,
     futex: &FutexTable,

@@ -62,6 +62,8 @@ impl GuestMemory for ProtectedAddressSpace {
     }
 }
 
+impl CurrentMmMemory for ProtectedAddressSpace {}
+
 #[test]
 fn linear_memory_bounds_reads() {
     let mut memory = LinearMemory::new(0x1000, b"abcdef".to_vec());

@@ -871,22 +871,31 @@ pub trait GuestMemory {
     fn finish_host_write(&mut self, _ranges: &[(u64, usize)]) {}
 }
 
+/// Marker trait for guest memory views that genuinely represent the currently
+/// executing task's address space.
+///
+/// Deliberately has no blanket implementation for all [`GuestMemory`] types.
+/// Concrete production engines, wrappers whose inner memory is `CurrentMmMemory`,
+/// and test doubles that represent the current address space implement this
+/// explicitly.
+pub trait CurrentMmMemory: GuestMemory {}
+
 /// Panic-safe lifetime bracket for a host syscall that may write through raw
 /// guest-memory pointers. Construction marks every exposed range in progress;
 /// Drop always closes the bracket, including `?`, early return, and unwind paths.
-pub struct HostWriteGuard<'a, M: GuestMemory + ?Sized> {
+pub struct HostWriteGuard<'a, M: CurrentMmMemory + ?Sized> {
     memory: &'a mut M,
     ranges: &'a [(u64, usize)],
 }
 
-impl<'a, M: GuestMemory + ?Sized> HostWriteGuard<'a, M> {
+impl<'a, M: CurrentMmMemory + ?Sized> HostWriteGuard<'a, M> {
     pub fn new(memory: &'a mut M, ranges: &'a [(u64, usize)]) -> Self {
         memory.begin_host_write(ranges);
         Self { memory, ranges }
     }
 }
 
-impl<M: GuestMemory + ?Sized> Drop for HostWriteGuard<'_, M> {
+impl<M: CurrentMmMemory + ?Sized> Drop for HostWriteGuard<'_, M> {
     fn drop(&mut self) {
         self.memory.finish_host_write(self.ranges);
     }
@@ -953,6 +962,8 @@ mod zero_tests {
             }
         }
     }
+
+    impl CurrentMmMemory for MockMem {}
 
     #[test]
     fn zero_range_chunked_streams_contiguous_chunks_without_full_alloc() {

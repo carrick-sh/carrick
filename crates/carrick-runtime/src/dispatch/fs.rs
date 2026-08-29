@@ -251,7 +251,7 @@ fn linux_termio_bytes(termios: &LinuxTermios) -> [u8; LINUX_TERMIO_SIZE] {
 }
 
 fn write_linux_termio(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     address: u64,
     termios: &LinuxTermios,
 ) -> DispatchOutcome {
@@ -302,7 +302,7 @@ struct GatheredIovecBytes {
 }
 
 fn gather_bounded_iovec_bytes(
-    memory: &impl GuestMemory,
+    memory: &impl CurrentMmMemory,
     iovecs: &[LinuxIovec],
 ) -> Result<Option<GatheredIovecBytes>, LinuxErrno> {
     let mut total = 0usize;
@@ -343,7 +343,7 @@ enum PwritevPayloads {
 }
 
 fn prepare_pwritev_payloads(
-    memory: &impl GuestMemory,
+    memory: &impl CurrentMmMemory,
     iovecs: &[LinuxIovec],
 ) -> Result<PwritevPayloads, LinuxErrno> {
     let mut borrowed_iovecs = Vec::with_capacity(iovecs.len());
@@ -394,7 +394,7 @@ struct PreparedReadvTargets {
 }
 
 fn prepare_readv_targets(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     iovecs: &[LinuxIovec],
 ) -> Result<Option<PreparedReadvTargets>, LinuxErrno> {
     let mut borrowed_iovecs = Vec::with_capacity(iovecs.len());
@@ -433,7 +433,7 @@ fn prepare_readv_targets(
 ///   l_len:i64@16, l_pid:i32@24. l_type: RDLCK=0, WRLCK=1, UNLCK=2.
 /// macOS flock (`libc::flock`): l_start:i64, l_len:i64, l_pid:i32, l_type:i16,
 ///   l_whence:i16. l_type: RDLCK=1, UNLCK=2, WRLCK=3. cmd: GETLK=7/SETLK=8/SETLKW=9.
-fn forward_record_lock<M: GuestMemory>(
+fn forward_record_lock<M: CurrentMmMemory>(
     this: &SyscallDispatcher,
     cx: &mut SyscallCtx<'_, M>,
     host_fd: i32,
@@ -541,7 +541,7 @@ fn forward_record_lock<M: GuestMemory>(
 /// non-host-backed no-op path (e.g. fd=1, in-memory/synthetic files) skipped
 /// this, so LTP fcntl13 (fd=1 with a bad address / bad l_whence) wrongly
 /// succeeded. Mirrors the host-backed path's checks in `forward_record_lock`.
-fn validate_flock_arg<M: GuestMemory>(memory: &M, arg: u64) -> Result<(), LinuxErrno> {
+fn validate_flock_arg<M: CurrentMmMemory>(memory: &M, arg: u64) -> Result<(), LinuxErrno> {
     let flock: LinuxFlock64 = memory.read_struct(arg).map_err(|_| LINUX_EFAULT)?;
     let l_type = flock.l_type;
     let l_whence = flock.l_whence;
@@ -1129,7 +1129,7 @@ fn normalize_logical_record_lock_range(
 }
 
 fn write_logical_record_lock_conflict(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     arg: u64,
     conflict: Option<LogicalRecordLock>,
     is_ofd: bool,
@@ -1767,7 +1767,7 @@ impl SyscallDispatcher {
     /// device-node override applied (S_IFCHR/S_IFBLK + stx_rdev_{major,minor}).
     fn write_statx_real_with_device(
         &self,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
         statxbuf: u64,
         path: &str,
         real: &crate::fs_backend::RealStat,
@@ -1969,7 +1969,7 @@ impl SyscallDispatcher {
         &self,
         pathname: GuestPtr,
         buffer: GuestPtr,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
     ) -> Result<DispatchOutcome, DispatchError> {
         let path = read_guest_c_string(memory, pathname.0)?;
         // An empty pathname is ENOENT (statfs has no AT_EMPTY_PATH form). glibc
@@ -1998,7 +1998,7 @@ impl SyscallDispatcher {
         Ok(write_statfs(memory, buffer.0))
     }
 
-    fn fstatfs(&self, fd: Fd, buf: GuestPtr, memory: &mut impl GuestMemory) -> DispatchOutcome {
+    fn fstatfs(&self, fd: Fd, buf: GuestPtr, memory: &mut impl CurrentMmMemory) -> DispatchOutcome {
         if !self.fd_table_contains(fd.0) {
             return DispatchOutcome::errno(LINUX_EBADF);
         }
@@ -2033,7 +2033,7 @@ impl SyscallDispatcher {
         context: &crate::kernel::KernelContext,
         pathname: GuestPtr,
         length: u64,
-        memory: &impl GuestMemory,
+        memory: &impl CurrentMmMemory,
     ) -> Result<DispatchOutcome, DispatchError> {
         let length = i64::from_ne_bytes(length.to_ne_bytes());
         if length < 0 {
@@ -2094,7 +2094,7 @@ impl SyscallDispatcher {
         }
     }
 
-    fn open_at_path<M: GuestMemory>(
+    fn open_at_path<M: CurrentMmMemory>(
         &self,
         cx: &mut SyscallCtx<'_, M>,
         dirfd: u64,
@@ -5460,7 +5460,7 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned { value: off as i64 }
     }
 
-    fn read_host_pipe_iovecs<M: GuestMemory>(
+    fn read_host_pipe_iovecs<M: CurrentMmMemory>(
         memory: &mut M,
         iovecs: &[LinuxIovec],
         host_fd: i32,
@@ -5512,7 +5512,7 @@ impl SyscallDispatcher {
     /// ([`Self::restore_splice_pipe_bytes`], [`Self::restore_pipe_bytes`]) or
     /// never consumed it (`vmsplice` gathers from guest memory), so a short
     /// count loses nothing.
-    fn splice_write_out<M: GuestMemory>(
+    fn splice_write_out<M: CurrentMmMemory>(
         &self,
         out_fd: i32,
         off_out_addr: u64,
@@ -6171,7 +6171,7 @@ impl SyscallDispatcher {
         &self,
         context: &crate::kernel::KernelContext,
         request: RenameAtRequest,
-        memory: &impl GuestMemory,
+        memory: &impl CurrentMmMemory,
     ) -> Result<DispatchOutcome, DispatchError> {
         const RENAME_NOREPLACE: u64 = 1;
         const RENAME_EXCHANGE: u64 = 2;
@@ -7048,7 +7048,7 @@ impl SyscallDispatcher {
         dirfd: u64,
         pathname: u64,
         mode: u64,
-        memory: &impl GuestMemory,
+        memory: &impl CurrentMmMemory,
     ) -> Result<DispatchOutcome, DispatchError> {
         let path = read_guest_c_string(memory, pathname)?;
         if path.is_empty() {
@@ -7246,7 +7246,7 @@ impl SyscallDispatcher {
     /// disposition: a handler runs, SIG_DFL terminates, a blocked SIGPIPE stays
     /// pending. Skip the mark when SIGPIPE is ignored (the common case for
     /// pipe/socket-heavy programs) so we don't queue a signal that's discarded.
-    pub(crate) fn raise_sigpipe_on_epipe<M: GuestMemory>(
+    pub(crate) fn raise_sigpipe_on_epipe<M: CurrentMmMemory>(
         &self,
         cx: &SyscallCtx<M>,
         outcome: DispatchOutcome,
@@ -7273,7 +7273,7 @@ impl SyscallDispatcher {
     /// would carry `len` bytes. Returns the permitted prefix length, or EFBIG
     /// (after queuing SIGXFSZ) when the write starts at or beyond the soft cap.
     /// A straddling write is truncated to the cap, as Linux requires.
-    fn fsize_write_len<M: GuestMemory>(
+    fn fsize_write_len<M: CurrentMmMemory>(
         &self,
         cx: &SyscallCtx<M>,
         offset: u64,
@@ -11708,7 +11708,7 @@ impl SyscallDispatcher {
                 let sent = rc.max(0) as usize;
                 let advance_and_return = |offset: usize,
                                           sent: usize,
-                                          memory: &mut dyn GuestMemory|
+                                          memory: &mut dyn CurrentMmMemory|
                  -> Result<DispatchOutcome, DispatchError> {
                     let new_off = offset.saturating_add(sent);
                     if offset_address == 0 {
@@ -15842,7 +15842,7 @@ fn read_host_dir_entries(_host_dir_fd: i32, _dir_path: &str) -> Option<Vec<RootF
 /// closed and the events are pushed back on the front of the queue, so the
 /// guest's `EFAULT` leaves nothing consumed and no fd leaked.
 #[allow(clippy::too_many_arguments)]
-fn read_fanotify<M: GuestMemory>(
+fn read_fanotify<M: CurrentMmMemory>(
     this: &SyscallDispatcher,
     context: &crate::kernel::KernelContext,
     registry: Option<&crate::thread::ThreadRegistry>,

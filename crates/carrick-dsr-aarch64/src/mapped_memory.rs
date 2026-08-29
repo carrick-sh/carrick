@@ -24,7 +24,9 @@ use carrick_dsr::test_hooks::{
     take_native_prepared_mapping_failpoint,
 };
 use carrick_guest_mem::protections::MemoryProtections;
-use carrick_guest_mem::{GuestMemory, MappingSharing, MemoryError, RepointPrivateError};
+use carrick_guest_mem::{
+    CurrentMmMemory, GuestMemory, MappingSharing, MemoryError, RepointPrivateError,
+};
 use carrick_mem::memory::{AddressSpace, MemoryLayout, MemoryRegion};
 use sha2::{Digest, Sha256};
 
@@ -4589,6 +4591,8 @@ impl GuestMemory for NativeMappedMemory {
         self.finish_host_write_ranges(ranges);
     }
 }
+
+impl CurrentMmMemory for NativeMappedMemory {}
 
 pub fn linux_prot_to_native(prot: u64) -> libc::c_int {
     let mut host_prot = 0;

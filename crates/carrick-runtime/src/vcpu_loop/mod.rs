@@ -47,8 +47,8 @@ use carrick_hal::{PlatformFutex, SignalPumpControl, ThreadedEngine, VcpuRegistry
 
 use crate::compat::CompatReporter;
 use crate::dispatch::{
-    DispatchError, DispatchOutcome, GuestMemory, ProcMapSharing, ProcMapsEntry, SyscallDispatcher,
-    SyscallRequest,
+    CurrentMmMemory, DispatchError, DispatchOutcome, ProcMapSharing, ProcMapsEntry,
+    SyscallDispatcher, SyscallRequest,
 };
 use crate::linux_abi::LinuxErrno;
 use crate::memory::AddressSpace;
@@ -1793,7 +1793,7 @@ fn core_file_mappings_from_address_space(
 /// the shim is enabled). Must run before the guest issues any intercepted
 /// syscall: at boot, and again in a forked child / after execve, since the
 /// child's pid and the new image's identity differ.
-pub(crate) fn stamp_identity_page<M: GuestMemory>(
+pub(crate) fn stamp_identity_page<M: CurrentMmMemory>(
     memory: &mut M,
     dispatcher: &SyscallDispatcher,
     kernel_context: &crate::kernel::KernelContext,
@@ -1806,7 +1806,7 @@ pub(crate) fn stamp_identity_page<M: GuestMemory>(
     )
 }
 
-fn stamp_identity_page_at<M: GuestMemory>(
+fn stamp_identity_page_at<M: CurrentMmMemory>(
     memory: &mut M,
     dispatcher: &SyscallDispatcher,
     kernel_context: &crate::kernel::KernelContext,
@@ -1848,7 +1848,7 @@ fn identity_gate_word(fast_path_enabled: bool, pid: u32) -> u32 {
     u32::from(fast_path_enabled && pid != 0)
 }
 
-fn stamp_identity_values<M: GuestMemory>(
+fn stamp_identity_values<M: CurrentMmMemory>(
     memory: &mut M,
     base: u64,
     pid: u32,
@@ -2707,7 +2707,7 @@ fn cleanup_failed_hvpatch_initial_cpu<T>(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-trait HvpatchProcessBackendOps<E: ThreadedEngine, M: GuestMemory> {
+trait HvpatchProcessBackendOps<E: ThreadedEngine, M: CurrentMmMemory> {
     type Prepared;
     type Backend;
 
@@ -3151,7 +3151,7 @@ fn bootstrap_hvpatch_process_child<E: ThreadedEngine>(
 }
 
 fn bootstrap_hvpatch_process_child_identity(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     dispatcher: &SyscallDispatcher,
     kernel_context: &crate::kernel::KernelContext,
     shares_mm: bool,
@@ -3166,7 +3166,7 @@ fn bootstrap_hvpatch_process_child_identity(
 }
 
 fn bootstrap_hvpatch_process_child_identity_with(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     dispatcher: &SyscallDispatcher,
     kernel_context: &crate::kernel::KernelContext,
     shares_mm: bool,
@@ -3199,7 +3199,7 @@ fn bootstrap_hvpatch_process_child_identity_with(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn bootstrap_hvpatch_process_child_tid(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     address: u64,
     tid: i32,
 ) -> Result<(), RuntimeError> {
@@ -9007,6 +9007,7 @@ mod tests {
     use super::signal::{lower_el0_fault, upgrade_protection_si_code};
     use super::*;
     use crate::vcpu_loop::executor::TaskBindingResolver;
+    use carrick_guest_mem::GuestMemory;
     use std::cell::RefCell;
     use std::num::NonZeroU64;
     use std::time::Duration;
@@ -9328,6 +9329,7 @@ mod tests {
                 Ok(())
             }
         }
+        impl carrick_guest_mem::CurrentMmMemory for RecordingMemory {}
 
         let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
         let mut memory = RecordingMemory {
@@ -9637,7 +9639,7 @@ mod tests {
         protections: carrick_guest_mem::protections::MemoryProtections,
     }
 
-    impl GuestMemory for ProtectionOnlyMemory {
+    impl carrick_guest_mem::GuestMemory for ProtectionOnlyMemory {
         fn protections(&self) -> Option<&carrick_guest_mem::protections::MemoryProtections> {
             Some(&self.protections)
         }
@@ -9661,6 +9663,8 @@ mod tests {
             })
         }
     }
+
+    impl CurrentMmMemory for ProtectionOnlyMemory {}
 
     struct EndpointTestSignalPump;
 
@@ -10136,7 +10140,7 @@ mod tests {
 
     #[derive(Default)]
     struct Memory(std::collections::BTreeMap<u64, Vec<u8>>);
-    impl GuestMemory for Memory {
+    impl carrick_guest_mem::GuestMemory for Memory {
         fn read_bytes_raw(
             &self,
             address: u64,
@@ -10158,6 +10162,8 @@ mod tests {
             Ok(())
         }
     }
+
+    impl CurrentMmMemory for Memory {}
 
     #[derive(Default)]
     struct FakeBackendOps {
@@ -11393,6 +11399,8 @@ mod tests {
             Ok(())
         }
     }
+
+    impl carrick_guest_mem::CurrentMmMemory for CrashCaptureTestEngine {}
 
     impl carrick_hal::RegAccess for CrashCaptureTestEngine {
         fn get_reg(&self, _register: carrick_hal::Reg) -> Result<u64, carrick_hal::OsError> {

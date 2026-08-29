@@ -645,7 +645,7 @@ macro_rules! define_syscall {
         $(
             $(#[$meta])*
             #[allow(unused_variables)]
-            pub(super) fn $name<M: GuestMemory>(
+            pub(super) fn $name<M: CurrentMmMemory>(
                 &self,
                 ctx: &mut SyscallCtx<M>,
             ) -> Result<DispatchOutcome, DispatchError> {
@@ -679,7 +679,7 @@ macro_rules! syscall_table {
         // returns, making the `Some(..)` unreachable — that's expected for a
         // not-yet-populated module table, so allow it.
         #[allow(unreachable_code)]
-        $vis fn $name<M: GuestMemory>(number: u64) -> Option<SyscallHandler<M>> {
+        $vis fn $name<M: CurrentMmMemory>(number: u64) -> Option<SyscallHandler<M>> {
             Some(match number {
                 $( $num => SyscallDispatcher::$handler, )*
                 _ => return None,
@@ -1057,7 +1057,7 @@ pub struct SyscallRequest {
 /// while the macro migration proceeds subsystem by subsystem.
 ///
 /// See [[plan-syscall-macro-split]].
-pub struct SyscallCtx<'a, M: GuestMemory> {
+pub struct SyscallCtx<'a, M: CurrentMmMemory> {
     /// Coherent kernel object generation captured once at syscall entry.
     pub kernel: &'a crate::kernel::KernelContext,
     pub request: SyscallRequest,
@@ -1071,7 +1071,7 @@ pub struct SyscallCtx<'a, M: GuestMemory> {
     pub thread: Option<ThreadCtx<'a>>,
 }
 
-impl<M: GuestMemory> SyscallCtx<'_, M> {
+impl<M: CurrentMmMemory> SyscallCtx<'_, M> {
     #[inline]
     pub fn number(&self) -> u64 {
         self.request.number.raw()
@@ -1114,7 +1114,7 @@ pub struct ThreadCtx<'a> {
 // `crate::dispatch::{…}` / `carrick_runtime::dispatch::{…}` site is unchanged.
 // (The `Aarch64SyscallFrame` re-export is gone: the dispatcher is ISA-neutral —
 // backends decode raw frames behind `GuestArch` and hand over `RawSyscall`.)
-pub use carrick_guest_mem::{Gpa, GuestMemory, GuestVa, HostVa, MemoryError};
+pub use carrick_guest_mem::{CurrentMmMemory, Gpa, GuestMemory, GuestVa, HostVa, MemoryError};
 
 impl SyscallRequest {
     /// Build an aarch64-ABI request from a bare canonical number (aarch64
@@ -2049,6 +2049,8 @@ impl GuestMemory for LinearMemory {
         Ok(())
     }
 }
+
+impl CurrentMmMemory for LinearMemory {}
 
 #[derive(Debug, Error)]
 #[allow(private_interfaces)]
@@ -3856,7 +3858,7 @@ pub(crate) type SyscallHandler<M> =
 /// test) go through it. Each module owns its own arms, so a future agent adds a
 /// syscall by editing ONE module's `dispatch_<area>` — never this function (the
 /// central `dispatch()` chokepoint is gone). See [[plan-concurrent-fanout-lanes]].
-fn resolve_handler<M: GuestMemory>(number: u64) -> Option<SyscallHandler<M>> {
+fn resolve_handler<M: CurrentMmMemory>(number: u64) -> Option<SyscallHandler<M>> {
     fs::dispatch_fs(number)
         .or_else(|| net::dispatch_net(number))
         .or_else(|| mem::dispatch_mem(number))
@@ -4593,7 +4595,7 @@ impl SyscallDispatcher {
         &self,
         kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
         reporter: &CompatReporter,
         thread: Option<ThreadCtx>,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
@@ -4750,7 +4752,7 @@ impl SyscallDispatcher {
     pub(crate) fn sync_vvar_realtime_offset(
         &self,
         clock: &crate::kernel::container::ClockDomain,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
     ) -> Result<(), MemoryError> {
         let epoch = clock.epoch();
         // Epoch 0 means no guest has ever moved the clock in this container, so
@@ -4797,7 +4799,7 @@ impl SyscallDispatcher {
     pub(crate) fn set_guest_realtime(
         &self,
         clock: &crate::kernel::container::ClockDomain,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
         target: Duration,
     ) -> Result<(), DispatchError> {
         if clock.is_controlled() {
@@ -6170,7 +6172,7 @@ impl SyscallDispatcher {
         &mut self,
         kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
         reporter: &CompatReporter,
     ) -> Result<DispatchOutcome, DispatchError> {
         // Tree-wide forward-progress beat for the deadlock watchdog.
@@ -6347,7 +6349,7 @@ impl SyscallDispatcher {
         &self,
         kernel: &crate::kernel::KernelContext,
         mut request: SyscallRequest,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
         reporter: &CompatReporter,
         tid: crate::thread::ThreadId,
         registry: &crate::thread::ThreadRegistry,
@@ -6443,7 +6445,7 @@ impl SyscallDispatcher {
         &self,
         kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
         reporter: &CompatReporter,
         tid: crate::thread::ThreadId,
         registry: &crate::thread::ThreadRegistry,
@@ -6492,7 +6494,7 @@ impl SyscallDispatcher {
         &self,
         kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
         reporter: &CompatReporter,
         tid: crate::thread::ThreadId,
         registry: &crate::thread::ThreadRegistry,
@@ -6586,7 +6588,7 @@ impl SyscallDispatcher {
         &self,
         kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
         reporter: &CompatReporter,
         tid: crate::thread::ThreadId,
         registry: &crate::thread::ThreadRegistry,
@@ -6738,7 +6740,7 @@ impl SyscallDispatcher {
         &mut self,
         kernel: &crate::kernel::KernelContext,
         mut request: SyscallRequest,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
         reporter: &CompatReporter,
         thread: Option<ThreadCtx>,
     ) -> Result<DispatchOutcome, DispatchError> {
@@ -7111,7 +7113,7 @@ pub fn check_syscall_flags(
     unknown
 }
 
-fn write_packed(memory: &mut impl GuestMemory, address: u64, bytes: &[u8]) -> DispatchOutcome {
+fn write_packed(memory: &mut impl CurrentMmMemory, address: u64, bytes: &[u8]) -> DispatchOutcome {
     if memory.write_bytes(address, bytes).is_err() {
         DispatchOutcome::Errno {
             errno: LINUX_EFAULT,
@@ -7129,7 +7131,7 @@ fn write_packed(memory: &mut impl GuestMemory, address: u64, bytes: &[u8]) -> Di
 /// reverse-engineered details. The expected response bytes are sourced live
 /// from the installed Rosetta binary rather than embedded here.
 pub(super) fn rosetta_handshake_ioctl(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     request: u64,
     arg: u64,
 ) -> Option<DispatchOutcome> {
@@ -7188,7 +7190,7 @@ fn relative_from_absolute_timespec(
 }
 
 fn dispatch_futex_pi(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     address: u64,
     command: u64,
     word: u32,
@@ -7244,7 +7246,7 @@ fn dispatch_futex_pi(
 fn dispatch_threaded_futex(
     clock: &crate::kernel::container::ClockDomain,
     request: SyscallRequest,
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     reporter: &CompatReporter,
     futex: &crate::thread::FutexTable,
     _tid: crate::thread::ThreadId,
@@ -7558,7 +7560,7 @@ struct FutexWaitvEntry {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn dispatch_futex_waitv_args(
     clock: &crate::kernel::container::ClockDomain,
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     futex: Option<&crate::thread::FutexTable>,
     waiters: u64,
     nr_futexes: u64,
@@ -7729,7 +7731,7 @@ pub(super) fn dispatch_futex_waitv_args(
 /// ABI struct to declare its kernel size up front and have a paired
 /// const assert validating `ABI_SIZE <= size_of::<T>()`.
 fn write_kernel_struct<T: KernelAbi>(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     address: u64,
     value: &T,
 ) -> DispatchOutcome {
@@ -7742,7 +7744,7 @@ fn write_kernel_struct<T: KernelAbi>(
 /// which is correct for TCGETS but 8 bytes short for the termios2 buffer that
 /// glibc-aarch64 hands to TCGETS2.
 fn write_termios2(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     address: u64,
     value: &LinuxTermios,
 ) -> DispatchOutcome {
@@ -7754,7 +7756,7 @@ fn write_termios2(
 /// have post-write bookkeeping that the `DispatchOutcome::Errno` shape
 /// would short-circuit). Same wire-size guarantee.
 fn write_kernel_struct_raw<T: KernelAbi>(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     address: u64,
     value: &T,
 ) -> Result<(), crate::dispatch::MemoryError> {
@@ -7764,7 +7766,7 @@ fn write_kernel_struct_raw<T: KernelAbi>(
 /// Type-safe read for Linux UAPI structs that implement [`KernelAbi`].
 /// Reads exactly the Linux wire size, then zero-fills any Rust-only tail
 /// bytes before returning the typed value.
-fn read_kernel_struct<T>(memory: &impl GuestMemory, address: u64) -> Result<T, LinuxErrno>
+fn read_kernel_struct<T>(memory: &impl CurrentMmMemory, address: u64) -> Result<T, LinuxErrno>
 where
     T: KernelAbi + FromBytes,
 {
@@ -7775,7 +7777,7 @@ where
 /// `length` is the guest-provided prefix length and must fit inside the
 /// Linux ABI size carried by the type.
 fn read_kernel_prefix<T>(
-    memory: &impl GuestMemory,
+    memory: &impl CurrentMmMemory,
     address: u64,
     length: usize,
 ) -> Result<T, LinuxErrno>
@@ -7793,7 +7795,7 @@ where
     Ok(value)
 }
 
-fn write_statfs(memory: &mut impl GuestMemory, statfsbuf: u64) -> DispatchOutcome {
+fn write_statfs(memory: &mut impl CurrentMmMemory, statfsbuf: u64) -> DispatchOutcome {
     let blocks = 1_048_576;
     let statfs = LinuxStatfs {
         f_type: LINUX_OVERLAYFS_SUPER_MAGIC,
@@ -8023,7 +8025,7 @@ fn linux_timeval_usec_is_valid(tv: LinuxTimeval) -> bool {
 
 fn adjtimex_bootstrap(
     clock: &crate::kernel::container::ClockDomain,
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     address: u64,
     can_adjust: bool,
 ) -> DispatchOutcome {
@@ -8214,7 +8216,7 @@ fn linux_timespec_from_duration(duration: Duration) -> LinuxTimespec {
 }
 
 pub(crate) fn complete_interrupted_sleep(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     remaining: Option<GuestPtr>,
     duration: Duration,
 ) -> DispatchOutcome {
@@ -8240,7 +8242,7 @@ fn linux_timeval_from_duration(duration: Duration) -> LinuxTimeval {
 }
 
 fn write_stat_record(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     statbuf: u64,
     record: &StatRecord,
 ) -> DispatchOutcome {
@@ -8278,7 +8280,7 @@ fn write_stat_record(
 }
 
 fn write_x8664_stat_record(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     statbuf: u64,
     record: &StatRecord,
 ) -> DispatchOutcome {
@@ -8352,7 +8354,7 @@ pub(super) fn real_stat_from_libc(st: &libc::stat) -> crate::fs_backend::RealSta
 
 /// Build and write a `statx` record from a real backing stat.
 fn write_statx_real(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     statxbuf: u64,
     path: &str,
     real: &crate::fs_backend::RealStat,
@@ -8361,7 +8363,7 @@ fn write_statx_real(
 }
 
 fn write_statx(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     statxbuf: u64,
     metadata: &RootFsMetadata,
 ) -> DispatchOutcome {
@@ -8369,7 +8371,7 @@ fn write_statx(
 }
 
 fn write_statx_record(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     statxbuf: u64,
     record: &StatRecord,
 ) -> DispatchOutcome {
@@ -8417,7 +8419,7 @@ fn write_statx_record(
 }
 
 fn write_synthetic_statx(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     statxbuf: u64,
     path: &str,
     size: usize,
@@ -8430,7 +8432,7 @@ fn write_synthetic_statx(
 /// `RootFsEntryKind`. Used for fd types that don't map to a VFS kind,
 /// such as pty character devices (S_IFCHR) and anonymous pipes (S_IFIFO).
 fn write_synthetic_statx_mode(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     statxbuf: u64,
     path: &str,
     size: usize,
@@ -8693,7 +8695,7 @@ impl SyscallDispatcher {
 }
 
 fn read_eventfd(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     address: u64,
     length: usize,
     state: &EventFdState,
@@ -8819,7 +8821,7 @@ fn write_eventfd(this: &SyscallDispatcher, bytes: &[u8], state: &EventFdState) -
 }
 
 fn read_timerfd(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     address: u64,
     length: usize,
     state: &TimerFdState,
@@ -8983,7 +8985,7 @@ fn duration_from_nanos_saturating(nanos: u128) -> Duration {
     Duration::new(seconds as u64, (nanos % NANOS_PER_SEC) as u32)
 }
 
-pub(super) fn read_u64(memory: &impl GuestMemory, address: u64) -> Result<u64, LinuxErrno> {
+pub(super) fn read_u64(memory: &impl CurrentMmMemory, address: u64) -> Result<u64, LinuxErrno> {
     let mut buf = [0u8; 8];
     memory
         .read_into(address, &mut buf)
@@ -8991,7 +8993,7 @@ pub(super) fn read_u64(memory: &impl GuestMemory, address: u64) -> Result<u64, L
     Ok(u64::from_ne_bytes(buf))
 }
 
-pub(super) fn read_u32(memory: &impl GuestMemory, address: u64) -> Result<u32, LinuxErrno> {
+pub(super) fn read_u32(memory: &impl CurrentMmMemory, address: u64) -> Result<u32, LinuxErrno> {
     let mut buf = [0u8; 4];
     memory
         .read_into(address, &mut buf)
@@ -9009,7 +9011,10 @@ pub(super) fn read_u32(memory: &impl GuestMemory, address: u64) -> Result<u32, L
 /// `futex_fatal_error()` (SIGABRT) on a VALID cross-process futex — observed in
 /// CPython multiprocessing SyncManager teardown, where a forked server child's
 /// `FUTEX_WAIT_BITSET|CLOCK_REALTIME` on a shared semaphore aborted the process.
-pub(super) fn read_futex_word(memory: &impl GuestMemory, address: u64) -> Result<u32, LinuxErrno> {
+pub(super) fn read_futex_word(
+    memory: &impl CurrentMmMemory,
+    address: u64,
+) -> Result<u32, LinuxErrno> {
     match read_u32(memory, address) {
         Ok(word) => Ok(word),
         Err(errno) => match memory.shared_futex_location(address) {
@@ -9026,7 +9031,7 @@ pub(super) fn read_futex_word(memory: &impl GuestMemory, address: u64) -> Result
 }
 
 pub(super) fn write_u32(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     address: u64,
     value: u32,
 ) -> Result<(), LinuxErrno> {
@@ -9035,24 +9040,30 @@ pub(super) fn write_u32(
         .map_err(|_| LINUX_EFAULT)
 }
 
-fn read_itimerspec(memory: &impl GuestMemory, address: u64) -> Result<LinuxItimerspec, LinuxErrno> {
+fn read_itimerspec(
+    memory: &impl CurrentMmMemory,
+    address: u64,
+) -> Result<LinuxItimerspec, LinuxErrno> {
     read_kernel_struct(memory, address)
 }
 
-fn read_itimerval(memory: &impl GuestMemory, address: u64) -> Result<LinuxItimerval, LinuxErrno> {
+fn read_itimerval(
+    memory: &impl CurrentMmMemory,
+    address: u64,
+) -> Result<LinuxItimerval, LinuxErrno> {
     read_kernel_struct(memory, address)
 }
 
-fn read_timespec(memory: &impl GuestMemory, address: u64) -> Result<LinuxTimespec, LinuxErrno> {
+fn read_timespec(memory: &impl CurrentMmMemory, address: u64) -> Result<LinuxTimespec, LinuxErrno> {
     read_kernel_struct(memory, address)
 }
 
-fn read_open_how(memory: &impl GuestMemory, address: u64) -> Result<LinuxOpenHow, LinuxErrno> {
+fn read_open_how(memory: &impl CurrentMmMemory, address: u64) -> Result<LinuxOpenHow, LinuxErrno> {
     read_kernel_struct(memory, address)
 }
 
 fn read_iovecs(
-    memory: &impl GuestMemory,
+    memory: &impl CurrentMmMemory,
     address: u64,
     count: usize,
 ) -> Result<Vec<LinuxIovec>, LinuxErrno> {
@@ -9088,7 +9099,7 @@ fn read_iovecs(
 }
 
 fn read_from_contents_at(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     contents: &[u8],
     mut offset: usize,
     iovecs: &[LinuxIovec],
@@ -9124,7 +9135,7 @@ fn read_from_contents_at(
 }
 
 fn read_from_synthetic_device_iovecs(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     kind: crate::vfs::SyntheticDeviceKind,
     iovecs: &[LinuxIovec],
 ) -> Result<usize, DispatchError> {
@@ -9167,7 +9178,7 @@ fn read_from_synthetic_device_iovecs(
 }
 
 fn read_from_file_contents_at(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     contents: &FileContents,
     mut offset: usize,
     iovecs: &[LinuxIovec],
@@ -9507,7 +9518,7 @@ fn now_realtime_timespec(clock: &crate::kernel::container::ClockDomain) -> (i64,
 /// C string as RAW BYTES — for `argv` / `envp` in `execve(2)`, which Linux
 /// treats as opaque byte strings (NOT UTF-8). See [`read_guest_c_string_bytes`].
 fn read_guest_string_array_bytes(
-    memory: &impl GuestMemory,
+    memory: &impl CurrentMmMemory,
     array_addr: u64,
 ) -> Result<Vec<Vec<u8>>, LinuxErrno> {
     if array_addr == 0 {
@@ -9704,7 +9715,7 @@ const SMALL_HOST_READ_BUF: usize = 8192;
 /// non-blocking guest fd gets EAGAIN. Never blocks under the dispatcher lock.
 /// `nonblocking` is the guest's intended mode (status_flags / O_NONBLOCK).
 fn read_host_pipe_into(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     guest_addr: u64,
     host_fd: i32,
     host_fd_owner: Option<HostFdRef>,
@@ -9758,7 +9769,7 @@ fn read_host_pipe_into(
 }
 
 fn read_host_pipe(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     guest_addr: u64,
     length: usize,
     host_fd: i32,
@@ -10206,7 +10217,7 @@ fn would_block_outcome(
 /// when carrick required UTF-8. The execve argv/env path keeps these bytes
 /// verbatim; callers needing a Rust `String` (fs path lookup) use the wrapper.
 fn read_guest_c_string_bytes(
-    memory: &impl GuestMemory,
+    memory: &impl CurrentMmMemory,
     address: u64,
 ) -> Result<Vec<u8>, LinuxErrno> {
     const CHUNK: usize = 256;
@@ -10241,7 +10252,7 @@ fn read_guest_c_string_bytes(
 /// boundaries (getdents/readlink/getcwd). The encoded form also doubles as the
 /// durable host representation, since APFS rejects a raw non-UTF-8 name (EILSEQ).
 /// argv/env use the bytes form and never reach here.
-fn read_guest_c_string(memory: &impl GuestMemory, address: u64) -> Result<String, LinuxErrno> {
+fn read_guest_c_string(memory: &impl CurrentMmMemory, address: u64) -> Result<String, LinuxErrno> {
     Ok(crate::pathcodec::encode_bytes(&read_guest_c_string_bytes(
         memory, address,
     )?))

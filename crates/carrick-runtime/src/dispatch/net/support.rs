@@ -90,7 +90,7 @@ use crate::linux_abi::{
 use carrick_abi::LINUX_SOCK_RDM;
 
 pub(super) fn read_epoll_event(
-    memory: &impl GuestMemory,
+    memory: &impl CurrentMmMemory,
     address: u64,
     guest_abi: LinuxGuestAbi,
 ) -> Result<LinuxEpollEvent, LinuxErrno> {
@@ -211,7 +211,7 @@ pub(super) fn drain_pending_epoll_ready(
     pending_ready.drain(..take).collect()
 }
 
-pub(super) fn write_epoll_events<M: GuestMemory>(
+pub(super) fn write_epoll_events<M: CurrentMmMemory>(
     memory: &mut M,
     events_address: u64,
     ready: &[LinuxEpollEvent],
@@ -366,14 +366,14 @@ pub(in crate::dispatch) fn host_fd_has_oob(_host_fd: i32) -> bool {
 }
 
 pub(super) fn read_pollfd(
-    memory: &impl GuestMemory,
+    memory: &impl CurrentMmMemory,
     address: u64,
 ) -> Result<LinuxPollFd, LinuxErrno> {
     read_kernel_struct(memory, address)
 }
 
 pub(super) fn read_fd_set(
-    memory: &impl GuestMemory,
+    memory: &impl CurrentMmMemory,
     address: u64,
     nfds: usize,
 ) -> Result<Vec<u8>, LinuxErrno> {
@@ -663,7 +663,11 @@ pub(super) fn linux_to_host_socktype(t: i32) -> i32 {
 /// Parse a Linux `sockaddr_nl` (family(2) pad(2) pid(4) groups(4) = 12 bytes)
 /// from guest memory, returning `(nl_pid, nl_groups)`. Missing / short
 /// addresses yield zeros (kernel treats pid=0 as "auto-assign").
-pub(super) fn read_sockaddr_nl(memory: &impl GuestMemory, addr: u64, addrlen: u32) -> (u32, u32) {
+pub(super) fn read_sockaddr_nl(
+    memory: &impl CurrentMmMemory,
+    addr: u64,
+    addrlen: u32,
+) -> (u32, u32) {
     if addr == 0 || addrlen < 12 {
         return (0, 0);
     }
@@ -689,7 +693,7 @@ pub(super) fn sockaddr_nl_bytes(pid: u32, groups: u32) -> Vec<u8> {
 
 /// Generic read(2)-style drain of a netlink recv queue into guest memory.
 pub(in crate::dispatch) fn drain_netlink_queue(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     address: u64,
     length: usize,
     queue: &mut VecDeque<u8>,
@@ -1573,7 +1577,7 @@ fn is_private_unix_host_path(host_path: &[u8]) -> bool {
 /// macOS BSD form. Returns the host-formatted bytes ready to hand to
 /// libc::bind/connect/sendto.
 pub(in crate::dispatch) fn read_linux_sockaddr(
-    memory: &impl GuestMemory,
+    memory: &impl CurrentMmMemory,
     addr: u64,
     addrlen: u32,
     _family_hint: i32,
@@ -1768,7 +1772,7 @@ pub(super) fn host_to_linux_sockaddr(
 /// the caller's `addrlen` (Linux truncates when the buffer is too small
 /// and writes the full required length into `*addrlen_addr`).
 pub(super) fn write_linux_sockaddr(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     addr: u64,
     addrlen_addr: u64,
     bytes: &[u8],
@@ -1798,7 +1802,7 @@ pub(super) fn write_linux_sockaddr(
 ///
 /// NOT for the generic host passthrough (which reports the host-updated optlen,
 /// not the clamped count) nor the netlink `SO_TYPE` path (which ignores faults).
-pub(super) fn write_sockopt_value<M: GuestMemory>(
+pub(super) fn write_sockopt_value<M: CurrentMmMemory>(
     memory: &mut M,
     optval_addr: u64,
     optlen_addr: u64,
@@ -1822,7 +1826,7 @@ pub(super) fn write_sockopt_value<M: GuestMemory>(
 }
 
 pub(super) fn read_linux_msghdr(
-    memory: &impl GuestMemory,
+    memory: &impl CurrentMmMemory,
     addr: u64,
 ) -> Result<LinuxMsghdr, LinuxErrno> {
     read_kernel_struct(memory, addr)

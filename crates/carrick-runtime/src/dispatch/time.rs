@@ -1199,7 +1199,7 @@ fn timeval_from_duration(d: std::time::Duration) -> crate::linux_abi::LinuxTimev
 /// serviced-syscall counter x the nominal per-syscall kernel cost. Read live
 /// for RUSAGE_SELF/`times`; `sys_exit` folds-and-zeroes it into the thread
 /// ledger so the zombie snapshot and RUSAGE_CHILDREN carry it after exit.
-fn el1_counted_system_us(memory: &impl GuestMemory) -> u64 {
+fn el1_counted_system_us(memory: &impl CurrentMmMemory) -> u64 {
     let counter_addr =
         crate::memory::LINUX_IDENTITY_PAGE_BASE + crate::memory::IDENTITY_OFF_SHIM_SYSCALLS;
     let Ok(bytes) = memory.read_bytes(counter_addr, 8) else {

@@ -651,7 +651,7 @@ fn is_async_op(op: u8) -> bool {
 /// Read the iovec array referenced by a Linux `msghdr` at `addr` (RECVMSG/
 /// SENDMSG point their SQE at one). msg_name/msg_control are ignored — carrick
 /// services connected-socket message I/O, the common io_uring case.
-fn read_msghdr_iovecs(memory: &impl GuestMemory, addr: u64) -> Option<Vec<LinuxIovec>> {
+fn read_msghdr_iovecs(memory: &impl CurrentMmMemory, addr: u64) -> Option<Vec<LinuxIovec>> {
     let bytes = memory
         .read_bytes(addr, core::mem::size_of::<LinuxMsghdr>())
         .ok()?;
@@ -695,7 +695,7 @@ pub(crate) fn complete_sqe(
     }
 }
 
-fn read_ring_u32(memory: &impl GuestMemory, addr: u64) -> u32 {
+fn read_ring_u32(memory: &impl CurrentMmMemory, addr: u64) -> u32 {
     memory
         .read_bytes(addr, 4)
         .ok()
@@ -704,13 +704,13 @@ fn read_ring_u32(memory: &impl GuestMemory, addr: u64) -> u32 {
         .unwrap_or(0)
 }
 
-fn write_ring_u32(memory: &mut impl GuestMemory, addr: u64, v: u32) {
+fn write_ring_u32(memory: &mut impl CurrentMmMemory, addr: u64, v: u32) {
     let _ = memory.write_bytes(addr, &v.to_ne_bytes());
 }
 
 /// Read `count` `iovec`s (16 bytes each) from the guest array at `addr`. `count`
 /// is capped at IOV_MAX (1024) so a bogus SQE can't drive an unbounded alloc.
-fn read_iovecs(memory: &impl GuestMemory, addr: u64, count: usize) -> Option<Vec<LinuxIovec>> {
+fn read_iovecs(memory: &impl CurrentMmMemory, addr: u64, count: usize) -> Option<Vec<LinuxIovec>> {
     if count > 1024 {
         return None;
     }
@@ -726,7 +726,7 @@ fn read_iovecs(memory: &impl GuestMemory, addr: u64, count: usize) -> Option<Vec
 /// Read each iovec's `[iov_base, iov_len)` from guest memory and concatenate
 /// into one host buffer (the gather half of WRITEV/SENDMSG). `Err(())` on a
 /// guest-memory fault; the caller maps it to its own error encoding.
-fn gather_iovecs(memory: &impl GuestMemory, iovs: &[LinuxIovec]) -> Result<Vec<u8>, ()> {
+fn gather_iovecs(memory: &impl CurrentMmMemory, iovs: &[LinuxIovec]) -> Result<Vec<u8>, ()> {
     let mut buf = Vec::new();
     for v in iovs {
         let chunk = memory
@@ -741,7 +741,7 @@ fn gather_iovecs(memory: &impl GuestMemory, iovs: &[LinuxIovec]) -> Result<Vec<u
 /// per iovec and stopping once `data` is exhausted (the scatter half of
 /// READV/RECVMSG). `Err(())` on a guest-memory fault.
 fn scatter_to_iovecs(
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     iovs: &[LinuxIovec],
     data: &[u8],
 ) -> Result<(), ()> {
@@ -764,7 +764,7 @@ impl SyscallDispatcher {
     /// file description. Guest virtual mappings are created only by mmap.
     pub(in crate::dispatch) fn io_uring_setup_impl(
         &self,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
         entries: u32,
         params_ptr: u64,
     ) -> DispatchOutcome {
@@ -827,7 +827,7 @@ impl SyscallDispatcher {
     /// ready by the time enter returns, so `min_complete` is already satisfied.
     pub(in crate::dispatch) fn io_uring_enter_impl(
         &self,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
         fd: i32,
         to_submit: u32,
         flags: u32,
@@ -949,7 +949,7 @@ impl SyscallDispatcher {
     /// Execute one SQE, returning the CQE `res` (bytes transferred or `-errno`).
     /// Phase 1: NOP and host-file READ/WRITE; any other opcode → `-EINVAL`,
     /// matching the kernel's response to an unsupported opcode.
-    fn io_uring_run_op(&self, memory: &mut impl GuestMemory, sqe: &LinuxIoUringSqe) -> i32 {
+    fn io_uring_run_op(&self, memory: &mut impl CurrentMmMemory, sqe: &LinuxIoUringSqe) -> i32 {
         match sqe.opcode {
             LINUX_IORING_OP_NOP => 0,
             LINUX_IORING_OP_READ => {
@@ -1138,7 +1138,11 @@ impl SyscallDispatcher {
     /// or errored, Block(host_fd, poll_events) if it would block (the enter loop
     /// then hands off to the runtime's kqueue wait). RECV/SEND go through the host
     /// socket; POLL_ADD polls the fd with a zero timeout.
-    fn try_async_op(&self, memory: &mut impl GuestMemory, sqe: &LinuxIoUringSqe) -> AsyncOutcome {
+    fn try_async_op(
+        &self,
+        memory: &mut impl CurrentMmMemory,
+        sqe: &LinuxIoUringSqe,
+    ) -> AsyncOutcome {
         match sqe.opcode {
             LINUX_IORING_OP_RECV => {
                 let Some(hfd) = self.host_socket_fd(sqe.fd) else {

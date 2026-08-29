@@ -1166,9 +1166,12 @@ impl GuestMemory for HostPtrPayloadMemory {
 }
 
 #[cfg(target_os = "macos")]
+impl CurrentMmMemory for HostPtrPayloadMemory {}
+
+#[cfg(target_os = "macos")]
 fn open_host_file_at_path(
     dispatcher: &mut SyscallDispatcher,
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     reporter: &CompatReporter,
     path_addr: u64,
     flags: u64,
@@ -1192,7 +1195,7 @@ fn open_host_file_at_path(
 #[cfg(target_os = "macos")]
 fn open_host_out_file(
     dispatcher: &mut SyscallDispatcher,
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     reporter: &CompatReporter,
 ) {
     open_host_file_at_path(
@@ -1563,6 +1566,8 @@ fn pwritev_host_file_reads_each_guest_iovec_once() {
             self.inner.read_into(address, dst)
         }
     }
+
+    impl CurrentMmMemory for CountingPayloadMemory {}
 
     let scratch = tempfile::TempDir::new().unwrap();
     let dir =

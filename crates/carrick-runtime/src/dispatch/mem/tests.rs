@@ -304,6 +304,8 @@ impl GuestMemory for CountingMmapMemory {
     }
 }
 
+impl CurrentMmMemory for CountingMmapMemory {}
+
 struct ConcurrentExecMemory(CountingMmapMemory);
 
 impl GuestMemory for ConcurrentExecMemory {
@@ -323,6 +325,8 @@ impl GuestMemory for ConcurrentExecMemory {
         true
     }
 }
+
+impl CurrentMmMemory for ConcurrentExecMemory {}
 
 struct ProtectionTrackingMemory {
     inner: CountingMmapMemory,
@@ -432,6 +436,8 @@ impl GuestMemory for DeferredSetterFailureMemory {
     }
 }
 
+impl CurrentMmMemory for DeferredSetterFailureMemory {}
+
 impl GuestMemory for FailingProtectMemory {
     fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
         self.inner.read_bytes_raw(address, length)
@@ -445,6 +451,8 @@ impl GuestMemory for FailingProtectMemory {
         Err(MemoryError::Unsupported)
     }
 }
+
+impl CurrentMmMemory for FailingProtectMemory {}
 
 impl GuestMemory for LazyResidentMemory {
     fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
@@ -463,6 +471,8 @@ impl GuestMemory for LazyResidentMemory {
         Ok(())
     }
 }
+
+impl CurrentMmMemory for LazyResidentMemory {}
 
 impl ProtectionTrackingMemory {
     fn new(base: u64, len: usize) -> Self {
@@ -604,6 +614,8 @@ impl GuestMemory for ProtectionTrackingMemory {
     }
 }
 
+impl CurrentMmMemory for ProtectionTrackingMemory {}
+
 fn returned(outcome: DispatchOutcome) -> i64 {
     match outcome {
         DispatchOutcome::Returned { value } => value,
@@ -621,7 +633,7 @@ fn native16k_dispatcher() -> SyscallDispatcher {
 
 fn threaded_memory_call(
     dispatcher: &SyscallDispatcher,
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     registry: &crate::thread::ThreadRegistry,
     reporter: &CompatReporter,
     request: SyscallRequest,
@@ -1293,6 +1305,8 @@ impl GuestMemory for FileBackedLoweringMemory {
         Ok(self.accept)
     }
 }
+
+impl CurrentMmMemory for FileBackedLoweringMemory {}
 
 /// Install a HostFile-backed guest fd whose backing file holds `payload`,
 /// returning the guest fd number.
@@ -5346,7 +5360,7 @@ fn eager_lock_paths_populate_mincore_residency() {
 // `vec![1u8; pages]` is uncatchable on alloc failure). Both arms must report
 // ENOMEM (errno 12), never panic/abort. The success path is covered by the
 // integration test `mm_lock_msync_mincore_stubs_validate_args_and_succeed`.
-fn mincore(memory: &mut impl GuestMemory, address: u64, length: u64) -> DispatchOutcome {
+fn mincore(memory: &mut impl CurrentMmMemory, address: u64, length: u64) -> DispatchOutcome {
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
     dispatcher
@@ -5396,6 +5410,8 @@ impl GuestMemory for GapMemory {
         }
     }
 }
+
+impl CurrentMmMemory for GapMemory {}
 
 #[test]
 fn mincore_unmapped_end_page_is_enomem_not_abort() {
@@ -5686,6 +5702,8 @@ impl GuestMemory for HeapVmaTrackingMemory {
             .set_mapping_protection(address, len, no_access, no_write);
     }
 }
+
+impl CurrentMmMemory for HeapVmaTrackingMemory {}
 
 #[test]
 fn brk_heap_real_vma_page_transitions() {

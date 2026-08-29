@@ -23,7 +23,7 @@ use crate::guest_arch::{GuestArch, PageTableCodec, PtGranule, SyscallRemap, Sysc
 use crate::trap::RawSyscall;
 use crate::{RegAccess, TrapError};
 use carrick_abi::{CanonicalNr, NativeNr};
-use carrick_guest_mem::{GuestMemory, X8664SyscallFrame};
+use carrick_guest_mem::{CurrentMmMemory, X8664SyscallFrame};
 
 // ─── ELF machine tag ─────────────────────────────────────────────────────────
 
@@ -466,7 +466,7 @@ impl GuestArch for X8664GuestArch {
         X8664BootSysregs::new()
     }
 
-    fn build_sigframe<E: RegAccess + GuestMemory>(
+    fn build_sigframe<E: RegAccess + CurrentMmMemory>(
         engine: &mut E,
         params: crate::sigframe::InjectParams,
     ) -> Result<crate::sigframe::SigframeInject, TrapError> {
@@ -687,7 +687,7 @@ impl GuestArch for X8664GuestArch {
         })
     }
 
-    fn restore_sigframe<E: RegAccess + GuestMemory>(
+    fn restore_sigframe<E: RegAccess + CurrentMmMemory>(
         engine: &mut E,
         _fpsimd_enabled: bool,
     ) -> Result<crate::sigframe::SigframeRestore, TrapError> {
@@ -2481,6 +2481,8 @@ mod tests {
         }
     }
 
+    impl carrick_guest_mem::CurrentMmMemory for SigframeStub {}
+
     impl crate::RegAccess for SigframeStub {
         fn get_reg(&self, _: crate::Reg) -> Result<u64, crate::OsError> {
             Ok(0)
@@ -2610,6 +2612,8 @@ mod tests {
             Ok(())
         }
     }
+
+    impl carrick_guest_mem::CurrentMmMemory for SigframeRoundtrip {}
 
     impl crate::RegAccess for SigframeRoundtrip {
         fn get_reg(&self, r: crate::Reg) -> Result<u64, crate::OsError> {
