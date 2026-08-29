@@ -4820,6 +4820,96 @@ mod container_policy_dispatch_tests {
     }
 
     #[test]
+    fn clone_vm_distinct_dispatcher_cannot_claim_sole_mm_with_peer_active() {
+        let dispatcher = SyscallDispatcher::new();
+        let parent_mm_id = crate::kernel::MmId::from_raw_u64(1).unwrap();
+        let prepared = dispatcher
+            .prepare_fork_mm(
+                parent_mm_id,
+                parent_mm_id,
+                crate::kernel::CloneObjectMode::Share,
+            )
+            .unwrap();
+        let child_dispatcher = dispatcher
+            .fork_clone_with_prepared_mm(parent_mm_id, parent_mm_id, 100, 101, prepared)
+            .expect("install shared fork mm");
+        let parent_executor = dispatcher
+            .enter_mm_executor()
+            .expect("admit parent MM executor");
+        let child_executor = child_dispatcher
+            .enter_mm_executor()
+            .expect("admit child MM executor");
+        let registry = crate::thread::ThreadRegistry::new(
+            crate::thread::ThreadId::synthetic_for_tests(101),
+        );
+        let futex = crate::thread::FutexTable::new();
+        let reporter = CompatReporter::default();
+        let mut memory = LinearMemory::new(0x10000, vec![0; 0x1000]);
+        let request = SyscallRequest::new(214, SyscallArgs::from([0; 6]));
+
+        assert!(matches!(
+            child_dispatcher.dispatch_threaded_with_mm_executor(
+                &child_executor,
+                &child_dispatcher.capture_one_task_context().unwrap(),
+                request,
+                &mut memory,
+                &reporter,
+                registry.main_tid(),
+                &registry,
+                &futex,
+            ),
+            Err(DispatchError::MmMutationPeerExecutor)
+        ));
+
+        drop(parent_executor);
+        assert_eq!(
+            child_dispatcher
+                .dispatch_threaded_with_mm_executor(
+                    &child_executor,
+                    &child_dispatcher.capture_one_task_context().unwrap(),
+                    request,
+                    &mut memory,
+                    &reporter,
+                    registry.main_tid(),
+                    &registry,
+                    &futex,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned {
+                value: crate::memory::LINUX_HEAP_BASE as i64,
+            }
+        );
+
+        drop(child_executor);
+        let sole_executor = dispatcher
+            .enter_mm_executor()
+            .expect("readmit sole parent MM executor");
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::sync_channel(1);
+        let (admitted_tx, admitted_rx) = std::sync::mpsc::sync_channel(1);
+        let peer = std::thread::spawn(move || {
+            attempted_tx.send(()).expect("announce peer admission");
+            let peer = child_dispatcher
+                .enter_mm_executor()
+                .expect("admit peer after sole authority releases");
+            admitted_tx.send(()).expect("announce peer admitted");
+            peer
+        });
+        crate::vcpu_loop::with_sole_mm_stage1(&sole_executor, |_authority| {
+            attempted_rx.recv().expect("peer attempts exact-MM admission");
+            assert_eq!(
+                admitted_rx.recv_timeout(std::time::Duration::from_millis(25)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+                "a peer entered while the sole-MM authority was live"
+            );
+        })
+        .expect("sole executor must mint sealed MM authority");
+        admitted_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("peer enters after sole-MM authority releases");
+        drop(peer.join().expect("peer admission worker exits"));
+    }
+
+    #[test]
     fn prepared_fork_mm_install_excludes_peer_vma_publication() {
         let dispatcher = Arc::new(SyscallDispatcher::new());
         let parent_mm_id = crate::kernel::MmId::from_raw_u64(1).unwrap();

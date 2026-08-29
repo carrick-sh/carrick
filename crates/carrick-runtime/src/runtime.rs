@@ -1015,7 +1015,7 @@ where
                 prot_none,
             } => {
                 let file = file.map(|(fd, offset, prot)| (fd.into_owned_fd(), offset, prot));
-                let retval = dispatcher.with_single_executor_mm_mutation(
+                let retval = dispatcher.with_mm_executor_mutation(
                     &kernel_context,
                     |dispatcher, mutation| {
                         let permit = mutation.host_alias_permit();
@@ -1085,7 +1085,7 @@ where
                             }
                         }
                     },
-                );
+                )?;
                 runtime.complete_syscall(retval)?;
                 last_syscall_retval = Some(retval);
             }

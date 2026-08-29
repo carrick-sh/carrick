@@ -1388,12 +1388,6 @@ pub(crate) struct KernelState {
     /// Issues crash-capture generations and broadcasts the one currently
     /// collecting. Sibling loops read it at their quiesce safe point.
     crash_capture: Option<Arc<crate::kernel::CrashCaptureAuthority>>,
-    /// Active guest executors for this Linux process. This population decides
-    /// only whether a stage-1 page-table pause must be raised. Process fork and
-    /// crash snapshot instead use durable `Task::threads()` membership because
-    /// futex, epoll, and fd suspension drops census participation without
-    /// removing the logical thread. See `kernel::guest_execution`.
-    guest_executors: Arc<crate::kernel::GuestExecutorCensus>,
     /// Cross-layer thread-clone admission spans Kernel reservation through
     /// runtime registration, handle visibility, and child start.
     clone_admission: Arc<CloneAdmissionGate>,
@@ -1441,7 +1435,6 @@ impl KernelState {
             persistent_exit_owner: std::sync::atomic::AtomicI32::new(0),
             process_fork_barrier,
             crash_capture,
-            guest_executors: Arc::new(crate::kernel::GuestExecutorCensus::default()),
             clone_admission: Arc::new(CloneAdmissionGate::default()),
             hvpatch_runtime,
             child_exit_signal,
@@ -1656,22 +1649,6 @@ impl KernelState {
         self.clone_admission.close_for_exec(owner)
     }
 
-    /// Must this thread raise the stage-1 page-table Pause-Modify-Resume
-    /// barrier before it mutates shared descriptors?
-    ///
-    /// This uses the guest-executor census rather than vCPU registry membership
-    /// because registration can be transiently absent while an admitted loop
-    /// acquires or rebinds its lease. `enter_guest_executor_then_register`
-    /// enters the census before attempting registry publication, so admitted
-    /// execution is visible throughout that gap. Callers hold participation
-    /// and therefore count themselves. Suspended futex, epoll, and fd loops
-    /// have dropped participation and are intentionally absent. Process fork
-    /// and crash do not use this predicate; their barrier raise decisions use
-    /// durable `Task::threads()` membership.
-    fn has_peer_guest_executor(&self) -> bool {
-        self.guest_executors.has_peer_executor()
-    }
-
     fn publish_process_terminal(&self, terminal: Result<RunResult, ()>) {
         let mut published = self.process_terminal.lock();
         if published.is_none() {
@@ -1749,22 +1726,32 @@ pub(crate) fn dispatch_with_panic_backstop(
     }
 }
 
-/// Enter the sole-executor stage-1 authority at an outer boundary that owns
-/// the dispatcher exclusively. Normalized handlers only receive `&self`, so
-/// safe code in a handler cannot satisfy this witness.
-pub(crate) fn with_single_executor_stage1<T>(
-    dispatcher: &mut SyscallDispatcher,
-    run: impl FnOnce(&mut SyscallDispatcher, &mut quiesce::Stage1Exclusive) -> T,
-) -> T {
-    let mut authority = quiesce::Stage1Exclusive::claim();
-    run(dispatcher, &mut authority)
+/// Enter sole-executor stage-1 authority only from an exact-MM census token.
+/// Normalized handlers receive no such token.
+pub(crate) fn with_sole_mm_stage1<T>(
+    participation: &crate::dispatch::MmExecutorParticipation,
+    run: impl FnOnce(&mut quiesce::SoleMmStage1<'_>) -> T,
+) -> Option<T> {
+    let mut authority = quiesce::SoleMmStage1::claim(participation)?;
+    Some(run(&mut authority))
 }
 
 #[cfg(test)]
-pub(crate) fn with_stage1_exclusive_for_test<T>(
-    run: impl FnOnce(&mut quiesce::Stage1Exclusive) -> T,
+pub(crate) fn with_real_pt_pause_for_test<T>(
+    run: impl FnOnce(&mut quiesce::PtPauseGuard) -> T,
 ) -> T {
-    let mut authority = quiesce::Stage1Exclusive::claim();
+    let barrier: &'static crate::fork_quiesce::PtQuiesce =
+        Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
+    let registry = carrick_hal::GenericVcpuRegistry::new();
+    let census = crate::kernel::GuestExecutorCensus::default();
+    let mut authority = quiesce::acquire_pt_pause(
+        barrier,
+        &registry,
+        &census,
+        ThreadId::synthetic_for_tests(20_900),
+        quiesce::PtPauseBudget::DEFAULT,
+    )
+    .expect("test must acquire a real page-table pause");
     run(&mut authority)
 }
 
@@ -2133,7 +2120,7 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     #[cfg(test)]
     crash_lease_drain_budget: CrashLeaseDrainBudget,
     kernel_thread: Option<crate::kernel::ThreadRef>,
-    guest_execution: Option<crate::kernel::GuestExecutorParticipation>,
+    guest_execution: Option<Arc<crate::dispatch::MmExecutorParticipation>>,
     /// Exact Task 1 execution authority while this logical thread is running.
     /// Empty only before its first reclaim snapshot and while blocked.
     execution_lease: ExecutionLeaseCell,
@@ -2474,6 +2461,7 @@ enum HvpatchProductionPhase {
     Complete,
 }
 
+#[cfg(test)]
 fn enter_guest_executor_then_register<F>(
     census: &Arc<crate::kernel::GuestExecutorCensus>,
     thread: Option<crate::kernel::ThreadRef>,
@@ -2489,6 +2477,25 @@ where
     F: FnOnce() -> carrick_hal::VcpuRegistrationEnrollment,
 {
     let participation = census.enter(thread)?;
+    let enrollment = register();
+    Ok((participation, enrollment))
+}
+
+fn enter_mm_executor_then_register<F>(
+    dispatcher: &crate::dispatch::SyscallDispatcher,
+    thread: Option<crate::kernel::ThreadRef>,
+    register: F,
+) -> Result<
+    (
+        Arc<crate::dispatch::MmExecutorParticipation>,
+        carrick_hal::VcpuRegistrationEnrollment,
+    ),
+    crate::kernel::GuestExecutorCensusError,
+>
+where
+    F: FnOnce() -> carrick_hal::VcpuRegistrationEnrollment,
+{
+    let participation = Arc::new(dispatcher.enter_mm_executor_for_thread(thread)?);
     let enrollment = register();
     Ok((participation, enrollment))
 }
@@ -4647,7 +4654,7 @@ where
         let cow_authority = Arc::new(KernelFrameCowAuthority {
             kernel: Arc::clone(child_context.kernel()),
             mm,
-            guest_executors: Arc::clone(&self.kernel.guest_executors),
+            guest_executors: self.kernel.dispatcher.mm_executor_census(),
             kicker: Arc::clone(&self.state.kicker),
             tid,
             identity: cow_identity,
@@ -5666,8 +5673,8 @@ where
                 context.thread().key(),
                 registration_wake_mode,
             );
-            let (participation, enrollment) = enter_guest_executor_then_register(
-                &self.kernel.guest_executors,
+            let (participation, enrollment) = enter_mm_executor_then_register(
+                &self.kernel.dispatcher,
                 self.state.kernel_thread.as_ref().map(Arc::clone),
                 || {
                     self.state
@@ -7731,22 +7738,21 @@ where
             .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
         let coordinator = kernel.dispatcher.mm_mutation_coordinator();
         let mm = context.shared().mm().id();
-        if kernel.has_peer_guest_executor() {
-            let mut pause = self.pt_pause(&kernel.guest_executors).map_err(|error| {
+        let executor = Arc::clone(self.guest_execution.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration("MM mutation lacks executor participation".to_owned())
+        })?);
+        if let Some(mut sole) = quiesce::SoleMmStage1::claim(&executor) {
+            let mut mutation =
+                crate::dispatch::mm_mutation::from_sole_executor(&mut sole, coordinator, mm);
+            Ok(run(&mut mutation))
+        } else {
+            let mut pause = self.pt_pause(executor.executor_census()).map_err(|error| {
                 RuntimeError::Configuration(format!(
                     "fault page-table pause failed before mutation: {error:?}"
                 ))
             })?;
             let mut mutation =
                 crate::dispatch::mm_mutation::from_pt_pause(&mut pause, coordinator, mm);
-            Ok(run(&mut mutation))
-        } else {
-            let mut exclusive = quiesce::Stage1Exclusive::claim();
-            let mut mutation = crate::dispatch::mm_mutation::from_stage1_exclusive(
-                &mut exclusive,
-                coordinator,
-                mm,
-            );
             Ok(run(&mut mutation))
         }
     }
@@ -7799,14 +7805,21 @@ where
         // different reasons, and the backend page-table manager needs to know
         // that so it can reclaim the spare sub-tables an alias teardown empties
         // (`carrick_hal::stage1_exclusive` documents what leaks when it cannot).
-        let mut stage1_exclusive = syscall_edits_stage1(frame.number.raw(), frame.args[2])
-            .then(quiesce::Stage1Exclusive::claim);
+        let mm_executor = Arc::clone(self.guest_execution.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration(
+                "syscall service lacks MM executor participation".to_owned(),
+            )
+        })?);
+        let edits_stage1 = syscall_edits_stage1(frame.number.raw(), frame.args[2]);
+        let mut sole_mm = edits_stage1
+            .then(|| quiesce::SoleMmStage1::claim(&mm_executor))
+            .flatten();
         let mut pt_pause = if syscall_takes_pre_dispatch_pt_pause(
             frame.number.raw(),
             frame.args[2],
-            kernel.has_peer_guest_executor(),
+            edits_stage1 && sole_mm.is_none(),
         ) {
-            match self.pt_pause(&kernel.guest_executors) {
+            match self.pt_pause(mm_executor.executor_census()) {
                 Ok(guard) => Some(guard),
                 Err(quiesce::PtPauseError::TimedOut) => {
                     // No dispatcher/backend mapping call has started yet. Return
@@ -7895,11 +7908,11 @@ where
                                 &mut mutation,
                             )
                         } else {
-                            let authority = stage1_exclusive.as_mut().unwrap_or_else(|| {
+                            let authority = sole_mm.as_mut().unwrap_or_else(|| {
                                 tracing::error!("mutation dispatch lacks outer stage-1 authority");
                                 std::process::abort();
                             });
-                            let mut mutation = crate::dispatch::mm_mutation::from_stage1_exclusive(
+                            let mut mutation = crate::dispatch::mm_mutation::from_sole_executor(
                                 authority,
                                 coordinator,
                                 kernel_context.shared().mm().id(),
@@ -8107,11 +8120,11 @@ where
                         let permit = mutation.host_alias_permit();
                         install_alias(&permit)
                     } else {
-                        let authority = stage1_exclusive.as_mut().unwrap_or_else(|| {
+                        let authority = sole_mm.as_mut().unwrap_or_else(|| {
                             tracing::error!("host-alias install lacks outer stage-1 authority");
                             std::process::abort();
                         });
-                        let mutation = crate::dispatch::mm_mutation::from_stage1_exclusive(
+                        let mutation = crate::dispatch::mm_mutation::from_sole_executor(
                             authority,
                             coordinator,
                             kernel_context.shared().mm().id(),
@@ -8783,7 +8796,7 @@ fn prepare_initial_runner_handoff<E: ThreadedEngine + 'static>(
             Arc::new(KernelFrameCowAuthority {
                 kernel: Arc::clone(context.kernel()),
                 mm,
-                guest_executors: Arc::clone(&kernel.guest_executors),
+                guest_executors: kernel.dispatcher.mm_executor_census(),
                 kicker: Arc::clone(kicker),
                 tid: this_tid,
                 identity: carrick_hal::FrameCowIdentity {
@@ -11342,7 +11355,13 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(runtime.guest_executors.participant_count_for_probe(), 0);
+        assert_eq!(
+            runtime
+                .dispatcher
+                .mm_executor_census()
+                .participant_count_for_probe(),
+            0
+        );
         assert_eq!(root.task().threads().len(), 2);
         assert_eq!(sibling.task().key(), root.task().key());
         assert!(
@@ -11436,7 +11455,8 @@ mod tests {
         let source = include_str!("mod.rs");
         let poll = source.split("fn poll_with_engine(").nth(1).unwrap();
         assert!(
-            poll.find("guest_executors").unwrap() < poll.find("subscribe_register_vcpu").unwrap()
+            poll.find("enter_mm_executor_then_register").unwrap()
+                < poll.find("subscribe_register_vcpu").unwrap()
         );
     }
 

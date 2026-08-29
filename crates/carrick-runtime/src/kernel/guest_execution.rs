@@ -15,18 +15,19 @@
 //! re-register through its own raised fork barrier.
 //!
 //! [`GuestExecutorCensus`] tracks live guest executor participation for one
-//! Linux process. When a thread suspends (for example on a futex, `epoll_wait`,
-//! or host blocking wait), suspension drops its [`GuestExecutorParticipation`]
-//! via `leave_executor`. Blocked logical loops do not remain in the census while
-//! suspended.
+//! exact dispatch MM. Distinct CLONE_VM dispatchers share the census through
+//! their shared MM authority. When a thread suspends (for example on a futex,
+//! `epoll_wait`, or host blocking wait), suspension drops its
+//! [`GuestExecutorParticipation`] via `leave_executor`. Blocked logical loops do
+//! not remain in the census while suspended.
 //!
 //! Upon waking and seeking initial admission or re-admission to execute guest
 //! code, a thread enters [`GuestExecutorCensus`] before attempting vCPU
-//! registration (`enter_guest_executor_then_register`). If a lease drain freeze
-//! is held by another owner, registration admission returns `Waiting`, and the
+//! registration (`enter_mm_executor_then_register`). If a lease drain freeze is
+//! held by another owner, registration admission returns `Waiting`, and the
 //! thread suspends again (dropping its participation). This ordering guarantees
 //! that any peer thread attempting to enter guest execution is visible in the
-//! census before its registration can be published.
+//! exact-MM census before its registration can be published.
 //!
 //! Membership is maintained by [`GuestExecutorParticipation`], an RAII guard
 //! held for the lifetime of an admitted guest executor quantum, in the same
@@ -48,7 +49,7 @@ use std::collections::BTreeSet;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 
 use super::objects::{
     CrashSafePointParticipation, CrashSafePointParticipationError, ThreadKey, ThreadRef,
@@ -91,14 +92,12 @@ pub enum GuestExecutorCensusError {
     CrashParticipationIdentityExhausted { thread: ThreadKey },
 }
 
-/// Live guest executors for one Linux process — the threads actively
-/// participating in guest execution on its behalf.
+/// Live guest executors for one exact dispatch MM.
 ///
-/// Scope is one Linux process because that is the scope of the vCPU registry:
-/// an HVPatch fork child receives a fresh kicker
-/// (`ThreadedEngine::fresh_fork_kicker`) alongside its own `KernelState`, and a
-/// legacy `libc::fork` child gets both by copying the parent's process. Threads
-/// of one thread group share both.
+/// The owning `DispatchMmAuthority` is shared by CLONE_VM dispatchers, so a
+/// process boundary cannot conceal a peer that may walk the same stage-1
+/// descriptors. Copied forks and exec replacements receive fresh authorities
+/// and therefore fresh censuses.
 #[derive(Debug, Default)]
 pub struct GuestExecutorCensus {
     state: Mutex<GuestExecutorCensusState>,
@@ -190,6 +189,28 @@ pub struct GuestExecutorParticipation {
     census: Arc<GuestExecutorCensus>,
     identity: GuestExecutorIdentity,
     crash_participation: Option<CrashSafePointParticipation>,
+}
+
+/// Proof that one exact census contains only the borrowing participant.
+///
+/// The census mutex remains held for the proof's lifetime, so another executor
+/// cannot enter after the sole-executor decision and race the protected work.
+pub(crate) struct SoleGuestExecutor<'participant> {
+    _state: MutexGuard<'participant, GuestExecutorCensusState>,
+    _participant: std::marker::PhantomData<&'participant GuestExecutorParticipation>,
+}
+
+impl GuestExecutorParticipation {
+    pub(crate) fn claim_sole(&self) -> Option<SoleGuestExecutor<'_>> {
+        let state = self.census.state.lock();
+        if state.participants.len() != 1 || !state.participants.contains(&self.identity) {
+            return None;
+        }
+        Some(SoleGuestExecutor {
+            _state: state,
+            _participant: std::marker::PhantomData,
+        })
+    }
 }
 
 impl Drop for GuestExecutorParticipation {

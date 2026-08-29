@@ -69,6 +69,7 @@ pub use frame_inventory::{
     FrameInventoryAuthority, FrameInventoryError, FrameInventoryReserveError,
     FrameInventorySnapshot, FrameRow, MappingRow,
 };
+pub(crate) use guest_execution::SoleGuestExecutor;
 pub use guest_execution::{
     GuestExecutorCensus, GuestExecutorCensusError, GuestExecutorParticipation,
 };

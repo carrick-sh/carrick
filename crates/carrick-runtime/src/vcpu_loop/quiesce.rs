@@ -81,6 +81,39 @@ impl Drop for Stage1Exclusive {
     }
 }
 
+/// Stage-1 authority for one executor proven sole in the exact MM census.
+///
+/// The census election stays locked until drop, preventing a CLONE_VM peer
+/// dispatcher from entering after the proof is minted.
+pub(crate) struct SoleMmStage1<'participant> {
+    _sole: crate::kernel::SoleGuestExecutor<'participant>,
+    _stage1: Stage1Exclusive,
+    mm: crate::kernel::MmId,
+    coordinator: Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>,
+}
+
+impl<'participant> SoleMmStage1<'participant> {
+    pub(super) fn claim(
+        participation: &'participant crate::dispatch::MmExecutorParticipation,
+    ) -> Option<Self> {
+        let sole = participation.claim_sole()?;
+        Some(Self {
+            _sole: sole,
+            _stage1: Stage1Exclusive::claim(),
+            mm: participation.mm_id(),
+            coordinator: participation.mutation_coordinator(),
+        })
+    }
+
+    pub(crate) fn authorizes(
+        &self,
+        coordinator: &Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>,
+        mm: crate::kernel::MmId,
+    ) -> bool {
+        self.mm == mm && Arc::ptr_eq(&self.coordinator, coordinator)
+    }
+}
+
 pub(crate) struct PtPauseGuard {
     _inner: crate::fork_quiesce::PtPauseGuard,
 }
@@ -1253,7 +1286,7 @@ where
         let cow_authority = Arc::new(KernelFrameCowAuthority {
             kernel: Arc::clone(child_context.kernel()),
             mm: child_mm_id,
-            guest_executors: Arc::clone(&child_kernel.guest_executors),
+            guest_executors: child_kernel.dispatcher.mm_executor_census(),
             kicker: Arc::clone(&child_kicker),
             tid: child_tid,
             identity: cow_identity,

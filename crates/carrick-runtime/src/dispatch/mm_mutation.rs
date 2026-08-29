@@ -137,11 +137,15 @@ pub(crate) fn from_pt_pause<'authority>(
     }
 }
 
-pub(crate) fn from_stage1_exclusive<'authority>(
-    _authority: &'authority mut crate::vcpu_loop::quiesce::Stage1Exclusive,
+pub(crate) fn from_sole_executor<'authority>(
+    authority: &'authority mut crate::vcpu_loop::quiesce::SoleMmStage1<'_>,
     coordinator: Arc<MmMutationCoordinator>,
     mm: MmId,
 ) -> MmMutationGuard<'authority> {
+    assert!(
+        authority.authorizes(&coordinator, mm),
+        "sole-executor authority belongs to another MM"
+    );
     MmMutationGuard {
         coordinator,
         mm,
@@ -213,9 +217,9 @@ pub(crate) mod test_support {
         coordinator: Arc<MmMutationCoordinator>,
         use_guard: impl FnOnce(&mut MmMutationGuard<'_>) -> T,
     ) -> T {
-        crate::vcpu_loop::with_stage1_exclusive_for_test(|authority| {
+        crate::vcpu_loop::with_real_pt_pause_for_test(|authority| {
             let mm = coordinator.mm();
-            let mut guard = from_stage1_exclusive(authority, coordinator, mm);
+            let mut guard = from_pt_pause(authority, coordinator, mm);
             use_guard(&mut guard)
         })
     }
