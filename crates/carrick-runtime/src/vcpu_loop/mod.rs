@@ -8186,6 +8186,7 @@ where
                 dispatch_with_panic_backstop(request.number.raw(), self.this_tid, || {
                     let lease_guard = if crate::dispatch::syscall_requires_execution_lease(
                         request.number.raw(),
+                        request.args,
                     ) {
                         Some(self.execution_lease.lock())
                     } else {

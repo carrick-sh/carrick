@@ -3918,6 +3918,15 @@ impl Task {
         self.job_control.lock().stopped_by.is_some()
     }
 
+    pub(crate) fn is_ptrace_stopped_by(&self, tracer: TaskKey) -> bool {
+        let lifecycle = self.lifecycle.lock();
+        if *lifecycle != TaskLifecycle::Live {
+            return false;
+        }
+        let state = self.job_control.lock();
+        state.ptrace_tracer == Some(tracer) && state.stopped_by_ptrace
+    }
+
     pub(super) fn claim_ptrace_traceme(&self, tracer: TaskKey) -> bool {
         let lifecycle = self.lifecycle.lock();
         if *lifecycle != TaskLifecycle::Live {

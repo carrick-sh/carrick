@@ -2548,16 +2548,123 @@ impl SyscallDispatcher {
                             DispatchOutcome::errno(LINUX_ESRCH)
                         }
                     }
-                    LINUX_PTRACE_PEEKTEXT
-                    | LINUX_PTRACE_PEEKDATA
-                    | LINUX_PTRACE_POKETEXT
-                    | LINUX_PTRACE_POKEDATA => {
-                        if target().is_none() {
-                            DispatchOutcome::errno(LINUX_ESRCH)
-                        } else if ptrace_text_data_addr_is_invalid(addr) {
-                            DispatchOutcome::errno(crate::linux_abi::LINUX_EIO)
-                        } else {
-                            DispatchOutcome::errno(LINUX_ENOSYS)
+                    LINUX_PTRACE_PEEKTEXT | LINUX_PTRACE_PEEKDATA => {
+                        if ptrace_text_data_addr_is_invalid(addr) {
+                            return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
+                        }
+                        let Ok(target_task_id) =
+                            crate::kernel::TaskId::from_abi_positive(pid.0)
+                        else {
+                            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+                        };
+                        let Some(target_task) = kernel.registry().task(target_task_id) else {
+                            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+                        };
+                        if !kernel.task_key_is_live(target_task.key()) {
+                            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+                        }
+                        if !target_task.is_ptrace_stopped_by(process.task_key()) {
+                            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+                        }
+                        let relation = cx.with_execution_lease(|lease| {
+                            kernel.foreign_mm(cx.kernel, lease, target_task.key())
+                        });
+                        let relation = match relation {
+                            Some(Ok(r)) => r,
+                            Some(Err(error)) => {
+                                return Ok(DispatchOutcome::errno(ptrace_foreign_mm_errno(&error)));
+                            }
+                            None => return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO)),
+                        };
+                        let foreign = match relation {
+                            crate::kernel::MmRelation::Foreign(foreign) => foreign,
+                            crate::kernel::MmRelation::Current(_) => {
+                                return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
+                            }
+                        };
+                        let Some(authority) = process.mm_access_authority() else {
+                            return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
+                        };
+                        let remote_va = carrick_guest_mem::GuestVa(addr.0);
+                        let range = match foreign.read_range(remote_va, 8) {
+                            Ok(Some(r)) => r,
+                            _ => return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO)),
+                        };
+                        let mut buf = [0u8; 8];
+                        match authority.read_foreign(&foreign, range, &mut buf) {
+                            Ok(receipt) if receipt.bytes_read() == 8 => {
+                                let word = u64::from_le_bytes(buf);
+                                DispatchOutcome::Returned {
+                                    value: word as i64,
+                                }
+                            }
+                            _ => DispatchOutcome::errno(crate::linux_abi::LINUX_EIO),
+                        }
+                    }
+                    LINUX_PTRACE_POKETEXT | LINUX_PTRACE_POKEDATA => {
+                        if ptrace_text_data_addr_is_invalid(addr) {
+                            return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
+                        }
+                        let Ok(target_task_id) =
+                            crate::kernel::TaskId::from_abi_positive(pid.0)
+                        else {
+                            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+                        };
+                        let Some(target_task) = kernel.registry().task(target_task_id) else {
+                            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+                        };
+                        if !kernel.task_key_is_live(target_task.key()) {
+                            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+                        }
+                        if !target_task.is_ptrace_stopped_by(process.task_key()) {
+                            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+                        }
+                        let staged_data = data.to_le_bytes();
+                        let relation = cx.with_execution_lease(|lease| {
+                            kernel.foreign_mm(cx.kernel, lease, target_task.key())
+                        });
+                        let relation = match relation {
+                            Some(Ok(r)) => r,
+                            Some(Err(error)) => {
+                                return Ok(DispatchOutcome::errno(ptrace_foreign_mm_errno(&error)));
+                            }
+                            None => return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO)),
+                        };
+                        let foreign = match relation {
+                            crate::kernel::MmRelation::Foreign(foreign) => foreign,
+                            crate::kernel::MmRelation::Current(_) => {
+                                return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
+                            }
+                        };
+                        let Some(authority) = process.mm_access_authority() else {
+                            return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
+                        };
+                        let remote_va = carrick_guest_mem::GuestVa(addr.0);
+                        let write_range = match foreign.write_range(remote_va, 8) {
+                            Ok(Some(r)) => r,
+                            _ => return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO)),
+                        };
+                        let mutation_tid = cx.tid();
+                        let commit_res = this.with_current_mm_executor_released(cx, || {
+                            authority.with_foreign_mutation(
+                                &foreign,
+                                mutation_tid,
+                                |mutation_guard| {
+                                    let mut witness = authority
+                                        .break_foreign_cow(mutation_guard, &foreign, write_range)?;
+                                    let prepared = authority.prepare_foreign_write_range(
+                                        &mut witness,
+                                        write_range,
+                                        &staged_data,
+                                    )?;
+                                    let _receipt = prepared.commit();
+                                    Ok(())
+                                },
+                            )
+                        })?;
+                        match commit_res {
+                            Ok(()) => DispatchOutcome::Returned { value: 0 },
+                            Err(_) => DispatchOutcome::errno(crate::linux_abi::LINUX_EIO),
                         }
                     }
                     LINUX_PTRACE_PEEKUSER | LINUX_PTRACE_POKEUSER => {
@@ -4794,6 +4901,13 @@ fn process_vm_foreign_mm_errno(error: &crate::kernel::MmAccessError) -> LinuxErr
     }
 }
 
+fn ptrace_foreign_mm_errno(error: &crate::kernel::MmAccessError) -> LinuxErrno {
+    match error {
+        crate::kernel::MmAccessError::UnknownTask(_) => LINUX_ESRCH,
+        _ => crate::linux_abi::LINUX_EIO,
+    }
+}
+
 fn fill_deterministic_bootstrap_random(bytes: &mut [u8]) {
     let mut state = 0x00ca_221c_u64;
     for byte in bytes {
@@ -6161,15 +6275,15 @@ mod kernel_process_dispatch_tests {
     #[test]
     fn syscall_requires_execution_lease_matches_exact_process_vm_numbers() {
         use crate::dispatch::syscall_requires_execution_lease;
-        assert!(syscall_requires_execution_lease(270));
-        assert!(syscall_requires_execution_lease(271));
+        let empty_args = SyscallArgs::from([0; 6]);
+        assert!(syscall_requires_execution_lease(270, empty_args));
+        assert!(syscall_requires_execution_lease(271, empty_args));
 
         for ordinary in [
             0,   // read
             1,   // write
             95,  // waitid
             98,  // futex
-            117, // ptrace
             124, // sched_yield
             172, // getpid
             173, // getppid
@@ -6179,8 +6293,37 @@ mod kernel_process_dispatch_tests {
             260, // wait4
         ] {
             assert!(
-                !syscall_requires_execution_lease(ordinary),
+                !syscall_requires_execution_lease(ordinary, empty_args),
                 "syscall {ordinary} must not require execution lease"
+            );
+        }
+
+        for req in [
+            LINUX_PTRACE_PEEKTEXT,
+            LINUX_PTRACE_PEEKDATA,
+            LINUX_PTRACE_POKETEXT,
+            LINUX_PTRACE_POKEDATA,
+        ] {
+            let args = SyscallArgs::from([req, 0, 0, 0, 0, 0]);
+            assert!(
+                syscall_requires_execution_lease(117, args),
+                "ptrace request {req} must require execution lease"
+            );
+        }
+
+        for req in [
+            0,  // PTRACE_TRACEME
+            3,  // PTRACE_PEEKUSER
+            6,  // PTRACE_POKEUSER
+            7,  // PTRACE_CONT
+            8,  // PTRACE_KILL
+            16, // PTRACE_ATTACH
+            17, // PTRACE_DETACH
+        ] {
+            let args = SyscallArgs::from([req, 0, 0, 0, 0, 0]);
+            assert!(
+                !syscall_requires_execution_lease(117, args),
+                "ptrace request {req} must not require execution lease"
             );
         }
     }
@@ -6194,7 +6337,7 @@ mod kernel_process_dispatch_tests {
             "process_vm_writev must not acquire caller/current-MM mutation authority",
         );
         assert!(!crate::dispatch::syscall_requires_mm_mutation(271, args));
-        assert!(crate::dispatch::syscall_requires_execution_lease(271));
+        assert!(crate::dispatch::syscall_requires_execution_lease(271, args));
         assert_eq!(crate::dispatch::MM_MUTATION_SYSCALLS.len(), 17);
     }
 
@@ -6584,6 +6727,174 @@ mod kernel_process_dispatch_tests {
                 Some(&lease),
             ),
             DispatchOutcome::errno(LINUX_ESRCH),
+        );
+    }
+
+    #[test]
+    fn hvpatch_ptrace_peektext_and_peekdata_are_equivalent() {
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_126);
+        let target = process_vm_target_with_payload(&root, 61_127, b"WORDPAIR");
+        arm_ptrace_memory_access(&root, &target);
+        let root = refreshed(&root);
+        let target_pid = target.task().key().id.raw();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+
+        let peektext = dispatch_with_lease(
+            &mut dispatcher,
+            &root,
+            &mut memory,
+            SYS_PTRACE,
+            [LINUX_PTRACE_PEEKTEXT, target_pid as u64, TARGET_VA, 0, 0, 0],
+            Some(&lease),
+        );
+        let peekdata = dispatch_with_lease(
+            &mut dispatcher,
+            &root,
+            &mut memory,
+            SYS_PTRACE,
+            [LINUX_PTRACE_PEEKDATA, target_pid as u64, TARGET_VA, 0, 0, 0],
+            Some(&lease),
+        );
+
+        assert_eq!(
+            peektext,
+            DispatchOutcome::Returned {
+                value: u64::from_le_bytes(*b"WORDPAIR") as i64,
+            },
+        );
+        assert_eq!(peektext, peekdata);
+    }
+
+    #[test]
+    fn hvpatch_ptrace_poketext_and_pokedata_are_equivalent() {
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_128);
+        let mut initial = vec![b'_'; 0x4000];
+        initial[..8].copy_from_slice(b"initword");
+        let target = crate::kernel::consumer_cow_fixture(root.kernel(), &root, 61_129, initial);
+        target.observe_caller_executor_census(dispatcher.mm_executor_census());
+        arm_ptrace_memory_access(&root, target.target());
+        let root = refreshed(&root);
+        let target_pid = target.target().task().key().id.raw();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+
+        let poketext_val = u64::from_le_bytes(*b"POKETEXT");
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [
+                    LINUX_PTRACE_POKETEXT,
+                    target_pid as u64,
+                    TARGET_VA,
+                    poketext_val,
+                    0,
+                    0,
+                ],
+                Some(&lease),
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        assert_eq!(target.child_bytes(0, 8), b"POKETEXT");
+
+        let pokedata_val = u64::from_le_bytes(*b"POKEDATA");
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [
+                    LINUX_PTRACE_POKEDATA,
+                    target_pid as u64,
+                    TARGET_VA,
+                    pokedata_val,
+                    0,
+                    0,
+                ],
+                Some(&lease),
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        assert_eq!(target.child_bytes(0, 8), b"POKEDATA");
+    }
+
+    #[test]
+    fn hvpatch_ptrace_memory_rejects_missing_or_wrong_execution_lease() {
+        let (_lane, mut dispatcher, _process, root, _root_lease) = bound_dispatcher(61_130);
+        let (_other_lane, _other_dispatcher, _other_process, _other_root, wrong_lease) =
+            bound_dispatcher(61_131);
+        let target = process_vm_target_with_payload(&root, 61_132, b"LEASTEST");
+        arm_ptrace_memory_access(&root, &target);
+        let root = refreshed(&root);
+        let target_pid = target.task().key().id.raw();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [LINUX_PTRACE_PEEKDATA, target_pid as u64, TARGET_VA, 0, 0, 0],
+                None,
+            ),
+            DispatchOutcome::errno(crate::linux_abi::LINUX_EIO),
+            "missing execution lease on ptrace memory read fails closed with EIO",
+        );
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [LINUX_PTRACE_PEEKDATA, target_pid as u64, TARGET_VA, 0, 0, 0],
+                Some(&wrong_lease),
+            ),
+            DispatchOutcome::errno(crate::linux_abi::LINUX_EIO),
+            "wrong execution lease on ptrace memory read fails closed with EIO",
+        );
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [
+                    LINUX_PTRACE_POKEDATA,
+                    target_pid as u64,
+                    TARGET_VA,
+                    0x1234_5678,
+                    0,
+                    0,
+                ],
+                None,
+            ),
+            DispatchOutcome::errno(crate::linux_abi::LINUX_EIO),
+            "missing execution lease on ptrace memory write fails closed with EIO",
+        );
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [
+                    LINUX_PTRACE_POKEDATA,
+                    target_pid as u64,
+                    TARGET_VA,
+                    0x1234_5678,
+                    0,
+                    0,
+                ],
+                Some(&wrong_lease),
+            ),
+            DispatchOutcome::errno(crate::linux_abi::LINUX_EIO),
+            "wrong execution lease on ptrace memory write fails closed with EIO",
         );
     }
 
