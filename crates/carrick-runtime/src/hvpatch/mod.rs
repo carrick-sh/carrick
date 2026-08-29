@@ -37,8 +37,8 @@ pub(crate) use mm_resources::{ExecMmDispositionKind, ExecMmReservation, RetiredS
 #[cfg(test)]
 pub(crate) use stage1_mm::Stage1MmPool;
 pub(crate) use stage1_mm::{
-    CowInvalidationError, CowInvalidationTicket, PreparedStage1Mm, Stage1MmLease,
-    Stage1MmRetirement,
+    CowInvalidationError, CowInvalidationObserver, CowInvalidationTicket, PreparedStage1Mm,
+    Stage1MmLease, Stage1MmRetirement,
 };
 
 /// Installation permission kept private to the HVPatch bootstrap/lifecycle

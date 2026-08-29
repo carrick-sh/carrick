@@ -35,7 +35,7 @@ impl ForeignAsid {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ForeignMmBinding {
     asid: ForeignAsid,
     stage1_root: Gpa,
@@ -50,6 +50,120 @@ impl ForeignMmBinding {
     }
     pub const fn stage1_root(self) -> Gpa {
         self.stage1_root
+    }
+
+    /// Boundary constructor for crates that intentionally depend only on HAL
+    /// domain types rather than on `carrick-guest-mem` directly.
+    pub const fn for_aarch64_root_raw(asid: ForeignAsid, stage1_root: u64) -> Self {
+        Self::for_aarch64(asid, Gpa(stage1_root))
+    }
+}
+
+/// Exact lifetime of one numeric target ASID. This is deliberately distinct
+/// from both owner and COW publication generations.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ForeignAsidGeneration {
+    asid: ForeignAsid,
+    generation: NonZeroU64,
+}
+
+impl ForeignAsidGeneration {
+    pub const fn from_runtime_binding(asid: ForeignAsid, generation: NonZeroU64) -> Self {
+        Self { asid, generation }
+    }
+
+    pub const fn asid(self) -> ForeignAsid {
+        self.asid
+    }
+
+    pub const fn generation(self) -> NonZeroU64 {
+        self.generation
+    }
+}
+
+/// Exact MM + ASID lifetime + stage-1 root. Keeping the validated binding as
+/// one field prevents a recycled numeric ASID from acknowledging work for an
+/// older root.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ForeignStage1Identity {
+    mm: ForeignMmId,
+    binding: ForeignMmBinding,
+    asid_generation: ForeignAsidGeneration,
+}
+
+impl ForeignStage1Identity {
+    pub const fn new(
+        mm: ForeignMmId,
+        binding: ForeignMmBinding,
+        asid_generation: ForeignAsidGeneration,
+    ) -> Option<Self> {
+        if binding.asid().raw_for_probe() != asid_generation.asid().raw_for_probe() {
+            return None;
+        }
+        Some(Self {
+            mm,
+            binding,
+            asid_generation,
+        })
+    }
+
+    pub const fn mm(self) -> ForeignMmId {
+        self.mm
+    }
+
+    pub const fn binding(self) -> ForeignMmBinding {
+        self.binding
+    }
+
+    pub const fn asid_generation(self) -> ForeignAsidGeneration {
+        self.asid_generation
+    }
+}
+
+/// Monotonic publication within one exact stage-1 identity.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct ForeignCowInvalidationGeneration(NonZeroU64);
+
+impl ForeignCowInvalidationGeneration {
+    pub const fn from_runtime_publication(raw: NonZeroU64) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw_for_probe(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Complete typed identity of one target-MM COW invalidation publication.
+///
+/// ```compile_fail
+/// # use carrick_hal::{ForeignAsidGeneration, ForeignCowInvalidationIdentity,
+/// #     ForeignStage1Identity};
+/// # fn swapped(stage1: ForeignStage1Identity, asid: ForeignAsidGeneration) {
+/// let _ = ForeignCowInvalidationIdentity::new(stage1, asid);
+/// # }
+/// ```
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ForeignCowInvalidationIdentity {
+    stage1: ForeignStage1Identity,
+    generation: ForeignCowInvalidationGeneration,
+}
+
+impl ForeignCowInvalidationIdentity {
+    pub const fn new(
+        stage1: ForeignStage1Identity,
+        generation: ForeignCowInvalidationGeneration,
+    ) -> Self {
+        Self { stage1, generation }
+    }
+
+    pub const fn stage1(self) -> ForeignStage1Identity {
+        self.stage1
+    }
+
+    pub const fn generation(self) -> ForeignCowInvalidationGeneration {
+        self.generation
     }
 }
 
@@ -118,6 +232,21 @@ pub trait ForeignCowReceipt: Debug + Send + Sync {
     fn physical_base(&self) -> Gpa;
     fn physical_len(&self) -> u64;
     fn owner_generation(&self) -> ForeignOwnerGeneration;
+    fn live_inventory(&self) -> &dyn ForeignCowLiveInventoryReceipt;
+}
+
+/// Sealed carrier proof that the COW receipt's complete physical identity is
+/// live in the exact post-commit inventory. Concrete values remain private to
+/// the transport and are data only; runtime compares every domain before
+/// minting safe write authority.
+pub trait ForeignCowLiveInventoryReceipt: Debug + Send + Sync {
+    fn mm(&self) -> ForeignMmId;
+    fn frame_inventory_revision(&self) -> ForeignFrameInventoryRevision;
+    fn mapping(&self) -> MappingId;
+    fn frame(&self) -> crate::FrameId;
+    fn physical_base(&self) -> Gpa;
+    fn physical_len(&self) -> u64;
+    fn owner_generation(&self) -> ForeignOwnerGeneration;
 }
 
 /// Backend completion data for a copy through one authenticated post-COW
@@ -151,22 +280,13 @@ pub trait ForeignMmReadLease: Debug + Send + Sync {
     fn break_cow(
         &self,
         invocation: &ForeignMmInvocation,
-        authority: &dyn ForeignMmLiveAuthority,
         invalidator: &mut dyn ForeignMmInvalidator,
         snapshot: &dyn ForeignMmSnapshot,
         va: GuestVa,
         len: usize,
         deadline: Instant,
     ) -> Result<Box<dyn ForeignCowReceipt>, ForeignMmTransportError> {
-        let _ = (
-            invocation,
-            authority,
-            invalidator,
-            snapshot,
-            va,
-            len,
-            deadline,
-        );
+        let _ = (invocation, invalidator, snapshot, va, len, deadline);
         Err(ForeignMmTransportError::AuthorityUnavailable)
     }
 
@@ -288,7 +408,6 @@ impl ForeignMmLeaseEndpoint {
 
     pub fn break_cow(
         &self,
-        authority: &dyn ForeignMmLiveAuthority,
         invalidator: &mut dyn ForeignMmInvalidator,
         snapshot: &dyn ForeignMmSnapshot,
         va: GuestVa,
@@ -296,15 +415,8 @@ impl ForeignMmLeaseEndpoint {
         deadline: Instant,
     ) -> Result<Box<dyn ForeignCowReceipt>, ForeignMmTransportError> {
         let invocation = ForeignMmInvocation { _private: () };
-        self.lease.break_cow(
-            &invocation,
-            authority,
-            invalidator,
-            snapshot,
-            va,
-            len,
-            deadline,
-        )
+        self.lease
+            .break_cow(&invocation, invalidator, snapshot, va, len, deadline)
     }
 
     pub fn write(
@@ -411,7 +523,6 @@ mod tests {
         fn break_cow(
             &self,
             _invocation: &ForeignMmInvocation,
-            _authority: &dyn ForeignMmLiveAuthority,
             _invalidator: &mut dyn ForeignMmInvalidator,
             snapshot: &dyn ForeignMmSnapshot,
             va: GuestVa,
@@ -492,6 +603,33 @@ mod tests {
         }
         fn vma_revision(&self) -> ForeignVmaRevision {
             self.vma_revision
+        }
+        fn frame_inventory_revision(&self) -> ForeignFrameInventoryRevision {
+            self.frame_inventory_revision
+        }
+        fn mapping(&self) -> MappingId {
+            self.mapping
+        }
+        fn frame(&self) -> crate::FrameId {
+            self.frame
+        }
+        fn physical_base(&self) -> Gpa {
+            self.physical_base
+        }
+        fn physical_len(&self) -> u64 {
+            self.physical_len
+        }
+        fn owner_generation(&self) -> ForeignOwnerGeneration {
+            self.owner_generation
+        }
+        fn live_inventory(&self) -> &dyn ForeignCowLiveInventoryReceipt {
+            self
+        }
+    }
+
+    impl ForeignCowLiveInventoryReceipt for CowReceipt {
+        fn mm(&self) -> ForeignMmId {
+            self.mm
         }
         fn frame_inventory_revision(&self) -> ForeignFrameInventoryRevision {
             self.frame_inventory_revision
@@ -610,7 +748,6 @@ mod tests {
         let mut invalidator = Invalidator;
         let cow = lease
             .break_cow(
-                &Live,
                 &mut invalidator,
                 snapshot.as_ref(),
                 GuestVa(0x4000),

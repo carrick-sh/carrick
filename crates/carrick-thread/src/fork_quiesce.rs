@@ -917,34 +917,19 @@ struct PtInvalidationState {
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct PtInvalidationParticipant {
-    mm_scope: u64,
+    stage1: carrick_hal::ForeignStage1Identity,
     tid: carrick_hal::ThreadId,
 }
 
 /// Data-only exact-ASID request published after a quiesced stage-1 edit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PtInvalidationRequest {
-    mm_scope: u64,
-    asid: u16,
-    asid_generation: u64,
-    invalidation_generation: u64,
+    identity: carrick_hal::ForeignCowInvalidationIdentity,
 }
 
 impl PtInvalidationRequest {
-    pub const fn mm_scope(self) -> u64 {
-        self.mm_scope
-    }
-
-    pub const fn asid(self) -> u16 {
-        self.asid
-    }
-
-    pub const fn asid_generation(self) -> u64 {
-        self.asid_generation
-    }
-
-    pub const fn invalidation_generation(self) -> u64 {
-        self.invalidation_generation
+    pub const fn identity(self) -> carrick_hal::ForeignCowInvalidationIdentity {
+        self.identity
     }
 }
 
@@ -1026,21 +1011,13 @@ impl PtQuiesce {
     /// names this logical executor. The callback runs without the barrier lock
     /// and the executor remains parked after acknowledgement until the pause
     /// guard drops.
-    pub fn park_servicing_invalidation(
+    pub fn park_servicing_exact_invalidation(
         &self,
+        stage1: carrick_hal::ForeignStage1Identity,
         tid: carrick_hal::ThreadId,
         mut service: impl FnMut(PtInvalidationRequest) -> Result<(), ()>,
     ) {
-        self.park_servicing_scoped_invalidation(0, tid, &mut service);
-    }
-
-    pub fn park_servicing_scoped_invalidation(
-        &self,
-        mm_scope: u64,
-        tid: carrick_hal::ThreadId,
-        mut service: impl FnMut(PtInvalidationRequest) -> Result<(), ()>,
-    ) {
-        let participant = PtInvalidationParticipant { mm_scope, tid };
+        let participant = PtInvalidationParticipant { stage1, tid };
         let mut serviced_phase = 0;
         let mut g = self.lock.lock().unwrap();
         while self.quiescing.load(Ordering::SeqCst) {
@@ -1135,21 +1112,9 @@ impl Drop for PtPauseGuard {
 }
 
 impl PtPauseGuard {
-    pub fn publish_invalidation(
+    pub fn publish_exact_invalidation(
         &self,
-        asid: u16,
-        asid_generation: u64,
-        expected: impl IntoIterator<Item = carrick_hal::ThreadId>,
-    ) -> Result<PtInvalidationPhase, PtInvalidationError> {
-        self.publish_scoped_invalidation(0, asid, asid_generation, asid_generation, expected)
-    }
-
-    pub fn publish_scoped_invalidation(
-        &self,
-        mm_scope: u64,
-        asid: u16,
-        asid_generation: u64,
-        invalidation_generation: u64,
+        identity: carrick_hal::ForeignCowInvalidationIdentity,
         expected: impl IntoIterator<Item = carrick_hal::ThreadId>,
     ) -> Result<PtInvalidationPhase, PtInvalidationError> {
         if !self.barrier.quiescing.load(Ordering::SeqCst) {
@@ -1159,19 +1124,20 @@ impl PtPauseGuard {
         if state.invalidation.is_some() {
             return Err(PtInvalidationError::AlreadyPublished);
         }
-        state.next_invalidation = state.next_invalidation.wrapping_add(1).max(1);
+        state.next_invalidation = state
+            .next_invalidation
+            .checked_add(1)
+            .unwrap_or_else(|| std::process::abort());
         let phase = PtInvalidationPhase(state.next_invalidation);
         state.invalidation = Some(PtInvalidationState {
             phase,
-            request: PtInvalidationRequest {
-                mm_scope,
-                asid,
-                asid_generation,
-                invalidation_generation,
-            },
+            request: PtInvalidationRequest { identity },
             expected: expected
                 .into_iter()
-                .map(|tid| PtInvalidationParticipant { mm_scope, tid })
+                .map(|tid| PtInvalidationParticipant {
+                    stage1: identity.stage1(),
+                    tid,
+                })
                 .collect(),
             acknowledged: BTreeSet::new(),
             failed: BTreeSet::new(),
@@ -1238,6 +1204,35 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
+
+    fn invalidation_identity(
+        mm: u64,
+        asid: u16,
+        asid_generation: u64,
+        root: u64,
+        cow_generation: u64,
+    ) -> carrick_hal::ForeignCowInvalidationIdentity {
+        use std::num::{NonZeroU16, NonZeroU64};
+
+        let mm = carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(mm).unwrap());
+        let asid = carrick_hal::ForeignAsid::from_kernel_allocation(NonZeroU16::new(asid).unwrap());
+        let binding = carrick_hal::ForeignMmBinding::for_aarch64_root_raw(asid, root);
+        let stage1 = carrick_hal::ForeignStage1Identity::new(
+            mm,
+            binding,
+            carrick_hal::ForeignAsidGeneration::from_runtime_binding(
+                asid,
+                NonZeroU64::new(asid_generation).unwrap(),
+            ),
+        )
+        .unwrap();
+        carrick_hal::ForeignCowInvalidationIdentity::new(
+            stage1,
+            carrick_hal::ForeignCowInvalidationGeneration::from_runtime_publication(
+                NonZeroU64::new(cow_generation).unwrap(),
+            ),
+        )
+    }
 
     #[test]
     fn quiesce_waits_for_all_others_then_releases() {
@@ -1579,17 +1574,17 @@ mod tests {
         let guard = barrier.pause_guard(carrick_hal::ThreadId::synthetic_for_tests(800));
         let serviced = Arc::new(AtomicBool::new(false));
         let worker_serviced = Arc::clone(&serviced);
+        let identity = invalidation_identity(13, 17, 23, 0x8000, 29);
         let worker = std::thread::spawn(move || {
-            barrier.park_servicing_invalidation(tid, |request| {
-                assert_eq!(request.asid(), 17);
-                assert_eq!(request.asid_generation(), 23);
+            barrier.park_servicing_exact_invalidation(identity.stage1(), tid, |request| {
+                assert_eq!(request.identity(), identity);
                 worker_serviced.store(true, Ordering::SeqCst);
                 Ok(())
             })
         });
 
         let phase = guard
-            .publish_invalidation(17, 23, [tid])
+            .publish_exact_invalidation(identity, [tid])
             .expect("publish exact-ASID invalidation phase");
         guard
             .wait_invalidation(&phase, Instant::now() + Duration::from_secs(1))
@@ -1613,15 +1608,20 @@ mod tests {
             failed_barrier.pause_guard(carrick_hal::ThreadId::synthetic_for_tests(810));
         let service_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let worker_calls = Arc::clone(&service_calls);
+        let failed_identity = invalidation_identity(15, 19, 29, 0xa000, 31);
         let worker = std::thread::spawn(move || {
-            failed_barrier.park_servicing_invalidation(failed_tid, |_| {
-                (worker_calls.fetch_add(1, Ordering::SeqCst) != 0)
-                    .then_some(())
-                    .ok_or(())
-            })
+            failed_barrier.park_servicing_exact_invalidation(
+                failed_identity.stage1(),
+                failed_tid,
+                |_| {
+                    (worker_calls.fetch_add(1, Ordering::SeqCst) != 0)
+                        .then_some(())
+                        .ok_or(())
+                },
+            )
         });
         let phase = failed_guard
-            .publish_invalidation(19, 29, [failed_tid])
+            .publish_exact_invalidation(failed_identity, [failed_tid])
             .expect("publish failure phase");
         assert_eq!(
             failed_guard.wait_invalidation(&phase, Instant::now() + Duration::from_secs(1)),
@@ -1630,8 +1630,9 @@ mod tests {
         failed_guard
             .finish_invalidation(&phase)
             .expect("retire failed publication while pause remains held");
+        let rollback_identity = invalidation_identity(15, 19, 29, 0xa000, 32);
         let rollback = failed_guard
-            .publish_invalidation(19, 30, [failed_tid])
+            .publish_exact_invalidation(rollback_identity, [failed_tid])
             .expect("publish rollback invalidation");
         failed_guard
             .wait_invalidation(&rollback, Instant::now() + Duration::from_secs(1))
@@ -1649,14 +1650,83 @@ mod tests {
         timeout_barrier.set_quiescing();
         let timeout_guard =
             timeout_barrier.pause_guard(carrick_hal::ThreadId::synthetic_for_tests(820));
+        let timeout_identity = invalidation_identity(17, 31, 37, 0xc000, 41);
         let phase = timeout_guard
-            .publish_invalidation(31, 37, [missing_tid])
+            .publish_exact_invalidation(timeout_identity, [missing_tid])
             .expect("publish timeout phase");
         assert_eq!(
             timeout_guard.wait_invalidation(&phase, Instant::now() + Duration::from_millis(10)),
             Err(PtInvalidationError::TimedOut(missing_tid))
         );
         drop(timeout_guard);
+    }
+
+    #[test]
+    fn pt_pause_exact_identity_does_not_accept_recycled_asid_with_new_root() {
+        use std::num::{NonZeroU16, NonZeroU64};
+
+        let mm = carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(91).unwrap());
+        let asid = carrick_hal::ForeignAsid::from_kernel_allocation(NonZeroU16::new(17).unwrap());
+        let old_binding = carrick_hal::ForeignMmBinding::for_aarch64_root_raw(asid, 0x8000);
+        let new_binding = carrick_hal::ForeignMmBinding::for_aarch64_root_raw(asid, 0x9000);
+        let old_stage1 = carrick_hal::ForeignStage1Identity::new(
+            mm,
+            old_binding,
+            carrick_hal::ForeignAsidGeneration::from_runtime_binding(
+                asid,
+                NonZeroU64::new(23).unwrap(),
+            ),
+        )
+        .unwrap();
+        let recycled_stage1 = carrick_hal::ForeignStage1Identity::new(
+            mm,
+            new_binding,
+            carrick_hal::ForeignAsidGeneration::from_runtime_binding(
+                asid,
+                NonZeroU64::new(24).unwrap(),
+            ),
+        )
+        .unwrap();
+        let request = carrick_hal::ForeignCowInvalidationIdentity::new(
+            old_stage1,
+            carrick_hal::ForeignCowInvalidationGeneration::from_runtime_publication(
+                NonZeroU64::new(29).unwrap(),
+            ),
+        );
+        let barrier: &'static PtQuiesce = Box::leak(Box::new(PtQuiesce::new()));
+        let tid = carrick_hal::ThreadId::synthetic_for_tests(831);
+        assert!(barrier.try_become_coordinator());
+        barrier.set_quiescing();
+        let guard = barrier.pause_guard(carrick_hal::ThreadId::synthetic_for_tests(830));
+        let wrong_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wrong_worker_calls = Arc::clone(&wrong_calls);
+        let wrong_worker = std::thread::spawn(move || {
+            barrier.park_servicing_exact_invalidation(recycled_stage1, tid, |_| {
+                wrong_worker_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+        let right_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let right_worker_calls = Arc::clone(&right_calls);
+        let right_worker = std::thread::spawn(move || {
+            barrier.park_servicing_exact_invalidation(old_stage1, tid, |observed| {
+                assert_eq!(observed.identity(), request);
+                right_worker_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+
+        let phase = guard
+            .publish_exact_invalidation(request, [tid])
+            .expect("publish typed exact-stage1 invalidation");
+        guard
+            .wait_invalidation(&phase, Instant::now() + Duration::from_secs(1))
+            .expect("only exact old identity acknowledges");
+        assert_eq!(right_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(wrong_calls.load(Ordering::SeqCst), 0);
+        drop(guard);
+        right_worker.join().unwrap();
+        wrong_worker.join().unwrap();
     }
 
     #[test]

@@ -65,19 +65,40 @@ pub(crate) struct Stage1MmLease {
     residency: AsidResidency,
     root_slot: Option<Stage1RootSlot>,
     lifecycle: Mutex<Stage1MmLeaseLifecycle>,
+    cow_invalidation_published: Arc<AtomicU64>,
     cow_invalidation: Mutex<CowInvalidationState>,
+    #[cfg(test)]
+    cow_invalidation_slow_paths: AtomicU64,
 }
 
 #[derive(Debug, Default)]
 struct CowInvalidationState {
     generation: u64,
     pending: BTreeSet<crate::kernel::objects::ExecutorId>,
+    observed: std::collections::BTreeMap<crate::kernel::objects::ExecutorId, Arc<AtomicU64>>,
+}
+
+/// Per-resident fast-path observation retained by the loaded owner executor.
+/// Two atomic loads answer the no-work case; the lease mutex is entered only
+/// after a published generation differs.
+#[derive(Clone, Debug)]
+pub(crate) struct CowInvalidationObserver {
+    executor: crate::kernel::objects::ExecutorId,
+    asid: AsidGeneration,
+    published: Arc<AtomicU64>,
+    observed: Arc<AtomicU64>,
+}
+
+impl CowInvalidationObserver {
+    fn needs_service(&self) -> bool {
+        self.observed.load(Ordering::Acquire) != self.published.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CowInvalidationTicket {
     asid: AsidGeneration,
-    generation: u64,
+    generation: carrick_hal::ForeignCowInvalidationGeneration,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -87,6 +108,7 @@ pub(crate) struct CowInvalidationPublication {
 }
 
 impl CowInvalidationPublication {
+    #[cfg(test)]
     pub(crate) const fn asid_generation(&self) -> AsidGeneration {
         self.ticket.asid
     }
@@ -106,7 +128,7 @@ impl CowInvalidationTicket {
         self.asid
     }
 
-    pub(crate) const fn generation(self) -> u64 {
+    pub(crate) const fn generation(self) -> carrick_hal::ForeignCowInvalidationGeneration {
         self.generation
     }
 }
@@ -157,7 +179,10 @@ impl Stage1MmLease {
             residency: AsidResidency::new(asid),
             root_slot,
             lifecycle: Mutex::new(Stage1MmLeaseLifecycle::Live),
+            cow_invalidation_published: Arc::new(AtomicU64::new(0)),
             cow_invalidation: Mutex::new(CowInvalidationState::default()),
+            #[cfg(test)]
+            cow_invalidation_slow_paths: AtomicU64::new(0),
         }
     }
 
@@ -177,6 +202,27 @@ impl Stage1MmLease {
         self.asid
     }
 
+    pub(crate) fn foreign_stage1_identity(
+        &self,
+        mm: crate::kernel::MmId,
+    ) -> carrick_hal::ForeignStage1Identity {
+        let binding = self.binding();
+        let mm = carrick_hal::ForeignMmId::from_kernel_allocation(
+            std::num::NonZeroU64::new(mm.raw()).unwrap_or_else(|| std::process::abort()),
+        );
+        let asid = carrick_hal::ForeignAsid::from_kernel_allocation(
+            std::num::NonZeroU16::new(binding.asid.raw()).unwrap_or_else(|| std::process::abort()),
+        );
+        let binding = carrick_hal::ForeignMmBinding::for_aarch64(asid, binding.stage1_root.gpa());
+        let asid_generation = carrick_hal::ForeignAsidGeneration::from_runtime_binding(
+            asid,
+            std::num::NonZeroU64::new(self.asid.generation())
+                .unwrap_or_else(|| std::process::abort()),
+        );
+        carrick_hal::ForeignStage1Identity::new(mm, binding, asid_generation)
+            .unwrap_or_else(|| std::process::abort())
+    }
+
     pub(crate) fn begin_asid_load(
         &self,
         executor: crate::kernel::objects::ExecutorId,
@@ -185,21 +231,66 @@ impl Stage1MmLease {
         if *lifecycle != Stage1MmLeaseLifecycle::Live {
             return Err(AsidResidencyError::Retiring);
         }
-        self.residency.begin_load(executor)
+        let load = self.residency.begin_load(executor)?;
+        let mut state = self.cow_invalidation.lock();
+        let initial = if state.pending.contains(&executor) {
+            0
+        } else {
+            state.generation
+        };
+        state
+            .observed
+            .entry(executor)
+            .or_insert_with(|| Arc::new(AtomicU64::new(initial)));
+        Ok(load)
+    }
+
+    pub(crate) fn cow_invalidation_observer(
+        &self,
+        executor: crate::kernel::objects::ExecutorId,
+    ) -> CowInvalidationObserver {
+        let observed = self
+            .cow_invalidation
+            .lock()
+            .observed
+            .get(&executor)
+            .cloned()
+            .unwrap_or_else(|| std::process::abort());
+        CowInvalidationObserver {
+            executor,
+            asid: self.asid,
+            published: Arc::clone(&self.cow_invalidation_published),
+            observed,
+        }
     }
 
     pub(crate) fn publish_cow_invalidation(&self) -> CowInvalidationPublication {
         let pending = self.residency.residents();
         let mut state = self.cow_invalidation.lock();
-        state.generation = state.generation.wrapping_add(1).max(1);
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .unwrap_or_else(|| std::process::abort());
+        let generation = carrick_hal::ForeignCowInvalidationGeneration::from_runtime_publication(
+            std::num::NonZeroU64::new(state.generation).unwrap_or_else(|| std::process::abort()),
+        );
+        for executor in &pending {
+            state
+                .observed
+                .entry(*executor)
+                .or_insert_with(|| Arc::new(AtomicU64::new(0)));
+        }
         state.pending = pending.iter().copied().collect();
-        CowInvalidationPublication {
+        let publication = CowInvalidationPublication {
             ticket: CowInvalidationTicket {
                 asid: self.asid,
-                generation: state.generation,
+                generation,
             },
             pending,
-        }
+        };
+        self.cow_invalidation_published
+            .store(state.generation, Ordering::Release);
+        publication
     }
 
     pub(crate) fn pending_cow_invalidation(
@@ -212,8 +303,16 @@ impl Stage1MmLease {
             .contains(&executor)
             .then_some(CowInvalidationTicket {
                 asid: self.asid,
-                generation: state.generation,
+                generation: carrick_hal::ForeignCowInvalidationGeneration::from_runtime_publication(
+                    std::num::NonZeroU64::new(state.generation)
+                        .unwrap_or_else(|| std::process::abort()),
+                ),
             })
+    }
+
+    #[cfg(test)]
+    fn cow_invalidation_slow_paths_for_tests(&self) -> u64 {
+        self.cow_invalidation_slow_paths.load(Ordering::Relaxed)
     }
 
     pub(crate) fn acknowledge_cow_invalidation(
@@ -222,12 +321,17 @@ impl Stage1MmLease {
         ticket: CowInvalidationTicket,
     ) -> Result<(), CowInvalidationError> {
         let mut state = self.cow_invalidation.lock();
-        if ticket.asid != self.asid || ticket.generation != state.generation {
+        if ticket.asid != self.asid || ticket.generation.raw_for_probe() != state.generation {
             return Err(CowInvalidationError::StaleGeneration);
         }
         if !state.pending.remove(&executor) {
             return Err(CowInvalidationError::UnexpectedExecutor);
         }
+        state
+            .observed
+            .get(&executor)
+            .unwrap_or_else(|| std::process::abort())
+            .store(state.generation, Ordering::Release);
         Ok(())
     }
 
@@ -236,14 +340,25 @@ impl Stage1MmLease {
     /// guest with stale translations.
     pub(crate) fn service_pending_cow_invalidation<E>(
         &self,
-        executor: crate::kernel::objects::ExecutorId,
+        observer: &CowInvalidationObserver,
         invalidate: impl FnOnce(AsidGeneration) -> Result<(), E>,
     ) -> Result<(), E> {
-        let Some(ticket) = self.pending_cow_invalidation(executor) else {
+        if observer.asid != self.asid
+            || !Arc::ptr_eq(&observer.published, &self.cow_invalidation_published)
+        {
+            std::process::abort();
+        }
+        if !observer.needs_service() {
             return Ok(());
+        }
+        #[cfg(test)]
+        self.cow_invalidation_slow_paths
+            .fetch_add(1, Ordering::Relaxed);
+        let Some(ticket) = self.pending_cow_invalidation(observer.executor) else {
+            std::process::abort();
         };
         invalidate(ticket.asid_generation())?;
-        self.acknowledge_cow_invalidation(executor, ticket)
+        self.acknowledge_cow_invalidation(observer.executor, ticket)
             .unwrap_or_else(|_| std::process::abort());
         Ok(())
     }
@@ -1693,10 +1808,11 @@ mod tests {
             .expect("load")
             .mark_resident()
             .expect("resident");
+        let observer = lease.cow_invalidation_observer(resident);
         let publication = lease.publish_cow_invalidation();
         let mut invalidated = Vec::new();
         lease
-            .service_pending_cow_invalidation(resident, |asid| {
+            .service_pending_cow_invalidation(&observer, |asid| {
                 invalidated.push(asid);
                 Ok::<(), &'static str>(())
             })
@@ -1706,10 +1822,37 @@ mod tests {
 
         lease.publish_cow_invalidation();
         assert_eq!(
-            lease.service_pending_cow_invalidation(resident, |_| Err("hardware failed")),
+            lease.service_pending_cow_invalidation(&observer, |_| Err("hardware failed")),
             Err("hardware failed")
         );
         assert!(lease.pending_cow_invalidation(resident).is_some());
+    }
+
+    #[test]
+    fn no_work_current_mm_reentry_never_enters_cow_invalidation_slow_path() {
+        let (_pool, lease) = Stage1MmPool::new_root_for_tests(0x8000, 4).expect("root pool");
+        let resident = executor(52);
+        lease
+            .begin_asid_load(resident)
+            .expect("load")
+            .mark_resident()
+            .expect("resident");
+        let observer = lease.cow_invalidation_observer(resident);
+        let hardware_calls = std::cell::Cell::new(0_u64);
+
+        lease
+            .service_pending_cow_invalidation(&observer, |_| {
+                hardware_calls.set(hardware_calls.get() + 1);
+                Ok::<(), ()>(())
+            })
+            .expect("no-work re-entry");
+
+        assert_eq!(hardware_calls.get(), 0, "no vtable/hardware callback");
+        assert_eq!(
+            lease.cow_invalidation_slow_paths_for_tests(),
+            0,
+            "no-work re-entry must not lock or perform a resident lookup"
+        );
     }
 
     #[test]

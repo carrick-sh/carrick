@@ -213,6 +213,18 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
             .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
     }
 
+    fn apply_with_receipt(
+        &self,
+        commit: carrick_hal::FrameInventoryCommit<()>,
+    ) -> Result<carrick_hal::FrameInventoryApplyReceipt, Box<dyn std::error::Error + Send + Sync>>
+    {
+        self.kernel
+            .frame_inventory()
+            .apply_with_receipt(self.mm, commit)
+            .map(|(_, receipt)| receipt)
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
+    }
+
     fn mapping_is_live(
         &self,
         mapping: carrick_hal::MappingId,

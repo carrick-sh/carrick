@@ -2490,6 +2490,39 @@ impl DispatchMmAuthority {
         }
     }
 
+    /// Production-shape MM authority for cross-layer foreign-COW tests. This
+    /// uses the real dispatch VMA authority, mutation coordinator, and executor
+    /// census; only the single test VMA is synthetic.
+    #[cfg(test)]
+    pub(crate) fn foreign_cow_composition_for_test(
+        mm_id: crate::kernel::MmId,
+        stage1: Arc<crate::hvpatch::Stage1MmLease>,
+        start: u64,
+        end: u64,
+    ) -> (Arc<Self>, mm_mutation::ForeignMmMutationAuthority) {
+        let authority = Arc::new(Self::new(mm_id));
+        {
+            let mut mem = authority.mem.lock();
+            mem.dynamic_maps.push(ProcMapsEntry {
+                start,
+                end,
+                read: true,
+                write: true,
+                execute: false,
+                sharing: ProcMapSharing::Private,
+                path: "[foreign-cow-composition]".to_owned(),
+            });
+        }
+        authority.mem.bump_revision();
+        let mutation = mm_mutation::ForeignMmMutationAuthority::new(
+            mm_id,
+            Arc::clone(&authority.mutation_coordinator),
+            Arc::clone(&authority.guest_executors),
+            stage1,
+        );
+        (authority, mutation)
+    }
+
     #[cfg(test)]
     fn snapshot_until(
         &self,

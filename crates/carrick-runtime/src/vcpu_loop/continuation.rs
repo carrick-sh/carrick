@@ -3552,13 +3552,30 @@ impl HvpatchTaskBinding {
 
     pub(crate) fn service_pending_cow_invalidation<E>(
         &self,
-        executor: crate::kernel::objects::ExecutorId,
+        observer: &crate::hvpatch::CowInvalidationObserver,
         invalidate: impl FnOnce(crate::hvpatch::AsidGeneration) -> Result<(), E>,
     ) -> Result<(), E> {
         self.stage1_mm
             .as_ref()
             .unwrap_or_else(|| std::process::abort())
-            .service_pending_cow_invalidation(executor, invalidate)
+            .service_pending_cow_invalidation(observer, invalidate)
+    }
+
+    pub(crate) fn cow_invalidation_observer(
+        &self,
+        executor: crate::kernel::objects::ExecutorId,
+    ) -> crate::hvpatch::CowInvalidationObserver {
+        self.stage1_mm
+            .as_ref()
+            .unwrap_or_else(|| std::process::abort())
+            .cow_invalidation_observer(executor)
+    }
+
+    pub(crate) fn foreign_stage1_identity(&self) -> carrick_hal::ForeignStage1Identity {
+        self.stage1_mm
+            .as_ref()
+            .unwrap_or_else(|| std::process::abort())
+            .foreign_stage1_identity(self.identity.mm)
     }
 
     pub(crate) fn pending_cow_invalidation(

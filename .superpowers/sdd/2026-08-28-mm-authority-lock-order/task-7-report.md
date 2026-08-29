@@ -402,3 +402,252 @@ message and progress receipt.
 - No guest/HVF-creation or Docker workload run was necessary or performed; the
   broad HVF crate tests exercise the host-side transaction and rollback path
   without launching a guest.
+
+## Fix Round 1 (review of `1bef8eb51948a4e97c5e521e686a99a936b62c3b`)
+
+This round repairs all six findings from the independent rejection. It also
+retains the director's alternative-(1) ruling: exact-target executors pause
+first, the COW edit publishes a typed exact-stage-1 invalidation second, active
+owner vCPUs acknowledge while remaining excluded, and inactive residents
+service the published generation at mandatory pre-entry. The cost remains an
+atomic generation pair and retained per-resident observer on the ordinary
+entry path, plus a mutex slow path only when the generations differ. No async
+continuation, maintenance vCPU, caller-engine fallback, `proc.rs` change, or
+HostAlias-to-PtPause reacquisition was introduced.
+
+### RED evidence captured against the rejected implementation
+
+The focused regressions were installed before their fixes and run against the
+rejected shape:
+
+```text
+RUSTC_WRAPPER= cargo test -p carrick-runtime \
+  production_composition_foreign_cow_does_not_reacquire_snapshot_under_alias -- --nocapture
+FAILED: production composition returned Err(ForeignWriteTimedOut)
+0 passed; 1 failed; 2090 filtered out
+
+RUSTC_WRAPPER= cargo test -p carrick-runtime \
+  foreign_cow_rejects_wrong_mapping_frame_physical_range_and_current_owner
+FAILED: expected ForeignCowReceiptMismatch
+
+RUSTC_WRAPPER= cargo test -p carrick-vmm-hvf \
+  foreign_cow_commit_cannot_be_reported_as_retryable_by_final_snapshot_contention
+FAILED: committed COW returned Err(TimedOut)
+
+RUSTC_WRAPPER= cargo test -p carrick-runtime \
+  no_work_current_mm_reentry_never_enters_cow_invalidation_slow_path
+FAILED: expected slow-path count 0, observed 1
+
+RUSTC_WRAPPER= cargo test -p carrick-thread \
+  pt_pause_exact_identity_does_not_accept_recycled_asid_with_new_root --no-run
+FAILED to compile: the typed ASID generation, stage-1 identity, COW generation,
+and exact invalidation request APIs did not exist (11 type/API errors)
+```
+
+### Finding 1 — production foreign COW self-timeout
+
+The runtime now authenticates the complete backend/VMA/inventory snapshot
+before entering `with_host_alias`. The HAL `break_cow` transport method no
+longer receives `ForeignMmLiveAuthority`, so the backend cannot reacquire the
+snapshot reader while alias publication is active. The concrete carrier COW
+transaction consumes only the pre-authenticated snapshot and the borrowed
+invalidator. Runtime validates the returned receipt after alias release while
+the exact-MM mutation guard still owns page-table exclusion.
+
+Covering production-shape tests use the real `Stage1MmBackend`,
+`DispatchMmAuthority`, VMA source, mutation coordinator, executor census,
+stage-1 lease, and host-alias/pause facade. The carrier transaction is covered
+in the HVF crate with the real `CarrierForeignMmTransport` and retained
+`MmAccessState`; the dependency direction prevents importing that concrete
+transport back into runtime, so the cross-crate seam is exercised on both
+sides rather than by inventing a second production authority constructor.
+
+```text
+RUSTC_WRAPPER= cargo test -p carrick-runtime production_composition_
+4 passed: success, final-snapshot contention, CLONE_VM, exec/retirement
+
+RUSTC_WRAPPER= cargo test -p carrick-vmm-hvf foreign_cow
+4 passed, including real carrier transport COW success and rollback
+```
+
+### Finding 2 — recoverable work after irreversible inventory publication
+
+`FrameCowAuthority::apply_with_receipt` now performs the inventory apply and
+returns the exact authenticated post-commit MM/revision/mapping set in the same
+kernel-owner operation. The backend retains the reservation challenge and
+authenticates the apply receipt before proceeding. It derives the final carrier
+snapshot from that receipt and the already authenticated pre-commit domains.
+After the successful apply boundary, every impossible mapping, inventory,
+stage-1, or owner postcondition fail-stops; there is no recoverable snapshot
+call or `?`. The carrier additionally proves the exact mapping/frame/physical
+extent against kernel authority and the exact owner generation/pointer against
+the live owner directory before rollback is disarmed.
+
+```text
+RUSTC_WRAPPER= cargo test -p carrick-vmm-hvf \
+  foreign_cow_commit_cannot_be_reported_as_retryable_by_final_snapshot_contention
+1 passed
+
+RUSTC_WRAPPER= cargo test -p carrick-runtime \
+  production_composition_committed_cow_ignores_final_snapshot_contention
+1 passed
+```
+
+### Finding 3 — ordinary entry took the invalidation mutex
+
+`Stage1MmLease` publishes the latest COW invalidation generation through an
+`Arc<AtomicU64>`. Each loaded resident retains its own observed
+`Arc<AtomicU64>` in `HvpatchPersistentExecutor` and passes that opaque observer
+through the quantum control. Ordinary current-MM entry compares only those two
+atomics. The resident map/mutex, ticket lookup, allocation, and hardware/vtable
+callback occur only after a generation mismatch. Checked increments now
+fail-stop on generation exhaustion rather than wrapping into an old identity.
+
+```text
+RUSTC_WRAPPER= cargo test -p carrick-runtime \
+  no_work_current_mm_reentry_never_enters_cow_invalidation_slow_path
+1 passed; asserted 0 slow paths and 0 hardware/vtable calls
+```
+
+### Finding 4 — raw, swappable invalidation identity domains
+
+HAL now carries opaque `ForeignAsidGeneration`, `ForeignStage1Identity`,
+`ForeignCowInvalidationGeneration`, and
+`ForeignCowInvalidationIdentity`. `PtInvalidationRequest`, publication state,
+participant ledger, executor matching, and acknowledgements carry those types
+end-to-end, including exact MM, binding, root, ASID, ASID lifetime, and COW
+publication. No raw MM/ASID/generation tuple remains in the pause ledger or
+acknowledgement path. A compile-fail doctest rejects swapping an ASID generation
+for a COW generation, and a host test proves a recycled numeric ASID with a new
+root/generation cannot service the old request.
+
+```text
+RUSTC_WRAPPER= cargo test -p carrick-hal
+111 unit tests passed; 2 compile-fail doctests passed
+
+RUSTC_WRAPPER= cargo test -p carrick-thread \
+  pt_pause_exact_identity_does_not_accept_recycled_asid_with_new_root
+1 passed
+```
+
+### Finding 5 — receipt did not authenticate the live mapping/owner
+
+The concrete carrier receipt now carries a backend-private live-inventory
+receipt. Before minting `CowBroken`, runtime compares its exact MM, inventory
+revision, mapping, frame, physical base, physical length, and owner generation
+with every corresponding outer receipt field; it also checks range coverage
+and physical overflow. `write_foreign` re-snapshots the retained exact MM,
+revalidates all three revisions and mapping membership, rechecks every sealed
+live-inventory domain, then lets the transport verify the still-current owner
+before copying. Wrong mapping, wrong frame, wrong physical base/length, and
+wrong/recycled owner all fail before witness minting or copy.
+
+```text
+RUSTC_WRAPPER= cargo test -p carrick-runtime \
+  foreign_cow_rejects_wrong_mapping_frame_physical_range_and_current_owner
+1 passed (all five injected receipt mismatches rejected)
+
+RUSTC_WRAPPER= cargo test -p carrick-runtime kernel::mm_access
+23 passed, including stale three-domain revision and recycled-owner write tests
+```
+
+### Finding 6 — missing production composition and topology coverage
+
+The runtime production-shape fixture uses the real target-MM backend, dispatch
+VMA authority, mutation coordinator, executor census, stage-1 lease, and exact
+foreign mutation binding. The HVF fixture uses the production carrier
+transport, retained `MmAccessState`, transaction, pre-image, inventory split,
+owner directory, and write path. The two-phase tests use the real `PtQuiesce`,
+`ForeignMmMutationAuthority`, `Stage1MmLease`, executor census, and
+`HostCondvarScheduler` at budget one. Coverage includes success, full
+occupancy, active target acknowledgement, inactive caller residency and
+pre-entry service, caller-worker self-wait avoidance, CLONE_VM, target exec and
+retirement, exact ASID/root reuse, parent/child COW separation, and every
+reversible transaction boundary.
+
+```text
+RUSTC_WRAPPER= cargo test -p carrick-runtime \
+  foreign_cow_active_target_acks_then_inactive_caller_resident_defers_to_reentry
+1 passed
+
+RUSTC_WRAPPER= cargo test -p carrick-runtime \
+  foreign_cow_vcpu_budget_one_full_occupancy_never_waits_on_caller_worker_self_ack
+1 passed
+
+RUSTC_WRAPPER= cargo test -p carrick-runtime production_composition_
+4 passed
+
+RUSTC_WRAPPER= cargo test -p carrick-vmm-hvf foreign_cow
+4 passed; exact stage-1/inventory/owner rollback fingerprint restored at each
+injected boundary
+```
+
+### Fix-round files and architectural cost
+
+- `crates/carrick-hal/src/foreign_mm.rs`, `src/lib.rs`, and `src/threaded.rs`:
+  typed invalidation identities, sealed receipt observation, removal of live
+  snapshot authority from COW transport, and authenticated inventory apply.
+- `crates/carrick-runtime/src/kernel/mm_access.rs`: pre-alias authentication,
+  receipt-only post-commit validation, exact live-inventory checks, and
+  production-shape facade tests.
+- `crates/carrick-runtime/src/dispatch/mod.rs`: narrow test construction of the
+  existing production dispatch/MM authority; no parallel authority path.
+- `crates/carrick-runtime/src/hvpatch/stage1_mm.rs` and `src/hvpatch/mod.rs`:
+  atomic published/observed fast path plus typed exact stage-1 publication.
+- `crates/carrick-runtime/src/vcpu_loop/{continuation,executor,mod,quiesce}.rs`:
+  retain the per-resident observer, mandatory pre-entry service, typed active
+  owner acknowledgements, and production topology tests.
+- `crates/carrick-thread/src/fork_quiesce.rs`: typed two-phase publication,
+  participant ledger, timeout/failure accounting, and ASID/root reuse test.
+- `crates/carrick-vmm-hvf/src/trap.rs`: production transaction receipt,
+  post-commit fail-stop validation, exact owner proof, and carrier tests.
+
+The added steady-state cost is two atomic loads on each HVPatch guest entry and
+one retained `Arc` observer per loaded resident. Mutex/lookup/callback work is
+absent until the carrier publishes a different exact-target generation.
+
+### Fix-round GREEN verification
+
+```text
+RUSTC_WRAPPER= cargo test -p carrick-vmm-hvf foreign_cow
+4 passed
+RUSTC_WRAPPER= cargo test -p carrick-vmm-hvf frame_cow
+1 passed
+RUSTC_WRAPPER= cargo test -p carrick-runtime kernel::mm_access
+23 passed
+RUSTC_WRAPPER= RUST_TEST_THREADS=1 cargo test -p carrick-runtime hvpatch::
+110 passed
+RUSTC_WRAPPER= cargo test -p carrick-thread --lib
+54 passed
+RUSTC_WRAPPER= cargo test -p carrick-hal
+111 unit + 2 compile-fail doctests passed
+
+RUSTC_WRAPPER= RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib
+2098 passed (run outside the restricted sandbox for Unix sockets/loopback)
+RUSTC_WRAPPER= RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf --lib
+280 passed (run outside the restricted sandbox for ptrace child-stop)
+
+RUSTC_WRAPPER= cargo check --workspace --all-targets
+green
+RUSTC_WRAPPER= cargo clippy -p carrick-hal -p carrick-thread \
+  -p carrick-runtime -p carrick-vmm-hvf --all-targets -- -D warnings
+green
+python3 scripts/migrate/check-mm-authority.py --self-test
+20 negative and 17 positive fixtures passed
+python3 scripts/migrate/check-mm-authority.py --check
+exit 1 with exactly the intentional Task 8 finding at
+crates/carrick-runtime/src/dispatch/proc.rs:4425
+cargo fmt --all -- --check
+green
+git diff --check
+green
+```
+
+The initial sandboxed broad runtime run produced 57 `EPERM` failures for Unix
+sockets, loopback binds, and scratch directories; the exact suite passed 2098/0
+when rerun with normal host permissions. The initial sandboxed HVF run produced
+one ptrace child-stop failure; the exact suite passed 280/0 with normal host
+permissions. These are execution-environment restrictions, not retained test
+failures. `progress.md` remained controller-owned and unchanged by this round;
+its SHA-256 stayed
+`1e7b55a97c617ca4603aecd943aa883e32cf8059203cba147e4ec20f354bcb4a`.

@@ -1911,6 +1911,20 @@ pub trait FrameCowAuthority: Send + Sync {
         commit: crate::FrameInventoryCommit<()>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
+    /// Apply the irreversible kernel inventory publication and return the
+    /// provenance-authenticated exact post-commit inventory state. Foreign
+    /// COW uses this boundary so no fallible live snapshot is reacquired after
+    /// the commit has become externally visible.
+    fn apply_with_receipt(
+        &self,
+        _commit: crate::FrameInventoryCommit<()>,
+    ) -> Result<crate::FrameInventoryApplyReceipt, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "frame COW authority does not issue apply receipts",
+        )))
+    }
+
     /// Authenticate that the just-published physical mapping is visible in
     /// the bound mm's kernel-owned graph before the backend advertises a COW
     /// commit or disarms the permission fault.
