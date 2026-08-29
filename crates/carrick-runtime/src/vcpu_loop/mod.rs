@@ -6818,8 +6818,6 @@ where
             platform_futex_factory,
             process_fork_barrier,
             crash_capture,
-            #[cfg(test)]
-            crash_lease_drain_budget: CrashLeaseDrainBudget::DEFAULT,
             kernel_thread,
             guest_execution: None,
             execution_lease: ExecutionLeaseCell::owned(),
@@ -6839,6 +6837,8 @@ where
             in_guest,
             max_traps,
             trace: std::env::var_os("CARRICK_TRACE_TRAPS").is_some(),
+            #[cfg(test)]
+            crash_lease_drain_budget: CrashLeaseDrainBudget::DEFAULT,
             vfork_release_fd: None,
             thread_exit_withdrawn: false,
             thread_exit_retry_subscription: None,
