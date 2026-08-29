@@ -278,3 +278,31 @@ RED and review-pending commits remain on `codex/fd-description-seam`; no push.
   subrange's writable VMA, COW each compound exactly once, and evolve only the
   lease's obsolete frozen mapping membership across kernel-authenticated
   successor snapshots.
+- Task 8 compound-COW milestone accepted at canonical `a8a19a5d6` (production
+  RED commits `25ad7f2e7`, `848d1b170`; delegated canonical commits
+  `897322ae3`, `5555ba2ed`, `634da8366`; controller RED/fix `70fa9166e`,
+  `a8a19a5d6`). Antigravity worker `compound-cow-cleanroom`, run id
+  `mm-authority-cleanroom-20260829-task8-compound`, conversation
+  `0750e0ec-130a-4d01-bf17-ef7c20b47db9`, used its three-turn hard cap. Round
+  one was rejected for phantom mutation authority, a successor-state race,
+  non-atomic snapshot/backing publication, first-leaf-only validation, and
+  missing negatives. Round two retained a real guard and serialized exact
+  lease state but was rejected for removing post-publication mapping/owner
+  checks and for a vacuous unmapped-alias negative. Round three restored those
+  checks and installed a real same-owner stage-1 alias negative. Independent
+  review then found one P1: the reusable semantic span was transport-asserted
+  but absent from the runtime-private kernel proof. Because the worker had
+  reached its cap, Codex added a separately committed RED showing that a
+  genuine 16 KiB proof plus an inflated receipt span minted authority, then
+  bound exact `GuestVa` plus non-zero semantic length into proof issuance and
+  both initial/reusable authentication sites. Final independent verdict:
+  APPROVE, no findings. Fresh controller gates: forged-span RED then GREEN;
+  runtime MM access 36/36; HVF foreign MM 19/19; HAL foreign MM 1/1; full
+  serialized runtime library 2,125/2,125; full serialized HVF library 288/288;
+  MM-authority checker over 253 Rust leaves; targeted all-target clippy with
+  warnings denied; formatting and diff hygiene. The full-suite sandbox failures
+  were attributed and rerun with required host authority: runtime socket/port/
+  scratch tests and the HVF ptrace-stop test passed outside the sandbox. Every
+  surviving worker and reviewer explicitly attested that it used neither Linux
+  kernel source nor abandoned Task 8 material; the contaminated streams remain
+  wholly abandoned and non-integrable.
