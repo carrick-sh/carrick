@@ -324,9 +324,10 @@ pub trait ForeignMmReadLease: Debug + Send + Sync {
     /// Prepares an infallible write into an authenticated compound COW span.
     ///
     /// The transport validates that the subrange `[va, va + src.len())` is
-    /// strictly contained within the compound `[cow.range_start(), cow.range_start() + cow.range_len())`
-    /// and that every crossed 4 KiB leaf translates contiguously to the
-    /// authenticated physical owner.
+    /// contained within the compound `[cow.range_start(), cow.range_start() + cow.range_len())`
+    /// (including exact boundary matches for full-span writes) and that every
+    /// crossed 4 KiB leaf translates contiguously to the authenticated physical
+    /// owner.
     #[allow(clippy::too_many_arguments)] // Object-safe transport carries exact mutation domains.
     fn prepare_write<'a>(
         &self,

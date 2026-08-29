@@ -593,7 +593,7 @@ mod foreign_mm_tests {
         let table_bytes = tables.as_bytes().to_vec();
         let (table_generation, table_host) = install_owner(root, &table_bytes);
         let mut data_bytes = vec![0_u8; data_len];
-        data_bytes[..bytes.len()].copy_from_slice(&bytes);
+        data_bytes[..bytes.len()].copy_from_slice(bytes);
         let (data_generation, data_host) = install_owner(data_ipa, &data_bytes);
 
         let table_mapping = carrick_hal::MappingId::from_kernel_allocation(nonzero(ordinal * 10));
@@ -1362,14 +1362,29 @@ mod foreign_mm_tests {
             )
             .expect("break compound COW");
         let after_cow = child.live.0.read().clone();
+        let cow_key = (cow.physical_base().raw(), cow.physical_len());
 
-        // Write to address before compound span
-        let before_span_va = TEST_VA - 0x1000;
+        // Install a real stage-1 alias OUTSIDE cow.range_start..range_end that translates to the
+        // SAME authenticated new physical owner.
+        let alias_va = TEST_VA + 0x1_0000;
+        {
+            let table_owner = global_frame_host_owners().lock()[&child.owners.0[0]].clone();
+            let page_tables = child.state.page_tables_authority();
+            let mut tables = page_tables.lock();
+            let tables = tables.as_mut().unwrap();
+            tables
+                .map_aliased(alias_va, cow.physical_base().raw(), 0x1000, true)
+                .expect("map stage-1 alias outside compound span");
+            unsafe { tables.sync_to_host(table_owner._mapping.as_ptr()) };
+        }
+
+        // Prove prepare_write rejects the alias specifically because semantic authority is
+        // out of span, even though physical translation names the same live owner.
         let rejected = lease.prepare_write(
             &child.live,
             &after_cow,
             cow.as_ref(),
-            GuestVa(before_span_va),
+            GuestVa(alias_va),
             b"test",
             deadline,
         );
@@ -1378,10 +1393,17 @@ mod foreign_mm_tests {
                 rejected,
                 Err(carrick_hal::ForeignMmTransportError::MutationFailed)
             ),
-            "out-of-span alias before span must be rejected: {rejected:?}"
+            "out-of-span alias targeting same physical owner must be rejected: {rejected:?}"
         );
 
-        let cow_key = (cow.physical_base().raw(), cow.physical_len());
+        // Verify bytes and commit state remain completely unchanged.
+        let owners = global_frame_host_owners().lock();
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(owners[&cow_key]._mapping.as_ptr(), 4) },
+            b"old!",
+            "target owner bytes must remain unmutated after rejected prepare_write",
+        );
+        drop(owners);
         child.owners.0.push(cow_key);
     }
 
@@ -8073,6 +8095,28 @@ fn perform_foreign_cow_transaction(
         shared_key_offset: 0,
         owner_generation,
     });
+    match runtime.authority.mapping_is_live(
+        split.new_extent.mapping,
+        split.new_extent.frame,
+        carrick_guest_mem::Gpa(new_physical_ipa),
+        cow_length,
+    ) {
+        Ok(true) => {}
+        Ok(false) | Err(_) => std::process::abort(),
+    }
+    let owner_is_live = global_frame_host_owners()
+        .lock()
+        .get(&(new_physical_ipa, CowArmedRanges::COMPOUND_SIZE))
+        .is_some_and(|owner| {
+            owner.generation == owner_generation
+                && std::ptr::eq(owner._mapping.as_ptr(), new_host_ptr)
+        });
+    if !owner_is_live {
+        std::process::abort();
+    }
+    if !committed_mapping_ids.contains(&split.new_extent.mapping) {
+        std::process::abort();
+    }
     owner_rollback.commit();
     lease.state.cow_armed.lock().disarm(span);
     let committed = CarrierForeignMmSnapshot {
