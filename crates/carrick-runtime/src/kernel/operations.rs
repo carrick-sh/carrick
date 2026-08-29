@@ -4449,6 +4449,7 @@ mod tests {
 
     use carrick_abi::{LinuxCloneFlags, LinuxSigaction, SigSet};
     use carrick_guest_mem::Gpa;
+    use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
     use proptest::prelude::*;
 
     use super::*;
@@ -4517,6 +4518,58 @@ mod tests {
         Kernel::bootstrap_root(input).expect("kernel")
     }
 
+    fn mm_authority_execution_lease(
+        context: &KernelContext,
+    ) -> crate::kernel::objects::ThreadExecutionLease {
+        let mm = context.shared().mm().id();
+        context
+            .thread()
+            .publish_initial_task_state(crate::kernel::objects::MigratableTaskState {
+                cpu: GuestCpuState::from_aarch64_v1(Aarch64TaskCpuStateV1 {
+                    gprs: [400; 31],
+                    pc: 400,
+                    pstate: 400,
+                    trap_pc: 400,
+                    trap_pstate: 400,
+                    sp_el0: 400,
+                    elr_el1: 400,
+                    spsr_el1: 400,
+                    ttbr0: 400,
+                    ttbr1: 400,
+                    tcr: 400,
+                    sctlr_el1: 400,
+                    mair_el1: 400,
+                    vbar_el1: 400,
+                    cpacr_el1: 400,
+                    cntkctl_el1: 400,
+                    tpidr_el1: 400,
+                    actlr_el1: 400,
+                    tpidr_el0: 400,
+                    tpidrro_el0: 400,
+                    contextidr_el1: 400,
+                    vregs: [400; 32],
+                    fpsr: 400,
+                    fpcr: 400,
+                    pending_resume_pc: None,
+                    last_syscall_nr: None,
+                    last_syscall_orig_x0: 400,
+                    last_fault_esr: 400,
+                    last_exit_class: 400,
+                    is_forked_child: false,
+                    syscall_continuation: None,
+                    mm_generation: mm.raw(),
+                    asid_generation: mm.raw(),
+                }),
+                mm,
+                asid_generation: mm.raw(),
+            })
+            .expect("publish exact root scheduler authority");
+        context
+            .thread()
+            .claim_runnable(crate::kernel::objects::ExecutorId::synthetic_for_tests(400))
+            .expect("claim exact root execution authority")
+    }
+
     fn fork_with_mm_backend(
         kernel: &Arc<Kernel>,
         parent: &KernelContext,
@@ -4546,13 +4599,14 @@ mod tests {
     #[test]
     fn mm_authority_relation_distinguishes_copied_and_shared_clone_vm_tasks() {
         let (kernel, root) = bootstrap_with_mm_backend(19_400);
+        let execution = mm_authority_execution_lease(&root);
 
-        let current = root.current_mm().expect("current MM authority");
+        let current = root.current_mm(&execution).expect("current MM authority");
         assert_eq!(current.mm_id(), root.shared().mm().id());
 
         let copied = fork_with_mm_backend(&kernel, &root, 19_401, "copied-mm child");
         let foreign = kernel
-            .foreign_mm(&root, copied.task().key())
+            .foreign_mm(&root, &execution, copied.task().key())
             .expect("foreign MM authority");
         assert!(matches!(foreign, MmRelation::Foreign(_)));
 
@@ -4573,7 +4627,7 @@ mod tests {
             .0;
         assert_ne!(shared.task().key(), root.task().key());
         let relation = kernel
-            .foreign_mm(&root, shared.task().key())
+            .foreign_mm(&root, &execution, shared.task().key())
             .expect("shared MM authority");
         assert!(matches!(relation, MmRelation::Current(_)));
     }
