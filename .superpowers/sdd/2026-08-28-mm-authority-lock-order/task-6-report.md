@@ -19,8 +19,9 @@ static split at the normalized resolver:
 - the threaded route constructs that guard from the actual pre-dispatch
   `PtPauseGuard`, or from `Stage1Exclusive` only when the executor census proves
   sole execution;
-- the non-threaded route uses the sealed single-executor issuer at its outer
-  boundary; focused tests use the same issuer through cfg(test)-only helpers;
+- the non-threaded route and the explicit public threaded single-executor API
+  require an exclusive `&mut SyscallDispatcher` outer-boundary witness and
+  claim the real `Stage1Exclusive`; normalized handlers receive only `&self`;
 - synchronous grow-down/residency faults use a separate, read-classified
   mutation route at the trap boundary, also backed by real pause/exclusive
   authority.
@@ -55,6 +56,21 @@ the pre-Task-6 implementation. The compile-fail doctests additionally reject:
 - cloning a permit;
 - returning a permit beyond its guard borrow.
 
+Repair round 1 also preserved red-first evidence for every reviewed defect:
+
+- `concurrency_contracts::shared_dispatcher_services_memory_state` reproduced
+  the public threaded `brk` regression as `ENOSYS`; after changing the test to
+  the explicit sole-executor API it compile-failed until that structural outer
+  boundary existed.
+- `cargo test -p carrick-runtime --doc mm_mutation` failed because the original
+  clone doctest cloned `&MmMutationGuard` rather than the owned guard.
+- the proc snapshot regression compile-failed until `mem_snapshot_until`
+  existed, then proved a snapshot cannot clone `MemState` during Installing.
+- while propagating the lifetime-bearing install type, rustc rejected the old
+  vCPU shape with E0597 because both `mutation` and `permit` died before the
+  stored install guard. The repaired consumer completes install/rollback inside
+  the permit scope; this is direct compiler evidence for the reviewed lifetime.
+
 ## Authority construction graph
 
 ```text
@@ -65,15 +81,16 @@ threaded syscall classifier (exact mutation table)
   -> MutationSyscallCtx only
   -> borrow-bound HostAliasPermit
   -> HostAliasTransactions::begin_dispatch
-  -> coordinator alias guard transfers through Pending -> Installing
-  -> permit-required HostAliasTransaction::claim
+  -> dispatch alias phase ends before an owned Pending outcome escapes
+  -> permit-required HostAliasTransaction::claim re-enters alias exclusion
+  -> lifetime-bearing HostAliasInstallGuard<'permit>
   -> backend install/rollback/commit while outer authority remains live
 
 ordinary classifier
   -> SyscallCtx (no mutation field and no permit path)
 
-non-threaded outer boundary / cfg(test) helper
-  -> sealed, non-Send single-executor issuer
+non-threaded or explicit single-executor outer boundary / cfg(test) helper
+  -> exclusive dispatcher witness -> real Stage1Exclusive
   -> same MmMutationGuard -> permit chain
 
 retained Task-5 foreign read
@@ -81,11 +98,12 @@ retained Task-5 foreign read
   -> mutually exclusive with alias work, without impersonating mutation
 ```
 
-The coordinator concurrency test holds alias work while another thread enters
-the alias queue and proves the inner phase has zero API/path for waiting on
-page-table exclusion. Snapshot readers and alias work now share this real
-per-MM observation point. The deleted thread-local `LockLevel` validator and
-executor fake acquisitions no longer exist.
+The coordinator concurrency test uses a real `PtPauseGuard` for both editors.
+The second editor remains at the outer pause election and cannot appear in the
+inner alias queue until the first editor releases both alias work and its real
+pause. Snapshot readers and alias work share the per-MM observation point. The
+deleted thread-local `LockLevel` validator, fake issuers, tautological
+`outer_waiters`, and executor fake acquisitions no longer exist.
 
 ## Changed files
 
@@ -100,11 +118,13 @@ executor fake acquisitions no longer exist.
 - `crates/carrick-runtime/src/dispatch/tests.rs`
 - `crates/carrick-runtime/src/dispatch/lock_order.rs` (deleted)
 - `crates/carrick-runtime/src/runtime.rs`
-- `crates/carrick-runtime/src/hvpatch/mod.rs` (test issuer migration only)
+- `crates/carrick-runtime/src/hvpatch/mod.rs` (test authority migration only)
 - `crates/carrick-runtime/src/vcpu_loop/mod.rs`
+- `crates/carrick-runtime/src/vcpu_loop/exec.rs`
 - `crates/carrick-runtime/src/vcpu_loop/quiesce.rs`
 - `crates/carrick-runtime/src/vcpu_loop/signal.rs`
 - `crates/carrick-runtime/src/vcpu_loop/executor.rs`
+- `crates/carrick-runtime/tests/integration/concurrency_contracts.rs`
 - this report
 
 ## GREEN evidence and exact census
@@ -118,8 +138,21 @@ executor fake acquisitions no longer exist.
   `foreign-current-memory=1`.
 - `RUSTC_WRAPPER= cargo test -p carrick-runtime mm_mutation` — PASS, 2/2
   focused unit tests; all other test binaries filtered cleanly.
+- `RUSTC_WRAPPER= cargo test -p carrick-runtime
+  mutation_classifier_exactly_matches_the_typed_handler_tables -- --nocapture`
+  — PASS, 1/1; the exact 17-entry classifier agrees with both typed mutation
+  handler tables for every syscall number through 512.
 - `RUST_TEST_THREADS=1 RUSTC_WRAPPER= cargo test -p carrick-runtime
-  dispatch::mem::tests --lib` — PASS, 126/126.
+  dispatch::mem::tests --lib` — PASS, 127/127.
+- `RUSTC_WRAPPER= cargo test -p carrick-runtime --test integration
+  concurrency_contracts::shared_dispatcher_services_memory_state` — PASS,
+  1/1; both `brk` calls return their Linux values through the explicit real
+  single-executor route.
+- `RUSTC_WRAPPER= cargo test -p carrick-runtime --doc mm_mutation` — PASS,
+  3/3 compile-fail doctests.
+- `RUSTC_WRAPPER= cargo test -p carrick-runtime
+  proc_mem_snapshot_waits_for_install_and_returns_one_coherent_generation` —
+  PASS, 1/1.
 - `RUSTC_WRAPPER= cargo test -p carrick-vmm-hvf frame_cow` — PASS, 1/1
   focused unit test; all other test binaries filtered cleanly.
 - `RUSTC_WRAPPER= cargo check --workspace` — PASS.
@@ -134,13 +167,17 @@ executor fake acquisitions no longer exist.
 - All permit-bearing fields and constructors are private to `mm_mutation`;
   public consumers can borrow a permit only from a live guard.
 - `MmMutationGuard` and `HostAliasPermit` are statically non-Clone/non-Copy;
-  the single-executor issuer is non-Clone and non-Send.
-- Real alias entry, pending transaction ownership, install claim, fault
-  materialization, rollback, and commit remain under the same coordinator and
-  real outer authority.
-- Read-only proc/VMA snapshots no longer enter alias work. Task 5's
-  revision/deadline semantics are retained by the coordinator's snapshot-read
-  side, which excludes alias work without granting mutation authority.
+  no single-executor issuer or constructor remains.
+- An owned pending transaction contains no alias guard. Claim re-enters the
+  exact-MM coordinator and returns `HostAliasInstallGuard<'permit>`, so safe
+  code cannot move install/rollback beyond the live permit and outer guard.
+- Each `DispatchMmAuthority` and mutation coordinator carries its exact
+  `MmId`; permit validation requires matching permit MM, authority MM,
+  coordinator MM, and coordinator `Arc` identity.
+- Read-only proc/VMA snapshots no longer enter alias work. Both fs proc-open
+  snapshots and `synthetic_proc_context` clone one exact authority's `MemState`
+  through the deadline-bounded coordinator read side, which excludes Installing
+  without granting mutation authority.
 - The mutation classifier is exact and fail-closed against the typed handler
   tables; ordinary dispatch cannot resolve a mutation handler.
 - The Task-5 per-MM state, retained foreign-read authority, deadlines, and

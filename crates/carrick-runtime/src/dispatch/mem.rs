@@ -2136,13 +2136,13 @@ struct MadviseRangeMeta {
 
 /// Owns alias exclusion from grow-down fault lookup through backend protection
 /// and dispatcher metadata publication.
-pub(crate) struct MmapGrowdownFaultPlan {
+pub(crate) struct MmapGrowdownFaultPlan<'permit> {
     start: u64,
     len: usize,
-    exclusion: super::HostAliasDispatchGuard,
+    exclusion: super::HostAliasDispatchGuard<'permit>,
 }
 
-impl MmapGrowdownFaultPlan {
+impl MmapGrowdownFaultPlan<'_> {
     pub(crate) fn start(&self) -> u64 {
         self.start
     }
@@ -2154,13 +2154,13 @@ impl MmapGrowdownFaultPlan {
 
 /// Owns alias exclusion from resident-fault lookup through backend protection
 /// and residency publication.
-pub(crate) struct ResidentFaultPlan {
+pub(crate) struct ResidentFaultPlan<'permit> {
     page: u64,
     prot: u64,
-    exclusion: super::HostAliasDispatchGuard,
+    exclusion: super::HostAliasDispatchGuard<'permit>,
 }
 
-impl ResidentFaultPlan {
+impl ResidentFaultPlan<'_> {
     pub(crate) fn page(&self) -> u64 {
         self.page
     }
@@ -2962,11 +2962,11 @@ impl SyscallDispatcher {
         self.mem().lock().growdown_ranges.push((low, start, end));
     }
 
-    pub(crate) fn mmap_growdown_fault_plan(
+    pub(crate) fn mmap_growdown_fault_plan<'permit>(
         &self,
-        permit: &super::mm_mutation::HostAliasPermit<'_>,
+        permit: &'permit super::mm_mutation::HostAliasPermit<'_>,
         addr: u64,
-    ) -> Option<MmapGrowdownFaultPlan> {
+    ) -> Option<MmapGrowdownFaultPlan<'permit>> {
         let exclusion = self.begin_host_alias_dispatch(permit);
         let page = page_floor(addr, self.linux_page_size());
         let mem_authority_6 = self.mem();
@@ -2992,12 +2992,13 @@ impl SyscallDispatcher {
     }
 
     #[cfg(test)]
-    pub(crate) fn mmap_growdown_fault_plan_for_test(
+    pub(crate) fn with_mmap_growdown_fault_plan_for_test<T>(
         &self,
         addr: u64,
-    ) -> Option<MmapGrowdownFaultPlan> {
+        use_plan: impl FnOnce(MmapGrowdownFaultPlan<'_>) -> T,
+    ) -> Option<T> {
         super::mm_mutation::test_support::with_permit(self.mm_mutation_coordinator(), |permit| {
-            self.mmap_growdown_fault_plan(permit, addr)
+            self.mmap_growdown_fault_plan(permit, addr).map(use_plan)
         })
     }
 
@@ -3056,8 +3057,9 @@ impl SyscallDispatcher {
     /// for the new image in the same execve transition.
     #[cfg(test)]
     pub(crate) fn reset_memory_state_on_execve(&self) {
-        let _vma_dispatch = self.begin_vma_dispatch_for_test();
-        self.mem().lock().reset_for_execve();
+        self.with_vma_dispatch_for_test(|_vma_dispatch| {
+            self.mem().lock().reset_for_execve();
+        });
     }
 
     pub(in crate::dispatch) fn next_mmap_address(
@@ -3438,10 +3440,8 @@ impl SyscallDispatcher {
         }
 
         mm_mutation fn brk(this, cx, requested: u64) {
-            let mut host_alias_dispatch = {
-                let permit = cx.mm_mutation.host_alias_permit();
-                this.begin_host_alias_dispatch(&permit)
-            };
+            let permit = cx.mm_mutation.host_alias_permit();
+            let mut host_alias_dispatch = this.begin_host_alias_dispatch(&permit);
             let mem_authority_13 = this.mem();
             let mut mem = mem_authority_13.lock();
             let current = mem.brk_current;
@@ -3537,10 +3537,8 @@ impl SyscallDispatcher {
         }
 
         mm_mutation fn mmap(this, cx, requested: GuestPtr, length: u64, prot: u64, flags: u64, fd: Fd, offset: u64) {
-            let mut host_alias_dispatch = {
-                let permit = cx.mm_mutation.host_alias_permit();
-                this.begin_conditional_vma_dispatch(&permit)
-            };
+            let permit = cx.mm_mutation.host_alias_permit();
+            let mut host_alias_dispatch = this.begin_conditional_vma_dispatch(&permit);
             let mut flags = flags;
             let memory = &mut *cx.memory;
             let page_size = this.linux_page_size();
@@ -5189,10 +5187,8 @@ impl SyscallDispatcher {
         }
 
         mm_mutation fn munmap(this, cx, address: GuestPtr, length: u64) {
-            let mut host_alias_dispatch = {
-                let permit = cx.mm_mutation.host_alias_permit();
-                this.begin_conditional_vma_dispatch(&permit)
-            };
+            let permit = cx.mm_mutation.host_alias_permit();
+            let mut host_alias_dispatch = this.begin_conditional_vma_dispatch(&permit);
             let page_size = this.linux_page_size();
             // Linux munmap EINVAL edges (__vm_munmap): the address must be
             // page-aligned and the length non-zero. LTP munmap03 munmaps the
@@ -5373,10 +5369,8 @@ impl SyscallDispatcher {
         }
 
         mm_mutation fn msync(this, cx, address: GuestPtr, length: u64, flags: u64) {
-            let _host_alias_dispatch = {
-                let permit = cx.mm_mutation.host_alias_permit();
-                this.begin_host_alias_dispatch(&permit)
-            };
+            let permit = cx.mm_mutation.host_alias_permit();
+            let _host_alias_dispatch = this.begin_host_alias_dispatch(&permit);
             if flags & !(LINUX_MS_ASYNC | LINUX_MS_INVALIDATE | LINUX_MS_SYNC) != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
@@ -5414,10 +5408,8 @@ impl SyscallDispatcher {
         }
 
         mm_mutation fn mlock(this, cx, address: GuestPtr, length: u64) {
-            let _host_alias_dispatch = {
-                let permit = cx.mm_mutation.host_alias_permit();
-                this.begin_host_alias_dispatch(&permit)
-            };
+            let permit = cx.mm_mutation.host_alias_permit();
+            let _host_alias_dispatch = this.begin_host_alias_dispatch(&permit);
             let page_size = this.linux_page_size();
             let Some(range) = page_rounded_range(address, length, page_size)? else {
                 return Ok(DispatchOutcome::Returned { value: 0 });
@@ -5440,10 +5432,8 @@ impl SyscallDispatcher {
         }
 
         mm_mutation fn munlock(this, cx, address: GuestPtr, length: u64) {
-            let _host_alias_dispatch = {
-                let permit = cx.mm_mutation.host_alias_permit();
-                this.begin_host_alias_dispatch(&permit)
-            };
+            let permit = cx.mm_mutation.host_alias_permit();
+            let _host_alias_dispatch = this.begin_host_alias_dispatch(&permit);
             let page_size = this.linux_page_size();
             let Some(range) = page_rounded_range(address, length, page_size)? else {
                 return Ok(DispatchOutcome::Returned { value: 0 });
@@ -5465,10 +5455,8 @@ impl SyscallDispatcher {
         }
 
         mm_mutation fn mlockall(this, cx, flags: u64) {
-            let _host_alias_dispatch = {
-                let permit = cx.mm_mutation.host_alias_permit();
-                this.begin_host_alias_dispatch(&permit)
-            };
+            let permit = cx.mm_mutation.host_alias_permit();
+            let _host_alias_dispatch = this.begin_host_alias_dispatch(&permit);
             let Some(flags) = LinuxMlockallFlags::from_bits(flags) else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
@@ -5490,19 +5478,15 @@ impl SyscallDispatcher {
         }
 
         mm_mutation fn munlockall(this, cx) {
-            let _host_alias_dispatch = {
-                let permit = cx.mm_mutation.host_alias_permit();
-                this.begin_host_alias_dispatch(&permit)
-            };
+            let permit = cx.mm_mutation.host_alias_permit();
+            let _host_alias_dispatch = this.begin_host_alias_dispatch(&permit);
             this.mem().lock().locked_ranges.clear();
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
         mm_mutation fn mlock2(this, cx, address: GuestPtr, length: u64, flags: u64) {
-            let _host_alias_dispatch = {
-                let permit = cx.mm_mutation.host_alias_permit();
-                this.begin_host_alias_dispatch(&permit)
-            };
+            let permit = cx.mm_mutation.host_alias_permit();
+            let _host_alias_dispatch = this.begin_host_alias_dispatch(&permit);
             let Some(flags) = LinuxMlock2Flags::from_bits(flags) else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
@@ -5530,10 +5514,8 @@ impl SyscallDispatcher {
         }
 
         mm_mutation fn mincore(this, cx, address: GuestPtr, length: u64, vec: GuestPtr) {
-            let _host_alias_dispatch = {
-                let permit = cx.mm_mutation.host_alias_permit();
-                this.begin_host_alias_dispatch(&permit)
-            };
+            let permit = cx.mm_mutation.host_alias_permit();
+            let _host_alias_dispatch = this.begin_host_alias_dispatch(&permit);
             let memory = &mut *cx.memory;
             let page_size = this.linux_page_size();
             // Linux requires a page-aligned start address, else EINVAL (this is
@@ -5580,10 +5562,8 @@ impl SyscallDispatcher {
         }
 
         mm_mutation fn mremap(this, cx, old_address: GuestPtr, old_size: u64, new_size_req: u64, flags: u64, new_address: GuestPtr) {
-            let mut host_alias_dispatch = {
-                let permit = cx.mm_mutation.host_alias_permit();
-                this.begin_conditional_vma_dispatch(&permit)
-            };
+            let permit = cx.mm_mutation.host_alias_permit();
+            let mut host_alias_dispatch = this.begin_conditional_vma_dispatch(&permit);
             let memory = &mut *cx.memory;
             let page_size = this.linux_page_size();
             // Errno precedence below is oracle-derived (real Linux 6.12.76,
@@ -6590,10 +6570,8 @@ impl SyscallDispatcher {
         }
 
         mm_mutation fn mprotect(this, cx, address: GuestPtr, length: u64, prot: u64) {
-            let mut host_alias_dispatch = {
-                let permit = cx.mm_mutation.host_alias_permit();
-                this.begin_conditional_vma_dispatch(&permit)
-            };
+            let permit = cx.mm_mutation.host_alias_permit();
+            let mut host_alias_dispatch = this.begin_conditional_vma_dispatch(&permit);
             let page_size = this.linux_page_size();
             if prot & !LinuxProtFlags::SUPPORTED_MASK != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
@@ -6877,10 +6855,8 @@ impl SyscallDispatcher {
         }
 
         mm_mutation fn madvise(this, cx, address: GuestPtr, length: u64, advice: u64) {
-            let mut host_alias_dispatch = {
-                let permit = cx.mm_mutation.host_alias_permit();
-                this.begin_conditional_vma_dispatch(&permit)
-            };
+            let permit = cx.mm_mutation.host_alias_permit();
+            let mut host_alias_dispatch = this.begin_conditional_vma_dispatch(&permit);
             let page_size = this.linux_page_size();
             if !address.0.is_multiple_of(page_size) || !linux_madvise_advice_is_supported(advice) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
@@ -6968,10 +6944,8 @@ impl SyscallDispatcher {
         }
 
         mm_mutation fn remap_file_pages(this, cx, addr: u64, size: u64, prot: u64, pgoff: u64, _flags: u64) {
-            let _host_alias_dispatch = {
-                let permit = cx.mm_mutation.host_alias_permit();
-                this.begin_host_alias_dispatch(&permit)
-            };
+            let permit = cx.mm_mutation.host_alias_permit();
+            let _host_alias_dispatch = this.begin_host_alias_dispatch(&permit);
             if addr == 0 || size == 0 || prot != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
@@ -7204,11 +7178,11 @@ impl SyscallDispatcher {
         }
     }
 
-    pub(crate) fn resident_fault_plan(
+    pub(crate) fn resident_fault_plan<'permit>(
         &self,
-        permit: &super::mm_mutation::HostAliasPermit<'_>,
+        permit: &'permit super::mm_mutation::HostAliasPermit<'_>,
         address: u64,
-    ) -> Option<ResidentFaultPlan> {
+    ) -> Option<ResidentFaultPlan<'permit>> {
         let exclusion = self.begin_host_alias_dispatch(permit);
         let page = page_floor(address, self.linux_page_size());
         let mem_authority_32 = self.mem();

@@ -1466,7 +1466,6 @@ struct HostAliasTransactionId(u64);
 pub struct HostAliasTransaction {
     authority: Arc<DispatchMmAuthority>,
     transactions: Arc<HostAliasTransactions>,
-    structural: Option<mm_mutation::HostAliasCoordinatorGuard>,
     id: HostAliasTransactionId,
     armed: bool,
 }
@@ -1498,13 +1497,17 @@ impl Serialize for HostAliasTransaction {
 }
 
 impl HostAliasTransaction {
-    pub(crate) fn claim(
+    pub(crate) fn claim<'permit>(
         mut self,
-        permit: &mm_mutation::HostAliasPermit<'_>,
-    ) -> Option<HostAliasInstallGuard> {
-        if !permit.authorizes(&self.authority.mutation_coordinator) {
+        permit: &'permit mm_mutation::HostAliasPermit<'_>,
+    ) -> Option<HostAliasInstallGuard<'permit>> {
+        if !permit.authorizes(&self.authority.mutation_coordinator, self.authority.mm_id) {
             return None;
         }
+        // Re-enter the alias coordinator under the caller's still-live outer
+        // permit. The pending transaction owns no alias phase, so safe code
+        // cannot smuggle exclusion through an owned DispatchOutcome.
+        let structural = self.authority.mutation_coordinator.begin_alias(permit);
         let mut phase = self.transactions.phase.lock();
         let HostAliasPhase::Pending { id, commit } = &mut *phase else {
             return None;
@@ -1521,16 +1524,21 @@ impl HostAliasTransaction {
         Some(HostAliasInstallGuard {
             authority: Arc::clone(&self.authority),
             transactions: Arc::clone(&self.transactions),
-            _structural: self.structural.take(),
+            _structural: structural,
             id: self.id,
             armed: true,
         })
     }
 
     #[cfg(test)]
-    pub(crate) fn claim_for_test(self) -> Option<HostAliasInstallGuard> {
+    pub(crate) fn with_claim_for_test<T>(
+        self,
+        use_install: impl FnOnce(HostAliasInstallGuard<'_>) -> T,
+    ) -> Option<T> {
         let coordinator = Arc::clone(&self.authority.mutation_coordinator);
-        mm_mutation::test_support::with_permit(coordinator, |permit| self.claim(permit))
+        mm_mutation::test_support::with_permit(coordinator, |permit| {
+            self.claim(permit).map(use_install)
+        })
     }
 }
 
@@ -1542,15 +1550,15 @@ impl Drop for HostAliasTransaction {
     }
 }
 
-pub(crate) struct HostAliasInstallGuard {
+pub(crate) struct HostAliasInstallGuard<'permit> {
     authority: Arc<DispatchMmAuthority>,
     transactions: Arc<HostAliasTransactions>,
-    _structural: Option<mm_mutation::HostAliasCoordinatorGuard>,
+    _structural: mm_mutation::HostAliasCoordinatorGuard<'permit>,
     id: HostAliasTransactionId,
     armed: bool,
 }
 
-impl HostAliasInstallGuard {
+impl HostAliasInstallGuard<'_> {
     pub(crate) fn bus_fault_range(&self) -> Option<(u64, u64)> {
         let phase = self.transactions.phase.lock();
         match &*phase {
@@ -1567,7 +1575,7 @@ impl HostAliasInstallGuard {
     }
 }
 
-impl Drop for HostAliasInstallGuard {
+impl Drop for HostAliasInstallGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
             self.transactions.abort_matching(self.id);
@@ -2312,11 +2320,11 @@ impl HostAliasTransactions {
         }
     }
 
-    fn begin_dispatch(
+    fn begin_dispatch<'permit>(
         self: &Arc<Self>,
-        permit: &mm_mutation::HostAliasPermit<'_>,
+        permit: &'permit mm_mutation::HostAliasPermit<'_>,
         coordinator: &Arc<mm_mutation::MmMutationCoordinator>,
-    ) -> HostAliasDispatchGuard {
+    ) -> HostAliasDispatchGuard<'permit> {
         let structural = coordinator.begin_alias(permit);
         let mut phase = self.phase.lock();
         while !matches!(*phase, HostAliasPhase::Idle) {
@@ -2324,7 +2332,7 @@ impl HostAliasTransactions {
         }
         *phase = HostAliasPhase::Dispatching;
         HostAliasDispatchGuard {
-            structural: Some(structural),
+            _structural: structural,
             authority: None,
             transactions: Arc::clone(self),
             active: true,
@@ -2364,6 +2372,7 @@ impl HostAliasTransactions {
 /// travel together here: `CLONE_VM` selects the same authority while a copied
 /// MM receives an exact fork-private authority.
 pub(crate) struct DispatchMmAuthority {
+    mm_id: crate::kernel::MmId,
     mem: Arc<mem::MemAuthority>,
     host_alias_transactions: Arc<HostAliasTransactions>,
     mutation_coordinator: Arc<mm_mutation::MmMutationCoordinator>,
@@ -2385,26 +2394,29 @@ pub(crate) struct DispatchMmAuthority {
 }
 
 impl DispatchMmAuthority {
-    fn new() -> Self {
+    fn new(mm_id: crate::kernel::MmId) -> Self {
         Self {
+            mm_id,
             mem: Arc::new(mem::MemAuthority::new(mem::MemState::new())),
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
-            mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new()),
+            mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
             vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
 
-    fn fork_private(&self) -> Self {
+    fn fork_private(&self, mm_id: crate::kernel::MmId) -> Self {
         Self {
+            mm_id,
             mem: self.mem.fork_private(),
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
-            mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new()),
+            mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
             vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
 
     fn fork_private_with_policy(
         &self,
+        mm_id: crate::kernel::MmId,
     ) -> Result<
         (
             Self,
@@ -2416,9 +2428,10 @@ impl DispatchMmAuthority {
         let (forked_mem, revision, ranges) = self.mem.fork_private_with_policy()?;
         Ok((
             Self {
+                mm_id,
                 mem: Arc::new(forked_mem),
                 host_alias_transactions: Arc::new(HostAliasTransactions::new()),
-                mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new()),
+                mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
                 // Never stamped: the child inherits the parent's vvar content
                 // through the COW split, and re-stamps on its next syscall
                 // only once a `clock_settime` has moved the global epoch.
@@ -2455,13 +2468,15 @@ impl DispatchMmAuthority {
 
     #[cfg(test)]
     pub(crate) fn new_for_test_with_revision(revision: crate::kernel::VmaRevision) -> Self {
+        let mm_id = crate::kernel::MmId::from_registry_allocation(std::num::NonZeroU64::MIN);
         Self {
+            mm_id,
             mem: Arc::new(mem::MemAuthority::with_revision(
                 mem::MemState::new(),
                 revision,
             )),
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
-            mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new()),
+            mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
             vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
@@ -2524,12 +2539,15 @@ impl DispatchMmBinding {
         })
     }
 
-    fn stage_private_exec(self: &Arc<Self>) -> PreparedDispatchMmExec {
+    fn stage_private_exec(
+        self: &Arc<Self>,
+        replacement_mm_id: crate::kernel::MmId,
+    ) -> PreparedDispatchMmExec {
         // The replacement stays private until promotion. Snapshot the current
         // authority; the exec transaction validates its source revision before
         // publication, so this read-only preparation is not host-alias work.
         let current = self.current.load_full();
-        let staged = Arc::new(current.fork_private());
+        let staged = Arc::new(current.fork_private(replacement_mm_id));
         let mut slot = self.staged_exec.lock();
         if slot.is_some() {
             tracing::error!("dispatcher already has a staged exec MM authority");
@@ -2544,11 +2562,11 @@ impl DispatchMmBinding {
         }
     }
 
-    fn begin_dispatch(
+    fn begin_dispatch<'permit>(
         &self,
-        permit: &mm_mutation::HostAliasPermit<'_>,
+        permit: &'permit mm_mutation::HostAliasPermit<'_>,
         marks_vma: bool,
-    ) -> HostAliasDispatchGuard {
+    ) -> HostAliasDispatchGuard<'permit> {
         loop {
             let authority = self.current.load_full();
             let guard = authority
@@ -2674,15 +2692,15 @@ impl crate::kernel::VmaSnapshotSource for DispatchMmAuthority {
     }
 }
 
-pub(crate) struct HostAliasDispatchGuard {
-    structural: Option<mm_mutation::HostAliasCoordinatorGuard>,
+pub(crate) struct HostAliasDispatchGuard<'permit> {
+    _structural: mm_mutation::HostAliasCoordinatorGuard<'permit>,
     authority: Option<Arc<DispatchMmAuthority>>,
     transactions: Arc<HostAliasTransactions>,
     active: bool,
     vma_revision: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
-impl HostAliasDispatchGuard {
+impl HostAliasDispatchGuard<'_> {
     fn with_authority(mut self, authority: Arc<DispatchMmAuthority>) -> Self {
         if !Arc::ptr_eq(&authority.host_alias_transactions, &self.transactions) {
             std::process::abort();
@@ -2738,14 +2756,13 @@ impl HostAliasDispatchGuard {
         HostAliasTransaction {
             authority,
             transactions: Arc::clone(&self.transactions),
-            structural: self.structural.take(),
             id,
             armed: true,
         }
     }
 }
 
-impl Drop for HostAliasDispatchGuard {
+impl Drop for HostAliasDispatchGuard<'_> {
     fn drop(&mut self) {
         if !self.active {
             return;
@@ -3070,7 +3087,7 @@ fn normalize_abs_path(path: &str) -> String {
     }
 }
 
-fn bootstrap_one_task_binding() -> crate::kernel::KernelTaskBinding {
+fn bootstrap_one_task_binding() -> (crate::kernel::KernelTaskBinding, crate::kernel::MmId) {
     let observed_pid = i32::try_from(std::process::id()).unwrap_or(1);
     let registry_id = crate::thread::ThreadId::main_from_host_pid();
     let bootstrap = match crate::kernel::RootBootstrap::for_reference_model(
@@ -3091,7 +3108,8 @@ fn bootstrap_one_task_binding() -> crate::kernel::KernelTaskBinding {
             std::process::abort();
         }
     };
-    context.task_binding()
+    let mm_id = context.shared().mm().id();
+    (context.task_binding(), mm_id)
 }
 
 impl Default for SyscallDispatcher {
@@ -4506,7 +4524,7 @@ impl SyscallDispatcher {
                 (revision, Arc::clone(&parent_mm), ranges)
             }
             crate::kernel::CloneObjectMode::Copy => {
-                let (forked, revision, ranges) = parent_mm.fork_private_with_policy()?;
+                let (forked, revision, ranges) = parent_mm.fork_private_with_policy(child_mm_id)?;
                 (revision, Arc::new(forked), ranges)
             }
         };
@@ -4797,9 +4815,10 @@ impl SyscallDispatcher {
     }
 
     fn new_with_host_resolver(snapshot: Option<&crate::vfs::HostResolverSnapshot>) -> Self {
-        let mm_authority = Arc::new(DispatchMmAuthority::new());
+        let (kernel_binding, mm_id) = bootstrap_one_task_binding();
+        let mm_authority = Arc::new(DispatchMmAuthority::new(mm_id));
         Self {
-            kernel_binding: RwLock::new(bootstrap_one_task_binding()),
+            kernel_binding: RwLock::new(kernel_binding),
             container: RwLock::new(None),
             timer_delivery: RwLock::new(None),
             file_authority: RwLock::new(None),
@@ -4925,46 +4944,55 @@ impl SyscallDispatcher {
         Ok(())
     }
 
-    pub(crate) fn begin_host_alias_dispatch(
+    pub(crate) fn begin_host_alias_dispatch<'permit>(
         &self,
-        permit: &mm_mutation::HostAliasPermit<'_>,
-    ) -> HostAliasDispatchGuard {
+        permit: &'permit mm_mutation::HostAliasPermit<'_>,
+    ) -> HostAliasDispatchGuard<'permit> {
         self.mm_binding.begin_dispatch(permit, false)
     }
 
     #[allow(dead_code)]
-    pub(crate) fn begin_vma_dispatch(
+    pub(crate) fn begin_vma_dispatch<'permit>(
         &self,
-        permit: &mm_mutation::HostAliasPermit<'_>,
-    ) -> HostAliasDispatchGuard {
+        permit: &'permit mm_mutation::HostAliasPermit<'_>,
+    ) -> HostAliasDispatchGuard<'permit> {
         self.mm_binding.begin_dispatch(permit, true)
     }
 
-    pub(crate) fn begin_conditional_vma_dispatch(
+    pub(crate) fn begin_conditional_vma_dispatch<'permit>(
         &self,
-        permit: &mm_mutation::HostAliasPermit<'_>,
-    ) -> HostAliasDispatchGuard {
+        permit: &'permit mm_mutation::HostAliasPermit<'_>,
+    ) -> HostAliasDispatchGuard<'permit> {
         self.mm_binding.begin_dispatch(permit, false)
     }
 
     #[cfg(test)]
-    pub(crate) fn begin_host_alias_dispatch_for_test(&self) -> HostAliasDispatchGuard {
+    pub(crate) fn with_host_alias_dispatch_for_test<T>(
+        &self,
+        use_guard: impl FnOnce(HostAliasDispatchGuard<'_>) -> T,
+    ) -> T {
         mm_mutation::test_support::with_permit(self.mm_mutation_coordinator(), |permit| {
-            self.begin_host_alias_dispatch(permit)
+            use_guard(self.begin_host_alias_dispatch(permit))
         })
     }
 
     #[cfg(test)]
-    pub(crate) fn begin_vma_dispatch_for_test(&self) -> HostAliasDispatchGuard {
+    pub(crate) fn with_vma_dispatch_for_test<T>(
+        &self,
+        use_guard: impl FnOnce(HostAliasDispatchGuard<'_>) -> T,
+    ) -> T {
         mm_mutation::test_support::with_permit(self.mm_mutation_coordinator(), |permit| {
-            self.begin_vma_dispatch(permit)
+            use_guard(self.begin_vma_dispatch(permit))
         })
     }
 
     #[cfg(test)]
-    pub(crate) fn begin_conditional_vma_dispatch_for_test(&self) -> HostAliasDispatchGuard {
+    pub(crate) fn with_conditional_vma_dispatch_for_test<T>(
+        &self,
+        use_guard: impl FnOnce(HostAliasDispatchGuard<'_>) -> T,
+    ) -> T {
         mm_mutation::test_support::with_permit(self.mm_mutation_coordinator(), |permit| {
-            self.begin_conditional_vma_dispatch(permit)
+            use_guard(self.begin_conditional_vma_dispatch(permit))
         })
     }
 
@@ -5257,6 +5285,7 @@ impl SyscallDispatcher {
     /// write, so K1 observers cannot see the destructive exec midpoint.
     pub(crate) fn publish_exec_image_state(
         &self,
+        replacement_mm_id: crate::kernel::MmId,
         regions: Vec<ProcMapsEntry>,
         auxv: Vec<u8>,
         file_mappings: Vec<crate::core_dump::FileMapping>,
@@ -5265,7 +5294,7 @@ impl SyscallDispatcher {
         // racy owner-count question while another CLONE_VM dispatcher can be
         // created or dropped, and keeps even a currently-private exec out of
         // the live authority until the existing successful publication seam.
-        let prepared = self.mm_binding.stage_private_exec();
+        let prepared = self.mm_binding.stage_private_exec(replacement_mm_id);
         let authority = Arc::clone(&prepared.staged);
         let mut mem = authority.mem.lock();
         mem.reset_for_execve();
@@ -6301,19 +6330,21 @@ impl SyscallDispatcher {
         // Tree-wide forward-progress beat for the deadlock watchdog.
         crate::deadlock_watchdog::tick();
         if syscall_requires_mm_mutation(request.number.raw(), request.args) {
-            let mut issuer = mm_mutation::single_executor_boundary(
-                self.mm_mutation_coordinator(),
-                kernel.shared().mm().id(),
-            );
-            let mut guard = issuer.guard();
-            self.dispatch_inner(
-                kernel,
-                request,
-                memory,
-                reporter,
-                None,
-                MutationDispatchRoute { guard: &mut guard },
-            )
+            crate::vcpu_loop::with_single_executor_stage1(self, |dispatcher, authority| {
+                let mut guard = mm_mutation::from_stage1_exclusive(
+                    authority,
+                    dispatcher.mm_mutation_coordinator(),
+                    kernel.shared().mm().id(),
+                );
+                dispatcher.dispatch_inner(
+                    kernel,
+                    request,
+                    memory,
+                    reporter,
+                    None,
+                    MutationDispatchRoute { guard: &mut guard },
+                )
+            })
         } else {
             self.dispatch_inner(
                 kernel,
@@ -6334,12 +6365,14 @@ impl SyscallDispatcher {
         kernel: &crate::kernel::KernelContext,
         run: impl FnOnce(&mut Self, &mut mm_mutation::MmMutationGuard<'_>) -> T,
     ) -> T {
-        let mut issuer = mm_mutation::single_executor_boundary(
-            self.mm_mutation_coordinator(),
-            kernel.shared().mm().id(),
-        );
-        let mut guard = issuer.guard();
-        run(self, &mut guard)
+        crate::vcpu_loop::with_single_executor_stage1(self, |dispatcher, authority| {
+            let mut guard = mm_mutation::from_stage1_exclusive(
+                authority,
+                dispatcher.mm_mutation_coordinator(),
+                kernel.shared().mm().id(),
+            );
+            run(dispatcher, &mut guard)
+        })
     }
 
     /// Apply a launch-time container syscall policy (the `carrick run` /
@@ -6529,6 +6562,39 @@ impl SyscallDispatcher {
         )
     }
 
+    /// Shared-dispatch semantics at a caller-proven sole-executor boundary.
+    ///
+    /// The exclusive `&mut self` is the unforgeable witness: ordinary
+    /// normalized handlers only have `&self` and therefore cannot mint stage-1
+    /// mutation authority. Multi-vCPU production uses the explicit
+    /// `PtPauseGuard`/`Stage1Exclusive` route in the vCPU loop instead.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_threaded_single_executor(
+        &mut self,
+        kernel: &crate::kernel::KernelContext,
+        request: SyscallRequest,
+        memory: &mut impl CurrentMmMemory,
+        reporter: &CompatReporter,
+        tid: crate::thread::ThreadId,
+        registry: &crate::thread::ThreadRegistry,
+        futex: &crate::thread::FutexTable,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        if syscall_requires_mm_mutation(request.number.raw(), request.args) {
+            crate::vcpu_loop::with_single_executor_stage1(self, |dispatcher, authority| {
+                let mut guard = mm_mutation::from_stage1_exclusive(
+                    authority,
+                    dispatcher.mm_mutation_coordinator(),
+                    kernel.shared().mm().id(),
+                );
+                dispatcher.dispatch_threaded_mutation(
+                    kernel, request, memory, reporter, tid, registry, futex, &mut guard,
+                )
+            })
+        } else {
+            self.dispatch_threaded(kernel, request, memory, reporter, tid, registry, futex)
+        }
+    }
+
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_threaded_for_test(
@@ -6542,14 +6608,11 @@ impl SyscallDispatcher {
         futex: &crate::thread::FutexTable,
     ) -> Result<DispatchOutcome, DispatchError> {
         if syscall_requires_mm_mutation(request.number.raw(), request.args) {
-            let mut issuer = mm_mutation::test_support::single_executor(
-                self.mm_mutation_coordinator(),
-                kernel.shared().mm().id(),
-            );
-            let mut guard = issuer.guard();
-            self.dispatch_threaded_mutation(
-                kernel, request, memory, reporter, tid, registry, futex, &mut guard,
-            )
+            mm_mutation::test_support::with_guard(self.mm_mutation_coordinator(), |guard| {
+                self.dispatch_threaded_mutation(
+                    kernel, request, memory, reporter, tid, registry, futex, guard,
+                )
+            })
         } else {
             self.dispatch_threaded(kernel, request, memory, reporter, tid, registry, futex)
         }
@@ -8827,8 +8890,33 @@ impl SyscallDispatcher {
         Some(threads)
     }
 
+    fn mem_snapshot_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<mem::MemState, crate::kernel::SnapshotError> {
+        // Select the authority exactly once: the coordinator guard and cloned
+        // MemState must belong to one pre- or post-exec MM generation.
+        let authority = self.mm_binding.current.load_full();
+        let _snapshot = authority
+            .mutation_coordinator
+            .begin_snapshot_until(deadline)
+            .ok_or_else(|| {
+                if std::time::Instant::now() >= deadline {
+                    crate::kernel::SnapshotError::TimedOut
+                } else {
+                    crate::kernel::SnapshotError::Busy
+                }
+            })?;
+        let snapshot = authority.mem.lock().clone();
+        Ok(snapshot)
+    }
+
     fn mem_snapshot(&self) -> mem::MemState {
-        self.mem().lock().clone()
+        self.mem_snapshot_until(std::time::Instant::now() + std::time::Duration::from_secs(30))
+            .unwrap_or_else(|error| {
+                tracing::error!(%error, "synthetic proc MemState snapshot timed out");
+                std::process::abort()
+            })
     }
 
     fn synthetic_proc_context(

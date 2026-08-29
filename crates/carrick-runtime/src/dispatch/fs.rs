@@ -8265,10 +8265,8 @@ impl SyscallDispatcher {
                     // publication, so a sibling cannot race between the seal
                     // check and the new seal becoming visible. Acquire it before
                     // any subsystem locks so we never wait while holding them.
-                    let _host_alias_dispatch = {
-                        let permit = cx.mm_mutation.host_alias_permit();
-                        this.begin_host_alias_dispatch(&permit)
-                    };
+                    let permit = cx.mm_mutation.host_alias_permit();
+                    let _host_alias_dispatch = this.begin_host_alias_dispatch(&permit);
                     let Some(open_file) = this.open_file(fd.0) else {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     };

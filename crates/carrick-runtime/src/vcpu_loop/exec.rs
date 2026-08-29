@@ -1298,8 +1298,11 @@ where
         // dispatcher memory-authority generation. The historical MM
         // retains the pre-staging snapshot, but records this deliberate
         // source revision so commit can reject any later mutation.
-        let mut prepared_dispatch_mm_exec =
-            Some(apply_exec_image_proc_state(&kernel.dispatcher, &img));
+        let mut prepared_dispatch_mm_exec = Some(apply_exec_image_proc_state(
+            &kernel.dispatcher,
+            replacement_mm_id,
+            &img,
+        ));
         if let Err(error) = prepared_kernel_exec.acknowledge_staged_vma_revision() {
             return Self::exec_failed_past_no_return(
                 kernel,
