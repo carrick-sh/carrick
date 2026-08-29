@@ -176,6 +176,8 @@ def production_mask(tokens: Sequence[Token]) -> list[bool]:
             "enum",
             "type",
             "use",
+            "const",
+            "static",
         }:
             pending_test_item = False
             cursor = index
@@ -397,6 +399,8 @@ def self_test() -> None:
         "test.rs": "#[cfg(test)] fn f<M: GuestMemory>(memory: &M) { memory.read_bytes(0, 1); }",
         "test-impl.rs": "#[cfg(test)] impl<T: GuestMemory> CurrentMmMemory for T {}",
         "test-use.rs": "#[cfg(test)] use crate::dispatch::lock_order::LockLevel;",
+        "test-const.rs": "#[cfg(test)] const LEVEL: LockLevel = LockLevel::Proc;",
+        "test-static.rs": "#[cfg(test)] static LEVEL: Option<LockLevel> = None;",
         "current-bound.rs": "fn dispatch<M: GuestMemory + CurrentMmMemory>(memory: &M) {}",
         "current-type-bound.rs": "struct SyscallCtx<M: GuestMemory + CurrentMmMemory> { memory: M }",
         "current-impl-bound.rs": "impl<M: GuestMemory + CurrentMmMemory> Dispatcher<M> {}",
