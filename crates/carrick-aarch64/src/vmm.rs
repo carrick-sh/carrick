@@ -346,6 +346,12 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         None
     }
 
+    fn frame_cow_owner_inventory(
+        &self,
+    ) -> Option<std::sync::Arc<dyn carrick_hal::FrameCowOwnerInventory>> {
+        None
+    }
+
     fn audit_executor_boundary(&mut self, _vcpu: &mut Self::Vcpu) -> Result<(), TrapError> {
         Err(TrapError::Hypervisor(
             "AArch64 VMM does not expose executor boundary audit authority".to_owned(),

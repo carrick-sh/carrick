@@ -478,6 +478,12 @@ impl TaskOnlyRuntimeProjectionSlot {
 }
 
 impl HvpatchTaskOnlyEngineState {
+    pub fn frame_cow_owner_inventory(
+        &self,
+    ) -> std::sync::Arc<dyn carrick_hal::FrameCowOwnerInventory> {
+        crate::trap::carrier_frame_cow_owner_inventory()
+    }
+
     pub fn preflight_runtime_projection(
         &self,
         cpu: &carrick_hal::threaded::GuestCpuState,
@@ -1076,6 +1082,12 @@ impl GuestVmBackend for HvfAarch64Vmm {
 impl Aarch64Vmm for HvfAarch64Vmm {
     fn foreign_mm_endpoint(&self) -> Option<carrick_hal::ForeignMmEndpoint> {
         Some(self.state.foreign_mm_endpoint())
+    }
+
+    fn frame_cow_owner_inventory(
+        &self,
+    ) -> Option<std::sync::Arc<dyn carrick_hal::FrameCowOwnerInventory>> {
+        Some(crate::trap::carrier_frame_cow_owner_inventory())
     }
 
     fn audit_executor_boundary(&mut self, vcpu: &mut Self::Vcpu) -> Result<(), TrapError> {

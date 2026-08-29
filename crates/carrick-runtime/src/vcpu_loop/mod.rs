@@ -132,6 +132,7 @@ fn apply_alias_frame_inventory(
 struct KernelFrameCowAuthority {
     kernel: Arc<crate::kernel::Kernel>,
     mm: crate::kernel::MmId,
+    owner_inventory: Arc<dyn carrick_hal::FrameCowOwnerInventory>,
     /// Exact-MM admission plus every participant's opaque pause endpoint.
     guest_executors: Arc<crate::kernel::GuestExecutorCensus>,
     tid: carrick_hal::ThreadId,
@@ -246,16 +247,62 @@ impl KernelFrameCowAuthority {
 }
 
 #[cfg(test)]
+#[derive(Debug)]
+struct FixedFrameCowOwnerLease {
+    generation: carrick_hal::ForeignOwnerGeneration,
+}
+
+#[cfg(test)]
+impl carrick_hal::FrameCowOwnerLease for FixedFrameCowOwnerLease {
+    fn generation(&self) -> carrick_hal::ForeignOwnerGeneration {
+        self.generation
+    }
+
+    fn is_current(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct FixedFrameCowOwnerInventory {
+    generation: carrick_hal::ForeignOwnerGeneration,
+}
+
+#[cfg(test)]
+impl carrick_hal::FrameCowOwnerInventory for FixedFrameCowOwnerInventory {
+    fn retain_current(
+        &self,
+        _gpa: carrick_guest_mem::Gpa,
+        _length: carrick_hal::FrameLength,
+    ) -> Result<Box<dyn carrick_hal::FrameCowOwnerLease>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        Ok(Box::new(FixedFrameCowOwnerLease {
+            generation: self.generation,
+        }))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn fixed_frame_cow_owner_inventory_for_test(
+    generation: carrick_hal::ForeignOwnerGeneration,
+) -> Arc<dyn carrick_hal::FrameCowOwnerInventory> {
+    Arc::new(FixedFrameCowOwnerInventory { generation })
+}
+
+#[cfg(test)]
 pub(crate) fn kernel_frame_cow_authority_for_test(
     kernel: Arc<crate::kernel::Kernel>,
     mm: crate::kernel::MmId,
     guest_executors: Arc<crate::kernel::GuestExecutorCensus>,
     tid: carrick_hal::ThreadId,
     asid: u16,
+    owner_inventory: Arc<dyn carrick_hal::FrameCowOwnerInventory>,
 ) -> Arc<dyn carrick_hal::FrameCowAuthority> {
     Arc::new(KernelFrameCowAuthority {
         kernel,
         mm,
+        owner_inventory,
         guest_executors,
         tid,
         identity: carrick_hal::FrameCowIdentity {
@@ -330,14 +377,20 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         frame: carrick_hal::FrameId,
         gpa: carrick_guest_mem::Gpa,
         length: carrick_hal::FrameLength,
-        owner_generation: carrick_hal::ForeignOwnerGeneration,
     ) -> Result<
         (
             carrick_hal::FrameInventoryApplyReceipt,
             carrick_hal::ForeignCowKernelProof,
+            carrick_hal::ForeignOwnerGeneration,
         ),
         Box<dyn std::error::Error + Send + Sync>,
     > {
+        // This endpoint is bound from the concrete owner engine when the
+        // Kernel COW authority is constructed. The foreign transport can name
+        // only the physical extent; it cannot choose the retained incarnation
+        // or the generation that will be signed.
+        let owner = self.owner_inventory.retain_current(gpa, length)?;
+        let owner_generation = owner.generation();
         let ((), receipt) = self
             .kernel
             .frame_inventory()
@@ -358,6 +411,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
                     gpa,
                     length,
                 )
+            || !owner.is_current()
         {
             std::process::abort();
         }
@@ -374,6 +428,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         Ok((
             receipt,
             carrick_hal::ForeignCowKernelProof::from_runtime_authority(Box::new(proof)),
+            owner_generation,
         ))
     }
 
@@ -2797,6 +2852,10 @@ trait HvpatchCloneBackendOps<M: threads::CloneTidMemory> {
         backend: &mut Self::Backend,
         token: carrick_vmm_hvf::hvf_aarch64_engine::HvpatchChildKernelBinding,
     ) -> Result<(), RuntimeError>;
+    fn frame_cow_owner_inventory(
+        &self,
+        backend: &Self::Backend,
+    ) -> Arc<dyn carrick_hal::FrameCowOwnerInventory>;
     fn activate_child(&mut self, backend: &mut Self::Backend) -> Result<(), RuntimeError>;
     fn make_binding_state(
         &mut self,
@@ -2946,6 +3005,10 @@ trait HvpatchProcessBackendOps<E: ThreadedEngine, M: CurrentMmMemory> {
         backend: &mut Self::Backend,
         token: carrick_vmm_hvf::hvf_aarch64_engine::HvpatchChildKernelBinding,
     ) -> Result<(), RuntimeError>;
+    fn frame_cow_owner_inventory(
+        &self,
+        backend: &Self::Backend,
+    ) -> Arc<dyn carrick_hal::FrameCowOwnerInventory>;
     fn activate_child(&mut self, backend: &mut Self::Backend) -> Result<(), RuntimeError>;
     fn make_binding_state(
         &mut self,
@@ -3108,6 +3171,13 @@ where
         backend.bind_child_kernel(token).map_err(RuntimeError::Trap)
     }
 
+    fn frame_cow_owner_inventory(
+        &self,
+        backend: &Self::Backend,
+    ) -> Arc<dyn carrick_hal::FrameCowOwnerInventory> {
+        backend.frame_cow_owner_inventory()
+    }
+
     fn activate_child(&mut self, backend: &mut Self::Backend) -> Result<(), RuntimeError> {
         backend.activate_child().map_err(RuntimeError::Trap)
     }
@@ -3186,6 +3256,13 @@ impl<M: threads::CloneTidMemory + 'static> HvpatchCloneBackendOps<M>
         token: carrick_vmm_hvf::hvf_aarch64_engine::HvpatchChildKernelBinding,
     ) -> Result<(), RuntimeError> {
         backend.bind_child_kernel(token).map_err(RuntimeError::Trap)
+    }
+
+    fn frame_cow_owner_inventory(
+        &self,
+        backend: &Self::Backend,
+    ) -> Arc<dyn carrick_hal::FrameCowOwnerInventory> {
+        backend.frame_cow_owner_inventory()
     }
 
     fn activate_child(&mut self, backend: &mut Self::Backend) -> Result<(), RuntimeError> {
@@ -4814,6 +4891,7 @@ where
         let cow_authority = Arc::new(KernelFrameCowAuthority {
             kernel: Arc::clone(child_context.kernel()),
             mm,
+            owner_inventory: ops.frame_cow_owner_inventory(&task_backend),
             guest_executors: self.kernel.dispatcher.mm_executor_census(),
             tid,
             identity: cow_identity,
@@ -8984,6 +9062,11 @@ fn prepare_initial_runner_handoff<E: ThreadedEngine + 'static>(
         .map_or(mm.raw(), crate::hvpatch::ProcessContext::asid_generation);
     engine.bind_task_snapshot_identity(mm.raw(), asid_generation);
     if let Some(process) = kernel.hvpatch_process.as_ref() {
+        let owner_inventory = engine.frame_cow_owner_inventory().ok_or_else(|| {
+            RuntimeError::Configuration(
+                "HVPatch initial runner has no carrier host-owner inventory".to_owned(),
+            )
+        })?;
         let binding = process.mm_binding().ok_or_else(|| {
             RuntimeError::Configuration("HVPatch initial runner task has no ASID".to_owned())
         })?;
@@ -8991,6 +9074,7 @@ fn prepare_initial_runner_handoff<E: ThreadedEngine + 'static>(
             Arc::new(KernelFrameCowAuthority {
                 kernel: Arc::clone(context.kernel()),
                 mm,
+                owner_inventory,
                 guest_executors: kernel.dispatcher.mm_executor_census(),
                 tid: this_tid,
                 identity: carrick_hal::FrameCowIdentity {
@@ -10277,6 +10361,17 @@ mod tests {
                 Ok(())
             }
 
+            fn frame_cow_owner_inventory(
+                &self,
+                _backend: &Self::Backend,
+            ) -> Arc<dyn carrick_hal::FrameCowOwnerInventory> {
+                fixed_frame_cow_owner_inventory_for_test(
+                    carrick_hal::ForeignOwnerGeneration::from_backend_counter(
+                        std::num::NonZeroU64::new(1).unwrap(),
+                    ),
+                )
+            }
+
             fn activate_child(&mut self, _backend: &mut Self::Backend) -> Result<(), RuntimeError> {
                 Ok(())
             }
@@ -10672,6 +10767,17 @@ mod tests {
         ) -> Result<(), RuntimeError> {
             self.child_kernel_bound = true;
             Ok(())
+        }
+
+        fn frame_cow_owner_inventory(
+            &self,
+            _backend: &Self::Backend,
+        ) -> Arc<dyn carrick_hal::FrameCowOwnerInventory> {
+            fixed_frame_cow_owner_inventory_for_test(
+                carrick_hal::ForeignOwnerGeneration::from_backend_counter(
+                    std::num::NonZeroU64::new(1).unwrap(),
+                ),
+            )
         }
 
         fn activate_child(&mut self, _backend: &mut Self::Backend) -> Result<(), RuntimeError> {
