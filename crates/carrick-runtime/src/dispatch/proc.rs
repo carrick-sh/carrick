@@ -5812,6 +5812,7 @@ mod kernel_process_dispatch_tests {
         let mut initial = vec![b'_'; 0x4000];
         initial[..4].copy_from_slice(b"same");
         let target = crate::kernel::consumer_cow_fixture(root.kernel(), &root, 61_097, initial);
+        target.observe_caller_executor_census(dispatcher.mm_executor_census());
         let root = refreshed(&root);
         let target_pid = target.target().task().key().id.raw();
         let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
@@ -5837,6 +5838,10 @@ mod kernel_process_dispatch_tests {
         assert_eq!(target.break_calls(), 1);
         assert_eq!(target.prepare_calls(), 1);
         assert_eq!(target.commit_calls(), 1);
+        assert!(
+            !target.break_observed_caller_executor(),
+            "caller MM participation must be absent before target COW mutation begins",
+        );
     }
 
     #[test]
