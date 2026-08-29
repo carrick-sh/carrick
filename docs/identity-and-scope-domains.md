@@ -201,12 +201,11 @@ atomically denies non-owner registration until barrier release. Membership and
 thaw wakes are one-shot, registry-owned publications, and production admission
 preserves census-before-registry ordering plus the existing logical phase.
 
-This is a partial closure of population/lifecycle item 1 (runtime-audit Part 2
-item 3). The pre-existing `ThreadExecutionState` satisfies the explicit
-run-state half, and purpose-specific Task witness types now retain exact
-identities. Their fork/crash/core consumer migration and final source closure
-remain open until the participant-witness milestone's completion gate; this
-receipt does not claim population closure early.
+This was the first half of population/lifecycle item 1 (runtime-audit Part 2
+item 3). The participant-witness milestone completed the other half: the
+pre-existing `ThreadExecutionState` remains the sole run-state authority, and
+purpose-specific Task witness types retain exact identities through every
+fork/crash/core consumer. No second lifecycle enum was introduced.
 
 The closing verification applies to code head `a6579a511`; `209522268` adds only
 this receipt. The HAL registry (13 tests), runtime lease drain (7), process fork
@@ -220,6 +219,54 @@ host-authority census exited 2 on the documented position-only inventory drift:
 `changed=[]`. Consequently `just ci` stopped at that same stage; every recipe it
 could not reach was run explicitly as listed above. The exact abort ledger
 closes at 405 sites: 355 carrier-invariant aborts and 50 typed-error debts.
+
+### Typed participant population closure — 2026-08-28
+
+Code head `7a2af1aee` closes the raw population-authority half of item 1.
+`ForkBarrierParticipants`, `CrashBarrierParticipants`,
+`ThreadExitParticipants`, `CrashCaptureParticipants`, and
+`CoreNoteParticipants` are minted from `Task`; owner-sensitive witnesses
+authenticate an exact `ThreadKey` under the Task membership lock.
+`GuestExecutorCensus` now owns exact thread or anonymous executor identities,
+rejects duplicates and exhaustion transactionally, and couples its membership
+to generation-stamped `CrashSafePointParticipationId` RAII. A stale crash guard
+cannot clear its successor, and unwind releases crash participation before the
+executor census identity.
+
+Fork and crash barrier control uses only `requires_quiesce()`. Numeric
+cardinality survives solely in explicitly suffixed `_for_probe` projections at
+the existing fixed-width USDT boundaries. `CrashQuorum` refreshes its
+Task-minted capture roster on every poll, so retirement between polls cannot
+strand collection. Non-final thread exit requires an exact survivor witness.
+
+The monotone source checker's 14 negative and 14 positive fixtures pass, and its
+production scan covers 162 Rust leaves with zero findings. The remaining five
+raw-search `threads().len()` matches are test-only assertions. Focused
+executor-census (8), stale-owner (1), crash-quorum (3), process-fork (17), core
+publication (9), fork-quiesce (10), and observability (76) tests pass.
+`just clippy`, `just doc`, `just deny`, `just check-matrix`, `just check
+--workspace`, the authoritative `just test` rerun (including 2,062 runtime
+tests), and unrestricted `just test-integration` (302 runtime integration
+tests) pass. One load-sensitive ptrace-stop unit failed in the first broad run,
+then passed three exact serial reruns and the complete authoritative rerun.
+`just lint-domains` and `just ci` stop only at the mandatory compiler
+host-authority positional inventory check with `changed=[]`; that inventory was
+not rebaselined. The exact abort ledger now closes at 407 sites: 357
+carrier-invariant aborts and 50 typed-error debts.
+
+The Antigravity fork worker `task-participant-fork` (conversation
+`353b580d-2a8a-4e8a-bb35-679894e54923`) required three turns: Codex rejected a
+boolean projection that would have lied in the existing sibling-count probe,
+and the same conversation repaired it before integration. Worker commits
+`4ccd570a2` and `d99f5c06f` became canonical commits `eaf216c95` and
+`d23f37022`. The crash/core worker `task-participant-crash` (conversation
+`a86ce8bd-f883-4e1a-a6b2-7d38522ef847`) completed in one turn; worker commit
+`d035366b2` became canonical commit `c02fc50f3`. Codex re-ran every bounded gate
+and independent reviewers approved both consumer migrations.
+
+This receipt closes populations and lifecycle only. `MmToken` plus structural
+`CurrentMm`/`ForeignMm` authority and the mintable page-table/host-alias lock
+order remain open; the full runtime abstraction audit is not complete here.
 
 ### 5. Lock order made structural
 
