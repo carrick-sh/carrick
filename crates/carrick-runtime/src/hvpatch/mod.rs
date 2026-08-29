@@ -2725,7 +2725,7 @@ mod tests {
         );
 
         let parent_transaction = parent
-            .begin_host_alias_dispatch()
+            .begin_host_alias_dispatch_for_test()
             .publish(crate::dispatch::HostAliasCommit::empty_for_test());
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
         let promotion = std::thread::spawn(move || {
@@ -2738,7 +2738,7 @@ mod tests {
         promotion.join().expect("promotion thread");
 
         let parent_install = parent_transaction
-            .claim()
+            .claim_for_test()
             .expect("the parent's predecessor transaction remains valid");
         assert_eq!(parent_install.bus_fault_range(), None);
         drop(parent_install);
@@ -2801,7 +2801,7 @@ mod tests {
             Vec::new(),
         );
 
-        let predecessor_dispatch = child.begin_host_alias_dispatch();
+        let predecessor_dispatch = child.begin_host_alias_dispatch_for_test();
         let start = std::sync::Arc::new(std::sync::Barrier::new(2));
         let thread_start = std::sync::Arc::clone(&start);
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);

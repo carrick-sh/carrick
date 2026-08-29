@@ -64,7 +64,7 @@ pub(super) fn current_thread_holds_pt_pause() -> bool {
 /// dispatch. Separate from [`PtPauseGuard`] because exclusivity has two
 /// sources: the pause (which raises the same marker, so the two nest harmlessly
 /// when both apply) and simply having no peer that can execute guest code.
-pub(super) struct Stage1Exclusive {
+pub(crate) struct Stage1Exclusive {
     _private: (),
 }
 
@@ -81,7 +81,7 @@ impl Drop for Stage1Exclusive {
     }
 }
 
-pub(super) struct PtPauseGuard {
+pub(crate) struct PtPauseGuard {
     _inner: crate::fork_quiesce::PtPauseGuard,
 }
 

@@ -59,12 +59,21 @@ syscall_table! {
     /// the other modules' tables. Add a `mem` syscall by adding an arm
     /// HERE — no shared routing table to edit.
     pub(crate) fn dispatch_mem;
+    213 => readahead,
+    223 => fadvise64,
+    425 => io_uring_setup,
+    426 => io_uring_enter,
+    427 => io_uring_register,
+    283 => sys_membarrier,
+    282 => userfaultfd,
+}
+
+mutation_syscall_table! {
+    pub(crate) fn dispatch_mem_mutation;
     214 => brk,
     215 => munmap,
     216 => mremap,
-    213 => readahead,
     222 => mmap,
-    223 => fadvise64,
     226 => mprotect,
     227 => msync,
     228 => mlock,
@@ -75,11 +84,6 @@ syscall_table! {
     233 => madvise,
     234 => remap_file_pages,
     284 => mlock2,
-    425 => io_uring_setup,
-    426 => io_uring_enter,
-    427 => io_uring_register,
-    283 => sys_membarrier,
-    282 => userfaultfd,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2922,7 +2926,6 @@ impl SyscallDispatcher {
     }
 
     pub(crate) fn mmap_fault_is_sigbus(&self, addr: u64) -> bool {
-        let _host_alias_dispatch = self.begin_host_alias_dispatch();
         self.mem()
             .lock()
             .bus_fault_ranges
@@ -2932,6 +2935,21 @@ impl SyscallDispatcher {
                     .checked_add(len)
                     .is_some_and(|end| addr >= start && addr < end)
             })
+    }
+
+    /// Read-only classifier used at the trap boundary before it chooses the
+    /// statically separate fault-mutation route.
+    pub(crate) fn fault_requires_mm_mutation(&self, addr: u64) -> bool {
+        let page = page_floor(addr, self.linux_page_size());
+        let mem_authority = self.mem();
+        let mem = mem_authority.lock();
+        mem.resident_fault_ranges
+            .iter()
+            .any(|fault| page >= fault.range.start().raw() && page < fault.range.end().raw())
+            || mem
+                .growdown_ranges
+                .iter()
+                .any(|&(low, current, _)| page >= low && page < current)
     }
 
     fn record_growdown_mapping(&self, start: u64, len: u64) {
@@ -2944,8 +2962,12 @@ impl SyscallDispatcher {
         self.mem().lock().growdown_ranges.push((low, start, end));
     }
 
-    pub(crate) fn mmap_growdown_fault_plan(&self, addr: u64) -> Option<MmapGrowdownFaultPlan> {
-        let exclusion = self.begin_host_alias_dispatch();
+    pub(crate) fn mmap_growdown_fault_plan(
+        &self,
+        permit: &super::mm_mutation::HostAliasPermit<'_>,
+        addr: u64,
+    ) -> Option<MmapGrowdownFaultPlan> {
+        let exclusion = self.begin_host_alias_dispatch(permit);
         let page = page_floor(addr, self.linux_page_size());
         let mem_authority_6 = self.mem();
         let mem = mem_authority_6.lock();
@@ -2967,6 +2989,16 @@ impl SyscallDispatcher {
             }
         }
         None
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mmap_growdown_fault_plan_for_test(
+        &self,
+        addr: u64,
+    ) -> Option<MmapGrowdownFaultPlan> {
+        super::mm_mutation::test_support::with_permit(self.mm_mutation_coordinator(), |permit| {
+            self.mmap_growdown_fault_plan(permit, addr)
+        })
     }
 
     pub(crate) fn commit_mmap_growdown(&self, plan: MmapGrowdownFaultPlan) {
@@ -3024,7 +3056,7 @@ impl SyscallDispatcher {
     /// for the new image in the same execve transition.
     #[cfg(test)]
     pub(crate) fn reset_memory_state_on_execve(&self) {
-        let _vma_dispatch = self.begin_vma_dispatch();
+        let _vma_dispatch = self.begin_vma_dispatch_for_test();
         self.mem().lock().reset_for_execve();
     }
 
@@ -3405,8 +3437,11 @@ impl SyscallDispatcher {
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
-        fn brk(this, cx, requested: u64) {
-            let mut host_alias_dispatch = this.begin_host_alias_dispatch();
+        mm_mutation fn brk(this, cx, requested: u64) {
+            let mut host_alias_dispatch = {
+                let permit = cx.mm_mutation.host_alias_permit();
+                this.begin_host_alias_dispatch(&permit)
+            };
             let mem_authority_13 = this.mem();
             let mut mem = mem_authority_13.lock();
             let current = mem.brk_current;
@@ -3501,8 +3536,11 @@ impl SyscallDispatcher {
             })
         }
 
-        fn mmap(this, cx, requested: GuestPtr, length: u64, prot: u64, flags: u64, fd: Fd, offset: u64) {
-            let mut host_alias_dispatch = this.begin_conditional_vma_dispatch();
+        mm_mutation fn mmap(this, cx, requested: GuestPtr, length: u64, prot: u64, flags: u64, fd: Fd, offset: u64) {
+            let mut host_alias_dispatch = {
+                let permit = cx.mm_mutation.host_alias_permit();
+                this.begin_conditional_vma_dispatch(&permit)
+            };
             let mut flags = flags;
             let memory = &mut *cx.memory;
             let page_size = this.linux_page_size();
@@ -5150,8 +5188,11 @@ impl SyscallDispatcher {
             })
         }
 
-        fn munmap(this, cx, address: GuestPtr, length: u64) {
-            let mut host_alias_dispatch = this.begin_conditional_vma_dispatch();
+        mm_mutation fn munmap(this, cx, address: GuestPtr, length: u64) {
+            let mut host_alias_dispatch = {
+                let permit = cx.mm_mutation.host_alias_permit();
+                this.begin_conditional_vma_dispatch(&permit)
+            };
             let page_size = this.linux_page_size();
             // Linux munmap EINVAL edges (__vm_munmap): the address must be
             // page-aligned and the length non-zero. LTP munmap03 munmaps the
@@ -5331,8 +5372,11 @@ impl SyscallDispatcher {
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
-        fn msync(this, cx, address: GuestPtr, length: u64, flags: u64) {
-            let _host_alias_dispatch = this.begin_host_alias_dispatch();
+        mm_mutation fn msync(this, cx, address: GuestPtr, length: u64, flags: u64) {
+            let _host_alias_dispatch = {
+                let permit = cx.mm_mutation.host_alias_permit();
+                this.begin_host_alias_dispatch(&permit)
+            };
             if flags & !(LINUX_MS_ASYNC | LINUX_MS_INVALIDATE | LINUX_MS_SYNC) != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
@@ -5369,8 +5413,11 @@ impl SyscallDispatcher {
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
-        fn mlock(this, cx, address: GuestPtr, length: u64) {
-            let _host_alias_dispatch = this.begin_host_alias_dispatch();
+        mm_mutation fn mlock(this, cx, address: GuestPtr, length: u64) {
+            let _host_alias_dispatch = {
+                let permit = cx.mm_mutation.host_alias_permit();
+                this.begin_host_alias_dispatch(&permit)
+            };
             let page_size = this.linux_page_size();
             let Some(range) = page_rounded_range(address, length, page_size)? else {
                 return Ok(DispatchOutcome::Returned { value: 0 });
@@ -5392,8 +5439,11 @@ impl SyscallDispatcher {
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
-        fn munlock(this, cx, address: GuestPtr, length: u64) {
-            let _host_alias_dispatch = this.begin_host_alias_dispatch();
+        mm_mutation fn munlock(this, cx, address: GuestPtr, length: u64) {
+            let _host_alias_dispatch = {
+                let permit = cx.mm_mutation.host_alias_permit();
+                this.begin_host_alias_dispatch(&permit)
+            };
             let page_size = this.linux_page_size();
             let Some(range) = page_rounded_range(address, length, page_size)? else {
                 return Ok(DispatchOutcome::Returned { value: 0 });
@@ -5414,8 +5464,11 @@ impl SyscallDispatcher {
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
-        fn mlockall(this, cx, flags: u64) {
-            let _host_alias_dispatch = this.begin_host_alias_dispatch();
+        mm_mutation fn mlockall(this, cx, flags: u64) {
+            let _host_alias_dispatch = {
+                let permit = cx.mm_mutation.host_alias_permit();
+                this.begin_host_alias_dispatch(&permit)
+            };
             let Some(flags) = LinuxMlockallFlags::from_bits(flags) else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
@@ -5436,14 +5489,20 @@ impl SyscallDispatcher {
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
-        fn munlockall(this, cx) {
-            let _host_alias_dispatch = this.begin_host_alias_dispatch();
+        mm_mutation fn munlockall(this, cx) {
+            let _host_alias_dispatch = {
+                let permit = cx.mm_mutation.host_alias_permit();
+                this.begin_host_alias_dispatch(&permit)
+            };
             this.mem().lock().locked_ranges.clear();
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
-        fn mlock2(this, cx, address: GuestPtr, length: u64, flags: u64) {
-            let _host_alias_dispatch = this.begin_host_alias_dispatch();
+        mm_mutation fn mlock2(this, cx, address: GuestPtr, length: u64, flags: u64) {
+            let _host_alias_dispatch = {
+                let permit = cx.mm_mutation.host_alias_permit();
+                this.begin_host_alias_dispatch(&permit)
+            };
             let Some(flags) = LinuxMlock2Flags::from_bits(flags) else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
@@ -5470,8 +5529,11 @@ impl SyscallDispatcher {
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
-        fn mincore(this, cx, address: GuestPtr, length: u64, vec: GuestPtr) {
-            let _host_alias_dispatch = this.begin_host_alias_dispatch();
+        mm_mutation fn mincore(this, cx, address: GuestPtr, length: u64, vec: GuestPtr) {
+            let _host_alias_dispatch = {
+                let permit = cx.mm_mutation.host_alias_permit();
+                this.begin_host_alias_dispatch(&permit)
+            };
             let memory = &mut *cx.memory;
             let page_size = this.linux_page_size();
             // Linux requires a page-aligned start address, else EINVAL (this is
@@ -5517,8 +5579,11 @@ impl SyscallDispatcher {
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
-        fn mremap(this, cx, old_address: GuestPtr, old_size: u64, new_size_req: u64, flags: u64, new_address: GuestPtr) {
-            let mut host_alias_dispatch = this.begin_conditional_vma_dispatch();
+        mm_mutation fn mremap(this, cx, old_address: GuestPtr, old_size: u64, new_size_req: u64, flags: u64, new_address: GuestPtr) {
+            let mut host_alias_dispatch = {
+                let permit = cx.mm_mutation.host_alias_permit();
+                this.begin_conditional_vma_dispatch(&permit)
+            };
             let memory = &mut *cx.memory;
             let page_size = this.linux_page_size();
             // Errno precedence below is oracle-derived (real Linux 6.12.76,
@@ -6524,8 +6589,11 @@ impl SyscallDispatcher {
             })
         }
 
-        fn mprotect(this, cx, address: GuestPtr, length: u64, prot: u64) {
-            let mut host_alias_dispatch = this.begin_conditional_vma_dispatch();
+        mm_mutation fn mprotect(this, cx, address: GuestPtr, length: u64, prot: u64) {
+            let mut host_alias_dispatch = {
+                let permit = cx.mm_mutation.host_alias_permit();
+                this.begin_conditional_vma_dispatch(&permit)
+            };
             let page_size = this.linux_page_size();
             if prot & !LinuxProtFlags::SUPPORTED_MASK != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
@@ -6808,8 +6876,11 @@ impl SyscallDispatcher {
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
-        fn madvise(this, cx, address: GuestPtr, length: u64, advice: u64) {
-            let mut host_alias_dispatch = this.begin_conditional_vma_dispatch();
+        mm_mutation fn madvise(this, cx, address: GuestPtr, length: u64, advice: u64) {
+            let mut host_alias_dispatch = {
+                let permit = cx.mm_mutation.host_alias_permit();
+                this.begin_conditional_vma_dispatch(&permit)
+            };
             let page_size = this.linux_page_size();
             if !address.0.is_multiple_of(page_size) || !linux_madvise_advice_is_supported(advice) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
@@ -6896,8 +6967,11 @@ impl SyscallDispatcher {
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
-        fn remap_file_pages(this, cx, addr: u64, size: u64, prot: u64, pgoff: u64, _flags: u64) {
-            let _host_alias_dispatch = this.begin_host_alias_dispatch();
+        mm_mutation fn remap_file_pages(this, cx, addr: u64, size: u64, prot: u64, pgoff: u64, _flags: u64) {
+            let _host_alias_dispatch = {
+                let permit = cx.mm_mutation.host_alias_permit();
+                this.begin_host_alias_dispatch(&permit)
+            };
             if addr == 0 || size == 0 || prot != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
@@ -7130,8 +7204,12 @@ impl SyscallDispatcher {
         }
     }
 
-    pub(crate) fn resident_fault_plan(&self, address: u64) -> Option<ResidentFaultPlan> {
-        let exclusion = self.begin_host_alias_dispatch();
+    pub(crate) fn resident_fault_plan(
+        &self,
+        permit: &super::mm_mutation::HostAliasPermit<'_>,
+        address: u64,
+    ) -> Option<ResidentFaultPlan> {
+        let exclusion = self.begin_host_alias_dispatch(permit);
         let page = page_floor(address, self.linux_page_size());
         let mem_authority_32 = self.mem();
         let mem = mem_authority_32.lock();

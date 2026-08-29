@@ -1012,69 +1012,77 @@ where
                 prot_none,
             } => {
                 let file = file.map(|(fd, offset, prot)| (fd.into_owned_fd(), offset, prot));
-                let retval = match transaction.claim() {
-                    None => {
-                        // No backend mutation started; dropping `file` closes the
-                        // owned dup and this pre-install claim failure is recoverable.
-                        drop(file);
-                        crate::linux_abi::LINUX_ENOMEM.guest_retval()
-                    }
-                    Some(install) => {
-                        if runtime
-                            .map_host_alias(
-                                va,
-                                ipa,
-                                len,
-                                &payload,
-                                file.map(|(fd, offset, prot)| (fd.into_raw_fd(), offset, prot)),
-                            )
-                            .is_err()
-                        {
-                            // Backend `Err` does not prove that stage-2/page-table
-                            // mutation never began. Process teardown is the only
-                            // sound rollback until the backend Result is stronger.
-                            std::process::abort();
-                        }
-                        let Ok(len) = usize::try_from(len) else {
-                            std::process::abort();
-                        };
-                        if prot_none && runtime.protect_range(va.raw(), len, 0).is_err() {
-                            std::process::abort();
-                        }
-                        // Publish the dispatcher's authoritative Linux VMA
-                        // protection + sharing only after the backend mapping and
-                        // requested leaf protection are both live. This is the
-                        // final infallible half of the alias transaction: a
-                        // sibling can never observe MAP_SHARED provenance for a
-                        // backing that failed to install, nor resume with a live
-                        // shared mapping classified as process-private.
-                        runtime.set_mapping_protection_and_sharing(
-                            va.raw(),
-                            len,
-                            prot_none,
-                            !carrick_abi::LinuxProtFlags::from_bits_truncate(prot)
-                                .contains(carrick_abi::LinuxProtFlags::WRITE),
-                            if shared {
-                                carrick_guest_mem::MappingSharing::Shared
-                            } else {
-                                carrick_guest_mem::MappingSharing::Private
-                            },
-                        );
-                        if let Some((bus_start, bus_len)) = install.bus_fault_range() {
-                            let Ok(bus_len) = usize::try_from(bus_len) else {
-                                std::process::abort();
-                            };
-                            if runtime.protect_range(bus_start, bus_len, 0).is_err() {
-                                std::process::abort();
+                let retval = dispatcher.with_single_executor_mm_mutation(
+                    &kernel_context,
+                    |dispatcher, mutation| {
+                        let permit = mutation.host_alias_permit();
+                        match transaction.claim(&permit) {
+                            None => {
+                                // No backend mutation started; dropping `file` closes the
+                                // owned dup and this pre-install claim failure is recoverable.
+                                drop(file);
+                                crate::linux_abi::LINUX_ENOMEM.guest_retval()
                             }
-                            runtime.set_no_access(bus_start, bus_len, true);
+                            Some(install) => {
+                                if runtime
+                                    .map_host_alias(
+                                        va,
+                                        ipa,
+                                        len,
+                                        &payload,
+                                        file.map(|(fd, offset, prot)| {
+                                            (fd.into_raw_fd(), offset, prot)
+                                        }),
+                                    )
+                                    .is_err()
+                                {
+                                    // Backend `Err` does not prove that stage-2/page-table
+                                    // mutation never began. Process teardown is the only
+                                    // sound rollback until the backend Result is stronger.
+                                    std::process::abort();
+                                }
+                                let Ok(len) = usize::try_from(len) else {
+                                    std::process::abort();
+                                };
+                                if prot_none && runtime.protect_range(va.raw(), len, 0).is_err() {
+                                    std::process::abort();
+                                }
+                                // Publish the dispatcher's authoritative Linux VMA
+                                // protection + sharing only after the backend mapping and
+                                // requested leaf protection are both live. This is the
+                                // final infallible half of the alias transaction: a
+                                // sibling can never observe MAP_SHARED provenance for a
+                                // backing that failed to install, nor resume with a live
+                                // shared mapping classified as process-private.
+                                runtime.set_mapping_protection_and_sharing(
+                                    va.raw(),
+                                    len,
+                                    prot_none,
+                                    !carrick_abi::LinuxProtFlags::from_bits_truncate(prot)
+                                        .contains(carrick_abi::LinuxProtFlags::WRITE),
+                                    if shared {
+                                        carrick_guest_mem::MappingSharing::Shared
+                                    } else {
+                                        carrick_guest_mem::MappingSharing::Private
+                                    },
+                                );
+                                if let Some((bus_start, bus_len)) = install.bus_fault_range() {
+                                    let Ok(bus_len) = usize::try_from(bus_len) else {
+                                        std::process::abort();
+                                    };
+                                    if runtime.protect_range(bus_start, bus_len, 0).is_err() {
+                                        std::process::abort();
+                                    }
+                                    runtime.set_no_access(bus_start, bus_len, true);
+                                }
+                                if dispatcher.commit_host_alias_install(install).is_err() {
+                                    std::process::abort();
+                                }
+                                success_retval
+                            }
                         }
-                        if dispatcher.commit_host_alias_install(install).is_err() {
-                            std::process::abort();
-                        }
-                        success_retval
-                    }
-                };
+                    },
+                );
                 runtime.complete_syscall(retval)?;
                 last_syscall_retval = Some(retval);
             }

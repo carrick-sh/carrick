@@ -1800,10 +1800,6 @@ const BOUNDARY_INVENTORY: &[ExecutorBoundaryInventoryEntry] = &[
         disposition: ExecutorStateDisposition::BoundaryReset,
     },
     ExecutorBoundaryInventoryEntry {
-        name: "dispatch-lock-order-depth",
-        disposition: ExecutorStateDisposition::BoundaryReset,
-    },
-    ExecutorBoundaryInventoryEntry {
         name: "path-resolution-depth",
         disposition: ExecutorStateDisposition::BoundaryReset,
     },
@@ -1853,9 +1849,6 @@ impl WorkerBoundaryAudit {
     pub(crate) fn audit_runtime_owned(&self) -> Result<(), TrapError> {
         if !carrick_thread::fork_quiesce::topology_depth_is_zero_for_executor_boundary() {
             return Err(boundary_error("topology-depth"));
-        }
-        if !crate::dispatch::lock_order::executor_boundary_is_clear() {
-            return Err(boundary_error("dispatch-lock-order-depth"));
         }
         if !SyscallDispatcher::executor_boundary_path_resolution_is_clear() {
             return Err(boundary_error("path-resolution-depth"));
@@ -5194,12 +5187,6 @@ pub(crate) mod tests {
                     );
                     self.owner_dirty_cleanup = Some(Box::new(move || drop(guard)));
                 }
-                2 => {
-                    let guard = crate::dispatch::lock_order::LockOrderGuard::acquire(
-                        crate::dispatch::lock_order::LockLevel::Proc,
-                    );
-                    self.owner_dirty_cleanup = Some(Box::new(move || drop(guard)));
-                }
                 3 => {
                     let guard = SyscallDispatcher::dirty_executor_boundary_path_guard_for_test();
                     self.owner_dirty_cleanup = Some(Box::new(move || drop(guard)));
@@ -8352,7 +8339,6 @@ pub(crate) mod tests {
             "sysv-mq-fd-cache",
             "logical-mq-wait-state",
             "fanotify-internal-open-depth",
-            "dispatch-lock-order-depth",
             "path-resolution-depth",
             "host-signal-mask",
             "exact-kick-binding",
@@ -8427,15 +8413,6 @@ pub(crate) mod tests {
         boundary
             .audit_runtime(&mut backend)
             .expect("topology unwound");
-
-        let lock = crate::dispatch::lock_order::LockOrderGuard::acquire(
-            crate::dispatch::lock_order::LockLevel::Proc,
-        );
-        assert!(boundary.audit_runtime(&mut backend).is_err());
-        drop(lock);
-        boundary
-            .audit_runtime(&mut backend)
-            .expect("lock order unwound");
 
         SyscallDispatcher::with_dirty_executor_boundary_path_resolution_for_test(|| {
             assert!(boundary.audit_runtime(&mut backend).is_err());
