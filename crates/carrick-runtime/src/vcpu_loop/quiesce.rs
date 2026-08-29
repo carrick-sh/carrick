@@ -734,7 +734,7 @@ where
             carrick_observability::probes::HvpatchForkQuiesce::new(
                 parent_pid,
                 forking_tid,
-                u32::from(quiesce_required),
+                fork_participants.initial_sibling_count_for_probe(),
                 quiesce_poll_iterations,
                 quiesce_elapsed_ns,
             ),
