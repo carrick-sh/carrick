@@ -75,6 +75,10 @@ impl Default for GuestExecutorCensusState {
     }
 }
 
+fn saturating_participant_count_for_probe(count: usize) -> i32 {
+    i32::try_from(count).unwrap_or(i32::MAX)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum GuestExecutorCensusError {
     #[error("thread {thread:?} is already admitted as a guest executor")]
@@ -171,7 +175,7 @@ impl GuestExecutorCensus {
 
     /// Numeric projection solely for the fixed-width probe ABI.
     pub(crate) fn participant_count_for_probe(&self) -> i32 {
-        i32::try_from(self.state.lock().participants.iter().count()).unwrap_or(i32::MAX)
+        saturating_participant_count_for_probe(self.state.lock().participants.iter().count())
     }
 }
 
@@ -255,6 +259,34 @@ mod tests {
         assert!(!census.has_peer_executor());
         drop(first);
         assert_eq!(census.participant_count_for_probe(), 0);
+    }
+
+    #[test]
+    fn probe_participant_count_saturates_at_i32_max() {
+        let max = usize::try_from(i32::MAX).expect("i32 max fits usize");
+        assert_eq!(saturating_participant_count_for_probe(max), i32::MAX);
+        assert_eq!(
+            saturating_participant_count_for_probe(max.saturating_add(1)),
+            i32::MAX
+        );
+    }
+
+    #[test]
+    fn anonymous_identity_exhaustion_never_reuses_the_final_token() {
+        let census = Arc::new(GuestExecutorCensus::default());
+        census.state.lock().next_anonymous = u64::MAX;
+
+        let final_token = census.enter(None).expect("final nonzero token");
+        assert!(matches!(
+            census.enter(None),
+            Err(GuestExecutorCensusError::AnonymousIdentityExhausted)
+        ));
+        drop(final_token);
+        assert_eq!(census.participant_count_for_probe(), 0);
+        assert!(matches!(
+            census.enter(None),
+            Err(GuestExecutorCensusError::AnonymousIdentityExhausted)
+        ));
     }
 
     #[test]
