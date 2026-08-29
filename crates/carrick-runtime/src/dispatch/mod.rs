@@ -1189,12 +1189,24 @@ impl<M: CurrentMmMemory> SyscallCtx<'_, M> {
 
 /// Exact classifier for syscalls that consume a live `ThreadExecutionLease`.
 ///
-/// Only `process_vm_readv` (270) and `process_vm_writev` (271) consume the
-/// execution lease. Ordinary syscalls return false and execute without
-/// acquiring or consulting the execution lease lock.
+/// `process_vm_readv` (270), `process_vm_writev` (271), and `ptrace` (117)
+/// memory access requests (`PTRACE_PEEKTEXT`, `PTRACE_PEEKDATA`, `PTRACE_POKETEXT`,
+/// `PTRACE_POKEDATA`) consume the execution lease. Ordinary syscalls and
+/// non-memory ptrace requests return false and execute without acquiring or
+/// consulting the execution lease lock.
 #[inline]
-pub(crate) const fn syscall_requires_execution_lease(nr: u64) -> bool {
-    nr == 270 || nr == 271
+pub(crate) const fn syscall_requires_execution_lease(nr: u64, args: SyscallArgs) -> bool {
+    match nr {
+        270 | 271 => true,
+        117 => matches!(
+            args.0[0],
+            carrick_abi::LINUX_PTRACE_PEEKTEXT
+                | carrick_abi::LINUX_PTRACE_PEEKDATA
+                | carrick_abi::LINUX_PTRACE_POKETEXT
+                | carrick_abi::LINUX_PTRACE_POKEDATA
+        ),
+        _ => false,
+    }
 }
 
 /// Per-thread coordination handles handed to tid-aware syscall handlers
