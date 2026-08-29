@@ -91,6 +91,15 @@ pub(crate) fn process_context_for_tests(
     )
 }
 
+#[cfg(test)]
+impl ProcessContext {
+    /// Enable the already-installed Task 7 foreign-MM facade in a dispatcher
+    /// unit fixture without exposing a production authority constructor.
+    pub(crate) fn enable_mm_access_for_tests(&mut self) {
+        self.mm_access = Some(crate::kernel::MmAccessAuthority::new());
+    }
+}
+
 #[derive(Clone)]
 struct ProcessTimerTarget {
     kernel: std::sync::Weak<crate::kernel::Kernel>,
