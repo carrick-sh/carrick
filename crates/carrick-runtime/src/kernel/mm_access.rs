@@ -1,7 +1,360 @@
-//! Compile-pressure contracts for kernel-minted MM authority.
-//!
-//! The authority types deliberately do not exist yet. These tests state the
-//! required kernel boundary before Task 3 supplies its opaque implementation.
+//! Kernel-minted authority for one exact Linux address-space incarnation.
+
+use std::marker::PhantomData;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use carrick_guest_mem::GuestVa;
+
+use super::{
+    Kernel, KernelContext, Mm, MmBackendSnapshot, MmId, SnapshotError, TaskKey, TaskLifecycle,
+};
+
+const MM_SNAPSHOT_TIMEOUT: Duration = Duration::from_millis(50);
+
+/// A retained, coherent observation of one exact `mm` incarnation.
+///
+/// Construction is confined to the kernel graph. The retained [`Arc`] keeps
+/// the old address space alive across target exec and retirement without
+/// retaining or following the task itself.
+#[derive(Clone, Debug)]
+pub struct MmToken {
+    task: TaskKey,
+    mm: Arc<Mm>,
+    snapshot: MmBackendSnapshot,
+}
+
+impl MmToken {
+    pub const fn task_key(&self) -> TaskKey {
+        self.task
+    }
+
+    pub fn mm_id(&self) -> MmId {
+        self.mm.id()
+    }
+
+    pub fn mm(&self) -> &Arc<Mm> {
+        &self.mm
+    }
+
+    pub fn read_range(
+        &self,
+        start: GuestVa,
+        len: usize,
+    ) -> Result<Option<MmReadRange<'_>>, MmAccessError> {
+        let Some(len) = NonZeroUsize::new(len) else {
+            return Ok(None);
+        };
+        self.validate_range(start, len, RangeAccess::Read)?;
+        Ok(Some(MmReadRange {
+            token: self,
+            start,
+            len,
+        }))
+    }
+
+    pub fn kernel_read_range(
+        &self,
+        start: GuestVa,
+        len: usize,
+    ) -> Result<Option<MmReadRange<'_>>, MmAccessError> {
+        let Some(len) = NonZeroUsize::new(len) else {
+            return Ok(None);
+        };
+        self.validate_range(start, len, RangeAccess::KernelRead)?;
+        Ok(Some(MmReadRange {
+            token: self,
+            start,
+            len,
+        }))
+    }
+
+    pub fn write_range(
+        &self,
+        start: GuestVa,
+        len: usize,
+    ) -> Result<Option<MmWriteRange<'_>>, MmAccessError> {
+        let Some(len) = NonZeroUsize::new(len) else {
+            return Ok(None);
+        };
+        self.validate_range(start, len, RangeAccess::Write)?;
+        Ok(Some(MmWriteRange {
+            token: self,
+            start,
+            len,
+        }))
+    }
+
+    fn validate_range(
+        &self,
+        start: GuestVa,
+        len: NonZeroUsize,
+        requested: RangeAccess,
+    ) -> Result<(), MmAccessError> {
+        let len_u64 = u64::try_from(len.get()).map_err(|_| MmAccessError::RangeOverflow {
+            start,
+            len: len.get(),
+        })?;
+        let end = start
+            .raw()
+            .checked_add(len_u64)
+            .ok_or(MmAccessError::RangeOverflow {
+                start,
+                len: len.get(),
+            })?;
+        let mut cursor = start.raw();
+
+        for vma in &self.snapshot.vmas {
+            if vma.end.raw() <= cursor {
+                continue;
+            }
+            if vma.start.raw() > cursor {
+                return Err(MmAccessError::Unmapped {
+                    address: GuestVa(cursor),
+                });
+            }
+
+            let access_error = match requested {
+                RangeAccess::Read if !vma.access.readable => Some(MmAccessError::ReadDenied {
+                    address: GuestVa(cursor),
+                }),
+                RangeAccess::Write if !vma.access.writable => Some(MmAccessError::WriteDenied {
+                    address: GuestVa(cursor),
+                }),
+                RangeAccess::KernelRead if !vma.access.kernel_visible => {
+                    Some(MmAccessError::KernelHidden {
+                        address: GuestVa(cursor),
+                    })
+                }
+                RangeAccess::KernelRead if !vma.access.readable => {
+                    Some(MmAccessError::ReadDenied {
+                        address: GuestVa(cursor),
+                    })
+                }
+                _ => None,
+            };
+            if let Some(error) = access_error {
+                return Err(error);
+            }
+
+            cursor = vma.end.raw().min(end);
+            if cursor == end {
+                return Ok(());
+            }
+        }
+
+        Err(MmAccessError::Unmapped {
+            address: GuestVa(cursor),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RangeAccess {
+    Read,
+    KernelRead,
+    Write,
+}
+
+/// A readable non-empty range bound by lifetime to its exact MM token.
+#[derive(Clone, Copy, Debug)]
+pub struct MmReadRange<'mm> {
+    token: &'mm MmToken,
+    start: GuestVa,
+    len: NonZeroUsize,
+}
+
+impl MmReadRange<'_> {
+    pub const fn start(&self) -> GuestVa {
+        self.start
+    }
+
+    pub const fn len(&self) -> NonZeroUsize {
+        self.len
+    }
+
+    pub fn mm_id(&self) -> MmId {
+        self.token.mm_id()
+    }
+}
+
+/// A writable non-empty range bound by lifetime to its exact MM token.
+#[derive(Debug)]
+pub struct MmWriteRange<'mm> {
+    token: &'mm MmToken,
+    start: GuestVa,
+    len: NonZeroUsize,
+}
+
+impl MmWriteRange<'_> {
+    pub const fn start(&self) -> GuestVa {
+        self.start
+    }
+
+    pub const fn len(&self) -> NonZeroUsize {
+        self.len
+    }
+
+    pub fn mm_id(&self) -> MmId {
+        self.token.mm_id()
+    }
+}
+
+/// Current-MM authority tied to the exact captured kernel context.
+#[derive(Clone, Debug)]
+pub struct CurrentMm<'context> {
+    token: MmToken,
+    context: PhantomData<&'context KernelContext>,
+}
+
+impl CurrentMm<'_> {
+    pub fn mm_id(&self) -> MmId {
+        self.token.mm_id()
+    }
+}
+
+/// Foreign-MM authority retaining an exact target address space.
+#[derive(Clone, Debug)]
+pub struct ForeignMm {
+    token: MmToken,
+}
+
+impl ForeignMm {
+    pub fn mm_id(&self) -> MmId {
+        self.token.mm_id()
+    }
+
+    pub fn mm(&self) -> &Arc<Mm> {
+        self.token.mm()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum MmRelation<'context> {
+    Current(CurrentMm<'context>),
+    Foreign(ForeignMm),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum MmAccessError {
+    #[error("kernel task {0:?} is not live at the requested generation")]
+    UnknownTask(TaskKey),
+    #[error("kernel context for task {0:?} no longer names its exact live task/MM binding")]
+    StaleContext(TaskKey),
+    #[error("MM {0:?} has no backend snapshot authority")]
+    MissingBackendAuthority(MmId),
+    #[error(transparent)]
+    Snapshot(#[from] SnapshotError),
+    #[error("MM snapshot contains malformed or overlapping VMA {start:?}..{end:?}")]
+    MalformedVma { start: GuestVa, end: GuestVa },
+    #[error("MM range {start:?} + {len} bytes overflows the guest VA domain")]
+    RangeOverflow { start: GuestVa, len: usize },
+    #[error("guest address {address:?} is not mapped in this MM")]
+    Unmapped { address: GuestVa },
+    #[error("guest address {address:?} is not readable in this MM")]
+    ReadDenied { address: GuestVa },
+    #[error("guest address {address:?} is not writable in this MM")]
+    WriteDenied { address: GuestVa },
+    #[error("guest address {address:?} is hidden from kernel memory access")]
+    KernelHidden { address: GuestVa },
+}
+
+impl KernelContext {
+    pub fn current_mm(&self) -> Result<CurrentMm<'_>, MmAccessError> {
+        let mm = self.authenticate_current_mm()?;
+        let token = snapshot_token(self.task.key(), mm)?;
+        Ok(CurrentMm {
+            token,
+            context: PhantomData,
+        })
+    }
+
+    fn authenticate_current_mm(&self) -> Result<Arc<Mm>, MmAccessError> {
+        let key = self.task.key();
+        if self.task.lifecycle() != TaskLifecycle::Live || self.thread.task_key() != key {
+            return Err(MmAccessError::StaleContext(key));
+        }
+        let Some(live_task) = self.kernel.registry().task(key.id) else {
+            return Err(MmAccessError::StaleContext(key));
+        };
+        let Some(live_thread) = live_task.thread(self.thread.key().tid) else {
+            return Err(MmAccessError::StaleContext(key));
+        };
+        let live_shared = live_task.shared();
+        let context_mm = self.shared.mm();
+        let live_mm = live_shared.mm();
+        if live_task.key() != key
+            || !Arc::ptr_eq(&live_task, &self.task)
+            || !Arc::ptr_eq(&live_thread, &self.thread)
+            || !Arc::ptr_eq(&live_shared, &self.shared)
+            || live_mm.id() != context_mm.id()
+            || !Arc::ptr_eq(&live_mm, &context_mm)
+        {
+            return Err(MmAccessError::StaleContext(key));
+        }
+        Ok(context_mm)
+    }
+}
+
+impl Kernel {
+    pub fn foreign_mm<'context>(
+        &self,
+        caller: &'context KernelContext,
+        target: TaskKey,
+    ) -> Result<MmRelation<'context>, MmAccessError> {
+        if !std::ptr::eq(self, caller.kernel.as_ref()) {
+            return Err(MmAccessError::StaleContext(caller.task.key()));
+        }
+        let caller_mm = caller.authenticate_current_mm()?;
+        let Some(task) = self.registry().task(target.id) else {
+            return Err(MmAccessError::UnknownTask(target));
+        };
+        if task.key() != target || task.lifecycle() != TaskLifecycle::Live {
+            return Err(MmAccessError::UnknownTask(target));
+        }
+        let target_mm = task.shared().mm();
+        let token = snapshot_token(target, target_mm)?;
+        if token.mm_id() == caller_mm.id() && Arc::ptr_eq(token.mm(), &caller_mm) {
+            Ok(MmRelation::Current(CurrentMm {
+                token,
+                context: PhantomData,
+            }))
+        } else {
+            Ok(MmRelation::Foreign(ForeignMm { token }))
+        }
+    }
+}
+
+fn snapshot_token(task: TaskKey, mm: Arc<Mm>) -> Result<MmToken, MmAccessError> {
+    let backend = mm
+        .backend()
+        .ok_or(MmAccessError::MissingBackendAuthority(mm.id()))?;
+    let deadline = Instant::now() + MM_SNAPSHOT_TIMEOUT;
+    let mut snapshot = backend.snapshot(deadline)?;
+    if backend.revision() != snapshot.revision
+        || backend.vma_revision(deadline)? != snapshot.vma_revision
+    {
+        return Err(MmAccessError::Snapshot(
+            SnapshotError::ChangedDuringObservation,
+        ));
+    }
+    snapshot
+        .vmas
+        .sort_unstable_by_key(|vma| (vma.start.raw(), vma.end.raw()));
+    let mut previous_end = None;
+    for vma in &snapshot.vmas {
+        if vma.start.raw() >= vma.end.raw() || previous_end.is_some_and(|end| vma.start.raw() < end)
+        {
+            return Err(MmAccessError::MalformedVma {
+                start: vma.start,
+                end: vma.end,
+            });
+        }
+        previous_end = Some(vma.end.raw());
+    }
+    Ok(MmToken { task, mm, snapshot })
+}
 
 #[cfg(test)]
 mod tests {

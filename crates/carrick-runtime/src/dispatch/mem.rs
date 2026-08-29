@@ -1037,49 +1037,126 @@ fn boot_region_is_hidden_reservation(map: &ProcMapsEntry, layout: MemoryLayout) 
 }
 
 fn project_vma_summaries(mem: &MemState) -> Vec<crate::kernel::VmaSummary> {
-    let mut ranges: Vec<(u64, u64)> = mem
-        .address_space_regions
-        .iter()
-        .flatten()
-        .filter(|map| !boot_region_is_hidden_reservation(map, mem.layout))
-        .chain(mem.dynamic_maps.iter())
-        .filter_map(|map| (map.start < map.end).then_some((map.start, map.end)))
-        .collect();
-    ranges.extend(
-        mem.growdown_ranges
+    fn append_uncovered(
+        maps: &mut Vec<ProcMapsEntry>,
+        start: u64,
+        end: u64,
+        template: &ProcMapsEntry,
+    ) {
+        if start >= end {
+            return;
+        }
+        let mut covered: Vec<(u64, u64)> = maps
             .iter()
-            .filter_map(|(_, current, end)| (current < end).then_some((*current, *end))),
-    );
-    if mem.brk_current > mem.layout.heap_base {
-        ranges.push((mem.layout.heap_base, mem.brk_current));
-    }
-    for vma in &mem.semantic_vmas {
-        if (vma.path == "[heap]"
-            || (vma.start >= mem.layout.heap_base && vma.end <= mem.brk_current))
-            && vma.start < vma.end
-        {
-            ranges.push((vma.start, vma.end));
+            .filter_map(|map| {
+                let covered_start = start.max(map.start);
+                let covered_end = end.min(map.end);
+                (covered_start < covered_end).then_some((covered_start, covered_end))
+            })
+            .collect();
+        covered.sort_unstable();
+        let mut cursor = start;
+        let mut gaps = Vec::new();
+        for (covered_start, covered_end) in covered {
+            if cursor < covered_start {
+                gaps.push((cursor, covered_start));
+            }
+            cursor = cursor.max(covered_end);
+            if cursor >= end {
+                break;
+            }
+        }
+        if cursor < end {
+            gaps.push((cursor, end));
+        }
+        for (gap_start, gap_end) in gaps {
+            if let Some(next) = maps.iter_mut().find(|map| {
+                map.start == gap_end
+                    && map.read == template.read
+                    && map.write == template.write
+                    && map.execute == template.execute
+                    && map.sharing == template.sharing
+                    && map.path == template.path
+            }) {
+                next.start = gap_start;
+            } else {
+                maps.push(ProcMapsEntry {
+                    start: gap_start,
+                    end: gap_end,
+                    ..template.clone()
+                });
+            }
         }
     }
-    ranges.sort_unstable();
 
-    let mut unioned: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
-    for (start, end) in ranges {
-        if let Some((_, previous_end)) = unioned.last_mut()
-            && start < *previous_end
-        {
-            *previous_end = (*previous_end).max(end);
-        } else {
-            unioned.push((start, end));
+    let mut maps = project_core_maps(mem);
+    let heap_template = ProcMapsEntry {
+        start: mem.layout.heap_base,
+        end: mem.brk_current,
+        read: true,
+        write: true,
+        execute: false,
+        sharing: ProcMapSharing::Private,
+        path: "[heap]".to_owned(),
+    };
+    append_uncovered(
+        &mut maps,
+        mem.layout.heap_base,
+        mem.brk_current,
+        &heap_template,
+    );
+    for (_, current, end) in &mem.growdown_ranges {
+        let template = mem
+            .dynamic_maps
+            .iter()
+            .chain(mem.address_space_regions.iter().flatten())
+            .find(|map| map.start < *end && *current < map.end)
+            .cloned()
+            .unwrap_or_else(|| ProcMapsEntry {
+                start: *current,
+                end: *end,
+                read: true,
+                write: true,
+                execute: false,
+                sharing: ProcMapSharing::Private,
+                path: "[stack]".to_owned(),
+            });
+        append_uncovered(&mut maps, *current, *end, &template);
+    }
+    maps.sort_by_key(|map| (map.start, map.end));
+    let mut summaries = Vec::with_capacity(maps.len() + mem.secretmem_maps.len() * 2);
+    for map in maps {
+        let mut boundaries = vec![map.start, map.end];
+        for secret in &mem.secretmem_maps {
+            let start = map.start.max(secret.start().raw());
+            let end = map.end.min(secret.end().raw());
+            if start < end {
+                boundaries.extend([start, end]);
+            }
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+
+        for window in boundaries.windows(2) {
+            let start = window[0];
+            let end = window[1];
+            let kernel_visible = !mem
+                .secretmem_maps
+                .iter()
+                .any(|secret| secret.start().raw() < end && start < secret.end().raw());
+            summaries.push(crate::kernel::VmaSummary {
+                start: GuestVa(start),
+                end: GuestVa(end),
+                access: crate::kernel::VmaAccess {
+                    readable: map.read,
+                    writable: map.write,
+                    executable: map.execute,
+                    kernel_visible,
+                },
+            });
         }
     }
-    unioned
-        .into_iter()
-        .map(|(start, end)| crate::kernel::VmaSummary {
-            start: GuestVa(start),
-            end: GuestVa(end),
-        })
-        .collect()
+    summaries
 }
 
 /// Linux-visible virtual size of this mm in bytes — the `VmSize` that

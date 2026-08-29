@@ -37,6 +37,51 @@ hal_id!(FrameId);
 hal_id!(MappingId);
 hal_id!(KernelTransactionId);
 
+/// Revision of the backend MM binding observed by foreign-memory transport.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub struct ForeignBackendRevision(u64);
+
+impl ForeignBackendRevision {
+    pub const fn from_authority_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw_for_probe(self) -> u64 {
+        self.0
+    }
+}
+
+/// Revision of the Linux VMA authority observed by foreign-memory transport.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub struct ForeignVmaRevision(u64);
+
+impl ForeignVmaRevision {
+    pub const fn from_authority_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw_for_probe(self) -> u64 {
+        self.0
+    }
+}
+
+/// Revision of the global frame inventory observed by foreign-memory transport.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub struct ForeignFrameInventoryRevision(u64);
+
+impl ForeignFrameInventoryRevision {
+    pub const fn from_authority_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw_for_probe(self) -> u64 {
+        self.0
+    }
+}
+
 /// Unpredictable authority capability bound to one runtime reservation.
 ///
 /// The bytes are deliberately not exported or printed. Public construction
