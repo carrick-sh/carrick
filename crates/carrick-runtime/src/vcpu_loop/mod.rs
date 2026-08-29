@@ -176,6 +176,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
     {
         quiesce::acquire_frame_cow_quiesce(
             quiesce::pt_barrier(),
+            self.mm,
             &self.guest_executors,
             self.tid,
             quiesce::PtPauseBudget::DEFAULT,
@@ -1730,10 +1731,15 @@ pub(crate) fn with_real_pt_pause_for_test<T>(
 
 /// Hand the dispatcher the loaded image's region list + auxv so /proc/self/maps
 /// and /proc/self/auxv reflect it (refreshed on each execve).
-pub(crate) fn apply_image_proc_state(dispatcher: &SyscallDispatcher, image: &AddressSpace) {
-    dispatcher.set_address_space_regions(proc_maps_from_address_space(image));
-    dispatcher.set_address_space_file_mappings(core_file_mappings_from_address_space(image));
-    dispatcher.set_auxv_image(image.linux_auxv_image().to_vec());
+pub(crate) fn apply_image_proc_state(
+    dispatcher: &mut SyscallDispatcher,
+    image: &AddressSpace,
+) -> Result<(), DispatchError> {
+    dispatcher.publish_initial_image_state(
+        proc_maps_from_address_space(image),
+        image.linux_auxv_image().to_vec(),
+        core_file_mappings_from_address_space(image),
+    )
 }
 
 /// Publish a successful exec image as one dispatcher VMA generation.
@@ -11499,7 +11505,7 @@ mod tests {
             .split("// Exec/exit can force")
             .next()
             .expect("bounded registration admission block");
-        assert!(registration.contains("enter_guest_executor_then_register"));
+        assert!(registration.contains("enter_mm_executor_then_register"));
         assert!(!registration.contains("is_quiescing"));
         assert!(!registration.contains("try_begin_fork"));
         assert!(!registration.contains("self.phase ="));

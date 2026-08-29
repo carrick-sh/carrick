@@ -5039,7 +5039,7 @@ mod ipc_set_tests {
                 .attachments
                 .insert(addr, shmid);
             let mut memory = FailingUnmapMemory::new(0x1000, 0x1000);
-            let _ = dispatcher.dispatch_normalized(
+            let _ = dispatcher.dispatch_normalized_mutation_for_test(
                 &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(197, SyscallArgs::from([addr, 0, 0, 0, 0, 0])),
                 &mut memory,
@@ -5120,7 +5120,7 @@ mod ipc_set_tests {
         let mut memory = LinearMemory::new(0x1000, vec![0; 0x1000]);
 
         let outcome = dispatcher
-            .dispatch_normalized(
+            .dispatch_normalized_mutation_for_test(
                 &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(197, SyscallArgs::from([addr, 0, 0, 0, 0, 0])),
                 &mut memory,
@@ -5170,7 +5170,7 @@ mod ipc_set_tests {
         });
         let mut memory = LinearMemory::new(0x1000, vec![0; 0x1000]);
         let outcome = dispatcher
-            .dispatch_normalized(
+            .dispatch_normalized_mutation_for_test(
                 &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     196,
@@ -5203,7 +5203,7 @@ mod ipc_set_tests {
         }]);
         let mut memory = LinearMemory::new(0x1000, vec![0; 0x1000]);
         let outcome = dispatcher
-            .dispatch_normalized(
+            .dispatch_normalized_mutation_for_test(
                 &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     196,

@@ -3976,7 +3976,7 @@ trait NormalizedDispatchRoute {
     fn dispatch<M: CurrentMmMemory>(
         &mut self,
         dispatcher: &SyscallDispatcher,
-        kernel: &crate::kernel::KernelContext,
+        _kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
         memory: &mut M,
         reporter: &CompatReporter,
@@ -4576,6 +4576,27 @@ impl SyscallDispatcher {
         })
     }
 
+    pub(crate) fn fork_clone_with_prepared_mm_authorized(
+        &self,
+        observed_parent_mm_id: crate::kernel::MmId,
+        observed_child_mm_id: crate::kernel::MmId,
+        parent_guest_pid: u32,
+        child_guest_pid: u32,
+        prepared_mm: PreparedDispatchMmFork,
+        permit: &mm_mutation::HostAliasPermit<'_>,
+    ) -> Result<Self, crate::kernel::SnapshotError> {
+        self.fork_clone_with_prepared_mm_authorized_observed(
+            observed_parent_mm_id,
+            observed_child_mm_id,
+            parent_guest_pid,
+            child_guest_pid,
+            prepared_mm,
+            permit,
+            |_| {},
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn fork_clone_with_prepared_mm(
         &self,
         observed_parent_mm_id: crate::kernel::MmId,
@@ -4584,23 +4605,27 @@ impl SyscallDispatcher {
         child_guest_pid: u32,
         prepared_mm: PreparedDispatchMmFork,
     ) -> Result<Self, crate::kernel::SnapshotError> {
-        self.fork_clone_with_prepared_mm_observed(
-            observed_parent_mm_id,
-            observed_child_mm_id,
-            parent_guest_pid,
-            child_guest_pid,
-            prepared_mm,
-            |_| {},
-        )
+        mm_mutation::test_support::with_permit(self.mm_mutation_coordinator(), |permit| {
+            self.fork_clone_with_prepared_mm_authorized(
+                observed_parent_mm_id,
+                observed_child_mm_id,
+                parent_guest_pid,
+                child_guest_pid,
+                prepared_mm,
+                permit,
+            )
+        })
     }
 
-    fn fork_clone_with_prepared_mm_observed(
+    #[allow(clippy::too_many_arguments)]
+    fn fork_clone_with_prepared_mm_authorized_observed(
         &self,
         observed_parent_mm_id: crate::kernel::MmId,
         observed_child_mm_id: crate::kernel::MmId,
         parent_guest_pid: u32,
         child_guest_pid: u32,
         prepared_mm: PreparedDispatchMmFork,
+        permit: &mm_mutation::HostAliasPermit<'_>,
         mut observe_install: impl FnMut(bool),
     ) -> Result<Self, crate::kernel::SnapshotError> {
         if observed_parent_mm_id != prepared_mm.parent_mm_id
@@ -4608,8 +4633,12 @@ impl SyscallDispatcher {
         {
             return Err(crate::kernel::SnapshotError::ChangedDuringObservation);
         }
-        let current_authority = self.mm_binding.current.load_full();
-        if !Arc::ptr_eq(&current_authority, &prepared_mm.parent_mm) {
+        let dispatch = self.mm_binding.begin_dispatch(permit, false);
+        let current_authority = dispatch.authority.as_ref().unwrap_or_else(|| {
+            tracing::error!("fork install guard lacks MM authority");
+            std::process::abort();
+        });
+        if !Arc::ptr_eq(current_authority, &prepared_mm.parent_mm) {
             return Err(crate::kernel::SnapshotError::ChangedDuringObservation);
         }
         if current_authority.vma_revision() != prepared_mm.parent_revision {
@@ -4642,7 +4671,31 @@ impl SyscallDispatcher {
             exec_host_fs_fallback: self.exec_host_fs_fallback,
         };
         observe_install(true);
+        drop(dispatch);
         Ok(child_dispatcher)
+    }
+
+    #[cfg(test)]
+    fn fork_clone_with_prepared_mm_observed(
+        &self,
+        observed_parent_mm_id: crate::kernel::MmId,
+        observed_child_mm_id: crate::kernel::MmId,
+        parent_guest_pid: u32,
+        child_guest_pid: u32,
+        prepared_mm: PreparedDispatchMmFork,
+        observe_install: impl FnMut(bool),
+    ) -> Result<Self, crate::kernel::SnapshotError> {
+        mm_mutation::test_support::with_permit(self.mm_mutation_coordinator(), |permit| {
+            self.fork_clone_with_prepared_mm_authorized_observed(
+                observed_parent_mm_id,
+                observed_child_mm_id,
+                parent_guest_pid,
+                child_guest_pid,
+                prepared_mm,
+                permit,
+                observe_install,
+            )
+        })
     }
 
     #[cfg(test)]
@@ -4778,6 +4831,24 @@ impl SyscallDispatcher {
         Some(resources::with_captured_resources(kernel, || {
             handler(self, &mut ctx)
         }))
+    }
+
+    /// Focused unit-test boundary for mutation handlers. Production callers
+    /// receive their guard from the exact-MM executor census; tests use the
+    /// real page-table-pause issuer rather than falling back to the ordinary
+    /// route (which intentionally cannot resolve mutation syscalls).
+    #[cfg(test)]
+    fn dispatch_normalized_mutation_for_test(
+        &self,
+        kernel: &crate::kernel::KernelContext,
+        request: SyscallRequest,
+        memory: &mut impl CurrentMmMemory,
+        reporter: &CompatReporter,
+        thread: Option<ThreadCtx>,
+    ) -> Option<Result<DispatchOutcome, DispatchError>> {
+        mm_mutation::test_support::with_guard(self.mm_mutation_coordinator(), |guard| {
+            self.dispatch_normalized_mutation(kernel, request, memory, reporter, thread, guard)
+        })
     }
 
     /// Membership test: is `number` claimed by some dispatch module? Mirrors
@@ -5334,13 +5405,31 @@ impl SyscallDispatcher {
             .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Capture the guest's `AddressSpace` region list so that
-    /// `/proc/self/maps` reflects the real loaded layout (executable
-    /// ELF segments, runtime regions, mmap arena, stack, EL0
-    /// trampoline, EL1 vectors, page tables) instead of a fixed
-    /// summary. Called once after `HvfTrapEngine::map_address_space`
-    /// succeeds.
+    /// Test-only publication boundary for synthetic boot layouts. Production
+    /// publishes the complete initial image through
+    /// `publish_initial_image_state`, under exact-MM mutation authority.
+    #[cfg(test)]
     pub fn set_address_space_regions(&self, regions: Vec<ProcMapsEntry>) {
+        mm_mutation::test_support::with_permit(self.mm_mutation_coordinator(), |permit| {
+            let _vma_dispatch = self.begin_vma_dispatch(permit);
+            self.replace_address_space_regions(regions);
+        });
+    }
+
+    /// Publish a synthetic or externally prepared address-space layout under
+    /// the same exact-MM mutation authority as production boot publication.
+    pub fn publish_address_space_regions(
+        &mut self,
+        regions: Vec<ProcMapsEntry>,
+    ) -> Result<(), DispatchError> {
+        self.with_mm_executor_mutation(|dispatcher, mutation| {
+            let permit = mutation.host_alias_permit();
+            let _vma_dispatch = dispatcher.begin_vma_dispatch(&permit);
+            dispatcher.replace_address_space_regions(regions);
+        })
+    }
+
+    fn replace_address_space_regions(&self, regions: Vec<ProcMapsEntry>) {
         let mem_authority = self.mem();
         let mut mem = mem_authority.lock();
         let layout = mem.layout;
@@ -5351,10 +5440,7 @@ impl SyscallDispatcher {
         mem.address_space_regions = Some(regions);
     }
 
-    pub(crate) fn set_address_space_file_mappings(
-        &self,
-        mappings: Vec<crate::core_dump::FileMapping>,
-    ) {
+    fn replace_address_space_file_mappings(&self, mappings: Vec<crate::core_dump::FileMapping>) {
         let mem_authority = self.mem();
         let mut mem = mem_authority.lock();
         let layout = mem.layout;
@@ -5364,6 +5450,25 @@ impl SyscallDispatcher {
                 mem::semantic_vmas_from_boot_regions(regions, &mappings, layout, brk_current);
         }
         mem.core_file_mappings = mappings;
+    }
+
+    /// Publish the loaded boot image as one VMA generation before the first
+    /// guest executor starts. The non-threaded outer boundary admits the exact
+    /// MM into its executor census, mints real sole-stage-1 authority, and only
+    /// then permits the host-alias/VMA transaction.
+    pub(crate) fn publish_initial_image_state(
+        &mut self,
+        regions: Vec<ProcMapsEntry>,
+        auxv: Vec<u8>,
+        file_mappings: Vec<crate::core_dump::FileMapping>,
+    ) -> Result<(), DispatchError> {
+        self.with_mm_executor_mutation(|dispatcher, mutation| {
+            let permit = mutation.host_alias_permit();
+            let _vma_dispatch = dispatcher.begin_vma_dispatch(&permit);
+            dispatcher.replace_address_space_regions(regions);
+            dispatcher.replace_address_space_file_mappings(file_mappings);
+            dispatcher.set_auxv_image(auxv);
+        })
     }
 
     /// Publish a replacement image's complete dispatcher memory generation.
@@ -6422,12 +6527,9 @@ impl SyscallDispatcher {
         if syscall_requires_mm_mutation(request.number.raw(), request.args) {
             let mut executor = executor;
             let coordinator = executor.mutation_coordinator();
+            let mm = executor.mm_id();
             crate::vcpu_loop::with_sole_mm_stage1(&mut executor, |authority| {
-                let mut guard = mm_mutation::from_sole_executor(
-                    authority,
-                    coordinator,
-                    kernel.shared().mm().id(),
-                );
+                let mut guard = mm_mutation::from_sole_executor(authority, coordinator, mm);
                 self.dispatch_inner(
                     kernel,
                     request,
@@ -6453,16 +6555,15 @@ impl SyscallDispatcher {
     /// Run a non-threaded completion under a fresh exact-MM census admission.
     pub(crate) fn with_mm_executor_mutation<T>(
         &mut self,
-        kernel: &crate::kernel::KernelContext,
         run: impl FnOnce(&mut Self, &mut mm_mutation::MmMutationGuard<'_>) -> T,
     ) -> Result<T, DispatchError> {
         let mut executor = self
             .enter_mm_executor()
             .map_err(DispatchError::MmExecutorAdmission)?;
         let coordinator = executor.mutation_coordinator();
+        let mm = executor.mm_id();
         crate::vcpu_loop::with_sole_mm_stage1(&mut executor, |authority| {
-            let mut guard =
-                mm_mutation::from_sole_executor(authority, coordinator, kernel.shared().mm().id());
+            let mut guard = mm_mutation::from_sole_executor(authority, coordinator, mm);
             run(self, &mut guard)
         })
         .ok_or(DispatchError::MmMutationPeerExecutor)

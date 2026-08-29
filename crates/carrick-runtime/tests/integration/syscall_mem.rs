@@ -767,7 +767,7 @@ fn mremap_bootstrap_accepts_shrinking_and_rejects_growth_with_enomem() {
             .unwrap();
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
-    publish_address_space_regions(&dispatcher, &memory);
+    publish_address_space_regions(&mut dispatcher, &memory);
 
     assert_eq!(
         dispatcher
@@ -947,7 +947,7 @@ fn madvise_accepts_common_advice_for_mapped_ranges() {
     .unwrap();
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
-    publish_address_space_regions(&dispatcher, &memory);
+    publish_address_space_regions(&mut dispatcher, &memory);
 
     assert_eq!(
         dispatcher

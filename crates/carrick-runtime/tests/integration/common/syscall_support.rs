@@ -434,20 +434,22 @@ pub fn rwx_perms() -> SegmentPerms {
     }
 }
 
-pub fn publish_address_space_regions(dispatcher: &SyscallDispatcher, memory: &AddressSpace) {
-    dispatcher.set_address_space_regions(
-        memory
-            .regions()
-            .iter()
-            .map(|region| ProcMapsEntry {
-                start: region.start,
-                end: region.end,
-                read: region.perms.read,
-                write: region.perms.write,
-                execute: region.perms.execute,
-                sharing: ProcMapSharing::Private,
-                path: String::new(),
-            })
-            .collect(),
-    );
+pub fn publish_address_space_regions(dispatcher: &mut SyscallDispatcher, memory: &AddressSpace) {
+    dispatcher
+        .publish_address_space_regions(
+            memory
+                .regions()
+                .iter()
+                .map(|region| ProcMapsEntry {
+                    start: region.start,
+                    end: region.end,
+                    read: region.perms.read,
+                    write: region.perms.write,
+                    execute: region.perms.execute,
+                    sharing: ProcMapSharing::Private,
+                    path: String::new(),
+                })
+                .collect(),
+        )
+        .expect("publish integration-test address-space regions");
 }

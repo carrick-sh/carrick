@@ -4471,6 +4471,39 @@ mod tests {
     #[derive(Debug)]
     struct TestMmBackend(MmBinding);
 
+    #[derive(Debug)]
+    struct RelationOnlyForeignTransport;
+
+    #[derive(Debug)]
+    struct RelationOnlyForeignLease;
+
+    impl carrick_hal::ForeignMmTransport for RelationOnlyForeignTransport {
+        fn retain(
+            &self,
+            _invocation: &carrick_hal::ForeignMmInvocation,
+            _snapshot: &dyn carrick_hal::ForeignMmSnapshot,
+            _deadline: std::time::Instant,
+        ) -> Result<Arc<dyn carrick_hal::ForeignMmReadLease>, carrick_hal::ForeignMmTransportError>
+        {
+            Ok(Arc::new(RelationOnlyForeignLease))
+        }
+    }
+
+    impl carrick_hal::ForeignMmReadLease for RelationOnlyForeignLease {
+        fn read(
+            &self,
+            _invocation: &carrick_hal::ForeignMmInvocation,
+            _authority: &dyn carrick_hal::ForeignMmLiveAuthority,
+            _snapshot: &dyn carrick_hal::ForeignMmSnapshot,
+            _va: carrick_guest_mem::GuestVa,
+            _dst: &mut [u8],
+            _deadline: std::time::Instant,
+        ) -> Result<Box<dyn carrick_hal::ForeignMmReadReceipt>, carrick_hal::ForeignMmTransportError>
+        {
+            Err(carrick_hal::ForeignMmTransportError::AuthorityUnavailable)
+        }
+    }
+
     impl MmBackend for TestMmBackend {
         fn snapshot(
             &self,
@@ -4480,14 +4513,21 @@ mod tests {
                 revision: 1,
                 binding: self.0,
                 vmas: Vec::new(),
-                vma_revision: None,
+                vma_revision: Some(crate::kernel::VmaRevision::from_authority_raw(1)),
                 mapping_ids: Vec::new(),
-                frame_inventory_revision: None,
+                frame_inventory_revision: Some(1),
             })
         }
 
         fn revision(&self) -> u64 {
             1
+        }
+
+        fn vma_revision(
+            &self,
+            _deadline: std::time::Instant,
+        ) -> Result<Option<crate::kernel::VmaRevision>, SnapshotError> {
+            Ok(Some(crate::kernel::VmaRevision::from_authority_raw(1)))
         }
     }
 
@@ -4605,6 +4645,9 @@ mod tests {
         assert_eq!(current.mm_id(), root.shared().mm().id());
 
         let copied = fork_with_mm_backend(&kernel, &root, 19_401, "copied-mm child");
+        copied.shared().mm().install_foreign_mm_endpoint_for_test(
+            carrick_hal::ForeignMmEndpoint::for_carrier(Arc::new(RelationOnlyForeignTransport)),
+        );
         let foreign = kernel
             .foreign_mm(&root, &execution, copied.task().key())
             .expect("foreign MM authority");

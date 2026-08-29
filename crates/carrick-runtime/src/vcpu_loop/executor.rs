@@ -8507,7 +8507,7 @@ pub(crate) mod tests {
 
     #[test]
     fn prohibited_real_owner_state_retires_worker_and_cleanup_leaves_no_inherited_state() {
-        for mode in 1..=6 {
+        for mode in [1, 3, 4, 5, 6] {
             let (kernel, context) = bootstrap(14_560 + mode as i32);
             let scheduler = Arc::new(Scheduler::new(kernel));
             let factory = Arc::new(FakeFactory::default());

@@ -2345,7 +2345,7 @@ fn f_add_seals_waits_for_alias_dispatch_and_publishes_under_same_exclusion() {
             let mut memory = LinearMemory::new(0x1000, vec![0; 0x1000]);
             started_tx.send(()).expect("report F_ADD_SEALS start");
             let outcome = sibling
-                .dispatch_normalized(
+                .dispatch_normalized_mutation_for_test(
                     &sibling.capture_one_task_context().unwrap(),
                     SyscallRequest::new(
                         25,
