@@ -59,13 +59,6 @@ pub use crate::trap::{
 /// (runtime.rs `run_threaded_hvf_loop`, the vcpu loop) is unchanged.
 pub type HvfAarch64Engine = Aarch64EngineCore<HvfAarch64Vmm>;
 
-/// Clone the carrier-owned foreign-MM transport installed for this HVPatch VM.
-/// The runtime stores the trait object privately; syscall consumers never see
-/// the concrete backend authority.
-pub fn foreign_mm_transport() -> Arc<dyn carrick_hal::ForeignMmTransport> {
-    crate::trap::foreign_mm_transport()
-}
-
 pub fn persistent_vcpu_identity(vcpu: &HvfAarch64Vcpu) -> u64 {
     vcpu.inner.id()
 }
@@ -470,7 +463,12 @@ impl TaskOnlyRuntimeProjectionSlot {
         let projection = slot.as_ref().ok_or_else(|| {
             TrapError::Hypervisor("HVPatch task runtime projection is loaded".to_owned())
         })?;
-        if !parked.runtime_authorities_match(&projection.page_tables, &projection.protections) {
+        let mm_access = parked.mm_access_authority();
+        if !parked.runtime_authorities_match(
+            &mm_access,
+            &projection.page_tables,
+            &projection.protections,
+        ) {
             return Err(TrapError::Hypervisor(
                 "HVPatch task runtime projection does not match parked task state".to_owned(),
             ));
@@ -490,7 +488,8 @@ impl HvpatchTaskOnlyEngineState {
         let parked = parked.as_ref().ok_or_else(|| {
             TrapError::Hypervisor("HVPatch task runtime state is already loaded".to_owned())
         })?;
-        if !parked.runtime_authorities_match(&page_tables, &protections) {
+        let mm_access = parked.mm_access_authority();
+        if !parked.runtime_authorities_match(&mm_access, &page_tables, &protections) {
             return Err(TrapError::Hypervisor(
                 "HVPatch task runtime projection does not match parked task state".to_owned(),
             ));
@@ -801,11 +800,13 @@ pub fn attach_task_only_engine(
         .lock()
         .take()
         .unwrap_or_else(|| std::process::abort());
+    let expected_mm_access = parked.mm_access_authority();
     swap_hvpatch_task_state(&mut executor.state.task, &mut parked);
-    if !executor
-        .state
-        .task_runtime_authorities_match(&projection.page_tables, &projection.protections)
-    {
+    if !executor.state.task_runtime_authorities_match(
+        &expected_mm_access,
+        &projection.page_tables,
+        &projection.protections,
+    ) {
         std::process::abort();
     }
     if state.parked_task.lock().replace(parked).is_some() {
@@ -860,10 +861,12 @@ pub fn detach_task_only_engine(
     engine: HvfAarch64Engine,
 ) -> (HvfAarch64Vmm, HvfAarch64Vcpu) {
     let (mut executor, vcpu, projection) = engine.into_injected_task_only_backend();
-    if !executor
-        .state
-        .task_runtime_authorities_match(&projection.page_tables, &projection.protections)
-    {
+    let expected_mm_access = executor.state.task_mm_access_authority();
+    if !executor.state.task_runtime_authorities_match(
+        &expected_mm_access,
+        &projection.page_tables,
+        &projection.protections,
+    ) {
         std::process::abort();
     }
     let mut parked = state
@@ -1060,6 +1063,10 @@ impl GuestVmBackend for HvfAarch64Vmm {
 }
 
 impl Aarch64Vmm for HvfAarch64Vmm {
+    fn foreign_mm_transport(&self) -> Option<Arc<dyn carrick_hal::ForeignMmTransport>> {
+        Some(self.state.foreign_mm_transport())
+    }
+
     fn audit_executor_boundary(&mut self, vcpu: &mut Self::Vcpu) -> Result<(), TrapError> {
         crate::trap::audit_hvpatch_executor_boundary(&self.state, &vcpu.mailbox)
     }

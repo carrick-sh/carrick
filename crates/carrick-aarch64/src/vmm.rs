@@ -342,6 +342,10 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     type SiblingBuilder: Send;
     type ProcessBuilder: Send;
 
+    fn foreign_mm_transport(&self) -> Option<std::sync::Arc<dyn carrick_hal::ForeignMmTransport>> {
+        None
+    }
+
     fn audit_executor_boundary(&mut self, _vcpu: &mut Self::Vcpu) -> Result<(), TrapError> {
         Err(TrapError::Hypervisor(
             "AArch64 VMM does not expose executor boundary audit authority".to_owned(),

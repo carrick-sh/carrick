@@ -492,10 +492,12 @@ impl ProcessContext {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn with_foreign_mm_transport(mut self) -> Self {
-        self.mm_access = Some(crate::kernel::MmAccessAuthority::new(
-            carrick_vmm_hvf::hvf_aarch64_engine::foreign_mm_transport(),
-        ));
+    fn with_foreign_mm_transport(
+        mut self,
+        transport: std::sync::Arc<dyn carrick_hal::ForeignMmTransport>,
+    ) -> Self {
+        self.mm_backend.read().bind_foreign_mm_transport(transport);
+        self.mm_access = Some(crate::kernel::MmAccessAuthority::new());
         self
     }
 
@@ -566,6 +568,9 @@ impl ProcessContext {
         mm_backend: std::sync::Arc<stage1_mm::Stage1MmBackend>,
     ) -> Self {
         mm_backend.bind_inventory(context.kernel(), context.shared().mm().id());
+        if let Some(transport) = self.mm_backend.read().cloned_foreign_mm_transport() {
+            mm_backend.bind_foreign_mm_transport(transport);
+        }
         let mut child = Self::new(
             std::sync::Arc::clone(&self.resources),
             context.task_binding(),
@@ -761,6 +766,9 @@ impl ProcessContext {
     ) -> Result<(PreparedProcessExec, crate::kernel::KernelContext), String> {
         let predecessor_backend = reservation.predecessor_backend();
         let backend = reservation.replacement_backend();
+        if let Some(transport) = predecessor_backend.cloned_foreign_mm_transport() {
+            backend.bind_foreign_mm_transport(transport);
+        }
         let kernel_backend: std::sync::Arc<dyn crate::kernel::MmBackend> = backend.clone();
         let (kernel, context) = match self
             .kernel_graph()
@@ -1348,7 +1356,10 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
     let context = ProcessContext::new(table, root.task_binding(), mm_backend);
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let context = context.with_foreign_mm_transport();
+    let context = match engine.foreign_mm_transport() {
+        Some(transport) => context.with_foreign_mm_transport(transport),
+        None => context,
+    };
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     debug_assert!(context.mm_access_authority().is_some());
     let binding = context.mm_binding().ok_or_else(|| {
@@ -3167,8 +3178,24 @@ mod tests {
     }
 
     #[test]
-    fn stage1_mm_reports_authoritative_mapping_ids_for_its_exact_mm() {
-        let (_process, root) = authoritative_root();
+    fn foreign_mm_live_snapshot_tracks_real_backend_vma_and_inventory_authorities() {
+        let (process, root) = authoritative_root();
+        let dispatcher = SyscallDispatcher::new();
+        process.bind_vma_source(dispatcher.vma_snapshot_source());
+        let backend = process.mm_backend.read().clone();
+        let deadline = || std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let before = backend.snapshot(deadline()).expect("initial live snapshot");
+
+        dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+            start: 0x1000,
+            end: 0x2000,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: crate::vfs::ProcMapSharing::Private,
+            path: "foreign-live-authority".to_owned(),
+        }]);
+        backend.publish_binding(backend.binding());
         let capacity = carrick_hal::FrameEventCapacity::for_event_count(2).unwrap();
         let mut reservation = root
             .kernel()
@@ -3209,15 +3236,11 @@ mod tests {
             .apply(root.shared().mm().id(), reservation.commit(()))
             .unwrap();
 
-        let mm = root.shared().mm();
-        let backend = mm.backend().expect("stage-1 mm backend");
-        assert_eq!(
-            backend
-                .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
-                .expect("backend snapshot")
-                .mapping_ids,
-            vec![mapping]
-        );
+        let after = backend.snapshot(deadline()).expect("mutated live snapshot");
+        assert!(after.revision > before.revision);
+        assert!(after.vma_revision > before.vma_revision);
+        assert!(after.frame_inventory_revision > before.frame_inventory_revision);
+        assert_eq!(after.mapping_ids, vec![mapping]);
     }
 
     #[test]
