@@ -2854,6 +2854,7 @@ impl ForkBarrierParticipants {
         self.siblings.iter().next().is_some()
     }
 
+    #[cfg(test)]
     pub(crate) fn contains_sibling(&self, key: ThreadKey) -> bool {
         self.siblings.contains(&key)
     }
@@ -2861,7 +2862,7 @@ impl ForkBarrierParticipants {
     /// Exact durable sibling cardinality solely for the existing USDT probe.
     /// Fork admission and barrier control must use [`Self::requires_quiesce`].
     pub(crate) fn initial_sibling_count_for_probe(&self) -> u32 {
-        saturating_fork_sibling_count_for_probe(self.siblings.iter().count())
+        saturating_fork_sibling_count_for_probe(self.siblings.len())
     }
 }
 
@@ -2875,6 +2876,7 @@ impl CrashBarrierParticipants {
         self.siblings.iter().next().is_some()
     }
 
+    #[cfg(test)]
     pub(crate) fn contains_sibling(&self, key: ThreadKey) -> bool {
         self.siblings.contains(&key)
     }
@@ -2890,6 +2892,7 @@ impl ThreadExitParticipants {
         self.survivors.iter().next().is_some()
     }
 
+    #[cfg(test)]
     pub(super) fn contains_survivor(&self, key: ThreadKey) -> bool {
         self.survivors.contains(&key)
     }
@@ -2913,7 +2916,7 @@ pub(crate) struct CoreNoteParticipants {
 
 impl CoreNoteParticipants {
     pub(crate) fn required_note_count_for_probe(&self) -> u64 {
-        u64::try_from(self.members.iter().count()).unwrap_or(u64::MAX)
+        u64::try_from(self.members.len()).unwrap_or(u64::MAX)
     }
 }
 
