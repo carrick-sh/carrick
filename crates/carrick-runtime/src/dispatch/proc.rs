@@ -4445,7 +4445,18 @@ impl SyscallDispatcher {
         });
         let relation = match relation {
             Some(Ok(r)) => r,
-            Some(Err(crate::kernel::MmAccessError::UnknownTask(_))) => {
+            Some(Err(
+                crate::kernel::MmAccessError::UnknownTask(_)
+                | crate::kernel::MmAccessError::StaleContext(_)
+                | crate::kernel::MmAccessError::StaleExecutionAuthority { .. }
+                | crate::kernel::MmAccessError::ExecutionAuthority(
+                    crate::kernel::objects::ThreadExecutionError::LeaseOwnerMismatch { .. }
+                    | crate::kernel::objects::ThreadExecutionError::StaleLease { .. }
+                    | crate::kernel::objects::ThreadExecutionError::SchedulerThreadMismatch {
+                        ..
+                    },
+                ),
+            )) => {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             Some(Err(_)) | None => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
@@ -4475,6 +4486,7 @@ impl SyscallDispatcher {
                 };
 
                 const CHUNK_SIZE: usize = 64 * 1024;
+                const PAGE_SIZE: u64 = 4096;
                 let mut copied: u64 = 0;
                 let mut ri = 0usize;
                 let mut ro = 0u64;
@@ -4497,20 +4509,31 @@ impl SyscallDispatcher {
                     }
                     let rem_remote = remote[ri].iov_len - ro;
                     let rem_local = local[li].iov_len - lo;
-                    let want = rem_remote.min(rem_local).min(CHUNK_SIZE as u64);
+
+                    let remote_va_raw = match remote[ri].iov_base.checked_add(ro) {
+                        Some(va) => va,
+                        None => break,
+                    };
+                    let local_va_raw = match local[li].iov_base.checked_add(lo) {
+                        Some(va) => va,
+                        None => break,
+                    };
+
+                    let page_rem_remote = PAGE_SIZE - (remote_va_raw % PAGE_SIZE);
+                    let page_rem_local = PAGE_SIZE - (local_va_raw % PAGE_SIZE);
+
+                    let want = rem_remote
+                        .min(rem_local)
+                        .min(page_rem_remote)
+                        .min(page_rem_local)
+                        .min(CHUNK_SIZE as u64);
                     let want_len = want as usize;
                     if want_len == 0 {
                         break;
                     }
 
-                    let remote_va = match remote[ri].iov_base.checked_add(ro) {
-                        Some(va) => carrick_guest_mem::GuestVa(va),
-                        None => break,
-                    };
-                    let local_va = match local[li].iov_base.checked_add(lo) {
-                        Some(va) => va,
-                        None => break,
-                    };
+                    let remote_va = carrick_guest_mem::GuestVa(remote_va_raw);
+                    let local_va = local_va_raw;
 
                     let range = match foreign.read_range(remote_va, want_len) {
                         Ok(Some(r)) => r,
@@ -4916,6 +4939,13 @@ mod kernel_process_dispatch_tests {
     #[derive(Debug)]
     struct ProcessVmBackend {
         binding: MmBinding,
+        pages: u64,
+    }
+
+    impl ProcessVmBackend {
+        fn with_pages(binding: MmBinding, pages: u64) -> Self {
+            Self { binding, pages }
+        }
     }
 
     impl MmBackend for ProcessVmBackend {
@@ -4925,7 +4955,7 @@ mod kernel_process_dispatch_tests {
                 binding: self.binding,
                 vmas: vec![VmaSummary {
                     start: GuestVa(TARGET_VA),
-                    end: GuestVa(TARGET_VA + 0x1000),
+                    end: GuestVa(TARGET_VA + self.pages * 0x1000),
                     access: VmaAccess {
                         readable: true,
                         writable: true,
@@ -4984,10 +5014,13 @@ mod kernel_process_dispatch_tests {
             dst: &mut [u8],
             _deadline: Instant,
         ) -> Result<Box<dyn ForeignMmReadReceipt>, ForeignMmTransportError> {
-            if va != GuestVa(TARGET_VA) || dst.len() != 4 {
+            if va.0 < TARGET_VA {
                 return Err(ForeignMmTransportError::Translation(va));
             }
-            dst.copy_from_slice(b"PEER");
+            let offset = (va.0 - TARGET_VA) as usize;
+            for (i, b) in dst.iter_mut().enumerate() {
+                *b = b"PEER"[(offset + i) % 4];
+            }
             Ok(Box::new(ProcessVmReadReceipt {
                 bytes: dst.len(),
                 owners: [carrick_hal::ForeignOwnerGeneration::from_backend_counter(
@@ -5015,6 +5048,7 @@ mod kernel_process_dispatch_tests {
         SyscallDispatcher,
         crate::hvpatch::ProcessContext,
         KernelContext,
+        crate::kernel::objects::ThreadExecutionLease,
     ) {
         let lane = HvpatchLaneScope::force(false);
         let (mut process, root) = crate::hvpatch::process_context_for_tests(root_pid);
@@ -5070,14 +5104,13 @@ mod kernel_process_dispatch_tests {
             .thread()
             .claim_runnable(executor)
             .expect("claim test lease");
-        process.set_test_execution_lease(lease);
         process.enable_mm_access_for_tests();
         let dispatcher = SyscallDispatcher::new();
         dispatcher.bind_hvpatch_process(process.clone());
         let root = dispatcher
             .capture_one_task_context()
             .expect("bound HVPatch root context");
-        (lane, dispatcher, process, root)
+        (lane, dispatcher, process, root, lease)
     }
 
     fn refreshed(context: &KernelContext) -> KernelContext {
@@ -5107,13 +5140,22 @@ mod kernel_process_dispatch_tests {
     }
 
     fn process_vm_target(parent: &KernelContext, registry_id: i32) -> KernelContext {
+        process_vm_target_with_pages(parent, registry_id, 1)
+    }
+
+    fn process_vm_target_with_pages(
+        parent: &KernelContext,
+        registry_id: i32,
+        pages: u64,
+    ) -> KernelContext {
         let asid = Asid::from_registry_allocation(
             NonZeroU16::new((registry_id as u16).max(1)).expect("nonzero ASID"),
         );
         let root = Stage1Root::for_aarch64_4k(Gpa(0x8000)).expect("aligned stage-1 root");
-        let backend: Arc<dyn MmBackend> = Arc::new(ProcessVmBackend {
-            binding: MmBinding::for_aarch64(asid, root),
-        });
+        let backend: Arc<dyn MmBackend> = Arc::new(ProcessVmBackend::with_pages(
+            MmBinding::for_aarch64(asid, root),
+            pages,
+        ));
         let child = parent
             .kernel()
             .reserve_fork(
@@ -5150,12 +5192,24 @@ mod kernel_process_dispatch_tests {
         number: u64,
         args: [u64; 6],
     ) -> DispatchOutcome {
+        dispatch_with_lease(dispatcher, context, memory, number, args, None)
+    }
+
+    fn dispatch_with_lease(
+        dispatcher: &mut SyscallDispatcher,
+        context: &KernelContext,
+        memory: &mut LinearMemory,
+        number: u64,
+        args: [u64; 6],
+        lease: Option<&crate::kernel::objects::ThreadExecutionLease>,
+    ) -> DispatchOutcome {
         dispatcher
-            .dispatch(
+            .dispatch_with_lease(
                 context,
                 SyscallRequest::new(number, SyscallArgs::from(args)),
                 memory,
                 &CompatReporter::default(),
+                lease,
             )
             .unwrap()
     }
@@ -5172,7 +5226,7 @@ mod kernel_process_dispatch_tests {
 
     #[test]
     fn process_vm_readv_reads_the_exact_foreign_mm() {
-        let (_lane, mut dispatcher, _process, root) = bound_dispatcher(61_090);
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_090);
         let target = process_vm_target(&root, 61_091);
         let root = refreshed(&root);
         let target_pid = target.task().key().id.raw();
@@ -5182,12 +5236,13 @@ mod kernel_process_dispatch_tests {
         memory.write_bytes(TARGET_VA, b"SELF").unwrap();
 
         assert_eq!(
-            dispatch(
+            dispatch_with_lease(
                 &mut dispatcher,
                 &root,
                 &mut memory,
                 SYS_PROCESS_VM_READV,
                 [target_pid as u64, LOCAL_IOV, 1, REMOTE_IOV, 1, 0],
+                Some(&lease),
             ),
             DispatchOutcome::Returned { value: 4 },
         );
@@ -5196,7 +5251,7 @@ mod kernel_process_dispatch_tests {
 
     #[test]
     fn process_vm_zero_length_ordering_matches_clean_room_oracle() {
-        let (_lane, mut dispatcher, _process, root) = bound_dispatcher(61_092);
+        let (_lane, mut dispatcher, _process, root, _lease) = bound_dispatcher(61_092);
         let missing_pid = 2_000_000_000u64;
         let mut memory = LinearMemory::new(0x1000, vec![0; 0x3000]);
         write_iovec(&mut memory, LOCAL_IOV, LOCAL_BUF, 0);
@@ -5251,7 +5306,7 @@ mod kernel_process_dispatch_tests {
 
     #[test]
     fn process_vm_readv_exact_current_routes_to_self_copy() {
-        let (_lane, mut dispatcher, _process, root) = bound_dispatcher(61_093);
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_093);
         let self_pid = root.task().key().id.raw();
         let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
         write_iovec(&mut memory, LOCAL_IOV, LOCAL_BUF, 4);
@@ -5259,12 +5314,13 @@ mod kernel_process_dispatch_tests {
         memory.write_bytes(TARGET_VA, b"SELF").unwrap();
 
         assert_eq!(
-            dispatch(
+            dispatch_with_lease(
                 &mut dispatcher,
                 &root,
                 &mut memory,
                 SYS_PROCESS_VM_READV,
                 [self_pid as u64, LOCAL_IOV, 1, REMOTE_IOV, 1, 0],
+                Some(&lease),
             ),
             DispatchOutcome::Returned { value: 4 },
         );
@@ -5273,7 +5329,7 @@ mod kernel_process_dispatch_tests {
 
     #[test]
     fn process_vm_readv_foreign_first_fault_returns_efault() {
-        let (_lane, mut dispatcher, _process, root) = bound_dispatcher(61_094);
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_094);
         let target = process_vm_target(&root, 61_095);
         let root = refreshed(&root);
         let target_pid = target.task().key().id.raw();
@@ -5282,12 +5338,13 @@ mod kernel_process_dispatch_tests {
         write_iovec(&mut memory, REMOTE_IOV, 0x9999_0000, 4);
 
         assert_eq!(
-            dispatch(
+            dispatch_with_lease(
                 &mut dispatcher,
                 &root,
                 &mut memory,
                 SYS_PROCESS_VM_READV,
                 [target_pid as u64, LOCAL_IOV, 1, REMOTE_IOV, 1, 0],
+                Some(&lease),
             ),
             DispatchOutcome::errno(LINUX_EFAULT),
         );
@@ -5295,7 +5352,7 @@ mod kernel_process_dispatch_tests {
 
     #[test]
     fn process_vm_readv_later_foreign_fault_returns_completed_prefix() {
-        let (_lane, mut dispatcher, _process, root) = bound_dispatcher(61_088);
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_088);
         let target = process_vm_target(&root, 61_089);
         let root = refreshed(&root);
         let target_pid = target.task().key().id.raw();
@@ -5307,12 +5364,13 @@ mod kernel_process_dispatch_tests {
         write_iovec(&mut memory, REMOTE_IOV_SECOND, 0x9999_0000, 4);
 
         assert_eq!(
-            dispatch(
+            dispatch_with_lease(
                 &mut dispatcher,
                 &root,
                 &mut memory,
                 SYS_PROCESS_VM_READV,
                 [target_pid as u64, LOCAL_IOV, 1, REMOTE_IOV, 2, 0],
+                Some(&lease),
             ),
             DispatchOutcome::Returned { value: 4 },
             "later fault must return exact completed prefix",
@@ -5321,8 +5379,105 @@ mod kernel_process_dispatch_tests {
     }
 
     #[test]
+    fn process_vm_readv_remote_single_iovec_mid_fault_returns_completed_prefix() {
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_086);
+        let target = process_vm_target(&root, 61_087);
+        let root = refreshed(&root);
+        let target_pid = target.task().key().id.raw();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x10000]);
+
+        // Single remote iovec of 8192 bytes (first 4096 mapped at TARGET_VA, second 4096 unmapped)
+        write_iovec(&mut memory, LOCAL_IOV, LOCAL_BUF, 8192);
+        write_iovec(&mut memory, REMOTE_IOV, TARGET_VA, 8192);
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PROCESS_VM_READV,
+                [target_pid as u64, LOCAL_IOV, 1, REMOTE_IOV, 1, 0],
+                Some(&lease),
+            ),
+            DispatchOutcome::Returned { value: 4096 },
+            "single remote iovec mid-fault must return exact completed prefix",
+        );
+        let read_bytes = memory.read_bytes(LOCAL_BUF, 4096).unwrap();
+        let expected = (0..4096).map(|i| b"PEER"[i % 4]).collect::<Vec<_>>();
+        assert_eq!(read_bytes, expected);
+        assert_eq!(
+            memory.read_bytes(LOCAL_BUF + 4096, 4096).unwrap(),
+            vec![0; 4096]
+        );
+    }
+
+    #[test]
+    fn process_vm_readv_local_single_iovec_mid_fault_returns_completed_prefix() {
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_084);
+        let target = process_vm_target_with_pages(&root, 61_085, 2);
+        let root = refreshed(&root);
+        let target_pid = target.task().key().id.raw();
+        // Memory has only 0x2000 total size starting at 0x1000, so LOCAL_BUF (0x2000) has capacity 0x1000 (4096 bytes).
+        // Writing at LOCAL_BUF + 4096 (0x3000) faults.
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x2000]);
+
+        // Single remote iovec of 8192 bytes, single local iovec of 8192 bytes
+        write_iovec(&mut memory, LOCAL_IOV, LOCAL_BUF, 8192);
+        write_iovec(&mut memory, REMOTE_IOV, TARGET_VA, 8192);
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PROCESS_VM_READV,
+                [target_pid as u64, LOCAL_IOV, 1, REMOTE_IOV, 1, 0],
+                Some(&lease),
+            ),
+            DispatchOutcome::Returned { value: 4096 },
+            "single local iovec mid-fault must return exact completed prefix",
+        );
+        let read_bytes = memory.read_bytes(LOCAL_BUF, 4096).unwrap();
+        let expected = (0..4096).map(|i| b"PEER"[i % 4]).collect::<Vec<_>>();
+        assert_eq!(read_bytes, expected);
+    }
+
+    #[test]
+    fn process_vm_readv_stale_target_returns_esrch() {
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_082);
+        let target = process_vm_target(&root, 61_083);
+        let root = refreshed(&root);
+        let target_pid = target.task().key().id.raw();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+        write_iovec(&mut memory, LOCAL_IOV, LOCAL_BUF, 4);
+        write_iovec(&mut memory, REMOTE_IOV, TARGET_VA, 4);
+
+        target
+            .kernel()
+            .exit_task(
+                target.task().key().id,
+                LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .expect("exit test task");
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PROCESS_VM_READV,
+                [target_pid as u64, LOCAL_IOV, 1, REMOTE_IOV, 1, 0],
+                Some(&lease),
+            ),
+            DispatchOutcome::errno(LINUX_ESRCH),
+            "stale target task must return ESRCH",
+        );
+    }
+
+    #[test]
     fn process_vm_writev_foreign_returns_efault() {
-        let (_lane, mut dispatcher, _process, root) = bound_dispatcher(61_096);
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_096);
         let target = process_vm_target(&root, 61_097);
         let root = refreshed(&root);
         let target_pid = target.task().key().id.raw();
@@ -5331,12 +5486,13 @@ mod kernel_process_dispatch_tests {
         write_iovec(&mut memory, REMOTE_IOV, TARGET_VA, 4);
 
         assert_eq!(
-            dispatch(
+            dispatch_with_lease(
                 &mut dispatcher,
                 &root,
                 &mut memory,
                 SYS_PROCESS_VM_WRITEV,
                 [target_pid as u64, LOCAL_IOV, 1, REMOTE_IOV, 1, 0],
+                Some(&lease),
             ),
             DispatchOutcome::errno(LINUX_EFAULT),
         );
@@ -5344,56 +5500,29 @@ mod kernel_process_dispatch_tests {
 
     #[test]
     fn process_vm_lease_consumer_limited_to_process_vm_syscalls() {
-        let (_lane, dispatcher, mut process, root) = bound_dispatcher(61_098);
-        process.clear_test_execution_lease();
-        let mut dispatcher_no_lease = SyscallDispatcher::new();
-        dispatcher_no_lease.bind_hvpatch_process(process);
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_098);
         let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
 
         // When dispatching without an active execution lease:
         // Ordinary syscalls (getpid, getppid, getuid, sched_yield) succeed normally
         // without attempting foreign MM access or failing due to missing lease authority.
         assert_eq!(
-            dispatch(
-                &mut dispatcher_no_lease,
-                &root,
-                &mut memory,
-                172,
-                [0, 0, 0, 0, 0, 0]
-            ),
+            dispatch(&mut dispatcher, &root, &mut memory, 172, [0, 0, 0, 0, 0, 0]),
             DispatchOutcome::Returned { value: 61_098 },
             "getpid must not require or consume execution lease authority",
         );
         assert_eq!(
-            dispatch(
-                &mut dispatcher_no_lease,
-                &root,
-                &mut memory,
-                173,
-                [0, 0, 0, 0, 0, 0]
-            ),
+            dispatch(&mut dispatcher, &root, &mut memory, 173, [0, 0, 0, 0, 0, 0]),
             DispatchOutcome::Returned { value: 1 },
             "getppid must not require or consume execution lease authority",
         );
         assert_eq!(
-            dispatch(
-                &mut dispatcher_no_lease,
-                &root,
-                &mut memory,
-                174,
-                [0, 0, 0, 0, 0, 0]
-            ),
+            dispatch(&mut dispatcher, &root, &mut memory, 174, [0, 0, 0, 0, 0, 0]),
             DispatchOutcome::Returned { value: 0 },
             "getuid must not require or consume execution lease authority",
         );
         assert_eq!(
-            dispatch(
-                &mut dispatcher_no_lease,
-                &root,
-                &mut memory,
-                124,
-                [0, 0, 0, 0, 0, 0]
-            ),
+            dispatch(&mut dispatcher, &root, &mut memory, 124, [0, 0, 0, 0, 0, 0]),
             DispatchOutcome::Returned { value: 0 },
             "sched_yield must not require or consume execution lease authority",
         );
@@ -5406,7 +5535,7 @@ mod kernel_process_dispatch_tests {
 
         assert_eq!(
             dispatch(
-                &mut dispatcher_no_lease,
+                &mut dispatcher,
                 &root,
                 &mut memory,
                 SYS_PROCESS_VM_READV,
@@ -5417,7 +5546,7 @@ mod kernel_process_dispatch_tests {
         );
         assert_eq!(
             dispatch(
-                &mut dispatcher_no_lease,
+                &mut dispatcher,
                 &root,
                 &mut memory,
                 SYS_PROCESS_VM_WRITEV,
@@ -5428,14 +5557,14 @@ mod kernel_process_dispatch_tests {
         );
 
         // With the valid execution lease, process_vm_readv consumes the lease and succeeds.
-        let mut dispatcher_with_lease = dispatcher;
         assert_eq!(
-            dispatch(
-                &mut dispatcher_with_lease,
+            dispatch_with_lease(
+                &mut dispatcher,
                 &root,
                 &mut memory,
                 SYS_PROCESS_VM_READV,
                 [target_pid as u64, LOCAL_IOV, 1, REMOTE_IOV, 1, 0],
+                Some(&lease),
             ),
             DispatchOutcome::Returned { value: 4 },
             "foreign process_vm_readv with valid execution lease consumes lease and succeeds",
@@ -5443,8 +5572,35 @@ mod kernel_process_dispatch_tests {
     }
 
     #[test]
+    fn syscall_requires_execution_lease_matches_exact_process_vm_numbers() {
+        use crate::dispatch::syscall_requires_execution_lease;
+        assert!(syscall_requires_execution_lease(270));
+        assert!(syscall_requires_execution_lease(271));
+
+        for ordinary in [
+            0,   // read
+            1,   // write
+            95,  // waitid
+            98,  // futex
+            117, // ptrace
+            124, // sched_yield
+            172, // getpid
+            173, // getppid
+            174, // getuid
+            220, // clone
+            222, // mmap
+            260, // wait4
+        ] {
+            assert!(
+                !syscall_requires_execution_lease(ordinary),
+                "syscall {ordinary} must not require execution lease"
+            );
+        }
+    }
+
+    #[test]
     fn kernel_wait_dispatch_validates_and_reports_echild() {
-        let (_lane, mut dispatcher, _process, root) = bound_dispatcher(61_001);
+        let (_lane, mut dispatcher, _process, root, _lease) = bound_dispatcher(61_001);
         let mut memory = LinearMemory::new(INFO_ADDR, vec![0; 0x100]);
 
         assert_eq!(
@@ -5491,7 +5647,7 @@ mod kernel_process_dispatch_tests {
 
     #[test]
     fn kernel_blocking_waits_park_on_logical_children() {
-        let (_lane, mut dispatcher, _process, root) = bound_dispatcher(61_011);
+        let (_lane, mut dispatcher, _process, root, _lease) = bound_dispatcher(61_011);
         let child = fork_child(&root, 61_012);
         let root = refreshed(&root);
         let child_pid = child.task().key().id.raw();
@@ -5527,7 +5683,7 @@ mod kernel_process_dispatch_tests {
 
     #[test]
     fn kernel_process_group_waits_use_a_broad_wake_selector() {
-        let (_lane, mut dispatcher, process, root) = bound_dispatcher(61_021);
+        let (_lane, mut dispatcher, process, root, _lease) = bound_dispatcher(61_021);
         let _child = fork_child(&root, 61_022);
         let root = refreshed(&root);
         let process_group = process.process_group().unwrap();
@@ -5559,7 +5715,7 @@ mod kernel_process_dispatch_tests {
 
     #[test]
     fn kernel_waitid_filters_unrequested_stop_and_finds_exited_sibling() {
-        let (_lane, mut dispatcher, _process, root) = bound_dispatcher(61_031);
+        let (_lane, mut dispatcher, _process, root, _lease) = bound_dispatcher(61_031);
         let stopped = fork_child(&root, 61_032);
         let root = refreshed(&root);
         let exited = fork_child(&root, 61_033);
@@ -5659,7 +5815,7 @@ mod kernel_process_dispatch_tests {
 
     #[test]
     fn kernel_ptrace_stop_wait_and_control_are_task_scoped() {
-        let (_lane, mut dispatcher, _process, root) = bound_dispatcher(61_041);
+        let (_lane, mut dispatcher, _process, root, _lease) = bound_dispatcher(61_041);
         let child = fork_child(&root, 61_042);
         let root = refreshed(&root);
         let child_pid = child.task().key().id.raw();
@@ -5707,7 +5863,7 @@ mod kernel_process_dispatch_tests {
 
     #[test]
     fn kernel_ptrace_attach_reports_guest_target_semantics() {
-        let (_lane, mut dispatcher, _process, root) = bound_dispatcher(61_051);
+        let (_lane, mut dispatcher, _process, root, _lease) = bound_dispatcher(61_051);
         let child = fork_child(&root, 61_052);
         let root = refreshed(&root);
         let child_pid = child.task().key().id.raw();

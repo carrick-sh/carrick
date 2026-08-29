@@ -9,12 +9,14 @@ use carrick_abi::{LINUX_EFAULT, LINUX_ESRCH, LinuxErrno};
 /// Temporary crate-private VMA-only compatibility view for the not-yet-migrated
 /// process_vm consumer. It carries no read authority; Task 8 removes it when
 /// that consumer switches to `ForeignMm` plus `MmAccessAuthority`.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct ForeignMmAccess {
     _target_pid: TaskId,
     vmas: Vec<VmaSummary>,
 }
 
+#[allow(dead_code)]
 impl ForeignMmAccess {
     /// Authenticates and creates a foreign MM access handle for `target_pid`.
     pub(crate) fn for_task(kernel: &Kernel, target_pid: TaskId) -> Result<Self, LinuxErrno> {

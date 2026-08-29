@@ -1107,6 +1107,7 @@ pub struct SyscallCtx<'a, M: CurrentMmMemory> {
     /// single-threaded `dispatch` path (legacy callers + unit tests), where
     /// tid-aware handlers fall back to pid-based answers.
     pub thread: Option<ThreadCtx<'a>>,
+    pub execution_lease: Option<&'a crate::kernel::objects::ThreadExecutionLease>,
 }
 
 /// Context available only after the outer run loop has established structural
@@ -1118,6 +1119,7 @@ pub struct MutationSyscallCtx<'a, 'mutation, 'authority, M: CurrentMmMemory> {
     pub reporter: &'a CompatReporter,
     pub thread: Option<ThreadCtx<'a>>,
     pub(crate) mm_mutation: &'mutation mut mm_mutation::MmMutationGuard<'authority>,
+    pub execution_lease: Option<&'a crate::kernel::objects::ThreadExecutionLease>,
 }
 
 impl<M: CurrentMmMemory> MutationSyscallCtx<'_, '_, '_, M> {
@@ -1170,41 +1172,23 @@ impl<M: CurrentMmMemory> SyscallCtx<'_, M> {
             .unwrap_or_else(crate::thread::ThreadId::main_from_host_pid)
     }
 
+    #[inline]
     pub(crate) fn with_execution_lease<R>(
         &self,
         operation: impl FnOnce(&crate::kernel::objects::ThreadExecutionLease) -> R,
     ) -> Option<R> {
-        with_active_execution_lease(operation)
+        self.execution_lease.map(operation)
     }
 }
 
-thread_local! {
-    static ACTIVE_EXECUTION_LEASE: std::cell::Cell<Option<*const crate::kernel::objects::ThreadExecutionLease>> =
-        const { std::cell::Cell::new(None) };
-}
-
-pub(crate) fn with_execution_lease<R>(
-    lease: Option<&crate::kernel::objects::ThreadExecutionLease>,
-    operation: impl FnOnce() -> R,
-) -> R {
-    let previous = ACTIVE_EXECUTION_LEASE.with(|cell| cell.replace(lease.map(|l| l as *const _)));
-    struct ResetExecutionLease(Option<*const crate::kernel::objects::ThreadExecutionLease>);
-    impl Drop for ResetExecutionLease {
-        fn drop(&mut self) {
-            ACTIVE_EXECUTION_LEASE.with(|cell| cell.set(self.0));
-        }
-    }
-    let _reset = ResetExecutionLease(previous);
-    operation()
-}
-
-pub(crate) fn with_active_execution_lease<R>(
-    operation: impl FnOnce(&crate::kernel::objects::ThreadExecutionLease) -> R,
-) -> Option<R> {
-    ACTIVE_EXECUTION_LEASE.with(|cell| {
-        let ptr = cell.get()?;
-        Some(operation(unsafe { &*ptr }))
-    })
+/// Exact classifier for syscalls that consume a live `ThreadExecutionLease`.
+///
+/// Only `process_vm_readv` (270) and `process_vm_writev` (271) consume the
+/// execution lease. Ordinary syscalls return false and execute without
+/// acquiring or consulting the execution lease lock.
+#[inline]
+pub(crate) const fn syscall_requires_execution_lease(nr: u64) -> bool {
+    nr == 270 || nr == 271
 }
 
 /// Per-thread coordination handles handed to tid-aware syscall handlers
@@ -4060,25 +4044,11 @@ trait NormalizedDispatchRoute {
     ) -> Option<Result<DispatchOutcome, DispatchError>>;
 }
 
-struct OrdinaryDispatchRoute;
-impl NormalizedDispatchRoute for OrdinaryDispatchRoute {
-    fn dispatch<M: CurrentMmMemory>(
-        &mut self,
-        dispatcher: &SyscallDispatcher,
-        kernel: &crate::kernel::KernelContext,
-        request: SyscallRequest,
-        memory: &mut M,
-        reporter: &CompatReporter,
-        thread: Option<ThreadCtx>,
-    ) -> Option<Result<DispatchOutcome, DispatchError>> {
-        dispatcher.dispatch_normalized(kernel, request, memory, reporter, thread)
-    }
+struct OrdinaryDispatchRoute<'lease> {
+    lease: Option<&'lease crate::kernel::objects::ThreadExecutionLease>,
 }
 
-struct MutationDispatchRoute<'guard, 'authority> {
-    guard: &'guard mut mm_mutation::MmMutationGuard<'authority>,
-}
-impl NormalizedDispatchRoute for MutationDispatchRoute<'_, '_> {
+impl NormalizedDispatchRoute for OrdinaryDispatchRoute<'_> {
     fn dispatch<M: CurrentMmMemory>(
         &mut self,
         dispatcher: &SyscallDispatcher,
@@ -4089,7 +4059,28 @@ impl NormalizedDispatchRoute for MutationDispatchRoute<'_, '_> {
         thread: Option<ThreadCtx>,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
         dispatcher
-            .dispatch_normalized_mutation(kernel, request, memory, reporter, thread, self.guard)
+            .dispatch_normalized_with_lease(kernel, request, memory, reporter, thread, self.lease)
+    }
+}
+
+struct MutationDispatchRoute<'guard, 'authority, 'lease> {
+    guard: &'guard mut mm_mutation::MmMutationGuard<'authority>,
+    lease: Option<&'lease crate::kernel::objects::ThreadExecutionLease>,
+}
+
+impl NormalizedDispatchRoute for MutationDispatchRoute<'_, '_, '_> {
+    fn dispatch<M: CurrentMmMemory>(
+        &mut self,
+        dispatcher: &SyscallDispatcher,
+        kernel: &crate::kernel::KernelContext,
+        request: SyscallRequest,
+        memory: &mut M,
+        reporter: &CompatReporter,
+        thread: Option<ThreadCtx>,
+    ) -> Option<Result<DispatchOutcome, DispatchError>> {
+        dispatcher.dispatch_normalized_mutation(
+            kernel, request, memory, reporter, thread, self.guard, self.lease,
+        )
     }
 }
 
@@ -4861,6 +4852,7 @@ impl SyscallDispatcher {
     /// Dispatch a syscall through the chained per-module routing. Returns `None`
     /// for an unclaimed number (the caller ENOSYSes); otherwise builds the
     /// transient `SyscallCtx` and invokes the resolved handler.
+    #[cfg(test)]
     fn dispatch_normalized(
         &self,
         kernel: &crate::kernel::KernelContext,
@@ -4868,6 +4860,18 @@ impl SyscallDispatcher {
         memory: &mut impl CurrentMmMemory,
         reporter: &CompatReporter,
         thread: Option<ThreadCtx>,
+    ) -> Option<Result<DispatchOutcome, DispatchError>> {
+        self.dispatch_normalized_with_lease(kernel, request, memory, reporter, thread, None)
+    }
+
+    fn dispatch_normalized_with_lease<'lease>(
+        &self,
+        kernel: &crate::kernel::KernelContext,
+        request: SyscallRequest,
+        memory: &mut impl CurrentMmMemory,
+        reporter: &CompatReporter,
+        thread: Option<ThreadCtx>,
+        execution_lease: Option<&'lease crate::kernel::objects::ThreadExecutionLease>,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
         let handler = resolve_handler(request.number.raw())?;
         let canonical_nr = request.number.raw();
@@ -4877,6 +4881,7 @@ impl SyscallDispatcher {
             memory,
             reporter,
             thread,
+            execution_lease,
         };
         let outcome = resources::with_captured_resources(kernel, || handler(self, &mut ctx));
         // Single choke point for the fork-coherent resolve cache: a structural
@@ -4891,7 +4896,7 @@ impl SyscallDispatcher {
         Some(outcome)
     }
 
-    fn dispatch_normalized_mutation<'authority>(
+    fn dispatch_normalized_mutation<'authority, 'lease>(
         &self,
         kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
@@ -4899,6 +4904,7 @@ impl SyscallDispatcher {
         reporter: &CompatReporter,
         thread: Option<ThreadCtx>,
         mm_mutation: &mut mm_mutation::MmMutationGuard<'authority>,
+        execution_lease: Option<&'lease crate::kernel::objects::ThreadExecutionLease>,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
         let handler = resolve_mutation_handler(request.number.raw())?;
         let mut ctx = MutationSyscallCtx {
@@ -4908,6 +4914,7 @@ impl SyscallDispatcher {
             reporter,
             thread,
             mm_mutation,
+            execution_lease,
         };
         Some(resources::with_captured_resources(kernel, || {
             handler(self, &mut ctx)
@@ -4928,7 +4935,9 @@ impl SyscallDispatcher {
         thread: Option<ThreadCtx>,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
         mm_mutation::test_support::with_guard(self.mm_mutation_coordinator(), |guard| {
-            self.dispatch_normalized_mutation(kernel, request, memory, reporter, thread, guard)
+            self.dispatch_normalized_mutation(
+                kernel, request, memory, reporter, thread, guard, None,
+            )
         })
     }
 
@@ -6613,49 +6622,52 @@ impl SyscallDispatcher {
         memory: &mut impl CurrentMmMemory,
         reporter: &CompatReporter,
     ) -> Result<DispatchOutcome, DispatchError> {
+        self.dispatch_with_lease(kernel, request, memory, reporter, None)
+    }
+
+    /// Single-threaded dispatch accepting an explicitly borrowed `ThreadExecutionLease`.
+    pub fn dispatch_with_lease(
+        &mut self,
+        kernel: &crate::kernel::KernelContext,
+        request: SyscallRequest,
+        memory: &mut impl CurrentMmMemory,
+        reporter: &CompatReporter,
+        lease: Option<&crate::kernel::objects::ThreadExecutionLease>,
+    ) -> Result<DispatchOutcome, DispatchError> {
         // Tree-wide forward-progress beat for the deadlock watchdog.
         crate::deadlock_watchdog::tick();
         let executor = self
             .enter_mm_executor()
             .map_err(DispatchError::MmExecutorAdmission)?;
-        #[cfg(test)]
-        let test_lease_holder = self
-            .hvpatch_process()
-            .and_then(|p| p.test_execution_lease_holder());
-        #[cfg(test)]
-        let test_lease_guard = test_lease_holder.as_ref().map(|h| h.lock());
-        #[cfg(test)]
-        let test_lease = test_lease_guard.as_deref();
-        #[cfg(not(test))]
-        let test_lease = None;
-        with_execution_lease(test_lease, || {
-            if syscall_requires_mm_mutation(request.number.raw(), request.args) {
-                let mut executor = executor;
-                let coordinator = executor.mutation_coordinator();
-                let mm = executor.mm_id();
-                crate::vcpu_loop::with_sole_mm_stage1(&mut executor, |authority| {
-                    let mut guard = mm_mutation::from_sole_executor(authority, coordinator, mm);
-                    self.dispatch_inner(
-                        kernel,
-                        request,
-                        memory,
-                        reporter,
-                        None,
-                        MutationDispatchRoute { guard: &mut guard },
-                    )
-                })
-                .ok_or(DispatchError::MmMutationPeerExecutor)?
-            } else {
+        if syscall_requires_mm_mutation(request.number.raw(), request.args) {
+            let mut executor = executor;
+            let coordinator = executor.mutation_coordinator();
+            let mm = executor.mm_id();
+            crate::vcpu_loop::with_sole_mm_stage1(&mut executor, |authority| {
+                let mut guard = mm_mutation::from_sole_executor(authority, coordinator, mm);
                 self.dispatch_inner(
                     kernel,
                     request,
                     memory,
                     reporter,
                     None,
-                    OrdinaryDispatchRoute,
+                    MutationDispatchRoute {
+                        guard: &mut guard,
+                        lease,
+                    },
                 )
-            }
-        })
+            })
+            .ok_or(DispatchError::MmMutationPeerExecutor)?
+        } else {
+            self.dispatch_inner(
+                kernel,
+                request,
+                memory,
+                reporter,
+                None,
+                OrdinaryDispatchRoute { lease },
+            )
+        }
     }
 
     /// Run a non-threaded completion under a fresh exact-MM census admission.
@@ -6850,6 +6862,23 @@ impl SyscallDispatcher {
         registry: &crate::thread::ThreadRegistry,
         futex: &crate::thread::FutexTable,
     ) -> Result<DispatchOutcome, DispatchError> {
+        self.dispatch_threaded_with_lease(
+            kernel, request, memory, reporter, tid, registry, futex, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_threaded_with_lease(
+        &self,
+        kernel: &crate::kernel::KernelContext,
+        request: SyscallRequest,
+        memory: &mut impl CurrentMmMemory,
+        reporter: &CompatReporter,
+        tid: crate::thread::ThreadId,
+        registry: &crate::thread::ThreadRegistry,
+        futex: &crate::thread::FutexTable,
+        lease: Option<&crate::kernel::objects::ThreadExecutionLease>,
+    ) -> Result<DispatchOutcome, DispatchError> {
         self.dispatch_threaded_with_route(
             kernel,
             request,
@@ -6858,7 +6887,7 @@ impl SyscallDispatcher {
             tid,
             registry,
             futex,
-            OrdinaryDispatchRoute,
+            OrdinaryDispatchRoute { lease },
         )
     }
 
@@ -6932,6 +6961,24 @@ impl SyscallDispatcher {
         futex: &crate::thread::FutexTable,
         guard: &mut mm_mutation::MmMutationGuard<'_>,
     ) -> Result<DispatchOutcome, DispatchError> {
+        self.dispatch_threaded_mutation_with_lease(
+            kernel, request, memory, reporter, tid, registry, futex, guard, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_threaded_mutation_with_lease(
+        &self,
+        kernel: &crate::kernel::KernelContext,
+        request: SyscallRequest,
+        memory: &mut impl CurrentMmMemory,
+        reporter: &CompatReporter,
+        tid: crate::thread::ThreadId,
+        registry: &crate::thread::ThreadRegistry,
+        futex: &crate::thread::FutexTable,
+        guard: &mut mm_mutation::MmMutationGuard<'_>,
+        lease: Option<&crate::kernel::objects::ThreadExecutionLease>,
+    ) -> Result<DispatchOutcome, DispatchError> {
         self.dispatch_threaded_with_route(
             kernel,
             request,
@@ -6940,7 +6987,7 @@ impl SyscallDispatcher {
             tid,
             registry,
             futex,
-            MutationDispatchRoute { guard },
+            MutationDispatchRoute { guard, lease },
         )
     }
 

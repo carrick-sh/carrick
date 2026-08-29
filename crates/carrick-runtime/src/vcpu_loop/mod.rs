@@ -8162,63 +8162,69 @@ where
             self.current_syscall_request = Some(request);
             let outcome =
                 dispatch_with_panic_backstop(request.number.raw(), self.this_tid, || {
-                    let lease_guard = self.execution_lease.lock();
-                    let lease = lease_guard.as_ref();
-                    crate::dispatch::with_execution_lease(lease, || {
-                        if crate::dispatch::syscall_requires_mm_mutation(
-                            request.number.raw(),
-                            request.args,
-                        ) {
-                            let coordinator = kernel.dispatcher.mm_mutation_coordinator();
-                            match stage1_authority.as_mut().unwrap_or_else(|| {
-                                tracing::error!("mutation dispatch lacks outer stage-1 authority");
-                                std::process::abort();
-                            }) {
-                                quiesce::MmStage1Authority::Sole(authority) => {
-                                    let mut mutation =
-                                        crate::dispatch::mm_mutation::from_sole_executor(
-                                            authority,
-                                            coordinator,
-                                            kernel_context.shared().mm().id(),
-                                        );
-                                    kernel.dispatcher.dispatch_threaded_mutation(
-                                        &kernel_context,
-                                        request,
-                                        engine,
-                                        &kernel.reporter,
-                                        self.this_tid,
-                                        &self.registry,
-                                        &self.futex,
-                                        &mut mutation,
-                                    )
-                                }
-                                quiesce::MmStage1Authority::Paused(authority) => {
-                                    let mut mutation =
-                                        crate::dispatch::mm_mutation::from_pt_pause(authority);
-                                    kernel.dispatcher.dispatch_threaded_mutation(
-                                        &kernel_context,
-                                        request,
-                                        engine,
-                                        &kernel.reporter,
-                                        self.this_tid,
-                                        &self.registry,
-                                        &self.futex,
-                                        &mut mutation,
-                                    )
-                                }
+                    let lease_guard = if crate::dispatch::syscall_requires_execution_lease(
+                        request.number.raw(),
+                    ) {
+                        Some(self.execution_lease.lock())
+                    } else {
+                        None
+                    };
+                    let lease = lease_guard.as_deref().and_then(|g| g.as_ref());
+                    if crate::dispatch::syscall_requires_mm_mutation(
+                        request.number.raw(),
+                        request.args,
+                    ) {
+                        let coordinator = kernel.dispatcher.mm_mutation_coordinator();
+                        match stage1_authority.as_mut().unwrap_or_else(|| {
+                            tracing::error!("mutation dispatch lacks outer stage-1 authority");
+                            std::process::abort();
+                        }) {
+                            quiesce::MmStage1Authority::Sole(authority) => {
+                                let mut mutation = crate::dispatch::mm_mutation::from_sole_executor(
+                                    authority,
+                                    coordinator,
+                                    kernel_context.shared().mm().id(),
+                                );
+                                kernel.dispatcher.dispatch_threaded_mutation_with_lease(
+                                    &kernel_context,
+                                    request,
+                                    engine,
+                                    &kernel.reporter,
+                                    self.this_tid,
+                                    &self.registry,
+                                    &self.futex,
+                                    &mut mutation,
+                                    lease,
+                                )
                             }
-                        } else {
-                            kernel.dispatcher.dispatch_threaded(
-                                &kernel_context,
-                                request,
-                                engine,
-                                &kernel.reporter,
-                                self.this_tid,
-                                &self.registry,
-                                &self.futex,
-                            )
+                            quiesce::MmStage1Authority::Paused(authority) => {
+                                let mut mutation =
+                                    crate::dispatch::mm_mutation::from_pt_pause(authority);
+                                kernel.dispatcher.dispatch_threaded_mutation_with_lease(
+                                    &kernel_context,
+                                    request,
+                                    engine,
+                                    &kernel.reporter,
+                                    self.this_tid,
+                                    &self.registry,
+                                    &self.futex,
+                                    &mut mutation,
+                                    lease,
+                                )
+                            }
                         }
-                    })
+                    } else {
+                        kernel.dispatcher.dispatch_threaded_with_lease(
+                            &kernel_context,
+                            request,
+                            engine,
+                            &kernel.reporter,
+                            self.this_tid,
+                            &self.registry,
+                            &self.futex,
+                            lease,
+                        )
+                    }
                 })?;
             if continuation::is_blocking_dispatch_outcome(&outcome) {
                 // The persistent executor converts this exact owned outcome into
