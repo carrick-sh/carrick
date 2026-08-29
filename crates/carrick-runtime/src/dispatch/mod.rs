@@ -2510,8 +2510,8 @@ pub struct MmExecutorParticipation {
 }
 
 impl MmExecutorParticipation {
-    pub(crate) fn claim_sole(&self) -> Option<crate::kernel::SoleGuestExecutor<'_>> {
-        self.participation.claim_sole()
+    pub(crate) fn participation_mut(&mut self) -> &mut crate::kernel::GuestExecutorParticipation {
+        &mut self.participation
     }
 
     pub(crate) fn mm_id(&self) -> crate::kernel::MmId {
@@ -2520,10 +2520,6 @@ impl MmExecutorParticipation {
 
     pub(crate) fn mutation_coordinator(&self) -> Arc<mm_mutation::MmMutationCoordinator> {
         Arc::clone(&self.authority.mutation_coordinator)
-    }
-
-    pub(crate) fn executor_census(&self) -> &crate::kernel::GuestExecutorCensus {
-        &self.authority.guest_executors
     }
 
     fn authorizes(&self, authority: &Arc<DispatchMmAuthority>) -> bool {
@@ -5054,23 +5050,33 @@ impl SyscallDispatcher {
     pub fn enter_mm_executor(
         &self,
     ) -> Result<MmExecutorParticipation, crate::kernel::GuestExecutorCensusError> {
-        self.enter_mm_executor_inner(None)
+        self.enter_mm_executor_inner(None, None)
     }
 
     pub(crate) fn enter_mm_executor_for_thread(
         &self,
         thread: Option<crate::kernel::ThreadRef>,
+        registry: Arc<dyn carrick_hal::VcpuRegistry>,
+        tid: carrick_hal::ThreadId,
     ) -> Result<MmExecutorParticipation, crate::kernel::GuestExecutorCensusError> {
-        self.enter_mm_executor_inner(thread)
+        self.enter_mm_executor_inner(thread, Some((registry, tid)))
     }
 
     fn enter_mm_executor_inner(
         &self,
         thread: Option<crate::kernel::ThreadRef>,
+        pause_endpoint: Option<(Arc<dyn carrick_hal::VcpuRegistry>, carrick_hal::ThreadId)>,
     ) -> Result<MmExecutorParticipation, crate::kernel::GuestExecutorCensusError> {
         loop {
             let authority = self.mm_binding.current.load_full();
-            let participation = authority.guest_executors.enter(thread.clone())?;
+            let participation = match pause_endpoint.as_ref() {
+                Some((registry, tid)) => authority.guest_executors.enter_with_pause_endpoint(
+                    thread.clone(),
+                    Arc::clone(registry),
+                    *tid,
+                )?,
+                None => authority.guest_executors.enter(thread.clone())?,
+            };
             if Arc::ptr_eq(&self.mm_binding.current.load_full(), &authority) {
                 return Ok(MmExecutorParticipation {
                     authority,
@@ -6414,10 +6420,12 @@ impl SyscallDispatcher {
             .enter_mm_executor()
             .map_err(DispatchError::MmExecutorAdmission)?;
         if syscall_requires_mm_mutation(request.number.raw(), request.args) {
-            crate::vcpu_loop::with_sole_mm_stage1(&executor, |authority| {
+            let mut executor = executor;
+            let coordinator = executor.mutation_coordinator();
+            crate::vcpu_loop::with_sole_mm_stage1(&mut executor, |authority| {
                 let mut guard = mm_mutation::from_sole_executor(
                     authority,
-                    executor.mutation_coordinator(),
+                    coordinator,
                     kernel.shared().mm().id(),
                 );
                 self.dispatch_inner(
@@ -6448,15 +6456,13 @@ impl SyscallDispatcher {
         kernel: &crate::kernel::KernelContext,
         run: impl FnOnce(&mut Self, &mut mm_mutation::MmMutationGuard<'_>) -> T,
     ) -> Result<T, DispatchError> {
-        let executor = self
+        let mut executor = self
             .enter_mm_executor()
             .map_err(DispatchError::MmExecutorAdmission)?;
-        crate::vcpu_loop::with_sole_mm_stage1(&executor, |authority| {
-            let mut guard = mm_mutation::from_sole_executor(
-                authority,
-                executor.mutation_coordinator(),
-                kernel.shared().mm().id(),
-            );
+        let coordinator = executor.mutation_coordinator();
+        crate::vcpu_loop::with_sole_mm_stage1(&mut executor, |authority| {
+            let mut guard =
+                mm_mutation::from_sole_executor(authority, coordinator, kernel.shared().mm().id());
             run(self, &mut guard)
         })
         .ok_or(DispatchError::MmMutationPeerExecutor)
@@ -6656,7 +6662,7 @@ impl SyscallDispatcher {
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch_threaded_with_mm_executor(
         &self,
-        executor: &MmExecutorParticipation,
+        executor: &mut MmExecutorParticipation,
         kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
         memory: &mut impl CurrentMmMemory,
@@ -6670,12 +6676,10 @@ impl SyscallDispatcher {
             return Err(DispatchError::MmMutationPeerExecutor);
         }
         if syscall_requires_mm_mutation(request.number.raw(), request.args) {
+            let coordinator = executor.mutation_coordinator();
             crate::vcpu_loop::with_sole_mm_stage1(executor, |outer| {
-                let mut guard = mm_mutation::from_sole_executor(
-                    outer,
-                    executor.mutation_coordinator(),
-                    kernel.shared().mm().id(),
-                );
+                let mut guard =
+                    mm_mutation::from_sole_executor(outer, coordinator, kernel.shared().mm().id());
                 self.dispatch_threaded_mutation(
                     kernel, request, memory, reporter, tid, registry, futex, &mut guard,
                 )

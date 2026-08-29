@@ -3,8 +3,9 @@
 //!
 //! Carrick coordinates mutations of shared guest state through distinct
 //! authorities:
-//! - Stage-1 page-table Pause-Modify-Resume uses [`GuestExecutorCensus`]
-//!   (`has_peer_executor`) to decide whether to pause sibling execution.
+//! - Stage-1 page-table Pause-Modify-Resume holds the exact-MM
+//!   [`GuestExecutorCensus`] locked while it either proves sole execution or
+//!   kicks and drains every registered executor endpoint.
 //! - Process fork and crash snapshot raise their quiesce barriers from their
 //!   distinct Task-minted durable-membership witnesses, not this census.
 //!
@@ -43,13 +44,16 @@
 //! into the task graph. A thread between publication and execution entry is not
 //! yet counted. It also cannot yet execute guest code, and the fork lane
 //! separately closes clone admission (`close_for_fork`) before it quiesces, but
-//! the page-table lane has no such closure.
+//! the page-table lane closes its own admission by holding the exact-MM census
+//! lock for the lifetime of its mutation authority.
 
-use std::collections::BTreeSet;
+use std::cell::Cell;
+use std::collections::BTreeMap;
+use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::{ArcMutexGuard, Mutex, RawMutex};
 
 use super::objects::{
     CrashSafePointParticipation, CrashSafePointParticipationError, ThreadKey, ThreadRef,
@@ -63,19 +67,20 @@ enum GuestExecutorIdentity {
 
 #[derive(Debug)]
 struct GuestExecutorCensusState {
-    participants: BTreeSet<GuestExecutorIdentity>,
+    participants: BTreeMap<GuestExecutorIdentity, Option<GuestExecutorPauseEndpoint>>,
     next_anonymous: u64,
 }
 
 impl Default for GuestExecutorCensusState {
     fn default() -> Self {
         Self {
-            participants: BTreeSet::new(),
+            participants: BTreeMap::new(),
             next_anonymous: 1,
         }
     }
 }
 
+#[cfg(test)]
 fn saturating_participant_count_for_probe(count: usize) -> i32 {
     i32::try_from(count).unwrap_or(i32::MAX)
 }
@@ -100,7 +105,7 @@ pub enum GuestExecutorCensusError {
 /// and therefore fresh censuses.
 #[derive(Debug, Default)]
 pub struct GuestExecutorCensus {
-    state: Mutex<GuestExecutorCensusState>,
+    state: Arc<Mutex<GuestExecutorCensusState>>,
 }
 
 impl GuestExecutorCensus {
@@ -116,6 +121,23 @@ impl GuestExecutorCensus {
         self: &Arc<Self>,
         thread: Option<ThreadRef>,
     ) -> Result<GuestExecutorParticipation, GuestExecutorCensusError> {
+        self.enter_inner(thread, None)
+    }
+
+    pub(crate) fn enter_with_pause_endpoint(
+        self: &Arc<Self>,
+        thread: Option<ThreadRef>,
+        registry: Arc<dyn carrick_hal::VcpuRegistry>,
+        tid: carrick_hal::ThreadId,
+    ) -> Result<GuestExecutorParticipation, GuestExecutorCensusError> {
+        self.enter_inner(thread, Some(GuestExecutorPauseEndpoint { registry, tid }))
+    }
+
+    fn enter_inner(
+        self: &Arc<Self>,
+        thread: Option<ThreadRef>,
+        pause_endpoint: Option<GuestExecutorPauseEndpoint>,
+    ) -> Result<GuestExecutorParticipation, GuestExecutorCensusError> {
         let mut state = self.state.lock();
         let identity = match thread.as_ref() {
             Some(thread) => GuestExecutorIdentity::Thread(thread.key()),
@@ -126,7 +148,11 @@ impl GuestExecutorCensus {
                 GuestExecutorIdentity::Anonymous(id)
             }
         };
-        if !state.participants.insert(identity) {
+        if state
+            .participants
+            .insert(identity, pause_endpoint)
+            .is_some()
+        {
             return Err(match identity {
                 GuestExecutorIdentity::Thread(thread) => {
                     GuestExecutorCensusError::DuplicateThread { thread }
@@ -141,7 +167,7 @@ impl GuestExecutorCensus {
                 Ok(participation) => Some(participation),
                 Err(error) => {
                     let removed = state.participants.remove(&identity);
-                    debug_assert!(removed);
+                    debug_assert!(removed.is_some());
                     return Err(match error {
                         CrashSafePointParticipationError::AlreadyActive { thread } => {
                             GuestExecutorCensusError::CrashParticipationAlreadyActive { thread }
@@ -159,22 +185,79 @@ impl GuestExecutorCensus {
             census: Arc::clone(self),
             identity,
             crash_participation,
+            _not_sync: std::marker::PhantomData,
         })
     }
 
-    /// Must a stop-the-world page-table pause be raised before mutating shared
-    /// stage-1 descriptors?
-    ///
-    /// Call ONLY from a thread that itself holds a
-    /// [`GuestExecutorParticipation`] — every admitted guest executor does —
-    /// since the caller counts itself.
-    pub fn has_peer_executor(&self) -> bool {
-        self.state.lock().participants.iter().nth(1).is_some()
+    /// Test-only instantaneous projection. It is not mutation authority: the
+    /// production sole-or-pause decision must hold [`ExactMmCensusGuard`].
+    #[cfg(test)]
+    pub(crate) fn has_peer_executor(&self) -> bool {
+        self.state.lock().participants.len() > 1
     }
 
     /// Numeric projection solely for the fixed-width probe ABI.
+    #[cfg(test)]
     pub(crate) fn participant_count_for_probe(&self) -> i32 {
         saturating_participant_count_for_probe(self.state.lock().participants.len())
+    }
+}
+
+#[derive(Clone)]
+struct GuestExecutorPauseEndpoint {
+    registry: Arc<dyn carrick_hal::VcpuRegistry>,
+    tid: carrick_hal::ThreadId,
+}
+
+impl fmt::Debug for GuestExecutorPauseEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GuestExecutorPauseEndpoint")
+            .field("tid", &self.tid)
+            .finish()
+    }
+}
+
+/// Lifetime-held exact-MM census election. While this exists, no new executor
+/// can enter the MM, which closes admission across a page-table mutation.
+pub(crate) struct ExactMmCensusGuard {
+    state: ArcMutexGuard<RawMutex, GuestExecutorCensusState>,
+}
+
+impl ExactMmCensusGuard {
+    pub(crate) fn participant_count(&self) -> usize {
+        self.state.participants.len()
+    }
+
+    pub(crate) fn all_have_pause_endpoints(&self) -> bool {
+        self.state.participants.values().all(Option::is_some)
+    }
+
+    pub(crate) fn any_in_guest(&self) -> bool {
+        self.state
+            .participants
+            .values()
+            .flatten()
+            .any(|endpoint| endpoint.registry.is_in_guest(endpoint.tid))
+    }
+
+    pub(crate) fn first_in_guest_tid(&self) -> Option<carrick_hal::ThreadId> {
+        self.state
+            .participants
+            .values()
+            .flatten()
+            .find_map(|endpoint| {
+                endpoint
+                    .registry
+                    .is_in_guest(endpoint.tid)
+                    .then_some(endpoint.tid)
+            })
+    }
+
+    pub(crate) fn kick_all_in_guest(&self) {
+        for endpoint in self.state.participants.values().flatten() {
+            let _ = endpoint.registry.kick_if_in_guest(endpoint.tid);
+        }
     }
 }
 
@@ -189,34 +272,39 @@ pub struct GuestExecutorParticipation {
     census: Arc<GuestExecutorCensus>,
     identity: GuestExecutorIdentity,
     crash_participation: Option<CrashSafePointParticipation>,
-}
-
-/// Proof that one exact census contains only the borrowing participant.
-///
-/// The census mutex remains held for the proof's lifetime, so another executor
-/// cannot enter after the sole-executor decision and race the protected work.
-pub(crate) struct SoleGuestExecutor<'participant> {
-    _state: MutexGuard<'participant, GuestExecutorCensusState>,
-    _participant: std::marker::PhantomData<&'participant GuestExecutorParticipation>,
+    _not_sync: std::marker::PhantomData<Cell<()>>,
 }
 
 impl GuestExecutorParticipation {
-    pub(crate) fn claim_sole(&self) -> Option<SoleGuestExecutor<'_>> {
-        let state = self.census.state.lock();
-        if state.participants.len() != 1 || !state.participants.contains(&self.identity) {
-            return None;
+    pub(crate) fn lock_exact_mm(&mut self) -> ExactMmCensusGuard {
+        let state = self.census.state.lock_arc();
+        assert!(
+            state.participants.contains_key(&self.identity),
+            "executor participation is absent from its exact-MM census"
+        );
+        ExactMmCensusGuard { state }
+    }
+}
+
+impl GuestExecutorCensus {
+    pub(crate) fn lock_for_frame_cow(&self) -> ExactMmCensusGuard {
+        ExactMmCensusGuard {
+            state: self.state.lock_arc(),
         }
-        Some(SoleGuestExecutor {
-            _state: state,
-            _participant: std::marker::PhantomData,
-        })
     }
 }
 
 impl Drop for GuestExecutorParticipation {
     fn drop(&mut self) {
         drop(self.crash_participation.take());
-        if !self.census.state.lock().participants.remove(&self.identity) {
+        if self
+            .census
+            .state
+            .lock()
+            .participants
+            .remove(&self.identity)
+            .is_none()
+        {
             std::process::abort();
         }
     }
@@ -275,6 +363,10 @@ mod tests {
         let census = Arc::new(GuestExecutorCensus::default());
         let first = census.enter(None).expect("first token");
         let second = census.enter(None).expect("second token");
+        assert_ne!(
+            first.identity, second.identity,
+            "two live executors must own distinct linear census identities"
+        );
         assert!(census.has_peer_executor());
         drop(second);
         assert!(!census.has_peer_executor());

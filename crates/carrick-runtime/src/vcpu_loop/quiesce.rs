@@ -60,6 +60,24 @@ pub(super) fn current_thread_holds_pt_pause() -> bool {
     carrick_hal::stage1_exclusive::current_thread_edits_exclusively()
 }
 
+/// Publish guest entry and re-check the page-table pause before crossing into
+/// the engine. Together with the coordinator's SeqCst `quiescing` publication
+/// and exact in-guest reads, this is the other half of the Dekker handshake:
+/// either the executor observes the pause and parks, or the coordinator
+/// observes the executor and kicks/drains it before editing.
+pub(super) fn enter_guest_or_park(
+    in_guest: &carrick_hal::InGuestFlag,
+    barrier: &'static crate::fork_quiesce::PtQuiesce,
+) -> bool {
+    in_guest.enter_guest();
+    if !barrier.is_quiescing() {
+        return true;
+    }
+    in_guest.leave_guest();
+    barrier.park();
+    false
+}
+
 /// Holds this thread's stage-1 exclusivity claim for a mapping syscall's whole
 /// dispatch. Separate from [`PtPauseGuard`] because exclusivity has two
 /// sources: the pause (which raises the same marker, so the two nest harmlessly
@@ -86,22 +104,29 @@ impl Drop for Stage1Exclusive {
 /// The census election stays locked until drop, preventing a CLONE_VM peer
 /// dispatcher from entering after the proof is minted.
 pub(crate) struct SoleMmStage1<'participant> {
-    _sole: crate::kernel::SoleGuestExecutor<'participant>,
     _stage1: Stage1Exclusive,
+    _census: crate::kernel::ExactMmCensusGuard,
+    _linear: std::marker::PhantomData<&'participant mut crate::dispatch::MmExecutorParticipation>,
     mm: crate::kernel::MmId,
     coordinator: Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>,
 }
 
 impl<'participant> SoleMmStage1<'participant> {
     pub(super) fn claim(
-        participation: &'participant crate::dispatch::MmExecutorParticipation,
+        participation: &'participant mut crate::dispatch::MmExecutorParticipation,
     ) -> Option<Self> {
-        let sole = participation.claim_sole()?;
+        let mm = participation.mm_id();
+        let coordinator = participation.mutation_coordinator();
+        let census = participation.participation_mut().lock_exact_mm();
+        if census.participant_count() != 1 {
+            return None;
+        }
         Some(Self {
-            _sole: sole,
             _stage1: Stage1Exclusive::claim(),
-            mm: participation.mm_id(),
-            coordinator: participation.mutation_coordinator(),
+            _census: census,
+            _linear: std::marker::PhantomData,
+            mm,
+            coordinator,
         })
     }
 
@@ -114,18 +139,55 @@ impl<'participant> SoleMmStage1<'participant> {
     }
 }
 
-pub(crate) struct PtPauseGuard {
-    _inner: crate::fork_quiesce::PtPauseGuard,
+pub(super) enum MmStage1Authority<'participant> {
+    Sole(SoleMmStage1<'participant>),
+    Paused(PtPauseGuard<'participant>),
 }
 
-impl PtPauseGuard {
-    fn new(inner: crate::fork_quiesce::PtPauseGuard) -> Self {
+pub(super) fn acquire_mm_stage1_authority<'participant>(
+    participation: &'participant mut crate::dispatch::MmExecutorParticipation,
+    tid: ThreadId,
+    budget: PtPauseBudget,
+) -> Result<MmStage1Authority<'participant>, PtPauseError> {
+    let mm = participation.mm_id();
+    let coordinator = participation.mutation_coordinator();
+    let census = participation.participation_mut().lock_exact_mm();
+    if census.participant_count() == 1 {
+        return Ok(MmStage1Authority::Sole(SoleMmStage1 {
+            _stage1: Stage1Exclusive::claim(),
+            _census: census,
+            _linear: std::marker::PhantomData,
+            mm,
+            coordinator,
+        }));
+    }
+    drop(census);
+    begin_pt_pause(pt_barrier(), tid, budget)?;
+    let census = participation.participation_mut().lock_exact_mm();
+    drain_exact_mm(pt_barrier(), census, tid, budget).map(MmStage1Authority::Paused)
+}
+
+pub(crate) struct PtPauseGuard<'mm> {
+    _inner: crate::fork_quiesce::PtPauseGuard,
+    _census: crate::kernel::ExactMmCensusGuard,
+    _authority: std::marker::PhantomData<&'mm mut ()>,
+}
+
+impl<'mm> PtPauseGuard<'mm> {
+    fn new(
+        census: crate::kernel::ExactMmCensusGuard,
+        inner: crate::fork_quiesce::PtPauseGuard,
+    ) -> Self {
         carrick_hal::stage1_exclusive::enter();
-        Self { _inner: inner }
+        Self {
+            _inner: inner,
+            _census: census,
+            _authority: std::marker::PhantomData,
+        }
     }
 }
 
-impl Drop for PtPauseGuard {
+impl Drop for PtPauseGuard<'_> {
     fn drop(&mut self) {
         carrick_hal::stage1_exclusive::exit();
         // `_inner` drops next and resumes sibling vCPUs only after the local
@@ -200,6 +262,7 @@ pub(crate) fn pt_barrier() -> &'static crate::fork_quiesce::PtQuiesce {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PtPauseError {
     TimedOut,
+    UnkickableExecutor,
 }
 
 /// The two independent budgets in a page-table pause.
@@ -239,25 +302,13 @@ impl PtPauseBudget {
 ///
 /// Maps [`carrick_hal::VcpuLeaseDrainPoll::Complete`] to 0 and
 /// [`carrick_hal::VcpuLeaseDrainPoll::Waiting`] to its exact raw `ThreadId`.
-pub(super) fn waiting_vcpu_tid(poll: carrick_hal::VcpuLeaseDrainPoll) -> i32 {
-    match poll {
-        carrick_hal::VcpuLeaseDrainPoll::Complete => 0,
-        carrick_hal::VcpuLeaseDrainPoll::Waiting(tid) => tid.raw(),
-    }
-}
-
-/// `census` is recorded, not consulted: whether to pause at all is decided by
-/// the caller (`KernelState::has_peer_guest_executor`). Carrying it into
-/// `pt-pause-begin` beside `waiting_vcpu_tid(kicker.poll_lease_drain(tid))` keeps the two populations visible
-/// side by side, so a reader can never again mistake the waiting lease identity for the
-/// set of threads that can execute guest code.
-pub(super) fn acquire_pt_pause(
+/// Acquire and hold exact-MM admission while every registered participant is
+/// kicked and observed out of guest across all process-local registries.
+fn begin_pt_pause(
     barrier: &'static crate::fork_quiesce::PtQuiesce,
-    kicker: &dyn carrick_hal::VcpuRegistry,
-    census: &crate::kernel::GuestExecutorCensus,
     tid: ThreadId,
     budget: PtPauseBudget,
-) -> Result<PtPauseGuard, PtPauseError> {
+) -> Result<(), PtPauseError> {
     // Serialize editors: at most one stop-the-world at a time. A loser parks
     // (if the winner has raised quiescing) or yields (tiny pre-flag window),
     // then retries. This stays independent of the fork/topology lock.
@@ -291,18 +342,31 @@ pub(super) fn acquire_pt_pause(
         }
     }
     barrier.set_quiescing();
+    Ok(())
+}
+
+fn drain_exact_mm<'mm>(
+    barrier: &'static crate::fork_quiesce::PtQuiesce,
+    census: crate::kernel::ExactMmCensusGuard,
+    tid: ThreadId,
+    budget: PtPauseBudget,
+) -> Result<PtPauseGuard<'mm>, PtPauseError> {
+    if !census.all_have_pause_endpoints() {
+        barrier.end();
+        return Err(PtPauseError::UnkickableExecutor);
+    }
     crate::probes::pt_pause_begin(
         tid.raw(),
-        i32::from(kicker.any_other_in_guest(tid)),
-        waiting_vcpu_tid(kicker.poll_lease_drain(tid)),
-        census.participant_count_for_probe(),
+        i32::from(census.any_in_guest()),
+        census.first_in_guest_tid().map_or(0, ThreadId::raw),
+        i32::try_from(census.participant_count()).unwrap_or(i32::MAX),
     );
 
     let start = Instant::now();
     let deadline = start + budget.drain;
     let mut spins: i32 = 0;
-    while kicker.any_other_in_guest(tid) {
-        kicker.kick_all_except(tid);
+    while census.any_in_guest() {
+        census.kick_all_in_guest();
         if Instant::now() >= deadline {
             crate::probes::pt_pause_timeout(tid.raw(), start.elapsed().as_micros() as i64);
             // Roll back BOTH persistent request bits and wake every sibling that
@@ -315,7 +379,53 @@ pub(super) fn acquire_pt_pause(
         std::thread::yield_now();
     }
     crate::probes::pt_pause_ready(tid.raw(), spins, start.elapsed().as_micros() as i64);
-    Ok(PtPauseGuard::new(barrier.pause_guard(tid)))
+    Ok(PtPauseGuard::new(census, barrier.pause_guard(tid)))
+}
+
+#[cfg(test)]
+pub(super) fn acquire_pt_pause<'participant>(
+    barrier: &'static crate::fork_quiesce::PtQuiesce,
+    participation: &'participant mut crate::kernel::GuestExecutorParticipation,
+    tid: ThreadId,
+    budget: PtPauseBudget,
+) -> Result<PtPauseGuard<'participant>, PtPauseError> {
+    begin_pt_pause(barrier, tid, budget)?;
+    let census = participation.lock_exact_mm();
+    drain_exact_mm(barrier, census, tid, budget)
+}
+
+pub(super) enum FrameCowExactMmGuard {
+    Nested,
+    Sole {
+        _stage1: Stage1Exclusive,
+        _census: crate::kernel::ExactMmCensusGuard,
+    },
+    Paused {
+        _guard: PtPauseGuard<'static>,
+    },
+}
+
+pub(super) fn acquire_frame_cow_quiesce(
+    barrier: &'static crate::fork_quiesce::PtQuiesce,
+    census: &crate::kernel::GuestExecutorCensus,
+    tid: ThreadId,
+    budget: PtPauseBudget,
+) -> Result<FrameCowExactMmGuard, PtPauseError> {
+    if current_thread_holds_pt_pause() {
+        return Ok(FrameCowExactMmGuard::Nested);
+    }
+    let sole = census.lock_for_frame_cow();
+    if sole.participant_count() <= 1 && !sole.any_in_guest() {
+        return Ok(FrameCowExactMmGuard::Sole {
+            _stage1: Stage1Exclusive::claim(),
+            _census: sole,
+        });
+    }
+    drop(sole);
+    begin_pt_pause(barrier, tid, budget)?;
+    let census = census.lock_for_frame_cow();
+    drain_exact_mm(barrier, census, tid, budget)
+        .map(|guard| FrameCowExactMmGuard::Paused { _guard: guard })
 }
 
 #[derive(Clone, Copy)]
@@ -471,23 +581,6 @@ where
     E::SiblingSpec: 'static,
     E::ProcessSpec: 'static,
 {
-    /// Pause sibling vCPUs for a stage-1 page-table edit (mmap/mprotect/munmap),
-    /// returning an RAII guard that resumes them on drop. A timeout is a typed
-    /// clean failure: nothing is held on the election path and the barrier
-    /// request is rolled back on the drain path, so no edit may begin either way.
-    pub(super) fn pt_pause(
-        &self,
-        census: &crate::kernel::GuestExecutorCensus,
-    ) -> Result<PtPauseGuard, PtPauseError> {
-        acquire_pt_pause(
-            pt_barrier(),
-            &*self.kicker,
-            census,
-            self.this_tid,
-            PtPauseBudget::DEFAULT,
-        )
-    }
-
     pub(super) fn prepare_in_process_fork<M, O>(
         &mut self,
         kernel: &Kernel,
@@ -1287,7 +1380,6 @@ where
             kernel: Arc::clone(child_context.kernel()),
             mm: child_mm_id,
             guest_executors: child_kernel.dispatcher.mm_executor_census(),
-            kicker: Arc::clone(&child_kicker),
             tid: child_tid,
             identity: cow_identity,
         });
@@ -1511,7 +1603,7 @@ where
 #[cfg(test)]
 mod pt_pause_tests {
     use super::*;
-    use carrick_hal::{GenericVcpuRegistry, VcpuKickDyn, VcpuLeaseDrainPoll, VcpuRegistry};
+    use carrick_hal::{GenericVcpuRegistry, VcpuKickDyn, VcpuRegistry};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct NoopKick;
@@ -1530,6 +1622,14 @@ mod pt_pause_tests {
         }
     }
 
+    struct RecordKick(Arc<AtomicUsize>);
+
+    impl VcpuKickDyn for RecordKick {
+        fn kick(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     fn tid(raw: i32) -> ThreadId {
         ThreadId::synthetic_for_tests(raw)
     }
@@ -1545,23 +1645,15 @@ mod pt_pause_tests {
         ));
     }
 
-    #[test]
-    fn waiting_vcpu_tid_maps_only_complete_to_zero() {
-        assert_eq!(waiting_vcpu_tid(VcpuLeaseDrainPoll::Complete), 0);
-        assert_eq!(
-            waiting_vcpu_tid(VcpuLeaseDrainPoll::Waiting(ThreadId::synthetic_for_tests(
-                27
-            ),)),
-            27,
-        );
-    }
-
-    #[test]
-    fn pt_pause_probe_uses_identity_mapper_not_scalar_count() {
-        let source = include_str!("quiesce.rs");
-        let pause = source.split("fn acquire_pt_pause").nth(1).unwrap();
-        assert!(pause.contains("waiting_vcpu_tid(kicker.poll_lease_drain(tid))"));
-        assert!(!pause.contains("kicker.count()"));
+    fn enter_for_test(
+        census: &Arc<crate::kernel::GuestExecutorCensus>,
+        registry: &Arc<GenericVcpuRegistry>,
+        tid: ThreadId,
+    ) -> crate::kernel::GuestExecutorParticipation {
+        let endpoint: Arc<dyn VcpuRegistry> = registry.clone();
+        census
+            .enter_with_pause_endpoint(None, endpoint, tid)
+            .expect("test exact-MM participation")
     }
 
     #[test]
@@ -1569,14 +1661,15 @@ mod pt_pause_tests {
         let barrier: &'static crate::fork_quiesce::PtQuiesce =
             Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
         let registry = Arc::new(GenericVcpuRegistry::new());
-        let census = crate::kernel::GuestExecutorCensus::default();
+        let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
+        let mut first_executor = enter_for_test(&census, &registry, tid(1591));
+        let mut second_executor = enter_for_test(&census, &registry, tid(1592));
         let mm = crate::kernel::MmId::from_raw_u64(91).expect("test MM");
         let coordinator = Arc::new(crate::dispatch::mm_mutation::MmMutationCoordinator::new(mm));
 
         let mut outer = acquire_pt_pause(
             barrier,
-            &*registry,
-            &census,
+            &mut first_executor,
             tid(1591),
             PtPauseBudget {
                 election: Duration::from_secs(1),
@@ -1589,7 +1682,6 @@ mod pt_pause_tests {
         let permit = mutation.host_alias_permit();
         let alias = coordinator.begin_alias(&permit);
 
-        let worker_registry = Arc::clone(&registry);
         let worker_coordinator = Arc::clone(&coordinator);
         let (attempted_tx, attempted_rx) = std::sync::mpsc::sync_channel(1);
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
@@ -1597,8 +1689,7 @@ mod pt_pause_tests {
             attempted_tx.send(()).expect("announce outer acquisition");
             let mut outer = acquire_pt_pause(
                 barrier,
-                &*worker_registry,
-                &census,
+                &mut second_executor,
                 tid(1592),
                 PtPauseBudget {
                     election: Duration::from_secs(1),
@@ -1917,9 +2008,11 @@ mod pt_pause_tests {
         let registry = Arc::new(GenericVcpuRegistry::new());
         // Recorded into `pt-pause-begin` beside the waiting lease identity; these
         // tests exercise the DRAIN, which reads the registry.
-        let census = crate::kernel::GuestExecutorCensus::default();
+        let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
         let coordinator = tid(1501);
         let sibling = tid(1502);
+        let mut coordinator_participation = enter_for_test(&census, &registry, coordinator);
+        let _sibling_participation = enter_for_test(&census, &registry, sibling);
         let coordinator_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
         let sibling_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
         sibling_in_guest.enter_guest();
@@ -1938,8 +2031,7 @@ mod pt_pause_tests {
         let backend_repoint_calls = AtomicUsize::new(0);
         let result = acquire_pt_pause(
             barrier,
-            &*registry,
-            &census,
+            &mut coordinator_participation,
             coordinator,
             PtPauseBudget {
                 election: Duration::from_secs(30),
@@ -1975,8 +2067,9 @@ mod pt_pause_tests {
         let registry = Arc::new(GenericVcpuRegistry::new());
         // Recorded into `pt-pause-begin` beside the waiting lease identity; these
         // tests exercise the DRAIN, which reads the registry.
-        let census = crate::kernel::GuestExecutorCensus::default();
+        let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
         let waiter = tid(1521);
+        let mut waiter_participation = enter_for_test(&census, &registry, waiter);
         let waiter_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
         register_for_test(&registry, waiter, &waiter_in_guest);
 
@@ -1986,8 +2079,7 @@ mod pt_pause_tests {
 
         let result = acquire_pt_pause(
             barrier,
-            &*registry,
-            &census,
+            &mut waiter_participation,
             waiter,
             PtPauseBudget {
                 election: Duration::from_millis(50),
@@ -2021,9 +2113,11 @@ mod pt_pause_tests {
         let registry = Arc::new(GenericVcpuRegistry::new());
         // Recorded into `pt-pause-begin` beside the waiting lease identity; these
         // tests exercise the DRAIN, which reads the registry.
-        let census = crate::kernel::GuestExecutorCensus::default();
+        let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
         let coordinator = tid(1511);
         let sibling = tid(1512);
+        let mut coordinator_participation = enter_for_test(&census, &registry, coordinator);
+        let _sibling_participation = enter_for_test(&census, &registry, sibling);
         let coordinator_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
         let sibling_in_guest = Arc::new(carrick_hal::InGuestFlag::for_guest_thread());
         sibling_in_guest.enter_guest();
@@ -2041,8 +2135,7 @@ mod pt_pause_tests {
         assert!(!current_thread_holds_pt_pause());
         let guard = acquire_pt_pause(
             barrier,
-            &*registry,
-            &census,
+            &mut coordinator_participation,
             coordinator,
             PtPauseBudget {
                 election: Duration::from_secs(30),
@@ -2061,6 +2154,202 @@ mod pt_pause_tests {
         drop(guard);
         assert!(!current_thread_holds_pt_pause());
         assert!(!barrier.is_quiescing());
+    }
+
+    #[test]
+    fn exact_mm_pause_drains_distinct_dispatcher_registries_and_blocks_admission() {
+        let barrier: &'static crate::fork_quiesce::PtQuiesce =
+            Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
+        let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
+        let coordinator_registry: Arc<dyn VcpuRegistry> = Arc::new(GenericVcpuRegistry::new());
+        let child_registry: Arc<dyn VcpuRegistry> = Arc::new(GenericVcpuRegistry::new());
+        let coordinator_tid = tid(1521);
+        let child_tid = tid(1522);
+        let coordinator_flag = carrick_hal::InGuestFlag::for_guest_thread();
+        let child_flag = carrick_hal::InGuestFlag::for_guest_thread();
+        let kicks = Arc::new(AtomicUsize::new(0));
+
+        let mut coordinator = census
+            .enter_with_pause_endpoint(None, Arc::clone(&coordinator_registry), coordinator_tid)
+            .expect("coordinator participation");
+        let child = census
+            .enter_with_pause_endpoint(None, Arc::clone(&child_registry), child_tid)
+            .expect("child participation");
+        assert!(matches!(
+            coordinator_registry.subscribe_register(
+                coordinator_tid,
+                Box::new(NoopKick),
+                &coordinator_flag,
+                Arc::new(|| {}),
+            ),
+            carrick_hal::VcpuRegistrationEnrollment::Registered
+        ));
+        assert!(matches!(
+            child_registry.subscribe_register(
+                child_tid,
+                Box::new(RecordKick(Arc::clone(&kicks))),
+                &child_flag,
+                Arc::new(|| {}),
+            ),
+            carrick_hal::VcpuRegistrationEnrollment::Registered
+        ));
+        child_flag.enter_guest();
+
+        let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let pause_worker = std::thread::spawn(move || {
+            let guard = acquire_pt_pause(
+                barrier,
+                &mut coordinator,
+                coordinator_tid,
+                PtPauseBudget {
+                    election: Duration::from_secs(1),
+                    drain: Duration::from_secs(1),
+                },
+            )
+            .expect("cross-dispatcher pause");
+            paused_tx.send(()).expect("announce exact-MM pause");
+            release_rx.recv().expect("release exact-MM pause");
+            drop(guard);
+            coordinator
+        });
+
+        let kick_deadline = Instant::now() + Duration::from_secs(1);
+        while kicks.load(Ordering::SeqCst) == 0 && Instant::now() < kick_deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            kicks.load(Ordering::SeqCst) > 0,
+            "child registry was not kicked"
+        );
+        assert_eq!(
+            paused_rx.recv_timeout(Duration::from_millis(25)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "pause completed while the child dispatcher remained in guest"
+        );
+        child_flag.leave_guest();
+        paused_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("pause completes only after child leaves guest");
+
+        let admission_census = Arc::clone(&census);
+        let admission_registry: Arc<dyn VcpuRegistry> = Arc::new(GenericVcpuRegistry::new());
+        let (admitted_tx, admitted_rx) = std::sync::mpsc::sync_channel(1);
+        let admission = std::thread::spawn(move || {
+            let participant = admission_census
+                .enter_with_pause_endpoint(None, admission_registry, tid(1523))
+                .expect("post-pause participant");
+            admitted_tx.send(()).expect("announce admission");
+            participant
+        });
+        assert_eq!(
+            admitted_rx.recv_timeout(Duration::from_millis(25)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "a new exact-MM executor entered during the pause"
+        );
+
+        release_tx.send(()).expect("release pause worker");
+        let coordinator = pause_worker.join().expect("pause worker");
+        admitted_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("admission resumes after pause");
+        drop(admission.join().expect("admission worker"));
+        drop(coordinator);
+        drop(child);
+    }
+
+    #[test]
+    fn standalone_frame_cow_sole_witness_blocks_exact_mm_admission() {
+        let barrier: &'static crate::fork_quiesce::PtQuiesce =
+            Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
+        let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
+        let registry: Arc<dyn VcpuRegistry> = Arc::new(GenericVcpuRegistry::new());
+        let _existing = census
+            .enter_with_pause_endpoint(None, registry, tid(1531))
+            .expect("existing frame-COW executor");
+
+        let guard = acquire_frame_cow_quiesce(
+            barrier,
+            &census,
+            tid(1531),
+            PtPauseBudget {
+                election: Duration::from_secs(1),
+                drain: Duration::from_secs(1),
+            },
+        )
+        .expect("standalone COW sole witness");
+
+        let admission_census = Arc::clone(&census);
+        let admission_registry: Arc<dyn VcpuRegistry> = Arc::new(GenericVcpuRegistry::new());
+        let (admitted_tx, admitted_rx) = std::sync::mpsc::sync_channel(1);
+        let admission = std::thread::spawn(move || {
+            let participant = admission_census
+                .enter_with_pause_endpoint(None, admission_registry, tid(1532))
+                .expect("frame-COW peer admission");
+            admitted_tx.send(()).expect("announce frame-COW peer");
+            participant
+        });
+        assert_eq!(
+            admitted_rx.recv_timeout(Duration::from_millis(25)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "frame-COW sole authority released exact-MM admission"
+        );
+        drop(guard);
+        admitted_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("frame-COW peer enters after sole witness releases");
+        drop(admission.join().expect("frame-COW admission worker"));
+    }
+
+    #[test]
+    fn raised_pt_pause_denies_guest_reentry_until_guard_releases() {
+        let production = include_str!("mod.rs")
+            .split("fn poll_with_engine(")
+            .nth(1)
+            .expect("production poll body");
+        assert!(
+            production.find("enter_guest_or_park").unwrap()
+                < production.find("engine.next_syscall()").unwrap(),
+            "production must re-check the pause after publishing in-guest and before engine entry"
+        );
+        let barrier: &'static crate::fork_quiesce::PtQuiesce =
+            Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
+        begin_pt_pause(
+            barrier,
+            tid(1541),
+            PtPauseBudget {
+                election: Duration::from_secs(1),
+                drain: Duration::from_secs(1),
+            },
+        )
+        .expect("raise page-table pause");
+        let in_guest = Arc::new(carrick_hal::InGuestFlag::for_guest_thread());
+        let worker_flag = Arc::clone(&in_guest);
+        let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let entered = enter_guest_or_park(&worker_flag, barrier);
+            completed_tx
+                .send(entered)
+                .expect("announce re-entry result");
+        });
+
+        assert_eq!(
+            completed_rx.recv_timeout(Duration::from_millis(25)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "an executor re-entered guest while page-table pause was raised"
+        );
+        assert!(
+            !in_guest.is_in_guest(),
+            "parked executor must withdraw its in-guest publication"
+        );
+
+        barrier.end();
+        assert!(
+            !completed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("re-entry check resumes after pause")
+        );
+        worker.join().expect("re-entry worker");
     }
 
     /// The drain must still see a sibling that went through the blocking-wait
@@ -2082,9 +2371,11 @@ mod pt_pause_tests {
         let registry = Arc::new(GenericVcpuRegistry::new());
         // Recorded into `pt-pause-begin` beside the waiting lease identity; these
         // tests exercise the DRAIN, which reads the registry.
-        let census = crate::kernel::GuestExecutorCensus::default();
+        let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
         let coordinator = tid(1531);
         let sibling = tid(1532);
+        let mut coordinator_participation = enter_for_test(&census, &registry, coordinator);
+        let _sibling_participation = enter_for_test(&census, &registry, sibling);
         let coordinator_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
         // The sibling's ONE lifetime flag, as `ThreadRuntimeState` holds it.
         let sibling_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
@@ -2101,8 +2392,7 @@ mod pt_pause_tests {
 
         let result = acquire_pt_pause(
             barrier,
-            &*registry,
-            &census,
+            &mut coordinator_participation,
             coordinator,
             PtPauseBudget {
                 election: Duration::from_secs(30),

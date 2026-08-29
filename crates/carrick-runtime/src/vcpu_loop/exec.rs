@@ -1613,7 +1613,6 @@ where
                     kernel: std::sync::Arc::clone(committed_context.kernel()),
                     mm: committed_mm,
                     guest_executors: kernel.dispatcher.mm_executor_census(),
-                    kicker: std::sync::Arc::clone(&self.kicker),
                     tid: self.this_tid,
                     identity: carrick_hal::FrameCowIdentity {
                         linux_pid: process.pid(),

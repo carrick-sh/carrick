@@ -230,6 +230,8 @@ pub trait VcpuRegistry: Send + Sync {
     fn kick_all_in_guest(&self) -> bool;
     fn kick_all_except(&self, except: ThreadId);
     fn any_other_in_guest(&self, except: ThreadId) -> bool;
+    /// Whether this exact registered vCPU is entering or executing guest code.
+    fn is_in_guest(&self, tid: ThreadId) -> bool;
     /// Bounded timeout diagnostics only: registered vCPU identities and their
     /// current in-guest handshake state, read from the SAME entries
     /// [`VcpuRegistry::any_other_in_guest`] reads, so a timeout dump cannot
@@ -613,6 +615,13 @@ impl VcpuRegistry for GenericVcpuRegistry {
             .vcpus
             .iter()
             .any(|(tid, entry)| *tid != except && entry.is_in_guest())
+    }
+
+    fn is_in_guest(&self, tid: ThreadId) -> bool {
+        self.lock()
+            .vcpus
+            .get(&tid)
+            .is_some_and(VcpuRegistration::is_in_guest)
     }
 
     fn debug_registered_vcpus(&self) -> Vec<(ThreadId, bool)> {

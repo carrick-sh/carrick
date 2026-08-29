@@ -22,12 +22,24 @@ static split at the normalized resolver:
 - CLONE_VM dispatchers share that exact-MM census through their shared authority
   Arc. The sole proof holds the census election locked for its whole lifetime,
   so a peer cannot enter after it is minted;
+- each executor owns one linear `MmExecutorParticipation`: the token is
+  `Send` but structurally `!Sync`, is never stored in an `Arc`, and sole/pause
+  dispatch requires an exclusive `&mut` borrow of that exact token;
+- each exact-MM census entry registered by the production vCPU path carries an
+  opaque pause endpoint for that executor's real registry and thread identity.
+  A multi-executor pause keeps exact-MM admission locked while it kicks and
+  drains every registered endpoint, including peers owned by distinct
+  CLONE_VM dispatchers and distinct registries;
 - the non-threaded route and explicit public threaded route must first enter an
   opaque `MmExecutorParticipation`; neither `&mut SyscallDispatcher` nor a
   thread-local stage-1 marker is mutation authority;
 - synchronous grow-down/residency faults use a separate, read-classified
   mutation route at the trap boundary, also backed by real pause/exclusive
   authority.
+- standalone frame-COW quiescence uses the same lifetime-held exact-MM census
+  election: it either holds the sole census witness until the frame operation
+  ends or performs the same all-endpoint pause and drain. There is no unlocked
+  `has_peer_executor` check followed by a separately minted exclusive guard.
 
 There is no optional guard, runtime authority enum, public/default/fake
 constructor, or thread-local observation used as authority. The classifier,
@@ -89,13 +101,41 @@ proves the same request is admitted. It also holds the sealed sole authority
 while a new peer attempts admission, proves that admission remains blocked, and
 then proves it completes after the authority releases.
 
+Repair round 3 began with compile-only regressions for the reviewed authority
+gaps. `cargo test -p carrick-runtime --no-run` failed because the then-current
+`MmExecutorParticipation` was still `Sync` and failed the new `!Sync` assertion,
+and because the
+new distinct-registry regression referenced the not-yet-implemented
+`enter_with_pause_endpoint` and exact-MM pause API. Production was changed only
+after that RED. The GREEN regression holds a real peer in guest execution in a
+second `GenericVcpuRegistry`, observes a real kick, proves pause cannot complete
+while that peer remains in guest, and proves exact-MM admission stays blocked
+until the pause guard drops. A standalone frame-COW regression additionally
+proves its sole witness keeps peer admission blocked for the witness lifetime;
+this closes the source-review finding that the old unlocked peer check could
+not provide.
+
+Final self-review found that the production loop's documented Dekker re-entry
+half was absent: it published `in_guest` and entered the engine without
+re-checking `PtQuiesce::is_quiescing`. The regression was added first and failed
+to compile with E0425 for the missing `enter_guest_or_park`. The implementation
+now publishes `in_guest`, performs the SeqCst pause re-check, withdraws the
+publication and parks when raised, and enters the engine only on the false
+branch. This prevents an already-admitted or just-drained executor from
+re-entering while the census-held pause guard remains live.
+
 ## Authority construction graph
 
 ```text
 threaded syscall classifier (exact mutation table)
-  -> real PtPauseGuard when peers exist
-     OR exact DispatchMmAuthority census participation
-        -> locked sole election -> sealed SoleMmStage1
+  -> exclusive borrow of this executor's linear exact-MM participation
+  -> lock exact DispatchMmAuthority census admission
+     -> one participant: keep locked sole election -> sealed SoleMmStage1
+     -> multiple participants: keep admission locked, kick every registered
+        real per-executor registry endpoint, drain every exact peer
+        -> real PtPauseGuard
+        -> every executor publishes in-guest then re-checks PtQuiesce;
+           a raised pause withdraws the publication and parks before engine entry
   -> non-cloneable MmMutationGuard for the exact per-MM coordinator
   -> MutationSyscallCtx only
   -> borrow-bound HostAliasPermit
@@ -109,8 +149,14 @@ ordinary classifier
   -> SyscallCtx (no mutation field and no permit path)
 
 non-threaded or explicit public threaded boundary
-  -> opaque exact-MM participation -> locked sole election -> SoleMmStage1
+  -> exclusive borrow of opaque exact-MM participation
+  -> same locked sole-or-all-endpoint election
   -> same MmMutationGuard -> permit chain
+
+standalone frame COW
+  -> same exact-MM census lock
+  -> lifetime-held sole witness OR all-endpoint PtPause drain
+  -> frame-COW guard; peer admission cannot race the decision
 
 cfg(test) alias helpers
   -> real PtPauseGuard (never a synthetic sole-executor claim)
@@ -129,6 +175,9 @@ deleted thread-local `LockLevel` validator, fake issuers, tautological
 
 ## Changed files
 
+- `Cargo.toml` (`parking_lot` owned lock support for lifetime-held census proof)
+- `crates/carrick-hal/src/threaded.rs`
+- `crates/carrick-hal/src/pump_fork_coord.rs`
 - `crates/carrick-runtime/src/dispatch/mm_mutation.rs` (new)
 - `crates/carrick-runtime/src/dispatch/mod.rs`
 - `crates/carrick-runtime/src/dispatch/abi_args.rs`
@@ -175,9 +224,20 @@ deleted thread-local `LockLevel` validator, fake issuers, tautological
   production_registration_keeps_census_before_registry_publication --
   --nocapture` — PASS, 1/1; production registration admits the exact-MM census
   before publishing the vCPU registry entry.
+- `RUST_TEST_THREADS=1 RUSTC_WRAPPER= cargo test -p carrick-runtime
+  vcpu_loop::quiesce::pt_pause_tests --lib -- --nocapture` — PASS, 15/15.
+  This includes two real, distinct `GenericVcpuRegistry` endpoints: the pause
+  issues a real kick, cannot complete until the peer leaves guest execution,
+  and blocks a third exact-MM admission until the guard releases. It also
+  includes the standalone frame-COW sole-witness admission regression and the
+  run-loop re-entry handshake that parks until the live pause releases.
 - `RUSTC_WRAPPER= cargo test -p carrick-runtime
   kernel::guest_execution::tests --lib` — PASS, 8/8 exact-MM census lifecycle,
-  unwind, and sole-election tests.
+  unwind, distinct executor identity, and sole-election tests. Static
+  assertions prove `MmExecutorParticipation: Send` and
+  `MmExecutorParticipation: !Sync + !Clone + !Copy`.
+- `RUSTC_WRAPPER= cargo test -p carrick-hal threaded` — PASS, 13/13, including
+  exact per-thread `is_in_guest` registry observation.
 - `RUST_TEST_THREADS=1 RUSTC_WRAPPER= cargo test -p carrick-runtime
   dispatch::mem::tests --lib` — PASS, 127/127.
 - `RUSTC_WRAPPER= cargo test -p carrick-runtime --test integration
@@ -193,7 +253,7 @@ deleted thread-local `LockLevel` validator, fake issuers, tautological
   focused unit test; all other test binaries filtered cleanly.
 - `RUSTC_WRAPPER= cargo check --workspace` — PASS.
 - `RUSTC_WRAPPER= cargo clippy -p carrick-runtime -p carrick-vmm-hvf
-  --all-targets -- -D warnings` — PASS.
+  -p carrick-hal --all-targets -- -D warnings` — PASS.
 - `cargo fmt --check` — PASS.
 - `git diff --check` — PASS (the repository fsmonitor emitted its known IPC
   warning but the gate returned success).
@@ -205,9 +265,16 @@ deleted thread-local `LockLevel` validator, fake issuers, tautological
 - `MmMutationGuard` and `HostAliasPermit` are statically non-Clone/non-Copy;
   no unscoped single-executor issuer or constructor remains.
 - `&mut SyscallDispatcher` is not authority. The only sole path borrows an
-  opaque participation tied by Arc identity to the exact current
+  opaque linear participation tied by Arc identity to the exact current
   `DispatchMmAuthority`, then holds that shared census locked while the sealed
-  `SoleMmStage1` and its mutation guard are live.
+  `SoleMmStage1` and its mutation guard are live. The token cannot be shared by
+  reference across threads and every dispatch/sole claim requires `&mut`.
+- A peer count is not treated as quiescence. Every production vCPU census entry
+  carries its real registry endpoint, and the multi-peer path keeps admission
+  locked while it kicks and observes every exact peer out of guest execution.
+  Each engine entry then re-checks the raised pause after publishing its exact
+  in-guest flag, so a drained executor cannot immediately re-enter. Frame COW
+  uses this same witness/drain path, so it has no check-then-claim window.
 - An owned pending transaction contains no alias guard. Claim re-enters the
   exact-MM coordinator and returns `HostAliasInstallGuard<'permit>`, so safe
   code cannot move install/rollback beyond the live permit and outer guard.
