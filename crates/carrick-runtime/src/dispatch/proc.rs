@@ -4544,12 +4544,7 @@ impl SyscallDispatcher {
                 } else {
                     const COMPOUND_SIZE: u64 = 16 * 1024;
                     let mut stage_buf = Vec::with_capacity(COMPOUND_SIZE as usize);
-                    let mut staged_chunks: Vec<(
-                        crate::kernel::MmWriteRange<'_>,
-                        usize,
-                        usize,
-                        u64,
-                    )> = Vec::new();
+                    let mut staged_chunks: Vec<StagedWriteChunk<'_>> = Vec::new();
 
                     while ri < remote.len() && li < local.len() {
                         while ri < remote.len() && ro >= remote[ri].iov_len {
@@ -4652,9 +4647,26 @@ impl SyscallDispatcher {
                                 }
                             };
 
-                            staged_chunks.push((write_range, buf_offset, want_len, want));
                             stage_ro += want;
                             stage_lo += want;
+                            while stage_ri < remote.len() && stage_ro >= remote[stage_ri].iov_len {
+                                stage_ri += 1;
+                                stage_ro = 0;
+                            }
+                            while stage_li < local.len() && stage_lo >= local[stage_li].iov_len {
+                                stage_li += 1;
+                                stage_lo = 0;
+                            }
+                            staged_chunks.push(StagedWriteChunk {
+                                range: write_range,
+                                buf_offset,
+                                len: want_len,
+                                want,
+                                post_ri: stage_ri,
+                                post_ro: stage_ro,
+                                post_li: stage_li,
+                                post_lo: stage_lo,
+                            });
                         }
 
                         if staged_chunks.is_empty() {
@@ -4668,12 +4680,13 @@ impl SyscallDispatcher {
                                 let mut witness: Option<crate::kernel::CowBroken<'_, '_, '_>> = None;
                                 let mut committed_chunks = 0usize;
 
-                                for (write_range, buf_offset, len, _) in &staged_chunks {
-                                    let src_chunk = &stage_buf[*buf_offset..*buf_offset + *len];
+                                for chunk in &staged_chunks {
+                                    let src_chunk =
+                                        &stage_buf[chunk.buf_offset..chunk.buf_offset + chunk.len];
 
                                     let (need_new_witness, prep_result) = match witness.as_mut() {
                                         Some(w) => match authority
-                                            .prepare_foreign_write_range(w, *write_range, src_chunk)
+                                            .prepare_foreign_write_range(w, chunk.range, src_chunk)
                                         {
                                             Ok(prep) => (false, Some(prep)),
                                             Err(
@@ -4689,7 +4702,7 @@ impl SyscallDispatcher {
                                         let new_witness = match authority.break_foreign_cow(
                                             mutation_guard,
                                             &foreign,
-                                            *write_range,
+                                            chunk.range,
                                         ) {
                                             Ok(w) => w,
                                             Err(_) => break,
@@ -4697,7 +4710,7 @@ impl SyscallDispatcher {
                                         witness = Some(new_witness);
                                         match authority.prepare_foreign_write_range(
                                             witness.as_mut().unwrap(),
-                                            *write_range,
+                                            chunk.range,
                                             src_chunk,
                                         ) {
                                             Ok(prep) => prep,
@@ -4729,19 +4742,15 @@ impl SyscallDispatcher {
                             }
                         };
 
-                        for (_, _, _, advance_len) in staged_chunks.iter().take(committed_chunks) {
-                            let want = *advance_len;
-                            copied += want;
-                            ro += want;
-                            lo += want;
-                            if ro >= remote[ri].iov_len {
-                                ri += 1;
-                                ro = 0;
+                        if committed_chunks > 0 {
+                            for chunk in &staged_chunks[..committed_chunks] {
+                                copied += chunk.want;
                             }
-                            if lo >= local[li].iov_len {
-                                li += 1;
-                                lo = 0;
-                            }
+                            let last = &staged_chunks[committed_chunks - 1];
+                            ri = last.post_ri;
+                            ro = last.post_ro;
+                            li = last.post_li;
+                            lo = last.post_lo;
                         }
 
                         if committed_chunks < staged_chunks.len() {
@@ -4760,6 +4769,17 @@ impl SyscallDispatcher {
             }
         }
     }
+}
+
+struct StagedWriteChunk<'mm> {
+    range: crate::kernel::MmWriteRange<'mm>,
+    buf_offset: usize,
+    len: usize,
+    want: u64,
+    post_ri: usize,
+    post_ro: u64,
+    post_li: usize,
+    post_lo: u64,
 }
 
 fn process_vm_foreign_mm_errno(error: &crate::kernel::MmAccessError) -> LinuxErrno {
@@ -5978,6 +5998,76 @@ mod kernel_process_dispatch_tests {
         assert_eq!(target.break_calls(), 1);
         assert_eq!(target.prepare_calls(), 1);
         assert_eq!(target.commit_calls(), 1);
+    }
+
+    #[test]
+    fn process_vm_writev_internal_zero_remote_iovec_preserves_exact_shorter_total() {
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_108);
+        let target =
+            crate::kernel::consumer_cow_fixture(root.kernel(), &root, 61_109, vec![b'_'; 0x4000]);
+        let root = refreshed(&root);
+        let target_pid = target.target().task().key().id.raw();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x5000]);
+        const LOCAL_IOV_20: u64 = 0x1300;
+        const REMOTE_IOVS_5: u64 = 0x1400;
+
+        write_iovec(&mut memory, LOCAL_IOV_20, LOCAL_BUF, 20);
+        memory
+            .write_bytes(LOCAL_BUF, b"11112222333344445555")
+            .unwrap();
+        write_iovec(&mut memory, REMOTE_IOVS_5, TARGET_VA, 4);
+        write_iovec(&mut memory, REMOTE_IOVS_5 + 16, TARGET_VA + 4, 0);
+        write_iovec(&mut memory, REMOTE_IOVS_5 + 32, TARGET_VA + 4, 4);
+        write_iovec(&mut memory, REMOTE_IOVS_5 + 48, TARGET_VA + 8, 4);
+        write_iovec(&mut memory, REMOTE_IOVS_5 + 64, TARGET_VA + 12, 4);
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PROCESS_VM_WRITEV,
+                [target_pid as u64, LOCAL_IOV_20, 1, REMOTE_IOVS_5, 5, 0],
+                Some(&lease),
+            ),
+            DispatchOutcome::Returned { value: 16 },
+        );
+        assert_eq!(target.child_bytes(0, 16), b"1111222233334444");
+        assert_eq!(target.child_bytes(16, 4), b"____");
+    }
+
+    #[test]
+    fn process_vm_writev_internal_zero_local_iovec_preserves_exact_shorter_total() {
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_110);
+        let target =
+            crate::kernel::consumer_cow_fixture(root.kernel(), &root, 61_111, vec![b'_'; 0x4000]);
+        let root = refreshed(&root);
+        let target_pid = target.target().task().key().id.raw();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x5000]);
+        const LOCAL_IOVS_5: u64 = 0x1300;
+        const REMOTE_IOV_20: u64 = 0x1400;
+
+        write_iovec(&mut memory, REMOTE_IOV_20, TARGET_VA, 20);
+        write_iovec(&mut memory, LOCAL_IOVS_5, LOCAL_BUF, 4);
+        write_iovec(&mut memory, LOCAL_IOVS_5 + 16, LOCAL_BUF + 4, 0);
+        write_iovec(&mut memory, LOCAL_IOVS_5 + 32, LOCAL_BUF + 4, 4);
+        write_iovec(&mut memory, LOCAL_IOVS_5 + 48, LOCAL_BUF + 8, 4);
+        write_iovec(&mut memory, LOCAL_IOVS_5 + 64, LOCAL_BUF + 12, 4);
+        memory.write_bytes(LOCAL_BUF, b"1111222233334444").unwrap();
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PROCESS_VM_WRITEV,
+                [target_pid as u64, LOCAL_IOVS_5, 5, REMOTE_IOV_20, 1, 0],
+                Some(&lease),
+            ),
+            DispatchOutcome::Returned { value: 16 },
+        );
+        assert_eq!(target.child_bytes(0, 16), b"1111222233334444");
+        assert_eq!(target.child_bytes(16, 4), b"____");
     }
 
     #[test]
