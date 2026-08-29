@@ -6677,6 +6677,109 @@ impl Drop for HvpatchSyscallServiceGuard {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CrashLeaseDrainBudget {
+    timeout: Duration,
+    poll_interval: Duration,
+}
+
+impl CrashLeaseDrainBudget {
+    const DEFAULT: Self = Self {
+        timeout: Duration::from_secs(10),
+        poll_interval: Duration::from_micros(200),
+    };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CrashLeaseDrainTimeout {
+    Waiting(ThreadId),
+    Busy(ThreadId),
+}
+
+impl std::fmt::Display for CrashLeaseDrainTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Waiting(tid) => write!(
+                formatter,
+                "HVPatch crash lease drain timed out waiting for sibling vCPU tid {}",
+                tid.raw()
+            ),
+            Self::Busy(owner) => write!(
+                formatter,
+                "HVPatch crash lease drain timed out behind freeze owner tid {}",
+                owner.raw()
+            ),
+        }
+    }
+}
+
+fn crash_lease_drain_park_duration(poll_interval: Duration, remaining: Duration) -> Duration {
+    poll_interval.min(remaining)
+}
+
+fn acquire_crash_lease_drain<N>(
+    registry: &dyn VcpuRegistry,
+    owner: ThreadId,
+    budget: CrashLeaseDrainBudget,
+    mut nudge: N,
+) -> Result<carrick_hal::VcpuLeaseDrainGuard, CrashLeaseDrainTimeout>
+where
+    N: FnMut(),
+{
+    let deadline = Instant::now() + budget.timeout;
+    let waiter = std::thread::current();
+    let callback: Arc<dyn Fn() + Send + Sync + 'static> = Arc::new(move || waiter.unpark());
+
+    loop {
+        let subscription = match registry.subscribe_lease_drain(owner, Arc::clone(&callback)) {
+            carrick_hal::VcpuLeaseDrainEnrollment::Frozen(guard) => return Ok(guard),
+            carrick_hal::VcpuLeaseDrainEnrollment::Waiting { subscription, .. }
+            | carrick_hal::VcpuLeaseDrainEnrollment::Busy { subscription, .. } => subscription,
+        };
+
+        nudge();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            std::thread::park_timeout(crash_lease_drain_park_duration(
+                budget.poll_interval,
+                remaining,
+            ));
+            drop(subscription);
+            if Instant::now() < deadline {
+                continue;
+            }
+        } else {
+            drop(subscription);
+        }
+
+        return match registry.subscribe_lease_drain(owner, Arc::clone(&callback)) {
+            carrick_hal::VcpuLeaseDrainEnrollment::Frozen(guard) => Ok(guard),
+            carrick_hal::VcpuLeaseDrainEnrollment::Waiting { tid, .. } => {
+                Err(CrashLeaseDrainTimeout::Waiting(tid))
+            }
+            carrick_hal::VcpuLeaseDrainEnrollment::Busy { owner, .. } => {
+                Err(CrashLeaseDrainTimeout::Busy(owner))
+            }
+        };
+    }
+}
+
+fn finish_crash_collection<T>(
+    authority: &crate::kernel::CrashCaptureAuthority,
+    barrier: &crate::fork_quiesce::QuiesceBarrier,
+    quiesced: bool,
+    lease_drain_guard: Option<carrick_hal::VcpuLeaseDrainGuard>,
+    result: Result<T, RuntimeError>,
+) -> Result<T, RuntimeError> {
+    authority.stop_collecting();
+    if quiesced {
+        barrier.end_quiesce();
+    }
+    barrier.end_fork();
+    drop(lease_drain_guard);
+    result
+}
+
 impl<E: ThreadedEngine + 'static> ThreadRuntimeState<E>
 where
     E::SiblingSpec: 'static,
@@ -6948,6 +7051,7 @@ where
         // seeing the generation would owe a register file it can never publish.
         authority.advertise(generation);
         let mut quiesced = false;
+        let mut lease_drain_guard = None;
         let result = (|| {
             if std::env::var_os("CARRICK_CORE_FAILPOINT")
                 .is_some_and(|value| value == "capture-registers")
@@ -6957,38 +7061,31 @@ where
                 ));
             }
             self.publish_crash_registers_if_requested(engine)?;
-            // Raise the barrier whenever this task has a sibling at all. The
-            // kicker counts LIVE vCPU leases, not threads: a sibling parked in
-            // a futex has already released its lease, so keying the decision on
-            // `kicker.count()` left the barrier down and the sleeper never
-            // reached a publish safe point (`ltp-mmap18`, 33.6x). The DRAIN
-            // below still keys on the kicker, which is the right question for
-            // its own purpose — "is any sibling still executing guest code?" —
-            // because the memory snapshot that follows needs that and nothing
-            // more. It is NOT the register-collection predicate; the quorum is.
+            // Raise the barrier whenever this task has a sibling at all. A
+            // sibling parked in a futex has already released its vCPU lease,
+            // so registry membership cannot decide whether the barrier is
+            // needed. The identity-aware enrollment below answers its own
+            // narrower question and freezes the empty sibling lease set through
+            // the complete live-memory snapshot. CrashQuorum remains the sole
+            // register-collection predicate.
             if context.task().threads().len() > 1 {
                 barrier.set_quiescing();
                 quiesced = true;
-                self.kicker.kick_all_except(self.this_tid);
-                self.futex.notify_signal_pending();
-                self.platform_futex.notify_signal_pending();
-                kernel.signal_arrival.wake_all_waiters();
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-                while self.kicker.count() > 1 {
-                    if std::time::Instant::now() >= deadline {
-                        return Err(RuntimeError::Configuration(format!(
-                            "HVPatch crash generation {} timed out: {} sibling vCPUs remain",
-                            generation.get(),
-                            self.kicker.count().saturating_sub(1)
-                        )));
-                    }
-                    self.kicker.kick_all_except(self.this_tid);
-                    self.futex.notify_signal_pending();
-                    self.platform_futex.notify_signal_pending();
-                    kernel.signal_arrival.wake_all_waiters();
-                    std::thread::sleep(std::time::Duration::from_micros(200));
-                }
             }
+            lease_drain_guard = Some(
+                acquire_crash_lease_drain(
+                    &*self.kicker,
+                    self.this_tid,
+                    CrashLeaseDrainBudget::DEFAULT,
+                    || {
+                        self.kicker.kick_all_except(self.this_tid);
+                        self.futex.notify_signal_pending();
+                        self.platform_futex.notify_signal_pending();
+                        kernel.signal_arrival.wake_all_waiters();
+                    },
+                )
+                .map_err(|timeout| RuntimeError::Configuration(timeout.to_string()))?,
+            );
             lifecycle(1, 0);
 
             engine.prepare_core_snapshot().map_err(|error| {
@@ -7278,12 +7375,7 @@ where
         if result.is_err() || matches!(&result, Ok(None)) {
             lifecycle(6, if result.is_err() { 1 } else { 2 });
         }
-        authority.stop_collecting();
-        if quiesced {
-            barrier.end_quiesce();
-        }
-        barrier.end_fork();
-        result
+        finish_crash_collection(authority, barrier, quiesced, lease_drain_guard, result)
     }
 
     fn trace_syscall(&self, traps: usize, frame: carrick_hal::RawSyscall) {
@@ -11219,6 +11311,285 @@ mod tests {
 
     fn registration_test_handle() -> Box<dyn carrick_hal::VcpuKickDyn> {
         Box::new(RegistrationTestKick)
+    }
+
+    fn register_crash_test_vcpu(
+        registry: &carrick_hal::GenericVcpuRegistry,
+        tid: ThreadId,
+        in_guest: &carrick_hal::InGuestFlag,
+    ) {
+        assert!(matches!(
+            registry
+                .subscribe_register(tid, registration_test_handle(), in_guest, Arc::new(|| {}),),
+            carrick_hal::VcpuRegistrationEnrollment::Registered
+        ));
+    }
+
+    #[test]
+    fn crash_lease_drain_short_budget_reports_exact_waiting_tid() {
+        let registry = carrick_hal::GenericVcpuRegistry::new();
+        let owner = ThreadId::synthetic_for_tests(70_221);
+        let sibling = ThreadId::synthetic_for_tests(70_222);
+        let owner_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
+        let sibling_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
+        register_crash_test_vcpu(&registry, owner, &owner_in_guest);
+        register_crash_test_vcpu(&registry, sibling, &sibling_in_guest);
+
+        let timeout = match acquire_crash_lease_drain(
+            &registry,
+            owner,
+            CrashLeaseDrainBudget {
+                timeout: Duration::ZERO,
+                poll_interval: Duration::from_secs(1),
+            },
+            || {},
+        ) {
+            Ok(_) => panic!("a live sibling must exhaust the zero crash-drain budget"),
+            Err(timeout) => timeout,
+        };
+
+        assert!(matches!(
+            timeout,
+            CrashLeaseDrainTimeout::Waiting(tid) if tid == sibling
+        ));
+    }
+
+    #[test]
+    fn crash_lease_drain_short_budget_reports_busy_owner() {
+        let registry = carrick_hal::GenericVcpuRegistry::new();
+        let freeze_owner = ThreadId::synthetic_for_tests(70_223);
+        let competing_owner = ThreadId::synthetic_for_tests(70_224);
+        let freeze = match registry.subscribe_lease_drain(freeze_owner, Arc::new(|| {})) {
+            carrick_hal::VcpuLeaseDrainEnrollment::Frozen(guard) => guard,
+            _ => panic!("first crash owner must acquire the unique drain freeze"),
+        };
+
+        let timeout = match acquire_crash_lease_drain(
+            &registry,
+            competing_owner,
+            CrashLeaseDrainBudget {
+                timeout: Duration::ZERO,
+                poll_interval: Duration::from_secs(1),
+            },
+            || {},
+        ) {
+            Ok(_) => panic!("a competing freeze must exhaust the zero crash-drain budget"),
+            Err(timeout) => timeout,
+        };
+
+        assert!(matches!(
+            timeout,
+            CrashLeaseDrainTimeout::Busy(owner) if owner == freeze_owner
+        ));
+        drop(freeze);
+    }
+
+    #[test]
+    fn crash_lease_drain_freezes_late_registration() {
+        let registry = carrick_hal::GenericVcpuRegistry::new();
+        let owner = ThreadId::synthetic_for_tests(70_225);
+        let late = ThreadId::synthetic_for_tests(70_226);
+        let guard = acquire_crash_lease_drain(
+            &registry,
+            owner,
+            CrashLeaseDrainBudget {
+                timeout: Duration::ZERO,
+                poll_interval: Duration::from_secs(1),
+            },
+            || {},
+        )
+        .expect("an empty sibling set must freeze atomically");
+        let late_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
+
+        let enrollment = registry.subscribe_register(
+            late,
+            registration_test_handle(),
+            &late_in_guest,
+            Arc::new(|| {}),
+        );
+        assert!(matches!(
+            &enrollment,
+            carrick_hal::VcpuRegistrationEnrollment::Waiting {
+                owner: waiting_owner,
+                ..
+            } if *waiting_owner == owner
+        ));
+        assert_eq!(
+            registry.poll_lease_drain(owner),
+            carrick_hal::VcpuLeaseDrainPoll::Complete
+        );
+        drop(enrollment);
+        drop(guard);
+    }
+
+    #[test]
+    fn crash_guard_source_spans_quorum_and_read_core_bytes() {
+        let source = include_str!("mod.rs");
+        let capture = source
+            .split("fn capture_core_for_publication(")
+            .nth(1)
+            .and_then(|tail| tail.split("fn trace_syscall(").next())
+            .expect("bounded crash publication body");
+        let envelope = capture.find("let result = (|| {").unwrap();
+        let acquire = capture.find("acquire_crash_lease_drain(").unwrap();
+        let prepare = capture.find("engine.prepare_core_snapshot()").unwrap();
+        let quorum = capture.find("quorum.poll()").unwrap();
+        let read = capture.find("engine.read_core_bytes").unwrap();
+        let finish = capture.rfind("finish_crash_collection(").unwrap();
+        assert!(envelope < acquire);
+        assert!(acquire < prepare);
+        assert!(prepare < quorum);
+        assert!(quorum < read);
+        assert!(read < finish);
+        assert!(
+            capture
+                .contains(".map_err(|timeout| RuntimeError::Configuration(timeout.to_string()))?")
+        );
+        assert!(!capture.contains("kicker.count()"));
+
+        let cleanup = source
+            .split("fn finish_crash_collection")
+            .nth(1)
+            .and_then(|tail| tail.split("impl<E: ThreadedEngine + 'static>").next())
+            .expect("bounded common crash cleanup helper");
+        let stop = cleanup.find("authority.stop_collecting()").unwrap();
+        let end_quiesce = cleanup.find("barrier.end_quiesce()").unwrap();
+        let end_fork = cleanup.find("barrier.end_fork()").unwrap();
+        let drop_guard = cleanup.find("drop(lease_drain_guard)").unwrap();
+        assert!(stop < end_quiesce);
+        assert!(end_quiesce < end_fork);
+        assert!(end_fork < drop_guard);
+    }
+
+    #[test]
+    fn crash_teardown_releases_barrier_before_guard() {
+        let registry = carrick_hal::GenericVcpuRegistry::new();
+        let barrier = Arc::new(crate::fork_quiesce::QuiesceBarrier::new());
+        let authority = crate::kernel::CrashCaptureAuthority::default();
+        let generation = authority.issue().expect("test crash generation");
+        authority.advertise(generation);
+        assert!(barrier.try_begin_fork());
+        barrier.set_quiescing();
+        let owner = ThreadId::synthetic_for_tests(70_227);
+        let late = ThreadId::synthetic_for_tests(70_228);
+        let guard = match registry.subscribe_lease_drain(owner, Arc::new(|| {})) {
+            carrick_hal::VcpuLeaseDrainEnrollment::Frozen(guard) => guard,
+            _ => panic!("crash owner must freeze the empty sibling set"),
+        };
+        let saw_quiescing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let observed = Arc::clone(&saw_quiescing);
+        let callback_barrier = Arc::clone(&barrier);
+        let late_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
+        let enrollment = registry.subscribe_register(
+            late,
+            registration_test_handle(),
+            &late_in_guest,
+            Arc::new(move || {
+                observed.store(
+                    callback_barrier.is_quiescing(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }),
+        );
+        assert!(matches!(
+            &enrollment,
+            carrick_hal::VcpuRegistrationEnrollment::Waiting { .. }
+        ));
+
+        finish_crash_collection(
+            &authority,
+            &barrier,
+            true,
+            Some(guard),
+            Ok::<_, RuntimeError>(()),
+        )
+        .expect("crash cleanup must preserve the successful result");
+
+        assert!(!saw_quiescing.load(std::sync::atomic::Ordering::SeqCst));
+        drop(enrollment);
+    }
+
+    #[test]
+    fn crash_lease_drain_timeout_releases_collection_and_barriers() {
+        let registry = carrick_hal::GenericVcpuRegistry::new();
+        let barrier = crate::fork_quiesce::QuiesceBarrier::new();
+        let authority = crate::kernel::CrashCaptureAuthority::default();
+        let generation = authority.issue().expect("test crash generation");
+        authority.advertise(generation);
+        assert!(barrier.try_begin_fork());
+        barrier.set_quiescing();
+        let owner = ThreadId::synthetic_for_tests(70_229);
+        let sibling = ThreadId::synthetic_for_tests(70_230);
+        let owner_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
+        let sibling_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
+        register_crash_test_vcpu(&registry, owner, &owner_in_guest);
+        register_crash_test_vcpu(&registry, sibling, &sibling_in_guest);
+        let result = acquire_crash_lease_drain(
+            &registry,
+            owner,
+            CrashLeaseDrainBudget {
+                timeout: Duration::ZERO,
+                poll_interval: Duration::from_micros(1),
+            },
+            || {},
+        )
+        .map(|guard| {
+            drop(guard);
+        })
+        .map_err(|timeout| RuntimeError::Configuration(timeout.to_string()));
+
+        let result = finish_crash_collection(&authority, &barrier, true, None, result);
+
+        assert!(result.is_err());
+        assert!(authority.collecting().is_none());
+        assert!(!barrier.is_quiescing());
+        assert!(barrier.try_begin_fork());
+        barrier.end_fork();
+    }
+
+    #[test]
+    fn crash_lease_drain_deadline_reenrolls_after_waiting_member_leaves() {
+        let registry = carrick_hal::GenericVcpuRegistry::new();
+        let owner = ThreadId::synthetic_for_tests(70_231);
+        let sibling = ThreadId::synthetic_for_tests(70_232);
+        let owner_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
+        let sibling_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
+        register_crash_test_vcpu(&registry, owner, &owner_in_guest);
+        register_crash_test_vcpu(&registry, sibling, &sibling_in_guest);
+        let mut nudged = false;
+
+        let guard = acquire_crash_lease_drain(
+            &registry,
+            owner,
+            CrashLeaseDrainBudget {
+                timeout: Duration::ZERO,
+                poll_interval: Duration::from_secs(1),
+            },
+            || {
+                assert!(
+                    !nudged,
+                    "the zero-budget path must perform one final enrollment"
+                );
+                nudged = true;
+                registry.unregister(sibling);
+            },
+        )
+        .expect("the final atomic enrollment must observe the sibling removal");
+
+        assert!(nudged);
+        drop(guard);
+    }
+
+    #[test]
+    fn crash_lease_drain_park_caps_to_remaining_budget() {
+        assert_eq!(
+            crash_lease_drain_park_duration(Duration::from_secs(1), Duration::from_millis(7)),
+            Duration::from_millis(7)
+        );
+        assert_eq!(
+            crash_lease_drain_park_duration(Duration::from_micros(200), Duration::from_secs(1)),
+            Duration::from_micros(200)
+        );
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
