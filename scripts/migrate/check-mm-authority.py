@@ -231,7 +231,7 @@ def scan_source(source: str, relative_path: str) -> list[Finding]:
     production = production_mask(tokens)
     findings: set[Finding] = set()
 
-    is_guest_mem_crate = "guest-mem" in relative_path or relative_path.startswith("crates/carrick-guest-mem")
+    is_guest_mem_crate = relative_path.startswith("crates/carrick-guest-mem/")
 
     def add(index: int, category: str, detail: str) -> None:
         if production[index]:
@@ -330,18 +330,18 @@ def scan_source(source: str, relative_path: str) -> list[Finding]:
     return sorted(findings)
 
 
-def _relative(path: Path) -> str:
+def _relative(path: Path, root: Path = REPO_ROOT) -> str:
     try:
-        return path.resolve().relative_to(REPO_ROOT.resolve()).as_posix()
+        return path.resolve().relative_to(root.resolve()).as_posix()
     except ValueError:
         return path.name
 
 
-def scan_paths(paths: Iterable[Path]) -> list[Finding]:
+def scan_paths(paths: Iterable[Path], root: Path = REPO_ROOT) -> list[Finding]:
     findings: list[Finding] = []
     for path in sorted(paths):
         if path.suffix == ".rs" and "tests" not in path.parts and path.name != "tests.rs":
-            findings.extend(scan_source(path.read_text(encoding="utf-8"), _relative(path)))
+            findings.extend(scan_source(path.read_text(encoding="utf-8"), _relative(path, root)))
     return sorted(findings)
 
 
@@ -392,6 +392,10 @@ def self_test() -> None:
             "untyped-current-bound",
             "fn dispatch(memory: &dyn GuestMemory) {}",
         ),
+        "crates/carrick-runtime/src/fake_guest_mem.rs": (
+            "untyped-current-bound",
+            "fn dispatch(memory: &impl GuestMemory) {}",
+        ),
         "type-generic-current.rs": (
             "untyped-current-bound",
             "struct SyscallCtx<'a, M: GuestMemory> { memory: &'a M }",
@@ -435,25 +439,31 @@ def self_test() -> None:
         "current-relation.rs": "match target { MmRelation::Current => memory.read_bytes(0, 1) }",
         "foreign-facade.rs": "fn f(access: ForeignMmAccess) { access.read_foreign(0, 1); }",
         "permitted-host-alias.rs": "fn f(t: &HostAliasTransactions, permit: &HostAliasPermit) { t.begin_dispatch(&permit); }",
-        "guest-mem-guard.rs": "pub struct HostWriteGuard<'a, M: GuestMemory + ?Sized> { memory: &'a mut M }",
-        "guest-mem-fn.rs": "pub fn zero_range(memory: &mut impl GuestMemory) {}",
+        "crates/carrick-guest-mem/src/guard.rs": "pub struct HostWriteGuard<'a, M: GuestMemory + ?Sized> { memory: &'a mut M }",
+        "crates/carrick-guest-mem/src/zero.rs": "pub fn zero_range(memory: &mut impl GuestMemory) {}",
     }
 
     with tempfile.TemporaryDirectory(prefix="carrick-mm-authority-") as directory:
         root = Path(directory)
         for name, (_, source) in negative.items():
-            (root / name).write_text(source + "\n", encoding="utf-8")
+            file_path = root / name
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text(source + "\n", encoding="utf-8")
         for name, source in positive.items():
-            (root / name).write_text(source + "\n", encoding="utf-8")
+            file_path = root / name
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text(source + "\n", encoding="utf-8")
 
         for name, (category, _) in negative.items():
-            findings = scan_paths([root / name])
+            file_path = root / name
+            findings = scan_paths([file_path], root=root)
             expected = [(category, name, 1)]
             actual = [(finding.category, finding.path, finding.line) for finding in findings]
             if actual != expected:
                 raise AssertionError(f"{name}: expected {expected!r}, got {actual!r}")
         for name in positive:
-            findings = scan_paths([root / name])
+            file_path = root / name
+            findings = scan_paths([file_path], root=root)
             if findings:
                 raise AssertionError(f"{name}: unexpected findings {findings!r}")
 
