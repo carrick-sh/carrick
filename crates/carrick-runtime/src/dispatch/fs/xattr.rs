@@ -13,7 +13,7 @@ impl SyscallDispatcher {
     /// that has no backing host file (e.g. the in-memory backend).
     fn xattr_target_path(
         &self,
-        memory: &impl GuestMemory,
+        memory: &impl CurrentMmMemory,
         target: XattrTarget,
     ) -> Result<String, LinuxErrno> {
         match target {
@@ -65,7 +65,7 @@ impl SyscallDispatcher {
 
     pub(super) fn setxattr(
         &self,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
         target: XattrTarget,
         name_ptr: GuestPtr,
         value_ptr: GuestPtr,
@@ -138,7 +138,7 @@ impl SyscallDispatcher {
 
     pub(super) fn getxattr(
         &self,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
         target: XattrTarget,
         name_ptr: GuestPtr,
         value_ptr: GuestPtr,
@@ -175,7 +175,7 @@ impl SyscallDispatcher {
 
     pub(super) fn listxattr(
         &self,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
         target: XattrTarget,
         list_ptr: GuestPtr,
         size: u64,
@@ -210,7 +210,7 @@ impl SyscallDispatcher {
 
     pub(super) fn removexattr(
         &self,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
         target: XattrTarget,
         name_ptr: GuestPtr,
     ) -> Result<DispatchOutcome, DispatchError> {

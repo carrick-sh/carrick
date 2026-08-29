@@ -106,7 +106,7 @@ pub(crate) use carrick_dsr_aarch64::esr::el0_debug_signal;
 /// when Darwin reports an initial read-only host mapping as a translation-style
 /// fault. The process-wide no-access and no-write sets are the durable VMA
 /// permission evidence; an address in neither set remains a genuine MAPERR.
-pub(crate) fn upgrade_protection_si_code<M: GuestMemory>(
+pub(crate) fn upgrade_protection_si_code<M: CurrentMmMemory>(
     memory: &M,
     signum: i32,
     si_code: i32,

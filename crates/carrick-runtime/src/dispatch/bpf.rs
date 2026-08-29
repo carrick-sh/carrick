@@ -319,7 +319,7 @@ fn validate_program(insns: &[BpfInsn]) -> Result<(), ProgRejection> {
 /// Write the load log into the guest's buffer (NUL-terminated, truncated to
 /// `log_size`), when one was requested. Best-effort: the load's own verdict
 /// is not displaced by a log-write fault.
-fn write_prog_log<M: GuestMemory>(memory: &mut M, attr: &BpfProgLoadAttr, message: &str) {
+fn write_prog_log<M: CurrentMmMemory>(memory: &mut M, attr: &BpfProgLoadAttr, message: &str) {
     if attr.log_level == 0 || attr.log_buf == 0 || attr.log_size == 0 {
         return;
     }

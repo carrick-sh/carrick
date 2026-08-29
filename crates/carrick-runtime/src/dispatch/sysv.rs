@@ -840,7 +840,7 @@ impl SysvIpcService {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn msgrcv<M: GuestMemory>(
+    fn msgrcv<M: CurrentMmMemory>(
         cx: &mut SyscallCtx<M>,
         id: MsgQueueId,
         creds: &crate::kernel::Credentials,
@@ -853,7 +853,7 @@ impl SysvIpcService {
         msg_queue_receive(cx, id, creds, msgp, msgsz, wanted, flags, operator)
     }
 
-    fn msgctl<M: GuestMemory>(
+    fn msgctl<M: CurrentMmMemory>(
         dispatcher: &SyscallDispatcher,
         cx: &mut SyscallCtx<M>,
         msqid: u64,
@@ -3342,7 +3342,7 @@ fn selected_msg_index(messages: &[MsgRecord], wanted: MsgType, flags: MsgOpFlags
 }
 
 #[allow(clippy::too_many_arguments)]
-fn msg_queue_receive<M: GuestMemory>(
+fn msg_queue_receive<M: CurrentMmMemory>(
     cx: &mut SyscallCtx<M>,
     id: MsgQueueId,
     creds: &crate::kernel::Credentials,
@@ -3488,7 +3488,7 @@ fn msg_queue_metrics() -> MsgQueueMetrics {
     metrics
 }
 
-fn write_msginfo<M: GuestMemory>(
+fn write_msginfo<M: CurrentMmMemory>(
     cx: &mut SyscallCtx<M>,
     addr: u64,
     metrics: MsgQueueMetrics,
@@ -3514,7 +3514,7 @@ fn write_msginfo<M: GuestMemory>(
     cx.memory.write_bytes(addr, &out).map_err(|_| LINUX_EFAULT)
 }
 
-fn msg_stat_by_index<M: GuestMemory>(
+fn msg_stat_by_index<M: CurrentMmMemory>(
     cx: &mut SyscallCtx<M>,
     selector: u64,
     buf: u64,
@@ -3545,7 +3545,7 @@ fn msg_stat_by_index<M: GuestMemory>(
     Ok(DispatchOutcome::Returned { value: id.as_i64() })
 }
 
-fn sysv_msgctl<M: GuestMemory>(
+fn sysv_msgctl<M: CurrentMmMemory>(
     this: &SyscallDispatcher,
     cx: &mut SyscallCtx<M>,
     msqid: u64,
@@ -3798,7 +3798,7 @@ struct SemopWaitCtx<'a> {
     completed: &'a dyn Fn(&[LinuxSembuf]),
 }
 
-fn sysv_semop<M: GuestMemory>(
+fn sysv_semop<M: CurrentMmMemory>(
     cx: &mut SyscallCtx<M>,
     sem_set: &SemSet,
     sops_addr: u64,
@@ -3920,7 +3920,7 @@ fn sysv_semop<M: GuestMemory>(
 }
 
 impl SyscallDispatcher {
-    fn sysv_semop<M: GuestMemory>(
+    fn sysv_semop<M: CurrentMmMemory>(
         &self,
         cx: &mut SyscallCtx<M>,
         semid: i32,
@@ -3982,7 +3982,7 @@ impl SyscallDispatcher {
         )
     }
 
-    fn sysv_semctl<M: GuestMemory>(
+    fn sysv_semctl<M: CurrentMmMemory>(
         &self,
         cx: &mut SyscallCtx<M>,
         semid: i32,
@@ -4209,7 +4209,7 @@ impl SyscallDispatcher {
         }
     }
 
-    fn write_sem_info<M: GuestMemory>(
+    fn write_sem_info<M: CurrentMmMemory>(
         &self,
         cx: &mut SyscallCtx<M>,
         arg: u64,
@@ -4253,7 +4253,7 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Returned { value: max_index })
     }
 
-    fn write_sem_stat<M: GuestMemory>(
+    fn write_sem_stat<M: CurrentMmMemory>(
         &self,
         cx: &mut SyscallCtx<M>,
         selector: SemStatSelector,
@@ -4365,6 +4365,8 @@ mod ipc_set_tests {
             self.set_unmapped_calls.push((address, len, unmapped));
         }
     }
+
+    impl CurrentMmMemory for FailingUnmapMemory {}
 
     fn insert_test_shm_segment(
         dispatcher: &SyscallDispatcher,

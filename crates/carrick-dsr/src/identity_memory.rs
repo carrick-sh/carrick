@@ -66,7 +66,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 
 use carrick_abi as linux_abi;
-use carrick_guest_mem::{GuestMemory, GuestVa, MemoryError, RepointPrivateError};
+use carrick_guest_mem::{CurrentMmMemory, GuestMemory, GuestVa, MemoryError, RepointPrivateError};
 
 use crate::native_error::NativeMemoryError;
 /// Executable-mutation coordination [`IdentityGuestMemory`] needs to serialize
@@ -1418,6 +1418,8 @@ impl<A: ExecutableMutationAuthority> GuestMemory for IdentityGuestMemory<A> {
         })
     }
 }
+
+impl<A: ExecutableMutationAuthority> CurrentMmMemory for IdentityGuestMemory<A> {}
 
 pub const IDENTITY_KERNEL_COPY_PIPE_BOUND: usize = 1024;
 /// Keep every pipe transfer comfortably below FreeBSD's atomic pipe-write bound

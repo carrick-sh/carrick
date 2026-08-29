@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use camino::Utf8PathBuf;
-use carrick_guest_mem::{GuestMemory, MemoryError};
+use carrick_guest_mem::{CurrentMmMemory, MemoryError};
 
 use super::objects::TaskKey;
 use crate::namespace::process::{CapabilitySet, capability_mask_for_names};
@@ -770,7 +770,7 @@ impl ClockDomain {
     /// vvar is guest-read-only, hence the carrick-internal unchecked writer.
     pub fn publish_vvar_realtime_offset(
         &self,
-        memory: &mut impl GuestMemory,
+        memory: &mut impl CurrentMmMemory,
     ) -> Result<(), MemoryError> {
         let Some(word) = self.vvar_realtime_off_ns() else {
             return Ok(());

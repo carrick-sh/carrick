@@ -2606,7 +2606,7 @@ fn threaded_epoll_wait_wakes_when_peer_thread_writes_to_accepted_socket() {
 }
 
 #[cfg(target_os = "macos")]
-fn write_sockaddr_in(memory: &mut impl GuestMemory, address: u64, port: u16) {
+fn write_sockaddr_in(memory: &mut impl CurrentMmMemory, address: u64, port: u16) {
     let mut sockaddr = [0u8; 16];
     sockaddr[0..2].copy_from_slice(&(LINUX_AF_INET as u16).to_le_bytes());
     sockaddr[2..4].copy_from_slice(&port.to_be_bytes());
@@ -2615,7 +2615,7 @@ fn write_sockaddr_in(memory: &mut impl GuestMemory, address: u64, port: u16) {
 }
 
 #[cfg(target_os = "macos")]
-fn read_sockaddr_in_port(memory: &impl GuestMemory, address: u64) -> u16 {
+fn read_sockaddr_in_port(memory: &impl CurrentMmMemory, address: u64) -> u16 {
     let bytes = memory.read_bytes(address, 16).unwrap();
     u16::from_be_bytes([bytes[2], bytes[3]])
 }
@@ -2623,7 +2623,7 @@ fn read_sockaddr_in_port(memory: &impl GuestMemory, address: u64) -> u16 {
 #[cfg(target_os = "macos")]
 fn add_epoll_interest(
     dispatcher: &mut SyscallDispatcher,
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     reporter: &CompatReporter,
     epfd: u64,
     fd: u64,
@@ -2655,7 +2655,7 @@ fn add_epoll_interest(
 fn dispatch_with_wait(
     dispatcher: &mut SyscallDispatcher,
     request: SyscallRequest,
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     reporter: &CompatReporter,
 ) -> DispatchOutcome {
     loop {
@@ -2716,7 +2716,7 @@ fn dispatch_with_wait(
 #[cfg(target_os = "macos")]
 fn set_tcp_keepidle(
     dispatcher: &mut SyscallDispatcher,
-    memory: &mut impl GuestMemory,
+    memory: &mut impl CurrentMmMemory,
     reporter: &CompatReporter,
     fd: u64,
     opt_addr: u64,

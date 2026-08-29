@@ -13,7 +13,7 @@
 
 use crate::sigframe::{InjectParams, SigframeInject, SigframeRestore};
 use crate::{RegAccess, TrapError};
-use carrick_guest_mem::GuestMemory;
+use carrick_guest_mem::CurrentMmMemory;
 
 // `SyscallRemap` is defined in `carrick-abi` (the dependency-leaf) so that
 // `carrick-abi::syscall_x86_64` can also use it without a cycle. Re-export it
@@ -126,14 +126,14 @@ pub trait GuestArch: Copy + 'static {
     /// layout (aarch64 `CarrickSigframe` today; x86_64 in Phase 2). Generic over
     /// the engine because a trap engine impls both `RegAccess` and `GuestMemory`
     /// on one type, and the shared builder needs both.
-    fn build_sigframe<E: RegAccess + GuestMemory>(
+    fn build_sigframe<E: RegAccess + CurrentMmMemory>(
         engine: &mut E,
         params: InjectParams,
     ) -> Result<SigframeInject, TrapError>;
 
     /// Pop the `rt_sigframe` at the guest SP and restore the pre-signal register
     /// state (the `rt_sigreturn(2)` path). Counterpart to [`GuestArch::build_sigframe`].
-    fn restore_sigframe<E: RegAccess + GuestMemory>(
+    fn restore_sigframe<E: RegAccess + CurrentMmMemory>(
         engine: &mut E,
         fpsimd_enabled: bool,
     ) -> Result<SigframeRestore, TrapError>;
@@ -215,13 +215,13 @@ mod tests {
         fn bootstrap_sysregs() -> Self::BootSysregs {
             FakeBootRegs
         }
-        fn build_sigframe<E: RegAccess + GuestMemory>(
+        fn build_sigframe<E: RegAccess + CurrentMmMemory>(
             _engine: &mut E,
             _params: InjectParams,
         ) -> Result<SigframeInject, TrapError> {
             Err(TrapError::Hypervisor("FakeArch is shape-only".to_string()))
         }
-        fn restore_sigframe<E: RegAccess + GuestMemory>(
+        fn restore_sigframe<E: RegAccess + CurrentMmMemory>(
             _engine: &mut E,
             _fpsimd_enabled: bool,
         ) -> Result<SigframeRestore, TrapError> {

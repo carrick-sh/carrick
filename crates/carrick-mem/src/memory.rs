@@ -97,7 +97,7 @@ use crate::linux_abi::{
     LINUX_AT_SECURE, LINUX_AT_UID, LINUX_PAGE_SIZE, LinuxAuxvEntry, align_down_u64,
     align_down_usize, align_up_u64,
 };
-use carrick_guest_mem::{Gpa, GuestMemory, MemoryError};
+use carrick_guest_mem::{CurrentMmMemory, Gpa, GuestMemory, MemoryError};
 use serde::Serialize;
 use thiserror::Error;
 use zerocopy::IntoBytes;
@@ -3832,6 +3832,8 @@ impl GuestMemory for AddressSpace {
         Ok(())
     }
 }
+
+impl CurrentMmMemory for AddressSpace {}
 
 #[cfg(test)]
 mod arena_size_tests {

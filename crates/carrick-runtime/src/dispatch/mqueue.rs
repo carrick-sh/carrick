@@ -1113,7 +1113,7 @@ fn mq_wait_interrupted(
 }
 
 fn read_abs_deadline(
-    memory: &impl GuestMemory,
+    memory: &impl CurrentMmMemory,
     addr: u64,
 ) -> Result<Option<(i64, i64)>, LinuxErrno> {
     if addr == 0 {

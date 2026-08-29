@@ -108,7 +108,7 @@ enum PrioTarget {
 /// EPERM case degraded into the EACCES self case — and
 /// `cred_ipc::read_target(host_pid)` is one file keyed by that shared pid, so
 /// it described the carrier rather than the target.
-fn resolve_prio_process_target<M: GuestMemory>(
+fn resolve_prio_process_target<M: CurrentMmMemory>(
     this: &SyscallDispatcher,
     cx: &SyscallCtx<'_, M>,
     who: i32,
@@ -1122,7 +1122,7 @@ impl SyscallDispatcher {
 }
 
 fn read_capability_header(
-    memory: &impl GuestMemory,
+    memory: &impl CurrentMmMemory,
     address: u64,
 ) -> Result<LinuxCapabilityHeader, LinuxErrno> {
     let bytes = memory
@@ -1132,7 +1132,7 @@ fn read_capability_header(
 }
 
 fn read_capability_data(
-    memory: &impl GuestMemory,
+    memory: &impl CurrentMmMemory,
     address: u64,
     count: usize,
 ) -> Result<Vec<LinuxCapabilityData>, LinuxErrno> {

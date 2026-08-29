@@ -152,7 +152,7 @@ impl SyscallDispatcher {
         &self,
         in_fd: i32,
         offset_address: u64,
-        memory: &impl GuestMemory,
+        memory: &impl CurrentMmMemory,
     ) -> Result<Result<usize, LinuxErrno>, DispatchError> {
         if offset_address != 0 {
             return match read_u64(memory, offset_address) {

@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use carrick_guest_mem::GuestMemory;
+use carrick_guest_mem::CurrentMmMemory;
 pub use carrick_guest_mem::{HostVa, SharedFutexLocation};
 
 use crate::error::{OsError, Reg, SysReg};
@@ -2060,7 +2060,7 @@ impl HvpatchVerifiedChildKernelBinding {
     }
 }
 
-pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
+pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
     /// Fail-closed backend-owned executor boundary audit. Transitional M:N
     /// workers call this only while the task is fully saved and owns no live
     /// executor/vCPU authority.

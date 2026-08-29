@@ -13,7 +13,7 @@ impl SyscallDispatcher {
         pathname: u64,
         mode: u64,
         flags: u64,
-        memory: &impl GuestMemory,
+        memory: &impl CurrentMmMemory,
     ) -> Result<DispatchOutcome, DispatchError> {
         if LinuxAccessMode::from_bits(mode).is_none() || !linux_access_flags_are_supported(flags) {
             return Ok(DispatchOutcome::errno(LINUX_EINVAL));

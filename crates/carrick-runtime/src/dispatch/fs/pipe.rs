@@ -1,5 +1,5 @@
 use carrick_abi::*;
-use carrick_guest_mem::GuestMemory;
+use carrick_guest_mem::CurrentMmMemory;
 use parking_lot::{Condvar, Mutex};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -143,7 +143,7 @@ impl PipeInner {
     }
 }
 
-pub(crate) fn read_pipe<M: GuestMemory>(
+pub(crate) fn read_pipe<M: CurrentMmMemory>(
     memory: &mut M,
     address: u64,
     length: usize,

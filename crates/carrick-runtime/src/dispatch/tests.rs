@@ -2797,6 +2797,8 @@ mod overlay_dispatch_tests {
                 })
             }
         }
+
+    impl CurrentMmMemory for SharedOnly {}
         // Software read fails, but the shared host pointer yields the word.
         let mem = SharedOnly { word: 0x00C0_FFEE };
         assert_eq!(read_futex_word(&mem, 0x0100_0160_0000), Ok(0x00C0_FFEE));
@@ -2881,6 +2883,8 @@ mod overlay_dispatch_tests {
             None
         }
     }
+
+    impl CurrentMmMemory for CountingMemory {}
 
     #[test]
     fn private_futex_wake_skips_shared_mapping_lookup() {
@@ -2986,6 +2990,8 @@ mod overlay_dispatch_tests {
                 })
             }
         }
+
+    impl CurrentMmMemory for SharedWord {}
         let mut memory = SharedWord { word: 0 };
         let location = carrick_guest_mem::SharedFutexLocation::Direct {
             word: HostVa(&memory.word as *const u32 as usize),

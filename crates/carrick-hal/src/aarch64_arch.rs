@@ -140,14 +140,14 @@ impl GuestArch for Aarch64GuestArch {
         }
     }
 
-    fn build_sigframe<E: crate::RegAccess + carrick_guest_mem::GuestMemory>(
+    fn build_sigframe<E: crate::RegAccess + carrick_guest_mem::CurrentMmMemory>(
         engine: &mut E,
         params: crate::sigframe::InjectParams,
     ) -> Result<crate::sigframe::SigframeInject, crate::TrapError> {
         crate::sigframe::build_sigframe(engine, params)
     }
 
-    fn restore_sigframe<E: crate::RegAccess + carrick_guest_mem::GuestMemory>(
+    fn restore_sigframe<E: crate::RegAccess + carrick_guest_mem::CurrentMmMemory>(
         engine: &mut E,
         fpsimd_enabled: bool,
     ) -> Result<crate::sigframe::SigframeRestore, crate::TrapError> {
@@ -280,6 +280,8 @@ mod tests {
             Ok(())
         }
     }
+
+    impl carrick_guest_mem::CurrentMmMemory for SigframeEngine {}
 
     impl crate::RegAccess for SigframeEngine {
         fn get_reg(&self, r: crate::Reg) -> Result<u64, crate::OsError> {

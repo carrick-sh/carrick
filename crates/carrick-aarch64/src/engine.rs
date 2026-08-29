@@ -26,7 +26,7 @@ use std::sync::Arc;
 use carrick_abi::LinuxSiginfo;
 use carrick_guest_mem::protections::MemoryProtections;
 use carrick_guest_mem::{
-    Gpa, GuestMemory, GuestVa, MappingSharing, MemoryError, RepointPrivateError,
+    CurrentMmMemory, Gpa, GuestMemory, GuestVa, MappingSharing, MemoryError, RepointPrivateError,
     SharedFutexLocation,
 };
 use carrick_hal::guest_arch::GuestArch as _;
@@ -1842,6 +1842,8 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             })
     }
 }
+
+impl<V: Aarch64Vmm> CurrentMmMemory for Aarch64EngineCore<V> {}
 
 fn classify_private_repoint_tlbi(result: Result<(), TrapError>) -> Result<(), RepointPrivateError> {
     result.map_err(|error| {

@@ -33,7 +33,7 @@ impl PreparedHvpatchProcessMm {
 }
 
 fn read_optional_fork_output(
-    memory: &impl GuestMemory,
+    memory: &impl CurrentMmMemory,
     address: Option<u64>,
 ) -> Option<Option<Vec<u8>>> {
     match address {
@@ -465,7 +465,7 @@ where
         attempt: ProcessForkAttempt,
     ) -> Result<PreparedInProcessFork, RuntimeError>
     where
-        M: GuestMemory + 'static,
+        M: CurrentMmMemory + 'static,
         O: HvpatchProcessBackendOps<E, M>,
     {
         let ProcessForkAttempt {

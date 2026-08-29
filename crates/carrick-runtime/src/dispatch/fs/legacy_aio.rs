@@ -93,7 +93,7 @@ struct LegacyAioIocb {
 }
 
 impl LegacyAioIocb {
-    fn read(memory: &impl GuestMemory, address: GuestPtr) -> Result<Self, LinuxErrno> {
+    fn read(memory: &impl CurrentMmMemory, address: GuestPtr) -> Result<Self, LinuxErrno> {
         if address.0 == 0 {
             return Err(LINUX_EFAULT);
         }
@@ -134,7 +134,7 @@ fn legacy_aio_iocb_errno(this: &SyscallDispatcher, iocb: LegacyAioIocb) -> Optio
     None
 }
 
-pub(super) fn io_setup<M: GuestMemory>(
+pub(super) fn io_setup<M: CurrentMmMemory>(
     this: &SyscallDispatcher,
     cx: &mut SyscallCtx<M>,
     nr_events: u64,
@@ -185,7 +185,7 @@ pub(super) fn io_destroy(
     }
 }
 
-pub(super) fn io_submit<M: GuestMemory>(
+pub(super) fn io_submit<M: CurrentMmMemory>(
     this: &SyscallDispatcher,
     cx: &mut SyscallCtx<M>,
     raw_ctx: u64,
@@ -232,7 +232,7 @@ pub(super) fn io_submit<M: GuestMemory>(
     })
 }
 
-pub(super) fn io_cancel<M: GuestMemory>(
+pub(super) fn io_cancel<M: CurrentMmMemory>(
     this: &SyscallDispatcher,
     cx: &mut SyscallCtx<M>,
     raw_ctx: u64,
@@ -254,7 +254,7 @@ pub(super) fn io_cancel<M: GuestMemory>(
     Ok(DispatchOutcome::errno(LINUX_EINVAL))
 }
 
-pub(super) fn io_getevents<M: GuestMemory>(
+pub(super) fn io_getevents<M: CurrentMmMemory>(
     this: &SyscallDispatcher,
     cx: &mut SyscallCtx<M>,
     raw_ctx: u64,
