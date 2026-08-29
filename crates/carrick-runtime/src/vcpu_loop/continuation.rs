@@ -4287,8 +4287,9 @@ mod tests {
             );
         }
         let dispatch = loop_source
-            .split("fn service_threaded_syscall")
+            .split("fn service_threaded_syscall_for_executor")
             .nth(1)
+            .and_then(|tail| tail.split("\n    fn ").next())
             .expect("dispatch service body");
         assert!(
             dispatch.contains("continuation::is_blocking_dispatch_outcome(&outcome)"),

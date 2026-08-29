@@ -124,6 +124,45 @@ publication and parks when raised, and enters the engine only on the false
 branch. This prevents an already-admitted or just-drained executor from
 re-entering while the census-held pause guard remains live.
 
+## Codex-owned final review closure
+
+Independent review of `32ae993ec` rejected Task 6 on three remaining defects:
+the frame-COW nested path still trusted an MM-agnostic thread-local boolean,
+five focused mutation tests still entered the ordinary route, and one
+registration source contract named the superseded helper. Codex closed those
+findings locally after the delegated implementer reached its repair-turn cap.
+
+The exact-MM nested path now upgrades a same-thread `Weak` to a non-`Send`,
+non-`Sync` `Rc<ExactMmStage1Lease>` keyed by the exact `MmId`. The lease owns
+the real lifetime-held census election or pause guard plus the stage-1 marker;
+the nested frame-COW guard owns a clone, so dropping the outer wrapper cannot
+release the underlying exclusion. A regression drops the outer pause first and
+proves the nested lease keeps the real barrier raised until its own drop.
+
+The full serialized runtime gate then exposed four additional deterministic
+closure defects that narrower filters had missed:
+
+- boot/VMA publication lost its alias transaction and therefore stopped
+  advancing the VMA revision; initial and integration-test publication now mint
+  exact-MM mutation authority before entering the VMA transaction;
+- copied-MM relation coverage predated the retained-transport requirement and
+  supplied neither an endpoint nor complete typed revision domains; its fixture
+  now carries both without exercising a raw read path;
+- the continuation source contract split at the wrapper rather than the live
+  executor dispatch body;
+- deleting the legacy lock-order boundary left its retired numeric dirty-state
+  mode in the executor audit test; the test now enumerates the exact surviving
+  prohibited modes.
+
+The same broad gate also made the fork-install exclusion race reproducible.
+Task 6 had removed the old untyped alias guard without replacing it. Production
+fork publication now borrows the forking thread's exact-MM census
+participation after the process barrier has drained siblings, mints sealed sole
+stage-1 authority, and requires its permit for the complete dispatcher-MM
+install. Direct tests use the real test pause issuer. The race-sensitive test,
+17 process-fork tests, and the full 2,083-test serialized runtime suite are
+green with that structural path.
+
 ## Authority construction graph
 
 ```text
@@ -190,14 +229,18 @@ deleted thread-local `LockLevel` validator, fake issuers, tautological
 - `crates/carrick-runtime/src/dispatch/lock_order.rs` (deleted)
 - `crates/carrick-runtime/src/runtime.rs`
 - `crates/carrick-runtime/src/hvpatch/mod.rs` (test authority migration only)
+- `crates/carrick-runtime/src/kernel/operations.rs` (typed foreign-MM fixture)
 - `crates/carrick-runtime/src/kernel/guest_execution.rs`
 - `crates/carrick-runtime/src/kernel/mod.rs`
+- `crates/carrick-runtime/src/vcpu_loop/continuation.rs` (source contract)
 - `crates/carrick-runtime/src/vcpu_loop/mod.rs`
 - `crates/carrick-runtime/src/vcpu_loop/exec.rs`
 - `crates/carrick-runtime/src/vcpu_loop/quiesce.rs`
 - `crates/carrick-runtime/src/vcpu_loop/signal.rs`
 - `crates/carrick-runtime/src/vcpu_loop/executor.rs`
 - `crates/carrick-runtime/tests/integration/concurrency_contracts.rs`
+- `crates/carrick-runtime/tests/integration/common/syscall_support.rs`
+- `crates/carrick-runtime/tests/integration/syscall_mem.rs`
 - this report
 
 ## GREEN evidence and exact census
@@ -225,7 +268,7 @@ deleted thread-local `LockLevel` validator, fake issuers, tautological
   --nocapture` — PASS, 1/1; production registration admits the exact-MM census
   before publishing the vCPU registry entry.
 - `RUST_TEST_THREADS=1 RUSTC_WRAPPER= cargo test -p carrick-runtime
-  vcpu_loop::quiesce::pt_pause_tests --lib -- --nocapture` — PASS, 15/15.
+  vcpu_loop::quiesce::pt_pause_tests --lib -- --nocapture` — PASS, 16/16.
   This includes two real, distinct `GenericVcpuRegistry` endpoints: the pause
   issues a real kick, cannot complete until the peer leaves guest execution,
   and blocks a third exact-MM admission until the guard releases. It also
@@ -254,6 +297,9 @@ deleted thread-local `LockLevel` validator, fake issuers, tautological
 - `RUSTC_WRAPPER= cargo check --workspace` — PASS.
 - `RUSTC_WRAPPER= cargo clippy -p carrick-runtime -p carrick-vmm-hvf
   -p carrick-hal --all-targets -- -D warnings` — PASS.
+- `RUST_TEST_THREADS=1 RUSTC_WRAPPER= cargo test -p carrick-runtime --lib`
+  — PASS, 2,083/2,083.
+- `RUSTC_WRAPPER= just test` — PASS, full repository host-test recipe.
 - `cargo fmt --check` — PASS.
 - `git diff --check` — PASS (the repository fsmonitor emitted its known IPC
   warning but the gate returned success).
