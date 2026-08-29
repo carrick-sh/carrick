@@ -1302,6 +1302,7 @@ mod tests {
         ReacquireSnapshot,
         WrongMm,
         WrongRange,
+        InflatedSemanticSpan,
         WrongMapping,
         WrongFrame,
         WrongPhysical,
@@ -1591,6 +1592,8 @@ mod tests {
                 start,
                 len: if self.fault == MockCowFault::WrongRange {
                     len
+                } else if self.fault == MockCowFault::InflatedSemanticSpan {
+                    self.physical_len as usize * 2
                 } else {
                     self.physical_len as usize
                 },
@@ -2787,6 +2790,27 @@ mod tests {
                 ));
             });
         }
+    }
+
+    #[test]
+    fn foreign_cow_rejects_genuine_proof_with_inflated_semantic_span() {
+        let (kernel, root) = bootstrap(31_130);
+        let execution = execution_lease(&root, 130);
+        let (child, _backend, _owner, bytes, counters) =
+            cow_fixture(&kernel, &root, 31_131, MockCowFault::InflatedSemanticSpan);
+        let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
+        let range = foreign.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
+
+        with_foreign_mutation(&foreign, |mutation| {
+            assert!(matches!(
+                super::MmAccessAuthority::new().break_foreign_cow(mutation, &foreign, range,),
+                Err(MmAccessError::ForeignCowReceiptMismatch)
+            ));
+        });
+
+        assert_eq!(&*bytes.lock(), b"same");
+        assert_eq!(counters.prepare_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(counters.commit_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
