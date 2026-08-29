@@ -4350,8 +4350,9 @@ impl SyscallDispatcher {
     /// the carrier's [`ForeignMmEndpoint`] and [`MmAccessAuthority`] streaming with
     /// chunk bounds aligned to 4 KiB page boundaries in both remote and local spaces.
     ///
-    /// Cross-process write transfers (`process_vm_writev`) remain unimplemented and return
-    /// EFAULT pending the separately reviewed prepare/commit+COW slice.
+    /// Cross-process write transfers (`process_vm_writev`) acquire the target MM's real
+    /// mutation authority via [`MmAccessAuthority::with_foreign_mutation`], break foreign COW
+    /// for each 16 KiB compound, prepare each subrange, and commit infallibly.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn process_vm_rw<M: CurrentMmMemory>(
         &self,
@@ -4451,9 +4452,6 @@ impl SyscallDispatcher {
                 }
             }
             crate::kernel::MmRelation::Foreign(foreign) => {
-                if !is_read {
-                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                }
                 let Some(process) = self.hvpatch_process() else {
                     return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 };
@@ -4469,78 +4467,197 @@ impl SyscallDispatcher {
                 let mut li = 0usize;
                 let mut lo = 0u64;
 
-                let mut chunk_buf = vec![0u8; CHUNK_SIZE];
+                if is_read {
+                    let mut chunk_buf = vec![0u8; CHUNK_SIZE];
 
-                while ri < remote.len() && li < local.len() {
-                    while ri < remote.len() && ro >= remote[ri].iov_len {
-                        ri += 1;
-                        ro = 0;
+                    while ri < remote.len() && li < local.len() {
+                        while ri < remote.len() && ro >= remote[ri].iov_len {
+                            ri += 1;
+                            ro = 0;
+                        }
+                        while li < local.len() && lo >= local[li].iov_len {
+                            li += 1;
+                            lo = 0;
+                        }
+                        if ri >= remote.len() || li >= local.len() {
+                            break;
+                        }
+                        let rem_remote = remote[ri].iov_len - ro;
+                        let rem_local = local[li].iov_len - lo;
+
+                        let remote_va_raw = match remote[ri].iov_base.checked_add(ro) {
+                            Some(va) => va,
+                            None => break,
+                        };
+                        let local_va_raw = match local[li].iov_base.checked_add(lo) {
+                            Some(va) => va,
+                            None => break,
+                        };
+
+                        let page_rem_remote = PAGE_SIZE - (remote_va_raw % PAGE_SIZE);
+                        let page_rem_local = PAGE_SIZE - (local_va_raw % PAGE_SIZE);
+
+                        let want = rem_remote
+                            .min(rem_local)
+                            .min(page_rem_remote)
+                            .min(page_rem_local)
+                            .min(CHUNK_SIZE as u64);
+                        let want_len = want as usize;
+                        if want_len == 0 {
+                            break;
+                        }
+
+                        let remote_va = carrick_guest_mem::GuestVa(remote_va_raw);
+                        let local_va = local_va_raw;
+
+                        let range = match foreign.read_range(remote_va, want_len) {
+                            Ok(Some(r)) => r,
+                            _ => break,
+                        };
+
+                        let read_buf = &mut chunk_buf[..want_len];
+                        match authority.read_foreign(&foreign, range, read_buf) {
+                            Ok(receipt) => {
+                                if receipt.bytes_read() != want_len {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+
+                        if cx.memory.write_bytes(local_va, read_buf).is_err() {
+                            break;
+                        }
+
+                        copied += want;
+                        ro += want;
+                        lo += want;
                     }
-                    while li < local.len() && lo >= local[li].iov_len {
-                        li += 1;
-                        lo = 0;
+
+                    if copied == 0 {
+                        Ok(DispatchOutcome::errno(LINUX_EFAULT))
+                    } else {
+                        Ok(DispatchOutcome::Returned {
+                            value: copied as i64,
+                        })
                     }
-                    if ri >= remote.len() || li >= local.len() {
-                        break;
-                    }
-                    let rem_remote = remote[ri].iov_len - ro;
-                    let rem_local = local[li].iov_len - lo;
+                } else {
+                    let write_res = authority.with_foreign_mutation(&foreign, cx.tid(), |mutation_guard| {
+                        let mut chunk_buf = vec![0u8; CHUNK_SIZE];
+                        let mut witness: Option<crate::kernel::CowBroken<'_, '_, '_>> = None;
 
-                    let remote_va_raw = match remote[ri].iov_base.checked_add(ro) {
-                        Some(va) => va,
-                        None => break,
-                    };
-                    let local_va_raw = match local[li].iov_base.checked_add(lo) {
-                        Some(va) => va,
-                        None => break,
-                    };
-
-                    let page_rem_remote = PAGE_SIZE - (remote_va_raw % PAGE_SIZE);
-                    let page_rem_local = PAGE_SIZE - (local_va_raw % PAGE_SIZE);
-
-                    let want = rem_remote
-                        .min(rem_local)
-                        .min(page_rem_remote)
-                        .min(page_rem_local)
-                        .min(CHUNK_SIZE as u64);
-                    let want_len = want as usize;
-                    if want_len == 0 {
-                        break;
-                    }
-
-                    let remote_va = carrick_guest_mem::GuestVa(remote_va_raw);
-                    let local_va = local_va_raw;
-
-                    let range = match foreign.read_range(remote_va, want_len) {
-                        Ok(Some(r)) => r,
-                        _ => break,
-                    };
-
-                    let read_buf = &mut chunk_buf[..want_len];
-                    match authority.read_foreign(&foreign, range, read_buf) {
-                        Ok(receipt) => {
-                            if receipt.bytes_read() != want_len {
+                        while ri < remote.len() && li < local.len() {
+                            while ri < remote.len() && ro >= remote[ri].iov_len {
+                                ri += 1;
+                                ro = 0;
+                            }
+                            while li < local.len() && lo >= local[li].iov_len {
+                                li += 1;
+                                lo = 0;
+                            }
+                            if ri >= remote.len() || li >= local.len() {
                                 break;
                             }
+                            let rem_remote = remote[ri].iov_len - ro;
+                            let rem_local = local[li].iov_len - lo;
+
+                            let remote_va_raw = match remote[ri].iov_base.checked_add(ro) {
+                                Some(va) => va,
+                                None => break,
+                            };
+                            let local_va_raw = match local[li].iov_base.checked_add(lo) {
+                                Some(va) => va,
+                                None => break,
+                            };
+
+                            let page_rem_remote = PAGE_SIZE - (remote_va_raw % PAGE_SIZE);
+                            let page_rem_local = PAGE_SIZE - (local_va_raw % PAGE_SIZE);
+
+                            let want = rem_remote
+                                .min(rem_local)
+                                .min(page_rem_remote)
+                                .min(page_rem_local)
+                                .min(CHUNK_SIZE as u64);
+                            let want_len = want as usize;
+                            if want_len == 0 {
+                                break;
+                            }
+
+                            let src_buf = &mut chunk_buf[..want_len];
+                            if cx.memory.read_into(local_va_raw, src_buf).is_err() {
+                                break;
+                            }
+
+                            let remote_va = carrick_guest_mem::GuestVa(remote_va_raw);
+                            let write_range = match foreign.write_range(remote_va, want_len) {
+                                Ok(Some(r)) => r,
+                                _ => break,
+                            };
+
+                            let (need_new_witness, prep_result) = match witness.as_mut() {
+                                Some(w) => {
+                                    match authority.prepare_foreign_write_range(w, write_range, src_buf) {
+                                        Ok(prep) => (false, Some(prep)),
+                                        Err(crate::kernel::MmAccessError::ForeignRangeAuthorityMismatch) => {
+                                            (true, None)
+                                        }
+                                        Err(_) => (false, None),
+                                    }
+                                }
+                                None => (true, None),
+                            };
+
+                            let prepared = if need_new_witness {
+                                drop(witness.take());
+                                let new_witness = match authority
+                                    .break_foreign_cow(mutation_guard, &foreign, write_range)
+                                {
+                                    Ok(w) => w,
+                                    Err(_) => break,
+                                };
+                                witness = Some(new_witness);
+                                match authority.prepare_foreign_write_range(
+                                    witness.as_mut().unwrap(),
+                                    write_range,
+                                    src_buf,
+                                ) {
+                                    Ok(prep) => prep,
+                                    Err(_) => break,
+                                }
+                            } else {
+                                match prep_result {
+                                    Some(prep) => prep,
+                                    None => break,
+                                }
+                            };
+
+                            let receipt = prepared.commit();
+                            if receipt.bytes_written() != want_len {
+                                break;
+                            }
+
+                            copied += want;
+                            ro += want;
+                            lo += want;
                         }
-                        Err(_) => break,
+
+                        Ok(copied)
+                    });
+
+                    match write_res {
+                        Ok(copied) => {
+                            if copied == 0 {
+                                Ok(DispatchOutcome::errno(LINUX_EFAULT))
+                            } else {
+                                Ok(DispatchOutcome::Returned {
+                                    value: copied as i64,
+                                })
+                            }
+                        }
+                        Err(error) => {
+                            Ok(DispatchOutcome::errno(process_vm_foreign_mm_errno(&error)))
+                        }
                     }
-
-                    if cx.memory.write_bytes(local_va, read_buf).is_err() {
-                        break;
-                    }
-
-                    copied += want;
-                    ro += want;
-                    lo += want;
-                }
-
-                if copied == 0 {
-                    Ok(DispatchOutcome::errno(LINUX_EFAULT))
-                } else {
-                    Ok(DispatchOutcome::Returned {
-                        value: copied as i64,
-                    })
                 }
             }
         }
