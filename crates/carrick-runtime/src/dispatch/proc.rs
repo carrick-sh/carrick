@@ -4390,28 +4390,69 @@ impl SyscallDispatcher {
         is_read: bool,
     ) -> Result<DispatchOutcome, DispatchError> {
         // Only flags == 0 is defined; anything else is EINVAL (process_vm01
-        // test_flags exercises -INT_MAX/-1/1/INT_MAX).
+        // test_flags exercises -INT_MAX/-1/1/INT_MAX). Invalid nonzero flags
+        // win over a zero-byte transfer.
         if flags != 0 {
             return Ok(DispatchOutcome::errno(LINUX_EINVAL));
         }
         let liovcnt = usize::try_from(liovcnt).map_err(|_| LINUX_EINVAL)?;
-        let riovcnt = usize::try_from(riovcnt).map_err(|_| LINUX_EINVAL)?;
-        // Import + validate both vectors: iov_len overflow → EINVAL, bad array
-        // pointer → EFAULT (read_iovecs). Read-only borrow ends with the vecs.
         let local = read_iovecs(&*cx.memory, local_iov.0, liovcnt)?;
+        let local_total: u64 = local.iter().map(|iov| iov.iov_len).sum();
+        if local_total == 0 {
+            return Ok(DispatchOutcome::Returned { value: 0 });
+        }
+
+        let riovcnt = usize::try_from(riovcnt).map_err(|_| LINUX_EINVAL)?;
         let remote = read_iovecs(&*cx.memory, remote_iov.0, riovcnt)?;
+        let remote_total: u64 = remote.iter().map(|iov| iov.iov_len).sum();
+        if remote_total == 0 {
+            return Ok(DispatchOutcome::Returned { value: 0 });
+        }
 
         // process_vm_readv/writev do a plain task lookup: pid 0 names NO task
         // (unlike sched_*, where 0 means "the calling process"). Linux returns
-        // ESRCH and transfers nothing. resolve_sched_target inherits the sched_*
-        // 0-is-self rule, so screen pid 0 out here before consulting it.
+        // ESRCH and transfers nothing.
         if pid.raw() == 0 {
             return Ok(DispatchOutcome::errno(LINUX_ESRCH));
         }
 
-        match resolve_sched_target(self, cx, pid.raw() as u64) {
-            SchedTarget::NotFound => Ok(DispatchOutcome::errno(LINUX_ESRCH)),
-            SchedTarget::SelfProc => {
+        let Ok(target_task_id) = crate::kernel::TaskId::from_abi_positive(pid.raw()) else {
+            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+        };
+        let Some(target_task) = cx.kernel.kernel().registry().task(target_task_id) else {
+            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+        };
+        if !cx.kernel.kernel().task_key_is_live(target_task.key()) {
+            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+        }
+
+        // ptrace_may_access(PTRACE_MODE_ATTACH_REALCREDS): a non-root
+        // caller that does not own the target is denied (process_vm01
+        // test_invalid_perm drops to `nobody` then reads root's pid).
+        // carrick models CAP_SYS_PTRACE as euid 0. The target's euid
+        // comes from its own kernel-graph credentials, the same
+        // authority `cred_snapshot()` answers the caller from.
+        let caller_euid = self.cred_snapshot().euid;
+        let target_euid = target_task.process_credentials().euid();
+        if !caller_euid.is_root() && caller_euid != target_euid {
+            return Ok(DispatchOutcome::errno(LINUX_EPERM));
+        }
+
+        let relation = cx.with_execution_lease(|lease| {
+            cx.kernel
+                .kernel()
+                .foreign_mm(cx.kernel, lease, target_task.key())
+        });
+        let relation = match relation {
+            Some(Ok(r)) => r,
+            Some(Err(crate::kernel::MmAccessError::UnknownTask(_))) => {
+                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+            }
+            Some(Err(_)) | None => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+        };
+
+        match relation {
+            crate::kernel::MmRelation::Current(_) => {
                 let (src, dst) = if is_read {
                     (&remote, &local)
                 } else {
@@ -4422,67 +4463,86 @@ impl SyscallDispatcher {
                     Err(errno) => Ok(DispatchOutcome::errno(errno)),
                 }
             }
-            SchedTarget::OtherGuest { euid: target_euid } => {
-                // ptrace_may_access(PTRACE_MODE_ATTACH_REALCREDS): a non-root
-                // caller that does not own the target is denied (process_vm01
-                // test_invalid_perm drops to `nobody` then reads root's pid).
-                // carrick models CAP_SYS_PTRACE as euid 0. The target's euid
-                // comes from its own kernel-graph credentials, the same
-                // authority `cred_snapshot()` answers the caller from.
-                let caller_euid = self.cred_snapshot().euid;
-                if !caller_euid.is_root() && caller_euid != target_euid {
-                    return Ok(DispatchOutcome::errno(LINUX_EPERM));
+            crate::kernel::MmRelation::Foreign(foreign) => {
+                if !is_read {
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 }
-                let Ok(target_task) = crate::kernel::TaskId::from_abi_positive(pid.raw()) else {
-                    return Ok(DispatchOutcome::errno(LINUX_ESRCH));
-                };
                 let Some(process) = self.hvpatch_process() else {
                     return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 };
-                let foreign = match crate::kernel::ForeignMmAccess::for_task(
-                    process.kernel_graph().as_ref(),
-                    target_task,
-                ) {
-                    Ok(f) => f,
-                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                let Some(authority) = process.mm_access_authority() else {
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 };
-                // Verify that remote iovecs are fully mapped in the peer's VMAs
-                for iov in &remote {
-                    let len = match usize::try_from(iov.iov_len) {
-                        Ok(l) => l,
-                        Err(_) => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
-                    };
-                    if len > 0 && !foreign.is_range_mapped(iov.iov_base, len) {
-                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+
+                const CHUNK_SIZE: usize = 64 * 1024;
+                let mut copied: u64 = 0;
+                let mut ri = 0usize;
+                let mut ro = 0u64;
+                let mut li = 0usize;
+                let mut lo = 0u64;
+
+                let mut chunk_buf = vec![0u8; CHUNK_SIZE];
+
+                while ri < remote.len() && li < local.len() {
+                    while ri < remote.len() && ro >= remote[ri].iov_len {
+                        ri += 1;
+                        ro = 0;
                     }
+                    while li < local.len() && lo >= local[li].iov_len {
+                        li += 1;
+                        lo = 0;
+                    }
+                    if ri >= remote.len() || li >= local.len() {
+                        break;
+                    }
+                    let rem_remote = remote[ri].iov_len - ro;
+                    let rem_local = local[li].iov_len - lo;
+                    let want = rem_remote.min(rem_local).min(CHUNK_SIZE as u64);
+                    let want_len = want as usize;
+                    if want_len == 0 {
+                        break;
+                    }
+
+                    let remote_va = match remote[ri].iov_base.checked_add(ro) {
+                        Some(va) => carrick_guest_mem::GuestVa(va),
+                        None => break,
+                    };
+                    let local_va = match local[li].iov_base.checked_add(lo) {
+                        Some(va) => va,
+                        None => break,
+                    };
+
+                    let range = match foreign.read_range(remote_va, want_len) {
+                        Ok(Some(r)) => r,
+                        _ => break,
+                    };
+
+                    let read_buf = &mut chunk_buf[..want_len];
+                    match authority.read_foreign(&foreign, range, read_buf) {
+                        Ok(receipt) => {
+                            if receipt.bytes_read() != want_len {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+
+                    if cx.memory.write_bytes(local_va, read_buf).is_err() {
+                        break;
+                    }
+
+                    copied += want;
+                    ro += want;
+                    lo += want;
                 }
-                // The TRANSFER across address spaces is not implemented, and
-                // must not pretend otherwise. `ForeignMmAccess` authenticates
-                // the peer and answers `is_range_mapped` from its VMAs, but it
-                // carries no read/write capability — so the only copier
-                // available here is `process_vm_copy_self`, which moves bytes
-                // WITHIN THE CALLER's address space at the peer's virtual
-                // addresses. Calling it reported success and moved the wrong
-                // memory: `process_vm_readv02` asked for "test" and received
-                // `IG_DNOTIFY=y` — kconfig text out of the CALLER's own mm —
-                // and `process_vm_writev02` returned 100000 while the target
-                // found 100000 differences.
-                //
-                // A lying success is worse than an honest error, so the
-                // unimplemented direction answers EFAULT (what this syscall did
-                // before the foreign-mm work began) until the real transfer
-                // exists. Everything above stays: pid and flag validation, the
-                // `ptrace_may_access` euid check, and the peer-VMA range check
-                // are all correct and are what a real transfer will build on.
-                //
-                // What it needs: a foreign stage-1 walker plus an IPA
-                // read/write pair promoted out of `carrick-vmm-hvf`, and `prot`
-                // bits on `VmaSummary` so a write can be refused on a read-only
-                // peer mapping. Per the transaction rule, reading a peer mm's
-                // stage-1 pages needs a revision-validated read, not a naive
-                // walk.
-                let _ = (&local, &remote, is_read);
-                Ok(DispatchOutcome::errno(LINUX_EFAULT))
+
+                if copied == 0 {
+                    Ok(DispatchOutcome::errno(LINUX_EFAULT))
+                } else {
+                    Ok(DispatchOutcome::Returned {
+                        value: copied as i64,
+                    })
+                }
             }
         }
     }
@@ -4839,6 +4899,7 @@ mod kernel_process_dispatch_tests {
     const SYS_WAITID: u64 = 95;
     const SYS_PTRACE: u64 = 117;
     const SYS_PROCESS_VM_READV: u64 = 270;
+    const SYS_PROCESS_VM_WRITEV: u64 = 271;
     const SYS_WAIT4: u64 = 260;
     const LINUX_P_ALL: u64 = 0;
     const LINUX_P_PID: u64 = 1;
@@ -4956,7 +5017,60 @@ mod kernel_process_dispatch_tests {
         KernelContext,
     ) {
         let lane = HvpatchLaneScope::force(false);
-        let (mut process, _) = crate::hvpatch::process_context_for_tests(root_pid);
+        let (mut process, root) = crate::hvpatch::process_context_for_tests(root_pid);
+        let state = crate::kernel::objects::MigratableTaskState {
+            cpu: carrick_hal::threaded::GuestCpuState::from_aarch64_v1(
+                carrick_hal::threaded::Aarch64TaskCpuStateV1 {
+                    gprs: [0; 31],
+                    pc: 0,
+                    pstate: 0,
+                    trap_pc: 0,
+                    trap_pstate: 0,
+                    sp_el0: 0,
+                    elr_el1: 0,
+                    spsr_el1: 0,
+                    ttbr0: 0,
+                    ttbr1: 0,
+                    tcr: 0,
+                    sctlr_el1: 0,
+                    mair_el1: 0,
+                    vbar_el1: 0,
+                    cpacr_el1: 0,
+                    cntkctl_el1: 0,
+                    tpidr_el1: 0,
+                    actlr_el1: 0,
+                    tpidr_el0: 0,
+                    tpidrro_el0: 0,
+                    contextidr_el1: 0,
+                    vregs: [0; 32],
+                    fpsr: 0,
+                    fpcr: 0,
+                    pending_resume_pc: None,
+                    last_syscall_nr: None,
+                    last_syscall_orig_x0: 0,
+                    last_fault_esr: 0,
+                    last_exit_class: 0,
+                    is_forked_child: false,
+                    syscall_continuation: None,
+                    mm_generation: root.shared().mm().id().raw(),
+                    asid_generation: root.shared().mm().id().raw(),
+                },
+            ),
+            mm: root.shared().mm().id(),
+            asid_generation: root.shared().mm().id().raw(),
+        };
+        root.thread()
+            .publish_initial_task_state(state)
+            .expect("publish test task state");
+        let executor = crate::kernel::objects::ExecutorId::for_transitional_thread(
+            crate::thread::ThreadId::synthetic_for_tests(root_pid),
+        )
+        .expect("test executor ID");
+        let lease = root
+            .thread()
+            .claim_runnable(executor)
+            .expect("claim test lease");
+        process.set_test_execution_lease(lease);
         process.enable_mm_access_for_tests();
         let dispatcher = SyscallDispatcher::new();
         dispatcher.bind_hvpatch_process(process.clone());
@@ -5132,6 +5246,199 @@ mod kernel_process_dispatch_tests {
             ),
             DispatchOutcome::errno(LINUX_EINVAL),
             "invalid flags win over a zero-byte transfer",
+        );
+    }
+
+    #[test]
+    fn process_vm_readv_exact_current_routes_to_self_copy() {
+        let (_lane, mut dispatcher, _process, root) = bound_dispatcher(61_093);
+        let self_pid = root.task().key().id.raw();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+        write_iovec(&mut memory, LOCAL_IOV, LOCAL_BUF, 4);
+        write_iovec(&mut memory, REMOTE_IOV, TARGET_VA, 4);
+        memory.write_bytes(TARGET_VA, b"SELF").unwrap();
+
+        assert_eq!(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PROCESS_VM_READV,
+                [self_pid as u64, LOCAL_IOV, 1, REMOTE_IOV, 1, 0],
+            ),
+            DispatchOutcome::Returned { value: 4 },
+        );
+        assert_eq!(memory.read_bytes(LOCAL_BUF, 4).unwrap(), b"SELF");
+    }
+
+    #[test]
+    fn process_vm_readv_foreign_first_fault_returns_efault() {
+        let (_lane, mut dispatcher, _process, root) = bound_dispatcher(61_094);
+        let target = process_vm_target(&root, 61_095);
+        let root = refreshed(&root);
+        let target_pid = target.task().key().id.raw();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+        write_iovec(&mut memory, LOCAL_IOV, LOCAL_BUF, 4);
+        write_iovec(&mut memory, REMOTE_IOV, 0x9999_0000, 4);
+
+        assert_eq!(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PROCESS_VM_READV,
+                [target_pid as u64, LOCAL_IOV, 1, REMOTE_IOV, 1, 0],
+            ),
+            DispatchOutcome::errno(LINUX_EFAULT),
+        );
+    }
+
+    #[test]
+    fn process_vm_readv_later_foreign_fault_returns_completed_prefix() {
+        let (_lane, mut dispatcher, _process, root) = bound_dispatcher(61_088);
+        let target = process_vm_target(&root, 61_089);
+        let root = refreshed(&root);
+        let target_pid = target.task().key().id.raw();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+
+        write_iovec(&mut memory, LOCAL_IOV, LOCAL_BUF, 8);
+        const REMOTE_IOV_SECOND: u64 = REMOTE_IOV + 16;
+        write_iovec(&mut memory, REMOTE_IOV, TARGET_VA, 4);
+        write_iovec(&mut memory, REMOTE_IOV_SECOND, 0x9999_0000, 4);
+
+        assert_eq!(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PROCESS_VM_READV,
+                [target_pid as u64, LOCAL_IOV, 1, REMOTE_IOV, 2, 0],
+            ),
+            DispatchOutcome::Returned { value: 4 },
+            "later fault must return exact completed prefix",
+        );
+        assert_eq!(memory.read_bytes(LOCAL_BUF, 4).unwrap(), b"PEER");
+    }
+
+    #[test]
+    fn process_vm_writev_foreign_returns_efault() {
+        let (_lane, mut dispatcher, _process, root) = bound_dispatcher(61_096);
+        let target = process_vm_target(&root, 61_097);
+        let root = refreshed(&root);
+        let target_pid = target.task().key().id.raw();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+        write_iovec(&mut memory, LOCAL_IOV, LOCAL_BUF, 4);
+        write_iovec(&mut memory, REMOTE_IOV, TARGET_VA, 4);
+
+        assert_eq!(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PROCESS_VM_WRITEV,
+                [target_pid as u64, LOCAL_IOV, 1, REMOTE_IOV, 1, 0],
+            ),
+            DispatchOutcome::errno(LINUX_EFAULT),
+        );
+    }
+
+    #[test]
+    fn process_vm_lease_consumer_limited_to_process_vm_syscalls() {
+        let (_lane, dispatcher, mut process, root) = bound_dispatcher(61_098);
+        process.clear_test_execution_lease();
+        let mut dispatcher_no_lease = SyscallDispatcher::new();
+        dispatcher_no_lease.bind_hvpatch_process(process);
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+
+        // When dispatching without an active execution lease:
+        // Ordinary syscalls (getpid, getppid, getuid, sched_yield) succeed normally
+        // without attempting foreign MM access or failing due to missing lease authority.
+        assert_eq!(
+            dispatch(
+                &mut dispatcher_no_lease,
+                &root,
+                &mut memory,
+                172,
+                [0, 0, 0, 0, 0, 0]
+            ),
+            DispatchOutcome::Returned { value: 61_098 },
+            "getpid must not require or consume execution lease authority",
+        );
+        assert_eq!(
+            dispatch(
+                &mut dispatcher_no_lease,
+                &root,
+                &mut memory,
+                173,
+                [0, 0, 0, 0, 0, 0]
+            ),
+            DispatchOutcome::Returned { value: 1 },
+            "getppid must not require or consume execution lease authority",
+        );
+        assert_eq!(
+            dispatch(
+                &mut dispatcher_no_lease,
+                &root,
+                &mut memory,
+                174,
+                [0, 0, 0, 0, 0, 0]
+            ),
+            DispatchOutcome::Returned { value: 0 },
+            "getuid must not require or consume execution lease authority",
+        );
+        assert_eq!(
+            dispatch(
+                &mut dispatcher_no_lease,
+                &root,
+                &mut memory,
+                124,
+                [0, 0, 0, 0, 0, 0]
+            ),
+            DispatchOutcome::Returned { value: 0 },
+            "sched_yield must not require or consume execution lease authority",
+        );
+
+        // For process_vm_readv / writev with a foreign target, missing execution lease fails closed with EFAULT.
+        let target = process_vm_target(&root, 61_099);
+        let target_pid = target.task().key().id.raw();
+        write_iovec(&mut memory, LOCAL_IOV, LOCAL_BUF, 4);
+        write_iovec(&mut memory, REMOTE_IOV, TARGET_VA, 4);
+
+        assert_eq!(
+            dispatch(
+                &mut dispatcher_no_lease,
+                &root,
+                &mut memory,
+                SYS_PROCESS_VM_READV,
+                [target_pid as u64, LOCAL_IOV, 1, REMOTE_IOV, 1, 0],
+            ),
+            DispatchOutcome::errno(LINUX_EFAULT),
+            "foreign process_vm_readv without execution lease fails closed with EFAULT",
+        );
+        assert_eq!(
+            dispatch(
+                &mut dispatcher_no_lease,
+                &root,
+                &mut memory,
+                SYS_PROCESS_VM_WRITEV,
+                [target_pid as u64, LOCAL_IOV, 1, REMOTE_IOV, 1, 0],
+            ),
+            DispatchOutcome::errno(LINUX_EFAULT),
+            "foreign process_vm_writev without execution lease fails closed with EFAULT",
+        );
+
+        // With the valid execution lease, process_vm_readv consumes the lease and succeeds.
+        let mut dispatcher_with_lease = dispatcher;
+        assert_eq!(
+            dispatch(
+                &mut dispatcher_with_lease,
+                &root,
+                &mut memory,
+                SYS_PROCESS_VM_READV,
+                [target_pid as u64, LOCAL_IOV, 1, REMOTE_IOV, 1, 0],
+            ),
+            DispatchOutcome::Returned { value: 4 },
+            "foreign process_vm_readv with valid execution lease consumes lease and succeeds",
         );
     }
 
