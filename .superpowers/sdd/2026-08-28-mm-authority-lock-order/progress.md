@@ -266,3 +266,15 @@ RED and review-pending commits remain on `codex/fd-description-seam`; no push.
   participating stream explicitly attested that it did not access Linux kernel
   source or abandoned Task 8 artifacts; any stream violating that rule remains
   wholly non-integrable and must be restarted from a clean accepted base.
+- Task 8 compound-COW RED is `25ad7f2e7`. Two production-carrier fixtures
+  isolate the remaining multi-write failures without Linux kernel source or
+  abandoned artifacts. Reusing the one authenticated COW result for a second
+  4 KiB subrange in its already-disarmed 16 KiB compound deterministically
+  returns `Retry`; advancing the same retained foreign lease to the next 16 KiB
+  compound after the first COW retires its initial mapping deterministically
+  returns `MissingBinding`. The unchanged single-write control remains green.
+  Acceptance must keep exact MM/binding and live revision authentication,
+  retranslate every subrange to the same authenticated owner, revalidate that
+  subrange's writable VMA, COW each compound exactly once, and evolve only the
+  lease's obsolete frozen mapping membership across kernel-authenticated
+  successor snapshots.
