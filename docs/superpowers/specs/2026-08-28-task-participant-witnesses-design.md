@@ -234,8 +234,17 @@ to preserve the four-position `pt-pause-begin` probe ABI.
 `Thread::enter_crash_safe_point_participation` becomes a minting operation over
 `Arc<Thread>` and returns a non-cloneable `CrashSafePointParticipation` guard.
 The guard is stored inside `GuestExecutorParticipation`; its `Drop` clears the
-thread flag. Direct `leave_crash_safe_point_participation` is private to the
-guard and retirement cleanup.
+exact generation it owns. Direct revocation is private to the guard and
+retirement cleanup.
+
+Participation is generation-stamped rather than a reusable boolean. A thread
+owns an active non-zero `CrashSafePointParticipationId` plus a monotonic next-id
+allocator. Entry atomically publishes a fresh id only when no generation is
+active. Retirement may revoke the active generation before its guard drops. A
+guard drop accepts either its exact active id or zero (already revoked), but a
+different non-zero id is a carrier invariant fault and must not be cleared.
+This prevents a late guard from an old loop from erasing a successor loop's
+participation.
 
 `GuestExecutorParticipation::drop` preserves the current publication order:
 first clear crash-safe-point participation, then remove the exact executor
@@ -349,4 +358,3 @@ reviewed commit:
     through their original conversations.
 12. Independent review is green and `main` is fast-forwarded to the exact
     milestone commit with `main...canonical` equal to `0 0`.
-
