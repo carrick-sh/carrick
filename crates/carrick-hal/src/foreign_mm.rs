@@ -576,8 +576,14 @@ mod tests {
             _deadline: Instant,
         ) -> Result<Box<dyn ForeignMmPreparedWrite + 'a>, ForeignMmTransportError> {
             assert_eq!(cow.mm(), snapshot.mm());
-            assert_eq!(cow.range_start(), va);
-            assert_eq!(cow.range_len(), src.len());
+            assert!(va.raw() >= cow.range_start().raw());
+            let va_end = va.raw().checked_add(src.len() as u64).unwrap();
+            let cow_end = cow
+                .range_start()
+                .raw()
+                .checked_add(cow.range_len() as u64)
+                .unwrap();
+            assert!(va_end <= cow_end);
             Ok(Box::new(PreparedWrite {
                 receipt: Box::new(WriteReceipt {
                     mm: snapshot.mm(),
