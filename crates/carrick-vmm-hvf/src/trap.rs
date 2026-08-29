@@ -564,18 +564,35 @@ mod foreign_mm_tests {
         data_ipa: u64,
         bytes: [u8; 4],
     ) -> InstalledMm {
+        install_mm_with_data_len(transport, ordinal, root, data_ipa, OWNER_LEN, &bytes)
+    }
+
+    fn install_mm_with_data_len(
+        transport: &CarrierForeignMmTransport,
+        ordinal: u64,
+        root: u64,
+        data_ipa: u64,
+        data_len: usize,
+        bytes: &[u8],
+    ) -> InstalledMm {
+        assert!(data_len >= bytes.len(), "fixture bytes must fit data owner");
+        assert_eq!(
+            data_len as u64 % CowArmedRanges::COMPOUND_SIZE,
+            0,
+            "fixture owner must contain whole host compounds",
+        );
         let mut tables = carrick_mem::page_table::PageTableManager::new(
             carrick_mem::memory::stage1_hvpatch_page_tables(),
             carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
         );
         tables.rebase(root).expect("rebase foreign test root");
         tables
-            .map_aliased(TEST_VA, data_ipa, OWNER_LEN as u64, false)
+            .map_aliased(TEST_VA, data_ipa, data_len as u64, false)
             .expect("map foreign test leaf");
 
         let table_bytes = tables.as_bytes().to_vec();
         let (table_generation, table_host) = install_owner(root, &table_bytes);
-        let mut data_bytes = vec![0_u8; OWNER_LEN];
+        let mut data_bytes = vec![0_u8; data_len];
         data_bytes[..bytes.len()].copy_from_slice(&bytes);
         let (data_generation, data_host) = install_owner(data_ipa, &data_bytes);
 
@@ -603,13 +620,13 @@ mod foreign_mm_tests {
             },
         );
         inventory.extents.insert(
-            (data_ipa, OWNER_LEN as u64),
+            (data_ipa, data_len as u64),
             InventoryExtent {
                 frame: data_frame,
                 mapping: data_mapping,
                 backing: InventoryBackingIdentity::Private(ordinal * 10 + 5),
                 stage2_base: data_ipa,
-                stage2_length: OWNER_LEN as u64,
+                stage2_length: data_len as u64,
                 stage2_owner: InventoryStage2OwnerIdentity {
                     host_addr: data_host,
                     generation: data_generation,
@@ -625,13 +642,13 @@ mod foreign_mm_tests {
                 .insert((table_frame, root, table_bytes.len() as u64), 1);
             frames
                 .extent_references
-                .insert((data_frame, data_ipa, OWNER_LEN as u64), 1);
+                .insert((data_frame, data_ipa, data_len as u64), 1);
             frames
                 .stage2_references
                 .insert((root, table_bytes.len() as u64), 1);
             frames
                 .stage2_references
-                .insert((data_ipa, OWNER_LEN as u64), 1);
+                .insert((data_ipa, data_len as u64), 1);
         }
         let asid = NonZeroU16::new(ordinal as u16).expect("nonzero test ASID");
         let binding = CarrierForeignMmBinding {
@@ -662,7 +679,7 @@ mod foreign_mm_tests {
             state,
             owners: OwnerCleanup(vec![
                 (root, table_bytes.len() as u64),
-                (data_ipa, OWNER_LEN as u64),
+                (data_ipa, data_len as u64),
             ]),
         }
     }
@@ -710,10 +727,10 @@ mod foreign_mm_tests {
             start: TEST_VA,
             ipa: data_key.0,
             host_addr,
-            size: OWNER_LEN,
+            size: data_key.1 as usize,
             physical_ipa: data_key.0,
             physical_host_addr: host_addr,
-            physical_size: OWNER_LEN,
+            physical_size: data_key.1 as usize,
             perms: u64::from(applevisor::memory::MemPerms::ReadWriteExec),
             guest_writable: true,
             sharing: GuestMappingSharing::Private,
@@ -733,7 +750,7 @@ mod foreign_mm_tests {
             .lock()
             .arm(&[carrick_aarch64::vmm::ForkCowRange {
                 va: TEST_VA,
-                len: OWNER_LEN,
+                len: data_key.1 as usize,
                 executable: false,
                 kernel_only: false,
             }]);
@@ -796,6 +813,7 @@ mod foreign_mm_tests {
             *b"old!",
         );
         let (_authority, lease, mut invalidator) = prepare_foreign_cow(&child);
+        let old_key = child.owners.0[1];
         let deadline = Instant::now() + Duration::from_secs(1);
         let cow = lease
             .break_cow(
@@ -842,6 +860,157 @@ mod foreign_mm_tests {
             b"new!"
         );
         child.owners.0.push(new_key);
+    }
+
+    #[test]
+    fn foreign_cow_one_compound_authorizes_distinct_subrange_writes() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let transport = CarrierForeignMmTransport::new();
+        let mut child = install_mm(
+            &transport,
+            125,
+            0x9a00_1c00_0000,
+            0x9b00_1c00_0000,
+            *b"old!",
+        );
+        let (_authority, lease, mut invalidator) = prepare_foreign_cow(&child);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let cow = lease
+            .break_cow(
+                &mut invalidator,
+                &child.snapshot,
+                GuestVa(TEST_VA),
+                4,
+                deadline,
+            )
+            .expect("break the exact child compound once");
+        let post = child.live.0.read().clone();
+
+        lease
+            .prepare_write(
+                &child.live,
+                &post,
+                cow.as_ref(),
+                GuestVa(TEST_VA),
+                b"one!",
+                deadline,
+            )
+            .expect("prepare first subrange")
+            .commit();
+        lease
+            .prepare_write(
+                &child.live,
+                &post,
+                cow.as_ref(),
+                GuestVa(TEST_VA + 0x1000),
+                b"two!",
+                deadline,
+            )
+            .expect("one authenticated compound must authorize a later subrange")
+            .commit();
+
+        assert_eq!(invalidator.calls, 1, "one compound must COW exactly once");
+        let old_owner = global_frame_host_owners().lock()[&old_key].clone();
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(old_owner._mapping.as_ptr(), 4) },
+            b"old!",
+            "subrange reuse must never write through the shared source owner",
+        );
+        let new_key = (cow.physical_base().raw(), cow.physical_len());
+        let new_owner = global_frame_host_owners().lock()[&new_key].clone();
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(new_owner._mapping.as_ptr(), 4) },
+            b"one!",
+        );
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(new_owner._mapping.as_ptr().add(0x1000), 4) },
+            b"two!",
+        );
+        child.owners.0.push(new_key);
+    }
+
+    #[test]
+    fn retained_foreign_lease_advances_across_two_compound_cow_commits() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let transport = CarrierForeignMmTransport::new();
+        let mut child = install_mm_with_data_len(
+            &transport,
+            126,
+            0x9a00_1d00_0000,
+            0x9b00_1d00_0000,
+            OWNER_LEN * 2,
+            b"old!",
+        );
+        let (_authority, lease, mut invalidator) = prepare_foreign_cow(&child);
+        let initially_retained_data_mapping = child.snapshot.mapping_ids[1];
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        let first = lease
+            .break_cow(
+                &mut invalidator,
+                &child.snapshot,
+                GuestVa(TEST_VA),
+                4,
+                deadline,
+            )
+            .expect("break first compound COW");
+        let after_first = child.live.0.read().clone();
+        assert!(
+            !after_first
+                .mapping_ids
+                .contains(&initially_retained_data_mapping),
+            "first COW must retire the mapping identity frozen into the retained lease",
+        );
+        lease
+            .prepare_write(
+                &child.live,
+                &after_first,
+                first.as_ref(),
+                GuestVa(TEST_VA),
+                b"one!",
+                deadline,
+            )
+            .expect("prepare first compound write")
+            .commit();
+
+        let second_va = TEST_VA + CowArmedRanges::COMPOUND_SIZE;
+        let second = lease
+            .break_cow(
+                &mut invalidator,
+                &after_first,
+                GuestVa(second_va),
+                4,
+                deadline,
+            )
+            .expect("the retained lease must accept its authenticated successor snapshot");
+        let after_second = child.live.0.read().clone();
+        lease
+            .prepare_write(
+                &child.live,
+                &after_second,
+                second.as_ref(),
+                GuestVa(second_va),
+                b"two!",
+                deadline,
+            )
+            .expect("prepare second compound write")
+            .commit();
+
+        assert_eq!(invalidator.calls, 2, "each compound must COW exactly once");
+        let first_key = (first.physical_base().raw(), first.physical_len());
+        let second_key = (second.physical_base().raw(), second.physical_len());
+        assert_ne!(first_key, second_key);
+        let owners = global_frame_host_owners().lock();
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(owners[&first_key]._mapping.as_ptr(), 4) },
+            b"one!",
+        );
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(owners[&second_key]._mapping.as_ptr(), 4) },
+            b"two!",
+        );
+        drop(owners);
+        child.owners.0.extend([first_key, second_key]);
     }
 
     #[test]
