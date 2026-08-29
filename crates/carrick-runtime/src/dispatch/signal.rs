@@ -2804,6 +2804,7 @@ mod tests {
             memory: &mut memory,
             reporter: &reporter,
             thread: None,
+            execution_lease: None,
         };
 
         assert_eq!(
@@ -3154,6 +3155,7 @@ mod tests {
             memory: &mut memory,
             reporter: &reporter,
             thread: None,
+            execution_lease: None,
         };
 
         for tgid in [0, -1, -2] {
@@ -3217,6 +3219,7 @@ mod tests {
             memory: &mut memory,
             reporter: &reporter,
             thread: None,
+            execution_lease: None,
         };
         let bad_info = GuestPtr(0x4000);
         let usr1 = crate::linux_abi::LINUX_SIGUSR1 as u64;
@@ -3314,6 +3317,7 @@ mod tests {
             memory: &mut memory,
             reporter: &reporter,
             thread: None,
+            execution_lease: None,
         };
         let outcome = d.sigqueueinfo_common(
             &cx,
@@ -3400,6 +3404,7 @@ mod tests {
             memory: &mut memory,
             reporter: &reporter,
             thread: None,
+            execution_lease: None,
         };
         let outcome = d.sigqueueinfo_common(
             &cx,
@@ -3471,6 +3476,7 @@ mod tests {
             memory: &mut memory,
             reporter: &reporter,
             thread: None,
+            execution_lease: None,
         };
         let outcome = d.sigqueueinfo_common(&cx, child_pid, child_pid, 0, GuestPtr(0x400), false);
 
@@ -4370,6 +4376,7 @@ mod tests {
                 registry: &registry,
                 futex: &futex,
             }),
+            execution_lease: None,
         };
         let mut caught = LinuxSigaction::empty();
         caught.sa_handler = 0x4000;
@@ -4538,6 +4545,7 @@ mod tests {
                 registry: &registry,
                 futex: &futex,
             }),
+            execution_lease: None,
         };
         let mut caught = LinuxSigaction::empty();
         caught.sa_handler = 0x4000;
@@ -4587,6 +4595,7 @@ mod tests {
                 registry: &registry,
                 futex: &futex,
             }),
+            execution_lease: None,
         };
         let routed = d.sigqueueinfo_common(
             &cx,

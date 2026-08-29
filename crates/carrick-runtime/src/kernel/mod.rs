@@ -45,7 +45,6 @@ pub use crash_capture::{
     CrashCaptureAuthority, CrashCaptureGeneration, CrashGenerationExhausted, CrashQuorum,
     CrashQuorumPoll, CrashRegisterFile, CrashRegisterVote,
 };
-pub(crate) use foreign_mm::ForeignMmAccess;
 pub(crate) use mm_access::MmAccessAuthority;
 pub use mm_access::{
     CowBroken, CurrentMm, ForeignMm, ForeignWriteReceipt, MmAccessError, MmReadRange, MmRelation,
