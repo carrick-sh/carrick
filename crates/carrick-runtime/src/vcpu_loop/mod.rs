@@ -1708,25 +1708,10 @@ pub(crate) fn with_sole_mm_stage1<T>(
 
 #[cfg(test)]
 pub(crate) fn with_real_pt_pause_for_test<T>(
+    coordinator: Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>,
     run: impl FnOnce(&mut quiesce::PtPauseGuard<'_>) -> T,
 ) -> T {
-    let barrier: &'static crate::fork_quiesce::PtQuiesce =
-        Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
-    let registry: Arc<dyn carrick_hal::VcpuRegistry> =
-        Arc::new(carrick_hal::GenericVcpuRegistry::new());
-    let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
-    let tid = ThreadId::synthetic_for_tests(20_900);
-    let mut participation = census
-        .enter_with_pause_endpoint(None, registry, tid)
-        .expect("test exact-MM participation");
-    let mut authority = quiesce::acquire_pt_pause(
-        barrier,
-        &mut participation,
-        tid,
-        quiesce::PtPauseBudget::DEFAULT,
-    )
-    .expect("test must acquire a real page-table pause");
-    run(&mut authority)
+    quiesce::with_real_mutation_pause_for_test(coordinator, run)
 }
 
 /// Hand the dispatcher the loaded image's region list + auxv so /proc/self/maps
@@ -7751,7 +7736,7 @@ where
                 crate::dispatch::mm_mutation::from_sole_executor(sole, coordinator, mm)
             }
             quiesce::MmStage1Authority::Paused(pause) => {
-                crate::dispatch::mm_mutation::from_pt_pause(pause, coordinator, mm)
+                crate::dispatch::mm_mutation::from_pt_pause(pause)
             }
         };
         Ok(run(&mut mutation))
@@ -7921,11 +7906,8 @@ where
                                 )
                             }
                             quiesce::MmStage1Authority::Paused(authority) => {
-                                let mut mutation = crate::dispatch::mm_mutation::from_pt_pause(
-                                    authority,
-                                    coordinator,
-                                    kernel_context.shared().mm().id(),
-                                );
+                                let mut mutation =
+                                    crate::dispatch::mm_mutation::from_pt_pause(authority);
                                 kernel.dispatcher.dispatch_threaded_mutation(
                                     &kernel_context,
                                     request,
@@ -8135,11 +8117,7 @@ where
                             install_alias(&permit)
                         }
                         quiesce::MmStage1Authority::Paused(authority) => {
-                            let mutation = crate::dispatch::mm_mutation::from_pt_pause(
-                                authority,
-                                coordinator,
-                                kernel_context.shared().mm().id(),
-                            );
+                            let mutation = crate::dispatch::mm_mutation::from_pt_pause(authority);
                             let permit = mutation.host_alias_permit();
                             install_alias(&permit)
                         }

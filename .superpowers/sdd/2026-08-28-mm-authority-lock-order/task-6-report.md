@@ -163,6 +163,17 @@ install. Direct tests use the real test pause issuer. The race-sensitive test,
 17 process-fork tests, and the full 2,083-test serialized runtime suite are
 green with that structural path.
 
+A final immutable-range review then found that the paused mutation constructor
+still accepted a pause guard alongside independently supplied MM/coordinator
+arguments. That permitted safe crate code to pair exclusion for MM A with a
+host-alias permit for MM B, and the focused test helper concealed the weakness
+by deriving a synthetic MM from a thread ID. The repaired constructor accepts
+only the pause guard and derives its exact MM/coordinator from the lease.
+Mutation-capable pauses receive that pair only inside the combined exact-MM
+acquisition path; frame-COW-only pauses carry no mutation identity and abort if
+misrouted. The test issuer now binds its real pause census directly to the
+coordinator MM without crossing the thread-ID domain.
+
 ## Authority construction graph
 
 ```text

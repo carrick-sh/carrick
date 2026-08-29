@@ -126,10 +126,11 @@ impl MmMutationGuard<'_> {
 }
 
 pub(crate) fn from_pt_pause<'authority>(
-    _authority: &'authority mut crate::vcpu_loop::quiesce::PtPauseGuard,
-    coordinator: Arc<MmMutationCoordinator>,
-    mm: MmId,
+    authority: &'authority mut crate::vcpu_loop::quiesce::PtPauseGuard,
 ) -> MmMutationGuard<'authority> {
+    let (coordinator, mm) = authority
+        .mutation_identity()
+        .unwrap_or_else(|| std::process::abort());
     MmMutationGuard {
         coordinator,
         mm,
@@ -217,9 +218,8 @@ pub(crate) mod test_support {
         coordinator: Arc<MmMutationCoordinator>,
         use_guard: impl FnOnce(&mut MmMutationGuard<'_>) -> T,
     ) -> T {
-        crate::vcpu_loop::with_real_pt_pause_for_test(|authority| {
-            let mm = coordinator.mm();
-            let mut guard = from_pt_pause(authority, coordinator, mm);
+        crate::vcpu_loop::with_real_pt_pause_for_test(coordinator, |authority| {
+            let mut guard = from_pt_pause(authority);
             use_guard(&mut guard)
         })
     }
