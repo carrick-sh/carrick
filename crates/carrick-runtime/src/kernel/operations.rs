@@ -17,8 +17,9 @@ use super::core::{
 use super::ids::{LinuxSignal, LinuxTid, MmId, ObjectIdError, ProcessGroupId, SessionId, TaskId};
 use super::objects::{
     Credentials, FileTable, LinuxWaitStatus, Mm, ObjectGraphError, ProcessGroup,
-    PtraceStopSettlement, Session, Task, TaskJobControlEvent, TaskKey, TaskLifecycle, TaskRef,
-    TaskShared, TaskSharedCloneError, ThreadKey, ThreadRef, ThreadResources, Zombie,
+    PtraceStopSettlement, Session, Task, TaskJobControlEvent, TaskKey, TaskLifecycle,
+    TaskParticipantError, TaskRef, TaskShared, TaskSharedCloneError, ThreadKey, ThreadRef,
+    ThreadResources, Zombie,
 };
 use super::registry::{IdError, TaskReservation, ThreadClaim, ThreadReservation};
 
@@ -2776,7 +2777,13 @@ impl Kernel {
         if record.task.key() != context.task.key() {
             return Err(KernelOperationError::ParentExited);
         }
-        if context.task.live_thread_count() <= 1 {
+        let exit_participants = context
+            .task
+            .thread_exit_participants(context.thread.key())
+            .map_err(|TaskParticipantError::UnknownThread { .. }| {
+                KernelOperationError::UnknownThread(context.thread.key().tid)
+            })?;
+        if !exit_participants.permits_nonfinal_exit() {
             return Err(KernelOperationError::LastThreadRequiresTaskExit(
                 context.thread.key().tid,
             ));
@@ -4536,6 +4543,13 @@ mod tests {
         assert!(fork.contains_sibling(sibling.thread().key()));
         assert!(crash.requires_quiesce());
         assert!(crash.contains_sibling(sibling.thread().key()));
+        assert_eq!(
+            leader
+                .task()
+                .core_note_participants()
+                .required_note_count_for_probe(),
+            2
+        );
     }
 
     #[test]
@@ -7447,7 +7461,7 @@ mod tests {
             .expect("thread identity remains valid across sibling publication");
 
         assert!(root.task().thread(first.thread().key().tid).is_none());
-        assert_eq!(root.task().live_thread_count(), 2);
+        assert_eq!(root.task().thread_count_for_test(), 2);
         assert_eq!(kernel.validate_invariants(), Ok(()));
     }
 
@@ -7676,7 +7690,7 @@ mod tests {
             &root.resources.fs_context(),
             &child.resources.fs_context()
         ));
-        assert_eq!(root.task.live_thread_count(), 2);
+        assert_eq!(root.task.thread_count_for_test(), 2);
     }
 
     #[test]
@@ -7803,7 +7817,7 @@ mod tests {
             .expect("sibling-only revision advance remains compatible");
 
         assert_eq!(second.task().key(), root.task().key());
-        assert_eq!(root.task.live_thread_count(), 3);
+        assert_eq!(root.task.thread_count_for_test(), 3);
     }
 
     #[test]
@@ -7932,7 +7946,7 @@ mod tests {
             assert_eq!(kernel.ids().counts(), counts);
             assert_eq!(Arc::strong_count(&files), file_refs);
             assert_eq!(Arc::strong_count(&credentials), credential_refs);
-            assert_eq!(root.task.live_thread_count(), 1);
+            assert_eq!(root.task.thread_count_for_test(), 1);
         }
     }
 
@@ -8216,7 +8230,7 @@ mod tests {
                 .context()
                 .expect("published thread context")
                 .task()
-                .live_thread_count(),
+                .thread_count_for_test(),
             2
         );
         assert_eq!(kernel.validate_invariants(), Ok(()));
@@ -8269,7 +8283,10 @@ mod tests {
             }
         };
         let published = prepared_thread.commit().unwrap();
-        assert_eq!(published.context().unwrap().task().live_thread_count(), 2);
+        assert_eq!(
+            published.context().unwrap().task().thread_count_for_test(),
+            2
+        );
     }
 
     #[test]

@@ -966,7 +966,7 @@ mod tests {
             LinuxTid::for_task_leader(committed.task.key().id)
         );
         assert_eq!(committed.thread.registry_id(), replacement_registry_id);
-        assert_eq!(committed.task.live_thread_count(), 1);
+        assert_eq!(committed.task.thread_count_for_test(), 1);
         assert_ne!(committed.shared.mm().id(), old_mm_id);
         assert_ne!(committed.shared.sighand().id(), old_sighand_id);
         assert_eq!(
@@ -1112,7 +1112,7 @@ mod tests {
             assert!(Arc::ptr_eq(&current.shared, &old_shared));
             assert!(Arc::ptr_eq(&current.resources, &old_resources));
             assert_eq!(kernel.ids().counts(), counts);
-            assert_eq!(current.task.live_thread_count(), 1);
+            assert_eq!(current.task.thread_count_for_test(), 1);
             assert_eq!(kernel.registry().retired_thread_count(), 0);
         }
     }
