@@ -220,3 +220,20 @@ RED and review-pending commits remain on `codex/fd-description-seam`; no push.
   `7af91b24-43aa-483b-9ecf-e60854fdcabf`. Scope is borrowed exact execution
   authority, ordering, and foreign reads only; writes, permissions expansion,
   ptrace, and proc-mem are excluded.
+- Task 8 clean-room read milestone accepted at `625663baa` (canonical commits
+  `96d765314`, `8975befa1`, `09ce4cd2a`, `625663baa`). The worker's first two
+  revisions were rejected for unconditional lease locking, a TLS/raw-pointer
+  authority channel, oversized fault chunks, missing exact-self behavior, and
+  incorrect error domains; the third revision removed those defects. An
+  independent clean-room reviewer then rejected `StaleContext -> ESRCH`; the
+  controller added a RED typed-domain regression and repaired the lowering so
+  only `UnknownTask` becomes ESRCH while caller/authority failures become
+  EFAULT. Final independent verdict: APPROVE, no findings. Controller gates:
+  19/19 focused `process_vm` tests, 2,118/2,118 serialized runtime library
+  tests, `check-mm-authority.py --check`, all-target runtime clippy with
+  warnings denied, formatting, and diff hygiene all pass. The execution-lease
+  lock is consulted only for syscall numbers 270/271, exact-self copies need no
+  lease, foreign reads are target-authenticated and 4 KiB fault-bounded, and
+  foreign writes still fail closed pending the separately reviewed
+  prepare/commit+COW slice. Clean-room provenance was reconfirmed by every
+  surviving agent; no Linux kernel source or abandoned Task 8 output was used.
