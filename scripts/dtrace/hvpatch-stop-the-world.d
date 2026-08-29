@@ -18,9 +18,10 @@
  *       hvpatch-fork-quiesce  fires UNCONDITIONALLY at the end of the HVPatch
  *                             in-process fork quiesce phase, whether or not the
  *                             barrier went up. arg2 is `initial_siblings`, the
- *                             lease count the raise decision was keyed on, so a
- *                             row with arg2 == 0 is a fork that ran with NO
- *                             barrier.
+ *                             durable task-thread sibling population from
+ *                             `Task::threads().len().saturating_sub(1)` which
+ *                             decides the fork barrier raise, so a row with
+ *                             arg2 == 0 is a fork that ran with NO barrier.
  *       fork-quiesce          the legacy libc::fork lane's equivalent; arg0 is
  *                             the phase (0 = entry), arg1 the sibling count.
  *

@@ -1520,6 +1520,62 @@ mod pt_pause_tests {
     }
 
     #[test]
+    fn pt_pause_probe_abi_and_dtrace_contract() {
+        let probes_source = include_str!("../../../carrick-observability/src/probes.rs");
+        let dtrace_source = include_str!("../../../../scripts/dtrace/hvpatch-stop-the-world.d");
+
+        // 1. USDT declaration has four i32 arguments.
+        assert!(probes_source.contains("fn pt__pause__begin(_: i32, _: i32, _: i32, _: i32) {}"));
+
+        // 2. Real wrapper argument names and order.
+        let wrapper_decl = probes_source
+            .split("pub fn pt_pause_begin(")
+            .nth(1)
+            .expect("real pt_pause_begin wrapper must exist")
+            .split(')')
+            .next()
+            .expect("wrapper argument list end");
+        assert!(wrapper_decl.contains("coordinator_tid: i32"));
+        assert!(wrapper_decl.contains("other_in_guest: i32"));
+        assert!(wrapper_decl.contains("waiting_sibling_tid: i32"));
+        assert!(wrapper_decl.contains("executor_census: i32"));
+        let coord_pos = wrapper_decl.find("coordinator_tid").unwrap();
+        let other_pos = wrapper_decl.find("other_in_guest").unwrap();
+        let waiting_pos = wrapper_decl.find("waiting_sibling_tid").unwrap();
+        let census_pos = wrapper_decl.find("executor_census").unwrap();
+        assert!(coord_pos < other_pos && other_pos < waiting_pos && waiting_pos < census_pos);
+
+        // 3. Disabled stub argument names and order.
+        let stub_decl = probes_source
+            .split("stub!(pt_pause_begin(")
+            .nth(1)
+            .expect("pt_pause_begin stub must exist")
+            .split("));")
+            .next()
+            .expect("stub argument list end");
+        assert!(stub_decl.contains("coordinator_tid: i32"));
+        assert!(stub_decl.contains("other_in_guest: i32"));
+        assert!(stub_decl.contains("waiting_sibling_tid: i32"));
+        assert!(stub_decl.contains("executor_census: i32"));
+        let stub_coord_pos = stub_decl.find("coordinator_tid").unwrap();
+        let stub_other_pos = stub_decl.find("other_in_guest").unwrap();
+        let stub_waiting_pos = stub_decl.find("waiting_sibling_tid").unwrap();
+        let stub_census_pos = stub_decl.find("executor_census").unwrap();
+        assert!(
+            stub_coord_pos < stub_other_pos
+                && stub_other_pos < stub_waiting_pos
+                && stub_waiting_pos < stub_census_pos
+        );
+
+        // 4. Exact DTrace predicate and metric label in hvpatch-stop-the-world.d.
+        assert!(dtrace_source.contains("arg2 == 0 && arg3 > 1"));
+        assert!(
+            dtrace_source
+                .contains(r#"@c["pt-raised-with-peer-executor-and-no-sibling-lease"] = count();"#)
+        );
+    }
+
+    #[test]
     fn process_fork_uses_identity_lease_subscription() {
         let source = include_str!("quiesce.rs");
         let prepare = source
