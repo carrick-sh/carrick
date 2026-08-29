@@ -260,6 +260,15 @@ exclusion and returns a non-cloneable `MmMutationGuard`. Its
 permit. Every host-alias entry point that can coexist with stage-1 mutation
 requires that permit. Constructors remain private to the owning modules.
 
+The threaded run loop creates the guard before dispatch from the actual
+`PtPauseGuard` or `Stage1Exclusive` authority selected for that syscall, then
+passes `&mut MmMutationGuard` through `SyscallCtx`. Non-threaded backends use a
+separate sealed single-executor authority minted only at their dispatch
+boundary. A handler cannot synthesize either authority, and a thread-local
+"pause held" observation is not accepted as structural proof. Foreign COW
+receives the same borrowed mutation guard through the private runtime facade;
+it does not reacquire page-table exclusion internally.
+
 The permit lifetime prevents dropping page-table exclusion while the alias
 phase is live. There is no reverse constructor, no optional token, and no
 runtime enum saying which level a caller claims. Callers that need only a
