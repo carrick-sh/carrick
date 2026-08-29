@@ -650,9 +650,21 @@ where
         // boundaries. The executor census is deliberately transient and can be
         // zero while a same-task sibling is wakeable, so it cannot authorize
         // skipping the COW barrier.
-        let initial_siblings = parent_context.task().threads().len().saturating_sub(1);
+        let fork_participants = match parent_context
+            .task()
+            .fork_barrier_participants(parent_context.thread().key())
+        {
+            Ok(participants) => participants,
+            Err(error) => {
+                tracing::warn!(%error, "hvpatch fork participant witness minting failed; fork(2) = EAGAIN");
+                return Ok(PreparedInProcessFork::Complete(Some(
+                    crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+                )));
+            }
+        };
+        let quiesce_required = fork_participants.requires_quiesce();
         let quiesce_poll_iterations = 0_u64;
-        if initial_siblings > 0 && !coordinator.quiesced {
+        if quiesce_required && !coordinator.quiesced {
             process_barrier.set_quiescing();
             coordinator.quiesced = true;
             self.kicker.kick_all_except(self.this_tid);
@@ -722,7 +734,7 @@ where
             carrick_observability::probes::HvpatchForkQuiesce::new(
                 parent_pid,
                 forking_tid,
-                initial_siblings.min(u32::MAX as usize) as u32,
+                u32::from(quiesce_required),
                 quiesce_poll_iterations,
                 quiesce_elapsed_ns,
             ),

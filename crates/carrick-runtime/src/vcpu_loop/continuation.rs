@@ -4792,7 +4792,7 @@ mod tests {
             "subscribe_lease_drain",
             "try_acquire_topology_lock",
             "subscribe_topology_release",
-            "parent_context.task().threads().len().saturating_sub(1)",
+            "fork_barrier_participants",
         ] {
             assert!(
                 fork.contains(required),
