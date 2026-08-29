@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::num::NonZeroU64;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
@@ -4200,7 +4201,8 @@ impl Task {
             cpu_accounting: Arc::new(ThreadCpuAccounting::default()),
             crash_vote: Mutex::new(None),
             parked_registers: Mutex::new(None),
-            crash_safe_point_participant: AtomicBool::new(false),
+            crash_safe_point_participant: AtomicU64::new(0),
+            next_crash_safe_point_participation: AtomicU64::new(1),
             thread_keyring: Mutex::new(None),
         })
     }
@@ -4228,7 +4230,8 @@ impl Task {
             cpu_accounting: Arc::new(ThreadCpuAccounting::default()),
             crash_vote: Mutex::new(None),
             parked_registers: Mutex::new(None),
-            crash_safe_point_participant: AtomicBool::new(false),
+            crash_safe_point_participant: AtomicU64::new(0),
+            next_crash_safe_point_participation: AtomicU64::new(1),
             thread_keyring: Mutex::new(None),
         })
     }
@@ -4256,7 +4259,8 @@ impl Task {
             cpu_accounting: Arc::new(ThreadCpuAccounting::default()),
             crash_vote: Mutex::new(None),
             parked_registers: Mutex::new(None),
-            crash_safe_point_participant: AtomicBool::new(false),
+            crash_safe_point_participant: AtomicU64::new(0),
+            next_crash_safe_point_participation: AtomicU64::new(1),
             thread_keyring: Mutex::new(None),
         })
     }
@@ -4288,7 +4292,8 @@ impl Task {
             cpu_accounting: Arc::clone(&caller.cpu_accounting),
             crash_vote: Mutex::new(None),
             parked_registers: Mutex::new(None),
-            crash_safe_point_participant: AtomicBool::new(false),
+            crash_safe_point_participant: AtomicU64::new(0),
+            next_crash_safe_point_participation: AtomicU64::new(1),
             thread_keyring: Mutex::new(None),
         })
     }
@@ -4525,7 +4530,7 @@ impl Task {
             // safe point. Say so at the source rather than leaving a fatal
             // sibling's quorum to infer it from a membership snapshot it took
             // before the retirement.
-            thread.leave_crash_safe_point_participation();
+            thread.revoke_crash_safe_point_participation();
         }
         retired
     }
@@ -5230,6 +5235,45 @@ impl Drop for ThreadExecutionLease {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CrashSafePointParticipationId(NonZeroU64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum CrashSafePointParticipationError {
+    #[error("thread {thread:?} already participates in a crash safe point")]
+    AlreadyActive { thread: ThreadKey },
+    #[error("thread {thread:?} exhausted crash safe-point participation identities")]
+    IdentityExhausted { thread: ThreadKey },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CrashSafePointRelease {
+    Released,
+    AlreadyRevoked,
+    Superseded,
+}
+
+pub(crate) struct CrashSafePointParticipation {
+    thread: Arc<Thread>,
+    id: CrashSafePointParticipationId,
+}
+
+impl CrashSafePointParticipation {
+    #[cfg(test)]
+    fn id_for_test(&self) -> CrashSafePointParticipationId {
+        self.id
+    }
+}
+
+impl Drop for CrashSafePointParticipation {
+    fn drop(&mut self) {
+        match self.thread.release_crash_safe_point_participation(self.id) {
+            CrashSafePointRelease::Released | CrashSafePointRelease::AlreadyRevoked => {}
+            CrashSafePointRelease::Superseded => std::process::abort(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Thread {
     key: ThreadKey,
@@ -5265,12 +5309,12 @@ pub struct Thread {
     /// suspends. Collected for core publication if a sibling crashes while
     /// this thread is not on an active vCPU lease.
     parked_registers: Mutex<Option<carrick_hal::Aarch64CoreRegisters>>,
-    /// True exactly while this thread has a live vCPU loop, and therefore can
-    /// still REACH a crash safe point. A thread published into the task graph
-    /// whose host loop was cancelled before it started, or whose loop has
-    /// already returned, is not a member of any crash quorum — waiting on one
-    /// is how a fatal sibling used to burn its whole collection deadline.
-    crash_safe_point_participant: AtomicBool,
+    /// Non-zero generation owned by the exact live executor quantum that can
+    /// still reach a crash safe point. Retirement may revoke it to zero; a
+    /// stale guard may never clear a successor's different generation.
+    crash_safe_point_participant: AtomicU64,
+    /// Next never-reused crash-safe-point participation generation.
+    next_crash_safe_point_participation: AtomicU64,
     /// `KEY_SPEC_THREAD_KEYRING`, materialised on demand.
     ///
     /// Per-THREAD, keyed by this object's exact [`ThreadKey`] rather than by a
@@ -6452,24 +6496,56 @@ impl Thread {
         *self.parked_registers.lock()
     }
 
-    /// Mark that this thread's vCPU loop is live, so it can reach a crash safe
-    /// point. Paired with [`Self::leave_crash_safe_point_participation`].
-    pub(crate) fn enter_crash_safe_point_participation(&self) {
+    /// Mint the exact generation owned by this live executor quantum.
+    pub(crate) fn enter_crash_safe_point_participation(
+        self: &Arc<Self>,
+    ) -> Result<CrashSafePointParticipation, CrashSafePointParticipationError> {
+        let raw = self
+            .next_crash_safe_point_participation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+                next.checked_add(1)
+            })
+            .map_err(|_| CrashSafePointParticipationError::IdentityExhausted {
+                thread: self.key,
+            })?;
+        let id = CrashSafePointParticipationId(
+            NonZeroU64::new(raw)
+                .ok_or(CrashSafePointParticipationError::IdentityExhausted { thread: self.key })?,
+        );
         self.crash_safe_point_participant
-            .store(true, Ordering::Release);
+            .compare_exchange(0, id.0.get(), Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| CrashSafePointParticipationError::AlreadyActive { thread: self.key })?;
+        Ok(CrashSafePointParticipation {
+            thread: Arc::clone(self),
+            id,
+        })
     }
 
-    /// Mark that this thread's vCPU loop has ended. It can never reach another
-    /// safe point, so no crash quorum may keep expecting a vote from it. Any
-    /// vote it already cast stays valid.
-    pub(crate) fn leave_crash_safe_point_participation(&self) {
-        self.crash_safe_point_participant
-            .store(false, Ordering::Release);
+    fn release_crash_safe_point_participation(
+        &self,
+        id: CrashSafePointParticipationId,
+    ) -> CrashSafePointRelease {
+        match self.crash_safe_point_participant.compare_exchange(
+            id.0.get(),
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => CrashSafePointRelease::Released,
+            Err(0) => CrashSafePointRelease::AlreadyRevoked,
+            Err(_) => CrashSafePointRelease::Superseded,
+        }
+    }
+
+    /// Revoke participation as the exact thread leaves the task graph. Its
+    /// eventual stale guard observes zero and cannot affect a successor.
+    fn revoke_crash_safe_point_participation(&self) {
+        self.crash_safe_point_participant.swap(0, Ordering::AcqRel);
     }
 
     /// Can this thread still reach a crash safe point?
     pub(crate) fn is_crash_safe_point_participant(&self) -> bool {
-        self.crash_safe_point_participant.load(Ordering::Acquire)
+        self.crash_safe_point_participant.load(Ordering::Acquire) != 0
     }
 
     /// Guest USER CPU (µs) accumulated across every execution interval.
@@ -7880,6 +7956,32 @@ mod tests {
 
         assert!(weak_task.upgrade().is_none());
         assert!(leader.task().is_none());
+    }
+
+    #[test]
+    fn stale_crash_participation_release_cannot_clear_a_successor() {
+        let fixture = Fixture::new();
+        let first = Arc::clone(&fixture.leader)
+            .enter_crash_safe_point_participation()
+            .expect("first participation");
+        let first_id = first.id_for_test();
+
+        fixture.leader.revoke_crash_safe_point_participation();
+        let second = Arc::clone(&fixture.leader)
+            .enter_crash_safe_point_participation()
+            .expect("successor participation");
+
+        assert_eq!(
+            fixture
+                .leader
+                .release_crash_safe_point_participation(first_id),
+            CrashSafePointRelease::Superseded
+        );
+        assert!(fixture.leader.is_crash_safe_point_participant());
+
+        std::mem::forget(first);
+        drop(second);
+        assert!(!fixture.leader.is_crash_safe_point_participant());
     }
 
     #[test]

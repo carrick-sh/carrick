@@ -64,7 +64,9 @@ pub use frame_inventory::{
     FrameInventoryAuthority, FrameInventoryError, FrameInventoryReserveError,
     FrameInventorySnapshot, FrameRow, MappingRow,
 };
-pub use guest_execution::{GuestExecutorCensus, GuestExecutorParticipation};
+pub use guest_execution::{
+    GuestExecutorCensus, GuestExecutorCensusError, GuestExecutorParticipation,
+};
 pub use ids::{
     CredentialsId, FileDescriptionId, FileSlotNumber, FileTableId, FsContextId, InvalidFileSlot,
     InvalidLinuxSignal, LinuxSignal, LinuxTid, MmId, ObjectIdError, ObjectIdRegistry,

@@ -1139,6 +1139,15 @@
       "rationale": "MmId raw value evaluated to zero in FrameInventoryAuthority::apply_retirement_with_receipt; violates NonZeroU64 MM identity invariant during retirement commit."
     },
     {
+      "file": "crates/carrick-runtime/src/kernel/guest_execution.rs",
+      "function": "<GuestExecutorParticipation as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "f5a32509dd5c3038ca56186d37732127ed58a94942389e7abfe557a1598968d2",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::guest_executor_census",
+      "rationale": "An exact guest-executor participation identity disappeared before its unique RAII guard dropped; continuing would undercount an admitted executor and permit unsafe stage-1 mutation."
+    },
+    {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
       "function": "next_file_slot_generation",
       "ordinal_in_function": 1,
@@ -1146,6 +1155,15 @@
       "verdict": "carrier_fault",
       "failure_domain": "kernel::file_slot_generation",
       "rationale": "FileSlot generation atomic counter overflow or zero; wrapping slot generations would cause ABA aliasing across file slot lifecycle."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "function": "<CrashSafePointParticipation as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "f022e996d54a77053ed52100ab989c1d05066cb11baf70d8fc5441b5595c941d",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::crash_safe_point_participation",
+      "rationale": "A stale crash-safe-point guard observed a different live successor generation for the same exact thread; clearing it would erase the successor, while continuing exposes overlapping executor ownership."
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",

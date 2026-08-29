@@ -262,7 +262,7 @@ pub(super) fn acquire_pt_pause(
         tid.raw(),
         i32::from(kicker.any_other_in_guest(tid)),
         waiting_vcpu_tid(kicker.poll_lease_drain(tid)),
-        census.live() as i32,
+        census.participant_count_for_probe(),
     );
 
     let start = Instant::now();

@@ -3390,7 +3390,10 @@ mod core_publication_tests {
             crate::kernel::CrashQuorum::open(std::sync::Arc::clone(context.task()), generation);
 
         // A live participant that has not answered is genuinely owed.
-        context.thread().enter_crash_safe_point_participation();
+        let participation = context
+            .thread()
+            .enter_crash_safe_point_participation()
+            .expect("crash safe-point participation");
         assert!(matches!(
             quorum.poll(),
             crate::kernel::CrashQuorumPoll::Waiting(_)
@@ -3400,7 +3403,7 @@ mod core_publication_tests {
         // but nothing may keep waiting for a note it can never write. This is
         // the `exit_group` terminal-claim loser that burned the full 10 s
         // collection deadline and then published no core at all.
-        context.thread().leave_crash_safe_point_participation();
+        drop(participation);
         let crate::kernel::CrashQuorumPoll::Complete(files) = quorum.poll() else {
             panic!("a departed thread must not be expected")
         };
@@ -3415,7 +3418,10 @@ mod core_publication_tests {
         let context = dispatcher.capture_one_task_context().expect("context");
         let quorum =
             crate::kernel::CrashQuorum::open(std::sync::Arc::clone(context.task()), generation);
-        context.thread().enter_crash_safe_point_participation();
+        let _participation = context
+            .thread()
+            .enter_crash_safe_point_participation()
+            .expect("crash safe-point participation");
         assert!(matches!(
             quorum.poll(),
             crate::kernel::CrashQuorumPoll::Waiting(_)
