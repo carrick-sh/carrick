@@ -174,6 +174,12 @@ acquisition path; frame-COW-only pauses carry no mutation identity and abort if
 misrouted. The test issuer now binds its real pause census directly to the
 coordinator MM without crossing the thread-ID domain.
 
+The same independent reviewer re-ran the repaired immutable range at
+`44cae1833` and returned no findings, `SPEC COMPLIANCE APPROVED`, and
+`CODE QUALITY APPROVED`. Its fresh receipts include mutation 2/2, exact pause
+16/16, checker fixtures 20 negative/17 positive, the single expected Task 8
+production finding, targeted runtime Clippy, formatting, and diff checks.
+
 ## Authority construction graph
 
 ```text
