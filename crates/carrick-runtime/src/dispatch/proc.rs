@@ -4331,11 +4331,13 @@ impl SyscallDispatcher {
     /// remote→local, writev copies local→remote.
     ///
     /// Validation mirrors the kernel's `process_vm_rw`: `flags != 0` → EINVAL
-    /// (only 0 is defined); both iovec arrays are imported up front so an
-    /// `iov_len` overflow → EINVAL and a bad array pointer → EFAULT before any
-    /// copy; the target `pid` is resolved against carrick's guest process model
-    /// (no such task → ESRCH); an unprivileged caller that does not own the
-    /// target → EPERM (ptrace_may_access).
+    /// (only 0 is defined); the local array is imported first and an empty local
+    /// transfer returns zero before the remote array or target is consulted, as
+    /// measured by the clean-room oracle. Otherwise each imported array rejects
+    /// `iov_len` overflow with EINVAL and a bad array pointer with EFAULT before
+    /// any copy. The target `pid` is then resolved against carrick's guest
+    /// process model (no such task → ESRCH); an unprivileged caller that does
+    /// not own the target → EPERM (ptrace_may_access).
     ///
     /// Transfer memory between local and remote address spaces (`process_vm_readv` / `process_vm_writev`).
     ///
@@ -4430,13 +4432,10 @@ impl SyscallDispatcher {
         });
         let relation = match relation {
             Some(Ok(r)) => r,
-            Some(Err(
-                crate::kernel::MmAccessError::UnknownTask(_)
-                | crate::kernel::MmAccessError::StaleContext(_),
-            )) => {
-                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+            Some(Err(error)) => {
+                return Ok(DispatchOutcome::errno(process_vm_foreign_mm_errno(&error)));
             }
-            Some(Err(_)) | None => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+            None => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
         };
 
         match relation {
@@ -4545,6 +4544,13 @@ impl SyscallDispatcher {
                 }
             }
         }
+    }
+}
+
+fn process_vm_foreign_mm_errno(error: &crate::kernel::MmAccessError) -> LinuxErrno {
+    match error {
+        crate::kernel::MmAccessError::UnknownTask(_) => LINUX_ESRCH,
+        _ => LINUX_EFAULT,
     }
 }
 
@@ -5565,6 +5571,23 @@ mod kernel_process_dispatch_tests {
             ),
             DispatchOutcome::errno(LINUX_EFAULT),
             "wrong caller lease authority must fail closed with EFAULT",
+        );
+    }
+
+    #[test]
+    fn process_vm_foreign_mm_errno_distinguishes_target_from_caller_staleness() {
+        let (_lane, _dispatcher, _process, root, _lease) = bound_dispatcher(61_077);
+        let key = root.task().key();
+
+        assert_eq!(
+            process_vm_foreign_mm_errno(&crate::kernel::MmAccessError::UnknownTask(key)),
+            LINUX_ESRCH,
+            "only a missing target is ESRCH",
+        );
+        assert_eq!(
+            process_vm_foreign_mm_errno(&crate::kernel::MmAccessError::StaleContext(key)),
+            LINUX_EFAULT,
+            "stale caller context is an authority failure, not a missing target",
         );
     }
 
