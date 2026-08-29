@@ -1120,7 +1120,7 @@ mod tests {
     #[derive(Debug)]
     struct MutableFixtureBackend {
         binding: MmBinding,
-        backend_revision: AtomicU64,
+        backend_revision: Arc<AtomicU64>,
         vma_revision: AtomicU64,
         inventory_revision: AtomicU64,
         mapping: parking_lot::RwLock<carrick_hal::MappingId>,
@@ -1132,7 +1132,7 @@ mod tests {
             let root = Stage1Root::for_aarch64_4k(Gpa(0xa000)).expect("aligned stage-1 root");
             Arc::new(Self {
                 binding: MmBinding::for_aarch64(asid, root),
-                backend_revision: AtomicU64::new(41),
+                backend_revision: Arc::new(AtomicU64::new(41)),
                 vma_revision: AtomicU64::new(43),
                 inventory_revision: AtomicU64::new(47),
                 mapping: parking_lot::RwLock::new(carrick_hal::MappingId::from_kernel_allocation(
@@ -1208,6 +1208,9 @@ mod tests {
         AdvancedBackend,
         AdvancedVma,
         AdvancedInventory,
+        PostCopyError,
+        WrongWriteReceipt,
+        AdvancedBackendAfterWrite,
     }
 
     #[derive(Debug)]
@@ -1220,6 +1223,7 @@ mod tests {
         frame: carrick_hal::FrameId,
         physical_base: Gpa,
         physical_len: u64,
+        post_write_backend_revision: Option<Arc<AtomicU64>>,
     }
 
     struct OwnerSigningOracleTransport {
@@ -1267,6 +1271,7 @@ mod tests {
         frame: carrick_hal::FrameId,
         physical_base: Gpa,
         physical_len: u64,
+        post_write_backend_revision: Option<Arc<AtomicU64>>,
     }
 
     #[derive(Debug)]
@@ -1489,6 +1494,22 @@ mod tests {
                 return Err(ForeignMmTransportError::Retry);
             }
             self.bytes.lock()[..src.len()].copy_from_slice(src);
+            if self.fault == MockCowFault::PostCopyError {
+                return Err(ForeignMmTransportError::OwnerStale);
+            }
+            if self.fault == MockCowFault::AdvancedBackendAfterWrite {
+                self.post_write_backend_revision
+                    .as_ref()
+                    .expect("post-write backend revision fixture")
+                    .fetch_add(1, Ordering::AcqRel);
+            }
+            let owner = if self.fault == MockCowFault::WrongWriteReceipt {
+                carrick_hal::ForeignOwnerGeneration::from_backend_counter(
+                    NonZeroU64::new(cow.owner_generation().raw_for_probe() + 1).unwrap(),
+                )
+            } else {
+                cow.owner_generation()
+            };
             Ok(Box::new(MockWriteReceipt(MockCowReceipt {
                 mm: cow.mm(),
                 start: va,
@@ -1500,7 +1521,7 @@ mod tests {
                 frame: cow.frame(),
                 physical_base: cow.physical_base(),
                 physical_len: cow.physical_len(),
-                owner: cow.owner_generation(),
+                owner,
                 kernel_proof: carrick_hal::ForeignCowKernelProof::from_runtime_authority(Box::new(
                     self.proof.clone(),
                 )),
@@ -1524,6 +1545,7 @@ mod tests {
                 frame: self.frame,
                 physical_base: self.physical_base,
                 physical_len: self.physical_len,
+                post_write_backend_revision: self.post_write_backend_revision.clone(),
             }))
         }
     }
@@ -1822,6 +1844,8 @@ mod tests {
                 frame,
                 physical_base,
                 physical_len,
+                post_write_backend_revision: (fault == MockCowFault::AdvancedBackendAfterWrite)
+                    .then(|| Arc::clone(&backend.backend_revision)),
             })),
         );
         let (_stage1_pool, stage1) = crate::hvpatch::Stage1MmPool::new_root_for_tests(0x8000, 4)
@@ -1894,6 +1918,7 @@ mod tests {
                 frame,
                 physical_base,
                 physical_len,
+                post_write_backend_revision: None,
             })),
         );
         child
@@ -2823,6 +2848,50 @@ mod tests {
             ));
         });
         assert_eq!(&*bytes.lock(), b"same");
+    }
+
+    fn assert_foreign_write_failure_is_atomic(pid: i32, marker: u64, fault: MockCowFault) {
+        let (kernel, root) = bootstrap(pid);
+        let execution = execution_lease(&root, marker);
+        let (child, _backend, _owner, bytes) = cow_fixture(&kernel, &root, pid + 1, fault);
+        let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
+        let range = foreign.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
+
+        let result = with_foreign_mutation(&foreign, |mutation| {
+            let cow = super::MmAccessAuthority::new()
+                .break_foreign_cow(mutation, &foreign, range)
+                .expect("prepare exact child COW");
+            super::MmAccessAuthority::new().write_foreign(cow, b"edit")
+        });
+
+        assert!(
+            result.is_err(),
+            "fault fixture must report failure: {fault:?}"
+        );
+        assert_eq!(
+            &*bytes.lock(),
+            b"same",
+            "a reported failure must leave target bytes unchanged: {fault:?}",
+        );
+    }
+
+    #[test]
+    fn foreign_write_transport_error_cannot_follow_target_mutation() {
+        assert_foreign_write_failure_is_atomic(31_150, 150, MockCowFault::PostCopyError);
+    }
+
+    #[test]
+    fn foreign_write_receipt_rejection_cannot_follow_target_mutation() {
+        assert_foreign_write_failure_is_atomic(31_160, 160, MockCowFault::WrongWriteReceipt);
+    }
+
+    #[test]
+    fn foreign_write_revision_recheck_cannot_follow_target_mutation() {
+        assert_foreign_write_failure_is_atomic(
+            31_170,
+            170,
+            MockCowFault::AdvancedBackendAfterWrite,
+        );
     }
 
     #[test]
