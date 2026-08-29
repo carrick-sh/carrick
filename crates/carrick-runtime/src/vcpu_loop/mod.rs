@@ -7099,7 +7099,11 @@ where
             // narrower question and freezes the empty sibling lease set through
             // the complete live-memory snapshot. CrashQuorum remains the sole
             // register-collection predicate.
-            if context.task().threads().len() > 1 {
+            let crash_participants = context
+                .task()
+                .crash_barrier_participants(context.thread().key())
+                .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+            if crash_participants.requires_quiesce() {
                 barrier.set_quiescing();
                 quiesced = true;
             }
@@ -7322,8 +7326,10 @@ where
             // thread WITHDREW from the quorum — parked where its register file
             // is unreadable — which is a real, bounded fidelity gap and is
             // reported rather than hidden behind a failed-closed core.
-            let required_threads =
-                u64::try_from(context.task().threads().len()).unwrap_or(u64::MAX);
+            let required_threads = context
+                .task()
+                .core_note_participants()
+                .required_note_count_for_probe();
             let thread_count = u64::try_from(threads.len()).unwrap_or(u64::MAX);
             let mapping_count = u64::try_from(mappings.len()).unwrap_or(u64::MAX);
             let region_count = u64::try_from(regions.len()).unwrap_or(u64::MAX);
@@ -11206,7 +11212,7 @@ mod tests {
         assert_eq!(sibling.task().key(), root.task().key());
         assert!(
             include_str!("quiesce.rs")
-                .contains("parent_context.task().threads().len().saturating_sub(1)")
+                .contains("fork_barrier_participants(parent_context.thread().key())")
         );
     }
 
