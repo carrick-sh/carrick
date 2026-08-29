@@ -8,47 +8,52 @@
 //! > is any OTHER thread able to run guest instructions before my mutation
 //! > completes?
 //!
-//! and that is a MEMBERSHIP question about vCPU loops. It is emphatically not
-//! [`carrick_hal::VcpuRegistry::count`], which counts live vCPU LEASES. The two
-//! populations diverge for exactly the threads that matter: a sibling parked in
-//! a futex, an `epoll_wait`, or a blocking fd wait has already released its
-//! lease and unregistered, so a two-thread process reads a lease count of 1 —
-//! yet a host fd readying, an `EVFILT_TIMER`, a cross-process shared-futex wake
-//! or the signal pump returns that sibling to guest without asking the mutator
-//! for permission. Keying the RAISE decision on the lease count therefore left
-//! the barrier down for precisely the thread that would go on to walk the
-//! half-edited structure.
+//! and that is a MEMBERSHIP question about active guest execution.
 //!
-//! The lease count remains the right question for the DRAIN that follows —
-//! "has everyone stopped yet?" — and the drains keep using it. Only the raise
-//! decision moves here.
+//! [`GuestExecutorCensus`] tracks live guest executor participation for one
+//! Linux process. When a thread suspends (for example on a futex, `epoll_wait`,
+//! or host blocking wait), suspension drops its [`GuestExecutorParticipation`]
+//! via `leave_executor`. Blocked logical loops do not remain in the census while
+//! suspended.
+//!
+//! Upon waking and seeking initial admission or re-admission to execute guest
+//! code, a thread enters [`GuestExecutorCensus`] before attempting vCPU
+//! registration (`enter_guest_executor_then_register`). If a barrier or lease
+//! drain freeze is active, registration admission is denied, and the thread
+//! suspends again (dropping its participation). This ordering guarantees that
+//! any peer thread attempting to enter guest execution is visible in the census
+//! before its registration can be published.
+//!
+//! Stop-the-world barriers use [`GuestExecutorCensus::has_peer_executor`] to
+//! decide whether to raise the barrier, while drain convergence uses
+//! identity-aware vCPU lease drain polling and `any_other_in_guest`.
 //!
 //! Membership is maintained by [`GuestExecutorParticipation`], an RAII guard
-//! held for exactly the lifetime of one vCPU loop, in the same spirit as the
-//! crash-capture quorum's participant flag: a thread published into the task
-//! graph whose host loop was cancelled before it started, and a loop that has
-//! already returned, are both outside the population. The guard carries the
-//! crash-safe-point facet too, so the two cannot drift — they are one fact
-//! ("this thread's vCPU loop is live") read by two subsystems.
+//! held for the lifetime of active guest execution participation, in the same
+//! spirit as the crash-capture quorum's participant flag: a thread published
+//! into the task graph whose host loop was cancelled before it started, and a
+//! thread that has suspended or returned, are both outside the population. The
+//! guard carries the crash-safe-point facet too, so the two cannot drift — they
+//! are one fact ("this thread actively participates in guest execution") read by
+//! two subsystems.
 //!
 //! Residual window, stated plainly: participation begins when the vCPU loop
-//! starts, not when `clone` publishes the thread into the task graph. A thread
-//! between publication and loop start is not yet counted. It also cannot yet
-//! execute guest code, and the fork lane separately closes clone admission
+//! enters execution, not when `clone` publishes the thread into the task graph.
+//! A thread between publication and loop start is not yet counted. It also cannot
+//! yet execute guest code, and the fork lane separately closes clone admission
 //! (`close_for_fork`) before it quiesces, but the page-table lane has no such
-//! closure. That window is unchanged from the lease-count predicate this
-//! replaces and is not addressed here.
+//! closure.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::objects::ThreadRef;
 
-/// Live vCPU loops for one Linux process — the threads that can execute guest
-/// code on its behalf.
+/// Live guest executors for one Linux process — the threads actively
+/// participating in guest execution on its behalf.
 ///
-/// Scope is one Linux process because that is the scope of the vCPU registry it
-/// replaces: an HVPatch fork child receives a fresh kicker
+/// Scope is one Linux process because that is the scope of the vCPU registry:
+/// an HVPatch fork child receives a fresh kicker
 /// (`ThreadedEngine::fresh_fork_kicker`) alongside its own `KernelState`, and a
 /// legacy `libc::fork` child gets both by copying the parent's process. Threads
 /// of one thread group share both.
@@ -125,10 +130,8 @@ mod tests {
     }
 
     #[test]
-    fn a_peer_that_released_its_vcpu_lease_still_counts() {
-        // The whole defect: the peer here is the parked sibling. It holds no
-        // vCPU lease and is absent from the kicker, but its loop is live and it
-        // can be woken back into guest at any moment.
+    fn a_peer_that_releases_participation_leaves_the_census() {
+        // When a peer suspends, it drops its participation and leaves the census.
         let census = Arc::new(GuestExecutorCensus::default());
         let _mutator = census.enter(None);
         let parked_sibling = census.enter(None);

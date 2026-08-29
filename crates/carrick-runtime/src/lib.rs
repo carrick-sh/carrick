@@ -1483,8 +1483,8 @@ pub mod io_wait {
                 // kick as spurious, re-entering the same wait. The `block_mask`
                 // keeps a genuinely-blocked signal parked (sigwait/ppoll mask).
                 // A FORK-QUIESCE (or execve thread-group replacement) nudge must
-                // ALSO surface as Interrupted: the forker now waits for the
-                // kicker count to drain to 1, and a ppoll-parked waiter that
+                // ALSO surface as Interrupted: the forker now waits for sibling
+                // vCPU leases to drain, and a ppoll-parked waiter that
                 // swallows the nudge as "spurious" never reaches
                 // `release_and_park_vcpu_for_fork` — with `wait_proc_exit`'s
                 // re-poll loop that deadlocked the whole guest (forker waiting

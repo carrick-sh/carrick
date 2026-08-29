@@ -5139,16 +5139,18 @@ mod real {
         /// these probes let a `carrick trace` PROVE the stop-the-world engages and
         /// converges (rather than guessing).
         ///  * `pt__pause__begin`: an editing vCPU became the sole coordinator.
-        ///    `tid` editor, `others_in_guest` siblings still walking tables at
-        ///    entry, `leases` live vCPU LEASES, `executors` live vCPU LOOPS.
+        ///    `coordinator_tid` coordinator tid, `other_in_guest` other-in-guest
+        ///    boolean (1 if any sibling is still walking tables at entry, 0
+        ///    otherwise), `waiting_sibling_tid` exact waiting sibling tid or zero
+        ///    when complete, `executor_census` live executor census.
         ///    The last two are different populations and the difference is the
         ///    point: a sibling parked in a futex / epoll / fd wait has released
-        ///    its lease and left the registry, so `leases` can read 1 while
-        ///    `executors` reads 2. `executors` is what the RAISE decision is
-        ///    keyed on (`kernel::guest_execution`); `leases` is what the drain
-        ///    below must still see fall. A row with `leases == 1` and
-        ///    `executors > 1` is a pause that the old lease-keyed predicate
-        ///    would have skipped entirely.
+        ///    its lease and left the registry, so `waiting_sibling_tid` can read 0
+        ///    while `executor_census` reads 2. `executor_census` is what the RAISE
+        ///    decision is keyed on (`kernel::guest_execution`); `waiting_sibling_tid`
+        ///    is what the drain observes at coordinator entry. A row with
+        ///    `waiting_sibling_tid == 0` and `executor_census > 1` is a pause with
+        ///    peer executor and no sibling lease.
         ///  * `pt__pause__ready`: all siblings left guest; the edit may proceed.
         ///    `spins` wait iterations, `wait_us` microseconds waited.
         ///  * `pt__pause__timeout`: the convergence deadline was hit. MUST never
@@ -6803,8 +6805,18 @@ mod real {
         carrick_usdt::supervisor__child__exit!(|| (pid, status));
     }
 
-    pub fn pt_pause_begin(tid: i32, others_in_guest: i32, leases: i32, executors: i32) {
-        carrick_usdt::pt__pause__begin!(|| (tid, others_in_guest, leases, executors));
+    pub fn pt_pause_begin(
+        coordinator_tid: i32,
+        other_in_guest: i32,
+        waiting_sibling_tid: i32,
+        executor_census: i32,
+    ) {
+        carrick_usdt::pt__pause__begin!(|| (
+            coordinator_tid,
+            other_in_guest,
+            waiting_sibling_tid,
+            executor_census,
+        ));
     }
 
     pub fn pt_pause_ready(tid: i32, spins: i32, wait_us: i64) {
@@ -7665,7 +7677,12 @@ mod stub {
     stub!(supervisor_child_ready(runtime_pid: i32));
     stub!(supervisor_foreground_pgrp(pgid: i32, errno: i32));
     stub!(supervisor_child_exit(pid: i32, status: i32));
-    stub!(pt_pause_begin(tid: i32, others_in_guest: i32, leases: i32, executors: i32));
+    stub!(pt_pause_begin(
+        coordinator_tid: i32,
+        other_in_guest: i32,
+        waiting_sibling_tid: i32,
+        executor_census: i32
+    ));
     stub!(pt_pause_ready(tid: i32, spins: i32, wait_us: i64));
     stub!(pt_pause_timeout(tid: i32, wait_us: i64));
     stub!(pt_pause_election_timeout(tid: i32, wait_us: i64));
