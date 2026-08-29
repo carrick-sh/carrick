@@ -968,6 +968,17 @@ pub fn invalidate_worker_asid(
     Aarch64EngineCore::<HvfAarch64Vmm>::invalidate_asid_on_vcpu(vcpu, asid, carrier_root)
 }
 
+/// Service an exact-ASID generation on a loaded owner vCPU without detaching
+/// the task or reacquiring runtime page-table exclusion.
+pub fn invalidate_loaded_asid(engine: &mut HvfAarch64Engine, asid: u16) -> Result<(), TrapError> {
+    let carrier_root = engine.vm().state.carrier_maintenance_root()?;
+    Aarch64EngineCore::<HvfAarch64Vmm>::invalidate_asid_on_vcpu(
+        engine.vcpu_mut(),
+        asid,
+        carrier_root,
+    )
+}
+
 pub fn persistent_executor_factory_authority(
     engine: &mut HvfAarch64Engine,
 ) -> Result<HvpatchPersistentExecutorFactoryAuthority, TrapError> {

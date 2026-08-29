@@ -34,6 +34,8 @@ pub struct MmToken {
     mm: Arc<Mm>,
     snapshot: MmBackendSnapshot,
     foreign_lease: Option<carrick_hal::ForeignMmLeaseEndpoint>,
+    #[allow(dead_code)] // Canonical process_vm consumer lands in Task 8.
+    foreign_mutation: Option<crate::dispatch::mm_mutation::ForeignMmMutationAuthority>,
 }
 
 impl MmToken {
@@ -242,6 +244,38 @@ impl ForeignMm {
     ) -> Result<Option<MmReadRange<'_>>, MmAccessError> {
         self.token.read_range(start, len)
     }
+
+    pub fn write_range(
+        &self,
+        start: GuestVa,
+        len: usize,
+    ) -> Result<Option<MmWriteRange<'_>>, MmAccessError> {
+        self.token.write_range(start, len)
+    }
+}
+
+/// Single-use runtime witness that one exact foreign-MM range now names a
+/// private, authenticated owner. Its fields and constructor stay inside the
+/// MM facade; HAL receipts alone cannot manufacture write authority.
+#[derive(Debug)]
+#[allow(dead_code)] // Minted and consumed by the canonical Task 8 syscall path.
+pub struct CowBroken<'mm> {
+    range: MmWriteRange<'mm>,
+    snapshot: ProjectedForeignMmSnapshot,
+    transport: Box<dyn carrick_hal::ForeignCowReceipt>,
+}
+
+/// Authenticated completion of one foreign copy through a consumed COW
+/// witness.
+#[derive(Debug)]
+pub struct ForeignWriteReceipt {
+    transport: Box<dyn carrick_hal::ForeignMmWriteReceipt>,
+}
+
+impl ForeignWriteReceipt {
+    pub fn bytes_written(&self) -> usize {
+        self.transport.bytes_written()
+    }
 }
 
 /// Authenticated completion of a private runtime foreign read.
@@ -272,6 +306,25 @@ impl MmAccessAuthority {
 
     pub(crate) fn new() -> Self {
         Self
+    }
+
+    #[allow(dead_code)] // Canonical process_vm consumer lands in Task 8.
+    pub fn with_foreign_mutation<T>(
+        &self,
+        mm: &ForeignMm,
+        tid: carrick_hal::ThreadId,
+        operation: impl FnOnce(
+            &mut crate::dispatch::mm_mutation::MmMutationGuard<'_>,
+        ) -> Result<T, MmAccessError>,
+    ) -> Result<T, MmAccessError> {
+        let authority = mm
+            .token
+            .foreign_mutation
+            .as_ref()
+            .ok_or(MmAccessError::MissingForeignMutationAuthority(mm.mm_id()))?;
+        authority
+            .with_guard(tid, operation)
+            .map_err(|error| MmAccessError::ForeignMutation(error.to_string()))?
     }
 
     #[allow(dead_code)] // Task 8 is the first syscall consumer.
@@ -338,6 +391,144 @@ impl MmAccessAuthority {
             return Ok(ForeignReadReceipt { transport: receipt });
         }
         Err(MmAccessError::ForeignReadRetryExhausted)
+    }
+
+    #[allow(dead_code)] // Canonical process_vm consumer lands in Task 8.
+    pub fn break_foreign_cow<'mm>(
+        &self,
+        mutation: &mut crate::dispatch::mm_mutation::MmMutationGuard<'_>,
+        mm: &'mm ForeignMm,
+        range: MmWriteRange<'mm>,
+    ) -> Result<CowBroken<'mm>, MmAccessError> {
+        if !Arc::ptr_eq(&range.token.mm, &mm.token.mm) || range.token.task != mm.token.task {
+            return Err(MmAccessError::ForeignRangeAuthorityMismatch);
+        }
+        let target_mutation = mm
+            .token
+            .foreign_mutation
+            .as_ref()
+            .ok_or(MmAccessError::MissingForeignMutationAuthority(mm.mm_id()))?;
+        if !target_mutation.authorizes(mutation) {
+            return Err(MmAccessError::ForeignMutationAuthorityMismatch);
+        }
+        let deadline = Instant::now() + Self::OVERALL_DEADLINE;
+        let lease = mm
+            .token
+            .foreign_lease
+            .as_ref()
+            .ok_or(MmAccessError::MissingForeignTransport(mm.mm_id()))?;
+        let live = RetainedMmLiveAuthority {
+            mm: Arc::clone(&mm.token.mm),
+        };
+        let before = snapshot_backend(&mm.token.mm, deadline)?;
+        validate_snapshot_vmas(&before)?;
+        validate_range_in_snapshot(&before, range.start, range.len, RangeAccess::Write)?;
+        let requested = ProjectedForeignMmSnapshot::from_backend(mm.mm_id(), &before)?;
+        let receipt = mutation.with_host_alias(|invalidator| {
+            lease.break_cow(
+                &live,
+                invalidator,
+                &requested,
+                range.start,
+                range.len.get(),
+                deadline,
+            )
+        });
+        let receipt = match receipt {
+            Ok(receipt) => receipt,
+            Err(carrick_hal::ForeignMmTransportError::TimedOut) => {
+                return Err(MmAccessError::ForeignWriteTimedOut);
+            }
+            Err(error) => return Err(MmAccessError::ForeignTransport(error)),
+        };
+        let after = ProjectedForeignMmSnapshot::from_backend(
+            mm.mm_id(),
+            &snapshot_backend(&mm.token.mm, deadline)?,
+        )?;
+        if receipt.mm() != after.mm
+            || receipt.range_start() != range.start
+            || receipt.range_len() != range.len.get()
+            || receipt.backend_revision() != after.backend_revision
+            || receipt.vma_revision() != after.vma_revision
+            || receipt.frame_inventory_revision() != after.frame_inventory_revision
+            || receipt.physical_len() == 0
+            || receipt.owner_generation().raw_for_probe() == 0
+        {
+            return Err(MmAccessError::ForeignCowReceiptMismatch);
+        }
+        Ok(CowBroken {
+            range,
+            snapshot: after,
+            transport: receipt,
+        })
+    }
+
+    #[allow(dead_code)] // Canonical process_vm consumer lands in Task 8.
+    pub fn write_foreign(
+        &self,
+        witness: CowBroken<'_>,
+        src: &[u8],
+    ) -> Result<ForeignWriteReceipt, MmAccessError> {
+        if src.len() != witness.range.len.get() {
+            return Err(MmAccessError::SourceLengthMismatch {
+                range: witness.range.len.get(),
+                source_len: src.len(),
+            });
+        }
+        let deadline = Instant::now() + Self::OVERALL_DEADLINE;
+        let mm = &witness.range.token.mm;
+        let before = snapshot_backend(mm, deadline)?;
+        validate_snapshot_vmas(&before)?;
+        validate_range_in_snapshot(
+            &before,
+            witness.range.start,
+            witness.range.len,
+            RangeAccess::Write,
+        )?;
+        let snapshot = ProjectedForeignMmSnapshot::from_backend(mm.id(), &before)?;
+        if snapshot != witness.snapshot {
+            return Err(MmAccessError::StaleCowBroken);
+        }
+        let lease = witness
+            .range
+            .token
+            .foreign_lease
+            .as_ref()
+            .ok_or(MmAccessError::MissingForeignTransport(mm.id()))?;
+        let live = RetainedMmLiveAuthority { mm: Arc::clone(mm) };
+        let receipt = match lease.write(
+            &live,
+            &snapshot,
+            witness.transport.as_ref(),
+            witness.range.start,
+            src,
+            deadline,
+        ) {
+            Ok(receipt) => receipt,
+            Err(carrick_hal::ForeignMmTransportError::TimedOut) => {
+                return Err(MmAccessError::ForeignWriteTimedOut);
+            }
+            Err(error) => return Err(MmAccessError::ForeignTransport(error)),
+        };
+        let after =
+            ProjectedForeignMmSnapshot::from_backend(mm.id(), &snapshot_backend(mm, deadline)?)?;
+        if after != snapshot {
+            return Err(MmAccessError::StaleCowBroken);
+        }
+        if receipt.mm() != snapshot.mm
+            || receipt.range_start() != witness.range.start
+            || receipt.range_len() != witness.range.len.get()
+            || receipt.bytes_written() != src.len()
+            || receipt.backend_revision() != snapshot.backend_revision
+            || receipt.vma_revision() != snapshot.vma_revision
+            || receipt.frame_inventory_revision() != snapshot.frame_inventory_revision
+            || receipt.mapping() != witness.transport.mapping()
+            || receipt.frame() != witness.transport.frame()
+            || receipt.owner_generation() != witness.transport.owner_generation()
+        {
+            return Err(MmAccessError::ForeignWriteReceiptMismatch);
+        }
+        Ok(ForeignWriteReceipt { transport: receipt })
     }
 }
 
@@ -470,12 +661,18 @@ pub enum MmAccessError {
     KernelHidden { address: GuestVa },
     #[error("foreign read range is not bound to the supplied retained MM")]
     ForeignRangeAuthorityMismatch,
+    #[error("page-table mutation authority does not name the exact foreign MM")]
+    ForeignMutationAuthorityMismatch,
     #[error("foreign read destination length {destination} does not match range length {range}")]
     DestinationLengthMismatch { range: usize, destination: usize },
     #[error("MM {0:?} lacks typed HVPatch foreign-read snapshot domains")]
     IncompleteForeignSnapshot(MmId),
     #[error("MM {0:?} has no carrier foreign-read transport")]
     MissingForeignTransport(MmId),
+    #[error("MM {0:?} has no exact target-MM mutation authority")]
+    MissingForeignMutationAuthority(MmId),
+    #[error("foreign MM mutation authority failed: {0}")]
+    ForeignMutation(String),
     #[error(transparent)]
     ForeignTransport(carrick_hal::ForeignMmTransportError),
     #[error("foreign MM transport receipt does not authenticate the requested snapshot")]
@@ -484,6 +681,16 @@ pub enum MmAccessError {
     ForeignReadRetryExhausted,
     #[error("foreign MM read exceeded its overall deadline budget")]
     ForeignReadTimedOut,
+    #[error("foreign COW receipt does not authenticate the exact MM/range/revisions")]
+    ForeignCowReceiptMismatch,
+    #[error("foreign write receipt does not authenticate the consumed COW witness")]
+    ForeignWriteReceiptMismatch,
+    #[error("foreign write source length {source_len} does not match range length {range}")]
+    SourceLengthMismatch { range: usize, source_len: usize },
+    #[error("foreign COW witness no longer matches the three live MM revisions")]
+    StaleCowBroken,
+    #[error("foreign MM write exceeded its overall deadline budget")]
+    ForeignWriteTimedOut,
 }
 
 impl KernelContext {
@@ -588,11 +795,19 @@ fn snapshot_token(
     } else {
         None
     };
+    let foreign_mutation = if retain_foreign {
+        let permit = ForeignEndpointPermit { _private: () };
+        mm.foreign_mm_mutation_authority(&permit, deadline)
+            .ok_or(MmAccessError::ForeignReadTimedOut)?
+    } else {
+        None
+    };
     Ok(MmToken {
         task,
         mm,
         snapshot,
         foreign_lease,
+        foreign_mutation,
     })
 }
 
@@ -631,7 +846,7 @@ fn validate_snapshot_vmas(snapshot: &MmBackendSnapshot) -> Result<(), MmAccessEr
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU16;
+    use std::num::{NonZeroU16, NonZeroU64};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
@@ -640,8 +855,8 @@ mod tests {
     use carrick_guest_mem::{Gpa, GuestVa};
     use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
     use carrick_hal::{
-        ForeignMmReadLease, ForeignMmReadReceipt, ForeignMmSnapshot, ForeignMmTransport,
-        ForeignMmTransportError, ThreadId,
+        ForeignCowReceipt, ForeignMmReadLease, ForeignMmReadReceipt, ForeignMmSnapshot,
+        ForeignMmTransport, ForeignMmTransportError, ForeignMmWriteReceipt, ThreadId,
     };
 
     use super::super::objects::{
@@ -829,6 +1044,300 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct MutableFixtureBackend {
+        binding: MmBinding,
+        backend_revision: AtomicU64,
+        vma_revision: AtomicU64,
+        inventory_revision: AtomicU64,
+    }
+
+    impl MutableFixtureBackend {
+        fn new() -> Arc<Self> {
+            let asid = Asid::from_registry_allocation(NonZeroU16::new(9).expect("nonzero ASID"));
+            let root = Stage1Root::for_aarch64_4k(Gpa(0xa000)).expect("aligned stage-1 root");
+            Arc::new(Self {
+                binding: MmBinding::for_aarch64(asid, root),
+                backend_revision: AtomicU64::new(41),
+                vma_revision: AtomicU64::new(43),
+                inventory_revision: AtomicU64::new(47),
+            })
+        }
+
+        fn advance(&self, domain: usize) {
+            match domain {
+                0 => &self.backend_revision,
+                1 => &self.vma_revision,
+                _ => &self.inventory_revision,
+            }
+            .fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    impl MmBackend for MutableFixtureBackend {
+        fn snapshot(&self, _deadline: Instant) -> Result<MmBackendSnapshot, SnapshotError> {
+            Ok(MmBackendSnapshot {
+                revision: self.backend_revision.load(Ordering::Acquire),
+                binding: self.binding,
+                vmas: vec![VmaSummary {
+                    start: GuestVa(0x3000),
+                    end: GuestVa(0x4000),
+                    access: VmaAccess {
+                        readable: true,
+                        writable: true,
+                        executable: false,
+                        kernel_visible: true,
+                    },
+                }],
+                vma_revision: Some(VmaRevision::from_authority_raw(
+                    self.vma_revision.load(Ordering::Acquire),
+                )),
+                mapping_ids: vec![carrick_hal::MappingId::from_kernel_allocation(
+                    NonZeroU64::new(53).unwrap(),
+                )],
+                frame_inventory_revision: Some(self.inventory_revision.load(Ordering::Acquire)),
+            })
+        }
+
+        fn revision(&self) -> u64 {
+            self.backend_revision.load(Ordering::Acquire)
+        }
+
+        fn vma_revision(&self, _deadline: Instant) -> Result<Option<VmaRevision>, SnapshotError> {
+            Ok(Some(VmaRevision::from_authority_raw(
+                self.vma_revision.load(Ordering::Acquire),
+            )))
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum MockCowFault {
+        None,
+        WrongMm,
+        WrongRange,
+        AdvancedBackend,
+        AdvancedVma,
+        AdvancedInventory,
+    }
+
+    #[derive(Debug)]
+    struct MockCowTransport {
+        owner_generation: Arc<AtomicU64>,
+        bytes: Arc<parking_lot::Mutex<Vec<u8>>>,
+        fault: MockCowFault,
+    }
+
+    #[derive(Debug)]
+    struct MockCowLease {
+        owner_generation: Arc<AtomicU64>,
+        bytes: Arc<parking_lot::Mutex<Vec<u8>>>,
+        fault: MockCowFault,
+    }
+
+    #[derive(Debug)]
+    struct MockCowReceipt {
+        mm: carrick_hal::ForeignMmId,
+        start: GuestVa,
+        len: usize,
+        backend: carrick_hal::ForeignBackendRevision,
+        vma: carrick_hal::ForeignVmaRevision,
+        inventory: carrick_hal::ForeignFrameInventoryRevision,
+        mapping: carrick_hal::MappingId,
+        frame: carrick_hal::FrameId,
+        owner: carrick_hal::ForeignOwnerGeneration,
+    }
+
+    impl ForeignCowReceipt for MockCowReceipt {
+        fn mm(&self) -> carrick_hal::ForeignMmId {
+            self.mm
+        }
+        fn range_start(&self) -> GuestVa {
+            self.start
+        }
+        fn range_len(&self) -> usize {
+            self.len
+        }
+        fn backend_revision(&self) -> carrick_hal::ForeignBackendRevision {
+            self.backend
+        }
+        fn vma_revision(&self) -> carrick_hal::ForeignVmaRevision {
+            self.vma
+        }
+        fn frame_inventory_revision(&self) -> carrick_hal::ForeignFrameInventoryRevision {
+            self.inventory
+        }
+        fn mapping(&self) -> carrick_hal::MappingId {
+            self.mapping
+        }
+        fn frame(&self) -> carrick_hal::FrameId {
+            self.frame
+        }
+        fn physical_base(&self) -> Gpa {
+            Gpa(0xb000)
+        }
+        fn physical_len(&self) -> u64 {
+            0x4000
+        }
+        fn owner_generation(&self) -> carrick_hal::ForeignOwnerGeneration {
+            self.owner
+        }
+    }
+
+    #[derive(Debug)]
+    struct MockWriteReceipt(MockCowReceipt);
+
+    impl ForeignMmWriteReceipt for MockWriteReceipt {
+        fn mm(&self) -> carrick_hal::ForeignMmId {
+            self.0.mm()
+        }
+        fn range_start(&self) -> GuestVa {
+            self.0.range_start()
+        }
+        fn range_len(&self) -> usize {
+            self.0.range_len()
+        }
+        fn bytes_written(&self) -> usize {
+            self.0.len
+        }
+        fn backend_revision(&self) -> carrick_hal::ForeignBackendRevision {
+            self.0.backend_revision()
+        }
+        fn vma_revision(&self) -> carrick_hal::ForeignVmaRevision {
+            self.0.vma_revision()
+        }
+        fn frame_inventory_revision(&self) -> carrick_hal::ForeignFrameInventoryRevision {
+            self.0.frame_inventory_revision()
+        }
+        fn mapping(&self) -> carrick_hal::MappingId {
+            self.0.mapping()
+        }
+        fn frame(&self) -> carrick_hal::FrameId {
+            self.0.frame()
+        }
+        fn owner_generation(&self) -> carrick_hal::ForeignOwnerGeneration {
+            self.0.owner_generation()
+        }
+    }
+
+    impl ForeignMmReadLease for MockCowLease {
+        fn read(
+            &self,
+            _invocation: &carrick_hal::ForeignMmInvocation,
+            _authority: &dyn carrick_hal::ForeignMmLiveAuthority,
+            _snapshot: &dyn ForeignMmSnapshot,
+            _va: GuestVa,
+            _dst: &mut [u8],
+            _deadline: Instant,
+        ) -> Result<Box<dyn ForeignMmReadReceipt>, ForeignMmTransportError> {
+            Err(ForeignMmTransportError::AuthorityUnavailable)
+        }
+
+        fn break_cow(
+            &self,
+            _invocation: &carrick_hal::ForeignMmInvocation,
+            _authority: &dyn carrick_hal::ForeignMmLiveAuthority,
+            _invalidator: &mut dyn carrick_hal::ForeignMmInvalidator,
+            snapshot: &dyn ForeignMmSnapshot,
+            va: GuestVa,
+            len: usize,
+            _deadline: Instant,
+        ) -> Result<Box<dyn ForeignCowReceipt>, ForeignMmTransportError> {
+            let next = |raw| NonZeroU64::new(raw + 1).unwrap();
+            let mm = if self.fault == MockCowFault::WrongMm {
+                carrick_hal::ForeignMmId::from_kernel_allocation(next(
+                    snapshot.mm().raw_for_probe(),
+                ))
+            } else {
+                snapshot.mm()
+            };
+            let start = if self.fault == MockCowFault::WrongRange {
+                GuestVa(va.raw() + 1)
+            } else {
+                va
+            };
+            let backend = carrick_hal::ForeignBackendRevision::from_authority_raw(
+                snapshot.backend_revision().raw_for_probe()
+                    + u64::from(self.fault == MockCowFault::AdvancedBackend),
+            );
+            let vma = carrick_hal::ForeignVmaRevision::from_authority_raw(
+                snapshot.vma_revision().raw_for_probe()
+                    + u64::from(self.fault == MockCowFault::AdvancedVma),
+            );
+            let inventory = carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(
+                snapshot.frame_inventory_revision().raw_for_probe()
+                    + u64::from(self.fault == MockCowFault::AdvancedInventory),
+            );
+            Ok(Box::new(MockCowReceipt {
+                mm,
+                start,
+                len,
+                backend,
+                vma,
+                inventory,
+                mapping: carrick_hal::MappingId::from_kernel_allocation(
+                    NonZeroU64::new(53).unwrap(),
+                ),
+                frame: carrick_hal::FrameId::from_kernel_allocation(NonZeroU64::new(59).unwrap()),
+                owner: carrick_hal::ForeignOwnerGeneration::from_backend_counter(
+                    NonZeroU64::new(self.owner_generation.load(Ordering::Acquire)).unwrap(),
+                ),
+            }))
+        }
+
+        fn write(
+            &self,
+            _invocation: &carrick_hal::ForeignMmInvocation,
+            _authority: &dyn carrick_hal::ForeignMmLiveAuthority,
+            snapshot: &dyn ForeignMmSnapshot,
+            cow: &dyn ForeignCowReceipt,
+            va: GuestVa,
+            src: &[u8],
+            _deadline: Instant,
+        ) -> Result<Box<dyn ForeignMmWriteReceipt>, ForeignMmTransportError> {
+            if cow.owner_generation().raw_for_probe()
+                != self.owner_generation.load(Ordering::Acquire)
+            {
+                return Err(ForeignMmTransportError::OwnerStale);
+            }
+            if cow.mm() != snapshot.mm()
+                || cow.range_start() != va
+                || cow.range_len() != src.len()
+                || cow.backend_revision() != snapshot.backend_revision()
+                || cow.vma_revision() != snapshot.vma_revision()
+                || cow.frame_inventory_revision() != snapshot.frame_inventory_revision()
+            {
+                return Err(ForeignMmTransportError::Retry);
+            }
+            self.bytes.lock()[..src.len()].copy_from_slice(src);
+            Ok(Box::new(MockWriteReceipt(MockCowReceipt {
+                mm: cow.mm(),
+                start: va,
+                len: src.len(),
+                backend: cow.backend_revision(),
+                vma: cow.vma_revision(),
+                inventory: cow.frame_inventory_revision(),
+                mapping: cow.mapping(),
+                frame: cow.frame(),
+                owner: cow.owner_generation(),
+            })))
+        }
+    }
+
+    impl ForeignMmTransport for MockCowTransport {
+        fn retain(
+            &self,
+            _invocation: &carrick_hal::ForeignMmInvocation,
+            _snapshot: &dyn ForeignMmSnapshot,
+            _deadline: Instant,
+        ) -> Result<Arc<dyn ForeignMmReadLease>, ForeignMmTransportError> {
+            Ok(Arc::new(MockCowLease {
+                owner_generation: Arc::clone(&self.owner_generation),
+                bytes: Arc::clone(&self.bytes),
+                fault: self.fault,
+            }))
+        }
+    }
+
     fn fixture_backend() -> Arc<dyn MmBackend> {
         let asid = Asid::from_registry_allocation(NonZeroU16::new(7).expect("nonzero ASID"));
         let root = Stage1Root::for_aarch64_4k(Gpa(0x8000)).expect("aligned stage-1 root");
@@ -960,6 +1469,219 @@ mod tests {
             MmRelation::Foreign(foreign) => foreign,
             MmRelation::Current(_) => panic!("copied-MM target must be foreign"),
         }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn cow_fixture(
+        kernel: &Arc<Kernel>,
+        parent: &KernelContext,
+        registry_id: i32,
+        fault: MockCowFault,
+    ) -> (
+        KernelContext,
+        Arc<MutableFixtureBackend>,
+        Arc<AtomicU64>,
+        Arc<parking_lot::Mutex<Vec<u8>>>,
+    ) {
+        let backend = MutableFixtureBackend::new();
+        let child = fork_with_backend(
+            kernel,
+            parent,
+            registry_id,
+            "foreign COW child",
+            Arc::clone(&backend) as Arc<dyn MmBackend>,
+        );
+        let owner_generation = Arc::new(AtomicU64::new(61));
+        let bytes = Arc::new(parking_lot::Mutex::new(b"same".to_vec()));
+        child.shared().mm().install_foreign_mm_endpoint_for_test(
+            carrick_hal::ForeignMmEndpoint::for_carrier(Arc::new(MockCowTransport {
+                owner_generation: Arc::clone(&owner_generation),
+                bytes: Arc::clone(&bytes),
+                fault,
+            })),
+        );
+        let mm = child.shared().mm().id();
+        let (_stage1_pool, stage1) = crate::hvpatch::Stage1MmPool::new_root_for_tests(0x8000, 4)
+            .expect("foreign mutation test stage-1 lease");
+        child
+            .shared()
+            .mm()
+            .install_foreign_mm_mutation_authority_for_test(
+                crate::dispatch::mm_mutation::ForeignMmMutationAuthority::new(
+                    mm,
+                    Arc::new(crate::dispatch::mm_mutation::MmMutationCoordinator::new(mm)),
+                    Arc::new(crate::kernel::GuestExecutorCensus::default()),
+                    stage1,
+                ),
+            );
+        (child, backend, owner_generation, bytes)
+    }
+
+    fn with_mm_mutation<T>(
+        mm: MmId,
+        run: impl FnOnce(&mut crate::dispatch::mm_mutation::MmMutationGuard<'_>) -> T,
+    ) -> T {
+        let coordinator = Arc::new(crate::dispatch::mm_mutation::MmMutationCoordinator::new(mm));
+        crate::vcpu_loop::with_real_pt_pause_for_test(coordinator, |pause| {
+            let mut mutation = crate::dispatch::mm_mutation::from_pt_pause(pause);
+            run(&mut mutation)
+        })
+    }
+
+    fn with_foreign_mutation<T>(
+        foreign: &super::super::ForeignMm,
+        run: impl FnOnce(&mut crate::dispatch::mm_mutation::MmMutationGuard<'_>) -> T,
+    ) -> T {
+        super::MmAccessAuthority::new()
+            .with_foreign_mutation(foreign, ThreadId::synthetic_for_tests(31_079), |mutation| {
+                Ok(run(mutation))
+            })
+            .expect("acquire exact target-MM mutation authority")
+    }
+
+    #[test]
+    fn foreign_cow_write_separates_copied_parent_and_child_at_the_same_va() {
+        let (kernel, root) = bootstrap(31_080);
+        let execution = execution_lease(&root, 80);
+        let parent_bytes = b"same".to_vec();
+        let (child, _backend, _owner, child_bytes) =
+            cow_fixture(&kernel, &root, 31_081, MockCowFault::None);
+        let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
+        let range = foreign.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
+
+        with_foreign_mutation(&foreign, |mutation| {
+            let cow = super::MmAccessAuthority::new()
+                .break_foreign_cow(mutation, &foreign, range)
+                .expect("break exact child COW");
+            let receipt = super::MmAccessAuthority::new()
+                .write_foreign(cow, b"edit")
+                .expect("copy through authenticated child owner");
+            assert_eq!(receipt.bytes_written(), 4);
+        });
+
+        assert_eq!(parent_bytes, b"same");
+        assert_eq!(&*child_bytes.lock(), b"edit");
+    }
+
+    #[test]
+    fn foreign_cow_rejects_wrong_mm_guard_range_and_backend_receipt_identity() {
+        let (kernel, root) = bootstrap(31_082);
+        let execution = execution_lease(&root, 82);
+        let (child, _backend, _owner, _bytes) =
+            cow_fixture(&kernel, &root, 31_083, MockCowFault::None);
+        let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
+        let range = foreign.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
+        let wrong_mm =
+            MmId::from_registry_allocation(NonZeroU64::new(foreign.mm_id().raw() + 1).unwrap());
+        with_mm_mutation(wrong_mm, |mutation| {
+            assert!(matches!(
+                super::MmAccessAuthority::new().break_foreign_cow(mutation, &foreign, range),
+                Err(MmAccessError::ForeignMutationAuthorityMismatch)
+            ));
+        });
+
+        let (other, _backend, _owner, _bytes) =
+            cow_fixture(&kernel, &root, 31_084, MockCowFault::None);
+        let other_foreign = foreign_mm(&kernel, &root, &execution, other.task().key());
+        let other_range = other_foreign
+            .write_range(GuestVa(0x3000), 4)
+            .unwrap()
+            .unwrap();
+        with_foreign_mutation(&foreign, |mutation| {
+            assert!(matches!(
+                super::MmAccessAuthority::new().break_foreign_cow(mutation, &foreign, other_range,),
+                Err(MmAccessError::ForeignRangeAuthorityMismatch)
+            ));
+        });
+
+        for fault in [MockCowFault::WrongMm, MockCowFault::WrongRange] {
+            let (target, _backend, _owner, _bytes) =
+                cow_fixture(&kernel, &root, 31_085 + fault as i32, fault);
+            let target = foreign_mm(&kernel, &root, &execution, target.task().key());
+            let target_range = target.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
+            with_foreign_mutation(&target, |mutation| {
+                assert!(matches!(
+                    super::MmAccessAuthority::new().break_foreign_cow(
+                        mutation,
+                        &target,
+                        target_range,
+                    ),
+                    Err(MmAccessError::ForeignCowReceiptMismatch)
+                ));
+            });
+        }
+    }
+
+    #[test]
+    fn foreign_cow_rejects_receipts_with_any_advanced_revision_domain() {
+        let (kernel, root) = bootstrap(31_090);
+        let execution = execution_lease(&root, 90);
+        for (index, fault) in [
+            MockCowFault::AdvancedBackend,
+            MockCowFault::AdvancedVma,
+            MockCowFault::AdvancedInventory,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (child, _backend, _owner, _bytes) =
+                cow_fixture(&kernel, &root, 31_091 + index as i32, fault);
+            let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
+            let range = foreign.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
+            with_foreign_mutation(&foreign, |mutation| {
+                assert!(matches!(
+                    super::MmAccessAuthority::new().break_foreign_cow(mutation, &foreign, range,),
+                    Err(MmAccessError::ForeignCowReceiptMismatch)
+                ));
+            });
+        }
+    }
+
+    #[test]
+    fn cow_broken_is_stale_after_any_revision_or_owner_generation_changes() {
+        for domain in 0..3 {
+            let (kernel, root) = bootstrap(31_100 + domain as i32 * 10);
+            let execution = execution_lease(&root, 100 + domain as u64);
+            let (child, backend, _owner, bytes) = cow_fixture(
+                &kernel,
+                &root,
+                31_101 + domain as i32 * 10,
+                MockCowFault::None,
+            );
+            let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
+            let range = foreign.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
+            with_foreign_mutation(&foreign, |mutation| {
+                let cow = super::MmAccessAuthority::new()
+                    .break_foreign_cow(mutation, &foreign, range)
+                    .unwrap();
+                backend.advance(domain);
+                assert!(matches!(
+                    super::MmAccessAuthority::new().write_foreign(cow, b"edit"),
+                    Err(MmAccessError::StaleCowBroken)
+                ));
+            });
+            assert_eq!(&*bytes.lock(), b"same");
+        }
+
+        let (kernel, root) = bootstrap(31_140);
+        let execution = execution_lease(&root, 140);
+        let (child, _backend, owner, bytes) =
+            cow_fixture(&kernel, &root, 31_141, MockCowFault::None);
+        let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
+        let range = foreign.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
+        with_foreign_mutation(&foreign, |mutation| {
+            let cow = super::MmAccessAuthority::new()
+                .break_foreign_cow(mutation, &foreign, range)
+                .unwrap();
+            owner.fetch_add(1, Ordering::AcqRel);
+            assert!(matches!(
+                super::MmAccessAuthority::new().write_foreign(cow, b"edit"),
+                Err(MmAccessError::ForeignTransport(
+                    ForeignMmTransportError::OwnerStale
+                ))
+            ));
+        });
+        assert_eq!(&*bytes.lock(), b"same");
     }
 
     #[test]

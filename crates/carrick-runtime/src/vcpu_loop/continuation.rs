@@ -3550,6 +3550,35 @@ impl HvpatchTaskBinding {
         })
     }
 
+    pub(crate) fn service_pending_cow_invalidation<E>(
+        &self,
+        executor: crate::kernel::objects::ExecutorId,
+        invalidate: impl FnOnce(crate::hvpatch::AsidGeneration) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.stage1_mm
+            .as_ref()
+            .unwrap_or_else(|| std::process::abort())
+            .service_pending_cow_invalidation(executor, invalidate)
+    }
+
+    pub(crate) fn pending_cow_invalidation(
+        &self,
+        executor: crate::kernel::objects::ExecutorId,
+    ) -> Option<crate::hvpatch::CowInvalidationTicket> {
+        self.stage1_mm.as_ref()?.pending_cow_invalidation(executor)
+    }
+
+    pub(crate) fn acknowledge_cow_invalidation(
+        &self,
+        executor: crate::kernel::objects::ExecutorId,
+        ticket: crate::hvpatch::CowInvalidationTicket,
+    ) -> Result<(), crate::hvpatch::CowInvalidationError> {
+        self.stage1_mm
+            .as_ref()
+            .ok_or(crate::hvpatch::CowInvalidationError::StaleGeneration)?
+            .acknowledge_cow_invalidation(executor, ticket)
+    }
+
     pub(crate) fn validate_state(
         &self,
         state: &crate::kernel::objects::MigratableTaskState,
@@ -4558,10 +4587,7 @@ mod tests {
             exec_replacement: None,
         };
         let need_resched = AtomicBool::new(false);
-        let mut control = HvpatchQuantumControl {
-            need_resched: &need_resched,
-            submission: &mut submission,
-        };
+        let mut control = HvpatchQuantumControl::for_test(&need_resched, &mut submission);
 
         for expected in expected {
             let mut engine = FakeInjectedLoopEngine::default();

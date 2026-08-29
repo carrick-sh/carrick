@@ -48,7 +48,8 @@ pub use crash_capture::{
 pub(crate) use foreign_mm::ForeignMmAccess;
 pub(crate) use mm_access::MmAccessAuthority;
 pub use mm_access::{
-    CurrentMm, ForeignMm, MmAccessError, MmReadRange, MmRelation, MmToken, MmWriteRange,
+    CowBroken, CurrentMm, ForeignMm, ForeignWriteReceipt, MmAccessError, MmReadRange, MmRelation,
+    MmToken, MmWriteRange,
 };
 pub use mm_transaction::{MmTransaction, StagedMmOp};
 

@@ -270,7 +270,7 @@ mod foreign_mm_tests {
     }
 
     #[derive(Debug)]
-    struct TestLiveAuthority(parking_lot::RwLock<TestSnapshot>);
+    struct TestLiveAuthority(Arc<parking_lot::RwLock<TestSnapshot>>);
 
     impl carrick_hal::ForeignMmLiveAuthority for TestLiveAuthority {
         fn snapshot(
@@ -297,10 +297,178 @@ mod foreign_mm_tests {
 
     impl Drop for OwnerCleanup {
         fn drop(&mut self) {
+            alias_registry().lock().retain(|alias| {
+                !self.0.iter().any(|&(ipa, length)| {
+                    (alias.physical_ipa, alias.physical_size as u64) == (ipa, length)
+                })
+            });
             let mut owners = global_frame_host_owners().lock();
             for key in self.0.drain(..) {
                 owners.remove(&key);
             }
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestForeignCowAuthority {
+        live: Arc<parking_lot::RwLock<TestSnapshot>>,
+        old_frame: carrick_hal::FrameId,
+        serial: std::sync::atomic::AtomicU64,
+        published:
+            parking_lot::Mutex<Option<(carrick_hal::MappingId, carrick_hal::FrameId, Gpa, u64)>>,
+    }
+
+    impl TestForeignCowAuthority {
+        fn new(installed: &InstalledMm) -> Self {
+            let old_frame = installed
+                .state
+                .frame_inventory
+                .ledger
+                .lock()
+                .extents
+                .get(&installed.owners.0[1])
+                .expect("data inventory extent")
+                .frame;
+            Self {
+                live: Arc::clone(&installed.live.0),
+                old_frame,
+                serial: std::sync::atomic::AtomicU64::new(
+                    installed.snapshot.mm.get().saturating_mul(1_000),
+                ),
+                published: parking_lot::Mutex::new(None),
+            }
+        }
+
+        fn next(&self) -> NonZeroU64 {
+            NonZeroU64::new(
+                self.serial
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            )
+            .expect("foreign COW test identity")
+        }
+    }
+
+    impl carrick_hal::FrameCowAuthority for TestForeignCowAuthority {
+        fn quiesce(
+            &self,
+        ) -> Result<Box<dyn carrick_hal::FrameCowQuiesce>, Box<dyn std::error::Error + Send + Sync>>
+        {
+            panic!("foreign backend must not reacquire frame-COW quiesce")
+        }
+
+        fn reserve(
+            &self,
+            frame_candidates: usize,
+            mapping_candidates: usize,
+            event_count: usize,
+        ) -> Result<carrick_hal::FrameInventoryReservation, Box<dyn std::error::Error + Send + Sync>>
+        {
+            let transaction = carrick_hal::KernelTransactionId::from_kernel_allocation(self.next());
+            let frames = (0..frame_candidates)
+                .map(|_| carrick_hal::FrameId::from_kernel_allocation(self.next()))
+                .collect();
+            let mappings = (0..mapping_candidates)
+                .map(|_| carrick_hal::MappingId::from_kernel_allocation(self.next()))
+                .collect();
+            Ok(
+                carrick_hal::FrameInventoryReservation::from_kernel_candidates(
+                    carrick_hal::FrameInventoryProvenance::from_kernel_entropy([0x7a; 32]),
+                    carrick_hal::FrameInventoryBatch::prepare(
+                        transaction,
+                        carrick_hal::FrameEventCapacity::for_event_count(event_count)?,
+                    )?,
+                    frames,
+                    mappings,
+                ),
+            )
+        }
+
+        fn apply(
+            &self,
+            commit: carrick_hal::FrameInventoryCommit<()>,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let events = commit.batch().events();
+            let mut removed = Vec::new();
+            let mut prepared = Vec::new();
+            for event in events {
+                match *event {
+                    carrick_hal::FrameInventoryEvent::UnmapMapping { mapping, .. } => {
+                        removed.push(mapping)
+                    }
+                    carrick_hal::FrameInventoryEvent::PrepareMapping {
+                        frame,
+                        mapping,
+                        gpa,
+                        length,
+                        ..
+                    } => prepared.push((mapping, frame, gpa, length.raw())),
+                    _ => {}
+                }
+            }
+            let new = prepared
+                .iter()
+                .copied()
+                .find(|(_, frame, _, _)| *frame != self.old_frame)
+                .expect("new private foreign COW mapping");
+            let mut live = self.live.write();
+            live.mapping_ids
+                .retain(|mapping| !removed.contains(mapping));
+            live.mapping_ids
+                .extend(prepared.iter().map(|(mapping, _, _, _)| *mapping));
+            live.mapping_ids.sort_unstable();
+            live.mapping_ids.dedup();
+            live.backend_revision = carrick_hal::ForeignBackendRevision::from_authority_raw(
+                live.backend_revision.raw_for_probe() + 1,
+            );
+            live.frame_inventory_revision =
+                carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(
+                    live.frame_inventory_revision.raw_for_probe() + 1,
+                );
+            *self.published.lock() = Some(new);
+            Ok(())
+        }
+
+        fn mapping_is_live(
+            &self,
+            mapping: carrick_hal::MappingId,
+            frame: carrick_hal::FrameId,
+            gpa: Gpa,
+            length: carrick_hal::FrameLength,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self
+                .published
+                .lock()
+                .as_ref()
+                .is_some_and(|published| *published == (mapping, frame, gpa, length.raw())))
+        }
+
+        fn frame_mapping_count(
+            &self,
+            frame: carrick_hal::FrameId,
+        ) -> Result<Option<usize>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok((frame == self.old_frame).then_some(2))
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestInvalidator {
+        expected: carrick_hal::ForeignMmBinding,
+        calls: usize,
+        fail_call: Option<usize>,
+    }
+
+    impl carrick_hal::ForeignMmInvalidator for TestInvalidator {
+        fn invalidate_exact_asid(
+            &mut self,
+            binding: carrick_hal::ForeignMmBinding,
+            _deadline: Instant,
+        ) -> Result<(), carrick_hal::ForeignMmTransportError> {
+            assert_eq!(binding, self.expected);
+            self.calls += 1;
+            if self.fail_call == Some(self.calls) {
+                return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
+            }
+            Ok(())
         }
     }
 
@@ -395,6 +563,23 @@ mod foreign_mm_tests {
                 },
             },
         );
+        {
+            let mut frames = inventory.frames.lock();
+            frames.references.insert(table_frame, 1);
+            frames.references.insert(data_frame, 1);
+            frames
+                .extent_references
+                .insert((table_frame, root, table_bytes.len() as u64), 1);
+            frames
+                .extent_references
+                .insert((data_frame, data_ipa, OWNER_LEN as u64), 1);
+            frames
+                .stage2_references
+                .insert((root, table_bytes.len() as u64), 1);
+            frames
+                .stage2_references
+                .insert((data_ipa, OWNER_LEN as u64), 1);
+        }
         let asid = NonZeroU16::new(ordinal as u16).expect("nonzero test ASID");
         let binding = CarrierForeignMmBinding {
             asid: carrick_hal::ForeignAsid::from_kernel_allocation(asid),
@@ -419,7 +604,7 @@ mod foreign_mm_tests {
         );
         transport.register(&snapshot, &state);
         InstalledMm {
-            live: TestLiveAuthority(parking_lot::RwLock::new(snapshot.clone())),
+            live: TestLiveAuthority(Arc::new(parking_lot::RwLock::new(snapshot.clone()))),
             snapshot,
             state,
             owners: OwnerCleanup(vec![
@@ -445,6 +630,238 @@ mod foreign_mm_tests {
             dst,
             deadline,
         )
+    }
+
+    fn prepare_foreign_cow(
+        installed: &InstalledMm,
+    ) -> (
+        Arc<TestForeignCowAuthority>,
+        carrick_hal::ForeignMmLeaseEndpoint,
+        TestInvalidator,
+    ) {
+        let data_key = installed.owners.0[1];
+        let (host_addr, generation) = global_frame_host_owner_identity(data_key.0, data_key.1)
+            .expect("foreign COW source owner");
+        let backing = installed
+            .state
+            .frame_inventory
+            .ledger
+            .lock()
+            .extents
+            .get(&data_key)
+            .expect("foreign COW source inventory")
+            .backing;
+        let root_key = installed.owners.0[0];
+        let scope = Some(root_key);
+        register_shared_alias(AliasBacking {
+            start: TEST_VA,
+            ipa: data_key.0,
+            host_addr,
+            size: OWNER_LEN,
+            physical_ipa: data_key.0,
+            physical_host_addr: host_addr,
+            physical_size: OWNER_LEN,
+            perms: u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+            guest_writable: true,
+            sharing: GuestMappingSharing::Private,
+            ownership_scope: alias_ownership_scope(
+                GuestMappingSharing::Private,
+                scope,
+                ContainerRootToken::ROOT,
+            ),
+            inventory_backing: backing,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: generation,
+        });
+        installed
+            .state
+            .cow_armed
+            .lock()
+            .arm(&[carrick_aarch64::vmm::ForkCowRange {
+                va: TEST_VA,
+                len: OWNER_LEN,
+                executable: false,
+                kernel_only: false,
+            }]);
+        let authority = Arc::new(TestForeignCowAuthority::new(installed));
+        installed.state.bind_cow_runtime(MmCowRuntimeBinding {
+            authority: authority.clone(),
+            identity: carrick_hal::FrameCowIdentity {
+                linux_pid: installed.snapshot.mm.get() as i32,
+                linux_tid: installed.snapshot.mm.get() as i32,
+                mm: installed.snapshot.mm.get(),
+                asid: installed.snapshot.asid.get(),
+            },
+            mm_root_slot: scope,
+            container_root: ContainerRootToken::ROOT,
+            persistent_vm_lifecycle: true,
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let endpoint =
+            carrick_hal::ForeignMmEndpoint::for_carrier(Arc::new(CarrierForeignMmTransport {
+                states: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
+                    (
+                        CarrierForeignMmSnapshot::capture(&installed.snapshot).binding,
+                        Arc::downgrade(&installed.state),
+                    ),
+                ]))),
+            }));
+        let lease = endpoint
+            .retain(&installed.snapshot, deadline)
+            .expect("retain foreign COW state");
+        let invalidator = TestInvalidator {
+            expected: carrick_hal::ForeignMmSnapshot::binding(&installed.snapshot),
+            calls: 0,
+            fail_call: None,
+        };
+        (authority, lease, invalidator)
+    }
+
+    fn foreign_cow_fingerprint(installed: &InstalledMm) -> (Vec<u8>, String, Vec<(u64, u64)>) {
+        let tables = installed.state.page_tables_authority();
+        let stage1 = tables
+            .lock()
+            .as_ref()
+            .expect("foreign COW page tables")
+            .as_bytes()
+            .to_vec();
+        let inventory = format!("{:?}", *installed.state.frame_inventory.ledger.lock());
+        let owners = global_frame_host_owners().lock().keys().copied().collect();
+        (stage1, inventory, owners)
+    }
+
+    #[test]
+    fn foreign_cow_write_keeps_the_shared_parent_owner_unchanged() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let transport = CarrierForeignMmTransport::new();
+        let mut child = install_mm(
+            &transport,
+            121,
+            0x9a00_1800_0000,
+            0x9b00_1800_0000,
+            *b"old!",
+        );
+        let (_authority, lease, mut invalidator) = prepare_foreign_cow(&child);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let cow = lease
+            .break_cow(
+                &child.live,
+                &mut invalidator,
+                &child.snapshot,
+                GuestVa(TEST_VA),
+                4,
+                deadline,
+            )
+            .expect("foreign child COW");
+        assert_eq!(invalidator.calls, 1);
+        let old_key = child.owners.0[1];
+        let mut parent_bytes = [0_u8; 4];
+        copy_from_pinned_owner(
+            &RetainedForeignMmBacking {
+                extents: vec![RetainedForeignExtent {
+                    key: old_key,
+                    owner: global_frame_host_owners().lock()[&old_key].clone(),
+                }],
+            },
+            old_key.0,
+            &mut parent_bytes,
+        )
+        .expect("read shared parent owner");
+        assert_eq!(&parent_bytes, b"old!");
+        let post = child.live.0.read().clone();
+        let write = lease
+            .write(
+                &child.live,
+                &post,
+                cow.as_ref(),
+                GuestVa(TEST_VA),
+                b"new!",
+                deadline,
+            )
+            .expect("write authenticated child owner");
+        assert_eq!(write.bytes_written(), 4);
+        assert_eq!(&parent_bytes, b"old!");
+        let new_key = (cow.physical_base().raw(), cow.physical_len());
+        let new_owner = global_frame_host_owners().lock()[&new_key].clone();
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(new_owner._mapping.as_ptr(), 4) },
+            b"new!"
+        );
+        child.owners.0.push(new_key);
+    }
+
+    #[test]
+    fn foreign_cow_each_reversible_boundary_restores_exact_stage1_inventory_and_owner_set() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        for phase in 1..=5 {
+            let transport = CarrierForeignMmTransport::new();
+            let installed = install_mm(
+                &transport,
+                121 + u64::from(phase),
+                0x9a00_2000_0000 + u64::from(phase) * 0x0200_0000,
+                0x9b00_2000_0000 + u64::from(phase) * 0x0200_0000,
+                *b"same",
+            );
+            let (_authority, lease, mut invalidator) = prepare_foreign_cow(&installed);
+            installed.state.set_foreign_cow_failpoint(phase);
+            let before = foreign_cow_fingerprint(&installed);
+            let result = lease.break_cow(
+                &installed.live,
+                &mut invalidator,
+                &installed.snapshot,
+                GuestVa(TEST_VA),
+                4,
+                Instant::now() + Duration::from_secs(1),
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(carrick_hal::ForeignMmTransportError::MutationFailed)
+                ),
+                "phase {phase} must fail before commit"
+            );
+            assert_eq!(foreign_cow_fingerprint(&installed), before, "phase {phase}");
+            assert!(installed.state.cow_armed.lock().span_for(TEST_VA).is_some());
+            let expected_invalidations = if phase == 4 {
+                2
+            } else if phase == 3 {
+                1
+            } else {
+                0
+            };
+            assert_eq!(invalidator.calls, expected_invalidations, "phase {phase}");
+        }
+    }
+
+    #[test]
+    fn foreign_cow_invalidation_failure_rolls_back_and_republishes_the_old_stage1() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let transport = CarrierForeignMmTransport::new();
+        let installed = install_mm(
+            &transport,
+            130,
+            0x9a00_3000_0000,
+            0x9b00_3000_0000,
+            *b"same",
+        );
+        let (_authority, lease, mut invalidator) = prepare_foreign_cow(&installed);
+        invalidator.fail_call = Some(1);
+        let before = foreign_cow_fingerprint(&installed);
+        assert!(
+            lease
+                .break_cow(
+                    &installed.live,
+                    &mut invalidator,
+                    &installed.snapshot,
+                    GuestVa(TEST_VA),
+                    4,
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .is_err()
+        );
+        assert_eq!(invalidator.calls, 2);
+        assert_eq!(foreign_cow_fingerprint(&installed), before);
     }
 
     #[test]
@@ -6120,6 +6537,20 @@ pub(crate) struct MmAccessState {
     /// non-cloneable mutation guard. Keeping it MM-owned now prevents a later
     /// lock authority from following an executor by accident.
     mutation_coordinator: parking_lot::Mutex<()>,
+    cow_runtime: parking_lot::RwLock<Option<MmCowRuntimeBinding>>,
+    cow_rollback_scratch: parking_lot::Mutex<Option<crate::page_table::PageTableManager>>,
+    #[cfg(test)]
+    foreign_cow_failpoint: std::sync::atomic::AtomicU8,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone)]
+struct MmCowRuntimeBinding {
+    authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
+    identity: carrick_hal::FrameCowIdentity,
+    mm_root_slot: Option<(u64, u64)>,
+    container_root: ContainerRootToken,
+    persistent_vm_lifecycle: bool,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -6143,7 +6574,17 @@ impl MmAccessState {
             cow_armed,
             cow_deferred_publications,
             mutation_coordinator: parking_lot::Mutex::new(()),
+            cow_runtime: parking_lot::RwLock::new(None),
+            cow_rollback_scratch: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            foreign_cow_failpoint: std::sync::atomic::AtomicU8::new(0),
         })
+    }
+
+    #[cfg(test)]
+    fn set_foreign_cow_failpoint(&self, phase: u8) {
+        self.foreign_cow_failpoint
+            .store(phase, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[cfg(test)]
@@ -6190,6 +6631,10 @@ impl MmAccessState {
         >,
     ) {
         *self.page_tables.write() = page_tables;
+    }
+
+    fn bind_cow_runtime(&self, binding: MmCowRuntimeBinding) {
+        *self.cow_runtime.write() = Some(binding);
     }
 
     fn retain_physical_backing(
@@ -6353,6 +6798,97 @@ struct CarrierForeignMmReceipt {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct CarrierForeignCowReceipt {
+    snapshot: CarrierForeignMmSnapshot,
+    start: carrick_guest_mem::GuestVa,
+    len: usize,
+    mapping: carrick_hal::MappingId,
+    frame: carrick_hal::FrameId,
+    physical_base: carrick_guest_mem::Gpa,
+    physical_len: u64,
+    owner_generation: carrick_hal::ForeignOwnerGeneration,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl carrick_hal::ForeignCowReceipt for CarrierForeignCowReceipt {
+    fn mm(&self) -> carrick_hal::ForeignMmId {
+        self.snapshot.mm
+    }
+    fn range_start(&self) -> carrick_guest_mem::GuestVa {
+        self.start
+    }
+    fn range_len(&self) -> usize {
+        self.len
+    }
+    fn backend_revision(&self) -> carrick_hal::ForeignBackendRevision {
+        self.snapshot.backend_revision
+    }
+    fn vma_revision(&self) -> carrick_hal::ForeignVmaRevision {
+        self.snapshot.vma_revision
+    }
+    fn frame_inventory_revision(&self) -> carrick_hal::ForeignFrameInventoryRevision {
+        self.snapshot.frame_inventory_revision
+    }
+    fn mapping(&self) -> carrick_hal::MappingId {
+        self.mapping
+    }
+    fn frame(&self) -> carrick_hal::FrameId {
+        self.frame
+    }
+    fn physical_base(&self) -> carrick_guest_mem::Gpa {
+        self.physical_base
+    }
+    fn physical_len(&self) -> u64 {
+        self.physical_len
+    }
+    fn owner_generation(&self) -> carrick_hal::ForeignOwnerGeneration {
+        self.owner_generation
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct CarrierForeignWriteReceipt {
+    cow: CarrierForeignCowReceipt,
+    bytes_written: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl carrick_hal::ForeignMmWriteReceipt for CarrierForeignWriteReceipt {
+    fn mm(&self) -> carrick_hal::ForeignMmId {
+        self.cow.snapshot.mm
+    }
+    fn range_start(&self) -> carrick_guest_mem::GuestVa {
+        self.cow.start
+    }
+    fn range_len(&self) -> usize {
+        self.cow.len
+    }
+    fn bytes_written(&self) -> usize {
+        self.bytes_written
+    }
+    fn backend_revision(&self) -> carrick_hal::ForeignBackendRevision {
+        self.cow.snapshot.backend_revision
+    }
+    fn vma_revision(&self) -> carrick_hal::ForeignVmaRevision {
+        self.cow.snapshot.vma_revision
+    }
+    fn frame_inventory_revision(&self) -> carrick_hal::ForeignFrameInventoryRevision {
+        self.cow.snapshot.frame_inventory_revision
+    }
+    fn mapping(&self) -> carrick_hal::MappingId {
+        self.cow.mapping
+    }
+    fn frame(&self) -> carrick_hal::FrameId {
+        self.cow.frame
+    }
+    fn owner_generation(&self) -> carrick_hal::ForeignOwnerGeneration {
+        self.cow.owner_generation
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl carrick_hal::ForeignMmReadReceipt for CarrierForeignMmReceipt {
     fn bytes_read(&self) -> usize {
         self.bytes_read
@@ -6394,6 +6930,420 @@ fn live_snapshot_matches(
     }
     let observed = authority.snapshot(deadline)?;
     Ok(expected.matches(observed.as_ref()))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn foreign_cow_failpoint(
+    state: &MmAccessState,
+    phase: u8,
+) -> Result<(), carrick_hal::ForeignMmTransportError> {
+    #[cfg(test)]
+    if state
+        .foreign_cow_failpoint
+        .load(std::sync::atomic::Ordering::SeqCst)
+        == phase
+    {
+        return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
+    }
+    let _ = (state, phase);
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn perform_foreign_cow_transaction(
+    lease: &CarrierForeignMmReadLease,
+    authority: &dyn carrick_hal::ForeignMmLiveAuthority,
+    invalidator: &mut dyn carrick_hal::ForeignMmInvalidator,
+    requested: &CarrierForeignMmSnapshot,
+    va: carrick_guest_mem::GuestVa,
+    len: usize,
+    deadline: std::time::Instant,
+) -> Result<CarrierForeignCowReceipt, carrick_hal::ForeignMmTransportError> {
+    if !live_snapshot_matches(authority, requested, deadline)? {
+        return Err(carrick_hal::ForeignMmTransportError::Retry);
+    }
+    let runtime = lease
+        .state
+        .cow_runtime
+        .try_read_until(deadline)
+        .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?
+        .clone()
+        .ok_or(carrick_hal::ForeignMmTransportError::AuthorityUnavailable)?;
+    if runtime.identity.mm != requested.mm.raw_for_probe()
+        || runtime.identity.asid != requested.binding.asid.raw_for_probe()
+    {
+        return Err(carrick_hal::ForeignMmTransportError::MissingBinding);
+    }
+    if !runtime.persistent_vm_lifecycle {
+        return Err(carrick_hal::ForeignMmTransportError::AuthorityUnavailable);
+    }
+    // The runtime already holds exact-MM page-table exclusion.  This is the
+    // inner topology/alias phase only; foreign COW must never reacquire the
+    // frame-COW quiesce or wait HostAlias -> PtPause.
+    let _topology = crate::fork_quiesce::acquire_topology_lock(
+        carrick_observability::probes::HvpatchTopologyOperation::AliasMap,
+        runtime.identity.linux_pid,
+        runtime.identity.linux_tid,
+    );
+    let span = lease
+        .state
+        .cow_armed
+        .lock()
+        .span_for(va.raw())
+        .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
+    let range_end = va
+        .raw()
+        .checked_add(len as u64)
+        .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
+    if range_end > span.va.saturating_add(span.len as u64) {
+        return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
+    }
+    let page_tables_authority = lease.state.page_tables_authority();
+    let old_ipa = {
+        let tables = page_tables_authority
+            .try_lock_until(deadline)
+            .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?;
+        tables
+            .as_ref()
+            .and_then(|tables| tables.translate_retained_output(span.va))
+            .ok_or(carrick_hal::ForeignMmTransportError::Translation(va))?
+    };
+    let old_physical_ipa = align_down(old_ipa, CowArmedRanges::COMPOUND_SIZE);
+    let old_extent = lease
+        .backing
+        .extent_for(old_physical_ipa, CowArmedRanges::COMPOUND_SIZE as usize)?;
+    let old_host = old_extent.owner._mapping.as_ptr();
+    let old_offset = old_ipa
+        .checked_sub(old_physical_ipa)
+        .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
+    let source_guest_writable = alias_registry()
+        .lock()
+        .iter()
+        .rev()
+        .find(|alias| {
+            alias_matches_process_scope(
+                alias.ownership_scope,
+                runtime.mm_root_slot,
+                runtime.container_root,
+            ) && alias.ipa <= old_ipa
+                && old_ipa < alias.ipa.saturating_add(alias.size as u64)
+        })
+        .map(|alias| alias.guest_writable)
+        .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)?;
+    if !source_guest_writable || lease.state.protections.range_write_denied(va.raw(), len) {
+        return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
+    }
+    let retain_old_compound = {
+        let tables = page_tables_authority
+            .try_lock_until(deadline)
+            .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?;
+        let tables = tables
+            .as_ref()
+            .ok_or(carrick_hal::ForeignMmTransportError::AuthorityUnavailable)?;
+        cow_source_has_retained_sibling(span, old_ipa, old_physical_ipa, |candidate| {
+            tables.translate_retained_output(candidate)
+        })
+    };
+    let split_shape = {
+        let inventory = lease
+            .state
+            .frame_inventory
+            .ledger
+            .try_lock_until(deadline)
+            .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?;
+        HvfVmState::cow_inventory_split_shape(
+            &inventory,
+            old_physical_ipa,
+            retain_old_compound,
+            |frame| {
+                runtime.authority.frame_mapping_count(frame).map_err(|_| {
+                    TrapError::Hypervisor("query foreign COW mapping count".to_owned())
+                })
+            },
+        )
+        .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?
+    };
+    let CowInventorySplitShape {
+        old_key,
+        old,
+        fragments,
+        retirement,
+    } = split_shape;
+    let mapping_candidates = fragments.len().saturating_add(1);
+    let event_count = 1usize
+        .saturating_add(mapping_candidates.saturating_mul(2))
+        .saturating_add(usize::from(retirement.retire_old_frame));
+    let mut reservation = runtime
+        .authority
+        .reserve(1, mapping_candidates, event_count)
+        .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
+    foreign_cow_failpoint(&lease.state, 1)?;
+    let new_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+        CowArmedRanges::COMPOUND_SIZE as usize,
+        crate::host_mapping::HostMappingKind::FrameCow,
+    )
+    .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
+    let new_host_ptr = new_host.as_ptr();
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            old_host,
+            new_host_ptr,
+            CowArmedRanges::COMPOUND_SIZE as usize,
+        );
+    }
+    let mut new_lease = GlobalFrameStage2Lease::reserve(
+        CowArmedRanges::COMPOUND_SIZE,
+        CowArmedRanges::COMPOUND_SIZE,
+    )
+    .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
+    let new_physical_ipa = new_lease.base;
+    let new_ipa = new_physical_ipa
+        .checked_add(old_offset)
+        .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
+    let stage2_perms = applevisor::memory::MemPerms::ReadWriteExec;
+    #[cfg(not(test))]
+    {
+        let map_result = unsafe {
+            inventory_hv_vm_map(
+                new_host_ptr.cast(),
+                new_physical_ipa,
+                CowArmedRanges::COMPOUND_SIZE as usize,
+                u64::from(stage2_perms),
+            )
+        };
+        if map_result != 0 {
+            return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
+        }
+        new_lease.mark_mapped();
+    }
+    #[cfg(test)]
+    new_lease.mark_test_mapped_without_backend();
+    let owner_generation =
+        register_global_frame_host_owner(new_lease, new_host, u64::from(stage2_perms))
+            .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
+    let mut owner_rollback = GlobalFrameOwnerRollback::default();
+    owner_rollback.record((new_physical_ipa, CowArmedRanges::COMPOUND_SIZE));
+    foreign_cow_failpoint(&lease.state, 2)?;
+    let backing = HvfVmState::private_backing_identity();
+    let split = match HvfVmState::stage_cow_inventory_split(
+        &mut reservation,
+        old_key,
+        old,
+        &fragments,
+        retirement,
+        CowInventoryReplacementStage {
+            gpa: new_physical_ipa,
+            backing,
+            stage2_owner: InventoryStage2OwnerIdentity {
+                host_addr: new_host_ptr as usize,
+                generation: owner_generation,
+            },
+        },
+    ) {
+        Ok(split) => split,
+        Err(_) => return Err(carrick_hal::ForeignMmTransportError::MutationFailed),
+    };
+    foreign_cow_failpoint(&lease.state, 5)?;
+    let page_table_extent = lease
+        .backing
+        .extent_for(requested.binding.stage1_root.raw(), 1)?;
+    let page_table_offset = usize::try_from(
+        requested
+            .binding
+            .stage1_root
+            .raw()
+            .saturating_sub(page_table_extent.key.0),
+    )
+    .map_err(|_| carrick_hal::ForeignMmTransportError::OwnerStale)?;
+    let page_table_host = unsafe {
+        page_table_extent
+            .owner
+            ._mapping
+            .as_ptr()
+            .add(page_table_offset)
+    };
+    let mut recycled = lease.state.cow_rollback_scratch.lock().take();
+    let mut rollback = None;
+    let page_table_result = (|| {
+        let mut tables = page_tables_authority
+            .try_lock_until(deadline)
+            .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?;
+        let tables = tables
+            .as_mut()
+            .ok_or(carrick_hal::ForeignMmTransportError::AuthorityUnavailable)?;
+        rollback = Some(HvfVmState::rollback_pre_image(&mut recycled, tables));
+        HvfVmState::refresh_stage1_exclusivity(tables);
+        tables
+            .repoint_preserving_attributes(span.va, new_ipa, span.len as u64)
+            .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
+        let span_end = span.va.saturating_add(span.len as u64);
+        let mut page_va = span.va & !0xfff;
+        while page_va < span_end {
+            if !lease.state.protections.range_write_denied(page_va, 1) {
+                tables
+                    .set_writable_preserving_attributes(page_va, 0x1000)
+                    .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
+            }
+            page_va = page_va.saturating_add(0x1000);
+        }
+        unsafe { tables.sync_to_host(page_table_host) };
+        foreign_cow_failpoint(&lease.state, 3)?;
+        Ok::<(), carrick_hal::ForeignMmTransportError>(())
+    })();
+    let binding = carrick_hal::ForeignMmBinding::for_aarch64(
+        requested.binding.asid,
+        requested.binding.stage1_root,
+    );
+    if let Err(error) = page_table_result {
+        if let Some(snapshot) = rollback.take() {
+            let recycled_manager = {
+                let mut tables = page_tables_authority.lock();
+                unsafe { snapshot.restore_quiesced_snapshot_to_host(page_table_host) };
+                tables.replace(snapshot)
+            };
+            *lease.state.cow_rollback_scratch.lock() = recycled_manager.or(recycled);
+            if invalidator
+                .invalidate_exact_asid(binding, deadline)
+                .is_err()
+            {
+                std::process::abort();
+            }
+        } else {
+            *lease.state.cow_rollback_scratch.lock() = recycled;
+        }
+        return Err(error);
+    }
+    let rollback = rollback.unwrap_or_else(|| std::process::abort());
+    if let Err(error) = invalidator.invalidate_exact_asid(binding, deadline) {
+        let recycled_manager = {
+            let mut tables = page_tables_authority.lock();
+            unsafe { rollback.restore_quiesced_snapshot_to_host(page_table_host) };
+            tables.replace(rollback)
+        };
+        *lease.state.cow_rollback_scratch.lock() = recycled_manager.or(recycled);
+        if invalidator
+            .invalidate_exact_asid(binding, deadline)
+            .is_err()
+        {
+            std::process::abort();
+        }
+        return Err(error);
+    }
+    if let Err(error) = foreign_cow_failpoint(&lease.state, 4) {
+        let recycled_manager = {
+            let mut tables = page_tables_authority.lock();
+            unsafe { rollback.restore_quiesced_snapshot_to_host(page_table_host) };
+            tables.replace(rollback)
+        };
+        *lease.state.cow_rollback_scratch.lock() = recycled_manager.or(recycled);
+        if invalidator
+            .invalidate_exact_asid(binding, deadline)
+            .is_err()
+        {
+            std::process::abort();
+        }
+        return Err(error);
+    }
+    *lease.state.cow_rollback_scratch.lock() = Some(rollback);
+    if let Err(_error) = runtime.authority.apply(reservation.commit(())) {
+        let rollback = lease
+            .state
+            .cow_rollback_scratch
+            .lock()
+            .take()
+            .unwrap_or_else(|| std::process::abort());
+        let recycled_manager = {
+            let mut tables = page_tables_authority.lock();
+            unsafe { rollback.restore_quiesced_snapshot_to_host(page_table_host) };
+            tables.replace(rollback)
+        };
+        *lease.state.cow_rollback_scratch.lock() = recycled_manager;
+        if invalidator
+            .invalidate_exact_asid(binding, deadline)
+            .is_err()
+        {
+            std::process::abort();
+        }
+        return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
+    }
+    let retired_old_stage2 = {
+        let mut inventory = lease.state.frame_inventory.ledger.lock();
+        HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || {
+            HvfVmState::retire_stage2_extent_from_mappings(
+                &mut [],
+                split.old.stage2_base,
+                split.old.stage2_length,
+            )
+        })
+        .unwrap_or_else(|_| std::process::abort())
+    };
+    if retired_old_stage2 {
+        mutate_external_alias_state(|_, aliases| {
+            aliases.retain(|alias| {
+                (alias.physical_ipa, alias.physical_size as u64)
+                    != (split.old.stage2_base, split.old.stage2_length)
+            });
+        });
+    }
+    let semantic_host = unsafe { new_host_ptr.add(old_offset as usize) };
+    register_shared_alias(AliasBacking {
+        start: span.va,
+        ipa: new_ipa,
+        host_addr: semantic_host as usize,
+        size: span.len,
+        physical_ipa: new_physical_ipa,
+        physical_host_addr: new_host_ptr as usize,
+        physical_size: CowArmedRanges::COMPOUND_SIZE as usize,
+        perms: u64::from(stage2_perms),
+        guest_writable: true,
+        sharing: GuestMappingSharing::Private,
+        ownership_scope: alias_ownership_scope(
+            GuestMappingSharing::Private,
+            runtime.mm_root_slot,
+            runtime.container_root,
+        ),
+        inventory_backing: backing,
+        shared_key_base: 0,
+        shared_key_offset: 0,
+        owner_generation,
+    });
+    let cow_length = carrick_hal::FrameLength::from_mapping_extent(
+        std::num::NonZeroU64::new(CowArmedRanges::COMPOUND_SIZE)
+            .unwrap_or_else(|| std::process::abort()),
+    );
+    match runtime.authority.mapping_is_live(
+        split.new_extent.mapping,
+        split.new_extent.frame,
+        carrick_guest_mem::Gpa(new_physical_ipa),
+        cow_length,
+    ) {
+        Ok(true) => {}
+        Ok(false) | Err(_) => std::process::abort(),
+    }
+    owner_rollback.commit();
+    lease.state.cow_armed.lock().disarm(span);
+    let committed = authority.snapshot(deadline)?;
+    let committed = CarrierForeignMmSnapshot::capture(committed.as_ref());
+    if committed.mm != requested.mm
+        || committed.binding != requested.binding
+        || committed.vma_revision != requested.vma_revision
+        || !committed.mapping_ids.contains(&split.new_extent.mapping)
+    {
+        std::process::abort();
+    }
+    let owner_generation = std::num::NonZeroU64::new(owner_generation)
+        .map(carrick_hal::ForeignOwnerGeneration::from_backend_counter)
+        .unwrap_or_else(|| std::process::abort());
+    Ok(CarrierForeignCowReceipt {
+        snapshot: committed,
+        start: va,
+        len,
+        mapping: split.new_extent.mapping,
+        frame: split.new_extent.frame,
+        physical_base: carrick_guest_mem::Gpa(new_physical_ipa),
+        physical_len: CowArmedRanges::COMPOUND_SIZE,
+        owner_generation,
+    })
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -6455,6 +7405,140 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
             snapshot: requested,
             bytes_read: completed,
             owner_generations,
+        }))
+    }
+
+    fn break_cow(
+        &self,
+        _invocation: &carrick_hal::ForeignMmInvocation,
+        authority: &dyn carrick_hal::ForeignMmLiveAuthority,
+        invalidator: &mut dyn carrick_hal::ForeignMmInvalidator,
+        snapshot: &dyn carrick_hal::ForeignMmSnapshot,
+        va: carrick_guest_mem::GuestVa,
+        len: usize,
+        deadline: std::time::Instant,
+    ) -> Result<Box<dyn carrick_hal::ForeignCowReceipt>, carrick_hal::ForeignMmTransportError> {
+        let requested = CarrierForeignMmSnapshot::capture(snapshot);
+        if requested.mm != self.retained.mm
+            || requested.binding != self.retained.binding
+            || requested.vma_revision != self.retained.vma_revision
+            || !self
+                .retained
+                .mapping_ids
+                .iter()
+                .all(|mapping| requested.mapping_ids.contains(mapping))
+        {
+            return Err(carrick_hal::ForeignMmTransportError::MissingBinding);
+        }
+        perform_foreign_cow_transaction(self, authority, invalidator, &requested, va, len, deadline)
+            .map(|receipt| Box::new(receipt) as Box<dyn carrick_hal::ForeignCowReceipt>)
+    }
+
+    fn write(
+        &self,
+        _invocation: &carrick_hal::ForeignMmInvocation,
+        authority: &dyn carrick_hal::ForeignMmLiveAuthority,
+        snapshot: &dyn carrick_hal::ForeignMmSnapshot,
+        cow: &dyn carrick_hal::ForeignCowReceipt,
+        va: carrick_guest_mem::GuestVa,
+        src: &[u8],
+        deadline: std::time::Instant,
+    ) -> Result<Box<dyn carrick_hal::ForeignMmWriteReceipt>, carrick_hal::ForeignMmTransportError>
+    {
+        let requested = CarrierForeignMmSnapshot::capture(snapshot);
+        if !live_snapshot_matches(authority, &requested, deadline)?
+            || requested.mm != self.retained.mm
+            || requested.binding != self.retained.binding
+            || cow.mm() != requested.mm
+            || cow.range_start() != va
+            || cow.range_len() != src.len()
+            || cow.backend_revision() != requested.backend_revision
+            || cow.vma_revision() != requested.vma_revision
+            || cow.frame_inventory_revision() != requested.frame_inventory_revision
+            || !requested.mapping_ids.contains(&cow.mapping())
+            || cow.physical_len() != CowArmedRanges::COMPOUND_SIZE
+        {
+            return Err(carrick_hal::ForeignMmTransportError::Retry);
+        }
+        let extent_key = (cow.physical_base().raw(), cow.physical_len());
+        let expected_generation = cow.owner_generation().raw_for_probe();
+        let inventory_extent = {
+            let inventory = self
+                .state
+                .frame_inventory
+                .ledger
+                .try_lock_until(deadline)
+                .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?;
+            inventory
+                .extents
+                .get(&extent_key)
+                .copied()
+                .filter(|extent| {
+                    extent.mapping == cow.mapping()
+                        && extent.frame == cow.frame()
+                        && extent.stage2_base == extent_key.0
+                        && extent.stage2_length == extent_key.1
+                        && extent.stage2_owner.generation == expected_generation
+                })
+                .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)?
+        };
+        let owner = global_frame_host_owners()
+            .try_lock_until(deadline)
+            .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?
+            .get(&extent_key)
+            .filter(|owner| {
+                owner.generation == expected_generation
+                    && owner._mapping.as_ptr() as usize == inventory_extent.stage2_owner.host_addr
+                    && owner._mapping.len() as u64 == extent_key.1
+            })
+            .cloned()
+            .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)?;
+        let mut owner_generations = Vec::new();
+        let physical = foreign_stage1_translate(
+            &self.backing,
+            requested.binding.stage1_root,
+            va,
+            &mut owner_generations,
+        )?;
+        let offset = physical
+            .checked_sub(extent_key.0)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .filter(|offset| {
+                offset
+                    .checked_add(src.len())
+                    .is_some_and(|end| end <= owner._mapping.len())
+            })
+            .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)?;
+        if !live_snapshot_matches(authority, &requested, deadline)?
+            || !global_frame_host_owner_matches(
+                extent_key.0,
+                extent_key.1,
+                owner._mapping.as_ptr() as usize,
+                expected_generation,
+            )
+        {
+            return Err(carrick_hal::ForeignMmTransportError::Retry);
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr(),
+                owner._mapping.as_ptr().add(offset),
+                src.len(),
+            );
+        }
+        let cow = CarrierForeignCowReceipt {
+            snapshot: requested,
+            start: va,
+            len: src.len(),
+            mapping: cow.mapping(),
+            frame: cow.frame(),
+            physical_base: cow.physical_base(),
+            physical_len: cow.physical_len(),
+            owner_generation: cow.owner_generation(),
+        };
+        Ok(Box::new(CarrierForeignWriteReceipt {
+            cow,
+            bytes_written: src.len(),
         }))
     }
 }
@@ -6898,6 +7982,13 @@ impl HvfTaskState {
     ) {
         self.cow_authority = Some(std::sync::Arc::clone(&authority));
         self.cow_identity = Some(identity);
+        self.mm_access.bind_cow_runtime(MmCowRuntimeBinding {
+            authority: std::sync::Arc::clone(&authority),
+            identity,
+            mm_root_slot: self.mm_root_slot,
+            container_root: self.container_root,
+            persistent_vm_lifecycle: self.persistent_vm_lifecycle,
+        });
         self.publish_pending_fork_frame_receipts();
         if let Some(ref mut reg) = self.registration {
             reg.cow_authority = Some(authority);

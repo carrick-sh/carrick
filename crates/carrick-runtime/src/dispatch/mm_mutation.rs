@@ -111,6 +111,7 @@ impl MmMutationCoordinator {
 pub struct MmMutationGuard<'authority> {
     coordinator: Arc<MmMutationCoordinator>,
     mm: MmId,
+    foreign_authority: Option<&'authority mut crate::vcpu_loop::quiesce::FrameCowExactMmGuard>,
     _authority: PhantomData<&'authority mut ()>,
 }
 
@@ -123,6 +124,98 @@ impl MmMutationGuard<'_> {
             _guard: PhantomData,
         }
     }
+
+    #[allow(dead_code)] // Canonical process_vm consumer lands in Task 8.
+    pub(crate) fn authorizes(&self, coordinator: &Arc<MmMutationCoordinator>, mm: MmId) -> bool {
+        self.mm == mm && self.coordinator.mm == mm && Arc::ptr_eq(&self.coordinator, coordinator)
+    }
+
+    #[allow(dead_code)] // Canonical process_vm consumer lands in Task 8.
+    pub(crate) fn with_host_alias<T>(&mut self, operation: impl FnOnce(&mut Self) -> T) -> T {
+        let coordinator = Arc::clone(&self.coordinator);
+        let permit = HostAliasPermit {
+            coordinator: Arc::clone(&coordinator),
+            mm: self.mm,
+            _guard: PhantomData,
+        };
+        let _alias = coordinator.begin_alias(&permit);
+        operation(self)
+    }
+}
+
+impl carrick_hal::ForeignMmInvalidator for MmMutationGuard<'_> {
+    fn invalidate_exact_asid(
+        &mut self,
+        binding: carrick_hal::ForeignMmBinding,
+        deadline: std::time::Instant,
+    ) -> Result<(), carrick_hal::ForeignMmTransportError> {
+        self.foreign_authority
+            .as_deref_mut()
+            .ok_or(carrick_hal::ForeignMmTransportError::AuthorityUnavailable)?
+            .publish_foreign_cow_invalidation(binding, deadline)
+            .map_err(|_| carrick_hal::ForeignMmTransportError::AuthorityUnavailable)
+    }
+}
+
+/// Sealed exact-target binding installed alongside the foreign-MM carrier
+/// transport. It owns no page-table authority itself; each use drains the
+/// target dispatcher census and borrows the resulting linear guard.
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // Installed now; canonical process_vm consumer lands in Task 8.
+pub(crate) struct ForeignMmMutationAuthority {
+    mm: MmId,
+    coordinator: Arc<MmMutationCoordinator>,
+    census: Arc<crate::kernel::GuestExecutorCensus>,
+    stage1: Arc<crate::hvpatch::Stage1MmLease>,
+}
+
+#[allow(dead_code)] // Installed now; canonical process_vm consumer lands in Task 8.
+impl ForeignMmMutationAuthority {
+    pub(crate) fn new(
+        mm: MmId,
+        coordinator: Arc<MmMutationCoordinator>,
+        census: Arc<crate::kernel::GuestExecutorCensus>,
+        stage1: Arc<crate::hvpatch::Stage1MmLease>,
+    ) -> Self {
+        assert_eq!(
+            coordinator.mm, mm,
+            "foreign mutation coordinator/MM mismatch"
+        );
+        Self {
+            mm,
+            coordinator,
+            census,
+            stage1,
+        }
+    }
+
+    pub(crate) fn authorizes(&self, guard: &MmMutationGuard<'_>) -> bool {
+        guard.authorizes(&self.coordinator, self.mm)
+    }
+
+    pub(crate) fn with_guard<T>(
+        &self,
+        tid: carrick_hal::ThreadId,
+        operation: impl FnOnce(&mut MmMutationGuard<'_>) -> T,
+    ) -> Result<T, ForeignMmMutationError> {
+        crate::vcpu_loop::with_foreign_mm_mutation_guard(
+            self.mm,
+            Arc::clone(&self.coordinator),
+            &self.census,
+            Arc::clone(&self.stage1),
+            tid,
+            operation,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[allow(dead_code)] // Canonical process_vm consumer lands in Task 8.
+pub(crate) enum ForeignMmMutationError {
+    #[error("target-MM page-table exclusion timed out")]
+    TimedOut,
+    #[error("target MM has an executor without a pause endpoint")]
+    UnkickableExecutor,
 }
 
 pub(crate) fn from_pt_pause<'authority>(
@@ -134,6 +227,7 @@ pub(crate) fn from_pt_pause<'authority>(
     MmMutationGuard {
         coordinator,
         mm,
+        foreign_authority: None,
         _authority: PhantomData,
     }
 }
@@ -150,6 +244,22 @@ pub(crate) fn from_sole_executor<'authority>(
     MmMutationGuard {
         coordinator,
         mm,
+        foreign_authority: None,
+        _authority: PhantomData,
+    }
+}
+
+#[allow(dead_code)] // Canonical process_vm consumer lands in Task 8.
+pub(crate) fn from_frame_cow<'authority>(
+    authority: &'authority mut crate::vcpu_loop::quiesce::FrameCowExactMmGuard,
+) -> MmMutationGuard<'authority> {
+    let (coordinator, mm) = authority
+        .mutation_identity()
+        .unwrap_or_else(|| std::process::abort());
+    MmMutationGuard {
+        coordinator,
+        mm,
+        foreign_authority: Some(authority),
         _authority: PhantomData,
     }
 }

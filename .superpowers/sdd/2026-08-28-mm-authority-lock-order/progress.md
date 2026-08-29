@@ -118,3 +118,40 @@ RED and review-pending commits remain on `codex/fd-description-seam`; no push.
   check, targeted clippy, format, and diff checks. The production checker is
   intentionally RED with exactly the one Task 8 `foreign-current-memory`
   finding. Report: `task-6-report.md`.
+- Task 7: Ruling: the five-file list omitted acquisition of target-MM mutation
+  authority and a carrier-owned target-ASID invalidator. A caller-MM
+  pre-dispatch guard cannot authorize foreign COW, and `process_vm_writev`
+  cannot select its target before dispatch. Task 7 therefore owns the minimal
+  additional runtime/MM binding, exact target census/coordinator acquisition,
+  and shared invalidation plumbing required to make its mandated facade usable
+  end to end; Task 8 may consume that API but may not invent authority. It must
+  not add process-vm to the current-MM classifier or fall back to the caller's
+  active engine. Cost if wrong: Task 7 touches more files than listed, but the
+  alternative either grants MM A authority over MM B or leaves the consumer
+  task unable to satisfy the spec.
+- Task 7: Ruling: target-ASID invalidation uses a two-phase page-table pause,
+  not an async continuation or reserved maintenance vCPU. After target-active
+  executors leave guest and admission closes, the coordinator edits stage-1,
+  publishes the exact invalidation generation, waits for every active target
+  owner-vCPU acknowledgement while they remain excluded, then commits or rolls
+  back. Inactive/resident executors record the generation and must service it
+  before next guest entry with that exact target binding, so the foreign caller
+  never waits on its own command while running another MM. Cost if wrong: this
+  expands the existing pause/executor protocol and adds a mandatory pre-entry
+  generation check; the rejected alternatives either deadlock at one vCPU,
+  consume product capacity, or defer the entire syscall through a new scheduler
+  continuation architecture.
+- Task 7: implementation complete and awaiting independent approval. The
+  canonical facade acquires a real exact-target mutation guard, mints a
+  single-use opaque `CowBroken`, revalidates token/range/three revisions and
+  owner generation before both COW and copy, and reuses the production HVF COW
+  transaction plus byte-exact rollback pre-image. Exact-ASID invalidation is a
+  two-phase active-owner acknowledgement with a mandatory inactive/resident
+  pre-entry generation gate; the backend never reacquires PtPause or uses the
+  caller engine. Fresh gates: HAL foreign-MM 1/1, runtime MM access 18/18,
+  runtime HVPatch 109/109, HVF foreign-COW 3/3 and frame-COW 1/1, thread 53/53,
+  serialized runtime 2,090/2,090, serialized HVF 279/279, workspace check,
+  targeted clippy, checker self-test 20 negative/17 positive, format and diff
+  checks. Production checker remains intentionally RED with exactly the one
+  Task 8 `foreign-current-memory` finding in untouched `dispatch/proc.rs`.
+  Report: `task-7-report.md`.

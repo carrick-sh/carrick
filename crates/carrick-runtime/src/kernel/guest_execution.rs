@@ -233,6 +233,15 @@ impl ExactMmCensusGuard {
         self.state.participants.values().all(Option::is_some)
     }
 
+    pub(crate) fn pause_endpoint_tids(&self) -> Vec<carrick_hal::ThreadId> {
+        self.state
+            .participants
+            .values()
+            .flatten()
+            .map(|endpoint| endpoint.tid)
+            .collect()
+    }
+
     pub(crate) fn any_in_guest(&self) -> bool {
         self.state
             .participants

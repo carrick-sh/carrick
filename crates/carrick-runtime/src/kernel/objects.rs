@@ -110,6 +110,7 @@ pub struct Mm {
     id: MmId,
     backend: Option<Arc<dyn MmBackend>>,
     foreign_mm_endpoint: RwLock<Option<carrick_hal::ForeignMmEndpoint>>,
+    foreign_mm_mutation: RwLock<Option<crate::dispatch::mm_mutation::ForeignMmMutationAuthority>>,
     io_uring_mappings: RwLock<Vec<crate::dispatch::ioring::IoUringMapping>>,
     legacy_aio_contexts: RwLock<BTreeSet<crate::dispatch::LegacyAioContextId>>,
     next_legacy_aio_context: AtomicU64,
@@ -125,6 +126,7 @@ impl Mm {
             id,
             backend: None,
             foreign_mm_endpoint: RwLock::new(None),
+            foreign_mm_mutation: RwLock::new(None),
             io_uring_mappings: RwLock::new(Vec::new()),
             legacy_aio_contexts: RwLock::new(BTreeSet::new()),
             next_legacy_aio_context: AtomicU64::new(1),
@@ -137,6 +139,7 @@ impl Mm {
             id,
             backend: Some(backend),
             foreign_mm_endpoint: RwLock::new(None),
+            foreign_mm_mutation: RwLock::new(None),
             io_uring_mappings: RwLock::new(Vec::new()),
             legacy_aio_contexts: RwLock::new(BTreeSet::new()),
             next_legacy_aio_context: AtomicU64::new(1),
@@ -150,6 +153,7 @@ impl Mm {
             id,
             backend: None,
             foreign_mm_endpoint: RwLock::new(None),
+            foreign_mm_mutation: RwLock::new(None),
             io_uring_mappings: RwLock::new(parent.io_uring_mappings.read().clone()),
             legacy_aio_contexts: RwLock::new(BTreeSet::new()),
             next_legacy_aio_context: AtomicU64::new(1),
@@ -162,6 +166,7 @@ impl Mm {
             id,
             backend: Some(backend),
             foreign_mm_endpoint: RwLock::new(None),
+            foreign_mm_mutation: RwLock::new(None),
             io_uring_mappings: RwLock::new(parent.io_uring_mappings.read().clone()),
             legacy_aio_contexts: RwLock::new(BTreeSet::new()),
             next_legacy_aio_context: AtomicU64::new(1),
@@ -311,6 +316,32 @@ impl Mm {
             .map(|endpoint| endpoint.clone())
     }
 
+    pub(crate) fn install_foreign_mm_mutation_authority(
+        &self,
+        authority: crate::dispatch::mm_mutation::ForeignMmMutationAuthority,
+        _permit: &crate::hvpatch::ForeignMmInstallPermit,
+    ) {
+        *self.foreign_mm_mutation.write() = Some(authority);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_foreign_mm_mutation_authority_for_test(
+        &self,
+        authority: crate::dispatch::mm_mutation::ForeignMmMutationAuthority,
+    ) {
+        *self.foreign_mm_mutation.write() = Some(authority);
+    }
+
+    pub(super) fn foreign_mm_mutation_authority(
+        &self,
+        _permit: &super::mm_access::ForeignEndpointPermit,
+        deadline: std::time::Instant,
+    ) -> Option<Option<crate::dispatch::mm_mutation::ForeignMmMutationAuthority>> {
+        self.foreign_mm_mutation
+            .try_read_until(deadline)
+            .map(|authority| authority.clone())
+    }
+
     pub(super) fn revision(&self) -> u64 {
         self.revision.load()
     }
@@ -325,6 +356,10 @@ impl std::fmt::Debug for Mm {
             .field(
                 "has_foreign_mm_endpoint",
                 &self.foreign_mm_endpoint.read().is_some(),
+            )
+            .field(
+                "has_foreign_mm_mutation_authority",
+                &self.foreign_mm_mutation.read().is_some(),
             )
             .field(
                 "legacy_aio_contexts",
