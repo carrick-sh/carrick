@@ -324,3 +324,29 @@ RED and review-pending commits remain on `codex/fd-description-seam`; no push.
   characterization 1/1 green; formatting and diff hygiene pass. The controller
   and both read-only design reviewers inspected only current Carrick source and
   explicitly used neither Linux kernel source nor abandoned Task 8 material.
+- Task 8 process-vm-write consumer milestone accepted at `0e64f643b`
+  (implementation commits `62e785eb5`, `c5f0d38bc`, `4f781a7f3`, `3302e8885`,
+  `82a1bc48b`, `58aa825c1`; abort-ledger closure `0e64f643b`). Antigravity
+  worker `process-vm-write-consumer-cleanroom`, run id
+  `mm-authority-cleanroom-20260829-task8-process-vm-write`, produced the initial
+  target-MM mutation and bounded owned-byte staging slices. Codex rejected its final
+  global-mutex revision because reciprocal A-to-B/B-to-A callers could still
+  retain the target census participation needed by the mutex owner, and its
+  concurrency regression used empty target censuses. The corrected boundary
+  retains the exact running execution lease, removes only the caller's exact-MM
+  executor participation before acquiring target mutation authority, performs
+  COW/prepare/commit solely from bounded owned bytes, drops target authority,
+  then re-enters and revalidates the same caller admission on success, error,
+  and unwind. Exact post-chunk cursors prevent internal zero-length iovecs from
+  repeating source or target ranges. A direct COW callback proves the caller
+  census is absent during target mutation; four boundary tests prove exact
+  restoration and typed binding-drift detection. Independent clean-room
+  verdict: ACCEPT, no P0-P3 findings. Fresh controller gates: boundary 4/4,
+  process-VM 26/26, syscall-process 9/9, serialized runtime library
+  2,136/2,136, MM-authority checker over 253 Rust leaves, strict runtime
+  clippy, formatting, and diff hygiene. Five new fail-closed abort boundaries
+  have exact `carrier_fault` ledger fingerprints; the checker returns to the
+  24 pre-existing unclassified MM-authority calls that remain final-audit debt.
+  Every surviving implementer and reviewer attested that it used neither Linux
+  kernel source nor abandoned Task 8 material; the rejected mutex stream was
+  not integrated.
