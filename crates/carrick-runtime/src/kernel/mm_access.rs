@@ -526,6 +526,8 @@ impl MmAccessAuthority {
                         proof.authenticates(
                             &mm.token.kernel,
                             mm.mm_id(),
+                            receipt.range_start(),
+                            receipt.range_len(),
                             receipt.frame_inventory_revision().raw_for_probe(),
                             receipt.mapping(),
                             receipt.frame(),
@@ -627,6 +629,8 @@ impl MmAccessAuthority {
                     proof.authenticates(
                         &range.token.kernel,
                         mm.id(),
+                        witness.transport.range_start(),
+                        witness.transport.range_len(),
                         witness.transport.frame_inventory_revision().raw_for_probe(),
                         witness.transport.mapping(),
                         witness.transport.frame(),
@@ -1748,6 +1752,9 @@ mod tests {
                 .authority
                 .apply_foreign_cow(
                     commit,
+                    va,
+                    std::num::NonZeroUsize::new(len)
+                        .ok_or(ForeignMmTransportError::MutationFailed)?,
                     self.mapping,
                     self.frame,
                     self.physical_base,
@@ -1996,6 +2003,8 @@ mod tests {
         let proof = crate::vcpu_loop::KernelForeignCowProof::new(
             Arc::clone(kernel),
             mm,
+            GuestVa(0x3000),
+            std::num::NonZeroUsize::new(physical_len as usize).unwrap(),
             inventory_revision,
             mapping,
             frame,
@@ -2071,6 +2080,8 @@ mod tests {
         let proof = crate::vcpu_loop::KernelForeignCowProof::new(
             Arc::clone(kernel),
             mm,
+            GuestVa(0x3000),
+            std::num::NonZeroUsize::new(physical_len as usize).unwrap(),
             inventory_revision,
             mapping,
             frame,
@@ -2864,7 +2875,15 @@ mod tests {
         );
 
         let (receipt, proof, authenticated_owner) = authority
-            .apply_foreign_cow(reservation.commit(()), mapping, frame, gpa, length)
+            .apply_foreign_cow(
+                reservation.commit(()),
+                GuestVa(0x3000),
+                std::num::NonZeroUsize::new(0x4000).unwrap(),
+                mapping,
+                frame,
+                gpa,
+                length,
+            )
             .expect("apply foreign COW inventory transaction");
         let proof = proof
             .downcast_ref::<crate::vcpu_loop::KernelForeignCowProof>()
@@ -2878,6 +2897,8 @@ mod tests {
             proof.authenticates(
                 &kernel,
                 mm,
+                GuestVa(0x3000),
+                0x4000,
                 receipt.revision(),
                 mapping,
                 frame,
@@ -2891,6 +2912,8 @@ mod tests {
             !proof.authenticates(
                 &kernel,
                 mm,
+                GuestVa(0x3000),
+                0x4000,
                 receipt.revision(),
                 mapping,
                 frame,

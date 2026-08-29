@@ -458,6 +458,8 @@ mod foreign_mm_tests {
         fn apply_foreign_cow(
             &self,
             commit: carrick_hal::FrameInventoryCommit<()>,
+            _semantic_start: carrick_guest_mem::GuestVa,
+            _semantic_len: std::num::NonZeroUsize,
             _mapping: carrick_hal::MappingId,
             _frame: carrick_hal::FrameId,
             gpa: Gpa,
@@ -8016,6 +8018,8 @@ fn perform_foreign_cow_transaction(
     let (apply_receipt, kernel_proof, authenticated_owner_generation) =
         match runtime.authority.apply_foreign_cow(
             commit,
+            carrick_guest_mem::GuestVa(span.va),
+            std::num::NonZeroUsize::new(span.len).unwrap_or_else(|| std::process::abort()),
             split.new_extent.mapping,
             split.new_extent.frame,
             carrick_guest_mem::Gpa(new_physical_ipa),
