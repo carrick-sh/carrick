@@ -1,7 +1,7 @@
 //! Kernel-minted authority for one exact Linux address-space incarnation.
 
 use std::marker::PhantomData;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -219,6 +219,131 @@ impl ForeignMm {
     pub fn mm_id(&self) -> MmId {
         self.token.mm_id()
     }
+
+    pub fn read_range(
+        &self,
+        start: GuestVa,
+        len: usize,
+    ) -> Result<Option<MmReadRange<'_>>, MmAccessError> {
+        self.token.read_range(start, len)
+    }
+}
+
+/// Authenticated completion of a private runtime foreign read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // Task 8 is the first syscall consumer.
+pub(crate) struct ForeignReadReceipt {
+    transport: carrick_hal::ForeignMmReadReceipt,
+}
+
+impl ForeignReadReceipt {
+    #[allow(dead_code)] // Task 8 is the first syscall consumer.
+    pub(crate) const fn bytes_read(&self) -> usize {
+        self.transport.bytes_read
+    }
+}
+
+/// Private runtime facade over the carrier transport. Syscall handlers receive
+/// only token-bound ranges and never transport snapshots or constructors.
+#[derive(Clone)]
+#[allow(dead_code)] // Installed in Task 5; consumed by process_vm in Task 8.
+pub(crate) struct MmAccessAuthority {
+    transport: Arc<dyn carrick_hal::ForeignMmTransport>,
+}
+
+impl std::fmt::Debug for MmAccessAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MmAccessAuthority").finish_non_exhaustive()
+    }
+}
+
+impl MmAccessAuthority {
+    #[allow(dead_code)] // Task 8 is the first syscall consumer.
+    const MAX_ATTEMPTS: usize = 3;
+
+    pub(crate) fn new(transport: Arc<dyn carrick_hal::ForeignMmTransport>) -> Self {
+        Self { transport }
+    }
+
+    #[allow(dead_code)] // Task 8 is the first syscall consumer.
+    pub fn read_foreign(
+        &self,
+        mm: &ForeignMm,
+        range: MmReadRange<'_>,
+        dst: &mut [u8],
+    ) -> Result<ForeignReadReceipt, MmAccessError> {
+        if !Arc::ptr_eq(&range.token.mm, &mm.token.mm) || range.token.task != mm.token.task {
+            return Err(MmAccessError::ForeignRangeAuthorityMismatch);
+        }
+        if dst.len() != range.len.get() {
+            return Err(MmAccessError::DestinationLengthMismatch {
+                range: range.len.get(),
+                destination: dst.len(),
+            });
+        }
+
+        for _ in 0..Self::MAX_ATTEMPTS {
+            let before = snapshot_token(mm.token.task, Arc::clone(&mm.token.mm))?;
+            before.validate_range(range.start, range.len, RangeAccess::Read)?;
+            let snapshot = project_foreign_snapshot(&before)?;
+            let receipt = match self.transport.read(&snapshot, range.start, dst) {
+                Ok(receipt) => receipt,
+                Err(carrick_hal::ForeignMmTransportError::Retry) => continue,
+                Err(error) => return Err(MmAccessError::ForeignTransport(error)),
+            };
+            let after = project_foreign_snapshot(&snapshot_token(
+                mm.token.task,
+                Arc::clone(&mm.token.mm),
+            )?)?;
+            if after != snapshot {
+                continue;
+            }
+            if receipt.mm != snapshot.mm
+                || receipt.binding != snapshot.binding
+                || receipt.backend_revision != snapshot.backend_revision
+                || receipt.vma_revision != snapshot.vma_revision
+                || receipt.frame_inventory_revision != snapshot.frame_inventory_revision
+                || receipt.bytes_read != dst.len()
+            {
+                return Err(MmAccessError::ForeignReceiptMismatch);
+            }
+            return Ok(ForeignReadReceipt { transport: receipt });
+        }
+        Err(MmAccessError::ForeignReadRetryExhausted)
+    }
+}
+
+#[allow(dead_code)] // Task 8 is the first syscall consumer.
+fn project_foreign_snapshot(
+    token: &MmToken,
+) -> Result<carrick_hal::ForeignMmSnapshot, MmAccessError> {
+    let vma_revision = token
+        .snapshot
+        .vma_revision
+        .ok_or(MmAccessError::IncompleteForeignSnapshot(token.mm_id()))?;
+    let frame_inventory_revision = token
+        .snapshot
+        .frame_inventory_revision
+        .ok_or(MmAccessError::IncompleteForeignSnapshot(token.mm_id()))?;
+    let mm = NonZeroU64::new(token.mm_id().raw())
+        .ok_or(MmAccessError::IncompleteForeignSnapshot(token.mm_id()))?;
+    let asid = NonZeroU16::new(token.snapshot.binding.asid.raw())
+        .ok_or(MmAccessError::IncompleteForeignSnapshot(token.mm_id()))?;
+    Ok(carrick_hal::ForeignMmSnapshot {
+        mm: carrick_hal::ForeignMmId::from_kernel_allocation(mm),
+        binding: carrick_hal::ForeignMmBinding::for_aarch64(
+            carrick_hal::ForeignAsid::from_kernel_allocation(asid),
+            token.snapshot.binding.stage1_root.gpa(),
+        ),
+        backend_revision: carrick_hal::ForeignBackendRevision::from_authority_raw(
+            token.snapshot.revision,
+        ),
+        vma_revision: carrick_hal::ForeignVmaRevision::from_authority_raw(vma_revision.raw()),
+        frame_inventory_revision: carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(
+            frame_inventory_revision,
+        ),
+        mapping_ids: token.snapshot.mapping_ids.clone(),
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -253,6 +378,18 @@ pub enum MmAccessError {
     WriteDenied { address: GuestVa },
     #[error("guest address {address:?} is hidden from kernel memory access")]
     KernelHidden { address: GuestVa },
+    #[error("foreign read range is not bound to the supplied retained MM")]
+    ForeignRangeAuthorityMismatch,
+    #[error("foreign read destination length {destination} does not match range length {range}")]
+    DestinationLengthMismatch { range: usize, destination: usize },
+    #[error("MM {0:?} lacks typed HVPatch foreign-read snapshot domains")]
+    IncompleteForeignSnapshot(MmId),
+    #[error(transparent)]
+    ForeignTransport(carrick_hal::ForeignMmTransportError),
+    #[error("foreign MM transport receipt does not authenticate the requested snapshot")]
+    ForeignReceiptMismatch,
+    #[error("foreign MM changed throughout the bounded read retry budget")]
+    ForeignReadRetryExhausted,
 }
 
 impl KernelContext {
@@ -372,8 +509,11 @@ mod tests {
 
     use carrick_abi::LinuxCloneFlags;
     use carrick_guest_mem::{Gpa, GuestVa};
-    use carrick_hal::ThreadId;
     use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
+    use carrick_hal::{
+        ForeignMmReadReceipt, ForeignMmSnapshot, ForeignMmTransport, ForeignMmTransportError,
+        ThreadId,
+    };
 
     use super::super::objects::{
         ExecutorId, MigratableTaskState, ThreadExecutionError, ThreadExecutionLease,
@@ -454,6 +594,45 @@ mod tests {
     #[derive(Debug)]
     struct ChurningBackend {
         backend_revision: AtomicU64,
+    }
+
+    struct RetryOnceForeignTransport {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    struct AlwaysRetryForeignTransport {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ForeignMmTransport for RetryOnceForeignTransport {
+        fn read(
+            &self,
+            snapshot: &ForeignMmSnapshot,
+            _va: GuestVa,
+            dst: &mut [u8],
+        ) -> Result<ForeignMmReadReceipt, ForeignMmTransportError> {
+            if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                return Err(ForeignMmTransportError::Retry);
+            }
+            dst.copy_from_slice(b"root");
+            Ok(ForeignMmReadReceipt::complete(
+                snapshot,
+                dst.len(),
+                Vec::new(),
+            ))
+        }
+    }
+
+    impl ForeignMmTransport for AlwaysRetryForeignTransport {
+        fn read(
+            &self,
+            _snapshot: &ForeignMmSnapshot,
+            _va: GuestVa,
+            _dst: &mut [u8],
+        ) -> Result<ForeignMmReadReceipt, ForeignMmTransportError> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            Err(ForeignMmTransportError::Retry)
+        }
     }
 
     impl MmBackend for ChurningBackend {
@@ -877,5 +1056,65 @@ mod tests {
                 SnapshotError::ChangedDuringObservation
             ))
         ));
+    }
+
+    #[test]
+    fn mm_access_authority_retries_from_a_fresh_snapshot_and_authenticates_receipt() {
+        let (kernel, root) = bootstrap(31_140);
+        let execution = execution_lease(&root, 141);
+        let child = fork_with_backend(
+            &kernel,
+            &root,
+            31_141,
+            "foreign-read child",
+            fixture_backend(),
+        );
+        let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
+        let range = foreign
+            .read_range(GuestVa(0x1000), 4)
+            .expect("validated read range")
+            .expect("nonempty read range");
+        let transport = Arc::new(RetryOnceForeignTransport {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let authority = super::MmAccessAuthority::new(transport.clone());
+        let mut bytes = [0_u8; 4];
+
+        let receipt = authority
+            .read_foreign(&foreign, range, &mut bytes)
+            .expect("bounded retry succeeds");
+
+        assert_eq!(&bytes, b"root");
+        assert_eq!(receipt.bytes_read(), bytes.len());
+        assert_eq!(transport.calls.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn mm_access_authority_exhausts_a_fixed_retry_budget() {
+        let (kernel, root) = bootstrap(31_142);
+        let execution = execution_lease(&root, 143);
+        let child = fork_with_backend(
+            &kernel,
+            &root,
+            31_143,
+            "churning foreign-read child",
+            fixture_backend(),
+        );
+        let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
+        let range = foreign
+            .read_range(GuestVa(0x1000), 4)
+            .expect("validated read range")
+            .expect("nonempty read range");
+        let transport = Arc::new(AlwaysRetryForeignTransport {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let authority = super::MmAccessAuthority::new(transport.clone());
+        let mut bytes = [0_u8; 4];
+
+        assert_eq!(
+            authority.read_foreign(&foreign, range, &mut bytes),
+            Err(MmAccessError::ForeignReadRetryExhausted)
+        );
+        assert_eq!(transport.calls.load(Ordering::Acquire), 3);
     }
 }

@@ -183,6 +183,19 @@ pub struct Aarch64TaskRuntimeProjection {
     pub protections: Arc<MemoryProtections>,
     pub process_asid: Option<u16>,
 }
+
+impl Aarch64TaskRuntimeProjection {
+    /// Require both runtime handles to name one exact shared MM authority.
+    /// Pointer identity is intentional: independently cloned contents cannot
+    /// substitute for the carrier-owned state shared by CLONE_VM tasks.
+    pub fn shares_exact_mm_authority(
+        &self,
+        page_tables: &Arc<Mutex<Option<PageTableManager>>>,
+        protections: &Arc<MemoryProtections>,
+    ) -> bool {
+        Arc::ptr_eq(&self.page_tables, page_tables) && Arc::ptr_eq(&self.protections, protections)
+    }
+}
 unsafe impl<V: Aarch64Vmm> Send for Aarch64TaskEngineState<V> {}
 
 impl<V: Aarch64Vmm> Aarch64TaskEngineState<V> {

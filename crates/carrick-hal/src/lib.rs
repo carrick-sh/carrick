@@ -14,6 +14,11 @@ pub use aarch64::{
 };
 pub mod error;
 pub use error::{MemPerms, OsError, Reg, SysReg};
+pub mod foreign_mm;
+pub use foreign_mm::{
+    ForeignAsid, ForeignMmBinding, ForeignMmId, ForeignMmReadReceipt, ForeignMmSnapshot,
+    ForeignMmTransport, ForeignMmTransportError, ForeignOwnerGeneration,
+};
 pub mod stage1_exclusive;
 
 pub mod trap;
