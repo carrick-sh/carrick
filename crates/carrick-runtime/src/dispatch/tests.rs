@@ -837,8 +837,8 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
             dispatcher.host_alias_transactions()
                 .next_id
                 .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
-            let guard = dispatcher.begin_host_alias_dispatch_for_test();
-            let _ = guard.publish(HostAliasCommit::mmap(mem::HostAliasMmapCommit {
+            dispatcher.with_host_alias_dispatch_for_test(|guard| {
+                let _ = guard.publish(HostAliasCommit::mmap(mem::HostAliasMmapCommit {
                 start: crate::memory::LINUX_HIGH_VA_THRESHOLD,
                 len: LINUX_PAGE_SIZE,
                 prot: LinuxProtFlags::READ,
@@ -855,7 +855,8 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
                 secretmem: false,
                 writable_memfd: None,
                 shared_file_alias: None,
-            }));
+                }));
+            });
             unsafe { libc::_exit(0) };
         }
         let mut status = 0;
@@ -4848,10 +4849,11 @@ mod container_policy_dispatch_tests {
                         let acquired_tx = acquired_tx.clone();
                         peer = Some(std::thread::spawn(move || {
                             attempted_tx.send(()).unwrap();
-                            let _vma = peer_dispatcher.begin_vma_dispatch_for_test();
-                            acquired_tx
-                                .send(peer_complete.load(std::sync::atomic::Ordering::Acquire))
-                                .unwrap();
+                            peer_dispatcher.with_vma_dispatch_for_test(|_vma| {
+                                acquired_tx
+                                    .send(peer_complete.load(std::sync::atomic::Ordering::Acquire))
+                                    .unwrap();
+                            });
                         }));
                         attempted_rx.recv().unwrap();
                         assert!(acquired_rx.try_recv().is_err());
@@ -5077,13 +5079,12 @@ mod container_policy_dispatch_tests {
         let dispatcher = SyscallDispatcher::new();
         let heap_base = dispatcher.mem().lock().layout.heap_base;
         let initial_revision = dispatcher.mem().vma_revision();
-        {
-            let _vma = dispatcher.begin_vma_dispatch_for_test();
+        dispatcher.with_vma_dispatch_for_test(|_vma| {
             let authority = dispatcher.mem();
             let mut state = authority.lock();
             mem::update_semantic_heap_pages(&mut state, heap_base, heap_base + 0x3000);
             state.brk_current = heap_base + 0x3000;
-        }
+        });
         let grown_revision = dispatcher.mem().vma_revision();
         assert!(grown_revision.raw() > initial_revision.raw());
 
@@ -5104,8 +5105,7 @@ mod container_policy_dispatch_tests {
             Some(carrick_hal::ForkLeafDisposition::Preserve)
         );
 
-        {
-            let _vma = dispatcher.begin_vma_dispatch_for_test();
+        dispatcher.with_vma_dispatch_for_test(|_vma| {
             let authority = dispatcher.mem();
             let mut state = authority.lock();
             mem::update_semantic_heap_pages(
@@ -5114,7 +5114,7 @@ mod container_policy_dispatch_tests {
                 heap_base + 0x1000,
             );
             state.brk_current = heap_base + 0x1000;
-        }
+        });
         assert!(dispatcher.mem().vma_revision().raw() > grown_revision.raw());
         let shrunk = dispatcher
             .prepare_fork_mm(

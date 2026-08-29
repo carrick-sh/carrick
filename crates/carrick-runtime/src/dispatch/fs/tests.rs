@@ -2336,66 +2336,67 @@ fn f_add_seals_waits_for_alias_dispatch_and_publishes_under_same_exclusion() {
         )
         .expect("install sealable fd");
 
-    let guard = dispatcher.begin_host_alias_dispatch_for_test();
-    let sibling = std::sync::Arc::clone(&dispatcher);
-    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
-    let (outcome_tx, outcome_rx) = std::sync::mpsc::sync_channel(1);
-    let thread = std::thread::spawn(move || {
-        let reporter = CompatReporter::default();
-        let mut memory = LinearMemory::new(0x1000, vec![0; 0x1000]);
-        started_tx.send(()).expect("report F_ADD_SEALS start");
-        let outcome = sibling
-            .dispatch_normalized(
-                &sibling.capture_one_task_context().unwrap(),
-                SyscallRequest::new(
-                    25,
-                    SyscallArgs::from([
-                        fd as u64,
-                        LINUX_F_ADD_SEALS,
-                        u64::from(carrick_abi::LinuxMemfdSeals::SHRINK.bits()),
-                        0,
-                        0,
-                        0,
-                    ]),
-                ),
-                &mut memory,
-                &reporter,
-                None,
-            )
-            .expect("fcntl is a claimed syscall")
-            .expect("F_ADD_SEALS must not be a fatal DispatchError");
-        outcome_tx
-            .send(outcome)
-            .expect("report F_ADD_SEALS outcome");
-    });
+    dispatcher.with_host_alias_dispatch_for_test(|guard| {
+        let sibling = std::sync::Arc::clone(&dispatcher);
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (outcome_tx, outcome_rx) = std::sync::mpsc::sync_channel(1);
+        let thread = std::thread::spawn(move || {
+            let reporter = CompatReporter::default();
+            let mut memory = LinearMemory::new(0x1000, vec![0; 0x1000]);
+            started_tx.send(()).expect("report F_ADD_SEALS start");
+            let outcome = sibling
+                .dispatch_normalized(
+                    &sibling.capture_one_task_context().unwrap(),
+                    SyscallRequest::new(
+                        25,
+                        SyscallArgs::from([
+                            fd as u64,
+                            LINUX_F_ADD_SEALS,
+                            u64::from(carrick_abi::LinuxMemfdSeals::SHRINK.bits()),
+                            0,
+                            0,
+                            0,
+                        ]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                    None,
+                )
+                .expect("fcntl is a claimed syscall")
+                .expect("F_ADD_SEALS must not be a fatal DispatchError");
+            outcome_tx
+                .send(outcome)
+                .expect("report F_ADD_SEALS outcome");
+        });
 
-    started_rx
-        .recv_timeout(std::time::Duration::from_secs(1))
-        .expect("F_ADD_SEALS thread reached dispatch");
-    assert!(
-        outcome_rx
-            .recv_timeout(std::time::Duration::from_millis(25))
-            .is_err(),
-        "F_ADD_SEALS raced an in-flight alias dispatch"
-    );
-    assert_eq!(
-        common.seals(),
-        Some(carrick_abi::LinuxMemfdSeals::empty().bits())
-    );
-
-    drop(guard);
-
-    assert_eq!(
-        outcome_rx
+        started_rx
             .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("F_ADD_SEALS resumes after alias dispatch exits"),
-        DispatchOutcome::Returned { value: 0 }
-    );
-    assert_eq!(
-        common.seals(),
-        Some(carrick_abi::LinuxMemfdSeals::SHRINK.bits())
-    );
-    thread.join().expect("join F_ADD_SEALS thread");
+            .expect("F_ADD_SEALS thread reached dispatch");
+        assert!(
+            outcome_rx
+                .recv_timeout(std::time::Duration::from_millis(25))
+                .is_err(),
+            "F_ADD_SEALS raced an in-flight alias dispatch"
+        );
+        assert_eq!(
+            common.seals(),
+            Some(carrick_abi::LinuxMemfdSeals::empty().bits())
+        );
+
+        drop(guard);
+
+        assert_eq!(
+            outcome_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("F_ADD_SEALS resumes after alias dispatch exits"),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(
+            common.seals(),
+            Some(carrick_abi::LinuxMemfdSeals::SHRINK.bits())
+        );
+        thread.join().expect("join F_ADD_SEALS thread");
+    });
 }
 
 #[test]

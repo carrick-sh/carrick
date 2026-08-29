@@ -4,7 +4,6 @@
 use crate::kernel::MmId;
 use parking_lot::{Condvar, Mutex};
 use std::marker::PhantomData;
-use std::rc::Rc;
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -17,13 +16,15 @@ struct CoordinatorState {
 /// Per-MM observation point for structural mutation/alias ownership.
 #[derive(Debug)]
 pub(crate) struct MmMutationCoordinator {
+    mm: MmId,
     state: Mutex<CoordinatorState>,
     idle: Condvar,
 }
 
 impl MmMutationCoordinator {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(mm: MmId) -> Self {
         Self {
+            mm,
             state: Mutex::new(CoordinatorState {
                 alias_active: false,
                 alias_waiters: 0,
@@ -33,15 +34,14 @@ impl MmMutationCoordinator {
         }
     }
 
-    pub(crate) fn begin_alias(
+    pub(crate) fn begin_alias<'permit>(
         self: &Arc<Self>,
-        permit: &HostAliasPermit<'_>,
-    ) -> HostAliasCoordinatorGuard {
+        permit: &'permit HostAliasPermit<'_>,
+    ) -> HostAliasCoordinatorGuard<'permit> {
         assert!(
-            permit.authorizes(self),
+            permit.authorizes(self, self.mm),
             "host-alias permit belongs to another MM"
         );
-        let _authorized_mm = permit.mm();
         let mut state = self.state.lock();
         if state.alias_active || state.snapshot_readers != 0 {
             state.alias_waiters += 1;
@@ -54,6 +54,7 @@ impl MmMutationCoordinator {
         drop(state);
         HostAliasCoordinatorGuard {
             coordinator: Arc::clone(self),
+            _permit: PhantomData,
         }
     }
 
@@ -88,10 +89,8 @@ impl MmMutationCoordinator {
     }
 
     #[cfg(test)]
-    const fn outer_waiters(&self) -> usize {
-        // Outer page-table exclusion is acquired before this coordinator can
-        // be entered, so this layer has no API capable of waiting for it.
-        0
+    pub(crate) const fn mm(&self) -> MmId {
+        self.mm
     }
 }
 
@@ -105,7 +104,9 @@ impl MmMutationCoordinator {
 ///
 /// ```compile_fail
 /// use carrick_runtime::dispatch::mm_mutation::MmMutationGuard;
-/// fn clone_guard(guard: &MmMutationGuard<'_>) { let _ = guard.clone(); }
+/// fn clone_guard(guard: MmMutationGuard<'_>) {
+///     let _: MmMutationGuard<'_> = guard.clone();
+/// }
 /// ```
 pub struct MmMutationGuard<'authority> {
     coordinator: Arc<MmMutationCoordinator>,
@@ -115,7 +116,7 @@ pub struct MmMutationGuard<'authority> {
 
 impl MmMutationGuard<'_> {
     /// Borrow the outer authority for one inner host-alias acquisition.
-    pub fn host_alias_permit(&mut self) -> HostAliasPermit<'_> {
+    pub fn host_alias_permit(&self) -> HostAliasPermit<'_> {
         HostAliasPermit {
             coordinator: Arc::clone(&self.coordinator),
             mm: self.mm,
@@ -159,21 +160,23 @@ pub(crate) fn from_stage1_exclusive<'authority>(
 pub struct HostAliasPermit<'guard> {
     coordinator: Arc<MmMutationCoordinator>,
     mm: MmId,
-    _guard: PhantomData<&'guard mut MmMutationGuard<'guard>>,
+    _guard: PhantomData<&'guard MmMutationGuard<'guard>>,
 }
 
 impl HostAliasPermit<'_> {
+    #[cfg(test)]
     pub(crate) const fn mm(&self) -> MmId {
         self.mm
     }
 
-    pub(crate) fn authorizes(&self, coordinator: &Arc<MmMutationCoordinator>) -> bool {
-        Arc::ptr_eq(&self.coordinator, coordinator)
+    pub(crate) fn authorizes(&self, coordinator: &Arc<MmMutationCoordinator>, mm: MmId) -> bool {
+        self.mm == mm && coordinator.mm == mm && Arc::ptr_eq(&self.coordinator, coordinator)
     }
 }
 
-pub(crate) struct HostAliasCoordinatorGuard {
+pub(crate) struct HostAliasCoordinatorGuard<'permit> {
     coordinator: Arc<MmMutationCoordinator>,
+    _permit: PhantomData<&'permit ()>,
 }
 
 pub(crate) struct MmSnapshotGuard {
@@ -193,7 +196,7 @@ impl Drop for MmSnapshotGuard {
     }
 }
 
-impl Drop for HostAliasCoordinatorGuard {
+impl Drop for HostAliasCoordinatorGuard<'_> {
     fn drop(&mut self) {
         let mut state = self.coordinator.state.lock();
         assert!(state.alias_active, "host-alias coordinator underflow");
@@ -202,57 +205,29 @@ impl Drop for HostAliasCoordinatorGuard {
     }
 }
 
-/// Sealed authority for the non-threaded dispatcher boundary. The issuer is
-/// neither `Clone` nor `Send`, and its constructor is intentionally kept out of
-/// production handler modules.
-pub(in crate::dispatch) struct SingleExecutorIssuer {
-    coordinator: Arc<MmMutationCoordinator>,
-    mm: MmId,
-    _not_send: PhantomData<Rc<()>>,
-}
-
-impl SingleExecutorIssuer {
-    pub(crate) fn guard(&mut self) -> MmMutationGuard<'_> {
-        MmMutationGuard {
-            coordinator: Arc::clone(&self.coordinator),
-            mm: self.mm,
-            _authority: PhantomData,
-        }
-    }
-}
-
-pub(super) fn single_executor_boundary(
-    coordinator: Arc<MmMutationCoordinator>,
-    mm: MmId,
-) -> SingleExecutorIssuer {
-    SingleExecutorIssuer {
-        coordinator,
-        mm,
-        _not_send: PhantomData,
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
-    use std::num::NonZeroU64;
 
-    pub(in crate::dispatch) fn single_executor(
+    pub(in crate::dispatch) fn with_guard<T>(
         coordinator: Arc<MmMutationCoordinator>,
-        mm: MmId,
-    ) -> SingleExecutorIssuer {
-        single_executor_boundary(coordinator, mm)
+        use_guard: impl FnOnce(&mut MmMutationGuard<'_>) -> T,
+    ) -> T {
+        crate::vcpu_loop::with_stage1_exclusive_for_test(|authority| {
+            let mm = coordinator.mm();
+            let mut guard = from_stage1_exclusive(authority, coordinator, mm);
+            use_guard(&mut guard)
+        })
     }
 
     pub(in crate::dispatch) fn with_permit<T>(
         coordinator: Arc<MmMutationCoordinator>,
         use_permit: impl FnOnce(&HostAliasPermit<'_>) -> T,
     ) -> T {
-        let mm = MmId::from_registry_allocation(NonZeroU64::new(1).expect("nonzero test MM"));
-        let mut issuer = single_executor(coordinator, mm);
-        let mut guard = issuer.guard();
-        let permit = guard.host_alias_permit();
-        use_permit(&permit)
+        with_guard(coordinator, |guard| {
+            let permit = guard.host_alias_permit();
+            use_permit(&permit)
+        })
     }
 }
 
@@ -273,42 +248,12 @@ mod tests {
 
     #[test]
     fn permit_is_bound_to_the_exact_guard_and_mm_coordinator() {
-        let coordinator = Arc::new(MmMutationCoordinator::new());
-        let mut issuer = super::test_support::single_executor(Arc::clone(&coordinator), mm(11));
-        let mut guard = issuer.guard();
-        let permit = guard.host_alias_permit();
-
-        assert_eq!(permit.mm(), mm(11));
-        assert!(permit.authorizes(&coordinator));
-        assert!(!permit.authorizes(&Arc::new(MmMutationCoordinator::new())));
-    }
-
-    #[test]
-    fn alias_waiter_already_owns_outer_mutation_authority() {
-        let coordinator = Arc::new(MmMutationCoordinator::new());
-        let mut first = super::test_support::single_executor(Arc::clone(&coordinator), mm(21));
-        let mut first_guard = first.guard();
-        let first_permit = first_guard.host_alias_permit();
-        let held = coordinator.begin_alias(&first_permit);
-
-        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let entered_worker = Arc::clone(&entered);
-        let coordinator_worker = Arc::clone(&coordinator);
-        let worker = std::thread::spawn(move || {
-            let mut second =
-                super::test_support::single_executor(Arc::clone(&coordinator_worker), mm(21));
-            let mut guard = second.guard();
-            entered_worker.store(true, std::sync::atomic::Ordering::Release);
-            let permit = guard.host_alias_permit();
-            drop(coordinator_worker.begin_alias(&permit));
+        let coordinator = Arc::new(MmMutationCoordinator::new(mm(11)));
+        super::test_support::with_permit(Arc::clone(&coordinator), |permit| {
+            assert_eq!(permit.mm(), mm(11));
+            assert!(permit.authorizes(&coordinator, mm(11)));
+            assert!(!permit.authorizes(&coordinator, mm(12)));
+            assert!(!permit.authorizes(&Arc::new(MmMutationCoordinator::new(mm(11))), mm(11)));
         });
-
-        while !entered.load(std::sync::atomic::Ordering::Acquire) {
-            std::thread::yield_now();
-        }
-        assert_eq!(coordinator.alias_waiters(), 1);
-        assert_eq!(coordinator.outer_waiters(), 0);
-        drop(held);
-        worker.join().expect("alias waiter exits");
     }
 }

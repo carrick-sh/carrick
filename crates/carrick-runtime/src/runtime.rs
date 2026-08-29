@@ -952,8 +952,11 @@ where
                         dispatcher.set_executable_identity(path.clone(), proc_argv, proc_env);
                         dispatcher.reset_signal_handlers_on_execve(&kernel_context);
                         // Reset and refresh memory proc state as one VMA generation.
-                        let prepared_dispatch_mm_exec =
-                            apply_exec_image_proc_state(&dispatcher, &new_image);
+                        let prepared_dispatch_mm_exec = apply_exec_image_proc_state(
+                            &dispatcher,
+                            prepared_kernel_exec.replacement_mm_id(),
+                            &new_image,
+                        );
                         runtime.execve_into(&new_image)?;
                         let exec_context = dispatcher
                             .commit_one_task_kernel_exec(prepared_kernel_exec)

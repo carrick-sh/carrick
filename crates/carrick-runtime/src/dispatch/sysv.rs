@@ -2500,10 +2500,8 @@ impl SyscallDispatcher {
         /// SHM_RND rounds an unaligned requested address down to a page
         /// boundary. SHM_REMAP remains unsupported.
         mm_mutation fn shmat(this, cx, shmid: u64, addr: u64, flag: u64) {
-            let host_alias_dispatch = {
-                let permit = cx.mm_mutation.host_alias_permit();
-                this.begin_host_alias_dispatch(&permit)
-            };
+            let permit = cx.mm_mutation.host_alias_permit();
+            let host_alias_dispatch = this.begin_host_alias_dispatch(&permit);
             let shmid = shmid as i32;
             let attach_flags = ShmAttachFlags::from_bits_retain(flag);
             let linux_page_size = this.linux_page_size();
@@ -2670,10 +2668,8 @@ impl SyscallDispatcher {
         /// mapping, and tear down the dynamic alias leaves so repeated SysV shm
         /// attach/detach cycles reclaim the backend's per-alias page-table pool.
         mm_mutation fn shmdt(this, cx, addr: u64) {
-            let mut host_alias_dispatch = {
-                let permit = cx.mm_mutation.host_alias_permit();
-                this.begin_conditional_vma_dispatch(&permit)
-            };
+            let permit = cx.mm_mutation.host_alias_permit();
+            let mut host_alias_dispatch = this.begin_conditional_vma_dispatch(&permit);
             let (shmid, len) = {
                 let process = this.sysv_process.lock();
                 let state = this.sysv.state.lock();
@@ -5250,49 +5246,49 @@ mod ipc_set_tests {
             },
         );
         let va = crate::memory::LINUX_HIGH_VA_THRESHOLD;
-        let guard = dispatcher.begin_host_alias_dispatch_for_test();
-        let transaction = guard.publish(HostAliasCommit::shmat(
-            crate::dispatch::mem::HostAliasMmapCommit {
-                start: va,
-                len: LINUX_PAGE_SIZE,
-                prot: crate::linux_abi::LinuxProtFlags::READ
-                    | crate::linux_abi::LinuxProtFlags::WRITE,
-                sharing: ProcMapSharing::Shared,
-                path: String::new(),
-                file_page_offset: None,
-                droppable: false,
-                semantic_vmas: None,
-                locked: None,
-                resident: true,
-                bus_fault: None,
-                write_sealed_shared: false,
-                read_only_shared_file: false,
-                secretmem: false,
-                writable_memfd: None,
-                shared_file_alias: None,
-            },
-            HostAliasShmatCommit {
-                va,
-                atime: 99,
-                lpid: 100,
-                reservation: PendingShmat {
-                    namespace: std::sync::Arc::clone(&dispatcher.sysv),
-                    shmid,
-                    path: PathBuf::from("/tmp/carrick-shm/test-pending-shmat"),
-                    armed: true,
+        let transaction = dispatcher.with_host_alias_dispatch_for_test(|guard| {
+            guard.publish(HostAliasCommit::shmat(
+                crate::dispatch::mem::HostAliasMmapCommit {
+                    start: va,
+                    len: LINUX_PAGE_SIZE,
+                    prot: crate::linux_abi::LinuxProtFlags::READ
+                        | crate::linux_abi::LinuxProtFlags::WRITE,
+                    sharing: ProcMapSharing::Shared,
+                    path: String::new(),
+                    file_page_offset: None,
+                    droppable: false,
+                    semantic_vmas: None,
+                    locked: None,
+                    resident: true,
+                    bus_fault: None,
+                    write_sealed_shared: false,
+                    read_only_shared_file: false,
+                    secretmem: false,
+                    writable_memfd: None,
+                    shared_file_alias: None,
                 },
-            },
-        ));
+                HostAliasShmatCommit {
+                    va,
+                    atime: 99,
+                    lpid: 100,
+                    reservation: PendingShmat {
+                        namespace: std::sync::Arc::clone(&dispatcher.sysv),
+                        shmid,
+                        path: PathBuf::from("/tmp/carrick-shm/test-pending-shmat"),
+                        armed: true,
+                    },
+                },
+            ))
+        });
         {
             assert!(!dispatcher.sysv_process.lock().attachments.contains_key(&va));
             let state = dispatcher.sysv.state.lock();
             let segment = state.segments.get(&shmid).expect("pending segment");
             assert_eq!((segment.nattch, segment.atime, segment.lpid), (7, 2, 5));
         }
-        let install = transaction
-            .claim_for_test()
+        transaction
+            .with_claim_for_test(|install| drop(install))
             .expect("claim pending host alias install");
-        drop(install);
         assert!(!dispatcher.sysv_process.lock().attachments.contains_key(&va));
         let state = dispatcher.sysv.state.lock();
         let segment = state.segments.get(&shmid).expect("aborted segment");

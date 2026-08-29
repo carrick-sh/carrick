@@ -1532,6 +1532,84 @@ mod pt_pause_tests {
     }
 
     #[test]
+    fn mm_mutation_alias_waiter_cannot_enter_inner_before_real_pt_pause() {
+        let barrier: &'static crate::fork_quiesce::PtQuiesce =
+            Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
+        let registry = Arc::new(GenericVcpuRegistry::new());
+        let census = crate::kernel::GuestExecutorCensus::default();
+        let mm = crate::kernel::MmId::from_raw_u64(91).expect("test MM");
+        let coordinator = Arc::new(crate::dispatch::mm_mutation::MmMutationCoordinator::new(mm));
+
+        let mut outer = acquire_pt_pause(
+            barrier,
+            &*registry,
+            &census,
+            tid(1591),
+            PtPauseBudget {
+                election: Duration::from_secs(1),
+                drain: Duration::from_secs(1),
+            },
+        )
+        .expect("first real page-table pause");
+        let mutation =
+            crate::dispatch::mm_mutation::from_pt_pause(&mut outer, Arc::clone(&coordinator), mm);
+        let permit = mutation.host_alias_permit();
+        let alias = coordinator.begin_alias(&permit);
+
+        let worker_registry = Arc::clone(&registry);
+        let worker_coordinator = Arc::clone(&coordinator);
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::sync_channel(1);
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            attempted_tx.send(()).expect("announce outer acquisition");
+            let mut outer = acquire_pt_pause(
+                barrier,
+                &*worker_registry,
+                &census,
+                tid(1592),
+                PtPauseBudget {
+                    election: Duration::from_secs(1),
+                    drain: Duration::from_secs(1),
+                },
+            )
+            .expect("second real page-table pause");
+            let mutation = crate::dispatch::mm_mutation::from_pt_pause(
+                &mut outer,
+                Arc::clone(&worker_coordinator),
+                mm,
+            );
+            let permit = mutation.host_alias_permit();
+            let alias = worker_coordinator.begin_alias(&permit);
+            entered_tx.send(()).expect("announce inner alias entry");
+            drop(alias);
+            drop(permit);
+            drop(mutation);
+            drop(outer);
+        });
+
+        attempted_rx.recv().expect("waiter attempts outer pause");
+        assert_eq!(
+            entered_rx.recv_timeout(Duration::from_millis(25)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "a real outer-page-table waiter reached alias work out of order"
+        );
+        assert_eq!(
+            coordinator.alias_waiters(),
+            0,
+            "inner coordinator must not contain a page-table-exclusion waiter"
+        );
+
+        drop(alias);
+        drop(permit);
+        drop(mutation);
+        drop(outer);
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second editor enters alias only after outer pause releases");
+        worker.join().expect("real outer-order worker exits");
+    }
+
+    #[test]
     fn pt_pause_probe_abi_and_dtrace_contract() {
         let probes_source = include_str!("../../../carrick-observability/src/probes.rs");
         let dtrace_source = include_str!("../../../../scripts/dtrace/hvpatch-stop-the-world.d");

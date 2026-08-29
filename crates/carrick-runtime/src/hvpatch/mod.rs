@@ -2571,6 +2571,7 @@ mod tests {
         );
 
         let abandoned = child.publish_exec_image_state(
+            crate::kernel::MmId::from_raw_u64(20_001).expect("replacement MM"),
             vec![crate::vfs::ProcMapsEntry {
                 start: 0x3000,
                 end: 0x4000,
@@ -2642,6 +2643,7 @@ mod tests {
             crate::kernel::CloneObjectMode::Share,
         );
         let prepared = child.publish_exec_image_state(
+            crate::kernel::MmId::from_raw_u64(20_002).expect("replacement MM"),
             vec![crate::vfs::ProcMapsEntry {
                 start: 0x3000,
                 end: 0x4000,
@@ -2711,6 +2713,7 @@ mod tests {
             crate::kernel::CloneObjectMode::Share,
         );
         let prepared = child.publish_exec_image_state(
+            crate::kernel::MmId::from_raw_u64(20_003).expect("replacement MM"),
             vec![crate::vfs::ProcMapsEntry {
                 start: 0x3000,
                 end: 0x4000,
@@ -2724,9 +2727,9 @@ mod tests {
             Vec::new(),
         );
 
-        let parent_transaction = parent
-            .begin_host_alias_dispatch_for_test()
-            .publish(crate::dispatch::HostAliasCommit::empty_for_test());
+        let parent_transaction = parent.with_host_alias_dispatch_for_test(|guard| {
+            guard.publish(crate::dispatch::HostAliasCommit::empty_for_test())
+        });
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
         let promotion = std::thread::spawn(move || {
             prepared.commit();
@@ -2737,11 +2740,12 @@ mod tests {
             .expect("child promotion must not join the shared predecessor transaction queue");
         promotion.join().expect("promotion thread");
 
-        let parent_install = parent_transaction
-            .claim_for_test()
+        parent_transaction
+            .with_claim_for_test(|parent_install| {
+                assert_eq!(parent_install.bus_fault_range(), None);
+                drop(parent_install);
+            })
             .expect("the parent's predecessor transaction remains valid");
-        assert_eq!(parent_install.bus_fault_range(), None);
-        drop(parent_install);
         assert_eq!(
             child
                 .vma_snapshot_source()
@@ -2788,6 +2792,7 @@ mod tests {
             crate::kernel::CloneObjectMode::Share,
         );
         let prepared = child.publish_exec_image_state(
+            crate::kernel::MmId::from_raw_u64(20_004).expect("replacement MM"),
             vec![crate::vfs::ProcMapsEntry {
                 start: 0x3000,
                 end: 0x4000,
@@ -2801,27 +2806,28 @@ mod tests {
             Vec::new(),
         );
 
-        let predecessor_dispatch = child.begin_host_alias_dispatch_for_test();
-        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let thread_start = std::sync::Arc::clone(&start);
-        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
-        let promotion = std::thread::spawn(move || {
-            thread_start.wait();
-            prepared.commit();
-            let _ = done_tx.send(());
-        });
-        start.wait();
-        assert_eq!(
-            done_rx.recv_timeout(std::time::Duration::from_millis(250)),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
-            "promotion completed while predecessor authority was actively Dispatching",
-        );
+        child.with_host_alias_dispatch_for_test(|predecessor_dispatch| {
+            let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let thread_start = std::sync::Arc::clone(&start);
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+            let promotion = std::thread::spawn(move || {
+                thread_start.wait();
+                prepared.commit();
+                let _ = done_tx.send(());
+            });
+            start.wait();
+            assert_eq!(
+                done_rx.recv_timeout(std::time::Duration::from_millis(250)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+                "promotion completed while predecessor authority was actively Dispatching",
+            );
 
-        drop(predecessor_dispatch);
-        done_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("promotion completes after predecessor dispatch releases");
-        promotion.join().expect("promotion thread");
+            drop(predecessor_dispatch);
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("promotion completes after predecessor dispatch releases");
+            promotion.join().expect("promotion thread");
+        });
     }
 
     #[test]
