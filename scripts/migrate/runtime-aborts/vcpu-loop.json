@@ -955,7 +955,16 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ProcessForkCoordinator::into_parts",
       "ordinal_in_function": 1,
-      "fingerprint": "6a0f90f224043b492e10ae5a822b3767a9f4011eeeb0ca63714e6c4e8ae4c61d",
+      "fingerprint": "1ab9b1e2b6f3cb9b77c48172b80e51d0f0ea7eb7e206fd4af971817724662574",
+      "verdict": "carrier_fault",
+      "failure_domain": "vcpu_loop::quiesce_coordinator",
+      "rationale": "ProcessForkCoordinator missing its unique vCPU lease-drain guard during decomposition indicates an impossible transition into protected fork work without frozen registration authority."
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
+      "function": "ProcessForkCoordinator::into_parts",
+      "ordinal_in_function": 2,
+      "fingerprint": "469eb85bd180e9708e99fe60ba61ce9a89c278f364c74313f947d902671e8605",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_coordinator",
       "rationale": "ProcessForkCoordinator missing process admission token during decomposition indicates double-consume or corrupt coordinator."
@@ -963,8 +972,8 @@
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ProcessForkCoordinator::into_parts",
-      "ordinal_in_function": 2,
-      "fingerprint": "6a0f90f224043b492e10ae5a822b3767a9f4011eeeb0ca63714e6c4e8ae4c61d",
+      "ordinal_in_function": 3,
+      "fingerprint": "469eb85bd180e9708e99fe60ba61ce9a89c278f364c74313f947d902671e8605",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_coordinator",
       "rationale": "ProcessForkCoordinator missing clone admission token during decomposition indicates double-consume or corrupt coordinator."
@@ -991,10 +1000,10 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 3,
-      "fingerprint": "447dd03311f475c177a4c249bcebafdd33e34447b3af1b33bf2fe24615d17081",
+      "fingerprint": "85419b6a3a0b3e3d6864915357c4aed6011c507b28f78bb5671727018011cee5",
       "verdict": "carrier_fault",
-      "failure_domain": "vcpu_loop::quiesce_barrier",
-      "rationale": "Process fork retry missing barrier progress subscription; thread cannot wait for quiesce progress."
+      "failure_domain": "vcpu_loop::quiesce_coordinator",
+      "rationale": "Publishing a second unique vCPU lease-drain guard into one ProcessForkCoordinator indicates a corrupt fork state transition and would lose one registration freeze authority."
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
@@ -1018,7 +1027,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 6,
-      "fingerprint": "17721a20861aa5e039e7f39fe51d06fbd95e591cf7afc5bc179224ebffb26f5d",
+      "fingerprint": "f465dcd20c71185dd9b96d907eb49384058da781135ca9df2aea4e08bf16d23b",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_rollback",
       "rationale": "Failed to restore original parent_tid memory bytes during fork copyout rollback; parent memory is corrupted."
@@ -1027,7 +1036,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 7,
-      "fingerprint": "17721a20861aa5e039e7f39fe51d06fbd95e591cf7afc5bc179224ebffb26f5d",
+      "fingerprint": "f465dcd20c71185dd9b96d907eb49384058da781135ca9df2aea4e08bf16d23b",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_rollback",
       "rationale": "Failed to restore original pidfd memory bytes during fork copyout rollback; parent memory is corrupted."
@@ -1036,7 +1045,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 8,
-      "fingerprint": "5033aa9964142e95f98658b31aacd9a5ead135995f6a148c63eb7697f81e1e5f",
+      "fingerprint": "9b465d0f54e60f9852ed3091d69163f6e7f76c0946f4a03d5dddba8c09b00235",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_rollback",
       "rationale": "Failed to restore parent_tid bytes on failpoint rollback; parent memory is corrupted."
@@ -1045,7 +1054,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 9,
-      "fingerprint": "5033aa9964142e95f98658b31aacd9a5ead135995f6a148c63eb7697f81e1e5f",
+      "fingerprint": "9b465d0f54e60f9852ed3091d69163f6e7f76c0946f4a03d5dddba8c09b00235",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_rollback",
       "rationale": "Failed to restore pidfd bytes on failpoint rollback; parent memory is corrupted."
@@ -1054,7 +1063,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 10,
-      "fingerprint": "6a8a82aa47d091ee793b22f01d00b11c2261bf5c4e841e0b2a56045eb71e323d",
+      "fingerprint": "0ed9c9bb5fe6c06cd3bcd3d824f745e87ff6874a40230d5d6ae14c73e472d9af",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_rollback",
       "rationale": "Failed to restore parent_tid memory on child materialization failure; parent memory is corrupted."
@@ -1063,7 +1072,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 11,
-      "fingerprint": "6a8a82aa47d091ee793b22f01d00b11c2261bf5c4e841e0b2a56045eb71e323d",
+      "fingerprint": "0ed9c9bb5fe6c06cd3bcd3d824f745e87ff6874a40230d5d6ae14c73e472d9af",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_rollback",
       "rationale": "Failed to restore pidfd memory on child materialization failure; parent memory is corrupted."
