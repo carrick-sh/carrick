@@ -250,20 +250,24 @@ Waves 4–5 stay with that document.
 
 [`identity-and-scope-domains.md`](identity-and-scope-domains.md) (2026-08-16, 42
 audited defects) is the correct ranked list and should stay the controlling
-document. Where its five recommendations stand at `28a8678c4`, each verified by
-grep:
+document. The original audit baseline was `28a8678c4`; the status column below
+is maintained through code head `7a2af1aee` using the cited source censuses,
+tests, and implementation receipts:
 
 | Domain | Prescribed fix | Status |
 |---|---|---|
 | **Scope** — a `static` carries no mark saying carrier vs. one Linux process | `CarrierGlobal<T>` + closed `CarrierScope` | **In flight, different shape.** No `CarrierGlobal` type exists (`grep -rl CarrierGlobal crates` → 0). `carrick-embed` Phase B is executing it instead: all 228 statics classified container-state vs. carrier-infra with per-row `Container` destinations ([`identity-and-scope-domains-embed-census.md`](identity-and-scope-domains-embed-census.md)). The census route is arguably better than the wrapper type; it should be recorded as the accepted answer so the wrapper is not also built. |
 | **Ownership** — no type separates the current `mm` from another process's | `MmToken`, `CurrentMm`/`ForeignMm` split, `CowBroken` witness | **Barely started.** `kernel/foreign_mm.rs` exists; `MmToken` and `CurrentMm` do not (0 files each). |
-| **Populations** — eight distinct thread sets, all `usize` | delete `count() -> usize`, replace with a witness type | **Partially closed.** `VcpuRegistry::count()` is deleted and fork/crash protected work now holds an identity-aware `VcpuLeaseDrainGuard`. Per-purpose participant sets minted from `Task` remain open. |
-| **Lifecycle** — "alive" vs. per-purpose "can reach a safe point" | explicit run state on kernel `Thread` | **Partially closed.** The lease-drain guard makes registration denial and barrier release explicit, and `kernel/crash_capture.rs` supplies `CrashQuorum` / `CrashQuorumPoll`; an explicit run-state type on kernel `Thread` remains open. |
+| **Populations** — eight distinct thread sets, all `usize` | delete `count() -> usize`, replace with a witness type | **Closed 2026-08-28.** `VcpuRegistry::count()` is deleted; fork/crash protected work holds an identity-aware `VcpuLeaseDrainGuard`; purpose-specific exact participant witnesses are minted from `Task`; and `GuestExecutorCensus` stores exact identities. The monotone source gate reports zero production findings across 162 Rust leaves. |
+| **Lifecycle** — "alive" vs. per-purpose "can reach a safe point" | explicit run state on kernel `Thread` | **Closed 2026-08-28.** The existing scheduler-owned `ThreadExecutionState` is the sole run-state authority. Purpose-specific Task witnesses, dynamic `CrashQuorum` membership, generation-stamped crash RAII, and exact non-final-exit survivors avoid duplicating lifecycle state. |
 | **Lock order** — make the hierarchy structural | a token only the outer acquisition can mint | **Shipped as a dead gate — see Finding B.** |
 
-The two "cheapest, do first" mechanical gates — a `static` lint and a
-`getpid`/`process::id()` ban, both on monotonic baselines — are unbuilt.
-`carrier_pid` appears in 3 files.
+The two "cheapest, do first" mechanical gates are now implemented as monotone
+source/compiler censuses: `check-runtime-global-state.py` covers process-global
+state and `check-host-authority-transitions.py` covers host-identity/authority
+operations. Both are wired through `just lint-domains`; the compiler census
+continues to fail closed on position-only drift rather than silently
+rebaselining it.
 
 One worked example from that document's scope class closed on the day of this
 audit: `AliasOwnershipScope::Root` became `ContainerRoot(ContainerRootToken)` in
@@ -454,19 +458,57 @@ independent of every one of them and can start immediately.
 
 The `420` in Finding A remains the historical raw-text count at `28a8678c4`;
 it is not a current ceiling. The token-aware, production-capable source census
-now requires three exact shards and classifies **404** current calls:
+now requires three exact shards and classifies **407** current calls:
 
 | Shard | Carrier fault | Typed-error debt | Total |
 |---|---:|---:|---:|
-| `runtime.json` | 118 | 47 | 165 |
+| `runtime.json` | 120 | 47 | 167 |
 | `hvf.json` | 101 | 0 | 101 |
-| `vcpu-loop.json` | 135 | 3 | 138 |
-| **Total** | **354** | **50** | **404** |
+| `vcpu-loop.json` | 136 | 3 | 139 |
+| **Total** | **357** | **50** | **407** |
 
 These are machine-counted classifications, not removals. Full `--check` fails
 closed unless all three named ledgers exist, match every current source leaf,
 and keep each shard's typed-error debt ceiling equal to its checked row count.
 `just lint-domains` runs that exact gate after the process-global-state census.
+
+## Population/lifecycle implementation receipt — 2026-08-28
+
+Code head `7a2af1aee` completes item 3 without inventing one generic "live
+thread" predicate. `ForkBarrierParticipants`, `CrashBarrierParticipants`,
+`ThreadExitParticipants`, `CrashCaptureParticipants`, and
+`CoreNoteParticipants` retain exact Task identities for their individual
+purposes. Owner-sensitive minting authenticates the exact `ThreadKey` under one
+Task-membership lock. `GuestExecutorCensus` owns exact thread or anonymous
+identities; duplicate admission, identity exhaustion, and crash participation
+failure are typed and transactional. Generation-stamped crash-participation
+RAII prevents a stale guard from clearing a successor.
+
+Fork/crash decisions use only boolean witness questions; numeric projections
+exist solely at the fixed-width probe ABI. `CrashQuorum` refreshes membership
+on every poll, and non-final exit requires an exact survivor. The pre-existing
+`ThreadExecutionState` remains the sole scheduler lifecycle authority.
+
+The source checker passes 14 negative and 14 positive fixtures and scans 162
+production Rust leaves with zero findings. Focused executor, witness, quorum,
+fork, core, thread-quiesce, and observability gates pass. Repository-wide
+Clippy, docs, dependency policy, support-matrix, workspace-build, full unit, and
+unrestricted integration gates pass. `just lint-domains` and `just ci` stop
+only at the known compiler host-authority positional inventory drift with
+`changed=[]`; no baseline was rewritten. The current abort census is the exact
+407-row table above.
+
+The delegated fork consumer used Antigravity conversation
+`353b580d-2a8a-4e8a-bb35-679894e54923` over three turns; Codex rejected and sent
+back a lossy boolean telemetry projection before integrating worker commits
+`4ccd570a2` and `d99f5c06f` as `eaf216c95` and `d23f37022`. The crash/core
+consumer used conversation `a86ce8bd-f883-4e1a-a6b2-7d38522ef847` for one turn;
+worker commit `d035366b2` became `c02fc50f3`. Codex re-ran the exact worker gates
+and independent reviews approved both migrations.
+
+This receipt does not close the whole audit. Item 4 (`MmToken`, structural
+`CurrentMm`/`ForeignMm`, and `CowBroken`) and item 5 (mintable structural lock
+ordering) remain open and are the next architectural milestones.
 
 ## The rule to carry forward
 
