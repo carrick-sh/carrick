@@ -124,6 +124,9 @@ mod tests {
         fn any_other_in_guest(&self, except: crate::ThreadId) -> bool {
             self.inner.any_other_in_guest(except)
         }
+        fn is_in_guest(&self, tid: crate::ThreadId) -> bool {
+            self.inner.is_in_guest(tid)
+        }
         fn debug_registered_vcpus(&self) -> Vec<(crate::ThreadId, bool)> {
             self.inner.debug_registered_vcpus()
         }

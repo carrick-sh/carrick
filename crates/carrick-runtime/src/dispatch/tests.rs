@@ -1,3 +1,6 @@
+static_assertions::assert_impl_all!(crate::dispatch::MmExecutorParticipation: Send);
+static_assertions::assert_not_impl_any!(crate::dispatch::MmExecutorParticipation: Sync, Clone, Copy);
+
 #[cfg(test)]
 mod overlay_dispatch_tests {
     //! End-to-end overlay tests that drive the public `dispatch` entry
@@ -4836,7 +4839,7 @@ mod container_policy_dispatch_tests {
         let parent_executor = dispatcher
             .enter_mm_executor()
             .expect("admit parent MM executor");
-        let child_executor = child_dispatcher
+        let mut child_executor = child_dispatcher
             .enter_mm_executor()
             .expect("admit child MM executor");
         let registry = crate::thread::ThreadRegistry::new(
@@ -4849,7 +4852,7 @@ mod container_policy_dispatch_tests {
 
         assert!(matches!(
             child_dispatcher.dispatch_threaded_with_mm_executor(
-                &child_executor,
+                &mut child_executor,
                 &child_dispatcher.capture_one_task_context().unwrap(),
                 request,
                 &mut memory,
@@ -4865,7 +4868,7 @@ mod container_policy_dispatch_tests {
         assert_eq!(
             child_dispatcher
                 .dispatch_threaded_with_mm_executor(
-                    &child_executor,
+                    &mut child_executor,
                     &child_dispatcher.capture_one_task_context().unwrap(),
                     request,
                     &mut memory,
@@ -4881,7 +4884,7 @@ mod container_policy_dispatch_tests {
         );
 
         drop(child_executor);
-        let sole_executor = dispatcher
+        let mut sole_executor = dispatcher
             .enter_mm_executor()
             .expect("readmit sole parent MM executor");
         let (attempted_tx, attempted_rx) = std::sync::mpsc::sync_channel(1);
@@ -4894,7 +4897,7 @@ mod container_policy_dispatch_tests {
             admitted_tx.send(()).expect("announce peer admitted");
             peer
         });
-        crate::vcpu_loop::with_sole_mm_stage1(&sole_executor, |_authority| {
+        crate::vcpu_loop::with_sole_mm_stage1(&mut sole_executor, |_authority| {
             attempted_rx.recv().expect("peer attempts exact-MM admission");
             assert_eq!(
                 admitted_rx.recv_timeout(std::time::Duration::from_millis(25)),
