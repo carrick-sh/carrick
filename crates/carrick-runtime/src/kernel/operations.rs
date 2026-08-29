@@ -4448,7 +4448,7 @@ mod tests {
     use crate::kernel::{
         Asid, Credentials, FileDescription, FileSlotNumber, FileTable, FsContext, LinuxSignal, Mm,
         MmBackendSnapshot, MmBinding, RootBootstrap, Sighand, SignalDisposition, SnapshotError,
-        Stage1Root, ThreadSignalState,
+        Stage1Root, TaskParticipantError, ThreadSignalState,
     };
 
     #[derive(Debug, Default)]
@@ -4497,6 +4497,79 @@ mod tests {
         )
         .expect("bootstrap input");
         Kernel::bootstrap_root(input).expect("kernel")
+    }
+
+    fn clone_sibling(
+        kernel: &Arc<Kernel>,
+        leader: &KernelContext,
+        registry_id: i32,
+    ) -> KernelContext {
+        let plan = ClonePlan::from_flags(
+            LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+        )
+        .expect("thread clone plan");
+        kernel
+            .clone_thread(
+                leader,
+                plan,
+                ThreadId::synthetic_for_tests(registry_id),
+                None,
+            )
+            .expect("clone sibling")
+    }
+
+    #[test]
+    fn task_mints_distinct_fork_and_crash_sibling_witnesses() {
+        let (kernel, leader) = bootstrap(19_410);
+        let sibling = clone_sibling(&kernel, &leader, 19_411);
+
+        let fork = leader
+            .task()
+            .fork_barrier_participants(leader.thread().key())
+            .expect("exact fork owner");
+        let crash = leader
+            .task()
+            .crash_barrier_participants(leader.thread().key())
+            .expect("exact crash owner");
+
+        assert!(fork.requires_quiesce());
+        assert!(fork.contains_sibling(sibling.thread().key()));
+        assert!(crash.requires_quiesce());
+        assert!(crash.contains_sibling(sibling.thread().key()));
+    }
+
+    #[test]
+    fn task_participant_witness_rejects_a_stale_exact_owner() {
+        let (kernel, leader) = bootstrap(19_420);
+        let sibling = clone_sibling(&kernel, &leader, 19_421);
+        kernel.exit_thread(&sibling, None).expect("retire sibling");
+
+        assert!(matches!(
+            leader
+                .task()
+                .fork_barrier_participants(sibling.thread().key()),
+            Err(TaskParticipantError::UnknownThread { .. })
+        ));
+    }
+
+    #[test]
+    fn thread_exit_participants_require_an_exact_survivor() {
+        let (kernel, leader) = bootstrap(19_430);
+        let sibling = clone_sibling(&kernel, &leader, 19_431);
+        let witness = leader
+            .task()
+            .thread_exit_participants(leader.thread().key())
+            .expect("exact exit owner");
+
+        assert!(witness.permits_nonfinal_exit());
+        assert!(witness.contains_survivor(sibling.thread().key()));
+
+        let (_sole_kernel, sole) = bootstrap(19_432);
+        let sole_witness = sole
+            .task()
+            .thread_exit_participants(sole.thread().key())
+            .expect("exact sole owner");
+        assert!(!sole_witness.permits_nonfinal_exit());
     }
 
     /// `RLIMIT_NPROC` is counted per REAL uid over live threads and refused at
