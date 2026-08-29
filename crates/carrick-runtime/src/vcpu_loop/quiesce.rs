@@ -1527,51 +1527,98 @@ mod pt_pause_tests {
         // 1. USDT declaration has four i32 arguments.
         assert!(probes_source.contains("fn pt__pause__begin(_: i32, _: i32, _: i32, _: i32) {}"));
 
-        // 2. Real wrapper argument names and order.
+        // 2. Real wrapper exact parameter names, types, and order (rejects added 5th arg).
         let wrapper_decl = probes_source
             .split("pub fn pt_pause_begin(")
             .nth(1)
             .expect("real pt_pause_begin wrapper must exist")
             .split(')')
             .next()
-            .expect("wrapper argument list end");
-        assert!(wrapper_decl.contains("coordinator_tid: i32"));
-        assert!(wrapper_decl.contains("other_in_guest: i32"));
-        assert!(wrapper_decl.contains("waiting_sibling_tid: i32"));
-        assert!(wrapper_decl.contains("executor_census: i32"));
-        let coord_pos = wrapper_decl.find("coordinator_tid").unwrap();
-        let other_pos = wrapper_decl.find("other_in_guest").unwrap();
-        let waiting_pos = wrapper_decl.find("waiting_sibling_tid").unwrap();
-        let census_pos = wrapper_decl.find("executor_census").unwrap();
-        assert!(coord_pos < other_pos && other_pos < waiting_pos && waiting_pos < census_pos);
+            .expect("wrapper parameter list end");
+        let wrapper_params: Vec<&str> = wrapper_decl
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(
+            wrapper_params,
+            vec![
+                "coordinator_tid: i32",
+                "other_in_guest: i32",
+                "waiting_sibling_tid: i32",
+                "executor_census: i32",
+            ]
+        );
 
-        // 3. Disabled stub argument names and order.
+        // 3. Real wrapper forwards the exact USDT tuple in the exact order.
+        let wrapper_body = probes_source
+            .split("pub fn pt_pause_begin(")
+            .nth(1)
+            .expect("real pt_pause_begin wrapper must exist")
+            .split("carrick_usdt::pt__pause__begin!(|| (")
+            .nth(1)
+            .expect("pt__pause__begin invocation must exist")
+            .split("));")
+            .next()
+            .expect("pt__pause__begin invocation end");
+        let forwarded_args: Vec<&str> = wrapper_body
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(
+            forwarded_args,
+            vec![
+                "coordinator_tid",
+                "other_in_guest",
+                "waiting_sibling_tid",
+                "executor_census",
+            ]
+        );
+
+        // 4. Disabled stub exact parameter names, types, and order (rejects added 5th arg).
         let stub_decl = probes_source
             .split("stub!(pt_pause_begin(")
             .nth(1)
             .expect("pt_pause_begin stub must exist")
             .split("));")
             .next()
-            .expect("stub argument list end");
-        assert!(stub_decl.contains("coordinator_tid: i32"));
-        assert!(stub_decl.contains("other_in_guest: i32"));
-        assert!(stub_decl.contains("waiting_sibling_tid: i32"));
-        assert!(stub_decl.contains("executor_census: i32"));
-        let stub_coord_pos = stub_decl.find("coordinator_tid").unwrap();
-        let stub_other_pos = stub_decl.find("other_in_guest").unwrap();
-        let stub_waiting_pos = stub_decl.find("waiting_sibling_tid").unwrap();
-        let stub_census_pos = stub_decl.find("executor_census").unwrap();
-        assert!(
-            stub_coord_pos < stub_other_pos
-                && stub_other_pos < stub_waiting_pos
-                && stub_waiting_pos < stub_census_pos
+            .expect("stub parameter list end");
+        let stub_params: Vec<&str> = stub_decl
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(
+            stub_params,
+            vec![
+                "coordinator_tid: i32",
+                "other_in_guest: i32",
+                "waiting_sibling_tid: i32",
+                "executor_census: i32",
+            ]
         );
 
-        // 4. Exact DTrace predicate and metric label in hvpatch-stop-the-world.d.
-        assert!(dtrace_source.contains("arg2 == 0 && arg3 > 1"));
-        assert!(
-            dtrace_source
-                .contains(r#"@c["pt-raised-with-peer-executor-and-no-sibling-lease"] = count();"#)
+        // 5. Bounded executable DTrace clause in hvpatch-stop-the-world.d.
+        let dtrace_clauses: Vec<&str> =
+            dtrace_source.split("carrick*:::pt-pause-begin\n").collect();
+        let target_clause = dtrace_clauses
+            .iter()
+            .find(|clause| {
+                clause.contains(r#"@c["pt-raised-with-peer-executor-and-no-sibling-lease"]"#)
+            })
+            .expect("executable pt-pause-begin clause with target aggregation must exist");
+        let predicate_end = target_clause.find('{').expect("clause body start");
+        let predicate = target_clause[..predicate_end].trim();
+        assert_eq!(
+            predicate,
+            "/(pid == $target || progenyof($target)) && arg2 == 0 && arg3 > 1/"
+        );
+        let action_end = target_clause.find('}').expect("clause body end");
+        let action = target_clause[predicate_end + 1..action_end].trim();
+        assert_eq!(
+            action,
+            r#"@c["pt-raised-with-peer-executor-and-no-sibling-lease"] = count();"#
         );
     }
 
