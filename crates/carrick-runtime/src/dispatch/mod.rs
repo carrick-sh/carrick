@@ -4864,14 +4864,14 @@ impl SyscallDispatcher {
         self.dispatch_normalized_with_lease(kernel, request, memory, reporter, thread, None)
     }
 
-    fn dispatch_normalized_with_lease<'lease>(
+    fn dispatch_normalized_with_lease(
         &self,
         kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
         memory: &mut impl CurrentMmMemory,
         reporter: &CompatReporter,
         thread: Option<ThreadCtx>,
-        execution_lease: Option<&'lease crate::kernel::objects::ThreadExecutionLease>,
+        execution_lease: Option<&crate::kernel::objects::ThreadExecutionLease>,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
         let handler = resolve_handler(request.number.raw())?;
         let canonical_nr = request.number.raw();
@@ -4896,6 +4896,7 @@ impl SyscallDispatcher {
         Some(outcome)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_normalized_mutation<'authority, 'lease>(
         &self,
         kernel: &crate::kernel::KernelContext,

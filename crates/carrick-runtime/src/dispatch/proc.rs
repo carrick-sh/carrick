@@ -4337,46 +4337,19 @@ impl SyscallDispatcher {
     /// (no such task → ESRCH); an unprivileged caller that does not own the
     /// target → EPERM (ptrace_may_access).
     ///
-    /// When the target is the CALLER (`pid == getpid()`, the LTP process_vm01
-    /// success cases and every setup sanity probe) the transfer runs entirely
-    /// within this guest's address space.
+    /// Transfer memory between local and remote address spaces (`process_vm_readv` / `process_vm_writev`).
     ///
-    /// A permitted cross-process transfer (LTP process_vm_readv02/03,
-    /// process_vm_writev02) is still UNIMPLEMENTED and lowers to EFAULT. That
-    /// is a divergence from Linux, not a permission answer. There is no "peer
-    /// VM" involved: under HVPatch every Linux process is a thread of ONE
-    /// carrier inside ONE VM, so the target's pages are already in this VM's
-    /// stage-2 map. What is missing is a FOREIGN-MM translation path:
+    /// When the target is the exact caller task (`target_task.key() == caller.key()`),
+    /// the transfer runs directly within this guest's address space via [`process_vm_copy_self`].
     ///
-    /// * VA→IPA for another mm. `Aarch64EngineCore` resolves a syscall buffer
-    ///   through `self.page_tables`, which is bound to the live vCPU's own
-    ///   `TTBR0_EL1` and hard-errors if the root disagrees; it cannot describe
-    ///   another mm. The peer's stage-1 root GPA *is* reachable
-    ///   (`Mm::backend()` → `MmBackend::snapshot()` → `MmBinding::stage1_root`),
-    ///   so a foreign walk is buildable on `carrick_mem::page_table`, but no
-    ///   such walker exists.
-    /// * IPA→host for another mm. Reads have a mm-agnostic path already
-    ///   (`copy_from_global_frame_owner` over the process-global frame-owner
-    ///   map in `carrick-vmm-hvf`), but it is private and has no write twin;
-    ///   the per-thread mapping lookups deliberately exclude other mms.
-    /// * Peer PROT_NONE/unmapped enforcement. `MemoryProtections` and the
-    ///   per-VMA `prot` bits are per-process and are NOT published into the
-    ///   kernel graph — `MmBackendSnapshot::vmas` carries bare `VmaSummary`
-    ///   ranges with no permissions — so a faithful peer-side EFAULT cannot be
-    ///   decided today.
+    /// Cross-process read transfers (`process_vm_readv`) route through Task 7 authority:
+    /// the caller's live [`ThreadExecutionLease`] authenticates [`Kernel::foreign_mm`],
+    /// obtaining an immutable [`ForeignMm`] reference, which reads foreign memory through
+    /// the carrier's [`ForeignMmEndpoint`] and [`MmAccessAuthority`] streaming with
+    /// chunk bounds aligned to 4 KiB page boundaries in both remote and local spaces.
     ///
-    /// Measured state of the four LTP suites, invoked the way the conformance
-    /// harness invokes them (under `/bin/sh -c`; a direct exec makes the test
-    /// guest PID 1 and breaks LTP's own reaper, which TBROKs every `tst_test`
-    /// suite with "Main test process might have exit!" and says nothing about
-    /// the syscall): `process_vm01` is 25/25 PASS, matching the Docker oracle.
-    /// `process_vm_readv02`, `process_vm_readv03` and `process_vm_writev02`
-    /// fail on exactly this EFAULT and nothing else, so the cross-process
-    /// transfer is the single remaining blocker for all three. Beware that
-    /// `process_vm_readv02` MISREPORTS the errno as "EPERM": it prints
-    /// `tst_strerrno(-TST_RET)` where `TST_RET` is the raw `-1`, so it always
-    /// names errno 1. `carrick trace` shows that call returning `errno=14`,
-    /// the same EFAULT as the other two.
+    /// Cross-process write transfers (`process_vm_writev`) remain unimplemented and return
+    /// EFAULT pending the separately reviewed prepare/commit+COW slice.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn process_vm_rw<M: CurrentMmMemory>(
         &self,
@@ -4438,6 +4411,18 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::errno(LINUX_EPERM));
         }
 
+        if target_task.key() == cx.kernel.task().key() {
+            let (src, dst) = if is_read {
+                (&remote, &local)
+            } else {
+                (&local, &remote)
+            };
+            return match process_vm_copy_self(&mut *cx.memory, src, dst) {
+                Ok(value) => Ok(DispatchOutcome::Returned { value }),
+                Err(errno) => Ok(DispatchOutcome::errno(errno)),
+            };
+        }
+
         let relation = cx.with_execution_lease(|lease| {
             cx.kernel
                 .kernel()
@@ -4447,15 +4432,7 @@ impl SyscallDispatcher {
             Some(Ok(r)) => r,
             Some(Err(
                 crate::kernel::MmAccessError::UnknownTask(_)
-                | crate::kernel::MmAccessError::StaleContext(_)
-                | crate::kernel::MmAccessError::StaleExecutionAuthority { .. }
-                | crate::kernel::MmAccessError::ExecutionAuthority(
-                    crate::kernel::objects::ThreadExecutionError::LeaseOwnerMismatch { .. }
-                    | crate::kernel::objects::ThreadExecutionError::StaleLease { .. }
-                    | crate::kernel::objects::ThreadExecutionError::SchedulerThreadMismatch {
-                        ..
-                    },
-                ),
+                | crate::kernel::MmAccessError::StaleContext(_),
             )) => {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
@@ -4979,10 +4956,14 @@ mod kernel_process_dispatch_tests {
     }
 
     #[derive(Debug)]
-    struct ProcessVmReadTransport;
+    struct ProcessVmReadTransport {
+        payload: Vec<u8>,
+    }
 
     #[derive(Debug)]
-    struct ProcessVmReadLease;
+    struct ProcessVmReadLease {
+        payload: Vec<u8>,
+    }
 
     #[derive(Debug)]
     struct ProcessVmReadReceipt {
@@ -5014,12 +4995,12 @@ mod kernel_process_dispatch_tests {
             dst: &mut [u8],
             _deadline: Instant,
         ) -> Result<Box<dyn ForeignMmReadReceipt>, ForeignMmTransportError> {
-            if va.0 < TARGET_VA {
+            if va.0 < TARGET_VA || self.payload.is_empty() {
                 return Err(ForeignMmTransportError::Translation(va));
             }
             let offset = (va.0 - TARGET_VA) as usize;
             for (i, b) in dst.iter_mut().enumerate() {
-                *b = b"PEER"[(offset + i) % 4];
+                *b = self.payload[(offset + i) % self.payload.len()];
             }
             Ok(Box::new(ProcessVmReadReceipt {
                 bytes: dst.len(),
@@ -5037,7 +5018,9 @@ mod kernel_process_dispatch_tests {
             _snapshot: &dyn ForeignMmSnapshot,
             _deadline: Instant,
         ) -> Result<Arc<dyn ForeignMmReadLease>, ForeignMmTransportError> {
-            Ok(Arc::new(ProcessVmReadLease))
+            Ok(Arc::new(ProcessVmReadLease {
+                payload: self.payload.clone(),
+            }))
         }
     }
 
@@ -5140,12 +5123,29 @@ mod kernel_process_dispatch_tests {
     }
 
     fn process_vm_target(parent: &KernelContext, registry_id: i32) -> KernelContext {
-        process_vm_target_with_pages(parent, registry_id, 1)
+        process_vm_target_with_payload_and_pages(parent, registry_id, b"PEER", 1)
+    }
+
+    fn process_vm_target_with_payload(
+        parent: &KernelContext,
+        registry_id: i32,
+        payload: &[u8],
+    ) -> KernelContext {
+        process_vm_target_with_payload_and_pages(parent, registry_id, payload, 1)
     }
 
     fn process_vm_target_with_pages(
         parent: &KernelContext,
         registry_id: i32,
+        pages: u64,
+    ) -> KernelContext {
+        process_vm_target_with_payload_and_pages(parent, registry_id, b"PEER", pages)
+    }
+
+    fn process_vm_target_with_payload_and_pages(
+        parent: &KernelContext,
+        registry_id: i32,
+        payload: &[u8],
         pages: u64,
     ) -> KernelContext {
         let asid = Asid::from_registry_allocation(
@@ -5173,7 +5173,9 @@ mod kernel_process_dispatch_tests {
             .unwrap()
             .0;
         child.shared().mm().install_foreign_mm_endpoint_for_test(
-            carrick_hal::ForeignMmEndpoint::for_carrier(Arc::new(ProcessVmReadTransport)),
+            carrick_hal::ForeignMmEndpoint::for_carrier(Arc::new(ProcessVmReadTransport {
+                payload: payload.to_vec(),
+            })),
         );
         child
     }
@@ -5250,6 +5252,46 @@ mod kernel_process_dispatch_tests {
     }
 
     #[test]
+    fn process_vm_readv_routes_to_exact_distinct_target_payloads() {
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_070);
+        let target_one = process_vm_target_with_payload(&root, 61_071, b"ONE1");
+        let target_two = process_vm_target_with_payload(&root, 61_072, b"TWO2");
+        let root = refreshed(&root);
+        let pid_one = target_one.task().key().id.raw();
+        let pid_two = target_two.task().key().id.raw();
+
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+        write_iovec(&mut memory, LOCAL_IOV, LOCAL_BUF, 4);
+        write_iovec(&mut memory, REMOTE_IOV, TARGET_VA, 4);
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PROCESS_VM_READV,
+                [pid_one as u64, LOCAL_IOV, 1, REMOTE_IOV, 1, 0],
+                Some(&lease),
+            ),
+            DispatchOutcome::Returned { value: 4 },
+        );
+        assert_eq!(memory.read_bytes(LOCAL_BUF, 4).unwrap(), b"ONE1");
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PROCESS_VM_READV,
+                [pid_two as u64, LOCAL_IOV, 1, REMOTE_IOV, 1, 0],
+                Some(&lease),
+            ),
+            DispatchOutcome::Returned { value: 4 },
+        );
+        assert_eq!(memory.read_bytes(LOCAL_BUF, 4).unwrap(), b"TWO2");
+    }
+
+    #[test]
     fn process_vm_zero_length_ordering_matches_clean_room_oracle() {
         let (_lane, mut dispatcher, _process, root, _lease) = bound_dispatcher(61_092);
         let missing_pid = 2_000_000_000u64;
@@ -5323,6 +5365,30 @@ mod kernel_process_dispatch_tests {
                 Some(&lease),
             ),
             DispatchOutcome::Returned { value: 4 },
+        );
+        assert_eq!(memory.read_bytes(LOCAL_BUF, 4).unwrap(), b"SELF");
+    }
+
+    #[test]
+    fn process_vm_readv_exact_caller_without_lease_succeeds() {
+        let (_lane, mut dispatcher, _process, root, _lease) = bound_dispatcher(61_076);
+        let self_pid = root.task().key().id.raw();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+        write_iovec(&mut memory, LOCAL_IOV, LOCAL_BUF, 4);
+        write_iovec(&mut memory, REMOTE_IOV, TARGET_VA, 4);
+        memory.write_bytes(TARGET_VA, b"SELF").unwrap();
+
+        // Dispatch via public dispatch (which passes no execution lease) for pid=self
+        assert_eq!(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PROCESS_VM_READV,
+                [self_pid as u64, LOCAL_IOV, 1, REMOTE_IOV, 1, 0],
+            ),
+            DispatchOutcome::Returned { value: 4 },
+            "exact caller self-copy must succeed without an execution lease",
         );
         assert_eq!(memory.read_bytes(LOCAL_BUF, 4).unwrap(), b"SELF");
     }
@@ -5472,6 +5538,33 @@ mod kernel_process_dispatch_tests {
             ),
             DispatchOutcome::errno(LINUX_ESRCH),
             "stale target task must return ESRCH",
+        );
+    }
+
+    #[test]
+    fn process_vm_readv_wrong_or_stale_caller_lease_returns_efault() {
+        let (_lane, mut dispatcher, _process, root, _root_lease) = bound_dispatcher(61_074);
+        let (_other_lane, _other_dispatcher, _other_process, _other_root, wrong_lease) =
+            bound_dispatcher(61_075);
+        let target = process_vm_target(&root, 61_076);
+        let root = refreshed(&root);
+        let target_pid = target.task().key().id.raw();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+        write_iovec(&mut memory, LOCAL_IOV, LOCAL_BUF, 4);
+        write_iovec(&mut memory, REMOTE_IOV, TARGET_VA, 4);
+
+        // Supplying a wrong/mismatched caller lease (from a different thread/task) must fail closed with EFAULT (not ESRCH)
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PROCESS_VM_READV,
+                [target_pid as u64, LOCAL_IOV, 1, REMOTE_IOV, 1, 0],
+                Some(&wrong_lease),
+            ),
+            DispatchOutcome::errno(LINUX_EFAULT),
+            "wrong caller lease authority must fail closed with EFAULT",
         );
     }
 
