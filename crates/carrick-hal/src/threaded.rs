@@ -128,9 +128,9 @@ impl<T: VcpuKick> VcpuKickDyn for T {
 ///
 /// EXACTLY ONE of these exists per guest thread. It is created with the
 /// thread's runtime state and lives as long as the thread does, across every
-/// blocking-wait reclaim, fork park and vCPU rebind. Registration
-/// ([`VcpuRegistry::register`]) publishes a clone of this same cell into the
-/// registry, so the run loop's stores and a coordinator's
+/// blocking-wait reclaim, fork park and vCPU rebind. Typed registration
+/// ([`VcpuRegistry::subscribe_register`]) publishes a clone of this same cell
+/// into the registry, so the run loop's stores and a coordinator's
 /// [`VcpuRegistry::any_other_in_guest`] reads always name the SAME memory —
 /// there is no second cell for either side to go stale against.
 ///
@@ -144,7 +144,8 @@ pub struct InGuestFlag(Arc<AtomicBool>);
 impl InGuestFlag {
     /// The one flag belonging to ONE guest thread, created together with that
     /// thread's runtime state. Call this exactly once per guest thread; every
-    /// later (re-)registration of that thread hands `register` this same flag.
+    /// later (re-)registration of that thread hands `subscribe_register` this
+    /// same flag.
     pub fn for_guest_thread() -> Self {
         Self(Arc::new(AtomicBool::new(false)))
     }
@@ -173,7 +174,7 @@ impl InGuestFlag {
     }
 }
 
-/// The process-wide registry of live vCPUs the run loop kicks/counts. Held as
+/// The process-wide registry of live vCPU identities and kick handles. Held as
 /// `Arc<dyn VcpuRegistry>` so the shared loop never names a concrete kicker.
 ///
 /// A registration is ONE indivisible entry carrying BOTH facets — the
@@ -185,15 +186,6 @@ impl InGuestFlag {
 /// code. It also gives the drain its real invariant — anything observable as
 /// in-guest is, by construction, kickable.
 pub trait VcpuRegistry: Send + Sync {
-    /// Temporarily retained until every backend and runtime caller has moved to
-    /// [`VcpuRegistry::subscribe_register`]. New production decisions must use
-    /// the atomic enrollment API instead.
-    /// Register (or RE-register, after a reclaim/rebind) this thread's vCPU.
-    ///
-    /// `in_guest` is the thread's one lifetime flag, not a fresh cell: the
-    /// registry stores a clone of it, and the caller keeps storing through the
-    /// flag it already owns.
-    fn register(&self, tid: ThreadId, handle: Box<dyn VcpuKickDyn>, in_guest: &InGuestFlag);
     /// Atomically diagnose whether every registration other than `except` has
     /// drained. This is diagnostic only; protected work requires a
     /// [`VcpuLeaseDrainGuard`] returned by [`VcpuRegistry::subscribe_lease_drain`].
@@ -205,8 +197,12 @@ pub trait VcpuRegistry: Send + Sync {
         except: ThreadId,
         callback: Arc<dyn Fn() + Send + Sync + 'static>,
     ) -> VcpuLeaseDrainEnrollment;
-    /// Atomically publish a registration or wait for a conflicting lease
-    /// freeze to thaw.
+    /// Atomically publish or replace this thread's vCPU registration, or wait
+    /// for a conflicting lease freeze to thaw.
+    ///
+    /// `in_guest` is the thread's one lifetime flag, not a fresh cell: the
+    /// registry stores a clone of it, and the caller keeps storing through the
+    /// flag it already owns.
     fn subscribe_register(
         &self,
         tid: ThreadId,
@@ -215,7 +211,7 @@ pub trait VcpuRegistry: Send + Sync {
         callback: Arc<dyn Fn() + Send + Sync + 'static>,
     ) -> VcpuRegistrationEnrollment;
     /// Drop this thread's whole registration — it holds no live vCPU, so it can
-    /// neither be kicked nor counted as in-guest until it registers again.
+    /// neither be kicked nor observed as in-guest until it registers again.
     fn unregister(&self, tid: ThreadId);
     fn kick(&self, tid: ThreadId);
     /// Kick `tid` only when its run loop still reports that it is entering or
@@ -234,9 +230,6 @@ pub trait VcpuRegistry: Send + Sync {
     fn kick_all_in_guest(&self) -> bool;
     fn kick_all_except(&self, except: ThreadId);
     fn any_other_in_guest(&self, except: ThreadId) -> bool;
-    /// Temporary diagnostic compatibility shim. Task 6 deletes it after the
-    /// remaining callers move to typed identity-aware queries.
-    fn count(&self) -> usize;
     /// Bounded timeout diagnostics only: registered vCPU identities and their
     /// current in-guest handshake state, read from the SAME entries
     /// [`VcpuRegistry::any_other_in_guest`] reads, so a timeout dump cannot
@@ -467,17 +460,6 @@ fn lowest_sibling(state: &VcpuRegistryState, except: ThreadId) -> Option<ThreadI
 }
 
 impl VcpuRegistry for GenericVcpuRegistry {
-    fn register(&self, tid: ThreadId, handle: Box<dyn VcpuKickDyn>, in_guest: &InGuestFlag) {
-        // Temporary compatibility path until Task 6 migrates the remaining
-        // callers. A legacy caller cannot wait safely, so fail closed if a
-        // sibling freeze denies admission.
-        if let VcpuRegistrationEnrollment::Waiting { .. } =
-            self.subscribe_register(tid, handle, in_guest, Arc::new(|| {}))
-        {
-            std::process::abort();
-        }
-    }
-
     fn poll_lease_drain(&self, except: ThreadId) -> VcpuLeaseDrainPoll {
         match lowest_sibling(&self.lock(), except) {
             Some(tid) => VcpuLeaseDrainPoll::Waiting(tid),
@@ -633,10 +615,6 @@ impl VcpuRegistry for GenericVcpuRegistry {
             .any(|(tid, entry)| *tid != except && entry.is_in_guest())
     }
 
-    fn count(&self) -> usize {
-        self.lock().vcpus.len()
-    }
-
     fn debug_registered_vcpus(&self) -> Vec<(ThreadId, bool)> {
         let mut snapshot: Vec<_> = self
             .lock()
@@ -667,6 +645,18 @@ mod generic_registry_tests {
 
     fn noop() -> Box<dyn VcpuKickDyn> {
         Box::new(CountingHandle(Arc::new(AtomicU64::new(0))))
+    }
+
+    fn register_for_test(
+        registry: &GenericVcpuRegistry,
+        tid: ThreadId,
+        handle: Box<dyn VcpuKickDyn>,
+        in_guest: &InGuestFlag,
+    ) {
+        assert!(matches!(
+            registry.subscribe_register(tid, handle, in_guest, Arc::new(|| {})),
+            VcpuRegistrationEnrollment::Registered
+        ));
     }
 
     #[test]
@@ -713,7 +703,7 @@ mod generic_registry_tests {
         let absent_owner = t(10);
         let sibling = t(20);
         let sibling_flag = InGuestFlag::for_guest_thread();
-        registry.register(sibling, noop(), &sibling_flag);
+        register_for_test(&registry, sibling, noop(), &sibling_flag);
 
         assert_eq!(
             registry.poll_lease_drain(absent_owner),
@@ -732,9 +722,9 @@ mod generic_registry_tests {
         let owner_flag = InGuestFlag::for_guest_thread();
         let high_flag = InGuestFlag::for_guest_thread();
         let low_flag = InGuestFlag::for_guest_thread();
-        registry.register(owner, noop(), &owner_flag);
-        registry.register(t(30), noop(), &high_flag);
-        registry.register(t(20), noop(), &low_flag);
+        register_for_test(&registry, owner, noop(), &owner_flag);
+        register_for_test(&registry, t(30), noop(), &high_flag);
+        register_for_test(&registry, t(20), noop(), &low_flag);
 
         assert_eq!(
             registry.poll_lease_drain(owner),
@@ -812,7 +802,7 @@ mod generic_registry_tests {
         let owner = t(10);
         let sibling = t(20);
         let sibling_flag = InGuestFlag::for_guest_thread();
-        registry.register(sibling, noop(), &sibling_flag);
+        register_for_test(&registry, sibling, noop(), &sibling_flag);
         let wakes = Arc::new(AtomicUsize::new(0));
         let wakes_for_callback = Arc::clone(&wakes);
         let wait = registry.subscribe_lease_drain(
@@ -838,7 +828,7 @@ mod generic_registry_tests {
         let sibling = t(20);
         let first_flag = InGuestFlag::for_guest_thread();
         let replacement_flag = InGuestFlag::for_guest_thread();
-        registry.register(sibling, noop(), &first_flag);
+        register_for_test(&registry, sibling, noop(), &first_flag);
         let wakes = Arc::new(AtomicUsize::new(0));
         let wakes_for_callback = Arc::clone(&wakes);
         let wait = registry.subscribe_lease_drain(
@@ -852,7 +842,7 @@ mod generic_registry_tests {
             VcpuLeaseDrainEnrollment::Waiting { tid, .. } if *tid == sibling
         ));
 
-        registry.register(sibling, noop(), &replacement_flag);
+        register_for_test(&registry, sibling, noop(), &replacement_flag);
         assert_eq!(wakes.load(Ordering::SeqCst), 0);
     }
 
@@ -862,7 +852,7 @@ mod generic_registry_tests {
         let owner = t(10);
         let sibling = t(20);
         let sibling_flag = InGuestFlag::for_guest_thread();
-        registry.register(sibling, noop(), &sibling_flag);
+        register_for_test(&registry, sibling, noop(), &sibling_flag);
         let cancelled_wakes = Arc::new(AtomicUsize::new(0));
         let retained_wakes = Arc::new(AtomicUsize::new(0));
         let cancelled_wakes_for_callback = Arc::clone(&cancelled_wakes);
@@ -888,16 +878,25 @@ mod generic_registry_tests {
     }
 
     #[test]
-    fn register_unregister_count() {
+    fn register_unregister_tracks_exact_identities() {
         let r = GenericVcpuRegistry::new();
+        let observer = t(99);
         let f1 = InGuestFlag::for_guest_thread();
         let f2 = InGuestFlag::for_guest_thread();
-        assert_eq!(r.count(), 0);
-        r.register(t(1), noop(), &f1);
-        r.register(t(2), noop(), &f2);
-        assert_eq!(r.count(), 2);
+        assert_eq!(r.poll_lease_drain(observer), VcpuLeaseDrainPoll::Complete);
+        register_for_test(&r, t(1), noop(), &f1);
+        register_for_test(&r, t(2), noop(), &f2);
+        assert_eq!(
+            r.poll_lease_drain(observer),
+            VcpuLeaseDrainPoll::Waiting(t(1))
+        );
         r.unregister(t(1));
-        assert_eq!(r.count(), 1);
+        assert_eq!(
+            r.poll_lease_drain(observer),
+            VcpuLeaseDrainPoll::Waiting(t(2))
+        );
+        r.unregister(t(2));
+        assert_eq!(r.poll_lease_drain(observer), VcpuLeaseDrainPoll::Complete);
     }
 
     #[test]
@@ -907,8 +906,8 @@ mod generic_registry_tests {
         let c2 = Arc::new(AtomicU64::new(0));
         let f1 = InGuestFlag::for_guest_thread();
         let f2 = InGuestFlag::for_guest_thread();
-        r.register(t(1), Box::new(CountingHandle(Arc::clone(&c1))), &f1);
-        r.register(t(2), Box::new(CountingHandle(Arc::clone(&c2))), &f2);
+        register_for_test(&r, t(1), Box::new(CountingHandle(Arc::clone(&c1))), &f1);
+        register_for_test(&r, t(2), Box::new(CountingHandle(Arc::clone(&c2))), &f2);
         r.kick_all_except(t(1));
         assert_eq!(c1.load(Ordering::SeqCst), 0, "caller must not be kicked");
         assert_eq!(c2.load(Ordering::SeqCst), 1, "the other vCPU is kicked");
@@ -922,8 +921,8 @@ mod generic_registry_tests {
         let r = GenericVcpuRegistry::new();
         let f1 = InGuestFlag::for_guest_thread();
         let f2 = InGuestFlag::for_guest_thread();
-        r.register(t(1), noop(), &f1);
-        r.register(t(2), noop(), &f2);
+        register_for_test(&r, t(1), noop(), &f1);
+        register_for_test(&r, t(2), noop(), &f2);
         assert!(!r.any_other_in_guest(t(1)));
         f2.enter_guest();
         assert!(r.any_other_in_guest(t(1)), "tid 2 is in-guest");
@@ -933,14 +932,14 @@ mod generic_registry_tests {
     }
 
     /// An unregistered thread holds no live vCPU: it is neither kickable nor
-    /// countable as in-guest, even though it still owns its flag.
+    /// visible as in-guest, even though it still owns its flag.
     #[test]
     fn unregistered_thread_is_invisible_to_the_drain() {
         let r = GenericVcpuRegistry::new();
         let f1 = InGuestFlag::for_guest_thread();
         let f2 = InGuestFlag::for_guest_thread();
-        r.register(t(1), noop(), &f1);
-        r.register(t(2), noop(), &f2);
+        register_for_test(&r, t(1), noop(), &f1);
+        register_for_test(&r, t(2), noop(), &f2);
         f1.enter_guest();
         assert!(r.any_other_in_guest(t(2)));
         r.unregister(t(1));
@@ -957,11 +956,11 @@ mod generic_registry_tests {
     /// `ThreadRuntimeState::new`) and stores into that same `Arc` for its whole
     /// life. Every blocking wait on a kicker-refreshing backend (HVF) and every
     /// fork park unregisters the thread and then re-registers only its kick
-    /// handle. If `unregister` drops the in-guest facet and `register` does not
-    /// restore it, the thread's stores land in an `Arc` the registry no longer
-    /// references and `any_other_in_guest` reports FALSE for a thread that is
-    /// executing guest code — the page-table-edit coordinator then edits
-    /// stage-1 descriptors under a live vCPU.
+    /// handle. If `unregister` drops the in-guest facet and re-registration does
+    /// not restore it, the thread's stores land in an `Arc` the registry no
+    /// longer references and `any_other_in_guest` reports FALSE for a thread
+    /// that is executing guest code — the page-table-edit coordinator then
+    /// edits stage-1 descriptors under a live vCPU.
     #[test]
     fn reregistration_keeps_the_in_guest_facet() {
         let r = GenericVcpuRegistry::new();
@@ -970,15 +969,16 @@ mod generic_registry_tests {
         // Each thread's ONE lifetime flag, as `ThreadRuntimeState::new` makes it.
         let blocker_in_guest = InGuestFlag::for_guest_thread();
         let coordinator_in_guest = InGuestFlag::for_guest_thread();
-        r.register(blocker, noop(), &blocker_in_guest);
-        r.register(coordinator, noop(), &coordinator_in_guest);
+        register_for_test(&r, blocker, noop(), &blocker_in_guest);
+        register_for_test(&r, coordinator, noop(), &coordinator_in_guest);
 
         // The thread blocks: a kicker-refreshing backend unregisters it while
         // it has no live vCPU.
         r.unregister(blocker);
         // It wakes, rebinds a vCPU and re-registers — exactly what
-        // `ThreadRuntimeState::register_vcpu` does, with the same flag.
-        r.register(blocker, noop(), &blocker_in_guest);
+        // `ThreadRuntimeState::subscribe_register_vcpu` does, with the same
+        // flag.
+        register_for_test(&r, blocker, noop(), &blocker_in_guest);
 
         // It re-enters the guest through the flag it has held since birth.
         blocker_in_guest.enter_guest();

@@ -1391,7 +1391,7 @@ pub(crate) struct KernelState {
     /// The threads that can execute guest code for this Linux process — the
     /// population every stop-the-world barrier's RAISE decision is keyed on,
     /// and the one thread-group teardown waits out. Deliberately NOT
-    /// `kicker.count()`: see `kernel::guest_execution`.
+    /// the vCPU lease registry: see `kernel::guest_execution`.
     guest_executors: Arc<crate::kernel::GuestExecutorCensus>,
     /// Cross-layer thread-clone admission spans Kernel reservation through
     /// runtime registration, handle visibility, and child start.
@@ -11534,15 +11534,6 @@ mod tests {
     }
 
     impl VcpuRegistry for CrashCallbackRegistry {
-        fn register(
-            &self,
-            tid: ThreadId,
-            handle: Box<dyn carrick_hal::VcpuKickDyn>,
-            in_guest: &carrick_hal::InGuestFlag,
-        ) {
-            self.inner.register(tid, handle, in_guest);
-        }
-
         fn poll_lease_drain(&self, except: ThreadId) -> carrick_hal::VcpuLeaseDrainPoll {
             self.inner.poll_lease_drain(except)
         }
@@ -11599,10 +11590,6 @@ mod tests {
 
         fn any_other_in_guest(&self, except: ThreadId) -> bool {
             self.inner.any_other_in_guest(except)
-        }
-
-        fn count(&self) -> usize {
-            self.inner.count()
         }
 
         fn debug_registered_vcpus(&self) -> Vec<(ThreadId, bool)> {
