@@ -306,3 +306,21 @@ RED and review-pending commits remain on `codex/fd-description-seam`; no push.
   surviving worker and reviewer explicitly attested that it used neither Linux
   kernel source nor abandoned Task 8 material; the contaminated streams remain
   wholly abandoned and non-integrable.
+- Task 8 process-vm-write consumer RED is `e01e68a68`. The syscall-level fixture
+  reuses the runtime's genuine kernel-proof/COW transport and records three
+  exact missing behaviors: a four-byte foreign write returns `EFAULT` instead
+  of changing only the child; two disjoint writes inside one authenticated
+  16 KiB compound return `EFAULT` instead of eight bytes with one COW break;
+  and a later invalid remote iovec returns `EFAULT` instead of the committed
+  four-byte prefix. The first-invalid-range control remains green and proves
+  zero COW, prepare, and commit calls with both retained peer and child bytes
+  unchanged. A separate green routing characterization pins syscall 271 to the
+  ordinary proc handler plus execution-lease acquisition while keeping it out
+  of the 17-entry current-MM mutation classifier. This is required because the
+  target is selected only inside dispatch: the consumer must call
+  `MmAccessAuthority::with_foreign_mutation` after resolving the foreign MM and
+  may never hold caller-MM mutation authority while acquiring target-MM
+  authority. Focused result: 3 expected RED / 1 green safety control; routing
+  characterization 1/1 green; formatting and diff hygiene pass. The controller
+  and both read-only design reviewers inspected only current Carrick source and
+  explicitly used neither Linux kernel source nor abandoned Task 8 material.
