@@ -458,14 +458,15 @@ independent of every one of them and can start immediately.
 
 The `420` in Finding A remains the historical raw-text count at `28a8678c4`;
 it is not a current ceiling. The token-aware, production-capable source census
-now requires three exact shards and classifies **407** current calls:
+now requires three exact shards and classifies **460** current calls at
+`bfdee9aac`:
 
 | Shard | Carrier fault | Typed-error debt | Total |
 |---|---:|---:|---:|
-| `runtime.json` | 120 | 47 | 167 |
-| `hvf.json` | 101 | 0 | 101 |
-| `vcpu-loop.json` | 136 | 3 | 139 |
-| **Total** | **357** | **50** | **407** |
+| `runtime.json` | 141 | 49 | 190 |
+| `hvf.json` | 120 | 0 | 120 |
+| `vcpu-loop.json` | 147 | 3 | 150 |
+| **Total** | **408** | **52** | **460** |
 
 These are machine-counted classifications, not removals. Full `--check` fails
 closed unless all three named ledgers exist, match every current source leaf,
@@ -509,8 +510,9 @@ fork, core, thread-quiesce, and observability gates pass. Repository-wide
 Clippy, docs, dependency policy, support-matrix, workspace-build, full unit, and
 unrestricted integration gates pass. `just lint-domains` and `just ci` stop
 only at the known compiler host-authority positional inventory drift with
-`changed=[]`; no baseline was rewritten. The current abort census is the exact
-407-row table above.
+`changed=[]`; no baseline was rewritten. The abort census has since been
+reconciled to the exact 460-row table above; all three shards and the 54 checker
+unit tests pass together at `bfdee9aac`.
 
 The delegated fork consumer used Antigravity conversation
 `353b580d-2a8a-4e8a-bb35-679894e54923` over three turns; Codex rejected and sent
@@ -520,9 +522,12 @@ consumer used conversation `a86ce8bd-f883-4e1a-a6b2-7d38522ef847` for one turn;
 worker commit `d035366b2` became `c02fc50f3`. Codex re-ran the exact worker gates
 and independent reviews approved both migrations.
 
-This receipt does not close the whole audit. Item 4 (`MmToken`, structural
-`CurrentMm`/`ForeignMm`, and `CowBroken`) and item 5 (mintable structural lock
-ordering) remain open and are the next architectural milestones.
+This receipt does not close the whole audit. Item 4 now has the structural
+`MmToken` / `CurrentMm` / `ForeignMm` / `CowBroken` seam plus accepted
+`process_vm_readv` / `process_vm_writev` and ptrace PEEK/writable-POKE
+consumers. RX `PTRACE_POKETEXT`, the retained `/proc/<pid>/mem` description,
+and the fail-closed differential matrix remain open. Item 5 (mintable
+structural lock ordering) also remains open.
 
 ## The rule to carry forward
 
