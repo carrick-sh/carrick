@@ -783,6 +783,7 @@ mod foreign_mm_tests {
                         Arc::downgrade(&installed.state),
                     ),
                 ]))),
+                custody: Arc::new(CarrierVmCustody::new()),
             }));
         let lease = endpoint
             .retain(&installed.snapshot, deadline)
@@ -8241,22 +8242,18 @@ pub fn destroy_persistent_vm_at_carrier_exit() -> Result<(), TrapError> {
             "carrier-exit cannot destroy VM while pending global frame retirements remain: {e}"
         )));
     }
+    let carrier = persistent_carrier_cell().lock().take().ok_or_else(|| {
+        TrapError::Hypervisor("carrier-exit live VM has no published carrier custody".to_owned())
+    })?;
+    let custody = std::sync::Arc::clone(&carrier.carrier_foreign_mm_transport.custody);
     // Drop the carrier's control-mapping authority first: `PersistentCarrierMappings`'s
     // `Drop` unmaps the five fixed stage-2 extents, which must precede
     // `hv_vm_destroy`. This only releases the cell's `Arc`; every executor pool
     // holding another `Arc` must already have been shut down by its container's
     // run terminal (`pool_shutdown` in `run_threaded_loop_inner`) — a retained
     // `Arc` leaves the extents mapped until `hv_vm_destroy` tears them down.
-    drop(persistent_carrier_cell().lock().take());
-    crate::probes::vm_lifecycle(2, -1);
-    let rc = unsafe { inventory_hv_vm_destroy() };
-    if rc != 0 {
-        return Err(TrapError::Hypervisor(format!(
-            "carrier-exit hv_vm_destroy rc={rc:#x}"
-        )));
-    }
-    record_vm_released();
-    Ok(())
+    drop(carrier);
+    destroy_vm_with_custody(&custody, "carrier-exit")
 }
 
 /// Whether the atomic slot-table admission permit is active; cached once.
@@ -8517,6 +8514,7 @@ fn create_vcpu(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn create_vm_with_admission(
     admission: VmCreateAdmission,
+    custody: &CarrierVmCustody,
 ) -> Result<
     (
         applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
@@ -8532,24 +8530,32 @@ fn create_vm_with_admission(
         Some(budget) => Some(acquire_admission_permit(budget)?),
         None => None,
     };
-    // Config is rebuilt per attempt inside the closure because `with_config`
-    // consumes it, so an HV_NO_RESOURCES retry needs a fresh one.
-    crate::probes::vm_lifecycle(0, admission.probe_code());
-    match create_with_no_resources_backpressure("hv_vm_create", || {
-        let config = fresh_vm_config()?;
-        virtual_machine_with_private_signals_blocked(config)
-    }) {
-        Ok(vm) => {
+    let create_result = create_vm_with_custody_using(
+        custody,
+        "hv_vm_create",
+        || {
+            // Config is rebuilt per attempt inside the closure because
+            // `with_config` consumes it, so an HV_NO_RESOURCES retry needs a
+            // fresh one.
+            crate::probes::vm_lifecycle(0, admission.probe_code());
+            create_with_no_resources_backpressure("hv_vm_create", || {
+                let config = fresh_vm_config()?;
+                virtual_machine_with_private_signals_blocked(config)
+            })
+        },
+        || {
             record_vm_resident();
             CARRIER_VM_LIVE.store(true, std::sync::atomic::Ordering::Release);
             crate::probes::vm_lifecycle(1, admission.probe_code());
-            Ok((vm, permit))
-        }
-        Err(e) => {
+        },
+    );
+    match create_result {
+        Ok(vm) => Ok((vm, permit)),
+        Err(error) => {
             if let Some(permit) = permit {
                 release_unregistered_admission_permit(permit);
             }
-            Err(e)
+            Err(error)
         }
     }
 }
@@ -9415,6 +9421,627 @@ impl CarrierForeignMmSnapshot {
     }
 }
 
+/// Carrier-local identity for one installed Hypervisor.framework VM.
+///
+/// Generations are monotonically allocated by [`CarrierVmCustody`] and never
+/// reused inside that carrier, so a teardown retry cannot accidentally operate
+/// on a successor VM that happens to reuse the same stage-2 coordinates.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CarrierVmGeneration(u64);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct CarrierStage2RecordId(u64);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CarrierLogicalOwner {
+    pub(crate) id: u64,
+    pub(crate) generation: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CarrierStage2RecordSpec {
+    pub(crate) vm_generation: CarrierVmGeneration,
+    pub(crate) ipa: u64,
+    pub(crate) len: usize,
+    pub(crate) host_addr: usize,
+    pub(crate) mapped: bool,
+    pub(crate) release_ipa: bool,
+    pub(crate) logical_owner: Option<CarrierLogicalOwner>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CarrierStage2RecordIdentity {
+    pub(crate) record_id: CarrierStage2RecordId,
+    pub(crate) vm_generation: CarrierVmGeneration,
+    pub(crate) logical_owner: Option<CarrierLogicalOwner>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // the real HV return adapter is wired in the next migration slice
+pub(crate) enum CarrierStage2BackendError {
+    HvReturn(u32),
+    ConcurrentRetirement,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CarrierStage2RetireOutcome {
+    RetiredUnmapped,
+    DeferredActivePins,
+    RetryPending(CarrierStage2BackendError),
+    TerminalizedByVmDestroy,
+    NotFound,
+    OwnerIdentityMismatch,
+    OwnerGenerationMismatch,
+    VmGenerationMismatch,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CarrierStage2RecordError {
+    InvalidExtent,
+    NoLiveVm,
+    VmGenerationMismatch,
+    RecordIdExhausted,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CarrierStage2PinError {
+    NotFound,
+    VmNotLive,
+    OwnerIdentityMismatch,
+    OwnerGenerationMismatch,
+    VmGenerationMismatch,
+    TerminalizedByVmDestroy,
+    NotMapped,
+    RetirementRequested,
+    PinCountExhausted,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CarrierStage2RecordSnapshot {
+    pub(crate) record_id: CarrierStage2RecordId,
+    pub(crate) vm_generation: CarrierVmGeneration,
+    pub(crate) ipa: u64,
+    pub(crate) len: usize,
+    pub(crate) host_addr: usize,
+    pub(crate) mapped: bool,
+    pub(crate) release_ipa: bool,
+    pub(crate) logical_owner: Option<CarrierLogicalOwner>,
+    pub(crate) pin_count: u64,
+    pub(crate) retirement_requested: bool,
+    pub(crate) retry_eligible: bool,
+    pub(crate) retry_pending: Option<CarrierStage2BackendError>,
+    pub(crate) terminalized_by_vm_destroy: bool,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CarrierStage2Record {
+    snapshot: CarrierStage2RecordSnapshot,
+    unmap_in_flight: bool,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
+pub(crate) enum CarrierVmCustodyError {
+    LifecycleConflict,
+    StaleGeneration,
+    GenerationExhausted,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
+enum CarrierVmLifecycle {
+    Vacant,
+    Creating(CarrierVmGeneration),
+    Live(CarrierVmGeneration),
+    Destroying(CarrierVmGeneration),
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+#[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
+struct CarrierVmCustodyState {
+    next_generation: u64,
+    lifecycle: CarrierVmLifecycle,
+    next_stage2_record_id: u64,
+    stage2_records: std::collections::BTreeMap<CarrierStage2RecordId, CarrierStage2Record>,
+}
+
+/// Carrier-owned VM lifecycle authority.
+///
+/// The state is intentionally neither static nor process-global. A failed
+/// backend destroy is represented by `abort_destroy`, which restores custody of
+/// the exact generation; a successful destroy must be committed before a later
+/// generation can begin creation.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+#[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
+pub(crate) struct CarrierVmCustody {
+    state: parking_lot::Mutex<CarrierVmCustodyState>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Default for CarrierVmCustody {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
+impl CarrierVmCustody {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: parking_lot::Mutex::new(CarrierVmCustodyState {
+                next_generation: 1,
+                lifecycle: CarrierVmLifecycle::Vacant,
+                next_stage2_record_id: 1,
+                stage2_records: std::collections::BTreeMap::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn begin_create(&self) -> Result<CarrierVmGeneration, CarrierVmCustodyError> {
+        let mut state = self.state.lock();
+        if state.lifecycle != CarrierVmLifecycle::Vacant {
+            return Err(CarrierVmCustodyError::LifecycleConflict);
+        }
+        let next_generation = state
+            .next_generation
+            .checked_add(1)
+            .ok_or(CarrierVmCustodyError::GenerationExhausted)?;
+        let generation = CarrierVmGeneration(state.next_generation);
+        state.next_generation = next_generation;
+        state.lifecycle = CarrierVmLifecycle::Creating(generation);
+        Ok(generation)
+    }
+
+    pub(crate) fn commit_create(
+        &self,
+        generation: CarrierVmGeneration,
+    ) -> Result<(), CarrierVmCustodyError> {
+        let mut state = self.state.lock();
+        match state.lifecycle {
+            CarrierVmLifecycle::Creating(current) if current == generation => {
+                state.lifecycle = CarrierVmLifecycle::Live(generation);
+                Ok(())
+            }
+            CarrierVmLifecycle::Creating(_) | CarrierVmLifecycle::Live(_) => {
+                Err(CarrierVmCustodyError::StaleGeneration)
+            }
+            CarrierVmLifecycle::Vacant | CarrierVmLifecycle::Destroying(_) => {
+                Err(CarrierVmCustodyError::LifecycleConflict)
+            }
+        }
+    }
+
+    pub(crate) fn abort_create(
+        &self,
+        generation: CarrierVmGeneration,
+    ) -> Result<(), CarrierVmCustodyError> {
+        let mut state = self.state.lock();
+        match state.lifecycle {
+            CarrierVmLifecycle::Creating(current) if current == generation => {
+                state.lifecycle = CarrierVmLifecycle::Vacant;
+                Ok(())
+            }
+            CarrierVmLifecycle::Creating(_) | CarrierVmLifecycle::Live(_) => {
+                Err(CarrierVmCustodyError::StaleGeneration)
+            }
+            CarrierVmLifecycle::Vacant | CarrierVmLifecycle::Destroying(_) => {
+                Err(CarrierVmCustodyError::LifecycleConflict)
+            }
+        }
+    }
+
+    pub(crate) fn begin_destroy(
+        &self,
+        generation: CarrierVmGeneration,
+    ) -> Result<(), CarrierVmCustodyError> {
+        let mut state = self.state.lock();
+        match state.lifecycle {
+            CarrierVmLifecycle::Live(current) if current == generation => {
+                state.lifecycle = CarrierVmLifecycle::Destroying(generation);
+                Ok(())
+            }
+            CarrierVmLifecycle::Live(_) => Err(CarrierVmCustodyError::StaleGeneration),
+            CarrierVmLifecycle::Vacant
+            | CarrierVmLifecycle::Creating(_)
+            | CarrierVmLifecycle::Destroying(_) => Err(CarrierVmCustodyError::LifecycleConflict),
+        }
+    }
+
+    pub(crate) fn abort_destroy(
+        &self,
+        generation: CarrierVmGeneration,
+    ) -> Result<(), CarrierVmCustodyError> {
+        let mut state = self.state.lock();
+        match state.lifecycle {
+            CarrierVmLifecycle::Destroying(current) if current == generation => {
+                state.lifecycle = CarrierVmLifecycle::Live(generation);
+                Ok(())
+            }
+            CarrierVmLifecycle::Destroying(_) | CarrierVmLifecycle::Live(_) => {
+                Err(CarrierVmCustodyError::StaleGeneration)
+            }
+            CarrierVmLifecycle::Vacant | CarrierVmLifecycle::Creating(_) => {
+                Err(CarrierVmCustodyError::LifecycleConflict)
+            }
+        }
+    }
+
+    pub(crate) fn commit_destroy(
+        &self,
+        generation: CarrierVmGeneration,
+    ) -> Result<(), CarrierVmCustodyError> {
+        let mut state = self.state.lock();
+        match state.lifecycle {
+            CarrierVmLifecycle::Destroying(current) if current == generation => {
+                for record in state
+                    .stage2_records
+                    .values_mut()
+                    .filter(|record| record.snapshot.vm_generation == generation)
+                {
+                    record.snapshot.mapped = false;
+                    record.snapshot.retirement_requested = true;
+                    record.snapshot.retry_eligible = false;
+                    record.snapshot.retry_pending = None;
+                    record.snapshot.terminalized_by_vm_destroy = true;
+                    record.unmap_in_flight = false;
+                }
+                state.lifecycle = CarrierVmLifecycle::Vacant;
+                Ok(())
+            }
+            CarrierVmLifecycle::Destroying(_) | CarrierVmLifecycle::Live(_) => {
+                Err(CarrierVmCustodyError::StaleGeneration)
+            }
+            CarrierVmLifecycle::Vacant | CarrierVmLifecycle::Creating(_) => {
+                Err(CarrierVmCustodyError::LifecycleConflict)
+            }
+        }
+    }
+
+    pub(crate) fn live_generation(&self) -> Option<CarrierVmGeneration> {
+        match self.state.lock().lifecycle {
+            CarrierVmLifecycle::Live(generation) => Some(generation),
+            CarrierVmLifecycle::Vacant
+            | CarrierVmLifecycle::Creating(_)
+            | CarrierVmLifecycle::Destroying(_) => None,
+        }
+    }
+
+    pub(crate) fn register_stage2_record(
+        &self,
+        spec: CarrierStage2RecordSpec,
+    ) -> Result<CarrierStage2RecordIdentity, CarrierStage2RecordError> {
+        if spec.len == 0 || (spec.mapped && spec.host_addr == 0) {
+            return Err(CarrierStage2RecordError::InvalidExtent);
+        }
+        let mut state = self.state.lock();
+        match state.lifecycle {
+            CarrierVmLifecycle::Live(generation) if generation == spec.vm_generation => {}
+            CarrierVmLifecycle::Live(_) => {
+                return Err(CarrierStage2RecordError::VmGenerationMismatch);
+            }
+            CarrierVmLifecycle::Vacant
+            | CarrierVmLifecycle::Creating(_)
+            | CarrierVmLifecycle::Destroying(_) => {
+                return Err(CarrierStage2RecordError::NoLiveVm);
+            }
+        }
+        let next_id = state
+            .next_stage2_record_id
+            .checked_add(1)
+            .ok_or(CarrierStage2RecordError::RecordIdExhausted)?;
+        let record_id = CarrierStage2RecordId(state.next_stage2_record_id);
+        state.next_stage2_record_id = next_id;
+        let identity = CarrierStage2RecordIdentity {
+            record_id,
+            vm_generation: spec.vm_generation,
+            logical_owner: spec.logical_owner,
+        };
+        state.stage2_records.insert(
+            record_id,
+            CarrierStage2Record {
+                snapshot: CarrierStage2RecordSnapshot {
+                    record_id,
+                    vm_generation: spec.vm_generation,
+                    ipa: spec.ipa,
+                    len: spec.len,
+                    host_addr: spec.host_addr,
+                    mapped: spec.mapped,
+                    release_ipa: spec.release_ipa,
+                    logical_owner: spec.logical_owner,
+                    pin_count: 0,
+                    retirement_requested: false,
+                    retry_eligible: false,
+                    retry_pending: None,
+                    terminalized_by_vm_destroy: false,
+                },
+                unmap_in_flight: false,
+            },
+        );
+        Ok(identity)
+    }
+
+    pub(crate) fn stage2_record_snapshot(
+        &self,
+        record_id: CarrierStage2RecordId,
+    ) -> Option<CarrierStage2RecordSnapshot> {
+        self.state
+            .lock()
+            .stage2_records
+            .get(&record_id)
+            .map(|record| record.snapshot)
+    }
+
+    fn stage2_identity_mismatch(
+        record: &CarrierStage2Record,
+        identity: CarrierStage2RecordIdentity,
+    ) -> Option<CarrierStage2RetireOutcome> {
+        if record.snapshot.vm_generation != identity.vm_generation {
+            return Some(CarrierStage2RetireOutcome::VmGenerationMismatch);
+        }
+        match (record.snapshot.logical_owner, identity.logical_owner) {
+            (Some(expected), Some(actual)) if expected.id != actual.id => {
+                Some(CarrierStage2RetireOutcome::OwnerIdentityMismatch)
+            }
+            (Some(expected), Some(actual)) if expected.generation != actual.generation => {
+                Some(CarrierStage2RetireOutcome::OwnerGenerationMismatch)
+            }
+            (None, None) | (Some(_), Some(_)) => None,
+            (None, Some(_)) | (Some(_), None) => {
+                Some(CarrierStage2RetireOutcome::OwnerIdentityMismatch)
+            }
+        }
+    }
+
+    pub(crate) fn pin_stage2_record(
+        self: &std::sync::Arc<Self>,
+        identity: CarrierStage2RecordIdentity,
+    ) -> Result<CarrierStage2Pin, CarrierStage2PinError> {
+        let mut state = self.state.lock();
+        match state.lifecycle {
+            CarrierVmLifecycle::Live(generation) if generation == identity.vm_generation => {}
+            CarrierVmLifecycle::Live(_) => {
+                return Err(CarrierStage2PinError::VmGenerationMismatch);
+            }
+            CarrierVmLifecycle::Vacant
+            | CarrierVmLifecycle::Creating(_)
+            | CarrierVmLifecycle::Destroying(_) => {
+                return Err(CarrierStage2PinError::VmNotLive);
+            }
+        }
+        let record = state
+            .stage2_records
+            .get_mut(&identity.record_id)
+            .ok_or(CarrierStage2PinError::NotFound)?;
+        if let Some(mismatch) = Self::stage2_identity_mismatch(record, identity) {
+            return Err(match mismatch {
+                CarrierStage2RetireOutcome::VmGenerationMismatch => {
+                    CarrierStage2PinError::VmGenerationMismatch
+                }
+                CarrierStage2RetireOutcome::OwnerIdentityMismatch => {
+                    CarrierStage2PinError::OwnerIdentityMismatch
+                }
+                CarrierStage2RetireOutcome::OwnerGenerationMismatch => {
+                    CarrierStage2PinError::OwnerGenerationMismatch
+                }
+                _ => CarrierStage2PinError::NotFound,
+            });
+        }
+        if record.snapshot.terminalized_by_vm_destroy {
+            return Err(CarrierStage2PinError::TerminalizedByVmDestroy);
+        }
+        if record.snapshot.retirement_requested || record.unmap_in_flight {
+            return Err(CarrierStage2PinError::RetirementRequested);
+        }
+        if !record.snapshot.mapped {
+            return Err(CarrierStage2PinError::NotMapped);
+        }
+        record.snapshot.pin_count = record
+            .snapshot
+            .pin_count
+            .checked_add(1)
+            .ok_or(CarrierStage2PinError::PinCountExhausted)?;
+        Ok(CarrierStage2Pin {
+            custody: std::sync::Arc::clone(self),
+            identity,
+            active: true,
+        })
+    }
+
+    pub(crate) fn retire_stage2_record_using(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+        unmap: impl FnOnce(u64, usize) -> Result<(), CarrierStage2BackendError>,
+    ) -> CarrierStage2RetireOutcome {
+        let (ipa, len) = {
+            let mut state = self.state.lock();
+            let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
+                return CarrierStage2RetireOutcome::NotFound;
+            };
+            if let Some(mismatch) = Self::stage2_identity_mismatch(record, identity) {
+                return mismatch;
+            }
+            if record.snapshot.terminalized_by_vm_destroy {
+                return CarrierStage2RetireOutcome::TerminalizedByVmDestroy;
+            }
+            record.snapshot.retirement_requested = true;
+            if record.snapshot.pin_count != 0 {
+                record.snapshot.retry_eligible = false;
+                return CarrierStage2RetireOutcome::DeferredActivePins;
+            }
+            if !record.snapshot.mapped {
+                record.snapshot.retry_eligible = false;
+                record.snapshot.retry_pending = None;
+                return CarrierStage2RetireOutcome::RetiredUnmapped;
+            }
+            if record.unmap_in_flight {
+                return CarrierStage2RetireOutcome::RetryPending(
+                    CarrierStage2BackendError::ConcurrentRetirement,
+                );
+            }
+            record.unmap_in_flight = true;
+            record.snapshot.retry_eligible = false;
+            (record.snapshot.ipa, record.snapshot.len)
+        };
+
+        let backend_result = unmap(ipa, len);
+        let mut state = self.state.lock();
+        let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
+            return CarrierStage2RetireOutcome::NotFound;
+        };
+        if let Some(mismatch) = Self::stage2_identity_mismatch(record, identity) {
+            return mismatch;
+        }
+        record.unmap_in_flight = false;
+        if record.snapshot.terminalized_by_vm_destroy {
+            return CarrierStage2RetireOutcome::TerminalizedByVmDestroy;
+        }
+        match backend_result {
+            Ok(()) => {
+                record.snapshot.mapped = false;
+                record.snapshot.retry_eligible = false;
+                record.snapshot.retry_pending = None;
+                CarrierStage2RetireOutcome::RetiredUnmapped
+            }
+            Err(error) => {
+                record.snapshot.retry_eligible = true;
+                record.snapshot.retry_pending = Some(error);
+                CarrierStage2RetireOutcome::RetryPending(error)
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+pub(crate) struct CarrierStage2Pin {
+    custody: std::sync::Arc<CarrierVmCustody>,
+    identity: CarrierStage2RecordIdentity,
+    active: bool,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for CarrierStage2Pin {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut state = self.custody.state.lock();
+        let Some(record) = state.stage2_records.get_mut(&self.identity.record_id) else {
+            return;
+        };
+        if CarrierVmCustody::stage2_identity_mismatch(record, self.identity).is_some() {
+            return;
+        }
+        record.snapshot.pin_count = record.snapshot.pin_count.saturating_sub(1);
+        if record.snapshot.pin_count == 0
+            && record.snapshot.retirement_requested
+            && record.snapshot.mapped
+            && !record.snapshot.terminalized_by_vm_destroy
+        {
+            record.snapshot.retry_eligible = true;
+        }
+        self.active = false;
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn custody_transition_error(
+    context: &str,
+    transition: &str,
+    error: CarrierVmCustodyError,
+) -> TrapError {
+    TrapError::Hypervisor(format!(
+        "{context}: carrier VM custody {transition} failed: {error:?}"
+    ))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn create_vm_with_custody_using<T>(
+    custody: &CarrierVmCustody,
+    context: &str,
+    create: impl FnOnce() -> Result<T, TrapError>,
+    record_created: impl FnOnce(),
+) -> Result<T, TrapError> {
+    let generation = custody
+        .begin_create()
+        .map_err(|error| custody_transition_error(context, "begin_create", error))?;
+    match create() {
+        Ok(vm) => {
+            custody
+                .commit_create(generation)
+                .map_err(|error| custody_transition_error(context, "commit_create", error))?;
+            record_created();
+            Ok(vm)
+        }
+        Err(error) => {
+            custody
+                .abort_create(generation)
+                .map_err(|error| custody_transition_error(context, "abort_create", error))?;
+            Err(error)
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn destroy_vm_with_custody_using(
+    custody: &CarrierVmCustody,
+    context: &str,
+    destroy: impl FnOnce() -> applevisor_sys::hv_return_t,
+    record_released: impl FnOnce(),
+) -> Result<(), TrapError> {
+    let generation = custody.live_generation().ok_or_else(|| {
+        TrapError::Hypervisor(format!(
+            "{context}: carrier VM custody has no live generation"
+        ))
+    })?;
+    custody
+        .begin_destroy(generation)
+        .map_err(|error| custody_transition_error(context, "begin_destroy", error))?;
+    let rc = destroy();
+    if rc != 0 {
+        custody
+            .abort_destroy(generation)
+            .map_err(|error| custody_transition_error(context, "abort_destroy", error))?;
+        return Err(TrapError::Hypervisor(format!(
+            "{context}: hv_vm_destroy rc={rc:#x}"
+        )));
+    }
+    custody
+        .commit_destroy(generation)
+        .map_err(|error| custody_transition_error(context, "commit_destroy", error))?;
+    record_released();
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn destroy_vm_with_custody(custody: &CarrierVmCustody, context: &str) -> Result<(), TrapError> {
+    destroy_vm_with_custody_using(
+        custody,
+        context,
+        || {
+            crate::probes::vm_lifecycle(2, -1);
+            unsafe { inventory_hv_vm_destroy() }
+        },
+        record_vm_released,
+    )
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Clone, Default, Debug)]
 pub(crate) struct CarrierForeignMmTransport {
@@ -9423,6 +10050,8 @@ pub(crate) struct CarrierForeignMmTransport {
             std::collections::HashMap<CarrierForeignMmBinding, std::sync::Weak<MmAccessState>>,
         >,
     >,
+    #[allow(dead_code)] // migrated into the VM create/destroy paths in the next custody slice
+    custody: std::sync::Arc<CarrierVmCustody>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -9479,6 +10108,398 @@ impl CarrierForeignMmTransport {
         }
         drop(identity);
         Ok(state)
+    }
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+mod carrier_vm_custody_tests {
+    use super::{
+        CarrierLogicalOwner, CarrierStage2BackendError, CarrierStage2PinError,
+        CarrierStage2RecordIdentity, CarrierStage2RecordSpec, CarrierStage2RetireOutcome,
+        CarrierVmCustody, CarrierVmCustodyError, CarrierVmGeneration, create_vm_with_custody_using,
+        destroy_vm_with_custody_using,
+    };
+
+    #[allow(clippy::expect_used)]
+    fn live_custody() -> (std::sync::Arc<CarrierVmCustody>, CarrierVmGeneration) {
+        let custody = std::sync::Arc::new(CarrierVmCustody::new());
+        let generation = custody.begin_create().expect("begin VM create");
+        custody
+            .commit_create(generation)
+            .expect("publish VM generation");
+        (custody, generation)
+    }
+
+    fn stage2_spec(
+        vm_generation: CarrierVmGeneration,
+        owner_generation: u64,
+    ) -> CarrierStage2RecordSpec {
+        CarrierStage2RecordSpec {
+            vm_generation,
+            ipa: 0x4000,
+            len: 0x4000,
+            host_addr: 0x1234_0000,
+            mapped: true,
+            release_ipa: true,
+            logical_owner: Some(CarrierLogicalOwner {
+                id: 7,
+                generation: owner_generation,
+            }),
+        }
+    }
+
+    #[test]
+    fn abort_destroy_preserves_the_exact_live_generation_for_retry() {
+        let custody = CarrierVmCustody::new();
+        let generation = custody.begin_create().expect("begin first VM create");
+        custody
+            .commit_create(generation)
+            .expect("publish first VM generation");
+
+        custody
+            .begin_destroy(generation)
+            .expect("begin first VM destroy");
+        custody
+            .abort_destroy(generation)
+            .expect("failed backend destroy restores custody");
+
+        assert_eq!(custody.live_generation(), Some(generation));
+        custody
+            .begin_destroy(generation)
+            .expect("same generation remains retryable");
+    }
+
+    #[test]
+    fn committed_destroy_prevents_a_stale_generation_from_mutating_its_successor() {
+        let custody = CarrierVmCustody::new();
+        let first = custody.begin_create().expect("begin first VM create");
+        custody
+            .commit_create(first)
+            .expect("publish first VM generation");
+        custody.begin_destroy(first).expect("begin first destroy");
+
+        assert_eq!(
+            custody.begin_create(),
+            Err(CarrierVmCustodyError::LifecycleConflict)
+        );
+
+        custody
+            .commit_destroy(first)
+            .expect("terminalize first VM generation");
+        let second = custody.begin_create().expect("begin successor VM create");
+        assert_ne!(first, second);
+        custody
+            .commit_create(second)
+            .expect("publish successor VM generation");
+
+        assert_eq!(
+            custody.begin_destroy(first),
+            Err(CarrierVmCustodyError::StaleGeneration)
+        );
+        assert_eq!(custody.live_generation(), Some(second));
+    }
+
+    #[test]
+    fn aborted_create_returns_custody_to_vacant_without_reusing_the_generation() {
+        let custody = CarrierVmCustody::new();
+        let failed = custody.begin_create().expect("begin failed VM create");
+        custody
+            .abort_create(failed)
+            .expect("failed backend create returns custody");
+
+        let successor = custody.begin_create().expect("retry VM create");
+        assert_ne!(failed, successor);
+        custody
+            .commit_create(successor)
+            .expect("publish retry generation");
+        assert_eq!(custody.live_generation(), Some(successor));
+    }
+
+    #[test]
+    fn backend_destroy_failure_preserves_live_custody_and_skips_release_publication() {
+        let custody = CarrierVmCustody::new();
+        let generation = custody.begin_create().expect("begin VM create");
+        custody
+            .commit_create(generation)
+            .expect("publish VM generation");
+        let released = std::sync::atomic::AtomicBool::new(false);
+
+        let result = destroy_vm_with_custody_using(
+            &custody,
+            "test destroy",
+            || 0xfae9_4001_u32 as applevisor_sys::hv_return_t,
+            || released.store(true, std::sync::atomic::Ordering::SeqCst),
+        );
+
+        assert!(matches!(result, Err(super::TrapError::Hypervisor(_))));
+        assert_eq!(custody.live_generation(), Some(generation));
+        assert!(!released.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            custody.begin_create(),
+            Err(CarrierVmCustodyError::LifecycleConflict),
+            "failed destroy must not admit a successor VM"
+        );
+    }
+
+    #[test]
+    fn backend_destroy_success_terminalizes_before_release_publication() {
+        let custody = CarrierVmCustody::new();
+        let generation = custody.begin_create().expect("begin VM create");
+        custody
+            .commit_create(generation)
+            .expect("publish VM generation");
+        let released_after_terminal = std::cell::Cell::new(false);
+
+        destroy_vm_with_custody_using(
+            &custody,
+            "test destroy",
+            || 0,
+            || released_after_terminal.set(custody.live_generation().is_none()),
+        )
+        .expect("destroy transaction succeeds");
+
+        assert!(released_after_terminal.get());
+        assert!(custody.begin_create().is_ok());
+    }
+
+    #[test]
+    fn backend_create_failure_returns_custody_to_vacant_and_skips_publication() {
+        let custody = CarrierVmCustody::new();
+        let published = std::cell::Cell::new(false);
+
+        let result = create_vm_with_custody_using(
+            &custody,
+            "test create",
+            || {
+                Err::<(), _>(super::TrapError::Hypervisor(
+                    "injected create failure".into(),
+                ))
+            },
+            || published.set(true),
+        );
+
+        assert!(matches!(result, Err(super::TrapError::Hypervisor(_))));
+        assert!(!published.get());
+        assert!(
+            custody.begin_create().is_ok(),
+            "failed create must return carrier custody to Vacant"
+        );
+    }
+
+    #[test]
+    fn backend_create_success_commits_generation_before_publication() {
+        let custody = CarrierVmCustody::new();
+        let published_generation = std::cell::Cell::new(None);
+
+        let value = create_vm_with_custody_using(
+            &custody,
+            "test create",
+            || Ok(17_u8),
+            || published_generation.set(custody.live_generation()),
+        )
+        .expect("create transaction succeeds");
+
+        assert_eq!(value, 17);
+        assert_eq!(published_generation.get(), custody.live_generation());
+        assert!(published_generation.get().is_some());
+    }
+
+    #[test]
+    fn persistent_unmap_failure_retains_the_exact_record_for_retry() {
+        let (custody, generation) = live_custody();
+        let identity = custody
+            .register_stage2_record(stage2_spec(generation, 11))
+            .expect("register exact stage-2 record");
+        let second = custody
+            .register_stage2_record(CarrierStage2RecordSpec {
+                ipa: 0x8000,
+                host_addr: 0x5678_0000,
+                ..stage2_spec(generation, 12)
+            })
+            .expect("register second exact stage-2 record");
+        assert_ne!(identity.record_id, second.record_id);
+        let injected = CarrierStage2BackendError::HvReturn(0xfae9_4001);
+
+        assert_eq!(
+            custody.retire_stage2_record_using(identity, |_, _| Err(injected)),
+            CarrierStage2RetireOutcome::RetryPending(injected)
+        );
+        let retained = custody
+            .stage2_record_snapshot(identity.record_id)
+            .expect("failed unmap record remains in carrier custody");
+        assert_eq!(retained.vm_generation, generation);
+        assert_eq!(retained.ipa, 0x4000);
+        assert_eq!(retained.len, 0x4000);
+        assert_eq!(retained.host_addr, 0x1234_0000);
+        assert!(retained.mapped);
+        assert!(retained.release_ipa);
+        assert_eq!(retained.logical_owner, identity.logical_owner);
+        assert_eq!(retained.retry_pending, Some(injected));
+
+        assert_eq!(
+            custody.retire_stage2_record_using(identity, |_, _| Ok(())),
+            CarrierStage2RetireOutcome::RetiredUnmapped
+        );
+        assert!(
+            !custody
+                .stage2_record_snapshot(identity.record_id)
+                .expect("retired tombstone remains exact")
+                .mapped
+        );
+    }
+
+    #[test]
+    fn last_pin_drop_is_non_panicking_and_only_marks_retry_eligibility() {
+        let (custody, generation) = live_custody();
+        let identity = custody
+            .register_stage2_record(stage2_spec(generation, 21))
+            .expect("register pinned record");
+        let pin = custody
+            .pin_stage2_record(identity)
+            .expect("pin exact record");
+        let unmap_calls = std::cell::Cell::new(0_u32);
+
+        assert_eq!(
+            custody.retire_stage2_record_using(identity, |_, _| {
+                unmap_calls.set(unmap_calls.get() + 1);
+                Ok(())
+            }),
+            CarrierStage2RetireOutcome::DeferredActivePins
+        );
+        assert_eq!(unmap_calls.get(), 0);
+        assert!(matches!(
+            custody.pin_stage2_record(identity),
+            Err(CarrierStage2PinError::RetirementRequested)
+        ));
+        drop(pin);
+        let eligible = custody
+            .stage2_record_snapshot(identity.record_id)
+            .expect("last-pin drop retains record");
+        assert_eq!(eligible.pin_count, 0);
+        assert!(eligible.retry_eligible);
+        assert!(eligible.mapped);
+
+        assert_eq!(
+            custody.retire_stage2_record_using(identity, |_, _| {
+                unmap_calls.set(unmap_calls.get() + 1);
+                Ok(())
+            }),
+            CarrierStage2RetireOutcome::RetiredUnmapped
+        );
+        assert_eq!(unmap_calls.get(), 1);
+    }
+
+    #[test]
+    fn successful_vm_destroy_terminalizes_generation_without_post_destroy_unmap() {
+        let (custody, generation) = live_custody();
+        let first = custody
+            .register_stage2_record(stage2_spec(generation, 31))
+            .expect("register first record");
+        let second = custody
+            .register_stage2_record(CarrierStage2RecordSpec {
+                ipa: 0xc000,
+                host_addr: 0x9abc_0000,
+                ..stage2_spec(generation, 32)
+            })
+            .expect("register second record");
+
+        destroy_vm_with_custody_using(&custody, "test destroy", || 0, || {})
+            .expect("destroy exact generation");
+        let post_destroy_unmaps = std::cell::Cell::new(0_u32);
+        for identity in [first, second] {
+            assert_eq!(
+                custody.retire_stage2_record_using(identity, |_, _| {
+                    post_destroy_unmaps.set(post_destroy_unmaps.get() + 1);
+                    Ok(())
+                }),
+                CarrierStage2RetireOutcome::TerminalizedByVmDestroy
+            );
+        }
+        assert_eq!(post_destroy_unmaps.get(), 0);
+    }
+
+    #[test]
+    fn failed_vm_destroy_preserves_records_and_live_generation() {
+        let (custody, generation) = live_custody();
+        let identity = custody
+            .register_stage2_record(stage2_spec(generation, 41))
+            .expect("register record");
+        let before = custody
+            .stage2_record_snapshot(identity.record_id)
+            .expect("record before destroy");
+
+        assert!(
+            destroy_vm_with_custody_using(
+                &custody,
+                "test destroy",
+                || 0xfae9_4001_u32 as applevisor_sys::hv_return_t,
+                || {},
+            )
+            .is_err()
+        );
+
+        assert_eq!(custody.live_generation(), Some(generation));
+        assert_eq!(
+            custody.stage2_record_snapshot(identity.record_id),
+            Some(before)
+        );
+        assert_eq!(
+            custody.retire_stage2_record_using(identity, |_, _| Ok(())),
+            CarrierStage2RetireOutcome::RetiredUnmapped
+        );
+    }
+
+    #[test]
+    fn cross_generation_same_key_rejects_old_vm_and_owner_identities() {
+        let (custody, first_generation) = live_custody();
+        let first = custody
+            .register_stage2_record(stage2_spec(first_generation, 51))
+            .expect("register predecessor record");
+        destroy_vm_with_custody_using(&custody, "test destroy", || 0, || {})
+            .expect("destroy predecessor VM");
+        let second_generation = custody.begin_create().expect("begin successor create");
+        custody
+            .commit_create(second_generation)
+            .expect("publish successor generation");
+        let second = custody
+            .register_stage2_record(stage2_spec(second_generation, 52))
+            .expect("register same-key successor");
+        assert_ne!(first.record_id, second.record_id);
+        let unmap_calls = std::cell::Cell::new(0_u32);
+
+        assert_eq!(
+            custody.retire_stage2_record_using(
+                CarrierStage2RecordIdentity {
+                    vm_generation: first_generation,
+                    ..second
+                },
+                |_, _| {
+                    unmap_calls.set(unmap_calls.get() + 1);
+                    Ok(())
+                },
+            ),
+            CarrierStage2RetireOutcome::VmGenerationMismatch
+        );
+        assert_eq!(
+            custody.retire_stage2_record_using(
+                CarrierStage2RecordIdentity {
+                    logical_owner: first.logical_owner,
+                    ..second
+                },
+                |_, _| {
+                    unmap_calls.set(unmap_calls.get() + 1);
+                    Ok(())
+                },
+            ),
+            CarrierStage2RetireOutcome::OwnerGenerationMismatch
+        );
+        assert_eq!(unmap_calls.get(), 0);
+        assert!(
+            custody
+                .stage2_record_snapshot(second.record_id)
+                .expect("successor remains mapped")
+                .mapped
+        );
     }
 }
 
@@ -18137,7 +19158,14 @@ impl HvfVmState {
             }
             None => None,
         };
-        let (vm, permit, syscall_transport, mailbox_slots, carrier_mappings) = match &carrier {
+        let (
+            vm,
+            permit,
+            syscall_transport,
+            mailbox_slots,
+            carrier_mappings,
+            carrier_foreign_mm_transport,
+        ) = match &carrier {
             Some(spec) => (
                 // A VM rebuilt since publication supersedes the bundle's handle,
                 // exactly as `from_persistent_executor_spec` reads it.
@@ -18149,9 +19177,15 @@ impl HvfVmState {
                 spec.syscall_transport,
                 std::sync::Arc::clone(&spec.mailbox_slots),
                 Some(std::sync::Arc::clone(&spec.carrier_mappings)),
+                std::sync::Arc::clone(&spec.carrier_foreign_mm_transport),
             ),
             None => {
-                let (vm, permit) = create_vm_with_admission(VmCreateAdmission::Initial)?;
+                let carrier_foreign_mm_transport =
+                    std::sync::Arc::new(CarrierForeignMmTransport::new());
+                let (vm, permit) = create_vm_with_admission(
+                    VmCreateAdmission::Initial,
+                    &carrier_foreign_mm_transport.custody,
+                )?;
                 let syscall_transport = HvfSyscallTransport::from_env()
                     .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
                 (
@@ -18160,6 +19194,7 @@ impl HvfVmState {
                     syscall_transport,
                     std::sync::Arc::new(MailboxSlotAllocator::new()),
                     None,
+                    carrier_foreign_mm_transport,
                 )
             }
         };
@@ -18175,10 +19210,7 @@ impl HvfVmState {
 
         let mut state = HvfVmState {
             _vm: std::mem::ManuallyDrop::new(vm),
-            carrier_foreign_mm_transport: carrier.as_ref().map_or_else(
-                || std::sync::Arc::new(CarrierForeignMmTransport::new()),
-                |spec| std::sync::Arc::clone(&spec.carrier_foreign_mm_transport),
-            ),
+            carrier_foreign_mm_transport,
             task: HvfTaskState {
                 mappings: Vec::new(),
                 mm_root_slot: None,
@@ -22865,14 +23897,10 @@ impl HvfVmState {
         }
         self.reclaim_authority.mark_vcpu_parked()?;
         self.release_mailbox_for_reclaim(mailbox)?;
-        crate::probes::vm_lifecycle(2, -1);
-        let vm_rc = unsafe { inventory_hv_vm_destroy() };
-        if vm_rc != 0 {
-            return Err(TrapError::Hypervisor(format!(
-                "shared_wait_park: hv_vm_destroy rc={vm_rc:#x}"
-            )));
-        }
-        record_vm_released();
+        destroy_vm_with_custody(
+            &self.carrier_foreign_mm_transport.custody,
+            "shared_wait_park",
+        )?;
         self.reclaim_authority.mark_vm_parked()?;
         Ok(())
     }
@@ -22895,14 +23923,10 @@ impl HvfVmState {
                     .into(),
             ));
         }
-        crate::probes::vm_lifecycle(2, -1);
-        let vm_rc = unsafe { inventory_hv_vm_destroy() };
-        if vm_rc != 0 {
-            return Err(TrapError::Hypervisor(format!(
-                "release_vm_after_reclaim_park: hv_vm_destroy rc={vm_rc:#x}"
-            )));
-        }
-        record_vm_released();
+        destroy_vm_with_custody(
+            &self.carrier_foreign_mm_transport.custody,
+            "release_vm_after_reclaim_park",
+        )?;
         self.reclaim_authority.mark_vm_parked()?;
         Ok(())
     }
@@ -22945,7 +23969,10 @@ impl HvfVmState {
                 "shared_wait_resume: parked syscall has no typed continuation authority".to_owned(),
             )
         })?;
-        let (new_vm, permit) = create_vm_with_admission(VmCreateAdmission::SharedWaitResume)?;
+        let (new_vm, permit) = create_vm_with_admission(
+            VmCreateAdmission::SharedWaitResume,
+            &self.carrier_foreign_mm_transport.custody,
+        )?;
         let new_vcpu = create_vcpu_with_permit(&new_vm, permit)?;
         enable_el0_counter_access(new_vcpu.id());
         Self::configure_executor_invariants(&new_vcpu)?;
@@ -25073,13 +26100,12 @@ impl HvfVmState {
             if vcpu_destroy_rc == 0 {
                 vcpu_destroyed(inherited_vcpu_id);
             }
-            crate::probes::vm_lifecycle(2, -1);
-            let vm_destroy_rc = unsafe { inventory_hv_vm_destroy() };
-            if vm_destroy_rc == 0 {
-                record_vm_released();
-            }
+            destroy_vm_with_custody(&self.carrier_foreign_mm_transport.custody, "execve_rebuild")?;
 
-            let (new_vm, permit) = create_vm_with_admission(VmCreateAdmission::ExecveRebuild)?;
+            let (new_vm, permit) = create_vm_with_admission(
+                VmCreateAdmission::ExecveRebuild,
+                &self.carrier_foreign_mm_transport.custody,
+            )?;
             let new_vcpu = create_vcpu_with_permit(&new_vm, permit)?;
             enable_el0_counter_access(new_vcpu.id());
             self.vcpu_id = new_vcpu.id();
@@ -26472,6 +27498,26 @@ fn raw_hvf_stage2_calls_are_inventory_gated() {
             .count(),
         2,
         "both lazy replay paths must use exact serialized replay"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn raw_vm_destroy_is_custody_transaction_gated() {
+    let source = include_str!("trap.rs");
+    assert_eq!(
+        source
+            .matches(concat!("applevisor_sys::hv_vm_", "destroy()"))
+            .count(),
+        1,
+        "the inventory boundary must remain the sole raw hv_vm_destroy caller"
+    );
+    assert_eq!(
+        source
+            .matches(concat!("inventory_hv_vm_", "destroy()"))
+            .count(),
+        2,
+        "inventory_hv_vm_destroy must appear only in its definition and the custody wrapper"
     );
 }
 
