@@ -116,9 +116,47 @@ for exe in "${exes[@]}"; do
     echo "test-signed: signed $exe"
 done
 
-# 3. Run each signed executable serially (one VM per process).
+# 3. Resolve an exact bare libtest filter to its unique fully-qualified name.
+#    Rust unit tests include their module path in `--list`; passing a bare
+#    function name together with `--exact` otherwise succeeds after running
+#    zero tests. Integration-test names are already bare, so accept either an
+#    exact listed name or one unique `::<bare-name>` suffix. Run only the
+#    executable which owns that exact test so the route is fail-closed.
+run_exes=("${exes[@]}")
+if [ "$#" -gt 0 ] && [ "${1#-}" = "$1" ]; then
+    requested_exact="$1"
+    has_exact=0
+    for arg in "$@"; do
+        [ "$arg" = "--exact" ] && has_exact=1
+    done
+    if [ "$has_exact" -eq 1 ]; then
+        exact_exe=""
+        exact_name=""
+        exact_matches=0
+        for exe in "${exes[@]}"; do
+            while IFS= read -r listed; do
+                name="${listed%: test}"
+                if [ "$name" = "$requested_exact" ] || [[ "$name" == *"::$requested_exact" ]]; then
+                    exact_exe="$exe"
+                    exact_name="$name"
+                    exact_matches=$((exact_matches + 1))
+                fi
+            done < <("$exe" --list 2>/dev/null)
+        done
+        if [ "$exact_matches" -ne 1 ]; then
+            echo "test-signed: exact filter $requested_exact matched $exact_matches tests; expected exactly one" >&2
+            exit 1
+        fi
+        shift
+        set -- "$exact_name" "$@"
+        run_exes=("$exact_exe")
+        echo "test-signed: resolved exact filter $requested_exact -> $exact_name"
+    fi
+fi
+
+# 4. Run each selected signed executable serially (one VM per process).
 failed=0
-for exe in "${exes[@]}"; do
+for exe in "${run_exes[@]}"; do
     echo "test-signed: running $exe $*"
     if ! env RUST_TEST_THREADS=1 "$exe" "$@"; then
         echo "test-signed: FAIL $exe" >&2
@@ -126,19 +164,25 @@ for exe in "${exes[@]}"; do
     fi
 done
 
-# 4. Negative control. The executable carrying the negative test is copied
+# 5. Negative control. The executable carrying the negative test is copied
 #    and re-signed ad-hoc WITHOUT the entitlement — byte-for-byte the state
 #    of a bare `cargo test` binary — and must classify HV_DENIED as
-#    EmbedError::Entitlement. The test is #[ignore] so step 3 skips it.
+#    EmbedError::Entitlement. The test is #[ignore] so step 4 skips it.
 carrier=""
+negative_test_name=""
+negative_matches=0
 for exe in "${exes[@]}"; do
-    if "$exe" --list 2>/dev/null | grep -qx "$negative_test: test"; then
-        carrier="$exe"
-        break
-    fi
+    while IFS= read -r listed; do
+        name="${listed%: test}"
+        if [ "$name" = "$negative_test" ] || [[ "$name" == *"::$negative_test" ]]; then
+            carrier="$exe"
+            negative_test_name="$name"
+            negative_matches=$((negative_matches + 1))
+        fi
+    done < <("$exe" --list 2>/dev/null)
 done
-if [ -z "$carrier" ]; then
-    echo "test-signed: no test executable of $pkg carries $negative_test; the negative control cannot run" >&2
+if [ "$negative_matches" -ne 1 ]; then
+    echo "test-signed: $negative_test matched $negative_matches tests in $pkg; expected exactly one for the negative control" >&2
     exit 1
 fi
 noent="$carrier.noent.$$"
@@ -153,7 +197,7 @@ neg_log="$(mktemp -t carrick-test-signed-negative)"
 scratch+=("$neg_log")
 echo "test-signed: negative control on $noent"
 neg_rc=0
-env RUST_TEST_THREADS=1 "$noent" --ignored --exact "$negative_test" >"$neg_log" 2>&1 || neg_rc=$?
+env RUST_TEST_THREADS=1 "$noent" --ignored --exact "$negative_test_name" >"$neg_log" 2>&1 || neg_rc=$?
 cat "$neg_log"
 if [ "$neg_rc" -ne 0 ] || ! grep -aq '^test result: ok. 1 passed' "$neg_log"; then
     echo "test-signed: FAIL negative control ($negative_test did not pass on the unentitled copy, rc=$neg_rc)" >&2
