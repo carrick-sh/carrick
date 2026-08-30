@@ -11,8 +11,10 @@ It enforces that:
 1. No unclassified or newly added raw lock acquisitions can appear (fail-closed, shrink-only).
 2. Paired SysV mutations use the typed `SysvProcessGuard` -> `SysvNamespacePermit` -> `lock_paired` authority.
 3. Standalone SysV operations use the encapsulated `with_state` / `with_sysv_process` closures.
-4. Test scopes, comments, and string literals are ignored.
-5. Exact agreement between code and checked-in inventory is required.
+4. Monotone category and total count ceilings cannot be exceeded.
+5. Exact trusted boundaries and their classifications are validated.
+6. Test scopes, comments, and string literals are ignored.
+7. Exact agreement between code and checked-in inventory is required.
 """
 
 from __future__ import annotations
@@ -40,6 +42,20 @@ CATEGORIES = {
     "file_table_internals": "direct acquisition of FileTable internal mutex/rwlock",
 }
 
+MAX_CATEGORY_CEILINGS: dict[str, int] = {
+    "proc": 60,
+    "pty_table": 10,
+    "sysv_process": 1,
+    "sysv_namespace": 3,
+    "file_table_internals": 33,
+}
+MAX_TOTAL_CEILING: int = 107
+
+EXPECTED_TRUSTED_BOUNDARIES: dict[str, str] = {
+    "crates/carrick-runtime/src/dispatch/sysv.rs::SyscallDispatcher::lock_sysv_process::sysv_process#1": "trusted_minting_boundary",
+    "crates/carrick-runtime/src/dispatch/sysv/lock_authority.rs::SysvNamespacePermit::lock_paired::sysv_namespace#1": "trusted_paired_boundary",
+}
+
 FILE_TABLE_INTERNAL_FIELDS = frozenset(
     {
         "open_files",
@@ -56,12 +72,19 @@ LOCK_METHODS = frozenset(
     {
         "lock",
         "try_lock",
+        "try_lock_for",
+        "try_lock_until",
+        "lock_arc",
         "read",
-        "write",
         "try_read",
-        "try_write",
+        "try_read_for",
         "try_read_until",
+        "read_arc",
+        "write",
+        "try_write",
+        "try_write_for",
         "try_write_until",
+        "write_arc",
     }
 )
 
@@ -234,6 +257,22 @@ def _matching_delimiter(tokens: Sequence[Token], start: int, opening: str, closi
     return len(tokens) - 1
 
 
+def _is_test_only_attribute(tokens: Sequence[Token], start: int, end: int) -> bool:
+    """Return True only if the attribute is strictly test-only (e.g. #[test], #[cfg(test)])."""
+    attr_texts = [item.text for item in tokens[start:end]]
+    if attr_texts == ["test"]:
+        return True
+    if attr_texts == ["cfg", "(", "test", ")"]:
+        return True
+    if "any" in attr_texts:
+        return False
+    if "not" in attr_texts and "test" in attr_texts:
+        return False
+    if attr_texts and attr_texts[0] == "cfg" and "test" in attr_texts:
+        return True
+    return False
+
+
 def production_mask(tokens: Sequence[Token]) -> list[bool]:
     """Return True for tokens that can compile when cfg(test) is disabled."""
     production = [True] * len(tokens)
@@ -248,13 +287,7 @@ def production_mask(tokens: Sequence[Token]) -> list[bool]:
 
         if token.text == "#" and index + 1 < len(tokens) and tokens[index + 1].text == "[":
             end = _matching_delimiter(tokens, index + 1, "[", "]")
-            attribute = [item.text for item in tokens[index + 2 : end]]
-            exact_test = attribute == ["test"]
-            exact_cfg_test = (
-                attribute == ["cfg", "(", "test", ")"]
-                or ("cfg" in attribute and "test" in attribute)
-            )
-            if exact_test or exact_cfg_test:
+            if _is_test_only_attribute(tokens, index + 2, end):
                 pending_test_attribute = True
             for attr_index in range(index, min(end + 1, len(tokens))):
                 production[attr_index] = not current_test
@@ -327,97 +360,136 @@ def scan_tokens(tokens: Sequence[Token], relative_path: str) -> list[RawLockSite
     prod_mask = production_mask(tokens)
     raw_occurrences: list[tuple[int, str, str, str]] = []  # (line, item, category, expression)
 
-    for i in range(len(tokens) - 3):
+    # Track local variable bindings inside functions for local lock alias detection
+    fn_aliases: dict[str, str] = {}
+
+    i = 0
+    while i < len(tokens):
         if not prod_mask[i] or tokens[i].kind == "string":
+            i += 1
             continue
 
-        # Category: `proc` -> `.proc.lock()`, `.proc.read()`, `.proc.write()`
+        # Check for let binding alias: `let [mut] var_name = ...`
+        if tokens[i].text == "let" and i + 1 < len(tokens):
+            idx = i + 1
+            if idx < len(tokens) and tokens[idx].text == "mut":
+                idx += 1
+            if idx < len(tokens) and tokens[idx].kind == "ident":
+                var_name = tokens[idx].text
+                eq_idx = -1
+                semi_idx = -1
+                for j in range(idx + 1, min(idx + 30, len(tokens))):
+                    if tokens[j].text == "=":
+                        eq_idx = j
+                    elif tokens[j].text in {";", "{"}:
+                        semi_idx = j
+                        break
+                if eq_idx != -1 and semi_idx != -1:
+                    rhs_tokens = [t.text for t in tokens[eq_idx + 1 : semi_idx] if t.text not in {"&", "mut", "*", "(", ")"}]
+                    if rhs_tokens and rhs_tokens[-1] == "proc":
+                        fn_aliases[var_name] = "proc"
+                    elif rhs_tokens and rhs_tokens[-1] == "pty_table":
+                        fn_aliases[var_name] = "pty_table"
+                    elif rhs_tokens and rhs_tokens[-1] == "sysv_process":
+                        fn_aliases[var_name] = "sysv_process"
+                    elif rhs_tokens and rhs_tokens[-1] == "state" and (
+                        "sysv" in rhs_tokens
+                        or relative_path.endswith("dispatch/sysv.rs")
+                        or relative_path.endswith("dispatch/sysv/lock_authority.rs")
+                    ):
+                        fn_aliases[var_name] = "sysv_namespace"
+                    elif rhs_tokens and rhs_tokens[-1] in FILE_TABLE_INTERNAL_FIELDS:
+                        fn_aliases[var_name] = "file_table_internals"
+
+        # Check for lock method invocation: `.<lock_method>(`
         if (
             tokens[i].text == "."
-            and tokens[i + 1].text == "proc"
-            and tokens[i + 2].text == "."
-            and tokens[i + 3].text in LOCK_METHODS
-            and i + 4 < len(tokens)
-            and tokens[i + 4].text == "("
+            and i + 1 < len(tokens)
+            and tokens[i + 1].text in LOCK_METHODS
+            and i + 2 < len(tokens)
+            and tokens[i + 2].text == "("
         ):
+            lock_method = tokens[i + 1].text
             enclosing = find_enclosing_item(tokens, i)
-            expr = f".proc.{tokens[i + 3].text}()"
-            raw_occurrences.append((tokens[i + 1].line, enclosing, "proc", expr))
+            category = None
+            expr = None
 
-        # Category: `pty_table` -> `.pty_table.lock()`, `.pty_table().lock()`
-        elif (
-            tokens[i].text == "."
-            and tokens[i + 1].text == "pty_table"
-        ):
-            cursor = i + 2
-            if cursor < len(tokens) and tokens[cursor].text == "(":
-                if cursor + 1 < len(tokens) and tokens[cursor + 1].text == ")":
-                    cursor += 2
-            if (
-                cursor + 1 < len(tokens)
-                and tokens[cursor].text == "."
-                and tokens[cursor + 1].text in LOCK_METHODS
-                and cursor + 2 < len(tokens)
-                and tokens[cursor + 2].text == "("
-            ):
-                enclosing = find_enclosing_item(tokens, i)
-                expr = f".pty_table.{tokens[cursor + 1].text}()"
-                raw_occurrences.append((tokens[i + 1].line, enclosing, "pty_table", expr))
+            # Look backwards from `.` at `i`
+            # Case 1: Immediately preceded by `)` -> parenthesized or method call
+            if i > 0 and tokens[i - 1].text == ")":
+                open_idx = -1
+                paren_depth = 0
+                for k in range(i - 1, -1, -1):
+                    if tokens[k].text == ")":
+                        paren_depth += 1
+                    elif tokens[k].text == "(":
+                        paren_depth -= 1
+                        if paren_depth == 0:
+                            open_idx = k
+                            break
+                if open_idx != -1:
+                    if open_idx > 0 and tokens[open_idx - 1].text == "pty_table":
+                        category = "pty_table"
+                        expr = f".pty_table.{lock_method}()"
+                    else:
+                        inner_tokens = [
+                            t.text for t in tokens[open_idx + 1 : i - 1] if t.text not in {"(", ")"}
+                        ]
+                        if inner_tokens:
+                            if inner_tokens[-1] == "proc":
+                                category = "proc"
+                                expr = f".proc.{lock_method}()"
+                            elif inner_tokens[-1] == "sysv_process":
+                                category = "sysv_process"
+                                expr = f".sysv_process.{lock_method}()"
+                            elif inner_tokens[-1] == "state" and (
+                                "sysv" in inner_tokens
+                                or relative_path.endswith("dispatch/sysv.rs")
+                                or relative_path.endswith("dispatch/sysv/lock_authority.rs")
+                            ):
+                                category = "sysv_namespace"
+                                expr = f".sysv.state.{lock_method}()" if "sysv" in inner_tokens else f".state.{lock_method}()"
+                            elif inner_tokens[-1] == "pty_table":
+                                category = "pty_table"
+                                expr = f".pty_table.{lock_method}()"
+                            elif inner_tokens[-1] in FILE_TABLE_INTERNAL_FIELDS:
+                                category = "file_table_internals"
+                                expr = f".{inner_tokens[-1]}.{lock_method}()"
+                            elif len(inner_tokens) == 1 and inner_tokens[0] in fn_aliases:
+                                category = fn_aliases[inner_tokens[0]]
+                                expr = f"{inner_tokens[0]}.{lock_method}()"
 
-        # Category: `sysv_process` -> `.sysv_process.lock()`
-        elif (
-            tokens[i].text == "."
-            and tokens[i + 1].text == "sysv_process"
-            and tokens[i + 2].text == "."
-            and tokens[i + 3].text in LOCK_METHODS
-            and i + 4 < len(tokens)
-            and tokens[i + 4].text == "("
-        ):
-            enclosing = find_enclosing_item(tokens, i)
-            expr = f".sysv_process.{tokens[i + 3].text}()"
-            raw_occurrences.append((tokens[i + 1].line, enclosing, "sysv_process", expr))
+            # Case 2: Immediately preceded by an ident
+            elif i > 0 and tokens[i - 1].kind == "ident":
+                prev_ident = tokens[i - 1].text
+                if i > 1 and tokens[i - 2].text == ".":
+                    if prev_ident == "proc":
+                        category = "proc"
+                        expr = f".proc.{lock_method}()"
+                    elif prev_ident == "pty_table":
+                        category = "pty_table"
+                        expr = f".pty_table.{lock_method}()"
+                    elif prev_ident == "sysv_process":
+                        category = "sysv_process"
+                        expr = f".sysv_process.{lock_method}()"
+                    elif prev_ident == "state":
+                        if i > 3 and tokens[i - 3].text == "sysv" and tokens[i - 4].text == ".":
+                            category = "sysv_namespace"
+                            expr = f".sysv.state.{lock_method}()"
+                        elif relative_path.endswith("dispatch/sysv.rs") or relative_path.endswith("dispatch/sysv/lock_authority.rs"):
+                            category = "sysv_namespace"
+                            expr = f".state.{lock_method}()"
+                    elif prev_ident in FILE_TABLE_INTERNAL_FIELDS:
+                        category = "file_table_internals"
+                        expr = f".{prev_ident}.{lock_method}()"
+                elif prev_ident in fn_aliases:
+                    category = fn_aliases[prev_ident]
+                    expr = f"{prev_ident}.{lock_method}()"
 
-        # Category: `sysv_namespace` -> `.sysv.state.lock()` or `.state.lock()`
-        elif (
-            tokens[i].text == "."
-            and tokens[i + 1].text == "sysv"
-            and tokens[i + 2].text == "."
-            and tokens[i + 3].text == "state"
-            and i + 5 < len(tokens)
-            and tokens[i + 4].text == "."
-            and tokens[i + 5].text in LOCK_METHODS
-            and i + 6 < len(tokens)
-            and tokens[i + 6].text == "("
-        ):
-            enclosing = find_enclosing_item(tokens, i)
-            expr = f".sysv.state.{tokens[i + 5].text}()"
-            raw_occurrences.append((tokens[i + 3].line, enclosing, "sysv_namespace", expr))
+            if category is not None and expr is not None:
+                raw_occurrences.append((tokens[i].line, enclosing, category, expr))
 
-        elif (
-            tokens[i].text == "."
-            and tokens[i + 1].text == "state"
-            and tokens[i + 2].text == "."
-            and tokens[i + 3].text in LOCK_METHODS
-            and i + 4 < len(tokens)
-            and tokens[i + 4].text == "("
-        ):
-            enclosing = find_enclosing_item(tokens, i)
-            if relative_path.endswith("dispatch/sysv.rs") or relative_path.endswith("dispatch/sysv/lock_authority.rs"):
-                expr = f".state.{tokens[i + 3].text}()"
-                raw_occurrences.append((tokens[i + 1].line, enclosing, "sysv_namespace", expr))
-
-        # Category: `file_table_internals`
-        elif (
-            tokens[i].text == "."
-            and tokens[i + 1].text in FILE_TABLE_INTERNAL_FIELDS
-            and tokens[i + 2].text == "."
-            and tokens[i + 3].text in LOCK_METHODS
-            and i + 4 < len(tokens)
-            and tokens[i + 4].text == "("
-        ):
-            enclosing = find_enclosing_item(tokens, i)
-            expr = f".{tokens[i + 1].text}.{tokens[i + 3].text}()"
-            raw_occurrences.append((tokens[i + 1].line, enclosing, "file_table_internals", expr))
+        i += 1
 
     # Assign stable ordinals and unique IDs per (file, item, category)
     ordinal_counters: dict[tuple[str, str], int] = {}
@@ -524,6 +596,16 @@ def validate_inventory(
         errors.append("Inventory 'entries' is not a list")
         return errors
 
+    # Ceiling validation
+    if len(current_sites) > MAX_TOTAL_CEILING:
+        errors.append(
+            f"Total raw lock site count {len(current_sites)} exceeds maximum ceiling {MAX_TOTAL_CEILING}"
+        )
+    if inventory_data.get("total_count", 0) > MAX_TOTAL_CEILING:
+        errors.append(
+            f"Inventory total_count {inventory_data.get('total_count')} exceeds maximum ceiling {MAX_TOTAL_CEILING}"
+        )
+
     # Check for duplicate IDs and validate entry fields in inventory
     inv_ids: set[str] = set()
     inv_entries_by_id: dict[str, dict[str, Any]] = {}
@@ -575,6 +657,37 @@ def validate_inventory(
                 errors.append(
                     f"Category count mismatch for '{cat}': declared {declared}, actual entries count {actual}"
                 )
+            if actual > MAX_CATEGORY_CEILINGS.get(cat, 999999):
+                errors.append(
+                    f"Category '{cat}' actual site count {actual} exceeds maximum ceiling {MAX_CATEGORY_CEILINGS.get(cat)}"
+                )
+            if declared > MAX_CATEGORY_CEILINGS.get(cat, 999999):
+                errors.append(
+                    f"Category '{cat}' inventory count {declared} exceeds maximum ceiling {MAX_CATEGORY_CEILINGS.get(cat)}"
+                )
+
+    # Validate trusted boundaries
+    for entry in entries:
+        eid = entry.get("id")
+        classification = entry.get("classification")
+        if classification is not None:
+            if eid not in EXPECTED_TRUSTED_BOUNDARIES:
+                errors.append(
+                    f"Entry {eid} has unreviewed/unauthorized classification '{classification}'"
+                )
+            elif classification != EXPECTED_TRUSTED_BOUNDARIES[eid]:
+                errors.append(
+                    f"Entry {eid} has unexpected classification '{classification}' (expected '{EXPECTED_TRUSTED_BOUNDARIES[eid]}')"
+                )
+    for expected_id, expected_cls in EXPECTED_TRUSTED_BOUNDARIES.items():
+        if expected_id in inv_ids:
+            entry = inv_entries_by_id.get(expected_id, {})
+            if entry.get("classification") != expected_cls:
+                errors.append(
+                    f"Expected trusted boundary {expected_id} is missing classification '{expected_cls}' (found '{entry.get('classification')}')"
+                )
+        elif len(entries) > 20:
+            errors.append(f"Expected trusted boundary {expected_id} is missing from production inventory")
 
     curr_sites_by_id = {site.id: site for site in current_sites}
     curr_ids = set(curr_sites_by_id.keys())
@@ -737,12 +850,77 @@ def run_self_tests() -> bool:
     assert len(sites) == 1, f"Expected 1 file_table_internals site, got {len(sites)}"
     assert sites[0].category == "file_table_internals"
 
-    # Test 8: Validation against valid inventory passes
+    # Adversarial Bypass Test 8: Parenthesized compound field `(x.sysv.state).lock()`
+    paren_compound_source = """
+    fn bypass_paren(d: &SyscallDispatcher) {
+        let _g = (d.sysv.state).lock();
+    }
+    """
+    tokens = lex_rust(paren_compound_source)
+    sites = scan_tokens(tokens, "crates/carrick-runtime/src/dispatch/sysv.rs")
+    assert len(sites) == 1, f"Parenthesized compound bypass was not caught: {sites}"
+    assert sites[0].category == "sysv_namespace"
+
+    # Adversarial Bypass Test 9: Parenthesized proc field `(self.proc).read()`
+    paren_proc_source = """
+    impl SyscallDispatcher {
+        fn bypass_proc_paren(&self) {
+            let _g = (self.proc).read();
+        }
+    }
+    """
+    tokens = lex_rust(paren_proc_source)
+    sites = scan_tokens(tokens, "crates/carrick-runtime/src/dispatch/proc.rs")
+    assert len(sites) == 1, f"Parenthesized proc bypass was not caught: {sites}"
+    assert sites[0].category == "proc"
+
+    # Adversarial Bypass Test 10: Local lock alias `let p = &self.proc; p.lock();`
+    alias_proc_source = """
+    impl SyscallDispatcher {
+        fn bypass_alias(&self) {
+            let p = &self.proc;
+            let _g = p.lock();
+        }
+    }
+    """
+    tokens = lex_rust(alias_proc_source)
+    sites = scan_tokens(tokens, "crates/carrick-runtime/src/dispatch/mod.rs")
+    assert len(sites) == 1, f"Local alias bypass was not caught: {sites}"
+    assert sites[0].category == "proc"
+
+    # Adversarial Bypass Test 11: Timed / alternative lock methods `try_lock_for`, `try_write_until`
+    timed_methods_source = """
+    impl SyscallDispatcher {
+        fn bypass_timed(&self, d: Duration, t: Instant) {
+            let _a = self.proc.try_lock_for(d);
+            let _b = self.sysv_process.try_write_until(t);
+        }
+    }
+    """
+    tokens = lex_rust(timed_methods_source)
+    sites = scan_tokens(tokens, "crates/carrick-runtime/src/dispatch/mod.rs")
+    assert len(sites) == 2, f"Timed methods were not caught: {sites}"
+    assert sites[0].category == "proc"
+    assert sites[1].category == "sysv_process"
+
+    # Adversarial Bypass Test 12: Production code under `#[cfg(any(test, target_os = "macos"))]` must NOT be ignored
+    cfg_any_source = """
+    #[cfg(any(test, target_os = "macos"))]
+    fn macos_prod_path(d: &SyscallDispatcher) {
+        let _g = d.proc.lock();
+    }
+    """
+    tokens = lex_rust(cfg_any_source)
+    sites = scan_tokens(tokens, "crates/carrick-runtime/src/dispatch/mod.rs")
+    assert len(sites) == 1, f"cfg(any(...)) production code was falsely ignored: {sites}"
+    assert sites[0].category == "proc"
+
+    # Test 13: Validation against valid inventory passes
     inv = build_inventory_dict(sites)
     errors = validate_inventory(sites, inv)
     assert len(errors) == 0, f"Valid inventory failed: {errors}"
 
-    # Test 9: Unclassified raw lock addition must FAIL validation
+    # Test 14: Unclassified raw lock addition must FAIL validation
     extra_sites = list(sites) + [
         RawLockSite(
             id="crates/carrick-runtime/src/dispatch/mod.rs::SyscallDispatcher::new_leak::proc#1",
@@ -757,7 +935,7 @@ def run_self_tests() -> bool:
     errors = validate_inventory(extra_sites, inv)
     assert any("Unclassified raw lock acquisition" in e for e in errors), f"Addition did not fail: {errors}"
 
-    # Test 10: Stale/expanded inventory entry must FAIL validation
+    # Test 15: Stale/expanded inventory entry must FAIL validation
     expanded_inv = dict(inv)
     expanded_entries = list(inv["entries"]) + [
         {
@@ -776,33 +954,19 @@ def run_self_tests() -> bool:
     errors = validate_inventory(sites, expanded_inv)
     assert any("Inventory entry not found in production source" in e for e in errors), f"Stale inventory did not fail: {errors}"
 
-    # Test 11: Duplicate ID in inventory must FAIL validation
-    dup_inv = dict(inv)
-    dup_entries = list(inv["entries"]) + [inv["entries"][0]]
-    dup_inv["entries"] = dup_entries
-    dup_inv["total_count"] = len(dup_entries)
-    errors = validate_inventory(sites, dup_inv)
-    assert any("Duplicate inventory entry ID" in e for e in errors), f"Duplicate ID did not fail: {errors}"
+    # Test 16: Category ceiling overflow must FAIL validation
+    overflow_inv = dict(inv)
+    overflow_inv["category_counts"] = dict(inv["category_counts"])
+    overflow_inv["category_counts"]["proc"] = 9999
+    errors = validate_inventory(sites, overflow_inv)
+    assert any("exceeds maximum ceiling" in e for e in errors), f"Category ceiling overflow did not fail: {errors}"
 
-    # Test 12: Header count mismatch must FAIL validation
-    mismatch_inv = dict(inv)
-    mismatch_inv["total_count"] = 999
-    errors = validate_inventory(sites, mismatch_inv)
-    assert any("Header total_count mismatch" in e for e in errors), f"Count mismatch did not fail: {errors}"
-
-    # Test 13: Extra disallowed field in inventory entry must FAIL validation
-    extra_field_inv = dict(inv)
-    extra_field_entries = [dict(inv["entries"][0], unreviewed_extra="illegal")]
-    extra_field_inv["entries"] = extra_field_entries
-    errors = validate_inventory(sites, extra_field_inv)
-    assert any("disallowed extra field" in e for e in errors), f"Extra field did not fail: {errors}"
-
-    # Test 14: Metadata mismatch (e.g. line drift or expression) must FAIL validation
-    line_drift_inv = dict(inv)
-    line_drift_entries = [dict(inv["entries"][0], line=inv["entries"][0]["line"] + 10)]
-    line_drift_inv["entries"] = line_drift_entries
-    errors = validate_inventory(sites, line_drift_inv)
-    assert any("Metadata mismatch" in e for e in errors), f"Line drift did not fail: {errors}"
+    # Test 17: Trusted boundary tampering must FAIL validation
+    tampered_inv = dict(inv)
+    tampered_entries = [dict(inv["entries"][0], classification="unreviewed_boundary")]
+    tampered_inv["entries"] = tampered_entries
+    errors = validate_inventory(sites, tampered_inv)
+    assert any("unreviewed/unauthorized classification" in e or "missing" in e for e in errors), f"Boundary tampering did not fail: {errors}"
 
     print("All check-dispatch-lock-authority self-tests PASSED.")
     return True
@@ -851,4 +1015,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

@@ -932,7 +932,7 @@
       "file": "crates/carrick-runtime/src/dispatch/sysv/lock_authority.rs",
       "function": "SysvProcessGuard<'a>::commit_remapped_shmat",
       "ordinal_in_function": 2,
-      "fingerprint": "eb3310cd83b5c2d4c9fa243f7551bb77e5a1b03ab9c7caee3165affa0e00aadd",
+      "fingerprint": "0ec7315e111acb2ef168649a858cc69fe5030dd5ff311b7ac51c86061958585d",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::sysv_shmat",
       "rationale": "PendingShmat reservation commit failed during remapped attachment reuse; continuing would leave uncommitted SysV IPC attachment state."

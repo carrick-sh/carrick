@@ -2274,6 +2274,9 @@ mod tests {
             // to race proc_sysvipc rendering against attachment cleanup and paired mutation,
             // and negative watchdog test spawns an intentionally wedged child to prove termination.
             ("dispatch/sysv.rs", [1, 0, 2]),
+            // Compile-fail test runner compiles isolated test snippets to verify
+            // lock-authority compile-time invariants.
+            ("dispatch/sysv/lock_authority.rs", [0, 0, 1]),
             ("dispatch/tests.rs", [3, 0, 0]),
             ("exec_stamps.rs", [1, 0, 0]),
             ("fs_backend.rs", [1, 0, 0]),

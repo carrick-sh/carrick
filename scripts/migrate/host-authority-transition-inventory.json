@@ -740,8 +740,8 @@
     "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1388 in `MsgQueueFdCache::new`, `libc::getpid` authenticates only the current carrier that owns the message-queue descriptor cache fork ownership sentinel; no guest identity selects a host target.",
     "review_id": "HA-000028",
     "source": {
-      "byte_end": 44765,
-      "byte_start": 44753,
+      "byte_end": 44803,
+      "byte_start": 44791,
       "column": 32,
       "column_end": 44,
       "column_start": 32,
@@ -767,8 +767,8 @@
     "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1394 in `MsgQueueFdCache::refresh_for_current_process`, `libc::getpid` authenticates the current carrier so inherited message-queue descriptors are drained after a host fork; it does not answer guest process identity.",
     "review_id": "HA-000029",
     "source": {
-      "byte_end": 44917,
-      "byte_start": 44905,
+      "byte_end": 44955,
+      "byte_start": 44943,
       "column": 33,
       "column_end": 45,
       "column_start": 33,
@@ -2890,8 +2890,8 @@
     "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1996 in `with_shm_nattch_file`, `std::fs::OpenOptions::new` accesses only the run-scoped SysV IPC backing object used by `with_shm_nattch_file`.",
     "review_id": "HA-000106",
     "source": {
-      "byte_end": 65536,
-      "byte_start": 65511,
+      "byte_end": 65574,
+      "byte_start": 65549,
       "column": 20,
       "column_end": 45,
       "column_start": 20,
@@ -3504,8 +3504,8 @@
     "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:2001 in `with_shm_nattch_file`, `std::fs::OpenOptions::open` accesses only the run-scoped SysV IPC backing object used by `with_shm_nattch_file`.",
     "review_id": "HA-000129",
     "source": {
-      "byte_end": 65640,
-      "byte_start": 65636,
+      "byte_end": 65678,
+      "byte_start": 65674,
       "column": 10,
       "column_end": 14,
       "column_start": 10,
@@ -6770,8 +6770,8 @@
     "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1335 in `lookup_msg_queue_path`, `std::fs::read_dir` accesses only the run-scoped SysV IPC backing object used by `lookup_msg_queue_path`.",
     "review_id": "HA-000252",
     "source": {
-      "byte_end": 43393,
-      "byte_start": 43376,
+      "byte_end": 43431,
+      "byte_start": 43414,
       "column": 19,
       "column_end": 36,
       "column_start": 19,
@@ -6797,8 +6797,8 @@
     "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1357 in `cleanup_msg_queue_files_for_scope`, `std::fs::read_dir` accesses only the run-scoped SysV IPC backing object used by `cleanup_msg_queue_files_for_scope`.",
     "review_id": "HA-000253",
     "source": {
-      "byte_end": 44093,
-      "byte_start": 44076,
+      "byte_end": 44131,
+      "byte_start": 44114,
       "column": 26,
       "column_end": 43,
       "column_start": 26,
@@ -6824,8 +6824,8 @@
     "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:3450 in `sorted_msg_queue_ids`, `std::fs::read_dir` accesses only the run-scoped SysV IPC backing object used by `sorted_msg_queue_ids`.",
     "review_id": "HA-000254",
     "source": {
-      "byte_end": 128525,
-      "byte_start": 128508,
+      "byte_end": 128620,
+      "byte_start": 128603,
       "column": 26,
       "column_end": 43,
       "column_start": 26,
@@ -8821,8 +8821,8 @@
     "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1361 in `cleanup_msg_queue_files_for_scope`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `cleanup_msg_queue_files_for_scope`.",
     "review_id": "HA-000329",
     "source": {
-      "byte_end": 44278,
-      "byte_start": 44258,
+      "byte_end": 44316,
+      "byte_start": 44296,
       "column": 25,
       "column_end": 45,
       "column_start": 25,
@@ -8848,8 +8848,8 @@
     "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:2060 in `decrement_shm_attachment`, `std::fs::remove_file` accesses only the run-scoped SysV IPC attachment-count backing object used by `decrement_shm_attachment`.",
     "review_id": "HA-000330",
     "source": {
-      "byte_end": 67455,
-      "byte_start": 67435,
+      "byte_end": 67493,
+      "byte_start": 67473,
       "column": 17,
       "column_end": 37,
       "column_start": 17,
@@ -8875,8 +8875,8 @@
     "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:2250 in `shmctl_rmid`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `shmctl_rmid`.",
     "review_id": "HA-000331",
     "source": {
-      "byte_end": 75160,
-      "byte_start": 75140,
+      "byte_end": 75198,
+      "byte_start": 75178,
       "column": 21,
       "column_end": 41,
       "column_start": 21,
@@ -8902,8 +8902,8 @@
     "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:2517 in `cleanup_sysv_ipc_on_process_exit`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `cleanup_sysv_ipc_on_process_exit`.",
     "review_id": "HA-000332",
     "source": {
-      "byte_end": 84686,
-      "byte_start": 84666,
+      "byte_end": 84781,
+      "byte_start": 84761,
       "column": 21,
       "column_end": 41,
       "column_start": 21,
@@ -8929,8 +8929,8 @@
     "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:2518 in `cleanup_sysv_ipc_on_process_exit`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `cleanup_sysv_ipc_on_process_exit`.",
     "review_id": "HA-000333",
     "source": {
-      "byte_end": 84743,
-      "byte_start": 84723,
+      "byte_end": 84838,
+      "byte_start": 84818,
       "column": 21,
       "column_end": 41,
       "column_start": 21,
@@ -8956,8 +8956,8 @@
     "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:3589 in `sysv_msgctl`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `sysv_msgctl`.",
     "review_id": "HA-000334",
     "source": {
-      "byte_end": 132958,
-      "byte_start": 132938,
+      "byte_end": 133053,
+      "byte_start": 133033,
       "column": 21,
       "column_end": 41,
       "column_start": 21,
@@ -8983,8 +8983,8 @@
     "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:3590 in `sysv_msgctl`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `sysv_msgctl`.",
     "review_id": "HA-000335",
     "source": {
-      "byte_end": 133007,
-      "byte_start": 132987,
+      "byte_end": 133102,
+      "byte_start": 133082,
       "column": 21,
       "column_end": 41,
       "column_start": 21,
@@ -9443,8 +9443,8 @@
     "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:3264 in `msgget_open`, `std::fs::rename` accesses only the run-scoped SysV IPC backing object used by `msgget_open`.",
     "review_id": "HA-000352",
     "source": {
-      "byte_end": 122444,
-      "byte_start": 122429,
+      "byte_end": 122539,
+      "byte_start": 122524,
       "column": 13,
       "column_end": 28,
       "column_start": 13,
@@ -13259,18 +13259,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:3529 in `bootstrap_one_task_binding`, the host result from `std::process::id` determines the guest root-process identity in the one-task adapter used by `bootstrap_one_task_binding`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:3533 in `bootstrap_one_task_binding`, the host result from `std::process::id` determines the guest root-process identity in the one-task adapter used by `bootstrap_one_task_binding`.",
     "review_id": "HA-000493",
     "source": {
-      "byte_end": 134876,
-      "byte_start": 134860,
+      "byte_end": 135120,
+      "byte_start": 135104,
       "column": 38,
       "column_end": 54,
       "column_start": 38,
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 3529,
-      "line_end": 3529,
-      "line_start": 3529
+      "line": 3533,
+      "line_end": 3533,
+      "line_start": 3533
     }
   },
   {
@@ -13286,18 +13286,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:4734 in `event_ring_guest_pid`, `std::process::id` acts only on the current carrier event-ring diagnostic fallback used by `event_ring_guest_pid`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:4738 in `event_ring_guest_pid`, `std::process::id` acts only on the current carrier event-ring diagnostic fallback used by `event_ring_guest_pid`; no guest identity selects its host target.",
     "review_id": "HA-000494",
     "source": {
-      "byte_end": 181392,
-      "byte_start": 181376,
+      "byte_end": 181636,
+      "byte_start": 181620,
       "column": 42,
       "column_end": 58,
       "column_start": 42,
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 4734,
-      "line_end": 4734,
-      "line_start": 4734
+      "line": 4738,
+      "line_end": 4738,
+      "line_start": 4738
     }
   },
   {
@@ -13313,18 +13313,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:5182 in `close_open_file_and_free_pty`, the host result from `std::process::id` determines the guest PTY entry lifetime decided by the host-process owner PID.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:5186 in `close_open_file_and_free_pty`, the host result from `std::process::id` determines the guest PTY entry lifetime decided by the host-process owner PID.",
     "review_id": "HA-000495",
     "source": {
-      "byte_end": 201123,
-      "byte_start": 201107,
+      "byte_end": 201367,
+      "byte_start": 201351,
       "column": 32,
       "column_end": 48,
       "column_start": 32,
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 5182,
-      "line_end": 5182,
-      "line_start": 5182
+      "line": 5186,
+      "line_end": 5186,
+      "line_start": 5186
     }
   },
   {
@@ -13340,18 +13340,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:6857 in `register_controlling_pty`, the host result from `std::process::id` determines the guest controlling PTY identity assigned to the host-process owner PID.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:6861 in `register_controlling_pty`, the host result from `std::process::id` determines the guest controlling PTY identity assigned to the host-process owner PID.",
     "review_id": "HA-000496",
     "source": {
-      "byte_end": 274065,
-      "byte_start": 274049,
+      "byte_end": 274309,
+      "byte_start": 274293,
       "column": 39,
       "column_end": 55,
       "column_start": 39,
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 6857,
-      "line_end": 6857,
-      "line_start": 6857
+      "line": 6861,
+      "line_end": 6861,
+      "line_start": 6861
     }
   },
   {
@@ -13367,18 +13367,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:7055 in `reset_one_task_kernel_binding_for_current_process`, the host result from `std::process::id` determines the guest fork-child identity in the one-task adapter used by `reset_one_task_kernel_binding_for_current_process`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:7059 in `reset_one_task_kernel_binding_for_current_process`, the host result from `std::process::id` determines the guest fork-child identity in the one-task adapter used by `reset_one_task_kernel_binding_for_current_process`.",
     "review_id": "HA-000497",
     "source": {
-      "byte_end": 281921,
-      "byte_start": 281905,
+      "byte_end": 282165,
+      "byte_start": 282149,
       "column": 47,
       "column_end": 63,
       "column_start": 47,
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 7055,
-      "line_end": 7055,
-      "line_start": 7055
+      "line": 7059,
+      "line_end": 7059,
+      "line_start": 7059
     }
   },
   {
@@ -16470,8 +16470,8 @@
     "rationale": "At crates/carrick-runtime/src/vcpu_loop/mod.rs:7547 in `capture_core_for_publication`, `std::thread::sleep` acts only on the current carrier vCPU worker used by `capture_core_for_publication`; no guest identity selects its host target.",
     "review_id": "HA-000616",
     "source": {
-      "byte_end": 301859,
-      "byte_start": 301841,
+      "byte_end": 301857,
+      "byte_start": 301839,
       "column": 17,
       "column_end": 35,
       "column_start": 17,
@@ -16941,8 +16941,8 @@
     "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:2980 in `msgsnd`, `std::thread::yield_now` acts only on the current SysV dispatch retry worker used by `msgsnd`; no guest identity selects its host target.",
     "review_id": "HA-000633",
     "source": {
-      "byte_end": 108778,
-      "byte_start": 108756,
+      "byte_end": 108873,
+      "byte_start": 108851,
       "column": 29,
       "column_end": 51,
       "column_start": 29,
@@ -16968,8 +16968,8 @@
     "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:3055 in `msgrcv`, `std::thread::yield_now` acts only on the current SysV dispatch retry worker used by `msgrcv`; no guest identity selects its host target.",
     "review_id": "HA-000634",
     "source": {
-      "byte_end": 112754,
-      "byte_start": 112732,
+      "byte_end": 112849,
+      "byte_start": 112827,
       "column": 29,
       "column_end": 51,
       "column_start": 29,
@@ -17157,8 +17157,8 @@
     "rationale": "At crates/carrick-runtime/src/vcpu_loop/mod.rs:7403 in `capture_core_for_publication`, `std::thread::yield_now` acts only on the current carrier vCPU worker used by `capture_core_for_publication`; no guest identity selects its host target.",
     "review_id": "HA-000642",
     "source": {
-      "byte_end": 294148,
-      "byte_start": 294126,
+      "byte_end": 294146,
+      "byte_start": 294124,
       "column": 13,
       "column_end": 35,
       "column_start": 13,

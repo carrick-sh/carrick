@@ -32,7 +32,7 @@
 //! multithreaded guest quiesces every other live vCPU at its lock-safe run-loop
 //! top (`ThreadRuntimeState::handle_fork`); a stage-1 page-table edit is a
 //! lighter Pause-Modify-Resume that keeps every vCPU alive
-//! ([`ThreadRuntimeState::pt_pause`]). The `in_guest` ↔ `quiescing` Dekker
+//! (`ThreadRuntimeState::pt_pause`). The `in_guest` ↔ `quiescing` Dekker
 //! handshake (SeqCst on both sides) is preserved verbatim in
 //! `run_vcpu_until_exit`.
 

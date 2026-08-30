@@ -444,7 +444,7 @@ pub(crate) struct MemState {
     /// maps (those have their own lifecycles).
     pub free_regions: Vec<(u64, u64)>,
     /// Snapshot of the guest's `AddressSpace` regions, captured at boot
-    /// via [`SyscallDispatcher::set_address_space_regions`]. When present,
+    /// via `SyscallDispatcher::set_address_space_regions`. When present,
     /// `/proc/self/maps` is rendered from this list (with the heap end
     /// tracking `brk_current` and the mmap arena end tracking `mmap_next`)
     /// instead of the hard-coded four-line summary.

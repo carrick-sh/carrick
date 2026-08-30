@@ -2802,24 +2802,25 @@ mod mm_executor_release_tests {
         let (dispatcher, context, lease, mut executor, census, tid) = boundary_fixture();
         let reporter = CompatReporter::default();
         let mut memory = LinearMemory::new(0x1_0000, vec![0; 0x1000]);
-        let mut syscall = SyscallCtx {
-            kernel: &context,
-            request: SyscallRequest::new(271, SyscallArgs::from([0; 6])),
-            memory: &mut memory,
-            reporter: &reporter,
-            thread: None,
-            execution_lease: Some(&lease),
-            mm_executor: Some(&mut executor),
-        };
+        {
+            let mut syscall = SyscallCtx {
+                kernel: &context,
+                request: SyscallRequest::new(271, SyscallArgs::from([0; 6])),
+                memory: &mut memory,
+                reporter: &reporter,
+                thread: None,
+                execution_lease: Some(&lease),
+                mm_executor: Some(&mut executor),
+            };
 
-        let value = dispatcher
-            .with_current_mm_executor_released(&mut syscall, || {
-                assert_eq!(census.participant_count_for_probe(), 0);
-                0x5eed_u64
-            })
-            .expect("release and restore exact caller MM executor");
-        assert_eq!(value, 0x5eed);
-        drop(syscall);
+            let value = dispatcher
+                .with_current_mm_executor_released(&mut syscall, || {
+                    assert_eq!(census.participant_count_for_probe(), 0);
+                    0x5eed_u64
+                })
+                .expect("release and restore exact caller MM executor");
+            assert_eq!(value, 0x5eed);
+        }
         assert_eq!(census.participant_count_for_probe(), 1);
         let exact = executor.participation_mut().lock_exact_mm();
         assert_eq!(exact.pause_endpoint_tids(), vec![tid]);
@@ -2837,24 +2838,25 @@ mod mm_executor_release_tests {
         let (dispatcher, context, lease, mut executor, census, _) = boundary_fixture();
         let reporter = CompatReporter::default();
         let mut memory = LinearMemory::new(0x1_0000, vec![0; 0x1000]);
-        let mut syscall = SyscallCtx {
-            kernel: &context,
-            request: SyscallRequest::new(271, SyscallArgs::from([0; 6])),
-            memory: &mut memory,
-            reporter: &reporter,
-            thread: None,
-            execution_lease: Some(&lease),
-            mm_executor: Some(&mut executor),
-        };
+        {
+            let mut syscall = SyscallCtx {
+                kernel: &context,
+                request: SyscallRequest::new(271, SyscallArgs::from([0; 6])),
+                memory: &mut memory,
+                reporter: &reporter,
+                thread: None,
+                execution_lease: Some(&lease),
+                mm_executor: Some(&mut executor),
+            };
 
-        let operation = dispatcher
-            .with_current_mm_executor_released(&mut syscall, || {
-                assert_eq!(census.participant_count_for_probe(), 0);
-                Err::<(), LinuxErrno>(crate::linux_abi::LINUX_EFAULT)
-            })
-            .expect("boundary itself succeeds");
-        assert_eq!(operation, Err(crate::linux_abi::LINUX_EFAULT));
-        drop(syscall);
+            let operation = dispatcher
+                .with_current_mm_executor_released(&mut syscall, || {
+                    assert_eq!(census.participant_count_for_probe(), 0);
+                    Err::<(), LinuxErrno>(crate::linux_abi::LINUX_EFAULT)
+                })
+                .expect("boundary itself succeeds");
+            assert_eq!(operation, Err(crate::linux_abi::LINUX_EFAULT));
+        }
         assert_eq!(census.participant_count_for_probe(), 1);
         context
             .thread()
@@ -2868,24 +2870,25 @@ mod mm_executor_release_tests {
         let (dispatcher, context, lease, mut executor, census, _) = boundary_fixture();
         let reporter = CompatReporter::default();
         let mut memory = LinearMemory::new(0x1_0000, vec![0; 0x1000]);
-        let mut syscall = SyscallCtx {
-            kernel: &context,
-            request: SyscallRequest::new(271, SyscallArgs::from([0; 6])),
-            memory: &mut memory,
-            reporter: &reporter,
-            thread: None,
-            execution_lease: Some(&lease),
-            mm_executor: Some(&mut executor),
-        };
+        {
+            let mut syscall = SyscallCtx {
+                kernel: &context,
+                request: SyscallRequest::new(271, SyscallArgs::from([0; 6])),
+                memory: &mut memory,
+                reporter: &reporter,
+                thread: None,
+                execution_lease: Some(&lease),
+                mm_executor: Some(&mut executor),
+            };
 
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = dispatcher.with_current_mm_executor_released(&mut syscall, || -> () {
-                assert_eq!(census.participant_count_for_probe(), 0);
-                panic!("injected operation panic");
-            });
-        }));
-        assert!(panic.is_err(), "operation panic must resume after re-entry");
-        drop(syscall);
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = dispatcher.with_current_mm_executor_released(&mut syscall, || -> () {
+                    assert_eq!(census.participant_count_for_probe(), 0);
+                    panic!("injected operation panic");
+                });
+            }));
+            assert!(panic.is_err(), "operation panic must resume after re-entry");
+        }
         assert_eq!(census.participant_count_for_probe(), 1);
         context
             .thread()
@@ -2903,24 +2906,25 @@ mod mm_executor_release_tests {
         ));
         let reporter = CompatReporter::default();
         let mut memory = LinearMemory::new(0x1_0000, vec![0; 0x1000]);
-        let mut syscall = SyscallCtx {
-            kernel: &context,
-            request: SyscallRequest::new(271, SyscallArgs::from([0; 6])),
-            memory: &mut memory,
-            reporter: &reporter,
-            thread: None,
-            execution_lease: Some(&lease),
-            mm_executor: Some(&mut executor),
-        };
+        {
+            let mut syscall = SyscallCtx {
+                kernel: &context,
+                request: SyscallRequest::new(271, SyscallArgs::from([0; 6])),
+                memory: &mut memory,
+                reporter: &reporter,
+                thread: None,
+                execution_lease: Some(&lease),
+                mm_executor: Some(&mut executor),
+            };
 
-        let error = dispatcher
-            .with_current_mm_executor_released(&mut syscall, || {
-                assert_eq!(census.participant_count_for_probe(), 0);
-                dispatcher.replace_current_mm_for_test(replacement);
-            })
-            .expect_err("post-operation dispatcher binding drift must fail typed");
-        assert!(matches!(error, DispatchError::MmExecutorBindingDrift));
-        drop(syscall);
+            let error = dispatcher
+                .with_current_mm_executor_released(&mut syscall, || {
+                    assert_eq!(census.participant_count_for_probe(), 0);
+                    dispatcher.replace_current_mm_for_test(replacement);
+                })
+                .expect_err("post-operation dispatcher binding drift must fail typed");
+            assert!(matches!(error, DispatchError::MmExecutorBindingDrift));
+        }
         assert_eq!(census.participant_count_for_probe(), 1);
 
         dispatcher.replace_current_mm_for_test(original);
