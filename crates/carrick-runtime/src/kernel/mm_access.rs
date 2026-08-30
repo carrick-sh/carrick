@@ -2216,7 +2216,8 @@ pub(crate) mod tests {
         caller_tid: ThreadId,
     ) -> RealProductionCowFixture {
         use carrick_vmm_hvf::trap::foreign_cow_test_support::{
-            FixtureShape, InitialInventoryIdentity, ProductionCarrierForeignCowHarness, TEST_VA,
+            FixtureShape, InitialInventoryIdentity, ProductionCarrierForeignCowCustody,
+            ProductionCarrierForeignCowHarness, TEST_VA,
         };
 
         let (_stage1_pool, stage1) =
@@ -2253,13 +2254,14 @@ pub(crate) mod tests {
         let projected = ProjectedForeignMmSnapshot::from_backend(mm, &backend_snapshot)
             .expect("typed real production carrier snapshot");
         let census = dispatch_mm.foreign_cow_executor_census_for_test();
+        let carrier_custody = ProductionCarrierForeignCowCustody::new();
         let authority = crate::vcpu_loop::kernel_frame_cow_authority_for_test(
             Arc::clone(kernel),
             mm,
             census,
             caller_tid,
             projected.binding.asid().raw_for_probe(),
-            carrick_vmm_hvf::trap::foreign_cow_test_support::owner_inventory(),
+            carrier_custody.owner_inventory(),
         );
         let identity = carrick_hal::FrameCowIdentity {
             linux_pid: caller_tid.raw(),
@@ -2268,6 +2270,7 @@ pub(crate) mod tests {
             asid: projected.binding.asid().raw_for_probe(),
         };
         let carrier = ProductionCarrierForeignCowHarness::install(
+            carrier_custody,
             &projected,
             shape,
             InitialInventoryIdentity {

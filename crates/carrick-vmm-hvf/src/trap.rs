@@ -783,7 +783,7 @@ mod foreign_mm_tests {
                         Arc::downgrade(&installed.state),
                     ),
                 ]))),
-                custody: Arc::new(CarrierVmCustody::new()),
+                custody: Arc::clone(legacy_test_carrier_vm_custody_arc()),
             }));
         let lease = endpoint
             .retain(&installed.snapshot, deadline)
@@ -6086,7 +6086,7 @@ impl GlobalFrameOwnerEntry {
     }
 }
 
-/// Process-global ownership of host mappings installed at reusable global frame
+/// Carrier-scoped ownership of host mappings installed at reusable global frame
 /// IPAs. Per-vCPU mapping rows are non-owning views; otherwise the vCPU that
 /// happened to service `mmap` would pin the host extent until process exit even
 /// after another thread completed the final `munmap`.
@@ -6221,8 +6221,9 @@ fn next_global_frame_owner_generation() -> u64 {
 /// Rows stamp this at publication, which always happens while the lease is
 /// live, so a row records the incarnation it was actually published against.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn global_frame_host_owner_generation(ipa: u64, length: u64) -> u64 {
-    global_frame_host_owner_identity(ipa, length).map_or(0, |(_, generation)| generation)
+fn global_frame_host_owner_generation_in(custody: &CarrierVmCustody, ipa: u64, length: u64) -> u64 {
+    global_frame_host_owner_identity_in(custody, ipa, length)
+        .map_or(0, |(_, generation)| generation)
 }
 
 /// The exact host pointer and generation currently owning a reusable extent.
@@ -6230,8 +6231,13 @@ fn global_frame_host_owner_generation(ipa: u64, length: u64) -> u64 {
 /// Retirement diagnostics and inventory authentication need the complete
 /// identity. A generation or a recycled host pointer alone is insufficient.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn global_frame_host_owner_identity(ipa: u64, length: u64) -> Option<(usize, u64)> {
-    global_frame_host_owners()
+fn global_frame_host_owner_identity_in(
+    custody: &CarrierVmCustody,
+    ipa: u64,
+    length: u64,
+) -> Option<(usize, u64)> {
+    custody
+        .global_frame_host_owners
         .lock()
         .get(&(ipa, length))
         .map(|entry| (entry.owner().host_addr, entry.owner().generation))
@@ -6253,15 +6259,26 @@ unsafe impl Sync for GlobalFrameHostOwner {}
 type GlobalFrameHostOwnerDirectory =
     parking_lot::Mutex<std::collections::BTreeMap<(u64, u64), GlobalFrameOwnerEntry>>;
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 fn global_frame_host_owners() -> &'static GlobalFrameHostOwnerDirectory {
-    static CELL: std::sync::OnceLock<GlobalFrameHostOwnerDirectory> = std::sync::OnceLock::new();
-    CELL.get_or_init(|| parking_lot::Mutex::new(std::collections::BTreeMap::new()))
+    &legacy_test_carrier_vm_custody().global_frame_host_owners
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn legacy_test_carrier_vm_custody() -> &'static CarrierVmCustody {
+    legacy_test_carrier_vm_custody_arc().as_ref()
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn legacy_test_carrier_vm_custody_arc() -> &'static std::sync::Arc<CarrierVmCustody> {
+    static CELL: std::sync::OnceLock<std::sync::Arc<CarrierVmCustody>> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::Arc::new(CarrierVmCustody::new()))
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
 struct CarrierFrameCowOwnerLease {
+    custody: std::sync::Arc<CarrierVmCustody>,
     key: (u64, u64),
     owner: std::sync::Arc<GlobalFrameHostOwner>,
     generation: carrick_hal::ForeignOwnerGeneration,
@@ -6274,7 +6291,8 @@ impl carrick_hal::FrameCowOwnerLease for CarrierFrameCowOwnerLease {
     }
 
     fn is_current(&self) -> bool {
-        global_frame_host_owners()
+        self.custody
+            .global_frame_host_owners
             .lock()
             .get(&self.key)
             .is_some_and(|current| std::sync::Arc::ptr_eq(current.owner(), &self.owner))
@@ -6283,7 +6301,9 @@ impl carrick_hal::FrameCowOwnerLease for CarrierFrameCowOwnerLease {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
-struct CarrierFrameCowOwnerInventory;
+struct CarrierFrameCowOwnerInventory {
+    custody: std::sync::Arc<CarrierVmCustody>,
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl carrick_hal::FrameCowOwnerInventory for CarrierFrameCowOwnerInventory {
@@ -6294,7 +6314,9 @@ impl carrick_hal::FrameCowOwnerInventory for CarrierFrameCowOwnerInventory {
     ) -> Result<Box<dyn carrick_hal::FrameCowOwnerLease>, Box<dyn std::error::Error + Send + Sync>>
     {
         let key = (gpa.raw(), length.raw());
-        let owner = global_frame_host_owners()
+        let owner = self
+            .custody
+            .global_frame_host_owners
             .lock()
             .get(&key)
             .map(|e| std::sync::Arc::clone(e.owner()))
@@ -6303,6 +6325,7 @@ impl carrick_hal::FrameCowOwnerInventory for CarrierFrameCowOwnerInventory {
             .map(carrick_hal::ForeignOwnerGeneration::from_backend_counter)
             .ok_or_else(|| std::io::Error::other("foreign COW host owner generation is zero"))?;
         Ok(Box::new(CarrierFrameCowOwnerLease {
+            custody: std::sync::Arc::clone(&self.custody),
             key,
             owner,
             generation,
@@ -6311,9 +6334,10 @@ impl carrick_hal::FrameCowOwnerInventory for CarrierFrameCowOwnerInventory {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn carrier_frame_cow_owner_inventory()
--> std::sync::Arc<dyn carrick_hal::FrameCowOwnerInventory> {
-    std::sync::Arc::new(CarrierFrameCowOwnerInventory)
+pub(crate) fn carrier_frame_cow_owner_inventory_in(
+    custody: std::sync::Arc<CarrierVmCustody>,
+) -> std::sync::Arc<dyn carrick_hal::FrameCowOwnerInventory> {
+    std::sync::Arc::new(CarrierFrameCowOwnerInventory { custody })
 }
 
 /// Global-frame stage-2 leases owned by a CARRIER MM rather than by a mapping
@@ -6431,7 +6455,8 @@ fn take_carrier_stage2_lease_if_owner(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn register_global_frame_host_owner(
+fn register_global_frame_host_owner_in(
+    custody: &CarrierVmCustody,
     lease: GlobalFrameStage2Lease,
     mapping: crate::host_mapping::OwnedHostMapping,
     perms: u64,
@@ -6457,7 +6482,7 @@ fn register_global_frame_host_owner(
         );
     }
     let generation = next_global_frame_owner_generation();
-    let mut owners = global_frame_host_owners().lock();
+    let mut owners = custody.global_frame_host_owners.lock();
     if owners.contains_key(&key) {
         return Err(TrapError::Hypervisor(format!(
             "global frame host owner collision at IPA 0x{:x} size {}",
@@ -6476,7 +6501,8 @@ fn register_global_frame_host_owner(
 /// Publish the host backing owner for a prepared exec mapping and stamp its
 /// live generation directly onto the region state.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn publish_exec_region_host_owner(
+fn publish_exec_region_host_owner_in(
+    custody: &CarrierVmCustody,
     region: &mut HvfMappedRegion,
     lease: GlobalFrameStage2Lease,
 ) -> Result<u64, TrapError> {
@@ -6488,7 +6514,7 @@ fn publish_exec_region_host_owner(
         ))
     })?;
     let owner_generation =
-        register_global_frame_host_owner(lease, host_mapping, u64::from(region.perms))?;
+        register_global_frame_host_owner_in(custody, lease, host_mapping, u64::from(region.perms))?;
     region.owner_generation = owner_generation;
     Ok(owner_generation)
 }
@@ -6677,24 +6703,27 @@ impl GlobalFrameRetirementOutcome {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn retire_global_frame_host_owner(
+pub(crate) fn retire_global_frame_host_owner_in(
+    custody: &CarrierVmCustody,
     ipa: u64,
     length: u64,
 ) -> GlobalFrameRetirementOutcome {
-    retire_global_frame_host_owner_inner(ipa, length, None)
+    retire_global_frame_host_owner_inner_in(custody, ipa, length, None)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn retire_global_frame_host_owner_if_generation(
+pub(crate) fn retire_global_frame_host_owner_if_generation_in(
+    custody: &CarrierVmCustody,
     ipa: u64,
     length: u64,
     expected_generation: u64,
 ) -> GlobalFrameRetirementOutcome {
-    retire_global_frame_host_owner_inner(ipa, length, Some(expected_generation))
+    retire_global_frame_host_owner_inner_in(custody, ipa, length, Some(expected_generation))
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn retire_global_frame_host_owner_inner(
+fn retire_global_frame_host_owner_inner_in(
+    custody: &CarrierVmCustody,
     ipa: u64,
     length: u64,
     expected_generation: Option<u64>,
@@ -6713,7 +6742,7 @@ fn retire_global_frame_host_owner_inner(
             std::backtrace::Backtrace::force_capture(),
         );
     }
-    let mut owners = global_frame_host_owners().lock();
+    let mut owners = custody.global_frame_host_owners.lock();
     let entry = match owners.get(&(ipa, length)) {
         Some(entry) => entry,
         None => return GlobalFrameRetirementOutcome::NotFound { ipa, length },
@@ -6774,8 +6803,10 @@ fn retire_global_frame_host_owner_inner(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn drain_and_retry_pending_global_frame_retirements() -> Result<(), TrapError> {
-    let mut owners = global_frame_host_owners().lock();
+pub(crate) fn drain_and_retry_pending_global_frame_retirements_in(
+    custody: &CarrierVmCustody,
+) -> Result<(), TrapError> {
+    let mut owners = custody.global_frame_host_owners.lock();
     let keys: Vec<(u64, u64)> = owners.keys().copied().collect();
     for key in keys {
         if let Some(entry) = owners.get(&key) {
@@ -6807,13 +6838,15 @@ pub(crate) fn drain_and_retry_pending_global_frame_retirements() -> Result<(), T
 /// scrub the unrelated allocation. The `(IPA, length, host pointer)` triple is
 /// the owning lease identity and therefore the only safe HVPatch predicate.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn global_frame_host_owner_matches(
+fn global_frame_host_owner_matches_in(
+    custody: &CarrierVmCustody,
     ipa: u64,
     length: u64,
     host_addr: usize,
     generation: u64,
 ) -> bool {
-    let owner = global_frame_host_owners()
+    let owner = custody
+        .global_frame_host_owners
         .lock()
         .get(&(ipa, length))
         .map(|entry| (entry.owner().host_addr(), entry.owner().generation()));
@@ -6863,10 +6896,14 @@ fn global_frame_host_owner_matches(
 /// for the duration of the copy; absence is authoritative failure, never a
 /// reason to dereference a retired per-vCPU descriptor.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn copy_from_global_frame_owner(ipa: u64, dst: &mut [u8]) -> Option<(u64, u64)> {
+fn copy_from_global_frame_owner_in(
+    custody: &CarrierVmCustody,
+    ipa: u64,
+    dst: &mut [u8],
+) -> Option<(u64, u64)> {
     let length = u64::try_from(dst.len()).ok()?;
     let end = ipa.checked_add(length)?;
-    let owners = global_frame_host_owners().lock();
+    let owners = custody.global_frame_host_owners.lock();
     let (&(owner_ipa, owner_length), entry) = owners
         .iter()
         .find(|((base, size), _)| ipa >= *base && end <= base.saturating_add(*size))?;
@@ -6901,7 +6938,10 @@ fn mapped_region_stage2_owner_identity(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn global_frame_region_owner_matches(mapping: &HvfMappedRegion) -> bool {
+fn global_frame_region_owner_matches_in(
+    custody: &CarrierVmCustody,
+    mapping: &HvfMappedRegion,
+) -> bool {
     let Some(identity) = mapped_region_stage2_owner_identity(mapping) else {
         return false;
     };
@@ -6915,12 +6955,87 @@ fn global_frame_region_owner_matches(mapping: &HvfMappedRegion) -> bool {
     if locally_owned {
         return true;
     }
-    global_frame_host_owner_matches(
+    global_frame_host_owner_matches_in(
+        custody,
         mapping.physical_ipa,
         mapping.physical_size as u64,
         identity.host_addr,
         identity.generation,
     )
+}
+
+// Legacy fixtures share one directory only inside this test binary. Production
+// code cannot name these adapters because they do not exist in a non-test build.
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn global_frame_host_owner_generation(ipa: u64, length: u64) -> u64 {
+    global_frame_host_owner_generation_in(legacy_test_carrier_vm_custody(), ipa, length)
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn global_frame_host_owner_identity(ipa: u64, length: u64) -> Option<(usize, u64)> {
+    global_frame_host_owner_identity_in(legacy_test_carrier_vm_custody(), ipa, length)
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn register_global_frame_host_owner(
+    lease: GlobalFrameStage2Lease,
+    mapping: crate::host_mapping::OwnedHostMapping,
+    perms: u64,
+) -> Result<u64, TrapError> {
+    register_global_frame_host_owner_in(legacy_test_carrier_vm_custody(), lease, mapping, perms)
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn publish_exec_region_host_owner(
+    region: &mut HvfMappedRegion,
+    lease: GlobalFrameStage2Lease,
+) -> Result<u64, TrapError> {
+    publish_exec_region_host_owner_in(legacy_test_carrier_vm_custody(), region, lease)
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn retire_global_frame_host_owner(ipa: u64, length: u64) -> GlobalFrameRetirementOutcome {
+    retire_global_frame_host_owner_in(legacy_test_carrier_vm_custody(), ipa, length)
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn retire_global_frame_host_owner_if_generation(
+    ipa: u64,
+    length: u64,
+    generation: u64,
+) -> GlobalFrameRetirementOutcome {
+    retire_global_frame_host_owner_if_generation_in(
+        legacy_test_carrier_vm_custody(),
+        ipa,
+        length,
+        generation,
+    )
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn drain_and_retry_pending_global_frame_retirements() -> Result<(), TrapError> {
+    drain_and_retry_pending_global_frame_retirements_in(legacy_test_carrier_vm_custody())
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn global_frame_host_owner_matches(
+    ipa: u64,
+    length: u64,
+    host_addr: usize,
+    generation: u64,
+) -> bool {
+    global_frame_host_owner_matches_in(
+        legacy_test_carrier_vm_custody(),
+        ipa,
+        length,
+        host_addr,
+        generation,
+    )
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn global_frame_region_owner_matches(mapping: &HvfMappedRegion) -> bool {
+    global_frame_region_owner_matches_in(legacy_test_carrier_vm_custody(), mapping)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -7353,7 +7468,8 @@ fn unregister_alias_entries(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn retained_private_reuse_alias_fragment(
+fn retained_private_reuse_alias_fragment_in(
+    custody: &CarrierVmCustody,
     registry: &[AliasBacking],
     va: u64,
     ipa: u64,
@@ -7385,7 +7501,8 @@ fn retained_private_reuse_alias_fragment(
                 <= entry
                     .physical_ipa
                     .saturating_add(entry.physical_size as u64)
-            && match global_frame_host_owner_identity(
+            && match global_frame_host_owner_identity_in(
+                custody,
                 entry.physical_ipa,
                 entry.physical_size as u64,
             ) {
@@ -7419,6 +7536,26 @@ fn retained_private_reuse_alias_fragment(
         shared_key_offset: 0,
         owner_generation: source.owner_generation,
     })
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn retained_private_reuse_alias_fragment(
+    registry: &[AliasBacking],
+    va: u64,
+    ipa: u64,
+    len: usize,
+    mm_root_slot: Option<(u64, u64)>,
+    container_root: ContainerRootToken,
+) -> Option<AliasBacking> {
+    retained_private_reuse_alias_fragment_in(
+        legacy_test_carrier_vm_custody(),
+        registry,
+        va,
+        ipa,
+        len,
+        mm_root_slot,
+        container_root,
+    )
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -8237,15 +8374,16 @@ pub fn destroy_persistent_vm_at_carrier_exit() -> Result<(), TrapError> {
     if !carrier_vm_live() {
         return Ok(());
     }
-    if let Err(e) = drain_and_retry_pending_global_frame_retirements() {
-        return Err(TrapError::Hypervisor(format!(
-            "carrier-exit cannot destroy VM while pending global frame retirements remain: {e}"
-        )));
-    }
     let carrier = persistent_carrier_cell().lock().take().ok_or_else(|| {
         TrapError::Hypervisor("carrier-exit live VM has no published carrier custody".to_owned())
     })?;
     let custody = std::sync::Arc::clone(&carrier.carrier_foreign_mm_transport.custody);
+    if let Err(e) = drain_and_retry_pending_global_frame_retirements_in(&custody) {
+        persistent_carrier_cell().lock().replace(carrier);
+        return Err(TrapError::Hypervisor(format!(
+            "carrier-exit cannot destroy VM while pending global frame retirements remain: {e}"
+        )));
+    }
     // Drop the carrier's control-mapping authority first: `PersistentCarrierMappings`'s
     // `Drop` unmaps the five fixed stage-2 extents, which must precede
     // `hv_vm_destroy`. This only releases the cell's `Arc`; every executor pool
@@ -9570,6 +9708,7 @@ struct CarrierVmCustodyState {
 #[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
 pub(crate) struct CarrierVmCustody {
     state: parking_lot::Mutex<CarrierVmCustodyState>,
+    global_frame_host_owners: GlobalFrameHostOwnerDirectory,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -9590,6 +9729,7 @@ impl CarrierVmCustody {
                 next_stage2_record_id: 1,
                 stage2_records: std::collections::BTreeMap::new(),
             }),
+            global_frame_host_owners: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -10057,7 +10197,17 @@ pub(crate) struct CarrierForeignMmTransport {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl CarrierForeignMmTransport {
     fn new() -> Self {
-        Self::default()
+        #[cfg(not(test))]
+        {
+            Self::default()
+        }
+        #[cfg(test)]
+        {
+            Self {
+                custody: std::sync::Arc::clone(legacy_test_carrier_vm_custody_arc()),
+                ..Self::default()
+            }
+        }
     }
 
     #[cfg(any(test, feature = "foreign-cow-test-support"))]
@@ -10145,6 +10295,72 @@ mod carrier_vm_custody_tests {
                 id: 7,
                 generation: owner_generation,
             }),
+        }
+    }
+
+    #[test]
+    fn global_frame_owner_directory_is_isolated_per_carrier_custody() {
+        let first = CarrierVmCustody::new();
+        let second = CarrierVmCustody::new();
+        let key = (0xa081_0000_0000, 0x4000);
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            key.1 as usize,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate carrier-local owner backing");
+        let owner = super::GlobalFrameHostOwner::new(
+            super::GlobalFrameStage2Lease::fixed(key.0, key.1),
+            mapping,
+            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            17,
+            key.0,
+            key.1,
+        );
+
+        first.global_frame_host_owners.lock().insert(
+            key,
+            super::GlobalFrameOwnerEntry::Live(std::sync::Arc::new(owner)),
+        );
+
+        assert!(first.global_frame_host_owners.lock().contains_key(&key));
+        assert!(second.global_frame_host_owners.lock().is_empty());
+    }
+
+    #[test]
+    fn production_global_frame_owner_operations_require_carrier_custody_static_audit() {
+        let source = include_str!("trap.rs");
+        let legacy_directory = concat!(
+            "#[cfg(all(test, target_os = \"macos\", target_arch = \"aarch64\"))]\n",
+            "fn global_frame_host_owners() -> &'static GlobalFrameHostOwnerDirectory"
+        );
+        assert!(
+            source.contains(legacy_directory),
+            "the legacy process-global-shaped owner directory must remain cfg(test)-only"
+        );
+
+        for operation in [
+            "global_frame_host_owner_generation_in",
+            "global_frame_host_owner_identity_in",
+            "register_global_frame_host_owner_in",
+            "publish_exec_region_host_owner_in",
+            "retire_global_frame_host_owner_in",
+            "retire_global_frame_host_owner_if_generation_in",
+            "drain_and_retry_pending_global_frame_retirements_in",
+            "global_frame_host_owner_matches_in",
+            "copy_from_global_frame_owner_in",
+            "global_frame_region_owner_matches_in",
+            "carrier_frame_cow_owner_inventory_in",
+        ] {
+            let marker = format!("fn {operation}(");
+            let signature = source
+                .split(&marker)
+                .nth(1)
+                .and_then(|tail| tail.split('{').next())
+                .unwrap_or_else(|| panic!("missing production owner operation `{operation}`"));
+            assert!(
+                signature.contains("custody:"),
+                "production owner operation `{operation}` must receive carrier custody explicitly"
+            );
         }
     }
 
@@ -10628,8 +10844,9 @@ impl MmAccessState {
         self.structural_owners.write().insert(key, owner);
     }
 
-    fn retain_physical_backing(
+    fn retain_physical_backing_in(
         &self,
+        custody: &CarrierVmCustody,
         snapshot: &CarrierForeignMmSnapshot,
         deadline: std::time::Instant,
     ) -> Result<RetainedForeignMmBacking, carrick_hal::ForeignMmTransportError> {
@@ -10656,7 +10873,8 @@ impl MmAccessState {
         {
             return Err(carrick_hal::ForeignMmTransportError::OwnerStale);
         }
-        let global_owners = global_frame_host_owners()
+        let global_owners = custody
+            .global_frame_host_owners
             .try_lock_until(deadline)
             .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?;
         let structural_owners = self.structural_owners.read();
@@ -10692,6 +10910,15 @@ impl MmAccessState {
             extents.push(RetainedForeignExtent { key, owner });
         }
         Ok(RetainedForeignMmBacking { extents })
+    }
+
+    #[cfg(test)]
+    fn retain_physical_backing(
+        &self,
+        snapshot: &CarrierForeignMmSnapshot,
+        deadline: std::time::Instant,
+    ) -> Result<RetainedForeignMmBacking, carrick_hal::ForeignMmTransportError> {
+        self.retain_physical_backing_in(legacy_test_carrier_vm_custody(), snapshot, deadline)
     }
 }
 
@@ -11011,6 +11238,7 @@ struct CarrierLeaseState {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 struct CarrierForeignMmReadLease {
+    custody: std::sync::Arc<CarrierVmCustody>,
     state: std::sync::Arc<MmAccessState>,
     inner: parking_lot::Mutex<CarrierLeaseState>,
 }
@@ -11221,10 +11449,14 @@ fn perform_foreign_cow_transaction(
     }
     #[cfg(any(test, feature = "foreign-cow-test-support"))]
     new_lease.mark_test_mapped_without_backend();
-    let owner_generation =
-        register_global_frame_host_owner(new_lease, new_host, u64::from(stage2_perms))
-            .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
-    let mut owner_rollback = GlobalFrameOwnerRollback::default();
+    let owner_generation = register_global_frame_host_owner_in(
+        &lease.custody,
+        new_lease,
+        new_host,
+        u64::from(stage2_perms),
+    )
+    .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
+    let mut owner_rollback = GlobalFrameOwnerRollback::new(std::sync::Arc::clone(&lease.custody));
     owner_rollback.record((new_physical_ipa, CowArmedRanges::COMPOUND_SIZE));
     foreign_cow_failpoint(&lease.state, 2)?;
     let backing = HvfVmState::private_backing_identity();
@@ -11367,7 +11599,9 @@ fn perform_foreign_cow_transaction(
     let owner_generation_token = std::num::NonZeroU64::new(owner_generation)
         .map(carrick_hal::ForeignOwnerGeneration::from_backend_counter)
         .unwrap_or_else(|| std::process::abort());
-    let owner_is_live = global_frame_host_owners()
+    let owner_is_live = lease
+        .custody
+        .global_frame_host_owners
         .lock()
         .get(&(new_physical_ipa, CowArmedRanges::COMPOUND_SIZE))
         .is_some_and(|entry| {
@@ -11423,7 +11657,8 @@ fn perform_foreign_cow_transaction(
     let retired_old_stage2 = {
         let mut inventory = lease.state.frame_inventory.ledger.lock();
         HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || {
-            HvfVmState::retire_stage2_extent_from_mappings(
+            HvfVmState::retire_stage2_extent_from_mappings_in(
+                &lease.custody,
                 &mut [],
                 split.old.stage2_base,
                 split.old.stage2_length,
@@ -11470,7 +11705,9 @@ fn perform_foreign_cow_transaction(
         Ok(true) => {}
         Ok(false) | Err(_) => std::process::abort(),
     }
-    let owner_is_live = global_frame_host_owners()
+    let owner_is_live = lease
+        .custody
+        .global_frame_host_owners
         .lock()
         .get(&(new_physical_ipa, CowArmedRanges::COMPOUND_SIZE))
         .is_some_and(|entry| {
@@ -11495,7 +11732,9 @@ fn perform_foreign_cow_transaction(
         ),
         mapping_ids: committed_mapping_ids,
     };
-    let new_owner_arc = global_frame_host_owners()
+    let new_owner_arc = lease
+        .custody
+        .global_frame_host_owners
         .lock()
         .get(&(new_physical_ipa, CowArmedRanges::COMPOUND_SIZE))
         .map(|entry| std::sync::Arc::clone(entry.owner()))
@@ -11679,7 +11918,9 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
                 })
                 .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)?
         };
-        let owner = global_frame_host_owners()
+        let owner = self
+            .custody
+            .global_frame_host_owners
             .try_lock_until(deadline)
             .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?
             .get(&extent_key)
@@ -11732,7 +11973,8 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
             })
             .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)?;
         if !live_snapshot_matches(authority, &requested, deadline)?
-            || !global_frame_host_owner_matches(
+            || !global_frame_host_owner_matches_in(
+                &self.custody,
                 extent_key.0,
                 extent_key.1,
                 owner.host_addr(),
@@ -11776,8 +12018,9 @@ impl carrick_hal::ForeignMmTransport for CarrierForeignMmTransport {
         }
         let retained = CarrierForeignMmSnapshot::capture(snapshot);
         let state = self.state_for(&retained, deadline)?;
-        let backing = state.retain_physical_backing(&retained, deadline)?;
+        let backing = state.retain_physical_backing_in(&self.custody, &retained, deadline)?;
         Ok(std::sync::Arc::new(CarrierForeignMmReadLease {
+            custody: std::sync::Arc::clone(&self.custody),
             state,
             inner: parking_lot::Mutex::new(CarrierLeaseState { retained, backing }),
         }))
@@ -11800,8 +12043,26 @@ pub mod foreign_cow_test_support {
     pub const TEST_VA: u64 = 0x6000_2000_0000;
     pub const OWNER_LEN: u64 = CowArmedRanges::COMPOUND_SIZE;
 
-    pub fn owner_inventory() -> std::sync::Arc<dyn carrick_hal::FrameCowOwnerInventory> {
-        carrier_frame_cow_owner_inventory()
+    pub struct ProductionCarrierForeignCowCustody {
+        custody: std::sync::Arc<CarrierVmCustody>,
+    }
+
+    impl ProductionCarrierForeignCowCustody {
+        pub fn new() -> Self {
+            Self {
+                custody: std::sync::Arc::new(CarrierVmCustody::new()),
+            }
+        }
+
+        pub fn owner_inventory(&self) -> std::sync::Arc<dyn carrick_hal::FrameCowOwnerInventory> {
+            carrier_frame_cow_owner_inventory_in(std::sync::Arc::clone(&self.custody))
+        }
+    }
+
+    impl Default for ProductionCarrierForeignCowCustody {
+        fn default() -> Self {
+            Self::new()
+        }
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -11844,6 +12105,7 @@ pub mod foreign_cow_test_support {
     impl ProductionCarrierForeignCowHarness {
         #[allow(clippy::too_many_arguments)]
         pub fn install(
+            custody: ProductionCarrierForeignCowCustody,
             snapshot: &dyn carrick_hal::ForeignMmSnapshot,
             shape: FixtureShape,
             inventory: InitialInventoryIdentity,
@@ -11866,10 +12128,12 @@ pub mod foreign_cow_test_support {
                 return Err("carrier fixture page-table shape changed".into());
             }
             let table_bytes = tables.as_bytes().to_vec();
-            let (table_generation, table_host) = install_owner(shape.stage1_root.0, &table_bytes)?;
+            let (table_generation, table_host) =
+                install_owner(&custody.custody, shape.stage1_root.0, &table_bytes)?;
             let mut data_bytes = vec![0_u8; shape.data_len as usize];
             data_bytes[..initial_bytes.len()].copy_from_slice(&initial_bytes);
-            let (data_generation, data_host) = install_owner(shape.data_ipa.0, &data_bytes)?;
+            let (data_generation, data_host) =
+                install_owner(&custody.custody, shape.data_ipa.0, &data_bytes)?;
 
             let root_key = (shape.stage1_root.0, shape.page_table_len);
             let data_key = (shape.data_ipa.0, shape.data_len);
@@ -11934,7 +12198,10 @@ pub mod foreign_cow_test_support {
                 std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
                 std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
             );
-            let transport = CarrierForeignMmTransport::new();
+            let transport = CarrierForeignMmTransport {
+                custody: custody.custody,
+                ..CarrierForeignMmTransport::new()
+            };
             transport.register(snapshot, &state);
             register_shared_alias(AliasBacking {
                 start: TEST_VA,
@@ -12002,7 +12269,7 @@ pub mod foreign_cow_test_support {
             alias_registry().lock().retain(|alias| {
                 !extents.contains(&(alias.physical_ipa, alias.physical_size as u64))
             });
-            let mut owners = global_frame_host_owners().lock();
+            let mut owners = self.transport.custody.global_frame_host_owners.lock();
             for extent in extents {
                 owners.remove(&extent);
             }
@@ -12026,7 +12293,11 @@ pub mod foreign_cow_test_support {
         Ok(tables)
     }
 
-    fn install_owner(ipa: u64, bytes: &[u8]) -> Result<(u64, usize), String> {
+    fn install_owner(
+        custody: &CarrierVmCustody,
+        ipa: u64,
+        bytes: &[u8],
+    ) -> Result<(u64, usize), String> {
         let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
             bytes.len(),
             crate::host_mapping::HostMappingKind::PerMmKernelState,
@@ -12045,7 +12316,8 @@ pub mod foreign_cow_test_support {
             ipa,
             bytes.len() as u64,
         );
-        if global_frame_host_owners()
+        if custody
+            .global_frame_host_owners
             .lock()
             .insert(
                 (ipa, bytes.len() as u64),
@@ -12066,6 +12338,8 @@ pub mod foreign_cow_test_support {
 /// authority move with the binding.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct HvfTaskState {
+    #[cfg(not(test))]
+    custody: std::sync::Arc<CarrierVmCustody>,
     mappings: Vec<HvfMappedRegion>,
     /// Per-mm stage-1 root-table slot. It contains page-table/control backing
     /// only; guest data frames live at stable global IPAs outside the slot.
@@ -12170,6 +12444,8 @@ impl std::ops::Deref for HvfTaskState {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 struct PendingExecStage2Cleanup {
+    #[cfg(not(test))]
+    custody: std::sync::Arc<CarrierVmCustody>,
     mappings: Vec<HvfMappedRegion>,
     /// Physical candidates selected at exec publication, bound to the exact
     /// global-owner incarnation observed at that boundary.
@@ -12207,6 +12483,12 @@ impl PendingExecStage2Cleanup {
             carrick_observability::probes::HvpatchExecPredecessorClassification,
         ),
     ) -> Result<(), TrapError> {
+        #[cfg(not(test))]
+        let custody = std::sync::Arc::clone(&self.custody);
+        #[cfg(not(test))]
+        let custody = custody.as_ref();
+        #[cfg(test)]
+        let custody = legacy_test_carrier_vm_custody();
         let identity = self.predecessor_identity;
         let classification =
             carrick_observability::probes::HvpatchExecPredecessorClassification::new(
@@ -12249,18 +12531,21 @@ impl PendingExecStage2Cleanup {
                 // for delayed cleanup to remove a later incarnation by bare key.
                 continue;
             }
-            if global_frame_host_owner_generation(ipa, size as u64) != owner_generation {
+            if global_frame_host_owner_generation_in(custody, ipa, size as u64) != owner_generation
+            {
                 continue;
             }
             if HvfVmState::retire_stage2_candidate_if_unreferenced(&self.frames, lease, || {
                 if owner_generation == 0 {
-                    HvfVmState::retire_stage2_extent_from_mappings(
+                    HvfVmState::retire_stage2_extent_from_mappings_in(
+                        custody,
                         &mut self.mappings,
                         ipa,
                         size as u64,
                     )
                 } else {
-                    let outcome = retire_global_frame_host_owner_if_generation(
+                    let outcome = retire_global_frame_host_owner_if_generation_in(
+                        custody,
                         ipa,
                         size as u64,
                         owner_generation,
@@ -12336,6 +12621,17 @@ pub(crate) fn swap_hvpatch_task_state(live: &mut HvfTaskState, parked: &mut HvfT
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfTaskState {
+    fn custody(&self) -> &CarrierVmCustody {
+        #[cfg(not(test))]
+        {
+            &self.custody
+        }
+        #[cfg(test)]
+        {
+            legacy_test_carrier_vm_custody()
+        }
+    }
+
     pub(crate) fn mm_access_authority(&self) -> std::sync::Arc<MmAccessState> {
         std::sync::Arc::clone(&self.mm_access)
     }
@@ -12516,7 +12812,8 @@ impl HvfTaskState {
                         alias.physical_size as u64,
                     )
                 {
-                    global_frame_host_owner_matches(
+                    global_frame_host_owner_matches_in(
+                        self.custody(),
                         alias.physical_ipa,
                         alias.physical_size as u64,
                         alias.physical_host_addr,
@@ -12546,7 +12843,7 @@ impl HvfTaskState {
                         mapping.physical_ipa,
                         mapping.physical_size as u64,
                     )
-                    || global_frame_region_owner_matches(mapping))
+                    || global_frame_region_owner_matches_in(self.custody(), mapping))
         })?;
         let offset = usize::try_from(physical_ipa - mapping.ipa).ok()?;
         Some((unsafe { mapping.host_addr.add(offset) }, physical_ipa))
@@ -12560,6 +12857,8 @@ impl HvfTaskState {
         let cow_armed = std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default()));
         let cow_deferred_publications = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
         Self {
+            #[cfg(not(test))]
+            custody: std::sync::Arc::new(CarrierVmCustody::new()),
             mappings: Vec::new(),
             mm_root_slot: None,
             container_root: ContainerRootToken(0),
@@ -12916,6 +13215,9 @@ fn bind_exec_predecessor_identity_slot(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfVmState {
+    pub(crate) fn carrier_vm_custody(&self) -> std::sync::Arc<CarrierVmCustody> {
+        std::sync::Arc::clone(&self.carrier_foreign_mm_transport.custody)
+    }
     pub(crate) fn foreign_mm_endpoint(&self) -> carrick_hal::ForeignMmEndpoint {
         carrick_hal::ForeignMmEndpoint::for_carrier(self.carrier_foreign_mm_transport.clone())
     }
@@ -14087,7 +14389,8 @@ struct ProcessInventoryDesc {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn inherited_fork_inventory_extents(
+fn inherited_fork_inventory_extents_in(
+    custody: &CarrierVmCustody,
     mapping: &ThreadMappingDesc,
     inventory: &std::collections::BTreeMap<(u64, u64), InventoryExtent>,
 ) -> Vec<((u64, u64), InventoryExtent)> {
@@ -14095,8 +14398,11 @@ fn inherited_fork_inventory_extents(
         host_addr: mapping.physical_host_addr as usize,
         generation: mapping.owner_generation,
     });
-    let live_owner =
-        global_frame_host_owner_identity(mapping.physical_ipa, mapping.physical_size as u64);
+    let live_owner = global_frame_host_owner_identity_in(
+        custody,
+        mapping.physical_ipa,
+        mapping.physical_size as u64,
+    );
     inventory
         .iter()
         .filter(|(_, extent)| {
@@ -14112,6 +14418,14 @@ fn inherited_fork_inventory_extents(
         })
         .map(|(&key, &extent)| (key, extent))
         .collect()
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn inherited_fork_inventory_extents(
+    mapping: &ThreadMappingDesc,
+    inventory: &std::collections::BTreeMap<(u64, u64), InventoryExtent>,
+) -> Vec<((u64, u64), InventoryExtent)> {
+    inherited_fork_inventory_extents_in(legacy_test_carrier_vm_custody(), mapping, inventory)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -14408,6 +14722,22 @@ pub struct HvpatchTaskOnlyBackendState {
 }
 
 impl HvpatchTaskOnlyBackendState {
+    pub(crate) fn carrier_vm_custody(&self) -> Result<std::sync::Arc<CarrierVmCustody>, TrapError> {
+        let registration = self
+            .registration
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("retired HVPatch registration".to_owned()))?;
+        #[cfg(not(test))]
+        {
+            Ok(std::sync::Arc::clone(&registration.custody))
+        }
+        #[cfg(test)]
+        {
+            let _ = registration;
+            Ok(std::sync::Arc::clone(legacy_test_carrier_vm_custody_arc()))
+        }
+    }
+
     pub(crate) fn take_registration(&mut self) -> Option<HvpatchTaskRegistration> {
         self.registration.take()
     }
@@ -14711,6 +15041,7 @@ impl HvpatchTaskMappingState {
 #[derive(Default)]
 #[allow(dead_code)] // retained task authority; worker-side load consumes these fields
 struct HvpatchPreparedTaskAuthority {
+    custody: Option<std::sync::Arc<CarrierVmCustody>>,
     mappings: Vec<HvpatchTaskMappingState>,
     mm_root_slot: Option<(u64, u64)>,
     container_root: ContainerRootToken,
@@ -16016,6 +16347,8 @@ pub(crate) struct HvpatchTaskRegistration {
     cow_identity: Option<carrick_hal::FrameCowIdentity>,
     cow_authority_identity: Option<std::num::NonZeroU64>,
     child_token_verifier: std::sync::Arc<carrick_hal::HvpatchChildTokenVerifier>,
+    #[cfg(not(test))]
+    custody: std::sync::Arc<CarrierVmCustody>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -16076,6 +16409,8 @@ impl HvpatchTaskRegistration {
             }))
         };
         Ok(HvfTaskState {
+            #[cfg(not(test))]
+            custody: std::sync::Arc::clone(&self.custody),
             mappings: task_mm
                 .mappings
                 .iter()
@@ -16316,7 +16651,7 @@ impl HvpatchPreparedCarrierTaskState {
             vm,
             mappings,
             mm_access,
-            carrier_foreign_mm_transport: _,
+            carrier_foreign_mm_transport,
             mailbox_slots: _,
             syscall_transport: _,
             persistent_vm_lifecycle: _,
@@ -16358,6 +16693,7 @@ impl HvpatchPreparedCarrierTaskState {
                 HvpatchCarrierTaskState::Sibling { vm }
             },
             HvpatchPreparedTaskAuthority {
+                custody: Some(std::sync::Arc::clone(&carrier_foreign_mm_transport.custody)),
                 mappings,
                 mm_root_slot,
                 container_root,
@@ -16440,6 +16776,16 @@ impl HvpatchCarrierTaskStateDirectory {
         task: HvpatchPreparedTaskAuthority,
         failpoint: u8,
     ) -> Result<HvpatchTaskOnlyBackendState, TrapError> {
+        #[cfg(not(test))]
+        let custody = match task.custody.as_ref() {
+            Some(custody) => std::sync::Arc::clone(custody),
+            None => {
+                abort_prepared_task_and_carrier(task, state)?;
+                return Err(TrapError::Hypervisor(
+                    "prepared HVPatch task has no carrier VM custody".to_owned(),
+                ));
+            }
+        };
         if identity.task_serial == 0
             || identity.thread_serial == 0
             || identity.execution_generation == 0
@@ -16754,6 +17100,8 @@ impl HvpatchCarrierTaskStateDirectory {
                 cow_identity: None,
                 cow_authority_identity: None,
                 child_token_verifier: std::sync::Arc::clone(&self.child_token_verifier),
+                #[cfg(not(test))]
+                custody,
             }),
         })
     }
@@ -17219,13 +17567,20 @@ fn reapply_global_exec_readonly_spans(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Default)]
 struct GlobalFrameOwnerRollback {
+    custody: std::sync::Arc<CarrierVmCustody>,
     keys: Vec<(u64, u64)>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl GlobalFrameOwnerRollback {
+    fn new(custody: std::sync::Arc<CarrierVmCustody>) -> Self {
+        Self {
+            custody,
+            keys: Vec::new(),
+        }
+    }
+
     fn record(&mut self, key: (u64, u64)) {
         self.keys.push(key);
     }
@@ -17239,7 +17594,7 @@ impl GlobalFrameOwnerRollback {
 impl Drop for GlobalFrameOwnerRollback {
     fn drop(&mut self) {
         for &(ipa, length) in self.keys.iter().rev() {
-            let outcome = retire_global_frame_host_owner(ipa, length);
+            let outcome = retire_global_frame_host_owner_in(&self.custody, ipa, length);
             if matches!(outcome, GlobalFrameRetirementOutcome::NotFound { .. }) {
                 eprintln!(
                     "carrick: FATAL: rollback lost global frame owner IPA 0x{ipa:x} size {length}"
@@ -17441,7 +17796,9 @@ impl HvfVmState {
         let authority_retained_stage2 = frames.authority_retained_stage2.iter().copied().collect();
         drop(frames);
         drop(inventory);
-        let owners = global_frame_host_owners()
+        let owners = self
+            .custody()
+            .global_frame_host_owners
             .lock()
             .iter()
             .map(|(&key, entry)| {
@@ -17512,15 +17869,29 @@ impl HvfVmState {
     }
 
     fn retire_stage2_extent(&mut self, ipa: u64, length: u64) -> Result<(), TrapError> {
-        Self::retire_stage2_extent_from_mappings(&mut self.mappings, ipa, length)
+        #[cfg(not(test))]
+        {
+            let custody = std::sync::Arc::clone(&self.custody);
+            Self::retire_stage2_extent_from_mappings_in(&custody, &mut self.mappings, ipa, length)
+        }
+        #[cfg(test)]
+        {
+            Self::retire_stage2_extent_from_mappings_in(
+                legacy_test_carrier_vm_custody(),
+                &mut self.mappings,
+                ipa,
+                length,
+            )
+        }
     }
 
-    fn retire_stage2_extent_from_mappings(
+    fn retire_stage2_extent_from_mappings_in(
+        custody: &CarrierVmCustody,
         mappings: &mut [HvfMappedRegion],
         ipa: u64,
         length: u64,
     ) -> Result<(), TrapError> {
-        let outcome = retire_global_frame_host_owner(ipa, length);
+        let outcome = retire_global_frame_host_owner_in(custody, ipa, length);
         if outcome.is_retired()
             || matches!(outcome, GlobalFrameRetirementOutcome::UnmapFailed { .. })
         {
@@ -17574,7 +17945,8 @@ impl HvfVmState {
         Ok(())
     }
 
-    fn retire_unowned_stage2_extent_from_mappings(
+    fn retire_unowned_stage2_extent_from_mappings_in(
+        custody: &CarrierVmCustody,
         mappings: &mut [HvfMappedRegion],
         ipa: u64,
         length: u64,
@@ -17584,7 +17956,7 @@ impl HvfVmState {
             host_addr,
             generation: 0,
         };
-        if let Some(live) = global_frame_host_owner_identity(ipa, length) {
+        if let Some(live) = global_frame_host_owner_identity_in(custody, ipa, length) {
             return Err(TrapError::Hypervisor(format!(
                 "unowned stage-2 retirement {ipa:#x}/{length:#x} found live global owner {live:?}"
             )));
@@ -17619,6 +17991,36 @@ impl HvfVmState {
             )));
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn retire_stage2_extent_from_mappings(
+        mappings: &mut [HvfMappedRegion],
+        ipa: u64,
+        length: u64,
+    ) -> Result<(), TrapError> {
+        Self::retire_stage2_extent_from_mappings_in(
+            legacy_test_carrier_vm_custody(),
+            mappings,
+            ipa,
+            length,
+        )
+    }
+
+    #[cfg(test)]
+    fn retire_unowned_stage2_extent_from_mappings(
+        mappings: &mut [HvfMappedRegion],
+        ipa: u64,
+        length: u64,
+        host_addr: usize,
+    ) -> Result<(), TrapError> {
+        Self::retire_unowned_stage2_extent_from_mappings_in(
+            legacy_test_carrier_vm_custody(),
+            mappings,
+            ipa,
+            length,
+            host_addr,
+        )
     }
 
     fn inventory_generation(raw: u64) -> carrick_hal::MappingGeneration {
@@ -18108,7 +18510,8 @@ impl HvfVmState {
         Ok(true)
     }
 
-    fn stage_mapping(
+    fn stage_mapping_in(
+        custody: &CarrierVmCustody,
         inventory: &mut HvpatchFrameInventory,
         reservation: &mut carrick_hal::FrameInventoryReservation,
         stage: InventoryMappingStage,
@@ -18211,7 +18614,7 @@ impl HvfVmState {
             })?;
         let stage2_lease = stage2_lease.unwrap_or((gpa, length));
         if is_reusable_global_frame_extent(stage2_lease.0, stage2_lease.1) {
-            match global_frame_host_owner_identity(stage2_lease.0, stage2_lease.1) {
+            match global_frame_host_owner_identity_in(custody, stage2_lease.0, stage2_lease.1) {
                 Some(live)
                     if stage2_owner.generation != 0
                         && live == (stage2_owner.host_addr, stage2_owner.generation) => {}
@@ -18264,6 +18667,20 @@ impl HvfVmState {
         };
         inventory.extents.insert((gpa, length), extent);
         Ok(extent)
+    }
+
+    #[cfg(test)]
+    fn stage_mapping(
+        inventory: &mut HvpatchFrameInventory,
+        reservation: &mut carrick_hal::FrameInventoryReservation,
+        stage: InventoryMappingStage,
+    ) -> Result<InventoryExtent, TrapError> {
+        Self::stage_mapping_in(
+            legacy_test_carrier_vm_custody(),
+            inventory,
+            reservation,
+            stage,
+        )
     }
 
     fn rollback_unpublished_mappings(
@@ -18489,7 +18906,8 @@ impl HvfVmState {
                     region.physical_ipa
                 ))
             })?;
-            Self::stage_mapping(
+            Self::stage_mapping_in(
+                self.custody(),
                 &mut inventory,
                 &mut reservation,
                 InventoryMappingStage {
@@ -18739,6 +19157,12 @@ impl HvfVmState {
     pub(crate) fn retire_task_state_process_mappings(
         task: &mut HvfTaskState,
     ) -> Result<(), TrapError> {
+        #[cfg(not(test))]
+        let custody = std::sync::Arc::clone(&task.custody);
+        #[cfg(not(test))]
+        let custody = custody.as_ref();
+        #[cfg(test)]
+        let custody = legacy_test_carrier_vm_custody();
         // Mature VMM processes own a private VM and retain the historical
         // teardown path; only the persistent single-VM HVPatch lane publishes
         // per-process frame-inventory retirement.
@@ -18845,7 +19269,7 @@ impl HvfVmState {
                     })
                     .collect();
                 if is_reusable_global_frame_extent(ipa, length) {
-                    let live_owner = global_frame_host_owner_identity(ipa, length);
+                    let live_owner = global_frame_host_owner_identity_in(custody, ipa, length);
                     if extent.stage2_owner.generation == 0 {
                         if live_owner.is_some() {
                             return Err(TrapError::Hypervisor(format!(
@@ -18983,7 +19407,7 @@ impl HvfVmState {
                 ))
             })?;
             if is_reusable_global_frame_extent(ipa, length) {
-                let live_owner = global_frame_host_owner_identity(ipa, length);
+                let live_owner = global_frame_host_owner_identity_in(custody, ipa, length);
                 if owner.generation == 0 {
                     if live_owner.is_some() {
                         return Err(TrapError::Hypervisor(format!(
@@ -18991,7 +19415,8 @@ impl HvfVmState {
                         )));
                     }
                     if Self::retire_stage2_candidate_if_unreferenced(&frames, lease, || {
-                        Self::retire_unowned_stage2_extent_from_mappings(
+                        Self::retire_unowned_stage2_extent_from_mappings_in(
+                            custody,
                             &mut task.mappings,
                             ipa,
                             length,
@@ -19002,7 +19427,8 @@ impl HvfVmState {
                     }
                 } else if live_owner == Some((owner.host_addr, owner.generation)) {
                     if Self::retire_stage2_candidate_if_unreferenced(&frames, lease, || {
-                        let outcome = retire_global_frame_host_owner_if_generation(
+                        let outcome = retire_global_frame_host_owner_if_generation_in(
+                            custody,
                             ipa,
                             length,
                             owner.generation,
@@ -19032,7 +19458,12 @@ impl HvfVmState {
                 }
             } else {
                 if Self::retire_stage2_candidate_if_unreferenced(&frames, lease, || {
-                    Self::retire_stage2_extent_from_mappings(&mut task.mappings, ipa, length)
+                    Self::retire_stage2_extent_from_mappings_in(
+                        custody,
+                        &mut task.mappings,
+                        ipa,
+                        length,
+                    )
                 })? {
                     extents.insert((ipa, size));
                 }
@@ -19208,10 +19639,14 @@ impl HvfVmState {
         };
         enable_el0_counter_access(vcpu.id());
 
+        #[cfg(not(test))]
+        let custody = std::sync::Arc::clone(&carrier_foreign_mm_transport.custody);
         let mut state = HvfVmState {
             _vm: std::mem::ManuallyDrop::new(vm),
             carrier_foreign_mm_transport,
             task: HvfTaskState {
+                #[cfg(not(test))]
+                custody,
                 mappings: Vec::new(),
                 mm_root_slot: None,
                 container_root: ContainerRootToken::next(),
@@ -19271,7 +19706,10 @@ impl HvfVmState {
                             key.0, key.1
                         ))
                     })?;
-                    let mut region = prepare_exec_region_raw(mapping)?;
+                    let mut region = prepare_exec_region_raw_in(
+                        &state.carrier_foreign_mm_transport.custody,
+                        mapping,
+                    )?;
                     let install = exec_stage2_install(mapping, &region);
                     let rc = unsafe {
                         inventory_hv_vm_map(
@@ -19288,7 +19726,11 @@ impl HvfVmState {
                         )));
                     }
                     lease.mark_mapped();
-                    publish_exec_region_host_owner(&mut region, lease)?;
+                    publish_exec_region_host_owner_in(
+                        &state.carrier_foreign_mm_transport.custody,
+                        &mut region,
+                        lease,
+                    )?;
                     state.mappings.push(region);
                 }
                 if !stage2_leases.is_empty() {
@@ -19315,7 +19757,11 @@ impl HvfVmState {
                         if mapping.perms.write { '+' } else { '-' },
                         if mapping.perms.execute { '+' } else { '-' },
                     );
-                    let region = map_region_raw(mapping, false)?;
+                    let region = map_region_raw_in(
+                        &state.carrier_foreign_mm_transport.custody,
+                        mapping,
+                        false,
+                    )?;
                     state.mappings.push(region);
                 }
                 plan
@@ -19858,7 +20304,8 @@ impl HvfVmState {
             inventory_backing,
             shared_key_base: 0,
             shared_key_offset: 0,
-            owner_generation: global_frame_host_owner_generation(
+            owner_generation: global_frame_host_owner_generation_in(
+                self.custody(),
                 physical_ipa,
                 physical_size as u64,
             ),
@@ -20075,7 +20522,8 @@ impl HvfVmState {
                     self.container_root,
                 ) && start >= alias.start
                     && start < alias.start.saturating_add(alias.size as u64)
-                    && global_frame_host_owner_matches(
+                    && global_frame_host_owner_matches_in(
+                        self.custody(),
                         alias.physical_ipa,
                         alias.physical_size as u64,
                         alias.physical_host_addr,
@@ -20096,7 +20544,7 @@ impl HvfVmState {
             .filter(|mapping| {
                 mapping.start > start
                     && mapping.start < end
-                    && global_frame_region_owner_matches(mapping)
+                    && global_frame_region_owner_matches_in(self.custody(), mapping)
             })
             .map(|mapping| mapping.start)
             .min();
@@ -20110,7 +20558,8 @@ impl HvfVmState {
                     self.container_root,
                 ) && alias.start > start
                     && alias.start < end
-                    && global_frame_host_owner_matches(
+                    && global_frame_host_owner_matches_in(
+                        self.custody(),
                         alias.physical_ipa,
                         alias.physical_size as u64,
                         alias.physical_host_addr,
@@ -20188,14 +20637,19 @@ impl HvfVmState {
             )));
         }
         lease.mark_mapped();
-        let owner_generation =
-            register_global_frame_host_owner(lease, host_mapping, u64::from(stage2_perms))?;
-        let mut owner_rollback = GlobalFrameOwnerRollback::default();
+        let owner_generation = register_global_frame_host_owner_in(
+            self.custody(),
+            lease,
+            host_mapping,
+            u64::from(stage2_perms),
+        )?;
+        let mut owner_rollback = GlobalFrameOwnerRollback::new(self.carrier_vm_custody());
         owner_rollback.record((physical_ipa, physical_len));
 
         let inventory_mapping = {
             let mut inventory = self.frame_inventory.lock();
-            Self::stage_mapping(
+            Self::stage_mapping_in(
+                self.custody(),
                 &mut inventory,
                 &mut reservation,
                 InventoryMappingStage {
@@ -20647,14 +21101,19 @@ impl HvfVmState {
             )));
         }
         new_lease.mark_mapped();
-        let owner_generation =
-            register_global_frame_host_owner(new_lease, new_host, u64::from(stage2_perms))?;
-        let mut owner_rollback = GlobalFrameOwnerRollback::default();
+        let owner_generation = register_global_frame_host_owner_in(
+            self.custody(),
+            new_lease,
+            new_host,
+            u64::from(stage2_perms),
+        )?;
+        let mut owner_rollback = GlobalFrameOwnerRollback::new(self.carrier_vm_custody());
         owner_rollback.record((new_physical_ipa, CowArmedRanges::COMPOUND_SIZE));
 
         let inventory_mapping = {
             let mut inventory = self.frame_inventory.lock();
-            Self::stage_mapping(
+            Self::stage_mapping_in(
+                self.custody(),
                 &mut inventory,
                 &mut reservation,
                 InventoryMappingStage {
@@ -21197,8 +21656,12 @@ impl HvfVmState {
             )));
         }
         new_lease.mark_mapped();
-        let owner_generation =
-            register_global_frame_host_owner(new_lease, new_host, u64::from(stage2_perms))?;
+        let owner_generation = register_global_frame_host_owner_in(
+            self.custody(),
+            new_lease,
+            new_host,
+            u64::from(stage2_perms),
+        )?;
 
         let backing = Self::private_backing_identity();
         let split = match Self::stage_cow_inventory_split(
@@ -21218,8 +21681,11 @@ impl HvfVmState {
         ) {
             Ok(split) => split,
             Err(error) => {
-                let _ =
-                    retire_global_frame_host_owner(new_physical_ipa, CowArmedRanges::COMPOUND_SIZE);
+                let _ = retire_global_frame_host_owner_in(
+                    self.custody(),
+                    new_physical_ipa,
+                    CowArmedRanges::COMPOUND_SIZE,
+                );
                 return Err(error);
             }
         };
@@ -21400,7 +21866,11 @@ impl HvfVmState {
                     std::process::abort();
                 }
             }
-            let _ = retire_global_frame_host_owner(new_physical_ipa, CowArmedRanges::COMPOUND_SIZE);
+            let _ = retire_global_frame_host_owner_in(
+                self.custody(),
+                new_physical_ipa,
+                CowArmedRanges::COMPOUND_SIZE,
+            );
             return Err(error);
         }
         // Publication succeeded: nothing needs the pre-image any more, so hand
@@ -22367,7 +22837,8 @@ impl HvfVmState {
             lease.mark_mapped();
         }
         let (host_mapping, owner_generation) = if self.persistent_vm_lifecycle {
-            let owner_generation = register_global_frame_host_owner(
+            let owner_generation = register_global_frame_host_owner_in(
+                self.custody(),
                 global_lease.take().ok_or_else(|| {
                     TrapError::Hypervisor("HVPatch alias lost its global IPA lease".to_owned())
                 })?,
@@ -22432,7 +22903,8 @@ impl HvfVmState {
                 );
                 std::process::abort();
             });
-            match Self::stage_mapping(
+            match Self::stage_mapping_in(
+                self.custody(),
                 &mut inventory,
                 &mut reservation,
                 InventoryMappingStage {
@@ -22596,7 +23068,8 @@ impl HvfVmState {
                     let stage1_lookup = self
                         .translate_va(chunk_address)
                         .unwrap_or(translated_lookup);
-                    let Some((mapping_start, mapping_end)) = copy_from_global_frame_owner(
+                    let Some((mapping_start, mapping_end)) = copy_from_global_frame_owner_in(
+                        self.custody(),
                         stage1_lookup,
                         &mut dst[copied..copied + chunk_len],
                     ) else {
@@ -22610,7 +23083,7 @@ impl HvfVmState {
                                 .iter()
                                 .any(|mapping| Self::region_owns_ipa(mapping, ipa))
                         });
-                        let owner_count = global_frame_host_owners().lock().len();
+                        let owner_count = self.custody().global_frame_host_owners.lock().len();
                         return Err(MemoryError::HostMap(format!(
                             "live core read has no current backing: va=0x{chunk_address:x} len={chunk_len} hot_lookup=0x{translated_lookup:x} stage1={stage1:x?} mappings={} semantic_mapping={semantic_mapping} stage1_mapping={stage1_mapping} global_owners={owner_count} persistent={}",
                             self.mappings.len(),
@@ -22678,7 +23151,8 @@ impl HvfVmState {
         // global frames deliberately have VA != IPA, so this lookup MUST stay
         // in the raw IPA domain; treating the GPA as a second VA made every
         // fork-shared futex fall through to the process-private table.
-        if let Some(location) = Self::shared_futex_mapping_for_ipa(
+        if let Some(location) = Self::shared_futex_mapping_for_ipa_in(
+            self.custody(),
             &self.mappings,
             backing_gpa,
             self.persistent_vm_lifecycle,
@@ -22700,7 +23174,8 @@ impl HvfVmState {
         None
     }
 
-    fn shared_futex_mapping_for_ipa(
+    fn shared_futex_mapping_for_ipa_in(
+        custody: &CarrierVmCustody,
         mappings: &[HvfMappedRegion],
         backing_gpa: u64,
         persistent_vm_lifecycle: bool,
@@ -22716,10 +23191,24 @@ impl HvfVmState {
                         mapping.physical_ipa,
                         mapping.physical_size as u64,
                     )
-                    || global_frame_region_owner_matches(mapping)))
+                    || global_frame_region_owner_matches_in(custody, mapping)))
             .then(|| mapping.view().shared_futex_location_for_ipa(backing_gpa))
             .flatten()
         })
+    }
+
+    #[cfg(test)]
+    fn shared_futex_mapping_for_ipa(
+        mappings: &[HvfMappedRegion],
+        backing_gpa: u64,
+        persistent_vm_lifecycle: bool,
+    ) -> Option<carrick_guest_mem::SharedFutexLocation> {
+        Self::shared_futex_mapping_for_ipa_in(
+            legacy_test_carrier_vm_custody(),
+            mappings,
+            backing_gpa,
+            persistent_vm_lifecycle,
+        )
     }
 
     pub(crate) fn write_guest_bytes(
@@ -22891,7 +23380,8 @@ impl HvfVmState {
             // republish its semantic lifetime edge before a later sibling
             // munmap is allowed to retire the containing stage-2 lease.
             let retained_fragment = retained_ipa.and_then(|ipa| {
-                retained_private_reuse_alias_fragment(
+                retained_private_reuse_alias_fragment_in(
+                    &self.carrier_foreign_mm_transport.custody,
                     &alias_registry().lock(),
                     chunk_va,
                     ipa,
@@ -23475,12 +23965,13 @@ impl HvfVmState {
                     mapping.physical_ipa,
                     mapping.physical_size as u64,
                 )
-                || global_frame_region_owner_matches(mapping)
+                || global_frame_region_owner_matches_in(self.custody(), mapping)
         };
         let alias_is_live = |alias: &AliasBacking| {
             !self.persistent_vm_lifecycle
                 || !is_reusable_global_frame_extent(alias.physical_ipa, alias.physical_size as u64)
-                || global_frame_host_owner_matches(
+                || global_frame_host_owner_matches_in(
+                    self.custody(),
                     alias.physical_ipa,
                     alias.physical_size as u64,
                     alias.physical_host_addr,
@@ -23686,7 +24177,7 @@ impl HvfVmState {
                         mapping.physical_ipa,
                         mapping.physical_size as u64,
                     )
-                    || global_frame_region_owner_matches(mapping))
+                    || global_frame_region_owner_matches_in(self.custody(), mapping))
         }) {
             return Some(mapping.view());
         }
@@ -23714,7 +24205,8 @@ impl HvfVmState {
                             alias.physical_ipa,
                             alias.physical_size as u64,
                         )
-                        || global_frame_host_owner_matches(
+                        || global_frame_host_owner_matches_in(
+                            self.custody(),
                             alias.physical_ipa,
                             alias.physical_size as u64,
                             alias.physical_host_addr,
@@ -24341,10 +24833,14 @@ impl HvfVmState {
         let vcpu = create_vcpu(&vm)?;
         enable_el0_counter_access(vcpu.id());
 
+        #[cfg(not(test))]
+        let custody = std::sync::Arc::clone(&carrier_foreign_mm_transport.custody);
         let mut state = HvfVmState {
             _vm: std::mem::ManuallyDrop::new(vm),
             carrier_foreign_mm_transport,
             task: HvfTaskState {
+                #[cfg(not(test))]
+                custody,
                 mappings: Vec::with_capacity(mappings.len()),
                 mm_root_slot,
                 container_root,
@@ -24618,7 +25114,8 @@ impl HvfTaskState {
                 ForkMappingDisposition::SharedFrameWritable
                     | ForkMappingDisposition::SharedFrameReadOnly
             ) {
-                let inherited = inherited_fork_inventory_extents(mapping, &parent_inventory);
+                let inherited =
+                    inherited_fork_inventory_extents_in(self.custody(), mapping, &parent_inventory);
                 // Fork lineage debug: CARRICK_FORK_DEBUG_VA=<hex guest VA>
                 // prints, for the mapping covering that VA, every inherited
                 // extent and — crucially — a mapping DROPPED for having none.
@@ -25271,7 +25768,8 @@ impl HvfVmState {
                 ) {
                     match (mapping.stage2_lease.take(), mapping.host) {
                         (Some(lease), ProcessMappingHost::Owned(host_mapping)) => {
-                            let owner_generation = register_global_frame_host_owner(
+                            let owner_generation = register_global_frame_host_owner_in(
+                                &plan.carrier_foreign_mm_transport.custody,
                                 lease,
                                 host_mapping,
                                 u64::from(mapping.perms),
@@ -25365,8 +25863,11 @@ impl HvfVmState {
             let mut inventory = plan.frame_inventory.lock();
             for mapping in inventory_mappings {
                 let stage2_owner = if is_reusable_global_frame_extent(mapping.gpa, mapping.length) {
-                    let generation =
-                        global_frame_host_owner_generation(mapping.gpa, mapping.length);
+                    let generation = global_frame_host_owner_generation_in(
+                        &plan.carrier_foreign_mm_transport.custody,
+                        mapping.gpa,
+                        mapping.length,
+                    );
                     InventoryStage2OwnerIdentity {
                         host_addr: mapping.stage2_owner.host_addr,
                         // If registered in `global_frame_host_owners()` above, use the authoritative
@@ -25389,7 +25890,8 @@ impl HvfVmState {
                 } else {
                     mapping.stage2_owner
                 };
-                let staged = match Self::stage_mapping(
+                let staged = match Self::stage_mapping_in(
+                    &plan.carrier_foreign_mm_transport.custody,
                     &mut inventory,
                     &mut process_reservation,
                     InventoryMappingStage {
@@ -25421,7 +25923,9 @@ impl HvfVmState {
                                 mapping.physical_ipa,
                                 mapping.physical_size as u64,
                             ) {
-                                global_frame_host_owners()
+                                plan.carrier_foreign_mm_transport
+                                    .custody
+                                    .global_frame_host_owners
                                     .lock()
                                     .remove(&(mapping.physical_ipa, mapping.physical_size as u64));
                             }
@@ -25454,6 +25958,9 @@ impl HvfVmState {
         Ok((
             stage2_leases,
             HvpatchPreparedTaskAuthority {
+                custody: Some(std::sync::Arc::clone(
+                    &plan.carrier_foreign_mm_transport.custody,
+                )),
                 mappings: mapped,
                 mm_root_slot: Some(plan.mm_root_slot),
                 container_root: plan.container_root,
@@ -25565,7 +26072,8 @@ impl HvfVmState {
                 ) {
                     match (mapping.stage2_lease.take(), mapping.host) {
                         (Some(lease), ProcessMappingHost::Owned(host_mapping)) => {
-                            let owner_generation = register_global_frame_host_owner(
+                            let owner_generation = register_global_frame_host_owner_in(
+                                &plan.carrier_foreign_mm_transport.custody,
                                 lease,
                                 host_mapping,
                                 u64::from(mapping.perms),
@@ -25663,10 +26171,14 @@ impl HvfVmState {
                 mm_access.install_structural_owner(std::sync::Arc::clone(owner));
             }
         }
+        #[cfg(not(test))]
+        let custody = std::sync::Arc::clone(&plan.carrier_foreign_mm_transport.custody);
         let mut state = HvfVmState {
             _vm: std::mem::ManuallyDrop::new(vm),
             carrier_foreign_mm_transport: std::sync::Arc::clone(&plan.carrier_foreign_mm_transport),
             task: HvfTaskState {
+                #[cfg(not(test))]
+                custody,
                 mappings: mapped,
                 mm_root_slot: Some(plan.mm_root_slot),
                 container_root: plan.container_root,
@@ -25715,8 +26227,11 @@ impl HvfVmState {
             let mut staged_mappings = Vec::with_capacity(inventory_mappings.len());
             for mapping in inventory_mappings {
                 let stage2_owner = if is_reusable_global_frame_extent(mapping.gpa, mapping.length) {
-                    let generation =
-                        global_frame_host_owner_generation(mapping.gpa, mapping.length);
+                    let generation = global_frame_host_owner_generation_in(
+                        &plan.carrier_foreign_mm_transport.custody,
+                        mapping.gpa,
+                        mapping.length,
+                    );
                     InventoryStage2OwnerIdentity {
                         host_addr: mapping.stage2_owner.host_addr,
                         // If registered in `global_frame_host_owners()` above, use the authoritative
@@ -25739,7 +26254,8 @@ impl HvfVmState {
                 } else {
                     mapping.stage2_owner
                 };
-                let staged = match Self::stage_mapping(
+                let staged = match Self::stage_mapping_in(
+                    &plan.carrier_foreign_mm_transport.custody,
                     &mut inventory,
                     &mut process_reservation,
                     InventoryMappingStage {
@@ -25770,7 +26286,9 @@ impl HvfVmState {
                                 mapping.physical_ipa,
                                 mapping.physical_size as u64,
                             ) {
-                                global_frame_host_owners()
+                                plan.carrier_foreign_mm_transport
+                                    .custody
+                                    .global_frame_host_owners
                                     .lock()
                                     .remove(&(mapping.physical_ipa, mapping.physical_size as u64));
                             }
@@ -25818,6 +26336,7 @@ impl HvfVmState {
         plan: &GuestMappingPlan,
     ) -> Result<(), TrapError> {
         use applevisor::prelude::*;
+        let custody = self.carrier_vm_custody();
         let predecessor_mm_root_slot = self.mm_root_slot;
         let replacement_mm_root_slot = if self.persistent_vm_lifecycle {
             self.pending_exec_mm_root_slot.ok_or_else(|| {
@@ -25908,7 +26427,7 @@ impl HvfVmState {
                         key.0, key.1
                     ))
                 })?;
-                let region = prepare_exec_region_raw(mapping)?;
+                let region = prepare_exec_region_raw_in(&custody, mapping)?;
                 prepared_exec_regions.push((region, lease));
             }
             if !stage2_leases.is_empty() {
@@ -26169,7 +26688,7 @@ impl HvfVmState {
                 .map(|&(ipa, size)| {
                     (
                         (ipa, size),
-                        global_frame_host_owner_generation(ipa, size as u64),
+                        global_frame_host_owner_generation_in(&custody, ipa, size as u64),
                     )
                 })
                 .collect();
@@ -26177,6 +26696,8 @@ impl HvfVmState {
             if self
                 .pending_exec_stage2_cleanup
                 .replace(PendingExecStage2Cleanup {
+                    #[cfg(not(test))]
+                    custody: std::sync::Arc::clone(&custody),
                     mappings: predecessor_mappings,
                     extents: predecessor_extents,
                     frames: predecessor_frames,
@@ -26269,15 +26790,20 @@ impl HvfVmState {
         // back. Mature VMM still maps through the historical helper here.
         if self.persistent_vm_lifecycle {
             for (mut region, lease) in prepared_exec_regions.drain(..) {
-                publish_exec_region_host_owner(&mut region, lease).unwrap_or_else(|error| {
-                    eprintln!("carrick: FATAL: publish HVPatch exec global-frame owner: {error}");
-                    std::process::abort();
-                });
+                publish_exec_region_host_owner_in(&custody, &mut region, lease).unwrap_or_else(
+                    |error| {
+                        eprintln!(
+                            "carrick: FATAL: publish HVPatch exec global-frame owner: {error}"
+                        );
+                        std::process::abort();
+                    },
+                );
                 self.mappings.push(region);
             }
         } else {
             for mapping in &plan.mappings {
-                self.mappings.push(map_region_raw(mapping, false)?);
+                self.mappings
+                    .push(map_region_raw_in(&custody, mapping, false)?);
             }
         }
         if let Some((retired, mut replacement)) = inventory_reservations.take() {
@@ -26293,7 +26819,8 @@ impl HvfVmState {
                             );
                             std::process::abort();
                         });
-                    let staged = match Self::stage_mapping(
+                    let staged = match Self::stage_mapping_in(
+                        &custody,
                         &mut inventory,
                         &mut replacement,
                         InventoryMappingStage {
@@ -27564,7 +28091,10 @@ fn carrier_exit_without_a_vm_is_a_recorded_no_op() {
     );
 }
 
-fn prepare_exec_region_raw(mapping: &GuestMapping) -> Result<HvfMappedRegion, TrapError> {
+fn prepare_exec_region_raw_in(
+    custody: &CarrierVmCustody,
+    mapping: &GuestMapping,
+) -> Result<HvfMappedRegion, TrapError> {
     let requested_size = usize::try_from(mapping.mapped_size)
         .map_err(|_| TrapError::MappingTooLarge(mapping.mapped_size))?;
     let backing_started = std::time::Instant::now();
@@ -27614,8 +28144,17 @@ fn prepare_exec_region_raw(mapping: &GuestMapping) -> Result<HvfMappedRegion, Tr
         guest_writable: mapping.perms.write,
         shared_key_base: 0,
         shared_key_offset: 0,
-        owner_generation: global_frame_host_owner_generation(mapping.ipa_start, size as u64),
+        owner_generation: global_frame_host_owner_generation_in(
+            custody,
+            mapping.ipa_start,
+            size as u64,
+        ),
     })
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn prepare_exec_region_raw(mapping: &GuestMapping) -> Result<HvfMappedRegion, TrapError> {
+    prepare_exec_region_raw_in(legacy_test_carrier_vm_custody(), mapping)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -27630,7 +28169,8 @@ fn exec_stage2_install(mapping: &GuestMapping, region: &HvfMappedRegion) -> Exec
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn map_region_raw(
+fn map_region_raw_in(
+    custody: &CarrierVmCustody,
     mapping: &GuestMapping,
     emit_exec_backing_census: bool,
 ) -> Result<HvfMappedRegion, TrapError> {
@@ -27738,7 +28278,11 @@ fn map_region_raw(
         guest_writable: mapping.perms.write,
         shared_key_base: 0,
         shared_key_offset: 0,
-        owner_generation: global_frame_host_owner_generation(mapping.ipa_start, size as u64),
+        owner_generation: global_frame_host_owner_generation_in(
+            custody,
+            mapping.ipa_start,
+            size as u64,
+        ),
     })
 }
 
