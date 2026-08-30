@@ -1918,6 +1918,14 @@
     {
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "STRUCTURAL_EPOCH_ALLOCATOR",
+      "fingerprint": "a7481b4fb92940c93b18cc3e9b4d1f52a042ff99da74a5b5afd8918fb204b5d2",
+      "classification": "monotonic_allocator",
+      "rationale": "Carrier-wide monotonic allocator STRUCTURAL_EPOCH_ALLOCATOR in crates/carrick-vmm-hvf/src/trap.rs generating unique structural epoch IDs across the host process."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "VCPU_CREATED_TOTAL",
       "fingerprint": "2e756ac7bd71d45ccd7c3226d04184881634330b1bb5e4463e0dd829e43a0d45",
       "classification": "carrier_infra",
@@ -2063,7 +2071,7 @@
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "frame_inventory_backend_tests::NEXT_TEST_PHYSICAL_IPA",
-      "fingerprint": "e03effbb2832e841f6968d338d9b1bb31096318e0a2f955c3834c41df5bf52f5",
+      "fingerprint": "b893935ee937c7974ef9469857d16d56359a7fe1e710c3aff3836e0d1c7798af",
       "classification": "test_only",
       "rationale": "Test-only fixture or lock frame_inventory_backend_tests::NEXT_TEST_PHYSICAL_IPA in crates/carrick-vmm-hvf/src/trap.rs scoped strictly to test harness execution."
     },
@@ -2330,6 +2338,14 @@
       "fingerprint": "d7a80eaeabb4a73206d52e64bec9c974ce8f2453dc622c3656d77b3e1d002232",
       "classification": "carrier_infra",
       "rationale": "Host thread-local cell THREAD_MAILBOX_SLOT_CLAIMS_TOTAL in crates/carrick-vmm-hvf/src/syscall_mailbox.rs maintaining per-host-thread execution state for the carrier."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "STAGE2_MAP_STUB_IN_TEST",
+      "fingerprint": "56e63dfeaf6c518c6dcd7167f28eb1690c1ace5cb6c186409f1d77875d3835c3",
+      "classification": "test_only",
+      "rationale": "Test-only thread-local cell STAGE2_MAP_STUB_IN_TEST in crates/carrick-vmm-hvf/src/trap.rs enabling hypervisor stage-2 stub in unit tests."
     },
     {
       "kind": "thread_local",
