@@ -12657,7 +12657,11 @@ impl SyscallDispatcher {
                 base: OpenDescriptionBase::new(flags & LINUX_O_NONBLOCK),
                 state: Arc::new(state),
             };
-            Ok(this.install_fd(description, linux_fd_flags_from_open_flags(flags)))
+            Ok(this.install_fd_with_status_flags(
+                description,
+                flags & LINUX_O_NONBLOCK,
+                linux_fd_flags_from_open_flags(flags),
+            ))
         }
 
         fn inotify_add_watch(this, cx, fd: Fd, pathname: GuestPtr, mask: u64) {
