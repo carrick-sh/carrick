@@ -286,7 +286,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "perform_foreign_cow_transaction",
       "ordinal_in_function": 18,
-      "fingerprint": "a40cfc9e75937b66460270f8605050403d77e177a2b33eb09a4965fff23ca1ce",
+      "fingerprint": "41f18c9dfe67859b720c7473acb429a652c792ddde2ea0f5bdab81e5d41bb089",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "Failed to retrieve registered global frame host owner Arc when retaining foreign extent for lease guard."
@@ -547,7 +547,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvpatchCarrierTaskStateDirectory::publish_inner",
       "ordinal_in_function": 1,
-      "fingerprint": "3a4c8cc093aa822bacf9c9d83877528a979ad8d46618018ce619e38dff8c07c7",
+      "fingerprint": "7cacf53a3144493187fcac5cd8df1af4b74141378286a1e17f07598b2a6af478",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Carrier frame registry authority was missing when constructing live sibling carrier MM authority during directory publication."
@@ -556,7 +556,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvpatchCarrierTaskStateDirectory::publish_inner",
       "ordinal_in_function": 2,
-      "fingerprint": "3a4c8cc093aa822bacf9c9d83877528a979ad8d46618018ce619e38dff8c07c7",
+      "fingerprint": "7cacf53a3144493187fcac5cd8df1af4b74141378286a1e17f07598b2a6af478",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Carrier frame registry authority was missing when constructing shared process carrier MM authority during directory publication."
@@ -565,7 +565,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvpatchCarrierTaskStateDirectory::publish_inner",
       "ordinal_in_function": 3,
-      "fingerprint": "3a4c8cc093aa822bacf9c9d83877528a979ad8d46618018ce619e38dff8c07c7",
+      "fingerprint": "7cacf53a3144493187fcac5cd8df1af4b74141378286a1e17f07598b2a6af478",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Carrier frame registry authority was missing when constructing new process carrier MM authority during directory publication."
@@ -628,7 +628,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "<GlobalFrameOwnerRollback as Drop>::drop",
       "ordinal_in_function": 1,
-      "fingerprint": "091c8b5dbeda35a0a53f97d950dfed99d17983ff4c6bd19e51507ec0d7489e1e",
+      "fingerprint": "094c1d0a3142be169b39f3258ad8fd4eff947744cb8460fdf4950834227bc8b1",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Failure to retire global frame host owner during rollback leaves the global frame host-owner generation registry corrupted or desynchronized."
@@ -664,7 +664,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::retire_task_state_process_mappings",
       "ordinal_in_function": 1,
-      "fingerprint": "74dfcdd3075137710a2b78a7a21fc128c2786623e6eca2208a65cea4159ffcb9",
+      "fingerprint": "d01eb747ac8535013505b6189720dfb5cb874153099e6c4a9aacba58ac12ee1c",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Validated retirement reservation disappeared from inventory ledger during process mapping retirement, indicating concurrent state mutation or broken transaction atomicity."
@@ -934,7 +934,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::prepare_task_only_plan",
       "ordinal_in_function": 1,
-      "fingerprint": "cdfa9b5e3f6db11f5a84bafef5571a110d342f5dc45bbda060a58087638793c4",
+      "fingerprint": "9c89365fbe8e50ff174990325c103ce6e0614af8466c21c0f3e869a13f207e15",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Rollback of staged unpublished inventory mappings failed during task-only child process preparation, leaving frame inventory in a corrupted state."
@@ -943,7 +943,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::from_process_spec",
       "ordinal_in_function": 1,
-      "fingerprint": "ad6d323098717ca1f82835f7b1db38c80760a956d8611d0adada8e57c6c1c5d5",
+      "fingerprint": "84175f8a5870ac96bb57dac06c3d8ea7c431c47d32accf2bb1e8dcfa09b152e8",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Rollback of staged unpublished inventory mappings failed during process materialization from spec, leaving frame inventory in a corrupted state."
