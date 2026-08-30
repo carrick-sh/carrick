@@ -2342,10 +2342,10 @@
     {
       "kind": "thread_local",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "STAGE2_MAP_STUB_IN_TEST",
-      "fingerprint": "56e63dfeaf6c518c6dcd7167f28eb1690c1ace5cb6c186409f1d77875d3835c3",
+      "symbol": "STAGE2_AUDIT_STATE",
+      "fingerprint": "f4a8dd5e57f884559783cd3de35e10deac5ea59dfd6c204ad6ecdf6f75b88658",
       "classification": "test_only",
-      "rationale": "Test-only thread-local cell STAGE2_MAP_STUB_IN_TEST in crates/carrick-vmm-hvf/src/trap.rs enabling hypervisor stage-2 stub in unit tests."
+      "rationale": "Test-only thread-local cell STAGE2_AUDIT_STATE in crates/carrick-vmm-hvf/src/trap.rs enabling hypervisor stage-2 audit and failure injection in unit tests."
     },
     {
       "kind": "thread_local",

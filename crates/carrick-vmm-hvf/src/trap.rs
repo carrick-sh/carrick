@@ -1950,13 +1950,137 @@ mod foreign_mm_tests {
     }
 
     #[test]
+    fn global_frame_host_owner_exact_drop_order() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let size = 0x4000usize;
+        let ipa = 0x8800_2800_0000u64;
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            size,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate host mapping for test");
+        let host_addr = mapping.as_ptr() as usize;
+        let mut lease = GlobalFrameStage2Lease::fixed(ipa, size as u64);
+        let observed_live = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        lease.drop_backing_audit = Some((host_addr, Arc::clone(&observed_live)));
+        let owner = GlobalFrameHostOwner {
+            _lease: lease,
+            _mapping: mapping,
+            perms: 7,
+            generation: 1,
+        };
+        assert!(alias_backing_is_live(host_addr));
+        drop(owner);
+        assert!(
+            observed_live.load(std::sync::atomic::Ordering::SeqCst),
+            "global frame host owner stage-2 lease must drop while host mapping is still live"
+        );
+        assert!(
+            !alias_backing_is_live(host_addr),
+            "host mapping must be unmapped after stage-2 lease release"
+        );
+    }
+
+    #[test]
+    fn all_owner_structs_declare_stage2_lease_before_host_mapping_static_audit() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let source = include_str!("trap.rs");
+
+        // 1. GlobalFrameHostOwner: _lease before _mapping
+        let gfho_hdr = concat!("\npub(crate) struct ", "GlobalFrameHostOwner {");
+        let gfho = source
+            .split(gfho_hdr)
+            .nth(1)
+            .and_then(|tail| tail.split('}').next())
+            .expect("GlobalFrameHostOwner struct body");
+        let gfho_lease = gfho
+            .find("_lease: GlobalFrameStage2Lease")
+            .expect("GlobalFrameHostOwner._lease exists");
+        let gfho_mapping = gfho
+            .find("_mapping: crate::host_mapping::OwnedHostMapping")
+            .expect("GlobalFrameHostOwner._mapping exists");
+        assert!(
+            gfho_lease < gfho_mapping,
+            "GlobalFrameHostOwner must declare _lease before _mapping for safe drop order"
+        );
+
+        // 2. StructuralBackingOwner: _stage2_lease before mapping
+        let sbo_hdr = concat!("\npub(crate) struct ", "StructuralBackingOwner {");
+        let sbo = source
+            .split(sbo_hdr)
+            .nth(1)
+            .and_then(|tail| tail.split('}').next())
+            .expect("StructuralBackingOwner struct body");
+        let sbo_lease = sbo
+            .find("_stage2_lease: GlobalFrameStage2Lease")
+            .expect("StructuralBackingOwner._stage2_lease exists");
+        let sbo_mapping = sbo
+            .find("mapping: crate::host_mapping::OwnedHostMapping")
+            .expect("StructuralBackingOwner.mapping exists");
+        assert!(
+            sbo_lease < sbo_mapping,
+            "StructuralBackingOwner must declare _stage2_lease before mapping for safe drop order"
+        );
+
+        // 3. ProcessMappingDesc: stage2_lease before host
+        let pmd_hdr = concat!("\nstruct ", "ProcessMappingDesc {");
+        let pmd_delim = concat!("struct ", "ProcessInventoryDesc");
+        let pmd = source
+            .split(pmd_hdr)
+            .nth(1)
+            .and_then(|tail| tail.split(pmd_delim).next())
+            .expect("ProcessMappingDesc struct body");
+        let pmd_lease = pmd
+            .find("stage2_lease: Option<GlobalFrameStage2Lease>")
+            .expect("ProcessMappingDesc.stage2_lease exists");
+        let pmd_host = pmd
+            .find("host: ProcessMappingHost")
+            .expect("ProcessMappingDesc.host exists");
+        assert!(
+            pmd_lease < pmd_host,
+            "ProcessMappingDesc must declare stage2_lease before host for safe drop order"
+        );
+    }
+
+    #[test]
+    fn all_foreign_mm_tests_acquire_test_lock_census_audit() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let source = include_str!("trap.rs");
+        let foreign_tests_body = source
+            .split("mod foreign_mm_tests {")
+            .nth(1)
+            .and_then(|tail| tail.split("mod task_only_carrier_directory_tests {").next())
+            .expect("foreign_mm_tests module body");
+        for block in foreign_tests_body.split("#[test]").skip(1) {
+            if !block.contains("fn ") {
+                continue;
+            }
+            let fn_name = block
+                .split("fn ")
+                .nth(1)
+                .and_then(|tail| tail.split('(').next())
+                .unwrap_or("unknown")
+                .trim();
+            assert!(
+                block.contains("FOREIGN_MM_TEST_LOCK.lock()"),
+                "test `{fn_name}` in `foreign_mm_tests` must acquire FOREIGN_MM_TEST_LOCK at entry"
+            );
+        }
+    }
+
+    #[test]
     fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycle() {
         let _guard = FOREIGN_MM_TEST_LOCK.lock();
         let _stage2_stub = ScopedStage2MapTestStub::enable();
         let root_slot_base = 0x9a00_0000_0000u64;
         let root_slot_size = 0x0020_0000usize;
 
-        // 1. Setup parent page tables and mappings with distinct payloads
+        // 1. Setup parent page tables and mappings covering all 5 required dispositions:
+        //    (a) IndependentPageTables
+        //    (b) IndependentKernelState (EL1 vectors & Mailbox)
+        //    (c) Shared Executable / RX (Code)
+        //    (d) Shared Writable User (Data)
+        //    (e) Private / COW User (Data)
         let _parent_pt = crate::page_table::PageTableManager::new(
             carrick_mem::memory::stage1_hvpatch_page_tables(),
             crate::memory::LINUX_PAGE_TABLES_BASE,
@@ -1999,27 +2123,57 @@ mod foreign_mm_tests {
             );
         }
 
-        let parent_data_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+        let parent_rx_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
             0x4000,
             crate::host_mapping::HostMappingKind::PrivateAnon,
         )
-        .expect("parent data host mapping");
-        let parent_data_addr = parent_data_host.as_ptr();
-        let data_payload = *b"parent_user_data_payload_canary!";
+        .expect("parent rx host mapping");
+        let parent_rx_addr = parent_rx_host.as_ptr();
+        let rx_payload = *b"parent_shared_rx_code_segment_payload!";
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                data_payload.as_ptr(),
-                parent_data_addr,
-                data_payload.len(),
-            );
+            std::ptr::copy_nonoverlapping(rx_payload.as_ptr(), parent_rx_addr, rx_payload.len());
         }
+        let mut parent_rx_lease = GlobalFrameStage2Lease::fixed(0x8800_3000_0000, 0x4000);
+        let rc = unsafe { inventory_hv_vm_map(parent_rx_addr.cast(), 0x8800_3000_0000, 0x4000, 5) };
+        assert_eq!(rc, 0);
+        parent_rx_lease.mark_mapped();
+        let parent_rx_gen = register_global_frame_host_owner(parent_rx_lease, parent_rx_host, 5)
+            .expect("register parent rx owner");
 
-        // Register parent data frame in global frame host owner directory
-        let mut parent_data_lease = GlobalFrameStage2Lease::fixed(0x8800_3000_0000, 0x4000);
-        parent_data_lease.mark_test_mapped_without_backend();
-        let parent_data_gen =
-            register_global_frame_host_owner(parent_data_lease, parent_data_host, 3)
-                .expect("register parent data owner");
+        let parent_rw_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            0x4000,
+            crate::host_mapping::HostMappingKind::PrivateAnon,
+        )
+        .expect("parent rw host mapping");
+        let parent_rw_addr = parent_rw_host.as_ptr();
+        let rw_payload = *b"parent_shared_rw_data_segment_payload!";
+        unsafe {
+            std::ptr::copy_nonoverlapping(rw_payload.as_ptr(), parent_rw_addr, rw_payload.len());
+        }
+        let mut parent_rw_lease = GlobalFrameStage2Lease::fixed(0x8800_4000_0000, 0x4000);
+        let rc = unsafe { inventory_hv_vm_map(parent_rw_addr.cast(), 0x8800_4000_0000, 0x4000, 3) };
+        assert_eq!(rc, 0);
+        parent_rw_lease.mark_mapped();
+        let parent_rw_gen = register_global_frame_host_owner(parent_rw_lease, parent_rw_host, 3)
+            .expect("register parent rw owner");
+
+        let parent_cow_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            0x4000,
+            crate::host_mapping::HostMappingKind::PrivateAnon,
+        )
+        .expect("parent cow host mapping");
+        let parent_cow_addr = parent_cow_host.as_ptr();
+        let cow_payload = *b"parent_private_cow_user_data_payload!";
+        unsafe {
+            std::ptr::copy_nonoverlapping(cow_payload.as_ptr(), parent_cow_addr, cow_payload.len());
+        }
+        let mut parent_cow_lease = GlobalFrameStage2Lease::fixed(0x8800_5000_0000, 0x4000);
+        let rc =
+            unsafe { inventory_hv_vm_map(parent_cow_addr.cast(), 0x8800_5000_0000, 0x4000, 3) };
+        assert_eq!(rc, 0);
+        parent_cow_lease.mark_mapped();
+        let parent_cow_gen = register_global_frame_host_owner(parent_cow_lease, parent_cow_host, 3)
+            .expect("register parent cow owner");
 
         let parent_mappings = vec![
             HvfMappedRegion {
@@ -2088,7 +2242,47 @@ mod foreign_mm_tests {
                 end: 0x0040_4000,
                 ipa: 0x8800_3000_0000,
                 physical_ipa: 0x8800_3000_0000,
-                host_addr: parent_data_addr,
+                host_addr: parent_rx_addr,
+                size: 0x4000,
+                physical_size: 0x4000,
+                perms: applevisor::memory::MemPerms::ReadExec,
+                guest_writable: false,
+                memory: None,
+                host_mapping: None,
+                structural_owner: None,
+                stage2_lease: None,
+                is_dynamic_alias: false,
+                sharing: GuestMappingSharing::GlobalShared,
+                shared_key_base: 0,
+                shared_key_offset: 0,
+                owner_generation: parent_rx_gen,
+            },
+            HvfMappedRegion {
+                start: 0x0060_0000,
+                end: 0x0060_4000,
+                ipa: 0x8800_4000_0000,
+                physical_ipa: 0x8800_4000_0000,
+                host_addr: parent_rw_addr,
+                size: 0x4000,
+                physical_size: 0x4000,
+                perms: applevisor::memory::MemPerms::ReadWrite,
+                guest_writable: true,
+                memory: None,
+                host_mapping: None,
+                structural_owner: None,
+                stage2_lease: None,
+                is_dynamic_alias: false,
+                sharing: GuestMappingSharing::GlobalShared,
+                shared_key_base: 0,
+                shared_key_offset: 0,
+                owner_generation: parent_rw_gen,
+            },
+            HvfMappedRegion {
+                start: 0x0080_0000,
+                end: 0x0080_4000,
+                ipa: 0x8800_5000_0000,
+                physical_ipa: 0x8800_5000_0000,
+                host_addr: parent_cow_addr,
                 size: 0x4000,
                 physical_size: 0x4000,
                 perms: applevisor::memory::MemPerms::ReadWrite,
@@ -2101,7 +2295,7 @@ mod foreign_mm_tests {
                 sharing: GuestMappingSharing::Private,
                 shared_key_base: 0,
                 shared_key_offset: 0,
-                owner_generation: parent_data_gen,
+                owner_generation: parent_cow_gen,
             },
         ];
 
@@ -2178,8 +2372,44 @@ mod foreign_mm_tests {
                         stage2_base: 0x8800_3000_0000,
                         stage2_length: 0x4000,
                         stage2_owner: InventoryStage2OwnerIdentity {
-                            host_addr: parent_data_addr as usize,
-                            generation: parent_data_gen,
+                            host_addr: parent_rx_addr as usize,
+                            generation: parent_rx_gen,
+                        },
+                    },
+                ),
+                (
+                    (0x8800_4000_0000, 0x4000),
+                    InventoryExtent {
+                        frame: carrick_hal::FrameId::from_kernel_allocation(
+                            std::num::NonZeroU64::new(5).unwrap(),
+                        ),
+                        mapping: carrick_hal::MappingId::from_kernel_allocation(
+                            std::num::NonZeroU64::new(5).unwrap(),
+                        ),
+                        backing: InventoryBackingIdentity::Private(5),
+                        stage2_base: 0x8800_4000_0000,
+                        stage2_length: 0x4000,
+                        stage2_owner: InventoryStage2OwnerIdentity {
+                            host_addr: parent_rw_addr as usize,
+                            generation: parent_rw_gen,
+                        },
+                    },
+                ),
+                (
+                    (0x8800_5000_0000, 0x4000),
+                    InventoryExtent {
+                        frame: carrick_hal::FrameId::from_kernel_allocation(
+                            std::num::NonZeroU64::new(6).unwrap(),
+                        ),
+                        mapping: carrick_hal::MappingId::from_kernel_allocation(
+                            std::num::NonZeroU64::new(6).unwrap(),
+                        ),
+                        backing: InventoryBackingIdentity::Private(6),
+                        stage2_base: 0x8800_5000_0000,
+                        stage2_length: 0x4000,
+                        stage2_owner: InventoryStage2OwnerIdentity {
+                            host_addr: parent_cow_addr as usize,
+                            generation: parent_cow_gen,
                         },
                     },
                 ),
@@ -2247,13 +2477,19 @@ mod foreign_mm_tests {
         );
         child_pt
             .map_aliased(0x0040_0000, 0x8800_3000_0000, 0x4000, false)
-            .expect("map child user aliased");
+            .expect("map child user aliased rx");
+        child_pt
+            .map_aliased(0x0060_0000, 0x8800_4000_0000, 0x4000, true)
+            .expect("map child user aliased rw");
+        child_pt
+            .map_aliased(0x0080_0000, 0x8800_5000_0000, 0x4000, false)
+            .expect("map child user aliased cow");
         child_pt
             .rebase(root_slot_base)
             .expect("rebase child page tables");
 
         let cow_ranges = vec![carrick_aarch64::vmm::ForkCowRange {
-            va: 0x0040_0000,
+            va: 0x0080_0000,
             len: 0x4000,
             executable: false,
             kernel_only: false,
@@ -2283,19 +2519,74 @@ mod foreign_mm_tests {
             (pt_desc.physical_ipa, pt_desc.physical_size)
         };
 
+        let (el1_physical_ipa, _el1_physical_size) = {
+            let el1_desc = plan
+                .mappings
+                .iter()
+                .find(|m| m.start == crate::memory::LINUX_EL1_VECTORS_BASE)
+                .expect("child el1 mapping descriptor");
+            assert_eq!(el1_desc.perms, applevisor::memory::MemPerms::ReadWrite);
+            assert_ne!(el1_desc.physical_ipa, 0);
+            assert_ne!(el1_desc.physical_ipa, pt_physical_ipa);
+            (el1_desc.physical_ipa, el1_desc.physical_size)
+        };
+
+        let (mailbox_physical_ipa, _mailbox_physical_size) = {
+            let mb_desc = plan
+                .mappings
+                .iter()
+                .find(|m| m.start == crate::memory::LINUX_SYSCALL_MAILBOX_BASE)
+                .expect("child mailbox mapping descriptor");
+            assert_eq!(mb_desc.perms, applevisor::memory::MemPerms::ReadWrite);
+            assert_ne!(mb_desc.physical_ipa, 0);
+            assert_ne!(mb_desc.physical_ipa, pt_physical_ipa);
+            assert_ne!(mb_desc.physical_ipa, el1_physical_ipa);
+            (mb_desc.physical_ipa, mb_desc.physical_size)
+        };
+
         {
-            let user_desc = plan
+            let rx_desc = plan
                 .mappings
                 .iter()
                 .find(|m| m.start == 0x0040_0000)
-                .expect("child user mapping descriptor");
+                .expect("child rx mapping descriptor");
             assert_eq!(
-                user_desc.inherited_frame,
+                rx_desc.inherited_frame,
                 Some(carrick_hal::FrameId::from_kernel_allocation(
                     std::num::NonZeroU64::new(4).unwrap()
                 ))
             );
-            assert_eq!(user_desc.owner_generation, parent_data_gen);
+            assert_eq!(rx_desc.owner_generation, parent_rx_gen);
+        }
+
+        {
+            let rw_desc = plan
+                .mappings
+                .iter()
+                .find(|m| m.start == 0x0060_0000)
+                .expect("child rw mapping descriptor");
+            assert_eq!(
+                rw_desc.inherited_frame,
+                Some(carrick_hal::FrameId::from_kernel_allocation(
+                    std::num::NonZeroU64::new(5).unwrap()
+                ))
+            );
+            assert_eq!(rw_desc.owner_generation, parent_rw_gen);
+        }
+
+        {
+            let cow_desc = plan
+                .mappings
+                .iter()
+                .find(|m| m.start == 0x0080_0000)
+                .expect("child cow mapping descriptor");
+            assert_eq!(
+                cow_desc.inherited_frame,
+                Some(carrick_hal::FrameId::from_kernel_allocation(
+                    std::num::NonZeroU64::new(6).unwrap()
+                ))
+            );
+            assert_eq!(cow_desc.owner_generation, parent_cow_gen);
         }
 
         // 3. Stage frame inventory reservation for child
@@ -2332,14 +2623,18 @@ mod foreign_mm_tests {
         })
         .expect("stage child inventory reservation");
 
-        // 4. Prepare task-only process spec through test conversion
-        let rollbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let order = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let (carrier_state, prepared_task) =
-            HvfVmState::prepare_task_only_for_test(plan, &rollbacks, Some(Arc::clone(&order)))
-                .expect("prepare_task_only_for_test for child");
+        // 4. Prepare task-only process spec through shared conversion engine
+        let spec = ProcessSpec::new(create_test_vm_instance(), plan);
+        let (carrier_state, prepared_task) = HvfVmState::prepare_task_only_process_spec(spec)
+            .expect("prepare_task_only_process_spec for child");
 
-        // Verify structural owner is populated on prepared mapping with nonzero generation
+        // Assert concrete HvpatchCarrierTaskState::Process without Option<VM> weakening
+        assert!(
+            matches!(&carrier_state, HvpatchCarrierTaskState::Process { .. }),
+            "expected concrete HvpatchCarrierTaskState::Process"
+        );
+
+        // Verify structural owners are populated on prepared mappings with nonzero distinct generations
         let prepared_pt = prepared_task
             .mappings
             .iter()
@@ -2349,6 +2644,46 @@ mod foreign_mm_tests {
         let pt_epoch = prepared_pt.structural_owner.as_ref().unwrap().epoch();
         assert_ne!(pt_epoch.raw(), 0);
         assert_eq!(prepared_pt.owner_generation, pt_epoch.raw());
+
+        let prepared_el1 = prepared_task
+            .mappings
+            .iter()
+            .find(|m| m.physical_ipa == el1_physical_ipa)
+            .expect("prepared el1 mapping");
+        assert_eq!(prepared_el1.perms, applevisor::memory::MemPerms::ReadWrite);
+        assert_eq!(prepared_el1.physical_ipa, el1_physical_ipa);
+
+        let prepared_mb = prepared_task
+            .mappings
+            .iter()
+            .find(|m| m.physical_ipa == mailbox_physical_ipa)
+            .expect("prepared mailbox mapping");
+        assert_eq!(prepared_mb.perms, applevisor::memory::MemPerms::ReadWrite);
+        assert_eq!(prepared_mb.physical_ipa, mailbox_physical_ipa);
+
+        let prepared_rx = prepared_task
+            .mappings
+            .iter()
+            .find(|m| m.start == 0x0040_0000)
+            .expect("prepared rx mapping");
+        assert_eq!(prepared_rx.owner_generation, parent_rx_gen);
+        assert_eq!(prepared_rx.perms, applevisor::memory::MemPerms::ReadExec);
+
+        let prepared_rw = prepared_task
+            .mappings
+            .iter()
+            .find(|m| m.start == 0x0060_0000)
+            .expect("prepared rw mapping");
+        assert_eq!(prepared_rw.owner_generation, parent_rw_gen);
+        assert_eq!(prepared_rw.perms, applevisor::memory::MemPerms::ReadWrite);
+
+        let prepared_cow = prepared_task
+            .mappings
+            .iter()
+            .find(|m| m.start == 0x0080_0000)
+            .expect("prepared cow mapping");
+        assert_eq!(prepared_cow.owner_generation, parent_cow_gen);
+        assert_eq!(prepared_cow.perms, applevisor::memory::MemPerms::ReadWrite);
 
         // Verify staged inventory row received the exact minted structural epoch
         if let HvpatchTaskInventoryAuthority::ProcessPrepared { staged, .. } =
@@ -2451,6 +2786,24 @@ mod foreign_mm_tests {
             .get(&(pt_physical_ipa, pt_physical_size as u64))
             .expect("pt mapping id")
             .mapping;
+        let rx_mapping_id = child_inventory
+            .lock()
+            .extents
+            .get(&(0x8800_3000_0000, 0x4000))
+            .expect("rx mapping id")
+            .mapping;
+        let rw_mapping_id = child_inventory
+            .lock()
+            .extents
+            .get(&(0x8800_4000_0000, 0x4000))
+            .expect("rw mapping id")
+            .mapping;
+        let cow_mapping_id = child_inventory
+            .lock()
+            .extents
+            .get(&(0x8800_5000_0000, 0x4000))
+            .expect("cow mapping id")
+            .mapping;
 
         let child_snapshot = TestSnapshot {
             mm: std::num::NonZeroU64::new(102).unwrap(),
@@ -2460,7 +2813,7 @@ mod foreign_mm_tests {
             vma_revision: carrick_hal::ForeignVmaRevision::from_authority_raw(1),
             frame_inventory_revision:
                 carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(1),
-            mapping_ids: vec![pt_mapping_id],
+            mapping_ids: vec![pt_mapping_id, rx_mapping_id, rw_mapping_id, cow_mapping_id],
         };
 
         let child_captured = CarrierForeignMmSnapshot::capture(&child_snapshot);
@@ -2520,12 +2873,34 @@ mod foreign_mm_tests {
             .retain_physical_backing(&child_captured, deadline)
             .expect("retain_physical_backing must succeed for authentic structural extents");
 
-        // Verify structural payload readback through retained physical owner
+        // Verify structural and shared payload readback through retained physical owners across all 5 dispositions
+        // (a) Independent page tables
         let mut read_pt = [0u8; 40];
         let read_gen = copy_from_pinned_owner(&retained, pt_physical_ipa, &mut read_pt)
             .expect("copy_from_pinned_owner for structural page tables");
         assert_eq!(&read_pt, expected_pt_bytes.as_slice());
         assert_eq!(read_gen.raw_for_probe(), pt_epoch.raw());
+
+        // (c) Shared RX executable segment
+        let mut read_rx = [0u8; 38];
+        let read_rx_gen = copy_from_pinned_owner(&retained, 0x8800_3000_0000, &mut read_rx)
+            .expect("copy_from_pinned_owner for shared rx");
+        assert_eq!(&read_rx, &rx_payload);
+        assert_eq!(read_rx_gen.raw_for_probe(), parent_rx_gen);
+
+        // (d) Shared RW data segment
+        let mut read_rw = [0u8; 38];
+        let read_rw_gen = copy_from_pinned_owner(&retained, 0x8800_4000_0000, &mut read_rw)
+            .expect("copy_from_pinned_owner for shared rw");
+        assert_eq!(&read_rw, &rw_payload);
+        assert_eq!(read_rw_gen.raw_for_probe(), parent_rw_gen);
+
+        // (e) Private COW data segment
+        let mut read_cow = [0u8; 37];
+        let read_cow_gen = copy_from_pinned_owner(&retained, 0x8800_5000_0000, &mut read_cow)
+            .expect("copy_from_pinned_owner for private cow");
+        assert_eq!(&read_cow, &cow_payload);
+        assert_eq!(read_cow_gen.raw_for_probe(), parent_cow_gen);
 
         // 7. Stale / tampered generation is rejected
         let mut stale_extents = child_inventory.lock().extents.clone();
@@ -2631,20 +3006,32 @@ mod foreign_mm_tests {
             lease.release_ipa,
             "reusable extent must have release_ipa = true"
         );
-        lease.mark_test_mapped_without_backend();
         let allocated_ipa = lease.base;
 
-        // 2. Wrap in host mapping and register global frame host owner
+        // 2. Wrap in host mapping, map stage-2, and register global frame host owner
         let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
             size,
             crate::host_mapping::HostMappingKind::PerMmKernelState,
         )
         .expect("allocate host mapping for test");
+        let host_addr = mapping.as_ptr() as usize;
         let payload = *b"releasable_global_extent_payload_v3!";
         unsafe {
             std::ptr::copy_nonoverlapping(payload.as_ptr(), mapping.as_ptr(), payload.len());
         }
-        let generation = register_global_frame_host_owner(lease, mapping, 3)
+
+        let rc = unsafe { inventory_hv_vm_map(mapping.as_ptr().cast(), allocated_ipa, size, 7) };
+        assert_eq!(rc, 0);
+        lease.mark_mapped();
+        assert!(
+            ScopedStage2MapTestStub::is_mapped(allocated_ipa, size),
+            "stage-2 mapping must be recorded in backend audit state"
+        );
+
+        let observed_live = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        lease.drop_backing_audit = Some((host_addr, Arc::clone(&observed_live)));
+
+        let generation = register_global_frame_host_owner(lease, mapping, 7)
             .expect("register global frame host owner");
         assert_ne!(generation, 0);
 
@@ -2670,6 +3057,19 @@ mod foreign_mm_tests {
             .expect("copy_from_pinned_owner with holder1");
         assert_eq!(&read_buf, &payload);
 
+        // While multiple holders exist, a new reservation attempt MUST NOT return the retained IPA
+        let probe1 = GlobalFrameStage2Lease::reserve(size as u64, size as u64)
+            .expect("reserve probe lease while multiple holders exist");
+        assert_ne!(
+            probe1.base, allocated_ipa,
+            "retained IPA cannot be returned by new reservation while multiple holders exist"
+        );
+        assert!(
+            ScopedStage2MapTestStub::is_mapped(allocated_ipa, size),
+            "retained IPA must remain mapped while multiple holders exist"
+        );
+        drop(probe1);
+
         // 4. Remove from registration registry while holders still exist
         global_frame_host_owners()
             .lock()
@@ -2677,7 +3077,20 @@ mod foreign_mm_tests {
         drop(owner);
         drop(backing1);
 
-        // 5. Holder2 still keeps the IPA alive and readable
+        // While holder2 remains live, a new reservation attempt STILL MUST NOT return the retained IPA
+        let probe2 = GlobalFrameStage2Lease::reserve(size as u64, size as u64)
+            .expect("reserve probe lease while holder2 remains live");
+        assert_ne!(
+            probe2.base, allocated_ipa,
+            "retained IPA cannot be returned while holder2 remains live"
+        );
+        assert!(
+            ScopedStage2MapTestStub::is_mapped(allocated_ipa, size),
+            "retained IPA must remain mapped while holder2 is live"
+        );
+        drop(probe2);
+
+        // 5. Holder2 still keeps the IPA alive, mapped in stage-2, and readable
         let extent2 = RetainedForeignExtent {
             key: (allocated_ipa, size as u64),
             owner: holder2,
@@ -2689,16 +3102,51 @@ mod foreign_mm_tests {
         copy_from_pinned_owner(&backing2, allocated_ipa, &mut read_buf2)
             .expect("copy_from_pinned_owner with holder2");
         assert_eq!(&read_buf2, &payload);
+        assert!(
+            ScopedStage2MapTestStub::is_mapped(allocated_ipa, size),
+            "stage-2 mapping must persist while retained holder is live"
+        );
+        assert!(
+            alias_backing_is_live(host_addr),
+            "host mapping must remain live while retained holder is live"
+        );
 
         // 6. Controlled final drop releases IPA back to allocator
         drop(backing2);
 
-        // 7. Prove deterministic allocator reuse of the released IPA
+        // 7. Verify stage-2 unmapped before host mapping release and deterministic reuse
+        assert!(
+            observed_live.load(std::sync::atomic::Ordering::SeqCst),
+            "stage-2 unmap must execute before host mapping deallocation"
+        );
+        assert!(
+            !ScopedStage2MapTestStub::is_mapped(allocated_ipa, size),
+            "stage-2 mapping must be unmapped after final holder drop"
+        );
+        assert!(
+            !alias_backing_is_live(host_addr),
+            "host mapping must be unmapped after final holder drop"
+        );
+
+        let events = ScopedStage2MapTestStub::events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Stage2BackendEvent::Map { ipa, .. } if *ipa == allocated_ipa)),
+            "events must record stage-2 map"
+        );
+        assert!(
+            events.iter().any(
+                |e| matches!(e, Stage2BackendEvent::Unmap { ipa, .. } if *ipa == allocated_ipa)
+            ),
+            "events must record stage-2 unmap"
+        );
+
         let new_lease = GlobalFrameStage2Lease::reserve(size as u64, size as u64)
             .expect("reserve new global frame stage-2 lease");
         assert_eq!(
             new_lease.base, allocated_ipa,
-            "allocator must deterministically reuse the released IPA range"
+            "allocator must deterministically reuse the released IPA range after final holder drop"
         );
         drop(new_lease);
     }
@@ -2708,29 +3156,374 @@ mod foreign_mm_tests {
         let _guard = FOREIGN_MM_TEST_LOCK.lock();
         let _stage2_stub = ScopedStage2MapTestStub::enable();
 
-        // 1. Reversible inventory reservation failure
-        let mut plan = ProcessSpecPlan {
-            mappings: Vec::new(),
+        // 1. Reversible stage-2 map failure through production ProcessSpec route with rollback
+        let pt_ipa = 0x9a00_0000_0000u64;
+        let pt_lease = GlobalFrameStage2Lease::fixed(pt_ipa, 0x20_0000);
+        let pt_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            0x20_0000,
+            crate::host_mapping::HostMappingKind::PrivateAnon,
+        )
+        .unwrap();
+        let pt_host_addr = pt_host.as_ptr();
+
+        let plan_map_fail = ProcessSpecPlan {
+            mappings: vec![ProcessMappingDesc {
+                start: crate::memory::LINUX_PAGE_TABLES_BASE,
+                ipa: pt_ipa,
+                end: pt_ipa + 0x20_0000,
+                stage2_lease: Some(pt_lease),
+                host: ProcessMappingHost::Owned(pt_host),
+                size: 0x20_0000,
+                physical_ipa: pt_ipa,
+                physical_host_addr: pt_host_addr,
+                physical_size: 0x20_0000,
+                inventory_backing: InventoryBackingIdentity::Private(1),
+                perms: applevisor::memory::MemPerms::ReadWrite,
+                is_dynamic_alias: false,
+                sharing: GuestMappingSharing::Private,
+                guest_writable: true,
+                inherited_frame: None,
+                shared_key_base: 0,
+                shared_key_offset: 0,
+                owner_generation: 0,
+            }],
             inventory_mappings: Vec::new(),
             protections: Arc::new(MemoryProtections::default()),
             mailbox_slots: Arc::new(MailboxSlotAllocator::new()),
             syscall_transport: HvfSyscallTransport::Mailbox,
             persistent_vm_lifecycle: true,
-            mm_root_slot: (0x9a00_0000_0000, 0x0020_0000),
+            mm_root_slot: (pt_ipa, 0x20_0000),
             container_root: ContainerRootToken::from_raw(1),
             frame_inventory: Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
             cow_armed: Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
             carrier_foreign_mm_transport: Arc::new(CarrierForeignMmTransport::new()),
         };
-        let fail_res = plan.stage_with_reservation_factory(|_, _, _| {
-            Err(TrapError::Hypervisor(
-                "injected reservation failure".to_owned(),
-            ))
-        });
-        assert!(fail_res.is_err());
-        assert!(plan.frame_inventory.lock().process_reservation.is_none());
+        let spec_map_fail = ProcessSpec::new(create_test_vm_instance(), plan_map_fail);
 
-        // 2. Transport retain failure on missing binding
+        _stage2_stub.set_fail_next_map(true);
+        let map_fail_res = HvfVmState::prepare_task_only_process_spec(spec_map_fail);
+        assert!(
+            matches!(map_fail_res, Err(TrapError::ChildMapFailed { .. })),
+            "injected stage2 map failure must return ChildMapFailed"
+        );
+        assert_eq!(
+            ScopedStage2MapTestStub::mapped_count(),
+            0,
+            "failed stage-2 mapping must roll back and leave zero live mappings"
+        );
+
+        // 2. Narrow test injection at production stage_mapping / inventory staging boundary
+        let pt_ipa2 = 0x9a00_2000_0000u64;
+        let pt_lease2 = GlobalFrameStage2Lease::fixed(pt_ipa2, 0x20_0000);
+        let pt_host2 = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            0x20_0000,
+            crate::host_mapping::HostMappingKind::PrivateAnon,
+        )
+        .unwrap();
+        let pt_host_addr2 = pt_host2.as_ptr();
+
+        let mut plan_stage_fail = ProcessSpecPlan {
+            mappings: vec![ProcessMappingDesc {
+                start: crate::memory::LINUX_PAGE_TABLES_BASE,
+                ipa: pt_ipa2,
+                end: pt_ipa2 + 0x20_0000,
+                stage2_lease: Some(pt_lease2),
+                host: ProcessMappingHost::Owned(pt_host2),
+                size: 0x20_0000,
+                physical_ipa: pt_ipa2,
+                physical_host_addr: pt_host_addr2,
+                physical_size: 0x20_0000,
+                inventory_backing: InventoryBackingIdentity::Private(1),
+                perms: applevisor::memory::MemPerms::ReadWrite,
+                is_dynamic_alias: false,
+                sharing: GuestMappingSharing::Private,
+                guest_writable: true,
+                inherited_frame: None,
+                shared_key_base: 0,
+                shared_key_offset: 0,
+                owner_generation: 0,
+            }],
+            inventory_mappings: vec![ProcessInventoryDesc {
+                gpa: pt_ipa2,
+                length: 0x20_0000,
+                permissions: carrick_hal::MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+                inherited_frame: None,
+                inherited_mapping: None,
+                backing: InventoryBackingIdentity::Private(1),
+                stage2_lease: (pt_ipa2, 0x20_0000),
+                stage2_owner: InventoryStage2OwnerIdentity {
+                    host_addr: pt_host_addr2 as usize,
+                    generation: 0,
+                },
+                fork_frame_receipt_kind: None,
+            }],
+            protections: Arc::new(MemoryProtections::default()),
+            mailbox_slots: Arc::new(MailboxSlotAllocator::new()),
+            syscall_transport: HvfSyscallTransport::Mailbox,
+            persistent_vm_lifecycle: true,
+            mm_root_slot: (pt_ipa2, 0x20_0000),
+            container_root: ContainerRootToken::from_raw(1),
+            frame_inventory: Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
+            cow_armed: Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
+            carrier_foreign_mm_transport: Arc::new(CarrierForeignMmTransport::new()),
+        };
+        plan_stage_fail
+            .stage_with_reservation_factory(|frame_candidates, mapping_candidates, capacity| {
+                let transaction = carrick_hal::KernelTransactionId::from_kernel_allocation(
+                    std::num::NonZeroU64::new(601).unwrap(),
+                );
+                let frames = (0..frame_candidates)
+                    .map(|id| {
+                        carrick_hal::FrameId::from_kernel_allocation(
+                            std::num::NonZeroU64::new(id as u64 + 1).unwrap(),
+                        )
+                    })
+                    .collect();
+                let mappings = (0..mapping_candidates)
+                    .map(|id| {
+                        carrick_hal::MappingId::from_kernel_allocation(
+                            std::num::NonZeroU64::new(id as u64 + 1).unwrap(),
+                        )
+                    })
+                    .collect();
+                Ok(
+                    carrick_hal::FrameInventoryReservation::from_kernel_candidates(
+                        carrick_hal::FrameInventoryProvenance::from_kernel_entropy([0x33; 32]),
+                        carrick_hal::FrameInventoryBatch::prepare(transaction, capacity).unwrap(),
+                        frames,
+                        mappings,
+                    ),
+                )
+            })
+            .expect("stage reservation for stage_mapping failure test");
+        let spec_stage_fail = ProcessSpec::new(create_test_vm_instance(), plan_stage_fail);
+
+        _stage2_stub.set_fail_stage_mapping(true);
+        let stage_fail_res = HvfVmState::prepare_task_only_process_spec(spec_stage_fail);
+        assert!(
+            matches!(stage_fail_res, Err(TrapError::Hypervisor(msg)) if msg.contains("injected stage_mapping failure")),
+            "injected stage_mapping failure must return Hypervisor error"
+        );
+        assert_eq!(
+            ScopedStage2MapTestStub::mapped_count(),
+            0,
+            "stage_mapping failure must roll back previously mapped stage-2 leases"
+        );
+
+        // 3. Real directory publication failure rollback with concrete Process state
+        let pt_ipa3 = 0x9a00_4000_0000u64;
+        let pt_lease3 = GlobalFrameStage2Lease::fixed(pt_ipa3, 0x20_0000);
+        let pt_host3 = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            0x20_0000,
+            crate::host_mapping::HostMappingKind::PrivateAnon,
+        )
+        .unwrap();
+        let pt_host_addr3 = pt_host3.as_ptr();
+
+        let mut plan_pub_fail = ProcessSpecPlan {
+            mappings: vec![ProcessMappingDesc {
+                start: crate::memory::LINUX_PAGE_TABLES_BASE,
+                ipa: pt_ipa3,
+                end: pt_ipa3 + 0x20_0000,
+                stage2_lease: Some(pt_lease3),
+                host: ProcessMappingHost::Owned(pt_host3),
+                size: 0x20_0000,
+                physical_ipa: pt_ipa3,
+                physical_host_addr: pt_host_addr3,
+                physical_size: 0x20_0000,
+                inventory_backing: InventoryBackingIdentity::Private(1),
+                perms: applevisor::memory::MemPerms::ReadWrite,
+                is_dynamic_alias: false,
+                sharing: GuestMappingSharing::Private,
+                guest_writable: true,
+                inherited_frame: None,
+                shared_key_base: 0,
+                shared_key_offset: 0,
+                owner_generation: 0,
+            }],
+            inventory_mappings: vec![ProcessInventoryDesc {
+                gpa: pt_ipa3,
+                length: 0x20_0000,
+                permissions: carrick_hal::MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+                inherited_frame: None,
+                inherited_mapping: None,
+                backing: InventoryBackingIdentity::Private(1),
+                stage2_lease: (pt_ipa3, 0x20_0000),
+                stage2_owner: InventoryStage2OwnerIdentity {
+                    host_addr: pt_host_addr3 as usize,
+                    generation: 0,
+                },
+                fork_frame_receipt_kind: None,
+            }],
+            protections: Arc::new(MemoryProtections::default()),
+            mailbox_slots: Arc::new(MailboxSlotAllocator::new()),
+            syscall_transport: HvfSyscallTransport::Mailbox,
+            persistent_vm_lifecycle: true,
+            mm_root_slot: (pt_ipa3, 0x20_0000),
+            container_root: ContainerRootToken::from_raw(1),
+            frame_inventory: Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
+            cow_armed: Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
+            carrier_foreign_mm_transport: Arc::new(CarrierForeignMmTransport::new()),
+        };
+        plan_pub_fail
+            .stage_with_reservation_factory(|frame_candidates, mapping_candidates, capacity| {
+                let transaction = carrick_hal::KernelTransactionId::from_kernel_allocation(
+                    std::num::NonZeroU64::new(701).unwrap(),
+                );
+                let frames = (0..frame_candidates)
+                    .map(|id| {
+                        carrick_hal::FrameId::from_kernel_allocation(
+                            std::num::NonZeroU64::new(id as u64 + 1).unwrap(),
+                        )
+                    })
+                    .collect();
+                let mappings = (0..mapping_candidates)
+                    .map(|id| {
+                        carrick_hal::MappingId::from_kernel_allocation(
+                            std::num::NonZeroU64::new(id as u64 + 1).unwrap(),
+                        )
+                    })
+                    .collect();
+                Ok(
+                    carrick_hal::FrameInventoryReservation::from_kernel_candidates(
+                        carrick_hal::FrameInventoryProvenance::from_kernel_entropy([0x33; 32]),
+                        carrick_hal::FrameInventoryBatch::prepare(transaction, capacity).unwrap(),
+                        frames,
+                        mappings,
+                    ),
+                )
+            })
+            .expect("stage reservation for directory rollback test");
+        let spec_pub_fail = ProcessSpec::new(create_test_vm_instance(), plan_pub_fail);
+
+        let (carrier_state_pub, prepared_task_pub) =
+            HvfVmState::prepare_task_only_process_spec(spec_pub_fail)
+                .expect("prepare_task_only_process_spec for directory rollback test");
+        assert!(
+            ScopedStage2MapTestStub::is_mapped(pt_ipa3, 0x20_0000),
+            "stage-2 mapping must be installed after successful preparation"
+        );
+
+        let (_issuer_pub, verifier_pub) = carrick_hal::HvpatchChildTokenIssuer::new_pair();
+        let directory_pub = Arc::new(HvpatchCarrierTaskStateDirectory::new(
+            std::num::NonZeroU64::new(1).unwrap(),
+            verifier_pub,
+        ));
+        let identity_pub = HvpatchCarrierTaskIdentity {
+            task_serial: 301,
+            thread_serial: 301,
+            execution_generation: 1,
+            linux_pid: 301,
+            linux_tid: 301,
+            asid: 1,
+        };
+        let pub_res = directory_pub.publish_inner(
+            identity_pub,
+            carrier_state_pub,
+            prepared_task_pub,
+            1, // Injected failpoint after alias commit
+        );
+        assert!(
+            pub_res.is_err(),
+            "injected publish failpoint must return error"
+        );
+        assert!(
+            directory_pub.inner.lock().states.is_empty(),
+            "no task state must remain published in directory after failure"
+        );
+        assert_eq!(
+            ScopedStage2MapTestStub::mapped_count(),
+            0,
+            "directory publish rollback must abort and unmap all stage2 leases"
+        );
+
+        // 4. Real retirement/unmap failure semantics via fallible retirement transaction
+        let ipa_retire = 0x8800_9000_0000u64;
+        let size_retire = 0x4000usize;
+        let mut lease_retire = GlobalFrameStage2Lease::fixed(ipa_retire, size_retire as u64);
+        let mapping_retire = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            size_retire,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate host mapping for retirement failure test");
+        let host_addr_retire = mapping_retire.as_ptr() as usize;
+        let rc = unsafe {
+            inventory_hv_vm_map(mapping_retire.as_ptr().cast(), ipa_retire, size_retire, 7)
+        };
+        assert_eq!(rc, 0);
+        lease_retire.mark_mapped();
+        let observed_live_retire = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        lease_retire.drop_backing_audit =
+            Some((host_addr_retire, Arc::clone(&observed_live_retire)));
+
+        let mut owner_retire = GlobalFrameHostOwner {
+            _lease: lease_retire,
+            _mapping: mapping_retire,
+            perms: 7,
+            generation: 1,
+        };
+        assert!(
+            ScopedStage2MapTestStub::is_mapped(ipa_retire, size_retire),
+            "owner extent must be mapped before retirement"
+        );
+
+        // Injected unmap failure must preserve mapped state and return error for caller retry
+        _stage2_stub.set_fail_next_unmap(true);
+        let unmap_err = owner_retire
+            .try_retire()
+            .expect_err("try_retire must fail when unmap fails");
+        assert!(
+            matches!(unmap_err, TrapError::Hypervisor(msg) if msg.contains("guest-memory unmap")),
+            "try_retire must return hypervisor unmap failure error"
+        );
+        assert!(
+            ScopedStage2MapTestStub::is_mapped(ipa_retire, size_retire),
+            "mapped extent MUST remain installed on unmap failure"
+        );
+        assert!(
+            ScopedStage2MapTestStub::events().iter().any(
+                |e| matches!(e, Stage2BackendEvent::UnmapAttemptFailed { ipa, .. } if *ipa == ipa_retire)
+            ),
+            "unmap attempt failure event must be recorded"
+        );
+        assert!(
+            alias_backing_is_live(host_addr_retire),
+            "host memory backing must remain live on failed retirement"
+        );
+
+        // Retrying retirement without unmap failure succeeds cleanly
+        owner_retire
+            .try_retire()
+            .expect("retry try_retire must succeed");
+        assert!(
+            !ScopedStage2MapTestStub::is_mapped(ipa_retire, size_retire),
+            "extent must be unmapped after successful retirement"
+        );
+        drop(owner_retire);
+        assert!(
+            !alias_backing_is_live(host_addr_retire),
+            "host mapping must be unmapped after owner drop"
+        );
+        assert!(
+            observed_live_retire.load(std::sync::atomic::Ordering::SeqCst),
+            "lease unmap must execute before host mapping release"
+        );
+        assert!(
+            ScopedStage2MapTestStub::events()
+                .iter()
+                .any(|e| matches!(e, Stage2BackendEvent::Unmap { ipa, .. } if *ipa == ipa_retire)),
+            "successful unmap event must be recorded"
+        );
+
+        // 5. Transport retain failure on missing binding
         let transport = Arc::new(CarrierForeignMmTransport::new());
         let endpoint = carrick_hal::ForeignMmEndpoint::for_carrier(
             transport as Arc<dyn carrick_hal::ForeignMmTransport>,
@@ -2752,13 +3545,14 @@ mod foreign_mm_tests {
             Err(carrick_hal::ForeignMmTransportError::MissingBinding)
         ));
 
-        // 3. Transport retain failure on expired deadline
+        // 6. Transport retain failure on expired deadline
         let expired_deadline = std::time::Instant::now() - std::time::Duration::from_millis(10);
         let retain_expired = endpoint.retain(&missing_snapshot, expired_deadline);
         assert!(matches!(
             retain_expired,
             Err(carrick_hal::ForeignMmTransportError::TimedOut)
         ));
+        ScopedStage2MapTestStub::clear_events();
     }
 }
 
@@ -5095,8 +5889,8 @@ fn alias_registry() -> &'static parking_lot::Mutex<Vec<AliasBacking>> {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
 pub(crate) struct GlobalFrameHostOwner {
-    _mapping: crate::host_mapping::OwnedHostMapping,
     _lease: GlobalFrameStage2Lease,
+    _mapping: crate::host_mapping::OwnedHostMapping,
     perms: u64,
     /// Which incarnation of this `(IPA, length)` lease this is.
     ///
@@ -5111,6 +5905,14 @@ pub(crate) struct GlobalFrameHostOwner {
     /// be the `cpython-importlib` SIGSEGV (5/8 crashes, 0/14 once the identity
     /// cannot recur).
     generation: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl GlobalFrameHostOwner {
+    #[allow(dead_code)]
+    pub(crate) fn try_retire(&mut self) -> Result<(), TrapError> {
+        self._lease.try_retire()
+    }
 }
 
 /// Monotonic source for [`GlobalFrameHostOwner::generation`]. Never reused, so a
@@ -11331,11 +12133,12 @@ impl GlobalFrameStage2Lease {
     fn key(&self) -> (u64, u64) {
         (self.base, self.length)
     }
-}
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl Drop for GlobalFrameStage2Lease {
-    fn drop(&mut self) {
+    #[allow(dead_code)]
+    pub(crate) fn try_retire(&mut self) -> Result<(), TrapError> {
+        if !self.active {
+            return Ok(());
+        }
         #[cfg(any(test, feature = "foreign-cow-test-support"))]
         if let Some((host_addr, observed)) = &self.drop_backing_audit {
             observed.store(
@@ -11343,30 +12146,42 @@ impl Drop for GlobalFrameStage2Lease {
                 std::sync::atomic::Ordering::SeqCst,
             );
         }
-        if !self.active {
-            return;
-        }
         #[cfg(not(any(test, feature = "foreign-cow-test-support")))]
         let unmap_backend = self.mapped;
         #[cfg(any(test, feature = "foreign-cow-test-support"))]
         let unmap_backend = self.backend_map_installed;
         if unmap_backend {
-            let size = usize::try_from(self.length).unwrap_or_else(|_| {
-                eprintln!("carrick: FATAL: global frame stage-2 lease is too large");
-                std::process::abort();
-            });
+            let size = usize::try_from(self.length).map_err(|_| {
+                TrapError::Hypervisor("global frame stage-2 lease is too large".to_owned())
+            })?;
             let rc = unsafe { inventory_hv_vm_unmap(self.base, size) };
             if rc != 0 {
-                eprintln!(
-                    "carrick: FATAL: rollback global frame stage-2 lease IPA 0x{:x} size {} failed: 0x{rc:x}",
-                    self.base, self.length
-                );
-                std::process::abort();
+                return Err(TrapError::Hypervisor(format!(
+                    "guest-memory unmap(guest=0x{:x}, size={}) failed: 0x{:x}",
+                    self.base, size, rc
+                )));
+            }
+            self.mapped = false;
+            #[cfg(any(test, feature = "foreign-cow-test-support"))]
+            {
+                self.backend_map_installed = false;
             }
         }
         if self.release_ipa {
-            release_global_frame_ipa(self.base, self.length).unwrap_or_else(|error| {
-                eprintln!("carrick: FATAL: release global frame stage-2 lease: {error}");
+            release_global_frame_ipa(self.base, self.length)?;
+            self.release_ipa = false;
+        }
+        self.active = false;
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for GlobalFrameStage2Lease {
+    fn drop(&mut self) {
+        if self.active {
+            self.try_retire().unwrap_or_else(|error| {
+                eprintln!("carrick: FATAL: rollback global frame stage-2 lease on drop: {error}");
                 std::process::abort();
             });
         }
@@ -15791,6 +16606,13 @@ impl HvfVmState {
         reservation: &mut carrick_hal::FrameInventoryReservation,
         stage: InventoryMappingStage,
     ) -> Result<InventoryExtent, TrapError> {
+        #[cfg(test)]
+        if STAGE2_AUDIT_STATE.with(|s| s.borrow().fail_stage_mapping) {
+            STAGE2_AUDIT_STATE.with(|s| s.borrow_mut().fail_stage_mapping = false);
+            return Err(TrapError::Hypervisor(
+                "injected stage_mapping failure".to_owned(),
+            ));
+        }
         let InventoryMappingStage {
             gpa,
             length,
@@ -23053,22 +23875,6 @@ impl HvfVmState {
         ))
     }
 
-    #[cfg(test)]
-    fn prepare_task_only_for_test(
-        plan: ProcessSpecPlan,
-        rollbacks: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        order: Option<std::sync::Arc<parking_lot::Mutex<Vec<&'static str>>>>,
-    ) -> Result<(HvpatchCarrierTaskState, HvpatchPreparedTaskAuthority), TrapError> {
-        let (_stage2_leases, prepared_task) = Self::prepare_task_only_plan(plan)?;
-        Ok((
-            HvpatchCarrierTaskState::Test {
-                rollbacks: std::sync::Arc::clone(rollbacks),
-                order,
-            },
-            prepared_task,
-        ))
-    }
-
     pub(crate) fn from_process_spec(
         spec: ProcessSpec,
     ) -> Result<(HvfVmState, applevisor::vcpu::Vcpu, MailboxBinding), TrapError> {
@@ -24779,8 +25585,39 @@ fn align_up(value: u64, alignment: u64) -> Result<u64, TrapError> {
 }
 
 #[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Stage2BackendEvent {
+    Map {
+        ipa: u64,
+        size: usize,
+        host: usize,
+        perms: u64,
+    },
+    Unmap {
+        ipa: u64,
+        size: usize,
+    },
+    UnmapAttemptFailed {
+        ipa: u64,
+        size: usize,
+    },
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct Stage2TestAuditState {
+    enabled: bool,
+    fail_next_map: bool,
+    fail_next_unmap: bool,
+    fail_stage_mapping: bool,
+    mapped_extents: std::collections::BTreeSet<(u64, usize)>,
+    events: Vec<Stage2BackendEvent>,
+}
+
+#[cfg(test)]
 thread_local! {
-    static STAGE2_MAP_STUB_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static STAGE2_AUDIT_STATE: std::cell::RefCell<Stage2TestAuditState> =
+        std::cell::RefCell::new(Stage2TestAuditState::default());
 }
 
 #[cfg(test)]
@@ -24789,16 +25626,75 @@ pub(crate) struct ScopedStage2MapTestStub;
 #[cfg(test)]
 impl ScopedStage2MapTestStub {
     pub(crate) fn enable() -> Self {
-        STAGE2_MAP_STUB_IN_TEST.with(|c| c.set(true));
+        STAGE2_AUDIT_STATE.with(|s| {
+            let mut state = s.borrow_mut();
+            state.enabled = true;
+            state.fail_next_map = false;
+            state.fail_next_unmap = false;
+            state.fail_stage_mapping = false;
+            state.mapped_extents.clear();
+            state.events.clear();
+        });
         Self
+    }
+
+    pub(crate) fn set_fail_next_map(&self, fail: bool) {
+        STAGE2_AUDIT_STATE.with(|s| s.borrow_mut().fail_next_map = fail);
+    }
+
+    pub(crate) fn set_fail_next_unmap(&self, fail: bool) {
+        STAGE2_AUDIT_STATE.with(|s| s.borrow_mut().fail_next_unmap = fail);
+    }
+
+    pub(crate) fn set_fail_stage_mapping(&self, fail: bool) {
+        STAGE2_AUDIT_STATE.with(|s| s.borrow_mut().fail_stage_mapping = fail);
+    }
+
+    pub(crate) fn is_mapped(ipa: u64, size: usize) -> bool {
+        STAGE2_AUDIT_STATE.with(|s| s.borrow().mapped_extents.contains(&(ipa, size)))
+    }
+
+    pub(crate) fn events() -> Vec<Stage2BackendEvent> {
+        STAGE2_AUDIT_STATE.with(|s| s.borrow().events.clone())
+    }
+
+    pub(crate) fn mapped_count() -> usize {
+        STAGE2_AUDIT_STATE.with(|s| s.borrow().mapped_extents.len())
+    }
+
+    pub(crate) fn clear_events() {
+        STAGE2_AUDIT_STATE.with(|s| s.borrow_mut().events.clear());
     }
 }
 
 #[cfg(test)]
 impl Drop for ScopedStage2MapTestStub {
     fn drop(&mut self) {
-        STAGE2_MAP_STUB_IN_TEST.with(|c| c.set(false));
+        STAGE2_AUDIT_STATE.with(|s| {
+            let mut state = s.borrow_mut();
+            state.enabled = false;
+            state.fail_next_map = false;
+            state.fail_next_unmap = false;
+            state.fail_stage_mapping = false;
+            state.mapped_extents.clear();
+            state.events.clear();
+        });
     }
+}
+
+#[cfg(test)]
+fn create_test_vm_instance() -> applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>
+{
+    #[repr(C)]
+    struct RawVmInstance {
+        _guard: Option<std::sync::Arc<()>>,
+        _phantom: std::marker::PhantomData<applevisor::vm::GicDisabled>,
+    }
+    let raw = RawVmInstance {
+        _guard: Some(std::sync::Arc::new(())),
+        _phantom: std::marker::PhantomData,
+    };
+    unsafe { std::mem::transmute(raw) }
 }
 
 /// Sole raw Hypervisor.framework stage-2 map boundary. Inventory-aware callers
@@ -24812,7 +25708,26 @@ unsafe fn inventory_hv_vm_map(
     permissions: u64,
 ) -> applevisor_sys::hv_return_t {
     #[cfg(test)]
-    if STAGE2_MAP_STUB_IN_TEST.with(|c| c.get()) {
+    if STAGE2_AUDIT_STATE.with(|s| s.borrow().enabled) {
+        let should_fail = STAGE2_AUDIT_STATE.with(|s| {
+            let mut state = s.borrow_mut();
+            if state.fail_next_map {
+                state.fail_next_map = false;
+                true
+            } else {
+                state.mapped_extents.insert((ipa, size));
+                state.events.push(Stage2BackendEvent::Map {
+                    ipa,
+                    size,
+                    host: host as usize,
+                    perms: permissions,
+                });
+                false
+            }
+        });
+        if should_fail {
+            return 0xfae9_4005u32 as applevisor_sys::hv_return_t;
+        }
         return 0;
     }
     let result = unsafe { applevisor_sys::hv_vm_map(host, ipa, size, permissions) };
@@ -24879,8 +25794,28 @@ unsafe fn inventory_hv_vm_map_replay(backing: AliasBacking) -> applevisor_sys::h
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe fn inventory_hv_vm_unmap(ipa: u64, size: usize) -> applevisor_sys::hv_return_t {
     #[cfg(test)]
-    if STAGE2_MAP_STUB_IN_TEST.with(|c| c.get()) {
+    if STAGE2_AUDIT_STATE.with(|s| s.borrow().enabled) {
+        let should_fail = STAGE2_AUDIT_STATE.with(|s| {
+            let mut state = s.borrow_mut();
+            if state.fail_next_unmap {
+                state.fail_next_unmap = false;
+                state
+                    .events
+                    .push(Stage2BackendEvent::UnmapAttemptFailed { ipa, size });
+                true
+            } else {
+                false
+            }
+        });
+        if should_fail {
+            return 0xfae9_4001u32 as applevisor_sys::hv_return_t;
+        }
         forget_replay_extent(ipa, size);
+        STAGE2_AUDIT_STATE.with(|s| {
+            let mut state = s.borrow_mut();
+            state.mapped_extents.remove(&(ipa, size));
+            state.events.push(Stage2BackendEvent::Unmap { ipa, size });
+        });
         return 0;
     }
     let result = unsafe { applevisor_sys::hv_vm_unmap(ipa, size) };
