@@ -28,6 +28,12 @@ use super::*;
 use crate::linux_abi::{LINUX_EIO, LINUX_ENOMSG, LINUX_ENOSPC, LinuxErrno};
 use carrick_abi::{NsGid, NsUid};
 
+#[cfg(not(doctest))]
+pub(crate) mod lock_authority;
+#[cfg(doctest)]
+pub mod lock_authority;
+pub(crate) use lock_authority::SysvProcessGuard;
+
 syscall_table! {
     /// Per-module syscall routing for the `sysv` subsystem (Task A1).
     ///
@@ -241,7 +247,7 @@ bitflags::bitflags! {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct ShmPermMode {
+pub(crate) struct ShmPermMode {
     bits: u32,
 }
 
@@ -298,7 +304,7 @@ impl ShmPermMode {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct ShmSegment {
+pub(crate) struct ShmSegment {
     pub path: PathBuf,
     /// Generation-exact attachment counter receipt. The public key path is
     /// reusable immediately after `IPC_RMID`, while this inode-qualified path
@@ -651,7 +657,7 @@ pub(crate) struct HostAliasShmatCommit {
 /// this reservation back, so sibling `IPC_RMID` can never erase the metadata
 /// required by a later successful alias install.
 #[derive(Debug)]
-pub(super) struct PendingShmat {
+pub(crate) struct PendingShmat {
     namespace: std::sync::Arc<SysvIpcNamespace>,
     shmid: i32,
     path: PathBuf,
@@ -659,8 +665,19 @@ pub(super) struct PendingShmat {
 }
 
 impl PendingShmat {
-    fn commit(mut self, atime: u64, lpid: i32) -> Result<i32, ()> {
-        let mut state = self.namespace.state.lock();
+    pub(super) fn commit_under_paired_guard(
+        mut self,
+        namespace: &SysvIpcNamespace,
+        state: &mut SysvShmState,
+        atime: u64,
+        lpid: i32,
+    ) -> Result<i32, ()> {
+        if !std::ptr::eq(
+            std::sync::Arc::as_ptr(&self.namespace),
+            namespace as *const _,
+        ) {
+            return Err(());
+        }
         let segment = state.segments.get_mut(&self.shmid).ok_or(())?;
         if segment.path != self.path || segment.pending_attaches == 0 {
             return Err(());
@@ -679,28 +696,29 @@ impl Drop for PendingShmat {
         if !self.armed {
             return;
         }
-        let mut state = self.namespace.state.lock();
-        let should_remove = state.segments.get_mut(&self.shmid).is_some_and(|segment| {
-            if segment.path != self.path || segment.pending_attaches == 0 {
-                std::process::abort();
+        self.namespace.with_state_mut(|state| {
+            let should_remove = state.segments.get_mut(&self.shmid).is_some_and(|segment| {
+                if segment.path != self.path || segment.pending_attaches == 0 {
+                    std::process::abort();
+                }
+                segment.pending_attaches -= 1;
+                segment.removed && segment.pending_attaches == 0 && segment.nattch == 0
+            });
+            if should_remove {
+                if let Some(segment) = state.segments.remove(&self.shmid) {
+                    let _ = std::fs::remove_file(segment.nattch_path);
+                }
             }
-            segment.pending_attaches -= 1;
-            segment.removed && segment.pending_attaches == 0 && segment.nattch == 0
         });
-        if should_remove {
-            if let Some(segment) = state.segments.remove(&self.shmid) {
-                let _ = std::fs::remove_file(segment.nattch_path);
-            }
-        }
     }
 }
 
 #[derive(Default, Debug)]
-pub(super) struct SysvShmState {
+pub struct SysvShmState {
     /// shmid (= host inode number, truncated to i32) → segment metadata.
     /// Populated lazily: a shmat against a known key but unfamiliar shmid
     /// resolves through the filesystem and inserts on the fly.
-    pub segments: HashMap<i32, ShmSegment>,
+    pub(crate) segments: HashMap<i32, ShmSegment>,
     /// Counter for IPC_PRIVATE segment filenames (combined with pid for
     /// uniqueness — fork-safe because each forked carrick process has its
     /// own pid).
@@ -765,8 +783,8 @@ impl SysvShmState {
 /// does not copy the namespace: children see the same segments, queues, and
 /// semaphore sets, including objects created after the fork.
 #[derive(Debug)]
-pub(super) struct SysvIpcNamespace {
-    pub(super) state: Mutex<SysvShmState>,
+pub struct SysvIpcNamespace {
+    state: Mutex<SysvShmState>,
     cleanup_claimed: AtomicBool,
 }
 
@@ -776,6 +794,24 @@ impl SysvIpcNamespace {
             state: Mutex::new(SysvShmState::new()),
             cleanup_claimed: AtomicBool::new(false),
         }
+    }
+
+    /// Run a standalone read-only operation with the namespace lock held.
+    pub(crate) fn with_state<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&SysvShmState) -> R,
+    {
+        let state = self.state.lock();
+        f(&state)
+    }
+
+    /// Run a standalone mutable operation with the namespace lock held.
+    pub(crate) fn with_state_mut<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut SysvShmState) -> R,
+    {
+        let mut state = self.state.lock();
+        f(&mut state)
     }
 
     fn claim_cleanup(&self) -> bool {
@@ -789,17 +825,17 @@ impl SysvIpcNamespace {
 /// shmat/shmdt state belongs to one Linux process and is inherited by value at
 /// fork just like its VMA graph.
 #[derive(Clone, Debug)]
-pub(super) struct SysvProcessAttachments {
+pub struct SysvProcessAttachments {
     /// Map guest VA (returned from shmat) → shmid so shmdt can find which
     /// segment to decrement when given just an address.
-    attachments: HashMap<u64, i32>,
+    pub(super) attachments: HashMap<u64, i32>,
     /// Attachment starts passed to remap_file_pages(2). Linux no longer
     /// accepts them as shmdt(2) segment starts.
-    remapped_attachments: HashSet<u64>,
+    pub(super) remapped_attachments: HashSet<u64>,
     /// A fork snapshot becomes chargeable only after authoritative child
     /// publication. This prevents every recoverable pre-publication failure
     /// from leaking one `shm_nattch` per inherited mapping.
-    inheritance_committed: bool,
+    pub(super) inheritance_committed: bool,
 }
 
 impl Default for SysvProcessAttachments {
@@ -1983,7 +2019,7 @@ fn read_shm_nattch(segment: &ShmSegment) -> u64 {
     with_shm_nattch_file(segment, |_file, count| Ok(count)).unwrap_or(segment.nattch)
 }
 
-fn adjust_shm_nattch(segment: &ShmSegment, delta: i64) -> u64 {
+pub(super) fn adjust_shm_nattch(segment: &ShmSegment, delta: i64) -> u64 {
     use std::io::{Seek, SeekFrom, Write};
 
     with_shm_nattch_file(segment, |file, count| {
@@ -2006,10 +2042,7 @@ fn adjust_shm_nattch(segment: &ShmSegment, delta: i64) -> u64 {
     })
 }
 
-/// Drop one live attachment and finalize a tombstoned generation at its exact
-/// last-owner edge. Every decrement path uses this helper so metadata and the
-/// inode-qualified receipt cannot diverge.
-fn decrement_shm_attachment(
+pub(super) fn decrement_shm_attachment(
     state: &mut SysvShmState,
     shmid: i32,
     lpid: i32,
@@ -2165,32 +2198,33 @@ pub(super) fn reserve_shmat(
     shmid: i32,
     needs_write: bool,
 ) -> Result<(i32, usize, PendingShmat), LinuxErrno> {
-    let mut state = namespace.state.lock();
-    let segment = state
-        .segments
-        .get_mut(&shmid)
-        .ok_or(crate::linux_abi::LINUX_EINVAL)?;
-    if segment.removed {
-        return Err(crate::linux_abi::LINUX_EINVAL);
-    }
-    if !segment.can_read(creds) || (needs_write && !segment.can_write(creds)) {
-        return Err(LINUX_EACCES);
-    }
-    let pending_attaches = segment
-        .pending_attaches
-        .checked_add(1)
-        .ok_or(LINUX_ENOSPC)?;
-    let path_cstr = std::ffi::CString::new(segment.path.as_os_str().as_encoded_bytes())
-        .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
-    let fd = unsafe { libc::open(path_cstr.as_ptr(), libc::O_RDWR) }.host_syscall_errno()?;
-    segment.pending_attaches = pending_attaches;
-    let reservation = PendingShmat {
-        namespace: std::sync::Arc::clone(namespace),
-        shmid,
-        path: segment.path.clone(),
-        armed: true,
-    };
-    Ok((fd, segment.size, reservation))
+    namespace.with_state_mut(|state| {
+        let segment = state
+            .segments
+            .get_mut(&shmid)
+            .ok_or(crate::linux_abi::LINUX_EINVAL)?;
+        if segment.removed {
+            return Err(crate::linux_abi::LINUX_EINVAL);
+        }
+        if !segment.can_read(creds) || (needs_write && !segment.can_write(creds)) {
+            return Err(LINUX_EACCES);
+        }
+        let pending_attaches = segment
+            .pending_attaches
+            .checked_add(1)
+            .ok_or(LINUX_ENOSPC)?;
+        let path_cstr = std::ffi::CString::new(segment.path.as_os_str().as_encoded_bytes())
+            .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
+        let fd = unsafe { libc::open(path_cstr.as_ptr(), libc::O_RDWR) }.host_syscall_errno()?;
+        segment.pending_attaches = pending_attaches;
+        let reservation = PendingShmat {
+            namespace: std::sync::Arc::clone(namespace),
+            shmid,
+            path: segment.path.clone(),
+            armed: true,
+        };
+        Ok((fd, segment.size, reservation))
+    })
 }
 
 /// Unlink the backing file for `shmid`. Existing mmaps remain valid (Linux
@@ -2293,30 +2327,48 @@ fn sysvipc_msg_table_from_files() -> String {
 // ===================================================================
 
 impl SyscallDispatcher {
+    pub(crate) fn lock_sysv_process(&self) -> SysvProcessGuard<'_> {
+        let guard = self.sysv_process.lock();
+        SysvProcessGuard::new(guard, &self.sysv)
+    }
+
+    pub(crate) fn with_sysv_process<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&SysvProcessAttachments) -> R,
+    {
+        let process = self.lock_sysv_process();
+        f(&process.guard)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_sysv_process_mut<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut SysvProcessAttachments) -> R,
+    {
+        let mut process = self.lock_sysv_process();
+        f(&mut process.guard)
+    }
+
     pub(super) fn commit_host_alias_shmat(&self, commit: HostAliasShmatCommit) {
-        let mut process = self.sysv_process.lock();
-        if process.attachments.contains_key(&commit.va) {
-            // The host mapping is already installed. Alias exclusion proves no
-            // legitimate shmat/shmdt mutation can intervene here, so an
-            // occupied VA is irrecoverable corruption.
-            std::process::abort();
-        }
-        let shmid = commit
-            .reservation
-            .commit(commit.atime, commit.lpid)
-            .unwrap_or_else(|()| std::process::abort());
-        process.attachments.insert(commit.va, shmid);
+        let mut process = self.lock_sysv_process();
+        process.commit_host_alias_shmat(commit);
     }
 
     pub(crate) fn sysvipc_shm_table(&self) -> String {
-        let state = self.sysv.state.lock();
+        let segments = self.sysv.with_state(|state| {
+            let mut list = state
+                .segments
+                .iter()
+                .map(|(shmid, seg)| (*shmid, seg.clone()))
+                .collect::<Vec<_>>();
+            list.sort_by_key(|(shmid, _)| *shmid);
+            list
+        });
         let mut rows = String::from(
             "       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime                   rss                  swap\n",
         );
-        let mut segments = state.segments.iter().collect::<Vec<_>>();
-        segments.sort_by_key(|(shmid, _)| **shmid);
         for (shmid, segment) in segments {
-            let nattch = read_shm_nattch(segment);
+            let nattch = read_shm_nattch(&segment);
             let rss = segment.size.div_ceil(LINUX_PAGE_SIZE as usize);
             rows.push_str(&format!(
                 "{:10} {:10} {:5o} {:21} {:5} {:5} {:6} {:5} {:5} {:5} {:5} {:10} {:10} {:10} {:21} {:21}\n",
@@ -2342,12 +2394,18 @@ impl SyscallDispatcher {
     }
 
     pub(crate) fn sysvipc_sem_table(&self) -> String {
-        let state = self.sysv.state.lock();
+        let semaphores = self.sysv.with_state(|state| {
+            let mut list = state
+                .semaphores
+                .iter()
+                .map(|(semid, meta)| (*semid, meta.clone()))
+                .collect::<Vec<_>>();
+            list.sort_by_key(|(semid, _)| semid.0);
+            list
+        });
         let mut rows = String::from(
             "       key      semid perms      nsems   uid   gid  cuid  cgid      otime      ctime\n",
         );
-        let mut semaphores = state.semaphores.iter().collect::<Vec<_>>();
-        semaphores.sort_by_key(|(semid, _)| semid.0);
         for (semid, meta) in semaphores {
             rows.push_str(&format!(
                 "{:10} {:10} {:5o} {:10} {:5} {:5} {:5} {:5} {:10} {:10}\n",
@@ -2375,21 +2433,8 @@ impl SyscallDispatcher {
         addr: u64,
         end: u64,
     ) -> Result<bool, LinuxErrno> {
-        let mut process = self.sysv_process.lock();
-        let state = self.sysv.state.lock();
-        for (attached, shmid) in process.attachments.clone() {
-            let Some(segment) = state.segments.get(&shmid) else {
-                return Err(crate::linux_abi::LINUX_EIDRM);
-            };
-            let Some(attached_end) = attached.checked_add(segment.size as u64) else {
-                continue;
-            };
-            if addr >= attached && end <= attached_end {
-                process.remapped_attachments.insert(attached);
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        let mut process = self.lock_sysv_process();
+        process.note_remap_file_pages(addr, end)
     }
 
     pub(crate) fn cleanup_sysv_shm_attachments_on_process_exit(&self) {
@@ -2400,52 +2445,47 @@ impl SyscallDispatcher {
         // forkserver, shared_memory tests): an exiting leader held sysv here
         // wanting proc, while a sibling's `newfstatat("/proc/...")` held proc
         // wanting sysv, and a third thread wedged behind them delivering
-        // SIGTERM. Resolve identity BEFORE touching the sysv lock.
+        // SIGTERM. Resolve identity and drain attachments under per-process
+        // authority before touching the shared namespace lock.
         let lpid = self.identity_pid() as i32;
         let (ids, charged) = {
-            let mut process = self.sysv_process.lock();
-            let charged = process.inheritance_committed;
+            let mut process = self.lock_sysv_process();
+            let charged = process.is_inheritance_committed();
             let ids = process
+                .guard
                 .attachments
                 .drain()
                 .map(|(_, shmid)| shmid)
                 .collect::<Vec<_>>();
-            process.remapped_attachments.clear();
+            process.guard.remapped_attachments.clear();
             (ids, charged)
         };
         if !charged {
             return;
         }
-        let mut state = self.sysv.state.lock();
-        for shmid in ids {
-            let _ = decrement_shm_attachment(&mut state, shmid, lpid, None);
-        }
+        self.sysv.with_state_mut(|state| {
+            for shmid in ids {
+                let _ = decrement_shm_attachment(state, shmid, lpid, None);
+            }
+        });
     }
 
     /// Fork one logical process's attachment table while retaining one shared
     /// IPC namespace. The returned snapshot is deliberately uncharged until
     /// authoritative child publication calls `commit_sysv_fork_inheritance`.
     pub(super) fn fork_sysv_process_attachments(&self) -> SysvProcessAttachments {
-        let mut process = self.sysv_process.lock().clone();
-        process.inheritance_committed = false;
-        process
+        let process = self.lock_sysv_process();
+        let mut copy = process.guard.clone();
+        copy.inheritance_committed = false;
+        copy
     }
 
     /// Charge every inherited attachment exactly once after the child task and
     /// its process context are authoritative. All recoverable fork failpoints
     /// occur before this boundary and therefore leave `shm_nattch` unchanged.
     pub(super) fn commit_sysv_fork_inheritance(&self) {
-        let mut process = self.sysv_process.lock();
-        if process.inheritance_committed {
-            return;
-        }
-        let mut state = self.sysv.state.lock();
-        for shmid in process.attachments.values() {
-            if let Some(segment) = state.segments.get_mut(shmid) {
-                segment.nattch = adjust_shm_nattch(segment, 1);
-            }
-        }
-        process.inheritance_committed = true;
+        let mut process = self.lock_sysv_process();
+        process.commit_fork_inheritance();
     }
 
     pub(crate) fn cleanup_sysv_ipc_on_process_exit(&self) {
@@ -2463,9 +2503,8 @@ impl SyscallDispatcher {
         if !self.sysv.claim_cleanup() {
             return;
         }
-        let shm_segments = {
-            let mut state = self.sysv.state.lock();
-            SysvIpcService::cleanup_process_exit(&mut state);
+        let shm_segments = self.sysv.with_state_mut(|state| {
+            SysvIpcService::cleanup_process_exit(state);
             state.semaphores.clear();
             state.sem_keys.clear();
             state
@@ -2473,7 +2512,7 @@ impl SyscallDispatcher {
                 .drain()
                 .map(|(_, segment)| segment)
                 .collect::<Vec<_>>()
-        };
+        });
         for segment in shm_segments {
             let _ = std::fs::remove_file(&segment.path);
             let _ = std::fs::remove_file(&segment.nattch_path);
@@ -2487,11 +2526,12 @@ impl SyscallDispatcher {
             let size = size as usize;
             let creds = this.cred_snapshot();
             let creator = this.identity_pid() as i32;
-            let mut state = this.sysv.state.lock();
-            match shmget_open(&mut state, &creds, key, size, flags, creator) {
-                Ok(shmid) => Ok(DispatchOutcome::Returned { value: shmid as i64 }),
-                Err(errno) => Ok(DispatchOutcome::errno(errno)),
-            }
+            this.sysv.with_state_mut(|state| {
+                match shmget_open(state, &creds, key, size, flags, creator) {
+                    Ok(shmid) => Ok(DispatchOutcome::Returned { value: shmid as i64 }),
+                    Err(errno) => Ok(DispatchOutcome::errno(errno)),
+                }
+            })
         }
 
         /// shmat(shmid, addr_hint, flag). Map the segment into the guest's
@@ -2537,25 +2577,9 @@ impl SyscallDispatcher {
             let hvf_page = crate::trap::HVF_PAGE_SIZE;
             let map_len = align_up_u64(size as u64, hvf_page).unwrap_or(size as u64);
             if addr == 0 && !attach_flags.contains(ShmAttachFlags::RDONLY) {
-                let mut process = this.sysv_process.lock();
-                let mut state = this.sysv.state.lock();
-                if let Some(va) = process.remapped_attachments.iter().next().copied() {
-                    let old_shmid = process.attachments.insert(va, shmid);
-                    if old_shmid != Some(shmid) {
-                        if let Some(old_shmid) = old_shmid {
-                            let _ = decrement_shm_attachment(&mut state, old_shmid, lpid, None);
-                        }
-                        drop(state);
-                        reservation
-                            .commit(
-                                unix_now_secs(),
-                                lpid,
-                            )
-                            .unwrap_or_else(|()| std::process::abort());
-                    } else {
-                        drop(state);
-                        drop(reservation);
-                    }
+                let mut process = this.lock_sysv_process();
+                if process.first_remapped_attachment().is_some() {
+                    let va = process.commit_remapped_shmat(shmid, lpid, reservation);
                     unsafe { libc::close(host_fd) };
                     return Ok(DispatchOutcome::Returned { value: va as i64 });
                 }
@@ -2570,7 +2594,7 @@ impl SyscallDispatcher {
             let requested_va = (addr != 0).then_some(addr & !(linux_page_size - 1));
             if let Some(va) = requested_va
                 && (this.guest_vma_overlaps(va, map_len)
-                    || this.sysv_process.lock().attachments.contains_key(&va))
+                    || this.with_sysv_process(|p| p.attachments.contains_key(&va)))
             {
                 // Without SHM_REMAP Linux refuses to replace any existing VMA.
                 // Check before consuming a monotonic alias IPA or touching a host
@@ -2592,7 +2616,7 @@ impl SyscallDispatcher {
                 crate::memory::LINUX_HIGH_VA_THRESHOLD
                     + (ipa - crate::memory::LINUX_ALIAS_IPA_BASE)
             });
-            if this.sysv_process.lock().attachments.contains_key(&va) {
+            if this.with_sysv_process(|p| p.attachments.contains_key(&va)) {
                 unsafe { libc::close(host_fd) };
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
@@ -2671,26 +2695,11 @@ impl SyscallDispatcher {
             let permit = cx.mm_mutation.host_alias_permit();
             let mut host_alias_dispatch = this.begin_conditional_vma_dispatch(&permit);
             let (shmid, len) = {
-                let process = this.sysv_process.lock();
-                let state = this.sysv.state.lock();
-                if process.remapped_attachments.contains(&addr) {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                let mut process = this.lock_sysv_process();
+                match process.validate_shmdt(addr) {
+                    Ok(pair) => pair,
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 }
-                let Some(shmid) = process.attachments.get(&addr).copied() else {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                };
-                let Some(segment) = state.segments.get(&shmid) else {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                };
-                let Some(aligned_len) =
-                    align_up_u64(segment.size as u64, crate::trap::HVF_PAGE_SIZE)
-                else {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-                };
-                let Ok(len) = usize::try_from(aligned_len) else {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-                };
-                (shmid, len)
             };
             if cx.memory.unmap_alias_range(addr, len).is_err() {
                 // A backend error may follow a partial page-table/stage-2
@@ -2702,27 +2711,9 @@ impl SyscallDispatcher {
             this.remove_mapping_metadata(addr, len as u64);
             let dtime = unix_now_secs();
             let lpid = this.identity_pid() as i32;
-            let mut process = this.sysv_process.lock();
-            let mut state = this.sysv.state.lock();
-            if process.remapped_attachments.contains(&addr)
-                || process.attachments.get(&addr).copied() != Some(shmid)
-            {
-                // Alias exclusion makes this impossible unless bookkeeping was
-                // mutated outside the contract. The backend unmap has already
-                // succeeded, so continuing with stale attachment metadata would
-                // leave two irreconcilable owners.
-                std::process::abort();
-            }
-            if !state.segments.contains_key(&shmid) {
-                // The backend alias is gone and the attachment still names this
-                // segment, so there is no recoverable bookkeeping state.
-                std::process::abort();
-            }
-            if !decrement_shm_attachment(&mut state, shmid, lpid, Some(dtime)) {
-                std::process::abort();
-            }
-            process.attachments.remove(&addr);
-            drop(state);
+            let mut process = this.lock_sysv_process();
+            process.commit_shmdt(addr, shmid, lpid, dtime);
+            drop(process);
             this.mark_vma_dispatch(&mut host_alias_dispatch);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
@@ -2737,8 +2728,7 @@ impl SyscallDispatcher {
             let shmid = shmid as i32;
             let creds = this.cred_snapshot();
             match cmd {
-                LINUX_IPC_RMID => {
-                    let mut state = this.sysv.state.lock();
+                LINUX_IPC_RMID => this.sysv.with_state_mut(|state| {
                     let Some(segment) = state.segments.get(&shmid).filter(|segment| !segment.removed)
                     else {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
@@ -2746,25 +2736,25 @@ impl SyscallDispatcher {
                     if !segment.can_write(&creds)
                     {
                         if segment.mode.is_empty_perms() {
-                            let _ = shmctl_rmid(&mut state, shmid);
+                            let _ = shmctl_rmid(state, shmid);
                         }
                         return Ok(DispatchOutcome::errno(LINUX_EPERM));
                     }
-                    match shmctl_rmid(&mut state, shmid) {
+                    match shmctl_rmid(state, shmid) {
                         Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
                         Err(errno) => Ok(DispatchOutcome::errno(errno)),
                     }
-                }
+                }),
                 LINUX_IPC_STAT => {
-                    let state = this.sysv.state.lock();
-                    let segment = match state.segments.get(&shmid).filter(|segment| !segment.removed) {
-                        Some(s) => s.clone(),
-                        None => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+                    let segment = this.sysv.with_state(|state| {
+                        state.segments.get(&shmid).filter(|segment| !segment.removed).cloned()
+                    });
+                    let Some(segment) = segment else {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     };
                     if !segment.can_read(&creds) {
                         return Ok(DispatchOutcome::errno(LINUX_EACCES));
                     }
-                    drop(state);
                     if buf == 0 {
                         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                     }
@@ -2801,31 +2791,33 @@ impl SyscallDispatcher {
                         Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
                     };
                     let now = unix_now_secs();
-                    let mut state = this.sysv.state.lock();
-                    match state.segments.get_mut(&shmid).filter(|segment| !segment.removed) {
-                        Some(seg) => {
-                            if !seg.can_write(&creds) {
-                                return Ok(DispatchOutcome::errno(LINUX_EPERM));
+                    this.sysv.with_state_mut(|state| {
+                        match state.segments.get_mut(&shmid).filter(|segment| !segment.removed) {
+                            Some(seg) => {
+                                if !seg.can_write(&creds) {
+                                    return Ok(DispatchOutcome::errno(LINUX_EPERM));
+                                }
+                                seg.mode = ShmPermMode::from_ipc_set(new_mode, seg.mode);
+                                seg.ctime = now;
+                                Ok(DispatchOutcome::Returned { value: 0 })
                             }
-                            seg.mode = ShmPermMode::from_ipc_set(new_mode, seg.mode);
-                            seg.ctime = now;
-                            Ok(DispatchOutcome::Returned { value: 0 })
+                            None => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
                         }
-                        None => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
-                    }
+                    })
                 }
                 LINUX_SHM_LOCK | LINUX_SHM_UNLOCK => {
-                    let mut state = this.sysv.state.lock();
-                    match state.segments.get_mut(&shmid).filter(|segment| !segment.removed) {
-                        Some(segment) if !segment.can_write(&creds) => {
-                            Ok(DispatchOutcome::errno(LINUX_EPERM))
+                    this.sysv.with_state_mut(|state| {
+                        match state.segments.get_mut(&shmid).filter(|segment| !segment.removed) {
+                            Some(segment) if !segment.can_write(&creds) => {
+                                Ok(DispatchOutcome::errno(LINUX_EPERM))
+                            }
+                            Some(segment) => {
+                                segment.mode.set_locked(cmd == LINUX_SHM_LOCK);
+                                Ok(DispatchOutcome::Returned { value: 0 })
+                            }
+                            None => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
                         }
-                        Some(segment) => {
-                            segment.mode.set_locked(cmd == LINUX_SHM_LOCK);
-                            Ok(DispatchOutcome::Returned { value: 0 })
-                        }
-                        None => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
-                    }
+                    })
                 }
                 LINUX_SHM_STAT | LINUX_SHM_STAT_ANY => {
                     // SHM_STAT takes an INDEX into the kernel's segment
@@ -2833,28 +2825,32 @@ impl SyscallDispatcher {
                     // segment at that index into `buf` and returns the
                     // shmid. LTP shmctl01 builds an index→shmid mapping by
                     // iterating SHM_STAT(0..N).
-                    let state = this.sysv.state.lock();
-                    let mut ids: Vec<i32> = state
-                        .segments
-                        .iter()
-                        .filter_map(|(id, segment)| (!segment.removed).then_some(*id))
-                        .collect();
-                    ids.sort();
-                    let target_id = if cmd == LINUX_SHM_STAT_ANY
-                        && state.segments.get(&shmid).is_some_and(|segment| !segment.removed)
-                    {
-                        shmid
-                    } else {
-                        let idx = shmid as usize; // SHM_STAT uses the first arg as idx
-                        match ids.get(idx) {
-                            Some(id) => *id,
-                            None => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
-                        }
-                    };
-                    let segment = state.segments.get(&target_id).cloned();
-                    drop(state);
-                    let Some(segment) = segment else {
-                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    let (target_id, segment) = match this.sysv.with_state(|state| {
+                        let mut ids: Vec<i32> = state
+                            .segments
+                            .iter()
+                            .filter_map(|(id, segment)| (!segment.removed).then_some(*id))
+                            .collect();
+                        ids.sort();
+                        let target_id = if cmd == LINUX_SHM_STAT_ANY
+                            && state.segments.get(&shmid).is_some_and(|segment| !segment.removed)
+                        {
+                            shmid
+                        } else {
+                            let idx = shmid as usize; // SHM_STAT uses the first arg as idx
+                            match ids.get(idx) {
+                                Some(id) => *id,
+                                None => return Err(LINUX_EINVAL),
+                            }
+                        };
+                        let segment = match state.segments.get(&target_id).cloned() {
+                            Some(s) => s,
+                            None => return Err(LINUX_EINVAL),
+                        };
+                        Ok((target_id, segment))
+                    }) {
+                        Ok(pair) => pair,
+                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                     };
                     if buf != 0 {
                         let bytes = shmid_ds_bytes(&segment, &this.cred_snapshot());
@@ -2869,8 +2865,7 @@ impl SyscallDispatcher {
                     // Aggregate info. Linux fills `struct shminfo`
                     // (IPC_INFO) or `struct shm_info` (SHM_INFO). Return
                     // values: max shmid INDEX currently in use (Linux).
-                    let state = this.sysv.state.lock();
-                    let used_ids = state.segments.len() as i64;
+                    let used_ids = this.sysv.with_state(|state| state.segments.len()) as i64;
                     if buf != 0 {
                         let mut bytes = [0u8; 72];
                         let put = |bytes: &mut [u8], idx: usize, value: u64| {
@@ -2908,11 +2903,12 @@ impl SyscallDispatcher {
                 Ok(key) => key,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
-            let mut state = this.sysv.state.lock();
-            match SysvIpcService::msgget(&mut state, &creds, key, msgflg) {
-                Ok(id) => Ok(DispatchOutcome::Returned { value: id.as_i64() }),
-                Err(errno) => Ok(DispatchOutcome::errno(errno)),
-            }
+            this.sysv.with_state_mut(|state| {
+                match SysvIpcService::msgget(state, &creds, key, msgflg) {
+                    Ok(id) => Ok(DispatchOutcome::Returned { value: id.as_i64() }),
+                    Err(errno) => Ok(DispatchOutcome::errno(errno)),
+                }
+            })
         }
 
         /// msgsnd(msqid, msgp, msgsz, msgflg): append one typed message.
@@ -3099,29 +3095,32 @@ impl SyscallDispatcher {
             let create = create_flags.contains(IpcCreateFlags::CREAT);
             let exclusive = create_flags.contains(IpcCreateFlags::EXCL);
             let creds = this.cred_snapshot();
-            {
-                let state = this.sysv.state.lock();
+            let existing_outcome = this.sysv.with_state(|state| {
                 if key != LINUX_IPC_PRIVATE
                     && let Some(guest_semid) = state.sem_keys.get(&key).copied()
                     && let Some(existing) = state.semaphores.get(&guest_semid)
                 {
                     if create && exclusive {
-                        return Ok(DispatchOutcome::errno(LINUX_EEXIST));
+                        return Some(Ok(DispatchOutcome::errno(LINUX_EEXIST)));
                     }
                     if nsems_usize > existing.nsems {
-                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        return Some(Ok(DispatchOutcome::errno(LINUX_EINVAL)));
                     }
                     let wants_read = semflg & 0o400 != 0;
                     let wants_write = semflg & 0o200 != 0;
                     if (wants_read && !existing.can_read(&creds))
                         || (wants_write && !existing.can_write(&creds))
                     {
-                        return Ok(DispatchOutcome::errno(LINUX_EACCES));
+                        return Some(Ok(DispatchOutcome::errno(LINUX_EACCES)));
                     }
-                    return Ok(DispatchOutcome::Returned {
+                    return Some(Ok(DispatchOutcome::Returned {
                         value: guest_semid.as_i64(),
-                    });
+                    }));
                 }
+                None
+            });
+            if let Some(outcome) = existing_outcome {
+                return outcome;
             }
             if !create && key != LINUX_IPC_PRIVATE {
                 return Ok(DispatchOutcome::errno(LINUX_ENOENT));
@@ -3130,41 +3129,42 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let now = unix_now_secs();
-            let mut state = this.sysv.state.lock();
-            if state.semaphores.len() >= LINUX_SEMMNI {
-                return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
-            }
-            let Ok((guest_semid, scan_index)) = state.allocate_sem_id() else {
-                return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
-            };
-            state.semaphores.insert(
-                guest_semid,
-                SemSet {
-                    key,
-                    scan_index,
-                    nsems: nsems_usize,
-                    mode: ShmPermMode::requested(semflg),
-                    uid: creds.euid,
-                    gid: creds.egid,
-                    cuid: creds.euid,
-                    cgid: creds.egid,
-                    ctime: now,
-                    otime: 0,
-                    values: Arc::new(Mutex::new(vec![0u16; nsems_usize])),
-                    logical_last_operators: Arc::new(Mutex::new(vec![None; nsems_usize])),
-                    logical_wait_counts: Arc::new(Mutex::new(vec![
-                        SemWaitCounts::default();
-                        nsems_usize
-                    ])),
-                    changed: Arc::new(parking_lot::Condvar::new()),
-                    removed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                },
-            );
-            if key != LINUX_IPC_PRIVATE {
-                state.sem_keys.insert(key, guest_semid);
-            }
-            Ok(DispatchOutcome::Returned {
-                value: guest_semid.as_i64(),
+            this.sysv.with_state_mut(|state| {
+                if state.semaphores.len() >= LINUX_SEMMNI {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
+                }
+                let Ok((guest_semid, scan_index)) = state.allocate_sem_id() else {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
+                };
+                state.semaphores.insert(
+                    guest_semid,
+                    SemSet {
+                        key,
+                        scan_index,
+                        nsems: nsems_usize,
+                        mode: ShmPermMode::requested(semflg),
+                        uid: creds.euid,
+                        gid: creds.egid,
+                        cuid: creds.euid,
+                        cgid: creds.egid,
+                        ctime: now,
+                        otime: 0,
+                        values: Arc::new(Mutex::new(vec![0u16; nsems_usize])),
+                        logical_last_operators: Arc::new(Mutex::new(vec![None; nsems_usize])),
+                        logical_wait_counts: Arc::new(Mutex::new(vec![
+                            SemWaitCounts::default();
+                            nsems_usize
+                        ])),
+                        changed: Arc::new(parking_lot::Condvar::new()),
+                        removed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    },
+                );
+                if key != LINUX_IPC_PRIVATE {
+                    state.sem_keys.insert(key, guest_semid);
+                }
+                Ok(DispatchOutcome::Returned {
+                    value: guest_semid.as_i64(),
+                })
             })
         }
 
@@ -3588,7 +3588,8 @@ fn sysv_msgctl<M: CurrentMmMemory>(
             }
             let _ = std::fs::remove_file(&path);
             let _ = std::fs::remove_file(msg_queue_wait_path(&path));
-            this.sysv.state.lock().message_queues.remove(&msqid);
+            this.sysv
+                .with_state_mut(|state| state.message_queues.remove(&msqid));
             carrick_thread::platform_futex::carrier_shared_futex_table()
                 .wake(msqid.raw() as u64, u32::MAX);
             Ok(DispatchOutcome::Returned { value: 0 })
@@ -3937,13 +3938,15 @@ impl SyscallDispatcher {
             Ok(guest_semid) => guest_semid,
             Err(errno) => return Ok(DispatchOutcome::errno(errno)),
         };
-        let (sem_set, wait_counts) = {
-            let state = self.sysv.state.lock();
+        let (sem_set, wait_counts) = match self.sysv.with_state(|state| {
             let meta = state.semaphores.get(&guest_semid).ok_or(LINUX_EINVAL);
             match meta {
-                Ok(meta) => (meta.clone(), Arc::clone(&meta.logical_wait_counts)),
-                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                Ok(meta) => Ok((meta.clone(), Arc::clone(&meta.logical_wait_counts))),
+                Err(errno) => Err(errno),
             }
+        }) {
+            Ok(pair) => pair,
+            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
         };
         let creds = self.cred_snapshot();
         if !sem_set.can_write(&creds) {
@@ -3965,11 +3968,13 @@ impl SyscallDispatcher {
         };
         let completed = |sops: &[LinuxSembuf]| {
             let now = unix_now_secs();
-            if let Some(pid) = logical_operator
-                && let Some(meta) = self.sysv.state.lock().semaphores.get_mut(&guest_semid)
-            {
-                meta.record_logical_semop(pid, sops);
-                meta.otime = now;
+            if let Some(pid) = logical_operator {
+                self.sysv.with_state_mut(|state| {
+                    if let Some(meta) = state.semaphores.get_mut(&guest_semid) {
+                        meta.record_logical_semop(pid, sops);
+                        meta.otime = now;
+                    }
+                });
             }
         };
         sysv_semop(
@@ -4018,31 +4023,37 @@ impl SyscallDispatcher {
             Ok(guest_semid) => guest_semid,
             Err(errno) => return Ok(DispatchOutcome::errno(errno)),
         };
-        let mut state = self.sysv.state.lock();
-        let Some(meta) = state.semaphores.get_mut(&guest_semid) else {
-            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-        };
-        if matches!(cmd, LINUX_IPC_RMID | LINUX_IPC_SET) && !meta.can_admin(creds) {
-            return Ok(DispatchOutcome::errno(LINUX_EPERM));
-        }
-        let now = unix_now_secs();
         let caller_pid = self
             .hvpatch_process()
             .map(|_| cx.kernel.task().key().id.raw())
             .unwrap_or(0);
+        let now = unix_now_secs();
 
         match cmd {
             LINUX_IPC_RMID => {
-                meta.removed
-                    .store(true, std::sync::atomic::Ordering::Release);
-                let key = meta.key;
-                let changed = Arc::clone(&meta.changed);
-                state.semaphores.remove(&guest_semid);
-                if key != LINUX_IPC_PRIVATE {
-                    state.sem_keys.remove(&key);
+                let (res, changed) = self.sysv.with_state_mut(|state| {
+                    let Some(meta) = state.semaphores.get_mut(&guest_semid) else {
+                        return (Err(LINUX_EINVAL), None);
+                    };
+                    if !meta.can_admin(creds) {
+                        return (Err(LINUX_EPERM), None);
+                    }
+                    meta.removed
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    let key = meta.key;
+                    let changed = Arc::clone(&meta.changed);
+                    state.semaphores.remove(&guest_semid);
+                    if key != LINUX_IPC_PRIVATE {
+                        state.sem_keys.remove(&key);
+                    }
+                    (Ok(()), Some(changed))
+                });
+                if let Err(errno) = res {
+                    return Ok(DispatchOutcome::errno(errno));
                 }
-                drop(state);
-                changed.notify_all();
+                if let Some(changed) = changed {
+                    changed.notify_all();
+                }
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
             LINUX_IPC_SET => {
@@ -4054,16 +4065,31 @@ impl SyscallDispatcher {
                     Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
                 };
                 let mode = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-                meta.mode = ShmPermMode::from_ipc_set(mode, meta.mode);
-                meta.ctime = now;
-                Ok(DispatchOutcome::Returned { value: 0 })
+                let res = self.sysv.with_state_mut(|state| {
+                    let Some(meta) = state.semaphores.get_mut(&guest_semid) else {
+                        return Err(LINUX_EINVAL);
+                    };
+                    if !meta.can_admin(creds) {
+                        return Err(LINUX_EPERM);
+                    }
+                    meta.mode = ShmPermMode::from_ipc_set(mode, meta.mode);
+                    meta.ctime = now;
+                    Ok(())
+                });
+                match res {
+                    Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+                    Err(errno) => Ok(DispatchOutcome::errno(errno)),
+                }
             }
             LINUX_IPC_STAT => {
-                if !meta.can_read(creds) {
-                    return Ok(DispatchOutcome::errno(LINUX_EACCES));
-                }
-                if arg != 0 {
-                    let out = LinuxSemidDs {
+                let ds_res = self.sysv.with_state(|state| {
+                    let Some(meta) = state.semaphores.get(&guest_semid) else {
+                        return Err(LINUX_EINVAL);
+                    };
+                    if !meta.can_read(creds) {
+                        return Err(LINUX_EACCES);
+                    }
+                    Ok(LinuxSemidDs {
                         sem_perm: LinuxIpcPerm {
                             key: meta.key,
                             uid: meta.uid.raw(),
@@ -4079,7 +4105,13 @@ impl SyscallDispatcher {
                         sem_nsems: meta.nsems as u64,
                         __unused3: 0,
                         __unused4: 0,
-                    };
+                    })
+                });
+                let out = match ds_res {
+                    Ok(out) => out,
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                };
+                if arg != 0 {
                     if cx.memory.write_bytes(arg, out.as_bytes()).is_err() {
                         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                     }
@@ -4090,106 +4122,165 @@ impl SyscallDispatcher {
                 let Ok(idx) = usize::try_from(semnum) else {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 };
-                if idx >= meta.nsems {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                let val_res = self.sysv.with_state(|state| {
+                    let Some(meta) = state.semaphores.get(&guest_semid) else {
+                        return Err(LINUX_EINVAL);
+                    };
+                    if idx >= meta.nsems {
+                        return Err(LINUX_EINVAL);
+                    }
+                    if !meta.can_read(creds) {
+                        return Err(LINUX_EACCES);
+                    }
+                    Ok(meta.values.lock()[idx])
+                });
+                match val_res {
+                    Ok(val) => Ok(DispatchOutcome::Returned { value: val as i64 }),
+                    Err(errno) => Ok(DispatchOutcome::errno(errno)),
                 }
-                if !meta.can_read(creds) {
-                    return Ok(DispatchOutcome::errno(LINUX_EACCES));
-                }
-                let val = meta.values.lock()[idx];
-                Ok(DispatchOutcome::Returned { value: val as i64 })
             }
             LINUX_SETVAL => {
                 let Ok(idx) = usize::try_from(semnum) else {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 };
-                if idx >= meta.nsems {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                }
-                if !meta.can_write(creds) {
-                    return Ok(DispatchOutcome::errno(LINUX_EACCES));
-                }
                 let val = arg as i32;
                 if !(0..=32767).contains(&val) {
                     return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ERANGE));
                 }
-                meta.values.lock()[idx] = val as u16;
-                meta.record_logical_setval(caller_pid, semnum);
-                meta.ctime = now;
-                let changed = Arc::clone(&meta.changed);
-                drop(state);
-                changed.notify_all();
+                let (res, changed) = self.sysv.with_state_mut(|state| {
+                    let Some(meta) = state.semaphores.get_mut(&guest_semid) else {
+                        return (Err(LINUX_EINVAL), None);
+                    };
+                    if idx >= meta.nsems {
+                        return (Err(LINUX_EINVAL), None);
+                    }
+                    if !meta.can_write(creds) {
+                        return (Err(LINUX_EACCES), None);
+                    }
+                    meta.values.lock()[idx] = val as u16;
+                    meta.record_logical_setval(caller_pid, semnum);
+                    meta.ctime = now;
+                    let changed = Arc::clone(&meta.changed);
+                    (Ok(()), Some(changed))
+                });
+                if let Err(errno) = res {
+                    return Ok(DispatchOutcome::errno(errno));
+                }
+                if let Some(changed) = changed {
+                    changed.notify_all();
+                }
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
             LINUX_GETPID => {
                 let Ok(idx) = usize::try_from(semnum) else {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 };
-                if idx >= meta.nsems {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                let pid_res = self.sysv.with_state(|state| {
+                    let Some(meta) = state.semaphores.get(&guest_semid) else {
+                        return Err(LINUX_EINVAL);
+                    };
+                    if idx >= meta.nsems {
+                        return Err(LINUX_EINVAL);
+                    }
+                    if !meta.can_read(creds) {
+                        return Err(LINUX_EACCES);
+                    }
+                    Ok(meta.logical_last_operator(semnum).unwrap_or(0))
+                });
+                match pid_res {
+                    Ok(pid) => Ok(DispatchOutcome::Returned {
+                        value: i64::from(pid),
+                    }),
+                    Err(errno) => Ok(DispatchOutcome::errno(errno)),
                 }
-                if !meta.can_read(creds) {
-                    return Ok(DispatchOutcome::errno(LINUX_EACCES));
-                }
-                let pid = meta.logical_last_operator(semnum).unwrap_or(0);
-                Ok(DispatchOutcome::Returned {
-                    value: i64::from(pid),
-                })
             }
             LINUX_GETNCNT => {
                 let Ok(idx) = usize::try_from(semnum) else {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 };
-                if idx >= meta.nsems {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                let count_res = self.sysv.with_state(|state| {
+                    let Some(meta) = state.semaphores.get(&guest_semid) else {
+                        return Err(LINUX_EINVAL);
+                    };
+                    if idx >= meta.nsems {
+                        return Err(LINUX_EINVAL);
+                    }
+                    if !meta.can_read(creds) {
+                        return Err(LINUX_EACCES);
+                    }
+                    Ok(meta
+                        .logical_wait_count(semnum, SemWaitKind::Increase)
+                        .unwrap_or(0))
+                });
+                match count_res {
+                    Ok(count) => Ok(DispatchOutcome::Returned {
+                        value: i64::from(count),
+                    }),
+                    Err(errno) => Ok(DispatchOutcome::errno(errno)),
                 }
-                if !meta.can_read(creds) {
-                    return Ok(DispatchOutcome::errno(LINUX_EACCES));
-                }
-                let count = meta
-                    .logical_wait_count(semnum, SemWaitKind::Increase)
-                    .unwrap_or(0);
-                Ok(DispatchOutcome::Returned {
-                    value: i64::from(count),
-                })
             }
             LINUX_GETZCNT => {
                 let Ok(idx) = usize::try_from(semnum) else {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 };
-                if idx >= meta.nsems {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                let count_res = self.sysv.with_state(|state| {
+                    let Some(meta) = state.semaphores.get(&guest_semid) else {
+                        return Err(LINUX_EINVAL);
+                    };
+                    if idx >= meta.nsems {
+                        return Err(LINUX_EINVAL);
+                    }
+                    if !meta.can_read(creds) {
+                        return Err(LINUX_EACCES);
+                    }
+                    Ok(meta
+                        .logical_wait_count(semnum, SemWaitKind::Zero)
+                        .unwrap_or(0))
+                });
+                match count_res {
+                    Ok(count) => Ok(DispatchOutcome::Returned {
+                        value: i64::from(count),
+                    }),
+                    Err(errno) => Ok(DispatchOutcome::errno(errno)),
                 }
-                if !meta.can_read(creds) {
-                    return Ok(DispatchOutcome::errno(LINUX_EACCES));
-                }
-                let count = meta
-                    .logical_wait_count(semnum, SemWaitKind::Zero)
-                    .unwrap_or(0);
-                Ok(DispatchOutcome::Returned {
-                    value: i64::from(count),
-                })
             }
             LINUX_GETALL => {
-                if !meta.can_read(creds) {
-                    return Ok(DispatchOutcome::errno(LINUX_EACCES));
-                }
-                let vals = meta.values.lock().clone();
+                let vals_res = self.sysv.with_state(|state| {
+                    let Some(meta) = state.semaphores.get(&guest_semid) else {
+                        return Err(LINUX_EINVAL);
+                    };
+                    if !meta.can_read(creds) {
+                        return Err(LINUX_EACCES);
+                    }
+                    Ok(meta.values.lock().clone())
+                });
+                let vals = match vals_res {
+                    Ok(vals) => vals,
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                };
                 let mut out = Vec::with_capacity(vals.len() * 2);
                 for v in &vals {
                     out.extend_from_slice(&v.to_le_bytes());
                 }
-                drop(state);
                 if cx.memory.write_bytes(arg, &out).is_err() {
                     return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 }
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
             LINUX_SETALL => {
-                if !meta.can_write(creds) {
-                    return Ok(DispatchOutcome::errno(LINUX_EACCES));
-                }
-                let nsems = meta.nsems;
+                let nsems_res = self.sysv.with_state(|state| {
+                    let Some(meta) = state.semaphores.get(&guest_semid) else {
+                        return Err(LINUX_EINVAL);
+                    };
+                    if !meta.can_write(creds) {
+                        return Err(LINUX_EACCES);
+                    }
+                    Ok(meta.nsems)
+                });
+                let nsems = match nsems_res {
+                    Ok(n) => n,
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                };
                 let bytes = match cx.memory.read_bytes(arg, nsems * 2) {
                     Ok(b) => b,
                     Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
@@ -4202,12 +4293,22 @@ impl SyscallDispatcher {
                     }
                     vals.push(v);
                 }
-                *meta.values.lock() = vals;
-                meta.record_logical_setall(caller_pid);
-                meta.ctime = now;
-                let changed = Arc::clone(&meta.changed);
-                drop(state);
-                changed.notify_all();
+                let (res, changed) = self.sysv.with_state_mut(|state| {
+                    let Some(meta) = state.semaphores.get_mut(&guest_semid) else {
+                        return (Err(LINUX_EINVAL), None);
+                    };
+                    *meta.values.lock() = vals;
+                    meta.record_logical_setall(caller_pid);
+                    meta.ctime = now;
+                    let changed = Arc::clone(&meta.changed);
+                    (Ok(()), Some(changed))
+                });
+                if let Err(errno) = res {
+                    return Ok(DispatchOutcome::errno(errno));
+                }
+                if let Some(changed) = changed {
+                    changed.notify_all();
+                }
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
             _ => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
@@ -4219,20 +4320,21 @@ impl SyscallDispatcher {
         cx: &mut SyscallCtx<M>,
         arg: u64,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let state = self.sysv.state.lock();
-        let used_sets = state.semaphores.len() as u32;
-        let used_sems = state
-            .semaphores
-            .values()
-            .map(|meta| meta.nsems as u32)
-            .sum::<u32>();
-        let max_index = state
-            .semaphores
-            .values()
-            .map(|meta| meta.scan_index)
-            .max()
-            .map_or(0, SemScanIndex::as_i64);
-        drop(state);
+        let (used_sets, used_sems, max_index) = self.sysv.with_state(|state| {
+            let used_sets = state.semaphores.len() as u32;
+            let used_sems = state
+                .semaphores
+                .values()
+                .map(|meta| meta.nsems as u32)
+                .sum::<u32>();
+            let max_index = state
+                .semaphores
+                .values()
+                .map(|meta| meta.scan_index)
+                .max()
+                .map_or(0, SemScanIndex::as_i64);
+            (used_sets, used_sems, max_index)
+        });
 
         if arg != 0 {
             let fields = [
@@ -4265,20 +4367,19 @@ impl SyscallDispatcher {
         arg: u64,
         creds: &crate::kernel::Credentials,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let state = self.sysv.state.lock();
-        let Some((guest_semid, meta)) = state
-            .semaphores
-            .iter()
-            .find(|(_, meta)| meta.scan_index == selector.scan_index())
-        else {
+        let meta_opt = self.sysv.with_state(|state| {
+            state
+                .semaphores
+                .iter()
+                .find(|(_, meta)| meta.scan_index == selector.scan_index())
+                .map(|(guest_semid, meta)| (*guest_semid, meta.clone()))
+        });
+        let Some((guest_semid, meta)) = meta_opt else {
             return Ok(DispatchOutcome::errno(LINUX_EINVAL));
         };
-        let guest_semid = *guest_semid;
-        let meta = meta.clone();
         if selector.enforces_read_permission() && !meta.can_read(creds) {
             return Ok(DispatchOutcome::errno(LINUX_EACCES));
         }
-        drop(state);
 
         if arg != 0 {
             let out = LinuxSemidDs {
@@ -4568,11 +4669,14 @@ mod ipc_set_tests {
             removed,
             pending_attaches: 0,
         };
-        let old = make_segment(old_receipt.clone(), 0o400, true);
-        let new = make_segment(new_receipt.clone(), 0o600, false);
-        assert_eq!(adjust_shm_nattch(&old, 1), 1);
-        assert_eq!(adjust_shm_nattch(&new, 1), 1);
-        assert_eq!(adjust_shm_nattch(&old, 1), 2);
+        let mut old = make_segment(old_receipt.clone(), 0o400, true);
+        let mut new = make_segment(new_receipt.clone(), 0o600, false);
+        old.nattch = adjust_shm_nattch(&old, 1);
+        assert_eq!(old.nattch, 1);
+        new.nattch = adjust_shm_nattch(&new, 1);
+        assert_eq!(new.nattch, 1);
+        old.nattch = adjust_shm_nattch(&old, 1);
+        assert_eq!(old.nattch, 2);
         assert_eq!(read_shm_nattch(&old), 2);
         assert_eq!(read_shm_nattch(&new), 1);
 
@@ -5421,5 +5525,217 @@ mod ipc_set_tests {
     #[test]
     fn sysv_scope_falls_back_when_no_active_context() {
         assert_eq!(sysv_scope(), "unscoped-sysv");
+    }
+
+    fn run_proc_sysvipc_concurrency_worker() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let dispatcher = Arc::new(SyscallDispatcher::new());
+        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+            100,
+            crate::thread::ThreadId::synthetic_for_tests(100),
+            "sysv-proc-race".to_owned(),
+        )
+        .expect("bootstrap root for /proc race");
+        let (_binding, context) =
+            crate::kernel::Kernel::bootstrap_root(bootstrap).expect("bootstrap /proc race root");
+        let context = Arc::new(context);
+        let shmid_1 = 5101;
+        let shmid_2 = 5102;
+        let _backing1 = insert_test_shm_segment(&dispatcher, shmid_1, LINUX_PAGE_SIZE as usize);
+        let _backing2 = insert_test_shm_segment(&dispatcher, shmid_2, LINUX_PAGE_SIZE as usize);
+
+        let running = Arc::new(AtomicBool::new(true));
+        let mut handles = Vec::new();
+
+        // Thread 1: /proc/sysvipc table renderers acquiring proc lock first
+        {
+            let d = Arc::clone(&dispatcher);
+            let context = Arc::clone(&context);
+            let r = Arc::clone(&running);
+            handles.push(std::thread::spawn(move || {
+                while r.load(Ordering::Relaxed) {
+                    let proc = d.synthetic_proc_context(&context);
+                    assert!(proc.sysvipc_shm.contains("key"));
+                    assert!(proc.sysvipc_sem.contains("key"));
+                    assert!(proc.sysvipc_msg.contains("key"));
+                    std::thread::yield_now();
+                }
+            }));
+        }
+
+        // Thread 2: attachment cleanup & exit racing
+        {
+            let d = Arc::clone(&dispatcher);
+            let r = Arc::clone(&running);
+            handles.push(std::thread::spawn(move || {
+                let va_base = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+                while r.load(Ordering::Relaxed) {
+                    let child = d.fork_clone_in_process(
+                        crate::thread::ThreadId::synthetic_for_tests(20),
+                        crate::thread::ThreadId::synthetic_for_tests(21),
+                        20,
+                        21,
+                    );
+                    child.with_sysv_process_mut(|proc| {
+                        proc.attachments.insert(va_base, shmid_1);
+                        proc.inheritance_committed = true;
+                    });
+                    child.sysv.with_state_mut(|state| {
+                        if let Some(seg) = state.segments.get_mut(&shmid_1) {
+                            seg.nattch = seg.nattch.saturating_add(1);
+                        }
+                    });
+                    child.cleanup_sysv_shm_attachments_on_process_exit();
+                    std::thread::yield_now();
+                }
+            }));
+        }
+
+        // Thread 3: paired fork inheritance commit
+        {
+            let d = Arc::clone(&dispatcher);
+            let r = Arc::clone(&running);
+            handles.push(std::thread::spawn(move || {
+                let va_base = crate::memory::LINUX_HIGH_VA_THRESHOLD + 0x10000;
+                while r.load(Ordering::Relaxed) {
+                    let child = d.fork_clone_in_process(
+                        crate::thread::ThreadId::synthetic_for_tests(10),
+                        crate::thread::ThreadId::synthetic_for_tests(11),
+                        10,
+                        11,
+                    );
+                    child.with_sysv_process_mut(|proc| {
+                        proc.attachments.insert(va_base, shmid_2);
+                    });
+                    child.commit_sysv_fork_inheritance();
+                    child.cleanup_sysv_shm_attachments_on_process_exit();
+                    std::thread::yield_now();
+                }
+            }));
+        }
+
+        // Thread 4: paired remap & validate_shmdt with seeded attachment
+        {
+            let d = Arc::clone(&dispatcher);
+            let r = Arc::clone(&running);
+            handles.push(std::thread::spawn(move || {
+                let remapped_va = crate::memory::LINUX_HIGH_VA_THRESHOLD + 0x20000;
+                let detachable_va = crate::memory::LINUX_HIGH_VA_THRESHOLD + 0x30000;
+                while r.load(Ordering::Relaxed) {
+                    let child = d.fork_clone_in_process(
+                        crate::thread::ThreadId::synthetic_for_tests(30),
+                        crate::thread::ThreadId::synthetic_for_tests(31),
+                        30,
+                        31,
+                    );
+                    child.with_sysv_process_mut(|proc| {
+                        proc.attachments.insert(remapped_va, shmid_1);
+                        proc.attachments.insert(detachable_va, shmid_1);
+                    });
+                    let remapped =
+                        child.note_sysv_remap_file_pages(remapped_va, remapped_va + 4096);
+                    assert_eq!(remapped, Ok(true));
+                    assert_eq!(
+                        child.lock_sysv_process().first_remapped_attachment(),
+                        Some(remapped_va)
+                    );
+                    assert_eq!(
+                        child.lock_sysv_process().validate_shmdt(detachable_va),
+                        Ok((shmid_1, crate::trap::HVF_PAGE_SIZE as usize))
+                    );
+                    child.cleanup_sysv_shm_attachments_on_process_exit();
+                    std::thread::yield_now();
+                }
+            }));
+        }
+
+        std::thread::sleep(Duration::from_millis(250));
+        running.store(false, Ordering::Relaxed);
+
+        for h in handles {
+            h.join().expect("worker thread join");
+        }
+    }
+
+    #[test]
+    fn proc_sysvipc_rendering_races_attachment_cleanup_and_paired_mutation_without_deadlock() {
+        if std::env::var_os("CARRICK_SYSVIPC_TEST_CHILD").is_some() {
+            run_proc_sysvipc_concurrency_worker();
+            return;
+        }
+
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test exe path"))
+            .env("CARRICK_SYSVIPC_TEST_CHILD", "1")
+            .arg("--exact")
+            .arg("dispatch::sysv::ipc_set_tests::proc_sysvipc_rendering_races_attachment_cleanup_and_paired_mutation_without_deadlock")
+            .arg("--nocapture")
+            .spawn()
+            .expect("spawn concurrency test child process");
+
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(10);
+        let mut exited = false;
+        while start.elapsed() < timeout {
+            if child.try_wait().expect("child try_wait").is_some() {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        if !exited {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "proc_sysvipc deadlock regression timed out after 10s (killed deadlocked child subprocess)"
+            );
+        }
+
+        let status = child.wait().expect("child wait");
+        assert!(
+            status.success(),
+            "child worker failed or crashed during concurrency race"
+        );
+    }
+
+    #[test]
+    fn watchdog_kills_and_reaps_on_deadlock_timeout() {
+        if std::env::var_os("CARRICK_SYSVIPC_TEST_CHILD_DEADLOCK").is_some() {
+            loop {
+                std::thread::park();
+            }
+        }
+
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test exe path"))
+            .env("CARRICK_SYSVIPC_TEST_CHILD_DEADLOCK", "1")
+            .arg("--exact")
+            .arg("dispatch::sysv::ipc_set_tests::watchdog_kills_and_reaps_on_deadlock_timeout")
+            .arg("--nocapture")
+            .spawn()
+            .expect("spawn deadlocked child process");
+
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(200);
+        let mut exited = false;
+        while start.elapsed() < timeout {
+            if child.try_wait().expect("child try_wait").is_some() {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        assert!(
+            !exited,
+            "deadlocked child exited unexpectedly before timeout"
+        );
+        let _ = child.kill();
+        let status = child.wait().expect("child wait after kill");
+        assert!(
+            !status.success(),
+            "killed deadlocked child should report non-zero / terminated status"
+        );
     }
 }

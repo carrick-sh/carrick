@@ -134,6 +134,7 @@ lint-domains:
     python3 scripts/migrate/check-task-participant-witnesses.py --check
     python3 scripts/migrate/check-mm-authority.py --check
     python3 scripts/migrate/check-host-authority-transitions.py --check
+    python3 scripts/migrate/check-dispatch-lock-authority.py --check
     python3 scripts/migrate/check-k1-file-authority-inventory.py
     python3 scripts/migrate/check-k1-file-authority-taxonomy.py
     python3 scripts/migrate/check-k1-burndown.py
