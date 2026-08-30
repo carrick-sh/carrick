@@ -167,4 +167,3 @@ Duration: 5.29s. Exit code: 0.
 - `python3 scripts/migrate/check-k1-file-authority-inventory.py`: Passed (exit code 0).
 - `python3 scripts/migrate/check-k1-file-authority-taxonomy.py`: Passed (exit code 0).
 - `python3 scripts/migrate/check-k1-burndown.py`: Passed (exit code 0).
-
