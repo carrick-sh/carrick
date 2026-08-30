@@ -9615,9 +9615,9 @@ impl SyscallDispatcher {
     /// renderers. `None` off the kernel-graph lane, where one Linux process is
     /// one host process and the mature host-process derivation is correct.
     ///
-    /// Takes the process binding rather than calling `hvpatch_process()`:
-    /// `synthetic_proc_context` builds this while already holding `self.proc`,
-    /// and re-acquiring it there deadlocks every synthetic-file lookup.
+    /// Takes the process binding captured in `synthetic_proc_context` so every
+    /// process-owned render field comes from one short mutex snapshot. The
+    /// caller releases that mutex before entering MM snapshot authority.
     fn synthetic_proc_processes(
         hvpatch_process: Option<&crate::hvpatch::ProcessContext>,
     ) -> Option<Vec<crate::vfs::SyntheticProcProcess>> {
@@ -9769,16 +9769,47 @@ impl SyscallDispatcher {
         &self,
         context: &crate::kernel::KernelContext,
     ) -> crate::vfs::SyntheticProcContext {
+        self.synthetic_proc_context_observed(context, || {})
+    }
+
+    fn synthetic_proc_context_observed(
+        &self,
+        context: &crate::kernel::KernelContext,
+        after_proc_snapshot: impl FnOnce(),
+    ) -> crate::vfs::SyntheticProcContext {
         // /proc/<pid>/status renders hex words; escape the typed sets at the
         // render boundary.
         let (sig_ignored, sig_caught, sig_shdpnd) = self.proc_status_signal_masks(context);
         let (sig_ignored, sig_caught, sig_shdpnd) =
             (sig_ignored.raw(), sig_caught.raw(), sig_shdpnd.raw());
-        let proc = self.proc.lock();
-        // Copy the process binding through the guard we already hold. Calling
-        // `hvpatch_process()` here would recursively acquire `self.proc` and
-        // deadlock every synthetic-file lookup on the HVPatch lane.
-        let hvpatch_process = proc.hvpatch_process.clone();
+        // Snapshot every process-owned render field together, then release the
+        // process mutex before entering MM snapshot authority. In-process fork
+        // publication holds MM alias authority while cloning this same process
+        // state, so retaining `proc` across `mem_snapshot()` would create the
+        // exact cycle `proc -> MM snapshot` versus `MM alias -> proc`.
+        let (
+            hvpatch_process,
+            executable_path,
+            argv,
+            task_comm,
+            timerslack_ns,
+            guest_arch,
+            guest_hostname,
+            environ,
+        ) = {
+            let proc = self.proc.lock();
+            (
+                proc.hvpatch_process.clone(),
+                proc.executable_path.clone(),
+                proc.argv.clone(),
+                linux_task_name_to_string(&proc.task_name),
+                proc.timerslack,
+                proc.reported_arch(),
+                proc.guest_hostname().to_string(),
+                proc.env.clone(),
+            )
+        };
+        after_proc_snapshot();
         let mem = self.mem_snapshot();
         let mut address_space_regions = mem.address_space_regions;
         if !mem.dynamic_maps.is_empty() {
@@ -9826,13 +9857,13 @@ impl SyscallDispatcher {
                 .collect()
         });
         crate::vfs::SyntheticProcContext {
-            executable_path: proc.executable_path.clone(),
-            argv: proc.argv.clone(),
-            task_comm: linux_task_name_to_string(&proc.task_name),
-            timerslack_ns: proc.timerslack,
-            guest_arch: proc.reported_arch(),
-            guest_hostname: proc.guest_hostname().to_string(),
-            environ: proc.env.clone(),
+            executable_path,
+            argv,
+            task_comm,
+            timerslack_ns,
+            guest_arch,
+            guest_hostname,
+            environ,
             open_fds: self.open_fd_numbers(),
             network: self.network.spec.clone(),
             auxv: mem.linux_auxv_image,
