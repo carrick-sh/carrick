@@ -1593,35 +1593,53 @@ impl Kernel {
         context.task().claim_ptrace_traceme(tracer)
     }
 
-    /// Retain authoritative ptrace-stopped state and exact task generation for
+    /// Validate authoritative settled ptrace-stopped state and exact task generation.
+    pub(crate) fn validate_settled_ptrace_stop(
+        &self,
+        tracer: TaskKey,
+        target: TaskKey,
+        expected_mm: MmId,
+    ) -> Result<(), carrick_abi::LinuxErrno> {
+        let task = {
+            let registry = self.registry().state.read();
+            let Some(record) = registry.tasks.get(&target.id) else {
+                return Err(carrick_abi::LINUX_ESRCH);
+            };
+            if record.task.key() != target {
+                return Err(carrick_abi::LINUX_ESRCH);
+            }
+            Arc::clone(&record.task)
+        };
+        task.validate_settled_ptrace_stop(tracer, expected_mm)
+    }
+
+    /// Retain authoritative settled ptrace-stopped state and exact task generation for
     /// a foreign or shared memory access.
     ///
-    /// Holds the registry read guard for the exact `TaskKey` (preventing PID
-    /// reuse and exec registry publication), then acquires `lifecycle` and
-    /// `job_control` in canonical order, validates that the target is `Live`,
-    /// has `tracer` as its exact current ptrace tracer, is `stopped_by_ptrace`
-    /// with a stop signal recorded, and has no pending resume command. It also
+    /// Acquires `lifecycle` and `job_control` in canonical order on the exact
+    /// `TaskKey`, validates that the target is `Live`, has `tracer` as its exact
+    /// current ptrace tracer, is `stopped_by_ptrace` with a stop signal recorded,
+    /// is `ptrace_stop_settled`, and has no pending resume command. It also
     /// validates that the target's current `MmId` matches `expected_mm`.
-    /// The memory `operation` runs while all guards remain continuously live.
-    pub(crate) fn with_ptrace_stopped_task<T>(
+    /// The memory `operation` runs while `lifecycle` and `job_control` guards remain live.
+    pub(crate) fn with_settled_ptrace_stopped_task<T>(
         &self,
         tracer: TaskKey,
         target: TaskKey,
         expected_mm: MmId,
         operation: impl FnOnce() -> T,
     ) -> Result<T, carrick_abi::LinuxErrno> {
-        let registry = self.registry().state.read();
-        let Some(record) = registry.tasks.get(&target.id) else {
-            return Err(carrick_abi::LINUX_ESRCH);
+        let task = {
+            let registry = self.registry().state.read();
+            let Some(record) = registry.tasks.get(&target.id) else {
+                return Err(carrick_abi::LINUX_ESRCH);
+            };
+            if record.task.key() != target {
+                return Err(carrick_abi::LINUX_ESRCH);
+            }
+            Arc::clone(&record.task)
         };
-        if record.task.key() != target {
-            return Err(carrick_abi::LINUX_ESRCH);
-        }
-        let result = record
-            .task
-            .with_ptrace_stopped_task(tracer, expected_mm, operation);
-        drop(registry);
-        result
+        task.with_settled_ptrace_stopped_task(tracer, expected_mm, operation)
     }
 
     pub(crate) fn stop_task_for_ptrace(&self, target: TaskId, signal: LinuxSignal) -> bool {
