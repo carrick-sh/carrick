@@ -13,8 +13,10 @@ const DNS_TTL_SECS: u32 = 0;
 /// carrick forks the host process to service a guest `execve`. A fork landing
 /// while `+[NSNumber initialize]` is in progress aborts the child outright:
 ///
-///     objc[...]: +[NSNumber initialize] may have been in progress in another
-///     thread when fork() was called. ... Crashing instead.
+/// ```text
+/// objc[...]: +[NSNumber initialize] may have been in progress in another
+/// thread when fork() was called. ... Crashing instead.
+/// ```
 ///
 /// That killed `node-libuv` in `--network bridge` mode before it emitted a
 /// single TAP line (exit 134). Proven by single-variable experiment: stubbing
