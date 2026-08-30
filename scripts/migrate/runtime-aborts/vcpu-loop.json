@@ -53,6 +53,33 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
+      "function": "HvpatchTaskBinding::service_pending_cow_invalidation",
+      "ordinal_in_function": 1,
+      "fingerprint": "bc9f21186c38e583b855c7272dc818a1553bfdbe48ec69c7841ffb0f9dde1657",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::mm_authority",
+      "rationale": "HvpatchTaskBinding missing stage-1 MM lease when servicing pending COW invalidations; cannot verify or flush desynchronized ASID generations."
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
+      "function": "HvpatchTaskBinding::cow_invalidation_observer",
+      "ordinal_in_function": 1,
+      "fingerprint": "b7f857326dd5a7269348f1dc6d6eb43b99d78dcd3f5cced5675162af13b55365",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::mm_authority",
+      "rationale": "HvpatchTaskBinding missing stage-1 MM lease when obtaining COW invalidation observer; executing without an observer would miss cross-vCPU page invalidations."
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
+      "function": "HvpatchTaskBinding::foreign_stage1_identity",
+      "ordinal_in_function": 1,
+      "fingerprint": "f3d8e6ad30db7bc2164a0ad7967517501a4456b4a4a575d2bea30a4d7645e662",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::mm_authority",
+      "rationale": "HvpatchTaskBinding missing stage-1 MM lease when extracting foreign stage-1 identity; cannot authenticate cross-process memory authority."
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
       "function": "ProcessDrain::excluding",
       "ordinal_in_function": 1,
       "fingerprint": "256f55c61c326b075387e1472a1ab914363ae4c8e1a43c5b3048b36bf3906a49",
@@ -134,6 +161,15 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
+      "function": "<HvpatchPersistentExecutor as PersistentExecutor>::run_until_boundary",
+      "ordinal_in_function": 1,
+      "fingerprint": "078a9c77b9993aa9c1b4b43f774c959b1881e6d9db1ddc35414d9573357e86f2",
+      "verdict": "carrier_fault",
+      "failure_domain": "vcpu_loop::executor_lease",
+      "rationale": "HvpatchPersistentExecutor task binding disappeared between quantum setup and control construction; running quantum without binding would execute hardware vCPU without task identity."
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
       "function": "<HvpatchPersistentExecutor as PersistentExecutor>::save",
       "ordinal_in_function": 1,
       "fingerprint": "ac2a3adc1bfec2fe7030e34507210cf828c69cc6eed1b4d2c87b2d6870bb8811",
@@ -181,7 +217,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
       "function": "<HvpatchPersistentExecutor as PersistentExecutor>::destroy",
       "ordinal_in_function": 1,
-      "fingerprint": "daa6dbd08bfced5847d2b9cfa1bddf134e60fc714648ee3e731e3a8b188f936e",
+      "fingerprint": "8ded1dca87246a4d987ff8283702368adcfc3b97bc55c25dbdf05bbddb083772",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::executor_lease",
       "rationale": "HvpatchPersistentExecutor lifecycle slot unexpectedly occupied during engine detachment in destroy; indicates duplicate detachment or corrupted lease."
@@ -190,7 +226,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
       "function": "<HvpatchPersistentExecutor as PersistentExecutor>::destroy",
       "ordinal_in_function": 2,
-      "fingerprint": "daa6dbd08bfced5847d2b9cfa1bddf134e60fc714648ee3e731e3a8b188f936e",
+      "fingerprint": "8ded1dca87246a4d987ff8283702368adcfc3b97bc55c25dbdf05bbddb083772",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::executor_lease",
       "rationale": "HvpatchPersistentExecutor missing lifecycle state during engine detachment in destroy."
@@ -284,6 +320,24 @@
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::executor_boundary",
       "rationale": "Kick handle remains bound after settlement transaction; kick target is inconsistent with successor state."
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "function": "<KernelFrameCowAuthority as carrick_hal::FrameCowAuthority>::apply_foreign_cow",
+      "ordinal_in_function": 1,
+      "fingerprint": "8c7178e46b833afca1d619358213a3c9365255976a3112ed73345197a7a943f9",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::mm_identity",
+      "rationale": "KernelFrameCowAuthority target MmId is zero; foreign COW authority cannot operate on an invalid MM identity."
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "function": "<KernelFrameCowAuthority as carrick_hal::FrameCowAuthority>::apply_foreign_cow",
+      "ordinal_in_function": 2,
+      "fingerprint": "6423d85336de02451e6bb59f7b0a7f60abb09c30197d088f543ef09fbf010a73",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Applied foreign COW frame inventory receipt failed authorization, revision, or owner generation verification; continuing would mint an unauthenticated foreign COW proof."
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
@@ -863,66 +917,93 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "function": "ThreadRuntimeState<E>::service_threaded_syscall",
+      "function": "ThreadRuntimeState<E>::service_threaded_syscall_for_executor",
       "ordinal_in_function": 1,
-      "fingerprint": "a5a60bc100bcabc44583109292465a4cd07f05643344485b8025c5db768088f5",
+      "fingerprint": "916c32acf4f3c5842a7d107649c1ed215cd5726445c8e4ac11f176f5699c4d58",
+      "verdict": "carrier_fault",
+      "failure_domain": "vcpu_loop::mm_stage1_authority",
+      "rationale": "Syscall requiring MM mutation dispatch lacks outer stage-1 authority phase; proceeding would mutate page tables without exclusive stage-1 pause or sole lease."
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "function": "ThreadRuntimeState<E>::service_threaded_syscall_for_executor",
+      "ordinal_in_function": 2,
+      "fingerprint": "916c32acf4f3c5842a7d107649c1ed215cd5726445c8e4ac11f176f5699c4d58",
+      "verdict": "carrier_fault",
+      "failure_domain": "vcpu_loop::mm_stage1_authority",
+      "rationale": "Ordinary syscall dispatch unexpectedly holds stage-1 mutation authority; indicates phase desynchronization between syscall classifier and MM executor."
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "function": "ThreadRuntimeState<E>::service_threaded_syscall_for_executor",
+      "ordinal_in_function": 3,
+      "fingerprint": "916c32acf4f3c5842a7d107649c1ed215cd5726445c8e4ac11f176f5699c4d58",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "Engine missing host alias inventory commit on mmap alias installation."
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "function": "ThreadRuntimeState<E>::service_threaded_syscall",
-      "ordinal_in_function": 2,
-      "fingerprint": "a5a60bc100bcabc44583109292465a4cd07f05643344485b8025c5db768088f5",
+      "function": "ThreadRuntimeState<E>::service_threaded_syscall_for_executor",
+      "ordinal_in_function": 4,
+      "fingerprint": "916c32acf4f3c5842a7d107649c1ed215cd5726445c8e4ac11f176f5699c4d58",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "Failed to apply host alias frame inventory to kernel context."
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "function": "ThreadRuntimeState<E>::service_threaded_syscall",
-      "ordinal_in_function": 3,
-      "fingerprint": "a5a60bc100bcabc44583109292465a4cd07f05643344485b8025c5db768088f5",
+      "function": "ThreadRuntimeState<E>::service_threaded_syscall_for_executor",
+      "ordinal_in_function": 5,
+      "fingerprint": "916c32acf4f3c5842a7d107649c1ed215cd5726445c8e4ac11f176f5699c4d58",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "Mapping length overflowed usize during alias protection setup."
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "function": "ThreadRuntimeState<E>::service_threaded_syscall",
-      "ordinal_in_function": 4,
-      "fingerprint": "a5a60bc100bcabc44583109292465a4cd07f05643344485b8025c5db768088f5",
+      "function": "ThreadRuntimeState<E>::service_threaded_syscall_for_executor",
+      "ordinal_in_function": 6,
+      "fingerprint": "916c32acf4f3c5842a7d107649c1ed215cd5726445c8e4ac11f176f5699c4d58",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "Failed to set hardware memory protection on alias range."
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "function": "ThreadRuntimeState<E>::service_threaded_syscall",
-      "ordinal_in_function": 5,
-      "fingerprint": "a5a60bc100bcabc44583109292465a4cd07f05643344485b8025c5db768088f5",
+      "function": "ThreadRuntimeState<E>::service_threaded_syscall_for_executor",
+      "ordinal_in_function": 7,
+      "fingerprint": "916c32acf4f3c5842a7d107649c1ed215cd5726445c8e4ac11f176f5699c4d58",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "Bus fault range length overflowed usize during alias protection setup."
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "function": "ThreadRuntimeState<E>::service_threaded_syscall",
-      "ordinal_in_function": 6,
-      "fingerprint": "a5a60bc100bcabc44583109292465a4cd07f05643344485b8025c5db768088f5",
+      "function": "ThreadRuntimeState<E>::service_threaded_syscall_for_executor",
+      "ordinal_in_function": 8,
+      "fingerprint": "916c32acf4f3c5842a7d107649c1ed215cd5726445c8e4ac11f176f5699c4d58",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "Failed to protect bus fault range on hardware engine."
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "function": "ThreadRuntimeState<E>::service_threaded_syscall",
-      "ordinal_in_function": 7,
-      "fingerprint": "a5a60bc100bcabc44583109292465a4cd07f05643344485b8025c5db768088f5",
+      "function": "ThreadRuntimeState<E>::service_threaded_syscall_for_executor",
+      "ordinal_in_function": 9,
+      "fingerprint": "916c32acf4f3c5842a7d107649c1ed215cd5726445c8e4ac11f176f5699c4d58",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "Failed to commit host alias install record to dispatcher."
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "function": "ThreadRuntimeState<E>::service_threaded_syscall_for_executor",
+      "ordinal_in_function": 10,
+      "fingerprint": "916c32acf4f3c5842a7d107649c1ed215cd5726445c8e4ac11f176f5699c4d58",
+      "verdict": "carrier_fault",
+      "failure_domain": "vcpu_loop::mm_stage1_authority",
+      "rationale": "Host-alias installation phase lacks outer stage-1 authority; proceeding would install host alias without stage-1 mutation permit."
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
@@ -950,6 +1031,24 @@
       "verdict": "carrier_fault",
       "failure_domain": "kernel::runtime_binding",
       "rationale": "KernelState missing HVPatch runtime reference during persistent job launch."
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
+      "function": "<ExactMmStage1Scope as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "d7cf1a294d7c4992c6a3b53b4536430616cd3c651fd7e6cde726e5f45cbbee70",
+      "verdict": "carrier_fault",
+      "failure_domain": "vcpu_loop::exact_mm_stage1_scope",
+      "rationale": "ExactMmStage1Scope stack underflow on drop; indicates unbalanced thread-local stage-1 scope entry and exit."
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
+      "function": "<ExactMmStage1Scope as Drop>::drop",
+      "ordinal_in_function": 2,
+      "fingerprint": "d7cf1a294d7c4992c6a3b53b4536430616cd3c651fd7e6cde726e5f45cbbee70",
+      "verdict": "carrier_fault",
+      "failure_domain": "vcpu_loop::exact_mm_stage1_scope",
+      "rationale": "ExactMmStage1Scope mismatched MM ID or lease pointer on drop; indicates out-of-order stage-1 scope nesting or corrupted thread-local stack."
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
