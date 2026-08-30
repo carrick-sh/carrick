@@ -17,6 +17,59 @@ use carrick_runtime::vfs::BindVfs;
 use support::*;
 
 #[test]
+fn inotify_init1_splits_status_and_descriptor_flags() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let mut run = |d: &mut SyscallDispatcher, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            &d.capture_one_task_context().unwrap(),
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    for (name, flags, expected_status, expected_descriptor) in [
+        ("default", 0, 0, 0),
+        ("nonblock", LINUX_O_NONBLOCK, LINUX_O_NONBLOCK, 0),
+        ("cloexec", LINUX_O_CLOEXEC, 0, LINUX_FD_CLOEXEC),
+        (
+            "both",
+            LINUX_O_NONBLOCK | LINUX_O_CLOEXEC,
+            LINUX_O_NONBLOCK,
+            LINUX_FD_CLOEXEC,
+        ),
+    ] {
+        let fd = match run(&mut dispatcher, 26, [flags, 0, 0, 0, 0, 0]) {
+            DispatchOutcome::Returned { value } => value as u64,
+            other => panic!("inotify_init1({name}): {other:?}"),
+        };
+
+        assert_eq!(
+            run(&mut dispatcher, 25, [fd, LINUX_F_GETFL, 0, 0, 0, 0]),
+            DispatchOutcome::Returned {
+                value: expected_status as i64
+            },
+            "inotify_init1({name}) F_GETFL"
+        );
+        assert_eq!(
+            run(&mut dispatcher, 25, [fd, LINUX_F_GETFD, 0, 0, 0, 0]),
+            DispatchOutcome::Returned {
+                value: expected_descriptor as i64
+            },
+            "inotify_init1({name}) F_GETFD"
+        );
+        assert_eq!(
+            run(&mut dispatcher, 57, [fd, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 },
+            "close inotify_init1({name}) descriptor"
+        );
+    }
+}
+
+#[test]
 fn inotify_init_add_watch_read_dispatch_plumbing() {
     // The event mechanism itself is unit-tested against a real vnode in
     // src/inotify.rs; here we verify the syscall plumbing at the dispatch seam,
