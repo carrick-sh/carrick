@@ -3633,6 +3633,12 @@ impl SyscallDispatcher {
                     // plain MAP_SHARED gets (which silently ignores unknown
                     // bits for back-compat). mmap20. Otherwise behaves like
                     // MAP_SHARED.
+                    if map_flags.contains(LinuxMmapFlags::ANONYMOUS) {
+                        return Ok(request.refused(
+                            MmapRefusal::Spec("MAP_SHARED_VALIDATE is invalid for an anonymous mapping"),
+                            LINUX_EINVAL,
+                        ));
+                    }
                     if map_flags.bits() & !LinuxMmapFlags::SUPPORTED_MASK != 0 {
                         return Ok(request.refused(
                             MmapRefusal::Spec("MAP_SHARED_VALIDATE with an unknown flag bit"),
@@ -4466,6 +4472,9 @@ impl SyscallDispatcher {
                             semantic_vmas: None,
                         },
                     );
+                    if map_flags.contains(LinuxMmapFlags::POPULATE) {
+                        this.mark_range_resident(addr, length);
+                    }
                     this.mark_vma_dispatch(&mut host_alias_dispatch);
                     return Ok(DispatchOutcome::Returned { value: addr as i64 });
                 }
@@ -4573,6 +4582,9 @@ impl SyscallDispatcher {
                         semantic_vmas: None,
                     },
                 );
+                if map_flags.contains(LinuxMmapFlags::POPULATE) {
+                    this.mark_range_resident(address, length);
+                }
                 if address_uses_alias {
                     this.record_alias_vma(address, length);
                 }
@@ -4623,6 +4635,9 @@ impl SyscallDispatcher {
                         semantic_vmas: None,
                     },
                 );
+                if map_flags.contains(LinuxMmapFlags::POPULATE) {
+                    this.mark_range_resident(address, length);
+                }
                 if map_flags.contains(LinuxMmapFlags::GROWSDOWN) {
                     this.record_growdown_mapping(address, length);
                 }
@@ -6926,11 +6941,11 @@ impl SyscallDispatcher {
                     // Linux dropping clean cache pages. zero_backing writes the
                     // host backing directly (same call the MAP_FIXED/munmap-reuse
                     // scrub uses), bypassing the guest write-protection gate.
-                    if meta.writable
-                        && !meta.shared
-                        && cx.memory.zero_backing(address.0, length).is_err()
-                    {
-                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    if meta.writable && !meta.shared {
+                        if cx.memory.zero_backing(address.0, length).is_err() {
+                            return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                        }
+                        this.mark_range_nonresident(address.0, length as u64);
                     }
                 }
                 // MADV_FREE only applies to private anonymous mappings; a shared
@@ -7176,6 +7191,15 @@ impl SyscallDispatcher {
         {
             locked_ranges_insert(&mut self.mem().lock().resident_ranges, range);
         }
+    }
+
+    fn mark_range_nonresident(&self, start: u64, len: u64) {
+        let Some(range) =
+            crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
+        else {
+            return;
+        };
+        locked_ranges_remove(&mut self.mem().lock().resident_ranges, range);
     }
 
     pub(crate) fn resident_fault_plan<'permit>(

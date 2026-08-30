@@ -5261,6 +5261,238 @@ fn mincore_onfault_lock_is_not_resident_until_page_is_touched() {
 }
 
 #[test]
+fn mmap_shared_validate_rejects_anonymous_but_keeps_file_and_unknown_flag_rules() {
+    const SYS_MMAP: u64 = 222;
+    const SHARED_VALIDATE: u64 = LINUX_MAP_SHARED | LINUX_MAP_PRIVATE;
+    const UNKNOWN_FLAG: u64 = 1 << 63;
+    const FILE_FD: i32 = 40;
+
+    let mut anonymous_dispatcher = SyscallDispatcher::new();
+    let mut anonymous_memory = CountingMmapMemory::new(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize);
+    let reporter = CompatReporter::default();
+    let anonymous = anonymous_dispatcher
+        .dispatch(
+            &anonymous_dispatcher
+                .capture_one_task_context()
+                .expect("anonymous context"),
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    LINUX_PAGE_SIZE,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    SHARED_VALIDATE | LINUX_MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+            &mut anonymous_memory,
+            &reporter,
+        )
+        .expect("anonymous MAP_SHARED_VALIDATE dispatch");
+    assert_eq!(anonymous, DispatchOutcome::errno(LINUX_EINVAL));
+
+    let install_file = |dispatcher: &SyscallDispatcher| {
+        dispatcher.captured_file_table().write_open_files().insert(
+            FILE_FD,
+            OpenFile::from_open_description_with_status_flags(
+                std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::File {
+                    base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
+                    path: "/shared-validate".into(),
+                    metadata: RootFsMetadata {
+                        path: "/shared-validate".into(),
+                        kind: RootFsEntryKind::File,
+                        mode: 0o644,
+                        size: LINUX_PAGE_SIZE as usize,
+                    },
+                    contents: FileContents::dense(vec![0x5a; LINUX_PAGE_SIZE as usize]),
+                    offset: 0,
+                    writable: false,
+                })),
+                crate::linux_abi::LINUX_O_RDONLY,
+                0,
+            ),
+        );
+    };
+
+    let mut file_dispatcher = SyscallDispatcher::new();
+    install_file(&file_dispatcher);
+    let mut file_memory = CountingMmapMemory::new(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize);
+    let file_backed = file_dispatcher
+        .dispatch(
+            &file_dispatcher
+                .capture_one_task_context()
+                .expect("file context"),
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    LINUX_PAGE_SIZE,
+                    LINUX_PROT_READ,
+                    SHARED_VALIDATE,
+                    FILE_FD as u64,
+                    0,
+                ]),
+            ),
+            &mut file_memory,
+            &reporter,
+        )
+        .expect("file-backed MAP_SHARED_VALIDATE dispatch");
+    assert!(
+        matches!(
+            file_backed,
+            DispatchOutcome::Returned { .. } | DispatchOutcome::MapHostAlias { .. }
+        ),
+        "file-backed MAP_SHARED_VALIDATE must remain valid: {file_backed:?}"
+    );
+
+    let mut unknown_dispatcher = SyscallDispatcher::new();
+    install_file(&unknown_dispatcher);
+    let mut unknown_memory = CountingMmapMemory::new(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize);
+    let unknown = unknown_dispatcher
+        .dispatch(
+            &unknown_dispatcher
+                .capture_one_task_context()
+                .expect("unknown-flag context"),
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    LINUX_PAGE_SIZE,
+                    LINUX_PROT_READ,
+                    SHARED_VALIDATE | UNKNOWN_FLAG,
+                    FILE_FD as u64,
+                    0,
+                ]),
+            ),
+            &mut unknown_memory,
+            &reporter,
+        )
+        .expect("unknown MAP_SHARED_VALIDATE flag dispatch");
+    assert_eq!(unknown, DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+}
+
+#[test]
+fn anonymous_mmap_residency_tracks_populate_first_touch_and_dontneed() {
+    const SYS_MMAP: u64 = 222;
+    const SYS_MADVISE: u64 = 233;
+
+    let mut private_dispatcher = SyscallDispatcher::new();
+    let mut private_memory = CountingMmapMemory::new(LINUX_MMAP_BASE, 3 * LINUX_PAGE_SIZE as usize);
+    let reporter = CompatReporter::default();
+    let private_context = private_dispatcher
+        .capture_one_task_context()
+        .expect("private mmap context");
+    let private_mmap =
+        |dispatcher: &mut SyscallDispatcher, memory: &mut CountingMmapMemory, flags: u64| {
+            returned(
+                dispatcher
+                    .dispatch(
+                        &private_context,
+                        SyscallRequest::new(
+                            SYS_MMAP,
+                            SyscallArgs([
+                                0,
+                                LINUX_PAGE_SIZE,
+                                LINUX_PROT_READ | LINUX_PROT_WRITE,
+                                flags,
+                                u64::MAX,
+                                0,
+                            ]),
+                        ),
+                        memory,
+                        &reporter,
+                    )
+                    .expect("private anonymous mmap dispatch"),
+            ) as u64
+        };
+
+    let untouched = private_mmap(
+        &mut private_dispatcher,
+        &mut private_memory,
+        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+    );
+    assert_eq!(
+        private_dispatcher
+            .mincore_residency_vector(&private_memory, untouched, 1, LINUX_PAGE_SIZE,),
+        Some(vec![0]),
+        "untouched anonymous memory must not be resident"
+    );
+
+    let populated = private_mmap(
+        &mut private_dispatcher,
+        &mut private_memory,
+        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | crate::linux_abi::LINUX_MAP_POPULATE,
+    );
+    assert_eq!(
+        private_dispatcher
+            .mincore_residency_vector(&private_memory, populated, 1, LINUX_PAGE_SIZE,),
+        Some(vec![1]),
+        "MAP_POPULATE must publish private-anonymous residency before return"
+    );
+
+    private_dispatcher.mark_range_resident(untouched, LINUX_PAGE_SIZE);
+    assert_eq!(
+        private_dispatcher
+            .mincore_residency_vector(&private_memory, untouched, 1, LINUX_PAGE_SIZE,),
+        Some(vec![1]),
+        "the first-touch publication must make the page resident"
+    );
+    assert_eq!(
+        private_dispatcher
+            .dispatch(
+                &private_context,
+                SyscallRequest::new(
+                    SYS_MADVISE,
+                    SyscallArgs([untouched, LINUX_PAGE_SIZE, LINUX_MADV_DONTNEED, 0, 0, 0]),
+                ),
+                &mut private_memory,
+                &reporter,
+            )
+            .expect("MADV_DONTNEED dispatch"),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        private_dispatcher
+            .mincore_residency_vector(&private_memory, untouched, 1, LINUX_PAGE_SIZE,),
+        Some(vec![0]),
+        "MADV_DONTNEED must retire private-anonymous residency"
+    );
+
+    for sharing in [LINUX_MAP_PRIVATE, LINUX_MAP_SHARED] {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize);
+        let context = dispatcher
+            .capture_one_task_context()
+            .expect("anonymous populate context");
+        let outcome = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    SYS_MMAP,
+                    SyscallArgs([
+                        0,
+                        LINUX_PAGE_SIZE,
+                        LINUX_PROT_READ | LINUX_PROT_WRITE,
+                        sharing | LINUX_MAP_ANONYMOUS | crate::linux_abi::LINUX_MAP_POPULATE,
+                        u64::MAX,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("anonymous MAP_POPULATE dispatch");
+        let address = returned(outcome) as u64;
+        assert_eq!(
+            dispatcher.mincore_residency_vector(&memory, address, 1, LINUX_PAGE_SIZE),
+            Some(vec![1]),
+            "MAP_POPULATE must publish residency for sharing={sharing:#x}"
+        );
+    }
+}
+
+#[test]
 fn eager_mlock_uses_committed_vma_metadata_before_lazy_backing_is_resident() {
     const SYS_MLOCK2: u64 = 284;
 
