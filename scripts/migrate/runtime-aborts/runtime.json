@@ -437,7 +437,7 @@
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "function": "SyscallDispatcher::mmap",
       "ordinal_in_function": 8,
-      "fingerprint": "8de95e2dbf901db24d0952a363fcd1a4f546438cc6c6167ee68f04ebfd36857c",
+      "fingerprint": "bfa470e34eaabf5d8c2d12de23e1ba8835bc4fb8007823bf6ae83e36958e4b87",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mmap_shared",
       "rationale": "restore_shared_identity backend operation failed during shared aperture mmap; page tables in inconsistent translation state."
@@ -446,7 +446,7 @@
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "function": "SyscallDispatcher::mmap",
       "ordinal_in_function": 9,
-      "fingerprint": "8de95e2dbf901db24d0952a363fcd1a4f546438cc6c6167ee68f04ebfd36857c",
+      "fingerprint": "bfa470e34eaabf5d8c2d12de23e1ba8835bc4fb8007823bf6ae83e36958e4b87",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mmap_shared",
       "rationale": "mark_identity_restored failed in shared aperture tracking after backend identity restore succeeded during mmap."
