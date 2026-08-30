@@ -15,161 +15,9 @@
 
 mod common;
 
+use common::SHARD_1_PROBES;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-
-use carrick_conformance_next::{PullPolicy, TestContainer};
-
-/// Exact materialized Shard 1 probe list: index % 3 == 1 over generic conformance probes.
-pub const SHARD_1_PROBES: &[&str] = &[
-    "acceptsock",
-    "adjtimexstate",
-    "altstacktid",
-    "bigread",
-    "brkheapgrow",
-    "cachestatpages",
-    "chmodfollowsymlink",
-    "clockgetres",
-    "clone3args",
-    "clone3signalflight",
-    "cloneexitsig",
-    "clonefsumask",
-    "cluster10errno",
-    "coredumpbit",
-    "credtransition",
-    "dirdac",
-    "dirrenamecache",
-    "dupclosestdin",
-    "epolletblockedhup",
-    "epolletpipeeof",
-    "epollinmemwake",
-    "epollpri",
-    "etchostnamefile",
-    "execfailsurvive",
-    "execpermitchurn",
-    "execsocket",
-    "execvereset",
-    "exitstatus127",
-    "faultaddr",
-    "fcntllease",
-    "fcntlowner",
-    "fdio",
-    "fexecveprobe",
-    "fifoforkeof",
-    "forkaltstack",
-    "forkfault",
-    "forkfpregs",
-    "forkshared",
-    "forksnapshot",
-    "fsescapeguard",
-    "fstatatflags",
-    "futexextra",
-    "futexghost",
-    "futexprivatewakeexact",
-    "futexshare",
-    "futexwaiterstates",
-    "getrandomflags",
-    "getrandomvdsoloop",
-    "icmp",
-    "iopriovhangup",
-    "iouringsqpoll",
-    "ipv6sendhoplimit",
-    "kernelidentity",
-    "killfault",
-    "killrt",
-    "lchownsymlink",
-    "lifecycleflagmatrix",
-    "linuxsysinfo",
-    "ltpcheckpointexec",
-    "mailboxregs",
-    "mapfixedfork",
-    "mem",
-    "memfdsecret",
-    "mincoreedge",
-    "mlock2",
-    "mmapdevzero",
-    "mmapfileforkwriteback",
-    "mmapprivfile",
-    "mmaptrimprotect",
-    "mmsgmatrix",
-    "mqnotifycrossproc",
-    "mremapmove",
-    "msgctlstat",
-    "mtforkcorrupt",
-    "nanosleeprem",
-    "nativex18",
-    "netifmcast",
-    "newmountapi",
-    "nsfsioctl",
-    "oomscoreadj",
-    "openat2valid",
-    "openempty",
-    "overlaysymlink",
-    "pathnonutf8",
-    "pendingunblock",
-    "pidnsinitsig",
-    "pidnswait",
-    "pipeszcrossend",
-    "ppid",
-    "prctldumpable",
-    "preadspecial",
-    "preemptsigstorm",
-    "procladder",
-    "procladder_mt",
-    "procpeermem",
-    "procselfpid",
-    "procsignalmulti",
-    "procstatussig",
-    "ptraceattach",
-    "ptracesequence",
-    "ptracestop",
-    "ptyfionread",
-    "ptypair",
-    "recursionguard",
-    "renameexchange",
-    "rlimitnofile",
-    "rlimitroundtrip",
-    "roreadwrite",
-    "rtsigqueueinfoxthread",
-    "schedaffinitysibling",
-    "schedprio",
-    "seccompenforce",
-    "selectnfds",
-    "selfraise",
-    "semtimedop",
-    "setgroupsroundtrip",
-    "shared_buffer_mmap",
-    "shmnestedfork",
-    "sigbadstack",
-    "siglongjmpaltstack",
-    "signalfdread",
-    "sigpipewrite",
-    "sigstopjobcontrol",
-    "sigunblockpending",
-    "sigwaitmatrix",
-    "sockoptdomainproto",
-    "splicematrix",
-    "spliceunixpoll",
-    "symlinkmknod",
-    "sysinfo",
-    "sysvmsgwake",
-    "sysvshm",
-    "termiosflow",
-    "threadcommname",
-    "threadstatstate",
-    "timeextra",
-    "tlsswitch",
-    "traceexecstop",
-    "udplitesock",
-    "unicodenorm",
-    "usernsmap",
-    "vdsosymbols",
-    "vforkvmshare",
-    "waitexitstorm",
-    "waitidspec",
-    "waitsiblingsigchld",
-    "xsignal",
-];
 
 const CACHED_SHARD_1_PROBE_COUNT: usize = 137;
 
@@ -428,23 +276,6 @@ fn test_shard_1_cached_oracles_are_complete() {
     }
 }
 
-/// Probes in Shard 1 that require container seccomp=unconfined.
-pub fn probe_needs_unconfined(name: &str) -> bool {
-    name == "clonefilesexec"
-}
-
-#[test]
-fn test_shard_1_security_policy_mapping() {
-    assert!(probe_needs_unconfined("clonefilesexec"));
-    assert!(!probe_needs_unconfined("clonebasic"));
-    assert!(!probe_needs_unconfined("acceptsock"));
-    assert!(!probe_needs_unconfined("forkfiletable"));
-
-    assert!(!SHARD_1_PROBES.contains(&"clonefilesexec"));
-    assert!(common::OUT_OF_PROCESS_PROBES.contains(&"execthreads"));
-    assert!(common::OUT_OF_PROCESS_PROBES.contains(&"vforkexecthread"));
-}
-
 // ---------------------------------------------------------------------------
 // Signed guest test
 // ---------------------------------------------------------------------------
@@ -505,14 +336,7 @@ fn generic_probe_shard_1() {
                 }
             };
 
-            let mut container = TestContainer::new(common::SMOKE_IMAGE)
-                .pull_policy(PullPolicy::Missing)
-                .mount_readonly(probe_bin.to_str().unwrap(), "/tmp/p")
-                .mount_readonly(probeinit.to_str().unwrap(), "/tmp/carrick-init");
-
-            if probe_needs_unconfined(probe_name) {
-                container = container.security_opt("seccomp=unconfined");
-            }
+            let container = common::generic_probe_container(probe_name, &probe_bin, &probeinit);
 
             eprintln!("RUN generic probe shard 1 {target}:{probe_name}");
             executed_count += 1;

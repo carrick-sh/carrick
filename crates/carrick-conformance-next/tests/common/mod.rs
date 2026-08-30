@@ -1,13 +1,543 @@
 //! Shared helpers for carrick-conformance-next guest-running tests.
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-use carrick_conformance_next::EmbedError;
+use carrick_conformance_next::{EmbedError, PullPolicy, TestContainer};
 
 /// The canonical conformance image: arm64 Ubuntu 24.04.
 pub const SMOKE_IMAGE: &str = "docker.io/library/ubuntu:24.04";
+
+/// Exact materialized list of 148 sorted unique probe names for generic shard 0.
+///
+/// Conceptually defined as:
+/// - class: "conformance"
+/// - excluded: false
+/// - runner: "generic"
+/// - sorted lexicographically
+/// - enumerated from index 0
+/// - retained where index % 3 == 0
+pub const SHARD_0_PROBES: &[&str] = &[
+    "abortdeath",
+    "accounting",
+    "aliassize",
+    "bigallocfree",
+    "blockingpipewrite",
+    "budget_two_proc",
+    "childsubreaper",
+    "clockcoherence",
+    "clocksettimevdso",
+    "clone3pidfdsig",
+    "cloneexithandled",
+    "clonefileshare",
+    "closedstdio",
+    "copyrangeflags",
+    "cpucount",
+    "devnullseek",
+    "dirops",
+    "dsrconstantpool",
+    "epollcluster",
+    "epolletmanyhup",
+    "epollforkeventfd",
+    "epolloutxthread",
+    "epollstaledel",
+    "eventwaitmatrix",
+    "execfromthread",
+    "execsig",
+    "execvenonutf8",
+    "exitgroupthreads",
+    "fallocatebig",
+    "fcntlgetlk",
+    "fcntlofdlock",
+    "fcntlstdio",
+    "fdstatus",
+    "fifoepolleof",
+    "flocklock",
+    "forkexecpthread",
+    "forkfpreclaim",
+    "forkhighva",
+    "forksleepfork",
+    "forkstackstorm",
+    "fsmeta",
+    "futexdeadline",
+    "futexforkwakegroups",
+    "futexpingpong",
+    "futexrequeue",
+    "futexsharedto",
+    "futexwakeexact",
+    "getrandomvdsofork",
+    "hugepage",
+    "ioctlcluster",
+    "iouringenterflag",
+    "ipv6recvhoplimit",
+    "itimerprofidle",
+    "killchld",
+    "killreap",
+    "killuidperm",
+    "legacyfs",
+    "linkstat",
+    "ltpcheckpoint",
+    "lxattr",
+    "mapfixed",
+    "mcastjoingroup",
+    "memfdsealmatrix",
+    "memmap",
+    "mknoddevnode",
+    "mmapcluster",
+    "mmapfile",
+    "mmapmunmap",
+    "mmapreuse",
+    "mmapzerofill",
+    "mprotectexec",
+    "mremapgrow",
+    "mremapshrink",
+    "msyncalign",
+    "mtsigrelease",
+    "nativeetexecfork",
+    "netflagmatrix",
+    "netpoll",
+    "nofiledefault",
+    "odirectory",
+    "openat2resolve",
+    "openeloop",
+    "otmpfileforkexec",
+    "pathflagmatrix",
+    "pauseinterrupt2",
+    "pidnsinitreap",
+    "pidnsroot",
+    "pipelargewrite",
+    "posixtimers",
+    "ppollunblock",
+    "prctlnnp",
+    "preadvwronly",
+    "procid",
+    "procladder_mixed",
+    "procpeerdir",
+    "procselfdir",
+    "procsignalmask",
+    "procstatstate",
+    "pselecteintr",
+    "ptracekillcont",
+    "ptracesignalstop",
+    "ptyfionbio",
+    "ptyforkreopen",
+    "readwronly",
+    "recvmsgtrunc",
+    "rlimitasdata",
+    "rlimitresource",
+    "roprotect",
+    "rtsigqueueinfo",
+    "saresethand",
+    "schedparam",
+    "scmrightsfds",
+    "seekholedata",
+    "selfhostnameresolve",
+    "semgetnsems",
+    "setfsid",
+    "setpgidparentgroup",
+    "shmlinkat",
+    "sigactionresetinfo",
+    "siginfo",
+    "signalfd4",
+    "sigpairrace",
+    "sigreenter",
+    "sigtimedwaitintr",
+    "sigwaitblock",
+    "sockbufreuseport",
+    "spawnflagmatrix",
+    "splicepipe",
+    "symlinkfollow",
+    "syscallregpreserve",
+    "sysvmsgselect",
+    "sysvsemstat",
+    "termiosbits",
+    "threadbarrier",
+    "threadspawn",
+    "timeclock",
+    "timeschildren",
+    "tmpfilewrite",
+    "udpconnectunspec",
+    "uffdpolicy",
+    "usernsisolation",
+    "vdsogtod",
+    "vforkpid",
+    "vmsplicepipe",
+    "waitidsiuid",
+    "waitrestart",
+    "xprocsigign",
+    "zerolenio",
+];
+
+/// Exact materialized Shard 1 probe list: index % 3 == 1 over generic conformance probes.
+pub const SHARD_1_PROBES: &[&str] = &[
+    "acceptsock",
+    "adjtimexstate",
+    "altstacktid",
+    "bigread",
+    "brkheapgrow",
+    "cachestatpages",
+    "chmodfollowsymlink",
+    "clockgetres",
+    "clone3args",
+    "clone3signalflight",
+    "cloneexitsig",
+    "clonefsumask",
+    "cluster10errno",
+    "coredumpbit",
+    "credtransition",
+    "dirdac",
+    "dirrenamecache",
+    "dupclosestdin",
+    "epolletblockedhup",
+    "epolletpipeeof",
+    "epollinmemwake",
+    "epollpri",
+    "etchostnamefile",
+    "execfailsurvive",
+    "execpermitchurn",
+    "execsocket",
+    "execvereset",
+    "exitstatus127",
+    "faultaddr",
+    "fcntllease",
+    "fcntlowner",
+    "fdio",
+    "fexecveprobe",
+    "fifoforkeof",
+    "forkaltstack",
+    "forkfault",
+    "forkfpregs",
+    "forkshared",
+    "forksnapshot",
+    "fsescapeguard",
+    "fstatatflags",
+    "futexextra",
+    "futexghost",
+    "futexprivatewakeexact",
+    "futexshare",
+    "futexwaiterstates",
+    "getrandomflags",
+    "getrandomvdsoloop",
+    "icmp",
+    "iopriovhangup",
+    "iouringsqpoll",
+    "ipv6sendhoplimit",
+    "kernelidentity",
+    "killfault",
+    "killrt",
+    "lchownsymlink",
+    "lifecycleflagmatrix",
+    "linuxsysinfo",
+    "ltpcheckpointexec",
+    "mailboxregs",
+    "mapfixedfork",
+    "mem",
+    "memfdsecret",
+    "mincoreedge",
+    "mlock2",
+    "mmapdevzero",
+    "mmapfileforkwriteback",
+    "mmapprivfile",
+    "mmaptrimprotect",
+    "mmsgmatrix",
+    "mqnotifycrossproc",
+    "mremapmove",
+    "msgctlstat",
+    "mtforkcorrupt",
+    "nanosleeprem",
+    "nativex18",
+    "netifmcast",
+    "newmountapi",
+    "nsfsioctl",
+    "oomscoreadj",
+    "openat2valid",
+    "openempty",
+    "overlaysymlink",
+    "pathnonutf8",
+    "pendingunblock",
+    "pidnsinitsig",
+    "pidnswait",
+    "pipeszcrossend",
+    "ppid",
+    "prctldumpable",
+    "preadspecial",
+    "preemptsigstorm",
+    "procladder",
+    "procladder_mt",
+    "procpeermem",
+    "procselfpid",
+    "procsignalmulti",
+    "procstatussig",
+    "ptraceattach",
+    "ptracesequence",
+    "ptracestop",
+    "ptyfionread",
+    "ptypair",
+    "recursionguard",
+    "renameexchange",
+    "rlimitnofile",
+    "rlimitroundtrip",
+    "roreadwrite",
+    "rtsigqueueinfoxthread",
+    "schedaffinitysibling",
+    "schedprio",
+    "seccompenforce",
+    "selectnfds",
+    "selfraise",
+    "semtimedop",
+    "setgroupsroundtrip",
+    "shared_buffer_mmap",
+    "shmnestedfork",
+    "sigbadstack",
+    "siglongjmpaltstack",
+    "signalfdread",
+    "sigpipewrite",
+    "sigstopjobcontrol",
+    "sigunblockpending",
+    "sigwaitmatrix",
+    "sockoptdomainproto",
+    "splicematrix",
+    "spliceunixpoll",
+    "symlinkmknod",
+    "sysinfo",
+    "sysvmsgwake",
+    "sysvshm",
+    "termiosflow",
+    "threadcommname",
+    "threadstatstate",
+    "timeextra",
+    "tlsswitch",
+    "traceexecstop",
+    "udplitesock",
+    "unicodenorm",
+    "usernsmap",
+    "vdsosymbols",
+    "vforkvmshare",
+    "waitexitstorm",
+    "waitidspec",
+    "waitsiblingsigchld",
+    "xsignal",
+];
+
+/// Exact materialized list of generic conformance probes for shard 2 (index % 3 == 2).
+/// Hard-asserted to have exactly 147 sorted unique names.
+pub const SHARD_2_PROBES: &[&str] = &[
+    "accessx",
+    "alarmretval",
+    "archiveflagmatrix",
+    "bindunixnode",
+    "bsd_signal_xlate",
+    "capbsetisolation",
+    "chmodsetgid",
+    "clocknanosleepcpu",
+    "clone3exithandled",
+    "clonebasic",
+    "clonefilesexec",
+    "clonestack",
+    "connrefused",
+    "coredumpfile",
+    "ctrel0",
+    "dirfdnotdir",
+    "dnotify",
+    "epollclosenodel",
+    "epolletchildhup",
+    "epollexclusive",
+    "epolloutrearm",
+    "epollpwait",
+    "eventfdsignalmatrix",
+    "execfatalstatus",
+    "execpipe",
+    "execthreads",
+    "exitgroupmainthreads",
+    "expectcontinue",
+    "fchmoddir",
+    "fcntllock",
+    "fcntlpipesz",
+    "fdstat",
+    "fgetflcreate",
+    "fifonode",
+    "forkcow",
+    "forkfiletable",
+    "forkheapalloc",
+    "forksigwalk",
+    "forksplicestage",
+    "fsetfl",
+    "fsx",
+    "futexforkrequeue",
+    "futexpilock",
+    "futexrealtime",
+    "futexsharedalias",
+    "futexwakecount",
+    "getrandomvdso",
+    "getsocknameval",
+    "inotifymatrix",
+    "iouring",
+    "iovecedge",
+    "itimer",
+    "keydeny",
+    "killgroup",
+    "killtarget",
+    "legacyaio",
+    "linkatflag",
+    "loopbacksubnet",
+    "lutimesym",
+    "manythreads",
+    "maskfork",
+    "memfdcreate",
+    "memflagmatrix",
+    "mkdirsetgid",
+    "mmapcage",
+    "mmapexecshared",
+    "mmapfileshare_mt",
+    "mmaprecl",
+    "mmapv8align",
+    "mock_network_socket",
+    "mqueue",
+    "mremapsharedshrink",
+    "msgoverflow",
+    "mtidlesleep",
+    "nativebrk",
+    "net",
+    "netlink_route",
+    "nicepriority",
+    "oappendroundtrip",
+    "opathfd",
+    "openbrokensymlinkcreate",
+    "openexcldir",
+    "patherrno",
+    "pauseeintr",
+    "pidfdprocdir",
+    "pidnsorphanreap",
+    "pipeextra",
+    "pollevent",
+    "ppollsig",
+    "prctlerrors",
+    "preadv2flags",
+    "procconfigloop",
+    "procladder_epollmgr",
+    "proclife",
+    "procprctlview",
+    "procselfstatleader",
+    "procstat",
+    "protnonesyscall",
+    "ptraceinvaliderrno",
+    "ptracesigdeath",
+    "ptracetraceme",
+    "ptyflagmatrix",
+    "readpasteof",
+    "recverrqueue",
+    "reparenttoinit",
+    "rlimitnproc",
+    "robustlist",
+    "rosharedbus",
+    "rtsigtimedwaitsiginfo",
+    "schedgetattr",
+    "schedthread",
+    "seccompexec",
+    "selecttimeout",
+    "semctlrange",
+    "sendfilebadf",
+    "setidthreadchurn",
+    "sharedanonfutexfork",
+    "shmrdonly",
+    "sigchld",
+    "signalexit",
+    "signals",
+    "sigqueueusr1",
+    "sigsuspendxthread",
+    "sigwaitalarm",
+    "sigwaitthread",
+    "sotimeo",
+    "splicenetpoll",
+    "statfdino",
+    "syncfilerange",
+    "sysvmsg",
+    "sysvsem",
+    "telemetrymap",
+    "tgsigqueue",
+    "threadrecycle",
+    "threadstatuscount",
+    "timersettimeabs",
+    "tmpfileatime",
+    "ttyencoding",
+    "udpreuseaddr",
+    "unlinkatbindmount",
+    "usernswrite",
+    "vforkexecthread",
+    "vfs_mount_rw",
+    "waitidcputime",
+    "waitpgid",
+    "writevpartial",
+    "xthreadsig",
+];
+
+/// Per-probe additions to the generic container launch request.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProbeLaunchPolicy {
+    pub security_opt: Option<&'static str>,
+    pub cap_add: Option<&'static str>,
+}
+
+const SPECIAL_PROBE_LAUNCH_POLICIES: &[(&str, ProbeLaunchPolicy)] = &[
+    (
+        "clocksettimevdso",
+        ProbeLaunchPolicy {
+            security_opt: None,
+            cap_add: Some("SYS_TIME"),
+        },
+    ),
+    (
+        "clonefilesexec",
+        ProbeLaunchPolicy {
+            security_opt: Some("seccomp=unconfined"),
+            cap_add: None,
+        },
+    ),
+    (
+        "clonefileshare",
+        ProbeLaunchPolicy {
+            security_opt: Some("seccomp=unconfined"),
+            cap_add: None,
+        },
+    ),
+    (
+        "usernsisolation",
+        ProbeLaunchPolicy {
+            security_opt: Some("seccomp=unconfined"),
+            cap_add: None,
+        },
+    ),
+];
+
+/// Derive launch additions from a probe name, independent of shard placement.
+pub fn probe_launch_policy(name: &str) -> ProbeLaunchPolicy {
+    SPECIAL_PROBE_LAUNCH_POLICIES
+        .iter()
+        .find_map(|(probe, policy)| (*probe == name).then(|| policy.clone()))
+        .unwrap_or_default()
+}
+
+/// Build the fully configured container used by every generic probe shard.
+pub fn generic_probe_container(
+    probe_name: &str,
+    probe_path: &Path,
+    probeinit_path: &Path,
+) -> TestContainer {
+    let policy = probe_launch_policy(probe_name);
+    let mut container = TestContainer::new(SMOKE_IMAGE)
+        .pull_policy(PullPolicy::Missing)
+        .mount_readonly(probe_path.display().to_string(), "/tmp/p")
+        .mount_readonly(probeinit_path.display().to_string(), "/tmp/carrick-init");
+
+    if let Some(option) = policy.security_opt {
+        container = container.security_opt(option);
+    }
+    if let Some(capability) = policy.cap_add {
+        container = container.cap_add(capability);
+    }
+    container
+}
 
 /// Generic probes whose Docker result is deliberately not committed as a
 /// static oracle. The old gate quarantines these for timing sensitivity or
@@ -150,6 +680,63 @@ pub fn select_cached_probes<'a>(probes: &'a [&'a str], requested: Option<&str>) 
         .filter(|probe| runs_in_cached_lane(probe))
         .filter(|probe| requested.as_ref().is_none_or(|names| names.contains(probe)))
         .collect()
+}
+
+#[test]
+fn special_probe_container_lowers_required_privileges() {
+    let cases = [
+        ("clocksettimevdso", &["SYS_TIME"][..], &[][..]),
+        ("usernsisolation", &[][..], &["seccomp=unconfined"][..]),
+        ("clonefileshare", &[][..], &["seccomp=unconfined"][..]),
+        ("clonefilesexec", &[][..], &["seccomp=unconfined"][..]),
+    ];
+
+    for (probe, expected_cap_add, expected_security_opts) in cases {
+        let container =
+            generic_probe_container(probe, Path::new("/tmp/probe"), Path::new("/tmp/probeinit"));
+        let request = container
+            .builder(["/tmp/carrick-init"])
+            .to_run_request()
+            .expect("lower generic probe request");
+
+        assert_eq!(
+            request.cap_add, expected_cap_add,
+            "wrong cap_add for {probe}"
+        );
+        assert_eq!(
+            request.security_opts, expected_security_opts,
+            "wrong security_opts for {probe}"
+        );
+    }
+}
+
+#[test]
+fn special_policy_names_are_unique_in_the_generic_shard_union() {
+    let shards = [SHARD_0_PROBES, SHARD_1_PROBES, SHARD_2_PROBES];
+    let mut union = std::collections::BTreeSet::new();
+    for probe in shards.iter().flat_map(|shard| shard.iter().copied()) {
+        assert!(
+            union.insert(probe),
+            "duplicate probe in shard union: {probe}"
+        );
+    }
+    assert_eq!(
+        union.len(),
+        SHARD_0_PROBES.len() + SHARD_1_PROBES.len() + SHARD_2_PROBES.len(),
+        "generic shard arrays must form a unique union"
+    );
+    assert_eq!(union.len(), 442, "generic shard union must remain complete");
+
+    for (special, _) in SPECIAL_PROBE_LAUNCH_POLICIES {
+        let occurrences = shards
+            .iter()
+            .map(|shard| shard.iter().filter(|probe| **probe == *special).count())
+            .sum::<usize>();
+        assert_eq!(
+            occurrences, 1,
+            "special launch-policy probe {special} must occur exactly once across the shard union"
+        );
+    }
 }
 
 #[test]
