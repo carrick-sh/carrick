@@ -1,6 +1,7 @@
 //! Dependency-neutral, object-safe contracts for carrier-owned foreign-MM reads.
 
 use std::fmt::Debug;
+use std::marker::PhantomData;
 use std::num::{NonZeroU16, NonZeroU64};
 use std::sync::Arc;
 use std::time::Instant;
@@ -189,6 +190,166 @@ pub trait ForeignMmSnapshot: Debug + Send + Sync {
     fn vma_revision(&self) -> ForeignVmaRevision;
     fn frame_inventory_revision(&self) -> ForeignFrameInventoryRevision;
     fn mapping_ids(&self) -> &[MappingId];
+    fn executable_ranges(&self) -> &[ForeignExecutableRange];
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ForeignExecutableRange {
+    start: GuestVa,
+    end: GuestVa,
+}
+
+impl ForeignExecutableRange {
+    pub fn from_kernel_projection(start: GuestVa, end: GuestVa) -> Option<Self> {
+        (start.raw() < end.raw()).then_some(Self { start, end })
+    }
+}
+
+/// Audited cross-crate proof that a live kernel ptrace-stop authority minted
+/// one exact executable write range.
+///
+/// # Safety
+///
+/// Implementors must be non-forgeable from safe code, must remain borrowed
+/// from the lock-held exact ptrace stop, and every returned identity/revision/
+/// range must come from the same coherent MM snapshot validated while that
+/// stop is held.
+pub unsafe trait ForeignPtraceTextAuthority {
+    fn mm(&self) -> ForeignMmId;
+    fn binding(&self) -> ForeignMmBinding;
+    fn backend_revision(&self) -> ForeignBackendRevision;
+    fn vma_revision(&self) -> ForeignVmaRevision;
+    fn frame_inventory_revision(&self) -> ForeignFrameInventoryRevision;
+    fn start(&self) -> GuestVa;
+    fn len(&self) -> usize;
+}
+
+/// Opaque plan for one exact executable range in one authenticated MM
+/// snapshot. The endpoint alone constructs it from projected VMA authority;
+/// callers cannot select either the RX bypass or publication requirement.
+pub struct ForeignPtraceTextCowPlan<'authority> {
+    mm: ForeignMmId,
+    binding: ForeignMmBinding,
+    backend_revision: ForeignBackendRevision,
+    vma_revision: ForeignVmaRevision,
+    frame_inventory_revision: ForeignFrameInventoryRevision,
+    start: GuestVa,
+    len: usize,
+    cow_start: GuestVa,
+    cow_len: usize,
+    _authority: PhantomData<&'authority dyn ForeignPtraceTextAuthority>,
+}
+
+impl ForeignPtraceTextCowPlan<'_> {
+    fn authenticates_immutable(
+        &self,
+        snapshot: &dyn ForeignMmSnapshot,
+        start: GuestVa,
+        len: usize,
+    ) -> bool {
+        self.mm == snapshot.mm()
+            && self.binding == snapshot.binding()
+            && self.backend_revision == snapshot.backend_revision()
+            && self.vma_revision == snapshot.vma_revision()
+            && self.start == start
+            && self.len == len
+            && derive_ptrace_text_cow_span(snapshot, start, len)
+                == Some((self.cow_start, self.cow_len))
+    }
+
+    pub fn authenticates(
+        &self,
+        snapshot: &dyn ForeignMmSnapshot,
+        start: GuestVa,
+        len: usize,
+    ) -> bool {
+        self.authenticates_immutable(snapshot, start, len)
+            && self.frame_inventory_revision == snapshot.frame_inventory_revision()
+    }
+
+    pub fn authenticated_cow_span(
+        &self,
+        snapshot: &dyn ForeignMmSnapshot,
+        start: GuestVa,
+        len: usize,
+    ) -> Option<(GuestVa, usize)> {
+        self.authenticates(snapshot, start, len)
+            .then_some((self.cow_start, self.cow_len))
+    }
+
+    pub fn authenticates_cow(
+        &self,
+        snapshot: &dyn ForeignMmSnapshot,
+        cow: &dyn ForeignCowReceipt,
+    ) -> bool {
+        self.authenticates_immutable(snapshot, self.start, self.len)
+            && cow.mm() == self.mm
+            && cow.backend_revision() == self.backend_revision
+            && cow.vma_revision() == self.vma_revision
+            && cow.frame_inventory_revision() == snapshot.frame_inventory_revision()
+            && cow.range_start() == self.cow_start
+            && cow.range_len() == self.cow_len
+    }
+}
+
+fn derive_ptrace_text_cow_span(
+    snapshot: &dyn ForeignMmSnapshot,
+    start: GuestVa,
+    len: usize,
+) -> Option<(GuestVa, usize)> {
+    const COMPOUND_SIZE: u64 = 16 * 1024;
+    let request_end = start.raw().checked_add(len as u64)?;
+    if len == 0 {
+        return None;
+    }
+    let compound_start = start.raw() & !(COMPOUND_SIZE - 1);
+    let compound_end = compound_start.checked_add(COMPOUND_SIZE)?;
+    snapshot
+        .executable_ranges()
+        .iter()
+        .filter(|range| range.start.raw() <= start.raw() && request_end <= range.end.raw())
+        .map(|range| {
+            let cow_start = range.start.raw().max(compound_start);
+            let cow_end = range.end.raw().min(compound_end);
+            let cow_len = usize::try_from(cow_end.checked_sub(cow_start)?).ok()?;
+            (cow_len != 0 && request_end <= cow_end).then_some((GuestVa(cow_start), cow_len))
+        })
+        .find_map(|span| span)
+}
+
+/// Snapshot-derived instruction-publication requirement for one exact write.
+/// This grants no write or COW authority; it only makes cache publication
+/// mandatory when the range intersects executable guest memory.
+pub struct ForeignInstructionPublicationPlan {
+    mm: ForeignMmId,
+    binding: ForeignMmBinding,
+    backend_revision: ForeignBackendRevision,
+    vma_revision: ForeignVmaRevision,
+    frame_inventory_revision: ForeignFrameInventoryRevision,
+    start: GuestVa,
+    len: usize,
+    required: bool,
+}
+
+impl ForeignInstructionPublicationPlan {
+    pub fn authenticates(
+        &self,
+        snapshot: &dyn ForeignMmSnapshot,
+        start: GuestVa,
+        len: usize,
+    ) -> bool {
+        self.mm == snapshot.mm()
+            && self.binding == snapshot.binding()
+            && self.backend_revision == snapshot.backend_revision()
+            && self.vma_revision == snapshot.vma_revision()
+            && self.frame_inventory_revision == snapshot.frame_inventory_revision()
+            && self.start == start
+            && self.len == len
+    }
+
+    pub const fn is_required(&self) -> bool {
+        self.required
+    }
 }
 
 /// Exact live backend used to re-observe real mutation authorities.
@@ -315,9 +476,18 @@ pub trait ForeignMmReadLease: Debug + Send + Sync {
         snapshot: &dyn ForeignMmSnapshot,
         va: GuestVa,
         len: usize,
+        executable: Option<&ForeignPtraceTextCowPlan<'_>>,
         deadline: Instant,
     ) -> Result<Box<dyn ForeignCowReceipt>, ForeignMmTransportError> {
-        let _ = (invocation, invalidator, snapshot, va, len, deadline);
+        let _ = (
+            invocation,
+            invalidator,
+            snapshot,
+            va,
+            len,
+            executable,
+            deadline,
+        );
         Err(ForeignMmTransportError::AuthorityUnavailable)
     }
 
@@ -337,9 +507,19 @@ pub trait ForeignMmReadLease: Debug + Send + Sync {
         cow: &dyn ForeignCowReceipt,
         va: GuestVa,
         src: &'a [u8],
+        publication: &ForeignInstructionPublicationPlan,
         deadline: Instant,
     ) -> Result<Box<dyn ForeignMmPreparedWrite + 'a>, ForeignMmTransportError> {
-        let _ = (invocation, authority, snapshot, cow, va, src, deadline);
+        let _ = (
+            invocation,
+            authority,
+            snapshot,
+            cow,
+            va,
+            src,
+            publication,
+            deadline,
+        );
         Err(ForeignMmTransportError::AuthorityUnavailable)
     }
 }
@@ -454,7 +634,63 @@ impl ForeignMmLeaseEndpoint {
     ) -> Result<Box<dyn ForeignCowReceipt>, ForeignMmTransportError> {
         let invocation = ForeignMmInvocation { _private: () };
         self.lease
-            .break_cow(&invocation, invalidator, snapshot, va, len, deadline)
+            .break_cow(&invocation, invalidator, snapshot, va, len, None, deadline)
+    }
+
+    pub fn prepare_ptrace_text_cow<'authority>(
+        &self,
+        snapshot: &dyn ForeignMmSnapshot,
+        authority: &'authority dyn ForeignPtraceTextAuthority,
+    ) -> Result<ForeignPtraceTextCowPlan<'authority>, ForeignMmTransportError> {
+        let va = authority.start();
+        let len = authority.len();
+        let cow_span = derive_ptrace_text_cow_span(snapshot, va, len);
+        if cow_span.is_none()
+            || authority.mm() != snapshot.mm()
+            || authority.binding() != snapshot.binding()
+            || authority.backend_revision() != snapshot.backend_revision()
+            || authority.vma_revision() != snapshot.vma_revision()
+            || authority.frame_inventory_revision() != snapshot.frame_inventory_revision()
+        {
+            return Err(ForeignMmTransportError::MutationFailed);
+        }
+        let (cow_start, cow_len) = cow_span.ok_or(ForeignMmTransportError::MutationFailed)?;
+        Ok(ForeignPtraceTextCowPlan {
+            mm: snapshot.mm(),
+            binding: snapshot.binding(),
+            backend_revision: snapshot.backend_revision(),
+            vma_revision: snapshot.vma_revision(),
+            frame_inventory_revision: snapshot.frame_inventory_revision(),
+            start: va,
+            len,
+            cow_start,
+            cow_len,
+            _authority: PhantomData,
+        })
+    }
+
+    pub fn break_cow_prepared_ptrace_text(
+        &self,
+        invalidator: &mut dyn ForeignMmInvalidator,
+        snapshot: &dyn ForeignMmSnapshot,
+        va: GuestVa,
+        len: usize,
+        plan: &ForeignPtraceTextCowPlan<'_>,
+        deadline: Instant,
+    ) -> Result<Box<dyn ForeignCowReceipt>, ForeignMmTransportError> {
+        if !plan.authenticates(snapshot, va, len) {
+            return Err(ForeignMmTransportError::MutationFailed);
+        }
+        let invocation = ForeignMmInvocation { _private: () };
+        self.lease.break_cow(
+            &invocation,
+            invalidator,
+            snapshot,
+            va,
+            len,
+            Some(plan),
+            deadline,
+        )
     }
 
     pub fn prepare_write<'a>(
@@ -467,9 +703,75 @@ impl ForeignMmLeaseEndpoint {
         deadline: Instant,
     ) -> Result<Box<dyn ForeignMmPreparedWrite + 'a>, ForeignMmTransportError> {
         let invocation = ForeignMmInvocation { _private: () };
-        self.lease
-            .prepare_write(&invocation, authority, snapshot, cow, va, src, deadline)
+        let publication = instruction_publication(snapshot, va, src.len())?;
+        self.lease.prepare_write(
+            &invocation,
+            authority,
+            snapshot,
+            cow,
+            va,
+            src,
+            &publication,
+            deadline,
+        )
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_executable_write_commit<'a>(
+        &self,
+        authority: &dyn ForeignMmLiveAuthority,
+        snapshot: &dyn ForeignMmSnapshot,
+        cow: &dyn ForeignCowReceipt,
+        va: GuestVa,
+        src: &'a [u8],
+        plan: &ForeignPtraceTextCowPlan<'_>,
+        deadline: Instant,
+    ) -> Result<Box<dyn ForeignMmPreparedWrite + 'a>, ForeignMmTransportError> {
+        if !plan.authenticates_cow(snapshot, cow)
+            || !plan.authenticates_immutable(snapshot, va, src.len())
+        {
+            return Err(ForeignMmTransportError::MutationFailed);
+        }
+        let invocation = ForeignMmInvocation { _private: () };
+        let publication = instruction_publication(snapshot, va, src.len())?;
+        self.lease.prepare_write(
+            &invocation,
+            authority,
+            snapshot,
+            cow,
+            va,
+            src,
+            &publication,
+            deadline,
+        )
+    }
+}
+
+fn instruction_publication(
+    snapshot: &dyn ForeignMmSnapshot,
+    start: GuestVa,
+    len: usize,
+) -> Result<ForeignInstructionPublicationPlan, ForeignMmTransportError> {
+    let end = start
+        .raw()
+        .checked_add(len as u64)
+        .ok_or(ForeignMmTransportError::MutationFailed)?;
+    if len == 0 {
+        return Err(ForeignMmTransportError::MutationFailed);
+    }
+    Ok(ForeignInstructionPublicationPlan {
+        mm: snapshot.mm(),
+        binding: snapshot.binding(),
+        backend_revision: snapshot.backend_revision(),
+        vma_revision: snapshot.vma_revision(),
+        frame_inventory_revision: snapshot.frame_inventory_revision(),
+        start,
+        len,
+        required: snapshot
+            .executable_ranges()
+            .iter()
+            .any(|range| range.start.raw() < end && start.raw() < range.end.raw()),
+    })
 }
 
 #[cfg(test)]
@@ -499,6 +801,10 @@ mod tests {
         }
         fn mapping_ids(&self) -> &[MappingId] {
             &self.0
+        }
+
+        fn executable_ranges(&self) -> &[ForeignExecutableRange] {
+            &[]
         }
     }
 
@@ -565,6 +871,7 @@ mod tests {
             snapshot: &dyn ForeignMmSnapshot,
             va: GuestVa,
             len: usize,
+            _executable: Option<&ForeignPtraceTextCowPlan<'_>>,
             _deadline: Instant,
         ) -> Result<Box<dyn ForeignCowReceipt>, ForeignMmTransportError> {
             Ok(Box::new(CowReceipt {
@@ -593,6 +900,7 @@ mod tests {
             cow: &dyn ForeignCowReceipt,
             va: GuestVa,
             src: &'a [u8],
+            _publication: &ForeignInstructionPublicationPlan,
             _deadline: Instant,
         ) -> Result<Box<dyn ForeignMmPreparedWrite + 'a>, ForeignMmTransportError> {
             assert_eq!(cow.mm(), snapshot.mm());

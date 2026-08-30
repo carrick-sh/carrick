@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use carrick_guest_mem::GuestVa;
 
-use super::objects::{ThreadExecutionError, ThreadExecutionLease};
+use super::objects::{PtraceTextAccess, ThreadExecutionError, ThreadExecutionLease};
 use super::{
     Kernel, KernelContext, Mm, MmBackendSnapshot, MmId, SnapshotError, TaskKey, TaskLifecycle,
 };
@@ -92,13 +92,58 @@ impl MmToken {
         }))
     }
 
+    fn ptrace_text_range<'mm, 'witness>(
+        &'mm self,
+        access: &'witness PtraceTextAccess<'witness>,
+        start: GuestVa,
+        len: usize,
+    ) -> Result<Option<PtraceTextWriteRange<'mm, 'witness>>, MmAccessError> {
+        if access.mm_id() != self.mm_id() {
+            return Err(MmAccessError::ForeignRangeAuthorityMismatch);
+        }
+        let Some(len) = NonZeroUsize::new(len) else {
+            return Ok(None);
+        };
+        let policy = validate_ptrace_text_range_in_snapshot(&self.snapshot, start, len)?;
+        let vma_revision = self
+            .snapshot
+            .vma_revision
+            .ok_or(MmAccessError::IncompleteForeignSnapshot(self.mm_id()))?;
+        let frame_inventory_revision = self
+            .snapshot
+            .frame_inventory_revision
+            .ok_or(MmAccessError::IncompleteForeignSnapshot(self.mm_id()))?;
+        Ok(Some(PtraceTextWriteRange {
+            token: self,
+            start,
+            len,
+            binding: carrick_hal::ForeignMmBinding::for_aarch64(
+                carrick_hal::ForeignAsid::from_kernel_allocation(
+                    NonZeroU16::new(self.snapshot.binding.asid.raw())
+                        .ok_or(MmAccessError::IncompleteForeignSnapshot(self.mm_id()))?,
+                ),
+                self.snapshot.binding.stage1_root.gpa(),
+            ),
+            backend_revision: carrick_hal::ForeignBackendRevision::from_authority_raw(
+                self.snapshot.revision,
+            ),
+            vma_revision: carrick_hal::ForeignVmaRevision::from_authority_raw(vma_revision.raw()),
+            frame_inventory_revision:
+                carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(
+                    frame_inventory_revision,
+                ),
+            executable: policy.executable,
+            _witness: PhantomData,
+        }))
+    }
+
     fn validate_range(
         &self,
         start: GuestVa,
         len: NonZeroUsize,
         requested: RangeAccess,
     ) -> Result<(), MmAccessError> {
-        validate_range_in_snapshot(&self.snapshot, start, len, requested)
+        validate_range_in_snapshot(&self.snapshot, start, len, requested).map(|_| ())
     }
 }
 
@@ -107,7 +152,7 @@ fn validate_range_in_snapshot(
     start: GuestVa,
     len: NonZeroUsize,
     requested: RangeAccess,
-) -> Result<(), MmAccessError> {
+) -> Result<bool, MmAccessError> {
     let len_u64 = u64::try_from(len.get()).map_err(|_| MmAccessError::RangeOverflow {
         start,
         len: len.get(),
@@ -120,7 +165,6 @@ fn validate_range_in_snapshot(
             len: len.get(),
         })?;
     let mut cursor = start.raw();
-
     for vma in &snapshot.vmas {
         if vma.end.raw() <= cursor {
             continue;
@@ -154,7 +198,7 @@ fn validate_range_in_snapshot(
 
         cursor = vma.end.raw().min(end);
         if cursor == end {
-            return Ok(());
+            return Ok(false);
         }
     }
 
@@ -168,6 +212,55 @@ enum RangeAccess {
     Read,
     KernelRead,
     Write,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PtraceTextRangePolicy {
+    executable: bool,
+}
+
+fn validate_ptrace_text_range_in_snapshot(
+    snapshot: &MmBackendSnapshot,
+    start: GuestVa,
+    len: NonZeroUsize,
+) -> Result<PtraceTextRangePolicy, MmAccessError> {
+    let end = start
+        .raw()
+        .checked_add(len.get() as u64)
+        .ok_or(MmAccessError::RangeOverflow {
+            start,
+            len: len.get(),
+        })?;
+    let mut cursor = start.raw();
+    let mut executable = true;
+    for vma in &snapshot.vmas {
+        if vma.end.raw() <= cursor {
+            continue;
+        }
+        if vma.start.raw() > cursor {
+            return Err(MmAccessError::Unmapped {
+                address: GuestVa(cursor),
+            });
+        }
+        if !vma.access.kernel_visible {
+            return Err(MmAccessError::KernelHidden {
+                address: GuestVa(cursor),
+            });
+        }
+        if !vma.access.writable && !vma.access.executable {
+            return Err(MmAccessError::WriteDenied {
+                address: GuestVa(cursor),
+            });
+        }
+        executable &= vma.access.executable;
+        cursor = vma.end.raw().min(end);
+        if cursor == end {
+            return Ok(PtraceTextRangePolicy { executable });
+        }
+    }
+    Err(MmAccessError::Unmapped {
+        address: GuestVa(cursor),
+    })
 }
 
 /// A readable non-empty range bound by lifetime to its exact MM token.
@@ -200,6 +293,56 @@ pub struct MmWriteRange<'mm> {
     len: NonZeroUsize,
 }
 
+/// Non-copy exceptional range whose lifetime is bounded by the exact settled
+/// ptrace stop that minted it.
+pub(crate) struct PtraceTextWriteRange<'mm, 'witness> {
+    token: &'mm MmToken,
+    start: GuestVa,
+    len: NonZeroUsize,
+    binding: carrick_hal::ForeignMmBinding,
+    backend_revision: carrick_hal::ForeignBackendRevision,
+    vma_revision: carrick_hal::ForeignVmaRevision,
+    frame_inventory_revision: carrick_hal::ForeignFrameInventoryRevision,
+    executable: bool,
+    _witness: PhantomData<&'witness mut ()>,
+}
+
+// SAFETY: construction is private to `MmToken::ptrace_text_range`, which
+// requires the non-cloneable lock-bounded `PtraceTextAccess`, authenticates the
+// exact MM id, and copies every revision/range from that token's coherent
+// backend snapshot.
+unsafe impl carrick_hal::ForeignPtraceTextAuthority for PtraceTextWriteRange<'_, '_> {
+    fn mm(&self) -> carrick_hal::ForeignMmId {
+        carrick_hal::ForeignMmId::from_kernel_allocation(
+            NonZeroU64::new(self.token.mm_id().raw()).unwrap_or_else(|| std::process::abort()),
+        )
+    }
+
+    fn binding(&self) -> carrick_hal::ForeignMmBinding {
+        self.binding
+    }
+
+    fn backend_revision(&self) -> carrick_hal::ForeignBackendRevision {
+        self.backend_revision
+    }
+
+    fn vma_revision(&self) -> carrick_hal::ForeignVmaRevision {
+        self.vma_revision
+    }
+
+    fn frame_inventory_revision(&self) -> carrick_hal::ForeignFrameInventoryRevision {
+        self.frame_inventory_revision
+    }
+
+    fn start(&self) -> GuestVa {
+        self.start
+    }
+
+    fn len(&self) -> usize {
+        self.len.get()
+    }
+}
+
 impl MmWriteRange<'_> {
     pub const fn start(&self) -> GuestVa {
         self.start
@@ -224,6 +367,30 @@ pub struct CurrentMm<'context> {
 impl CurrentMm<'_> {
     pub fn mm_id(&self) -> MmId {
         self.token.mm_id()
+    }
+
+    pub fn write_range(
+        &self,
+        start: GuestVa,
+        len: usize,
+    ) -> Result<Option<MmWriteRange<'_>>, MmAccessError> {
+        self.token.write_range(start, len)
+    }
+}
+
+pub(crate) trait MmAccessTarget {
+    fn access_token(&self) -> &MmToken;
+}
+
+impl MmAccessTarget for CurrentMm<'_> {
+    fn access_token(&self) -> &MmToken {
+        &self.token
+    }
+}
+
+impl MmAccessTarget for ForeignMm {
+    fn access_token(&self) -> &MmToken {
+        &self.token
     }
 }
 
@@ -365,6 +532,24 @@ impl MmAccessAuthority {
             .map_err(|error| MmAccessError::ForeignMutation(error.to_string()))?
     }
 
+    pub fn with_current_mutation<T>(
+        &self,
+        mm: &CurrentMm<'_>,
+        tid: carrick_hal::ThreadId,
+        operation: impl FnOnce(
+            &mut crate::dispatch::mm_mutation::MmMutationGuard<'_>,
+        ) -> Result<T, MmAccessError>,
+    ) -> Result<T, MmAccessError> {
+        let authority = mm
+            .token
+            .foreign_mutation
+            .as_ref()
+            .ok_or(MmAccessError::MissingForeignMutationAuthority(mm.mm_id()))?;
+        authority
+            .with_guard(tid, operation)
+            .map_err(|error| MmAccessError::ForeignMutation(error.to_string()))?
+    }
+
     #[allow(dead_code)] // Task 8 is the first syscall consumer.
     pub fn read_foreign(
         &self,
@@ -432,13 +617,60 @@ impl MmAccessAuthority {
     }
 
     #[allow(dead_code)] // Canonical process_vm consumer lands in Task 8.
-    pub fn break_foreign_cow<'mm, 'guard, 'authority>(
+    pub fn break_foreign_cow<'mm, 'guard, 'authority, T: MmAccessTarget + ?Sized>(
         &self,
         mutation: &'guard mut crate::dispatch::mm_mutation::MmMutationGuard<'authority>,
-        mm: &'mm ForeignMm,
+        mm: &'mm T,
         range: MmWriteRange<'mm>,
     ) -> Result<CowBroken<'mm, 'guard, 'authority>, MmAccessError> {
-        self.break_foreign_cow_inner(mutation, mm, range, false)
+        self.break_foreign_cow_inner(mutation, mm, range, None, false)
+            .map(|(cow, plan)| {
+                debug_assert!(plan.is_none());
+                cow
+            })
+    }
+
+    pub(crate) fn write_ptrace_text_under_witness<
+        'mm,
+        'src,
+        'witness,
+        'guard,
+        'authority,
+        T: MmAccessTarget + ?Sized,
+    >(
+        &self,
+        mutation: &'guard mut crate::dispatch::mm_mutation::MmMutationGuard<'authority>,
+        mm: &'mm T,
+        access: &'witness PtraceTextAccess<'witness>,
+        start: GuestVa,
+        src: &'src [u8],
+    ) -> Result<ForeignWriteReceipt, MmAccessError> {
+        let range = mm
+            .access_token()
+            .ptrace_text_range(access, start, src.len())?
+            .ok_or(MmAccessError::SourceLengthMismatch {
+                range: 0,
+                source_len: src.len(),
+            })?;
+        let ordinary_shape = MmWriteRange {
+            token: range.token,
+            start: range.start,
+            len: range.len,
+        };
+        if !range.executable {
+            let (mut cow, plan) =
+                self.break_foreign_cow_inner(mutation, mm, ordinary_shape, None, false)?;
+            debug_assert!(plan.is_none());
+            return Ok(self
+                .prepare_foreign_write_inner(&mut cow, ordinary_shape, src, None)?
+                .commit());
+        }
+        let (mut cow, plan) =
+            self.break_foreign_cow_inner(mutation, mm, ordinary_shape, Some(&range), false)?;
+        let plan = plan.ok_or(MmAccessError::ForeignRangeAuthorityMismatch)?;
+        Ok(self
+            .prepare_foreign_write_inner(&mut cow, ordinary_shape, src, Some(&plan))?
+            .commit())
     }
 
     #[cfg(test)]
@@ -448,45 +680,88 @@ impl MmAccessAuthority {
         mm: &'mm ForeignMm,
         range: MmWriteRange<'mm>,
     ) -> Result<CowBroken<'mm, 'guard, 'authority>, MmAccessError> {
-        self.break_foreign_cow_inner(mutation, mm, range, true)
+        self.break_foreign_cow_inner(mutation, mm, range, None, true)
+            .map(|(cow, plan)| {
+                debug_assert!(plan.is_none());
+                cow
+            })
     }
 
-    fn break_foreign_cow_inner<'mm, 'guard, 'authority>(
+    fn break_foreign_cow_inner<'mm, 'guard, 'authority, 'ptrace, T: MmAccessTarget + ?Sized>(
         &self,
         mutation: &'guard mut crate::dispatch::mm_mutation::MmMutationGuard<'authority>,
-        mm: &'mm ForeignMm,
+        mm: &'mm T,
         range: MmWriteRange<'mm>,
+        ptrace_authority: Option<&'ptrace dyn carrick_hal::ForeignPtraceTextAuthority>,
         contend_final_snapshot: bool,
-    ) -> Result<CowBroken<'mm, 'guard, 'authority>, MmAccessError> {
-        if !Arc::ptr_eq(&range.token.mm, &mm.token.mm) || range.token.task != mm.token.task {
+    ) -> Result<
+        (
+            CowBroken<'mm, 'guard, 'authority>,
+            Option<carrick_hal::ForeignPtraceTextCowPlan<'ptrace>>,
+        ),
+        MmAccessError,
+    > {
+        let token = mm.access_token();
+        if !Arc::ptr_eq(&range.token.mm, &token.mm) || range.token.task != token.task {
             return Err(MmAccessError::ForeignRangeAuthorityMismatch);
         }
-        let target_mutation = mm
-            .token
-            .foreign_mutation
-            .as_ref()
-            .ok_or(MmAccessError::MissingForeignMutationAuthority(mm.mm_id()))?;
+        let target_mutation = token.foreign_mutation.as_ref().ok_or(
+            MmAccessError::MissingForeignMutationAuthority(token.mm_id()),
+        )?;
         if !target_mutation.authorizes(mutation) {
             return Err(MmAccessError::ForeignMutationAuthorityMismatch);
         }
         let deadline = Instant::now() + Self::OVERALL_DEADLINE;
-        let lease = mm
-            .token
+        let lease = token
             .foreign_lease
             .as_ref()
-            .ok_or(MmAccessError::MissingForeignTransport(mm.mm_id()))?;
-        let before = snapshot_backend(&mm.token.mm, deadline)?;
+            .ok_or(MmAccessError::MissingForeignTransport(token.mm_id()))?;
+        let before = snapshot_backend(&token.mm, deadline)?;
         validate_snapshot_vmas(&before)?;
-        validate_range_in_snapshot(&before, range.start, range.len, RangeAccess::Write)?;
-        let requested = ProjectedForeignMmSnapshot::from_backend(mm.mm_id(), &before)?;
-        let receipt = mutation.with_host_alias(|invalidator| {
-            lease.break_cow(
-                invalidator,
-                &requested,
+        let ptrace_policy = if ptrace_authority.is_some() {
+            Some(validate_ptrace_text_range_in_snapshot(
+                &before,
                 range.start,
-                range.len.get(),
-                deadline,
-            )
+                range.len,
+            )?)
+        } else {
+            validate_range_in_snapshot(&before, range.start, range.len, RangeAccess::Write)?;
+            None
+        };
+        let requested = ProjectedForeignMmSnapshot::from_backend(token.mm_id(), &before)?;
+        let executable_plan =
+            if let (Some(authority), Some(policy)) = (ptrace_authority, ptrace_policy) {
+                if !policy.executable {
+                    None
+                } else {
+                    Some(
+                        lease
+                            .prepare_ptrace_text_cow(&requested, authority)
+                            .map_err(MmAccessError::ForeignTransport)?,
+                    )
+                }
+            } else {
+                None
+            };
+        let receipt = mutation.with_host_alias(|invalidator| {
+            if let Some(plan) = executable_plan.as_ref() {
+                lease.break_cow_prepared_ptrace_text(
+                    invalidator,
+                    &requested,
+                    range.start,
+                    range.len.get(),
+                    plan,
+                    deadline,
+                )
+            } else {
+                lease.break_cow(
+                    invalidator,
+                    &requested,
+                    range.start,
+                    range.len.get(),
+                    deadline,
+                )
+            }
         });
         let receipt = match receipt {
             Ok(receipt) => receipt,
@@ -524,8 +799,8 @@ impl MmAccessAuthority {
                     .downcast_ref::<crate::vcpu_loop::KernelForeignCowProof>()
                     .is_some_and(|proof| {
                         proof.authenticates(
-                            &mm.token.kernel,
-                            mm.mm_id(),
+                            &token.kernel,
+                            token.mm_id(),
                             receipt.range_start(),
                             receipt.range_len(),
                             receipt.frame_inventory_revision().raw_for_probe(),
@@ -548,11 +823,14 @@ impl MmAccessAuthority {
         if !valid {
             return Err(MmAccessError::ForeignCowReceiptMismatch);
         }
-        Ok(CowBroken {
-            range,
-            transport: receipt,
-            guard: mutation,
-        })
+        Ok((
+            CowBroken {
+                range,
+                transport: receipt,
+                guard: mutation,
+            },
+            executable_plan,
+        ))
     }
 
     #[allow(dead_code)] // Canonical process_vm consumer lands in Task 8.
@@ -571,6 +849,16 @@ impl MmAccessAuthority {
         witness: &'witness mut CowBroken<'mm, 'guard, 'authority>,
         range: MmWriteRange<'mm>,
         src: &'src [u8],
+    ) -> Result<PreparedForeignWrite<'mm, 'src, 'witness, 'guard, 'authority>, MmAccessError> {
+        self.prepare_foreign_write_inner(witness, range, src, None)
+    }
+
+    fn prepare_foreign_write_inner<'mm, 'src, 'witness, 'guard, 'authority>(
+        &self,
+        witness: &'witness mut CowBroken<'mm, 'guard, 'authority>,
+        range: MmWriteRange<'mm>,
+        src: &'src [u8],
+        executable_plan: Option<&carrick_hal::ForeignPtraceTextCowPlan>,
     ) -> Result<PreparedForeignWrite<'mm, 'src, 'witness, 'guard, 'authority>, MmAccessError> {
         if src.len() != range.len.get() {
             return Err(MmAccessError::SourceLengthMismatch {
@@ -614,7 +902,14 @@ impl MmAccessAuthority {
         let deadline = Instant::now() + Self::OVERALL_DEADLINE;
         let before = snapshot_backend(mm, deadline)?;
         validate_snapshot_vmas(&before)?;
-        validate_range_in_snapshot(&before, range.start, range.len, RangeAccess::Write)?;
+        if executable_plan.is_some() {
+            if !validate_ptrace_text_range_in_snapshot(&before, range.start, range.len)?.executable
+            {
+                return Err(MmAccessError::ForeignRangeAuthorityMismatch);
+            }
+        } else {
+            validate_range_in_snapshot(&before, range.start, range.len, RangeAccess::Write)?;
+        }
         let snapshot = ProjectedForeignMmSnapshot::from_backend(mm.id(), &before)?;
         if snapshot.mm != witness.transport.mm()
             || snapshot.backend_revision != witness.transport.backend_revision()
@@ -648,14 +943,27 @@ impl MmAccessAuthority {
             .as_ref()
             .ok_or(MmAccessError::MissingForeignTransport(mm.id()))?;
         let live = RetainedMmLiveAuthority { mm: Arc::clone(mm) };
-        let prepared_transport = match lease.prepare_write(
-            &live,
-            &snapshot,
-            witness.transport.as_ref(),
-            range.start,
-            src,
-            deadline,
-        ) {
+        let prepared = if let Some(plan) = executable_plan {
+            lease.prepare_executable_write_commit(
+                &live,
+                &snapshot,
+                witness.transport.as_ref(),
+                range.start,
+                src,
+                plan,
+                deadline,
+            )
+        } else {
+            lease.prepare_write(
+                &live,
+                &snapshot,
+                witness.transport.as_ref(),
+                range.start,
+                src,
+                deadline,
+            )
+        };
+        let prepared_transport = match prepared {
             Ok(prepared) => prepared,
             Err(carrick_hal::ForeignMmTransportError::TimedOut) => {
                 return Err(MmAccessError::ForeignWriteTimedOut);
@@ -711,6 +1019,7 @@ struct ProjectedForeignMmSnapshot {
     vma_revision: carrick_hal::ForeignVmaRevision,
     frame_inventory_revision: carrick_hal::ForeignFrameInventoryRevision,
     mapping_ids: Vec<carrick_hal::MappingId>,
+    executable_ranges: Vec<carrick_hal::ForeignExecutableRange>,
 }
 
 impl ProjectedForeignMmSnapshot {
@@ -742,6 +1051,14 @@ impl ProjectedForeignMmSnapshot {
                     frame_inventory_revision,
                 ),
             mapping_ids: snapshot.mapping_ids.clone(),
+            executable_ranges: snapshot
+                .vmas
+                .iter()
+                .filter(|vma| vma.access.executable && vma.access.kernel_visible)
+                .filter_map(|vma| {
+                    carrick_hal::ForeignExecutableRange::from_kernel_projection(vma.start, vma.end)
+                })
+                .collect(),
         })
     }
 }
@@ -764,6 +1081,10 @@ impl carrick_hal::ForeignMmSnapshot for ProjectedForeignMmSnapshot {
     }
     fn mapping_ids(&self) -> &[carrick_hal::MappingId] {
         &self.mapping_ids
+    }
+
+    fn executable_ranges(&self) -> &[carrick_hal::ForeignExecutableRange] {
+        &self.executable_ranges
     }
 }
 
@@ -964,14 +1285,23 @@ fn snapshot_token(
                 .map_err(MmAccessError::ForeignTransport)?,
         )
     } else {
-        None
+        let permit = ForeignEndpointPermit { _private: () };
+        mm.foreign_mm_endpoint(&permit, deadline)
+            .flatten()
+            .and_then(|endpoint| {
+                ProjectedForeignMmSnapshot::from_backend(mm.id(), &snapshot)
+                    .ok()
+                    .and_then(|projected| endpoint.retain(&projected, deadline).ok())
+            })
     };
     let foreign_mutation = if retain_foreign {
         let permit = ForeignEndpointPermit { _private: () };
         mm.foreign_mm_mutation_authority(&permit, deadline)
             .ok_or(MmAccessError::ForeignReadTimedOut)?
     } else {
-        None
+        let permit = ForeignEndpointPermit { _private: () };
+        mm.foreign_mm_mutation_authority(&permit, deadline)
+            .flatten()
     };
     Ok(MmToken {
         task,
@@ -1234,6 +1564,7 @@ pub(crate) mod tests {
         vma_revision: AtomicU64,
         inventory_revision: AtomicU64,
         mapping: parking_lot::RwLock<carrick_hal::MappingId>,
+        access: parking_lot::RwLock<VmaAccess>,
     }
 
     impl MutableFixtureBackend {
@@ -1248,12 +1579,22 @@ pub(crate) mod tests {
                 mapping: parking_lot::RwLock::new(carrick_hal::MappingId::from_kernel_allocation(
                     NonZeroU64::new(53).unwrap(),
                 )),
+                access: parking_lot::RwLock::new(VmaAccess {
+                    readable: true,
+                    writable: true,
+                    executable: false,
+                    kernel_visible: true,
+                }),
             })
         }
 
         fn bind_inventory_mapping(&self, mapping: carrick_hal::MappingId, revision: u64) {
             *self.mapping.write() = mapping;
             self.inventory_revision.store(revision, Ordering::Release);
+        }
+
+        fn set_access(&self, access: VmaAccess) {
+            *self.access.write() = access;
         }
 
         fn advance(&self, domain: usize) {
@@ -1274,12 +1615,7 @@ pub(crate) mod tests {
                 vmas: vec![VmaSummary {
                     start: GuestVa(0x3000),
                     end: GuestVa(0x4000),
-                    access: VmaAccess {
-                        readable: true,
-                        writable: true,
-                        executable: false,
-                        kernel_visible: true,
-                    },
+                    access: *self.access.read(),
                 }],
                 vma_revision: Some(VmaRevision::from_authority_raw(
                     self.vma_revision.load(Ordering::Acquire),
@@ -1341,6 +1677,7 @@ pub(crate) mod tests {
         counters: MockCowCounters,
         fault: MockCowFault,
         proof: crate::vcpu_loop::KernelForeignCowProof,
+        ptrace_proof: Option<crate::vcpu_loop::KernelForeignCowProof>,
         mapping: carrick_hal::MappingId,
         frame: carrick_hal::FrameId,
         physical_base: Gpa,
@@ -1390,6 +1727,7 @@ pub(crate) mod tests {
         counters: MockCowCounters,
         fault: MockCowFault,
         proof: crate::vcpu_loop::KernelForeignCowProof,
+        ptrace_proof: Option<crate::vcpu_loop::KernelForeignCowProof>,
         mapping: carrick_hal::MappingId,
         frame: carrick_hal::FrameId,
         physical_base: Gpa,
@@ -1535,6 +1873,7 @@ pub(crate) mod tests {
             snapshot: &dyn ForeignMmSnapshot,
             va: GuestVa,
             len: usize,
+            executable: Option<&carrick_hal::ForeignPtraceTextCowPlan>,
             _deadline: Instant,
         ) -> Result<Box<dyn ForeignCowReceipt>, ForeignMmTransportError> {
             self.counters.break_calls.fetch_add(1, Ordering::SeqCst);
@@ -1557,10 +1896,16 @@ pub(crate) mod tests {
             } else {
                 snapshot.mm()
             };
+            let (authorized_start, authorized_len) = match executable {
+                Some(plan) => plan
+                    .authenticated_cow_span(snapshot, va, len)
+                    .ok_or(ForeignMmTransportError::MutationFailed)?,
+                None => (va, self.physical_len as usize),
+            };
             let start = if self.fault == MockCowFault::WrongRange {
-                GuestVa(va.raw() + 1)
+                GuestVa(authorized_start.raw() + 1)
             } else {
-                va
+                authorized_start
             };
             let backend = carrick_hal::ForeignBackendRevision::from_authority_raw(
                 snapshot.backend_revision().raw_for_probe()
@@ -1607,15 +1952,18 @@ pub(crate) mod tests {
                     self.fault,
                     MockCowFault::WrongOwner | MockCowFault::ForgedConsistentOwner
                 ));
+            let proof = executable
+                .and_then(|_| self.ptrace_proof.as_ref())
+                .unwrap_or(&self.proof);
             Ok(Box::new(MockCowReceipt {
                 mm,
                 start,
                 len: if self.fault == MockCowFault::WrongRange {
-                    len
+                    authorized_len
                 } else if self.fault == MockCowFault::InflatedSemanticSpan {
                     self.physical_len as usize * 2
                 } else {
-                    self.physical_len as usize
+                    authorized_len
                 },
                 backend,
                 vma,
@@ -1632,7 +1980,7 @@ pub(crate) mod tests {
                     NonZeroU64::new(owner_raw).unwrap(),
                 ),
                 kernel_proof: carrick_hal::ForeignCowKernelProof::from_runtime_authority(Box::new(
-                    self.proof.clone(),
+                    proof.clone(),
                 )),
             }))
         }
@@ -1645,6 +1993,7 @@ pub(crate) mod tests {
             cow: &dyn ForeignCowReceipt,
             va: GuestVa,
             src: &'a [u8],
+            _publication: &carrick_hal::ForeignInstructionPublicationPlan,
             _deadline: Instant,
         ) -> Result<Box<dyn carrick_hal::ForeignMmPreparedWrite + 'a>, ForeignMmTransportError>
         {
@@ -1728,6 +2077,7 @@ pub(crate) mod tests {
                 counters: self.counters.clone(),
                 fault: self.fault,
                 proof: self.proof.clone(),
+                ptrace_proof: self.ptrace_proof.clone(),
                 mapping: self.mapping,
                 frame: self.frame,
                 physical_base: self.physical_base,
@@ -1757,6 +2107,7 @@ pub(crate) mod tests {
             snapshot: &dyn ForeignMmSnapshot,
             va: GuestVa,
             len: usize,
+            _executable: Option<&carrick_hal::ForeignPtraceTextCowPlan>,
             _deadline: Instant,
         ) -> Result<Box<dyn ForeignCowReceipt>, ForeignMmTransportError> {
             let commit = self
@@ -2028,6 +2379,18 @@ pub(crate) mod tests {
             carrick_hal::FrameLength::from_mapping_extent(NonZeroU64::new(physical_len).unwrap()),
             owner,
         );
+        let ptrace_proof = crate::vcpu_loop::KernelForeignCowProof::new(
+            Arc::clone(kernel),
+            mm,
+            GuestVa(0x3000),
+            std::num::NonZeroUsize::new(0x1000).unwrap(),
+            inventory_revision,
+            mapping,
+            frame,
+            physical_base,
+            carrick_hal::FrameLength::from_mapping_extent(NonZeroU64::new(physical_len).unwrap()),
+            owner,
+        );
         child.shared().mm().install_foreign_mm_endpoint_for_test(
             carrick_hal::ForeignMmEndpoint::for_carrier(Arc::new(MockCowTransport {
                 owner_generation: Arc::clone(&owner_generation),
@@ -2035,6 +2398,7 @@ pub(crate) mod tests {
                 counters: counters.clone(),
                 fault,
                 proof,
+                ptrace_proof: Some(ptrace_proof),
                 mapping,
                 frame,
                 physical_base,
@@ -2065,6 +2429,7 @@ pub(crate) mod tests {
     /// genuine kernel proof and commits a prepared write.
     pub(crate) struct ConsumerCowFixture {
         target: KernelContext,
+        backend: Arc<MutableFixtureBackend>,
         peer_bytes: Vec<u8>,
         child_bytes: Arc<parking_lot::Mutex<Vec<u8>>>,
         counters: MockCowCounters,
@@ -2107,6 +2472,10 @@ pub(crate) mod tests {
                 .break_observed_caller_executor
                 .load(Ordering::SeqCst)
         }
+
+        pub(crate) fn set_vma_access_for_test(&self, access: VmaAccess) {
+            self.backend.set_access(access);
+        }
     }
 
     pub(crate) fn consumer_cow_fixture(
@@ -2121,11 +2490,12 @@ pub(crate) mod tests {
             "consumer fixture covers one exact 16 KiB COW compound",
         );
         let peer_bytes = initial_bytes.clone();
-        let (target, _backend, _owner, child_bytes, counters) =
+        let (target, backend, _owner, child_bytes, counters) =
             cow_fixture(kernel, parent, registry_id, MockCowFault::None);
         *child_bytes.lock() = initial_bytes;
         ConsumerCowFixture {
             target,
+            backend,
             peer_bytes,
             child_bytes,
             counters,
@@ -2185,6 +2555,7 @@ pub(crate) mod tests {
                 counters: MockCowCounters::default(),
                 fault: MockCowFault::ReacquireSnapshot,
                 proof,
+                ptrace_proof: None,
                 mapping,
                 frame,
                 physical_base,
@@ -2418,6 +2789,137 @@ pub(crate) mod tests {
             Gpa(0x9a00_3000_0000)
         );
         assert_ne!(fixture.dispatch_mm.vma_revision().raw(), 0);
+        let _keep_carrier_live = &fixture.carrier;
+    }
+
+    #[test]
+    fn production_rx_ptrace_text_commit_accepts_post_cow_inventory_revision() {
+        use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
+
+        let (kernel, root) = bootstrap(31_114);
+        let execution = execution_lease(&root, 114);
+        let fixture = real_production_cow_fixture(
+            &kernel,
+            &root,
+            31_115,
+            0x9a00_3100_0000,
+            0x9b00_3100_0000,
+            ThreadId::synthetic_for_tests(31_080),
+        );
+        fixture
+            .dispatch_mm
+            .set_foreign_cow_vma_access_for_test(VmaAccess {
+                readable: true,
+                writable: false,
+                executable: true,
+                kernel_visible: true,
+            });
+        assert!(kernel.claim_ptrace_traceme(&fixture.child));
+        let stop = crate::kernel::LinuxSignal::for_signal_number(12).unwrap();
+        assert!(kernel.stop_task_for_ptrace(fixture.child.task().key().id, stop));
+        assert_eq!(
+            kernel.settle_task_ptrace_stop(fixture.child.task().key().id),
+            crate::kernel::objects::PtraceStopSettlement::Stopped,
+        );
+        let witness = fixture
+            .child
+            .task()
+            .begin_ptrace_memory_access(root.task().key())
+            .expect("settled ptrace text witness");
+        let foreign = foreign_mm(&kernel, &root, &execution, fixture.child.task().key());
+
+        let write = with_foreign_mutation(&foreign, |mutation| {
+            witness
+                .with_revalidated_text(foreign.mm_id(), |access| {
+                    super::MmAccessAuthority::new().write_ptrace_text_under_witness(
+                        mutation,
+                        &foreign,
+                        &access,
+                        GuestVa(TEST_VA),
+                        b"edit",
+                    )
+                })
+                .expect("revalidate exact ptrace text stop")
+        });
+
+        assert!(
+            write.is_ok(),
+            "post-COW executable prepare failed: {write:?}"
+        );
+        assert_eq!(write.unwrap().bytes_written(), 4);
+        let _keep_carrier_live = &fixture.carrier;
+    }
+
+    #[test]
+    fn production_ptrace_text_carries_executable_authority_when_snapshot_is_writable_but_source_is_rx()
+     {
+        use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
+
+        let (kernel, root) = bootstrap(31_116);
+        let execution = execution_lease(&root, 116);
+        let fixture = real_production_cow_fixture(
+            &kernel,
+            &root,
+            31_117,
+            0x9a00_3200_0000,
+            0x9b00_3200_0000,
+            ThreadId::synthetic_for_tests(31_081),
+        );
+        fixture
+            .dispatch_mm
+            .set_foreign_cow_vma_access_for_test(VmaAccess {
+                readable: true,
+                writable: true,
+                executable: true,
+                kernel_visible: true,
+            });
+        fixture.carrier.set_source_guest_writable_for_test(false);
+        fixture.carrier.set_source_stage1_writable_for_test();
+        assert!(
+            !fixture.carrier.source_direct_store_would_fault_for_test(),
+            "fixture must model the live writable preimage / exact RX alias disagreement"
+        );
+        assert!(kernel.claim_ptrace_traceme(&fixture.child));
+        let stop = crate::kernel::LinuxSignal::for_signal_number(12).unwrap();
+        assert!(kernel.stop_task_for_ptrace(fixture.child.task().key().id, stop));
+        assert_eq!(
+            kernel.settle_task_ptrace_stop(fixture.child.task().key().id),
+            crate::kernel::objects::PtraceStopSettlement::Stopped,
+        );
+        let witness = fixture
+            .child
+            .task()
+            .begin_ptrace_memory_access(root.task().key())
+            .expect("settled ptrace text witness");
+        let foreign = foreign_mm(&kernel, &root, &execution, fixture.child.task().key());
+
+        let write = with_foreign_mutation(&foreign, |mutation| {
+            witness
+                .with_revalidated_text(foreign.mm_id(), |access| {
+                    super::MmAccessAuthority::new().write_ptrace_text_under_witness(
+                        mutation,
+                        &foreign,
+                        &access,
+                        GuestVa(TEST_VA),
+                        b"edit",
+                    )
+                })
+                .expect("revalidate exact ptrace text stop")
+        });
+
+        assert!(
+            write.is_ok(),
+            "executable POKETEXT lost its authenticated transport plan: {write:?}"
+        );
+        assert_eq!(write.unwrap().bytes_written(), 4);
+        assert!(
+            !fixture.carrier.source_guest_writable_for_test(),
+            "ptrace executable authority must not widen the source RX protection"
+        );
+        assert!(
+            fixture.carrier.source_direct_store_would_fault_for_test(),
+            "exact RX alias authority must force the post-COW stage-1 leaf nonwritable"
+        );
         let _keep_carrier_live = &fixture.carrier;
     }
 

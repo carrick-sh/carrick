@@ -558,6 +558,14 @@ impl ProcessContext {
             .stop_task_for_ptrace(self.task_id(), signal)
     }
 
+    pub(crate) fn stop_for_ptrace_fault(
+        &self,
+        fault: crate::kernel::objects::PtraceSynchronousFault,
+    ) -> bool {
+        self.kernel_graph()
+            .stop_task_for_ptrace_fault(self.task_id(), fault)
+    }
+
     pub(crate) fn consume_ptrace_resume_signal(&self, signum: i32) -> bool {
         let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(signum) else {
             return false;

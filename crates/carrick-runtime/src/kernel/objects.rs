@@ -3027,6 +3027,20 @@ pub(crate) struct PtraceMemoryAccessWitness {
     stop_generation: u64,
 }
 
+/// Borrowed proof that one exact ptrace stop still authorizes text mutation of
+/// its exact MM. The value exists only while the target lifecycle/job-control
+/// locks are held by `with_revalidated_text` and is deliberately non-cloneable.
+pub(crate) struct PtraceTextAccess<'witness> {
+    mm_id: MmId,
+    _witness: std::marker::PhantomData<&'witness mut ()>,
+}
+
+impl PtraceTextAccess<'_> {
+    pub(crate) fn mm_id(&self) -> MmId {
+        self.mm_id
+    }
+}
+
 impl PtraceMemoryAccessWitness {
     pub(crate) fn mm_id(&self) -> MmId {
         self.mm_id
@@ -3037,6 +3051,22 @@ impl PtraceMemoryAccessWitness {
         operation: impl FnOnce() -> T,
     ) -> Result<T, carrick_abi::LinuxErrno> {
         self.task.with_ptrace_memory_access(self, operation)
+    }
+
+    pub(crate) fn with_revalidated_text<T>(
+        &self,
+        mm_id: MmId,
+        operation: impl for<'witness> FnOnce(PtraceTextAccess<'witness>) -> T,
+    ) -> Result<T, carrick_abi::LinuxErrno> {
+        if mm_id != self.mm_id {
+            return Err(carrick_abi::LINUX_ESRCH);
+        }
+        self.task.with_ptrace_memory_access(self, || {
+            operation(PtraceTextAccess {
+                mm_id,
+                _witness: std::marker::PhantomData,
+            })
+        })
     }
 }
 
@@ -3059,6 +3089,8 @@ struct TaskJobControl {
     ptrace_stop_generation: u64,
     ptrace_resume_command: Option<PtraceResumeCommand>,
     ptrace_resume_signal: Option<LinuxSignal>,
+    ptrace_stopped_fault: Option<BoundPtraceSynchronousFault>,
+    ptrace_resume_fault: Option<BoundPtraceSynchronousFault>,
     pending_continue: bool,
     stop_invalidation_generation: u64,
     default_stop_generation: DefaultStopGeneration,
@@ -3069,10 +3101,18 @@ struct PtraceResumeCommand {
     signal: Option<LinuxSignal>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BoundPtraceSynchronousFault {
+    stop_generation: u64,
+    fault: PtraceSynchronousFault,
+}
+
 fn clear_ptrace_transient_state(state: &mut TaskJobControl) {
     state.ptrace_stop_settled = false;
     state.ptrace_resume_command = None;
     state.ptrace_resume_signal = None;
+    state.ptrace_stopped_fault = None;
+    state.ptrace_resume_fault = None;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3080,6 +3120,14 @@ pub(crate) enum PtraceStopSettlement {
     NotPtraceStopped,
     Stopped,
     Resumed { signal: Option<LinuxSignal> },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PtraceSynchronousFault {
+    pub(crate) signal: LinuxSignal,
+    pub(crate) si_code: i32,
+    pub(crate) si_addr: u64,
+    pub(crate) interrupted_pc: Option<u64>,
 }
 
 fn advance_job_control_stop_invalidation_generation(state: &mut TaskJobControl) {
@@ -4022,6 +4070,14 @@ impl Task {
     }
 
     pub(super) fn stop_for_ptrace(&self, signal: LinuxSignal) -> bool {
+        self.stop_for_ptrace_inner(signal, None)
+    }
+
+    fn stop_for_ptrace_inner(
+        &self,
+        signal: LinuxSignal,
+        fault: Option<PtraceSynchronousFault>,
+    ) -> bool {
         let lifecycle = self.lifecycle.lock();
         if *lifecycle != TaskLifecycle::Live {
             return false;
@@ -4039,7 +4095,21 @@ impl Task {
         state.pending_stop_is_ptrace = true;
         state.stopped_by_ptrace = true;
         clear_ptrace_transient_state(&mut state);
+        state.ptrace_stopped_fault = fault.map(|fault| BoundPtraceSynchronousFault {
+            stop_generation: state.ptrace_stop_generation,
+            fault,
+        });
         true
+    }
+
+    pub(super) fn stop_for_ptrace_fault(&self, fault: PtraceSynchronousFault) -> bool {
+        self.stop_for_ptrace_inner(fault.signal, Some(fault))
+    }
+
+    pub(super) fn take_ptrace_resume_fault(&self) -> Option<PtraceSynchronousFault> {
+        let mut state = self.job_control.lock();
+        let bound = state.ptrace_resume_fault.take()?;
+        (bound.stop_generation == state.ptrace_stop_generation).then_some(bound.fault)
     }
 
     pub(super) fn resume_from_ptrace(&self, tracer: TaskKey, signal: Option<LinuxSignal>) -> bool {
@@ -4057,7 +4127,14 @@ impl Task {
                 return false;
             }
         }
-        if let Some(signal) = signal {
+        let resumed_fault = {
+            let state = self.job_control.lock();
+            state.ptrace_stopped_fault.filter(|bound| {
+                bound.stop_generation == state.ptrace_stop_generation
+                    && signal == Some(bound.fault.signal)
+            })
+        };
+        if let Some(signal) = signal.filter(|_| resumed_fault.is_none()) {
             self.discard_opposing_job_control_signals(signal);
             self.record_job_control_signal_generation(signal);
             let pending = self.shared().pending_signals();
@@ -4070,6 +4147,8 @@ impl Task {
         {
             let mut state = self.job_control.lock();
             state.ptrace_resume_signal = signal;
+            state.ptrace_resume_fault = resumed_fault;
+            state.ptrace_stopped_fault = None;
             if state.ptrace_stop_settled {
                 state.stopped_by = None;
                 state.stopped_by_ptrace = false;
@@ -7868,6 +7947,8 @@ mod tests {
             assert!(!state.ptrace_stop_settled);
             assert_eq!(state.ptrace_resume_command, None);
             assert_eq!(state.ptrace_resume_signal, None);
+            assert_eq!(state.ptrace_stopped_fault, None);
+            assert_eq!(state.ptrace_resume_fault, None);
         };
 
         let detached = stage_early_resume();

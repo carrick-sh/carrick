@@ -2671,73 +2671,92 @@ impl SyscallDispatcher {
                             return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
                         }
                         let staged_data = data.to_le_bytes();
-                        match relation {
-                            crate::kernel::MmRelation::Current(_) => {
-                                match ptrace_witness.with_revalidated(
-                                    || -> Result<DispatchOutcome, LinuxErrno> {
-                                        match cx.memory.write_bytes(addr.0, &staged_data) {
-                                            Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
-                                            Err(_) => {
-                                                Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO))
-                                            }
-                                        }
-                                    },
-                                ) {
-                                    Ok(Ok(outcome)) => outcome,
-                                    Ok(Err(errno)) | Err(errno) => DispatchOutcome::errno(errno),
-                                }
-                            }
-                            crate::kernel::MmRelation::Foreign(foreign) => {
+                        let remote_va = carrick_guest_mem::GuestVa(addr.0);
+                        let mutation_tid = cx.tid();
+                        macro_rules! commit_transport_poke {
+                            ($mm:expr, $with_mutation:ident) => {{
                                 let Some(authority) = process.mm_access_authority() else {
                                     return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
                                 };
-                                let remote_va = carrick_guest_mem::GuestVa(addr.0);
-                                let write_range = match foreign.write_range(remote_va, 8) {
-                                    Ok(Some(r)) => r,
-                                    _ => {
-                                        return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO))
+                                let result = this.with_current_mm_executor_released(cx, || {
+                                    let mutation = authority.$with_mutation(
+                                        &$mm,
+                                        mutation_tid,
+                                        |mutation_guard| -> Result<_, crate::kernel::MmAccessError> {
+                                            Ok(if request == LINUX_PTRACE_POKETEXT {
+                                            ptrace_witness.with_revalidated_text(
+                                                $mm.mm_id(),
+                                                |text_access| -> Result<(), crate::kernel::MmAccessError> {
+                                                    authority.write_ptrace_text_under_witness(
+                                                        mutation_guard,
+                                                        &$mm,
+                                                        &text_access,
+                                                        remote_va,
+                                                        &staged_data,
+                                                    )?;
+                                                    Ok(())
+                                                },
+                                            )
+                                        } else {
+                                            ptrace_witness.with_revalidated(
+                                                || -> Result<(), crate::kernel::MmAccessError> {
+                                                    let write_range = $mm
+                                                        .write_range(remote_va, 8)?
+                                                        .ok_or(crate::kernel::MmAccessError::SourceLengthMismatch {
+                                                            range: 0,
+                                                            source_len: staged_data.len(),
+                                                        })?;
+                                                let mut cow = authority.break_foreign_cow(
+                                                    mutation_guard,
+                                                    &$mm,
+                                                    write_range,
+                                                )?;
+                                                authority
+                                                    .prepare_foreign_write_range(
+                                                        &mut cow,
+                                                        write_range,
+                                                        &staged_data,
+                                                    )?
+                                                    .commit();
+                                                Ok(())
+                                                },
+                                            )
+                                        })
+                                        },
+                                    );
+                                    match mutation {
+                                        Err(error) => Err(PtracePokeFailure::Mutation(error)),
+                                        Ok(Err(errno)) => Err(PtracePokeFailure::Witness(errno)),
+                                        Ok(Ok(Err(error))) => Err(PtracePokeFailure::Write(error)),
+                                        Ok(Ok(Ok(()))) => Ok(()),
                                     }
-                                };
-                                let mutation_tid = cx.tid();
-                                let commit_res =
-                                    this.with_current_mm_executor_released(cx, || {
-                                        authority.with_foreign_mutation(
-                                            &foreign,
-                                            mutation_tid,
-                                            |mutation_guard| {
-                                                ptrace_witness
-                                                    .with_revalidated(
-                                                        || -> Result<(), crate::kernel::MmAccessError> {
-                                                            let mut witness = authority
-                                                                .break_foreign_cow(
-                                                                    mutation_guard,
-                                                                    &foreign,
-                                                                    write_range,
-                                                                )?;
-                                                            let prepared = authority
-                                                                .prepare_foreign_write_range(
-                                                                    &mut witness,
-                                                                    write_range,
-                                                                    &staged_data,
-                                                                )?;
-                                                            let _receipt = prepared.commit();
-                                                            Ok(())
-                                                        },
-                                                    )
-                                                    .map_err(|_| {
-                                                        crate::kernel::MmAccessError::UnknownTask(
-                                                            target_key,
-                                                        )
-                                                    })?
-                                            },
-                                        )
-                                    })?;
-                                match commit_res {
+                                })?;
+                                match result {
                                     Ok(()) => DispatchOutcome::Returned { value: 0 },
-                                    Err(error) => {
-                                        DispatchOutcome::errno(ptrace_foreign_mm_errno(&error))
-                                    }
+                                    Err(error) => DispatchOutcome::errno(ptrace_poke_failure_errno(&error)),
                                 }
+                            }};
+                        }
+                        match relation {
+                            crate::kernel::MmRelation::Current(current) => {
+                                if request != LINUX_PTRACE_POKETEXT {
+                                    match ptrace_witness.with_revalidated(
+                                        || -> Result<DispatchOutcome, LinuxErrno> {
+                                            match cx.memory.write_bytes(addr.0, &staged_data) {
+                                                Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+                                                Err(_) => Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO)),
+                                            }
+                                        },
+                                    ) {
+                                        Ok(Ok(outcome)) => outcome,
+                                        Ok(Err(errno)) | Err(errno) => DispatchOutcome::errno(errno),
+                                    }
+                                } else {
+                                    commit_transport_poke!(current, with_current_mutation)
+                                }
+                            }
+                            crate::kernel::MmRelation::Foreign(foreign) => {
+                                commit_transport_poke!(foreign, with_foreign_mutation)
                             }
                         }
                     }
@@ -4982,6 +5001,22 @@ fn ptrace_foreign_mm_errno(error: &crate::kernel::MmAccessError) -> LinuxErrno {
     }
 }
 
+#[derive(Debug)]
+enum PtracePokeFailure {
+    Mutation(crate::kernel::MmAccessError),
+    Witness(LinuxErrno),
+    Write(crate::kernel::MmAccessError),
+}
+
+fn ptrace_poke_failure_errno(error: &PtracePokeFailure) -> LinuxErrno {
+    match error {
+        PtracePokeFailure::Mutation(error) | PtracePokeFailure::Write(error) => {
+            ptrace_foreign_mm_errno(error)
+        }
+        PtracePokeFailure::Witness(errno) => *errno,
+    }
+}
+
 fn fill_deterministic_bootstrap_random(bytes: &mut [u8]) {
     let mut state = 0x00ca_221c_u64;
     for byte in bytes {
@@ -6764,6 +6799,142 @@ mod kernel_process_dispatch_tests {
         assert_eq!(target.prepare_calls(), 1);
         assert_eq!(target.commit_calls(), 1);
         assert!(!target.break_observed_caller_executor());
+    }
+
+    #[test]
+    fn hvpatch_ptrace_poketext_accepts_rx_mapping_and_preserves_cow_peer() {
+        // mov w0, #42; ret  ->  mov w0, #43; ret
+        let before = [0x40, 0x05, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6];
+        let after = [0x60, 0x05, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6];
+
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_153);
+        let mut initial = vec![0; 0x4000];
+        initial[..8].copy_from_slice(&before);
+        let target = crate::kernel::consumer_cow_fixture(root.kernel(), &root, 61_154, initial);
+        target.set_vma_access_for_test(VmaAccess {
+            readable: true,
+            writable: false,
+            executable: true,
+            kernel_visible: true,
+        });
+        target.observe_caller_executor_census(dispatcher.mm_executor_census());
+        arm_ptrace_memory_access(&root, target.target());
+        let root = refreshed(&root);
+        let target_pid = target.target().task().key().id.raw();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [
+                    LINUX_PTRACE_POKETEXT,
+                    target_pid as u64,
+                    TARGET_VA,
+                    u64::from_le_bytes(after),
+                    0,
+                    0,
+                ],
+                Some(&lease),
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        assert_eq!(target.child_bytes(0, 8), after);
+        assert_eq!(&target.peer_bytes()[..8], before);
+        assert_eq!(target.break_calls(), 1);
+        assert_eq!(target.prepare_calls(), 1);
+        assert_eq!(target.commit_calls(), 1);
+    }
+
+    #[test]
+    fn hvpatch_ptrace_poke_preserves_mutation_witness_and_write_error_domains() {
+        let source = include_str!("proc.rs");
+        let poke = source
+            .split_once("macro_rules! commit_transport_poke")
+            .expect("ptrace poke transport macro")
+            .1
+            .split_once("LINUX_PTRACE_PEEKUSER")
+            .expect("end of ptrace poke transport block")
+            .0;
+
+        assert!(
+            !poke.contains(".map_err(|_| crate::kernel::MmAccessError::UnknownTask(target_key))?"),
+            "ptrace witness revalidation errors must not be erased into an unrelated MM-access error",
+        );
+        assert!(
+            poke.contains("PtracePokeFailure::Mutation")
+                && poke.contains("PtracePokeFailure::Witness")
+                && poke.contains("PtracePokeFailure::Write"),
+            "the dispatcher must retain the failing authority layer through errno lowering",
+        );
+    }
+
+    #[test]
+    fn hvpatch_ptrace_poketext_rejects_prot_none_and_nonexecutable_ranges() {
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_155);
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+        for (registry_id, access) in [
+            (
+                61_156,
+                VmaAccess {
+                    readable: false,
+                    writable: false,
+                    executable: false,
+                    kernel_visible: true,
+                },
+            ),
+            (
+                61_157,
+                VmaAccess {
+                    readable: true,
+                    writable: false,
+                    executable: false,
+                    kernel_visible: true,
+                },
+            ),
+            (
+                61_158,
+                VmaAccess {
+                    readable: true,
+                    writable: true,
+                    executable: false,
+                    kernel_visible: false,
+                },
+            ),
+        ] {
+            let target = crate::kernel::consumer_cow_fixture(
+                root.kernel(),
+                &root,
+                registry_id,
+                vec![0; 0x4000],
+            );
+            target.set_vma_access_for_test(access);
+            target.observe_caller_executor_census(dispatcher.mm_executor_census());
+            arm_ptrace_memory_access(&root, target.target());
+            let refreshed_root = refreshed(&root);
+            assert_eq!(
+                dispatch_with_lease(
+                    &mut dispatcher,
+                    &refreshed_root,
+                    &mut memory,
+                    SYS_PTRACE,
+                    [
+                        LINUX_PTRACE_POKETEXT,
+                        target.target().task().key().id.raw() as u64,
+                        TARGET_VA,
+                        0,
+                        0,
+                        0,
+                    ],
+                    Some(&lease),
+                ),
+                DispatchOutcome::errno(crate::linux_abi::LINUX_EIO),
+            );
+            assert_eq!(target.break_calls(), 0);
+            assert_eq!(target.commit_calls(), 0);
+        }
     }
 
     #[test]

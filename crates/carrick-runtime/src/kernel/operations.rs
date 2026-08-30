@@ -17,9 +17,9 @@ use super::core::{
 use super::ids::{LinuxSignal, LinuxTid, MmId, ObjectIdError, ProcessGroupId, SessionId, TaskId};
 use super::objects::{
     Credentials, FileTable, LinuxWaitStatus, Mm, ObjectGraphError, ProcessGroup,
-    PtraceStopSettlement, Session, Task, TaskJobControlEvent, TaskKey, TaskLifecycle,
-    TaskParticipantError, TaskRef, TaskShared, TaskSharedCloneError, ThreadKey, ThreadRef,
-    ThreadResources, Zombie,
+    PtraceStopSettlement, PtraceSynchronousFault, Session, Task, TaskJobControlEvent, TaskKey,
+    TaskLifecycle, TaskParticipantError, TaskRef, TaskShared, TaskSharedCloneError, ThreadKey,
+    ThreadRef, ThreadResources, Zombie,
 };
 use super::registry::{IdError, TaskReservation, ThreadClaim, ThreadReservation};
 
@@ -1633,6 +1633,44 @@ impl Kernel {
             parent.wake();
         }
         true
+    }
+
+    pub(crate) fn stop_task_for_ptrace_fault(
+        &self,
+        target: TaskId,
+        fault: PtraceSynchronousFault,
+    ) -> bool {
+        let task = {
+            let state = self.registry().state.read();
+            let Some(record) = state.tasks.get(&target) else {
+                return false;
+            };
+            if record.task.lifecycle() != TaskLifecycle::Live {
+                return false;
+            }
+            Arc::clone(&record.task)
+        };
+        if !task.stop_for_ptrace_fault(fault) {
+            return false;
+        }
+        let parent = self.current_parent_task(&task);
+        task.wake();
+        if let Some(parent) = parent {
+            parent.wake();
+        }
+        true
+    }
+
+    pub(crate) fn take_ptrace_resume_fault(
+        &self,
+        target: TaskId,
+    ) -> Option<PtraceSynchronousFault> {
+        self.registry()
+            .state
+            .read()
+            .tasks
+            .get(&target)
+            .and_then(|record| record.task.take_ptrace_resume_fault())
     }
 
     pub(crate) fn resume_task_from_ptrace(
@@ -6218,6 +6256,43 @@ mod tests {
                 .wait_child(root.task().key().id, Some(child_id), WaitMode::Observe)
                 .expect("resumed child remains live"),
             WaitOutcome::StillRunning,
+        );
+    }
+
+    #[test]
+    fn ptrace_resume_preserves_exact_synchronous_fault_provenance() {
+        let (kernel, root) = bootstrap(1);
+        let child = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(7_091),
+                "ptrace synchronous-fault child".to_owned(),
+                None,
+            )
+            .expect("fork child");
+        let child_id = child.task().key().id;
+        let signal = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGSEGV).expect("SIGSEGV");
+        let fault = PtraceSynchronousFault {
+            signal,
+            si_code: 2,
+            si_addr: 0xfeed_4000,
+            interrupted_pc: Some(0x4000_1234),
+        };
+
+        assert!(kernel.claim_ptrace_traceme(&child));
+        assert!(kernel.stop_task_for_ptrace_fault(child_id, fault));
+        assert!(matches!(
+            kernel
+                .wait_child(root.task().key().id, Some(child_id), WaitMode::Consume)
+                .expect("plain wait sees synchronous ptrace stop"),
+            WaitOutcome::Stopped { signal: stopped, .. } if stopped == signal
+        ));
+        assert!(kernel.resume_task_from_ptrace(root.task().key(), child_id, Some(signal)));
+        assert_eq!(
+            kernel.take_ptrace_resume_fault(child_id),
+            Some(fault),
+            "the exact stop generation must retain synchronous code/address/PC through resume"
         );
     }
 

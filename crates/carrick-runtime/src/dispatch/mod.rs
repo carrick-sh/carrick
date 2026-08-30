@@ -2594,6 +2594,21 @@ impl DispatchMmAuthority {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_foreign_cow_vma_access_for_test(&self, access: crate::kernel::VmaAccess) {
+        let mut mem = self.mem.lock();
+        let vma = mem
+            .dynamic_maps
+            .iter_mut()
+            .find(|vma| vma.path == "[foreign-cow-composition]")
+            .expect("foreign COW composition VMA");
+        vma.read = access.readable;
+        vma.write = access.writable;
+        vma.execute = access.executable;
+        drop(mem);
+        self.mem.bump_revision();
+    }
+
+    #[cfg(test)]
     fn snapshot_until(
         &self,
         deadline: std::time::Instant,
