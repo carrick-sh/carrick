@@ -6945,6 +6945,8 @@ impl SyscallDispatcher {
                         if cx.memory.zero_backing(address.0, length).is_err() {
                             return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                         }
+                    }
+                    if meta.all_private_anon {
                         this.mark_range_nonresident(address.0, length as u64);
                     }
                 }
