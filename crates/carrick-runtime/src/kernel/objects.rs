@@ -3014,6 +3014,29 @@ struct TaskIdentity {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct JobControlStopInvalidationGeneration(u64);
 
+/// Non-forgeable authority for one exact settled ptrace stop.
+///
+/// A resume, detach, or later stop generation invalidates the witness even if
+/// the same tracer establishes another settled stop before the consumer
+/// reaches its commit point.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PtraceMemoryAccessWitness {
+    target: TaskKey,
+    tracer: TaskKey,
+    mm_id: MmId,
+    stop_generation: u64,
+}
+
+impl PtraceMemoryAccessWitness {
+    pub(crate) fn mm_id(self) -> MmId {
+        self.mm_id
+    }
+
+    pub(crate) fn target(self) -> TaskKey {
+        self.target
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum DefaultStopGeneration {
     #[default]
@@ -3030,6 +3053,7 @@ struct TaskJobControl {
     stopped_by_ptrace: bool,
     ptrace_tracer: Option<TaskKey>,
     ptrace_stop_settled: bool,
+    ptrace_stop_generation: u64,
     ptrace_resume_command: Option<PtraceResumeCommand>,
     ptrace_resume_signal: Option<LinuxSignal>,
     pending_continue: bool,
@@ -3061,6 +3085,14 @@ fn advance_job_control_stop_invalidation_generation(state: &mut TaskJobControl) 
         std::process::abort();
     };
     state.stop_invalidation_generation = next;
+}
+
+fn advance_ptrace_stop_generation(state: &mut TaskJobControl) {
+    let Some(next) = state.ptrace_stop_generation.checked_add(1) else {
+        tracing::error!("ptrace stop generation exhausted");
+        std::process::abort();
+    };
+    state.ptrace_stop_generation = next;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3918,11 +3950,10 @@ impl Task {
         self.job_control.lock().stopped_by.is_some()
     }
 
-    pub(super) fn validate_settled_ptrace_stop(
+    pub(super) fn begin_ptrace_memory_access(
         &self,
         tracer: TaskKey,
-        expected_mm: MmId,
-    ) -> Result<(), carrick_abi::LinuxErrno> {
+    ) -> Result<PtraceMemoryAccessWitness, carrick_abi::LinuxErrno> {
         let lifecycle = self.lifecycle.lock();
         if *lifecycle != TaskLifecycle::Live {
             return Err(carrick_abi::LINUX_ESRCH);
@@ -3936,17 +3967,17 @@ impl Task {
         {
             return Err(carrick_abi::LINUX_ESRCH);
         }
-        let target_mm = self.shared().mm();
-        if target_mm.id() != expected_mm {
-            return Err(carrick_abi::LINUX_ESRCH);
-        }
-        Ok(())
+        Ok(PtraceMemoryAccessWitness {
+            target: self.key(),
+            tracer,
+            mm_id: self.shared().mm().id(),
+            stop_generation: job_control.ptrace_stop_generation,
+        })
     }
 
-    pub(super) fn with_settled_ptrace_stopped_task<T>(
+    pub(super) fn with_ptrace_memory_access<T>(
         &self,
-        tracer: TaskKey,
-        expected_mm: MmId,
+        witness: &PtraceMemoryAccessWitness,
         operation: impl FnOnce() -> T,
     ) -> Result<T, carrick_abi::LinuxErrno> {
         let lifecycle = self.lifecycle.lock();
@@ -3954,16 +3985,18 @@ impl Task {
             return Err(carrick_abi::LINUX_ESRCH);
         }
         let job_control = self.job_control.lock();
-        if job_control.ptrace_tracer != Some(tracer)
+        if self.key() != witness.target
+            || job_control.ptrace_tracer != Some(witness.tracer)
             || !job_control.stopped_by_ptrace
             || job_control.stopped_by.is_none()
             || !job_control.ptrace_stop_settled
             || job_control.ptrace_resume_command.is_some()
+            || job_control.ptrace_stop_generation != witness.stop_generation
         {
             return Err(carrick_abi::LINUX_ESRCH);
         }
         let target_mm = self.shared().mm();
-        if target_mm.id() != expected_mm {
+        if target_mm.id() != witness.mm_id {
             return Err(carrick_abi::LINUX_ESRCH);
         }
         let result = operation();
@@ -3997,6 +4030,7 @@ impl Task {
         if state.stopped_by.is_some() {
             return state.stopped_by_ptrace;
         }
+        advance_ptrace_stop_generation(&mut state);
         state.stopped_by = Some(signal);
         state.pending_stop = Some(signal);
         state.pending_stop_is_ptrace = true;
