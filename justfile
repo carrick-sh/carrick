@@ -445,6 +445,10 @@ gate-containers: build
 test-embed *ARGS: build
     ./scripts/test-signed.sh carrick-embed {{ARGS}}
 
+# Guest-running tests of carrick-vmm-hvf from SIGNED cargo test executables.
+test-hvf *ARGS:
+    ./scripts/test-signed.sh carrick-vmm-hvf {{ARGS}}
+
 # Guest-running tests of carrick-conformance-next from SIGNED cargo test executables.
 test-conformance-next *ARGS: build
     ./scripts/test-signed.sh carrick-conformance-next {{ARGS}}
