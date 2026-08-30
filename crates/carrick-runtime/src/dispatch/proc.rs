@@ -2584,8 +2584,7 @@ impl SyscallDispatcher {
                         if expected_mm_id != ptrace_witness.mm_id() {
                             return Ok(DispatchOutcome::errno(LINUX_ESRCH));
                         }
-                        match kernel.with_ptrace_memory_access(
-                            &ptrace_witness,
+                        match ptrace_witness.with_revalidated(
                             || -> Result<DispatchOutcome, LinuxErrno> {
                                 if !addr.0.is_multiple_of(8)
                                     || ptrace_text_data_addr_is_invalid(addr)
@@ -2674,8 +2673,7 @@ impl SyscallDispatcher {
                         let staged_data = data.to_le_bytes();
                         match relation {
                             crate::kernel::MmRelation::Current(_) => {
-                                match kernel.with_ptrace_memory_access(
-                                    &ptrace_witness,
+                                match ptrace_witness.with_revalidated(
                                     || -> Result<DispatchOutcome, LinuxErrno> {
                                         match cx.memory.write_bytes(addr.0, &staged_data) {
                                             Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
@@ -2707,9 +2705,8 @@ impl SyscallDispatcher {
                                             &foreign,
                                             mutation_tid,
                                             |mutation_guard| {
-                                                kernel
-                                                    .with_ptrace_memory_access(
-                                                        &ptrace_witness,
+                                                ptrace_witness
+                                                    .with_revalidated(
                                                         || -> Result<(), crate::kernel::MmAccessError> {
                                                             let mut witness = authority
                                                                 .break_foreign_cow(
@@ -7187,7 +7184,7 @@ mod kernel_process_dispatch_tests {
         );
 
         assert_eq!(
-            root.kernel().with_ptrace_memory_access(&witness, || ()),
+            witness.with_revalidated(|| ()),
             Err(LINUX_ESRCH),
             "a new settled stop must not revive an earlier memory-access capability",
         );
@@ -7433,10 +7430,9 @@ mod kernel_process_dispatch_tests {
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
 
-        let kernel_clone = Arc::clone(root.kernel());
         let handle = std::thread::spawn(move || {
-            kernel_clone
-                .with_ptrace_memory_access(&witness, || {
+            witness
+                .with_revalidated(|| {
                     entered_tx.send(()).unwrap();
                     release_rx.recv().unwrap();
                 })
@@ -7479,10 +7475,9 @@ mod kernel_process_dispatch_tests {
         let (entered_tx2, entered_rx2) = std::sync::mpsc::channel();
         let (release_tx2, release_rx2) = std::sync::mpsc::channel();
 
-        let kernel_clone3 = Arc::clone(root.kernel());
         let handle2 = std::thread::spawn(move || {
-            kernel_clone3
-                .with_ptrace_memory_access(&witness2, || {
+            witness2
+                .with_revalidated(|| {
                     entered_tx2.send(()).unwrap();
                     release_rx2.recv().unwrap();
                 })
