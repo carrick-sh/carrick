@@ -367,28 +367,10 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "<GlobalFrameStage2Lease as Drop>::drop",
       "ordinal_in_function": 1,
-      "fingerprint": "d77b1e7150cedfa257372fcd5737cd76374ceeb12465b383c44f41b0a2760bd0",
+      "fingerprint": "6cdbab9538db8fb6802d47e83e7bf5999ce6d0a3d4b7a47b939f42f01fdc9d85",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Global frame stage-2 lease length overflow during drop prevents rollback of hypervisor stage-2 mappings, leaking physical translations."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "<GlobalFrameStage2Lease as Drop>::drop",
-      "ordinal_in_function": 2,
-      "fingerprint": "d77b1e7150cedfa257372fcd5737cd76374ceeb12465b383c44f41b0a2760bd0",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Hypervisor unmap failure during global frame stage-2 lease rollback leaves stage-2 translations intact, corrupting future global-frame IPA allocations."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "<GlobalFrameStage2Lease as Drop>::drop",
-      "ordinal_in_function": 3,
-      "fingerprint": "5ae97e4b9f8f7a461d52a3ef79e3d4ae987b0817f91fcde3e87147620b92a01a",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Releasing global-frame IPA extent failed during lease drop, corrupting the global-frame IPA allocator inventory."
+      "rationale": "Global frame stage-2 lease rollback failure during drop prevents unmapping or releasing physical backing, leaking physical translations and corrupting the global-frame IPA allocator inventory."
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
