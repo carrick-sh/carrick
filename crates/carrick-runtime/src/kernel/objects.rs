@@ -3918,7 +3918,32 @@ impl Task {
         self.job_control.lock().stopped_by.is_some()
     }
 
-    pub(super) fn with_ptrace_stopped_task<T>(
+    pub(super) fn validate_settled_ptrace_stop(
+        &self,
+        tracer: TaskKey,
+        expected_mm: MmId,
+    ) -> Result<(), carrick_abi::LinuxErrno> {
+        let lifecycle = self.lifecycle.lock();
+        if *lifecycle != TaskLifecycle::Live {
+            return Err(carrick_abi::LINUX_ESRCH);
+        }
+        let job_control = self.job_control.lock();
+        if job_control.ptrace_tracer != Some(tracer)
+            || !job_control.stopped_by_ptrace
+            || job_control.stopped_by.is_none()
+            || !job_control.ptrace_stop_settled
+            || job_control.ptrace_resume_command.is_some()
+        {
+            return Err(carrick_abi::LINUX_ESRCH);
+        }
+        let target_mm = self.shared().mm();
+        if target_mm.id() != expected_mm {
+            return Err(carrick_abi::LINUX_ESRCH);
+        }
+        Ok(())
+    }
+
+    pub(super) fn with_settled_ptrace_stopped_task<T>(
         &self,
         tracer: TaskKey,
         expected_mm: MmId,
@@ -3932,6 +3957,7 @@ impl Task {
         if job_control.ptrace_tracer != Some(tracer)
             || !job_control.stopped_by_ptrace
             || job_control.stopped_by.is_none()
+            || !job_control.ptrace_stop_settled
             || job_control.ptrace_resume_command.is_some()
         {
             return Err(carrick_abi::LINUX_ESRCH);

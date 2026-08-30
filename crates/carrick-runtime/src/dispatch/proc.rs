@@ -2575,7 +2575,7 @@ impl SyscallDispatcher {
                             crate::kernel::MmRelation::Current(current) => current.mm_id(),
                             crate::kernel::MmRelation::Foreign(foreign) => foreign.mm_id(),
                         };
-                        match kernel.with_ptrace_stopped_task(
+                        match kernel.with_settled_ptrace_stopped_task(
                             process.task_key(),
                             target_key,
                             expected_mm_id,
@@ -2652,61 +2652,90 @@ impl SyscallDispatcher {
                             crate::kernel::MmRelation::Current(current) => current.mm_id(),
                             crate::kernel::MmRelation::Foreign(foreign) => foreign.mm_id(),
                         };
-                        let staged_data = data.to_le_bytes();
-                        match kernel.with_ptrace_stopped_task(
+                        if let Err(errno) = kernel.validate_settled_ptrace_stop(
                             process.task_key(),
                             target_key,
                             expected_mm_id,
-                            || -> Result<DispatchOutcome, LinuxErrno> {
-                                if !addr.0.is_multiple_of(8)
-                                    || ptrace_text_data_addr_is_invalid(addr)
-                                {
-                                    return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
-                                }
-                                match relation {
-                                    crate::kernel::MmRelation::Foreign(foreign) => {
-                                        let Some(authority) = process.mm_access_authority() else {
-                                            return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
-                                        };
-                                        let remote_va = carrick_guest_mem::GuestVa(addr.0);
-                                        let write_range = match foreign.write_range(remote_va, 8) {
-                                            Ok(Some(r)) => r,
-                                            _ => return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO)),
-                                        };
-                                        let mutation_tid = cx.tid();
-                                        let commit_res = this.with_current_mm_executor_released(cx, || {
-                                            authority.with_foreign_mutation(
-                                                &foreign,
-                                                mutation_tid,
-                                                |mutation_guard| {
-                                                    let mut witness = authority
-                                                        .break_foreign_cow(mutation_guard, &foreign, write_range)?;
-                                                    let prepared = authority.prepare_foreign_write_range(
-                                                        &mut witness,
-                                                        write_range,
-                                                        &staged_data,
-                                                    )?;
-                                                    let _receipt = prepared.commit();
-                                                    Ok(())
-                                                },
-                                            )
-                                        });
-                                        match commit_res {
-                                            Ok(Ok(())) => Ok(DispatchOutcome::Returned { value: 0 }),
-                                            _ => Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO)),
-                                        }
-                                    }
-                                    crate::kernel::MmRelation::Current(_) => {
+                        ) {
+                            return Ok(DispatchOutcome::errno(errno));
+                        }
+                        if !addr.0.is_multiple_of(8) || ptrace_text_data_addr_is_invalid(addr) {
+                            return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
+                        }
+                        let staged_data = data.to_le_bytes();
+                        match relation {
+                            crate::kernel::MmRelation::Current(_) => {
+                                match kernel.with_settled_ptrace_stopped_task(
+                                    process.task_key(),
+                                    target_key,
+                                    expected_mm_id,
+                                    || -> Result<DispatchOutcome, LinuxErrno> {
                                         match cx.memory.write_bytes(addr.0, &staged_data) {
                                             Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
-                                            Err(_) => Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO)),
+                                            Err(_) => {
+                                                Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO))
+                                            }
                                         }
+                                    },
+                                ) {
+                                    Ok(Ok(outcome)) => outcome,
+                                    Ok(Err(errno)) | Err(errno) => DispatchOutcome::errno(errno),
+                                }
+                            }
+                            crate::kernel::MmRelation::Foreign(foreign) => {
+                                let Some(authority) = process.mm_access_authority() else {
+                                    return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
+                                };
+                                let remote_va = carrick_guest_mem::GuestVa(addr.0);
+                                let write_range = match foreign.write_range(remote_va, 8) {
+                                    Ok(Some(r)) => r,
+                                    _ => {
+                                        return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO))
+                                    }
+                                };
+                                let mutation_tid = cx.tid();
+                                let commit_res =
+                                    this.with_current_mm_executor_released(cx, || {
+                                        authority.with_foreign_mutation(
+                                            &foreign,
+                                            mutation_tid,
+                                            |mutation_guard| {
+                                                let mut witness = authority.break_foreign_cow(
+                                                    mutation_guard,
+                                                    &foreign,
+                                                    write_range,
+                                                )?;
+                                                kernel
+                                                    .with_settled_ptrace_stopped_task(
+                                                        process.task_key(),
+                                                        target_key,
+                                                        expected_mm_id,
+                                                        || -> Result<(), crate::kernel::MmAccessError> {
+                                                            let prepared = authority
+                                                                .prepare_foreign_write_range(
+                                                                    &mut witness,
+                                                                    write_range,
+                                                                    &staged_data,
+                                                                )?;
+                                                            let _receipt = prepared.commit();
+                                                            Ok(())
+                                                        },
+                                                    )
+                                                    .map_err(|_| {
+                                                        crate::kernel::MmAccessError::UnknownTask(
+                                                            target_key,
+                                                        )
+                                                    })?
+                                            },
+                                        )
+                                    })?;
+                                match commit_res {
+                                    Ok(()) => DispatchOutcome::Returned { value: 0 },
+                                    Err(error) => {
+                                        DispatchOutcome::errno(ptrace_foreign_mm_errno(&error))
                                     }
                                 }
-                            },
-                        ) {
-                            Ok(Ok(outcome)) => outcome,
-                            Ok(Err(errno)) | Err(errno) => DispatchOutcome::errno(errno),
+                            }
                         }
                     }
                     LINUX_PTRACE_PEEKUSER | LINUX_PTRACE_POKEUSER => {
@@ -5609,6 +5638,12 @@ mod kernel_process_dispatch_tests {
                 .kernel()
                 .stop_task_for_ptrace(tracee.task().key().id, stop)
         );
+        assert_eq!(
+            tracer
+                .kernel()
+                .settle_task_ptrace_stop(tracee.task().key().id),
+            crate::kernel::objects::PtraceStopSettlement::Stopped,
+        );
     }
 
     fn write_iovec(memory: &mut LinearMemory, address: u64, base: u64, len: u64) {
@@ -7263,6 +7298,55 @@ mod kernel_process_dispatch_tests {
     }
 
     #[test]
+    fn hvpatch_ptrace_memory_rejects_unsettled_pending_stop_target() {
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_149);
+        let target = process_vm_target_with_payload(&root, 61_150, b"UNSETTLE");
+        assert!(root.kernel().claim_ptrace_traceme(&target));
+        let stop = crate::kernel::LinuxSignal::for_signal_number(12).unwrap();
+        assert!(
+            root.kernel()
+                .stop_task_for_ptrace(target.task().key().id, stop)
+        );
+        // Note: settle_task_ptrace_stop is deliberately NOT called here!
+        let root = refreshed(&root);
+        let target_pid = target.task().key().id.raw();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [LINUX_PTRACE_PEEKDATA, target_pid as u64, TARGET_VA, 0, 0, 0],
+                Some(&lease),
+            ),
+            DispatchOutcome::errno(LINUX_ESRCH),
+            "unsettled pending-stop target must return ESRCH on peek",
+        );
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [
+                    LINUX_PTRACE_POKEDATA,
+                    target_pid as u64,
+                    TARGET_VA,
+                    0x1234,
+                    0,
+                    0,
+                ],
+                Some(&lease),
+            ),
+            DispatchOutcome::errno(LINUX_ESRCH),
+            "unsettled pending-stop target must return ESRCH on poke",
+        );
+    }
+
+    #[test]
     fn hvpatch_ptrace_scoped_guard_blocks_concurrent_cont_and_detach() {
         let (_lane, _dispatcher, _process, root, _lease) = bound_dispatcher(61_147);
         let target = process_vm_target_with_payload(&root, 61_148, b"BLOCKING");
@@ -7271,6 +7355,7 @@ mod kernel_process_dispatch_tests {
         let target_key = target.task().key();
         let expected_mm = target.shared().mm().id();
 
+        // 1. Verify CONT is blocked while scoped guard is live
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
 
@@ -7278,7 +7363,7 @@ mod kernel_process_dispatch_tests {
         let tracer_key = root.task().key();
         let handle = std::thread::spawn(move || {
             kernel_clone
-                .with_ptrace_stopped_task(tracer_key, target_key, expected_mm, || {
+                .with_settled_ptrace_stopped_task(tracer_key, target_key, expected_mm, || {
                     entered_tx.send(()).unwrap();
                     release_rx.recv().unwrap();
                 })
@@ -7305,6 +7390,48 @@ mod kernel_process_dispatch_tests {
 
         assert!(resume_thread.join().is_ok());
         assert!(resumed_rx.recv().unwrap());
+
+        // 2. Re-arm and settle stop, then verify DETACH is blocked while scoped guard is live
+        let stop = crate::kernel::LinuxSignal::for_signal_number(12).unwrap();
+        assert!(root.kernel().stop_task_for_ptrace(target_key.id, stop));
+        assert_eq!(
+            root.kernel().settle_task_ptrace_stop(target_key.id),
+            crate::kernel::objects::PtraceStopSettlement::Stopped,
+        );
+
+        let (entered_tx2, entered_rx2) = std::sync::mpsc::channel();
+        let (release_tx2, release_rx2) = std::sync::mpsc::channel();
+
+        let kernel_clone3 = Arc::clone(root.kernel());
+        let handle2 = std::thread::spawn(move || {
+            kernel_clone3
+                .with_settled_ptrace_stopped_task(tracer_key, target_key, expected_mm, || {
+                    entered_tx2.send(()).unwrap();
+                    release_rx2.recv().unwrap();
+                })
+                .unwrap();
+        });
+
+        entered_rx2.recv().unwrap();
+
+        let (detached_tx, detached_rx) = std::sync::mpsc::channel();
+        let kernel_clone4 = Arc::clone(root.kernel());
+        let detach_thread = std::thread::spawn(move || {
+            let res = kernel_clone4.detach_task_from_ptrace(tracer_key, target_key.id);
+            detached_tx.send(res).unwrap();
+        });
+
+        assert_eq!(
+            detached_rx.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "detach must be blocked while scoped memory guard is live",
+        );
+
+        release_tx2.send(()).unwrap();
+        handle2.join().unwrap();
+
+        assert!(detach_thread.join().is_ok());
+        assert!(detached_rx.recv().unwrap());
     }
 
     #[test]
