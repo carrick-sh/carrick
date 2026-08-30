@@ -5293,26 +5293,7 @@ fn mmap_shared_validate_rejects_anonymous_but_keeps_file_and_unknown_flag_rules(
     assert_eq!(anonymous, DispatchOutcome::errno(LINUX_EINVAL));
 
     let install_file = |dispatcher: &SyscallDispatcher| {
-        dispatcher.captured_file_table().write_open_files().insert(
-            FILE_FD,
-            OpenFile::from_open_description_with_status_flags(
-                std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::File {
-                    base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
-                    path: "/shared-validate".into(),
-                    metadata: RootFsMetadata {
-                        path: "/shared-validate".into(),
-                        kind: RootFsEntryKind::File,
-                        mode: 0o644,
-                        size: LINUX_PAGE_SIZE as usize,
-                    },
-                    contents: FileContents::dense(vec![0x5a; LINUX_PAGE_SIZE as usize]),
-                    offset: 0,
-                    writable: false,
-                })),
-                crate::linux_abi::LINUX_O_RDONLY,
-                0,
-            ),
-        );
+        install_host_file_fd(dispatcher, FILE_FD, &[0x5a; LINUX_PAGE_SIZE as usize]);
     };
 
     let mut file_dispatcher = SyscallDispatcher::new();
@@ -5382,7 +5363,7 @@ fn anonymous_mmap_residency_tracks_populate_first_touch_and_dontneed() {
     let reporter = CompatReporter::default();
     let private_context = private_dispatcher
         .capture_one_task_context()
-        .expect("private mmap context");
+        .expect("private map context");
     let private_mmap = |dispatcher: &mut SyscallDispatcher,
                         memory: &mut CountingMmapMemory,
                         prot: u64,
@@ -5398,7 +5379,7 @@ fn anonymous_mmap_residency_tracks_populate_first_touch_and_dontneed() {
                     memory,
                     &reporter,
                 )
-                .expect("private anonymous mmap dispatch"),
+                .expect("private anonymous map dispatch"),
         ) as u64
     };
 
