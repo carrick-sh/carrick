@@ -950,9 +950,9 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::prepare_task_only_process_spec",
+      "function": "HvfVmState::prepare_task_only_plan",
       "ordinal_in_function": 1,
-      "fingerprint": "d54c6add508741924bde410ded56b6ac3489e671d071ea44706c4649ed9f6236",
+      "fingerprint": "cdfa9b5e3f6db11f5a84bafef5571a110d342f5dc45bbda060a58087638793c4",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Rollback of staged unpublished inventory mappings failed during task-only child process preparation, leaving frame inventory in a corrupted state."
