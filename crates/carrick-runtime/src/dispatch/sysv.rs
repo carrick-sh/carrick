@@ -797,7 +797,7 @@ impl SysvIpcNamespace {
     }
 
     /// Run a standalone read-only operation with the namespace lock held.
-    pub(crate) fn with_state<F, R>(&self, f: F) -> R
+    pub(in crate::dispatch::sysv) fn with_state<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&SysvShmState) -> R,
     {
@@ -806,7 +806,7 @@ impl SysvIpcNamespace {
     }
 
     /// Run a standalone mutable operation with the namespace lock held.
-    pub(crate) fn with_state_mut<F, R>(&self, f: F) -> R
+    pub(in crate::dispatch::sysv) fn with_state_mut<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut SysvShmState) -> R,
     {
@@ -2327,12 +2327,12 @@ fn sysvipc_msg_table_from_files() -> String {
 // ===================================================================
 
 impl SyscallDispatcher {
-    pub(crate) fn lock_sysv_process(&self) -> SysvProcessGuard<'_> {
+    pub(in crate::dispatch::sysv) fn lock_sysv_process(&self) -> SysvProcessGuard<'_> {
         let guard = self.sysv_process.lock();
         SysvProcessGuard::new(guard, &self.sysv)
     }
 
-    pub(crate) fn with_sysv_process<F, R>(&self, f: F) -> R
+    pub(in crate::dispatch::sysv) fn with_sysv_process<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&SysvProcessAttachments) -> R,
     {
@@ -2341,7 +2341,7 @@ impl SyscallDispatcher {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_sysv_process_mut<F, R>(&self, f: F) -> R
+    pub(in crate::dispatch::sysv) fn with_sysv_process_mut<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut SysvProcessAttachments) -> R,
     {
@@ -4268,19 +4268,37 @@ impl SyscallDispatcher {
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
             LINUX_SETALL => {
-                let nsems_res = self.sysv.with_state(|state| {
+                struct SetallPrepareWitness {
+                    guest_semid: GuestSemId,
+                    scan_index: SemScanIndex,
+                    nsems: usize,
+                    values: Arc<Mutex<Vec<u16>>>,
+                    removed: Arc<std::sync::atomic::AtomicBool>,
+                }
+
+                let prepare_res = self.sysv.with_state(|state| {
                     let Some(meta) = state.semaphores.get(&guest_semid) else {
                         return Err(LINUX_EINVAL);
                     };
                     if !meta.can_write(creds) {
                         return Err(LINUX_EACCES);
                     }
-                    Ok(meta.nsems)
+                    if meta.removed.load(std::sync::atomic::Ordering::Acquire) {
+                        return Err(crate::linux_abi::LINUX_EIDRM);
+                    }
+                    Ok(SetallPrepareWitness {
+                        guest_semid,
+                        scan_index: meta.scan_index,
+                        nsems: meta.nsems,
+                        values: Arc::clone(&meta.values),
+                        removed: Arc::clone(&meta.removed),
+                    })
                 });
-                let nsems = match nsems_res {
-                    Ok(n) => n,
+                let witness = match prepare_res {
+                    Ok(w) => w,
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 };
+                let nsems = witness.nsems;
                 let bytes = match cx.memory.read_bytes(arg, nsems * 2) {
                     Ok(b) => b,
                     Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
@@ -4294,9 +4312,21 @@ impl SyscallDispatcher {
                     vals.push(v);
                 }
                 let (res, changed) = self.sysv.with_state_mut(|state| {
-                    let Some(meta) = state.semaphores.get_mut(&guest_semid) else {
+                    let Some(meta) = state.semaphores.get_mut(&witness.guest_semid) else {
                         return (Err(LINUX_EINVAL), None);
                     };
+                    // Revalidate exact object identity, scan_index, nsems, values pointer, not removed, and write permissions.
+                    if meta.scan_index != witness.scan_index
+                        || meta.nsems != witness.nsems
+                        || !Arc::ptr_eq(&meta.values, &witness.values)
+                        || witness.removed.load(std::sync::atomic::Ordering::Acquire)
+                        || meta.removed.load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        return (Err(crate::linux_abi::LINUX_EIDRM), None);
+                    }
+                    if !meta.can_write(creds) {
+                        return (Err(LINUX_EACCES), None);
+                    }
                     *meta.values.lock() = vals;
                     meta.record_logical_setall(caller_pid);
                     meta.ctime = now;
@@ -5737,5 +5767,159 @@ mod ipc_set_tests {
             !status.success(),
             "killed deadlocked child should report non-zero / terminated status"
         );
+    }
+
+    #[test]
+    fn remapped_shmat_same_shmid_does_not_deadlock_and_preserves_accounting() {
+        let dispatcher = SyscallDispatcher::new();
+        let shmid = 5544;
+        let _file = insert_test_shm_segment(&dispatcher, shmid, LINUX_PAGE_SIZE as usize);
+        let va = crate::memory::LINUX_HIGH_VA_THRESHOLD + 0x40000;
+
+        // Seed initial attachment at `va` for `shmid`
+        dispatcher.with_sysv_process_mut(|proc| {
+            proc.attachments.insert(va, shmid);
+        });
+        dispatcher.sysv.with_state_mut(|state| {
+            if let Some(seg) = state.segments.get_mut(&shmid) {
+                seg.nattch = 1;
+            }
+        });
+
+        // Note remap covering `va`
+        let remapped = dispatcher.note_sysv_remap_file_pages(va, va + 4096);
+        assert_eq!(remapped, Ok(true));
+
+        // Create a pending reservation for the same shmid
+        let reservation = PendingShmat {
+            namespace: Arc::clone(&dispatcher.sysv),
+            shmid,
+            path: PathBuf::from("/tmp/carrick-shm/test-same-shmid"),
+            armed: true,
+        };
+        dispatcher.sysv.with_state_mut(|state| {
+            if let Some(seg) = state.segments.get_mut(&shmid) {
+                seg.pending_attaches = 1;
+                seg.path = PathBuf::from("/tmp/carrick-shm/test-same-shmid");
+            }
+        });
+
+        assert_eq!(
+            dispatcher
+                .sysv
+                .with_state(|state| state.segments.get(&shmid).map(|s| s.pending_attaches)),
+            Some(1)
+        );
+
+        // Commit remapped shmat with the same shmid.
+        let mut process = dispatcher.lock_sysv_process();
+        let committed_va = process.commit_remapped_shmat(shmid, 1234, reservation);
+        drop(process);
+
+        assert_eq!(committed_va, va);
+
+        // Verify nattch remains 1 and pending_attaches is 0
+        dispatcher.sysv.with_state(|state| {
+            let seg = state.segments.get(&shmid).expect("segment exists");
+            assert_eq!(seg.nattch, 1);
+            assert_eq!(seg.pending_attaches, 0);
+        });
+    }
+
+    #[test]
+    fn semctl_setall_witness_revalidates_permissions_and_identity_under_concurrency() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let dispatcher = Arc::new(SyscallDispatcher::new());
+        let semid_raw = 8899;
+        let guest_semid = GuestSemId(semid_raw);
+        let nsems = 4;
+        let mut fixture = InMemSemFixture::new(nsems);
+        fixture.set.mode = ShmPermMode::requested(0o666);
+        dispatcher.sysv.with_state_mut(|state| {
+            state.semaphores.insert(guest_semid, fixture.set);
+        });
+
+        let creds = dispatcher.cred_snapshot();
+
+        let running = Arc::new(AtomicBool::new(true));
+        let mut handles = Vec::new();
+
+        // Thread 1: repeatedly execute SETALL with valid memory
+        {
+            let d = Arc::clone(&dispatcher);
+            let r = Arc::clone(&running);
+            let c = creds.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut memory = LinearMemory::new(0x2000, vec![0; 0x1000]);
+                let mem_addr = 0x2000;
+                let vals: Vec<u16> = vec![10, 20, 30, 40];
+                let mut bytes = Vec::new();
+                for v in &vals {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                memory.write_bytes(mem_addr, &bytes).unwrap();
+
+                while r.load(Ordering::Relaxed) {
+                    let mut cx = SyscallCtx {
+                        kernel: &d.capture_one_task_context().unwrap(),
+                        request: SyscallRequest::new(
+                            195,
+                            SyscallArgs::from([semid_raw as u64, 0, LINUX_SETALL, mem_addr, 0, 0]),
+                        ),
+                        memory: &mut memory,
+                        reporter: &CompatReporter::default(),
+                        thread: None,
+                        execution_lease: None,
+                        mm_executor: None,
+                    };
+                    let outcome = d.sysv_semctl(&mut cx, semid_raw, 0, LINUX_SETALL, mem_addr, &c);
+                    match outcome {
+                        Ok(DispatchOutcome::Returned { value: 0 }) => {}
+                        Ok(DispatchOutcome::Errno { errno }) => {
+                            assert!(
+                                errno == LINUX_EINVAL
+                                    || errno == LINUX_EACCES
+                                    || errno == crate::linux_abi::LINUX_EIDRM,
+                                "unexpected errno from concurrent SETALL: {errno:?}"
+                            );
+                        }
+                        other => panic!("unexpected outcome: {other:?}"),
+                    }
+                    std::thread::yield_now();
+                }
+            }));
+        }
+
+        // Thread 2: toggle permissions via mode modification
+        {
+            let d = Arc::clone(&dispatcher);
+            let r = Arc::clone(&running);
+            handles.push(std::thread::spawn(move || {
+                while r.load(Ordering::Relaxed) {
+                    d.sysv.with_state_mut(|state| {
+                        if let Some(meta) = state.semaphores.get_mut(&guest_semid) {
+                            // Toggle write permission for non-owner
+                            meta.mode = ShmPermMode::requested(0o444);
+                        }
+                    });
+                    std::thread::yield_now();
+                    d.sysv.with_state_mut(|state| {
+                        if let Some(meta) = state.semaphores.get_mut(&guest_semid) {
+                            meta.mode = ShmPermMode::requested(0o666);
+                        }
+                    });
+                    std::thread::yield_now();
+                }
+            }));
+        }
+
+        std::thread::sleep(Duration::from_millis(150));
+        running.store(false, Ordering::Relaxed);
+
+        for h in handles {
+            h.join().expect("worker join");
+        }
     }
 }

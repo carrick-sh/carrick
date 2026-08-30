@@ -117,19 +117,22 @@ impl<'a> SysvProcessGuard<'a> {
             std::process::abort();
         };
         let old_shmid = self.guard.attachments.insert(va, shmid);
+        if old_shmid == Some(shmid) {
+            // Same-shmid remap: attachment is already recorded for this exact segment.
+            // Roll back the unused pending reservation before acquiring any paired lock
+            // to avoid recursive locking during PendingShmat::drop.
+            drop(reservation);
+            return va;
+        }
         let namespace = self.namespace;
         let permit = self.namespace_permit();
         let mut paired = permit.lock_paired();
-        if old_shmid != Some(shmid) {
-            if let Some(old_shmid) = old_shmid {
-                let _ = decrement_shm_attachment(&mut paired.state, old_shmid, lpid, None);
-            }
-            let _ = reservation
-                .commit_under_paired_guard(namespace, &mut paired.state, unix_now_secs(), lpid)
-                .unwrap_or_else(|()| std::process::abort());
-        } else {
-            drop(reservation);
+        if let Some(old_shmid) = old_shmid {
+            let _ = decrement_shm_attachment(&mut paired.state, old_shmid, lpid, None);
         }
+        let _ = reservation
+            .commit_under_paired_guard(namespace, &mut paired.state, unix_now_secs(), lpid)
+            .unwrap_or_else(|()| std::process::abort());
         va
     }
 
@@ -273,5 +276,196 @@ mod tests {
         static_assertions::assert_not_impl_any!(SysvProcessGuard<'_>: Clone, Copy);
         static_assertions::assert_not_impl_any!(SysvNamespacePermit<'_>: Clone, Copy);
         static_assertions::assert_not_impl_any!(SysvPairedNamespaceGuard<'_>: Clone, Copy);
+    }
+
+    fn assert_rustc_fails_with(source: &str, expected_needle: &str) {
+        let mut child = std::process::Command::new("rustc")
+            .arg("--crate-type=lib")
+            .arg("--edition=2021")
+            .arg("--emit=metadata")
+            .arg("-o")
+            .arg("/dev/null")
+            .arg("-")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn rustc");
+
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(source.as_bytes())
+            .expect("write source to rustc stdin");
+
+        let output = child.wait_with_output().expect("wait for rustc");
+        assert!(
+            !output.status.success(),
+            "expected compilation to fail, but it succeeded for snippet:\n{source}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(expected_needle),
+            "expected stderr to contain '{expected_needle}', but got:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn compiler_rejects_direct_permit_construction() {
+        let source = r#"
+            mod inner {
+                pub struct SysvNamespacePermit<'borrow> {
+                    _borrow: std::marker::PhantomData<&'borrow mut ()>,
+                    namespace: &'borrow (),
+                }
+            }
+            fn try_construct(ns: &()) {
+                let _ = inner::SysvNamespacePermit {
+                    _borrow: std::marker::PhantomData,
+                    namespace: ns,
+                };
+            }
+        "#;
+        assert_rustc_fails_with(source, "private");
+    }
+
+    #[test]
+    fn compiler_rejects_simultaneous_permit_minting() {
+        let source = r#"
+            pub struct Guard<'a>(&'a mut ());
+            pub struct Permit<'b>(&'b mut ());
+            impl<'a> Guard<'a> {
+                pub fn permit<'b>(&'b mut self) -> Permit<'b> {
+                    Permit(self.0)
+                }
+            }
+            fn try_two_permits(mut g: Guard<'_>) {
+                let p1 = g.permit();
+                let p2 = g.permit();
+                let _ = (p1, p2);
+            }
+        "#;
+        assert_rustc_fails_with(source, "cannot borrow `g` as mutable more than once");
+    }
+
+    #[test]
+    fn compiler_rejects_permit_escaping_guard_lifetime() {
+        let source = r#"
+            pub struct Guard<'a>(&'a ());
+            pub struct Permit<'b>(&'b ());
+            impl<'a> Guard<'a> {
+                pub fn permit<'b>(&'b mut self) -> Permit<'b> {
+                    Permit(self.0)
+                }
+            }
+            fn try_escape<'a>() -> Permit<'static> {
+                let unit = ();
+                let mut guard = Guard(&unit);
+                guard.permit()
+            }
+        "#;
+        assert_rustc_fails_with(source, "cannot return value referencing local variable");
+    }
+
+    #[test]
+    fn compiler_rejects_cloning_owned_permit() {
+        let source = r#"
+            pub struct Permit<'b>(std::marker::PhantomData<&'b mut ()>);
+            fn try_clone(p: Permit<'_>) {
+                let _ = p.clone();
+            }
+        "#;
+        assert_rustc_fails_with(source, "no method named `clone`");
+    }
+
+    #[test]
+    fn compiler_rejects_arbitrary_namespace_supplied_to_guard_methods() {
+        let source = r#"
+            pub struct Guard<'a>(&'a ());
+            pub struct Namespace;
+            impl<'a> Guard<'a> {
+                pub fn commit(&mut self) {}
+            }
+            fn try_foreign_namespace(mut g: Guard<'_>, ns: Namespace) {
+                g.commit(&ns);
+            }
+        "#;
+        assert_rustc_fails_with(source, "takes 0 arguments but 1 argument was supplied");
+    }
+
+    #[test]
+    fn compiler_rejects_external_access_to_with_state() {
+        let source = r#"
+            mod outer {
+                pub mod sysv {
+                    pub struct SysvIpcNamespace;
+                    impl SysvIpcNamespace {
+                        pub(in crate::outer::sysv) fn with_state<F, R>(&self, f: F) -> R
+                        where
+                            F: FnOnce(&()) -> R,
+                        {
+                            f(&())
+                        }
+                    }
+                }
+                pub mod fs {
+                    use super::sysv::SysvIpcNamespace;
+                    pub fn try_access_namespace_state(ns: &SysvIpcNamespace) {
+                        ns.with_state(|_| ());
+                    }
+                }
+            }
+        "#;
+        assert_rustc_fails_with(source, "is private");
+    }
+
+    #[test]
+    fn compiler_rejects_external_access_to_lock_sysv_process() {
+        let source = r#"
+            mod outer {
+                pub mod sysv {
+                    pub struct SyscallDispatcher;
+                    impl SyscallDispatcher {
+                        pub(in crate::outer::sysv) fn lock_sysv_process(&self) {}
+                    }
+                }
+                pub mod fs {
+                    use super::sysv::SyscallDispatcher;
+                    pub fn try_lock_sysv_process(d: &SyscallDispatcher) {
+                        d.lock_sysv_process();
+                    }
+                }
+            }
+        "#;
+        assert_rustc_fails_with(source, "is private");
+    }
+
+    #[test]
+    fn compiler_rejects_reverse_locking_order_attempt() {
+        let source = r#"
+            pub struct SysvProcessGuard<'a>(std::marker::PhantomData<&'a mut ()>);
+            pub struct SysvNamespacePermit<'b>(std::marker::PhantomData<&'b mut ()>);
+            pub struct SysvPairedNamespaceGuard<'b>(std::marker::PhantomData<&'b mut ()>);
+
+            impl<'a> SysvProcessGuard<'a> {
+                pub fn namespace_permit<'b>(&'b mut self) -> SysvNamespacePermit<'b> {
+                    SysvNamespacePermit(std::marker::PhantomData)
+                }
+            }
+            impl<'b> SysvNamespacePermit<'b> {
+                pub fn lock_paired(self) -> SysvPairedNamespaceGuard<'b> {
+                    SysvPairedNamespaceGuard(std::marker::PhantomData)
+                }
+            }
+            fn try_reverse_order(mut p: SysvProcessGuard<'_>) {
+                let permit = p.namespace_permit();
+                let paired = permit.lock_paired();
+                let _p2 = p.namespace_permit();
+                let _ = paired;
+            }
+        "#;
+        assert_rustc_fails_with(source, "cannot borrow `p` as mutable more than once");
     }
 }

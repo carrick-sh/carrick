@@ -4523,16 +4523,16 @@ impl SyscallDispatcher {
     /// Transfer memory between local and remote address spaces (`process_vm_readv` / `process_vm_writev`).
     ///
     /// When the target is the exact caller task (`target_task.key() == caller.key()`),
-    /// the transfer runs directly within this guest's address space via [`process_vm_copy_self`].
+    /// the transfer runs directly within this guest's address space via `process_vm_copy_self`.
     ///
     /// Cross-process read transfers (`process_vm_readv`) route through Task 7 authority:
-    /// the caller's live [`ThreadExecutionLease`] authenticates [`Kernel::foreign_mm`],
-    /// obtaining an immutable [`ForeignMm`] reference, which reads foreign memory through
-    /// the carrier's [`ForeignMmEndpoint`] and [`MmAccessAuthority`] streaming with
+    /// the caller's live `ThreadExecutionLease` authenticates `Kernel::foreign_mm`,
+    /// obtaining an immutable `ForeignMm` reference, which reads foreign memory through
+    /// the carrier's `ForeignMmEndpoint` and `MmAccessAuthority` streaming with
     /// chunk bounds aligned to 4 KiB page boundaries in both remote and local spaces.
     ///
     /// Cross-process write transfers (`process_vm_writev`) acquire the target MM's real
-    /// mutation authority via [`MmAccessAuthority::with_foreign_mutation`], break foreign COW
+    /// mutation authority via `MmAccessAuthority::with_foreign_mutation`, break foreign COW
     /// for each 16 KiB compound, prepare each subrange, and commit infallibly.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn process_vm_rw<M: CurrentMmMemory>(
