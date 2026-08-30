@@ -5746,6 +5746,63 @@ fn statx_sync_flags_are_mutually_exclusive() {
     ));
 }
 
+#[test]
+fn synthetic_proc_snapshot_and_in_process_fork_do_not_deadlock() {
+    let dispatcher = Arc::new(SyscallDispatcher::new());
+    let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+        100,
+        crate::thread::ThreadId::synthetic_for_tests(100),
+        "proc-mm-lock-order".to_owned(),
+    )
+    .expect("bootstrap root for /proc/MM race");
+    let (_binding, context) =
+        crate::kernel::Kernel::bootstrap_root(bootstrap).expect("bootstrap /proc/MM root");
+    let context = Arc::new(context);
+    let (at_snapshot, reached_snapshot) = std::sync::mpsc::sync_channel(0);
+    let (resume_snapshot, resume) = std::sync::mpsc::sync_channel(0);
+    let renderer_dispatcher = Arc::clone(&dispatcher);
+    let renderer = std::thread::spawn(move || {
+        let proc = renderer_dispatcher.synthetic_proc_context_observed(&context, || {
+            at_snapshot
+                .send(())
+                .expect("announce completed process snapshot");
+            resume.recv().expect("resume MM snapshot");
+        });
+        assert_eq!(proc.task_comm, "exe");
+    });
+
+    let mut proc_acquirer = None;
+    let (acquired, acquisition) = std::sync::mpsc::channel();
+    let acquired_while_alias_held = dispatcher.with_host_alias_dispatch_for_test(|_alias| {
+        reached_snapshot
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("renderer reached process/MM boundary");
+        let acquirer_dispatcher = Arc::clone(&dispatcher);
+        proc_acquirer = Some(std::thread::spawn(move || {
+            let _proc = acquirer_dispatcher.proc.lock();
+            acquired.send(()).expect("announce process lock acquisition");
+        }));
+
+        let acquired_while_alias_held = acquisition
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .is_ok();
+        resume_snapshot
+            .send(())
+            .expect("release renderer toward MM snapshot");
+        acquired_while_alias_held
+    });
+
+    renderer.join().expect("renderer join");
+    proc_acquirer
+        .expect("process-lock acquirer")
+        .join()
+        .expect("process-lock acquirer join");
+    assert!(
+        acquired_while_alias_held,
+        "synthetic /proc retained process lock while MM alias authority was held"
+    );
+}
+
 #[cfg(test)]
 mod container_caps_tests {
     //! Launch-time `--cap-add` grants are container state. Two containers in
