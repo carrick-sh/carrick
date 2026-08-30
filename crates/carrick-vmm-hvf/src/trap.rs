@@ -1835,6 +1835,7 @@ mod foreign_mm_tests {
 
     #[test]
     fn structural_backing_owner_lifecycle_and_retained_backing() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
         let size = 0x4000usize;
         let ipa = 0x8800_1000_0000u64;
         let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -1899,6 +1900,7 @@ mod foreign_mm_tests {
 
     #[test]
     fn structural_backing_owner_invalid_arguments_and_exact_drop_order() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
         let size = 0x4000usize;
         let ipa = 0x8800_2000_0000u64;
         let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -1949,11 +1951,12 @@ mod foreign_mm_tests {
 
     #[test]
     fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycle() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
         let _stage2_stub = ScopedStage2MapTestStub::enable();
         let root_slot_base = 0x9a00_0000_0000u64;
         let root_slot_size = 0x0020_0000usize;
 
-        // 1. Setup parent page tables and mappings
+        // 1. Setup parent page tables and mappings with distinct payloads
         let _parent_pt = crate::page_table::PageTableManager::new(
             carrick_mem::memory::stage1_hvpatch_page_tables(),
             crate::memory::LINUX_PAGE_TABLES_BASE,
@@ -2010,6 +2013,13 @@ mod foreign_mm_tests {
                 data_payload.len(),
             );
         }
+
+        // Register parent data frame in global frame host owner directory
+        let mut parent_data_lease = GlobalFrameStage2Lease::fixed(0x8800_3000_0000, 0x4000);
+        parent_data_lease.mark_test_mapped_without_backend();
+        let parent_data_gen =
+            register_global_frame_host_owner(parent_data_lease, parent_data_host, 3)
+                .expect("register parent data owner");
 
         let parent_mappings = vec![
             HvfMappedRegion {
@@ -2084,14 +2094,14 @@ mod foreign_mm_tests {
                 perms: applevisor::memory::MemPerms::ReadWrite,
                 guest_writable: true,
                 memory: None,
-                host_mapping: Some(parent_data_host),
+                host_mapping: None,
                 structural_owner: None,
                 stage2_lease: None,
                 is_dynamic_alias: false,
                 sharing: GuestMappingSharing::Private,
                 shared_key_base: 0,
                 shared_key_offset: 0,
-                owner_generation: 1,
+                owner_generation: parent_data_gen,
             },
         ];
 
@@ -2169,7 +2179,7 @@ mod foreign_mm_tests {
                         stage2_length: 0x4000,
                         stage2_owner: InventoryStage2OwnerIdentity {
                             host_addr: parent_data_addr as usize,
-                            generation: 1,
+                            generation: parent_data_gen,
                         },
                     },
                 ),
@@ -2216,10 +2226,10 @@ mod foreign_mm_tests {
             registration: None,
         };
 
-        // 2. Perform production parent -> child build_process_spec_internal
+        // 2. Perform production parent -> child build_process_plan
         let request = carrick_hal::ProcessForkRequest {
             entry: carrick_hal::GuestEntryRegs::default(),
-            child_ttbr0: 0,
+            child_ttbr0: root_slot_base,
             root_slot_base,
             root_slot_size: root_slot_size as u64,
             plan: carrick_hal::ForkProjectionPlan::Copied {
@@ -2235,22 +2245,62 @@ mod foreign_mm_tests {
             carrick_mem::memory::stage1_hvpatch_page_tables(),
             crate::memory::LINUX_PAGE_TABLES_BASE,
         );
+        child_pt
+            .map_aliased(0x0040_0000, 0x8800_3000_0000, 0x4000, false)
+            .expect("map child user aliased");
+        child_pt
+            .rebase(root_slot_base)
+            .expect("rebase child page tables");
 
-        let mut spec = parent_task
-            .build_process_spec_internal(
+        let cow_ranges = vec![carrick_aarch64::vmm::ForkCowRange {
+            va: 0x0040_0000,
+            len: 0x4000,
+            executable: false,
+            kernel_only: false,
+        }];
+
+        let carrier_foreign_mm_transport = Arc::new(CarrierForeignMmTransport::new());
+        let mut plan = parent_task
+            .build_process_plan(
                 request,
                 &mut child_pt,
-                &[],
+                &cow_ranges,
                 Arc::new(MailboxSlotAllocator::new()),
                 HvfSyscallTransport::Mailbox,
-                Arc::new(CarrierForeignMmTransport::new()),
-                None,
+                Arc::clone(&carrier_foreign_mm_transport),
             )
-            .expect("build_process_spec_internal for child");
+            .expect("build_process_plan for child");
+
+        // Verify structural and user dispositions in plan
+        let (pt_physical_ipa, pt_physical_size) = {
+            let pt_desc = plan
+                .mappings
+                .iter()
+                .find(|m| m.start == crate::memory::LINUX_PAGE_TABLES_BASE)
+                .expect("child pt mapping descriptor");
+            assert_eq!(pt_desc.physical_ipa, root_slot_base);
+            assert!(pt_desc.stage2_lease.is_some());
+            (pt_desc.physical_ipa, pt_desc.physical_size)
+        };
+
+        {
+            let user_desc = plan
+                .mappings
+                .iter()
+                .find(|m| m.start == 0x0040_0000)
+                .expect("child user mapping descriptor");
+            assert_eq!(
+                user_desc.inherited_frame,
+                Some(carrick_hal::FrameId::from_kernel_allocation(
+                    std::num::NonZeroU64::new(4).unwrap()
+                ))
+            );
+            assert_eq!(user_desc.owner_generation, parent_data_gen);
+        }
 
         // 3. Stage frame inventory reservation for child
         let next_id = std::sync::atomic::AtomicU64::new(500);
-        spec.stage_with_reservation_factory(|frame_candidates, mapping_candidates, capacity| {
+        plan.stage_with_reservation_factory(|frame_candidates, mapping_candidates, capacity| {
             let tx_raw = next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let transaction = carrick_hal::KernelTransactionId::from_kernel_allocation(
                 std::num::NonZeroU64::new(tx_raw).unwrap(),
@@ -2282,19 +2332,12 @@ mod foreign_mm_tests {
         })
         .expect("stage child inventory reservation");
 
-        // Record child's expected structural IPA extents from spec descriptors
-        // Record child's expected structural IPA extents from spec descriptors
-        let pt_desc = spec
-            .mappings
-            .iter()
-            .find(|m| m.start == crate::memory::LINUX_PAGE_TABLES_BASE)
-            .expect("child pt mapping descriptor");
-        let pt_physical_ipa = pt_desc.physical_ipa;
-        let pt_physical_size = pt_desc.physical_size;
-
-        // 4. Prepare task-only process spec through production conversion
-        let (carrier_state, prepared_task) = HvfVmState::prepare_task_only_process_spec(spec)
-            .expect("prepare_task_only_process_spec for child");
+        // 4. Prepare task-only process spec through test conversion
+        let rollbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let order = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (carrier_state, prepared_task) =
+            HvfVmState::prepare_task_only_for_test(plan, &rollbacks, Some(Arc::clone(&order)))
+                .expect("prepare_task_only_for_test for child");
 
         // Verify structural owner is populated on prepared mapping with nonzero generation
         let prepared_pt = prepared_task
@@ -2365,13 +2408,24 @@ mod foreign_mm_tests {
             .expect("bind child kernel token");
         backend_state
             .apply_inventory(|commit| {
+                let mappings = commit
+                    .batch()
+                    .events()
+                    .iter()
+                    .filter_map(|event| match *event {
+                        carrick_hal::FrameInventoryEvent::PrepareMapping {
+                            mapping, frame, ..
+                        } => Some((mapping, frame)),
+                        _ => None,
+                    })
+                    .collect();
                 Ok(
                     carrick_hal::FrameInventoryApplyReceipt::from_kernel_authority(
                         carrick_hal::FrameInventoryProvenance::from_kernel_entropy([0x33; 32]),
                         commit.batch().transaction(),
                         std::num::NonZeroU64::new(2).unwrap(),
                         1,
-                        Vec::new(),
+                        mappings,
                     ),
                 )
             })
@@ -2389,7 +2443,7 @@ mod foreign_mm_tests {
         // Verify structural owner was installed into child task MmAccessState
         let child_mm_access = Arc::clone(&child_task_state.mm_access);
 
-        // 6. Retain structural physical backing via Foreign MM transport
+        // 6. Retain structural physical backing via CarrierForeignMmTransport::retain
         let child_inventory = &child_mm_access.frame_inventory;
         let pt_mapping_id = child_inventory
             .lock()
@@ -2398,16 +2452,10 @@ mod foreign_mm_tests {
             .expect("pt mapping id")
             .mapping;
 
-        let child_snapshot = CarrierForeignMmSnapshot {
-            mm: carrick_hal::ForeignMmId::from_kernel_allocation(
-                std::num::NonZeroU64::new(102).unwrap(),
-            ),
-            binding: CarrierForeignMmBinding {
-                asid: carrick_hal::ForeignAsid::from_kernel_allocation(
-                    std::num::NonZeroU16::new(5).unwrap(),
-                ),
-                stage1_root: carrick_guest_mem::Gpa(root_slot_base),
-            },
+        let child_snapshot = TestSnapshot {
+            mm: std::num::NonZeroU64::new(102).unwrap(),
+            asid: std::num::NonZeroU16::new(5).unwrap(),
+            stage1_root: carrick_guest_mem::Gpa(root_slot_base),
             backend_revision: carrick_hal::ForeignBackendRevision::from_authority_raw(1),
             vma_revision: carrick_hal::ForeignVmaRevision::from_authority_raw(1),
             frame_inventory_revision:
@@ -2415,9 +2463,61 @@ mod foreign_mm_tests {
             mapping_ids: vec![pt_mapping_id],
         };
 
+        let child_captured = CarrierForeignMmSnapshot::capture(&child_snapshot);
+
+        // Register child identity in carrier foreign MM transport
+        carrier_foreign_mm_transport.register_identity(
+            child_captured.mm,
+            child_captured.binding,
+            &child_task_state.mm_access,
+        );
+
+        let endpoint =
+            carrick_hal::ForeignMmEndpoint::for_carrier(Arc::clone(&carrier_foreign_mm_transport)
+                as Arc<dyn carrick_hal::ForeignMmTransport>);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+
+        // Tampered ASID rejected via state_for / retain
+        let bad_asid_snapshot = TestSnapshot {
+            asid: std::num::NonZeroU16::new(99).unwrap(),
+            ..child_snapshot.clone()
+        };
+        let bad_asid_res = endpoint.retain(&bad_asid_snapshot, deadline);
+        assert!(matches!(
+            bad_asid_res,
+            Err(carrick_hal::ForeignMmTransportError::MissingBinding)
+        ));
+        let bad_asid_captured = CarrierForeignMmSnapshot::capture(&bad_asid_snapshot);
+        let bad_asid_state = carrier_foreign_mm_transport.state_for(&bad_asid_captured, deadline);
+        assert!(matches!(
+            bad_asid_state,
+            Err(carrick_hal::ForeignMmTransportError::MissingBinding)
+        ));
+
+        // Tampered stage1 root rejected via state_for / retain
+        let bad_root_snapshot = TestSnapshot {
+            stage1_root: carrick_guest_mem::Gpa(root_slot_base + 0x1000),
+            ..child_snapshot.clone()
+        };
+        let bad_root_res = endpoint.retain(&bad_root_snapshot, deadline);
+        assert!(matches!(
+            bad_root_res,
+            Err(carrick_hal::ForeignMmTransportError::MissingBinding)
+        ));
+        let bad_root_captured = CarrierForeignMmSnapshot::capture(&bad_root_snapshot);
+        let bad_root_state = carrier_foreign_mm_transport.state_for(&bad_root_captured, deadline);
+        assert!(matches!(
+            bad_root_state,
+            Err(carrick_hal::ForeignMmTransportError::MissingBinding)
+        ));
+
+        // Authentic snapshot succeeds via ForeignMmEndpoint / transport retain
+        let _lease = endpoint
+            .retain(&child_snapshot, deadline)
+            .expect("CarrierForeignMmTransport::retain must succeed for authentic child");
+
         let retained = child_mm_access
-            .retain_physical_backing(&child_snapshot, deadline)
+            .retain_physical_backing(&child_captured, deadline)
             .expect("retain_physical_backing must succeed for authentic structural extents");
 
         // Verify structural payload readback through retained physical owner
@@ -2450,7 +2550,16 @@ mod foreign_mm_tests {
                 stale_mm_access.install_structural_owner(Arc::clone(owner));
             }
         }
-        let stale_res = stale_mm_access.retain_physical_backing(&child_snapshot, deadline);
+        let stale_transport = Arc::new(CarrierForeignMmTransport::new());
+        stale_transport.register_identity(
+            child_captured.mm,
+            child_captured.binding,
+            &stale_mm_access,
+        );
+        let stale_endpoint = carrick_hal::ForeignMmEndpoint::for_carrier(
+            stale_transport as Arc<dyn carrick_hal::ForeignMmTransport>,
+        );
+        let stale_res = stale_endpoint.retain(&child_snapshot, deadline);
         assert!(matches!(
             stale_res,
             Err(carrick_hal::ForeignMmTransportError::OwnerStale)
@@ -2507,6 +2616,149 @@ mod foreign_mm_tests {
 
         // Dropping final retained backing cleanly releases structural owner
         drop(retained);
+    }
+
+    #[test]
+    fn releasable_stage2_lease_lifecycle_and_deterministic_allocator_reuse() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let _stage2_stub = ScopedStage2MapTestStub::enable();
+        let size = 0x4000usize;
+
+        // 1. Reserve a releasable global frame stage-2 lease
+        let mut lease = GlobalFrameStage2Lease::reserve(size as u64, size as u64)
+            .expect("reserve releasable global frame stage-2 lease");
+        assert!(
+            lease.release_ipa,
+            "reusable extent must have release_ipa = true"
+        );
+        lease.mark_test_mapped_without_backend();
+        let allocated_ipa = lease.base;
+
+        // 2. Wrap in host mapping and register global frame host owner
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            size,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate host mapping for test");
+        let payload = *b"releasable_global_extent_payload_v3!";
+        unsafe {
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), mapping.as_ptr(), payload.len());
+        }
+        let generation = register_global_frame_host_owner(lease, mapping, 3)
+            .expect("register global frame host owner");
+        assert_ne!(generation, 0);
+
+        // 3. Create multiple retained physical owners
+        let owner = global_frame_host_owners()
+            .lock()
+            .get(&(allocated_ipa, size as u64))
+            .cloned()
+            .expect("global frame host owner must be registered");
+
+        let holder1 = RetainedPhysicalOwner::Global(Arc::clone(&owner));
+        let holder2 = RetainedPhysicalOwner::Global(Arc::clone(&owner));
+
+        let extent1 = RetainedForeignExtent {
+            key: (allocated_ipa, size as u64),
+            owner: holder1,
+        };
+        let backing1 = RetainedForeignMmBacking {
+            extents: vec![extent1],
+        };
+        let mut read_buf = [0u8; 36];
+        copy_from_pinned_owner(&backing1, allocated_ipa, &mut read_buf)
+            .expect("copy_from_pinned_owner with holder1");
+        assert_eq!(&read_buf, &payload);
+
+        // 4. Remove from registration registry while holders still exist
+        global_frame_host_owners()
+            .lock()
+            .remove(&(allocated_ipa, size as u64));
+        drop(owner);
+        drop(backing1);
+
+        // 5. Holder2 still keeps the IPA alive and readable
+        let extent2 = RetainedForeignExtent {
+            key: (allocated_ipa, size as u64),
+            owner: holder2,
+        };
+        let backing2 = RetainedForeignMmBacking {
+            extents: vec![extent2],
+        };
+        let mut read_buf2 = [0u8; 36];
+        copy_from_pinned_owner(&backing2, allocated_ipa, &mut read_buf2)
+            .expect("copy_from_pinned_owner with holder2");
+        assert_eq!(&read_buf2, &payload);
+
+        // 6. Controlled final drop releases IPA back to allocator
+        drop(backing2);
+
+        // 7. Prove deterministic allocator reuse of the released IPA
+        let new_lease = GlobalFrameStage2Lease::reserve(size as u64, size as u64)
+            .expect("reserve new global frame stage-2 lease");
+        assert_eq!(
+            new_lease.base, allocated_ipa,
+            "allocator must deterministically reuse the released IPA range"
+        );
+        drop(new_lease);
+    }
+
+    #[test]
+    fn foreign_mm_failure_injection_at_composition_boundaries() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let _stage2_stub = ScopedStage2MapTestStub::enable();
+
+        // 1. Reversible inventory reservation failure
+        let mut plan = ProcessSpecPlan {
+            mappings: Vec::new(),
+            inventory_mappings: Vec::new(),
+            protections: Arc::new(MemoryProtections::default()),
+            mailbox_slots: Arc::new(MailboxSlotAllocator::new()),
+            syscall_transport: HvfSyscallTransport::Mailbox,
+            persistent_vm_lifecycle: true,
+            mm_root_slot: (0x9a00_0000_0000, 0x0020_0000),
+            container_root: ContainerRootToken::from_raw(1),
+            frame_inventory: Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
+            cow_armed: Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
+            carrier_foreign_mm_transport: Arc::new(CarrierForeignMmTransport::new()),
+        };
+        let fail_res = plan.stage_with_reservation_factory(|_, _, _| {
+            Err(TrapError::Hypervisor(
+                "injected reservation failure".to_owned(),
+            ))
+        });
+        assert!(fail_res.is_err());
+        assert!(plan.frame_inventory.lock().process_reservation.is_none());
+
+        // 2. Transport retain failure on missing binding
+        let transport = Arc::new(CarrierForeignMmTransport::new());
+        let endpoint = carrick_hal::ForeignMmEndpoint::for_carrier(
+            transport as Arc<dyn carrick_hal::ForeignMmTransport>,
+        );
+        let missing_snapshot = TestSnapshot {
+            mm: std::num::NonZeroU64::new(888).unwrap(),
+            asid: std::num::NonZeroU16::new(1).unwrap(),
+            stage1_root: carrick_guest_mem::Gpa(0x1000),
+            backend_revision: carrick_hal::ForeignBackendRevision::from_authority_raw(1),
+            vma_revision: carrick_hal::ForeignVmaRevision::from_authority_raw(1),
+            frame_inventory_revision:
+                carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(1),
+            mapping_ids: vec![],
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let retain_missing = endpoint.retain(&missing_snapshot, deadline);
+        assert!(matches!(
+            retain_missing,
+            Err(carrick_hal::ForeignMmTransportError::MissingBinding)
+        ));
+
+        // 3. Transport retain failure on expired deadline
+        let expired_deadline = std::time::Instant::now() - std::time::Duration::from_millis(10);
+        let retain_expired = endpoint.retain(&missing_snapshot, expired_deadline);
+        assert!(matches!(
+            retain_expired,
+            Err(carrick_hal::ForeignMmTransportError::TimedOut)
+        ));
     }
 }
 
@@ -11764,17 +12016,11 @@ fn process_mapping_needs_stage2_install(inherited_frame: Option<carrick_hal::Fra
 /// without entering private COW. Shared-anonymous aliases remain mm-scoped; only
 /// shared-file mappings use the VM-global alias namespace.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub struct ProcessSpec {
-    vm: Option<applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>>,
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub struct ProcessSpecPlan {
     mappings: Vec<ProcessMappingDesc>,
     inventory_mappings: Vec<ProcessInventoryDesc>,
     protections: std::sync::Arc<MemoryProtections>,
-    // No `page_tables`: the child's stage-1 graph reaches the backend through
-    // `bind_stage1_page_tables`, which the shared engine calls with the SAME
-    // manager it puts in its own process spec, immediately after
-    // `from_process_spec` returns. Carrying a second copy here meant cloning
-    // the whole 1.75 MiB `LINUX_PAGE_TABLES_SIZE` image once per fork only to
-    // overwrite it unread a few instructions later.
     mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
     syscall_transport: HvfSyscallTransport,
     persistent_vm_lifecycle: bool,
@@ -11786,7 +12032,7 @@ pub struct ProcessSpec {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl ProcessSpec {
+impl ProcessSpecPlan {
     pub(crate) fn stage_with_reservation_factory(
         &mut self,
         mut reserve: impl FnMut(
@@ -11812,6 +12058,94 @@ impl ProcessSpec {
         let reservation = reserve(frame_candidates, mapping_candidates, capacity)?;
         self.frame_inventory.lock().process_reservation = Some(reservation);
         Ok(())
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub struct ProcessSpec {
+    vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
+    mappings: Vec<ProcessMappingDesc>,
+    inventory_mappings: Vec<ProcessInventoryDesc>,
+    protections: std::sync::Arc<MemoryProtections>,
+    mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
+    syscall_transport: HvfSyscallTransport,
+    persistent_vm_lifecycle: bool,
+    mm_root_slot: (u64, u64),
+    container_root: ContainerRootToken,
+    frame_inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
+    cow_armed: std::sync::Arc<parking_lot::Mutex<CowArmedRanges>>,
+    carrier_foreign_mm_transport: std::sync::Arc<CarrierForeignMmTransport>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ProcessSpec {
+    pub(crate) fn new(
+        vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
+        plan: ProcessSpecPlan,
+    ) -> Self {
+        Self {
+            vm,
+            mappings: plan.mappings,
+            inventory_mappings: plan.inventory_mappings,
+            protections: plan.protections,
+            mailbox_slots: plan.mailbox_slots,
+            syscall_transport: plan.syscall_transport,
+            persistent_vm_lifecycle: plan.persistent_vm_lifecycle,
+            mm_root_slot: plan.mm_root_slot,
+            container_root: plan.container_root,
+            frame_inventory: plan.frame_inventory,
+            cow_armed: plan.cow_armed,
+            carrier_foreign_mm_transport: plan.carrier_foreign_mm_transport,
+        }
+    }
+
+    pub(crate) fn into_plan(
+        self,
+    ) -> (
+        applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
+        ProcessSpecPlan,
+    ) {
+        let plan = ProcessSpecPlan {
+            mappings: self.mappings,
+            inventory_mappings: self.inventory_mappings,
+            protections: self.protections,
+            mailbox_slots: self.mailbox_slots,
+            syscall_transport: self.syscall_transport,
+            persistent_vm_lifecycle: self.persistent_vm_lifecycle,
+            mm_root_slot: self.mm_root_slot,
+            container_root: self.container_root,
+            frame_inventory: self.frame_inventory,
+            cow_armed: self.cow_armed,
+            carrier_foreign_mm_transport: self.carrier_foreign_mm_transport,
+        };
+        (self.vm, plan)
+    }
+
+    pub(crate) fn stage_with_reservation_factory(
+        &mut self,
+        reserve: impl FnMut(
+            usize,
+            usize,
+            carrick_hal::FrameEventCapacity,
+        ) -> Result<carrick_hal::FrameInventoryReservation, TrapError>,
+    ) -> Result<(), TrapError> {
+        let mut plan = ProcessSpecPlan {
+            mappings: std::mem::take(&mut self.mappings),
+            inventory_mappings: std::mem::take(&mut self.inventory_mappings),
+            protections: std::sync::Arc::clone(&self.protections),
+            mailbox_slots: std::sync::Arc::clone(&self.mailbox_slots),
+            syscall_transport: self.syscall_transport,
+            persistent_vm_lifecycle: self.persistent_vm_lifecycle,
+            mm_root_slot: self.mm_root_slot,
+            container_root: self.container_root,
+            frame_inventory: std::sync::Arc::clone(&self.frame_inventory),
+            cow_armed: std::sync::Arc::clone(&self.cow_armed),
+            carrier_foreign_mm_transport: std::sync::Arc::clone(&self.carrier_foreign_mm_transport),
+        };
+        let result = plan.stage_with_reservation_factory(reserve);
+        self.mappings = plan.mappings;
+        self.inventory_mappings = plan.inventory_mappings;
+        result
     }
 }
 
@@ -11943,16 +12277,16 @@ pub(crate) struct HvpatchCarrierTaskStateKey {
 #[allow(dead_code)]
 enum HvpatchCarrierTaskState {
     Sibling {
-        vm: Option<applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>>,
+        vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
     },
     /// A distinct Linux process which retains an already-published MM.  The
     /// existing carrier-MM row owns the VM/stage-2 lifecycle; this edge owns no
     /// replacement carrier authority of its own.
     SharedProcess {
-        vm: Option<applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>>,
+        vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
     },
     Process {
-        vm: Option<applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>>,
+        vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
         stage2_leases: Vec<GlobalFrameStage2Lease>,
     },
     #[cfg(test)]
@@ -11971,7 +12305,7 @@ enum HvpatchCarrierMmAuthority {
         // have taken some already; this is the backstop for the rest.
         stage2_lease_keys: Vec<(u64, u64)>,
         frames: std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
-        _vm: Option<applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>>,
+        _vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
     },
     #[cfg(test)]
     Test {
@@ -13765,9 +14099,9 @@ impl HvpatchPreparedCarrierTaskState {
         Ok(Self::new(
             identity,
             if shared_kernel_mm.is_some() {
-                HvpatchCarrierTaskState::SharedProcess { vm: Some(vm) }
+                HvpatchCarrierTaskState::SharedProcess { vm }
             } else {
-                HvpatchCarrierTaskState::Sibling { vm: Some(vm) }
+                HvpatchCarrierTaskState::Sibling { vm }
             },
             HvpatchPreparedTaskAuthority {
                 mappings,
@@ -21659,22 +21993,22 @@ impl HvfVmState {
         page_tables: &mut crate::page_table::PageTableManager,
         cow_ranges: &[carrick_aarch64::vmm::ForkCowRange],
     ) -> Result<ProcessSpec, TrapError> {
-        self.task.build_process_spec_internal(
+        let plan = self.task.build_process_plan(
             request,
             page_tables,
             cow_ranges,
             std::sync::Arc::clone(&self.mailbox_slots),
             self.syscall_transport,
             std::sync::Arc::clone(&self.carrier_foreign_mm_transport),
-            Some((*self._vm).clone()),
-        )
+        )?;
+        Ok(ProcessSpec::new((*self._vm).clone(), plan))
     }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfTaskState {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn build_process_spec_internal(
+    pub(crate) fn build_process_plan(
         &self,
         request: carrick_hal::ProcessForkRequest,
         page_tables: &mut crate::page_table::PageTableManager,
@@ -21682,8 +22016,7 @@ impl HvfTaskState {
         mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
         syscall_transport: HvfSyscallTransport,
         carrier_foreign_mm_transport: std::sync::Arc<CarrierForeignMmTransport>,
-        vm: Option<applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>>,
-    ) -> Result<ProcessSpec, TrapError> {
+    ) -> Result<ProcessSpecPlan, TrapError> {
         use carrick_observability::probes::{
             HvpatchForkProcessSpecStage, HvpatchForkProcessSpecStagePhase,
         };
@@ -22401,8 +22734,7 @@ impl HvfTaskState {
                 child_cow_armed.ranges.len(),
             );
         }
-        let spec = ProcessSpec {
-            vm,
+        let plan = ProcessSpecPlan {
             mappings,
             inventory_mappings,
             protections,
@@ -22415,16 +22747,12 @@ impl HvfTaskState {
             cow_armed: std::sync::Arc::new(parking_lot::Mutex::new(child_cow_armed)),
             carrier_foreign_mm_transport,
         };
-        // Zero bytes: this stage no longer copies the page-table image (see the
-        // `ProcessSpec` field comment). Reporting the old
-        // `LINUX_PAGE_TABLES_SIZE` here would keep claiming a copy that the
-        // stage does not make.
         emit_stage(
             HvpatchForkProcessSpecStagePhase::BackendSpecFinalize,
             stage_started,
             0,
         );
-        Ok(spec)
+        Ok(plan)
     }
 }
 
@@ -22433,13 +22761,24 @@ impl HvfVmState {
     fn prepare_task_only_process_spec(
         spec: ProcessSpec,
     ) -> Result<(HvpatchCarrierTaskState, HvpatchPreparedTaskAuthority), TrapError> {
-        let mut mapped = Vec::with_capacity(spec.mappings.len());
-        let mut stage2_leases = Vec::with_capacity(spec.mappings.len());
+        let (vm, plan) = spec.into_plan();
+        let (stage2_leases, prepared_task) = Self::prepare_task_only_plan(plan)?;
+        Ok((
+            HvpatchCarrierTaskState::Process { vm, stage2_leases },
+            prepared_task,
+        ))
+    }
+
+    fn prepare_task_only_plan(
+        plan: ProcessSpecPlan,
+    ) -> Result<(Vec<GlobalFrameStage2Lease>, HvpatchPreparedTaskAuthority), TrapError> {
+        let mut mapped = Vec::with_capacity(plan.mappings.len());
+        let mut stage2_leases = Vec::with_capacity(plan.mappings.len());
         let mut structural_owners = std::collections::BTreeMap::new();
-        let inventory_mappings = spec.inventory_mappings;
+        let inventory_mappings = plan.inventory_mappings;
         let mut pending_aliases = Vec::new();
         let mut pending_receipts = Vec::new();
-        for mut mapping in spec.mappings {
+        for mut mapping in plan.mappings {
             let semantic_physical_offset = mapping
                 .ipa
                 .checked_sub(mapping.physical_ipa)
@@ -22497,7 +22836,7 @@ impl HvfVmState {
                     ownership_scope: alias_ownership_scope(
                         mapping.sharing,
                         None,
-                        spec.container_root,
+                        plan.container_root,
                     ),
                     inventory_backing: mapping.inventory_backing,
                     shared_key_base: mapping.shared_key_base,
@@ -22507,7 +22846,7 @@ impl HvfVmState {
                 pending_aliases.push(if mapping.sharing.uses_global_ipa() {
                     alias
                 } else {
-                    rebind_inherited_alias_to_process(alias, spec.mm_root_slot)
+                    rebind_inherited_alias_to_process(alias, plan.mm_root_slot)
                 });
             }
             let (host_mapping, structural_owner, stage2_lease, owner_generation) =
@@ -22571,8 +22910,8 @@ impl HvfVmState {
                         }
                     }
                 };
-            if let Some(stage2_lease) = stage2_lease {
-                stage2_leases.push(stage2_lease);
+            if let Some(lease) = stage2_lease {
+                stage2_leases.push(lease);
             }
             mapped.push(HvpatchTaskMappingState {
                 start: mapping.start,
@@ -22581,7 +22920,7 @@ impl HvfVmState {
                 end: mapping.end,
                 host_addr,
                 physical_host_addr: mapping.physical_host_addr,
-                size: mapping.size,
+                size: mapping.physical_size,
                 physical_size: mapping.physical_size,
                 perms: mapping.perms,
                 guest_writable: mapping.guest_writable,
@@ -22594,7 +22933,7 @@ impl HvfVmState {
                 owner_generation,
             });
         }
-        let mut process_reservation = spec
+        let mut process_reservation = plan
             .frame_inventory
             .lock()
             .process_reservation
@@ -22608,7 +22947,7 @@ impl HvfVmState {
         let mut staged_inventory_mappings = Vec::with_capacity(inventory_mappings.len());
         let process_commit;
         {
-            let mut inventory = spec.frame_inventory.lock();
+            let mut inventory = plan.frame_inventory.lock();
             for mapping in inventory_mappings {
                 let stage2_owner = if is_reusable_global_frame_extent(mapping.gpa, mapping.length) {
                     let generation =
@@ -22688,21 +23027,18 @@ impl HvfVmState {
         }
         let process_challenge = process_commit.receipt_challenge();
         Ok((
-            HvpatchCarrierTaskState::Process {
-                vm: spec.vm,
-                stage2_leases,
-            },
+            stage2_leases,
             HvpatchPreparedTaskAuthority {
                 mappings: mapped,
-                mm_root_slot: Some(spec.mm_root_slot),
-                container_root: spec.container_root,
+                mm_root_slot: Some(plan.mm_root_slot),
+                container_root: plan.container_root,
                 inventory: HvpatchTaskInventoryAuthority::ProcessPrepared {
-                    ledger: spec.frame_inventory,
+                    ledger: plan.frame_inventory,
                     staged: staged_inventory_mappings,
                     commit: Some(process_commit),
                     challenge: Some(process_challenge),
                 },
-                cow_armed: Some(spec.cow_armed),
+                cow_armed: Some(plan.cow_armed),
                 // A freshly materialized process has no deferred COW
                 // publication yet, but it must own the slot they land in:
                 // `from_process_spec` gives the live state the same fresh
@@ -22717,20 +23053,34 @@ impl HvfVmState {
         ))
     }
 
+    #[cfg(test)]
+    fn prepare_task_only_for_test(
+        plan: ProcessSpecPlan,
+        rollbacks: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        order: Option<std::sync::Arc<parking_lot::Mutex<Vec<&'static str>>>>,
+    ) -> Result<(HvpatchCarrierTaskState, HvpatchPreparedTaskAuthority), TrapError> {
+        let (_stage2_leases, prepared_task) = Self::prepare_task_only_plan(plan)?;
+        Ok((
+            HvpatchCarrierTaskState::Test {
+                rollbacks: std::sync::Arc::clone(rollbacks),
+                order,
+            },
+            prepared_task,
+        ))
+    }
+
     pub(crate) fn from_process_spec(
         spec: ProcessSpec,
     ) -> Result<(HvfVmState, applevisor::vcpu::Vcpu, MailboxBinding), TrapError> {
-        let vm = spec.vm.ok_or_else(|| {
-            TrapError::Hypervisor("ProcessSpec missing hypervisor VM handle".to_owned())
-        })?;
+        let (vm, plan) = spec.into_plan();
         let vcpu = create_vcpu(&vm)?;
         enable_el0_counter_access(vcpu.id());
-        let mut mapped = Vec::with_capacity(spec.mappings.len());
+        let mut mapped = Vec::with_capacity(plan.mappings.len());
         let mut structural_owners = std::collections::BTreeMap::new();
-        let inventory_mappings = spec.inventory_mappings;
+        let inventory_mappings = plan.inventory_mappings;
         let mut aliases_to_publish = Vec::new();
         let mut pending_fork_frame_receipts = Vec::new();
-        for mut mapping in spec.mappings {
+        for mut mapping in plan.mappings {
             let semantic_physical_offset = mapping
                 .ipa
                 .checked_sub(mapping.physical_ipa)
@@ -22786,7 +23136,7 @@ impl HvfVmState {
                     ownership_scope: alias_ownership_scope(
                         mapping.sharing,
                         None,
-                        spec.container_root,
+                        plan.container_root,
                     ),
                     inventory_backing: mapping.inventory_backing,
                     shared_key_base: mapping.shared_key_base,
@@ -22796,7 +23146,7 @@ impl HvfVmState {
                 aliases_to_publish.push(if mapping.sharing.uses_global_ipa() {
                     alias
                 } else {
-                    rebind_inherited_alias_to_process(alias, spec.mm_root_slot)
+                    rebind_inherited_alias_to_process(alias, plan.mm_root_slot)
                 });
             }
             let (host_mapping, structural_owner, stage2_lease, owner_generation) =
@@ -22881,7 +23231,7 @@ impl HvfVmState {
                 owner_generation,
             });
         }
-        let mut process_reservation = spec
+        let mut process_reservation = plan
             .frame_inventory
             .lock()
             .process_reservation
@@ -22894,9 +23244,9 @@ impl HvfVmState {
         let process_transaction = process_reservation.transaction();
         let mm_access = MmAccessState::new(
             std::sync::Arc::new(parking_lot::Mutex::new(None)),
-            spec.protections,
-            spec.frame_inventory,
-            spec.cow_armed,
+            plan.protections,
+            plan.frame_inventory,
+            plan.cow_armed,
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
         );
         for mapping in &mapped {
@@ -22906,11 +23256,11 @@ impl HvfVmState {
         }
         let mut state = HvfVmState {
             _vm: std::mem::ManuallyDrop::new(vm),
-            carrier_foreign_mm_transport: std::sync::Arc::clone(&spec.carrier_foreign_mm_transport),
+            carrier_foreign_mm_transport: std::sync::Arc::clone(&plan.carrier_foreign_mm_transport),
             task: HvfTaskState {
                 mappings: mapped,
-                mm_root_slot: Some(spec.mm_root_slot),
-                container_root: spec.container_root,
+                mm_root_slot: Some(plan.mm_root_slot),
+                container_root: plan.container_root,
                 pending_exec_mm_root_slot: None,
                 pending_exec_asid: None,
                 pending_exec_predecessor_identity: None,
@@ -22925,7 +23275,7 @@ impl HvfVmState {
                 forked_no_exec: false,
                 last_syscall_nr: None,
                 last_syscall_orig_x0: 0,
-                persistent_vm_lifecycle: spec.persistent_vm_lifecycle,
+                persistent_vm_lifecycle: plan.persistent_vm_lifecycle,
                 cow_authority: None,
                 cow_identity: None,
                 pending_fork_frame_receipts: Vec::new(),
@@ -22936,8 +23286,8 @@ impl HvfVmState {
             },
             carrier_mappings: None,
             reclaim_authority: ReclaimParkAuthority::Live,
-            mailbox_slots: spec.mailbox_slots,
-            syscall_transport: spec.syscall_transport,
+            mailbox_slots: plan.mailbox_slots,
+            syscall_transport: plan.syscall_transport,
             vcpu_id: vcpu.id(),
             vcpu_handle: vcpu.get_handle(),
         };

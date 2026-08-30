@@ -2706,7 +2706,11 @@ pub(crate) mod tests {
                         "retained race winner failed COW: {result:?}"
                     );
                 }
-                Err(MmAccessError::UnknownTask(_) | MmAccessError::StaleContext(_)) => {}
+                Err(
+                    MmAccessError::UnknownTask(_)
+                    | MmAccessError::StaleContext(_)
+                    | MmAccessError::MissingForeignTransport(_),
+                ) => {}
                 Err(MmAccessError::Snapshot(SnapshotError::TimedOut)) => {}
                 Ok(MmRelation::Current(_)) => panic!("foreign race selected caller MM"),
                 Err(error) => panic!("unexpected foreign acquisition race outcome: {error:?}"),
