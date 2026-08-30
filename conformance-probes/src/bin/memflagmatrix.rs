@@ -11,7 +11,7 @@
 //! Output format: deterministic `key=value` lines diffed line-by-line against
 //! the native Linux oracle.
 
-use conformance_probes::{errno, report};
+use conformance_probes::{errno, report, run_bounded_bool_child};
 use std::ffi::c_void;
 
 const MAP_FIXED_NOREPLACE: i32 = 0x100000;
@@ -87,6 +87,9 @@ unsafe fn test_mmap_matrix(page: usize) {
         0,
     );
     let no_type_einval = no_type == libc::MAP_FAILED && errno() == libc::EINVAL;
+    if no_type != libc::MAP_FAILED {
+        libc::munmap(no_type, page);
+    }
 
     // 2. Conflicting MAP_TYPE (both MAP_SHARED and MAP_PRIVATE specified) -> EINVAL
     let both_types = libc::mmap(
@@ -98,6 +101,9 @@ unsafe fn test_mmap_matrix(page: usize) {
         0,
     );
     let both_types_einval = both_types == libc::MAP_FAILED && errno() == libc::EINVAL;
+    if both_types != libc::MAP_FAILED {
+        libc::munmap(both_types, page);
+    }
 
     // 3. Length == 0 on anonymous mmap -> EINVAL
     let len_zero = libc::mmap(
@@ -109,6 +115,9 @@ unsafe fn test_mmap_matrix(page: usize) {
         0,
     );
     let len_zero_einval = len_zero == libc::MAP_FAILED && errno() == libc::EINVAL;
+    if len_zero != libc::MAP_FAILED {
+        libc::munmap(len_zero, page);
+    }
 
     // 4. Unaligned offset on anonymous mmap -> EINVAL
     let unaligned_offset = libc::mmap(
@@ -120,6 +129,9 @@ unsafe fn test_mmap_matrix(page: usize) {
         1,
     );
     let unaligned_offset_einval = unaligned_offset == libc::MAP_FAILED && errno() == libc::EINVAL;
+    if unaligned_offset != libc::MAP_FAILED {
+        libc::munmap(unaligned_offset, page);
+    }
 
     // 5. Invalid protection flags bitmask -> EINVAL
     let invalid_prot = libc::mmap(
@@ -130,7 +142,12 @@ unsafe fn test_mmap_matrix(page: usize) {
         -1,
         0,
     );
-    let invalid_prot_einval = invalid_prot == libc::MAP_FAILED && errno() == libc::EINVAL;
+    let invalid_prot_result = if invalid_prot == libc::MAP_FAILED {
+        format!("errno:{}", errno())
+    } else {
+        libc::munmap(invalid_prot, page);
+        "success".to_owned()
+    };
 
     // 6. MAP_FIXED with unaligned target address -> EINVAL
     let fixed_unaligned = libc::mmap(
@@ -142,6 +159,9 @@ unsafe fn test_mmap_matrix(page: usize) {
         0,
     );
     let fixed_unaligned_einval = fixed_unaligned == libc::MAP_FAILED && errno() == libc::EINVAL;
+    if fixed_unaligned != libc::MAP_FAILED {
+        libc::munmap(fixed_unaligned, page);
+    }
 
     // 7. MAP_FIXED_NOREPLACE on an existing mapping -> EEXIST
     let base = libc::mmap(
@@ -163,6 +183,9 @@ unsafe fn test_mmap_matrix(page: usize) {
             0,
         );
         noreplace_existing_eexist = clash == libc::MAP_FAILED && errno() == libc::EEXIST;
+        if clash != libc::MAP_FAILED && clash != base {
+            libc::munmap(clash, page);
+        }
         libc::munmap(base, page);
     }
 
@@ -223,7 +246,7 @@ unsafe fn test_mmap_matrix(page: usize) {
         mmap_both_types_einval = both_types_einval,
         mmap_len_zero_einval = len_zero_einval,
         mmap_unaligned_offset_einval = unaligned_offset_einval,
-        mmap_invalid_prot_einval = invalid_prot_einval,
+        mmap_invalid_prot_result = invalid_prot_result,
         mmap_fixed_unaligned_einval = fixed_unaligned_einval,
         mmap_fixed_noreplace_eexist = noreplace_existing_eexist,
         mmap_fixed_noreplace_unmapped_ok = noreplace_unmapped_ok,
@@ -233,99 +256,114 @@ unsafe fn test_mmap_matrix(page: usize) {
 }
 
 unsafe fn test_mprotect_matrix(page: usize) {
-    let p = libc::mmap(
-        core::ptr::null_mut(),
-        page * 3,
-        libc::PROT_READ | libc::PROT_WRITE,
-        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-        -1,
-        0,
-    );
-    if p == libc::MAP_FAILED {
-        report!(
-            mprotect_unaligned_einval = false,
-            mprotect_len_zero_ok = false,
-            mprotect_invalid_prot_einval = false,
-            mprotect_unmapped_enomem = false,
-            mprotect_transitions_preserved = false,
-            mprotect_partial_split_preserved = false,
-        );
-        return;
-    }
+    let map_rw = |pages: usize| {
+        libc::mmap(
+            core::ptr::null_mut(),
+            page * pages,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
 
-    // 1. Non-page-aligned address -> EINVAL
-    let unaligned_rc = libc::mprotect((p as *mut u8).add(1).cast(), page, libc::PROT_READ);
-    let unaligned_einval = unaligned_rc == -1 && errno() == libc::EINVAL;
+    // Each subcase owns its mapping and process. A crash or wedge therefore
+    // becomes one exact row instead of truncating the rest of the probe.
+    let unaligned_einval = run_bounded_bool_child(|| {
+        let p = map_rw(1);
+        if p == libc::MAP_FAILED {
+            return false;
+        }
+        let rc = libc::mprotect((p as *mut u8).add(1).cast(), page, libc::PROT_READ);
+        let ok = rc == -1 && errno() == libc::EINVAL;
+        libc::munmap(p, page);
+        ok
+    });
 
-    // 2. Length == 0 -> 0 (success / no-op on Linux)
-    let len_zero_rc = libc::mprotect(p, 0, libc::PROT_READ);
-    let len_zero_ok = len_zero_rc == 0;
+    let len_zero_ok = run_bounded_bool_child(|| {
+        let p = map_rw(1);
+        if p == libc::MAP_FAILED {
+            return false;
+        }
+        let ok = libc::mprotect(p, 0, libc::PROT_READ) == 0;
+        libc::munmap(p, page);
+        ok
+    });
 
-    // 3. Invalid protection flags bitmask -> EINVAL
-    let inv_prot_rc = libc::mprotect(p, page, 1 << 28);
-    let inv_prot_einval = inv_prot_rc == -1 && errno() == libc::EINVAL;
+    let inv_prot_einval = run_bounded_bool_child(|| {
+        let p = map_rw(1);
+        if p == libc::MAP_FAILED {
+            return false;
+        }
+        let rc = libc::mprotect(p, page, 1 << 28);
+        let ok = rc == -1 && errno() == libc::EINVAL;
+        libc::munmap(p, page);
+        ok
+    });
 
-    // 4. mprotect on unmapped memory -> ENOMEM
-    let unmapped = get_unmapped_page(page);
-    let unmapped_rc = libc::mprotect(unmapped, page, libc::PROT_READ);
-    let unmapped_enomem = unmapped_rc == -1 && errno() == libc::ENOMEM;
+    let unmapped_enomem = run_bounded_bool_child(|| {
+        let unmapped = get_unmapped_page(page);
+        if unmapped.is_null() {
+            return false;
+        }
+        let rc = libc::mprotect(unmapped, page, libc::PROT_READ);
+        rc == -1 && errno() == libc::ENOMEM
+    });
 
-    // 5. Protection state transitions: RW -> PROT_NONE -> PROT_READ -> RW with data preservation
-    let single = libc::mmap(
-        core::ptr::null_mut(),
-        page,
-        libc::PROT_READ | libc::PROT_WRITE,
-        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-        -1,
-        0,
-    );
-    let mut transitions_preserved = false;
-    if single != libc::MAP_FAILED {
-        let b = single as *mut u8;
+    let transitions_preserved = run_bounded_bool_child(|| {
+        let p = map_rw(1);
+        if p == libc::MAP_FAILED {
+            return false;
+        }
+        let b = p as *mut u8;
         *b = 0xA5;
         *b.add(page - 1) = 0x5A;
 
-        let rc_none = libc::mprotect(single, page, libc::PROT_NONE);
-        let rc_read = libc::mprotect(single, page, libc::PROT_READ);
+        let rc_none = libc::mprotect(p, page, libc::PROT_NONE);
+        let rc_read = libc::mprotect(p, page, libc::PROT_READ);
         let read_intact = rc_read == 0 && *b == 0xA5 && *b.add(page - 1) == 0x5A;
-        let rc_rw = libc::mprotect(single, page, libc::PROT_READ | libc::PROT_WRITE);
+        let rc_rw = libc::mprotect(p, page, libc::PROT_READ | libc::PROT_WRITE);
         if rc_rw == 0 {
             *b = 0xB6;
             *b.add(page - 1) = 0x6B;
         }
         let write_intact = rc_rw == 0 && *b == 0xB6 && *b.add(page - 1) == 0x6B;
-        transitions_preserved = rc_none == 0 && rc_read == 0 && read_intact && write_intact;
-        libc::munmap(single, page);
-    }
+        let ok = rc_none == 0 && rc_read == 0 && read_intact && write_intact;
+        libc::munmap(p, page);
+        ok
+    });
 
-    // 6. Partial split: 3 contiguous pages, protect only middle page to PROT_READ
-    let p0 = p as *mut u8;
-    let p1 = p0.add(page);
-    let p2 = p0.add(page * 2);
-    *p0 = 0x11;
-    *p1 = 0x22;
-    *p2 = 0x33;
-
-    let split_rc = libc::mprotect(p1.cast(), page, libc::PROT_READ);
-    let mut split_ok = split_rc == 0;
-    // Outer pages remain writable
-    *p0 = 0x14;
-    *p2 = 0x36;
-    if *p0 != 0x14 || *p1 != 0x22 || *p2 != 0x36 {
-        split_ok = false;
-    }
-    // Restore middle page to RW
-    let restore_rc = libc::mprotect(p1.cast(), page, libc::PROT_READ | libc::PROT_WRITE);
-    if restore_rc != 0 {
-        split_ok = false;
-    } else {
-        *p1 = 0x25;
-        if *p0 != 0x14 || *p1 != 0x25 || *p2 != 0x36 {
-            split_ok = false;
+    let split_ok = run_bounded_bool_child(|| {
+        let p = map_rw(3);
+        if p == libc::MAP_FAILED {
+            return false;
         }
-    }
+        let p0 = p as *mut u8;
+        let p1 = p0.add(page);
+        let p2 = p0.add(page * 2);
+        *p0 = 0x11;
+        *p1 = 0x22;
+        *p2 = 0x33;
 
-    libc::munmap(p, page * 3);
+        let split_rc = libc::mprotect(p1.cast(), page, libc::PROT_READ);
+        let mut ok = split_rc == 0;
+        *p0 = 0x14;
+        *p2 = 0x36;
+        if *p0 != 0x14 || *p1 != 0x22 || *p2 != 0x36 {
+            ok = false;
+        }
+        let restore_rc = libc::mprotect(p1.cast(), page, libc::PROT_READ | libc::PROT_WRITE);
+        if restore_rc != 0 {
+            ok = false;
+        } else {
+            *p1 = 0x25;
+            if *p0 != 0x14 || *p1 != 0x25 || *p2 != 0x36 {
+                ok = false;
+            }
+        }
+        libc::munmap(p, page * 3);
+        ok
+    });
 
     report!(
         mprotect_unaligned_einval = unaligned_einval,

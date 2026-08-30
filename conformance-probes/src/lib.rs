@@ -18,6 +18,42 @@
 use core::mem::MaybeUninit;
 use std::io;
 
+/// Complete, deterministic observation of one boolean probe case executed in
+/// a bounded child process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundedChildResult {
+    /// The byte reported by the child, or `None` when it died before reporting.
+    pub result: Option<bool>,
+    /// Normal exit status, when the child exited normally.
+    pub exit: Option<i32>,
+    /// Terminating signal, when the child was killed by a signal.
+    pub signal: Option<i32>,
+    /// Whether the parent enforced the wall-clock timeout with `SIGKILL`.
+    pub timed_out: bool,
+}
+
+impl std::fmt::Display for BoundedChildResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let result = self
+            .result
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "missing".to_owned());
+        let exit = self
+            .exit
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_owned());
+        let signal = self
+            .signal
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_owned());
+        write!(
+            f,
+            "result={result},exit={exit},signal={signal},timeout={}",
+            self.timed_out
+        )
+    }
+}
+
 /// Last `errno`, or `-1` if libc gave us a non-os error.
 #[inline]
 pub fn errno() -> i32 {
@@ -165,6 +201,91 @@ pub unsafe fn reap(pid: i32) -> (i32, i32) {
     }
 }
 
+/// Run one boolean probe case in a child, killing it after one second if it
+/// neither returns nor terminates. The parent always records the child's exact
+/// result byte, normal exit status, terminating signal, and timeout state.
+///
+/// Setup failures panic instead of turning into a plausible conformance value.
+pub unsafe fn run_bounded_bool_child<F: FnOnce() -> bool>(f: F) -> BoundedChildResult {
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+    let (read_fd, write_fd) = pipe2();
+    let pid = libc::fork();
+    if pid < 0 {
+        let error = errno();
+        libc::close(read_fd);
+        libc::close(write_fd);
+        panic!("fork() failed: errno={error}");
+    }
+    if pid == 0 {
+        libc::close(read_fd);
+        let byte = [u8::from(f())];
+        loop {
+            let written = libc::write(write_fd, byte.as_ptr().cast(), byte.len());
+            if written == 1 || errno() != libc::EINTR {
+                break;
+            }
+        }
+        libc::close(write_fd);
+        libc::_exit(0);
+    }
+
+    libc::close(write_fd);
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    let mut poll_fd = libc::pollfd {
+        fd: read_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let mut timed_out = false;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            timed_out = true;
+            break;
+        }
+        let remaining_ms = i32::try_from(remaining.as_millis())
+            .unwrap_or(i32::MAX)
+            .max(1);
+        let poll_result = libc::poll(&mut poll_fd, 1, remaining_ms);
+        if poll_result > 0 {
+            break;
+        }
+        if poll_result == 0 {
+            timed_out = true;
+            break;
+        }
+        if errno() != libc::EINTR {
+            let error = errno();
+            libc::kill(pid, libc::SIGKILL);
+            let _ = reap(pid);
+            libc::close(read_fd);
+            panic!("poll() failed while waiting for probe child: errno={error}");
+        }
+    }
+
+    if timed_out {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    let mut byte = [0u8; 1];
+    let read = libc::read(read_fd, byte.as_mut_ptr().cast(), byte.len());
+    libc::close(read_fd);
+    let (waited, status) = reap(pid);
+    if waited != pid {
+        panic!(
+            "wait4() failed for probe child {pid}: rc={waited} errno={}",
+            errno()
+        );
+    }
+
+    BoundedChildResult {
+        result: (read == 1).then_some(byte[0] != 0),
+        exit: libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status)),
+        signal: libc::WIFSIGNALED(status).then(|| libc::WTERMSIG(status)),
+        timed_out,
+    }
+}
+
 /// Print one `key=value` boolean line on stdout. The conformance harness
 /// reads stdout byte-for-byte and diffs against the Linux oracle, so this
 /// is the *single allowed channel* for probe output. Use it instead of
@@ -176,4 +297,59 @@ macro_rules! report {
             println!("{}={}", stringify!($k), $v);
         )+
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_child_result_formats_every_observation() {
+        assert_eq!(
+            BoundedChildResult {
+                result: Some(true),
+                exit: Some(0),
+                signal: None,
+                timed_out: false,
+            }
+            .to_string(),
+            "result=true,exit=0,signal=none,timeout=false"
+        );
+        assert_eq!(
+            BoundedChildResult {
+                result: None,
+                exit: None,
+                signal: Some(libc::SIGSEGV),
+                timed_out: false,
+            }
+            .to_string(),
+            "result=missing,exit=none,signal=11,timeout=false"
+        );
+    }
+
+    #[test]
+    fn bounded_child_reports_success_false_and_signal() {
+        let success = unsafe { run_bounded_bool_child(|| true) };
+        assert_eq!(success.result, Some(true));
+        assert_eq!(success.exit, Some(0));
+        assert_eq!(success.signal, None);
+        assert!(!success.timed_out);
+
+        let failure = unsafe { run_bounded_bool_child(|| false) };
+        assert_eq!(failure.result, Some(false));
+        assert_eq!(failure.exit, Some(0));
+        assert_eq!(failure.signal, None);
+        assert!(!failure.timed_out);
+
+        let signal = unsafe {
+            run_bounded_bool_child(|| {
+                libc::raise(libc::SIGKILL);
+                true
+            })
+        };
+        assert_eq!(signal.result, None);
+        assert_eq!(signal.exit, None);
+        assert_eq!(signal.signal, Some(libc::SIGKILL));
+        assert!(!signal.timed_out);
+    }
 }
