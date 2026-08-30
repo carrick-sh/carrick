@@ -3633,17 +3633,21 @@ impl SyscallDispatcher {
                     // plain MAP_SHARED gets (which silently ignores unknown
                     // bits for back-compat). mmap20. Otherwise behaves like
                     // MAP_SHARED.
-                    if map_flags.contains(LinuxMmapFlags::ANONYMOUS) {
-                        return Ok(request.refused(
-                            MmapRefusal::Spec("MAP_SHARED_VALIDATE is invalid for an anonymous mapping"),
+                    let refusal = if map_flags.contains(LinuxMmapFlags::ANONYMOUS) {
+                        Some((
+                            "MAP_SHARED_VALIDATE is invalid for anonymous memory",
                             LINUX_EINVAL,
-                        ));
-                    }
-                    if map_flags.bits() & !LinuxMmapFlags::SUPPORTED_MASK != 0 {
-                        return Ok(request.refused(
-                            MmapRefusal::Spec("MAP_SHARED_VALIDATE with an unknown flag bit"),
+                        ))
+                    } else if map_flags.bits() & !LinuxMmapFlags::SUPPORTED_MASK != 0 {
+                        Some((
+                            "MAP_SHARED_VALIDATE with an unknown flag bit",
                             crate::linux_abi::LINUX_EOPNOTSUPP,
-                        ));
+                        ))
+                    } else {
+                        None
+                    };
+                    if let Some((reason, errno)) = refusal {
+                        return Ok(request.refused(MmapRefusal::Spec(reason), errno));
                     }
                     Some(MmapSharing::Shared)
                 } else if t == LinuxMmapFlags::SHARED {
