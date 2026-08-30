@@ -9722,7 +9722,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 4736,
+      "line": 4765,
       "categories": [
         "mapping"
       ],
@@ -15717,7 +15717,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/runtime.rs",
-      "line": 2509,
+      "line": 2507,
       "categories": [
         "stream"
       ],

@@ -492,6 +492,14 @@
     {
       "kind": "env_var_os",
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+      "symbol": "ipc_set_tests::remapped_shmat_same_shmid_does_not_deadlock_and_preserves_accounting::CARRICK_SAME_SHMID_TEST_CHILD",
+      "fingerprint": "5ce33d23c6269f3e9d7b296cc5ad1d97c03659130da4ada9048d434d10412736",
+      "classification": "test_only",
+      "rationale": "Test-only subprocess sentinel isolates the same-shmid remapped shmat deadlock watchdog regression test and is absent from production builds."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
       "symbol": "ipc_set_tests::watchdog_kills_and_reaps_on_deadlock_timeout::CARRICK_SYSVIPC_TEST_CHILD_DEADLOCK",
       "fingerprint": "e050f8de716dc76a296742adc56a973f60c4915aefd51b0a44653218cf8da7d2",
       "classification": "test_only",
@@ -576,6 +584,14 @@
       "fingerprint": "74a10faac7acd44b2a482888e2c4ab78e4f4976ecc57aa0f8be30f5d095f97f0",
       "classification": "config_debug",
       "rationale": "Environment variable DISABLE_ENV read in install::DISABLE_ENV (crates/carrick-runtime/src/kernel/debug/server.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
+      "symbol": "tests::production_carrier_budget_one_full_occupancy_defers_caller_self_ack_to_entry::ISOLATED_ENV",
+      "fingerprint": "db47b947bff4c3855c8dadde05cd337b2537f37926863719961a524d914ad7de",
+      "classification": "test_only",
+      "rationale": "Test-only subprocess sentinel isolates the one-vCPU full-occupancy handshake case and is absent from production builds."
     },
     {
       "kind": "env_var_os",
@@ -1243,6 +1259,14 @@
     },
     {
       "kind": "static",
+      "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+      "symbol": "SETALL_INTERLEAVING_HOOK",
+      "fingerprint": "c2adb22c84c943cdd36986311d36dfbbe022f140d191d276d55896f407d12da1",
+      "classification": "test_only",
+      "rationale": "Test-only synchronization hook allows deterministic testing of SETALL prepare-to-finalize interleaving and permission revalidation."
+    },
+    {
+      "kind": "static",
       "file": "crates/carrick-runtime/src/dtrace_consumer.rs",
       "symbol": "STDOUT_FP",
       "fingerprint": "14ede0199364dcf8fdea889dab6dd3e191dde639a0fa144484728c8feb4ed7b0",
@@ -1669,6 +1693,14 @@
     },
     {
       "kind": "static",
+      "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
+      "symbol": "foreign_cow_handshake_test_lock::LOCK",
+      "fingerprint": "68f1c965cdc5df3062e0e69d4e0575047d68bc650b4206c04c92c2c85e425ce8",
+      "classification": "test_only",
+      "rationale": "Cfg(test)-only mutex serializes foreign-COW handshake fixtures that share process-wide test controls; it is absent from production builds."
+    },
+    {
+      "kind": "static",
       "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
       "symbol": "tests::PTRACE_SIGNAL_TEST_LOCK",
       "fingerprint": "e38f595f6e8bc2ee4fc3f9fc01b1c1bc93d9eff2a6e7fb4e6889d90ef35bf947",
@@ -1998,6 +2030,14 @@
     {
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "foreign_mm_tests::FOREIGN_MM_TEST_LOCK",
+      "fingerprint": "93502987434aeab58511d7c5865a095b1819487990ad883ce0ebc4eca2fae982",
+      "classification": "test_only",
+      "rationale": "Test-module mutex serializes production-carrier foreign-MM fixtures that share global frame and failpoint controls; it is absent from production builds."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "fork_debug_ipa::CELL",
       "fingerprint": "cc3f21d07848ecf292592d67a15c1705782e6f022e25f6936acd6d67fc592f23",
       "classification": "config_debug",
@@ -2269,6 +2309,14 @@
     },
     {
       "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
+      "symbol": "EXACT_MM_STAGE1",
+      "fingerprint": "1831bf5d7c756e3b61f4c1029d96d250a26dae7fcad2141c09e88c86e8db501e",
+      "classification": "carrier_infra",
+      "rationale": "Per-host-service-thread weak lookup stack supports synchronous re-entry into an exact live MM stage-1 lease; authority remains in the upgraded lease and exact executor census rather than the thread-local observation."
+    },
+    {
+      "kind": "thread_local",
       "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
       "symbol": "SIGNAL_PROGRESS",
       "fingerprint": "7755e08c063b13aa58b05d249ee9449b42430aeb6fce85646cf2bb3f9a460ad5",
@@ -2290,38 +2338,6 @@
       "fingerprint": "d4c0c2b4d0434b284b08ad53be54942e8a78fe5ab78362a24ab33dbb97953d8e",
       "classification": "carrier_infra",
       "rationale": "Host thread-local cell THREAD_VCPU_CREATED_TOTAL in crates/carrick-vmm-hvf/src/trap.rs maintaining per-host-thread execution state for the carrier."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "symbol": "tests::production_carrier_budget_one_full_occupancy_defers_caller_self_ack_to_entry::ISOLATED_ENV",
-      "fingerprint": "db47b947bff4c3855c8dadde05cd337b2537f37926863719961a524d914ad7de",
-      "classification": "test_only",
-      "rationale": "Test-only subprocess sentinel isolates the one-vCPU full-occupancy handshake case and is absent from production builds."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
-      "symbol": "foreign_cow_handshake_test_lock::LOCK",
-      "fingerprint": "68f1c965cdc5df3062e0e69d4e0575047d68bc650b4206c04c92c2c85e425ce8",
-      "classification": "test_only",
-      "rationale": "Cfg(test)-only mutex serializes foreign-COW handshake fixtures that share process-wide test controls; it is absent from production builds."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "foreign_mm_tests::FOREIGN_MM_TEST_LOCK",
-      "fingerprint": "93502987434aeab58511d7c5865a095b1819487990ad883ce0ebc4eca2fae982",
-      "classification": "test_only",
-      "rationale": "Test-module mutex serializes production-carrier foreign-MM fixtures that share global frame and failpoint controls; it is absent from production builds."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
-      "symbol": "EXACT_MM_STAGE1",
-      "fingerprint": "1831bf5d7c756e3b61f4c1029d96d250a26dae7fcad2141c09e88c86e8db501e",
-      "classification": "carrier_infra",
-      "rationale": "Per-host-service-thread weak lookup stack supports synchronous re-entry into an exact live MM stage-1 lease; authority remains in the upgraded lease and exact executor census rather than the thread-local observation."
     }
   ]
 }
