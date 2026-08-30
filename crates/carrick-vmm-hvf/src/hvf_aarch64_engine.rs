@@ -396,6 +396,7 @@ pub struct HvpatchTaskOnlyEngineState {
     _snapshot: Aarch64VcpuSnapshot,
     runtime_projection: TaskOnlyRuntimeProjectionSlot,
     parked_task: parking_lot::Mutex<Option<HvfTaskState>>,
+    custody: std::sync::Arc<crate::trap::CarrierVmCustody>,
 }
 // SAFETY: the task projection contains only task-owned Arc authorities and raw
 // mapping metadata whose pointees are retained by the registration. It carries
@@ -481,7 +482,7 @@ impl HvpatchTaskOnlyEngineState {
     pub fn frame_cow_owner_inventory(
         &self,
     ) -> std::sync::Arc<dyn carrick_hal::FrameCowOwnerInventory> {
-        crate::trap::carrier_frame_cow_owner_inventory()
+        crate::trap::carrier_frame_cow_owner_inventory_in(std::sync::Arc::clone(&self.custody))
     }
 
     pub fn preflight_runtime_projection(
@@ -644,6 +645,7 @@ impl HvpatchPreparedTaskOnlyEngineState {
             _not_send: _,
         } = self;
         let backend = carrier.commit(directory)?;
+        let custody = backend.carrier_vm_custody()?;
         Ok(HvpatchTaskOnlyEngineState {
             _backend: backend,
             _snapshot: snapshot,
@@ -655,6 +657,7 @@ impl HvpatchPreparedTaskOnlyEngineState {
                 },
             ),
             parked_task: parking_lot::Mutex::new(None),
+            custody,
         })
     }
 
@@ -1087,7 +1090,9 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     fn frame_cow_owner_inventory(
         &self,
     ) -> Option<std::sync::Arc<dyn carrick_hal::FrameCowOwnerInventory>> {
-        Some(crate::trap::carrier_frame_cow_owner_inventory())
+        Some(crate::trap::carrier_frame_cow_owner_inventory_in(
+            self.state.carrier_vm_custody(),
+        ))
     }
 
     fn audit_executor_boundary(&mut self, vcpu: &mut Self::Vcpu) -> Result<(), TrapError> {
