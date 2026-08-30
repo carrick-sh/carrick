@@ -7102,6 +7102,19 @@ mod kernel_process_dispatch_tests {
                 &root,
                 &mut memory,
                 SYS_PTRACE,
+                [LINUX_PTRACE_PEEKDATA, target_pid as u64, TARGET_VA, 0, 0, 0],
+                None,
+            ),
+            DispatchOutcome::errno(LINUX_ESRCH),
+            "untraced target must return ESRCH before execution-lease/MM acquisition",
+        );
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
                 [LINUX_PTRACE_PEEKDATA, target_pid as u64, 1, 0, 0, 0],
                 Some(&lease),
             ),
@@ -7120,6 +7133,37 @@ mod kernel_process_dispatch_tests {
             ),
             DispatchOutcome::errno(LINUX_ESRCH),
             "nonexistent target with unaligned address must return ESRCH",
+        );
+    }
+
+    #[test]
+    fn hvpatch_ptrace_memory_witness_rejects_resume_restop_aba() {
+        let (_lane, _dispatcher, _process, root, _lease) = bound_dispatcher(61_151);
+        let target = process_vm_target_with_payload(&root, 61_152, b"ABASTOP1");
+        arm_ptrace_memory_access(&root, &target);
+        let tracer_key = root.task().key();
+        let target_key = target.task().key();
+
+        let witness = root
+            .kernel()
+            .begin_ptrace_memory_access(tracer_key, target_key)
+            .expect("settled stop must mint an exact access witness");
+
+        assert!(
+            root.kernel()
+                .resume_task_from_ptrace(tracer_key, target_key.id, None)
+        );
+        let stop = crate::kernel::LinuxSignal::for_signal_number(12).unwrap();
+        assert!(root.kernel().stop_task_for_ptrace(target_key.id, stop));
+        assert_eq!(
+            root.kernel().settle_task_ptrace_stop(target_key.id),
+            crate::kernel::objects::PtraceStopSettlement::Stopped,
+        );
+
+        assert_eq!(
+            root.kernel().with_ptrace_memory_access(&witness, || ()),
+            Err(LINUX_ESRCH),
+            "a new settled stop must not revive an earlier memory-access capability",
         );
     }
 
