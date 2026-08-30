@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "shard": "runtime.json",
-  "typed_error_debt_ceiling": 47,
+  "typed_error_debt_ceiling": 49,
   "rows": [
     {
       "file": "crates/carrick-runtime/src/dispatch/creds.rs",
@@ -578,6 +578,33 @@
       "rationale": "Unmapping host memory range failed under concurrent-exec protection, leaving a live host mapping outside VMA/arena allocation ownership."
     },
     {
+      "file": "crates/carrick-runtime/src/dispatch/mm_mutation.rs",
+      "function": "from_pt_pause",
+      "ordinal_in_function": 1,
+      "fingerprint": "b9c13fcd0a74f8dfc82ea9b7134de5ec9bc88d3d7b5aa96ec96210fcc9d414e8",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mm_mutation",
+      "rationale": "Active PtPauseGuard missing mutation identity (coordinator/MM); continuing would construct MmMutationGuard without valid MM coordinator authority while page-table exclusion is active."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mm_mutation.rs",
+      "function": "from_frame_cow",
+      "ordinal_in_function": 1,
+      "fingerprint": "b9c13fcd0a74f8dfc82ea9b7134de5ec9bc88d3d7b5aa96ec96210fcc9d414e8",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mm_mutation",
+      "rationale": "Active FrameCowExactMmGuard missing mutation identity (coordinator/MM); continuing would construct MmMutationGuard without valid MM coordinator authority while frame COW exclusion is active."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mm_mutation.rs",
+      "function": "<MmSnapshotGuard as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "3f70b0e00aaeda60afd5b18ca4f9a4d8b0c87c47e3249aae8ab198f22cc98a0a",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mm_mutation",
+      "rationale": "snapshot_readers counter underflow during MmSnapshotGuard drop indicates corrupted coordinator reader accounting."
+    },
+    {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
       "function": "MmExecutorParticipation::participation_mut",
       "ordinal_in_function": 1,
@@ -599,15 +626,6 @@
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
       "function": "DispatchMmBinding::stage_private_exec",
       "ordinal_in_function": 1,
-      "fingerprint": "8edc1640f3b9b9700c5d035bc01c5fffd8971223c4d0845b0d351675529c28b5",
-      "verdict": "carrier_fault",
-      "failure_domain": "dispatch::mm_binding",
-      "rationale": "Active MM authority missing from dispatch guard during stage_private_exec; cannot stage exec memory without active MM authority."
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "DispatchMmBinding::stage_private_exec",
-      "ordinal_in_function": 2,
       "fingerprint": "4aef0363471e49bff0f161b4ebc0e6e28e7d7ebe526ef3732f79b8c79ba2277d",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mm_binding",
@@ -633,7 +651,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "HostAliasDispatchGuard::with_authority",
+      "function": "HostAliasDispatchGuard<'_>::with_authority",
       "ordinal_in_function": 1,
       "fingerprint": "0267bea011b5128f256b8a1887f3a675bdbaf358d9131072306f4c6388fa3e8c",
       "verdict": "carrier_fault",
@@ -642,7 +660,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "HostAliasDispatchGuard::publish",
+      "function": "HostAliasDispatchGuard<'_>::publish",
       "ordinal_in_function": 1,
       "fingerprint": "d61a81a7bd88e9562eaea4f0c88b62bf008bfb17afa61af390fd913da93ea7c7",
       "verdict": "typed_error_debt",
@@ -652,7 +670,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "HostAliasDispatchGuard::publish",
+      "function": "HostAliasDispatchGuard<'_>::publish",
       "ordinal_in_function": 2,
       "fingerprint": "9f1bed49d732289f922f32cc472a860aa7f65e780c44636eb4c988ae41e94b7a",
       "verdict": "carrier_fault",
@@ -661,7 +679,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "<HostAliasDispatchGuard as Drop>::drop",
+      "function": "<HostAliasDispatchGuard<'_> as Drop>::drop",
       "ordinal_in_function": 1,
       "fingerprint": "647ae84d915eee12ca825debc3308248177857b5592c816b808bcefad4574160",
       "verdict": "carrier_fault",
@@ -708,21 +726,21 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "SyscallDispatcher::prepare_fork_mm",
-      "ordinal_in_function": 1,
-      "fingerprint": "48f6c1094873743dd9583e5f7b2ee7206b100dd1c9ba79e0e4151c4dae91da7d",
+      "function": "SyscallDispatcher::bind_hvpatch_process",
+      "ordinal_in_function": 3,
+      "fingerprint": "31139df9317ab927fd6e22f2f85bc47b3e0693e63c92c37eb80993b84534ab7b",
       "verdict": "carrier_fault",
-      "failure_domain": "dispatch::mm_binding",
-      "rationale": "Active MM authority missing from fork dispatch guard in prepare_fork_mm; cannot prepare child MM without parent authority."
+      "failure_domain": "dispatch::hvpatch_binding",
+      "rationale": "Binding exact HVPatch stage-1 MM lease authority failed during HVPatch process binding; dispatcher cannot install foreign MM mutation authority for address space management."
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "SyscallDispatcher::fork_clone_with_prepared_mm_observed",
+      "function": "SyscallDispatcher::fork_clone_with_prepared_mm_authorized_observed",
       "ordinal_in_function": 1,
       "fingerprint": "2cfe013f5a69171fea944dd0db920adbca4cc96de6d0db1bff76bcf04a7cac4c",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mm_binding",
-      "rationale": "Active MM authority missing from fork install guard during fork_clone_with_prepared_mm_observed; cannot validate parent MM state."
+      "rationale": "Active MM authority missing from fork install guard during fork_clone_with_prepared_mm_authorized_observed; cannot validate parent MM state."
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
@@ -835,6 +853,16 @@
       "failure_domain": "dispatch::fs_context",
       "rationale": "Capturing task context for set_cwd occurs before filesystem mutation and should return a typed LinuxErrno instead of aborting.",
       "typed_error": "LinuxErrno"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "function": "SyscallDispatcher::mem_snapshot",
+      "ordinal_in_function": 1,
+      "fingerprint": "6b3d3aea2123f9a86d4ba55e04199eb4e2522717611d077598e39fa73357e9e5",
+      "verdict": "typed_error_debt",
+      "failure_domain": "dispatch::mem_snapshot",
+      "rationale": "Synthetic proc MemState snapshot acquisition timeout occurs during non-destructive read before synthetic VFS publication and should propagate SnapshotError instead of aborting.",
+      "typed_error": "SnapshotError"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/resources.rs",
@@ -1021,6 +1049,25 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
+      "function": "ProcessContext::with_foreign_mm_endpoint",
+      "ordinal_in_function": 1,
+      "fingerprint": "cf1c906e9cd309f400108da061c6f910d894281d73b3d14da8d399d6fede33b1",
+      "verdict": "typed_error_debt",
+      "failure_domain": "hvpatch::bootstrap",
+      "rationale": "Foreign MM endpoint installation failure on root ProcessContext occurs during root bootstrap before guest execution and should return a typed RuntimeError instead of aborting.",
+      "typed_error": "RuntimeError"
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
+      "function": "ProcessContext::bind_mm_mutation_authority",
+      "ordinal_in_function": 1,
+      "fingerprint": "6fb6fe453c184b4bc258bbda13d456c78f8bdc55d3ef97180a708217f04fcf8f",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::process_context",
+      "rationale": "Capturing leader task context in ProcessContext::bind_mm_mutation_authority failed; cannot install foreign MM mutation authority without active task context in kernel graph."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
       "function": "ProcessContext::prepare_exec_for_linux_tid_with_mm_reservation",
       "ordinal_in_function": 1,
       "fingerprint": "72df3f9cd8428963b58f217a5c5412b8ecda2d34010408a4d8c9af29706166ce",
@@ -1032,7 +1079,7 @@
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
       "function": "ProcessContext::prepare_exec_for_linux_tid_with_mm_reservation",
       "ordinal_in_function": 2,
-      "fingerprint": "673385d25320d437e1288c5c00d750e136d8d4a962d7d75c15e9d53e2edad91a",
+      "fingerprint": "611b38e4f82a27b7f8236b1f0ba2649d342f85cf0ad34800ca814b59b52b89f2",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::exec_rollback",
       "rationale": "Exec MM reservation abort failed during error cleanup after VMA freeze preparation failure; leaves MM reservation and lease state inconsistent."
@@ -1081,6 +1128,114 @@
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::exec_commit",
       "rationale": "Exec MM reservation commit failed after predecessor VMA freeze was already committed; state is irreversible and cannot resume predecessor or child."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
+      "function": "Stage1MmLease::foreign_stage1_identity",
+      "ordinal_in_function": 1,
+      "fingerprint": "f46462d79fd1b59ae0ee948a480cba764105e4e3d5c5200bb78f9ca379e38ab2",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::stage1_mm",
+      "rationale": "Zero MmId raw value encountered during foreign_stage1_identity construction; violates non-zero MM identifier invariant."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
+      "function": "Stage1MmLease::foreign_stage1_identity",
+      "ordinal_in_function": 2,
+      "fingerprint": "041c092e46b0fe4728607df73eebd2db858eeb05b6468391d9e26b209b599d22",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::stage1_mm",
+      "rationale": "Zero ASID encountered in live Stage1MmLease binding; violates non-zero ASID invariant for active stage-1 lease."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
+      "function": "Stage1MmLease::foreign_stage1_identity",
+      "ordinal_in_function": 3,
+      "fingerprint": "da48a4e83dc2521d9adfaff83bfa44c31e525c8ce5239b1e145777d2a248545a",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::stage1_mm",
+      "rationale": "Zero ASID generation encountered in live Stage1MmLease; violates non-zero ASID generation invariant."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
+      "function": "Stage1MmLease::foreign_stage1_identity",
+      "ordinal_in_function": 4,
+      "fingerprint": "e87c6d689261085ddb6f3cb5fa5f9e5c9c96ef07fe7a978235a724cebbb3a31b",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::stage1_mm",
+      "rationale": "Mismatched ASID or invalid parameters when constructing ForeignStage1Identity; violates cross-domain stage-1 identity invariants."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
+      "function": "Stage1MmLease::cow_invalidation_observer",
+      "ordinal_in_function": 1,
+      "fingerprint": "92bec361fae983953fb95b9f8a268aae8969834402a7e6aa03a20d3aab7576b6",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::stage1_mm",
+      "rationale": "Executor missing from CowInvalidationState observed map in cow_invalidation_observer; executor was not properly admitted or observer state is corrupted."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
+      "function": "Stage1MmLease::publish_cow_invalidation",
+      "ordinal_in_function": 1,
+      "fingerprint": "b9d9ffadd302ac214fe75f3b0eb824e0d16f69cf24a79d4a33a7386f6c7cadff",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::stage1_mm",
+      "rationale": "COW invalidation generation counter u64 overflow in publish_cow_invalidation would wrap generation and corrupt TLB invalidation tracking."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
+      "function": "Stage1MmLease::publish_cow_invalidation",
+      "ordinal_in_function": 2,
+      "fingerprint": "c94c73aad9fc2a6c9431f444dffe7b76847301f17da4336540133be25bf379fd",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::stage1_mm",
+      "rationale": "Zero COW invalidation generation encountered after increment in publish_cow_invalidation; violates non-zero generation invariant."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
+      "function": "Stage1MmLease::pending_cow_invalidation",
+      "ordinal_in_function": 1,
+      "fingerprint": "ca18c917ec7dbdb1367e191e97ffe8223ef55b3d050e898bdf5a38794ff322d6",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::stage1_mm",
+      "rationale": "Zero COW invalidation generation in pending_cow_invalidation with active pending executors; violates non-zero invalidation generation invariant."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
+      "function": "Stage1MmLease::acknowledge_cow_invalidation",
+      "ordinal_in_function": 1,
+      "fingerprint": "b8758b2503bb419b499218177276b9bc9134ed01ee6b3830776f398e50b676ed",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::stage1_mm",
+      "rationale": "Executor present in pending set but missing from observed map during acknowledge_cow_invalidation; internal invalidation state is corrupted."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
+      "function": "Stage1MmLease::service_pending_cow_invalidation",
+      "ordinal_in_function": 1,
+      "fingerprint": "4060d621f257516b2d5a3d49e8245e4d2d651b7f32a639ea481ed89d3ab4ebc2",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::stage1_mm",
+      "rationale": "Mismatched ASID or published generation Arc reference in CowInvalidationObserver during service_pending_cow_invalidation; violates exact-lease observer binding."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
+      "function": "Stage1MmLease::service_pending_cow_invalidation",
+      "ordinal_in_function": 2,
+      "fingerprint": "0e1ace655bf0982a6953ec08ae3eed54503790406ed3cfc6f9ac28414dbc3bab",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::stage1_mm",
+      "rationale": "CowInvalidationObserver indicates service needed but pending_cow_invalidation returned None; indicates desynchronized or corrupted observer state."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
+      "function": "Stage1MmLease::service_pending_cow_invalidation",
+      "ordinal_in_function": 3,
+      "fingerprint": "f0f534b646fe147e2bccf04e63054ced6fe075709c0b404f75f1a3abac2ee39e",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::stage1_mm",
+      "rationale": "Acknowledging COW invalidation failed after hardware invalidation completed in service_pending_cow_invalidation; leaves invalidation ticket in indeterminate state."
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
@@ -1187,7 +1342,7 @@
       "file": "crates/carrick-runtime/src/kernel/guest_execution.rs",
       "function": "<GuestExecutorParticipation as Drop>::drop",
       "ordinal_in_function": 1,
-      "fingerprint": "f5a32509dd5c3038ca56186d37732127ed58a94942389e7abfe557a1598968d2",
+      "fingerprint": "beb57309cd7079e70269fe4c89487a6af7bc1b128056b2a4b0e5c474d3a108a3",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::guest_executor_census",
       "rationale": "An exact guest-executor participation identity disappeared before its unique RAII guard dropped; continuing would undercount an admitted executor and permit unsafe stage-1 mutation."
@@ -1548,7 +1703,7 @@
       "file": "crates/carrick-runtime/src/runtime.rs",
       "function": "run_combined_syscall_loop_with_dispatcher",
       "ordinal_in_function": 1,
-      "fingerprint": "4a160cb4ed4612e02ba7bf8a9e327ac8d3b5e2075ed47a1c9670251c7888f452",
+      "fingerprint": "5a706a5fda5fb0ad90cd4e73704db5c4613afb0913b8e75175b3f42e302a2ab2",
       "verdict": "carrier_fault",
       "failure_domain": "runtime::host_alias_mapping",
       "rationale": "runtime.map_host_alias backend failure during alias installation; leaves hardware page tables and stage-2 mappings in an unrecoverable split state."
@@ -1557,7 +1712,7 @@
       "file": "crates/carrick-runtime/src/runtime.rs",
       "function": "run_combined_syscall_loop_with_dispatcher",
       "ordinal_in_function": 2,
-      "fingerprint": "4a160cb4ed4612e02ba7bf8a9e327ac8d3b5e2075ed47a1c9670251c7888f452",
+      "fingerprint": "5a706a5fda5fb0ad90cd4e73704db5c4613afb0913b8e75175b3f42e302a2ab2",
       "verdict": "carrier_fault",
       "failure_domain": "runtime::host_alias_mapping",
       "rationale": "Host alias mapping length overflowed usize after backend mapping was installed; cannot apply memory protection to live mapping."
@@ -1566,7 +1721,7 @@
       "file": "crates/carrick-runtime/src/runtime.rs",
       "function": "run_combined_syscall_loop_with_dispatcher",
       "ordinal_in_function": 3,
-      "fingerprint": "4a160cb4ed4612e02ba7bf8a9e327ac8d3b5e2075ed47a1c9670251c7888f452",
+      "fingerprint": "5a706a5fda5fb0ad90cd4e73704db5c4613afb0913b8e75175b3f42e302a2ab2",
       "verdict": "carrier_fault",
       "failure_domain": "runtime::host_alias_mapping",
       "rationale": "runtime.protect_range failed to apply PROT_NONE to installed host alias mapping; continuing would leave inaccessible memory readable."
@@ -1575,7 +1730,7 @@
       "file": "crates/carrick-runtime/src/runtime.rs",
       "function": "run_combined_syscall_loop_with_dispatcher",
       "ordinal_in_function": 4,
-      "fingerprint": "4a160cb4ed4612e02ba7bf8a9e327ac8d3b5e2075ed47a1c9670251c7888f452",
+      "fingerprint": "5a706a5fda5fb0ad90cd4e73704db5c4613afb0913b8e75175b3f42e302a2ab2",
       "verdict": "carrier_fault",
       "failure_domain": "runtime::host_alias_mapping",
       "rationale": "Host alias bus fault length overflowed usize after backend mapping was installed; cannot apply bus-fault guard protection."
@@ -1584,7 +1739,7 @@
       "file": "crates/carrick-runtime/src/runtime.rs",
       "function": "run_combined_syscall_loop_with_dispatcher",
       "ordinal_in_function": 5,
-      "fingerprint": "4a160cb4ed4612e02ba7bf8a9e327ac8d3b5e2075ed47a1c9670251c7888f452",
+      "fingerprint": "5a706a5fda5fb0ad90cd4e73704db5c4613afb0913b8e75175b3f42e302a2ab2",
       "verdict": "carrier_fault",
       "failure_domain": "runtime::host_alias_mapping",
       "rationale": "runtime.protect_range failed to apply guard protection to bus fault range of host alias mapping; leaves invalid file region accessible."
@@ -1593,7 +1748,7 @@
       "file": "crates/carrick-runtime/src/runtime.rs",
       "function": "run_combined_syscall_loop_with_dispatcher",
       "ordinal_in_function": 6,
-      "fingerprint": "4a160cb4ed4612e02ba7bf8a9e327ac8d3b5e2075ed47a1c9670251c7888f452",
+      "fingerprint": "5a706a5fda5fb0ad90cd4e73704db5c4613afb0913b8e75175b3f42e302a2ab2",
       "verdict": "carrier_fault",
       "failure_domain": "runtime::host_alias_mapping",
       "rationale": "dispatcher.commit_host_alias_install failed after backend host mapping was installed; leaves uncommitted alias mapping in guest address space."
