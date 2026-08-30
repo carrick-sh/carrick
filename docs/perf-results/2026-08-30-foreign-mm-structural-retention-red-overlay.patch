@@ -1,0 +1,47 @@
+# Carrick foreign-MM structural-retention RED overlay
+# Base commit: 700dcae52972a1312aab85c947821396c9f7c471
+# Base trap.rs blob: e27e9bc7af9e8c9a8bef9eab140f57080097bc60
+# Overlay trap.rs blob: 3a73918b1824d6c1c9da906fe99eb04f065728c1
+# Apply from the exact base: git apply --check /path/to/this/patch
+# Apply from the exact base: git apply /path/to/this/patch
+# Verify: RUSTC_WRAPPER= RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf --lib trap::foreign_mm_tests::red_overlay_global_owner_retains_backing_until_stage2_retirement -- --exact --nocapture
+diff --git a/crates/carrick-vmm-hvf/src/trap.rs b/crates/carrick-vmm-hvf/src/trap.rs
+index e27e9bc7a..3a73918b1 100644
+--- a/crates/carrick-vmm-hvf/src/trap.rs
++++ b/crates/carrick-vmm-hvf/src/trap.rs
+@@ -234,6 +234,34 @@ mod foreign_mm_tests {
+     const OWNER_LEN: usize = 0x4000;
+     static FOREIGN_MM_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+-
++
++    #[test]
++    fn red_overlay_global_owner_retains_backing_until_stage2_retirement() {
++        let _guard = FOREIGN_MM_TEST_LOCK.lock();
++        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
++            OWNER_LEN,
++            crate::host_mapping::HostMappingKind::PerMmKernelState,
++        )
++        .expect("allocate global-owner rollback backing");
++        let host_addr = mapping.as_ptr() as usize;
++        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
++        let mut lease = GlobalFrameStage2Lease::fixed(0x7d00_0000_0000, OWNER_LEN as u64);
++        lease.drop_backing_audit = Some((host_addr, Arc::clone(&observed)));
++        let owner = GlobalFrameHostOwner {
++            _mapping: mapping,
++            _lease: lease,
++            perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
++            generation: next_global_frame_owner_generation(),
++        };
++
++        drop(owner);
++
++        assert!(
++            observed.load(std::sync::atomic::Ordering::SeqCst),
++            "stage-2 retirement must observe the exact host backing still live"
++        );
++        assert!(!alias_backing_is_live(host_addr));
++    }
++
+     #[derive(Clone, Debug, Eq, PartialEq)]
+     struct TestSnapshot {
+         mm: NonZeroU64,

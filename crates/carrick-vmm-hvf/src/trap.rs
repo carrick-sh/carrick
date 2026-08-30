@@ -234,6 +234,77 @@ mod foreign_mm_tests {
     const OWNER_LEN: usize = 0x4000;
     static FOREIGN_MM_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
+    #[derive(Debug, Eq, PartialEq)]
+    struct InventoryExtentFingerprint {
+        key: (u64, u64),
+        frame: carrick_hal::FrameId,
+        mapping: carrick_hal::MappingId,
+        backing: InventoryBackingIdentity,
+        stage2_base: u64,
+        stage2_length: u64,
+        owner_host_addr: usize,
+        owner_generation: u64,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct InventoryFingerprint {
+        initialized: bool,
+        extents: Vec<InventoryExtentFingerprint>,
+        shared: std::collections::BTreeMap<InventoryBackingIdentity, carrick_hal::FrameId>,
+        references: std::collections::BTreeMap<carrick_hal::FrameId, usize>,
+        extent_references: std::collections::BTreeMap<(carrick_hal::FrameId, u64, u64), usize>,
+        stage2_references: std::collections::BTreeMap<(u64, u64), usize>,
+        authority_retained_stage2: std::collections::BTreeSet<(u64, u64)>,
+    }
+
+    fn inventory_fingerprint(inventory: &HvpatchFrameInventory) -> InventoryFingerprint {
+        let frames = inventory.frames.lock();
+        InventoryFingerprint {
+            initialized: inventory.initialized,
+            extents: inventory
+                .extents
+                .iter()
+                .map(|(&key, extent)| InventoryExtentFingerprint {
+                    key,
+                    frame: extent.frame,
+                    mapping: extent.mapping,
+                    backing: extent.backing,
+                    stage2_base: extent.stage2_base,
+                    stage2_length: extent.stage2_length,
+                    owner_host_addr: extent.stage2_owner.host_addr,
+                    owner_generation: extent.stage2_owner.generation,
+                })
+                .collect(),
+            shared: frames.shared.clone(),
+            references: frames.references.clone(),
+            extent_references: frames.extent_references.clone(),
+            stage2_references: frames.stage2_references.clone(),
+            authority_retained_stage2: frames.authority_retained_stage2.clone(),
+        }
+    }
+
+    struct ExternalAliasStateRestore {
+        aliases: Vec<AliasBacking>,
+        replay: std::collections::BTreeSet<ReplayMappingKey>,
+    }
+
+    impl ExternalAliasStateRestore {
+        fn capture() -> Self {
+            let replay = replay_mappings().lock().clone();
+            let aliases = alias_registry().lock().clone();
+            Self { aliases, replay }
+        }
+    }
+
+    impl Drop for ExternalAliasStateRestore {
+        fn drop(&mut self) {
+            mutate_external_alias_state(|replay, aliases| {
+                *replay = std::mem::take(&mut self.replay);
+                *aliases = std::mem::take(&mut self.aliases);
+            });
+        }
+    }
+
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct TestSnapshot {
         mm: NonZeroU64,
@@ -2114,10 +2185,26 @@ mod foreign_mm_tests {
     }
 
     #[test]
+    #[ignore = "requires a signed HVF test executable"]
     fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycle() {
         let _guard = FOREIGN_MM_TEST_LOCK.lock();
-        let _stage2_stub = ScopedStage2MapTestStub::enable();
-        let root_slot_base = 0x9a00_0000_0000u64;
+        let custody = Arc::new(CarrierVmCustody::new());
+        let carrier_foreign_mm_transport = Arc::new(CarrierForeignMmTransport {
+            custody: Arc::clone(&custody),
+            ..CarrierForeignMmTransport::default()
+        });
+        let (vm, permit, creation) = create_vm_with_admission(
+            VmCreateAdmission::Initial,
+            &carrier_foreign_mm_transport.custody,
+        )
+        .expect("create custody-approved signed-test VM");
+        drop(permit);
+        let vm = SetupVmGuard::new(vm, true);
+        creation
+            .commit()
+            .expect("commit signed-test VM creation transaction");
+        let vm = std::mem::ManuallyDrop::new(vm.into_inner());
+        let root_slot_base = crate::memory::LINUX_HVPATCH_ROOT_SLOT_BASE + 0x20_0000;
         let root_slot_size = 0x0020_0000usize;
 
         // 1. Setup parent page tables and mappings covering all 5 required dispositions:
@@ -2178,12 +2265,19 @@ mod foreign_mm_tests {
         unsafe {
             std::ptr::copy_nonoverlapping(rx_payload.as_ptr(), parent_rx_addr, rx_payload.len());
         }
-        let mut parent_rx_lease = GlobalFrameStage2Lease::fixed(0x8800_3000_0000, 0x4000);
-        let rc = unsafe { inventory_hv_vm_map(parent_rx_addr.cast(), 0x8800_3000_0000, 0x4000, 5) };
+        let mut parent_rx_lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000)
+            .expect("reserve parent rx global-frame IPA");
+        let parent_rx_ipa = parent_rx_lease.base;
+        let rc = unsafe { inventory_hv_vm_map(parent_rx_addr.cast(), parent_rx_ipa, 0x4000, 5) };
         assert_eq!(rc, 0);
         parent_rx_lease.mark_mapped();
-        let parent_rx_gen = register_global_frame_host_owner(parent_rx_lease, parent_rx_host, 5)
-            .expect("register parent rx owner");
+        let parent_rx_gen = register_global_frame_host_owner_in(
+            &carrier_foreign_mm_transport.custody,
+            parent_rx_lease,
+            parent_rx_host,
+            5,
+        )
+        .expect("register parent rx owner");
 
         let parent_rw_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
             0x4000,
@@ -2195,12 +2289,19 @@ mod foreign_mm_tests {
         unsafe {
             std::ptr::copy_nonoverlapping(rw_payload.as_ptr(), parent_rw_addr, rw_payload.len());
         }
-        let mut parent_rw_lease = GlobalFrameStage2Lease::fixed(0x8800_4000_0000, 0x4000);
-        let rc = unsafe { inventory_hv_vm_map(parent_rw_addr.cast(), 0x8800_4000_0000, 0x4000, 3) };
+        let mut parent_rw_lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000)
+            .expect("reserve parent rw global-frame IPA");
+        let parent_rw_ipa = parent_rw_lease.base;
+        let rc = unsafe { inventory_hv_vm_map(parent_rw_addr.cast(), parent_rw_ipa, 0x4000, 3) };
         assert_eq!(rc, 0);
         parent_rw_lease.mark_mapped();
-        let parent_rw_gen = register_global_frame_host_owner(parent_rw_lease, parent_rw_host, 3)
-            .expect("register parent rw owner");
+        let parent_rw_gen = register_global_frame_host_owner_in(
+            &carrier_foreign_mm_transport.custody,
+            parent_rw_lease,
+            parent_rw_host,
+            3,
+        )
+        .expect("register parent rw owner");
 
         let parent_cow_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
             0x4000,
@@ -2212,13 +2313,19 @@ mod foreign_mm_tests {
         unsafe {
             std::ptr::copy_nonoverlapping(cow_payload.as_ptr(), parent_cow_addr, cow_payload.len());
         }
-        let mut parent_cow_lease = GlobalFrameStage2Lease::fixed(0x8800_5000_0000, 0x4000);
-        let rc =
-            unsafe { inventory_hv_vm_map(parent_cow_addr.cast(), 0x8800_5000_0000, 0x4000, 3) };
+        let mut parent_cow_lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000)
+            .expect("reserve parent COW global-frame IPA");
+        let parent_cow_ipa = parent_cow_lease.base;
+        let rc = unsafe { inventory_hv_vm_map(parent_cow_addr.cast(), parent_cow_ipa, 0x4000, 3) };
         assert_eq!(rc, 0);
         parent_cow_lease.mark_mapped();
-        let parent_cow_gen = register_global_frame_host_owner(parent_cow_lease, parent_cow_host, 3)
-            .expect("register parent cow owner");
+        let parent_cow_gen = register_global_frame_host_owner_in(
+            &carrier_foreign_mm_transport.custody,
+            parent_cow_lease,
+            parent_cow_host,
+            3,
+        )
+        .expect("register parent cow owner");
 
         let parent_mappings = vec![
             HvfMappedRegion {
@@ -2285,8 +2392,8 @@ mod foreign_mm_tests {
             HvfMappedRegion {
                 start: 0x0040_0000,
                 end: 0x0040_4000,
-                ipa: 0x8800_3000_0000,
-                physical_ipa: 0x8800_3000_0000,
+                ipa: parent_rx_ipa,
+                physical_ipa: parent_rx_ipa,
                 host_addr: parent_rx_addr,
                 size: 0x4000,
                 physical_size: 0x4000,
@@ -2305,8 +2412,8 @@ mod foreign_mm_tests {
             HvfMappedRegion {
                 start: 0x0060_0000,
                 end: 0x0060_4000,
-                ipa: 0x8800_4000_0000,
-                physical_ipa: 0x8800_4000_0000,
+                ipa: parent_rw_ipa,
+                physical_ipa: parent_rw_ipa,
                 host_addr: parent_rw_addr,
                 size: 0x4000,
                 physical_size: 0x4000,
@@ -2325,8 +2432,8 @@ mod foreign_mm_tests {
             HvfMappedRegion {
                 start: 0x0080_0000,
                 end: 0x0080_4000,
-                ipa: 0x8800_5000_0000,
-                physical_ipa: 0x8800_5000_0000,
+                ipa: parent_cow_ipa,
+                physical_ipa: parent_cow_ipa,
                 host_addr: parent_cow_addr,
                 size: 0x4000,
                 physical_size: 0x4000,
@@ -2405,7 +2512,7 @@ mod foreign_mm_tests {
                     },
                 ),
                 (
-                    (0x8800_3000_0000, 0x4000),
+                    (parent_rx_ipa, 0x4000),
                     InventoryExtent {
                         frame: carrick_hal::FrameId::from_kernel_allocation(
                             std::num::NonZeroU64::new(4).unwrap(),
@@ -2414,7 +2521,7 @@ mod foreign_mm_tests {
                             std::num::NonZeroU64::new(4).unwrap(),
                         ),
                         backing: InventoryBackingIdentity::Private(4),
-                        stage2_base: 0x8800_3000_0000,
+                        stage2_base: parent_rx_ipa,
                         stage2_length: 0x4000,
                         stage2_owner: InventoryStage2OwnerIdentity {
                             host_addr: parent_rx_addr as usize,
@@ -2423,7 +2530,7 @@ mod foreign_mm_tests {
                     },
                 ),
                 (
-                    (0x8800_4000_0000, 0x4000),
+                    (parent_rw_ipa, 0x4000),
                     InventoryExtent {
                         frame: carrick_hal::FrameId::from_kernel_allocation(
                             std::num::NonZeroU64::new(5).unwrap(),
@@ -2432,7 +2539,7 @@ mod foreign_mm_tests {
                             std::num::NonZeroU64::new(5).unwrap(),
                         ),
                         backing: InventoryBackingIdentity::Private(5),
-                        stage2_base: 0x8800_4000_0000,
+                        stage2_base: parent_rw_ipa,
                         stage2_length: 0x4000,
                         stage2_owner: InventoryStage2OwnerIdentity {
                             host_addr: parent_rw_addr as usize,
@@ -2441,7 +2548,7 @@ mod foreign_mm_tests {
                     },
                 ),
                 (
-                    (0x8800_5000_0000, 0x4000),
+                    (parent_cow_ipa, 0x4000),
                     InventoryExtent {
                         frame: carrick_hal::FrameId::from_kernel_allocation(
                             std::num::NonZeroU64::new(6).unwrap(),
@@ -2450,7 +2557,7 @@ mod foreign_mm_tests {
                             std::num::NonZeroU64::new(6).unwrap(),
                         ),
                         backing: InventoryBackingIdentity::Private(6),
-                        stage2_base: 0x8800_5000_0000,
+                        stage2_base: parent_cow_ipa,
                         stage2_length: 0x4000,
                         stage2_owner: InventoryStage2OwnerIdentity {
                             host_addr: parent_cow_addr as usize,
@@ -2521,13 +2628,13 @@ mod foreign_mm_tests {
             crate::memory::LINUX_PAGE_TABLES_BASE,
         );
         child_pt
-            .map_aliased(0x0040_0000, 0x8800_3000_0000, 0x4000, false)
+            .map_aliased(0x0040_0000, parent_rx_ipa, 0x4000, false)
             .expect("map child user aliased rx");
         child_pt
-            .map_aliased(0x0060_0000, 0x8800_4000_0000, 0x4000, true)
+            .map_aliased(0x0060_0000, parent_rw_ipa, 0x4000, true)
             .expect("map child user aliased rw");
         child_pt
-            .map_aliased(0x0080_0000, 0x8800_5000_0000, 0x4000, false)
+            .map_aliased(0x0080_0000, parent_cow_ipa, 0x4000, false)
             .expect("map child user aliased cow");
         child_pt
             .rebase(root_slot_base)
@@ -2540,7 +2647,6 @@ mod foreign_mm_tests {
             kernel_only: false,
         }];
 
-        let carrier_foreign_mm_transport = Arc::new(CarrierForeignMmTransport::new());
         let mut plan = parent_task
             .build_process_plan(
                 request,
@@ -2668,17 +2774,18 @@ mod foreign_mm_tests {
         })
         .expect("stage child inventory reservation");
 
-        // 4. Prepare task-only process plan through shared conversion engine
-        let (carrier_state, prepared_task) = HvfVmState::prepare_task_only_plan_for_test(plan)
-            .expect("prepare_task_only_plan_for_test for child");
+        // 4. Cross the real production ProcessSpec boundary with the VM clone;
+        // the non-dropping root handle above keeps custody as the sole raw
+        // destroy owner during exact signed-test cleanup.
+        let spec = ProcessSpec::new((*vm).clone(), plan);
+        let (carrier_state, prepared_task) = HvfVmState::prepare_task_only_process_spec(spec)
+            .expect("prepare_task_only_process_spec for child");
 
-        // Assert concrete HvpatchCarrierTaskState::Process / LeaseTest without Option<VM> weakening
+        // The signed acceptance route must never weaken to the test-only lease
+        // carrier used by host-only rollback tests.
         assert!(
-            matches!(
-                &carrier_state,
-                HvpatchCarrierTaskState::Process { .. } | HvpatchCarrierTaskState::LeaseTest { .. }
-            ),
-            "expected concrete HvpatchCarrierTaskState::Process or LeaseTest"
+            matches!(&carrier_state, HvpatchCarrierTaskState::Process { .. }),
+            "expected concrete HvpatchCarrierTaskState::Process"
         );
 
         // Verify structural owners are populated on prepared mappings with nonzero distinct generations
@@ -2700,7 +2807,8 @@ mod foreign_mm_tests {
             .expect("prepared el1 mapping");
         assert_eq!(prepared_el1.perms, applevisor::memory::MemPerms::ReadWrite);
         assert_eq!(prepared_el1.physical_ipa, el1_physical_ipa);
-        let el1_owner = global_frame_host_owners()
+        let el1_owner = custody
+            .global_frame_host_owners
             .lock()
             .get(&(el1_physical_ipa, el1_physical_size as u64))
             .map(|e| Arc::clone(e.owner()))
@@ -2720,7 +2828,8 @@ mod foreign_mm_tests {
             .expect("prepared mailbox mapping");
         assert_eq!(prepared_mb.perms, applevisor::memory::MemPerms::ReadWrite);
         assert_eq!(prepared_mb.physical_ipa, mailbox_physical_ipa);
-        let mb_owner = global_frame_host_owners()
+        let mb_owner = custody
+            .global_frame_host_owners
             .lock()
             .get(&(mailbox_physical_ipa, mailbox_physical_size as u64))
             .map(|e| Arc::clone(e.owner()))
@@ -2872,19 +2981,19 @@ mod foreign_mm_tests {
         let rx_mapping_id = child_inventory
             .lock()
             .extents
-            .get(&(0x8800_3000_0000, 0x4000))
+            .get(&(parent_rx_ipa, 0x4000))
             .expect("rx mapping id")
             .mapping;
         let rw_mapping_id = child_inventory
             .lock()
             .extents
-            .get(&(0x8800_4000_0000, 0x4000))
+            .get(&(parent_rw_ipa, 0x4000))
             .expect("rw mapping id")
             .mapping;
         let cow_mapping_id = child_inventory
             .lock()
             .extents
-            .get(&(0x8800_5000_0000, 0x4000))
+            .get(&(parent_cow_ipa, 0x4000))
             .expect("cow mapping id")
             .mapping;
 
@@ -2960,7 +3069,7 @@ mod foreign_mm_tests {
             .expect("CarrierForeignMmTransport::retain must succeed for authentic child");
 
         let retained = child_mm_access
-            .retain_physical_backing(&child_captured, deadline)
+            .retain_physical_backing_in(&custody, &child_captured, deadline)
             .expect("retain_physical_backing must succeed for authentic structural extents");
 
         // Verify structural and shared payload readback through retained physical owners across all 5 dispositions
@@ -2987,21 +3096,21 @@ mod foreign_mm_tests {
 
         // (c) Shared RX executable segment
         let mut read_rx = [0u8; 38];
-        let read_rx_gen = copy_from_pinned_owner(&retained, 0x8800_3000_0000, &mut read_rx)
+        let read_rx_gen = copy_from_pinned_owner(&retained, parent_rx_ipa, &mut read_rx)
             .expect("copy_from_pinned_owner for shared rx");
         assert_eq!(&read_rx, &rx_payload);
         assert_eq!(read_rx_gen.raw_for_probe(), parent_rx_gen);
 
         // (d) Shared RW data segment
         let mut read_rw = [0u8; 38];
-        let read_rw_gen = copy_from_pinned_owner(&retained, 0x8800_4000_0000, &mut read_rw)
+        let read_rw_gen = copy_from_pinned_owner(&retained, parent_rw_ipa, &mut read_rw)
             .expect("copy_from_pinned_owner for shared rw");
         assert_eq!(&read_rw, &rw_payload);
         assert_eq!(read_rw_gen.raw_for_probe(), parent_rw_gen);
 
         // (e) Private COW data segment
         let mut read_cow = [0u8; 37];
-        let read_cow_gen = copy_from_pinned_owner(&retained, 0x8800_5000_0000, &mut read_cow)
+        let read_cow_gen = copy_from_pinned_owner(&retained, parent_cow_ipa, &mut read_cow)
             .expect("copy_from_pinned_owner for private cow");
         assert_eq!(&read_cow, &cow_payload);
         assert_eq!(read_cow_gen.raw_for_probe(), parent_cow_gen);
@@ -3111,15 +3220,13 @@ mod foreign_mm_tests {
         drop(retained);
         drop(_lease);
 
-        // Clean up registered global frame owners from test
-        {
-            let mut owners = global_frame_host_owners().lock();
-            owners.remove(&(0x8800_3000_0000, 0x4000));
-            owners.remove(&(0x8800_4000_0000, 0x4000));
-            owners.remove(&(0x8800_5000_0000, 0x4000));
-            owners.remove(&(el1_physical_ipa, el1_physical_size as u64));
-            owners.remove(&(mailbox_physical_ipa, mailbox_physical_size as u64));
-        }
+        destroy_vm_with_custody(
+            &carrier_foreign_mm_transport.custody,
+            "signed structural-retention acceptance cleanup",
+        )
+        .expect("destroy signed-test VM through exact custody");
+        finalize_carrier_exit_global_frame_owners_in(&carrier_foreign_mm_transport.custody)
+            .expect("finalize signed-test terminal stage-2 records");
     }
 
     #[test]
@@ -3363,7 +3470,67 @@ mod foreign_mm_tests {
         .unwrap();
         let pt_host_addr2_row2 = pt_host2_row2.as_ptr();
 
-        let inventory_shared = Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
+        let sentinel_ipa = 0x7c00_0000_0000u64;
+        let sentinel_len = 0x4000u64;
+        let sentinel_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            sentinel_len as usize,
+            crate::host_mapping::HostMappingKind::PrivateAnon,
+        )
+        .expect("allocate authoritative rollback sentinel backing");
+        assert_eq!(
+            unsafe {
+                inventory_hv_vm_map(
+                    sentinel_host.as_ptr().cast(),
+                    sentinel_ipa,
+                    sentinel_len as usize,
+                    3,
+                )
+            },
+            0,
+            "install authoritative rollback sentinel stage-2 mapping"
+        );
+        let sentinel_frame =
+            carrick_hal::FrameId::from_kernel_allocation(std::num::NonZeroU64::new(91).unwrap());
+        let sentinel_mapping =
+            carrick_hal::MappingId::from_kernel_allocation(std::num::NonZeroU64::new(92).unwrap());
+        let sentinel_backing = InventoryBackingIdentity::Private(93);
+        let sentinel_owner = InventoryStage2OwnerIdentity {
+            host_addr: sentinel_host.as_ptr() as usize,
+            generation: 0,
+        };
+        let sentinel_frames = Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry {
+            shared: std::collections::BTreeMap::from([(sentinel_backing, sentinel_frame)]),
+            references: std::collections::BTreeMap::from([(sentinel_frame, 3)]),
+            extent_references: std::collections::BTreeMap::from([(
+                (sentinel_frame, sentinel_ipa, sentinel_len),
+                2,
+            )]),
+            stage2_references: std::collections::BTreeMap::from([(
+                (sentinel_ipa, sentinel_len),
+                4,
+            )]),
+            authority_retained_stage2: std::collections::BTreeSet::from([(
+                sentinel_ipa,
+                sentinel_len,
+            )]),
+        }));
+        let inventory_shared = Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory {
+            initialized: true,
+            extents: std::collections::BTreeMap::from([(
+                (sentinel_ipa, sentinel_len),
+                InventoryExtent {
+                    frame: sentinel_frame,
+                    mapping: sentinel_mapping,
+                    backing: sentinel_backing,
+                    stage2_base: sentinel_ipa,
+                    stage2_length: sentinel_len,
+                    stage2_owner: sentinel_owner,
+                },
+            )]),
+            frames: sentinel_frames,
+            ..HvpatchFrameInventory::default()
+        }));
+        let authoritative_preimage = inventory_fingerprint(&inventory_shared.lock());
 
         let mut plan_stage_fail = ProcessSpecPlan {
             mappings: vec![
@@ -3494,18 +3661,19 @@ mod foreign_mm_tests {
         );
         assert_eq!(
             ScopedStage2MapTestStub::mapped_count(),
-            0,
-            "stage_mapping failure must roll back both row 1 and row 2 stage-2 leases"
+            1,
+            "stage_mapping failure must preserve only the authoritative sentinel mapping"
         );
         assert!(!ScopedStage2MapTestStub::is_mapped(pt_ipa2_row1, 0x20_0000));
         assert!(!ScopedStage2MapTestStub::is_mapped(pt_ipa2_row2, 0x20_0000));
-        assert!(
-            inventory_shared.lock().extents.is_empty(),
-            "inventory extents must be empty after rollback"
-        );
-        assert!(
-            inventory_shared.lock().frames.lock().references.is_empty(),
-            "inventory frame references must be empty"
+        assert!(ScopedStage2MapTestStub::is_mapped(
+            sentinel_ipa,
+            sentinel_len as usize
+        ));
+        assert_eq!(
+            inventory_fingerprint(&inventory_shared.lock()),
+            authoritative_preimage,
+            "row-2 failure must restore every authoritative inventory component exactly"
         );
         assert!(
             global_frame_host_owners().lock().is_empty(),
@@ -3515,8 +3683,43 @@ mod foreign_mm_tests {
             alias_registry().lock().is_empty(),
             "alias registry must be empty"
         );
+        assert_eq!(
+            unsafe { inventory_hv_vm_unmap(sentinel_ipa, sentinel_len as usize) },
+            0,
+            "remove authoritative rollback sentinel mapping"
+        );
+        drop(sentinel_host);
 
         // 3. Real directory publication failure rollback with concrete Process state and dynamic alias
+        let external_state_restore = ExternalAliasStateRestore::capture();
+        let preexisting_alias = AliasBacking {
+            start: 0x6000_7a00_0000,
+            ipa: 0x7b00_0000_0000,
+            host_addr: 0x1234_0000,
+            size: 0x4000,
+            physical_ipa: 0x7b00_0000_0000,
+            physical_host_addr: 0x1234_0000,
+            physical_size: 0x4000,
+            perms: 3,
+            guest_writable: true,
+            sharing: GuestMappingSharing::GlobalShared,
+            ownership_scope: AliasOwnershipScope::Global,
+            inventory_backing: InventoryBackingIdentity::SharedFile {
+                device: 71,
+                inode: 72,
+                offset: 0,
+                length: 0x4000,
+            },
+            shared_key_base: 0x6000_7a00_0000,
+            shared_key_offset: 0,
+            owner_generation: 73,
+        };
+        register_shared_alias(preexisting_alias);
+        let alias_preimage = alias_registry().lock().clone();
+        let replay_preimage = replay_mappings().lock().clone();
+        assert!(!alias_preimage.is_empty());
+        assert!(!replay_preimage.is_empty());
+
         let pt_ipa3 = 0x9a00_4000_0000u64;
         let pt_lease3 = GlobalFrameStage2Lease::fixed(pt_ipa3, 0x20_0000);
         let pt_host3 = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -3643,15 +3846,22 @@ mod foreign_mm_tests {
             directory_pub.inner.lock().states.is_empty(),
             "no task state must remain published in directory after failure"
         );
-        assert!(
-            alias_registry().lock().is_empty(),
-            "dynamic aliases must be completely rolled back from alias registry"
+        assert_eq!(
+            *alias_registry().lock(),
+            alias_preimage,
+            "failed publication must restore the exact nonempty alias preimage"
+        );
+        assert_eq!(
+            *replay_mappings().lock(),
+            replay_preimage,
+            "failed publication must restore the exact nonempty replay preimage"
         );
         assert_eq!(
             ScopedStage2MapTestStub::mapped_count(),
             0,
             "directory publish rollback must abort and unmap all stage2 leases"
         );
+        drop(external_state_restore);
 
         // 4. Real retirement/unmap failure semantics via fallible retirement transaction
         let ipa_retire = 0x8800_9000_0000u64;
@@ -14159,15 +14369,6 @@ impl MmAccessState {
             extents.push(RetainedForeignExtent { key, owner });
         }
         Ok(RetainedForeignMmBacking { extents })
-    }
-
-    #[cfg(test)]
-    fn retain_physical_backing(
-        &self,
-        snapshot: &CarrierForeignMmSnapshot,
-        deadline: std::time::Instant,
-    ) -> Result<RetainedForeignMmBacking, carrick_hal::ForeignMmTransportError> {
-        self.retain_physical_backing_in(legacy_test_carrier_vm_custody_arc(), snapshot, deadline)
     }
 }
 
@@ -28658,8 +28859,11 @@ impl HvfTaskState {
                 ForkMappingDisposition::SharedFrameWritable
                     | ForkMappingDisposition::SharedFrameReadOnly
             ) {
-                let inherited =
-                    inherited_fork_inventory_extents_in(self.custody(), mapping, &parent_inventory);
+                let inherited = inherited_fork_inventory_extents_in(
+                    &carrier_foreign_mm_transport.custody,
+                    mapping,
+                    &parent_inventory,
+                );
                 // Fork lineage debug: CARRICK_FORK_DEBUG_VA=<hex guest VA>
                 // prints, for the mapping covering that VA, every inherited
                 // extent and — crucially — a mapping DROPPED for having none.
