@@ -2975,6 +2975,167 @@ mod foreign_mm_tests {
     }
 
     #[test]
+    fn current_generation_structural_owner_needs_no_replay_rebind() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let _stage2_stub = ScopedStage2MapTestStub::enable();
+        let transport = Arc::new(CarrierForeignMmTransport::new());
+        let ipa = 0x0030_0000;
+        let len = 0x4000_u64;
+        let mapping = GuestMapping {
+            guest_start: ipa,
+            ipa_start: ipa,
+            mapped_size: len,
+            offset_in_mapping: 0,
+            payload_size: len,
+            perms: carrick_mem::elf::SegmentPerms {
+                read: true,
+                write: false,
+                execute: true,
+            },
+            shared: false,
+            image: Arc::new(vec![0x52; len as usize]),
+            private_file_backing: None,
+        };
+        let region = map_region_raw_in(&transport.custody, &mapping, false, true)
+            .expect("map current-generation structural region");
+        let owner = region
+            .structural_owner
+            .as_ref()
+            .cloned()
+            .expect("current-generation structural owner");
+        let identity = *owner.retained.record_identity.lock();
+        let before = transport
+            .custody
+            .stage2_record_snapshot(identity.record_id)
+            .expect("current-generation structural record");
+        assert!(before.mapped);
+        assert!(before.backend_map_installed);
+        assert!(!before.retirement_requested);
+        assert!(!before.terminalized_by_vm_destroy);
+
+        let report = reconcile_global_frame_owners_after_replay_in(&transport.custody, &[], false)
+            .expect("a current-generation backend-installed structural owner is already live");
+
+        assert_eq!(report, GlobalFrameReplayReconcileReport::default());
+        assert_eq!(
+            transport.custody.stage2_record_snapshot(identity.record_id),
+            Some(before),
+            "current-generation reconciliation must not rebind or mutate custody",
+        );
+        assert_eq!(
+            *owner.retained.record_identity.lock(),
+            identity,
+            "current-generation reconciliation must retain the exact owner record identity",
+        );
+        drop(region);
+        drop(owner);
+        retry_structural_backing_identities_in_using(
+            &transport.custody,
+            &[identity],
+            &mut unmap_global_frame_stage2_record,
+            &mut release_retired_stage2_ipa,
+        )
+        .expect("retire current-generation reconciliation fixture");
+    }
+
+    #[test]
+    fn old_generation_structural_owner_still_requires_exact_replay() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let _stage2_stub = ScopedStage2MapTestStub::enable();
+        let transport = Arc::new(CarrierForeignMmTransport::new());
+        let ipa = 0x0034_0000;
+        let len = 0x4000_u64;
+        let mapping = GuestMapping {
+            guest_start: ipa,
+            ipa_start: ipa,
+            mapped_size: len,
+            offset_in_mapping: 0,
+            payload_size: len,
+            perms: carrick_mem::elf::SegmentPerms {
+                read: true,
+                write: false,
+                execute: true,
+            },
+            shared: false,
+            image: Arc::new(vec![0x63; len as usize]),
+            private_file_backing: None,
+        };
+        let region = map_region_raw_in(&transport.custody, &mapping, false, true)
+            .expect("map G1 structural region");
+        let owner = region
+            .structural_owner
+            .as_ref()
+            .cloned()
+            .expect("G1 structural owner");
+        let g1_identity = *owner.retained.record_identity.lock();
+        let host_addr = owner.ptr() as usize;
+        let perms = u64::from(region.perms);
+
+        destroy_vm_with_custody_using(&transport.custody, "structural G1 destroy", || 0, || {})
+            .expect("destroy G1 structural fixture");
+        let g2 = transport.custody.begin_create().expect("begin G2");
+        let empty_error =
+            reconcile_global_frame_owners_after_replay_in(&transport.custody, &[], false)
+                .expect_err("an old-generation structural owner requires exact replay");
+        assert!(empty_error.to_string().contains(
+            "live structural backing IPA 0x340000 size 16384 was not replayed into the current VM"
+        ));
+
+        let drift_error = reconcile_global_frame_owners_after_replay_in(
+            &transport.custody,
+            &[GlobalFrameReplayExtent {
+                ipa,
+                length: len,
+                host_addr,
+                perms: perms ^ 1,
+            }],
+            false,
+        )
+        .expect_err("same-key structural replay with drifted permissions must fail closed");
+        assert!(
+            drift_error
+                .to_string()
+                .contains("structural backing replay identity drift"),
+            "unexpected drift failure: {drift_error}",
+        );
+        assert_eq!(
+            *owner.retained.record_identity.lock(),
+            g1_identity,
+            "rejected replay must not rebind the retained owner identity",
+        );
+
+        let report = reconcile_global_frame_owners_after_replay_in(
+            &transport.custody,
+            &[GlobalFrameReplayExtent {
+                ipa,
+                length: len,
+                host_addr,
+                perms,
+            }],
+            false,
+        )
+        .expect("exact structural replay rebinds G1 custody into G2");
+
+        assert_eq!(report.rebound, 1);
+        let g2_identity = *owner.retained.record_identity.lock();
+        assert_ne!(g2_identity.record_id, g1_identity.record_id);
+        assert_eq!(g2_identity.vm_generation, g2);
+        transport
+            .custody
+            .commit_create(g2)
+            .expect("publish G2 fixture");
+        drop(region);
+        drop(owner);
+        retry_structural_backing_identities_in_using(
+            &transport.custody,
+            &[g2_identity],
+            &mut unmap_global_frame_stage2_record,
+            &mut release_retired_stage2_ipa,
+        )
+        .expect("retire G2 structural replay fixture");
+    }
+
+    #[test]
     fn initial_structural_epoch_failure_does_not_publish_stage2() {
         let _guard = FOREIGN_MM_TEST_LOCK.lock();
         let _stage2_stub = ScopedStage2MapTestStub::enable();
@@ -9334,6 +9495,19 @@ fn reconcile_global_frame_owners_after_replay_in_using(
             }
             finalize_terminal_stage2_record_using(custody, identity, release_ipa)?;
             report.retired += 1;
+            continue;
+        }
+        if replay.is_none()
+            && custody.setup_generation() == Some(snapshot.vm_generation)
+            && snapshot.mapped
+            && snapshot.backend_map_installed
+            && !snapshot.retirement_requested
+            && !snapshot.terminalized_by_vm_destroy
+        {
+            // A record installed directly while creating the current VM is
+            // already authoritative stage-2 state, not a replay candidate.
+            // Only an older/terminal/retiring or backend-disarmed record must
+            // authenticate through an explicit replay extent below.
             continue;
         }
         if let Some(replay) = replay {
