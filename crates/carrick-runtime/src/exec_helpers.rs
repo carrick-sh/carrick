@@ -492,6 +492,25 @@ pub(crate) fn stop_for_ptrace_signal(dispatcher: &SyscallDispatcher, signum: i32
     }
 }
 
+pub(crate) fn stop_for_ptrace_fault(
+    dispatcher: &SyscallDispatcher,
+    fault: crate::kernel::objects::PtraceSynchronousFault,
+) -> bool {
+    let Some(process) = dispatcher.hvpatch_process() else {
+        return stop_for_ptrace_signal(dispatcher, fault.signal.raw());
+    };
+    if !dispatcher.is_ptrace_traceme() {
+        return false;
+    }
+    if process.consume_ptrace_resume_signal(fault.signal.raw()) {
+        return false;
+    }
+    if fault.signal.raw() == crate::linux_abi::LINUX_SIGKILL {
+        return false;
+    }
+    process.stop_for_ptrace_fault(fault)
+}
+
 /// After a `PTRACE_TRACEME`d exec, stop with SIGTRAP so a tracer sees the
 /// exec stop.
 pub(crate) fn stop_after_traced_exec(dispatcher: &SyscallDispatcher) {

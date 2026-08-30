@@ -17,11 +17,13 @@ pub use error::{MemPerms, OsError, Reg, SysReg};
 pub mod foreign_mm;
 pub use foreign_mm::{
     ForeignAsid, ForeignAsidGeneration, ForeignCowInvalidationGeneration,
-    ForeignCowInvalidationIdentity, ForeignCowKernelProof, ForeignCowReceipt, ForeignMmBinding,
-    ForeignMmEndpoint, ForeignMmId, ForeignMmInvalidator, ForeignMmInvocation,
-    ForeignMmLeaseEndpoint, ForeignMmLiveAuthority, ForeignMmPreparedWrite, ForeignMmReadLease,
-    ForeignMmReadReceipt, ForeignMmSnapshot, ForeignMmTransport, ForeignMmTransportError,
-    ForeignMmWriteReceipt, ForeignOwnerGeneration, ForeignStage1Identity,
+    ForeignCowInvalidationIdentity, ForeignCowKernelProof, ForeignCowReceipt,
+    ForeignExecutableRange, ForeignInstructionPublicationPlan, ForeignMmBinding, ForeignMmEndpoint,
+    ForeignMmId, ForeignMmInvalidator, ForeignMmInvocation, ForeignMmLeaseEndpoint,
+    ForeignMmLiveAuthority, ForeignMmPreparedWrite, ForeignMmReadLease, ForeignMmReadReceipt,
+    ForeignMmSnapshot, ForeignMmTransport, ForeignMmTransportError, ForeignMmWriteReceipt,
+    ForeignOwnerGeneration, ForeignPtraceTextAuthority, ForeignPtraceTextCowPlan,
+    ForeignStage1Identity,
 };
 pub mod stage1_exclusive;
 

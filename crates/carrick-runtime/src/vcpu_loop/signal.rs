@@ -147,6 +147,7 @@ pub(crate) fn lower_el0_fault(esr: u64, elr: u64, far: u64) -> Option<(i32, i32,
 }
 
 pub(crate) enum FaultSignalDisposition {
+    Stopped,
     Injected,
     Terminate(i32),
 }
@@ -166,6 +167,19 @@ pub(crate) fn inject_fault_signal<T: SyscallTrap>(
     interrupted_pc: Option<u64>,
 ) -> Result<FaultSignalDisposition, RuntimeError> {
     crate::probes::signal_deliver(this_tid.raw(), signum);
+    if let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(signum)
+        && crate::exec_helpers::stop_for_ptrace_fault(
+            dispatcher,
+            crate::kernel::objects::PtraceSynchronousFault {
+                signal,
+                si_code,
+                si_addr,
+                interrupted_pc,
+            },
+        )
+    {
+        return Ok(FaultSignalDisposition::Stopped);
+    }
     crate::exec_helpers::stop_for_debug_signal(signum);
 
     let action = dispatcher.registered_signal_handler(context, signum);
@@ -275,6 +289,7 @@ pub(super) fn deliver_fault_signal<E: ThreadedEngine>(
         si_addr,
         interrupted_pc,
     )? {
+        FaultSignalDisposition::Stopped => Ok(None),
         FaultSignalDisposition::Injected => Ok(None),
         FaultSignalDisposition::Terminate(signum) => terminate(signum),
     }
@@ -723,6 +738,8 @@ mod tests {
         restart: bool,
         delivered_signum: i32,
         delivered_handler: u64,
+        delivered_interrupted_pc: Option<u64>,
+        delivered_fault_siginfo: Option<(i32, u64)>,
     }
 
     impl crate::trap::SyscallTrap for NoopTrap {
@@ -751,16 +768,18 @@ mod tests {
             handler: u64,
             _sa_restorer: u64,
             _pending_syscall_retval: Option<i64>,
-            _interrupted_pc: Option<u64>,
+            interrupted_pc: Option<u64>,
             _altstack: Option<(u64, u64)>,
             _saved_sigmask: u64,
-            _fault_siginfo: Option<(i32, u64)>,
+            fault_siginfo: Option<(i32, u64)>,
             _queued_siginfo: Option<crate::linux_abi::LinuxSiginfo>,
             restart_syscall: bool,
         ) -> Result<(), TrapError> {
             self.restart = restart_syscall;
             self.delivered_signum = signum;
             self.delivered_handler = handler;
+            self.delivered_interrupted_pc = interrupted_pc;
+            self.delivered_fault_siginfo = fault_siginfo;
             Ok(())
         }
 
@@ -955,6 +974,132 @@ mod tests {
         assert!(libc::WIFSIGNALED(exit_status));
         assert_eq!(libc::WTERMSIG(exit_status), libc::SIGKILL);
         let _ = crate::guest_cpu::reap_child_guest_ns(child as u32);
+    }
+
+    #[test]
+    fn synchronous_fault_stops_for_ptrace_before_default_termination() {
+        let _guard = PTRACE_SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::guest_cpu::init_child_table();
+        let parent = std::process::id();
+        let prepared = crate::guest_cpu::prepare_child_record_pre_fork(parent, 0, 0, false, 0)
+            .expect("prepare synchronous-fault tracee");
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            crate::guest_cpu::complete_child_record_post_fork_child();
+            let dispatcher = SyscallDispatcher::new();
+            dispatcher.set_ptrace_traceme_for_test();
+            let context = dispatcher.exact_signal_context_for_test();
+            let tid = ThreadId::main_from_host_pid();
+            let disposition = inject_fault_signal(
+                &mut NoopTrap::default(),
+                &dispatcher,
+                &context,
+                tid,
+                crate::linux_abi::LINUX_SIGSEGV,
+                2,
+                0xfeed_0000,
+                Some(0x4000),
+            );
+            let stopped_before_delivery =
+                matches!(disposition, Ok(FaultSignalDisposition::Stopped));
+            unsafe { libc::_exit(i32::from(!stopped_before_delivery)) };
+        }
+
+        crate::guest_cpu::publish_prepared_child_record_parent_ref(prepared, child as u32);
+        let mut stop_status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(child, &mut stop_status, libc::WUNTRACED) },
+            child
+        );
+        if !libc::WIFSTOPPED(stop_status) || libc::WSTOPSIG(stop_status) != libc::SIGSTOP {
+            if !libc::WIFEXITED(stop_status) && !libc::WIFSIGNALED(stop_status) {
+                let _ = unsafe { libc::kill(child, libc::SIGKILL) };
+                let _ = unsafe { libc::waitpid(child, &mut stop_status, 0) };
+            }
+            panic!(
+                "synchronous SIGSEGV must become a ptrace delivery stop first; status={stop_status}"
+            );
+        }
+        assert_eq!(unsafe { libc::kill(child, libc::SIGCONT) }, 0);
+        let mut exit_status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut exit_status, 0) }, child);
+        assert!(libc::WIFEXITED(exit_status));
+        assert_eq!(libc::WEXITSTATUS(exit_status), 0);
+        let _ = crate::guest_cpu::reap_child_guest_ns(child as u32);
+    }
+
+    #[test]
+    fn synchronous_fault_reinjection_preserves_siginfo_pc_and_forced_rules() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.exact_signal_context_for_test();
+        let tid = ThreadId::main_from_host_pid();
+        let signal = crate::kernel::LinuxSignal::for_signal_number(crate::linux_abi::LINUX_SIGSEGV)
+            .expect("SIGSEGV");
+        let mut caught = carrick_abi::LinuxSigaction::empty();
+        caught.sa_handler = 0x7000;
+        caught.sa_flags = carrick_abi::LINUX_SA_SIGINFO;
+        context.signal_authority().install_action(signal, caught);
+        let mut trap = NoopTrap::default();
+        assert!(matches!(
+            inject_fault_signal(
+                &mut trap,
+                &dispatcher,
+                &context,
+                tid,
+                crate::linux_abi::LINUX_SIGSEGV,
+                2,
+                0xfeed_4000,
+                Some(0x4000_1234),
+            ),
+            Ok(FaultSignalDisposition::Injected)
+        ));
+        assert_eq!(trap.delivered_signum, crate::linux_abi::LINUX_SIGSEGV);
+        assert_eq!(trap.delivered_interrupted_pc, Some(0x4000_1234));
+        assert_eq!(trap.delivered_fault_siginfo, Some((2, 0xfeed_4000)));
+
+        context
+            .signal_authority()
+            .set_blocked(carrick_abi::SigSet::EMPTY.with(crate::linux_abi::LINUX_SIGSEGV));
+        assert!(matches!(
+            inject_fault_signal(
+                &mut NoopTrap::default(),
+                &dispatcher,
+                &context,
+                tid,
+                crate::linux_abi::LINUX_SIGSEGV,
+                2,
+                0xfeed_4000,
+                Some(0x4000_1234),
+            ),
+            Ok(FaultSignalDisposition::Terminate(
+                crate::linux_abi::LINUX_SIGSEGV
+            ))
+        ));
+
+        context
+            .signal_authority()
+            .set_blocked(carrick_abi::SigSet::EMPTY);
+        let mut ignored = carrick_abi::LinuxSigaction::empty();
+        ignored.sa_handler = carrick_abi::LINUX_SIG_IGN;
+        context.signal_authority().install_action(signal, ignored);
+        assert!(matches!(
+            inject_fault_signal(
+                &mut NoopTrap::default(),
+                &dispatcher,
+                &context,
+                tid,
+                crate::linux_abi::LINUX_SIGSEGV,
+                2,
+                0xfeed_4000,
+                Some(0x4000_1234),
+            ),
+            Ok(FaultSignalDisposition::Terminate(
+                crate::linux_abi::LINUX_SIGSEGV
+            ))
+        ));
     }
 
     #[test]

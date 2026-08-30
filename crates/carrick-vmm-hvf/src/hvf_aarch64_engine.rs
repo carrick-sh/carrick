@@ -578,7 +578,11 @@ impl HvpatchTaskOnlyEngineState {
         }
         let (page_tables, protections) = self.runtime_projection.clone_authorities()?;
         let mut task = self._backend.runtime_task_state(page_tables, protections)?;
-        self._backend.activate()?;
+        self._backend.register_foreign_mm(&task)?;
+        if let Err(error) = self._backend.activate() {
+            self._backend.unregister_foreign_mm();
+            return Err(error);
+        }
         task.publish_pending_fork_frame_receipts();
         task.registration = self._backend.take_registration();
         if self.parked_task.lock().replace(task).is_some() {

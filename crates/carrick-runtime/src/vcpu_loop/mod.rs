@@ -4530,6 +4530,23 @@ where
                 }
             }
         }
+        if let Some(fault) = context.kernel().take_ptrace_resume_fault(task.key().id) {
+            if let Some(outcome) = deliver_fault_signal(
+                &self.kernel,
+                &context,
+                engine,
+                self.state.this_tid,
+                self.state.fatal_image_generation,
+                fault.signal.raw(),
+                fault.si_code,
+                fault.si_addr,
+                fault.interrupted_pc,
+                self.traps,
+            )? {
+                return Ok(Some(self.enter_terminal_with_outcome(engine, outcome)));
+            }
+            return Ok(None);
+        }
         if ptrace_stop_settled
             && let Some(outcome) = service_signals_threaded(
                 &self.kernel,
