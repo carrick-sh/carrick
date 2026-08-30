@@ -2270,13 +2270,11 @@ mod tests {
         let expected: BTreeMap<&str, [usize; 3]> = BTreeMap::from([
             ("dispatch/ioring.rs", [1, 0, 0]),
             ("dispatch/mem/tests.rs", [5, 0, 0]),
-            // SysV deadlock regression test spawns an isolated child test process
-            // to race proc_sysvipc rendering against attachment cleanup and paired mutation,
-            // and negative watchdog test spawns an intentionally wedged child to prove termination.
-            ("dispatch/sysv.rs", [1, 0, 2]),
-            // Compile-fail test runner compiles isolated test snippets to verify
-            // lock-authority compile-time invariants.
-            ("dispatch/sysv/lock_authority.rs", [0, 0, 1]),
+            // SysV deadlock regression test spawns isolated child test processes:
+            // 1. proc_sysvipc rendering races attachment cleanup and paired mutation
+            // 2. watchdog kills and reaps on deadlock timeout
+            // 3. same-shmid remapped shmat deadlock watchdog regression
+            ("dispatch/sysv.rs", [1, 0, 3]),
             ("dispatch/tests.rs", [3, 0, 0]),
             ("exec_stamps.rs", [1, 0, 0]),
             ("fs_backend.rs", [1, 0, 0]),

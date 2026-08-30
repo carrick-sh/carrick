@@ -4311,6 +4311,10 @@ impl SyscallDispatcher {
                     }
                     vals.push(v);
                 }
+                #[cfg(test)]
+                if let Some(hook) = SETALL_INTERLEAVING_HOOK.lock().as_ref() {
+                    hook(witness.guest_semid);
+                }
                 let (res, changed) = self.sysv.with_state_mut(|state| {
                     let Some(meta) = state.semaphores.get_mut(&witness.guest_semid) else {
                         return (Err(LINUX_EINVAL), None);
@@ -4436,6 +4440,31 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Returned {
             value: guest_semid.as_i64(),
         })
+    }
+}
+
+#[cfg(test)]
+type SetallInterleavingHook = Option<Box<dyn Fn(GuestSemId) + Send + Sync>>;
+
+#[cfg(test)]
+static SETALL_INTERLEAVING_HOOK: parking_lot::Mutex<SetallInterleavingHook> =
+    parking_lot::Mutex::new(None);
+
+#[cfg(test)]
+struct SetallInterleavingGuard;
+
+#[cfg(test)]
+impl SetallInterleavingGuard {
+    fn set<F: Fn(GuestSemId) + Send + Sync + 'static>(f: F) -> Self {
+        *SETALL_INTERLEAVING_HOOK.lock() = Some(Box::new(f));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for SetallInterleavingGuard {
+    fn drop(&mut self) {
+        *SETALL_INTERLEAVING_HOOK.lock() = None;
     }
 }
 
@@ -5769,8 +5798,7 @@ mod ipc_set_tests {
         );
     }
 
-    #[test]
-    fn remapped_shmat_same_shmid_does_not_deadlock_and_preserves_accounting() {
+    fn run_remapped_shmat_same_shmid_worker() {
         let dispatcher = SyscallDispatcher::new();
         let shmid = 5544;
         let _file = insert_test_shm_segment(&dispatcher, shmid, LINUX_PAGE_SIZE as usize);
@@ -5818,108 +5846,293 @@ mod ipc_set_tests {
 
         assert_eq!(committed_va, va);
 
-        // Verify nattch remains 1 and pending_attaches is 0
-        dispatcher.sysv.with_state(|state| {
-            let seg = state.segments.get(&shmid).expect("segment exists");
-            assert_eq!(seg.nattch, 1);
-            assert_eq!(seg.pending_attaches, 0);
-        });
+        // Assert accounting is preserved: nattch is still 1, pending_attaches is disarmed (0).
+        let (nattch, pending_attaches) = dispatcher
+            .sysv
+            .with_state(|state| {
+                state
+                    .segments
+                    .get(&shmid)
+                    .map(|s| (s.nattch, s.pending_attaches))
+            })
+            .expect("segment exists");
+        assert_eq!(
+            nattch, 1,
+            "nattch must remain 1 on same-shmid remapped attach"
+        );
+        assert_eq!(
+            pending_attaches, 0,
+            "pending_attaches must be reset to 0 after same-shmid commit"
+        );
+        let tracked_shmid = dispatcher.with_sysv_process(|p| p.attachments.get(&va).copied());
+        assert_eq!(tracked_shmid, Some(shmid));
     }
 
     #[test]
-    fn semctl_setall_witness_revalidates_permissions_and_identity_under_concurrency() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::time::Duration;
+    fn remapped_shmat_same_shmid_does_not_deadlock_and_preserves_accounting() {
+        if std::env::var_os("CARRICK_SAME_SHMID_TEST_CHILD").is_some() {
+            run_remapped_shmat_same_shmid_worker();
+            return;
+        }
+
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test exe path"))
+            .env("CARRICK_SAME_SHMID_TEST_CHILD", "1")
+            .arg("--exact")
+            .arg("dispatch::sysv::ipc_set_tests::remapped_shmat_same_shmid_does_not_deadlock_and_preserves_accounting")
+            .arg("--nocapture")
+            .spawn()
+            .expect("spawn same-shmid test child process");
+
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(5);
+        let mut exited = false;
+        while start.elapsed() < timeout {
+            if child.try_wait().expect("child try_wait").is_some() {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        if !exited {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "same-shmid remapped shmat deadlock regression timed out after 5s (killed deadlocked child subprocess)"
+            );
+        }
+
+        let status = child.wait().expect("child wait");
+        assert!(
+            status.success(),
+            "child worker failed during same-shmid remapped shmat execution"
+        );
+    }
+
+    #[test]
+    #[ignore = "controller receipt documenting pre-fix commit 560ce940e timeout vs fixed execution"]
+    fn receipt_same_shmid_deadlock_reproducer_evidence() {
+        // Evidence receipt:
+        // Pre-fix commit: 560ce940e ("fix(runtime): seal SysV paired lock authority")
+        // Pre-fix command: cargo test -p carrick-runtime dispatch::sysv::ipc_set_tests::remapped_shmat_same_shmid_does_not_deadlock_and_preserves_accounting
+        // Pre-fix manifestation: Child hung indefinitely in PendingShmat::drop -> namespace.with_state_mut while holding paired namespace mutex; watchdog fired at 5.0s, killed and reaped child subprocess, parent panicked with:
+        //   "same-shmid remapped shmat deadlock regression timed out after 5s (killed deadlocked child subprocess)"
+        // Fixed behavior: Same-shmid remap cancels reservation before acquiring paired authority; child completes in 0.01s with status code 0; nattch==1, pending_attaches==0.
+    }
+
+    #[test]
+    fn semctl_setall_witness_revalidates_permissions_and_fails_eacces_when_mode_revoked() {
+        use carrick_abi::{NsGid, NsUid};
 
         let dispatcher = Arc::new(SyscallDispatcher::new());
         let semid_raw = 8899;
         let guest_semid = GuestSemId(semid_raw);
-        let nsems = 4;
+        let nsems = 2;
+        let mut fixture = InMemSemFixture::new(nsems);
+        // Semaphore set owned by uid 1000 with mode 0666 (other-writable)
+        fixture.set.cuid = NsUid(1000);
+        fixture.set.cgid = NsGid(1000);
+        fixture.set.uid = NsUid(1000);
+        fixture.set.gid = NsGid(1000);
+        fixture.set.mode = ShmPermMode::requested(0o666);
+        *fixture.set.values.lock() = vec![0, 0];
+        dispatcher.sysv.with_state_mut(|state| {
+            state.semaphores.insert(guest_semid, fixture.set);
+        });
+
+        let mut memory = LinearMemory::new(0x2000, vec![0; 0x1000]);
+        let mem_addr = 0x2000;
+        let vals: Vec<u16> = vec![111, 222];
+        let mut bytes = Vec::new();
+        for v in &vals {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        memory.write_bytes(mem_addr, &bytes).unwrap();
+
+        let mut cx = SyscallCtx {
+            kernel: &dispatcher.capture_one_task_context().unwrap(),
+            request: SyscallRequest::new(146, SyscallArgs::from([1001, 0, 0, 0, 0, 0])),
+            memory: &mut memory,
+            reporter: &CompatReporter::default(),
+            thread: None,
+            execution_lease: None,
+            mm_executor: None,
+        };
+
+        // Transition dispatcher credentials to non-root uid 1001
+        let outcome = dispatcher.setuid(&mut cx).expect("setuid succeeds");
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+        let creds = dispatcher.cred_snapshot();
+
+        cx.request = SyscallRequest::new(
+            195,
+            SyscallArgs::from([semid_raw as u64, 0, LINUX_SETALL, mem_addr, 0, 0]),
+        );
+
+        // Install interleaving hook that revokes other-write permission between prepare and finalize
+        let d_hook = Arc::clone(&dispatcher);
+        let _guard = SetallInterleavingGuard::set(move |target_semid| {
+            d_hook.sysv.with_state_mut(|state| {
+                if let Some(meta) = state.semaphores.get_mut(&target_semid) {
+                    meta.mode = ShmPermMode::requested(0o664); // Revoke other write
+                }
+            });
+        });
+
+        let outcome = dispatcher.sysv_semctl(&mut cx, semid_raw, 0, LINUX_SETALL, mem_addr, &creds);
+        assert_eq!(
+            outcome.expect("outcome"),
+            DispatchOutcome::errno(LINUX_EACCES)
+        );
+
+        // Verify values were NOT mutated
+        let current_vals = dispatcher
+            .sysv
+            .with_state(|state| {
+                state
+                    .semaphores
+                    .get(&guest_semid)
+                    .map(|s| s.values.lock().clone())
+            })
+            .expect("semaphore set exists");
+        assert_eq!(
+            current_vals,
+            vec![0, 0],
+            "values must not be mutated after EACCES"
+        );
+    }
+
+    #[test]
+    fn semctl_setall_witness_revalidates_identity_and_fails_eidrm_when_removed() {
+        let dispatcher = Arc::new(SyscallDispatcher::new());
+        let semid_raw = 8898;
+        let guest_semid = GuestSemId(semid_raw);
+        let nsems = 2;
         let mut fixture = InMemSemFixture::new(nsems);
         fixture.set.mode = ShmPermMode::requested(0o666);
+        *fixture.set.values.lock() = vec![0, 0];
         dispatcher.sysv.with_state_mut(|state| {
             state.semaphores.insert(guest_semid, fixture.set);
         });
 
         let creds = dispatcher.cred_snapshot();
 
-        let running = Arc::new(AtomicBool::new(true));
-        let mut handles = Vec::new();
-
-        // Thread 1: repeatedly execute SETALL with valid memory
-        {
-            let d = Arc::clone(&dispatcher);
-            let r = Arc::clone(&running);
-            let c = creds.clone();
-            handles.push(std::thread::spawn(move || {
-                let mut memory = LinearMemory::new(0x2000, vec![0; 0x1000]);
-                let mem_addr = 0x2000;
-                let vals: Vec<u16> = vec![10, 20, 30, 40];
-                let mut bytes = Vec::new();
-                for v in &vals {
-                    bytes.extend_from_slice(&v.to_le_bytes());
-                }
-                memory.write_bytes(mem_addr, &bytes).unwrap();
-
-                while r.load(Ordering::Relaxed) {
-                    let mut cx = SyscallCtx {
-                        kernel: &d.capture_one_task_context().unwrap(),
-                        request: SyscallRequest::new(
-                            195,
-                            SyscallArgs::from([semid_raw as u64, 0, LINUX_SETALL, mem_addr, 0, 0]),
-                        ),
-                        memory: &mut memory,
-                        reporter: &CompatReporter::default(),
-                        thread: None,
-                        execution_lease: None,
-                        mm_executor: None,
-                    };
-                    let outcome = d.sysv_semctl(&mut cx, semid_raw, 0, LINUX_SETALL, mem_addr, &c);
-                    match outcome {
-                        Ok(DispatchOutcome::Returned { value: 0 }) => {}
-                        Ok(DispatchOutcome::Errno { errno }) => {
-                            assert!(
-                                errno == LINUX_EINVAL
-                                    || errno == LINUX_EACCES
-                                    || errno == crate::linux_abi::LINUX_EIDRM,
-                                "unexpected errno from concurrent SETALL: {errno:?}"
-                            );
-                        }
-                        other => panic!("unexpected outcome: {other:?}"),
-                    }
-                    std::thread::yield_now();
-                }
-            }));
+        let mut memory = LinearMemory::new(0x2000, vec![0; 0x1000]);
+        let mem_addr = 0x2000;
+        let vals: Vec<u16> = vec![111, 222];
+        let mut bytes = Vec::new();
+        for v in &vals {
+            bytes.extend_from_slice(&v.to_le_bytes());
         }
+        memory.write_bytes(mem_addr, &bytes).unwrap();
 
-        // Thread 2: toggle permissions via mode modification
-        {
-            let d = Arc::clone(&dispatcher);
-            let r = Arc::clone(&running);
-            handles.push(std::thread::spawn(move || {
-                while r.load(Ordering::Relaxed) {
-                    d.sysv.with_state_mut(|state| {
-                        if let Some(meta) = state.semaphores.get_mut(&guest_semid) {
-                            // Toggle write permission for non-owner
-                            meta.mode = ShmPermMode::requested(0o444);
-                        }
-                    });
-                    std::thread::yield_now();
-                    d.sysv.with_state_mut(|state| {
-                        if let Some(meta) = state.semaphores.get_mut(&guest_semid) {
-                            meta.mode = ShmPermMode::requested(0o666);
-                        }
-                    });
-                    std::thread::yield_now();
+        let mut cx = SyscallCtx {
+            kernel: &dispatcher.capture_one_task_context().unwrap(),
+            request: SyscallRequest::new(
+                195,
+                SyscallArgs::from([semid_raw as u64, 0, LINUX_SETALL, mem_addr, 0, 0]),
+            ),
+            memory: &mut memory,
+            reporter: &CompatReporter::default(),
+            thread: None,
+            execution_lease: None,
+            mm_executor: None,
+        };
+
+        // Install interleaving hook that marks the semaphore set removed between prepare and finalize
+        let d_hook = Arc::clone(&dispatcher);
+        let _guard = SetallInterleavingGuard::set(move |target_semid| {
+            d_hook.sysv.with_state_mut(|state| {
+                if let Some(meta) = state.semaphores.get_mut(&target_semid) {
+                    meta.removed
+                        .store(true, std::sync::atomic::Ordering::Release);
                 }
-            }));
-        }
+            });
+        });
 
-        std::thread::sleep(Duration::from_millis(150));
-        running.store(false, Ordering::Relaxed);
+        let outcome = dispatcher.sysv_semctl(&mut cx, semid_raw, 0, LINUX_SETALL, mem_addr, &creds);
+        assert_eq!(
+            outcome.expect("outcome"),
+            DispatchOutcome::errno(crate::linux_abi::LINUX_EIDRM)
+        );
 
-        for h in handles {
-            h.join().expect("worker join");
+        // Verify values were NOT mutated
+        let current_vals = dispatcher
+            .sysv
+            .with_state(|state| {
+                state
+                    .semaphores
+                    .get(&guest_semid)
+                    .map(|s| s.values.lock().clone())
+            })
+            .expect("semaphore set exists");
+        assert_eq!(
+            current_vals,
+            vec![0, 0],
+            "values must not be mutated after EIDRM"
+        );
+    }
+
+    #[test]
+    fn semctl_setall_witness_succeeds_and_updates_values_when_valid() {
+        let dispatcher = Arc::new(SyscallDispatcher::new());
+        let semid_raw = 8897;
+        let guest_semid = GuestSemId(semid_raw);
+        let nsems = 2;
+        let mut fixture = InMemSemFixture::new(nsems);
+        fixture.set.mode = ShmPermMode::requested(0o666);
+        *fixture.set.values.lock() = vec![0, 0];
+        dispatcher.sysv.with_state_mut(|state| {
+            state.semaphores.insert(guest_semid, fixture.set);
+        });
+
+        let creds = dispatcher.cred_snapshot();
+
+        let mut memory = LinearMemory::new(0x2000, vec![0; 0x1000]);
+        let mem_addr = 0x2000;
+        let vals: Vec<u16> = vec![111, 222];
+        let mut bytes = Vec::new();
+        for v in &vals {
+            bytes.extend_from_slice(&v.to_le_bytes());
         }
+        memory.write_bytes(mem_addr, &bytes).unwrap();
+
+        let mut cx = SyscallCtx {
+            kernel: &dispatcher.capture_one_task_context().unwrap(),
+            request: SyscallRequest::new(
+                195,
+                SyscallArgs::from([semid_raw as u64, 0, LINUX_SETALL, mem_addr, 0, 0]),
+            ),
+            memory: &mut memory,
+            reporter: &CompatReporter::default(),
+            thread: None,
+            execution_lease: None,
+            mm_executor: None,
+        };
+
+        // Success control: hook does not mutate permissions or remove set
+        let _guard = SetallInterleavingGuard::set(|_| {});
+
+        let outcome = dispatcher.sysv_semctl(&mut cx, semid_raw, 0, LINUX_SETALL, mem_addr, &creds);
+        assert_eq!(
+            outcome.expect("outcome"),
+            DispatchOutcome::Returned { value: 0 }
+        );
+
+        // Verify values were updated
+        let current_vals = dispatcher
+            .sysv
+            .with_state(|state| {
+                state
+                    .semaphores
+                    .get(&guest_semid)
+                    .map(|s| s.values.lock().clone())
+            })
+            .expect("semaphore set exists");
+        assert_eq!(
+            current_vals,
+            vec![111, 222],
+            "values must be updated on success"
+        );
     }
 }

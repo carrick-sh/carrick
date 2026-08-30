@@ -744,6 +744,98 @@ def validate_inventory(
     return errors
 
 
+def validate_sysv_lock_authority_rules(
+    repo_root: Path,
+    override_sources: dict[str, str] | None = None,
+) -> list[str]:
+    """Validate exact visibility tokens and strict caller boundaries for SysV lock authority APIs."""
+    errors: list[str] = []
+
+    def get_source(rel_path: str) -> str:
+        if override_sources and rel_path in override_sources:
+            return override_sources[rel_path]
+        full_path = repo_root / rel_path
+        return full_path.read_text(encoding="utf-8") if full_path.exists() else ""
+
+    # 1. Check exact visibility tokens in crates/carrick-runtime/src/dispatch/sysv.rs
+    sysv_source = get_source("crates/carrick-runtime/src/dispatch/sysv.rs")
+    if sysv_source:
+        sysv_tokens = lex_rust(sysv_source)
+        expected_restricted_fns = {
+            "with_state",
+            "with_state_mut",
+            "lock_sysv_process",
+            "with_sysv_process",
+            "with_sysv_process_mut",
+        }
+        for idx, token in enumerate(sysv_tokens):
+            if token.text == "fn" and idx + 1 < len(sysv_tokens) and sysv_tokens[idx + 1].text in expected_restricted_fns:
+                fn_name = sysv_tokens[idx + 1].text
+                # Look backward from `fn` for visibility starting at `pub`
+                vis_tokens = []
+                k = idx - 1
+                found_pub = False
+                while k >= 0 and sysv_tokens[k].text not in {"}", ";", "{"}:
+                    if sysv_tokens[k].text == "pub":
+                        found_pub = True
+                        vis_tokens = [t.text for t in sysv_tokens[k:idx]]
+                        break
+                    k -= 1
+                expected_vis = ["pub", "(", "in", "crate", "::", "dispatch", "::", "sysv", ")"]
+                if not found_pub or vis_tokens != expected_vis:
+                    vis_str = "".join(vis_tokens) if vis_tokens else "private"
+                    errors.append(
+                        f"crates/carrick-runtime/src/dispatch/sysv.rs: helper '{fn_name}' has unauthorized visibility '{vis_str}' (must be exact 'pub(in crate::dispatch::sysv)')"
+                    )
+
+    # 2. Check strict cross-module caller boundary
+    runtime_src = repo_root / "crates/carrick-runtime/src"
+    if runtime_src.exists() or override_sources:
+        restricted_identifiers = {
+            "lock_sysv_process",
+            "with_sysv_process",
+            "with_sysv_process_mut",
+            "SysvProcessGuard",
+            "SysvNamespacePermit",
+            "SysvPairedNamespaceGuard",
+            "lock_paired",
+        }
+        files_to_check: list[tuple[str, str]] = []
+        if override_sources:
+            for rpath, src in override_sources.items():
+                if (
+                    rpath.startswith("crates/carrick-runtime/src/")
+                    and not rpath.startswith("crates/carrick-runtime/src/dispatch/sysv")
+                    and not rpath.endswith("dispatch/sysv.rs")
+                ):
+                    files_to_check.append((rpath, src))
+        else:
+            for path in sorted(runtime_src.rglob("*.rs")):
+                rpath = str(path.relative_to(repo_root))
+                if not rpath.startswith("crates/carrick-runtime/src/dispatch/sysv") and not rpath.endswith("dispatch/sysv.rs"):
+                    files_to_check.append((rpath, path.read_text(encoding="utf-8")))
+
+        for rpath, src in files_to_check:
+            tokens = lex_rust(src)
+            prod_mask = production_mask(tokens)
+            for idx, token in enumerate(tokens):
+                if not prod_mask[idx]:
+                    continue
+                if token.text in restricted_identifiers:
+                    errors.append(
+                        f"{rpath}:{token.line}: unauthorized cross-module reference to SysV lock authority identifier '{token.text}' outside dispatch::sysv"
+                    )
+                elif token.text in {"with_state", "with_state_mut"}:
+                    # Check if called on sysv namespace
+                    if idx > 0 and tokens[idx - 1].text == ".":
+                        if idx > 1 and tokens[idx - 2].kind == "ident" and tokens[idx - 2].text in {"sysv", "namespace", "ipc"}:
+                            errors.append(
+                                f"{rpath}:{token.line}: unauthorized cross-module call to '{token.text}' outside dispatch::sysv"
+                            )
+
+    return errors
+
+
 def run_self_tests() -> bool:
     """Run comprehensive self-tests verifying red-first fail-closed behavior."""
     print("Running check-dispatch-lock-authority self-tests...")
@@ -968,7 +1060,76 @@ def run_self_tests() -> bool:
     errors = validate_inventory(sites, tampered_inv)
     assert any("unreviewed/unauthorized classification" in e or "missing" in e for e in errors), f"Boundary tampering did not fail: {errors}"
 
-    print("All check-dispatch-lock-authority self-tests PASSED.")
+    # Test 18: Negative visibility test - pub(crate) on with_state must FAIL
+    widened_vis_source = """
+    impl SysvIpcNamespace {
+        pub(crate) fn with_state<F, R>(&self, f: F) -> R { f(&self.state) }
+    }
+    """
+    errs = validate_sysv_lock_authority_rules(
+        REPO_ROOT,
+        override_sources={"crates/carrick-runtime/src/dispatch/sysv.rs": widened_vis_source},
+    )
+    assert any("helper 'with_state' has unauthorized visibility 'pub(crate)'" in e for e in errs), f"Widened visibility did not fail: {errs}"
+
+    # Test 19: Negative visibility test - pub on lock_sysv_process must FAIL
+    pub_vis_source = """
+    impl SyscallDispatcher {
+        pub fn lock_sysv_process(&self) {}
+    }
+    """
+    errs = validate_sysv_lock_authority_rules(
+        REPO_ROOT,
+        override_sources={"crates/carrick-runtime/src/dispatch/sysv.rs": pub_vis_source},
+    )
+    assert any("helper 'lock_sysv_process' has unauthorized visibility 'pub'" in e for e in errs), f"Public visibility did not fail: {errs}"
+
+    # Test 20: Negative caller test - sibling module calling lock_sysv_process must FAIL
+    sibling_caller_source = """
+    impl SyscallDispatcher {
+        fn leak_sysv(&self) {
+            let _g = self.lock_sysv_process();
+        }
+    }
+    """
+    errs = validate_sysv_lock_authority_rules(
+        REPO_ROOT,
+        override_sources={
+            "crates/carrick-runtime/src/dispatch/sysv.rs": "",
+            "crates/carrick-runtime/src/dispatch/fs.rs": sibling_caller_source,
+        },
+    )
+    assert any("unauthorized cross-module reference to SysV lock authority identifier 'lock_sysv_process'" in e for e in errs), f"Sibling caller did not fail: {errs}"
+
+    # Test 21: Negative caller test - sibling module calling namespace.with_state must FAIL
+    sibling_ns_caller_source = """
+    fn leak_ns(d: &SyscallDispatcher) {
+        d.sysv.with_state(|_| ());
+    }
+    """
+    errs = validate_sysv_lock_authority_rules(
+        REPO_ROOT,
+        override_sources={
+            "crates/carrick-runtime/src/dispatch/sysv.rs": "",
+            "crates/carrick-runtime/src/dispatch/net.rs": sibling_ns_caller_source,
+        },
+    )
+    assert any("unauthorized cross-module call to 'with_state'" in e for e in errs), f"Sibling namespace caller did not fail: {errs}"
+
+    # Test 22: Negative caller test - sibling module referencing SysvNamespacePermit must FAIL
+    sibling_permit_source = """
+    fn leak_permit(_p: &SysvNamespacePermit) {}
+    """
+    errs = validate_sysv_lock_authority_rules(
+        REPO_ROOT,
+        override_sources={
+            "crates/carrick-runtime/src/dispatch/sysv.rs": "",
+            "crates/carrick-runtime/src/dispatch/mod.rs": sibling_permit_source,
+        },
+    )
+    assert any("unauthorized cross-module reference to SysV lock authority identifier 'SysvNamespacePermit'" in e for e in errs), f"Sibling permit reference did not fail: {errs}"
+
+    print("All check-dispatch-lock-authority self-tests PASSED (22 fixtures).")
     return True
 
 
@@ -1003,13 +1164,16 @@ def main() -> int:
         return 1
 
     errors = validate_inventory(current_sites, inventory_data)
-    if errors:
-        print(f"FAIL: Found {len(errors)} dispatch lock authority inventory violation(s):", file=sys.stderr)
-        for err in errors:
+    rule_errors = validate_sysv_lock_authority_rules(REPO_ROOT)
+    all_errors = errors + rule_errors
+
+    if all_errors:
+        print(f"FAIL: Found {len(all_errors)} dispatch lock authority violation(s):", file=sys.stderr)
+        for err in all_errors:
             print(f"  - {err}", file=sys.stderr)
         return 1
 
-    print(f"OK: Verified exact match of {len(current_sites)} production raw lock sites against {args.inventory.name}.")
+    print(f"OK: Verified exact match of {len(current_sites)} production raw lock sites and SysV authority rules against {args.inventory.name}.")
     return 0
 
 

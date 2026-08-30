@@ -618,7 +618,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/sysv/lock_authority.rs::SysvNamespacePermit::lock_paired::sysv_namespace#1",
       "file": "crates/carrick-runtime/src/dispatch/sysv/lock_authority.rs",
-      "line": 256,
+      "line": 212,
       "item": "SysvNamespacePermit::lock_paired",
       "category": "sysv_namespace",
       "expression": ".state.lock()",
