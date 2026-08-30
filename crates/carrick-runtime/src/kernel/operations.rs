@@ -1593,13 +1593,13 @@ impl Kernel {
         context.task().claim_ptrace_traceme(tracer)
     }
 
-    /// Validate authoritative settled ptrace-stopped state and exact task generation.
-    pub(crate) fn validate_settled_ptrace_stop(
+    /// Mint authority for one exact settled ptrace stop before any target-MM
+    /// retention or transport work begins.
+    pub(crate) fn begin_ptrace_memory_access(
         &self,
         tracer: TaskKey,
         target: TaskKey,
-        expected_mm: MmId,
-    ) -> Result<(), carrick_abi::LinuxErrno> {
+    ) -> Result<super::objects::PtraceMemoryAccessWitness, carrick_abi::LinuxErrno> {
         let task = {
             let registry = self.registry().state.read();
             let Some(record) = registry.tasks.get(&target.id) else {
@@ -1610,27 +1610,26 @@ impl Kernel {
             }
             Arc::clone(&record.task)
         };
-        task.validate_settled_ptrace_stop(tracer, expected_mm)
+        task.begin_ptrace_memory_access(tracer)
     }
 
-    /// Retain authoritative settled ptrace-stopped state and exact task generation for
-    /// a foreign or shared memory access.
+    /// Revalidate and retain one exact settled-stop witness across the
+    /// irreversible portion of a foreign or shared memory access.
     ///
     /// Acquires `lifecycle` and `job_control` in canonical order on the exact
-    /// `TaskKey`, validates that the target is `Live`, has `tracer` as its exact
-    /// current ptrace tracer, is `stopped_by_ptrace` with a stop signal recorded,
-    /// is `ptrace_stop_settled`, and has no pending resume command. It also
-    /// validates that the target's current `MmId` matches `expected_mm`.
+    /// `TaskKey`, validates that the target is `Live`, retains the witness's
+    /// exact tracer relationship and stop generation, is `stopped_by_ptrace`
+    /// with a settled stop signal recorded, and has no pending resume command.
+    /// It also validates that the target's current `MmId` matches the witness.
     /// The memory `operation` runs while `lifecycle` and `job_control` guards remain live.
-    pub(crate) fn with_settled_ptrace_stopped_task<T>(
+    pub(crate) fn with_ptrace_memory_access<T>(
         &self,
-        tracer: TaskKey,
-        target: TaskKey,
-        expected_mm: MmId,
+        witness: &super::objects::PtraceMemoryAccessWitness,
         operation: impl FnOnce() -> T,
     ) -> Result<T, carrick_abi::LinuxErrno> {
         let task = {
             let registry = self.registry().state.read();
+            let target = witness.target();
             let Some(record) = registry.tasks.get(&target.id) else {
                 return Err(carrick_abi::LINUX_ESRCH);
             };
@@ -1639,7 +1638,7 @@ impl Kernel {
             }
             Arc::clone(&record.task)
         };
-        task.with_settled_ptrace_stopped_task(tracer, expected_mm, operation)
+        task.with_ptrace_memory_access(witness, operation)
     }
 
     pub(crate) fn stop_task_for_ptrace(&self, target: TaskId, signal: LinuxSignal) -> bool {

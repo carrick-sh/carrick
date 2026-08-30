@@ -2561,6 +2561,12 @@ impl SyscallDispatcher {
                             return Ok(DispatchOutcome::errno(LINUX_ESRCH));
                         }
                         let target_key = target_task.key();
+                        let ptrace_witness = match kernel
+                            .begin_ptrace_memory_access(process.task_key(), target_key)
+                        {
+                            Ok(witness) => witness,
+                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                        };
                         let relation = cx.with_execution_lease(|lease| {
                             kernel.foreign_mm(cx.kernel, lease, target_key)
                         });
@@ -2575,10 +2581,11 @@ impl SyscallDispatcher {
                             crate::kernel::MmRelation::Current(current) => current.mm_id(),
                             crate::kernel::MmRelation::Foreign(foreign) => foreign.mm_id(),
                         };
-                        match kernel.with_settled_ptrace_stopped_task(
-                            process.task_key(),
-                            target_key,
-                            expected_mm_id,
+                        if expected_mm_id != ptrace_witness.mm_id() {
+                            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+                        }
+                        match kernel.with_ptrace_memory_access(
+                            &ptrace_witness,
                             || -> Result<DispatchOutcome, LinuxErrno> {
                                 if !addr.0.is_multiple_of(8)
                                     || ptrace_text_data_addr_is_invalid(addr)
@@ -2638,6 +2645,12 @@ impl SyscallDispatcher {
                             return Ok(DispatchOutcome::errno(LINUX_ESRCH));
                         }
                         let target_key = target_task.key();
+                        let ptrace_witness = match kernel
+                            .begin_ptrace_memory_access(process.task_key(), target_key)
+                        {
+                            Ok(witness) => witness,
+                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                        };
                         let relation = cx.with_execution_lease(|lease| {
                             kernel.foreign_mm(cx.kernel, lease, target_key)
                         });
@@ -2652,12 +2665,8 @@ impl SyscallDispatcher {
                             crate::kernel::MmRelation::Current(current) => current.mm_id(),
                             crate::kernel::MmRelation::Foreign(foreign) => foreign.mm_id(),
                         };
-                        if let Err(errno) = kernel.validate_settled_ptrace_stop(
-                            process.task_key(),
-                            target_key,
-                            expected_mm_id,
-                        ) {
-                            return Ok(DispatchOutcome::errno(errno));
+                        if expected_mm_id != ptrace_witness.mm_id() {
+                            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
                         }
                         if !addr.0.is_multiple_of(8) || ptrace_text_data_addr_is_invalid(addr) {
                             return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
@@ -2665,10 +2674,8 @@ impl SyscallDispatcher {
                         let staged_data = data.to_le_bytes();
                         match relation {
                             crate::kernel::MmRelation::Current(_) => {
-                                match kernel.with_settled_ptrace_stopped_task(
-                                    process.task_key(),
-                                    target_key,
-                                    expected_mm_id,
+                                match kernel.with_ptrace_memory_access(
+                                    &ptrace_witness,
                                     || -> Result<DispatchOutcome, LinuxErrno> {
                                         match cx.memory.write_bytes(addr.0, &staged_data) {
                                             Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
@@ -2700,17 +2707,16 @@ impl SyscallDispatcher {
                                             &foreign,
                                             mutation_tid,
                                             |mutation_guard| {
-                                                let mut witness = authority.break_foreign_cow(
-                                                    mutation_guard,
-                                                    &foreign,
-                                                    write_range,
-                                                )?;
                                                 kernel
-                                                    .with_settled_ptrace_stopped_task(
-                                                        process.task_key(),
-                                                        target_key,
-                                                        expected_mm_id,
+                                                    .with_ptrace_memory_access(
+                                                        &ptrace_witness,
                                                         || -> Result<(), crate::kernel::MmAccessError> {
+                                                            let mut witness = authority
+                                                                .break_foreign_cow(
+                                                                    mutation_guard,
+                                                                    &foreign,
+                                                                    write_range,
+                                                                )?;
                                                             let prepared = authority
                                                                 .prepare_foreign_write_range(
                                                                     &mut witness,
@@ -7115,6 +7121,26 @@ mod kernel_process_dispatch_tests {
                 &root,
                 &mut memory,
                 SYS_PTRACE,
+                [
+                    LINUX_PTRACE_POKEDATA,
+                    target_pid as u64,
+                    TARGET_VA,
+                    0x1234,
+                    0,
+                    0,
+                ],
+                None,
+            ),
+            DispatchOutcome::errno(LINUX_ESRCH),
+            "untraced POKE must return ESRCH before execution-lease/MM acquisition",
+        );
+
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
                 [LINUX_PTRACE_PEEKDATA, target_pid as u64, 1, 0, 0, 0],
                 Some(&lease),
             ),
@@ -7397,17 +7423,20 @@ mod kernel_process_dispatch_tests {
         arm_ptrace_memory_access(&root, &target);
         let root = refreshed(&root);
         let target_key = target.task().key();
-        let expected_mm = target.shared().mm().id();
+        let tracer_key = root.task().key();
+        let witness = root
+            .kernel()
+            .begin_ptrace_memory_access(tracer_key, target_key)
+            .unwrap();
 
         // 1. Verify CONT is blocked while scoped guard is live
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
 
         let kernel_clone = Arc::clone(root.kernel());
-        let tracer_key = root.task().key();
         let handle = std::thread::spawn(move || {
             kernel_clone
-                .with_settled_ptrace_stopped_task(tracer_key, target_key, expected_mm, || {
+                .with_ptrace_memory_access(&witness, || {
                     entered_tx.send(()).unwrap();
                     release_rx.recv().unwrap();
                 })
@@ -7442,6 +7471,10 @@ mod kernel_process_dispatch_tests {
             root.kernel().settle_task_ptrace_stop(target_key.id),
             crate::kernel::objects::PtraceStopSettlement::Stopped,
         );
+        let witness2 = root
+            .kernel()
+            .begin_ptrace_memory_access(tracer_key, target_key)
+            .unwrap();
 
         let (entered_tx2, entered_rx2) = std::sync::mpsc::channel();
         let (release_tx2, release_rx2) = std::sync::mpsc::channel();
@@ -7449,7 +7482,7 @@ mod kernel_process_dispatch_tests {
         let kernel_clone3 = Arc::clone(root.kernel());
         let handle2 = std::thread::spawn(move || {
             kernel_clone3
-                .with_settled_ptrace_stopped_task(tracer_key, target_key, expected_mm, || {
+                .with_ptrace_memory_access(&witness2, || {
                     entered_tx2.send(()).unwrap();
                     release_rx2.recv().unwrap();
                 })
