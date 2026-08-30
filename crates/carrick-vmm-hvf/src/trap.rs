@@ -839,7 +839,10 @@ mod foreign_mm_tests {
                 extents: vec![RetainedForeignExtent {
                     key: old_key,
                     owner: RetainedPhysicalOwner::Global(
-                        global_frame_host_owners().lock()[&old_key].owner().clone(),
+                        global_frame_host_owners().lock()[&old_key]
+                            .owner()
+                            .pin()
+                            .expect("pin shared parent owner"),
                     ),
                 }],
             },
@@ -1871,6 +1874,7 @@ mod foreign_mm_tests {
         let lease = GlobalFrameStage2Lease::fixed(ipa, size as u64);
         let owner = StructuralBackingOwner::new(mapping, lease, epoch, ipa, size)
             .expect("create structural backing owner");
+        let identity = *owner.retained.record_identity.lock();
         assert_eq!(owner.len(), size);
         assert_eq!(owner.ptr(), ptr);
         assert_eq!(owner.epoch(), epoch);
@@ -1915,6 +1919,15 @@ mod foreign_mm_tests {
         // Non-retained IPA lookup fails
         let missing = backing.extent_for(ipa + 0x1_0000, size);
         assert!(missing.is_err());
+        drop(backing);
+        drop(owner);
+        retry_structural_backing_identities_in_using(
+            legacy_test_carrier_vm_custody(),
+            &[identity],
+            &mut unmap_global_frame_stage2_record,
+            &mut release_retired_stage2_ipa,
+        )
+        .expect("explicitly retire structural lifecycle fixture");
     }
 
     #[test]
@@ -1956,21 +1969,31 @@ mod foreign_mm_tests {
         let observed_live = Arc::new(std::sync::atomic::AtomicBool::new(false));
         lease3.drop_backing_audit = Some((host_addr, Arc::clone(&observed_live)));
         let owner = StructuralBackingOwner::new(mapping3, lease3, epoch, ipa, size).unwrap();
+        let identity = *owner.retained.record_identity.lock();
         assert!(alias_backing_is_live(host_addr));
         drop(owner);
         assert!(
-            observed_live.load(std::sync::atomic::Ordering::SeqCst),
-            "stage-2 lease drop must execute while host mapping is still live"
+            !observed_live.load(std::sync::atomic::Ordering::SeqCst),
+            "structural owner Drop must not execute lease retirement"
         );
         assert!(
-            !alias_backing_is_live(host_addr),
-            "host mapping must be unmapped after stage-2 lease release"
+            alias_backing_is_live(host_addr),
+            "custody must retain backing until the explicit safe point"
         );
+        retry_structural_backing_identities_in_using(
+            legacy_test_carrier_vm_custody(),
+            &[identity],
+            &mut unmap_global_frame_stage2_record,
+            &mut release_retired_stage2_ipa,
+        )
+        .expect("explicitly retire structural drop-order fixture");
+        assert!(!alias_backing_is_live(host_addr));
     }
 
     #[test]
-    fn global_frame_host_owner_exact_drop_order() {
+    fn global_frame_host_owner_drop_does_no_hv_and_explicit_retirement_releases_backing() {
         let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let _stage2_stub = ScopedStage2MapTestStub::enable();
         let size = 0x4000usize;
         let ipa = 0x8800_2800_0000u64;
         let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -1980,61 +2003,69 @@ mod foreign_mm_tests {
         .expect("allocate host mapping for test");
         let host_addr = mapping.as_ptr() as usize;
         let mut lease = GlobalFrameStage2Lease::fixed(ipa, size as u64);
-        let observed_live = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        lease.drop_backing_audit = Some((host_addr, Arc::clone(&observed_live)));
-        let owner = GlobalFrameHostOwner::new(lease, mapping, 7, 1, ipa, size as u64);
+        assert_eq!(
+            unsafe { inventory_hv_vm_map(mapping.as_ptr().cast(), ipa, size, 7) },
+            0
+        );
+        lease.mark_mapped();
+        let generation = register_global_frame_host_owner(lease, mapping, 7)
+            .expect("register global frame host owner");
+        let owner = global_frame_host_owners()
+            .lock()
+            .get(&(ipa, size as u64))
+            .expect("published owner")
+            .owner()
+            .clone();
         assert!(alias_backing_is_live(host_addr));
         drop(owner);
         assert!(
-            observed_live.load(std::sync::atomic::Ordering::SeqCst),
-            "global frame host owner stage-2 lease must drop while host mapping is still live"
+            ScopedStage2MapTestStub::is_mapped(ipa, size),
+            "dropping an owner Arc must not perform hypervisor retirement"
         );
         assert!(
-            !alias_backing_is_live(host_addr),
-            "host mapping must be unmapped after stage-2 lease release"
+            alias_backing_is_live(host_addr),
+            "carrier directory custody must retain backing until explicit retirement"
         );
+        assert!(matches!(
+            retire_global_frame_host_owner_if_generation(ipa, size as u64, generation),
+            GlobalFrameRetirementOutcome::RetiredUnmapped { .. }
+        ));
+        assert!(!ScopedStage2MapTestStub::is_mapped(ipa, size));
+        assert!(!alias_backing_is_live(host_addr));
     }
 
     #[test]
-    fn all_owner_structs_declare_stage2_lease_before_host_mapping_static_audit() {
+    fn owner_structs_encode_their_required_retirement_authority_static_audit() {
         let _guard = FOREIGN_MM_TEST_LOCK.lock();
         let source = include_str!("trap.rs");
 
-        // 1. GlobalFrameHostOwner: _lease before _mapping
+        // 1. GlobalFrameHostOwner: carrier custody is the sole stage-2
+        // retirement authority. The owner has no lease and no Drop path that
+        // can issue hypervisor work.
         let gfho_hdr = concat!("\npub(crate) struct ", "GlobalFrameHostOwner {");
         let gfho = source
             .split(gfho_hdr)
             .nth(1)
             .and_then(|tail| tail.split('}').next())
             .expect("GlobalFrameHostOwner struct body");
-        let gfho_lease = gfho
-            .find("_lease: parking_lot::Mutex<Option<GlobalFrameStage2Lease>>")
-            .expect("GlobalFrameHostOwner._lease exists");
-        let gfho_mapping = gfho
-            .find("_mapping: parking_lot::Mutex<Option<crate::host_mapping::OwnedHostMapping>>")
-            .expect("GlobalFrameHostOwner._mapping exists");
-        assert!(
-            gfho_lease < gfho_mapping,
-            "GlobalFrameHostOwner must declare _lease before _mapping for safe drop order"
-        );
+        assert!(gfho.contains("mapping: std::sync::Arc<GlobalFrameSharedMapping>"));
+        assert!(gfho.contains("custody: std::sync::Weak<CarrierVmCustody>"));
+        assert!(gfho.contains("record_identity: CarrierStage2RecordIdentity"));
+        assert!(!gfho.contains("GlobalFrameStage2Lease"));
+        assert!(!source.contains(concat!("impl Drop for ", "GlobalFrameHostOwner")));
+        assert!(!source.contains(concat!("Arc::", "strong_count")));
 
-        // 2. StructuralBackingOwner: _stage2_lease before mapping
+        // 2. StructuralBackingOwner: carrier custody owns the exact stage-2
+        // record and retained backing; final owner Drop can only request.
         let sbo_hdr = concat!("\npub(crate) struct ", "StructuralBackingOwner {");
         let sbo = source
             .split(sbo_hdr)
             .nth(1)
             .and_then(|tail| tail.split('}').next())
             .expect("StructuralBackingOwner struct body");
-        let sbo_lease = sbo
-            .find("_stage2_lease: GlobalFrameStage2Lease")
-            .expect("StructuralBackingOwner._stage2_lease exists");
-        let sbo_mapping = sbo
-            .find("mapping: crate::host_mapping::OwnedHostMapping")
-            .expect("StructuralBackingOwner.mapping exists");
-        assert!(
-            sbo_lease < sbo_mapping,
-            "StructuralBackingOwner must declare _stage2_lease before mapping for safe drop order"
-        );
+        assert!(sbo.contains("custody: std::sync::Weak<CarrierVmCustody>"));
+        assert!(sbo.contains("retained: std::sync::Arc<StructuralBackingCustodyEntry>"));
+        assert!(!sbo.contains("GlobalFrameStage2Lease"));
 
         // 3. ProcessMappingDesc: stage2_lease before host
         let pmd_hdr = concat!("\nstruct ", "ProcessMappingDesc {");
@@ -3126,9 +3157,6 @@ mod foreign_mm_tests {
             "stage-2 mapping must be recorded in backend audit state"
         );
 
-        let observed_live = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        lease.drop_backing_audit = Some((host_addr, Arc::clone(&observed_live)));
-
         let generation = register_global_frame_host_owner(lease, mapping, 7)
             .expect("register global frame host owner");
         assert_ne!(generation, 0);
@@ -3140,8 +3168,10 @@ mod foreign_mm_tests {
             .cloned()
             .expect("global frame host owner must be registered");
 
-        let holder1 = RetainedPhysicalOwner::Global(Arc::clone(owner.owner()));
-        let holder2 = RetainedPhysicalOwner::Global(Arc::clone(owner.owner()));
+        let holder1 =
+            RetainedPhysicalOwner::Global(owner.owner().pin().expect("pin first retained owner"));
+        let holder2 =
+            RetainedPhysicalOwner::Global(owner.owner().pin().expect("pin second retained owner"));
 
         let extent1 = RetainedForeignExtent {
             key: (allocated_ipa, size as u64),
@@ -3168,10 +3198,12 @@ mod foreign_mm_tests {
         );
         drop(probe1);
 
-        // 4. Remove from registration registry while holders still exist
-        global_frame_host_owners()
-            .lock()
-            .remove(&(allocated_ipa, size as u64));
+        // 4. Explicit retirement while typed pins exist must defer and keep the
+        // directory entry, stage-2 mapping, backing, and IPA reservation.
+        assert!(matches!(
+            retire_global_frame_host_owner_if_generation(allocated_ipa, size as u64, generation),
+            GlobalFrameRetirementOutcome::DeferredActivePins { .. }
+        ));
         drop(owner);
         drop(backing1);
 
@@ -3209,14 +3241,18 @@ mod foreign_mm_tests {
             "host mapping must remain live while retained holder is live"
         );
 
-        // 6. Controlled final drop releases IPA back to allocator
+        // 6. The final typed pin only makes explicit retirement eligible; its
+        // Drop itself performs no hypervisor work.
         drop(backing2);
+        assert!(ScopedStage2MapTestStub::is_mapped(allocated_ipa, size));
+        assert!(alias_backing_is_live(host_addr));
+        assert!(matches!(
+            retire_global_frame_host_owner_if_generation(allocated_ipa, size as u64, generation),
+            GlobalFrameRetirementOutcome::RetiredUnmapped { .. }
+        ));
 
-        // 7. Verify stage-2 unmapped before host mapping release and deterministic reuse
-        assert!(
-            observed_live.load(std::sync::atomic::Ordering::SeqCst),
-            "stage-2 unmap must execute before host mapping deallocation"
-        );
+        // 7. Verify explicit retirement unmapped stage-2, released backing,
+        // and returned the IPA for deterministic allocator reuse.
         assert!(
             !ScopedStage2MapTestStub::is_mapped(allocated_ipa, size),
             "stage-2 mapping must be unmapped after final holder drop"
@@ -3655,8 +3691,8 @@ mod foreign_mm_tests {
             .try_retire()
             .expect_err("try_retire must fail when unmap fails");
         assert!(
-            matches!(unmap_err, TrapError::Hypervisor(msg) if msg.contains("guest-memory unmap")),
-            "try_retire must return hypervisor unmap failure error"
+            matches!(unmap_err, TrapError::Hypervisor(msg) if msg.contains("retry pending")),
+            "try_retire must expose custody's retry-pending outcome"
         );
         assert!(
             ScopedStage2MapTestStub::is_mapped(ipa_retire, size_retire),
@@ -3687,8 +3723,8 @@ mod foreign_mm_tests {
             "host mapping must be unmapped after owner drop"
         );
         assert!(
-            observed_live_retire.load(std::sync::atomic::Ordering::SeqCst),
-            "lease unmap must execute before host mapping release"
+            !observed_live_retire.load(std::sync::atomic::Ordering::SeqCst),
+            "transferred legacy lease audit state must not drive owner retirement"
         );
         assert!(
             ScopedStage2MapTestStub::events()
@@ -4893,7 +4929,13 @@ mod task_only_carrier_directory_tests {
             .registration
             .as_mut()
             .unwrap()
-            .rebind_exec_authority(replacement, (0x1200_0000, 0x20_0000), Vec::new(), false)
+            .rebind_exec_authority(
+                replacement,
+                (0x1200_0000, 0x20_0000),
+                Vec::new(),
+                legacy_test_carrier_vm_custody_arc(),
+                false,
+            )
             .unwrap();
 
         assert_eq!(old_task_mm.inventory.lock().phase_name(), "retired");
@@ -4972,7 +5014,13 @@ mod task_only_carrier_directory_tests {
             .registration
             .as_mut()
             .unwrap()
-            .rebind_exec_authority(replacement, (0x1000_0000, 0x20_0000), Vec::new(), true)
+            .rebind_exec_authority(
+                replacement,
+                (0x1000_0000, 0x20_0000),
+                Vec::new(),
+                legacy_test_carrier_vm_custody_arc(),
+                true,
+            )
             .unwrap();
         let inventory = second_mm.inventory.lock();
         assert_eq!(inventory.phase_name(), "shared_process");
@@ -5724,8 +5772,20 @@ fn rebuilt_vm_cell() -> &'static parking_lot::Mutex<Option<SharedVm>> {
 /// `from_persistent_executor_spec` does, so a VM rebuilt after publication
 /// supersedes the bundle's handle.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn persistent_carrier_cell() -> &'static parking_lot::Mutex<Option<PersistentExecutorSpec>> {
-    static CELL: std::sync::OnceLock<parking_lot::Mutex<Option<PersistentExecutorSpec>>> =
+#[derive(Clone)]
+enum PersistentCarrierCellEntry {
+    Published(PersistentExecutorSpec),
+    CreateCleanup {
+        custody: std::sync::Arc<CarrierVmCustody>,
+        generation: CarrierVmGeneration,
+        vcpu_id: Option<applevisor_sys::hv_vcpu_t>,
+        raw_vm_destroyed: bool,
+    },
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn persistent_carrier_cell() -> &'static parking_lot::Mutex<Option<PersistentCarrierCellEntry>> {
+    static CELL: std::sync::OnceLock<parking_lot::Mutex<Option<PersistentCarrierCellEntry>>> =
         std::sync::OnceLock::new();
     CELL.get_or_init(|| parking_lot::Mutex::new(None))
 }
@@ -6092,74 +6152,152 @@ impl GlobalFrameOwnerEntry {
 /// after another thread completed the final `munmap`.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
+struct GlobalFrameSharedMapping {
+    mapping: crate::host_mapping::OwnedHostMapping,
+    logical_pin_count: parking_lot::Mutex<u64>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl GlobalFrameSharedMapping {
+    fn new(mapping: crate::host_mapping::OwnedHostMapping) -> Self {
+        Self {
+            mapping,
+            logical_pin_count: parking_lot::Mutex::new(0),
+        }
+    }
+
+    fn pin(&self) -> Result<(), CarrierStage2PinError> {
+        let mut count = self.logical_pin_count.lock();
+        *count = count
+            .checked_add(1)
+            .ok_or(CarrierStage2PinError::PinCountExhausted)?;
+        Ok(())
+    }
+
+    fn unpin(&self) {
+        let mut count = self.logical_pin_count.lock();
+        *count = count.saturating_sub(1);
+    }
+
+    fn pin_count(&self) -> u64 {
+        *self.logical_pin_count.lock()
+    }
+}
+
+// SAFETY: this mapping is immutable after publication. Its process address is
+// stable, reads are guarded by typed custody pins, and only explicit terminal
+// custody retirement can drop the final shared owner.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe impl Send for GlobalFrameSharedMapping {}
+
+// SAFETY: see the Send argument above; concurrent users only read/copy bytes
+// from the stable MAP_SHARED extent.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe impl Sync for GlobalFrameSharedMapping {}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
 pub(crate) struct GlobalFrameHostOwner {
-    _lease: parking_lot::Mutex<Option<GlobalFrameStage2Lease>>,
-    _mapping: parking_lot::Mutex<Option<crate::host_mapping::OwnedHostMapping>>,
-    perms: u64,
-    /// Which incarnation of this `(IPA, length)` lease this is.
-    ///
-    /// The host-pointer check alone is NOT an identity. Retiring an owner
-    /// `munmap`s its host buffer and returns the IPA to the allocator, and both
-    /// come straight back: measured on the canonical host, a
-    /// `map_shared_anon`/`munmap` cycle returns the SAME host VA 499 of 499
-    /// times, with ONE distinct address
-    /// (`docs/perf-results/2026-08-19-global-frame-lease-identity/`). So a stale
-    /// per-thread row naming the old triple re-authenticates against the NEW
-    /// owner and the anonymous-reuse scrub zeroes a live granule — confirmed to
-    /// be the `cpython-importlib` SIGSEGV (5/8 crashes, 0/14 once the identity
-    /// cannot recur).
-    generation: u64,
-    #[allow(dead_code)]
-    ipa: u64,
-    length: u64,
-    host_addr: usize,
+    mapping: std::sync::Arc<GlobalFrameSharedMapping>,
+    custody: std::sync::Weak<CarrierVmCustody>,
+    record_identity: CarrierStage2RecordIdentity,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl GlobalFrameHostOwner {
+    fn from_record(
+        mapping: std::sync::Arc<GlobalFrameSharedMapping>,
+        custody: std::sync::Arc<CarrierVmCustody>,
+        record_identity: CarrierStage2RecordIdentity,
+    ) -> Self {
+        Self {
+            mapping,
+            custody: std::sync::Arc::downgrade(&custody),
+            record_identity,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn new(
-        lease: GlobalFrameStage2Lease,
+        mut lease: GlobalFrameStage2Lease,
         mapping: crate::host_mapping::OwnedHostMapping,
         perms: u64,
         generation: u64,
         ipa: u64,
         length: u64,
     ) -> Self {
-        let host_addr = mapping.as_ptr() as usize;
-        Self {
-            _lease: parking_lot::Mutex::new(Some(lease)),
-            _mapping: parking_lot::Mutex::new(Some(mapping)),
-            perms,
-            generation,
-            ipa,
-            length,
-            host_addr,
+        if !lease.mapped {
+            lease.mark_test_mapped_without_backend();
         }
+        let custody = std::sync::Arc::clone(legacy_test_carrier_vm_custody_arc());
+        let identity = transfer_global_frame_stage2_lease_to_custody(
+            &custody,
+            lease,
+            mapping.as_ptr() as usize,
+            perms,
+            Some(CarrierLogicalOwner {
+                id: generation,
+                generation,
+            }),
+        )
+        .unwrap_or_else(|error| panic!("register test global owner record: {error}"));
+        assert_eq!(
+            custody
+                .stage2_record_snapshot(identity.record_id)
+                .map(|snapshot| (snapshot.ipa, snapshot.len as u64)),
+            Some((ipa, length))
+        );
+        Self::from_record(
+            std::sync::Arc::new(GlobalFrameSharedMapping::new(mapping)),
+            custody,
+            identity,
+        )
+    }
+
+    fn snapshot(&self) -> Option<CarrierStage2RecordSnapshot> {
+        self.custody
+            .upgrade()?
+            .stage2_record_snapshot(self.record_identity.record_id)
+    }
+
+    fn pin(self: &std::sync::Arc<Self>) -> Result<GlobalFrameOwnerPin, CarrierStage2PinError> {
+        let custody = self
+            .custody
+            .upgrade()
+            .ok_or(CarrierStage2PinError::NotFound)?;
+        let stage2_pin = custody.pin_stage2_record(self.record_identity)?;
+        self.mapping.pin()?;
+        Ok(GlobalFrameOwnerPin {
+            owner: std::sync::Arc::clone(self),
+            _stage2_pin: stage2_pin,
+        })
     }
 
     pub(crate) fn host_addr(&self) -> usize {
-        self.host_addr
+        self.mapping.mapping.as_ptr() as usize
     }
 
     pub(crate) fn generation(&self) -> u64 {
-        self.generation
+        self.record_identity
+            .logical_owner
+            .map_or(0, |owner| owner.generation)
     }
 
     #[allow(dead_code)]
     pub(crate) fn ipa(&self) -> u64 {
-        self.ipa
+        self.snapshot().map_or(0, |snapshot| snapshot.ipa)
     }
 
     pub(crate) fn length(&self) -> u64 {
-        self.length
+        self.mapping.mapping.len() as u64
     }
 
     pub(crate) fn perms(&self) -> u64 {
-        self.perms
+        self.snapshot().map_or(0, |snapshot| snapshot.perms)
     }
 
     pub(crate) fn ptr(&self) -> *mut u8 {
-        self.host_addr as *mut u8
+        self.mapping.mapping.as_ptr()
     }
 
     pub(crate) fn as_ptr(&self) -> *mut u8 {
@@ -6167,53 +6305,76 @@ impl GlobalFrameHostOwner {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.length as usize
+        self.mapping.mapping.len()
     }
 
     #[allow(dead_code)]
     pub(crate) fn is_retired(&self) -> bool {
-        self._lease.lock().is_none()
+        self.snapshot()
+            .is_none_or(|snapshot| !snapshot.mapped || snapshot.terminalized_by_vm_destroy)
     }
 
     pub(crate) fn lease_fingerprint(&self) -> Option<ExecLeaseFingerprint> {
-        self._lease.lock().as_ref().map(ExecLeaseFingerprint::from)
+        self.snapshot().map(|snapshot| ExecLeaseFingerprint {
+            base: snapshot.ipa,
+            length: snapshot.len as u64,
+            mapped: snapshot.mapped,
+            active: !snapshot.terminalized_by_vm_destroy,
+            release_ipa: snapshot.release_ipa,
+        })
     }
 
-    pub(crate) fn try_retire(&self) -> Result<(), TrapError> {
-        let mut lease_guard = self._lease.lock();
-        if let Some(lease) = lease_guard.as_mut() {
-            lease.try_retire()?;
-            lease_guard.take();
-            let mut mapping_guard = self._mapping.lock();
-            mapping_guard.take();
-            Ok(())
-        } else {
-            Ok(())
-        }
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl Drop for GlobalFrameHostOwner {
-    fn drop(&mut self) {
-        if let Some(mut lease) = self._lease.lock().take() {
-            if let Err(error) = lease.try_retire() {
-                eprintln!("carrick: warning: global frame stage-2 lease unmap on drop: {error}");
+    #[cfg(test)]
+    fn try_retire(&self) -> Result<(), TrapError> {
+        let custody = self.custody.upgrade().ok_or_else(|| {
+            TrapError::Hypervisor("global owner carrier custody disappeared".to_owned())
+        })?;
+        match custody
+            .retire_stage2_record_using(self.record_identity, unmap_global_frame_stage2_record)
+        {
+            CarrierStage2RetireOutcome::RetiredUnmapped
+            | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
+                finalize_global_frame_owner_record(&custody, self)
             }
+            CarrierStage2RetireOutcome::DeferredActivePins => Err(TrapError::Hypervisor(
+                "global owner retirement deferred by active pins".to_owned(),
+            )),
+            CarrierStage2RetireOutcome::RetryPending(error) => Err(TrapError::Hypervisor(format!(
+                "global owner retirement retry pending: {error:?}"
+            ))),
+            outcome => Err(TrapError::Hypervisor(format!(
+                "global owner retirement identity failure: {outcome:?}"
+            ))),
         }
     }
 }
 
-/// Monotonic source for [`GlobalFrameHostOwner::generation`]. Never reused, so a
-/// retired lease's incarnation can never be mistaken for a live one. Starts at
-/// 1, leaving 0 free as "no generation known".
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-static GLOBAL_FRAME_OWNER_GENERATION: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
+#[derive(Debug)]
+pub(crate) struct GlobalFrameOwnerPin {
+    owner: std::sync::Arc<GlobalFrameHostOwner>,
+    _stage2_pin: CarrierStage2Pin,
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl GlobalFrameOwnerPin {
+    fn owner(&self) -> &GlobalFrameHostOwner {
+        &self.owner
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for GlobalFrameOwnerPin {
+    fn drop(&mut self) {
+        self.owner.mapping.unpin();
+    }
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 fn next_global_frame_owner_generation() -> u64 {
-    GLOBAL_FRAME_OWNER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    legacy_test_carrier_vm_custody()
+        .allocate_logical_owner()
+        .map_or(0, |owner| owner.generation)
 }
 
 /// The live owner generation for `(ipa, length)`, or 0 when unowned.
@@ -6240,18 +6401,35 @@ fn global_frame_host_owner_identity_in(
         .global_frame_host_owners
         .lock()
         .get(&(ipa, length))
-        .map(|entry| (entry.owner().host_addr, entry.owner().generation))
+        .map(|entry| (entry.owner().host_addr(), entry.owner().generation()))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn global_frame_owner_is_replayable_in(
+    custody: &CarrierVmCustody,
+    ipa: u64,
+    length: u64,
+    host_addr: usize,
+    generation: u64,
+) -> bool {
+    match custody.global_frame_host_owners.lock().get(&(ipa, length)) {
+        Some(GlobalFrameOwnerEntry::Live(owner)) => {
+            owner.host_addr() == host_addr && (generation == 0 || owner.generation() == generation)
+        }
+        Some(GlobalFrameOwnerEntry::RetirementPending { .. }) => false,
+        None => generation == 0,
+    }
 }
 
 // SAFETY: the mapping is process-address-space state. Its address is stable,
-// HVF and guest-memory access already cross host threads, and the only owning
-// operation (Drop/munmap) is serialized by the topology lock plus this mutex.
+// HVF and guest-memory access already cross host threads, and explicit custody
+// retirement serializes stage-2 unmap before the final owning Arc is removed.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe impl Send for GlobalFrameHostOwner {}
 
-// SAFETY: all owner fields are immutable after publication. Reads hold an Arc
-// to the exact mapping/lease incarnation, and final Drop cannot run until the
-// last reader releases that Arc.
+// SAFETY: all owner fields are immutable after publication. Reads hold a typed
+// custody pin for the exact record, and retirement cannot remove the backing
+// until every such pin is released.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe impl Sync for GlobalFrameHostOwner {}
 
@@ -6272,15 +6450,21 @@ fn legacy_test_carrier_vm_custody() -> &'static CarrierVmCustody {
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 fn legacy_test_carrier_vm_custody_arc() -> &'static std::sync::Arc<CarrierVmCustody> {
     static CELL: std::sync::OnceLock<std::sync::Arc<CarrierVmCustody>> = std::sync::OnceLock::new();
-    CELL.get_or_init(|| std::sync::Arc::new(CarrierVmCustody::new()))
+    CELL.get_or_init(|| std::sync::Arc::new(CarrierVmCustody::new_live_fixture()))
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn carrier_stage2_leases()
+-> &'static parking_lot::Mutex<std::collections::BTreeMap<(u64, u64), CarrierStage2RecordIdentity>>
+{
+    &legacy_test_carrier_vm_custody_arc().carrier_stage2_records
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
 struct CarrierFrameCowOwnerLease {
-    custody: std::sync::Arc<CarrierVmCustody>,
     key: (u64, u64),
-    owner: std::sync::Arc<GlobalFrameHostOwner>,
+    pin: GlobalFrameOwnerPin,
     generation: carrick_hal::ForeignOwnerGeneration,
 }
 
@@ -6291,11 +6475,13 @@ impl carrick_hal::FrameCowOwnerLease for CarrierFrameCowOwnerLease {
     }
 
     fn is_current(&self) -> bool {
-        self.custody
-            .global_frame_host_owners
-            .lock()
-            .get(&self.key)
-            .is_some_and(|current| std::sync::Arc::ptr_eq(current.owner(), &self.owner))
+        self.pin.owner().custody.upgrade().is_some_and(|custody| {
+            custody
+                .global_frame_host_owners
+                .lock()
+                .get(&self.key)
+                .is_some_and(|current| std::sync::Arc::ptr_eq(current.owner(), &self.pin.owner))
+        })
     }
 }
 
@@ -6324,10 +6510,14 @@ impl carrick_hal::FrameCowOwnerInventory for CarrierFrameCowOwnerInventory {
         let generation = std::num::NonZeroU64::new(owner.generation())
             .map(carrick_hal::ForeignOwnerGeneration::from_backend_counter)
             .ok_or_else(|| std::io::Error::other("foreign COW host owner generation is zero"))?;
+        let pin = owner.pin().map_err(|error| {
+            std::io::Error::other(format!(
+                "foreign COW host owner cannot be pinned: {error:?}"
+            ))
+        })?;
         Ok(Box::new(CarrierFrameCowOwnerLease {
-            custody: std::sync::Arc::clone(&self.custody),
             key,
-            owner,
+            pin,
             generation,
         }))
     }
@@ -6353,63 +6543,78 @@ pub(crate) fn carrier_frame_cow_owner_inventory_in(
 /// released exactly once, by whichever of retirement or carrier teardown
 /// reaches it first.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
-struct CarrierStage2LeaseOwner {
-    lease: GlobalFrameStage2Lease,
-    host_addr: usize,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn carrier_stage2_leases()
--> &'static parking_lot::Mutex<std::collections::BTreeMap<(u64, u64), CarrierStage2LeaseOwner>> {
-    static CELL: std::sync::OnceLock<
-        parking_lot::Mutex<std::collections::BTreeMap<(u64, u64), CarrierStage2LeaseOwner>>,
-    > = std::sync::OnceLock::new();
-    CELL.get_or_init(|| parking_lot::Mutex::new(std::collections::BTreeMap::new()))
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn register_carrier_stage2_leases(
+    custody: &std::sync::Arc<CarrierVmCustody>,
     leases: &mut Vec<GlobalFrameStage2Lease>,
     owner_hosts: &std::collections::BTreeMap<(u64, u64), usize>,
-) -> Result<Vec<(u64, u64)>, TrapError> {
+) -> Result<Vec<CarrierStage2RecordIdentity>, TrapError> {
     let keys: Vec<_> = leases.iter().map(GlobalFrameStage2Lease::key).collect();
     let mut distinct = std::collections::BTreeSet::new();
-    let mut registered = carrier_stage2_leases().lock();
+    let registered = custody.carrier_stage2_records.lock();
+    let mut validation_error = None;
     for (&key, lease) in keys.iter().zip(leases.iter()) {
         if !distinct.insert(key) || registered.contains_key(&key) {
-            return Err(TrapError::Hypervisor(format!(
+            validation_error = Some(TrapError::Hypervisor(format!(
                 "carrier stage-2 lease collision at IPA 0x{:x} size {}",
                 key.0, key.1
             )));
+            break;
         }
         let host_addr = owner_hosts.get(&key).copied().unwrap_or_default();
         if host_addr == 0 || !lease.active || !lease.mapped {
-            return Err(TrapError::Hypervisor(format!(
+            validation_error = Some(TrapError::Hypervisor(format!(
                 "carrier stage-2 lease {key:?} has no exact active mapped host owner: host=0x{host_addr:x} active={} mapped={}",
                 lease.active, lease.mapped
             )));
+            break;
         }
     }
-    for (key, lease) in keys.iter().copied().zip(leases.drain(..)) {
-        registered.insert(
-            key,
-            CarrierStage2LeaseOwner {
-                lease,
-                host_addr: owner_hosts[&key],
-            },
-        );
+    drop(registered);
+    if let Some(error) = validation_error {
+        for (key, mut lease) in keys.iter().copied().zip(leases.drain(..)) {
+            if lease.try_retire().is_err() {
+                let identity = transfer_global_frame_stage2_lease_to_custody(
+                    custody,
+                    lease,
+                    owner_hosts.get(&key).copied().unwrap_or(1),
+                    0,
+                    None,
+                )?;
+                let _ = custody.request_stage2_record_retirement(identity);
+            }
+        }
+        return Err(error);
     }
-    Ok(keys)
+    let mut registered = custody.carrier_stage2_records.lock();
+    let mut identities = Vec::with_capacity(keys.len());
+    for (key, lease) in keys.iter().copied().zip(leases.drain(..)) {
+        let identity = transfer_global_frame_stage2_lease_to_custody(
+            custody,
+            lease,
+            owner_hosts[&key],
+            0,
+            None,
+        )?;
+        registered.insert(key, identity);
+        identities.push(identity);
+    }
+    Ok(identities)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn carrier_stage2_lease_owner_matches(ipa: u64, length: u64, host_addr: usize) -> bool {
-    carrier_stage2_leases()
+fn carrier_stage2_lease_owner_matches(
+    custody: &CarrierVmCustody,
+    ipa: u64,
+    length: u64,
+    host_addr: usize,
+) -> bool {
+    custody
+        .carrier_stage2_records
         .lock()
         .get(&(ipa, length))
-        .is_some_and(|owner| {
-            owner.lease.active && owner.lease.mapped && owner.host_addr == host_addr
+        .and_then(|identity| custody.stage2_record_snapshot(identity.record_id))
+        .is_some_and(|record| {
+            record.mapped && !record.terminalized_by_vm_destroy && record.host_addr == host_addr
         })
 }
 
@@ -6430,36 +6635,189 @@ fn collect_carrier_stage2_owner_hosts(
     Ok(owners)
 }
 
-/// Take the carrier-owned lease for an exact extent, if one is published.
+/// Take the carrier-owned exact record for an explicit retirement safe point.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn take_carrier_stage2_lease(ipa: u64, length: u64) -> Option<GlobalFrameStage2Lease> {
-    carrier_stage2_leases()
+fn take_carrier_stage2_record(
+    custody: &CarrierVmCustody,
+    ipa: u64,
+    length: u64,
+) -> Option<CarrierStage2RecordIdentity> {
+    custody
+        .carrier_stage2_records
         .lock()
-        .remove(&(ipa, length))
-        .map(|owner| owner.lease)
+        .get(&(ipa, length))
+        .copied()
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn take_carrier_stage2_lease_if_owner(
+fn take_carrier_stage2_record_if_owner(
+    custody: &CarrierVmCustody,
     ipa: u64,
     length: u64,
     host_addr: usize,
-) -> Option<GlobalFrameStage2Lease> {
-    let mut owners = carrier_stage2_leases().lock();
-    let matches = owners.get(&(ipa, length)).is_some_and(|owner| {
-        owner.lease.active && owner.lease.mapped && owner.host_addr == host_addr
-    });
+) -> Option<CarrierStage2RecordIdentity> {
+    let owners = custody.carrier_stage2_records.lock();
+    let matches = owners
+        .get(&(ipa, length))
+        .and_then(|identity| custody.stage2_record_snapshot(identity.record_id))
+        .is_some_and(|record| {
+            record.mapped && !record.terminalized_by_vm_destroy && record.host_addr == host_addr
+        });
     matches
-        .then(|| owners.remove(&(ipa, length)).map(|owner| owner.lease))
+        .then(|| owners.get(&(ipa, length)).copied())
         .flatten()
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn register_global_frame_host_owner_in(
+fn retire_carrier_stage2_record_at_safe_point(
     custody: &CarrierVmCustody,
+    identity: CarrierStage2RecordIdentity,
+) -> Result<(), TrapError> {
+    retire_carrier_stage2_record_at_safe_point_using(
+        custody,
+        identity,
+        unmap_global_frame_stage2_record,
+        release_retired_stage2_ipa,
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn retire_carrier_stage2_record_at_safe_point_using(
+    custody: &CarrierVmCustody,
+    identity: CarrierStage2RecordIdentity,
+    unmap: impl FnOnce(u64, usize) -> Result<(), CarrierStage2BackendError>,
+    mut release: impl FnMut(u64, u64) -> Result<(), TrapError>,
+) -> Result<(), TrapError> {
+    let snapshot = custody
+        .stage2_record_snapshot(identity.record_id)
+        .ok_or_else(|| TrapError::Hypervisor("carrier stage-2 record disappeared".to_owned()))?;
+    let key = (snapshot.ipa, snapshot.len as u64);
+    match custody.retire_stage2_record_using(identity, unmap) {
+        CarrierStage2RetireOutcome::RetiredUnmapped
+        | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
+            finalize_terminal_stage2_record_using(custody, identity, &mut release)?;
+            let mut records = custody.carrier_stage2_records.lock();
+            if records.get(&key) == Some(&identity) {
+                records.remove(&key);
+            }
+            Ok(())
+        }
+        CarrierStage2RetireOutcome::DeferredActivePins => Ok(()),
+        outcome => Err(TrapError::Hypervisor(format!(
+            "retire carrier stage-2 record at safe point: {outcome:?}"
+        ))),
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn transfer_global_frame_stage2_lease_to_custody(
+    custody: &std::sync::Arc<CarrierVmCustody>,
+    mut lease: GlobalFrameStage2Lease,
+    host_addr: usize,
+    perms: u64,
+    logical_owner: Option<CarrierLogicalOwner>,
+) -> Result<CarrierStage2RecordIdentity, TrapError> {
+    if !lease.active || !lease.mapped || host_addr == 0 {
+        return Err(TrapError::Hypervisor(format!(
+            "global frame host owner lease is not active and mapped: key={:?} active={} mapped={} host=0x{host_addr:x}",
+            lease.key(),
+            lease.active,
+            lease.mapped,
+        )));
+    }
+    let registration = (|| {
+        let vm_generation = custody.setup_generation().ok_or_else(|| {
+            TrapError::Hypervisor(
+                "global frame owner registration has no creating/live carrier VM".to_owned(),
+            )
+        })?;
+        let logical_owner = match logical_owner {
+            Some(owner) => owner,
+            None => custody.allocate_logical_owner().map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "allocate carrier-local global frame owner identity: {error:?}"
+                ))
+            })?,
+        };
+        #[cfg(not(any(test, feature = "foreign-cow-test-support")))]
+        let backend_map_installed = lease.mapped;
+        #[cfg(any(test, feature = "foreign-cow-test-support"))]
+        let backend_map_installed = lease.backend_map_installed;
+        custody
+            .register_stage2_record(CarrierStage2RecordSpec {
+                vm_generation,
+                ipa: lease.base,
+                len: usize::try_from(lease.length).map_err(|_| {
+                    TrapError::Hypervisor("global frame owner lease is too large".to_owned())
+                })?,
+                host_addr,
+                mapped: lease.mapped,
+                backend_map_installed,
+                release_ipa: lease.release_ipa,
+                perms,
+                logical_owner: Some(logical_owner),
+            })
+            .map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "transfer global frame lease into carrier custody: {error:?}"
+                ))
+            })
+    })();
+    let identity = match registration {
+        Ok(identity) => identity,
+        Err(registration_error) => {
+            lease.try_retire().map_err(|rollback_error| {
+                TrapError::Hypervisor(format!(
+                    "{registration_error}; explicit pre-custody rollback failed: {rollback_error}"
+                ))
+            })?;
+            return Err(registration_error);
+        }
+    };
+    lease.active = false;
+    lease.mapped = false;
+    lease.release_ipa = false;
+    #[cfg(any(test, feature = "foreign-cow-test-support"))]
+    {
+        lease.backend_map_installed = false;
+        lease.drop_backing_audit = None;
+    }
+    Ok(identity)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn unmap_global_frame_stage2_record(ipa: u64, len: usize) -> Result<(), CarrierStage2BackendError> {
+    let rc = unsafe { inventory_hv_vm_unmap(ipa, len) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CarrierStage2BackendError::HvReturn(rc as u32))
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn register_global_frame_host_owner_in(
+    custody: &std::sync::Arc<CarrierVmCustody>,
     lease: GlobalFrameStage2Lease,
     mapping: crate::host_mapping::OwnedHostMapping,
     perms: u64,
+) -> Result<u64, TrapError> {
+    register_global_frame_host_owner_in_using(
+        custody,
+        lease,
+        mapping,
+        perms,
+        &mut unmap_global_frame_stage2_record,
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn register_global_frame_host_owner_in_using(
+    custody: &std::sync::Arc<CarrierVmCustody>,
+    lease: GlobalFrameStage2Lease,
+    mapping: crate::host_mapping::OwnedHostMapping,
+    perms: u64,
+    rollback_unmap: &mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
 ) -> Result<u64, TrapError> {
     let key = lease.key();
     if key.1 != mapping.len() as u64 || !lease.mapped {
@@ -6481,20 +6839,53 @@ fn register_global_frame_host_owner_in(
             std::backtrace::Backtrace::force_capture(),
         );
     }
-    let generation = next_global_frame_owner_generation();
+    let record_identity = transfer_global_frame_stage2_lease_to_custody(
+        custody,
+        lease,
+        mapping.as_ptr() as usize,
+        perms,
+        None,
+    )?;
+    let generation = record_identity
+        .logical_owner
+        .map_or(0, |owner| owner.generation);
+    let owner = std::sync::Arc::new(GlobalFrameHostOwner::from_record(
+        std::sync::Arc::new(GlobalFrameSharedMapping::new(mapping)),
+        std::sync::Arc::clone(custody),
+        record_identity,
+    ));
     let mut owners = custody.global_frame_host_owners.lock();
     if owners.contains_key(&key) {
+        drop(owners);
+        let outcome = custody.retire_stage2_record_using(record_identity, rollback_unmap);
+        match outcome {
+            CarrierStage2RetireOutcome::RetiredUnmapped
+            | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
+                if finalize_global_frame_owner_record(custody, &owner).is_err() {
+                    custody
+                        .pending_global_frame_owners
+                        .lock()
+                        .insert(record_identity.record_id, owner);
+                }
+            }
+            CarrierStage2RetireOutcome::DeferredActivePins
+            | CarrierStage2RetireOutcome::RetryPending(_)
+            | CarrierStage2RetireOutcome::NotFound
+            | CarrierStage2RetireOutcome::OwnerIdentityMismatch
+            | CarrierStage2RetireOutcome::OwnerGenerationMismatch
+            | CarrierStage2RetireOutcome::VmGenerationMismatch => {
+                custody
+                    .pending_global_frame_owners
+                    .lock()
+                    .insert(record_identity.record_id, owner);
+            }
+        }
         return Err(TrapError::Hypervisor(format!(
             "global frame host owner collision at IPA 0x{:x} size {}",
             key.0, key.1
         )));
     }
-    owners.insert(
-        key,
-        GlobalFrameOwnerEntry::Live(std::sync::Arc::new(GlobalFrameHostOwner::new(
-            lease, mapping, perms, generation, key.0, key.1,
-        ))),
-    );
+    owners.insert(key, GlobalFrameOwnerEntry::Live(owner));
     Ok(generation)
 }
 
@@ -6502,7 +6893,7 @@ fn register_global_frame_host_owner_in(
 /// live generation directly onto the region state.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn publish_exec_region_host_owner_in(
-    custody: &CarrierVmCustody,
+    custody: &std::sync::Arc<CarrierVmCustody>,
     region: &mut HvfMappedRegion,
     lease: GlobalFrameStage2Lease,
 ) -> Result<u64, TrapError> {
@@ -6575,18 +6966,50 @@ impl StructuralEpoch {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
 pub(crate) struct StructuralBackingOwner {
-    _stage2_lease: GlobalFrameStage2Lease,
-    mapping: crate::host_mapping::OwnedHostMapping,
+    custody: std::sync::Weak<CarrierVmCustody>,
+    retained: std::sync::Arc<StructuralBackingCustodyEntry>,
     epoch: StructuralEpoch,
     physical_ipa: u64,
     physical_size: usize,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct StructuralBackingCustodyEntry {
+    mapping: std::sync::Arc<GlobalFrameSharedMapping>,
+    record_identity: parking_lot::Mutex<CarrierStage2RecordIdentity>,
+    owner_retired: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl StructuralBackingOwner {
+    #[cfg(test)]
     pub(crate) fn new(
         mapping: crate::host_mapping::OwnedHostMapping,
-        stage2_lease: GlobalFrameStage2Lease,
+        mut stage2_lease: GlobalFrameStage2Lease,
+        epoch: StructuralEpoch,
+        physical_ipa: u64,
+        physical_size: usize,
+    ) -> Result<std::sync::Arc<Self>, TrapError> {
+        if !stage2_lease.mapped {
+            stage2_lease.mark_test_mapped_without_backend();
+        }
+        Self::new_in(
+            legacy_test_carrier_vm_custody_arc(),
+            mapping,
+            stage2_lease,
+            u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+            epoch,
+            physical_ipa,
+            physical_size,
+        )
+    }
+
+    pub(crate) fn new_in(
+        custody: &std::sync::Arc<CarrierVmCustody>,
+        mapping: crate::host_mapping::OwnedHostMapping,
+        mut stage2_lease: GlobalFrameStage2Lease,
+        perms: u64,
         epoch: StructuralEpoch,
         physical_ipa: u64,
         physical_size: usize,
@@ -6597,6 +7020,11 @@ impl StructuralBackingOwner {
             || physical_ipa.checked_add(physical_size as u64).is_none()
             || epoch.raw() == 0
         {
+            stage2_lease.try_retire().map_err(|rollback| {
+                TrapError::Hypervisor(format!(
+                    "invalid structural backing owner and explicit lease rollback failed: {rollback}"
+                ))
+            })?;
             return Err(TrapError::Hypervisor(format!(
                 "invalid structural backing owner identity: epoch={:?} ipa=0x{:x} len={}",
                 epoch, physical_ipa, physical_size
@@ -6604,13 +7032,37 @@ impl StructuralBackingOwner {
         }
         let (lease_base, lease_len) = stage2_lease.key();
         if lease_base != physical_ipa || lease_len != physical_size as u64 {
+            stage2_lease.try_retire().map_err(|rollback| {
+                TrapError::Hypervisor(format!(
+                    "mismatched structural backing owner and explicit lease rollback failed: {rollback}"
+                ))
+            })?;
             return Err(TrapError::Hypervisor(format!(
                 "structural stage-2 lease ({lease_base:#x}, {lease_len:#x}) does not match physical extent ({physical_ipa:#x}, {physical_size:#x})"
             )));
         }
+        let identity = transfer_global_frame_stage2_lease_to_custody(
+            custody,
+            stage2_lease,
+            mapping.as_ptr() as usize,
+            perms,
+            Some(CarrierLogicalOwner {
+                id: epoch.raw(),
+                generation: epoch.raw(),
+            }),
+        )?;
+        let retained = std::sync::Arc::new(StructuralBackingCustodyEntry {
+            mapping: std::sync::Arc::new(GlobalFrameSharedMapping::new(mapping)),
+            record_identity: parking_lot::Mutex::new(identity),
+            owner_retired: std::sync::atomic::AtomicBool::new(false),
+        });
+        custody
+            .structural_backings
+            .lock()
+            .insert(identity.record_id, std::sync::Arc::clone(&retained));
         Ok(std::sync::Arc::new(Self {
-            _stage2_lease: stage2_lease,
-            mapping,
+            custody: std::sync::Arc::downgrade(custody),
+            retained,
             epoch,
             physical_ipa,
             physical_size,
@@ -6618,11 +7070,11 @@ impl StructuralBackingOwner {
     }
 
     pub(crate) fn ptr(&self) -> *mut u8 {
-        self.mapping.as_ptr()
+        self.retained.mapping.mapping.as_ptr()
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.mapping.len()
+        self.retained.mapping.mapping.len()
     }
 
     pub(crate) fn epoch(&self) -> StructuralEpoch {
@@ -6633,6 +7085,20 @@ impl StructuralBackingOwner {
     #[allow(dead_code)]
     fn stage2_key(&self) -> (u64, u64) {
         (self.physical_ipa, self.physical_size as u64)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for StructuralBackingOwner {
+    fn drop(&mut self) {
+        self.retained
+            .owner_retired
+            .store(true, std::sync::atomic::Ordering::Release);
+        let Some(custody) = self.custody.upgrade() else {
+            return;
+        };
+        let identity = *self.retained.record_identity.lock();
+        let _ = custody.request_stage2_record_retirement(identity);
     }
 }
 
@@ -6671,18 +7137,26 @@ fn fork_debug_va() -> Option<u64> {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GlobalFrameRetirementOutcome {
-    /// The owner was found and successfully unmapped, released its IPA, and dropped host backing.
-    Retired {
+    RetiredUnmapped {
         ipa: u64,
         length: u64,
         generation: u64,
     },
-    /// Stage-2 unmap failed; the owner's lease and host backing remain retained in failed-retirement custody.
-    UnmapFailed {
+    DeferredActivePins {
+        ipa: u64,
+        length: u64,
+        generation: u64,
+    },
+    RetryPending {
         ipa: u64,
         length: u64,
         generation: u64,
         error: String,
+    },
+    TerminalizedByVmDestroy {
+        ipa: u64,
+        length: u64,
+        generation: u64,
     },
     /// No owner was registered for this (ipa, length) key.
     NotFound { ipa: u64, length: u64 },
@@ -6698,8 +7172,531 @@ pub(crate) enum GlobalFrameRetirementOutcome {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl GlobalFrameRetirementOutcome {
     pub(crate) fn is_retired(&self) -> bool {
-        matches!(self, Self::Retired { .. })
+        matches!(
+            self,
+            Self::RetiredUnmapped { .. } | Self::TerminalizedByVmDestroy { .. }
+        )
     }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn finalize_global_frame_owner_record(
+    custody: &CarrierVmCustody,
+    owner: &GlobalFrameHostOwner,
+) -> Result<(), TrapError> {
+    finalize_global_frame_owner_record_using(custody, owner, &mut release_retired_stage2_ipa)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn finalize_global_frame_owner_record_using(
+    custody: &CarrierVmCustody,
+    owner: &GlobalFrameHostOwner,
+    release_ipa: &mut dyn FnMut(u64, u64) -> Result<(), TrapError>,
+) -> Result<(), TrapError> {
+    finalize_terminal_stage2_record_using(custody, owner.record_identity, release_ipa)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn finalize_terminal_stage2_record_using(
+    custody: &CarrierVmCustody,
+    identity: CarrierStage2RecordIdentity,
+    release_ipa: &mut dyn FnMut(u64, u64) -> Result<(), TrapError>,
+) -> Result<(), TrapError> {
+    let claim = custody
+        .claim_terminal_stage2_release(identity)
+        .map_err(|error| {
+            TrapError::Hypervisor(format!("claim global owner terminal release: {error:?}"))
+        })?;
+    if let Some((ipa, length)) = claim {
+        if let Err(error) = release_ipa(ipa, length) {
+            custody.abort_terminal_stage2_release(identity);
+            return Err(error);
+        }
+        custody.commit_terminal_stage2_release(identity);
+    }
+    custody
+        .structural_backings
+        .lock()
+        .remove(&identity.record_id);
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn retry_structural_backing_retirements_in_using(
+    custody: &CarrierVmCustody,
+    unmap: &mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+    release_ipa: &mut dyn FnMut(u64, u64) -> Result<(), TrapError>,
+) -> Result<(), TrapError> {
+    let retained = custody
+        .structural_backings
+        .lock()
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    let identities = retained
+        .iter()
+        .map(|retained| *retained.record_identity.lock())
+        .collect::<Vec<_>>();
+    retry_structural_backing_identities_in_using(custody, &identities, unmap, release_ipa)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn retry_structural_backing_identities_in_using(
+    custody: &CarrierVmCustody,
+    identities: &[CarrierStage2RecordIdentity],
+    unmap: &mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+    release_ipa: &mut dyn FnMut(u64, u64) -> Result<(), TrapError>,
+) -> Result<(), TrapError> {
+    for &identity in identities {
+        let Some(retained) = custody
+            .structural_backings
+            .lock()
+            .get(&identity.record_id)
+            .cloned()
+        else {
+            continue;
+        };
+        if custody.stage2_record_snapshot(identity.record_id).is_none() {
+            continue;
+        }
+        if !retained
+            .owner_retired
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            continue;
+        }
+        match custody.retire_stage2_record_using(identity, &mut *unmap) {
+            CarrierStage2RetireOutcome::RetiredUnmapped
+            | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
+                finalize_terminal_stage2_record_using(custody, identity, release_ipa)?;
+            }
+            CarrierStage2RetireOutcome::DeferredActivePins => {}
+            outcome => {
+                return Err(TrapError::Hypervisor(format!(
+                    "retire structural backing at explicit safe point: {outcome:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GlobalFrameReplayExtent {
+    ipa: u64,
+    length: u64,
+    host_addr: usize,
+    perms: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl GlobalFrameReplayExtent {
+    fn key(self) -> (u64, u64) {
+        (self.ipa, self.length)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct GlobalFrameReplayReconcileReport {
+    rebound: usize,
+    retired: usize,
+    deferred: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn reconcile_global_frame_owners_after_replay_in(
+    custody: &std::sync::Arc<CarrierVmCustody>,
+    replayed: &[GlobalFrameReplayExtent],
+    retire_unreplayed: bool,
+) -> Result<GlobalFrameReplayReconcileReport, TrapError> {
+    reconcile_global_frame_owners_after_replay_in_using(
+        custody,
+        replayed,
+        retire_unreplayed,
+        &mut release_retired_stage2_ipa,
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn finalize_carrier_exit_global_frame_owners_in(
+    custody: &std::sync::Arc<CarrierVmCustody>,
+) -> Result<(), TrapError> {
+    finalize_carrier_exit_global_frame_owners_in_using(custody, &mut release_retired_stage2_ipa)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn finalize_carrier_exit_global_frame_owners_in_using(
+    custody: &std::sync::Arc<CarrierVmCustody>,
+    release_ipa: &mut dyn FnMut(u64, u64) -> Result<(), TrapError>,
+) -> Result<(), TrapError> {
+    let report = reconcile_global_frame_owners_after_replay_in_using(
+        custody,
+        &[],
+        true,
+        release_ipa,
+    )
+    .map_err(|error| {
+        TrapError::Hypervisor(format!(
+            "carrier-exit terminal global frame cleanup after successful VM destroy failed: {error}"
+        ))
+    })?;
+    if report.deferred != 0 {
+        return Err(TrapError::Hypervisor(format!(
+            "carrier-exit terminal global frame cleanup deferred {} pinned owner(s)",
+            report.deferred
+        )));
+    }
+    let carrier_records = custody
+        .carrier_stage2_records
+        .lock()
+        .iter()
+        .map(|(&key, &identity)| (key, identity))
+        .collect::<Vec<_>>();
+    for (key, identity) in carrier_records {
+        let snapshot = custody
+            .stage2_record_snapshot(identity.record_id)
+            .ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "carrier-exit carrier-MM stage-2 record disappeared".to_owned(),
+                )
+            })?;
+        if !snapshot.terminalized_by_vm_destroy || snapshot.pin_count != 0 {
+            return Err(TrapError::Hypervisor(format!(
+                "carrier-exit carrier-MM terminal cleanup deferred IPA 0x{:x} size {}",
+                key.0, key.1
+            )));
+        }
+        finalize_terminal_stage2_record_using(custody, identity, release_ipa)?;
+        custody.carrier_stage2_records.lock().remove(&key);
+    }
+    for identity in custody.stage2_record_identities() {
+        let snapshot = custody
+            .stage2_record_snapshot(identity.record_id)
+            .ok_or_else(|| {
+                TrapError::Hypervisor("carrier-exit detached stage-2 record disappeared".to_owned())
+            })?;
+        if !snapshot.terminalized_by_vm_destroy || snapshot.pin_count != 0 {
+            return Err(TrapError::Hypervisor(format!(
+                "carrier-exit detached terminal cleanup deferred IPA 0x{:x} size {}",
+                snapshot.ipa, snapshot.len
+            )));
+        }
+        finalize_terminal_stage2_record_using(custody, identity, release_ipa)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn reconcile_global_frame_owners_after_replay_in_using(
+    custody: &std::sync::Arc<CarrierVmCustody>,
+    replayed: &[GlobalFrameReplayExtent],
+    retire_unreplayed: bool,
+    release_ipa: &mut dyn FnMut(u64, u64) -> Result<(), TrapError>,
+) -> Result<GlobalFrameReplayReconcileReport, TrapError> {
+    let mut replayed_by_key = std::collections::BTreeMap::new();
+    for extent in replayed.iter().copied() {
+        if replayed_by_key.insert(extent.key(), extent).is_some() {
+            return Err(TrapError::Hypervisor(
+                "global frame replay contains duplicate extents".to_owned(),
+            ));
+        }
+    }
+    let entries = custody
+        .global_frame_host_owners
+        .lock()
+        .iter()
+        .map(|(&key, entry)| (key, entry.is_live(), std::sync::Arc::clone(entry.owner())))
+        .collect::<Vec<_>>();
+    let mut report = GlobalFrameReplayReconcileReport::default();
+
+    for (key, was_live, owner) in entries {
+        let replay = replayed_by_key.get(&key).copied();
+        if let (true, Some(replay)) = (was_live, replay) {
+            if replay.host_addr != owner.host_addr() {
+                return Err(TrapError::Hypervisor(format!(
+                    "global frame replay host drift at IPA 0x{:x} size {}: expected=0x{:x} actual=0x{:x}",
+                    key.0,
+                    key.1,
+                    owner.host_addr(),
+                    replay.host_addr,
+                )));
+            }
+            let old_snapshot = custody
+                .stage2_record_snapshot(owner.record_identity.record_id)
+                .ok_or_else(|| {
+                    TrapError::Hypervisor("global frame replay owner record disappeared".to_owned())
+                })?;
+            if (
+                old_snapshot.ipa,
+                old_snapshot.len as u64,
+                old_snapshot.host_addr,
+            ) != (key.0, key.1, replay.host_addr)
+            {
+                return Err(TrapError::Hypervisor(
+                    "global frame replay record extent identity drifted".to_owned(),
+                ));
+            }
+            if old_snapshot.perms != replay.perms {
+                return Err(TrapError::Hypervisor(format!(
+                    "global frame replay permission drift at IPA 0x{:x} size {}: expected=0x{:x} actual=0x{:x}",
+                    key.0, key.1, old_snapshot.perms, replay.perms
+                )));
+            }
+            if old_snapshot.vm_generation
+                == custody.setup_generation().ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "global frame replay has no creating/live VM generation".to_owned(),
+                    )
+                })?
+                && old_snapshot.mapped
+            {
+                continue;
+            }
+            let mut owners = custody.global_frame_host_owners.lock();
+            let current = owners.get(&key).ok_or_else(|| {
+                TrapError::Hypervisor("global frame owner disappeared during rebind".to_owned())
+            })?;
+            if !current.is_live() || !std::sync::Arc::ptr_eq(current.owner(), &owner) {
+                return Err(TrapError::Hypervisor(
+                    "global frame owner changed during replay rebind".to_owned(),
+                ));
+            }
+            let new_identity = custody
+                .rebind_terminal_stage2_record(
+                    owner.record_identity,
+                    replay.host_addr,
+                    replay.perms,
+                )
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "rebind global frame owner after VM replay: {error:?}"
+                    ))
+                })?;
+            let successor = std::sync::Arc::new(GlobalFrameHostOwner::from_record(
+                std::sync::Arc::clone(&owner.mapping),
+                std::sync::Arc::clone(custody),
+                new_identity,
+            ));
+            owners.insert(key, GlobalFrameOwnerEntry::Live(successor));
+            drop(owners);
+            let _ = custody.remove_terminal_stage2_record(owner.record_identity);
+            report.rebound += 1;
+            continue;
+        }
+
+        if was_live && !retire_unreplayed {
+            return Err(TrapError::Hypervisor(format!(
+                "live global frame owner IPA 0x{:x} size {} was not replayed into the current VM",
+                key.0, key.1
+            )));
+        }
+        if replay.is_some() {
+            return Err(TrapError::Hypervisor(format!(
+                "retired global frame owner IPA 0x{:x} size {} was replayed",
+                key.0, key.1
+            )));
+        }
+
+        let snapshot = custody
+            .stage2_record_snapshot(owner.record_identity.record_id)
+            .ok_or_else(|| {
+                TrapError::Hypervisor("retired global frame owner record disappeared".to_owned())
+            })?;
+        if !snapshot.terminalized_by_vm_destroy {
+            return Err(TrapError::Hypervisor(
+                "unreplayed global frame owner is not terminalized by VM destroy".to_owned(),
+            ));
+        }
+        if snapshot.pin_count != 0 {
+            custody.global_frame_host_owners.lock().insert(
+                key,
+                GlobalFrameOwnerEntry::RetirementPending { owner, error: None },
+            );
+            report.deferred += 1;
+            continue;
+        }
+        finalize_global_frame_owner_record_using(custody, &owner, release_ipa)?;
+        let mut owners = custody.global_frame_host_owners.lock();
+        if owners
+            .get(&key)
+            .is_some_and(|entry| std::sync::Arc::ptr_eq(entry.owner(), &owner))
+        {
+            owners.remove(&key);
+        }
+        report.retired += 1;
+    }
+
+    let detached = custody
+        .pending_global_frame_owners
+        .lock()
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    for owner in detached {
+        let Some(snapshot) = custody.stage2_record_snapshot(owner.record_identity.record_id) else {
+            custody
+                .pending_global_frame_owners
+                .lock()
+                .remove(&owner.record_identity.record_id);
+            continue;
+        };
+        if !snapshot.terminalized_by_vm_destroy || snapshot.pin_count != 0 {
+            report.deferred += 1;
+            continue;
+        }
+        finalize_global_frame_owner_record_using(custody, &owner, release_ipa)?;
+        custody
+            .pending_global_frame_owners
+            .lock()
+            .remove(&owner.record_identity.record_id);
+        report.retired += 1;
+    }
+
+    let carrier_records = custody
+        .carrier_stage2_records
+        .lock()
+        .iter()
+        .map(|(&key, &identity)| (key, identity))
+        .collect::<Vec<_>>();
+    for (key, old_identity) in carrier_records {
+        let snapshot = custody
+            .stage2_record_snapshot(old_identity.record_id)
+            .ok_or_else(|| {
+                TrapError::Hypervisor("carrier-MM replay stage-2 record disappeared".to_owned())
+            })?;
+        let replay = replayed_by_key.get(&key).copied();
+        if let Some(replay) = replay {
+            if (replay.host_addr, replay.perms) != (snapshot.host_addr, snapshot.perms) {
+                return Err(TrapError::Hypervisor(format!(
+                    "carrier-MM replay identity drift at IPA 0x{:x} size {}",
+                    key.0, key.1
+                )));
+            }
+            let current_generation = custody.setup_generation().ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "carrier-MM replay has no creating/live VM generation".to_owned(),
+                )
+            })?;
+            if snapshot.vm_generation == current_generation && snapshot.mapped {
+                continue;
+            }
+            let new_identity = custody
+                .rebind_terminal_stage2_record(old_identity, replay.host_addr, replay.perms)
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "rebind carrier-MM stage-2 record after VM replay: {error:?}"
+                    ))
+                })?;
+            let mut records = custody.carrier_stage2_records.lock();
+            if records.get(&key) != Some(&old_identity) {
+                return Err(TrapError::Hypervisor(
+                    "carrier-MM stage-2 owner changed during replay rebind".to_owned(),
+                ));
+            }
+            records.insert(key, new_identity);
+            drop(records);
+            let _ = custody.remove_terminal_stage2_record(old_identity);
+            report.rebound += 1;
+            continue;
+        }
+        if !retire_unreplayed {
+            return Err(TrapError::Hypervisor(format!(
+                "live carrier-MM stage-2 record IPA 0x{:x} size {} was not replayed into the current VM",
+                key.0, key.1
+            )));
+        }
+        if !snapshot.terminalized_by_vm_destroy {
+            return Err(TrapError::Hypervisor(
+                "unreplayed carrier-MM stage-2 record is not terminalized by VM destroy".to_owned(),
+            ));
+        }
+        finalize_terminal_stage2_record_using(custody, old_identity, release_ipa)?;
+        let mut records = custody.carrier_stage2_records.lock();
+        if records.get(&key) == Some(&old_identity) {
+            records.remove(&key);
+        }
+        report.retired += 1;
+    }
+
+    let structural = custody
+        .structural_backings
+        .lock()
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    for retained in structural {
+        let identity = *retained.record_identity.lock();
+        let snapshot = custody
+            .stage2_record_snapshot(identity.record_id)
+            .ok_or_else(|| {
+                TrapError::Hypervisor("structural backing stage-2 record disappeared".to_owned())
+            })?;
+        let key = (snapshot.ipa, snapshot.len as u64);
+        let replay = replayed_by_key.get(&key).copied();
+
+        if retained
+            .owner_retired
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            if !snapshot.terminalized_by_vm_destroy {
+                return Err(TrapError::Hypervisor(format!(
+                    "retired structural backing IPA 0x{:x} size {} survived VM destroy",
+                    key.0, key.1
+                )));
+            }
+            finalize_terminal_stage2_record_using(custody, identity, release_ipa)?;
+            report.retired += 1;
+            continue;
+        }
+        if let Some(replay) = replay {
+            if (replay.host_addr, replay.perms) != (snapshot.host_addr, snapshot.perms) {
+                return Err(TrapError::Hypervisor(format!(
+                    "structural backing replay identity drift at IPA 0x{:x} size {}",
+                    key.0, key.1
+                )));
+            }
+            let current_generation = custody.setup_generation().ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "structural backing replay has no creating/live VM generation".to_owned(),
+                )
+            })?;
+            if snapshot.vm_generation == current_generation && snapshot.mapped {
+                continue;
+            }
+            let old_identity = identity;
+            let new_identity = custody
+                .rebind_terminal_stage2_record(old_identity, replay.host_addr, replay.perms)
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "rebind structural backing after VM replay: {error:?}"
+                    ))
+                })?;
+            *retained.record_identity.lock() = new_identity;
+            let mut retained_by_record = custody.structural_backings.lock();
+            retained_by_record.remove(&old_identity.record_id);
+            retained_by_record.insert(new_identity.record_id, std::sync::Arc::clone(&retained));
+            drop(retained_by_record);
+            let _ = custody.remove_terminal_stage2_record(old_identity);
+            report.rebound += 1;
+            continue;
+        }
+        if !retire_unreplayed {
+            return Err(TrapError::Hypervisor(format!(
+                "live structural backing IPA 0x{:x} size {} was not replayed into the current VM",
+                key.0, key.1
+            )));
+        }
+        if !snapshot.terminalized_by_vm_destroy {
+            return Err(TrapError::Hypervisor(
+                "unreplayed structural backing is not terminalized by VM destroy".to_owned(),
+            ));
+        }
+        finalize_terminal_stage2_record_using(custody, identity, release_ipa)?;
+        report.retired += 1;
+    }
+    Ok(report)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -6728,6 +7725,40 @@ fn retire_global_frame_host_owner_inner_in(
     length: u64,
     expected_generation: Option<u64>,
 ) -> GlobalFrameRetirementOutcome {
+    retire_global_frame_host_owner_inner_in_using(
+        custody,
+        ipa,
+        length,
+        expected_generation,
+        &mut unmap_global_frame_stage2_record,
+    )
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn retire_global_frame_host_owner_if_generation_in_using(
+    custody: &CarrierVmCustody,
+    ipa: u64,
+    length: u64,
+    expected_generation: u64,
+    unmap: &mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+) -> GlobalFrameRetirementOutcome {
+    retire_global_frame_host_owner_inner_in_using(
+        custody,
+        ipa,
+        length,
+        Some(expected_generation),
+        unmap,
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn retire_global_frame_host_owner_inner_in_using(
+    custody: &CarrierVmCustody,
+    ipa: u64,
+    length: u64,
+    expected_generation: Option<u64>,
+    unmap: &mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+) -> GlobalFrameRetirementOutcome {
     // Lifecycle debug: CARRICK_FORK_DEBUG_IPA=<hex> logs every owner
     // retirement overlapping that IPA, with the caller. Retiring an owner
     // drops its OwnedHostMapping — macOS can recycle the host VA immediately —
@@ -6742,88 +7773,222 @@ fn retire_global_frame_host_owner_inner_in(
             std::backtrace::Backtrace::force_capture(),
         );
     }
+    // Hold the exact directory slot through record retirement, terminal IPA
+    // finalization, and directory removal. This makes the terminal publication
+    // one serialized transaction: a concurrent caller can only observe the
+    // incumbent before it begins or the empty/successor slot after it commits.
     let mut owners = custody.global_frame_host_owners.lock();
-    let entry = match owners.get(&(ipa, length)) {
-        Some(entry) => entry,
+    let owner = match owners.get(&(ipa, length)) {
+        Some(entry) => std::sync::Arc::clone(entry.owner()),
         None => return GlobalFrameRetirementOutcome::NotFound { ipa, length },
     };
-    let owner = entry.owner().clone();
     if let Some(expected) = expected_generation {
-        if owner.generation != expected {
+        if owner.generation() != expected {
             return GlobalFrameRetirementOutcome::MismatchedGeneration {
                 ipa,
                 length,
-                current_generation: owner.generation,
+                current_generation: owner.generation(),
                 expected_generation: expected,
             };
         }
     }
-    let generation = owner.generation;
-    if std::sync::Arc::strong_count(&owner) > 2 {
+    let generation = owner.generation();
+    if owner.mapping.pin_count() != 0 {
+        let outcome = custody.request_stage2_record_retirement(owner.record_identity);
+        if outcome != CarrierStage2RetireOutcome::DeferredActivePins {
+            return GlobalFrameRetirementOutcome::RetryPending {
+                ipa,
+                length,
+                generation,
+                error: format!("carrier stage-2 retirement request failed: {outcome:?}"),
+            };
+        }
         owners.insert(
             (ipa, length),
-            GlobalFrameOwnerEntry::RetirementPending {
-                owner: owner.clone(),
-                error: None,
-            },
+            GlobalFrameOwnerEntry::RetirementPending { owner, error: None },
         );
-        return GlobalFrameRetirementOutcome::UnmapFailed {
+        return GlobalFrameRetirementOutcome::DeferredActivePins {
             ipa,
             length,
             generation,
-            error: "owner held by active foreign references".to_owned(),
         };
     }
-    match owner.try_retire() {
-        Ok(()) => {
-            owners.remove(&(ipa, length));
-            GlobalFrameRetirementOutcome::Retired {
-                ipa,
-                length,
-                generation,
+    let outcome = custody.retire_stage2_record_using(owner.record_identity, unmap);
+    match outcome {
+        CarrierStage2RetireOutcome::RetiredUnmapped
+        | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
+            let terminalized =
+                matches!(outcome, CarrierStage2RetireOutcome::TerminalizedByVmDestroy);
+            if let Err(error) = finalize_global_frame_owner_record(custody, &owner) {
+                owners.insert(
+                    (ipa, length),
+                    GlobalFrameOwnerEntry::RetirementPending {
+                        owner,
+                        error: Some(error.to_string()),
+                    },
+                );
+                return GlobalFrameRetirementOutcome::RetryPending {
+                    ipa,
+                    length,
+                    generation,
+                    error: error.to_string(),
+                };
             }
-        }
-        Err(error) => {
-            let err_str = error.to_string();
-            owners.insert(
-                (ipa, length),
-                GlobalFrameOwnerEntry::RetirementPending {
-                    owner: owner.clone(),
-                    error: Some(err_str.clone()),
-                },
-            );
-            GlobalFrameRetirementOutcome::UnmapFailed {
-                ipa,
-                length,
-                generation,
-                error: err_str,
+            if owners
+                .get(&(ipa, length))
+                .is_some_and(|entry| std::sync::Arc::ptr_eq(entry.owner(), &owner))
+            {
+                owners.remove(&(ipa, length));
             }
-        }
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn drain_and_retry_pending_global_frame_retirements_in(
-    custody: &CarrierVmCustody,
-) -> Result<(), TrapError> {
-    let mut owners = custody.global_frame_host_owners.lock();
-    let keys: Vec<(u64, u64)> = owners.keys().copied().collect();
-    for key in keys {
-        if let Some(entry) = owners.get(&key) {
-            let owner = entry.owner().clone();
-            if std::sync::Arc::strong_count(&owner) <= 2 {
-                if let Ok(()) = owner.try_retire() {
-                    owners.remove(&key);
+            if terminalized {
+                GlobalFrameRetirementOutcome::TerminalizedByVmDestroy {
+                    ipa,
+                    length,
+                    generation,
+                }
+            } else {
+                GlobalFrameRetirementOutcome::RetiredUnmapped {
+                    ipa,
+                    length,
+                    generation,
                 }
             }
         }
+        CarrierStage2RetireOutcome::DeferredActivePins => {
+            owners.insert(
+                (ipa, length),
+                GlobalFrameOwnerEntry::RetirementPending { owner, error: None },
+            );
+            GlobalFrameRetirementOutcome::DeferredActivePins {
+                ipa,
+                length,
+                generation,
+            }
+        }
+        CarrierStage2RetireOutcome::RetryPending(error) => {
+            owners.insert(
+                (ipa, length),
+                GlobalFrameOwnerEntry::RetirementPending {
+                    owner,
+                    error: Some(format!("{error:?}")),
+                },
+            );
+            GlobalFrameRetirementOutcome::RetryPending {
+                ipa,
+                length,
+                generation,
+                error: format!("{error:?}"),
+            }
+        }
+        unexpected => GlobalFrameRetirementOutcome::RetryPending {
+            ipa,
+            length,
+            generation,
+            error: format!("carrier stage-2 record identity failure: {unexpected:?}"),
+        },
     }
-    if owners.is_empty() {
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn drain_and_retry_pending_global_frame_retirements_in(
+    custody: &CarrierVmCustody,
+) -> Result<(), TrapError> {
+    drain_all_global_frame_retirements_in_using(custody, &mut unmap_global_frame_stage2_record)
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn drain_all_global_frame_retirements_in_using(
+    custody: &CarrierVmCustody,
+    unmap: &mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+) -> Result<(), TrapError> {
+    let directory = custody
+        .global_frame_host_owners
+        .lock()
+        .iter()
+        .filter_map(|(&key, entry)| entry.is_live().then_some((key, entry.owner().generation())))
+        .collect::<Vec<_>>();
+    for ((ipa, length), generation) in directory {
+        let _ = retire_global_frame_host_owner_inner_in_using(
+            custody,
+            ipa,
+            length,
+            Some(generation),
+            unmap,
+        );
+    }
+
+    // A carrier safe point is also the explicit retry point for directory and
+    // collision candidates whose first retirement attempt was deferred.
+    let _ = retry_pending_global_frame_retirements_in_using(custody, unmap);
+    let directory_remaining = custody.global_frame_host_owners.lock().len();
+    let collision_remaining = custody.pending_global_frame_owners.lock().len();
+    if directory_remaining == 0 && collision_remaining == 0 {
         Ok(())
     } else {
         Err(TrapError::Hypervisor(format!(
-            "global frame host owner directory has {} entries pending retirement before VM destroy",
-            owners.len()
+            "global frame host owner custody has {directory_remaining} directory and {collision_remaining} collision entries remaining at carrier drain"
+        )))
+    }
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn retry_pending_global_frame_retirements_in_using(
+    custody: &CarrierVmCustody,
+    unmap: &mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+) -> Result<(), TrapError> {
+    let pending_directory = custody
+        .global_frame_host_owners
+        .lock()
+        .iter()
+        .filter_map(|(&key, entry)| {
+            entry
+                .is_pending()
+                .then_some((key, entry.owner().generation()))
+        })
+        .collect::<Vec<_>>();
+    for ((ipa, length), generation) in pending_directory {
+        let _ = retire_global_frame_host_owner_inner_in_using(
+            custody,
+            ipa,
+            length,
+            Some(generation),
+            unmap,
+        );
+    }
+
+    let detached = custody
+        .pending_global_frame_owners
+        .lock()
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    for owner in detached {
+        let outcome = custody.retire_stage2_record_using(owner.record_identity, &mut *unmap);
+        if matches!(
+            outcome,
+            CarrierStage2RetireOutcome::RetiredUnmapped
+                | CarrierStage2RetireOutcome::TerminalizedByVmDestroy
+        ) && finalize_global_frame_owner_record(custody, &owner).is_ok()
+        {
+            custody
+                .pending_global_frame_owners
+                .lock()
+                .remove(&owner.record_identity.record_id);
+        }
+    }
+
+    let directory_pending = custody
+        .global_frame_host_owners
+        .lock()
+        .values()
+        .filter(|entry| entry.is_pending())
+        .count();
+    let detached_pending = custody.pending_global_frame_owners.lock().len();
+    if directory_pending == 0 && detached_pending == 0 {
+        Ok(())
+    } else {
+        Err(TrapError::Hypervisor(format!(
+            "global frame host owner custody has {directory_pending} directory and {detached_pending} collision entries pending retirement"
         )))
     }
 }
@@ -6938,6 +8103,33 @@ fn mapped_region_stage2_owner_identity(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn replayed_global_frame_owners_for_regions_in<'a>(
+    custody: &CarrierVmCustody,
+    regions: impl Iterator<Item = &'a HvfMappedRegion>,
+) -> Vec<GlobalFrameReplayExtent> {
+    let owners = custody.global_frame_host_owners.lock();
+    let mut replayed = std::collections::BTreeMap::new();
+    for mapping in regions {
+        let Some(identity) = mapped_region_stage2_owner_identity(mapping) else {
+            continue;
+        };
+        let key = (mapping.physical_ipa, mapping.physical_size as u64);
+        if owners
+            .get(&key)
+            .is_some_and(|entry| entry.is_live() && entry.owner().host_addr() == identity.host_addr)
+        {
+            replayed.entry(key).or_insert(GlobalFrameReplayExtent {
+                ipa: key.0,
+                length: key.1,
+                host_addr: identity.host_addr,
+                perms: u64::from(mapping.perms),
+            });
+        }
+    }
+    replayed.into_values().collect()
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn global_frame_region_owner_matches_in(
     custody: &CarrierVmCustody,
     mapping: &HvfMappedRegion,
@@ -6982,7 +8174,7 @@ fn register_global_frame_host_owner(
     mapping: crate::host_mapping::OwnedHostMapping,
     perms: u64,
 ) -> Result<u64, TrapError> {
-    register_global_frame_host_owner_in(legacy_test_carrier_vm_custody(), lease, mapping, perms)
+    register_global_frame_host_owner_in(legacy_test_carrier_vm_custody_arc(), lease, mapping, perms)
 }
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
@@ -6990,7 +8182,7 @@ fn publish_exec_region_host_owner(
     region: &mut HvfMappedRegion,
     lease: GlobalFrameStage2Lease,
 ) -> Result<u64, TrapError> {
-    publish_exec_region_host_owner_in(legacy_test_carrier_vm_custody(), region, lease)
+    publish_exec_region_host_owner_in(legacy_test_carrier_vm_custody_arc(), region, lease)
 }
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
@@ -8372,26 +9564,74 @@ fn record_vm_released() {
 /// call after a successful destroy) records no lifecycle event at all.
 pub fn destroy_persistent_vm_at_carrier_exit() -> Result<(), TrapError> {
     if !carrier_vm_live() {
+        let terminal = persistent_carrier_cell().lock().take();
+        let Some(entry) = terminal else {
+            return Ok(());
+        };
+        if let PersistentCarrierCellEntry::CreateCleanup {
+            custody,
+            generation,
+            mut vcpu_id,
+            mut raw_vm_destroyed,
+        } = entry
+        {
+            if let Err(error) = drive_pending_carrier_vm_cleanup(
+                &custody,
+                generation,
+                &mut vcpu_id,
+                &mut raw_vm_destroyed,
+                "carrier create-cleanup retry",
+            ) {
+                *persistent_carrier_cell().lock() =
+                    Some(PersistentCarrierCellEntry::CreateCleanup {
+                        custody,
+                        generation,
+                        vcpu_id,
+                        raw_vm_destroyed,
+                    });
+                return Err(error);
+            }
+            return Ok(());
+        }
+        let PersistentCarrierCellEntry::Published(carrier) = entry else {
+            unreachable!()
+        };
+        let custody = std::sync::Arc::clone(&carrier.carrier_foreign_mm_transport.custody);
+        if let Err(error) = finalize_carrier_exit_global_frame_owners_in(&custody) {
+            *persistent_carrier_cell().lock() =
+                Some(PersistentCarrierCellEntry::Published(carrier));
+            return Err(error);
+        }
+        drop(carrier);
         return Ok(());
     }
-    let carrier = persistent_carrier_cell().lock().take().ok_or_else(|| {
+    let entry = persistent_carrier_cell().lock().take().ok_or_else(|| {
         TrapError::Hypervisor("carrier-exit live VM has no published carrier custody".to_owned())
     })?;
+    let PersistentCarrierCellEntry::Published(carrier) = entry else {
+        *persistent_carrier_cell().lock() = Some(entry);
+        return Err(TrapError::Hypervisor(
+            "carrier-exit live VM has only create-cleanup custody".to_owned(),
+        ));
+    };
     let custody = std::sync::Arc::clone(&carrier.carrier_foreign_mm_transport.custody);
-    if let Err(e) = drain_and_retry_pending_global_frame_retirements_in(&custody) {
-        persistent_carrier_cell().lock().replace(carrier);
-        return Err(TrapError::Hypervisor(format!(
-            "carrier-exit cannot destroy VM while pending global frame retirements remain: {e}"
-        )));
+    // Keep the published bundle recoverable until raw destroy succeeds. A
+    // failed destroy leaves the exact VM live, so its publication must remain
+    // reachable for retry rather than disappearing with a provisional take.
+    if let Err(error) = destroy_vm_with_custody(&custody, "carrier-exit") {
+        *persistent_carrier_cell().lock() = Some(PersistentCarrierCellEntry::Published(carrier));
+        return Err(error);
     }
-    // Drop the carrier's control-mapping authority first: `PersistentCarrierMappings`'s
-    // `Drop` unmaps the five fixed stage-2 extents, which must precede
-    // `hv_vm_destroy`. This only releases the cell's `Arc`; every executor pool
-    // holding another `Arc` must already have been shut down by its container's
-    // run terminal (`pool_shutdown` in `run_threaded_loop_inner`) — a retained
-    // `Arc` leaves the extents mapped until `hv_vm_destroy` tears them down.
+    // A successful raw destroy is the terminal authority for every exact VM
+    // record. Pending pre-destroy unmap failures cannot veto that success.
+    // Carrier exit has no replay successor, so every remaining logical owner
+    // is retired after terminalization.
+    if let Err(error) = finalize_carrier_exit_global_frame_owners_in(&custody) {
+        *persistent_carrier_cell().lock() = Some(PersistentCarrierCellEntry::Published(carrier));
+        return Err(error);
+    }
     drop(carrier);
-    destroy_vm_with_custody(&custody, "carrier-exit")
+    Ok(())
 }
 
 /// Whether the atomic slot-table admission permit is active; cached once.
@@ -8466,6 +9706,35 @@ fn acquire_atomic_vcpu_permit(budget: usize) -> Result<PermitToken, TrapError> {
 enum HeldPermit {
     Flock(GlobalVcpuPermit),
     Atomic(PermitToken),
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct HeldPermitGuard {
+    permit: Option<HeldPermit>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HeldPermitGuard {
+    fn new(permit: HeldPermit) -> Self {
+        Self {
+            permit: Some(permit),
+        }
+    }
+
+    fn into_inner(mut self) -> HeldPermit {
+        self.permit
+            .take()
+            .unwrap_or_else(|| unreachable!("held permit guard already consumed"))
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for HeldPermitGuard {
+    fn drop(&mut self) {
+        if let Some(permit) = self.permit.take() {
+            release_unregistered_admission_permit(permit);
+        }
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -8612,22 +9881,20 @@ fn create_with_no_resources_backpressure_bounded<T>(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn create_vcpu_with_permit(
     vm: &applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
-    permit: Option<HeldPermit>,
+    permit: Option<HeldPermitGuard>,
 ) -> Result<applevisor::vcpu::Vcpu, TrapError> {
     // The permit (this process's admitted soft-budget slot) is held across all
     // retries; only the terminal outcome registers or releases it.
     match create_with_no_resources_backpressure("hv_vcpu_create", || vm.vcpu_create()) {
         Ok(vcpu) => {
             if let Some(permit) = permit {
-                register_admission_permit(vcpu.id(), permit);
+                register_admission_permit(vcpu.id(), permit.into_inner());
             }
             vcpu_created();
             Ok(vcpu)
         }
         Err(e) => {
-            if let Some(permit) = permit {
-                release_unregistered_admission_permit(permit);
-            }
+            drop(permit);
             Err(e)
         }
     }
@@ -8650,13 +9917,320 @@ fn create_vcpu(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct PendingCarrierVmCreation {
+    custody: std::sync::Arc<CarrierVmCustody>,
+    generation: CarrierVmGeneration,
+    probe_code: i32,
+    vcpu_id: Option<applevisor_sys::hv_vcpu_t>,
+    armed: bool,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl PendingCarrierVmCreation {
+    fn record_vcpu(&mut self, vcpu_id: applevisor_sys::hv_vcpu_t) {
+        self.vcpu_id = Some(vcpu_id);
+    }
+
+    fn commit(mut self) -> Result<(), TrapError> {
+        if let Err(error) = self.custody.commit_create(self.generation) {
+            let mut vcpu_id = self.vcpu_id.take();
+            let mut raw_vm_destroyed = false;
+            let cleanup_error = drive_pending_carrier_vm_cleanup(
+                &self.custody,
+                self.generation,
+                &mut vcpu_id,
+                &mut raw_vm_destroyed,
+                "VM setup commit failure cleanup",
+            )
+            .err();
+            self.armed = false;
+            if cleanup_error.is_some() {
+                *persistent_carrier_cell().lock() =
+                    Some(PersistentCarrierCellEntry::CreateCleanup {
+                        custody: std::sync::Arc::clone(&self.custody),
+                        generation: self.generation,
+                        vcpu_id,
+                        raw_vm_destroyed,
+                    });
+            }
+            let commit_error = custody_transition_error("VM setup", "commit_create", error);
+            return Err(match cleanup_error {
+                Some(cleanup_error) => TrapError::Hypervisor(format!(
+                    "{commit_error}; {cleanup_error}; exact Creating cleanup retained"
+                )),
+                None => commit_error,
+            });
+        }
+        record_vm_resident();
+        CARRIER_VM_LIVE.store(true, std::sync::atomic::Ordering::Release);
+        crate::probes::vm_lifecycle(1, self.probe_code);
+        self.armed = false;
+        Ok(())
+    }
+
+    fn rollback(mut self, setup_error: TrapError) -> Result<(), TrapError> {
+        let mut vcpu_id = self.vcpu_id.take();
+        let mut raw_vm_destroyed = false;
+        if let Err(rollback_error) = drive_pending_carrier_vm_cleanup(
+            &self.custody,
+            self.generation,
+            &mut vcpu_id,
+            &mut raw_vm_destroyed,
+            "VM setup rollback",
+        ) {
+            self.armed = false;
+            *persistent_carrier_cell().lock() = Some(PersistentCarrierCellEntry::CreateCleanup {
+                custody: std::sync::Arc::clone(&self.custody),
+                generation: self.generation,
+                vcpu_id,
+                raw_vm_destroyed,
+            });
+            return Err(TrapError::Hypervisor(format!(
+                "VM setup failed ({setup_error}); {rollback_error}; exact Creating custody published for cleanup retry"
+            )));
+        }
+        self.armed = false;
+        Err(setup_error)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn drive_pending_carrier_vm_cleanup(
+    custody: &std::sync::Arc<CarrierVmCustody>,
+    generation: CarrierVmGeneration,
+    vcpu_id: &mut Option<applevisor_sys::hv_vcpu_t>,
+    raw_vm_destroyed: &mut bool,
+    context: &str,
+) -> Result<(), TrapError> {
+    drive_pending_carrier_vm_cleanup_using(
+        custody,
+        generation,
+        vcpu_id,
+        raw_vm_destroyed,
+        context,
+        |id| unsafe { applevisor_sys::hv_vcpu_destroy(id) },
+        |custody, generation, context| {
+            destroy_vm_with_custody_target(
+                custody,
+                context,
+                CarrierVmDestroyTarget::Creating(generation),
+            )
+        },
+        finalize_carrier_exit_global_frame_owners_in,
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(clippy::too_many_arguments)]
+fn drive_pending_carrier_vm_cleanup_using(
+    custody: &std::sync::Arc<CarrierVmCustody>,
+    generation: CarrierVmGeneration,
+    vcpu_id: &mut Option<applevisor_sys::hv_vcpu_t>,
+    raw_vm_destroyed: &mut bool,
+    context: &str,
+    mut destroy_vcpu: impl FnMut(applevisor_sys::hv_vcpu_t) -> applevisor_sys::hv_return_t,
+    mut destroy_vm: impl FnMut(
+        &std::sync::Arc<CarrierVmCustody>,
+        CarrierVmGeneration,
+        &str,
+    ) -> Result<(), TrapError>,
+    mut finalize_records: impl FnMut(&std::sync::Arc<CarrierVmCustody>) -> Result<(), TrapError>,
+) -> Result<(), TrapError> {
+    if let Some(id) = *vcpu_id {
+        let rc = destroy_vcpu(id);
+        if rc != 0 {
+            return Err(TrapError::Hypervisor(format!(
+                "{context}: hv_vcpu_destroy rc={rc:#x}; exact vCPU cleanup retained"
+            )));
+        }
+        vcpu_destroyed(id);
+        *vcpu_id = None;
+    }
+    if !*raw_vm_destroyed {
+        destroy_vm(custody, generation, context)?;
+        *raw_vm_destroyed = true;
+    }
+    finalize_records(custody).map_err(|error| {
+        TrapError::Hypervisor(format!(
+            "{context}: terminal setup-record cleanup failed after raw VM destroy: {error}"
+        ))
+    })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for PendingCarrierVmCreation {
+    fn drop(&mut self) {
+        debug_assert!(
+            !self.armed,
+            "pending carrier VM creation escaped without explicit commit/rollback"
+        );
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn finish_pending_vm_creation<T>(
+    pending: Option<PendingCarrierVmCreation>,
+    result: Result<T, TrapError>,
+) -> Result<T, TrapError> {
+    let Some(pending) = pending else {
+        return result;
+    };
+    match result {
+        Ok(value) => {
+            pending.commit()?;
+            Ok(value)
+        }
+        Err(error) => pending.rollback(error).and_then(|()| unreachable!()),
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn commit_pending_creation_before_vcpu_handoff(
+    pending: &mut Option<PendingCarrierVmCreation>,
+) -> Result<(), TrapError> {
+    let creation = pending.take().ok_or_else(|| {
+        TrapError::Hypervisor("VM creation transaction disappeared before vCPU handoff".to_owned())
+    })?;
+    creation.commit()
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn prepare_initial_carrier_before_admission<T, U>(
+    prepare_fallible_inputs: impl FnOnce() -> Result<T, TrapError>,
+    acquire_vm_and_permit: impl FnOnce() -> Result<U, TrapError>,
+) -> Result<(T, U), TrapError> {
+    let inputs = prepare_fallible_inputs()?;
+    let acquired = acquire_vm_and_permit()?;
+    Ok((inputs, acquired))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SetupVcpuCleanup {
+    PendingRaw,
+    LocalRaii,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct SetupVmGuard {
+    vm: std::mem::ManuallyDrop<SharedVm>,
+    pending_raw_cleanup: bool,
+    armed: bool,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl SetupVmGuard {
+    fn new(vm: SharedVm, pending_raw_cleanup: bool) -> Self {
+        Self {
+            vm: std::mem::ManuallyDrop::new(vm),
+            pending_raw_cleanup,
+            armed: true,
+        }
+    }
+
+    fn into_inner(mut self) -> SharedVm {
+        self.armed = false;
+        // SAFETY: `armed` prevents Drop from touching the value after this
+        // single ownership transfer.
+        unsafe { std::mem::ManuallyDrop::take(&mut self.vm) }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl std::ops::Deref for SetupVmGuard {
+    type Target = SharedVm;
+
+    fn deref(&self) -> &Self::Target {
+        &self.vm
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for SetupVmGuard {
+    fn drop(&mut self) {
+        if !self.armed || self.pending_raw_cleanup {
+            return;
+        }
+        // SAFETY: a reused carrier VM has no Pending raw cleanup owner. Drop
+        // only this clone through its ordinary applevisor RAII path.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.vm) };
+        self.armed = false;
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct SetupVcpuGuard {
+    vcpu: std::mem::ManuallyDrop<applevisor::vcpu::Vcpu>,
+    cleanup: SetupVcpuCleanup,
+    armed: bool,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl SetupVcpuGuard {
+    fn new(vcpu: applevisor::vcpu::Vcpu, cleanup: SetupVcpuCleanup) -> Self {
+        Self {
+            vcpu: std::mem::ManuallyDrop::new(vcpu),
+            cleanup,
+            armed: true,
+        }
+    }
+
+    fn into_inner(mut self) -> applevisor::vcpu::Vcpu {
+        self.armed = false;
+        // SAFETY: `armed` prevents Drop from touching the value after this
+        // single ownership transfer.
+        unsafe { std::mem::ManuallyDrop::take(&mut self.vcpu) }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl std::ops::Deref for SetupVcpuGuard {
+    type Target = applevisor::vcpu::Vcpu;
+
+    fn deref(&self) -> &Self::Target {
+        &self.vcpu
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn complete_local_vcpu_raii_cleanup(
+    id: applevisor_sys::hv_vcpu_t,
+    drop_wrapper: impl FnOnce(),
+    record_destroyed: impl FnOnce(applevisor_sys::hv_vcpu_t),
+) {
+    drop_wrapper();
+    record_destroyed(id);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for SetupVcpuGuard {
+    fn drop(&mut self) {
+        if !self.armed || self.cleanup == SetupVcpuCleanup::PendingRaw {
+            return;
+        }
+        let id = self.vcpu.id();
+        complete_local_vcpu_raii_cleanup(
+            id,
+            || {
+                // SAFETY: the local-reuse lane has no Pending transaction. Its
+                // ordinary applevisor RAII destruction remains the sole HV owner.
+                unsafe { std::mem::ManuallyDrop::drop(&mut self.vcpu) };
+            },
+            vcpu_destroyed,
+        );
+        self.armed = false;
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn create_vm_with_admission(
     admission: VmCreateAdmission,
-    custody: &CarrierVmCustody,
+    custody: &std::sync::Arc<CarrierVmCustody>,
 ) -> Result<
     (
         applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
-        Option<HeldPermit>,
+        Option<HeldPermitGuard>,
+        PendingCarrierVmCreation,
     ),
     TrapError,
 > {
@@ -8665,34 +10239,39 @@ fn create_vm_with_admission(
     // bounded (ADMISSION_PERMIT_MAX_WAIT) — persistent exhaustion propagates as
     // a typed error instead of parking here forever.
     let permit = match admission.global_permit_budget() {
-        Some(budget) => Some(acquire_admission_permit(budget)?),
+        Some(budget) => Some(HeldPermitGuard::new(acquire_admission_permit(budget)?)),
         None => None,
     };
-    let create_result = create_vm_with_custody_using(
-        custody,
-        "hv_vm_create",
-        || {
-            // Config is rebuilt per attempt inside the closure because
-            // `with_config` consumes it, so an HV_NO_RESOURCES retry needs a
-            // fresh one.
-            crate::probes::vm_lifecycle(0, admission.probe_code());
-            create_with_no_resources_backpressure("hv_vm_create", || {
-                let config = fresh_vm_config()?;
-                virtual_machine_with_private_signals_blocked(config)
-            })
-        },
-        || {
-            record_vm_resident();
-            CARRIER_VM_LIVE.store(true, std::sync::atomic::Ordering::Release);
-            crate::probes::vm_lifecycle(1, admission.probe_code());
-        },
-    );
+    let generation = custody
+        .begin_create()
+        .map_err(|error| custody_transition_error("hv_vm_create", "begin_create", error))?;
+    let create_result = {
+        // Config is rebuilt per attempt inside the closure because
+        // `with_config` consumes it, so an HV_NO_RESOURCES retry needs a
+        // fresh one.
+        crate::probes::vm_lifecycle(0, admission.probe_code());
+        create_with_no_resources_backpressure("hv_vm_create", || {
+            let config = fresh_vm_config()?;
+            virtual_machine_with_private_signals_blocked(config)
+        })
+    };
     match create_result {
-        Ok(vm) => Ok((vm, permit)),
+        Ok(vm) => Ok((
+            vm,
+            permit,
+            PendingCarrierVmCreation {
+                custody: std::sync::Arc::clone(custody),
+                generation,
+                probe_code: admission.probe_code(),
+                vcpu_id: None,
+                armed: true,
+            },
+        )),
         Err(error) => {
-            if let Some(permit) = permit {
-                release_unregistered_admission_permit(permit);
-            }
+            custody
+                .abort_create(generation)
+                .map_err(|abort| custody_transition_error("hv_vm_create", "abort_create", abort))?;
+            drop(permit);
             Err(error)
         }
     }
@@ -9034,9 +10613,7 @@ fn reconcile_carrier_stage2_authority_retention(
 ) {
     if authority_population_complete {
         frames.authority_retained_stage2.remove(&lease);
-    } else if !frames.stage2_references.contains_key(&lease)
-        && carrier_stage2_leases().lock().contains_key(&lease)
-    {
+    } else if !frames.stage2_references.contains_key(&lease) {
         frames.authority_retained_stage2.insert(lease);
     }
 }
@@ -9587,7 +11164,9 @@ pub(crate) struct CarrierStage2RecordSpec {
     pub(crate) len: usize,
     pub(crate) host_addr: usize,
     pub(crate) mapped: bool,
+    pub(crate) backend_map_installed: bool,
     pub(crate) release_ipa: bool,
+    pub(crate) perms: u64,
     pub(crate) logical_owner: Option<CarrierLogicalOwner>,
 }
 
@@ -9627,6 +11206,10 @@ pub(crate) enum CarrierStage2RecordError {
     NoLiveVm,
     VmGenerationMismatch,
     RecordIdExhausted,
+    RecordNotFound,
+    RecordNotTerminal,
+    RecordIdentityMismatch,
+    ReleaseInFlight,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -9652,13 +11235,18 @@ pub(crate) struct CarrierStage2RecordSnapshot {
     pub(crate) len: usize,
     pub(crate) host_addr: usize,
     pub(crate) mapped: bool,
+    pub(crate) backend_map_installed: bool,
     pub(crate) release_ipa: bool,
+    pub(crate) perms: u64,
     pub(crate) logical_owner: Option<CarrierLogicalOwner>,
     pub(crate) pin_count: u64,
     pub(crate) retirement_requested: bool,
     pub(crate) retry_eligible: bool,
     pub(crate) retry_pending: Option<CarrierStage2BackendError>,
     pub(crate) terminalized_by_vm_destroy: bool,
+    pub(crate) superseded_by_rebind: bool,
+    pub(crate) release_in_flight: bool,
+    pub(crate) release_retry_pending: bool,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -9694,6 +11282,8 @@ struct CarrierVmCustodyState {
     next_generation: u64,
     lifecycle: CarrierVmLifecycle,
     next_stage2_record_id: u64,
+    next_logical_owner_id: u64,
+    next_logical_owner_generation: u64,
     stage2_records: std::collections::BTreeMap<CarrierStage2RecordId, CarrierStage2Record>,
 }
 
@@ -9708,7 +11298,18 @@ struct CarrierVmCustodyState {
 #[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
 pub(crate) struct CarrierVmCustody {
     state: parking_lot::Mutex<CarrierVmCustodyState>,
+    structural_backings: parking_lot::Mutex<
+        std::collections::BTreeMap<
+            CarrierStage2RecordId,
+            std::sync::Arc<StructuralBackingCustodyEntry>,
+        >,
+    >,
+    carrier_stage2_records:
+        parking_lot::Mutex<std::collections::BTreeMap<(u64, u64), CarrierStage2RecordIdentity>>,
     global_frame_host_owners: GlobalFrameHostOwnerDirectory,
+    pending_global_frame_owners: parking_lot::Mutex<
+        std::collections::BTreeMap<CarrierStage2RecordId, std::sync::Arc<GlobalFrameHostOwner>>,
+    >,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -9727,10 +11328,26 @@ impl CarrierVmCustody {
                 next_generation: 1,
                 lifecycle: CarrierVmLifecycle::Vacant,
                 next_stage2_record_id: 1,
+                next_logical_owner_id: 1,
+                next_logical_owner_generation: 1,
                 stage2_records: std::collections::BTreeMap::new(),
             }),
+            structural_backings: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
+            carrier_stage2_records: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             global_frame_host_owners: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
+            pending_global_frame_owners: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
         }
+    }
+
+    #[cfg(any(test, feature = "foreign-cow-test-support"))]
+    fn new_live_fixture() -> Self {
+        let custody = Self::new();
+        {
+            let mut state = custody.state.lock();
+            state.next_generation = 2;
+            state.lifecycle = CarrierVmLifecycle::Live(CarrierVmGeneration(1));
+        }
+        custody
     }
 
     pub(crate) fn begin_create(&self) -> Result<CarrierVmGeneration, CarrierVmCustodyError> {
@@ -9774,6 +11391,38 @@ impl CarrierVmCustody {
         let mut state = self.state.lock();
         match state.lifecycle {
             CarrierVmLifecycle::Creating(current) if current == generation => {
+                state.lifecycle = CarrierVmLifecycle::Vacant;
+                Ok(())
+            }
+            CarrierVmLifecycle::Creating(_) | CarrierVmLifecycle::Live(_) => {
+                Err(CarrierVmCustodyError::StaleGeneration)
+            }
+            CarrierVmLifecycle::Vacant | CarrierVmLifecycle::Destroying(_) => {
+                Err(CarrierVmCustodyError::LifecycleConflict)
+            }
+        }
+    }
+
+    fn abort_created_vm_after_raw_destroy(
+        &self,
+        generation: CarrierVmGeneration,
+    ) -> Result<(), CarrierVmCustodyError> {
+        let mut state = self.state.lock();
+        match state.lifecycle {
+            CarrierVmLifecycle::Creating(current) if current == generation => {
+                for record in state
+                    .stage2_records
+                    .values_mut()
+                    .filter(|record| record.snapshot.vm_generation == generation)
+                {
+                    record.snapshot.mapped = false;
+                    record.snapshot.backend_map_installed = false;
+                    record.snapshot.retirement_requested = true;
+                    record.snapshot.retry_eligible = false;
+                    record.snapshot.retry_pending = None;
+                    record.snapshot.terminalized_by_vm_destroy = true;
+                    record.unmap_in_flight = false;
+                }
                 state.lifecycle = CarrierVmLifecycle::Vacant;
                 Ok(())
             }
@@ -9835,6 +11484,7 @@ impl CarrierVmCustody {
                     .filter(|record| record.snapshot.vm_generation == generation)
                 {
                     record.snapshot.mapped = false;
+                    record.snapshot.backend_map_installed = false;
                     record.snapshot.retirement_requested = true;
                     record.snapshot.retry_eligible = false;
                     record.snapshot.retry_pending = None;
@@ -9862,6 +11512,152 @@ impl CarrierVmCustody {
         }
     }
 
+    fn setup_generation(&self) -> Option<CarrierVmGeneration> {
+        match self.state.lock().lifecycle {
+            CarrierVmLifecycle::Creating(generation) | CarrierVmLifecycle::Live(generation) => {
+                Some(generation)
+            }
+            CarrierVmLifecycle::Vacant | CarrierVmLifecycle::Destroying(_) => None,
+        }
+    }
+
+    fn creating_generation(&self) -> Option<CarrierVmGeneration> {
+        match self.state.lock().lifecycle {
+            CarrierVmLifecycle::Creating(generation) => Some(generation),
+            CarrierVmLifecycle::Vacant
+            | CarrierVmLifecycle::Live(_)
+            | CarrierVmLifecycle::Destroying(_) => None,
+        }
+    }
+
+    fn stage2_record_identities(&self) -> Vec<CarrierStage2RecordIdentity> {
+        self.state
+            .lock()
+            .stage2_records
+            .iter()
+            .map(|(&record_id, record)| CarrierStage2RecordIdentity {
+                record_id,
+                vm_generation: record.snapshot.vm_generation,
+                logical_owner: record.snapshot.logical_owner,
+            })
+            .collect()
+    }
+
+    fn allocate_logical_owner(&self) -> Result<CarrierLogicalOwner, CarrierStage2RecordError> {
+        let mut state = self.state.lock();
+        let next_id = state
+            .next_logical_owner_id
+            .checked_add(1)
+            .ok_or(CarrierStage2RecordError::RecordIdExhausted)?;
+        let next_generation = state
+            .next_logical_owner_generation
+            .checked_add(1)
+            .ok_or(CarrierStage2RecordError::RecordIdExhausted)?;
+        let owner = CarrierLogicalOwner {
+            id: state.next_logical_owner_id,
+            generation: state.next_logical_owner_generation,
+        };
+        state.next_logical_owner_id = next_id;
+        state.next_logical_owner_generation = next_generation;
+        Ok(owner)
+    }
+
+    fn remove_terminal_stage2_record(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+    ) -> Option<CarrierStage2RecordSnapshot> {
+        let mut state = self.state.lock();
+        let record = state.stage2_records.get(&identity.record_id)?;
+        if Self::stage2_identity_mismatch(record, identity).is_some()
+            || record.snapshot.pin_count != 0
+            || (record.snapshot.mapped && !record.snapshot.terminalized_by_vm_destroy)
+        {
+            return None;
+        }
+        state
+            .stage2_records
+            .remove(&identity.record_id)
+            .map(|record| record.snapshot)
+    }
+
+    fn claim_terminal_stage2_release(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+    ) -> Result<Option<(u64, u64)>, CarrierStage2RecordError> {
+        let mut state = self.state.lock();
+        let record = state
+            .stage2_records
+            .get_mut(&identity.record_id)
+            .ok_or(CarrierStage2RecordError::RecordNotFound)?;
+        if Self::stage2_identity_mismatch(record, identity).is_some() {
+            return Err(CarrierStage2RecordError::RecordIdentityMismatch);
+        }
+        if record.snapshot.pin_count != 0
+            || (record.snapshot.mapped && !record.snapshot.terminalized_by_vm_destroy)
+        {
+            return Err(CarrierStage2RecordError::RecordNotTerminal);
+        }
+        if record.snapshot.release_in_flight {
+            return Err(CarrierStage2RecordError::ReleaseInFlight);
+        }
+        if !record.snapshot.release_ipa {
+            state.stage2_records.remove(&identity.record_id);
+            return Ok(None);
+        }
+        record.snapshot.release_in_flight = true;
+        record.snapshot.release_retry_pending = false;
+        Ok(Some((record.snapshot.ipa, record.snapshot.len as u64)))
+    }
+
+    fn commit_terminal_stage2_release(&self, identity: CarrierStage2RecordIdentity) {
+        let mut state = self.state.lock();
+        let removable = state
+            .stage2_records
+            .get(&identity.record_id)
+            .is_some_and(|record| {
+                Self::stage2_identity_mismatch(record, identity).is_none()
+                    && record.snapshot.release_in_flight
+                    && record.snapshot.release_ipa
+            });
+        debug_assert!(
+            removable,
+            "claimed terminal release identity must remain stable"
+        );
+        if removable {
+            state.stage2_records.remove(&identity.record_id);
+        }
+    }
+
+    fn abort_terminal_stage2_release(&self, identity: CarrierStage2RecordIdentity) {
+        let mut state = self.state.lock();
+        let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
+            debug_assert!(false, "claimed terminal release record disappeared");
+            return;
+        };
+        debug_assert!(Self::stage2_identity_mismatch(record, identity).is_none());
+        record.snapshot.release_in_flight = false;
+        record.snapshot.release_retry_pending = true;
+    }
+
+    #[cfg(test)]
+    fn pending_global_frame_owner_count(&self) -> usize {
+        self.pending_global_frame_owners.lock().len()
+    }
+
+    #[cfg(test)]
+    fn disarm_stage2_backend_map_for_test(&self, identity: CarrierStage2RecordIdentity) {
+        let mut state = self.state.lock();
+        let record = state
+            .stage2_records
+            .get_mut(&identity.record_id)
+            .unwrap_or_else(|| panic!("missing test stage-2 record"));
+        assert!(
+            Self::stage2_identity_mismatch(record, identity).is_none(),
+            "test stage-2 record identity drifted"
+        );
+        record.snapshot.backend_map_installed = false;
+    }
+
     pub(crate) fn register_stage2_record(
         &self,
         spec: CarrierStage2RecordSpec,
@@ -9871,13 +11667,12 @@ impl CarrierVmCustody {
         }
         let mut state = self.state.lock();
         match state.lifecycle {
-            CarrierVmLifecycle::Live(generation) if generation == spec.vm_generation => {}
-            CarrierVmLifecycle::Live(_) => {
+            CarrierVmLifecycle::Creating(generation) | CarrierVmLifecycle::Live(generation)
+                if generation == spec.vm_generation => {}
+            CarrierVmLifecycle::Creating(_) | CarrierVmLifecycle::Live(_) => {
                 return Err(CarrierStage2RecordError::VmGenerationMismatch);
             }
-            CarrierVmLifecycle::Vacant
-            | CarrierVmLifecycle::Creating(_)
-            | CarrierVmLifecycle::Destroying(_) => {
+            CarrierVmLifecycle::Vacant | CarrierVmLifecycle::Destroying(_) => {
                 return Err(CarrierStage2RecordError::NoLiveVm);
             }
         }
@@ -9902,17 +11697,103 @@ impl CarrierVmCustody {
                     len: spec.len,
                     host_addr: spec.host_addr,
                     mapped: spec.mapped,
+                    backend_map_installed: spec.backend_map_installed,
                     release_ipa: spec.release_ipa,
+                    perms: spec.perms,
                     logical_owner: spec.logical_owner,
                     pin_count: 0,
                     retirement_requested: false,
                     retry_eligible: false,
                     retry_pending: None,
                     terminalized_by_vm_destroy: false,
+                    superseded_by_rebind: false,
+                    release_in_flight: false,
+                    release_retry_pending: false,
                 },
                 unmap_in_flight: false,
             },
         );
+        Ok(identity)
+    }
+
+    fn rebind_terminal_stage2_record(
+        &self,
+        old_identity: CarrierStage2RecordIdentity,
+        host_addr: usize,
+        perms: u64,
+    ) -> Result<CarrierStage2RecordIdentity, CarrierStage2RecordError> {
+        let mut state = self.state.lock();
+        let live_generation = match state.lifecycle {
+            CarrierVmLifecycle::Creating(generation) | CarrierVmLifecycle::Live(generation) => {
+                generation
+            }
+            CarrierVmLifecycle::Vacant | CarrierVmLifecycle::Destroying(_) => {
+                return Err(CarrierStage2RecordError::NoLiveVm);
+            }
+        };
+        let old = state
+            .stage2_records
+            .get(&old_identity.record_id)
+            .copied()
+            .ok_or(CarrierStage2RecordError::RecordNotFound)?;
+        if Self::stage2_identity_mismatch(&old, old_identity).is_some() {
+            return Err(CarrierStage2RecordError::RecordIdentityMismatch);
+        }
+        if !old.snapshot.terminalized_by_vm_destroy || old.snapshot.mapped {
+            return Err(CarrierStage2RecordError::RecordNotTerminal);
+        }
+        if old.snapshot.release_in_flight {
+            return Err(CarrierStage2RecordError::ReleaseInFlight);
+        }
+        if old.snapshot.vm_generation == live_generation {
+            return Err(CarrierStage2RecordError::VmGenerationMismatch);
+        }
+        if host_addr == 0 || host_addr != old.snapshot.host_addr {
+            return Err(CarrierStage2RecordError::InvalidExtent);
+        }
+        let next_id = state
+            .next_stage2_record_id
+            .checked_add(1)
+            .ok_or(CarrierStage2RecordError::RecordIdExhausted)?;
+        let record_id = CarrierStage2RecordId(state.next_stage2_record_id);
+        state.next_stage2_record_id = next_id;
+        let identity = CarrierStage2RecordIdentity {
+            record_id,
+            vm_generation: live_generation,
+            logical_owner: old_identity.logical_owner,
+        };
+        state.stage2_records.insert(
+            record_id,
+            CarrierStage2Record {
+                snapshot: CarrierStage2RecordSnapshot {
+                    record_id,
+                    vm_generation: live_generation,
+                    ipa: old.snapshot.ipa,
+                    len: old.snapshot.len,
+                    host_addr,
+                    mapped: true,
+                    backend_map_installed: true,
+                    release_ipa: old.snapshot.release_ipa,
+                    perms,
+                    logical_owner: old.snapshot.logical_owner,
+                    pin_count: 0,
+                    retirement_requested: false,
+                    retry_eligible: false,
+                    retry_pending: None,
+                    terminalized_by_vm_destroy: false,
+                    superseded_by_rebind: false,
+                    release_in_flight: false,
+                    release_retry_pending: false,
+                },
+                unmap_in_flight: false,
+            },
+        );
+        let old = state
+            .stage2_records
+            .get_mut(&old_identity.record_id)
+            .ok_or(CarrierStage2RecordError::RecordNotFound)?;
+        old.snapshot.release_ipa = false;
+        old.snapshot.superseded_by_rebind = true;
         Ok(identity)
     }
 
@@ -10003,6 +11884,25 @@ impl CarrierVmCustody {
         })
     }
 
+    fn request_stage2_record_retirement(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+    ) -> CarrierStage2RetireOutcome {
+        let mut state = self.state.lock();
+        let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
+            return CarrierStage2RetireOutcome::NotFound;
+        };
+        if let Some(mismatch) = Self::stage2_identity_mismatch(record, identity) {
+            return mismatch;
+        }
+        if record.snapshot.terminalized_by_vm_destroy {
+            return CarrierStage2RetireOutcome::TerminalizedByVmDestroy;
+        }
+        record.snapshot.retirement_requested = true;
+        record.snapshot.retry_eligible = record.snapshot.pin_count == 0;
+        CarrierStage2RetireOutcome::DeferredActivePins
+    }
+
     pub(crate) fn retire_stage2_record_using(
         &self,
         identity: CarrierStage2RecordIdentity,
@@ -10034,6 +11934,12 @@ impl CarrierVmCustody {
                     CarrierStage2BackendError::ConcurrentRetirement,
                 );
             }
+            if !record.snapshot.backend_map_installed {
+                record.snapshot.mapped = false;
+                record.snapshot.retry_eligible = false;
+                record.snapshot.retry_pending = None;
+                return CarrierStage2RetireOutcome::RetiredUnmapped;
+            }
             record.unmap_in_flight = true;
             record.snapshot.retry_eligible = false;
             (record.snapshot.ipa, record.snapshot.len)
@@ -10054,6 +11960,7 @@ impl CarrierVmCustody {
         match backend_result {
             Ok(()) => {
                 record.snapshot.mapped = false;
+                record.snapshot.backend_map_installed = false;
                 record.snapshot.retry_eligible = false;
                 record.snapshot.retry_pending = None;
                 CarrierStage2RetireOutcome::RetiredUnmapped
@@ -10096,6 +12003,12 @@ impl Drop for CarrierStage2Pin {
         {
             record.snapshot.retry_eligible = true;
         }
+        let remove_terminal_predecessor = record.snapshot.pin_count == 0
+            && record.snapshot.terminalized_by_vm_destroy
+            && record.snapshot.superseded_by_rebind;
+        if remove_terminal_predecessor {
+            state.stage2_records.remove(&self.identity.record_id);
+        }
         self.active = false;
     }
 }
@@ -10112,6 +12025,7 @@ fn custody_transition_error(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(test)]
 fn create_vm_with_custody_using<T>(
     custody: &CarrierVmCustody,
     context: &str,
@@ -10139,6 +12053,7 @@ fn create_vm_with_custody_using<T>(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(test)]
 fn destroy_vm_with_custody_using(
     custody: &CarrierVmCustody,
     context: &str,
@@ -10171,15 +12086,73 @@ fn destroy_vm_with_custody_using(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn destroy_vm_with_custody(custody: &CarrierVmCustody, context: &str) -> Result<(), TrapError> {
-    destroy_vm_with_custody_using(
-        custody,
-        context,
-        || {
+    destroy_vm_with_custody_target(custody, context, CarrierVmDestroyTarget::Live)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy)]
+enum CarrierVmDestroyTarget {
+    Live,
+    Creating(CarrierVmGeneration),
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn destroy_vm_with_custody_target(
+    custody: &CarrierVmCustody,
+    context: &str,
+    target: CarrierVmDestroyTarget,
+) -> Result<(), TrapError> {
+    let generation = match target {
+        CarrierVmDestroyTarget::Live => {
+            let generation = custody.live_generation().ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "{context}: carrier VM custody has no live generation"
+                ))
+            })?;
+            custody
+                .begin_destroy(generation)
+                .map_err(|error| custody_transition_error(context, "begin_destroy", error))?;
             crate::probes::vm_lifecycle(2, -1);
-            unsafe { inventory_hv_vm_destroy() }
-        },
-        record_vm_released,
-    )
+            generation
+        }
+        CarrierVmDestroyTarget::Creating(generation) => {
+            if custody.creating_generation() != Some(generation) {
+                return Err(TrapError::Hypervisor(format!(
+                    "{context}: carrier VM custody has no exact Creating generation {generation:?}"
+                )));
+            }
+            generation
+        }
+    };
+
+    let rc = unsafe { inventory_hv_vm_destroy() };
+    if rc != 0 {
+        if matches!(target, CarrierVmDestroyTarget::Live) {
+            custody
+                .abort_destroy(generation)
+                .map_err(|error| custody_transition_error(context, "abort_destroy", error))?;
+        }
+        let retained = match target {
+            CarrierVmDestroyTarget::Live => "exact Live custody restored",
+            CarrierVmDestroyTarget::Creating(_) => "exact Creating custody retained",
+        };
+        return Err(TrapError::Hypervisor(format!(
+            "{context}: hv_vm_destroy rc={rc:#x}; {retained}"
+        )));
+    }
+
+    match target {
+        CarrierVmDestroyTarget::Live => {
+            custody
+                .commit_destroy(generation)
+                .map_err(|error| custody_transition_error(context, "commit_destroy", error))?;
+            record_vm_released();
+            Ok(())
+        }
+        CarrierVmDestroyTarget::Creating(_) => custody
+            .abort_created_vm_after_raw_destroy(generation)
+            .map_err(|error| custody_transition_error(context, "abort_created_vm", error)),
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -10290,7 +12263,9 @@ mod carrier_vm_custody_tests {
             len: 0x4000,
             host_addr: 0x1234_0000,
             mapped: true,
+            backend_map_installed: true,
             release_ipa: true,
+            perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
             logical_owner: Some(CarrierLogicalOwner {
                 id: 7,
                 generation: owner_generation,
@@ -10300,27 +12275,23 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn global_frame_owner_directory_is_isolated_per_carrier_custody() {
-        let first = CarrierVmCustody::new();
-        let second = CarrierVmCustody::new();
+        let (first, _) = live_custody();
+        let (second, _) = live_custody();
         let key = (0xa081_0000_0000, 0x4000);
         let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
             key.1 as usize,
             crate::host_mapping::HostMappingKind::PerMmKernelState,
         )
         .expect("allocate carrier-local owner backing");
-        let owner = super::GlobalFrameHostOwner::new(
-            super::GlobalFrameStage2Lease::fixed(key.0, key.1),
+        let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
+        lease.mark_test_mapped_without_backend();
+        super::register_global_frame_host_owner_in(
+            &first,
+            lease,
             mapping,
             u64::from(applevisor::memory::MemPerms::ReadWrite),
-            17,
-            key.0,
-            key.1,
-        );
-
-        first.global_frame_host_owners.lock().insert(
-            key,
-            super::GlobalFrameOwnerEntry::Live(std::sync::Arc::new(owner)),
-        );
+        )
+        .expect("register carrier-local owner");
 
         assert!(first.global_frame_host_owners.lock().contains_key(&key));
         assert!(second.global_frame_host_owners.lock().is_empty());
@@ -10345,7 +12316,7 @@ mod carrier_vm_custody_tests {
             "publish_exec_region_host_owner_in",
             "retire_global_frame_host_owner_in",
             "retire_global_frame_host_owner_if_generation_in",
-            "drain_and_retry_pending_global_frame_retirements_in",
+            "reconcile_global_frame_owners_after_replay_in",
             "global_frame_host_owner_matches_in",
             "copy_from_global_frame_owner_in",
             "global_frame_region_owner_matches_in",
@@ -10362,6 +12333,1234 @@ mod carrier_vm_custody_tests {
                 "production owner operation `{operation}` must receive carrier custody explicitly"
             );
         }
+    }
+
+    #[test]
+    fn vm_rebuild_funnels_reconcile_owner_generation_before_guest_entry_static_audit() {
+        let source = include_str!("trap.rs");
+        let shared_wait = source
+            .split(concat!("pub(crate) fn shared_wait_", "resume("))
+            .nth(1)
+            .and_then(|tail| {
+                tail.split(concat!("pub(crate) fn destroy_vcpu_", "on_thread_exit"))
+                    .next()
+            })
+            .expect("shared-wait resume body");
+        let shared_rebind = shared_wait
+            .rfind("reconcile_global_frame_owners_after_replay_in(")
+            .expect("shared-wait owner rebind");
+        let shared_entry = shared_wait
+            .find("self.reacquire_mailbox_after_vcpu_create")
+            .expect("shared-wait guest-entry preparation");
+        assert!(shared_rebind < shared_entry);
+
+        let initial = source
+            .split(concat!("fn new_with_", "plan_inner("))
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("/// Volatile copy out of guest-shared memory")
+                    .next()
+            })
+            .expect("initial carrier creation body");
+        let initial_rebind = initial
+            .find("reconcile_global_frame_owners_after_replay_in(")
+            .expect("initial carrier owner reconciliation");
+        let initial_entry = initial
+            .find("// Start PC:")
+            .expect("initial guest entry setup");
+        assert!(initial_rebind < initial_entry);
+
+        let exec = source
+            .split(concat!("pub(crate) fn execve_", "rebuild("))
+            .nth(1)
+            .and_then(|tail| {
+                tail.split(concat!("pub(crate) fn restore_vcpu_", "into("))
+                    .next()
+            })
+            .expect("exec rebuild body");
+        assert!(
+            exec.matches("reconcile_global_frame_owners_after_replay_in(")
+                .count()
+                >= 2,
+            "exec must retire terminal predecessor owners and audit replayed successors"
+        );
+
+        let carrier_exit = source
+            .split(concat!("pub fn destroy_persistent_vm_", "at_carrier_exit("))
+            .nth(1)
+            .and_then(|tail| {
+                tail.split(concat!("pub fn atomic_permit_", "enabled("))
+                    .next()
+            })
+            .expect("carrier-exit destroy body");
+        assert!(!carrier_exit.contains("drain_and_retry_pending_global_frame_retirements_in"));
+        let raw_destroy = carrier_exit
+            .find("destroy_vm_with_custody")
+            .expect("carrier-exit raw destroy");
+        let terminal_cleanup = carrier_exit
+            .rfind("finalize_carrier_exit_global_frame_owners_in(&custody)")
+            .expect("carrier-exit terminal owner cleanup");
+        assert!(raw_destroy < terminal_cleanup);
+        assert!(
+            !carrier_exit.contains("let _ = finalize_carrier_exit_global_frame_owners_in"),
+            "carrier exit must propagate terminal cleanup failure"
+        );
+    }
+
+    #[test]
+    fn global_owner_late_final_pin_defers_persistent_failure_without_abort_then_retries() {
+        let (custody, _) = live_custody();
+        let key = (0xa081_1000_0000, 0x4000);
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            key.1 as usize,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate pinned global owner backing");
+        let host_addr = mapping.as_ptr() as usize;
+        let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
+        lease.mark_mapped();
+        let generation = super::register_global_frame_host_owner_in(
+            &custody,
+            lease,
+            mapping,
+            u64::from(applevisor::memory::MemPerms::ReadWrite),
+        )
+        .expect("register pinned global owner");
+        let pin = custody.global_frame_host_owners.lock()[&key]
+            .owner()
+            .pin()
+            .expect("pin exact global owner record");
+        let mut unmap_calls = 0_u32;
+
+        assert!(matches!(
+            super::retire_global_frame_host_owner_if_generation_in_using(
+                &custody,
+                key.0,
+                key.1,
+                generation,
+                &mut |_, _| {
+                    unmap_calls += 1;
+                    Ok(())
+                },
+            ),
+            super::GlobalFrameRetirementOutcome::DeferredActivePins { .. }
+        ));
+        assert_eq!(unmap_calls, 0);
+        assert!(super::alias_backing_is_live(host_addr));
+
+        drop(pin);
+        let injected = super::CarrierStage2BackendError::HvReturn(0xfae9_4001);
+        assert!(matches!(
+            super::retry_pending_global_frame_retirements_in_using(&custody, &mut |_, _| Err(
+                injected
+            ),),
+            Err(super::TrapError::Hypervisor(_))
+        ));
+        assert!(super::alias_backing_is_live(host_addr));
+
+        super::retry_pending_global_frame_retirements_in_using(&custody, &mut |_, _| Ok(()))
+            .expect("explicit safe point retries final owner retirement");
+        assert!(!super::alias_backing_is_live(host_addr));
+    }
+
+    #[test]
+    fn global_owner_collision_retains_failed_rollback_candidate_until_safe_point() {
+        let (custody, _) = live_custody();
+        let key = (0xa081_2000_0000, 0x4000);
+        let incumbent_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            key.1 as usize,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate incumbent global owner backing");
+        let mut incumbent_lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
+        incumbent_lease.mark_test_mapped_without_backend();
+        let incumbent_generation = super::register_global_frame_host_owner_in(
+            &custody,
+            incumbent_lease,
+            incumbent_mapping,
+            u64::from(applevisor::memory::MemPerms::ReadWrite),
+        )
+        .expect("register incumbent global owner");
+
+        let candidate_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            key.1 as usize,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate colliding global owner backing");
+        let candidate_host = candidate_mapping.as_ptr() as usize;
+        let mut candidate_lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
+        candidate_lease.mark_mapped();
+        let injected = super::CarrierStage2BackendError::HvReturn(0xfae9_4001);
+
+        assert!(
+            super::register_global_frame_host_owner_in_using(
+                &custody,
+                candidate_lease,
+                candidate_mapping,
+                u64::from(applevisor::memory::MemPerms::ReadWrite),
+                &mut |_, _| Err(injected),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            super::global_frame_host_owner_generation_in(&custody, key.0, key.1),
+            incumbent_generation,
+            "collision must not replace the incumbent"
+        );
+        assert_eq!(custody.pending_global_frame_owner_count(), 1);
+        assert!(super::alias_backing_is_live(candidate_host));
+
+        super::retry_pending_global_frame_retirements_in_using(&custody, &mut |_, _| Ok(()))
+            .expect("safe point retires colliding candidate");
+        assert_eq!(custody.pending_global_frame_owner_count(), 0);
+        assert!(!super::alias_backing_is_live(candidate_host));
+        assert_eq!(
+            super::global_frame_host_owner_generation_in(&custody, key.0, key.1),
+            incumbent_generation
+        );
+    }
+
+    #[test]
+    fn global_owner_stale_same_key_generation_never_retires_successor() {
+        let (custody, _) = live_custody();
+        let key = (0xa081_3000_0000, 0x4000);
+        let install = || {
+            let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                key.1 as usize,
+                crate::host_mapping::HostMappingKind::PerMmKernelState,
+            )
+            .expect("allocate same-key global owner backing");
+            let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
+            lease.mark_test_mapped_without_backend();
+            super::register_global_frame_host_owner_in(
+                &custody,
+                lease,
+                mapping,
+                u64::from(applevisor::memory::MemPerms::ReadWrite),
+            )
+            .expect("register same-key global owner")
+        };
+        let predecessor = install();
+        assert!(matches!(
+            super::retire_global_frame_host_owner_if_generation_in_using(
+                &custody,
+                key.0,
+                key.1,
+                predecessor,
+                &mut |_, _| Ok(()),
+            ),
+            super::GlobalFrameRetirementOutcome::RetiredUnmapped { .. }
+        ));
+        let successor = install();
+        assert_ne!(predecessor, successor);
+        let mut unmap_calls = 0_u32;
+        let stale = super::retire_global_frame_host_owner_if_generation_in_using(
+            &custody,
+            key.0,
+            key.1,
+            predecessor,
+            &mut |_, _| {
+                unmap_calls += 1;
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            stale,
+            super::GlobalFrameRetirementOutcome::MismatchedGeneration {
+                current_generation,
+                expected_generation,
+                ..
+            } if current_generation == successor && expected_generation == predecessor
+        ));
+        assert_eq!(unmap_calls, 0);
+        assert_eq!(
+            super::global_frame_host_owner_generation_in(&custody, key.0, key.1),
+            successor
+        );
+    }
+
+    #[test]
+    fn vm_rebuild_rebinds_live_owner_to_g2_and_transfers_release_authority_once() {
+        let (custody, g1) = live_custody();
+        let key = (0xa081_4000_0000_u64, 0x4000_u64);
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            key.1 as usize,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate rebuild owner backing");
+        let host_addr = mapping.as_ptr() as usize;
+        let mut lease = super::GlobalFrameStage2Lease::reserve(key.1, key.1)
+            .expect("reserve rebuild owner IPA");
+        let reserved_key = lease.key();
+        lease.mark_test_mapped_without_backend();
+        let generation = super::register_global_frame_host_owner_in(
+            &custody,
+            lease,
+            mapping,
+            u64::from(applevisor::memory::MemPerms::ReadWrite),
+        )
+        .expect("register rebuild owner");
+        let old_owner = custody.global_frame_host_owners.lock()[&reserved_key]
+            .owner()
+            .clone();
+        let old_identity = old_owner.record_identity;
+        let old_pin = old_owner.pin().expect("pin G1 owner");
+        let fixed_key = (0xa081_4000_0000_u64, 0x4000_u64);
+        let fixed_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            fixed_key.1 as usize,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate fixed rebuild owner backing");
+        let fixed_host = fixed_mapping.as_ptr() as usize;
+        let mut fixed_lease = super::GlobalFrameStage2Lease::fixed(fixed_key.0, fixed_key.1);
+        fixed_lease.mark_test_mapped_without_backend();
+        super::register_global_frame_host_owner_in(
+            &custody,
+            fixed_lease,
+            fixed_mapping,
+            u64::from(applevisor::memory::MemPerms::ReadWrite),
+        )
+        .expect("register fixed rebuild owner");
+        let fixed_old_identity = custody.global_frame_host_owners.lock()[&fixed_key]
+            .owner()
+            .record_identity;
+
+        destroy_vm_with_custody_using(&custody, "G1 destroy", || 0, || {}).expect("destroy G1");
+        let terminal = custody
+            .stage2_record_snapshot(old_identity.record_id)
+            .expect("terminal G1 record");
+        assert_eq!(terminal.vm_generation, g1);
+        assert!(terminal.terminalized_by_vm_destroy);
+        assert!(terminal.release_ipa);
+        assert!(super::alias_backing_is_live(host_addr));
+        let reservation_probe =
+            super::GlobalFrameStage2Lease::reserve(reserved_key.1, reserved_key.1)
+                .expect("probe reservation while G1 owner awaits replay");
+        assert_ne!(
+            reservation_probe.base, reserved_key.0,
+            "successful destroy must preserve the live logical owner's IPA reservation"
+        );
+        drop(reservation_probe);
+
+        let g2 = custody.begin_create().expect("begin G2 create");
+        custody.commit_create(g2).expect("publish G2");
+        let mut release_calls = 0_u32;
+        let report = super::reconcile_global_frame_owners_after_replay_in_using(
+            &custody,
+            &[
+                super::GlobalFrameReplayExtent {
+                    ipa: reserved_key.0,
+                    length: reserved_key.1,
+                    host_addr,
+                    perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+                },
+                super::GlobalFrameReplayExtent {
+                    ipa: fixed_key.0,
+                    length: fixed_key.1,
+                    host_addr: fixed_host,
+                    perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+                },
+            ],
+            false,
+            &mut |_, _| {
+                release_calls += 1;
+                Ok(())
+            },
+        )
+        .expect("rebind live G1 owner into G2");
+        assert_eq!(report.rebound, 2);
+        assert_eq!(report.retired, 0);
+
+        let current = custody.global_frame_host_owners.lock()[&reserved_key]
+            .owner()
+            .clone();
+        assert_eq!(current.record_identity.vm_generation, g2);
+        assert_eq!(current.generation(), generation);
+        assert!(!std::sync::Arc::ptr_eq(&old_owner, &current));
+        assert!(
+            !custody
+                .stage2_record_snapshot(old_identity.record_id)
+                .expect("pinned G1 record remains")
+                .release_ipa
+        );
+        assert!(
+            custody
+                .stage2_record_snapshot(current.record_identity.record_id)
+                .expect("current G2 record")
+                .release_ipa
+        );
+        let fixed_current = custody.global_frame_host_owners.lock()[&fixed_key]
+            .owner()
+            .clone();
+        assert_eq!(fixed_current.record_identity.vm_generation, g2);
+        assert!(
+            !custody
+                .stage2_record_snapshot(fixed_current.record_identity.record_id)
+                .expect("current fixed G2 record")
+                .release_ipa
+        );
+        assert!(
+            custody
+                .stage2_record_snapshot(fixed_old_identity.record_id)
+                .is_none()
+        );
+        let current_record_id = current.record_identity.record_id;
+        let second = super::reconcile_global_frame_owners_after_replay_in_using(
+            &custody,
+            &[
+                super::GlobalFrameReplayExtent {
+                    ipa: reserved_key.0,
+                    length: reserved_key.1,
+                    host_addr,
+                    perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+                },
+                super::GlobalFrameReplayExtent {
+                    ipa: fixed_key.0,
+                    length: fixed_key.1,
+                    host_addr: fixed_host,
+                    perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+                },
+            ],
+            false,
+            &mut |_, _| {
+                release_calls += 1;
+                Ok(())
+            },
+        )
+        .expect("same replay reconciliation is idempotent");
+        assert_eq!(second, super::GlobalFrameReplayReconcileReport::default());
+        assert_eq!(
+            custody.global_frame_host_owners.lock()[&reserved_key]
+                .owner()
+                .record_identity
+                .record_id,
+            current_record_id
+        );
+        let g2_pin = current.pin().expect("owner auth pins current G2 record");
+        assert_eq!(old_pin._stage2_pin.identity.vm_generation, g1);
+        assert_eq!(g2_pin._stage2_pin.identity.vm_generation, g2);
+        assert_eq!(unsafe { *old_pin.owner().ptr() }, unsafe {
+            *g2_pin.owner().ptr()
+        });
+
+        drop(old_pin);
+        assert!(
+            custody
+                .stage2_record_snapshot(old_identity.record_id)
+                .is_none()
+        );
+        assert_eq!(release_calls, 0, "G1 final pin must not release G2 IPA");
+        assert!(
+            custody
+                .stage2_record_snapshot(current.record_identity.record_id)
+                .is_some_and(|snapshot| snapshot.release_ipa && snapshot.mapped)
+        );
+        drop(g2_pin);
+        assert!(super::alias_backing_is_live(host_addr));
+        assert_eq!(reserved_key.1, key.1);
+    }
+
+    #[test]
+    fn vm_destroy_success_terminalizes_pending_owner_but_failure_preserves_exact_g1() {
+        let (custody, g1) = live_custody();
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            0x4000,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate pending rebuild owner");
+        let host_addr = mapping.as_ptr() as usize;
+        let mut lease = super::GlobalFrameStage2Lease::reserve(0x4000, 0x4000)
+            .expect("reserve pending rebuild owner IPA");
+        let key = lease.key();
+        lease.mark_mapped();
+        let generation = super::register_global_frame_host_owner_in(
+            &custody,
+            lease,
+            mapping,
+            u64::from(applevisor::memory::MemPerms::ReadWrite),
+        )
+        .expect("register pending rebuild owner");
+        let identity = custody.global_frame_host_owners.lock()[&key]
+            .owner()
+            .record_identity;
+        let injected = CarrierStage2BackendError::HvReturn(0xfae9_4001);
+        assert!(matches!(
+            super::retire_global_frame_host_owner_if_generation_in_using(
+                &custody,
+                key.0,
+                key.1,
+                generation,
+                &mut |_, _| Err(injected),
+            ),
+            super::GlobalFrameRetirementOutcome::RetryPending { .. }
+        ));
+        let before_failed_destroy = custody
+            .stage2_record_snapshot(identity.record_id)
+            .expect("pending G1 record");
+
+        assert!(
+            destroy_vm_with_custody_using(
+                &custody,
+                "failed G1 destroy",
+                || 0xfae9_4002_u32 as i32,
+                || {},
+            )
+            .is_err()
+        );
+        assert_eq!(custody.live_generation(), Some(g1));
+        assert_eq!(
+            custody.stage2_record_snapshot(identity.record_id),
+            Some(before_failed_destroy),
+            "failed raw destroy must preserve exact G1 record"
+        );
+
+        destroy_vm_with_custody_using(&custody, "successful G1 destroy", || 0, || {})
+            .expect("persistent pre-destroy unmap failure must not block raw destroy");
+        assert!(
+            custody
+                .stage2_record_snapshot(identity.record_id)
+                .is_some_and(|snapshot| snapshot.terminalized_by_vm_destroy)
+        );
+        assert!(super::alias_backing_is_live(host_addr));
+
+        let g2 = custody.begin_create().expect("begin successor VM");
+        custody.commit_create(g2).expect("publish successor VM");
+        let mut releases = 0_u32;
+        let report = super::reconcile_global_frame_owners_after_replay_in_using(
+            &custody,
+            &[],
+            true,
+            &mut |ipa, length| {
+                assert_eq!((ipa, length), key);
+                releases += 1;
+                Ok(())
+            },
+        )
+        .expect("retired G1 owner is finalized, not rebound");
+        assert_eq!(report.rebound, 0);
+        assert_eq!(report.retired, 1);
+        assert_eq!(releases, 1);
+        assert!(!custody.global_frame_host_owners.lock().contains_key(&key));
+        assert!(!super::alias_backing_is_live(host_addr));
+    }
+
+    #[test]
+    fn carrier_exit_propagates_terminal_owner_cleanup_failure_after_destroy_success() {
+        let (custody, g1) = live_custody();
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            0x4000,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate carrier-exit owner backing");
+        let host_addr = mapping.as_ptr() as usize;
+        let mut lease = super::GlobalFrameStage2Lease::reserve(0x4000, 0x4000)
+            .expect("reserve carrier-exit owner IPA");
+        let key = lease.key();
+        lease.mark_test_mapped_without_backend();
+        super::register_global_frame_host_owner_in(
+            &custody,
+            lease,
+            mapping,
+            u64::from(applevisor::memory::MemPerms::ReadWrite),
+        )
+        .expect("register carrier-exit owner");
+        let identity = custody.global_frame_host_owners.lock()[&key]
+            .owner()
+            .record_identity;
+
+        destroy_vm_with_custody_using(&custody, "carrier-exit test", || 0, || {})
+            .expect("raw carrier-exit destroy succeeds");
+        let injected = "injected terminal owner release failure";
+        let error =
+            super::finalize_carrier_exit_global_frame_owners_in_using(&custody, &mut |_, _| {
+                Err(super::TrapError::Hypervisor(injected.to_owned()))
+            })
+            .expect_err("carrier exit must propagate terminal cleanup failure");
+
+        assert!(matches!(
+            error,
+            super::TrapError::Hypervisor(message)
+                if message.contains("carrier-exit terminal global frame cleanup")
+                    && message.contains(injected)
+        ));
+        assert_eq!(custody.live_generation(), None);
+        assert!(
+            custody
+                .stage2_record_snapshot(identity.record_id)
+                .is_some_and(|snapshot| {
+                    snapshot.vm_generation == g1 && snapshot.terminalized_by_vm_destroy
+                }),
+            "cleanup failure must retain already-terminalized exact custody"
+        );
+        assert!(custody.global_frame_host_owners.lock().contains_key(&key));
+        assert!(super::alias_backing_is_live(host_addr));
+    }
+
+    #[test]
+    fn terminal_release_claim_aborts_for_retry_and_commits_removal_exactly_once() {
+        let (custody, _) = live_custody();
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            0x4000,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate terminal release backing");
+        let mut lease = super::GlobalFrameStage2Lease::reserve(0x4000, 0x4000)
+            .expect("reserve terminal release IPA");
+        lease.mark_test_mapped_without_backend();
+        super::register_global_frame_host_owner_in(
+            &custody,
+            lease,
+            mapping,
+            u64::from(applevisor::memory::MemPerms::ReadWrite),
+        )
+        .expect("register terminal release owner");
+        let owner = custody
+            .global_frame_host_owners
+            .lock()
+            .values()
+            .next()
+            .expect("terminal release owner")
+            .owner()
+            .clone();
+        let identity = owner.record_identity;
+        assert_eq!(
+            custody.retire_stage2_record_using(identity, |_, _| Ok(())),
+            super::CarrierStage2RetireOutcome::RetiredUnmapped
+        );
+
+        let mut releases = 0_u32;
+        assert!(
+            super::finalize_terminal_stage2_record_using(&custody, identity, &mut |_, _| {
+                releases += 1;
+                Err(super::TrapError::Hypervisor(
+                    "injected release failure".to_owned(),
+                ))
+            },)
+            .is_err()
+        );
+        assert_eq!(releases, 1);
+        assert!(
+            custody
+                .stage2_record_snapshot(identity.record_id)
+                .is_some_and(|snapshot| {
+                    snapshot.release_ipa
+                        && !snapshot.release_in_flight
+                        && snapshot.release_retry_pending
+                })
+        );
+
+        super::finalize_terminal_stage2_record_using(&custody, identity, &mut |_, _| {
+            releases += 1;
+            Ok(())
+        })
+        .expect("retry commits claimed release and removal");
+        assert_eq!(releases, 2);
+        assert!(custody.stage2_record_snapshot(identity.record_id).is_none());
+        assert!(
+            super::finalize_terminal_stage2_record_using(&custody, identity, &mut |_, _| {
+                releases += 1;
+                Ok(())
+            },)
+            .is_err()
+        );
+        assert_eq!(releases, 2, "removed identity cannot release twice");
+    }
+
+    #[test]
+    fn post_raw_create_failures_never_publish_live_and_terminalize_exact_setup_generation() {
+        for stage in ["initial-vcpu", "shared-wait-map", "exec-reconcile"] {
+            let custody = CarrierVmCustody::new();
+            let generation = custody.begin_create().expect("begin injected create");
+            let identity = custody
+                .register_stage2_record(stage2_spec(generation, 70))
+                .expect("setup may register exact Creating-generation records");
+            assert_eq!(
+                custody.live_generation(),
+                None,
+                "{stage} published too early"
+            );
+
+            custody
+                .abort_created_vm_after_raw_destroy(generation)
+                .expect("injected post-create failure rolls back exact raw VM");
+            assert_eq!(custody.live_generation(), None);
+            assert!(
+                custody
+                    .stage2_record_snapshot(identity.record_id)
+                    .is_some_and(|snapshot| {
+                        snapshot.vm_generation == generation && snapshot.terminalized_by_vm_destroy
+                    })
+            );
+            assert!(
+                custody.begin_create().is_ok(),
+                "{stage} did not restore Vacant"
+            );
+        }
+    }
+
+    #[test]
+    fn late_g1_carrier_mm_retirement_request_cannot_mutate_same_key_g2_record() {
+        let (custody, g1) = live_custody();
+        let key = (0xa081_9000_0000, 0x4000);
+        let mut g1_lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
+        g1_lease.mark_test_mapped_without_backend();
+        let owners = std::collections::BTreeMap::from([(key, 0x1000)]);
+        let old_identity =
+            super::register_carrier_stage2_leases(&custody, &mut vec![g1_lease], &owners)
+                .expect("register G1 carrier-MM record")[0];
+        assert_eq!(old_identity.vm_generation, g1);
+        destroy_vm_with_custody_using(&custody, "carrier G1 destroy", || 0, || {})
+            .expect("destroy G1");
+        let g2 = custody.begin_create().expect("begin G2");
+        let report = super::reconcile_global_frame_owners_after_replay_in_using(
+            &custody,
+            &[super::GlobalFrameReplayExtent {
+                ipa: key.0,
+                length: key.1,
+                host_addr: owners[&key],
+                perms: 0,
+            }],
+            false,
+            &mut |_, _| panic!("rebind must transfer rather than release IPA authority"),
+        )
+        .expect("production replay reconciliation rebinds carrier-MM record");
+        assert_eq!(report.rebound, 1);
+        let new_identity = custody.carrier_stage2_records.lock()[&key];
+        custody.commit_create(g2).expect("publish G2");
+
+        assert_eq!(
+            custody.request_stage2_record_retirement(old_identity),
+            super::CarrierStage2RetireOutcome::NotFound
+        );
+        assert!(
+            custody
+                .stage2_record_snapshot(new_identity.record_id)
+                .is_some_and(|snapshot| {
+                    snapshot.vm_generation == g2
+                        && snapshot.mapped
+                        && !snapshot.retirement_requested
+                })
+        );
+    }
+
+    #[test]
+    fn terminal_release_claim_blocks_generation_rebind_until_abort() {
+        let (custody, _) = live_custody();
+        let identity = custody
+            .register_stage2_record(stage2_spec(custody.live_generation().expect("G1 live"), 91))
+            .expect("register G1 record");
+        destroy_vm_with_custody_using(&custody, "G1 destroy", || 0, || {}).expect("destroy G1");
+        let _g2 = custody.begin_create().expect("begin G2 replay");
+        assert!(
+            custody
+                .claim_terminal_stage2_release(identity)
+                .expect("claim exact terminal release")
+                .is_some()
+        );
+        assert_eq!(
+            custody.rebind_terminal_stage2_record(
+                identity,
+                0x1234_0000,
+                stage2_spec(identity.vm_generation, 91).perms
+            ),
+            Err(super::CarrierStage2RecordError::ReleaseInFlight)
+        );
+        custody.abort_terminal_stage2_release(identity);
+        assert!(
+            custody
+                .rebind_terminal_stage2_record(
+                    identity,
+                    0x1234_0000,
+                    stage2_spec(identity.vm_generation, 91).perms,
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn create_cleanup_retains_failed_vcpu_then_retries_terminal_finalization_only() {
+        let custody = std::sync::Arc::new(CarrierVmCustody::new());
+        let generation = custody.begin_create().expect("begin Creating VM");
+        let identity = custody
+            .register_stage2_record(stage2_spec(generation, 92))
+            .expect("register setup record");
+        let mut vcpu_id = Some(41);
+        let mut raw_vm_destroyed = false;
+        let vm_destroy_calls = std::cell::Cell::new(0_u32);
+        let finalize_calls = std::cell::Cell::new(0_u32);
+
+        let first = super::drive_pending_carrier_vm_cleanup_using(
+            &custody,
+            generation,
+            &mut vcpu_id,
+            &mut raw_vm_destroyed,
+            "injected cleanup",
+            |_| 0xfae9_4001_u32 as applevisor_sys::hv_return_t,
+            |_, _, _| {
+                vm_destroy_calls.set(vm_destroy_calls.get() + 1);
+                Ok(())
+            },
+            |_| {
+                finalize_calls.set(finalize_calls.get() + 1);
+                Ok(())
+            },
+        );
+        assert!(first.is_err());
+        assert_eq!(vcpu_id, Some(41));
+        assert!(!raw_vm_destroyed);
+        assert_eq!(vm_destroy_calls.get(), 0);
+
+        let second = super::drive_pending_carrier_vm_cleanup_using(
+            &custody,
+            generation,
+            &mut vcpu_id,
+            &mut raw_vm_destroyed,
+            "injected cleanup retry",
+            |_| 0,
+            |custody, generation, _| {
+                vm_destroy_calls.set(vm_destroy_calls.get() + 1);
+                custody
+                    .abort_created_vm_after_raw_destroy(generation)
+                    .map_err(|error| super::TrapError::Hypervisor(format!("{error:?}")))
+            },
+            |custody| {
+                finalize_calls.set(finalize_calls.get() + 1);
+                super::finalize_carrier_exit_global_frame_owners_in_using(custody, &mut |_, _| {
+                    Err(super::TrapError::Hypervisor("release retry".to_owned()))
+                })
+            },
+        );
+        assert!(second.is_err());
+        assert_eq!(vcpu_id, None);
+        assert!(raw_vm_destroyed);
+        assert_eq!(vm_destroy_calls.get(), 1);
+        assert!(
+            custody
+                .stage2_record_snapshot(identity.record_id)
+                .is_some_and(|snapshot| snapshot.release_retry_pending)
+        );
+
+        super::drive_pending_carrier_vm_cleanup_using(
+            &custody,
+            generation,
+            &mut vcpu_id,
+            &mut raw_vm_destroyed,
+            "terminal cleanup retry",
+            |_| panic!("vCPU already destroyed"),
+            |_, _, _| panic!("raw VM destroy must not repeat"),
+            |custody| {
+                finalize_calls.set(finalize_calls.get() + 1);
+                super::finalize_carrier_exit_global_frame_owners_in_using(custody, &mut |_, _| {
+                    Ok(())
+                })
+            },
+        )
+        .expect("terminal record cleanup retries without repeating raw destroy");
+        assert_eq!(vm_destroy_calls.get(), 1);
+        assert_eq!(finalize_calls.get(), 2);
+        assert!(custody.stage2_record_snapshot(identity.record_id).is_none());
+    }
+
+    #[test]
+    fn initial_fallible_input_failure_precedes_vm_and_admission_permit_acquisition() {
+        let admission_attempted = std::cell::Cell::new(false);
+        let result = super::prepare_initial_carrier_before_admission(
+            || {
+                Err::<(), _>(super::TrapError::Hypervisor(
+                    "injected syscall transport setup failure".to_owned(),
+                ))
+            },
+            || {
+                admission_attempted.set(true);
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(
+            !admission_attempted.get(),
+            "no VM or admission permit may be acquired before fallible transport setup succeeds"
+        );
+    }
+
+    #[test]
+    fn pending_vcpu_wrapper_never_runs_raii_destroy_before_exact_cleanup() {
+        struct DropProbe(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let _held = std::mem::ManuallyDrop::new(DropProbe(std::sync::Arc::clone(&drops)));
+        }
+        assert_eq!(
+            drops.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the wrapper must stay disarmed while PendingCarrierVmCreation owns raw cleanup"
+        );
+    }
+
+    #[test]
+    fn carrier_reuse_vcpu_failure_drops_wrapper_then_releases_accounting_once() {
+        let order = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        struct DropProbe(std::sync::Arc<parking_lot::Mutex<Vec<&'static str>>>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.lock().push("wrapper-drop");
+            }
+        }
+        let wrapper = DropProbe(std::sync::Arc::clone(&order));
+        super::complete_local_vcpu_raii_cleanup(
+            71,
+            || drop(wrapper),
+            |id| {
+                assert_eq!(id, 71);
+                order.lock().push("accounting-release");
+            },
+        );
+        assert_eq!(&*order.lock(), &["wrapper-drop", "accounting-release"]);
+    }
+
+    #[test]
+    fn fresh_vm_vcpu_and_permit_wrappers_remain_guarded_until_commit_static_audit() {
+        let source = include_str!("trap.rs");
+        let create = source
+            .split("fn create_vm_with_admission(")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("fn virtual_machine_with_private_signals_blocked(")
+                    .next()
+            })
+            .expect("create-with-admission body");
+        assert!(
+            create.find("HeldPermitGuard::new").expect("permit guard")
+                < create
+                    .find(".begin_create()")
+                    .expect("custody begin_create"),
+            "permit ownership must be armed before any fallible custody transition"
+        );
+
+        let shared = source
+            .split(concat!("fn shared_wait_resume_", "inner("))
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("pub(crate) fn destroy_vcpu_on_thread_exit")
+                    .next()
+            })
+            .expect("shared-wait rebuild body");
+        assert!(shared.contains("SetupVmGuard::new(new_vm, true)"));
+        assert!(shared.contains("SetupVcpuCleanup::PendingRaw"));
+        assert!(
+            shared
+                .find("commit_pending_creation_before_vcpu_handoff")
+                .expect("shared commit")
+                < shared
+                    .find("new_vcpu.into_inner()")
+                    .expect("shared handoff")
+        );
+
+        let exec = source
+            .split(concat!("fn execve_rebuild_", "inner("))
+            .nth(1)
+            .and_then(|tail| tail.split("impl HvfInner").next())
+            .expect("exec rebuild body");
+        assert!(exec.contains("SetupVmGuard::new(new_vm, true)"));
+        assert!(exec.contains("SetupVcpuCleanup::PendingRaw"));
+        let commit = exec
+            .rfind("commit_pending_creation_before_vcpu_handoff")
+            .expect("exec commit");
+        assert!(
+            commit
+                < exec
+                    .rfind("new_vcpu.into_inner()")
+                    .expect("exec vCPU handoff")
+        );
+        assert!(commit < exec.rfind("new_vm.into_inner()").expect("exec VM handoff"));
+    }
+
+    #[test]
+    fn carrier_mm_logical_authority_follows_g1_record_rebind_and_retires_g2_once() {
+        let (custody, g1) = live_custody();
+        let key = (0xa081_a000_0000, 0x4000);
+        let old_identity = custody
+            .register_stage2_record(CarrierStage2RecordSpec {
+                ipa: key.0,
+                ..stage2_spec(g1, 93)
+            })
+            .expect("register G1 carrier-MM record");
+        custody
+            .carrier_stage2_records
+            .lock()
+            .insert(key, old_identity);
+        let mut authority = super::carrier_stage2_logical_leases(&custody, &[old_identity]);
+
+        destroy_vm_with_custody_using(&custody, "G1 destroy", || 0, || {}).expect("destroy G1");
+        let g2 = custody.begin_create().expect("begin G2");
+        super::reconcile_global_frame_owners_after_replay_in_using(
+            &custody,
+            &[super::GlobalFrameReplayExtent {
+                ipa: key.0,
+                length: key.1,
+                host_addr: 0x1234_0000,
+                perms: stage2_spec(g1, 93).perms,
+            }],
+            false,
+            &mut |_, _| panic!("rebind must not release G1 authority"),
+        )
+        .expect("rebind live carrier-MM authority");
+        custody.commit_create(g2).expect("publish G2");
+        let new_identity = custody.carrier_stage2_records.lock()[&key];
+        assert_ne!(old_identity.record_id, new_identity.record_id);
+
+        let frames = std::sync::Arc::new(parking_lot::Mutex::new(
+            super::InventoryFrameRegistry::default(),
+        ));
+        super::request_carrier_stage2_record_retirements(
+            &mut authority,
+            &std::sync::Arc::downgrade(&custody),
+            &frames,
+        );
+        assert!(
+            custody
+                .stage2_record_snapshot(new_identity.record_id)
+                .is_some_and(|snapshot| snapshot.retirement_requested)
+        );
+        let mut releases = 0_u32;
+        super::retire_carrier_stage2_record_at_safe_point_using(
+            &custody,
+            new_identity,
+            |_, _| Ok(()),
+            |_, _| {
+                releases += 1;
+                Ok(())
+            },
+        )
+        .expect("current G2 logical authority retires at explicit safe point");
+        assert_eq!(releases, 1);
+        assert!(
+            custody
+                .stage2_record_snapshot(new_identity.record_id)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn concurrent_exact_owner_finalization_cannot_republish_removed_owner() {
+        let (custody, _) = live_custody();
+        let key = (0xa081_b000_0000, 0x4000);
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            key.1 as usize,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate concurrent-retirement owner");
+        let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
+        lease.mark_mapped();
+        super::register_global_frame_host_owner_in(
+            &custody,
+            lease,
+            mapping,
+            u64::from(applevisor::memory::MemPerms::ReadWrite),
+        )
+        .expect("register concurrent-retirement owner");
+        let generation = custody
+            .global_frame_host_owners
+            .lock()
+            .get(&key)
+            .expect("owner")
+            .owner()
+            .generation();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+
+        let first_custody = std::sync::Arc::clone(&custody);
+        let first = std::thread::spawn(move || {
+            super::retire_global_frame_host_owner_if_generation_in_using(
+                &first_custody,
+                key.0,
+                key.1,
+                generation,
+                &mut |_, _| {
+                    entered_tx.send(()).expect("announce terminal interleave");
+                    resume_rx.recv().expect("resume terminal interleave");
+                    Ok(())
+                },
+            )
+        });
+        entered_rx.recv().expect("first retirement reached unmap");
+        let second_custody = std::sync::Arc::clone(&custody);
+        let second = std::thread::spawn(move || {
+            super::retire_global_frame_host_owner_if_generation_in_using(
+                &second_custody,
+                key.0,
+                key.1,
+                generation,
+                &mut |_, _| panic!("serialized second retirement must not unmap"),
+            )
+        });
+        resume_tx.send(()).expect("finish first retirement");
+        assert!(matches!(
+            first.join().expect("first retirement thread"),
+            super::GlobalFrameRetirementOutcome::RetiredUnmapped { .. }
+        ));
+        assert!(matches!(
+            second.join().expect("second retirement thread"),
+            super::GlobalFrameRetirementOutcome::NotFound { .. }
+        ));
+        assert!(custody.global_frame_host_owners.lock().get(&key).is_none());
+    }
+
+    #[test]
+    fn structural_owner_drop_requests_then_safe_point_retires_with_backing_intact() {
+        let (custody, _) = live_custody();
+        let key = (0x7d00_1000_0000, 0x4000);
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            key.1 as usize,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate structural backing");
+        let host_addr = mapping.as_ptr() as usize;
+        let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
+        lease.mark_test_mapped_without_backend();
+        let owner = super::StructuralBackingOwner::new_in(
+            &custody,
+            mapping,
+            lease,
+            u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+            super::next_structural_epoch().expect("structural epoch"),
+            key.0,
+            key.1 as usize,
+        )
+        .expect("publish structural custody");
+        let identity = *owner.retained.record_identity.lock();
+
+        drop(owner);
+        assert!(super::alias_backing_is_live(host_addr));
+        assert!(
+            custody
+                .stage2_record_snapshot(identity.record_id)
+                .is_some_and(|record| record.retirement_requested && record.mapped)
+        );
+        super::retry_structural_backing_retirements_in_using(
+            &custody,
+            &mut |_, _| Ok(()),
+            &mut |_, _| Ok(()),
+        )
+        .expect("explicit safe point retires structural backing");
+        assert!(custody.stage2_record_snapshot(identity.record_id).is_none());
+        assert!(!super::alias_backing_is_live(host_addr));
+    }
+
+    #[test]
+    fn live_structural_owner_rebinds_exactly_to_g2_before_late_drop() {
+        let (custody, g1) = live_custody();
+        let key = (0x7d00_2000_0000, 0x4000);
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            key.1 as usize,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate rebuild structural backing");
+        let host_addr = mapping.as_ptr() as usize;
+        let perms = u64::from(applevisor::memory::MemPerms::ReadWriteExec);
+        let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
+        lease.mark_test_mapped_without_backend();
+        let owner = super::StructuralBackingOwner::new_in(
+            &custody,
+            mapping,
+            lease,
+            perms,
+            super::next_structural_epoch().expect("structural epoch"),
+            key.0,
+            key.1 as usize,
+        )
+        .expect("publish rebuild structural custody");
+        let old_identity = *owner.retained.record_identity.lock();
+        assert_eq!(old_identity.vm_generation, g1);
+
+        destroy_vm_with_custody_using(&custody, "structural G1 destroy", || 0, || {})
+            .expect("destroy structural G1");
+        let g2 = custody.begin_create().expect("begin structural G2");
+        custody.commit_create(g2).expect("publish structural G2");
+        let report = super::reconcile_global_frame_owners_after_replay_in_using(
+            &custody,
+            &[super::GlobalFrameReplayExtent {
+                ipa: key.0,
+                length: key.1,
+                host_addr,
+                perms,
+            }],
+            false,
+            &mut |_, _| Ok(()),
+        )
+        .expect("rebind structural backing into G2");
+        assert_eq!(report.rebound, 1);
+        let new_identity = *owner.retained.record_identity.lock();
+        assert_eq!(new_identity.vm_generation, g2);
+        assert_ne!(new_identity.record_id, old_identity.record_id);
+        assert!(
+            custody
+                .stage2_record_snapshot(old_identity.record_id)
+                .is_none()
+        );
+        assert!(super::alias_backing_is_live(host_addr));
+
+        drop(owner);
+        assert!(
+            custody
+                .stage2_record_snapshot(new_identity.record_id)
+                .is_some_and(|record| record.retirement_requested)
+        );
+    }
+
+    #[test]
+    fn creation_funnels_hold_transaction_through_setup_and_prepared_writes_hold_pin_static_audit() {
+        let source = include_str!("trap.rs");
+        for (outer, inner) in [
+            (
+                concat!("pub(crate) fn new_with_", "plan("),
+                "Self::new_with_plan_inner",
+            ),
+            (
+                concat!("pub(crate) fn shared_wait_", "resume("),
+                "self.shared_wait_resume_inner",
+            ),
+            (
+                concat!("pub(crate) fn execve_", "rebuild("),
+                "self.execve_rebuild_inner",
+            ),
+        ] {
+            let body = source
+                .split(outer)
+                .nth(1)
+                .and_then(|tail| tail.split("\n    fn ").next())
+                .expect("creation funnel wrapper");
+            assert!(body.contains(inner));
+            assert!(body.contains("finish_pending_vm_creation"));
+        }
+        let prepared = source
+            .split(concat!("struct CarrierForeign", "PreparedWrite<'a> {"))
+            .nth(1)
+            .and_then(|tail| tail.split('}').next())
+            .expect("prepared foreign write fields");
+        assert!(prepared.contains("_owner_pin: GlobalFrameOwnerPin"));
+
+        let lease_drop = source
+            .split(concat!("impl Drop for GlobalFrameStage2", "Lease {"))
+            .nth(1)
+            .and_then(|tail| tail.split("\n}\n").next())
+            .expect("global-frame lease Drop body");
+        assert!(!lease_drop.contains("try_retire"));
+        assert!(!lease_drop.contains("inventory_hv_vm_unmap"));
+        assert!(!lease_drop.contains("process::abort"));
+        let structural_drop = source
+            .split(concat!("impl Drop for StructuralBacking", "Owner {"))
+            .nth(1)
+            .and_then(|tail| tail.split("\n}\n").next())
+            .expect("structural owner Drop body");
+        assert!(structural_drop.contains("request_stage2_record_retirement"));
+        assert!(!structural_drop.contains("inventory_hv_vm_unmap"));
+        assert!(!prepared.contains("Arc<GlobalFrameHostOwner>"));
     }
 
     #[test]
@@ -10562,6 +13761,53 @@ mod carrier_vm_custody_tests {
                 .expect("retired tombstone remains exact")
                 .mapped
         );
+    }
+
+    #[test]
+    fn carrier_safe_point_failure_retains_directory_identity_until_exact_retry_finishes() {
+        let (custody, generation) = live_custody();
+        let identity = custody
+            .register_stage2_record(stage2_spec(generation, 13))
+            .expect("register carrier stage-2 record");
+        let key = (0x4000, 0x4000);
+        custody.carrier_stage2_records.lock().insert(key, identity);
+        let injected = CarrierStage2BackendError::HvReturn(0xfae9_4001);
+
+        let error = super::retire_carrier_stage2_record_at_safe_point_using(
+            &custody,
+            identity,
+            |_, _| Err(injected),
+            |_, _| panic!("release must not run while unmap is retry-pending"),
+        )
+        .expect_err("persistent unmap failure must remain visible to its safe point");
+        assert!(matches!(
+            error,
+            super::TrapError::Hypervisor(message) if message.contains("RetryPending")
+        ));
+        assert_eq!(
+            custody.carrier_stage2_records.lock().get(&key),
+            Some(&identity)
+        );
+        assert!(
+            custody
+                .stage2_record_snapshot(identity.record_id)
+                .is_some_and(|record| record.retry_pending == Some(injected))
+        );
+
+        let mut releases = 0_u32;
+        super::retire_carrier_stage2_record_at_safe_point_using(
+            &custody,
+            identity,
+            |_, _| Ok(()),
+            |_, _| {
+                releases += 1;
+                Ok(())
+            },
+        )
+        .expect("exact safe-point retry retires and releases the record");
+        assert_eq!(releases, 1);
+        assert!(!custody.carrier_stage2_records.lock().contains_key(&key));
+        assert!(custody.stage2_record_snapshot(identity.record_id).is_none());
     }
 
     #[test]
@@ -10846,7 +14092,7 @@ impl MmAccessState {
 
     fn retain_physical_backing_in(
         &self,
-        custody: &CarrierVmCustody,
+        custody: &std::sync::Arc<CarrierVmCustody>,
         snapshot: &CarrierForeignMmSnapshot,
         deadline: std::time::Instant,
     ) -> Result<RetainedForeignMmBacking, carrick_hal::ForeignMmTransportError> {
@@ -10891,7 +14137,10 @@ impl MmAccessState {
                 })
                 .cloned()
             {
-                RetainedPhysicalOwner::Global(global)
+                let pin = global
+                    .pin()
+                    .map_err(|_| carrick_hal::ForeignMmTransportError::OwnerStale)?;
+                RetainedPhysicalOwner::Global(pin)
             } else if let Ok(size) = usize::try_from(key.1)
                 && let Some(structural) = structural_owners
                     .get(&(key.0, size))
@@ -10918,14 +14167,14 @@ impl MmAccessState {
         snapshot: &CarrierForeignMmSnapshot,
         deadline: std::time::Instant,
     ) -> Result<RetainedForeignMmBacking, carrick_hal::ForeignMmTransportError> {
-        self.retain_physical_backing_in(legacy_test_carrier_vm_custody(), snapshot, deadline)
+        self.retain_physical_backing_in(legacy_test_carrier_vm_custody_arc(), snapshot, deadline)
     }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
 pub(crate) enum RetainedPhysicalOwner {
-    Global(std::sync::Arc<GlobalFrameHostOwner>),
+    Global(GlobalFrameOwnerPin),
     Structural(std::sync::Arc<StructuralBackingOwner>),
 }
 
@@ -10933,21 +14182,21 @@ pub(crate) enum RetainedPhysicalOwner {
 impl RetainedPhysicalOwner {
     pub(crate) fn ptr(&self) -> *mut u8 {
         match self {
-            Self::Global(owner) => owner.ptr(),
+            Self::Global(pin) => pin.owner().ptr(),
             Self::Structural(owner) => owner.ptr(),
         }
     }
 
     pub(crate) fn len(&self) -> usize {
         match self {
-            Self::Global(owner) => owner.len(),
+            Self::Global(pin) => pin.owner().len(),
             Self::Structural(owner) => owner.len(),
         }
     }
 
     pub(crate) fn generation(&self) -> u64 {
         match self {
-            Self::Global(owner) => owner.generation(),
+            Self::Global(pin) => pin.owner().generation(),
             Self::Structural(owner) => owner.epoch.raw(),
         }
     }
@@ -11187,7 +14436,7 @@ impl carrick_hal::ForeignMmWriteReceipt for CarrierForeignWriteReceipt {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 struct CarrierForeignPreparedWrite<'a> {
-    _owner: std::sync::Arc<GlobalFrameHostOwner>,
+    _owner_pin: GlobalFrameOwnerPin,
     dst_ptr: *mut u8,
     src: &'a [u8],
     receipt: Box<CarrierForeignWriteReceipt>,
@@ -11739,9 +14988,12 @@ fn perform_foreign_cow_transaction(
         .get(&(new_physical_ipa, CowArmedRanges::COMPOUND_SIZE))
         .map(|entry| std::sync::Arc::clone(entry.owner()))
         .unwrap_or_else(|| std::process::abort());
+    let new_owner_pin = new_owner_arc
+        .pin()
+        .unwrap_or_else(|_| std::process::abort());
     lease_guard.backing.extents.push(RetainedForeignExtent {
         key: (new_physical_ipa, CowArmedRanges::COMPOUND_SIZE),
-        owner: RetainedPhysicalOwner::Global(new_owner_arc),
+        owner: RetainedPhysicalOwner::Global(new_owner_pin),
     });
     lease_guard.retained = committed.clone();
     Ok(CarrierForeignCowReceipt {
@@ -11983,7 +15235,10 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
         {
             return Err(carrick_hal::ForeignMmTransportError::Retry);
         }
-        let dst_ptr = unsafe { owner.as_ptr().add(offset) };
+        let owner_pin = owner
+            .pin()
+            .map_err(|_| carrick_hal::ForeignMmTransportError::Retry)?;
+        let dst_ptr = unsafe { owner_pin.owner().as_ptr().add(offset) };
         let receipt = Box::new(CarrierForeignWriteReceipt {
             snapshot: requested,
             start: va,
@@ -11994,7 +15249,7 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
             bytes_written: src.len(),
         });
         Ok(Box::new(CarrierForeignPreparedWrite {
-            _owner: owner,
+            _owner_pin: owner_pin,
             dst_ptr,
             src,
             receipt,
@@ -12049,9 +15304,8 @@ pub mod foreign_cow_test_support {
 
     impl ProductionCarrierForeignCowCustody {
         pub fn new() -> Self {
-            Self {
-                custody: std::sync::Arc::new(CarrierVmCustody::new()),
-            }
+            let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+            Self { custody }
         }
 
         pub fn owner_inventory(&self) -> std::sync::Arc<dyn carrick_hal::FrameCowOwnerInventory> {
@@ -12294,7 +15548,7 @@ pub mod foreign_cow_test_support {
     }
 
     fn install_owner(
-        custody: &CarrierVmCustody,
+        custody: &std::sync::Arc<CarrierVmCustody>,
         ipa: u64,
         bytes: &[u8],
     ) -> Result<(u64, usize), String> {
@@ -12307,26 +15561,15 @@ pub mod foreign_cow_test_support {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapping.as_ptr(), bytes.len());
         }
         let host_addr = mapping.as_ptr() as usize;
-        let generation = next_global_frame_owner_generation();
-        let owner = GlobalFrameHostOwner::new(
-            GlobalFrameStage2Lease::fixed(ipa, bytes.len() as u64),
+        let mut lease = GlobalFrameStage2Lease::fixed(ipa, bytes.len() as u64);
+        lease.mark_test_mapped_without_backend();
+        let generation = register_global_frame_host_owner_in(
+            custody,
+            lease,
             mapping,
             u64::from(applevisor::memory::MemPerms::ReadWriteExec),
-            generation,
-            ipa,
-            bytes.len() as u64,
-        );
-        if custody
-            .global_frame_host_owners
-            .lock()
-            .insert(
-                (ipa, bytes.len() as u64),
-                GlobalFrameOwnerEntry::Live(std::sync::Arc::new(owner)),
-            )
-            .is_some()
-        {
-            return Err("carrier fixture physical owner collided".into());
-        }
+        )
+        .map_err(|error| format!("register carrier fixture physical owner: {error}"))?;
         Ok((generation, host_addr))
     }
 }
@@ -12551,8 +15794,10 @@ impl PendingExecStage2Cleanup {
                         owner_generation,
                     );
                     match outcome {
-                        GlobalFrameRetirementOutcome::Retired { .. }
-                        | GlobalFrameRetirementOutcome::UnmapFailed { .. } => Ok(()),
+                        GlobalFrameRetirementOutcome::RetiredUnmapped { .. }
+                        | GlobalFrameRetirementOutcome::TerminalizedByVmDestroy { .. }
+                        | GlobalFrameRetirementOutcome::DeferredActivePins { .. }
+                        | GlobalFrameRetirementOutcome::RetryPending { .. } => Ok(()),
                         outcome => Err(TrapError::Hypervisor(format!(
                             "HVPatch exec predecessor owner generation drifted at IPA 0x{ipa:x} size {size}: {outcome:?}"
                         ))),
@@ -12571,6 +15816,16 @@ impl PendingExecStage2Cleanup {
                 ) && !retired_extents.contains(&(alias.physical_ipa, alias.physical_size))
             });
         });
+        let structural_retirements = self
+            .mappings
+            .iter()
+            .filter_map(|mapping| {
+                mapping
+                    .structural_owner
+                    .as_ref()
+                    .map(|owner| *owner.retained.record_identity.lock())
+            })
+            .collect::<Vec<_>>();
         let mut retained_backings = Vec::new();
         for mapping in self.mappings.drain(..) {
             if retired_extents.contains(&(mapping.physical_ipa, mapping.physical_size)) {
@@ -12580,6 +15835,12 @@ impl PendingExecStage2Cleanup {
             }
         }
         std::mem::forget(retained_backings);
+        retry_structural_backing_identities_in_using(
+            custody,
+            &structural_retirements,
+            &mut unmap_global_frame_stage2_record,
+            &mut release_retired_stage2_ipa,
+        )?;
         self.armed = false;
         publish(classification);
         Ok(())
@@ -13663,6 +16924,7 @@ struct GlobalFrameIpaAllocator {
     next: u64,
     free: Vec<(u64, u64)>,
     live: std::collections::BTreeMap<u64, u64>,
+    drop_release_retry: Vec<(u64, u64)>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -13672,10 +16934,17 @@ impl GlobalFrameIpaAllocator {
             next: carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE,
             free: Vec::new(),
             live: std::collections::BTreeMap::new(),
+            drop_release_retry: Vec::new(),
         }
     }
 
     fn allocate(&mut self, length: u64, alignment: u64) -> Result<u64, TrapError> {
+        let pending = std::mem::take(&mut self.drop_release_retry);
+        for (base, length) in pending {
+            if self.release(base, length).is_err() {
+                self.drop_release_retry.push((base, length));
+            }
+        }
         let length = align_up(length, CowArmedRanges::COMPOUND_SIZE)?;
         if length == 0 {
             return Err(TrapError::Hypervisor(
@@ -13916,12 +17185,25 @@ impl GlobalFrameStage2Lease {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl Drop for GlobalFrameStage2Lease {
     fn drop(&mut self) {
-        if self.active {
-            self.try_retire().unwrap_or_else(|error| {
-                eprintln!("carrick: FATAL: rollback global frame stage-2 lease on drop: {error}");
-                std::process::abort();
-            });
+        if !self.active {
+            return;
         }
+        debug_assert!(
+            !self.mapped,
+            "mapped global-frame lease escaped without custody transfer or explicit rollback"
+        );
+        if !self.mapped && self.release_ipa {
+            let mut allocator = global_frame_ipa_allocator().lock();
+            if let Err(error) = allocator.release(self.base, self.length) {
+                eprintln!(
+                    "carrick: retaining unmapped global-frame reservation for allocator retry: {error}"
+                );
+                allocator.drop_release_retry.push((self.base, self.length));
+            } else {
+                self.release_ipa = false;
+            }
+        }
+        self.active = false;
     }
 }
 
@@ -14883,11 +18165,8 @@ enum HvpatchCarrierTaskState {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 enum HvpatchCarrierMmAuthority {
     Live {
-        // Keys into `carrier_stage2_leases()`. `Drop::drop` runs BEFORE any
-        // field drops, so releasing them there still issues every
-        // `hv_vm_unmap` while the carrier VM below is alive. Retirement may
-        // have taken some already; this is the backstop for the rest.
-        stage2_lease_keys: Vec<(u64, u64)>,
+        stage2_logical_leases: Vec<CarrierStage2LogicalLease>,
+        custody: std::sync::Weak<CarrierVmCustody>,
         frames: std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
         _vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
     },
@@ -14903,12 +18182,55 @@ enum HvpatchCarrierMmAuthority {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn retire_carrier_stage2_lease_keys(
-    stage2_lease_keys: &mut Vec<(u64, u64)>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CarrierStage2LogicalLease {
+    key: (u64, u64),
+    logical_owner: Option<CarrierLogicalOwner>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn carrier_stage2_logical_leases(
+    custody: &CarrierVmCustody,
+    identities: &[CarrierStage2RecordIdentity],
+) -> Vec<CarrierStage2LogicalLease> {
+    identities
+        .iter()
+        .filter_map(|identity| {
+            custody
+                .stage2_record_snapshot(identity.record_id)
+                .map(|snapshot| CarrierStage2LogicalLease {
+                    key: (snapshot.ipa, snapshot.len as u64),
+                    logical_owner: identity.logical_owner,
+                })
+        })
+        .collect()
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn request_carrier_stage2_record_retirements(
+    stage2_logical_leases: &mut Vec<CarrierStage2LogicalLease>,
+    custody: &std::sync::Weak<CarrierVmCustody>,
     frames: &std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
 ) {
+    let Some(custody) = custody.upgrade() else {
+        stage2_logical_leases.clear();
+        return;
+    };
     let mut frames = frames.lock();
-    for key in std::mem::take(stage2_lease_keys) {
+    for logical_lease in std::mem::take(stage2_logical_leases) {
+        let Some(identity) = custody
+            .carrier_stage2_records
+            .lock()
+            .get(&logical_lease.key)
+            .copied()
+            .filter(|identity| identity.logical_owner == logical_lease.logical_owner)
+        else {
+            continue;
+        };
+        let Some(snapshot) = custody.stage2_record_snapshot(identity.record_id) else {
+            continue;
+        };
+        let key = (snapshot.ipa, snapshot.len as u64);
         let authority_retained = frames.authority_retained_stage2.remove(&key);
         if frames.stage2_references.contains_key(&key) || authority_retained {
             // Another MM still names this physical lease, or the Kernel reported
@@ -14918,7 +18240,7 @@ fn retire_carrier_stage2_lease_keys(
             // `retire_stage2_extent_from_mappings`.
             continue;
         }
-        drop(take_carrier_stage2_lease(key.0, key.1));
+        let _ = custody.request_stage2_record_retirement(identity);
     }
 }
 
@@ -14927,11 +18249,12 @@ impl Drop for HvpatchCarrierMmAuthority {
     fn drop(&mut self) {
         match self {
             Self::Live {
-                stage2_lease_keys,
+                stage2_logical_leases,
+                custody,
                 frames,
                 ..
             } => {
-                retire_carrier_stage2_lease_keys(stage2_lease_keys, frames);
+                request_carrier_stage2_record_retirements(stage2_logical_leases, custody, frames);
             }
             #[cfg(test)]
             Self::Test { order } => {
@@ -14942,7 +18265,17 @@ impl Drop for HvpatchCarrierMmAuthority {
                 stage2_lease_keys,
                 frames,
             } => {
-                retire_carrier_stage2_lease_keys(stage2_lease_keys, frames);
+                let custody = legacy_test_carrier_vm_custody_arc();
+                let identities = stage2_lease_keys
+                    .drain(..)
+                    .filter_map(|key| custody.carrier_stage2_records.lock().get(&key).copied())
+                    .collect::<Vec<_>>();
+                let mut logical_leases = carrier_stage2_logical_leases(custody, &identities);
+                request_carrier_stage2_record_retirements(
+                    &mut logical_leases,
+                    &std::sync::Arc::downgrade(custody),
+                    frames,
+                );
             }
         }
     }
@@ -15726,6 +19059,7 @@ fn abort_prepared_task_and_carrier(
     mut task: HvpatchPreparedTaskAuthority,
     state: HvpatchCarrierTaskState,
 ) -> Result<(), TrapError> {
+    let custody = task.custody.as_ref().cloned();
     // The backend ledger must forget every unpublished mapping BEFORE the
     // carrier leases can return their IPAs to the allocator. Keep `task` alive
     // until after carrier teardown so its host mappings still back any installed
@@ -15736,8 +19070,40 @@ fn abort_prepared_task_and_carrier(
             std::process::abort();
         });
     let state_result = state.abort();
+    let mut owner_rollback_error = None;
+    if let Some(custody) = custody.as_ref() {
+        for mapping in &task.mappings {
+            if is_reusable_global_frame_extent(mapping.physical_ipa, mapping.physical_size as u64)
+                && mapping.owner_generation != 0
+            {
+                let outcome = retire_global_frame_host_owner_if_generation_in(
+                    custody,
+                    mapping.physical_ipa,
+                    mapping.physical_size as u64,
+                    mapping.owner_generation,
+                );
+                if !outcome.is_retired() {
+                    owner_rollback_error = Some(TrapError::Hypervisor(format!(
+                        "prepared task global owner rollback deferred: {outcome:?}"
+                    )));
+                }
+            }
+        }
+    }
     drop(task);
     state_result?;
+    if let Some(custody) = custody.as_ref()
+        && let Err(error) = retry_structural_backing_retirements_in_using(
+            custody,
+            &mut unmap_global_frame_stage2_record,
+            &mut release_retired_stage2_ipa,
+        )
+    {
+        owner_rollback_error = Some(error);
+    }
+    if let Some(error) = owner_rollback_error {
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -16271,7 +19637,8 @@ impl HvpatchCarrierTaskStateDirectory {
         key: HvpatchCarrierTaskStateKey,
         new_mm_key: HvpatchMmAuthorityKey,
         task_mm: &std::sync::Arc<HvpatchTaskMmAuthority>,
-        stage2_lease_keys: Vec<(u64, u64)>,
+        stage2_record_identities: Vec<CarrierStage2RecordIdentity>,
+        custody: &std::sync::Arc<CarrierVmCustody>,
     ) -> Result<(), TrapError> {
         if key.directory_instance != self.instance {
             return Err(TrapError::Hypervisor(
@@ -16302,7 +19669,11 @@ impl HvpatchCarrierTaskStateDirectory {
         let new_carrier_mm = match existing_carrier_mm.as_deref() {
             Some(HvpatchCarrierMmAuthority::Live { _vm, .. }) => {
                 Some(std::sync::Arc::new(HvpatchCarrierMmAuthority::Live {
-                    stage2_lease_keys,
+                    stage2_logical_leases: carrier_stage2_logical_leases(
+                        custody,
+                        &stage2_record_identities,
+                    ),
+                    custody: std::sync::Arc::downgrade(custody),
                     frames,
                     _vm: _vm.clone(),
                 }))
@@ -16531,7 +19902,8 @@ impl HvpatchTaskRegistration {
         &mut self,
         new_task_mm: std::sync::Arc<HvpatchTaskMmAuthority>,
         replacement_mm_root_slot: (u64, u64),
-        stage2_lease_keys: Vec<(u64, u64)>,
+        stage2_record_identities: Vec<CarrierStage2RecordIdentity>,
+        custody: &std::sync::Arc<CarrierVmCustody>,
         retain_shared_predecessor_authority: bool,
     ) -> Result<(), TrapError> {
         let new_mm_key = HvpatchMmAuthorityKey {
@@ -16543,7 +19915,8 @@ impl HvpatchTaskRegistration {
             self.key,
             new_mm_key,
             &new_task_mm,
-            stage2_lease_keys,
+            stage2_record_identities,
+            custody,
         )?;
         if let Some(old_task_mm) = self.task_mm.take() {
             old_task_mm.record_holder(HvpatchTaskMmHolder::ExecRebind);
@@ -16909,6 +20282,9 @@ impl HvpatchCarrierTaskStateDirectory {
                 "prepared HVPatch child retained parent COW authority".to_owned(),
             ));
         }
+        let carrier_custody = task.custody.as_ref().cloned().ok_or_else(|| {
+            TrapError::Hypervisor("prepared HVPatch task has no carrier custody".to_owned())
+        })?;
         let (carrier_mm, test_rollbacks): (
             Option<std::sync::Arc<HvpatchCarrierMmAuthority>>,
             Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
@@ -16917,7 +20293,8 @@ impl HvpatchCarrierTaskStateDirectory {
                 existing_carrier_mm.or_else(|| {
                     Some(std::sync::Arc::new(HvpatchCarrierMmAuthority::Live {
                         _vm: vm,
-                        stage2_lease_keys: Vec::new(),
+                        stage2_logical_leases: Vec::new(),
+                        custody: std::sync::Arc::downgrade(&carrier_custody),
                         frames: std::sync::Arc::clone(
                             carrier_frames
                                 .as_ref()
@@ -16931,7 +20308,8 @@ impl HvpatchCarrierTaskStateDirectory {
                 existing_carrier_mm.or_else(|| {
                     Some(std::sync::Arc::new(HvpatchCarrierMmAuthority::Live {
                         _vm: vm,
-                        stage2_lease_keys: Vec::new(),
+                        stage2_logical_leases: Vec::new(),
+                        custody: std::sync::Arc::downgrade(&carrier_custody),
                         frames: std::sync::Arc::clone(
                             carrier_frames
                                 .as_ref()
@@ -16961,21 +20339,28 @@ impl HvpatchCarrierTaskStateDirectory {
                             return Err(error);
                         }
                     };
-                let stage2_lease_keys =
-                    match register_carrier_stage2_leases(&mut stage2_leases, &owner_hosts) {
-                        Ok(keys) => keys,
-                        Err(error) => {
-                            abort_prepared_task_and_carrier(
-                                task,
-                                HvpatchCarrierTaskState::Process { vm, stage2_leases },
-                            )?;
-                            return Err(error);
-                        }
-                    };
+                let stage2_record_identities = match register_carrier_stage2_leases(
+                    &carrier_custody,
+                    &mut stage2_leases,
+                    &owner_hosts,
+                ) {
+                    Ok(keys) => keys,
+                    Err(error) => {
+                        abort_prepared_task_and_carrier(
+                            task,
+                            HvpatchCarrierTaskState::Process { vm, stage2_leases },
+                        )?;
+                        return Err(error);
+                    }
+                };
                 (
                     Some(std::sync::Arc::new(HvpatchCarrierMmAuthority::Live {
                         _vm: vm,
-                        stage2_lease_keys,
+                        stage2_logical_leases: carrier_stage2_logical_leases(
+                            &carrier_custody,
+                            &stage2_record_identities,
+                        ),
+                        custody: std::sync::Arc::downgrade(&carrier_custody),
                         frames: std::sync::Arc::clone(
                             carrier_frames
                                 .as_ref()
@@ -17003,20 +20388,30 @@ impl HvpatchCarrierTaskStateDirectory {
                             return Err(error);
                         }
                     };
-                let stage2_lease_keys =
-                    match register_carrier_stage2_leases(&mut stage2_leases, &owner_hosts) {
-                        Ok(keys) => keys,
-                        Err(error) => {
-                            abort_prepared_task_and_carrier(
-                                task,
-                                HvpatchCarrierTaskState::LeaseTest { stage2_leases },
-                            )?;
-                            return Err(error);
-                        }
-                    };
+                let stage2_record_identities = match register_carrier_stage2_leases(
+                    &carrier_custody,
+                    &mut stage2_leases,
+                    &owner_hosts,
+                ) {
+                    Ok(keys) => keys,
+                    Err(error) => {
+                        abort_prepared_task_and_carrier(
+                            task,
+                            HvpatchCarrierTaskState::LeaseTest { stage2_leases },
+                        )?;
+                        return Err(error);
+                    }
+                };
                 (
                     Some(std::sync::Arc::new(HvpatchCarrierMmAuthority::LeaseTest {
-                        stage2_lease_keys,
+                        stage2_lease_keys: stage2_record_identities
+                            .iter()
+                            .filter_map(|identity| {
+                                carrier_custody
+                                    .stage2_record_snapshot(identity.record_id)
+                                    .map(|snapshot| (snapshot.ipa, snapshot.len as u64))
+                            })
+                            .collect(),
                         frames: std::sync::Arc::clone(
                             carrier_frames
                                 .as_ref()
@@ -17128,9 +20523,22 @@ impl HvpatchCarrierTaskStateDirectory {
 impl HvpatchCarrierTaskState {
     fn abort(self) -> Result<(), TrapError> {
         match self {
-            Self::Sibling { .. } | Self::SharedProcess { .. } | Self::Process { .. } => Ok(()),
+            Self::Sibling { .. } | Self::SharedProcess { .. } => Ok(()),
+            Self::Process {
+                mut stage2_leases, ..
+            } => {
+                for lease in &mut stage2_leases {
+                    lease.try_retire()?;
+                }
+                Ok(())
+            }
             #[cfg(test)]
-            Self::LeaseTest { .. } => Ok(()),
+            Self::LeaseTest { mut stage2_leases } => {
+                for lease in &mut stage2_leases {
+                    lease.try_retire()?;
+                }
+                Ok(())
+            }
             #[cfg(test)]
             Self::Test { rollbacks, order } => {
                 rollbacks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -17893,7 +21301,11 @@ impl HvfVmState {
     ) -> Result<(), TrapError> {
         let outcome = retire_global_frame_host_owner_in(custody, ipa, length);
         if outcome.is_retired()
-            || matches!(outcome, GlobalFrameRetirementOutcome::UnmapFailed { .. })
+            || matches!(
+                outcome,
+                GlobalFrameRetirementOutcome::DeferredActivePins { .. }
+                    | GlobalFrameRetirementOutcome::RetryPending { .. }
+            )
         {
             return Ok(());
         }
@@ -17925,8 +21337,8 @@ impl HvfVmState {
         // not on a mapping row. Without this the fallback below released an IPA
         // whose lease was still live, and the lease's `Drop` then released it
         // again.
-        if let Some(lease) = take_carrier_stage2_lease(ipa, length) {
-            drop(lease);
+        if let Some(identity) = take_carrier_stage2_record(custody, ipa, length) {
+            retire_carrier_stage2_record_at_safe_point(custody, identity)?;
             return Ok(());
         }
         if is_reusable_global_frame_extent(ipa, length)
@@ -17974,8 +21386,9 @@ impl HvfVmState {
             drop(lease);
             return Ok(());
         }
-        if let Some(lease) = take_carrier_stage2_lease_if_owner(ipa, length, host_addr) {
-            drop(lease);
+        if let Some(identity) = take_carrier_stage2_record_if_owner(custody, ipa, length, host_addr)
+        {
+            retire_carrier_stage2_record_at_safe_point(custody, identity)?;
             return Ok(());
         }
         if is_reusable_global_frame_extent(ipa, length) {
@@ -19288,6 +22701,7 @@ impl HvfVmState {
                                 })
                         });
                         let carrier_lease = carrier_stage2_lease_owner_matches(
+                            custody,
                             ipa,
                             length,
                             extent.stage2_owner.host_addr,
@@ -19356,13 +22770,14 @@ impl HvfVmState {
                                 }))
                     });
                     let carrier_lease = carrier_stage2_lease_owner_matches(
+                        custody,
                         ipa,
                         length,
                         extent.stage2_owner.host_addr,
                     );
                     if !local_lease
                         && !carrier_lease
-                        && take_carrier_stage2_lease(ipa, length).is_none()
+                        && take_carrier_stage2_record(custody, ipa, length).is_none()
                     {
                         return Err(TrapError::Hypervisor(format!(
                             "HVPatch process retirement structural lease {lease:?} has no exact local, structural, or carrier lease"
@@ -19434,8 +22849,10 @@ impl HvfVmState {
                             owner.generation,
                         );
                         match outcome {
-                            GlobalFrameRetirementOutcome::Retired { .. }
-                            | GlobalFrameRetirementOutcome::UnmapFailed { .. } => Ok(()),
+                            GlobalFrameRetirementOutcome::RetiredUnmapped { .. }
+                            | GlobalFrameRetirementOutcome::TerminalizedByVmDestroy { .. }
+                            | GlobalFrameRetirementOutcome::DeferredActivePins { .. }
+                            | GlobalFrameRetirementOutcome::RetryPending { .. } => Ok(()),
                             outcome => Err(TrapError::Hypervisor(format!(
                                 "HVPatch process retirement owner identity drifted for lease {lease:?}: {outcome:?}"
                             ))),
@@ -19552,6 +22969,15 @@ impl HvfVmState {
     pub(crate) fn new_with_plan(
         plan: &GuestMappingPlan,
     ) -> Result<(HvfVmState, applevisor::vcpu::Vcpu, MailboxBinding), TrapError> {
+        let mut pending_creation = None;
+        let result = Self::new_with_plan_inner(plan, &mut pending_creation);
+        finish_pending_vm_creation(pending_creation, result)
+    }
+
+    fn new_with_plan_inner(
+        plan: &GuestMappingPlan,
+        pending_creation: &mut Option<PendingCarrierVmCreation>,
+    ) -> Result<(HvfVmState, applevisor::vcpu::Vcpu, MailboxBinding), TrapError> {
         use applevisor::prelude::*;
 
         // Carrier reuse: when this carrier already owns a VM, a new container's
@@ -19577,7 +23003,15 @@ impl HvfVmState {
                     ));
                 }
             }
-            cell.clone()
+            match cell.as_ref() {
+                Some(PersistentCarrierCellEntry::Published(spec)) => Some(spec.clone()),
+                Some(PersistentCarrierCellEntry::CreateCleanup { .. }) => {
+                    return Err(TrapError::Hypervisor(
+                        "carrier VM creation cleanup is pending retry".to_owned(),
+                    ));
+                }
+                None => unreachable!(),
+            }
         } else {
             None
         };
@@ -19613,12 +23047,20 @@ impl HvfVmState {
             None => {
                 let carrier_foreign_mm_transport =
                     std::sync::Arc::new(CarrierForeignMmTransport::new());
-                let (vm, permit) = create_vm_with_admission(
-                    VmCreateAdmission::Initial,
-                    &carrier_foreign_mm_transport.custody,
-                )?;
-                let syscall_transport = HvfSyscallTransport::from_env()
-                    .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
+                let (syscall_transport, (vm, permit, creation)) =
+                    prepare_initial_carrier_before_admission(
+                        || {
+                            HvfSyscallTransport::from_env()
+                                .map_err(|error| TrapError::Hypervisor(error.to_string()))
+                        },
+                        || {
+                            create_vm_with_admission(
+                                VmCreateAdmission::Initial,
+                                &carrier_foreign_mm_transport.custody,
+                            )
+                        },
+                    )?;
+                *pending_creation = Some(creation);
                 (
                     vm,
                     permit,
@@ -19629,20 +23071,31 @@ impl HvfVmState {
                 )
             }
         };
+        let vm = SetupVmGuard::new(vm, carrier.is_none());
         drop(boot_gate);
-        let vcpu = if carrier.is_some() {
-            // Existing-VM vCPU: admitted by the in-process scheduler, like a
-            // thread sibling (see `create_vcpu`).
-            create_vcpu(&vm)?
-        } else {
-            create_vcpu_with_permit(&vm, permit)?
-        };
+        let vcpu = SetupVcpuGuard::new(
+            if carrier.is_some() {
+                // Existing-VM vCPU: admitted by the in-process scheduler, like a
+                // thread sibling (see `create_vcpu`).
+                create_vcpu(&vm)?
+            } else {
+                create_vcpu_with_permit(&vm, permit)?
+            },
+            if carrier.is_some() {
+                SetupVcpuCleanup::LocalRaii
+            } else {
+                SetupVcpuCleanup::PendingRaw
+            },
+        );
+        if let Some(creation) = pending_creation.as_mut() {
+            creation.record_vcpu(vcpu.id());
+        }
         enable_el0_counter_access(vcpu.id());
 
         #[cfg(not(test))]
         let custody = std::sync::Arc::clone(&carrier_foreign_mm_transport.custody);
         let mut state = HvfVmState {
-            _vm: std::mem::ManuallyDrop::new(vm),
+            _vm: std::mem::ManuallyDrop::new(vm.into_inner()),
             carrier_foreign_mm_transport,
             task: HvfTaskState {
                 #[cfg(not(test))]
@@ -19767,6 +23220,17 @@ impl HvfVmState {
                 plan
             }
         };
+        if carrier.is_none() {
+            let replayed = replayed_global_frame_owners_for_regions_in(
+                &state.carrier_foreign_mm_transport.custody,
+                state.mappings.iter(),
+            );
+            reconcile_global_frame_owners_after_replay_in(
+                &state.carrier_foreign_mm_transport.custody,
+                &replayed,
+                false,
+            )?;
+        }
 
         // Start PC: if an EL0 entry trampoline is installed, the vCPU begins
         // at the trampoline page (in EL1h) and executes the single `eret`
@@ -19921,7 +23385,10 @@ impl HvfVmState {
             Some(spec) => Self::allocate_persistent_mailbox_for_vcpu(spec, &vcpu)?,
             None => state.allocate_mailbox_for_vcpu(&vcpu)?,
         };
-        Ok((state, vcpu, mailbox))
+        if pending_creation.is_some() {
+            commit_pending_creation_before_vcpu_handoff(pending_creation)?;
+        }
+        Ok((state, vcpu.into_inner(), mailbox))
     }
 }
 
@@ -20637,13 +24104,14 @@ impl HvfVmState {
             )));
         }
         lease.mark_mapped();
+        let custody = self.carrier_vm_custody();
         let owner_generation = register_global_frame_host_owner_in(
-            self.custody(),
+            &custody,
             lease,
             host_mapping,
             u64::from(stage2_perms),
         )?;
-        let mut owner_rollback = GlobalFrameOwnerRollback::new(self.carrier_vm_custody());
+        let mut owner_rollback = GlobalFrameOwnerRollback::new(custody);
         owner_rollback.record((physical_ipa, physical_len));
 
         let inventory_mapping = {
@@ -21101,13 +24569,14 @@ impl HvfVmState {
             )));
         }
         new_lease.mark_mapped();
+        let custody = self.carrier_vm_custody();
         let owner_generation = register_global_frame_host_owner_in(
-            self.custody(),
+            &custody,
             new_lease,
             new_host,
             u64::from(stage2_perms),
         )?;
-        let mut owner_rollback = GlobalFrameOwnerRollback::new(self.carrier_vm_custody());
+        let mut owner_rollback = GlobalFrameOwnerRollback::new(custody);
         owner_rollback.record((new_physical_ipa, CowArmedRanges::COMPOUND_SIZE));
 
         let inventory_mapping = {
@@ -21656,8 +25125,9 @@ impl HvfVmState {
             )));
         }
         new_lease.mark_mapped();
+        let custody = self.carrier_vm_custody();
         let owner_generation = register_global_frame_host_owner_in(
-            self.custody(),
+            &custody,
             new_lease,
             new_host,
             u64::from(stage2_perms),
@@ -22837,8 +26307,9 @@ impl HvfVmState {
             lease.mark_mapped();
         }
         let (host_mapping, owner_generation) = if self.persistent_vm_lifecycle {
+            let custody = self.carrier_vm_custody();
             let owner_generation = register_global_frame_host_owner_in(
-                self.custody(),
+                &custody,
                 global_lease.take().ok_or_else(|| {
                     TrapError::Hypervisor("HVPatch alias lost its global IPA lease".to_owned())
                 })?,
@@ -24451,6 +27922,25 @@ impl HvfVmState {
         replay_alias_union: bool,
         continuation: Option<carrick_hal::threaded::Aarch64SyscallContinuationV1>,
     ) -> Result<(), TrapError> {
+        let mut pending_creation = None;
+        let result = self.shared_wait_resume_inner(
+            vcpu,
+            mailbox,
+            replay_alias_union,
+            continuation,
+            &mut pending_creation,
+        );
+        finish_pending_vm_creation(pending_creation, result)
+    }
+
+    fn shared_wait_resume_inner(
+        &mut self,
+        vcpu: &mut applevisor::vcpu::Vcpu,
+        mailbox: &mut MailboxBinding,
+        replay_alias_union: bool,
+        continuation: Option<carrick_hal::threaded::Aarch64SyscallContinuationV1>,
+        pending_creation: &mut Option<PendingCarrierVmCreation>,
+    ) -> Result<(), TrapError> {
         if self.reclaim_authority != ReclaimParkAuthority::VmParked {
             return Err(TrapError::Hypervisor(
                 "shared_wait_resume: no parked VM executor authority".to_owned(),
@@ -24461,18 +27951,22 @@ impl HvfVmState {
                 "shared_wait_resume: parked syscall has no typed continuation authority".to_owned(),
             )
         })?;
-        let (new_vm, permit) = create_vm_with_admission(
+        let (new_vm, permit, creation) = create_vm_with_admission(
             VmCreateAdmission::SharedWaitResume,
             &self.carrier_foreign_mm_transport.custody,
         )?;
-        let new_vcpu = create_vcpu_with_permit(&new_vm, permit)?;
+        let new_vm = SetupVmGuard::new(new_vm, true);
+        *pending_creation = Some(creation);
+        let new_vcpu = SetupVcpuGuard::new(
+            create_vcpu_with_permit(&new_vm, permit)?,
+            SetupVcpuCleanup::PendingRaw,
+        );
+        let creation = pending_creation.as_mut().ok_or_else(|| {
+            TrapError::Hypervisor("shared-wait creation transaction disappeared".to_owned())
+        })?;
+        creation.record_vcpu(new_vcpu.id());
         enable_el0_counter_access(new_vcpu.id());
         Self::configure_executor_invariants(&new_vcpu)?;
-        self.vcpu_id = new_vcpu.id();
-        self.vcpu_handle = new_vcpu.get_handle();
-        std::mem::forget(std::mem::replace(vcpu, new_vcpu));
-        replace_destroyed_vm(self, new_vm);
-
         // Snapshot the registry's CURRENT membership before the replay: an
         // alias another thread `munmap`'d while we were parked was removed
         // from the registry (`unregister_alias`) but may still sit in this
@@ -24483,6 +27977,7 @@ impl HvfVmState {
         // execve-clear), so absence here means "gone on purpose".
         let registered_aliases = alias_registry().lock().clone();
         let mut mapped_extents = std::collections::HashSet::new();
+        let mut replayed_global_owners = Vec::new();
         for mapping in &self.mappings {
             // Skip a sibling-munmap'd stale high-VA entry ENTIRELY (absence
             // from the registry = gone on purpose, mirroring the union loop
@@ -24507,12 +28002,13 @@ impl HvfVmState {
             if mapping.is_dynamic_alias && live_alias.is_none() {
                 continue;
             }
-            let (host_addr, ipa, size, perms) = live_alias.map_or(
+            let (host_addr, ipa, size, perms, owner_generation) = live_alias.map_or(
                 (
                     mapping.host_addr,
                     mapping.ipa,
                     mapping.size,
                     u64::from(mapping.perms),
+                    mapping.owner_generation,
                 ),
                 |alias| {
                     (
@@ -24520,9 +28016,21 @@ impl HvfVmState {
                         alias.physical_ipa,
                         alias.physical_size,
                         alias.perms,
+                        alias.owner_generation,
                     )
                 },
             );
+            if is_reusable_global_frame_extent(ipa, size as u64)
+                && !global_frame_owner_is_replayable_in(
+                    &self.carrier_foreign_mm_transport.custody,
+                    ipa,
+                    size as u64,
+                    host_addr as usize,
+                    owner_generation,
+                )
+            {
+                continue;
+            }
             if !mapped_extents.insert((ipa, size)) {
                 continue;
             }
@@ -24535,6 +28043,12 @@ impl HvfVmState {
                     code: r as u32,
                 });
             }
+            replayed_global_owners.push(GlobalFrameReplayExtent {
+                ipa,
+                length: size as u64,
+                host_addr: host_addr as usize,
+                perms,
+            });
         }
 
         if replay_alias_union || self.mappings.iter().any(|mapping| mapping.is_dynamic_alias) {
@@ -24547,6 +28061,17 @@ impl HvfVmState {
                     self.container_root,
                 ) || !mapped_extents.insert((b.physical_ipa, b.physical_size))
                     || !alias_backing_is_live(b.host_addr)
+                {
+                    continue;
+                }
+                if is_reusable_global_frame_extent(b.physical_ipa, b.physical_size as u64)
+                    && !global_frame_owner_is_replayable_in(
+                        &self.carrier_foreign_mm_transport.custody,
+                        b.physical_ipa,
+                        b.physical_size as u64,
+                        b.physical_host_addr,
+                        b.owner_generation,
+                    )
                 {
                     continue;
                 }
@@ -24566,11 +28091,28 @@ impl HvfVmState {
                         code: r as u32,
                     });
                 }
+                replayed_global_owners.push(GlobalFrameReplayExtent {
+                    ipa: b.physical_ipa,
+                    length: b.physical_size as u64,
+                    host_addr: b.physical_host_addr,
+                    perms: b.perms,
+                });
             }
         }
 
-        self.reacquire_mailbox_after_vcpu_create(vcpu, mailbox, Some(continuation))?;
+        reconcile_global_frame_owners_after_replay_in(
+            &self.carrier_foreign_mm_transport.custody,
+            &replayed_global_owners,
+            false,
+        )?;
+
+        self.reacquire_mailbox_after_vcpu_create(&new_vcpu, mailbox, Some(continuation))?;
         self.reclaim_authority.mark_live_after_recreate()?;
+        commit_pending_creation_before_vcpu_handoff(pending_creation)?;
+        self.vcpu_id = new_vcpu.id();
+        self.vcpu_handle = new_vcpu.get_handle();
+        std::mem::forget(std::mem::replace(vcpu, new_vcpu.into_inner()));
+        replace_destroyed_vm(self, new_vm.into_inner());
         Ok(())
     }
 
@@ -24597,7 +28139,9 @@ impl HvfVmState {
             // Any other holder (a worker) is still refused as before.
             let cell = persistent_carrier_cell().lock();
             return match cell.as_ref() {
-                Some(spec) if std::sync::Arc::ptr_eq(&spec.carrier_mappings, carrier_mappings) => {
+                Some(PersistentCarrierCellEntry::Published(spec))
+                    if std::sync::Arc::ptr_eq(&spec.carrier_mappings, carrier_mappings) =>
+                {
                     Ok(spec.clone())
                 }
                 _ => Err(TrapError::Hypervisor(
@@ -24621,7 +28165,7 @@ impl HvfVmState {
         {
             let mut cell = persistent_carrier_cell().lock();
             if cell.is_none() {
-                *cell = Some(spec.clone());
+                *cell = Some(PersistentCarrierCellEntry::Published(spec.clone()));
             }
         }
         carrier_published().notify_all();
@@ -25804,9 +29348,11 @@ impl HvfVmState {
                                     mapping.physical_ipa
                                 ))
                             })?;
-                            let owner = StructuralBackingOwner::new(
+                            let owner = StructuralBackingOwner::new_in(
+                                &plan.carrier_foreign_mm_transport.custody,
                                 host,
                                 lease,
+                                u64::from(mapping.perms),
                                 epoch,
                                 mapping.physical_ipa,
                                 mapping.physical_size,
@@ -25917,20 +29463,44 @@ impl HvfVmState {
                                 std::process::abort();
                         });
                         drop(inventory);
-                        drop(stage2_leases);
+                        let mut stage2_rollback_error = None;
+                        for lease in &mut stage2_leases {
+                            if let Err(rollback_error) = lease.try_retire() {
+                                stage2_rollback_error = Some(rollback_error);
+                            }
+                        }
                         for mapping in &mapped {
                             if is_reusable_global_frame_extent(
                                 mapping.physical_ipa,
                                 mapping.physical_size as u64,
                             ) {
-                                plan.carrier_foreign_mm_transport
-                                    .custody
-                                    .global_frame_host_owners
-                                    .lock()
-                                    .remove(&(mapping.physical_ipa, mapping.physical_size as u64));
+                                let outcome = retire_global_frame_host_owner_if_generation_in(
+                                    &plan.carrier_foreign_mm_transport.custody,
+                                    mapping.physical_ipa,
+                                    mapping.physical_size as u64,
+                                    mapping.owner_generation,
+                                );
+                                if !outcome.is_retired() {
+                                    stage2_rollback_error = Some(TrapError::Hypervisor(format!(
+                                        "task-only child owner rollback deferred: {outcome:?}"
+                                    )));
+                                }
                             }
                         }
                         drop(mapped);
+                        drop(structural_owners);
+                        if let Err(rollback_error) = retry_structural_backing_retirements_in_using(
+                            &plan.carrier_foreign_mm_transport.custody,
+                            &mut unmap_global_frame_stage2_record,
+                            &mut release_retired_stage2_ipa,
+                        ) {
+                            stage2_rollback_error = Some(rollback_error);
+                        }
+                        if let Some(rollback_error) = stage2_rollback_error {
+                            return Err(TrapError::Hypervisor(format!(
+                                "{error}; explicit task-only stage-2 rollback failed: {rollback_error}"
+                            )));
+                        }
                         return Err(error);
                     }
                 };
@@ -26108,9 +29678,11 @@ impl HvfVmState {
                                     mapping.physical_ipa
                                 ))
                             })?;
-                            let owner = StructuralBackingOwner::new(
+                            let owner = StructuralBackingOwner::new_in(
+                                &plan.carrier_foreign_mm_transport.custody,
                                 host,
                                 lease,
+                                u64::from(mapping.perms),
                                 epoch,
                                 mapping.physical_ipa,
                                 mapping.physical_size,
@@ -26335,6 +29907,18 @@ impl HvfVmState {
         mailbox: &mut MailboxBinding,
         plan: &GuestMappingPlan,
     ) -> Result<(), TrapError> {
+        let mut pending_creation = None;
+        let result = self.execve_rebuild_inner(vcpu, mailbox, plan, &mut pending_creation);
+        finish_pending_vm_creation(pending_creation, result)
+    }
+
+    fn execve_rebuild_inner(
+        &mut self,
+        vcpu: &mut applevisor::vcpu::Vcpu,
+        mailbox: &mut MailboxBinding,
+        plan: &GuestMappingPlan,
+        pending_creation: &mut Option<PendingCarrierVmCreation>,
+    ) -> Result<(), TrapError> {
         use applevisor::prelude::*;
         let custody = self.carrier_vm_custody();
         let predecessor_mm_root_slot = self.mm_root_slot;
@@ -26467,6 +30051,8 @@ impl HvfVmState {
         let was_forked_child = self.is_forked_child;
         let shared_projection = self.shared_process_mm;
         let address_space_teardown_started = std::time::Instant::now();
+        let mut pending_exec_vcpu = None;
+        let mut pending_exec_vm = None;
         let retired_physical_extents = if self.persistent_vm_lifecycle {
             // The vCPU is stopped at the execve syscall exit and every sibling
             // has already retired. Build the complete predecessor/replacement
@@ -26621,17 +30207,28 @@ impl HvfVmState {
             }
             destroy_vm_with_custody(&self.carrier_foreign_mm_transport.custody, "execve_rebuild")?;
 
-            let (new_vm, permit) = create_vm_with_admission(
+            let (new_vm, permit, creation) = create_vm_with_admission(
                 VmCreateAdmission::ExecveRebuild,
                 &self.carrier_foreign_mm_transport.custody,
             )?;
-            let new_vcpu = create_vcpu_with_permit(&new_vm, permit)?;
+            let new_vm = SetupVmGuard::new(new_vm, true);
+            *pending_creation = Some(creation);
+            reconcile_global_frame_owners_after_replay_in(
+                &self.carrier_foreign_mm_transport.custody,
+                &[],
+                true,
+            )?;
+            let new_vcpu = SetupVcpuGuard::new(
+                create_vcpu_with_permit(&new_vm, permit)?,
+                SetupVcpuCleanup::PendingRaw,
+            );
+            let creation = pending_creation.as_mut().ok_or_else(|| {
+                TrapError::Hypervisor("exec creation transaction disappeared".to_owned())
+            })?;
+            creation.record_vcpu(new_vcpu.id());
             enable_el0_counter_access(new_vcpu.id());
-            self.vcpu_id = new_vcpu.id();
-            self.vcpu_handle = new_vcpu.get_handle();
-            // Swap the new VM + vCPU into place WITHOUT running Drop on the old.
-            std::mem::forget(std::mem::replace(vcpu, new_vcpu));
-            replace_destroyed_vm(self, new_vm);
+            pending_exec_vcpu = Some(new_vcpu);
+            pending_exec_vm = Some(new_vm);
             std::collections::BTreeSet::new()
         };
         emit_replace_stage(
@@ -26805,6 +30402,9 @@ impl HvfVmState {
                 self.mappings
                     .push(map_region_raw_in(&custody, mapping, false)?);
             }
+            let replayed =
+                replayed_global_frame_owners_for_regions_in(&custody, self.mappings.iter());
+            reconcile_global_frame_owners_after_replay_in(&custody, &replayed, false)?;
         }
         if let Some((retired, mut replacement)) = inventory_reservations.take() {
             let staged_inventory_mappings = {
@@ -26875,7 +30475,7 @@ impl HvfVmState {
                     }
                 }
                 let stage2_lease_keys =
-                    register_carrier_stage2_leases(&mut stage2_leases, &owner_hosts)
+                    register_carrier_stage2_leases(&custody, &mut stage2_leases, &owner_hosts)
                         .unwrap_or_else(|error| {
                             // Replacement inventory already names every candidate.
                             // Fail-stop before unwinding can drop their leases or host
@@ -26943,6 +30543,7 @@ impl HvfVmState {
                     new_task_mm,
                     replacement_mm_root_slot,
                     stage2_lease_keys,
+                    &custody,
                     shared_projection,
                 ) {
                     eprintln!("carrick: FATAL: rebind HVPatch exec MM authority: {error}");
@@ -26965,22 +30566,28 @@ impl HvfVmState {
         // registers clear except for SP and PC. Without this, musl's _start in the
         // new image inherits the previous process's x8 which can decode as a bogus
         // syscall number on the first svc.
+        let active_vcpu = pending_exec_vcpu.as_deref().unwrap_or(vcpu);
         let post_publication = (|| -> std::result::Result<MailboxBinding, TrapError> {
             let registers_started = std::time::Instant::now();
             for reg in GPR_TABLE {
-                vcpu.set_reg(reg, 0).map_err(hvf_error)?;
+                active_vcpu.set_reg(reg, 0).map_err(hvf_error)?;
             }
 
             let initial_pc = plan.el0_trampoline_entry.unwrap_or(plan.entry);
-            vcpu.set_reg(Reg::PC, initial_pc).map_err(hvf_error)?;
+            active_vcpu
+                .set_reg(Reg::PC, initial_pc)
+                .map_err(hvf_error)?;
             const AARCH64_PSTATE_EL1H_DAIF_MASKED: u64 = 0x3c5;
-            vcpu.set_reg(Reg::CPSR, AARCH64_PSTATE_EL1H_DAIF_MASKED)
+            active_vcpu
+                .set_reg(Reg::CPSR, AARCH64_PSTATE_EL1H_DAIF_MASKED)
                 .map_err(hvf_error)?;
             if let Some(_trampoline) = plan.el0_trampoline_entry {
                 const AARCH64_PSTATE_EL0T_DAIF_MASKED: u64 = 0x3c0;
-                vcpu.set_sys_reg(SysReg::SPSR_EL1, AARCH64_PSTATE_EL0T_DAIF_MASKED)
+                active_vcpu
+                    .set_sys_reg(SysReg::SPSR_EL1, AARCH64_PSTATE_EL0T_DAIF_MASKED)
                     .map_err(hvf_error)?;
-                vcpu.set_sys_reg(SysReg::ELR_EL1, plan.entry)
+                active_vcpu
+                    .set_sys_reg(SysReg::ELR_EL1, plan.entry)
                     .map_err(hvf_error)?;
             }
             // C=1, I=1, UCI=1 (bit 26), UCT=1 (bit 15), DZE=1 (bit 14) — EL0 cache-
@@ -26997,52 +30604,62 @@ impl HvfVmState {
             let boot = <HvfTrapEngine as carrick_hal::ThreadedEngine>::Arch::bootstrap_sysregs();
             let mut sctlr_el1: u64 = boot.sctlr_el1 & !1;
             if let Some(pt_base) = plan.stage1_page_tables_base {
-                vcpu.set_sys_reg(SysReg::MAIR_EL1, boot.mair_el1)
+                active_vcpu
+                    .set_sys_reg(SysReg::MAIR_EL1, boot.mair_el1)
                     .map_err(hvf_error)?;
                 // 48-bit VA, TTBR0 + TTBR1 both active sharing one root. MUST stay
                 // identical to the canonical TCR comment/value in new_with_plan.
                 // boot.tcr_el1 is the shared bootstrap value via GuestArch
                 // (canonical rationale in carrick_mem::arch_sysregs).
-                vcpu.set_sys_reg(SysReg::TCR_EL1, boot.tcr_el1)
+                active_vcpu
+                    .set_sys_reg(SysReg::TCR_EL1, boot.tcr_el1)
                     .map_err(hvf_error)?;
                 let ttbr = pt_base | (u64::from(replacement_asid) << 48);
-                vcpu.set_sys_reg(SysReg::TTBR0_EL1, ttbr)
+                active_vcpu
+                    .set_sys_reg(SysReg::TTBR0_EL1, ttbr)
                     .map_err(hvf_error)?;
                 // TTBR1 shares the same root (see the TCR comment above).
-                vcpu.set_sys_reg(SysReg::TTBR1_EL1, ttbr)
+                active_vcpu
+                    .set_sys_reg(SysReg::TTBR1_EL1, ttbr)
                     .map_err(hvf_error)?;
                 sctlr_el1 |= 1;
             }
-            vcpu.set_sys_reg(SysReg::SCTLR_EL1, sctlr_el1)
+            active_vcpu
+                .set_sys_reg(SysReg::SCTLR_EL1, sctlr_el1)
                 .map_err(hvf_error)?;
             // boot.cpacr_el1 (FPEN=0b11, no FP/SIMD trap at EL0) is shared.
-            vcpu.set_sys_reg(SysReg::CPACR_EL1, boot.cpacr_el1)
+            active_vcpu
+                .set_sys_reg(SysReg::CPACR_EL1, boot.cpacr_el1)
                 .map_err(hvf_error)?;
             if let Some(vectors_base) = plan.el1_vectors_base {
-                vcpu.set_sys_reg(SysReg::VBAR_EL1, vectors_base)
+                active_vcpu
+                    .set_sys_reg(SysReg::VBAR_EL1, vectors_base)
                     .map_err(hvf_error)?;
             }
             if let Some(stack_pointer) = plan.initial_stack_pointer {
-                vcpu.set_sys_reg(SysReg::SP_EL0, stack_pointer)
+                active_vcpu
+                    .set_sys_reg(SysReg::SP_EL0, stack_pointer)
                     .map_err(hvf_error)?;
             }
             // execve resets TPIDR_EL0 — the new image's musl init will call
             // set_thread_area to initialise it.
-            vcpu.set_sys_reg(SysReg::TPIDR_EL0, 0).map_err(hvf_error)?;
+            active_vcpu
+                .set_sys_reg(SysReg::TPIDR_EL0, 0)
+                .map_err(hvf_error)?;
 
             // Verify post-execve sysreg state through dtrace. If stage-1 isn't on or
             // TTBR0 doesn't point at the new tables, the new process will fault on the
             // first LDAXR.
-            let actual_sctlr = vcpu.get_sys_reg(SysReg::SCTLR_EL1).unwrap_or(0);
-            let actual_ttbr0 = vcpu.get_sys_reg(SysReg::TTBR0_EL1).unwrap_or(0);
-            let actual_mair = vcpu.get_sys_reg(SysReg::MAIR_EL1).unwrap_or(0);
+            let actual_sctlr = active_vcpu.get_sys_reg(SysReg::SCTLR_EL1).unwrap_or(0);
+            let actual_ttbr0 = active_vcpu.get_sys_reg(SysReg::TTBR0_EL1).unwrap_or(0);
+            let actual_mair = active_vcpu.get_sys_reg(SysReg::MAIR_EL1).unwrap_or(0);
             emit_replace_stage(
                 carrick_observability::probes::HvpatchExecReplaceStagePhase::Registers,
                 registers_started,
             );
             crate::probes::execve_sysregs(actual_sctlr, actual_ttbr0, actual_mair);
             self.populate_vdso_data_page();
-            self.allocate_mailbox_for_vcpu(vcpu)
+            self.allocate_mailbox_for_vcpu(active_vcpu)
         })();
         let mailbox_started = std::time::Instant::now();
         *mailbox = post_publication.unwrap_or_else(|error| {
@@ -27059,6 +30676,18 @@ impl HvfVmState {
             carrick_observability::probes::HvpatchExecReplaceStagePhase::Mailbox,
             mailbox_started,
         );
+        if let Some(new_vcpu) = pending_exec_vcpu {
+            let new_vm = pending_exec_vm.take().ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "exec VM disappeared before committed vCPU handoff".to_owned(),
+                )
+            })?;
+            commit_pending_creation_before_vcpu_handoff(pending_creation)?;
+            self.vcpu_id = new_vcpu.id();
+            self.vcpu_handle = new_vcpu.get_handle();
+            std::mem::forget(std::mem::replace(vcpu, new_vcpu.into_inner()));
+            replace_destroyed_vm(self, new_vm.into_inner());
+        }
         Ok(())
     }
 }
@@ -29208,9 +32837,18 @@ mod frame_inventory_backend_tests {
         let key = lease.key();
         lease.mark_test_mapped_without_backend();
         let owners = std::collections::BTreeMap::from([(key, host_addr)]);
+        let identities = register_carrier_stage2_leases(
+            legacy_test_carrier_vm_custody_arc(),
+            &mut vec![lease],
+            &owners,
+        )
+        .unwrap();
+        assert_eq!(identities.len(), 1);
         assert_eq!(
-            register_carrier_stage2_leases(&mut vec![lease], &owners).unwrap(),
-            vec![key]
+            legacy_test_carrier_vm_custody_arc()
+                .stage2_record_snapshot(identities[0].record_id)
+                .map(|snapshot| (snapshot.ipa, snapshot.len as u64)),
+            Some(key)
         );
         key
     }
@@ -29822,7 +33460,10 @@ mod frame_inventory_backend_tests {
         assert!(alias_backing_is_live(host_addr as usize));
         HvfVmState::retire_task_state_exec_predecessor(&mut task)
             .expect("post-TLBI detached cleanup");
-        assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            !observed.load(std::sync::atomic::Ordering::SeqCst),
+            "lease Drop must not execute stage-2 retirement"
+        );
         assert!(!alias_backing_is_live(host_addr as usize));
         assert!(task.pending_exec_stage2_cleanup.is_none());
     }
@@ -29989,7 +33630,7 @@ mod frame_inventory_backend_tests {
             lease_key.0,
             lease_key.1 as u64,
         );
-        let successor_generation = successor.generation;
+        let successor_generation = successor.generation();
         let stale_generation = successor_generation.wrapping_add(1);
         assert_ne!(stale_generation, successor_generation);
         assert!(
@@ -30732,14 +34373,16 @@ mod frame_inventory_backend_tests {
             generation,
             "test seam must not disarm a recycled owner generation"
         );
-        if let Some(lease) = owner._lease.lock().as_mut() {
-            assert!(
-                lease.mapped,
-                "production publication must retain a mapped stage-2 lease"
-            );
-            lease.mapped = false;
-            lease.backend_map_installed = false;
-        }
+        let snapshot = owner.snapshot().expect("test owner stage-2 record");
+        assert!(
+            snapshot.mapped,
+            "production publication must retain a mapped stage-2 record"
+        );
+        owner
+            .custody
+            .upgrade()
+            .expect("test owner custody")
+            .disarm_stage2_backend_map_for_test(owner.record_identity);
     }
 
     fn process_retirement_task(
@@ -31926,8 +35569,8 @@ mod frame_inventory_backend_tests {
         _stage2_stub.set_fail_next_unmap(true);
         let outcome = retire_global_frame_host_owner_if_generation(key.0, key.1, owner_generation);
         assert!(
-            matches!(outcome, GlobalFrameRetirementOutcome::UnmapFailed { ipa, length, generation, .. } if ipa == key.0 && length == key.1 && generation == owner_generation),
-            "unmap failure must return UnmapFailed outcome"
+            matches!(outcome, GlobalFrameRetirementOutcome::RetryPending { ipa, length, generation, .. } if ipa == key.0 && length == key.1 && generation == owner_generation),
+            "unmap failure must return RetryPending outcome"
         );
         {
             let entry = global_frame_host_owners()
@@ -32004,7 +35647,7 @@ mod frame_inventory_backend_tests {
         let retry_outcome =
             retire_global_frame_host_owner_if_generation(key.0, key.1, owner_generation);
         assert!(
-            matches!(retry_outcome, GlobalFrameRetirementOutcome::Retired { ipa, length, generation } if ipa == key.0 && length == key.1 && generation == owner_generation),
+            matches!(retry_outcome, GlobalFrameRetirementOutcome::RetiredUnmapped { ipa, length, generation } if ipa == key.0 && length == key.1 && generation == owner_generation),
             "retry with matching generation must succeed"
         );
         assert!(
@@ -32051,19 +35694,23 @@ mod frame_inventory_backend_tests {
         )
         .expect("register global frame host owner");
 
-        // Clone an active reader reference
+        // Acquire an active typed reader pin.
         let reader_ref = global_frame_host_owners()
             .lock()
             .get(&key)
             .expect("owner entry")
             .owner()
-            .clone();
+            .pin()
+            .expect("pin exact owner record");
 
         // Attempt retirement while reader holds Arc: must NOT report Retired!
         let outcome = retire_global_frame_host_owner_if_generation(key.0, key.1, owner_generation);
         assert!(
-            matches!(outcome, GlobalFrameRetirementOutcome::UnmapFailed { .. }),
-            "retirement while shared Arc is held must return UnmapFailed, never Retired",
+            matches!(
+                outcome,
+                GlobalFrameRetirementOutcome::DeferredActivePins { .. }
+            ),
+            "retirement while a typed pin is held must defer, never retire",
         );
         assert!(
             global_frame_host_owners()
@@ -32102,7 +35749,7 @@ mod frame_inventory_backend_tests {
     }
 
     #[test]
-    fn vm_destroy_drain_resolves_pending_retirements_or_fails_closed() {
+    fn explicit_live_vm_safe_point_retries_pending_retirements_or_reports_failure() {
         let _allocator_test_guard = global_frame_allocator_test_lock().lock();
         let _stage2_stub = ScopedStage2MapTestStub::enable();
         let mut lease =
@@ -32136,15 +35783,15 @@ mod frame_inventory_backend_tests {
             "owner must be in RetirementPending",
         );
 
-        // Persistent failure during drain must fail closed with error
+        // Persistent failure during an explicit live-VM retry remains pending.
         _stage2_stub.set_fail_next_unmap(true);
         let drain_err = drain_and_retry_pending_global_frame_retirements();
         assert!(
             drain_err.is_err(),
-            "drain must fail closed when unmap persistently fails",
+            "safe-point retry must report persistent unmap failure",
         );
 
-        // Clearing unmap failure allows drain to succeed cleanly before VM destroy
+        // Clearing unmap failure allows the explicit safe point to complete.
         let drain_ok = drain_and_retry_pending_global_frame_retirements();
         assert!(drain_ok.is_ok(), "drain must succeed when unmap succeeds");
         assert!(global_frame_host_owners().lock().is_empty());
@@ -32358,7 +36005,7 @@ mod frame_inventory_backend_tests {
     }
 
     #[test]
-    fn final_carrier_mm_drop_releases_an_unreferenced_stage2_lease_once() {
+    fn final_carrier_mm_drop_requests_then_safe_point_releases_stage2_once() {
         let _allocator_test_guard = global_frame_allocator_test_lock().lock();
         let frames =
             std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
@@ -32371,6 +36018,10 @@ mod frame_inventory_backend_tests {
             frames,
         });
 
+        assert!(global_frame_ipa_allocator().lock().is_live(key.0, key.1));
+        assert!(carrier_stage2_leases().lock().contains_key(&key));
+        HvfVmState::retire_stage2_extent_from_mappings(&mut [], key.0, key.1)
+            .expect("explicit safe point performs requested carrier retirement");
         assert!(!global_frame_ipa_allocator().lock().is_live(key.0, key.1));
         assert!(!carrier_stage2_leases().lock().contains_key(&key));
     }
@@ -32380,27 +36031,80 @@ mod frame_inventory_backend_tests {
         let key = next_test_physical_key(0x4000);
         let mut unmapped = vec![GlobalFrameStage2Lease::fixed(key.0, key.1)];
         let owners = std::collections::BTreeMap::from([(key, 0x1000)]);
-        let error = register_carrier_stage2_leases(&mut unmapped, &owners)
-            .expect_err("an unmapped carrier lease cannot authenticate retirement");
+        let error = register_carrier_stage2_leases(
+            legacy_test_carrier_vm_custody_arc(),
+            &mut unmapped,
+            &owners,
+        )
+        .expect_err("an unmapped carrier lease cannot authenticate retirement");
         assert!(error.to_string().contains("mapped=false"));
-        assert_eq!(unmapped.len(), 1);
+        assert!(
+            unmapped.is_empty(),
+            "rejection explicitly rolls back candidates"
+        );
         assert!(!carrier_stage2_leases().lock().contains_key(&key));
 
+        let mut unmapped = vec![GlobalFrameStage2Lease::fixed(key.0, key.1)];
         unmapped[0].mark_test_mapped_without_backend();
         unmapped[0].active = false;
-        let error = register_carrier_stage2_leases(&mut unmapped, &owners)
-            .expect_err("an inactive mapped carrier lease cannot authenticate retirement");
+        let error = register_carrier_stage2_leases(
+            legacy_test_carrier_vm_custody_arc(),
+            &mut unmapped,
+            &owners,
+        )
+        .expect_err("an inactive mapped carrier lease cannot authenticate retirement");
         assert!(error.to_string().contains("active=false"));
-        assert_eq!(unmapped.len(), 1);
+        assert!(unmapped.is_empty());
         assert!(!carrier_stage2_leases().lock().contains_key(&key));
 
-        unmapped[0].active = true;
-        let error =
-            register_carrier_stage2_leases(&mut unmapped, &std::collections::BTreeMap::new())
-                .expect_err("a mapped key without its exact host owner is still insufficient");
+        let mut unmapped = vec![GlobalFrameStage2Lease::fixed(key.0, key.1)];
+        unmapped[0].mark_test_mapped_without_backend();
+        let error = register_carrier_stage2_leases(
+            legacy_test_carrier_vm_custody_arc(),
+            &mut unmapped,
+            &std::collections::BTreeMap::new(),
+        )
+        .expect_err("a mapped key without its exact host owner is still insufficient");
         assert!(error.to_string().contains("host=0x0"));
-        assert_eq!(unmapped.len(), 1);
+        assert!(unmapped.is_empty());
         assert!(!carrier_stage2_leases().lock().contains_key(&key));
+    }
+
+    #[test]
+    fn mapped_setup_failure_explicitly_unmaps_before_backing_drop_without_drop_hv() {
+        let _allocator_test_guard = global_frame_allocator_test_lock().lock();
+        let _stage2 = ScopedStage2MapTestStub::enable();
+        let custody = std::sync::Arc::new(CarrierVmCustody::new());
+        let key = (0x7d00_1800_0000, 0x4000);
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            key.1 as usize,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate failed-setup backing");
+        let host_addr = mapping.as_ptr() as usize;
+        let mut lease = GlobalFrameStage2Lease::fixed(key.0, key.1);
+        assert_eq!(
+            unsafe {
+                inventory_hv_vm_map(
+                    mapping.as_ptr().cast(),
+                    key.0,
+                    key.1 as usize,
+                    u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+                )
+            },
+            0
+        );
+        lease.mark_mapped();
+
+        register_global_frame_host_owner_in(
+            &custody,
+            lease,
+            mapping,
+            u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+        )
+        .expect_err("vacant custody rejects mapped publication after explicit rollback");
+        assert!(!ScopedStage2MapTestStub::is_mapped(key.0, key.1 as usize));
+        assert!(!alias_backing_is_live(host_addr));
     }
 
     #[test]
@@ -32463,33 +36167,32 @@ mod frame_inventory_backend_tests {
 
         let owners =
             std::collections::BTreeMap::from([(reserved_key, 0x2000), (existing_key, 0x1000)]);
-        let error = register_carrier_stage2_leases(&mut candidates, &owners)
-            .expect_err("an existing carrier key must reject the complete batch");
+        let error = register_carrier_stage2_leases(
+            legacy_test_carrier_vm_custody_arc(),
+            &mut candidates,
+            &owners,
+        )
+        .expect_err("an existing carrier key must reject the complete batch");
 
         assert!(error.to_string().contains("collision"));
-        assert_eq!(
-            candidates.len(),
-            2,
-            "registration failure retains ownership"
+        assert!(
+            candidates.is_empty(),
+            "registration failure explicitly rolls back every rejected candidate"
         );
         assert!(
             !carrier_stage2_leases().lock().contains_key(&reserved_key),
             "no prefix of a rejected lease batch may become visible",
         );
         assert!(
-            global_frame_ipa_allocator()
+            !global_frame_ipa_allocator()
                 .lock()
                 .is_live(reserved_key.0, reserved_key.1),
-            "the caller must keep every rejected candidate live until inventory rollback",
+            "the rejected reservation must be explicitly released before returning",
         );
-
-        drop(candidates);
-        drop(
-            carrier_stage2_leases()
-                .lock()
-                .remove(&existing_key)
-                .expect("remove collision fixture"),
-        );
+        let _ = carrier_stage2_leases()
+            .lock()
+            .remove(&existing_key)
+            .expect("remove collision fixture");
     }
 
     #[test]
@@ -32555,6 +36258,8 @@ mod frame_inventory_backend_tests {
         assert!(ledger.extents.is_empty());
         assert!(ledger.frames.lock().stage2_references.is_empty());
         drop(ledger);
+        HvfVmState::retire_stage2_extent_from_mappings(&mut [], key.0, key.1)
+            .expect("directory rollback safe point performs requested carrier retirement");
         assert!(
             !carrier_stage2_leases().lock().contains_key(&key),
             "rollback must expose zero refs before the final carrier drain",
