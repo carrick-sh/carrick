@@ -5378,38 +5378,34 @@ fn anonymous_mmap_residency_tracks_populate_first_touch_and_dontneed() {
     const SYS_MADVISE: u64 = 233;
 
     let mut private_dispatcher = SyscallDispatcher::new();
-    let mut private_memory = CountingMmapMemory::new(LINUX_MMAP_BASE, 3 * LINUX_PAGE_SIZE as usize);
+    let mut private_memory = CountingMmapMemory::new(LINUX_MMAP_BASE, 4 * LINUX_PAGE_SIZE as usize);
     let reporter = CompatReporter::default();
     let private_context = private_dispatcher
         .capture_one_task_context()
         .expect("private mmap context");
-    let private_mmap =
-        |dispatcher: &mut SyscallDispatcher, memory: &mut CountingMmapMemory, flags: u64| {
-            returned(
-                dispatcher
-                    .dispatch(
-                        &private_context,
-                        SyscallRequest::new(
-                            SYS_MMAP,
-                            SyscallArgs([
-                                0,
-                                LINUX_PAGE_SIZE,
-                                LINUX_PROT_READ | LINUX_PROT_WRITE,
-                                flags,
-                                u64::MAX,
-                                0,
-                            ]),
-                        ),
-                        memory,
-                        &reporter,
-                    )
-                    .expect("private anonymous mmap dispatch"),
-            ) as u64
-        };
+    let private_mmap = |dispatcher: &mut SyscallDispatcher,
+                        memory: &mut CountingMmapMemory,
+                        prot: u64,
+                        flags: u64| {
+        returned(
+            dispatcher
+                .dispatch(
+                    &private_context,
+                    SyscallRequest::new(
+                        SYS_MMAP,
+                        SyscallArgs([0, LINUX_PAGE_SIZE, prot, flags, u64::MAX, 0]),
+                    ),
+                    memory,
+                    &reporter,
+                )
+                .expect("private anonymous mmap dispatch"),
+        ) as u64
+    };
 
     let untouched = private_mmap(
         &mut private_dispatcher,
         &mut private_memory,
+        LINUX_PROT_READ | LINUX_PROT_WRITE,
         LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
     );
     assert_eq!(
@@ -5422,6 +5418,7 @@ fn anonymous_mmap_residency_tracks_populate_first_touch_and_dontneed() {
     let populated = private_mmap(
         &mut private_dispatcher,
         &mut private_memory,
+        LINUX_PROT_READ | LINUX_PROT_WRITE,
         LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | crate::linux_abi::LINUX_MAP_POPULATE,
     );
     assert_eq!(
@@ -5429,6 +5426,23 @@ fn anonymous_mmap_residency_tracks_populate_first_touch_and_dontneed() {
             .mincore_residency_vector(&private_memory, populated, 1, LINUX_PAGE_SIZE,),
         Some(vec![1]),
         "MAP_POPULATE must publish private-anonymous residency before return"
+    );
+
+    let populated_prot_none = private_mmap(
+        &mut private_dispatcher,
+        &mut private_memory,
+        0,
+        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | crate::linux_abi::LINUX_MAP_POPULATE,
+    );
+    assert_eq!(
+        private_dispatcher.mincore_residency_vector(
+            &private_memory,
+            populated_prot_none,
+            1,
+            LINUX_PAGE_SIZE,
+        ),
+        Some(vec![1]),
+        "MAP_POPULATE must publish PROT_NONE private-anonymous residency before return"
     );
 
     private_dispatcher.mark_range_resident(untouched, LINUX_PAGE_SIZE);
@@ -5490,6 +5504,66 @@ fn anonymous_mmap_residency_tracks_populate_first_touch_and_dontneed() {
             "MAP_POPULATE must publish residency for sharing={sharing:#x}"
         );
     }
+}
+
+#[test]
+fn readonly_private_anonymous_dontneed_retires_populated_residency() {
+    const SYS_MMAP: u64 = 222;
+    const SYS_MADVISE: u64 = 233;
+
+    let mut dispatcher = SyscallDispatcher::new();
+    let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize);
+    let reporter = CompatReporter::default();
+    let context = dispatcher
+        .capture_one_task_context()
+        .expect("read-only private-anonymous context");
+    let address = returned(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    SYS_MMAP,
+                    SyscallArgs([
+                        0,
+                        LINUX_PAGE_SIZE,
+                        LINUX_PROT_READ,
+                        LINUX_MAP_PRIVATE
+                            | LINUX_MAP_ANONYMOUS
+                            | crate::linux_abi::LINUX_MAP_POPULATE,
+                        u64::MAX,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("read-only private-anonymous MAP_POPULATE dispatch"),
+    ) as u64;
+    assert_eq!(
+        dispatcher.mincore_residency_vector(&memory, address, 1, LINUX_PAGE_SIZE),
+        Some(vec![1]),
+        "MAP_POPULATE must begin resident"
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    SYS_MADVISE,
+                    SyscallArgs([address, LINUX_PAGE_SIZE, LINUX_MADV_DONTNEED, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("read-only private-anonymous MADV_DONTNEED dispatch"),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher.mincore_residency_vector(&memory, address, 1, LINUX_PAGE_SIZE),
+        Some(vec![0]),
+        "MADV_DONTNEED must retire synthetic residency even when the VMA is read-only"
+    );
 }
 
 #[test]
