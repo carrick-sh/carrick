@@ -352,4 +352,17 @@ mod tests {
         assert_eq!(signal.signal, Some(libc::SIGKILL));
         assert!(!signal.timed_out);
     }
+
+    #[test]
+    fn bounded_child_times_out_and_reaps_never_returning_child() {
+        let timeout = unsafe {
+            run_bounded_bool_child(|| loop {
+                libc::pause();
+            })
+        };
+        assert_eq!(timeout.result, None);
+        assert_eq!(timeout.exit, None);
+        assert_eq!(timeout.signal, Some(libc::SIGKILL));
+        assert!(timeout.timed_out);
+    }
 }
