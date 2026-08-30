@@ -222,6 +222,10 @@ pub unsafe trait ForeignPtraceTextAuthority {
     fn frame_inventory_revision(&self) -> ForeignFrameInventoryRevision;
     fn start(&self) -> GuestVa;
     fn len(&self) -> usize;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// Opaque plan for one exact executable range in one authenticated MM

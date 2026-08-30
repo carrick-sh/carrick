@@ -313,9 +313,7 @@ pub(crate) struct PtraceTextWriteRange<'mm, 'witness> {
 // backend snapshot.
 unsafe impl carrick_hal::ForeignPtraceTextAuthority for PtraceTextWriteRange<'_, '_> {
     fn mm(&self) -> carrick_hal::ForeignMmId {
-        carrick_hal::ForeignMmId::from_kernel_allocation(
-            NonZeroU64::new(self.token.mm_id().raw()).unwrap_or_else(|| std::process::abort()),
-        )
+        carrick_hal::ForeignMmId::from_kernel_allocation(self.token.mm_id().nonzero())
     }
 
     fn binding(&self) -> carrick_hal::ForeignMmBinding {
@@ -1953,7 +1951,7 @@ pub(crate) mod tests {
                     MockCowFault::WrongOwner | MockCowFault::ForgedConsistentOwner
                 ));
             let proof = executable
-                .and_then(|_| self.ptrace_proof.as_ref())
+                .and(self.ptrace_proof.as_ref())
                 .unwrap_or(&self.proof);
             Ok(Box::new(MockCowReceipt {
                 mm,
@@ -2873,10 +2871,19 @@ pub(crate) mod tests {
                 executable: true,
                 kernel_visible: true,
             });
-        fixture.carrier.set_source_guest_writable_for_test(false);
-        fixture.carrier.set_source_stage1_writable_for_test();
+        fixture
+            .carrier
+            .set_source_guest_writable_for_test(false)
+            .expect("make production carrier source alias read-execute");
+        fixture
+            .carrier
+            .set_source_stage1_writable_for_test()
+            .expect("make production carrier source stage-1 leaf writable");
         assert!(
-            !fixture.carrier.source_direct_store_would_fault_for_test(),
+            !fixture
+                .carrier
+                .source_direct_store_would_fault_for_test()
+                .expect("read production carrier source stage-1 leaf"),
             "fixture must model the live writable preimage / exact RX alias disagreement"
         );
         assert!(kernel.claim_ptrace_traceme(&fixture.child));
@@ -2913,11 +2920,17 @@ pub(crate) mod tests {
         );
         assert_eq!(write.unwrap().bytes_written(), 4);
         assert!(
-            !fixture.carrier.source_guest_writable_for_test(),
+            !fixture
+                .carrier
+                .source_guest_writable_for_test()
+                .expect("read production carrier source alias permissions"),
             "ptrace executable authority must not widen the source RX protection"
         );
         assert!(
-            fixture.carrier.source_direct_store_would_fault_for_test(),
+            fixture
+                .carrier
+                .source_direct_store_would_fault_for_test()
+                .expect("read production carrier post-COW stage-1 leaf"),
             "exact RX alias authority must force the post-COW stage-1 leaf nonwritable"
         );
         let _keep_carrier_live = &fixture.carrier;

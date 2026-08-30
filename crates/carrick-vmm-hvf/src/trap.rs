@@ -2891,6 +2891,359 @@ mod foreign_mm_tests {
     }
 
     #[test]
+    fn initial_carrier_control_mapping_keeps_direct_unmap_owner() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let _stage2_stub = ScopedStage2MapTestStub::enable();
+        let transport = Arc::new(CarrierForeignMmTransport::new());
+        let ipa = carrick_mem::memory::LINUX_EL0_TRAMPOLINE_BASE;
+        let len = carrick_mem::memory::LINUX_EL0_TRAMPOLINE_SIZE;
+        let mapping = GuestMapping {
+            guest_start: ipa,
+            ipa_start: ipa,
+            mapped_size: len,
+            offset_in_mapping: 0,
+            payload_size: len,
+            perms: carrick_mem::elf::SegmentPerms {
+                read: true,
+                write: false,
+                execute: true,
+            },
+            shared: false,
+            image: Arc::new(vec![0xd6; len as usize]),
+            private_file_backing: None,
+        };
+
+        let region = map_region_raw_in(&transport.custody, &mapping, false, true)
+            .expect("map initial carrier-control region");
+
+        assert!(
+            region.host_mapping.is_some(),
+            "persistent carrier mappings must retain direct-unmap host ownership",
+        );
+        assert!(
+            region.structural_owner.is_none(),
+            "persistent carrier mappings must not also publish structural custody",
+        );
+        assert_eq!(region.owner_generation, 0);
+    }
+
+    #[test]
+    fn initial_fixed_mapping_publishes_exact_structural_owner() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let _stage2_stub = ScopedStage2MapTestStub::enable();
+        let transport = Arc::new(CarrierForeignMmTransport::new());
+        let ipa = 0x0020_0000;
+        let len = 0x4000_u64;
+        let mapping = GuestMapping {
+            guest_start: ipa,
+            ipa_start: ipa,
+            mapped_size: len,
+            offset_in_mapping: 0,
+            payload_size: len,
+            perms: carrick_mem::elf::SegmentPerms {
+                read: true,
+                write: false,
+                execute: true,
+            },
+            shared: false,
+            image: Arc::new(vec![0x5a; len as usize]),
+            private_file_backing: None,
+        };
+
+        let region = map_region_raw_in(&transport.custody, &mapping, false, true)
+            .expect("map initial fixed executable region");
+        let owner = region
+            .structural_owner
+            .as_ref()
+            .expect("initial fixed mapping must publish structural ownership");
+        let identity = *owner.retained.record_identity.lock();
+
+        assert!(region.host_mapping.is_none());
+        assert_eq!(owner.ptr(), region.host_addr);
+        assert_eq!(owner.physical_ipa, ipa);
+        assert_eq!(owner.physical_size, len as usize);
+        assert_eq!(region.owner_generation, owner.epoch().raw());
+
+        drop(region);
+        retry_structural_backing_identities_in_using(
+            &transport.custody,
+            &[identity],
+            &mut unmap_global_frame_stage2_record,
+            &mut release_retired_stage2_ipa,
+        )
+        .expect("retire initial fixed mapping fixture");
+    }
+
+    #[test]
+    fn initial_structural_epoch_failure_does_not_publish_stage2() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let _stage2_stub = ScopedStage2MapTestStub::enable();
+        let transport = Arc::new(CarrierForeignMmTransport::new());
+        let ipa = 0x0024_0000;
+        let len = 0x4000_u64;
+        let mapping = GuestMapping {
+            guest_start: ipa,
+            ipa_start: ipa,
+            mapped_size: len,
+            offset_in_mapping: 0,
+            payload_size: len,
+            perms: carrick_mem::elf::SegmentPerms {
+                read: true,
+                write: false,
+                execute: true,
+            },
+            shared: false,
+            image: Arc::new(vec![0x3c; len as usize]),
+            private_file_backing: None,
+        };
+
+        let error = map_region_raw_in_using_epoch_allocator(
+            &transport.custody,
+            &mapping,
+            false,
+            true,
+            || {
+                Err(TrapError::Hypervisor(
+                    "injected structural epoch failure".to_owned(),
+                ))
+            },
+        )
+        .expect_err("injected structural epoch failure must abort initial mapping");
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected structural epoch failure")
+        );
+        assert!(
+            ScopedStage2MapTestStub::events().is_empty(),
+            "fallible structural authority must be minted before publishing stage-2",
+        );
+    }
+
+    #[test]
+    fn structural_alias_rejects_forged_semantic_host_projection() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let _stage2_stub = ScopedStage2MapTestStub::enable();
+        let transport = Arc::new(CarrierForeignMmTransport::new());
+        let ipa = 0x0028_0000;
+        let len = 0x4000_u64;
+        let mapping = GuestMapping {
+            guest_start: 0x0040_0000,
+            ipa_start: ipa,
+            mapped_size: len,
+            offset_in_mapping: 0,
+            payload_size: len,
+            perms: carrick_mem::elf::SegmentPerms {
+                read: true,
+                write: false,
+                execute: true,
+            },
+            shared: false,
+            image: Arc::new(vec![0x7a; len as usize]),
+            private_file_backing: None,
+        };
+        let region = map_region_raw_in(&transport.custody, &mapping, false, true)
+            .expect("map structural alias source");
+        let owner = region
+            .structural_owner
+            .as_ref()
+            .expect("structural alias source owner");
+        let identity = *owner.retained.record_identity.lock();
+        let source = ThreadMappingDesc::from_region(&region);
+        let forged = AliasBacking {
+            start: region.start + 0x1000,
+            ipa: region.physical_ipa + 0x1000,
+            host_addr: source.physical_host_addr as usize + 0x2000,
+            size: 0x1000,
+            physical_ipa: region.physical_ipa,
+            physical_host_addr: source.physical_host_addr as usize,
+            physical_size: region.physical_size,
+            perms: u64::from(region.perms),
+            guest_writable: region.guest_writable,
+            sharing: region.sharing,
+            ownership_scope: AliasOwnershipScope::MmRootSlot {
+                base: 0x9000_0000,
+                size: 0x20_0000,
+            },
+            inventory_backing: InventoryBackingIdentity::Private(841),
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: region.owner_generation,
+        };
+
+        let projected = ThreadMappingDesc::from_alias_with_structural_owner(
+            forged,
+            std::slice::from_ref(&source),
+        )
+        .expect("decode forged alias metadata");
+
+        assert!(
+            projected.structural_owner.is_none(),
+            "matching physical identity must not authenticate a forged semantic host projection",
+        );
+        drop(projected);
+        drop(source);
+        drop(region);
+        retry_structural_backing_identities_in_using(
+            &transport.custody,
+            &[identity],
+            &mut unmap_global_frame_stage2_record,
+            &mut release_retired_stage2_ipa,
+        )
+        .expect("retire forged semantic projection fixture");
+    }
+
+    #[test]
+    fn initial_fixed_mapping_composes_through_first_fork_preparation() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let _stage2_stub = ScopedStage2MapTestStub::enable();
+        let transport = Arc::new(CarrierForeignMmTransport::new());
+        let ipa = 0x002c_0000;
+        let len = 0x4000_u64;
+        let mapping = GuestMapping {
+            guest_start: 0x0040_0000,
+            ipa_start: ipa,
+            mapped_size: len,
+            offset_in_mapping: 0,
+            payload_size: len,
+            perms: carrick_mem::elf::SegmentPerms {
+                read: true,
+                write: false,
+                execute: true,
+            },
+            shared: false,
+            image: Arc::new(vec![0x6b; len as usize]),
+            private_file_backing: None,
+        };
+        let region = map_region_raw_in(&transport.custody, &mapping, false, true)
+            .expect("map production initial fixed region");
+        let root_owner = region
+            .structural_owner
+            .as_ref()
+            .cloned()
+            .expect("production initial fixed owner");
+        let identity = *root_owner.retained.record_identity.lock();
+        let projected = ThreadMappingDesc::from_region(&region);
+        let inherited_frame =
+            carrick_hal::FrameId::from_kernel_allocation(NonZeroU64::new(842).unwrap());
+        let inherited_mapping =
+            carrick_hal::MappingId::from_kernel_allocation(NonZeroU64::new(843).unwrap());
+        let mut plan = ProcessSpecPlan {
+            mappings: vec![ProcessMappingDesc {
+                start: projected.start,
+                ipa: projected.ipa,
+                end: projected.end,
+                stage2_lease: None,
+                host: ProcessMappingHost::Borrowed {
+                    pointer: projected.physical_host_addr,
+                    structural_owner: projected.structural_owner.clone(),
+                },
+                size: projected.size,
+                physical_ipa: projected.physical_ipa,
+                physical_host_addr: projected.physical_host_addr,
+                physical_size: projected.physical_size,
+                inventory_backing: InventoryBackingIdentity::Private(844),
+                perms: projected.perms,
+                is_dynamic_alias: projected.is_dynamic_alias,
+                sharing: projected.sharing,
+                guest_writable: projected.guest_writable,
+                inherited_frame: Some(inherited_frame),
+                shared_key_base: projected.shared_key_base,
+                shared_key_offset: projected.shared_key_offset,
+                owner_generation: projected.owner_generation,
+            }],
+            inventory_mappings: vec![ProcessInventoryDesc {
+                gpa: projected.physical_ipa,
+                length: projected.physical_size as u64,
+                permissions: carrick_hal::MemPerms {
+                    read: true,
+                    write: false,
+                    exec: true,
+                },
+                inherited_frame: Some(inherited_frame),
+                inherited_mapping: Some(inherited_mapping),
+                backing: InventoryBackingIdentity::Private(844),
+                stage2_lease: (projected.physical_ipa, projected.physical_size as u64),
+                stage2_owner: InventoryStage2OwnerIdentity {
+                    host_addr: projected.physical_host_addr as usize,
+                    generation: projected.owner_generation,
+                },
+                fork_frame_receipt_kind: Some(
+                    carrick_observability::probes::HvpatchForkFrameKind::PrivateCow,
+                ),
+            }],
+            protections: Arc::new(MemoryProtections::default()),
+            mailbox_slots: Arc::new(MailboxSlotAllocator::new()),
+            syscall_transport: HvfSyscallTransport::Mailbox,
+            persistent_vm_lifecycle: true,
+            mm_root_slot: (0x9000_0000, 0x20_0000),
+            container_root: ContainerRootToken::from_raw(1),
+            frame_inventory: Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
+            cow_armed: Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
+            carrier_foreign_mm_transport: Arc::clone(&transport),
+        };
+        plan.stage_with_reservation_factory(|frame_candidates, mapping_candidates, capacity| {
+            Ok(
+                carrick_hal::FrameInventoryReservation::from_kernel_candidates(
+                    carrick_hal::FrameInventoryProvenance::from_kernel_entropy([0x77; 32]),
+                    carrick_hal::FrameInventoryBatch::prepare(
+                        carrick_hal::KernelTransactionId::from_kernel_allocation(
+                            NonZeroU64::new(845).unwrap(),
+                        ),
+                        capacity,
+                    )
+                    .unwrap(),
+                    (0..frame_candidates)
+                        .map(|index| {
+                            carrick_hal::FrameId::from_kernel_allocation(
+                                NonZeroU64::new(846 + index as u64).unwrap(),
+                            )
+                        })
+                        .collect(),
+                    (0..mapping_candidates)
+                        .map(|index| {
+                            carrick_hal::MappingId::from_kernel_allocation(
+                                NonZeroU64::new(856 + index as u64).unwrap(),
+                            )
+                        })
+                        .collect(),
+                ),
+            )
+        })
+        .expect("reserve first-fork inventory");
+        let (carrier, mut child) = HvfVmState::prepare_task_only_plan_for_test(plan)
+            .expect("prepare first child from production initial mapping");
+        let child_mapping = child
+            .mappings
+            .iter()
+            .find(|mapping| mapping.start == region.start)
+            .expect("prepared first-fork fixed mapping");
+        assert!(
+            child_mapping
+                .structural_owner
+                .as_ref()
+                .is_some_and(|owner| Arc::ptr_eq(owner, &root_owner)),
+            "first fork must preserve the exact owner created by map_region_raw_in",
+        );
+        child
+            .rollback_unpublished_inventory()
+            .expect("rollback first-fork inventory");
+        carrier.abort().expect("retire first-fork fixture leases");
+        drop(child);
+        drop(projected);
+        drop(region);
+        drop(root_owner);
+        retry_structural_backing_identities_in_using(
+            &transport.custody,
+            &[identity],
+            &mut unmap_global_frame_stage2_record,
+            &mut release_retired_stage2_ipa,
+        )
+        .expect("retire first-fork composition fixture");
+    }
+
+    #[test]
     fn copied_fork_child_retain_preserves_borrowed_structural_owner() {
         let _guard = FOREIGN_MM_TEST_LOCK.lock();
         let _stage2_stub = ScopedStage2MapTestStub::enable();
@@ -3024,6 +3377,167 @@ mod foreign_mm_tests {
             }),
             "ordinary inherited private RX must publish exact child-scoped alias authority for foreign text COW",
         );
+
+        let child_mapping = prepared
+            .mappings
+            .iter()
+            .find(|mapping| mapping.start == 0x0040_0000)
+            .expect("materialized child structural mapping");
+        let child_source = ThreadMappingDesc {
+            start: child_mapping.start,
+            ipa: child_mapping.ipa,
+            end: child_mapping.end,
+            host_addr: child_mapping.host_addr,
+            size: semantic_extent_size(child_mapping.start, child_mapping.end),
+            physical_ipa: child_mapping.physical_ipa,
+            physical_host_addr: child_mapping.physical_host_addr,
+            physical_size: child_mapping.physical_size,
+            perms: child_mapping.perms,
+            is_dynamic_alias: child_mapping.is_dynamic_alias,
+            sharing: child_mapping.sharing,
+            guest_writable: child_mapping.guest_writable,
+            shared_key_base: child_mapping.shared_key_base,
+            shared_key_offset: child_mapping.shared_key_offset,
+            owner_generation: child_mapping.owner_generation,
+            structural_owner: child_mapping.structural_owner.clone(),
+        };
+        let child_publication = prepared
+            .pending_aliases
+            .iter()
+            .copied()
+            .find(|alias| alias.start == 0x0040_0000)
+            .expect("child alias publication");
+        let overlay_publication = AliasBacking {
+            start: child_publication.start + 0x1000,
+            ipa: child_publication.ipa + 0x1000,
+            host_addr: child_publication.host_addr + 0x1000,
+            size: 0x1000,
+            ..child_publication
+        };
+        let grandchild_overlay = ThreadMappingDesc::from_alias_with_structural_owner(
+            overlay_publication,
+            std::slice::from_ref(&child_source),
+        )
+        .expect("plan grandchild overlay from child publication");
+        assert!(
+            grandchild_overlay
+                .structural_owner
+                .as_ref()
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, &owner)),
+            "grandchild overlay must retain the exact root structural owner Arc",
+        );
+
+        let mut grandchild_plan = ProcessSpecPlan {
+            mappings: vec![ProcessMappingDesc {
+                start: grandchild_overlay.start,
+                ipa: grandchild_overlay.ipa,
+                end: grandchild_overlay.end,
+                stage2_lease: None,
+                host: ProcessMappingHost::Borrowed {
+                    pointer: grandchild_overlay.physical_host_addr,
+                    structural_owner: grandchild_overlay.structural_owner.clone(),
+                },
+                size: grandchild_overlay.size,
+                physical_ipa: grandchild_overlay.physical_ipa,
+                physical_host_addr: grandchild_overlay.physical_host_addr,
+                physical_size: grandchild_overlay.physical_size,
+                inventory_backing: overlay_publication.inventory_backing,
+                perms: grandchild_overlay.perms,
+                is_dynamic_alias: true,
+                sharing: grandchild_overlay.sharing,
+                guest_writable: grandchild_overlay.guest_writable,
+                inherited_frame: Some(carrick_hal::FrameId::from_kernel_allocation(
+                    NonZeroU64::new(822).unwrap(),
+                )),
+                shared_key_base: grandchild_overlay.shared_key_base,
+                shared_key_offset: grandchild_overlay.shared_key_offset,
+                owner_generation: grandchild_overlay.owner_generation,
+            }],
+            inventory_mappings: vec![ProcessInventoryDesc {
+                gpa: physical_ipa,
+                length: len,
+                permissions: carrick_hal::MemPerms {
+                    read: true,
+                    write: false,
+                    exec: true,
+                },
+                inherited_frame: Some(carrick_hal::FrameId::from_kernel_allocation(
+                    NonZeroU64::new(822).unwrap(),
+                )),
+                inherited_mapping: Some(carrick_hal::MappingId::from_kernel_allocation(
+                    NonZeroU64::new(823).unwrap(),
+                )),
+                backing: overlay_publication.inventory_backing,
+                stage2_lease: (physical_ipa, len),
+                stage2_owner: InventoryStage2OwnerIdentity {
+                    host_addr: host_addr as usize,
+                    generation: owner_generation,
+                },
+                fork_frame_receipt_kind: Some(
+                    carrick_observability::probes::HvpatchForkFrameKind::PrivateCow,
+                ),
+            }],
+            protections: Arc::new(MemoryProtections::default()),
+            mailbox_slots: Arc::new(MailboxSlotAllocator::new()),
+            syscall_transport: HvfSyscallTransport::Mailbox,
+            persistent_vm_lifecycle: true,
+            mm_root_slot: (physical_ipa + 0x20_0000, len),
+            container_root: ContainerRootToken::from_raw(1),
+            frame_inventory: Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
+            cow_armed: Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
+            carrier_foreign_mm_transport: Arc::clone(&transport),
+        };
+        grandchild_plan
+            .stage_with_reservation_factory(|frame_candidates, mapping_candidates, capacity| {
+                Ok(
+                    carrick_hal::FrameInventoryReservation::from_kernel_candidates(
+                        carrick_hal::FrameInventoryProvenance::from_kernel_entropy([0x66; 32]),
+                        carrick_hal::FrameInventoryBatch::prepare(
+                            carrick_hal::KernelTransactionId::from_kernel_allocation(
+                                NonZeroU64::new(824).unwrap(),
+                            ),
+                            capacity,
+                        )
+                        .unwrap(),
+                        (0..frame_candidates)
+                            .map(|index| {
+                                carrick_hal::FrameId::from_kernel_allocation(
+                                    NonZeroU64::new(825 + index as u64).unwrap(),
+                                )
+                            })
+                            .collect(),
+                        (0..mapping_candidates)
+                            .map(|index| {
+                                carrick_hal::MappingId::from_kernel_allocation(
+                                    NonZeroU64::new(835 + index as u64).unwrap(),
+                                )
+                            })
+                            .collect(),
+                    ),
+                )
+            })
+            .expect("reserve grandchild overlay inventory");
+        let (grandchild_carrier, mut grandchild_prepared) =
+            HvfVmState::prepare_task_only_plan_for_test(grandchild_plan)
+                .expect("materialize grandchild structural overlay");
+        let materialized_overlay = grandchild_prepared
+            .mappings
+            .iter()
+            .find(|mapping| mapping.start == overlay_publication.start)
+            .expect("materialized grandchild overlay");
+        assert!(
+            materialized_overlay
+                .structural_owner
+                .as_ref()
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, &owner)),
+            "grandchild materialization must preserve the exact owner Arc",
+        );
+        grandchild_prepared
+            .rollback_unpublished_inventory()
+            .expect("rollback grandchild fixture inventory");
+        grandchild_carrier
+            .abort()
+            .expect("retire grandchild fixture leases");
         let (ledger, mapping_ids) = match &prepared.inventory {
             HvpatchTaskInventoryAuthority::ProcessPrepared { ledger, staged, .. } => (
                 Arc::clone(ledger),
@@ -9643,7 +10157,7 @@ fn alias_is_owned_by_process(
 /// translation and backing lifetime before copying them.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn missing_process_aliases(
-    local_ipas: &std::collections::HashSet<u64>,
+    local_aliases: &std::collections::HashSet<ProcessAliasKey>,
     aliases: &[AliasBacking],
     mm_root_slot: Option<(u64, u64)>,
     container_root: ContainerRootToken,
@@ -9652,7 +10166,7 @@ fn missing_process_aliases(
         .iter()
         .copied()
         .filter(|alias| {
-            !local_ipas.contains(&alias.ipa)
+            !local_aliases.contains(&process_alias_key(*alias))
                 && alias_matches_process_scope(alias.ownership_scope, mm_root_slot, container_root)
         })
         .collect()
@@ -9663,7 +10177,7 @@ fn missing_process_aliases(
 /// owners as well as lookup rows, so a retired row may remain in `mappings`
 /// after munmap; only an exact live-registry publication makes it semantic.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-/// Exact-identity key of one process-scoped alias publication: the four
+/// Exact-identity key of one process-scoped alias publication: the five
 /// fields `mapping_is_current_for_process_fork` matches. Fork-path callers
 /// walk EVERY mapping and previously linear-scanned the alias registry per
 /// mapping — O(mappings x aliases) per fork, the dominant term of the
@@ -9672,6 +10186,39 @@ fn missing_process_aliases(
 /// index makes one pass over the registry and answers each mapping in O(1).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 type ProcessAliasKey = (u64, u64, usize, usize, u64);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn process_alias_key(alias: AliasBacking) -> ProcessAliasKey {
+    (
+        alias.start,
+        alias.ipa,
+        alias.host_addr,
+        alias.size,
+        alias.owner_generation,
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn mapped_region_process_alias_key(mapping: &HvfMappedRegion) -> ProcessAliasKey {
+    (
+        mapping.start,
+        mapping.ipa,
+        mapping.host_addr as usize,
+        semantic_extent_size(mapping.start, mapping.end),
+        mapping.owner_generation,
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn thread_mapping_process_alias_key(mapping: &ThreadMappingDesc) -> ProcessAliasKey {
+    (
+        mapping.start,
+        mapping.ipa,
+        mapping.host_addr as usize,
+        mapping.size,
+        mapping.owner_generation,
+    )
+}
 
 /// One-pass index of the process-scoped alias publications, keyed by
 /// [`ProcessAliasKey`]. First occurrence wins, mirroring the linear scans'
@@ -9716,19 +10263,17 @@ fn mapping_is_current_for_process_fork_indexed(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn current_dynamic_alias_ipas(
+fn current_process_alias_keys(
     mappings: &[HvfMappedRegion],
     aliases: &[AliasBacking],
     mm_root_slot: Option<(u64, u64)>,
     container_root: ContainerRootToken,
-) -> std::collections::HashSet<u64> {
+) -> std::collections::HashSet<ProcessAliasKey> {
     let index = process_alias_index(aliases, mm_root_slot, container_root);
     mappings
         .iter()
-        .filter(|mapping| {
-            mapping.is_dynamic_alias && mapping_is_current_for_process_fork_indexed(mapping, &index)
-        })
-        .map(|mapping| mapping.ipa)
+        .filter(|mapping| mapping_is_current_for_process_fork_indexed(mapping, &index))
+        .map(mapped_region_process_alias_key)
         .collect()
 }
 
@@ -15795,16 +16340,28 @@ fn foreign_cow_failpoint(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct ForeignCowTransactionRequest<'a> {
+    requested: &'a CarrierForeignMmSnapshot,
+    va: carrick_guest_mem::GuestVa,
+    len: usize,
+    executable: Option<&'a carrick_hal::ForeignPtraceTextCowPlan<'a>>,
+    deadline: std::time::Instant,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn perform_foreign_cow_transaction(
     lease: &CarrierForeignMmReadLease,
     lease_guard: &mut CarrierLeaseState,
     invalidator: &mut dyn carrick_hal::ForeignMmInvalidator,
-    requested: &CarrierForeignMmSnapshot,
-    va: carrick_guest_mem::GuestVa,
-    len: usize,
-    executable: Option<&carrick_hal::ForeignPtraceTextCowPlan>,
-    deadline: std::time::Instant,
+    request: ForeignCowTransactionRequest<'_>,
 ) -> Result<CarrierForeignCowReceipt, carrick_hal::ForeignMmTransportError> {
+    let ForeignCowTransactionRequest {
+        requested,
+        va,
+        len,
+        executable,
+        deadline,
+    } = request;
     let executable_span = match executable {
         Some(plan) => Some(
             plan.authenticated_cow_span(requested, va, len)
@@ -16468,11 +17025,13 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
             self,
             &mut lease_guard,
             invalidator,
-            &requested,
-            va,
-            len,
-            executable,
-            deadline,
+            ForeignCowTransactionRequest {
+                requested: &requested,
+                va,
+                len,
+                executable,
+                deadline,
+            },
         )
         .map(|receipt| Box::new(receipt) as Box<dyn carrick_hal::ForeignCowReceipt>)
     }
@@ -16884,7 +17443,7 @@ pub mod foreign_cow_test_support {
             carrick_hal::ForeignMmEndpoint::for_carrier(std::sync::Arc::new(self.transport.clone()))
         }
 
-        pub fn set_source_guest_writable_for_test(&self, writable: bool) {
+        pub fn set_source_guest_writable_for_test(&self, writable: bool) -> Result<(), String> {
             let data_key = self.original_extents[1];
             let mut aliases = alias_registry().lock();
             let alias = aliases
@@ -16894,26 +17453,28 @@ pub mod foreign_cow_test_support {
                     alias.start == TEST_VA
                         && (alias.physical_ipa, alias.physical_size as u64) == data_key
                 })
-                .expect("production carrier source alias");
+                .ok_or_else(|| "production carrier source alias is absent".to_owned())?;
             alias.guest_writable = writable;
             alias.perms = u64::from(if writable {
                 applevisor::memory::MemPerms::ReadWriteExec
             } else {
                 applevisor::memory::MemPerms::ReadExec
             });
+            Ok(())
         }
 
-        pub fn set_source_stage1_writable_for_test(&self) {
-            self.state
-                .page_tables_authority()
-                .lock()
+        pub fn set_source_stage1_writable_for_test(&self) -> Result<(), String> {
+            let page_tables = self.state.page_tables_authority();
+            let mut page_tables = page_tables.lock();
+            page_tables
                 .as_mut()
-                .expect("production carrier page tables")
+                .ok_or_else(|| "production carrier page tables are absent".to_owned())?
                 .set_writable_preserving_attributes(TEST_VA, 0x1000)
-                .expect("make production carrier source leaf writable");
+                .map_err(|error| format!("make production carrier source leaf writable: {error:?}"))
+                .map(|_| ())
         }
 
-        pub fn source_direct_store_would_fault_for_test(&self) -> bool {
+        pub fn source_direct_store_would_fault_for_test(&self) -> Result<bool, String> {
             const AP_MASK: u64 = 0b11 << 6;
             const AP_USER_RW: u64 = 0b01 << 6;
             let tables = self.state.page_tables_authority();
@@ -16921,20 +17482,20 @@ pub mod foreign_cow_test_support {
             let leaf = carrick_mem::page_table::terminal_descriptor(
                 tables
                     .as_ref()
-                    .expect("production carrier page tables")
+                    .ok_or_else(|| "production carrier page tables are absent".to_owned())?
                     .debug_walk(TEST_VA),
             );
-            leaf & AP_MASK != AP_USER_RW
+            Ok(leaf & AP_MASK != AP_USER_RW)
         }
 
-        pub fn source_guest_writable_for_test(&self) -> bool {
-            alias_registry()
-                .lock()
+        pub fn source_guest_writable_for_test(&self) -> Result<bool, String> {
+            let aliases = alias_registry().lock();
+            aliases
                 .iter()
                 .rev()
                 .find(|alias| alias.start == TEST_VA)
-                .expect("production carrier source alias")
-                .guest_writable
+                .map(|alias| alias.guest_writable)
+                .ok_or_else(|| "production carrier source alias is absent".to_owned())
         }
     }
 
@@ -18700,6 +19261,62 @@ impl ThreadMappingDesc {
             owner_generation: alias.owner_generation,
             structural_owner: None,
         })
+    }
+
+    fn from_alias_with_structural_owner(alias: AliasBacking, sources: &[Self]) -> Option<Self> {
+        let semantic_projection_is_exact = alias
+            .ipa
+            .checked_sub(alias.physical_ipa)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .filter(|offset| {
+                offset
+                    .checked_add(alias.size)
+                    .is_some_and(|end| end <= alias.physical_size)
+                    && alias
+                        .physical_host_addr
+                        .checked_add(*offset)
+                        .is_some_and(|host_addr| host_addr == alias.host_addr)
+            })
+            .is_some();
+        let structural_owner = if semantic_projection_is_exact {
+            sources
+                .iter()
+                .filter_map(|source| source.structural_owner.as_ref())
+                .find(|owner| {
+                    owner.ptr() as usize == alias.physical_host_addr
+                        && owner.physical_ipa == alias.physical_ipa
+                        && owner.physical_size == alias.physical_size
+                        && owner.epoch().raw() == alias.owner_generation
+                })
+                .cloned()
+        } else {
+            None
+        };
+        let mut mapping = Self::from_alias(alias)?;
+        mapping.structural_owner = structural_owner;
+        Some(mapping)
+    }
+
+    fn into_shared_mm_task_mapping(self) -> HvpatchTaskMappingState {
+        HvpatchTaskMappingState {
+            start: self.start,
+            ipa: self.ipa,
+            physical_ipa: self.physical_ipa,
+            end: self.end,
+            host_addr: self.host_addr,
+            physical_host_addr: self.physical_host_addr,
+            size: self.size,
+            physical_size: self.physical_size,
+            perms: self.perms,
+            guest_writable: self.guest_writable,
+            host_mapping: None,
+            structural_owner: self.structural_owner,
+            is_dynamic_alias: self.is_dynamic_alias,
+            sharing: self.sharing,
+            shared_key_base: self.shared_key_base,
+            shared_key_offset: self.shared_key_offset,
+            owner_generation: self.owner_generation,
+        }
     }
 
     fn into_unowned_region(self) -> HvfMappedRegion {
@@ -21550,25 +22167,7 @@ impl HvpatchPreparedCarrierTaskState {
         let cow_deferred_publications = std::sync::Arc::clone(&mm_access.cow_deferred_publications);
         let mappings = mappings
             .into_iter()
-            .map(|mapping| HvpatchTaskMappingState {
-                start: mapping.start,
-                ipa: mapping.ipa,
-                physical_ipa: mapping.physical_ipa,
-                end: mapping.end,
-                host_addr: mapping.host_addr,
-                physical_host_addr: mapping.physical_host_addr,
-                size: mapping.size,
-                physical_size: mapping.physical_size,
-                perms: mapping.perms,
-                guest_writable: mapping.guest_writable,
-                host_mapping: None,
-                structural_owner: None,
-                is_dynamic_alias: mapping.is_dynamic_alias,
-                sharing: mapping.sharing,
-                shared_key_base: mapping.shared_key_base,
-                shared_key_offset: mapping.shared_key_offset,
-                owner_generation: mapping.owner_generation,
-            })
+            .map(ThreadMappingDesc::into_shared_mm_task_mapping)
             .collect();
         Ok(Self::new(
             identity,
@@ -24730,6 +25329,7 @@ impl HvfVmState {
                         &state.carrier_foreign_mm_transport.custody,
                         mapping,
                         false,
+                        true,
                     )?;
                     state.mappings.push(region);
                 }
@@ -25140,7 +25740,7 @@ impl HvfVmState {
                 ),
             })
             .collect();
-        let local_ipas = current_dynamic_alias_ipas(
+        let local_aliases = current_process_alias_keys(
             &self.mappings,
             &aliases,
             self.mm_root_slot,
@@ -25148,7 +25748,7 @@ impl HvfVmState {
         );
         ranges.extend(
             missing_process_aliases(
-                &local_ipas,
+                &local_aliases,
                 &aliases,
                 self.mm_root_slot,
                 self.container_root,
@@ -30026,10 +30626,12 @@ impl HvfTaskState {
                 if !seen_dynamic_aliases.insert(key) {
                     return None;
                 }
-                alias_index
-                    .get(&key)
-                    .copied()
-                    .and_then(ThreadMappingDesc::from_alias)
+                let alias = alias_index.get(&key).copied()?;
+                let source = ThreadMappingDesc::from_region(mapping);
+                ThreadMappingDesc::from_alias_with_structural_owner(
+                    alias,
+                    std::slice::from_ref(&source),
+                )
             })
             .collect();
         // Fork-union audit: `CARRICK_FORK_DEBUG_VA=<hex guest VA>` reports every
@@ -30109,16 +30711,15 @@ impl HvfTaskState {
         let local_regions = source_mappings.len() as u64;
         // A structural boot mapping can physically contain a narrower semantic
         // alias at the same IPA (the private-overlay aperture is the canonical
-        // case). Only an exact dynamic publication suppresses a registry row;
-        // keying every local descriptor by IPA hid MAP_FIXED private ownership
-        // from fork even though stage-1 already selected it.
-        let local_ipas: std::collections::HashSet<u64> = source_mappings
+        // case). Only an exact current local descriptor suppresses a registry
+        // row; keying every local descriptor by IPA hid MAP_FIXED private
+        // ownership from fork even though stage-1 already selected it.
+        let local_aliases: std::collections::HashSet<ProcessAliasKey> = source_mappings
             .iter()
-            .filter(|mapping| mapping.is_dynamic_alias)
-            .map(|mapping| mapping.ipa)
+            .map(thread_mapping_process_alias_key)
             .collect();
         let missing = missing_process_aliases(
-            &local_ipas,
+            &local_aliases,
             &aliases,
             self.mm_root_slot,
             self.container_root,
@@ -30135,7 +30736,8 @@ impl HvfTaskState {
             // do not require a valid stage-1 leaf: a live PROT_NONE alias is
             // intentionally invalid in stage-1 and still must survive fork.
             if alias_backing_is_live(alias.host_addr)
-                && let Some(mapping) = ThreadMappingDesc::from_alias(alias)
+                && let Some(mapping) =
+                    ThreadMappingDesc::from_alias_with_structural_owner(alias, &source_mappings)
             {
                 added_regions = added_regions.saturating_add(1);
                 added_bytes = added_bytes.saturating_add(mapping.size as u64);
@@ -31973,7 +32575,7 @@ impl HvfVmState {
         } else {
             for mapping in &plan.mappings {
                 self.mappings
-                    .push(map_region_raw_in(&custody, mapping, false)?);
+                    .push(map_region_raw_in(&custody, mapping, false, false)?);
             }
             let replayed =
                 replayed_global_frame_owners_for_regions_in(&custody, self.mappings.iter());
@@ -33375,12 +33977,44 @@ fn exec_stage2_install(mapping: &GuestMapping, region: &HvfMappedRegion) -> Exec
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn map_region_raw_in(
-    custody: &CarrierVmCustody,
+    custody: &std::sync::Arc<CarrierVmCustody>,
     mapping: &GuestMapping,
     emit_exec_backing_census: bool,
+    retain_structural_owner: bool,
+) -> Result<HvfMappedRegion, TrapError> {
+    map_region_raw_in_using_epoch_allocator(
+        custody,
+        mapping,
+        emit_exec_backing_census,
+        retain_structural_owner,
+        next_structural_epoch,
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn map_region_raw_in_using_epoch_allocator(
+    custody: &std::sync::Arc<CarrierVmCustody>,
+    mapping: &GuestMapping,
+    emit_exec_backing_census: bool,
+    retain_structural_owner: bool,
+    allocate_epoch: impl FnOnce() -> Result<StructuralEpoch, TrapError>,
 ) -> Result<HvfMappedRegion, TrapError> {
     let size = usize::try_from(mapping.mapped_size)
         .map_err(|_| TrapError::MappingTooLarge(mapping.mapped_size))?;
+    let end =
+        mapping
+            .guest_start
+            .checked_add(mapping.mapped_size)
+            .ok_or(TrapError::MappingOverflow {
+                guest_start: mapping.guest_start,
+                mapped_size: mapping.mapped_size,
+            })?;
+    let retain_structural_owner =
+        retain_structural_owner && !is_persistent_executor_carrier_guest_mapping(mapping);
+    // Mint every fallible structural identity before stage-2 publication. If
+    // this fails, dropping the not-yet-mapped host backing is sufficient
+    // rollback; no HVF mapping or custody record exists yet.
+    let structural_epoch = retain_structural_owner.then(allocate_epoch).transpose()?;
     // MAP_SHARED, not MAP_PRIVATE: a MAP_PRIVATE anon page mapped into the
     // guest via hv_vm_map desyncs from the host buffer — the guest's own store
     // and a later guest load observe different memory (the "PROT_REA" wild-PC
@@ -33448,20 +34082,12 @@ fn map_region_raw_in(
             mapping.ipa_start, mapping.guest_start
         )));
     }
-    let end =
-        mapping
-            .guest_start
-            .checked_add(mapping.mapped_size)
-            .ok_or(TrapError::MappingOverflow {
-                guest_start: mapping.guest_start,
-                mapped_size: mapping.mapped_size,
-            })?;
     let sharing = if mapping.shared {
         GuestMappingSharing::GlobalShared
     } else {
         GuestMappingSharing::Private
     };
-    Ok(HvfMappedRegion {
+    let mut region = HvfMappedRegion {
         start: mapping.guest_start,
         ipa: mapping.ipa_start,
         physical_ipa: mapping.ipa_start,
@@ -33488,7 +34114,36 @@ fn map_region_raw_in(
             mapping.ipa_start,
             size as u64,
         ),
-    })
+    };
+    if retain_structural_owner {
+        let host_mapping = region.host_mapping.take().ok_or_else(|| {
+            TrapError::Hypervisor(format!(
+                "initial fixed mapping at IPA 0x{:x} has no host owner",
+                region.physical_ipa
+            ))
+        })?;
+        let epoch = structural_epoch.ok_or_else(|| {
+            TrapError::Hypervisor(format!(
+                "initial fixed mapping at IPA 0x{:x} has no structural epoch",
+                region.physical_ipa
+            ))
+        })?;
+        let mut lease =
+            GlobalFrameStage2Lease::fixed(region.physical_ipa, region.physical_size as u64);
+        lease.mark_mapped();
+        let owner = StructuralBackingOwner::new_in(
+            custody,
+            host_mapping,
+            lease,
+            u64::from(region.perms),
+            epoch,
+            region.physical_ipa,
+            region.physical_size,
+        )?;
+        region.owner_generation = epoch.raw();
+        region.structural_owner = Some(owner);
+    }
+    Ok(region)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -39116,6 +39771,65 @@ mod thread_sibling_tests {
     }
 
     #[test]
+    fn shared_mm_task_projection_preserves_structural_owner() {
+        let size = 0x4000usize;
+        let ipa = 0x8800_3100_0000u64;
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            size,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate shared-MM projection backing");
+        let host = mapping.as_ptr();
+        let epoch = next_structural_epoch().expect("shared-MM projection epoch");
+        let owner = StructuralBackingOwner::new(
+            mapping,
+            GlobalFrameStage2Lease::fixed(ipa, size as u64),
+            epoch,
+            ipa,
+            size,
+        )
+        .expect("publish shared-MM projection owner");
+        let identity = *owner.retained.record_identity.lock();
+        let desc = ThreadMappingDesc {
+            start: 0x0040_0000,
+            ipa,
+            end: 0x0040_4000,
+            host_addr: host,
+            size,
+            physical_ipa: ipa,
+            physical_host_addr: host,
+            physical_size: size,
+            perms: applevisor::memory::MemPerms::ReadExec,
+            is_dynamic_alias: false,
+            sharing: GuestMappingSharing::Private,
+            guest_writable: false,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: epoch.raw(),
+            structural_owner: Some(std::sync::Arc::clone(&owner)),
+        };
+
+        let projected = desc.into_shared_mm_task_mapping();
+        assert!(
+            projected
+                .structural_owner
+                .as_ref()
+                .is_some_and(|projected| std::sync::Arc::ptr_eq(projected, &owner)),
+            "shared-process and sibling task projections must retain the exact structural owner",
+        );
+
+        drop(projected);
+        drop(owner);
+        retry_structural_backing_identities_in_using(
+            legacy_test_carrier_vm_custody(),
+            &[identity],
+            &mut unmap_global_frame_stage2_record,
+            &mut release_retired_stage2_ipa,
+        )
+        .expect("retire shared-MM projection fixture");
+    }
+
+    #[test]
     fn thread_mapping_descriptor_preserves_shared_mapping_metadata() {
         // `into_unowned_region` (the surviving half of the old `ThreadMappingDesc`
         // round-trip; `from_region` moved to the engine's sibling-builder seam)
@@ -39940,9 +40654,9 @@ mod tag_strip_tests {
         AliasBacking, AliasOwnershipScope, ContainerRootToken, CowArmedSpan, GuestMappingPlan,
         GuestMappingSharing, HVF_PAGE_SIZE, HvfMappedRegion, InventoryBackingIdentity,
         ThreadMappingDesc, alias_is_owned_by_process, alias_matches_process_scope, alias_registry,
-        current_dynamic_alias_ipas, forget_replay_extent, inherited_fork_inventory_extents,
+        current_process_alias_keys, forget_replay_extent, inherited_fork_inventory_extents,
         lookup_shared_alias, mapping_is_current_for_process_fork_indexed, missing_process_aliases,
-        process_alias_index,
+        process_alias_index, process_alias_key,
     };
     /// Test adapter preserving the retired linear signature over the index.
     fn mapping_is_current_for_process_fork_test(
@@ -40980,6 +41694,79 @@ mod tag_strip_tests {
     }
 
     #[test]
+    fn next_generation_fork_deduplicates_exact_private_alias_but_keeps_overlay() {
+        let root_slot = (0x9000_0000, 0x20_0000);
+        let start = 0x0040_0000;
+        let ipa = 0x0020_0000;
+        let host = 0x3000usize;
+        let generation = 17;
+        let local = HvfMappedRegion {
+            start,
+            ipa,
+            physical_ipa: ipa,
+            end: start + 0x4000,
+            host_addr: host as *mut u8,
+            size: 0x4000,
+            physical_size: 0x4000,
+            perms: applevisor::memory::MemPerms::ReadExec,
+            memory: None,
+            host_mapping: None,
+            structural_owner: None,
+            stage2_lease: None,
+            is_dynamic_alias: false,
+            sharing: GuestMappingSharing::Private,
+            guest_writable: false,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: generation,
+        };
+        let exact = AliasBacking {
+            start,
+            ipa,
+            host_addr: host,
+            size: 0x4000,
+            physical_ipa: ipa,
+            physical_host_addr: host,
+            physical_size: 0x4000,
+            perms: u64::from(applevisor::memory::MemPerms::ReadExec),
+            guest_writable: false,
+            sharing: GuestMappingSharing::Private,
+            ownership_scope: AliasOwnershipScope::MmRootSlot {
+                base: root_slot.0,
+                size: root_slot.1,
+            },
+            inventory_backing: InventoryBackingIdentity::Private(71),
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: generation,
+        };
+        let overlay = AliasBacking {
+            start: start + 0x1000,
+            host_addr: host + 0x1000,
+            size: 0x1000,
+            ..exact
+        };
+        let aliases = [exact, overlay];
+        let current = current_process_alias_keys(
+            &[local],
+            &aliases,
+            Some(root_slot),
+            ContainerRootToken::ROOT,
+        );
+
+        assert_eq!(
+            missing_process_aliases(
+                &current,
+                &aliases,
+                Some(root_slot),
+                ContainerRootToken::ROOT,
+            ),
+            vec![overlay],
+            "the exact child publication must not duplicate its local row, while a narrower same-IPA overlay remains a fork source",
+        );
+    }
+
+    #[test]
     fn process_fork_includes_sibling_owned_private_aliases() {
         let root_slot = (
             carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE,
@@ -41005,7 +41792,6 @@ mod tag_strip_tests {
             shared_key_offset: 0,
             owner_generation: 0,
         };
-        let local_ipas = std::collections::HashSet::from([local_ipa]);
         let local_scope = AliasOwnershipScope::MmRootSlot {
             base: root_slot.0,
             size: root_slot.1,
@@ -41021,9 +41807,10 @@ mod tag_strip_tests {
                 },
             ),
         ];
+        let local_aliases = std::collections::HashSet::from([process_alias_key(aliases[0])]);
 
         let missing = missing_process_aliases(
-            &local_ipas,
+            &local_aliases,
             &aliases,
             Some(root_slot),
             ContainerRootToken::ROOT,
@@ -41080,7 +41867,7 @@ mod tag_strip_tests {
         };
         let aliases = [live_fragment];
 
-        let current = current_dynamic_alias_ipas(
+        let current = current_process_alias_keys(
             &[mapping],
             &aliases,
             Some(root_slot),

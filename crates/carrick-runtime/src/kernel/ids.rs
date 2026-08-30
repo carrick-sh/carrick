@@ -121,6 +121,12 @@ serial_id!(FsContextId);
 serial_id!(CredentialsId);
 serial_id!(SighandId);
 
+impl MmId {
+    pub(crate) const fn nonzero(self) -> NonZeroU64 {
+        self.0
+    }
+}
+
 impl TaskId {
     pub(crate) const fn from_registry_allocation(raw: NonZeroI32) -> Self {
         Self(raw)
