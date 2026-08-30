@@ -483,6 +483,22 @@
     },
     {
       "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+      "symbol": "ipc_set_tests::proc_sysvipc_rendering_races_attachment_cleanup_and_paired_mutation_without_deadlock::CARRICK_SYSVIPC_TEST_CHILD",
+      "fingerprint": "e28376f20995e878ba99603697a82582e826926b3fec69ce4d2cf26aaeb05157",
+      "classification": "test_only",
+      "rationale": "Test-only subprocess sentinel isolates the proc_sysvipc deadlock regression test and is absent from production builds."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+      "symbol": "ipc_set_tests::watchdog_kills_and_reaps_on_deadlock_timeout::CARRICK_SYSVIPC_TEST_CHILD_DEADLOCK",
+      "fingerprint": "e050f8de716dc76a296742adc56a973f60c4915aefd51b0a44653218cf8da7d2",
+      "classification": "test_only",
+      "rationale": "Test-only subprocess sentinel for negative watchdog termination and child reaping verification."
+    },
+    {
+      "kind": "env_var_os",
       "file": "crates/carrick-runtime/src/exec_stamps.rs",
       "symbol": "stamp_record::CARRICK_EXEC_STAMPS",
       "fingerprint": "857b733af0acdc35b398e51cf338091b3948d948728d2bcecabe8ce4ac86a6c1",

@@ -312,29 +312,32 @@ can only shrink.
 
 ## Finding B — the lock-order validator gates nothing
 
-`dispatch/lock_order.rs` documents a clean nine-level hierarchy (`PtPause`,
+`dispatch/lock_order.rs` originally documented a clean nine-level hierarchy (`PtPause`,
 `HostAlias`, `FdTable`, `FsState`, `PtyTable`, `Proc`, `SysV`, `Signal`,
-`ThreadRegistry`) and validates it. Two facts make it inert:
+`ThreadRegistry`) and validated it. Two facts made it inert:
 
-1. Its checks are `#[cfg(debug_assertions)]` (`lock_order.rs:57`, `:80`), and the
+1. Its checks were `#[cfg(debug_assertions)]` (`lock_order.rs:57`, `:80`), and the
    justfile says so itself, in the `build-debug-profile` comment: *"Every other
    signed lane is a release build, so every `debug_assert!` … is compiled out and
    can never fire in any runnable configuration. Without this recipe those
    assertions are decoration: an invariant that looks guarded and is not."* That
    recipe is explicitly *"never a perf or conformance artifact"*, so no gate runs
    it.
-2. There are **two** real acquisition sites in the whole tree
+2. There were **two** real acquisition sites in the whole tree
    (`vcpu_loop/executor.rs:5198` and `:8431`), plus one boundary check at
-   `:1857`. Both acquisitions declare the same level, `LockLevel::Proc`. Eight of
-   the nine documented levels are never declared by anyone.
+   `:1857`. Both acquisitions declared the same level, `LockLevel::Proc`. Eight of
+   the nine documented levels were never declared by anyone.
 
-So the hierarchy is documentation, not enforcement — which is what
+So the hierarchy was documentation, not enforcement — which is what
 [`identity-and-scope-domains.md`](identity-and-scope-domains.md) item 5 already
 concluded on different evidence: discipline has failed here twice, wedging a
 carrier at 0% CPU once and turning an intended `ENOMEM` into an unkillable hang
-via an alias-cleanup self-deadlock. A token only the outer acquisition can mint
-is the fix; the current validator should be deleted with it rather than left as a
-green-looking artifact.
+via an alias-cleanup self-deadlock. The debug-only generic validator was deleted.
+The concrete edges are now structurally closed with mintable tokens rather than a
+nine-level runtime hierarchy: MM `PtPause` -> `HostAlias` was closed via the
+`MmToken` subsystem, and SysV per-process -> shared namespace was structurally
+sealed via `SysvProcessGuard` -> `SysvNamespacePermit` -> `SysvPairedNamespaceGuard`
+with the fail-closed `check-dispatch-lock-authority.py` gate.
 
 ## Finding C — a field's scope lives in one constructor, not in its type
 
@@ -522,12 +525,25 @@ consumer used conversation `a86ce8bd-f883-4e1a-a6b2-7d38522ef847` for one turn;
 worker commit `d035366b2` became `c02fc50f3`. Codex re-ran the exact worker gates
 and independent reviews approved both migrations.
 
+## SysV paired-lock authority implementation receipt — 2026-08-29
+
+The concrete lock-order edge from item 5 (per-process SysV attachment lock -> shared SysV namespace lock) is structurally sealed by this milestone.
+
+- **Lock Authority Module**: Created private `crates/carrick-runtime/src/dispatch/sysv/lock_authority.rs` providing `SysvProcessGuard<'a>`, `SysvNamespacePermit<'process>`, and `SysvPairedNamespaceGuard<'process>`. A process guard must be acquired first and is the sole way to mint an exact-owner, borrow-bound permit required for paired namespace locking.
+- **Enforcement & Non-leakage**: Permits and guards cannot be constructed freely, cloned, copied, leaked as raw mutex guards, or used across mismatched owner identities. Four compile-fail doctests compile against the actual authority API and reject multiple minting, cloning, lifetime escape, and a separately chosen namespace.
+- **Call-Site Migration**: All five production paired sites in `dispatch/sysv.rs` (`note_sysv_remap_file_pages`, `commit_sysv_fork_inheritance`, `commit_remapped_shmat`, `validate_shmdt`/`commit_shmdt`, and `commit_host_alias_shmat`) have been migrated to the typed authority.
+- **Ergonomic Standalone APIs**: Standalone namespace-only and process-only accessors remain clean via private scoped closures (`with_state`, `with_state_mut`, `with_sysv_process`, `with_sysv_process_mut`). `SysvIpcNamespace.state` and `SyscallDispatcher.sysv_process` are strictly private.
+- **Fail-Closed Gate**: Added `scripts/migrate/check-dispatch-lock-authority.py` and `scripts/migrate/dispatch-lock-authority.json`, with self-tests (`--self-test`) and shrink-only enforcement wired into `just lint-domains`. The exact inventory includes one trusted raw process-lock minting boundary and three namespace-lock boundaries, plus the existing proc, PTY, and FileTable sites.
+- **Concurrency Verification**: Added bounded subprocess regression testing with watchdog timeouts. The race enters the production `synthetic_proc_context` route while attachment cleanup and paired mutation run concurrently; an intentionally wedged child proves timeout kill and reap.
+- **Deliberate Partial Boundary**: This milestone seals the structural process-then-exact-namespace order without changing SysV accounting semantics. The baseline flocked `nattch` update and RMID unlink remain synchronous under namespace authority. Extracting that host I/O is a separate generation-authenticated prepare/execute/finalize campaign; this receipt does not claim zero host I/O under Carrick locks.
+
 This receipt does not close the whole audit. Item 4 now has the structural
 `MmToken` / `CurrentMm` / `ForeignMm` / `CowBroken` seam plus accepted
 `process_vm_readv` / `process_vm_writev` and ptrace PEEK/writable-POKE
 consumers. RX `PTRACE_POKETEXT`, the retained `/proc/<pid>/mem` description,
 and the fail-closed differential matrix remain open. Item 5 (mintable
-structural lock ordering) also remains open.
+structural lock ordering) is now structurally closed for both concrete edges
+(MM `PtPause` -> `HostAlias` and SysV per-process -> shared namespace).
 
 ## The rule to carry forward
 

@@ -142,11 +142,13 @@ use std::time::Duration;
 // LOCK ORDERING: dispatch handlers must not hold subsystem locks while entering
 // guest-memory callbacks or blocking host waits. When multiple dispatcher
 // locks are unavoidable, acquire fd/open-description state before filesystem
-// overlay state, then pty_table, then proc/signal/thread registries. The
-// EPOLL_INMEM_KQUEUES registry is independent and must not be held while
-// acquiring dispatcher fd/open-description locks; in-memory wake broadcasts only
-// trigger already-registered kqueues. Futex waits are prepared under dispatcher
-// state and parked only after those locks have been released.
+// overlay state, then pty_table, then proc/signal/thread registries. For paired
+// SysV operations, the per-process attachment lock must precede the shared SysV
+// namespace lock; this is structurally enforced via `SysvProcessGuard` and
+// `SysvNamespacePermit`. The EPOLL_INMEM_KQUEUES registry is independent and must
+// not be held while acquiring dispatcher fd/open-description locks; in-memory wake
+// broadcasts only trigger already-registered kqueues. Futex waits are prepared under
+// dispatcher state and parked only after those locks have been released.
 
 use crate::compat::{CompatEvent, CompatReporter, SyscallArgs};
 use crate::fs_backend::FsBackend;
@@ -766,7 +768,10 @@ mod bpf;
 pub mod mm_mutation;
 mod mount_api;
 mod mqueue;
+#[cfg(not(doctest))]
 mod sysv;
+#[cfg(doctest)]
+pub mod sysv;
 pub use sysv::SysvWaitState;
 #[macro_use]
 mod time;
