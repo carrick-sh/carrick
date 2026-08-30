@@ -1613,34 +1613,6 @@ impl Kernel {
         task.begin_ptrace_memory_access(tracer)
     }
 
-    /// Revalidate and retain one exact settled-stop witness across the
-    /// irreversible portion of a foreign or shared memory access.
-    ///
-    /// Acquires `lifecycle` and `job_control` in canonical order on the exact
-    /// `TaskKey`, validates that the target is `Live`, retains the witness's
-    /// exact tracer relationship and stop generation, is `stopped_by_ptrace`
-    /// with a settled stop signal recorded, and has no pending resume command.
-    /// It also validates that the target's current `MmId` matches the witness.
-    /// The memory `operation` runs while `lifecycle` and `job_control` guards remain live.
-    pub(crate) fn with_ptrace_memory_access<T>(
-        &self,
-        witness: &super::objects::PtraceMemoryAccessWitness,
-        operation: impl FnOnce() -> T,
-    ) -> Result<T, carrick_abi::LinuxErrno> {
-        let task = {
-            let registry = self.registry().state.read();
-            let target = witness.target();
-            let Some(record) = registry.tasks.get(&target.id) else {
-                return Err(carrick_abi::LINUX_ESRCH);
-            };
-            if record.task.key() != target {
-                return Err(carrick_abi::LINUX_ESRCH);
-            }
-            Arc::clone(&record.task)
-        };
-        task.with_ptrace_memory_access(witness, operation)
-    }
-
     pub(crate) fn stop_task_for_ptrace(&self, target: TaskId, signal: LinuxSignal) -> bool {
         let task = {
             let state = self.registry().state.read();

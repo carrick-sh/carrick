@@ -1315,6 +1315,15 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "function": "advance_ptrace_stop_generation",
+      "ordinal_in_function": 1,
+      "fingerprint": "1eb2aa0347d1d244ca615e62d64915fa431b8f4660cc6517687a5a449a8f6f77",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::ptrace_stop_authority",
+      "rationale": "Ptrace stop generation overflow would wrap an exact stopped-task capability and permit a stale memory-access witness to authenticate a later stop."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
       "function": "Task::publish_wake",
       "ordinal_in_function": 1,
       "fingerprint": "8b44ac2d863e3ab1f46cc76583787e515d3ec40608d8a4a2a2e0323160a6377e",

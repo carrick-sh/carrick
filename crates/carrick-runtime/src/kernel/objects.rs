@@ -3019,21 +3019,24 @@ pub(crate) struct JobControlStopInvalidationGeneration(u64);
 /// A resume, detach, or later stop generation invalidates the witness even if
 /// the same tracer establishes another settled stop before the consumer
 /// reaches its commit point.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct PtraceMemoryAccessWitness {
-    target: TaskKey,
+    task: Arc<Task>,
     tracer: TaskKey,
     mm_id: MmId,
     stop_generation: u64,
 }
 
 impl PtraceMemoryAccessWitness {
-    pub(crate) fn mm_id(self) -> MmId {
+    pub(crate) fn mm_id(&self) -> MmId {
         self.mm_id
     }
 
-    pub(crate) fn target(self) -> TaskKey {
-        self.target
+    pub(crate) fn with_revalidated<T>(
+        &self,
+        operation: impl FnOnce() -> T,
+    ) -> Result<T, carrick_abi::LinuxErrno> {
+        self.task.with_ptrace_memory_access(self, operation)
     }
 }
 
@@ -3951,7 +3954,7 @@ impl Task {
     }
 
     pub(super) fn begin_ptrace_memory_access(
-        &self,
+        self: &Arc<Self>,
         tracer: TaskKey,
     ) -> Result<PtraceMemoryAccessWitness, carrick_abi::LinuxErrno> {
         let lifecycle = self.lifecycle.lock();
@@ -3968,7 +3971,7 @@ impl Task {
             return Err(carrick_abi::LINUX_ESRCH);
         }
         Ok(PtraceMemoryAccessWitness {
-            target: self.key(),
+            task: Arc::clone(self),
             tracer,
             mm_id: self.shared().mm().id(),
             stop_generation: job_control.ptrace_stop_generation,
@@ -3985,7 +3988,7 @@ impl Task {
             return Err(carrick_abi::LINUX_ESRCH);
         }
         let job_control = self.job_control.lock();
-        if self.key() != witness.target
+        if self.key() != witness.task.key()
             || job_control.ptrace_tracer != Some(witness.tracer)
             || !job_control.stopped_by_ptrace
             || job_control.stopped_by.is_none()
