@@ -2023,7 +2023,7 @@
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "global_frame_host_owners::CELL",
-      "fingerprint": "20173b10bf6c3cf93d4dc8930f5ad695f7747e9af5efe373636957efdb21b1b8",
+      "fingerprint": "acd96c473a71f14b5869666a9e242f3d7fef7507c85d5c1c33d299ef8d68fa42",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static global_frame_host_owners::CELL in crates/carrick-vmm-hvf/src/trap.rs maintaining host process lifecycle or VM resources."
     },
@@ -2197,14 +2197,6 @@
     },
     {
       "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/dispatch/lock_order.rs",
-      "symbol": "HELD_LOCKS",
-      "fingerprint": "27838d080c21fbb624a642f013b90cba658033d81c4c01272375391a192fce3d",
-      "classification": "carrier_infra",
-      "rationale": "Host thread-local cell HELD_LOCKS in crates/carrick-runtime/src/dispatch/lock_order.rs maintaining per-host-thread execution state for the carrier."
-    },
-    {
-      "kind": "thread_local",
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
       "symbol": "description_readiness::VISITED",
       "fingerprint": "f408f8c0ae0cb4b9200f22f10fafea3dfd5630f6080f4126702024046a4d6374",
@@ -2282,6 +2274,38 @@
       "fingerprint": "d4c0c2b4d0434b284b08ad53be54942e8a78fe5ab78362a24ab33dbb97953d8e",
       "classification": "carrier_infra",
       "rationale": "Host thread-local cell THREAD_VCPU_CREATED_TOTAL in crates/carrick-vmm-hvf/src/trap.rs maintaining per-host-thread execution state for the carrier."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
+      "symbol": "tests::production_carrier_budget_one_full_occupancy_defers_caller_self_ack_to_entry::ISOLATED_ENV",
+      "fingerprint": "db47b947bff4c3855c8dadde05cd337b2537f37926863719961a524d914ad7de",
+      "classification": "test_only",
+      "rationale": "Test-only subprocess sentinel isolates the one-vCPU full-occupancy handshake case and is absent from production builds."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
+      "symbol": "foreign_cow_handshake_test_lock::LOCK",
+      "fingerprint": "68f1c965cdc5df3062e0e69d4e0575047d68bc650b4206c04c92c2c85e425ce8",
+      "classification": "test_only",
+      "rationale": "Cfg(test)-only mutex serializes foreign-COW handshake fixtures that share process-wide test controls; it is absent from production builds."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "foreign_mm_tests::FOREIGN_MM_TEST_LOCK",
+      "fingerprint": "93502987434aeab58511d7c5865a095b1819487990ad883ce0ebc4eca2fae982",
+      "classification": "test_only",
+      "rationale": "Test-module mutex serializes production-carrier foreign-MM fixtures that share global frame and failpoint controls; it is absent from production builds."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
+      "symbol": "EXACT_MM_STAGE1",
+      "fingerprint": "1831bf5d7c756e3b61f4c1029d96d250a26dae7fcad2141c09e88c86e8db501e",
+      "classification": "carrier_infra",
+      "rationale": "Per-host-service-thread weak lookup stack supports synchronous re-entry into an exact live MM stage-1 lease; authority remains in the upgraded lease and exact executor census rather than the thread-local observation."
     }
   ]
 }

@@ -472,6 +472,20 @@ closed unless all three named ledgers exist, match every current source leaf,
 and keep each shard's typed-error debt ceiling equal to its checked row count.
 `just lint-domains` runs that exact gate after the process-global-state census.
 
+## Global-state ledger reconciliation — 2026-08-29
+
+The monotone source census is reconciled with current accepted runtime state.
+Three new test-harness leaves are classified `test_only`: the isolated
+one-vCPU subprocess sentinel and the two foreign-COW fixture locks. The
+`EXACT_MM_STAGE1` thread-local is classified `carrier_infra`: it is a
+per-service-thread weak lookup stack for synchronous re-entry, while authority
+remains in the upgraded exact-MM lease and executor census. The stale
+`dispatch/lock_order.rs::HELD_LOCKS` row was removed with the deleted
+debug-only validator required by item 5, and the carrier-global host-frame owner
+fingerprint was refreshed against its current accepted definition without
+changing its classification. `check-runtime-global-state.py --check` now exits
+zero with no additions, removals, or fingerprint drift.
+
 ## Population/lifecycle implementation receipt — 2026-08-28
 
 Code head `7a2af1aee` completes item 3 without inventing one generic "live
