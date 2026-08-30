@@ -350,3 +350,31 @@ RED and review-pending commits remain on `codex/fd-description-seam`; no push.
   Every surviving implementer and reviewer attested that it used neither Linux
   kernel source nor abandoned Task 8 material; the rejected mutex stream was
   not integrated.
+- Task 8 ptrace foreign-MM writable-data milestone accepted at `51078d7c1`
+  (Antigravity implementation commits `2de0b7ec0`, `ea955974c`, `ed4f1c791`;
+  Codex RED/correction commits `40cd920ad`, `1b98f8d79`, `51078d7c1`). The
+  consumer routes exact-word `PEEKTEXT`/`PEEKDATA` through retained foreign-MM
+  read authority and routes writable-mapping `POKETEXT`/`POKEDATA` through
+  caller-executor release plus exact target-MM mutation, COW, prepare, and
+  consuming commit. Codex rejected three Antigravity revisions in sequence:
+  snapshot-only tracer authorization, registry/topology ABBA while holding a
+  stopped-task guard, and final registry reacquisition beneath target mutation.
+  The accepted boundary mints authority before any execution-lease/MM
+  transport work, retains the exact `Arc<Task>`, binds it to the exact tracer,
+  settled stop generation, `TaskKey`, and `MmId`, and revalidates only the task
+  leaf while holding lifecycle/job-control guards across COW through commit.
+  `CONT`, `DETACH`, exit, PID reuse, MM replacement, and resume/re-stop ABA all
+  fail closed without a registry or topology acquisition beneath mutation.
+  Independent clean-room verdict: ACCEPT, no P0-P3 findings. Fresh controller
+  gates: ptrace 15/15, process-VM 26/26, syscall-process 9/9, serialized runtime
+  library 2,151/2,151, MM-authority checker over 253 Rust leaves, strict runtime
+  clippy, formatting, and diff hygiene. The new stop-generation exhaustion
+  abort has an exact `carrier_fault` ledger fingerprint; the checker remains at
+  the 24 unrelated pre-existing unclassified MM-authority calls. RX-only
+  `POKETEXT` remains deliberately fail-closed and is a separate required
+  instruction-publication milestone: it needs typed executable-write authority,
+  permission-preserving RX COW, AArch64 instruction-cache publication, and a
+  signed warm-function execution receipt. Every surviving implementer and
+  reviewer used neither Linux kernel source nor abandoned material; the one
+  contaminated review stream was abandoned in full and none of its conclusions
+  or output was reused.
