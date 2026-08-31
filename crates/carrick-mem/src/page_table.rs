@@ -268,6 +268,32 @@ pub struct PageTableManager {
     /// break-before-make ordering that keeps a concurrent sibling walk safe
     /// without quiescing.
     dirty: Vec<(usize, bool)>,
+    /// Pre-images of every descriptor word written since [`Self::begin_undo`],
+    /// in write order, with the scalar state to restore alongside them.
+    ///
+    /// A COW/mmap transaction needs a pre-transaction image to roll back to on
+    /// failure. Taking that by CLONING the manager copies the whole 1.75 MiB
+    /// table region on every transaction — on the success path too, which is
+    /// the overwhelming majority. Under a fork/exit storm that showed up as
+    /// `PageTableManager::clone`/`clone_from` and `_platform_memmove` at ~31%
+    /// of all carrier CPU, since a fork storm is a COW-fault storm. A
+    /// transaction touches a bounded set of descriptors, so journalling their
+    /// pre-images costs a word per edit and rolls back by replaying them.
+    undo: Option<UndoJournal>,
+}
+
+/// Pre-transaction state captured by [`PageTableManager::begin_undo`].
+#[derive(Clone, Debug, Default)]
+struct UndoJournal {
+    /// `(byte offset, value before the write)`, in write order. Replayed in
+    /// REVERSE so repeated writes to one offset unwind to the oldest value.
+    words: Vec<(usize, u64)>,
+    next_free: u64,
+    free_tables: Vec<u64>,
+    reclaim_pending: bool,
+    /// Length of `dirty` when the journal opened, so a rollback can drop
+    /// exactly the entries the failed transaction appended.
+    dirty_len: usize,
 }
 
 impl Clone for PageTableManager {
@@ -282,6 +308,7 @@ impl Clone for PageTableManager {
             stage1_exclusive: self.stage1_exclusive,
             reclaim_pending: self.reclaim_pending,
             dirty: self.dirty.clone(),
+            undo: self.undo.clone(),
         }
     }
 
@@ -299,6 +326,7 @@ impl Clone for PageTableManager {
         self.stage1_exclusive = source.stage1_exclusive;
         self.reclaim_pending = source.reclaim_pending;
         self.dirty.clone_from(&source.dirty);
+        self.undo.clone_from(&source.undo);
     }
 }
 
@@ -321,6 +349,7 @@ impl PageTableManager {
             stage1_exclusive: false,
             reclaim_pending: false,
             dirty: Vec::new(),
+            undo: None,
         }
     }
 
@@ -461,6 +490,14 @@ impl PageTableManager {
     /// reused page can never be referenced by a sibling's stale walk cache.
     fn free_table(&mut self, pa: u64) {
         if let Ok(off) = self.pa_to_off(pa) {
+            // Bulk zeroing bypasses `write_desc`, so journal the page word by
+            // word; coalescing is rare and a missed pre-image here would be an
+            // unrecoverable rollback.
+            if self.undo.is_some() {
+                for word in (off..off + PT_PAGE as usize).step_by(8) {
+                    self.note_undo(word);
+                }
+            }
             for b in &mut self.bytes[off..off + PT_PAGE as usize] {
                 *b = 0;
             }
@@ -495,14 +532,26 @@ impl PageTableManager {
     /// Write a leaf/child descriptor (a block, page, or sub-table entry that is
     /// not itself newly pointing the walker at a fresh table).
     fn write_desc(&mut self, off: usize, desc: u64) {
+        self.note_undo(off);
         self.bytes[off..off + 8].copy_from_slice(&desc.to_le_bytes());
         self.dirty.push((off, false));
+    }
+
+    /// Record one descriptor word's pre-image while a journal is open.
+    fn note_undo(&mut self, off: usize) {
+        if self.undo.is_some() {
+            let previous = self.read_desc(off);
+            if let Some(journal) = self.undo.as_mut() {
+                journal.words.push((off, previous));
+            }
+        }
     }
 
     /// Write a table descriptor that exposes a (freshly populated) sub-table to
     /// the walker. Tagged so the host sync orders it AFTER the sub-table's
     /// entries are visible.
     fn write_table_desc(&mut self, off: usize, desc: u64) {
+        self.note_undo(off);
         self.bytes[off..off + 8].copy_from_slice(&desc.to_le_bytes());
         self.dirty.push((off, true));
     }
@@ -550,6 +599,83 @@ impl PageTableManager {
     /// `host` must point to a writable, non-overlapping mapping of at least
     /// `self.bytes.len()` bytes which backs this mm's live page tables, and all
     /// hardware walkers of that backing must remain quiesced for the copy.
+    /// Open an undo journal covering every descriptor edit from here until
+    /// [`Self::commit_undo`] or [`Self::rollback_undo`].
+    ///
+    /// Replaces snapshotting the manager by clone: see the `undo` field. An
+    /// already-open journal is kept and this is a no-op, so a nested caller
+    /// cannot silently shorten an outer transaction's rollback.
+    pub fn begin_undo(&mut self) {
+        if self.undo.is_none() {
+            self.undo = Some(UndoJournal {
+                words: Vec::new(),
+                next_free: self.next_free,
+                free_tables: self.free_tables.clone(),
+                reclaim_pending: self.reclaim_pending,
+                dirty_len: self.dirty.len(),
+            });
+        }
+    }
+
+    /// Whether a journal is currently open.
+    pub fn undo_is_open(&self) -> bool {
+        self.undo.is_some()
+    }
+
+    /// Discard the journal: the transaction succeeded and its edits stand.
+    pub fn commit_undo(&mut self) {
+        self.undo = None;
+    }
+
+    /// Undo every edit since [`Self::begin_undo`] and publish the restored
+    /// words to the live host backing.
+    ///
+    /// Pre-images replay in REVERSE write order so repeated writes to one
+    /// offset unwind to the value that offset held before the transaction.
+    /// Each restored word is stored to the host as an aligned atomic 64-bit
+    /// write preceded by a release fence — the conservative form of the
+    /// ordering `sync_to_host` applies only to table pointers, used here
+    /// because a rollback restores pointers and leaves indiscriminately.
+    ///
+    /// # Safety
+    /// `host` must point to a writable mapping of at least `self.bytes.len()`
+    /// bytes backing the live guest page tables, and no vCPU may be walking or
+    /// editing this mm (the caller holds the COW quiesce and topology guards).
+    pub unsafe fn rollback_undo(&mut self, host: *mut u8) {
+        use core::sync::atomic::{AtomicU64, Ordering, fence};
+
+        let Some(journal) = self.undo.take() else {
+            return;
+        };
+        for &(off, previous) in journal.words.iter().rev() {
+            self.bytes[off..off + 8].copy_from_slice(&previous.to_le_bytes());
+            fence(Ordering::SeqCst);
+            // SAFETY: offsets are 8-byte aligned (index * 8) and within
+            // `self.bytes`, which the caller guarantees `host` backs.
+            unsafe {
+                let slot = host.add(off).cast::<AtomicU64>();
+                (*slot).store(previous, Ordering::Release);
+            }
+        }
+        fence(Ordering::SeqCst);
+        self.next_free = journal.next_free;
+        self.free_tables = journal.free_tables;
+        self.reclaim_pending = journal.reclaim_pending;
+        // The failed transaction's dirty entries describe offsets that now hold
+        // their pre-images again, and this method has already published them.
+        self.dirty.truncate(journal.dirty_len);
+    }
+
+    /// Replace the live host backing with this manager's complete image.
+    ///
+    /// The COW/mmap transactions roll back through [`Self::rollback_undo`],
+    /// which republishes only the words it changed. This whole-image restore
+    /// remains for the foreign-MM write path, which still snapshots by clone.
+    ///
+    /// # Safety
+    /// `host` must point to a writable mapping of at least `self.bytes.len()`
+    /// bytes backing the live guest page tables, and no vCPU may be walking or
+    /// editing this mm (the caller holds the quiesce and topology guards).
     pub unsafe fn restore_quiesced_snapshot_to_host(&self, host: *mut u8) {
         use core::sync::atomic::{Ordering, fence};
 
@@ -1645,6 +1771,118 @@ mod tests {
         let mut bytes = stage1_identity_page_tables();
         bytes.resize(0x40000, 0);
         PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE)
+    }
+
+    /// The undo journal must roll a transaction back to EXACTLY the image a
+    /// clone-based snapshot would have restored.
+    ///
+    /// The clone is the oracle on purpose: it is the implementation this
+    /// replaced, and a rollback that is subtly incomplete corrupts guest page
+    /// tables on an error path the conformance gate may rarely reach — the
+    /// kind of bug that hides. Journalling exists because cloning copied the
+    /// whole 1.75 MiB table region on EVERY COW/mmap transaction, success path
+    /// included; under a fork storm that was ~31% of carrier CPU.
+    #[test]
+    fn undo_journal_rollback_matches_a_cloned_snapshot() {
+        // A mixed edit sequence: protection changes, aliasing, repointing, a
+        // fresh mapping that must split tables, and an unmap that can coalesce.
+        type Edit = Box<dyn Fn(&mut PageTableManager)>;
+        let edits: Vec<Edit> = vec![
+            Box::new(|m: &mut PageTableManager| {
+                m.set_readonly(LINUX_HEAP_BASE, 0x4000, false).ok();
+            }),
+            Box::new(|m: &mut PageTableManager| {
+                m.set_rw(LINUX_HEAP_BASE, 0x2000, false).ok();
+            }),
+            Box::new(|m: &mut PageTableManager| {
+                m.map_private_aliased(LINUX_MMAP_BASE, LINUX_ALIAS_IPA_BASE, 0x8000, false)
+                    .ok();
+            }),
+            Box::new(|m: &mut PageTableManager| {
+                m.set_prot_none(LINUX_MMAP_BASE, 0x4000).ok();
+            }),
+            Box::new(|m: &mut PageTableManager| {
+                m.repoint_preserving_attributes(
+                    LINUX_MMAP_BASE,
+                    LINUX_ALIAS_IPA_BASE + 0x10000,
+                    0x4000,
+                )
+                .ok();
+            }),
+            Box::new(|m: &mut PageTableManager| {
+                m.unmap_aliased(LINUX_MMAP_BASE, 0x8000).ok();
+            }),
+            Box::new(|m: &mut PageTableManager| {
+                m.invalidate(LINUX_HEAP_BASE, 0x4000).ok();
+            }),
+        ];
+
+        // Every prefix of the sequence is a transaction to roll back.
+        for length in 1..=edits.len() {
+            let mut journalled = manager();
+            journalled.set_multi_vcpu(false);
+            journalled.set_stage1_exclusive(true);
+            // Some pre-transaction history, so the rollback target is not the
+            // pristine image and repeated writes to one offset really occur.
+            journalled.set_readonly(LINUX_HEAP_BASE, 0x8000, false).ok();
+            journalled
+                .map_private_aliased(LINUX_MMAP_BASE, LINUX_ALIAS_IPA_BASE, 0x4000, false)
+                .ok();
+
+            let oracle = journalled.clone();
+            journalled.begin_undo();
+            assert!(journalled.undo_is_open());
+            for edit in edits.iter().take(length) {
+                edit(&mut journalled);
+            }
+            // Model the worst case for the host backing: every edit already
+            // synced. Rollback must republish enough to bring it back to the
+            // pre-image, and it republishes only the words it changed — which
+            // is the whole point, so seeding `host` with zeros would assert the
+            // opposite of the intended behaviour.
+            let mut host = journalled.as_bytes().to_vec();
+            // SAFETY: `host` is a writable buffer of exactly the region length
+            // and no guest is running against this test-local manager.
+            unsafe { journalled.rollback_undo(host.as_mut_ptr()) };
+
+            assert!(
+                !journalled.undo_is_open(),
+                "rollback must close the journal"
+            );
+            assert_eq!(
+                journalled.as_bytes(),
+                oracle.as_bytes(),
+                "prefix of {length} edit(s): journalled rollback diverged from the cloned image"
+            );
+            assert_eq!(
+                journalled.pool_stats(),
+                oracle.pool_stats(),
+                "prefix of {length} edit(s): spare-table pool state diverged"
+            );
+            assert_eq!(
+                journalled.coalesce_policy(),
+                oracle.coalesce_policy(),
+                "prefix of {length} edit(s): coalesce policy state diverged"
+            );
+            assert_eq!(
+                &host[..],
+                oracle.as_bytes(),
+                "prefix of {length} edit(s): host backing was not restored to the pre-image"
+            );
+        }
+    }
+
+    /// Committing must leave the edits in place and close the journal.
+    #[test]
+    fn undo_journal_commit_keeps_the_transaction() {
+        let mut mgr = manager();
+        mgr.begin_undo();
+        mgr.set_readonly(LINUX_HEAP_BASE, 0x4000, false)
+            .expect("protect heap");
+        let after = mgr.clone();
+        mgr.commit_undo();
+        assert!(!mgr.undo_is_open());
+        assert_eq!(mgr.as_bytes(), after.as_bytes());
     }
 
     #[test]
