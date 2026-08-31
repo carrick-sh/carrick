@@ -26383,7 +26383,19 @@ impl HvpatchTaskRegistration {
         )?;
         if let Some(old_task_mm) = self.task_mm.take() {
             old_task_mm.record_holder(HvpatchTaskMmHolder::ExecRebind);
-            if !retain_shared_predecessor_authority {
+            if retain_shared_predecessor_authority {
+                // "Retain" means another task still shares this predecessor and
+                // owns retiring it. That holds only while another reference
+                // actually exists: if ours is the LAST, nobody is left to
+                // retire it, and dropping a published inventory unretired is
+                // what `HvpatchTaskMmAuthority::drop` aborts the carrier over
+                // (`vforkexecthread`, holder `exec-rebind`). `Arc::into_inner`
+                // answers "am I the last holder" atomically, so this cannot
+                // race a concurrent sharer.
+                if let Some(sole) = std::sync::Arc::into_inner(old_task_mm) {
+                    sole.retire_exec_predecessor();
+                }
+            } else {
                 old_task_mm.retire_exec_predecessor();
             }
         }
@@ -26418,6 +26430,13 @@ impl HvpatchTaskRegistration {
         self.directory.retire(self.key)?;
         if let Some(task_mm) = self.task_mm.take() {
             task_mm.record_holder(HvpatchTaskMmHolder::RegistrationCleanup);
+            // NOTE: this drop is where `execthreads` aborts -- seven sibling
+            // registrations share one MM authority and the last one drops a
+            // still-published inventory. Retiring it here (the symmetric fix to
+            // the `exec-rebind` path below) removes the abort but HANGS 2 runs
+            // in 3, so the missing retirement belongs further upstream, before
+            // the registrations tear down. Measured 2026-08-31; left as the
+            // abort rather than traded for a hang.
             drop(task_mm);
         }
         Ok(())
