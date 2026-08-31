@@ -7630,6 +7630,16 @@ where
                     region_bytes.push(Vec::new());
                     continue;
                 }
+                // `MADV_DONTDUMP`: same shape Linux produces -- the VMA is
+                // still a PT_LOAD, with no contents behind it.
+                if process
+                    .dump_omitted
+                    .iter()
+                    .any(|&(start, end)| start < map.end && map.start < end)
+                {
+                    region_bytes.push(Vec::new());
+                    continue;
+                }
                 if std::env::var_os("CARRICK_CORE_FAILPOINT")
                     .is_some_and(|value| value == "memory-read")
                 {

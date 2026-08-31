@@ -3815,6 +3815,19 @@ pub enum VmaForkChildPolicy {
     ZeroInChild,
 }
 
+/// Core-dump inclusion policy for a semantic VMA (`MADV_DONTDUMP` /
+/// `MADV_DODUMP`).
+///
+/// Linux keeps a `DONTDUMP` VMA in the core's program headers but writes no
+/// contents for it (`p_filesz == 0`), which is the same shape carrick already
+/// produces for executable file-backed mappings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum VmaDumpPolicy {
+    #[default]
+    Include,
+    Omit,
+}
+
 /// Two-axis fork inheritance policy for a semantic VMA.
 /// `copy` and `child_contents` are independent axes: DONTFORK and WIPEONFORK
 /// may coexist; DOFORK clears only `copy = Omit`; KEEPONFORK clears only
@@ -3842,6 +3855,11 @@ impl VmaForkPolicy {
 // `always`/`madvise` modes), so accepting them as a success no-op matches the
 // kernel and keeps allocators (Go runtime, jemalloc, glibc) from treating a
 // spurious EINVAL as a hard error.
+// Core-dump inclusion hints. Unlike the THP hints below these are NOT no-ops:
+// `MADV_DONTDUMP` must actually keep the range's contents out of a core dump,
+// which carrick honours through `VmaDumpPolicy`.
+pub const LINUX_MADV_DONTDUMP: u64 = 16;
+pub const LINUX_MADV_DODUMP: u64 = 17;
 pub const LINUX_MADV_HUGEPAGE: u64 = 14;
 pub const LINUX_MADV_NOHUGEPAGE: u64 = 15;
 pub const LINUX_MADV_COLLAPSE: u64 = 25;

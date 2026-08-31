@@ -382,6 +382,9 @@ pub struct SemanticVma {
     pub execute: bool,
     pub provenance: VmaBackingProvenance,
     pub fork_policy: carrick_abi::VmaForkPolicy,
+    /// `MADV_DONTDUMP`/`MADV_DODUMP`: whether this VMA's CONTENTS reach a core
+    /// dump. The VMA itself is still listed either way, matching Linux.
+    pub dump_policy: carrick_abi::VmaDumpPolicy,
     pub droppable: bool,
     pub path: String,
     pub file_page_offset: Option<u64>,
@@ -1334,6 +1337,7 @@ fn update_semantic_vma_prot(
             execute,
             provenance: vma.provenance,
             fork_policy: vma.fork_policy,
+            dump_policy: vma.dump_policy,
             droppable: vma.droppable,
             path: vma.path.clone(),
             file_page_offset: mid_offset,
@@ -1354,12 +1358,13 @@ fn update_semantic_vma_prot(
     *vmas = next;
 }
 
-fn update_semantic_vma_fork_policy(
+fn update_semantic_vma_policy(
     vmas: &mut Vec<SemanticVma>,
     start: u64,
     len: u64,
     copy_update: Option<carrick_abi::VmaForkCopyPolicy>,
     child_update: Option<carrick_abi::VmaForkChildPolicy>,
+    dump_update: Option<carrick_abi::VmaDumpPolicy>,
 ) {
     let Some(end) = start.checked_add(len) else {
         return;
@@ -1389,6 +1394,7 @@ fn update_semantic_vma_fork_policy(
         if let Some(ch) = child_update {
             fork_policy.child_contents = ch;
         }
+        let dump_policy = dump_update.unwrap_or(vma.dump_policy);
         next.push(SemanticVma {
             start: mid_start,
             end: mid_end,
@@ -1397,6 +1403,7 @@ fn update_semantic_vma_fork_policy(
             execute: vma.execute,
             provenance: vma.provenance,
             fork_policy,
+            dump_policy,
             droppable: vma.droppable,
             path: vma.path.clone(),
             file_page_offset: mid_offset,
@@ -1466,6 +1473,7 @@ pub(super) fn update_semantic_heap_pages(mem: &mut MemState, old_page_end: u64, 
             execute: false,
             provenance: VmaBackingProvenance::PrivateAnonymous,
             fork_policy: carrick_abi::VmaForkPolicy::DEFAULT,
+            dump_policy: carrick_abi::VmaDumpPolicy::Include,
             droppable: false,
             path: "[heap]".to_owned(),
             file_page_offset: None,
@@ -1548,6 +1556,7 @@ pub(super) fn semantic_vmas_from_boot_regions(
             execute: region.execute,
             provenance,
             fork_policy: carrick_abi::VmaForkPolicy::DEFAULT,
+            dump_policy: carrick_abi::VmaDumpPolicy::Include,
             droppable: false,
             path: region.path.clone(),
             file_page_offset,
@@ -2437,22 +2446,38 @@ impl SyscallDispatcher {
         }
     }
 
-    pub(crate) fn update_madvise_fork_policy(
+    pub(crate) fn update_madvise_vma_policy(
         &self,
         start: u64,
         len: u64,
         copy_update: Option<carrick_abi::VmaForkCopyPolicy>,
         child_update: Option<carrick_abi::VmaForkChildPolicy>,
+        dump_update: Option<carrick_abi::VmaDumpPolicy>,
     ) {
         let mem_authority = self.mem();
         let mut mem = mem_authority.lock();
-        update_semantic_vma_fork_policy(
+        update_semantic_vma_policy(
             &mut mem.semantic_vmas,
             start,
             len,
             copy_update,
             child_update,
+            dump_update,
         );
+    }
+
+    /// Whether `[start, start + len)` is fully covered by VMAs whose contents
+    /// `MADV_DONTDUMP` keeps out of a core dump.
+    pub fn vma_dump_omitted_for_test(&self, start: u64, len: u64) -> bool {
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        self.mem()
+            .lock()
+            .semantic_vmas
+            .iter()
+            .filter(|vma| vma.start < end && start < vma.end)
+            .all(|vma| vma.dump_policy == carrick_abi::VmaDumpPolicy::Omit)
     }
 
     /// Private VMAs added after image construction. Dynamic mapping helpers
@@ -6958,7 +6983,28 @@ impl SyscallDispatcher {
                         LINUX_MADV_KEEPONFORK => (None, Some(carrick_abi::VmaForkChildPolicy::Preserve)),
                         _ => unreachable!(),
                     };
-                    this.update_madvise_fork_policy(address.0, end - address.0, copy_update, child_update);
+                    this.update_madvise_vma_policy(address.0, end - address.0, copy_update, child_update, None);
+                    this.mark_vma_dispatch(&mut host_alias_dispatch);
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
+                LINUX_MADV_DONTDUMP | LINUX_MADV_DODUMP => {
+                    // Not an advisory no-op: Linux keeps a DONTDUMP VMA in the
+                    // core's program headers but writes no contents for it, so
+                    // the policy has to reach the dump. carrick rejected both
+                    // with EINVAL, which is what `memflagmatrix`'s
+                    // `madvise_hints_matrix_ok` caught -- the oracle returns 0.
+                    let dump_update = if advice == LINUX_MADV_DONTDUMP {
+                        carrick_abi::VmaDumpPolicy::Omit
+                    } else {
+                        carrick_abi::VmaDumpPolicy::Include
+                    };
+                    this.update_madvise_vma_policy(
+                        address.0,
+                        end - address.0,
+                        None,
+                        None,
+                        Some(dump_update),
+                    );
                     this.mark_vma_dispatch(&mut host_alias_dispatch);
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
@@ -7598,6 +7644,8 @@ fn linux_madvise_advice_is_supported(advice: u64) -> bool {
             | LINUX_MADV_DOFORK
             | LINUX_MADV_WIPEONFORK
             | LINUX_MADV_KEEPONFORK
+            | LINUX_MADV_DONTDUMP
+            | LINUX_MADV_DODUMP
             // THP hints: advisory, accepted as a success no-op (see the abi
             // constants). carrick can't promote to huge pages, but neither must
             // it reject the hint — real Linux with THP built in returns 0.

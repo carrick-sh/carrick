@@ -327,7 +327,9 @@ use crate::linux_abi::{
     LINUX_LOCK_SH,
     LINUX_LOCK_UN,
     LINUX_MADV_COLLAPSE,
+    LINUX_MADV_DODUMP,
     LINUX_MADV_DOFORK,
+    LINUX_MADV_DONTDUMP,
     LINUX_MADV_DONTFORK,
     LINUX_MADV_DONTNEED,
     LINUX_MADV_FREE,
@@ -3343,6 +3345,8 @@ pub(crate) struct CoreProcessSnapshot {
     pub auxv: Vec<(u64, u64)>,
     pub maps: Vec<ProcMapsEntry>,
     pub file_mappings: Vec<crate::core_dump::FileMapping>,
+    /// `MADV_DONTDUMP` ranges: still listed as PT_LOAD, contents elided.
+    pub dump_omitted: Vec<(u64, u64)>,
     pub cwd: String,
     pub rlimit_core: u64,
     pub dumpable: bool,
@@ -3676,6 +3680,7 @@ mod core_publication_tests {
             auxv: vec![(6, 4096)],
             maps: Vec::new(),
             file_mappings: Vec::new(),
+            dump_omitted: Vec::new(),
             cwd: "/tmp/coretest".to_owned(),
             rlimit_core: 4096,
             dumpable: true,
@@ -6112,6 +6117,12 @@ impl SyscallDispatcher {
         let dumpable = proc.dumpable != 0;
         let maps = mem::project_core_maps(&mem);
         let file_mappings = mem.core_file_mappings.clone();
+        let dump_omitted = mem
+            .semantic_vmas
+            .iter()
+            .filter(|vma| vma.dump_policy == carrick_abi::VmaDumpPolicy::Omit)
+            .map(|vma| (vma.start, vma.end))
+            .collect::<Vec<_>>();
         let cwd = context.resources().fs_context().cwd();
         drop(mem);
         drop(proc);
@@ -6130,6 +6141,7 @@ impl SyscallDispatcher {
             auxv,
             maps,
             file_mappings,
+            dump_omitted,
             cwd,
             rlimit_core,
             dumpable,

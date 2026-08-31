@@ -939,6 +939,46 @@ fn mmap_anonymous_fixed_mapping_zeroes_guest_memory_and_mprotect_munmap_are_noop
 }
 
 #[test]
+fn madvise_dontdump_and_dodump_are_accepted_and_flip_the_vma_dump_policy() {
+    // carrick answered EINVAL for both, which `memflagmatrix`'s
+    // `madvise_hints_matrix_ok` caught: the Docker oracle returns 0. They are
+    // not advisory no-ops like the THP hints -- `MADV_DONTDUMP` has to keep the
+    // range's CONTENTS out of a core dump, so the accepted call must leave the
+    // policy behind on the semantic VMA for the core writer to honour.
+    let mut memory = AddressSpace::from_segments(
+        0,
+        [(LINUX_MMAP_BASE, rwx_perms(), b"secret".to_vec(), 0x4000)],
+    )
+    .unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    publish_address_space_regions(&mut dispatcher, &memory);
+
+    for (advice, expected_omitted) in [(LINUX_MADV_DONTDUMP, true), (LINUX_MADV_DODUMP, false)] {
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
+                    SyscallRequest::new(
+                        233,
+                        SyscallArgs::from([LINUX_MMAP_BASE, 0x1000, advice, 0, 0, 0]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 },
+            "madvise advice {advice} must succeed"
+        );
+        assert_eq!(
+            dispatcher.vma_dump_omitted_for_test(LINUX_MMAP_BASE, 0x1000),
+            expected_omitted,
+            "advice {advice} must leave the range's dump policy behind"
+        );
+    }
+}
+
+#[test]
 fn madvise_accepts_common_advice_for_mapped_ranges() {
     let mut memory = AddressSpace::from_segments(
         0,

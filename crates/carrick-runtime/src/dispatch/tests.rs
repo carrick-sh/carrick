@@ -5114,18 +5114,20 @@ mod container_policy_dispatch_tests {
         ]);
 
         // Mark 0x10000..0x12000 as DONTFORK
-        dispatcher.update_madvise_fork_policy(
+        dispatcher.update_madvise_vma_policy(
             0x10000,
             0x2000,
             Some(carrick_abi::VmaForkCopyPolicy::Omit),
             None,
+            None,
         );
         // Mark 0x22000..0x24000 as WIPEONFORK
-        dispatcher.update_madvise_fork_policy(
+        dispatcher.update_madvise_vma_policy(
             0x22000,
             0x2000,
             None,
             Some(carrick_abi::VmaForkChildPolicy::ZeroInChild),
+            None,
         );
 
         let parent_mm_id = crate::kernel::MmId::from_raw_u64(1).unwrap();
@@ -5397,6 +5399,7 @@ mod container_policy_dispatch_tests {
             execute: false,
             provenance: mem::VmaBackingProvenance::PrivateAnonymous,
             fork_policy: carrick_abi::VmaForkPolicy::DEFAULT,
+            dump_policy: carrick_abi::VmaDumpPolicy::Include,
             droppable: false,
             path: "[invalid]".to_owned(),
             file_page_offset: None,
