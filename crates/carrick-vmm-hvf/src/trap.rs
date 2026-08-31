@@ -7050,69 +7050,69 @@ mod task_only_carrier_directory_tests {
     /// "proportional to this process" from "proportional to the carrier".
     #[test]
     fn retiring_one_owner_does_not_scan_foreign_alias_rows() {
-        let _test_lock = ALIAS_TEST_LOCK.lock();
-        alias_registry().lock().clear();
-        replay_mappings().lock().clear();
-        *alias_version_registry().lock() = AliasVersionRegistry::default();
-
         const FOREIGN_OWNERS: usize = 512;
         let retiring_root_slot = (0x4fff_1000_0000_u64, 0x4000_u64);
         let retiring_scope = AliasOwnershipScope::MmRootSlot {
             base: retiring_root_slot.0,
             size: retiring_root_slot.1,
         };
-        {
-            let mut registry = alias_registry().lock();
-            let mut replay = replay_mappings().lock();
-            for index in 0..FOREIGN_OWNERS {
-                let mut foreign = alias(0x3000_0000 + index, 1);
-                foreign.ipa = 0x6000_0000_0000 + (index as u64) * 0x4000;
-                foreign.physical_ipa = 0x5000_0000_0000 + (index as u64) * 0x4000;
-                foreign.ownership_scope = AliasOwnershipScope::MmRootSlot {
-                    base: 0x1000_0000_0000 + (index as u64) * 0x4000,
-                    size: 0x4000,
-                };
-                replay.insert(replay_mapping_key(foreign));
-                registry.push(foreign);
-            }
-            let mut mine = alias(0x9999_0000, 1);
-            mine.ownership_scope = retiring_scope;
-            replay.insert(replay_mapping_key(mine));
-            registry.push(mine);
+
+        // Driven against local authorities, NOT the process-global registry:
+        // measuring visited rows against carrier-global state made this
+        // assertion depend on whatever other tests were running concurrently.
+        let mut registry = AliasRegistry::default();
+        let mut replay = std::collections::BTreeSet::new();
+        let mut versions = AliasVersionRegistry::default();
+        for index in 0..FOREIGN_OWNERS {
+            let mut foreign = alias(0x3000_0000 + index, 1);
+            foreign.ipa = 0x6000_0000_0000 + (index as u64) * 0x4000;
+            foreign.physical_ipa = 0x5000_0000_0000 + (index as u64) * 0x4000;
+            foreign.ownership_scope = AliasOwnershipScope::MmRootSlot {
+                base: 0x1000_0000_0000 + (index as u64) * 0x4000,
+                size: 0x4000,
+            };
+            replay.insert(replay_mapping_key(foreign));
+            registry.push(foreign);
         }
+        let mut mine = alias(0x9999_0000, 1);
+        mine.ownership_scope = retiring_scope;
+        replay.insert(replay_mapping_key(mine));
+        registry.push(mine);
 
         let before = alias_state_rows_scanned();
-        retire_process_aliases(Some(retiring_root_slot), ContainerRootToken::ROOT, |_| true);
+        retire_process_aliases_in(
+            &mut registry,
+            &replay,
+            &mut versions,
+            Some(retiring_root_slot),
+            ContainerRootToken::ROOT,
+            |_| true,
+        );
         let scanned = alias_state_rows_scanned() - before;
 
         assert_eq!(
-            alias_registry().lock().len(),
+            registry.len(),
             FOREIGN_OWNERS,
             "retirement must drop exactly the retiring owner's row"
         );
         assert!(
-            !alias_registry()
-                .lock()
+            !registry
                 .iter()
                 .any(|entry| entry.ownership_scope == retiring_scope),
             "the retiring owner's alias row must be gone"
         );
-        // The real contract: cost is a function of the RETIRING process, not
-        // of the carrier. On this fixture the process owns one row and there
-        // are no `Global` rows, so the bound is a small constant regardless of
-        // how many other owners are live. For reference on the same fixture:
-        // the clone-and-diff mutator visited 3,076 rows, a single flat-`Vec`
-        // retain visited 513, and a scope-partitioned registry visits ~1.
+        // The contract: cost is a function of the RETIRING process, not of the
+        // carrier. This process owns one row and there are no `Global` rows, so
+        // the bound is a small constant however many other owners are live. On
+        // this fixture the clone-and-diff mutator visited 3,076 rows, a single
+        // flat-`Vec` retain visited 513, and the scope-partitioned registry
+        // visits ~1.
         assert!(
             scanned <= 16,
             "retiring one owner visited {scanned} alias rows with {FOREIGN_OWNERS} \
              foreign owners live; retirement cost must be a function of the \
              retiring process, not of the carrier"
         );
-
-        alias_registry().lock().clear();
-        replay_mappings().lock().clear();
-        *alias_version_registry().lock() = AliasVersionRegistry::default();
     }
 
     #[test]
@@ -9057,6 +9057,38 @@ impl AliasRegistry {
             .map(|(_, alias)| *alias)
     }
 
+    #[cfg(feature = "foreign-cow-test-support")]
+    /// Mutate the row registered LAST among those matching, and report
+    /// whether one was found. Selection is identical to
+    /// [`Self::newest_matching`]; a row is located by (scope, position)
+    /// rather than by sequence because a split row's fragments share their
+    /// parent's sequence.
+    fn update_newest_matching(
+        &mut self,
+        mut matches: impl FnMut(&AliasBacking) -> bool,
+        update: impl FnOnce(&mut AliasBacking),
+    ) -> bool {
+        let mut best: Option<(AliasOwnershipScope, usize, u64)> = None;
+        for (scope, rows) in &self.by_scope {
+            for (position, (seq, alias)) in rows.iter().enumerate() {
+                if matches(alias) && best.is_none_or(|(_, _, best_seq)| *seq >= best_seq) {
+                    best = Some((*scope, position, *seq));
+                }
+            }
+        }
+        let Some((scope, position, _)) = best else {
+            return false;
+        };
+        let Some(rows) = self.by_scope.get_mut(&scope) else {
+            return false;
+        };
+        let Some(slot) = rows.get_mut(position) else {
+            return false;
+        };
+        update(&mut slot.1);
+        true
+    }
+
     /// [`Self::newest_matching`] restricted to the scopes one process can see.
     /// Exact for any predicate that already required
     /// `alias_matches_process_scope`, and O(that process's rows) rather than
@@ -9140,6 +9172,57 @@ impl AliasRegistry {
         if self.by_scope.get(&scope).is_some_and(Vec::is_empty) {
             self.by_scope.remove(&scope);
         }
+    }
+
+    /// The FIRST row registered for `(ipa, scope)`.
+    ///
+    /// Every row of one scope lives in one bucket in insertion order, so the
+    /// first match in that bucket IS the first match in global insertion
+    /// order — the answer the historical whole-registry `find` gave, without
+    /// visiting any other process's rows.
+    fn find_by_key(&self, ipa: u64, scope: AliasOwnershipScope) -> Option<AliasBacking> {
+        let rows = self.scope_rows(scope);
+        note_alias_state_rows_scanned(rows.len());
+        rows.iter()
+            .find(|(_, entry)| entry.ipa == ipa)
+            .map(|(_, entry)| *entry)
+    }
+
+    /// Replace the first row for `alias`'s `(ipa, scope)`, or append it.
+    /// Same first-occurrence semantics as [`Self::find_by_key`]; a replaced
+    /// row keeps its sequence, so it keeps its place in the global order
+    /// exactly as an in-place `Vec` write did.
+    fn upsert_by_key(&mut self, alias: AliasBacking) {
+        let scope = alias.ownership_scope;
+        if let Some(rows) = self.by_scope.get_mut(&scope) {
+            note_alias_state_rows_scanned(rows.len());
+            if let Some(slot) = rows.iter_mut().find(|(_, entry)| entry.ipa == alias.ipa) {
+                slot.1 = alias;
+                return;
+            }
+        }
+        self.push(alias);
+    }
+
+    /// Every row one process can see, in global insertion order.
+    ///
+    /// The fork paths materialized the WHOLE carrier registry and then
+    /// filtered it by scope, which is O(all processes) per fork plus a sort
+    /// and an allocation. Every consumer of that vector re-applies
+    /// `alias_matches_process_scope`, so restricting it here is exact.
+    fn process_visible_ordered(
+        &self,
+        mm_root_slot: Option<(u64, u64)>,
+        container_root: ContainerRootToken,
+    ) -> Vec<AliasBacking> {
+        let mut rows: Vec<(u64, AliasBacking)> =
+            Self::process_visible_scopes(mm_root_slot, container_root)
+                .into_iter()
+                .flat_map(|scope| self.scope_rows(scope).iter().copied())
+                .collect();
+        note_alias_state_rows_scanned(rows.len());
+        rows.sort_by_key(|(seq, _)| *seq);
+        rows.into_iter().map(|(_, alias)| alias).collect()
     }
 
     /// A registry holding only the rows one process can see, sequences and
@@ -20398,20 +20481,23 @@ pub mod foreign_cow_test_support {
         pub fn set_source_guest_writable_for_test(&self, writable: bool) -> Result<(), String> {
             let data_key = self.original_extents[1];
             let mut aliases = alias_registry().lock();
-            let alias = aliases
-                .iter_mut()
-                .rev()
-                .find(|alias| {
+            let updated = aliases.update_newest_matching(
+                |alias| {
                     alias.start == TEST_VA
                         && (alias.physical_ipa, alias.physical_size as u64) == data_key
-                })
-                .ok_or_else(|| "production carrier source alias is absent".to_owned())?;
-            alias.guest_writable = writable;
-            alias.perms = u64::from(if writable {
-                applevisor::memory::MemPerms::ReadWriteExec
-            } else {
-                applevisor::memory::MemPerms::ReadExec
-            });
+                },
+                |alias| {
+                    alias.guest_writable = writable;
+                    alias.perms = u64::from(if writable {
+                        applevisor::memory::MemPerms::ReadWriteExec
+                    } else {
+                        applevisor::memory::MemPerms::ReadExec
+                    });
+                },
+            );
+            if !updated {
+                return Err("production carrier source alias is absent".to_owned());
+            }
             Ok(())
         }
 
@@ -20443,9 +20529,7 @@ pub mod foreign_cow_test_support {
         pub fn source_guest_writable_for_test(&self) -> Result<bool, String> {
             let aliases = alias_registry().lock();
             aliases
-                .iter()
-                .rev()
-                .find(|alias| alias.start == TEST_VA)
+                .newest_matching(|alias| alias.start == TEST_VA)
                 .map(|alias| alias.guest_writable)
                 .ok_or_else(|| "production carrier source alias is absent".to_owned())
         }
@@ -23092,28 +23176,124 @@ fn inherited_fork_inventory_extents(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn fork_translation_has_overlay_owner(
+    index: &ForkTranslationOverlayIndex,
     mappings: &[ProcessMappingDesc],
     candidate_index: usize,
     va: u64,
     translated: u64,
-    mm_root_slot: Option<(u64, u64)>,
-    container_root: ContainerRootToken,
 ) -> bool {
-    mappings.iter().enumerate().any(|(index, overlay)| {
-        index != candidate_index
-            && va >= overlay.start
-            && va < overlay.end
-            && overlay
-                .ipa
-                .checked_add(va - overlay.start)
-                .is_some_and(|ipa| ipa == translated)
-    }) || alias_registry().lock().iter().any(|alias| {
-        (alias_matches_process_scope(alias.ownership_scope, mm_root_slot, container_root)
-            || matches!(alias.ownership_scope, AliasOwnershipScope::ContainerRoot(container) if container == container_root))
-            && va >= alias.start
-            && va < alias.start.saturating_add(alias.size as u64)
-            && alias.ipa.checked_add(va.saturating_sub(alias.start)) == Some(translated)
-    })
+    index.has_overlay_owner(mappings, candidate_index, va, translated)
+}
+
+/// Overlay owners of one forking process's translations, indexed by the
+/// translation they produce.
+///
+/// A row can satisfy the overlay predicate only if its `ipa - start` equals
+/// `translated - va` and it starts within its own length of `va`, so those two
+/// facts are the index and the exact containment test stays a per-candidate
+/// check. Same construction as [`ForkOverlayOwnerIndex`], and for the same
+/// reason: the previous shape asked the question by scanning every source
+/// mapping AND the whole carrier-global alias registry, once per mapping, so a
+/// process with M mappings in a carrier holding R alias rows paid O(M * (M + R))
+/// per fork. Measured 20.1% of carrier CPU under a fork/exit storm even after
+/// the call was made lazy.
+///
+/// The alias half admits exactly the scopes the original predicate did: the
+/// scopes `alias_matches_process_scope` accepts, plus this container's root
+/// regardless of `mm_root_slot`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Default)]
+struct ForkTranslationOverlayIndex {
+    mappings_by_delta_and_start: std::collections::BTreeMap<(u64, u64), Vec<usize>>,
+    mappings_widest_by_delta: std::collections::BTreeMap<u64, u64>,
+    aliases_by_delta_and_start: std::collections::BTreeMap<(u64, u64), Vec<AliasBacking>>,
+    aliases_widest_by_delta: std::collections::BTreeMap<u64, u64>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ForkTranslationOverlayIndex {
+    fn build(
+        mappings: &[ProcessMappingDesc],
+        mm_root_slot: Option<(u64, u64)>,
+        container_root: ContainerRootToken,
+    ) -> Self {
+        let mut index = Self::default();
+        for (position, overlay) in mappings.iter().enumerate() {
+            let delta = overlay.ipa.wrapping_sub(overlay.start);
+            index
+                .mappings_by_delta_and_start
+                .entry((delta, overlay.start))
+                .or_default()
+                .push(position);
+            let widest = index.mappings_widest_by_delta.entry(delta).or_insert(0);
+            *widest = (*widest).max(overlay.end.saturating_sub(overlay.start));
+        }
+        let registry = alias_registry().lock();
+        let mut scopes: Vec<AliasOwnershipScope> =
+            AliasRegistry::process_visible_scopes(mm_root_slot, container_root).to_vec();
+        let container_scope = AliasOwnershipScope::ContainerRoot(container_root);
+        if !scopes.contains(&container_scope) {
+            scopes.push(container_scope);
+        }
+        for scope in scopes {
+            let rows = registry.scope_rows(scope);
+            note_alias_state_rows_scanned(rows.len());
+            for (_, alias) in rows {
+                let delta = alias.ipa.wrapping_sub(alias.start);
+                index
+                    .aliases_by_delta_and_start
+                    .entry((delta, alias.start))
+                    .or_default()
+                    .push(*alias);
+                let widest = index.aliases_widest_by_delta.entry(delta).or_insert(0);
+                *widest = (*widest).max(alias.size as u64);
+            }
+        }
+        index
+    }
+
+    fn has_overlay_owner(
+        &self,
+        mappings: &[ProcessMappingDesc],
+        candidate_index: usize,
+        va: u64,
+        translated: u64,
+    ) -> bool {
+        let delta = translated.wrapping_sub(va);
+        if let Some(&widest) = self.mappings_widest_by_delta.get(&delta) {
+            let lower = va.saturating_sub(widest);
+            for (_, positions) in self
+                .mappings_by_delta_and_start
+                .range((delta, lower)..=(delta, va))
+            {
+                for &position in positions {
+                    let overlay = &mappings[position];
+                    if position != candidate_index
+                        && va >= overlay.start
+                        && va < overlay.end
+                        && overlay
+                            .ipa
+                            .checked_add(va - overlay.start)
+                            .is_some_and(|ipa| ipa == translated)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        let Some(&widest) = self.aliases_widest_by_delta.get(&delta) else {
+            return false;
+        };
+        let lower = va.saturating_sub(widest);
+        self.aliases_by_delta_and_start
+            .range((delta, lower)..=(delta, va))
+            .flat_map(|(_, aliases)| aliases)
+            .any(|alias| {
+                va >= alias.start
+                    && va < alias.start.saturating_add(alias.size as u64)
+                    && alias.ipa.checked_add(va.saturating_sub(alias.start)) == Some(translated)
+            })
+    }
 }
 
 /// The boot-time shared aperture is a physical stage-2 owner, not one dense
@@ -24785,7 +24965,34 @@ fn retire_process_aliases(
     let replay = replay_mappings().lock();
     let mut registry = alias_registry().lock();
     let mut versions = alias_version_registry().lock();
+    retire_process_aliases_in(
+        &mut registry,
+        &replay,
+        &mut versions,
+        mm_root_slot,
+        container_root,
+        global_keep,
+    );
+}
 
+/// The body of [`retire_process_aliases`], against explicitly supplied
+/// authorities rather than the process-global ones.
+///
+/// Taking the three structures as parameters is what makes the complexity
+/// contract testable: `retiring_one_owner_does_not_scan_foreign_alias_rows`
+/// measures visited rows, and driving the carrier-global registry made that
+/// measurement depend on whatever other tests happened to be running (observed
+/// failing roughly one run in three). A per-process operation should not need
+/// process-global state to be exercised, and now it does not.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn retire_process_aliases_in(
+    registry: &mut AliasRegistry,
+    replay: &std::collections::BTreeSet<ReplayMappingKey>,
+    versions: &mut AliasVersionRegistry,
+    mm_root_slot: Option<(u64, u64)>,
+    container_root: ContainerRootToken,
+    global_keep: impl FnMut(&AliasBacking) -> bool,
+) {
     let owned_scope = AliasRegistry::owned_scope(mm_root_slot, container_root);
     let global_before: Vec<AliasBacking> = registry
         .scope_rows(AliasOwnershipScope::Global)
@@ -24868,7 +25075,7 @@ fn retire_process_aliases(
             eprintln!("carrick: FATAL: external replay mutation epoch exhausted");
             std::process::abort();
         });
-        let base = replay_rows_for_ipa(&replay, physical_ipa);
+        let base = replay_rows_for_ipa(replay, physical_ipa);
         for id in reset_replay_chain(&mut versions.replays, physical_ipa, base) {
             versions.replay_version_owner.remove(&id);
         }
@@ -24989,26 +25196,18 @@ impl AliasPublicationReceipt {
         let mut replay = replay_mappings().lock();
         let mut registry = alias_registry().lock();
         let mut versions = alias_version_registry().lock();
-        let mut alias_increments = Vec::<((u64, AliasOwnershipScope), u64)>::new();
-        let mut replay_increments = Vec::<(u64, u64)>::new();
+        // Keyed, not linear-scanned: publishing k aliases used to cost O(k^2)
+        // here before it even reached the registry.
+        let mut alias_increments =
+            std::collections::BTreeMap::<(u64, AliasOwnershipScope), u64>::new();
+        let mut replay_increments = std::collections::BTreeMap::<u64, u64>::new();
         for alias in aliases {
-            let alias_key = (alias.ipa, alias.ownership_scope);
-            if let Some((_, count)) = alias_increments
-                .iter_mut()
-                .find(|(key, _)| *key == alias_key)
-            {
-                *count = count.checked_add(1).unwrap_or(u64::MAX);
-            } else {
-                alias_increments.push((alias_key, 1));
-            }
-            if let Some((_, count)) = replay_increments
-                .iter_mut()
-                .find(|(ipa, _)| *ipa == alias.physical_ipa)
-            {
-                *count = count.checked_add(1).unwrap_or(u64::MAX);
-            } else {
-                replay_increments.push((alias.physical_ipa, 1));
-            }
+            let count = alias_increments
+                .entry((alias.ipa, alias.ownership_scope))
+                .or_insert(0);
+            *count = count.checked_add(1).unwrap_or(u64::MAX);
+            let count = replay_increments.entry(alias.physical_ipa).or_insert(0);
+            *count = count.checked_add(1).unwrap_or(u64::MAX);
         }
         let alias_exhausted = alias_increments.iter().any(|(key, count)| {
             let current = versions.alias_epochs.get(key).copied().unwrap_or(0);
@@ -25036,16 +25235,13 @@ impl AliasPublicationReceipt {
                 .ok_or_else(|| {
                     TrapError::Hypervisor("replay version epoch exhausted".to_owned())
                 })?;
-            let alias_base = registry.iter().find(|entry| {
-                entry.ipa == alias.ipa && entry.ownership_scope == alias.ownership_scope
-            });
+            let alias_base = registry.find_by_key(alias.ipa, alias.ownership_scope);
             let replay_base = replay_rows_for_ipa(&replay, alias.physical_ipa);
-            note_alias_state_rows_scanned(registry.len());
             versions
                 .aliases
                 .entry(alias_key)
                 .or_insert_with(|| AliasVersionChain {
-                    base: alias_base.copied(),
+                    base: alias_base,
                     versions: Vec::new(),
                 })
                 .versions
@@ -25074,13 +25270,7 @@ impl AliasPublicationReceipt {
             }
             replay.insert(replay_mapping_key(*alias));
             note_alias_state_rows_scanned(registry.len());
-            if let Some(entry) = registry.iter_mut().find(|entry| {
-                entry.ipa == alias.ipa && entry.ownership_scope == alias.ownership_scope
-            }) {
-                *entry = *alias;
-            } else {
-                registry.push(*alias);
-            }
+            registry.upsert_by_key(*alias);
             receipt.versions.push(id);
         }
         Ok(receipt)
@@ -29252,7 +29442,9 @@ impl HvfVmState {
     /// silently sharing the parent's frame. The alias registry supplies mappings
     /// installed by sibling vCPUs and filters retired lifetime-owner rows.
     pub(crate) fn fork_cow_ranges(&self) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
-        let aliases = alias_registry().lock().ordered();
+        let aliases = alias_registry()
+            .lock()
+            .process_visible_ordered(self.mm_root_slot, self.container_root);
         let alias_index = process_alias_index(&aliases, self.mm_root_slot, self.container_root);
         let mut ranges: Vec<_> = self
             .mappings
@@ -30521,9 +30713,18 @@ impl HvfTaskState {
         );
 
         // Another vCPU of this mm may have won while we waited for topology.
-        let (span, armed) = {
+        // Take only what the fault path needs. This used to CLONE the whole
+        // armed-range vector on EVERY COW fault — a heap allocation and copy
+        // proportional to the mm's armed range count — to serve one boolean
+        // and two diagnostics. A fork arms every private writable range, so
+        // the clone grew with the very thing the faults are resolving.
+        let (span, armed_is_empty, armed_len) = {
             let cow_armed = self.cow_armed.lock();
-            (cow_armed.span_for(fault_va), cow_armed.ranges.clone())
+            (
+                cow_armed.span_for(fault_va),
+                cow_armed.ranges.is_empty(),
+                cow_armed.ranges.len(),
+            )
         };
         let Some(span) = span else {
             let mapping = self.mapping_for_range_in(custody, fault_va, 1);
@@ -30549,13 +30750,13 @@ impl HvfTaskState {
                     identity.linux_tid,
                     identity.mm,
                     mapping.map(|m| (m.start, m.end, m.ipa, m.guest_writable, m.sharing)),
-                    armed.len(),
+                    armed_len,
                 );
             }
             match unarmed_permission_fault_route(
                 private_writable_mapping,
                 write_denied,
-                !armed.is_empty(),
+                !armed_is_empty,
                 live_leaf_is_writable,
             ) {
                 UnarmedPermissionFaultRoute::NotCow => return Ok(false),
@@ -30578,7 +30779,9 @@ impl HvfTaskState {
                         )
                     });
                     return Err(TrapError::Hypervisor(format!(
-                        "HVPatch private writable permission fault at VA 0x{fault_va:x} has no COW arm; mapping={mapping_shape:?} write_denied={write_denied} armed={armed:?}"
+                        "HVPatch private writable permission fault at VA 0x{fault_va:x} has no COW arm; mapping={mapping_shape:?} write_denied={write_denied} armed={:?}",
+                        // Only the fatal path pays to materialize the list.
+                        self.cow_armed.lock().ranges
                     )));
                 }
             }
@@ -32574,7 +32777,9 @@ impl HvfVmState {
             let retained_fragment = retained_ipa.and_then(|ipa| {
                 retained_private_reuse_alias_fragment_in(
                     &self.carrier_foreign_mm_transport.custody,
-                    &alias_registry().lock().ordered(),
+                    &alias_registry()
+                        .lock()
+                        .process_visible_ordered(self.mm_root_slot, self.container_root),
                     chunk_va,
                     ipa,
                     chunk_len,
@@ -33611,7 +33816,9 @@ impl HvfVmState {
         // resolve to a freed backing. Registration is creation-complete
         // (every `add_alias` registers; removal happens only on munmap /
         // execve-clear), so absence here means "gone on purpose".
-        let registered_aliases = alias_registry().lock().ordered();
+        let registered_aliases = alias_registry()
+            .lock()
+            .process_visible_ordered(self.mm_root_slot, self.container_root);
         let mut mapped_extents = std::collections::HashSet::new();
         let mut replayed_global_owners = Vec::new();
         for mapping in &self.mappings {
@@ -34137,7 +34344,9 @@ impl HvfTaskState {
                 TrapError::Hypervisor("hvpatch child stage-1 root slot overflow".to_owned())
             })?;
         let mut cursor = request.root_slot_base;
-        let aliases = alias_registry().lock().ordered();
+        let aliases = alias_registry()
+            .lock()
+            .process_visible_ordered(self.mm_root_slot, self.container_root);
         let alias_index = process_alias_index(&aliases, self.mm_root_slot, self.container_root);
         let mut seen_dynamic_aliases = std::collections::HashSet::new();
         let mut source_mappings: Vec<ThreadMappingDesc> = self
@@ -34662,6 +34871,12 @@ impl HvfTaskState {
 
         let stage_started = std::time::Instant::now();
         let mut child_pte_receipts = Vec::new();
+        // Copied out so the memoizing closures below borrow neither `self`.
+        let fork_mm_root_slot = self.mm_root_slot;
+        let fork_container_root = self.container_root;
+        // Built once for the whole fork; see `ForkTranslationOverlayIndex`.
+        let overlay_index =
+            ForkTranslationOverlayIndex::build(&mappings, fork_mm_root_slot, fork_container_root);
         for (index, mapping) in mappings.iter().enumerate() {
             let Some(translated) = page_tables
                 .translate(mapping.start)
@@ -34697,15 +34912,25 @@ impl HvfTaskState {
             // stage-1 graph is authoritative, so authenticate its translation
             // against any other exact overlay owner rather than assuming the
             // winning overlay was appended after this descriptor.
-            let overlay_matches = fork_translation_has_overlay_owner(
-                &mappings,
-                index,
-                mapping.start,
-                translated,
-                self.mm_root_slot,
-                self.container_root,
-            );
-            if translated != mapping.ipa && !overlay_matches {
+            // Answer the overlay question at most ONCE per mapping, and only
+            // when a cheaper condition has already failed.
+            // `fork_translation_has_overlay_owner` walks every source mapping
+            // AND the whole alias registry, so evaluating it eagerly for every
+            // mapping made fork O(M * (M + R)) — 14.4% of carrier CPU under a
+            // fork/exit storm. Both consumers below reach it only in the
+            // uncommon case, so most mappings never pay for it at all.
+            let mut overlay_matches: Option<bool> = None;
+            if translated != mapping.ipa
+                && !*overlay_matches.get_or_insert_with(|| {
+                    fork_translation_has_overlay_owner(
+                        &overlay_index,
+                        &mappings,
+                        index,
+                        mapping.start,
+                        translated,
+                    )
+                })
+            {
                 return Err(TrapError::Hypervisor(format!(
                     "hvpatch child stage-1 VA 0x{:x} resolves to IPA 0x{translated:x}, expected 0x{:x}",
                     mapping.start, mapping.ipa
@@ -34714,7 +34939,15 @@ impl HvfTaskState {
             if mapping.inherited_frame.is_some()
                 && mapping.sharing == GuestMappingSharing::Private
                 && !is_kernel_only_stage1_range(mapping.start, mapping.size)
-                && !overlay_matches
+                && !*overlay_matches.get_or_insert_with(|| {
+                    fork_translation_has_overlay_owner(
+                        &overlay_index,
+                        &mappings,
+                        index,
+                        mapping.start,
+                        translated,
+                    )
+                })
             {
                 const VALID: u64 = 1;
                 const NON_GLOBAL: u64 = 1 << 11;
@@ -43116,13 +43349,14 @@ mod frame_inventory_backend_tests {
             mapping(stale_ipa, 0x3000_0000),
         ];
 
+        let overlay_index =
+            ForkTranslationOverlayIndex::build(&mappings, None, ContainerRootToken::ROOT);
         assert!(fork_translation_has_overlay_owner(
+            &overlay_index,
             &mappings,
             1,
             0x4000_0000,
             winning_ipa,
-            None,
-            ContainerRootToken::ROOT,
         ));
     }
 }
