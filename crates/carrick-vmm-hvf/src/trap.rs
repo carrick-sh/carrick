@@ -16173,6 +16173,238 @@ mod carrier_vm_custody_tests {
     }
 
     #[test]
+    fn explicit_offset_structural_retirement_unmaps_with_physical_sized_projection() {
+        let _stage2_stub = super::ScopedStage2MapTestStub::enable();
+        let (custody, _) = live_custody();
+        let ipa = 0x7d00_1800_0000;
+        let len = 0x4000_u64;
+        let mapping = super::GuestMapping {
+            guest_start: ipa,
+            ipa_start: ipa,
+            mapped_size: len,
+            offset_in_mapping: 0,
+            payload_size: len,
+            perms: carrick_mem::elf::SegmentPerms {
+                read: true,
+                write: true,
+                execute: false,
+            },
+            shared: false,
+            image: std::sync::Arc::new(vec![0; len as usize]),
+            private_file_backing: None,
+        };
+        let region = super::map_region_raw_in(&custody, &mapping, false, true)
+            .expect("map structural root-slot fixture");
+        let owner = region
+            .structural_owner
+            .as_ref()
+            .cloned()
+            .expect("structural root-slot owner");
+        let identity = *owner.retained.record_identity.lock();
+        let mm_access = super::MmAccessState::new(
+            std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            std::sync::Arc::new(super::MemoryProtections::default()),
+            std::sync::Arc::new(parking_lot::Mutex::new(
+                super::HvpatchFrameInventory::default(),
+            )),
+            std::sync::Arc::new(parking_lot::Mutex::new(super::CowArmedRanges::default())),
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+        );
+        mm_access.install_structural_owner(std::sync::Arc::clone(&owner));
+        drop(owner);
+        let mut mappings = vec![region];
+        let projection_offset = 0x1000_u64;
+        mappings[0].start += projection_offset;
+        mappings[0].ipa += projection_offset;
+        mappings[0].host_addr = mappings[0]
+            .host_addr
+            .wrapping_add(projection_offset as usize);
+        // `unowned_runtime_region` intentionally retains the physical owner
+        // size even when this row is only an offset semantic projection.
+        assert_eq!(mappings[0].size, mappings[0].physical_size);
+        assert_eq!(mappings[0].end - mappings[0].start, len - projection_offset,);
+
+        let exact_generation = mappings[0].owner_generation;
+        mappings[0].owner_generation = exact_generation.saturating_add(1);
+        let drift_error = super::HvfVmState::retire_stage2_extent_from_mappings_in(
+            &custody,
+            &mut mappings,
+            ipa,
+            len,
+        )
+        .expect_err("a drifted region generation must not authenticate structural retirement");
+        assert!(
+            drift_error
+                .to_string()
+                .contains("is not the exact current custody owner"),
+            "unexpected structural generation-drift rejection: {drift_error}",
+        );
+        assert!(
+            !mappings[0]
+                .structural_owner
+                .as_ref()
+                .expect("drift rejection preserves structural owner")
+                .retained
+                .owner_retired
+                .load(std::sync::atomic::Ordering::Acquire),
+            "authentication failure must precede the retirement request",
+        );
+        assert!(
+            super::ScopedStage2MapTestStub::is_mapped(ipa, len as usize),
+            "generation-drift rejection must preserve the structural map",
+        );
+        mappings[0].owner_generation = exact_generation;
+
+        let subextent_error = super::HvfVmState::retire_stage2_extent_from_mappings_in(
+            &custody,
+            &mut mappings,
+            ipa + 0x1000,
+            0x1000,
+        )
+        .expect_err("a structural subextent must not retire or bypass its whole owner");
+        assert!(
+            subextent_error
+                .to_string()
+                .contains("is not the exact current custody owner"),
+            "unexpected structural subextent rejection: {subextent_error}",
+        );
+        assert!(
+            super::ScopedStage2MapTestStub::is_mapped(ipa, len as usize),
+            "failed-closed subextent retirement must preserve the whole structural map",
+        );
+
+        super::HvfVmState::retire_stage2_extent_from_mappings_in(&custody, &mut mappings, ipa, len)
+            .expect("explicitly retire structural root slot");
+
+        assert!(
+            custody.stage2_record_snapshot(identity.record_id).is_none(),
+            "explicit MM retirement must remove stage-2 custody even while stale MM-access metadata retains an Arc",
+        );
+        assert!(
+            !super::ScopedStage2MapTestStub::is_mapped(ipa, len as usize),
+            "the returned root slot must be available for the next child hv_vm_map",
+        );
+        let replacement = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            len as usize,
+            crate::host_mapping::HostMappingKind::PrivateAnon,
+        )
+        .expect("allocate replacement root-slot backing");
+        assert_eq!(
+            unsafe {
+                super::inventory_hv_vm_map(
+                    replacement.as_ptr().cast(),
+                    ipa,
+                    len as usize,
+                    u64::from(applevisor::memory::MemPerms::ReadWrite),
+                )
+            },
+            0,
+            "a second child must map the returned root slot while stale MM-access metadata still exists",
+        );
+        assert_eq!(
+            unsafe { super::inventory_hv_vm_unmap(ipa, len as usize) },
+            0
+        );
+        drop(replacement);
+        drop(mm_access);
+    }
+
+    #[test]
+    fn pinned_structural_retirement_refuses_root_slot_reuse_until_terminal() {
+        let _stage2_stub = super::ScopedStage2MapTestStub::enable();
+        let (custody, _) = live_custody();
+        let ipa = 0x7d00_1c00_0000;
+        let len = 0x4000_u64;
+        let mapping = super::GuestMapping {
+            guest_start: ipa,
+            ipa_start: ipa,
+            mapped_size: len,
+            offset_in_mapping: 0,
+            payload_size: len,
+            perms: carrick_mem::elf::SegmentPerms {
+                read: true,
+                write: true,
+                execute: false,
+            },
+            shared: false,
+            image: std::sync::Arc::new(vec![0; len as usize]),
+            private_file_backing: None,
+        };
+        let region = super::map_region_raw_in(&custody, &mapping, false, true)
+            .expect("map pinned structural root-slot fixture");
+        let owner = region
+            .structural_owner
+            .as_ref()
+            .cloned()
+            .expect("pinned structural root-slot owner");
+        let identity = *owner.retained.record_identity.lock();
+        let mm_access = super::MmAccessState::new(
+            std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            std::sync::Arc::new(super::MemoryProtections::default()),
+            std::sync::Arc::new(parking_lot::Mutex::new(
+                super::HvpatchFrameInventory::default(),
+            )),
+            std::sync::Arc::new(parking_lot::Mutex::new(super::CowArmedRanges::default())),
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+        );
+        mm_access.install_structural_owner(std::sync::Arc::clone(&owner));
+        drop(owner);
+        let pin = custody
+            .pin_stage2_record(identity)
+            .expect("pin structural root slot");
+        let mut mappings = vec![region];
+
+        let retirement_error = super::HvfVmState::retire_stage2_extent_from_mappings_in(
+            &custody,
+            &mut mappings,
+            ipa,
+            len,
+        )
+        .expect_err("active pin must prevent successful structural retirement");
+        assert!(
+            retirement_error
+                .to_string()
+                .contains("did not reach terminal retirement"),
+            "unexpected active-pin retirement error: {retirement_error}",
+        );
+        assert!(
+            custody
+                .stage2_record_snapshot(identity.record_id)
+                .is_some_and(|snapshot| snapshot.mapped),
+            "deferred retirement must keep the old stage-2 record mapped",
+        );
+        let replacement = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            len as usize,
+            crate::host_mapping::HostMappingKind::PrivateAnon,
+        )
+        .expect("allocate refused replacement root-slot backing");
+        assert_ne!(
+            unsafe {
+                super::inventory_hv_vm_map(
+                    replacement.as_ptr().cast(),
+                    ipa,
+                    len as usize,
+                    u64::from(applevisor::memory::MemPerms::ReadWrite),
+                )
+            },
+            0,
+            "same-IPA reuse must remain refused until structural retirement is terminal",
+        );
+        drop(replacement);
+
+        drop(pin);
+        drop(mappings);
+        drop(mm_access);
+        super::retry_structural_backing_identities_in_using(
+            &custody,
+            &[identity],
+            &mut super::unmap_global_frame_stage2_record,
+            &mut super::release_retired_stage2_ipa,
+        )
+        .expect("clean up deferred pinned structural fixture");
+    }
+
+    #[test]
     fn live_structural_owner_rebinds_exactly_to_g2_before_late_drop() {
         let (custody, g1) = live_custody();
         let key = (0x7d00_2000_0000, 0x4000);
@@ -20806,18 +21038,22 @@ fn process_mapping_needs_child_alias_authority(mapping: &ProcessMappingDesc) -> 
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn structural_fork_owner_identity_in(
+fn authenticated_structural_owner_record_in(
     custody: &CarrierVmCustody,
-    mapping: &ThreadMappingDesc,
-) -> Option<InventoryStage2OwnerIdentity> {
-    let owner = mapping.structural_owner.as_ref()?;
+    owner: &std::sync::Arc<StructuralBackingOwner>,
+    physical_host_addr: *mut u8,
+    physical_ipa: u64,
+    physical_size: usize,
+    perms: applevisor::memory::MemPerms,
+    owner_generation: u64,
+) -> Option<CarrierStage2RecordIdentity> {
     let owner_custody = owner.custody.upgrade()?;
     if !std::ptr::eq(owner_custody.as_ref(), custody)
-        || owner.ptr() != mapping.physical_host_addr
-        || owner.len() != mapping.physical_size
-        || owner.physical_ipa != mapping.physical_ipa
-        || owner.physical_size != mapping.physical_size
-        || owner.epoch().raw() != mapping.owner_generation
+        || owner.ptr() != physical_host_addr
+        || owner.len() != physical_size
+        || owner.physical_ipa != physical_ipa
+        || owner.physical_size != physical_size
+        || owner.epoch().raw() != owner_generation
         || owner
             .retained
             .owner_retired
@@ -20836,25 +21072,54 @@ fn structural_fork_owner_identity_in(
     }
     let snapshot = custody.stage2_record_snapshot(identity.record_id)?;
     let logical_owner = CarrierLogicalOwner {
-        id: mapping.owner_generation,
-        generation: mapping.owner_generation,
+        id: owner_generation,
+        generation: owner_generation,
     };
     (identity.vm_generation == snapshot.vm_generation
         && identity.logical_owner == Some(logical_owner)
         && custody.setup_generation() == Some(snapshot.vm_generation)
-        && snapshot.ipa == mapping.physical_ipa
-        && snapshot.len == mapping.physical_size
-        && snapshot.host_addr == mapping.physical_host_addr as usize
-        && snapshot.perms == u64::from(mapping.perms)
+        && snapshot.ipa == physical_ipa
+        && snapshot.len == physical_size
+        && snapshot.host_addr == physical_host_addr as usize
+        && snapshot.perms == u64::from(perms)
         && snapshot.logical_owner == Some(logical_owner)
         && snapshot.mapped
         && snapshot.backend_map_installed
         && !snapshot.retirement_requested
         && !snapshot.terminalized_by_vm_destroy)
-        .then_some(InventoryStage2OwnerIdentity {
-            host_addr: mapping.physical_host_addr as usize,
-            generation: mapping.owner_generation,
-        })
+        .then_some(identity)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn mapped_region_physical_host_addr(mapping: &HvfMappedRegion) -> Option<*mut u8> {
+    let offset = usize::try_from(mapping.ipa.checked_sub(mapping.physical_ipa)?).ok()?;
+    let semantic_size = usize::try_from(mapping.end.checked_sub(mapping.start)?).ok()?;
+    offset
+        .checked_add(semantic_size)
+        .filter(|end| *end <= mapping.physical_size)?;
+    (mapping.host_addr as usize)
+        .checked_sub(offset)
+        .map(|base| base as *mut u8)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn structural_fork_owner_identity_in(
+    custody: &CarrierVmCustody,
+    mapping: &ThreadMappingDesc,
+) -> Option<InventoryStage2OwnerIdentity> {
+    authenticated_structural_owner_record_in(
+        custody,
+        mapping.structural_owner.as_ref()?,
+        mapping.physical_host_addr,
+        mapping.physical_ipa,
+        mapping.physical_size,
+        mapping.perms,
+        mapping.owner_generation,
+    )?;
+    Some(InventoryStage2OwnerIdentity {
+        host_addr: mapping.physical_host_addr as usize,
+        generation: mapping.owner_generation,
+    })
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -24579,16 +24844,67 @@ impl HvfVmState {
         {
             return Ok(());
         }
-        if let Some(owner) = mappings.iter_mut().find_map(|mapping| {
-            (mapping.structural_owner.as_ref().is_some_and(|owner| {
-                owner.physical_ipa <= ipa
-                    && ipa
-                        .checked_add(length)
-                        .is_some_and(|end| end <= owner.physical_ipa + owner.physical_size as u64)
-            }))
-            .then(|| mapping.structural_owner.take())
-            .flatten()
-        }) {
+        let structural_claim = mappings.iter().position(|mapping| {
+            mapping.structural_owner.as_ref().is_some_and(|owner| {
+                (mapping.physical_ipa, mapping.physical_size as u64) == (ipa, length)
+                    || (owner.physical_ipa <= ipa
+                        && ipa.checked_add(length).is_some_and(|candidate_end| {
+                            owner
+                                .physical_ipa
+                                .checked_add(owner.physical_size as u64)
+                                .is_some_and(|owner_end| candidate_end <= owner_end)
+                        }))
+            })
+        });
+        if let Some(index) = structural_claim {
+            let owner = mappings[index]
+                .structural_owner
+                .take()
+                .unwrap_or_else(|| unreachable!("structural claim lost its owner"));
+            let mapping = &mappings[index];
+            let identity = authenticated_structural_owner_record_in(
+                custody,
+                &owner,
+                mapped_region_physical_host_addr(mapping).unwrap_or(std::ptr::null_mut()),
+                mapping.physical_ipa,
+                mapping.physical_size,
+                mapping.perms,
+                mapping.owner_generation,
+            );
+            let Some(identity) = identity
+                .filter(|_| mapping.physical_ipa == ipa && mapping.physical_size as u64 == length)
+            else {
+                mappings[index].structural_owner = Some(owner);
+                return Err(TrapError::Hypervisor(format!(
+                    "structural retirement owner for IPA 0x{ipa:x} size {length} is not the exact current custody owner"
+                )));
+            };
+            // Process retirement is the authoritative lifetime boundary for
+            // this structural stage-2 extent.  MM-access projections retain
+            // owner Arcs so foreign reads can authenticate live semantic
+            // mappings, but those metadata references must not postpone the
+            // root-slot unmap after the Kernel has retired the MM and returned
+            // its fixed slot for reuse.
+            owner
+                .retained
+                .owner_retired
+                .store(true, std::sync::atomic::Ordering::Release);
+            let retirement = retry_structural_backing_identities_in_using(
+                custody,
+                &[identity],
+                &mut unmap_global_frame_stage2_record,
+                &mut release_retired_stage2_ipa,
+            );
+            if let Err(error) = retirement {
+                mappings[index].structural_owner = Some(owner);
+                return Err(error);
+            }
+            if custody.stage2_record_snapshot(identity.record_id).is_some() {
+                mappings[index].structural_owner = Some(owner);
+                return Err(TrapError::Hypervisor(format!(
+                    "structural retirement owner for IPA 0x{ipa:x} size {length} did not reach terminal retirement"
+                )));
+            }
             drop(owner);
             return Ok(());
         }
@@ -34832,8 +35148,9 @@ unsafe fn inventory_hv_vm_map(
             if state.fail_next_map {
                 state.fail_next_map = false;
                 true
+            } else if !state.mapped_extents.insert((ipa, size)) {
+                true
             } else {
-                state.mapped_extents.insert((ipa, size));
                 state.events.push(Stage2BackendEvent::Map {
                     ipa,
                     size,
