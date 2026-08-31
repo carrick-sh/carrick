@@ -3922,7 +3922,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 8479,
+      "line": 8484,
       "categories": [
         "table_guard"
       ],
@@ -3933,7 +3933,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 8491,
+      "line": 8496,
       "categories": [
         "table_guard"
       ],
