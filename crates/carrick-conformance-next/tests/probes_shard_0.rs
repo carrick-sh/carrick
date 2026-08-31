@@ -251,19 +251,10 @@ fn test_shard_0_expected_gaps_derivation() {
     let musl_shard_gaps = expected_shard_gaps(common::MUSL_BASELINE_GAPS);
     let gnu_shard_gaps = expected_shard_gaps(common::GNU_BASELINE_GAPS);
 
-    let expected_musl_set = BTreeSet::from([
-        "budget_two_proc",
-        "eventwaitmatrix",
-        "execfromthread",
-        "memfdsealmatrix",
-    ]);
+    let expected_musl_set =
+        BTreeSet::from(["budget_two_proc", "execfromthread", "memfdsealmatrix"]);
 
-    let expected_gnu_set = BTreeSet::from([
-        "budget_two_proc",
-        "eventwaitmatrix",
-        "execfromthread",
-        "memfdsealmatrix",
-    ]);
+    let expected_gnu_set = BTreeSet::from(["budget_two_proc", "execfromthread", "memfdsealmatrix"]);
 
     assert_eq!(
         musl_shard_gaps, expected_musl_set,
@@ -364,13 +355,13 @@ fn test_probe_binary_locator_and_gap_counts() {
     let gnu_shard_gaps = expected_shard_gaps(common::GNU_BASELINE_GAPS);
     assert_eq!(
         musl_shard_gaps.len(),
-        4,
-        "musl shard 0 must contain exactly 4 baseline gaps"
+        3,
+        "musl shard 0 must contain exactly 3 baseline gaps"
     );
     assert_eq!(
         gnu_shard_gaps.len(),
-        4,
-        "gnu shard 0 must contain exactly 4 baseline gaps"
+        3,
+        "gnu shard 0 must contain exactly 3 baseline gaps"
     );
 }
 
@@ -449,6 +440,14 @@ fn generic_probe_shard_0() {
             let normalized_carrick = normalize(&combined);
 
             if let Some(diff) = diff_lines(&normalized_carrick, &cached_oracle) {
+                // Announce the mismatch as shards 1 and 2 do. Shard 0 used to
+                // surface a diff only inside the assertion message, so an
+                // EXPECTED gap left no trace in the log at all and the gate
+                // read as if every shard-0 probe matched.
+                eprintln!("DIFF generic probe shard 0 {target}:{probe_name}");
+                eprintln!(
+                    "--- observed ---\n{normalized_carrick}\n--- oracle ---\n{cached_oracle}"
+                );
                 observed_mismatches.insert(*probe_name);
                 diff_details.push(format!("{probe_name}:\n{diff}"));
             }

@@ -8440,7 +8440,39 @@ fn dispatch_threaded_futex(
     };
     let flags = operation & !LINUX_FUTEX_CMD_MASK;
     let futex_flags = LinuxFutexFlags::from_bits_retain(flags);
+    // Unknown OPERATION outranks bad flags; see the `futex` handler.
+    if !linux_futex_command_is_known(raw_command) {
+        return DispatchOutcome::Errno {
+            errno: LINUX_ENOSYS,
+        };
+    }
     if flags & !LinuxFutexFlags::SUPPORTED_MASK != 0 {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EINVAL,
+        };
+    }
+    // Identical well-formedness gate to the `futex` handler in `proc.rs`; a
+    // guest thread reaches THIS path, so validating only there left every
+    // check unreachable in practice (`eventwaitmatrix`).
+    if !address.is_multiple_of(4) {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EINVAL,
+        };
+    }
+    if matches!(
+        raw_command,
+        LINUX_FUTEX_WAIT_BITSET | LINUX_FUTEX_WAKE_BITSET
+    ) && request.arg(5) as u32 == 0
+    {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EINVAL,
+        };
+    }
+    if timeout_address != 0
+        && matches!(raw_command, LINUX_FUTEX_WAIT | LINUX_FUTEX_WAIT_BITSET)
+        && let Ok(timespec) = read_timespec(memory, timeout_address)
+        && !linux_timeout_timespec_is_valid(timespec)
+    {
         return DispatchOutcome::Errno {
             errno: LINUX_EINVAL,
         };
@@ -9175,6 +9207,24 @@ fn linux_clock_is_known(clock_id: u64) -> bool {
             | LINUX_CLOCK_REALTIME_ALARM
             | LINUX_CLOCK_BOOTTIME_ALARM
             | LINUX_CLOCK_TAI
+    )
+}
+
+/// Clocks a `timerfd` can be armed on.
+///
+/// Strictly smaller than [`linux_clock_is_known`]: the CPU-time clocks and the
+/// coarse/raw variants are readable through `clock_gettime` but cannot back a
+/// timer. carrick admitted anything it could read, so
+/// `timerfd_create(CLOCK_PROCESS_CPUTIME_ID)` returned a working fd where
+/// Linux answers EINVAL (`eventwaitmatrix` `timerfd_create_cputime_einval`).
+fn linux_timerfd_clock_is_supported(clock_id: u64) -> bool {
+    matches!(
+        clock_id,
+        LINUX_CLOCK_REALTIME
+            | LINUX_CLOCK_MONOTONIC
+            | LINUX_CLOCK_BOOTTIME
+            | LINUX_CLOCK_REALTIME_ALARM
+            | LINUX_CLOCK_BOOTTIME_ALARM
     )
 }
 
@@ -10703,6 +10753,39 @@ pub fn rootfs_errno(error: RootFsError) -> LinuxErrno {
         RootFsError::DirectoryTooLarge(_) => LINUX_E2BIG,
         RootFsError::Io(_) => LINUX_EINVAL,
     }
+}
+
+/// Futex operations carrick implements. An operation outside this set is
+/// ENOSYS -- "this op does not exist" -- which Linux distinguishes from the
+/// EINVAL it gives a malformed call (`eventwaitmatrix`
+/// `futex_invalid_op_enosys`).
+pub(crate) fn linux_futex_command_is_known(command: u64) -> bool {
+    matches!(
+        command,
+        LINUX_FUTEX_WAIT
+            | LINUX_FUTEX_WAKE
+            | LINUX_FUTEX_REQUEUE
+            | LINUX_FUTEX_CMP_REQUEUE
+            | LINUX_FUTEX_LOCK_PI
+            | LINUX_FUTEX_UNLOCK_PI
+            | LINUX_FUTEX_TRYLOCK_PI
+            | LINUX_FUTEX_WAIT_BITSET
+            | LINUX_FUTEX_WAKE_BITSET
+    )
+}
+
+/// A `struct timespec` used as a syscall TIMEOUT: non-negative seconds and
+/// `tv_nsec` in `[0, 1e9)`. Linux answers EINVAL otherwise, before it waits.
+///
+/// `ppoll` accepted both a negative `tv_nsec` and one at or past a full second
+/// and silently folded them into a millisecond count, so a request Linux
+/// rejects outright became a long sleep (`eventwaitmatrix`
+/// `ppoll_negative_nsec_einval` / `ppoll_overflow_nsec_einval`).
+pub(crate) fn linux_timeout_timespec_is_valid(timespec: LinuxTimespec) -> bool {
+    // Copied out: `LinuxTimespec` is packed, so a reference to a field would
+    // be unaligned.
+    let (tv_sec, tv_nsec) = (timespec.tv_sec, timespec.tv_nsec);
+    tv_sec >= 0 && (0..1_000_000_000).contains(&tv_nsec)
 }
 
 fn linux_utimensat_timespec_is_valid(timespec: LinuxTimespec) -> bool {
