@@ -22459,22 +22459,50 @@ fn projected_fork_mapping_disposition(
     mapping: &ThreadMappingDesc,
     shares_mm: bool,
     ranges: &[carrick_hal::ForkProjectionRange],
-) -> Result<Option<(ForkMappingDisposition, Vec<(u64, u64)>)>, ProjectedForkSpan> {
+) -> ForkMappingPlan {
     let base = fork_mapping_disposition(mapping, shares_mm);
     if !matches!(
         base,
         ForkMappingDisposition::SharedFrameWritable | ForkMappingDisposition::SharedFrameReadOnly
     ) {
-        return Ok(Some((base, Vec::new())));
+        return ForkMappingPlan::preserved(base);
     }
     match projected_fork_span(ranges, mapping.start, mapping.end) {
-        ProjectedForkSpan::Preserve => Ok(Some((base, Vec::new()))),
-        ProjectedForkSpan::Omit => Ok(None),
-        ProjectedForkSpan::Zero { wiped } => Ok(Some((
-            ForkMappingDisposition::IndependentGuestZeroed,
+        ProjectedForkSpan::Preserve => ForkMappingPlan::preserved(base),
+        ProjectedForkSpan::Omit => ForkMappingPlan::Omit,
+        ProjectedForkSpan::Zero { wiped } => ForkMappingPlan::Map {
+            disposition: ForkMappingDisposition::IndependentGuestZeroed,
             wiped,
-        ))),
-        ProjectedForkSpan::PartialOmit => Err(ProjectedForkSpan::PartialOmit),
+        },
+        ProjectedForkSpan::PartialOmit => ForkMappingPlan::PartialOmit,
+    }
+}
+
+/// What one VMM mapping becomes in the child once the fork projection has been
+/// applied on top of the mapping's own disposition.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ForkMappingPlan {
+    /// The child gets the mapping. `wiped` names the sub-ranges, relative to
+    /// the mapping's semantic start, whose bytes must read as zero there.
+    Map {
+        disposition: ForkMappingDisposition,
+        wiped: Vec<(u64, u64)>,
+    },
+    /// `MADV_DONTFORK` over the whole span: the child gets nothing here.
+    Omit,
+    /// `MADV_DONTFORK` over only part of the span, which one descriptor cannot
+    /// express. See `ProjectedForkSpan::PartialOmit`.
+    PartialOmit,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ForkMappingPlan {
+    fn preserved(disposition: ForkMappingDisposition) -> Self {
+        Self::Map {
+            disposition,
+            wiped: Vec::new(),
+        }
     }
 }
 
@@ -35155,9 +35183,9 @@ impl HvfTaskState {
                 // `MADV_DONTFORK`: the child gets no mapping, no stage-1 leaf
                 // and no inventory row here, which is what makes its `mincore`
                 // answer ENOMEM the way Linux's does.
-                Ok(None) => continue,
-                Ok(Some(resolved)) => resolved,
-                Err(_) => {
+                ForkMappingPlan::Omit => continue,
+                ForkMappingPlan::Map { disposition, wiped } => (disposition, wiped),
+                ForkMappingPlan::PartialOmit => {
                     return Err(TrapError::Hypervisor(format!(
                         "hvpatch fork: MADV_DONTFORK covers only part of the physical mapping \
                          at VA 0x{:x}..0x{:x}; a hole inside one mapping is not representable, \
@@ -43625,10 +43653,7 @@ mod frame_inventory_backend_tests {
         };
         assert_eq!(
             projected_fork_mapping_disposition(&guest, false, &[]),
-            Ok(Some((
-                ForkMappingDisposition::SharedFrameReadOnly,
-                Vec::new()
-            ))),
+            ForkMappingPlan::preserved(ForkMappingDisposition::SharedFrameReadOnly),
             "an empty projection must leave the mapping's own disposition alone",
         );
         assert_eq!(
@@ -43637,7 +43662,7 @@ mod frame_inventory_backend_tests {
                 false,
                 &span(carrick_hal::ForkLeafDisposition::Omit)
             ),
-            Ok(None),
+            ForkMappingPlan::Omit,
             "MADV_DONTFORK must drop the mapping from the child entirely",
         );
         assert_eq!(
@@ -43646,10 +43671,10 @@ mod frame_inventory_backend_tests {
                 false,
                 &span(carrick_hal::ForkLeafDisposition::Zero)
             ),
-            Ok(Some((
-                ForkMappingDisposition::IndependentGuestZeroed,
-                vec![(0, guest.end - guest.start)]
-            ))),
+            ForkMappingPlan::Map {
+                disposition: ForkMappingDisposition::IndependentGuestZeroed,
+                wiped: vec![(0, guest.end - guest.start)],
+            },
             "MADV_WIPEONFORK must give the child its own frame, not a shared one",
         );
 
@@ -43668,10 +43693,7 @@ mod frame_inventory_backend_tests {
                     disposition: carrick_hal::ForkLeafDisposition::Omit,
                 }]
             ),
-            Ok(Some((
-                ForkMappingDisposition::IndependentPageTables,
-                Vec::new()
-            ))),
+            ForkMappingPlan::preserved(ForkMappingDisposition::IndependentPageTables),
         );
 
         // A partial MADV_DONTFORK cannot be a hole inside one descriptor, and
@@ -43686,7 +43708,7 @@ mod frame_inventory_backend_tests {
                     disposition: carrick_hal::ForkLeafDisposition::Omit,
                 }]
             ),
-            Err(ProjectedForkSpan::PartialOmit),
+            ForkMappingPlan::PartialOmit,
         );
 
         // A partial WIPEONFORK IS representable: the child's own frame is
@@ -43702,10 +43724,10 @@ mod frame_inventory_backend_tests {
                     disposition: carrick_hal::ForkLeafDisposition::Zero,
                 }]
             ),
-            Ok(Some((
-                ForkMappingDisposition::IndependentGuestZeroed,
-                vec![(half, half)]
-            ))),
+            ForkMappingPlan::Map {
+                disposition: ForkMappingDisposition::IndependentGuestZeroed,
+                wiped: vec![(half, half)],
+            },
         );
 
         // A projection range that does not reach this mapping changes nothing.
