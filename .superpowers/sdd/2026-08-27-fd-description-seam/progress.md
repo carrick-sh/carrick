@@ -539,3 +539,77 @@ range per COW fault and whose `disarm` rebuilds the whole `Vec` per fault, and
 topology lock on EVERY page fault.
 
 Not yet run on this branch: the full unfiltered probe gate and `just ci`.
+
+## 2026-08-31 — full probe gate GREEN, and the fixes it took
+
+`just conformance-probes` (full, unfiltered, `CARRICK_RUN_ID=cn-fullgate-10`)
+exits **0**: 818 probe runs, zero `test result: FAILED`, zero aborts, the 46
+`carrick-cli` conformance tests pass, and scoped cleanup reports zero residual
+processes. The only DIFFs are the three declared baseline gaps
+(`lifecycleflagmatrix`, `memflagmatrix`, `vfs_mount_rw`).
+
+Ten gate runs were needed. The gate had never reached exit zero, and each phase
+that failed was masking the next.
+
+### Product bugs the gate surfaced (all pre-existing on `main`)
+
+1. **`mremap` with a misaligned `old_address` aborted the carrier.**
+   `man 2 mremap` documents EINVAL for it; the handler validated a long list of
+   other EINVAL conditions, including the MREMAP_FIXED `new_address`
+   alignment, but never the source. The request therefore ran the whole move,
+   published the destination, could not reclaim the misaligned source, and hit
+   the deliberate fail-stop `abort()`. That killed the entire shard-2
+   executable at `memflagmatrix`, so ~146 other shard-2 probes were never
+   compared at all.
+2. **`hv_vm_create: HV_BUSY` in the concurrent container gate.**
+   `carrier_root_boot_gate` exists to stop two roots both creating the one
+   per-process VM, and is held across `hv_vm_create` — but `CARRIER_VM_LIVE`,
+   the predicate that gate guards, was published far later by
+   `PendingCarrierVmCreation::commit`. The second root took the gate, still
+   read `false`, and created. The flag's own doc already said it is "set on the
+   single create funnel's success"; the code had drifted. Publishing it in
+   `create_vm_with_admission` fixes it.
+3. **`probe-inventory.json` was missing `ptracepoketext`**, which
+   `ptrace_poketext_signed` already owns, and `PROBE_SOURCE_COUNT` was 490
+   against 491 sources on disk.
+
+### Diagnostics defects fixed where they happened
+
+- The `mremap` fail-stop printed NOTHING before aborting. Locating it needed a
+  7.5 GiB core dump. It now names the destination, the source, and both errors.
+- `create_with_no_resources_backpressure` takes a `what` label for its trace
+  output and threw it away on the error path, and `create_vcpu` wrapped bare.
+  HV_BUSY surfaced as "owning resource is busy (error 0xfae94002)" with nothing
+  saying which call. Naming them is what identified defect 2 above.
+
+### Baselines
+
+23 probes the gate proves passing were removed from the gap lists, most of them
+signals and process lifecycle — the axes the O(N^2) work in this branch was
+starving: `childsubreaper`, `clonefsumask`, `coredumpfile`,
+`futexforkwakegroups`, `killchld`, `mmapfileshare_mt`, `mprotectexec`,
+`pidfdprocdir`, `pidnsroot`, `proclife`, `procpeerdir`, `ptraceattach`,
+`rlimitnproc`, `setidthreadchurn`, `siginfo`, `sigpairrace`,
+`sigtimedwaitintr`, `sigwaitblock`, `telemetrymap` and the rest. Every removal
+was made only after the gate reported it as an unexpected pass, and no gate run
+ever reported an unexpected FAILURE. `memflagmatrix` was ADDED as a declared
+gap: it used to crash before it could be compared, and now that it can be, it
+genuinely diverges on `madvise` WIPEONFORK/DONTFORK lifecycle, `mincore`
+lifecycle, `mmap` invalid-prot and `mremap` DONTUNMAP.
+
+### Known residual, NOT introduced here
+
+Carrick's own host process intermittently fails to `mmap` a sigaltstack when
+spawning a thread — `failed to allocate an alternative stack: Cannot allocate
+memory (os error 12)` — which truncates whatever guest is running. It hit
+`telemetrymap` twice but can hit any probe. Measured at roughly one run in
+five, reproducible in ISOLATION (not positional or cumulative), and it
+reproduces on unmodified `main`. Ruled out: host thread leak (flat at 8-25),
+VM region growth (fluctuates 327-7259, no trend), carrier VSZ growth (flat at
+~467 GB from the first probes), and guest `setrlimit` leaking into the host
+(carrick never sets host `RLIMIT_AS`). Not yet explained; it is the next thing
+to chase for a gate that is green every time rather than most times.
+
+A separate one-off: an `inventory owner absent` fatal during process
+retirement in `forkstackstorm`, seen once in ten gate runs and not reproducible
+in 3 filtered plus 2 full-shard runs.
