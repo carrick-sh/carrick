@@ -11741,15 +11741,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 104781,
-        "byte_start": 104756,
+        "byte_end": 105376,
+        "byte_start": 105351,
         "column": 30,
         "column_end": 55,
         "column_start": 30,
         "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
-        "line": 2942,
-        "line_end": 2942,
-        "line_start": 2942
+        "line": 2956,
+        "line_end": 2956,
+        "line_start": 2956
       }
     },
     {
@@ -12232,15 +12232,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 157997,
-        "byte_start": 157979,
+        "byte_end": 159675,
+        "byte_start": 159657,
         "column": 9,
         "column_end": 27,
         "column_start": 9,
         "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
-        "line": 4279,
-        "line_end": 4279,
-        "line_start": 4279
+        "line": 4312,
+        "line_end": 4312,
+        "line_start": 4312
       }
     },
     {
@@ -12744,15 +12744,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 152979,
-        "byte_start": 152957,
+        "byte_end": 154657,
+        "byte_start": 154635,
         "column": 9,
         "column_end": 31,
         "column_start": 9,
         "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
-        "line": 4139,
-        "line_end": 4139,
-        "line_start": 4139
+        "line": 4172,
+        "line_end": 4172,
+        "line_start": 4172
       }
     },
     {
@@ -12816,9 +12816,9 @@
       }
     }
   ],
-  "rows_sha256": "4c08af60e52e4547bf64dc2d7c44bb311489b1d657b4782bb6ede2196612c28b",
+  "rows_sha256": "8d01e2c58f1df3e1eea1a6f55037e92d1259e54678e042f8897552964ac8c230",
   "schema": 1,
-  "source_head": "f245576fb36076bd87f56f8090f6efe3e0e6950c",
+  "source_head": "a23c3e1d3ca277fb7f59ac61e625e52ad8482062",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",

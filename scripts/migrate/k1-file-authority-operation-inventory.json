@@ -11091,7 +11091,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
-      "line": 1100,
+      "line": 1106,
       "categories": [
         "mapping"
       ],
@@ -14259,7 +14259,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 7586,
+      "line": 7591,
       "categories": [
         "epoll"
       ],
@@ -14268,7 +14268,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 7588,
+      "line": 7593,
       "categories": [
         "epoll"
       ],
@@ -14277,7 +14277,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 7590,
+      "line": 7595,
       "categories": [
         "epoll"
       ],
@@ -14286,7 +14286,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 8026,
+      "line": 8031,
       "categories": [
         "lifecycle"
       ],
@@ -14295,7 +14295,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 8030,
+      "line": 8035,
       "categories": [
         "lifecycle"
       ],
@@ -14304,7 +14304,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 8123,
+      "line": 8128,
       "categories": [
         "lifecycle"
       ],
@@ -14313,7 +14313,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 8301,
+      "line": 8306,
       "categories": [
         "epoll"
       ],
@@ -14322,7 +14322,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 8302,
+      "line": 8307,
       "categories": [
         "epoll"
       ],
@@ -14331,7 +14331,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 8304,
+      "line": 8309,
       "categories": [
         "epoll"
       ],
@@ -14340,7 +14340,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 8305,
+      "line": 8310,
       "categories": [
         "epoll"
       ],
@@ -14349,7 +14349,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 8312,
+      "line": 8317,
       "categories": [
         "epoll"
       ],
@@ -14358,7 +14358,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 8313,
+      "line": 8318,
       "categories": [
         "epoll"
       ],
@@ -14367,7 +14367,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 8316,
+      "line": 8321,
       "categories": [
         "epoll"
       ],
@@ -14376,7 +14376,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 8319,
+      "line": 8324,
       "categories": [
         "epoll"
       ],
@@ -14385,7 +14385,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 8322,
+      "line": 8327,
       "categories": [
         "epoll"
       ],
@@ -14394,7 +14394,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 8324,
+      "line": 8329,
       "categories": [
         "epoll"
       ],
@@ -14403,7 +14403,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 8396,
+      "line": 8401,
       "categories": [
         "lifecycle"
       ],
@@ -14412,7 +14412,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 8402,
+      "line": 8407,
       "categories": [
         "stream"
       ],
@@ -14421,7 +14421,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 8479,
+      "line": 8484,
       "categories": [
         "table_guard"
       ],
@@ -14430,7 +14430,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 8491,
+      "line": 8496,
       "categories": [
         "table_guard"
       ],
@@ -16005,7 +16005,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "line": 4440,
+      "line": 4454,
       "categories": [
         "mapping"
       ],
@@ -16014,7 +16014,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "line": 6365,
+      "line": 6379,
       "categories": [
         "epoll"
       ],
@@ -16023,7 +16023,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "line": 6375,
+      "line": 6389,
       "categories": [
         "epoll"
       ],
@@ -16032,7 +16032,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "line": 6381,
+      "line": 6395,
       "categories": [
         "epoll"
       ],
@@ -16041,7 +16041,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "line": 6401,
+      "line": 6415,
       "categories": [
         "epoll"
       ],
@@ -16077,7 +16077,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
-      "line": 1831,
+      "line": 1845,
       "categories": [
         "mapping"
       ],
