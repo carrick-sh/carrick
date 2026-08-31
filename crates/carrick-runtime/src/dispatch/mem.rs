@@ -3660,8 +3660,14 @@ impl SyscallDispatcher {
                     None
                 }
             };
+            // `mmap` and `mprotect` differ here, and `memflagmatrix` asserts
+            // both: `mprotect` rejects unknown protection bits with EINVAL,
+            // while `mmap` IGNORES them and maps the range with whatever known
+            // access bits are present (`mmap_invalid_prot_result=success` for
+            // `prot = 1 << 28`). carrick rejected them in both, so a mapping
+            // Linux creates came back EINVAL. Unknown bits are simply not
+            // consulted below; only READ/WRITE/EXEC are.
             if length == 0
-                || prot_flags.bits() & !LinuxProtFlags::SUPPORTED_MASK != 0
                 || map_flags.bits() & !LinuxMmapFlags::SUPPORTED_MASK != 0
                 || map_sharing.is_none()
                 || (!map_flags.contains(LinuxMmapFlags::ANONYMOUS)
@@ -3670,7 +3676,7 @@ impl SyscallDispatcher {
                     && !requested.0.is_multiple_of(page_size))
             {
                 return Ok(request.refused(
-                    MmapRefusal::Spec("zero length, unsupported prot/flag bits, no map type, or a misaligned offset/fixed address"),
+                    MmapRefusal::Spec("zero length, unsupported flag bits, no map type, or a misaligned offset/fixed address"),
                     LINUX_EINVAL,
                 ));
             }
@@ -5620,6 +5626,14 @@ impl SyscallDispatcher {
             // unobservable — they all yield EINVAL — but this must precede the
             // size rounding below, which answers ENOMEM.
             if !old_address.0.is_multiple_of(page_size) {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            // `man 2 mremap`: a zero `old_size` asks for a NEW mapping of the
+            // same pages, which is only meaningful for a shareable mapping and
+            // necessarily relocates -- so it requires MREMAP_MAYMOVE. Without
+            // it Linux answers EINVAL; carrick rounded the zero up and tried to
+            // resize in place (`memflagmatrix` `mremap_old_len_zero_einval`).
+            if old_size == 0 && flags & LINUX_MREMAP_MAYMOVE == 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let Some(old_size) = align_up_u64(old_size, page_size) else {
