@@ -2489,7 +2489,10 @@ struct CarrierWaitServiceInner {
     control_write: OwnedFd,
     reactor_poll_calls: AtomicU64,
     #[cfg(test)]
-    reactor_poll_observer: Mutex<Option<Arc<std::sync::Barrier>>>,
+    /// Test observer for "a poll cycle completed", paired with the
+    /// `reactor_poll_calls` value when it was installed so a cycle that had
+    /// already counted before installation cannot satisfy it.
+    reactor_poll_observer: Mutex<Option<(u64, Arc<std::sync::Barrier>)>>,
 }
 
 impl CarrierWaitServiceInner {
@@ -2739,8 +2742,30 @@ impl CarrierWaitServiceInner {
             // is still in the pipe and wakes the next poll, whose take then
             // finds this observer.
             #[cfg(test)]
-            if let Some(observer) = inner.reactor_poll_observer.lock().take() {
-                observer.wait();
+            {
+                // Only a cycle that COUNTED after the observer was installed
+                // satisfies it. The increment above happens before this take,
+                // so a cycle already in flight when the observer arrived would
+                // otherwise rendezvous while the counter it published was
+                // already included in the waiter's "before" reading -- the
+                // observer fires, the count has not moved, and the waiter
+                // concludes the reactor ignored its nudge.
+                let mut slot = inner.reactor_poll_observer.lock();
+                let stale = slot.as_ref().is_some_and(|(installed_at, _)| {
+                    inner.reactor_poll_calls.load(Ordering::Acquire) <= *installed_at
+                });
+                if stale {
+                    drop(slot);
+                    // Declining costs a wakeup: this cycle may have drained the
+                    // very byte that was meant to wake the next one, which
+                    // would park the reactor in `poll(-1)` with an observer
+                    // nobody can satisfy. Re-arm so the next cycle runs
+                    // immediately and finds this observer.
+                    inner.nudge_reactor();
+                } else if let Some((_, observer)) = slot.take() {
+                    drop(slot);
+                    observer.wait();
+                }
             }
             if result < 0 {
                 continue;
@@ -3204,7 +3229,8 @@ impl CarrierWaitService {
     #[cfg(test)]
     fn observe_next_reactor_poll(&self) -> Arc<std::sync::Barrier> {
         let observer = Arc::new(std::sync::Barrier::new(2));
-        *self.inner.reactor_poll_observer.lock() = Some(Arc::clone(&observer));
+        let installed_at = self.inner.reactor_poll_calls.load(Ordering::Acquire);
+        *self.inner.reactor_poll_observer.lock() = Some((installed_at, Arc::clone(&observer)));
         observer
     }
 }
