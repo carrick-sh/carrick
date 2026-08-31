@@ -7395,6 +7395,7 @@ fn test_semantic_vma(
         execute: false,
         provenance: VmaBackingProvenance::PrivateAnonymous,
         fork_policy,
+        dump_policy: carrick_abi::VmaDumpPolicy::Include,
         droppable,
         path: "[mremap-policy]".to_owned(),
         file_page_offset: None,
