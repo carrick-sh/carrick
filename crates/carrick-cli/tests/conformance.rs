@@ -47,13 +47,22 @@ const KNOWN_PROBE_GAPS: &[&str] = &[
     // (holders `registration-cleanup` and `exec-rebind`).
     //
     // `execfromthread` no longer aborts -- it reaches stage 2 and its first two
-    // lines match -- but its third still diverges: with a second thread alive,
-    // the exec survivor's `gettid()` must equal `getpid()`, because Linux makes
-    // the execing thread the group leader permanently. carrick reports it
-    // correctly under the volume-mount transport and wrongly under the
-    // container-injection transport this gate uses, which is exactly the
-    // "presentation-only alias" the probe was written to catch. Closing it
-    // needs the survivor re-keyed in the kernel graph, not a wider alias.
+    // lines match. Its third diverges for a reason that is NOT exec-specific,
+    // traced 2026-08-31: `getpid` is pid-namespace translated and `gettid` is
+    // not. The identity page publishes `ns_self_pid_for(task)` (task 5 -> ns
+    // pid 4 in a container), while both `gettid` paths -- the dispatcher arm
+    // and the EL1 CONTEXTIDR_EL1 fast path -- publish the raw kernel-graph tid.
+    // Inside any pid namespace the two numbering spaces are offset, so a
+    // thread-group leader observes `gettid() != getpid()`, which no Linux
+    // process can. exec merely exposes it, because the survivor is promoted to
+    // leader and then asks both questions.
+    //
+    // It is not a one-line translation: `host_to_ns` maps HOST pids, and a
+    // Linux tid here is a kernel-graph id with no thread registration in the
+    // namespace region to translate through. Publishing an untranslated or
+    // zero id through a fast path the guest reads with no vm exit is worse than
+    // the current wrong answer. Closing it needs thread ids represented in the
+    // pid namespace, alongside `ns_self_pid_for`.
     "execthreads",
     "execfromthread",
     "vforkexecthread",
