@@ -291,7 +291,7 @@ mod foreign_mm_tests {
     impl ExternalAliasStateRestore {
         fn capture() -> Self {
             let replay = replay_mappings().lock().clone();
-            let aliases = alias_registry().lock().clone();
+            let aliases = alias_registry().lock().ordered();
             Self { aliases, replay }
         }
     }
@@ -300,7 +300,7 @@ mod foreign_mm_tests {
         fn drop(&mut self) {
             mutate_external_alias_state(|replay, aliases| {
                 *replay = std::mem::take(&mut self.replay);
-                *aliases = std::mem::take(&mut self.aliases);
+                aliases.replace_all(std::mem::take(&mut self.aliases));
             });
         }
     }
@@ -6237,7 +6237,7 @@ mod foreign_mm_tests {
             owner_generation: 73,
         };
         register_shared_alias(preexisting_alias);
-        let alias_preimage = alias_registry().lock().clone();
+        let alias_preimage = alias_registry().lock().ordered();
         let replay_preimage = replay_mappings().lock().clone();
         assert!(!alias_preimage.is_empty());
         assert!(!replay_preimage.is_empty());
@@ -6369,7 +6369,7 @@ mod foreign_mm_tests {
             "no task state must remain published in directory after failure"
         );
         assert_eq!(
-            *alias_registry().lock(),
+            alias_registry().lock().ordered(),
             alias_preimage,
             "failed publication must restore the exact nonempty alias preimage"
         );
@@ -7056,9 +7056,10 @@ mod task_only_carrier_directory_tests {
         *alias_version_registry().lock() = AliasVersionRegistry::default();
 
         const FOREIGN_OWNERS: usize = 512;
+        let retiring_root_slot = (0x4fff_1000_0000_u64, 0x4000_u64);
         let retiring_scope = AliasOwnershipScope::MmRootSlot {
-            base: 0x4fff_1000_0000,
-            size: 0x4000,
+            base: retiring_root_slot.0,
+            size: retiring_root_slot.1,
         };
         {
             let mut registry = alias_registry().lock();
@@ -7081,7 +7082,7 @@ mod task_only_carrier_directory_tests {
         }
 
         let before = alias_state_rows_scanned();
-        retain_external_aliases(|entry| entry.ownership_scope != retiring_scope);
+        retire_process_aliases(Some(retiring_root_slot), ContainerRootToken::ROOT, |_| true);
         let scanned = alias_state_rows_scanned() - before;
 
         assert_eq!(
@@ -7096,20 +7097,17 @@ mod task_only_carrier_directory_tests {
                 .any(|entry| entry.ownership_scope == retiring_scope),
             "the retiring owner's alias row must be gone"
         );
-        // `Vec::retain` over a flat carrier-global registry is inherently ONE
-        // pass, so this bound is a constant-factor contract, not an O(1) one:
-        // it separates "one visit per row" from the seven passes plus two
-        // whole-container clones the generic clone-and-diff mutator performed
-        // (measured on this exact fixture: 3,076 rows visited for 513 rows of
-        // state, versus 513 now). Making retirement sublinear needs the
-        // registry itself keyed by ownership scope; that is a separate change
-        // and this test will tighten with it.
-        let rows = (FOREIGN_OWNERS + 1) as u64;
+        // The real contract: cost is a function of the RETIRING process, not
+        // of the carrier. On this fixture the process owns one row and there
+        // are no `Global` rows, so the bound is a small constant regardless of
+        // how many other owners are live. For reference on the same fixture:
+        // the clone-and-diff mutator visited 3,076 rows, a single flat-`Vec`
+        // retain visited 513, and a scope-partitioned registry visits ~1.
         assert!(
-            scanned <= 2 * rows,
-            "retiring one owner visited {scanned} carrier-global alias rows for \
-             {rows} rows of state; retirement must not re-scan the carrier's \
-             alias state once per touched key"
+            scanned <= 16,
+            "retiring one owner visited {scanned} alias rows with {FOREIGN_OWNERS} \
+             foreign owners live; retirement cost must be a function of the \
+             retiring process, not of the carrier"
         );
 
         alias_registry().lock().clear();
@@ -8922,10 +8920,271 @@ fn is_kernel_only_stage1_range(start: u64, len: usize) -> bool {
 pub use carrick_host::futex_key::{shared_file_key_base, shared_futex_waiter_key};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn alias_registry() -> &'static parking_lot::Mutex<Vec<AliasBacking>> {
-    static CELL: std::sync::OnceLock<parking_lot::Mutex<Vec<AliasBacking>>> =
+fn alias_registry() -> &'static parking_lot::Mutex<AliasRegistry> {
+    static CELL: std::sync::OnceLock<parking_lot::Mutex<AliasRegistry>> =
         std::sync::OnceLock::new();
-    CELL.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
+    CELL.get_or_init(|| parking_lot::Mutex::new(AliasRegistry::default()))
+}
+
+/// The carrier-global alias registry, partitioned by owning scope.
+///
+/// This was a flat `Vec<AliasBacking>`. Because the container is
+/// carrier-global but almost every question asked of it is per-process, a
+/// guest process exit had to walk every OTHER live process's rows to find its
+/// own: measured 2026-08-30 at 45.4% of all carrier user CPU under a
+/// fork/exit storm, and O(N^2) across N exiting processes. The address
+/// translation path had the same shape — `lookup_shared_alias_by_va` filtered
+/// by ownership scope only AFTER scanning the whole registry.
+///
+/// Rows are grouped by [`AliasOwnershipScope`], which is exactly the axis
+/// `alias_is_owned_by_process` selects on, so retirement is a bucket removal.
+/// Each row keeps a monotonic insertion sequence so the historical GLOBAL
+/// order is still available exactly: several lookups take the LAST matching
+/// row, and that must keep meaning "most recently registered", not "in
+/// whichever scope happens to sort last".
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Default, Clone)]
+struct AliasRegistry {
+    by_scope: std::collections::BTreeMap<AliasOwnershipScope, Vec<(u64, AliasBacking)>>,
+    next_seq: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl AliasRegistry {
+    fn push(&mut self, alias: AliasBacking) {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+        self.by_scope
+            .entry(alias.ownership_scope)
+            .or_default()
+            .push((seq, alias));
+    }
+
+    #[cfg(test)]
+    /// Replace every row, in the given order, with fresh sequences.
+    fn replace_all(&mut self, aliases: impl IntoIterator<Item = AliasBacking>) {
+        self.by_scope.clear();
+        self.extend(aliases);
+    }
+
+    #[cfg(test)]
+    fn extend(&mut self, aliases: impl IntoIterator<Item = AliasBacking>) {
+        for alias in aliases {
+            self.push(alias);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.by_scope.clear();
+        // `next_seq` is deliberately NOT reset: sequence numbers are identity
+        // for ordering comparisons that may outlive a clear.
+    }
+
+    fn len(&self) -> usize {
+        self.by_scope.values().map(Vec::len).sum()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.by_scope.values().all(Vec::is_empty)
+    }
+
+    /// Rows of one scope, oldest first.
+    fn scope_rows(&self, scope: AliasOwnershipScope) -> &[(u64, AliasBacking)] {
+        self.by_scope.get(&scope).map_or(&[], Vec::as_slice)
+    }
+
+    /// Every row in GLOBAL insertion order, oldest first. O(n log n); use
+    /// [`Self::scope_rows`] when the question is scoped.
+    fn ordered(&self) -> Vec<AliasBacking> {
+        let mut rows: Vec<(u64, AliasBacking)> = self
+            .by_scope
+            .values()
+            .flat_map(|rows| rows.iter().copied())
+            .collect();
+        // STABLE: a row split into fragments keeps its parent's sequence,
+        // so equal keys must retain their bucket-relative emission order.
+        rows.sort_by_key(|(seq, _)| *seq);
+        rows.into_iter().map(|(_, alias)| alias).collect()
+    }
+
+    /// Every row, in NO meaningful order, borrowed and without allocating.
+    ///
+    /// Use this only where the answer cannot depend on order: `any`, `min`,
+    /// a per-key `find` (all rows for one `(ipa, scope)` live in one bucket,
+    /// so bucket order IS their insertion order), or a whole-registry
+    /// predicate. Where the caller takes the first or last match ACROSS keys,
+    /// use [`Self::oldest_matching`] / [`Self::newest_matching`] instead:
+    /// those answers change with the order, and getting it wrong is silent.
+    /// With a thousand processes aliasing one shared futex page at the same
+    /// IPA, bucket order handed different processes different `host_addr`s for
+    /// the same futex word.
+    ///
+    /// Materializing global order here instead was measured at 89.6% of all
+    /// carrier CPU (`AliasRegistry::ordered`), because these lookups are hot;
+    /// the ordering primitives below are single passes with no allocation, so
+    /// they cost exactly what the old flat `Vec` scan cost.
+    fn iter(&self) -> impl Iterator<Item = &AliasBacking> {
+        self.by_scope
+            .values()
+            .flat_map(|rows| rows.iter().map(|(_, alias)| alias))
+    }
+
+    /// The matching row registered FIRST, in global insertion order.
+    fn oldest_matching(
+        &self,
+        mut matches: impl FnMut(&AliasBacking) -> bool,
+    ) -> Option<AliasBacking> {
+        self.by_scope
+            .values()
+            .flatten()
+            .filter(|(_, alias)| matches(alias))
+            .min_by_key(|(seq, _)| *seq)
+            .map(|(_, alias)| *alias)
+    }
+
+    /// The matching row registered LAST, in global insertion order — the
+    /// answer the historical `registry.iter().rev().find(..)` lookups want.
+    fn newest_matching(
+        &self,
+        mut matches: impl FnMut(&AliasBacking) -> bool,
+    ) -> Option<AliasBacking> {
+        self.by_scope
+            .values()
+            .flatten()
+            .filter(|(_, alias)| matches(alias))
+            .max_by_key(|(seq, _)| *seq)
+            .map(|(_, alias)| *alias)
+    }
+
+    /// [`Self::newest_matching`] restricted to the scopes one process can see.
+    /// Exact for any predicate that already required
+    /// `alias_matches_process_scope`, and O(that process's rows) rather than
+    /// O(carrier).
+    fn newest_matching_for_process(
+        &self,
+        mm_root_slot: Option<(u64, u64)>,
+        container_root: ContainerRootToken,
+        mut matches: impl FnMut(&AliasBacking) -> bool,
+    ) -> Option<AliasBacking> {
+        Self::process_visible_scopes(mm_root_slot, container_root)
+            .into_iter()
+            .flat_map(|scope| self.scope_rows(scope))
+            .filter(|(_, alias)| matches(alias))
+            .max_by_key(|(seq, _)| *seq)
+            .map(|(_, alias)| *alias)
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut AliasBacking> {
+        self.by_scope
+            .values_mut()
+            .flat_map(|rows| rows.iter_mut().map(|(_, alias)| alias))
+    }
+
+    #[cfg(test)]
+    fn contains(&self, alias: &AliasBacking) -> bool {
+        self.scope_rows(alias.ownership_scope)
+            .iter()
+            .any(|(_, row)| row == alias)
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&AliasBacking) -> bool) {
+        for rows in self.by_scope.values_mut() {
+            rows.retain(|(_, alias)| keep(alias));
+        }
+        self.by_scope.retain(|_, rows| !rows.is_empty());
+    }
+
+    /// Remove every row of one scope and return them, oldest first. This is
+    /// the process-retirement primitive: O(that scope's rows), not O(carrier).
+    fn remove_scope(&mut self, scope: AliasOwnershipScope) -> Vec<AliasBacking> {
+        self.by_scope
+            .remove(&scope)
+            .map(|rows| rows.into_iter().map(|(_, alias)| alias).collect())
+            .unwrap_or_default()
+    }
+
+    /// Retain within one scope, returning the removed rows oldest first.
+    fn retain_in_scope(
+        &mut self,
+        scope: AliasOwnershipScope,
+        mut keep: impl FnMut(&AliasBacking) -> bool,
+    ) -> Vec<AliasBacking> {
+        let mut removed = Vec::new();
+        if let Some(rows) = self.by_scope.get_mut(&scope) {
+            rows.retain(|(_, alias)| {
+                let survives = keep(alias);
+                if !survives {
+                    removed.push(*alias);
+                }
+                survives
+            });
+            if rows.is_empty() {
+                self.by_scope.remove(&scope);
+            }
+        }
+        removed
+    }
+
+    /// Mutable access to one scope's rows, sequences included, for callers
+    /// that rebuild a bucket in place (a VA unmap splits rows into fragments
+    /// that must inherit their parent's sequence).
+    fn scope_rows_mut(
+        &mut self,
+        scope: AliasOwnershipScope,
+    ) -> Option<&mut Vec<(u64, AliasBacking)>> {
+        self.by_scope.get_mut(&scope)
+    }
+
+    fn drop_empty_scope(&mut self, scope: AliasOwnershipScope) {
+        if self.by_scope.get(&scope).is_some_and(Vec::is_empty) {
+            self.by_scope.remove(&scope);
+        }
+    }
+
+    /// A registry holding only the rows one process can see, sequences and
+    /// order preserved. Every caller that plans a mutation against a private
+    /// copy is scope-filtered anyway, so cloning the whole carrier-global
+    /// registry per `munmap` was pure per-process tax.
+    fn process_visible_snapshot(
+        &self,
+        mm_root_slot: Option<(u64, u64)>,
+        container_root: ContainerRootToken,
+    ) -> Self {
+        let mut snapshot = Self {
+            by_scope: std::collections::BTreeMap::new(),
+            next_seq: self.next_seq,
+        };
+        for scope in Self::process_visible_scopes(mm_root_slot, container_root) {
+            if let Some(rows) = self.by_scope.get(&scope) {
+                snapshot.by_scope.insert(scope, rows.clone());
+            }
+        }
+        snapshot
+    }
+
+    /// The two scopes a process can see, per `alias_matches_process_scope`:
+    /// the one it owns, plus the shared-file `Global` namespace.
+    fn process_visible_scopes(
+        mm_root_slot: Option<(u64, u64)>,
+        container_root: ContainerRootToken,
+    ) -> [AliasOwnershipScope; 2] {
+        [
+            Self::owned_scope(mm_root_slot, container_root),
+            AliasOwnershipScope::Global,
+        ]
+    }
+
+    /// The scope a process owns, per `alias_is_owned_by_process`.
+    fn owned_scope(
+        mm_root_slot: Option<(u64, u64)>,
+        container_root: ContainerRootToken,
+    ) -> AliasOwnershipScope {
+        match mm_root_slot {
+            Some((base, size)) => AliasOwnershipScope::MmRootSlot { base, size },
+            None => AliasOwnershipScope::ContainerRoot(container_root),
+        }
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -11622,15 +11881,11 @@ fn alias_backing_is_live(host_addr: usize) -> bool {
 /// Find the registered alias whose `hv_vm_map`'d IPA window contains `ipa`.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn lookup_shared_alias(ipa: u64) -> Option<AliasBacking> {
-    alias_registry()
-        .lock()
-        .iter()
-        .find(|e| {
-            ipa >= e.ipa
-                && ipa < e.ipa.saturating_add(e.size as u64)
-                && alias_backing_is_live(e.host_addr)
-        })
-        .copied()
+    alias_registry().lock().oldest_matching(|e| {
+        ipa >= e.ipa
+            && ipa < e.ipa.saturating_add(e.size as u64)
+            && alias_backing_is_live(e.host_addr)
+    })
 }
 
 /// Find the registered alias whose guest-VA window FULLY contains `[va, va+len)`.
@@ -11821,9 +12076,7 @@ fn lookup_shared_alias_by_va(
     let end = va.saturating_add(len as u64);
     alias_registry()
         .lock()
-        .iter()
-        .rev()
-        .find(|e| {
+        .newest_matching_for_process(mm_root_slot, container_root, |e| {
             alias_matches_process_scope(e.ownership_scope, mm_root_slot, container_root)
                 && va >= e.start
                 && end <= e.start.saturating_add(e.size as u64)
@@ -11833,24 +12086,16 @@ fn lookup_shared_alias_by_va(
                 // `alias_backing_is_live`.
                 && alias_backing_is_live(e.host_addr.saturating_add((va - e.start) as usize))
         })
-        .copied()
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn lookup_live_alias_by_va_any_scope(va: u64, len: usize) -> Option<AliasBacking> {
     let end = va.saturating_add(len as u64);
-    alias_registry()
-        .lock()
-        .iter()
-        .rev()
-        .find(|entry| {
-            va >= entry.start
-                && end <= entry.start.saturating_add(entry.size as u64)
-                && alias_backing_is_live(
-                    entry.host_addr.saturating_add((va - entry.start) as usize),
-                )
-        })
-        .copied()
+    alias_registry().lock().newest_matching(|entry| {
+        va >= entry.start
+            && end <= entry.start.saturating_add(entry.size as u64)
+            && alias_backing_is_live(entry.host_addr.saturating_add((va - entry.start) as usize))
+    })
 }
 
 /// Drop the index entry for any alias whose guest-VA window overlaps
@@ -11863,50 +12108,72 @@ fn lookup_live_alias_by_va_any_scope(va: u64, len: usize) -> Option<AliasBacking
 /// Keyed on the VA `start` because `munmap` supplies a VA.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn unregister_alias_entries(
-    registry: &mut Vec<AliasBacking>,
+    registry: &mut AliasRegistry,
     va: u64,
     len: usize,
     mm_root_slot: Option<(u64, u64)>,
     container_root: ContainerRootToken,
 ) -> std::collections::BTreeSet<(u64, u64)> {
     let end = va.saturating_add(len as u64);
-    let mut replacement = Vec::with_capacity(registry.len().saturating_add(1));
     let mut candidates = std::collections::BTreeSet::new();
-    for entry in registry.drain(..) {
-        let entry_end = entry.start.saturating_add(entry.size as u64);
-        if !alias_matches_process_scope(entry.ownership_scope, mm_root_slot, container_root)
-            || entry_end <= va
-            || entry.start >= end
-        {
-            replacement.push(entry);
+    // `alias_matches_process_scope` admits exactly the owned scope and the
+    // shared-file `Global` namespace, so this touches two buckets rather than
+    // draining and rebuilding the whole carrier-global registry per unmap.
+    let scopes = AliasRegistry::process_visible_scopes(mm_root_slot, container_root);
+    for scope in scopes {
+        let Some(rows) = registry.scope_rows_mut(scope) else {
             continue;
+        };
+        note_alias_state_rows_scanned(rows.len());
+        let mut replacement = Vec::with_capacity(rows.len().saturating_add(1));
+        for (seq, entry) in rows.drain(..) {
+            let entry_end = entry.start.saturating_add(entry.size as u64);
+            if entry_end <= va || entry.start >= end {
+                replacement.push((seq, entry));
+                continue;
+            }
+            candidates.insert((entry.physical_ipa, entry.physical_size as u64));
+            // Fragments inherit the parent's sequence: they occupy its place in
+            // the global order, and `AliasRegistry::ordered` sorts stably.
+            if entry.start < va {
+                replacement.push((
+                    seq,
+                    AliasBacking {
+                        size: usize::try_from(va - entry.start).unwrap_or_default(),
+                        ..entry
+                    },
+                ));
+            }
+            if entry_end > end {
+                let delta = end.saturating_sub(entry.start);
+                replacement.push((
+                    seq,
+                    AliasBacking {
+                        start: end,
+                        ipa: entry.ipa.saturating_add(delta),
+                        host_addr: entry.host_addr.saturating_add(delta as usize),
+                        size: usize::try_from(entry_end - end).unwrap_or_default(),
+                        shared_key_offset: entry.shared_key_offset.saturating_add(delta),
+                        ..entry
+                    },
+                ));
+            }
         }
-        candidates.insert((entry.physical_ipa, entry.physical_size as u64));
-        if entry.start < va {
-            replacement.push(AliasBacking {
-                size: usize::try_from(va - entry.start).unwrap_or_default(),
-                ..entry
-            });
-        }
-        if entry_end > end {
-            let delta = end.saturating_sub(entry.start);
-            replacement.push(AliasBacking {
-                start: end,
-                ipa: entry.ipa.saturating_add(delta),
-                host_addr: entry.host_addr.saturating_add(delta as usize),
-                size: usize::try_from(entry_end - end).unwrap_or_default(),
-                shared_key_offset: entry.shared_key_offset.saturating_add(delta),
-                ..entry
-            });
+        *rows = replacement;
+        registry.drop_empty_scope(scope);
+    }
+    // A candidate extent is reclaimable only when NO row this process can see
+    // still names it. Collect the survivors once instead of rescanning the
+    // registry per candidate.
+    let mut retained_extents = std::collections::BTreeSet::new();
+    for scope in scopes {
+        let rows = registry.scope_rows(scope);
+        note_alias_state_rows_scanned(rows.len());
+        for (_, entry) in rows {
+            retained_extents.insert((entry.physical_ipa, entry.physical_size as u64));
         }
     }
-    *registry = replacement;
-    candidates.retain(|&(physical_ipa, physical_size)| {
-        !registry.iter().any(|entry| {
-            alias_matches_process_scope(entry.ownership_scope, mm_root_slot, container_root)
-                && (entry.physical_ipa, entry.physical_size as u64) == (physical_ipa, physical_size)
-        })
-    });
+    candidates.retain(|extent| !retained_extents.contains(extent));
     candidates
 }
 
@@ -19153,9 +19420,7 @@ fn perform_foreign_cow_transaction(
         .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
     let source_alias_guest_writable = alias_registry()
         .lock()
-        .iter()
-        .rev()
-        .find(|alias| {
+        .newest_matching_for_process(runtime.mm_root_slot, runtime.container_root, |alias| {
             let semantic_offset = span.va.checked_sub(alias.start);
             let alias_end = alias.start.checked_add(alias.size as u64);
             alias_matches_process_scope(
@@ -20740,39 +21005,43 @@ impl HvfTaskState {
     ) -> Option<(*mut u8, u64)> {
         let physical_ipa = align_down(ipa, CowArmedRanges::COMPOUND_SIZE);
         let physical_end = physical_ipa.checked_add(CowArmedRanges::COMPOUND_SIZE)?;
-        if let Some(alias) = alias_registry().lock().iter().rev().find(|alias| {
-            alias_matches_process_scope(
-                alias.ownership_scope,
-                self.mm_root_slot,
-                self.container_root,
-            ) && semantic_va >= alias.start
-                && semantic_va < alias.start.saturating_add(alias.size as u64)
-                && alias
-                    .ipa
-                    .checked_add(semantic_va.saturating_sub(alias.start))
-                    == Some(ipa)
-                && physical_ipa >= alias.physical_ipa
-                && physical_end
-                    <= alias
-                        .physical_ipa
-                        .saturating_add(alias.physical_size as u64)
-                && if self.persistent_vm_lifecycle
-                    && is_reusable_global_frame_extent(
-                        alias.physical_ipa,
-                        alias.physical_size as u64,
-                    )
-                {
-                    global_frame_host_owner_matches_in(
-                        custody,
-                        alias.physical_ipa,
-                        alias.physical_size as u64,
-                        alias.physical_host_addr,
-                        alias.owner_generation,
-                    )
-                } else {
-                    alias_backing_is_live(alias.physical_host_addr)
-                }
-        }) {
+        if let Some(alias) = alias_registry().lock().newest_matching_for_process(
+            self.mm_root_slot,
+            self.container_root,
+            |alias| {
+                alias_matches_process_scope(
+                    alias.ownership_scope,
+                    self.mm_root_slot,
+                    self.container_root,
+                ) && semantic_va >= alias.start
+                    && semantic_va < alias.start.saturating_add(alias.size as u64)
+                    && alias
+                        .ipa
+                        .checked_add(semantic_va.saturating_sub(alias.start))
+                        == Some(ipa)
+                    && physical_ipa >= alias.physical_ipa
+                    && physical_end
+                        <= alias
+                            .physical_ipa
+                            .saturating_add(alias.physical_size as u64)
+                    && if self.persistent_vm_lifecycle
+                        && is_reusable_global_frame_extent(
+                            alias.physical_ipa,
+                            alias.physical_size as u64,
+                        )
+                    {
+                        global_frame_host_owner_matches_in(
+                            custody,
+                            alias.physical_ipa,
+                            alias.physical_size as u64,
+                            alias.physical_host_addr,
+                            alias.owner_generation,
+                        )
+                    } else {
+                        alias_backing_is_live(alias.physical_host_addr)
+                    }
+            },
+        ) {
             let offset = usize::try_from(physical_ipa - alias.physical_ipa).ok()?;
             return Some((
                 unsafe { (alias.physical_host_addr as *mut u8).add(offset) },
@@ -20839,17 +21108,11 @@ impl HvfTaskState {
             }) {
                 return Some(mapping.view());
             }
-            if let Some(alias) = alias_registry()
-                .lock()
-                .iter()
-                .rev()
-                .find(|alias| {
-                    ipa >= alias.ipa
-                        && ipa < alias.ipa.saturating_add(alias.size as u64)
-                        && alias_is_live(alias)
-                })
-                .copied()
-            {
+            if let Some(alias) = alias_registry().lock().newest_matching(|alias| {
+                ipa >= alias.ipa
+                    && ipa < alias.ipa.saturating_add(alias.size as u64)
+                    && alias_is_live(alias)
+            }) {
                 return Some(MappingView::from_alias(&alias));
             }
         }
@@ -20863,11 +21126,10 @@ impl HvfTaskState {
         }
         if !self.protections.range_no_access(address, length) {
             let end = address.saturating_add(length as u64);
-            if let Some(alias) = alias_registry()
-                .lock()
-                .iter()
-                .rev()
-                .find(|alias| {
+            if let Some(alias) = alias_registry().lock().newest_matching_for_process(
+                self.mm_root_slot,
+                self.container_root,
+                |alias| {
                     alias_matches_process_scope(
                         alias.ownership_scope,
                         self.mm_root_slot,
@@ -20875,9 +21137,8 @@ impl HvfTaskState {
                     ) && address >= alias.start
                         && end <= alias.start.saturating_add(alias.size as u64)
                         && alias_is_live(alias)
-                })
-                .copied()
-            {
+                },
+            ) {
                 return Some(MappingView::from_alias(&alias));
             }
         }
@@ -24494,68 +24755,99 @@ fn scoped_alias_epoch_update(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-/// Drop every carrier-global alias row a retiring guest process owns.
+/// Drop every alias row a retiring guest process owns.
 ///
-/// This is the process-exit counterpart of [`scoped_alias_epoch_update`]: the
-/// caller knows exactly which rows leave, so the generic
-/// [`mutate_external_alias_state`] path — which CLONES the whole replay set and
-/// alias registry and re-derives the touched keys by diffing them — is pure
-/// waste here, and it is waste proportional to every OTHER live process. It is
-/// the dominant term in guest process exit (measured 2026-08-30: 89.8% of a
-/// carrier-global topology-lock hold that itself ran 44.5 s across 2,004
-/// retirements, growing linearly with the number of live children).
+/// This is the process-exit counterpart of [`scoped_alias_epoch_update`]. Two
+/// things made the previous shape O(live processes) per exit, and therefore
+/// O(N^2) across an exiting process group:
 ///
-/// `retain` semantics are preserved exactly: `keep` sees every row in registry
-/// order, surviving rows keep their relative order, and the epoch/chain reset
-/// applied to a changed key is the same reset the generic path applies.
-fn retain_external_aliases(keep: impl FnMut(&AliasBacking) -> bool) {
-    let mut keep = keep;
+/// - the generic [`mutate_external_alias_state`] path CLONED the whole replay
+///   set and alias registry and re-derived the touched keys by diffing them,
+///   even though the caller knows exactly which rows leave; and
+/// - the registry was a flat carrier-global `Vec`, so even a single `retain`
+///   pass visited every other live process's rows.
+///
+/// `alias_is_owned_by_process` selects exactly one [`AliasOwnershipScope`], and
+/// the registry is now partitioned on that axis, so the owned rows leave as a
+/// bucket removal. The only other rows a process may drop are `Global`
+/// shared-file aliases, whose population is bounded by open files rather than
+/// by live processes. Everything else is not visited at all.
+///
+/// Measured 2026-08-30: the single-pass version was 45.4% of all carrier user
+/// CPU under a 1,000-child fork/exit storm.
+fn retire_process_aliases(
+    mm_root_slot: Option<(u64, u64)>,
+    container_root: ContainerRootToken,
+    global_keep: impl FnMut(&AliasBacking) -> bool,
+) {
     // Same replay -> alias -> version lock order as receipt publication and
     // retirement, and as `mutate_external_alias_state`.
     let replay = replay_mappings().lock();
     let mut registry = alias_registry().lock();
     let mut versions = alias_version_registry().lock();
 
-    // ONE pass. `Vec::retain` visits in registry order, so the first vacant
-    // entry per key is that key's first occurrence before the mutation, and
-    // the first `or_insert` on a surviving row is its first occurrence after
-    // it. That reproduces the generic path's first-occurrence semantics for
-    // duplicate keys exactly, without cloning either global container or
-    // re-deriving the touched keys by diffing whole snapshots.
-    note_alias_state_rows_scanned(registry.len());
-    let mut first_before: std::collections::BTreeMap<
-        (u64, AliasOwnershipScope),
-        (AliasBacking, bool),
-    > = std::collections::BTreeMap::new();
-    let mut first_after: std::collections::BTreeMap<(u64, AliasOwnershipScope), AliasBacking> =
-        std::collections::BTreeMap::new();
-    let mut key_order: Vec<(u64, AliasOwnershipScope)> = Vec::new();
-    registry.retain(|alias| {
-        let key = (alias.ipa, alias.ownership_scope);
-        let survives = keep(alias);
-        if let std::collections::btree_map::Entry::Vacant(slot) = first_before.entry(key) {
-            slot.insert((*alias, !survives));
-            key_order.push(key);
-        }
-        if survives {
-            first_after.entry(key).or_insert(*alias);
-        }
-        survives
-    });
+    let owned_scope = AliasRegistry::owned_scope(mm_root_slot, container_root);
+    let global_before: Vec<AliasBacking> = registry
+        .scope_rows(AliasOwnershipScope::Global)
+        .iter()
+        .map(|(_, alias)| *alias)
+        .collect();
+    let removed_owned = registry.remove_scope(owned_scope);
+    registry.retain_in_scope(AliasOwnershipScope::Global, global_keep);
+    let global_after: Vec<AliasBacking> = registry
+        .scope_rows(AliasOwnershipScope::Global)
+        .iter()
+        .map(|(_, alias)| *alias)
+        .collect();
+    note_alias_state_rows_scanned(removed_owned.len() + global_before.len() + global_after.len());
 
-    // Only a key whose FIRST occurrence was removed can have a different
-    // effective row afterwards; a removal behind a surviving first occurrence
-    // is invisible to every reader, exactly as in the generic path.
+    // Affected keys, in first-seen order, with their effective row afterwards.
+    // Removing a whole scope leaves every key in it with no successor; the
+    // `Global` half keeps the generic path's first-occurrence semantics for
+    // duplicate keys exactly.
+    let mut affected: Vec<((u64, AliasOwnershipScope), Option<AliasBacking>)> = Vec::new();
+    let mut seen_keys = std::collections::BTreeSet::new();
+    for alias in &removed_owned {
+        let key = (alias.ipa, owned_scope);
+        if seen_keys.insert(key) {
+            affected.push((key, None));
+        }
+    }
+    let mut global_first_before: std::collections::BTreeMap<u64, AliasBacking> =
+        std::collections::BTreeMap::new();
+    let mut global_order: Vec<u64> = Vec::new();
+    for alias in &global_before {
+        if global_first_before.insert(alias.ipa, *alias).is_none() {
+            global_order.push(alias.ipa);
+        }
+    }
+    let mut global_first_after: std::collections::BTreeMap<u64, AliasBacking> =
+        std::collections::BTreeMap::new();
+    for alias in &global_after {
+        global_first_after.entry(alias.ipa).or_insert(*alias);
+    }
+    for ipa in global_order {
+        let before = global_first_before[&ipa];
+        let after = global_first_after.get(&ipa).copied();
+        if after == Some(before) {
+            continue;
+        }
+        affected.push(((ipa, AliasOwnershipScope::Global), after));
+    }
+
     let mut affected_physical: Vec<u64> = Vec::new();
     let mut affected_physical_seen: std::collections::BTreeSet<u64> =
         std::collections::BTreeSet::new();
-    for key in key_order {
-        let (before, first_removed) = first_before[&key];
-        let after = first_after.get(&key).copied();
-        if !first_removed && after == Some(before) {
-            continue;
-        }
-        for alias in std::iter::once(before).chain(after) {
+    for (key, after) in affected {
+        let before_rows = if key.1 == owned_scope {
+            removed_owned
+                .iter()
+                .find(|alias| alias.ipa == key.0)
+                .copied()
+        } else {
+            global_first_before.get(&key.0).copied()
+        };
+        for alias in before_rows.into_iter().chain(after) {
             if affected_physical_seen.insert(alias.physical_ipa) {
                 affected_physical.push(alias.physical_ipa);
             }
@@ -24569,8 +24861,8 @@ fn retain_external_aliases(keep: impl FnMut(&AliasBacking) -> bool) {
         }
     }
 
-    // A retain never touches the replay set, so the generic path's replay-side
-    // diff can only report the IPAs already implied by the alias changes.
+    // A retirement never touches the replay set, so the generic path's
+    // replay-side diff can only report the IPAs the alias changes already imply.
     for physical_ipa in affected_physical {
         bump_version_epoch(&mut versions.replay_epochs, physical_ipa).unwrap_or_else(|| {
             eprintln!("carrick: FATAL: external replay mutation epoch exhausted");
@@ -24585,7 +24877,7 @@ fn retain_external_aliases(keep: impl FnMut(&AliasBacking) -> bool) {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn mutate_external_alias_state<R>(
-    mutate: impl FnOnce(&mut std::collections::BTreeSet<ReplayMappingKey>, &mut Vec<AliasBacking>) -> R,
+    mutate: impl FnOnce(&mut std::collections::BTreeSet<ReplayMappingKey>, &mut AliasRegistry) -> R,
 ) -> R {
     // All external writers use the same replay -> alias -> version lock order
     // as receipt publication/retirement. A mutation becomes the new effective
@@ -24744,19 +25036,16 @@ impl AliasPublicationReceipt {
                 .ok_or_else(|| {
                     TrapError::Hypervisor("replay version epoch exhausted".to_owned())
                 })?;
-            let alias_base = registry
-                .iter()
-                .find(|entry| {
-                    entry.ipa == alias.ipa && entry.ownership_scope == alias.ownership_scope
-                })
-                .copied();
+            let alias_base = registry.iter().find(|entry| {
+                entry.ipa == alias.ipa && entry.ownership_scope == alias.ownership_scope
+            });
             let replay_base = replay_rows_for_ipa(&replay, alias.physical_ipa);
             note_alias_state_rows_scanned(registry.len());
             versions
                 .aliases
                 .entry(alias_key)
                 .or_insert_with(|| AliasVersionChain {
-                    base: alias_base,
+                    base: alias_base.copied(),
                     versions: Vec::new(),
                 })
                 .versions
@@ -24822,11 +25111,10 @@ impl AliasPublicationReceipt {
                 note_alias_state_rows_scanned(registry.len());
                 let current_value = registry
                     .iter()
-                    .find(|entry| entry.ipa == ipa && entry.ownership_scope == scope)
-                    .copied();
+                    .find(|entry| entry.ipa == ipa && entry.ownership_scope == scope);
                 if was_top
                     && current_epoch == Some(removed.epoch)
-                    && current_value == Some(removed.value)
+                    && current_value == Some(&removed.value)
                 {
                     note_alias_state_rows_scanned(registry.len());
                     registry.retain(|entry| !(entry.ipa == ipa && entry.ownership_scope == scope));
@@ -28262,24 +28550,13 @@ impl HvfVmState {
                 }
             }
         }
-        retain_external_aliases(|alias| {
-            if alias_is_owned_by_process(
-                alias.ownership_scope,
-                task.mm_root_slot,
-                task.container_root,
-            ) {
-                false
-            } else if matches!(alias.ownership_scope, AliasOwnershipScope::Global) {
-                let key = (alias.physical_ipa, alias.physical_size as u64);
-                let retired_exact_owner = superseded_owners.get(&key).is_some_and(|owner| {
-                    owner.host_addr == alias.physical_host_addr
-                        && owner.generation == alias.owner_generation
-                });
-                !extents.contains(&(alias.physical_ipa, alias.physical_size))
-                    && !retired_exact_owner
-            } else {
-                true
-            }
+        retire_process_aliases(task.mm_root_slot, task.container_root, |alias| {
+            let key = (alias.physical_ipa, alias.physical_size as u64);
+            let retired_exact_owner = superseded_owners.get(&key).is_some_and(|owner| {
+                owner.host_addr == alias.physical_host_addr
+                    && owner.generation == alias.owner_generation
+            });
+            !extents.contains(&(alias.physical_ipa, alias.physical_size)) && !retired_exact_owner
         });
 
         // A retained shared extent still points at its original host allocation.
@@ -28975,7 +29252,7 @@ impl HvfVmState {
     /// silently sharing the parent's frame. The alias registry supplies mappings
     /// installed by sibling vCPUs and filters retired lifetime-owner rows.
     pub(crate) fn fork_cow_ranges(&self) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
-        let aliases = alias_registry().lock().clone();
+        let aliases = alias_registry().lock().ordered();
         let alias_index = process_alias_index(&aliases, self.mm_root_slot, self.container_root);
         let mut ranges: Vec<_> = self
             .mappings
@@ -29355,9 +29632,7 @@ impl HvfVmState {
         // directly before allocating a second overlapping frame.
         let live_alias_end = alias_registry()
             .lock()
-            .iter()
-            .rev()
-            .find(|alias| {
+            .newest_matching_for_process(self.mm_root_slot, self.container_root, |alias| {
                 alias_matches_process_scope(
                     alias.ownership_scope,
                     self.mm_root_slot,
@@ -32080,13 +32355,13 @@ impl HvfVmState {
         // A shared-file alias installed by another sibling may be absent from
         // this thread's mapping Vec. Its global IPA is nevertheless unique and
         // the live alias registry owns the same translated backing identity.
-        if let Some(alias) = alias_registry().lock().iter().rev().find(|alias| {
+        if let Some(alias) = alias_registry().lock().newest_matching(|alias| {
             alias.sharing.has_shared_futex_identity()
                 && backing_gpa >= alias.ipa
                 && backing_gpa.saturating_add(4) <= alias.ipa.saturating_add(alias.size as u64)
                 && alias_backing_is_live(alias.host_addr)
         }) {
-            return MappingView::from_alias(alias).shared_futex_location_for_ipa(backing_gpa);
+            return MappingView::from_alias(&alias).shared_futex_location_for_ipa(backing_gpa);
         }
         None
     }
@@ -32299,7 +32574,7 @@ impl HvfVmState {
             let retained_fragment = retained_ipa.and_then(|ipa| {
                 retained_private_reuse_alias_fragment_in(
                     &self.carrier_foreign_mm_transport.custody,
-                    &alias_registry().lock(),
+                    &alias_registry().lock().ordered(),
                     chunk_va,
                     ipa,
                     chunk_len,
@@ -32721,9 +32996,12 @@ impl HvfVmState {
         // index. Reservation failure therefore leaves the exact pre-munmap
         // lifetime graph intact; the checked stage-1 invalidation has already
         // made the guest range inaccessible.
-        let registry_before = alias_registry().lock().clone();
+        let visible = alias_registry()
+            .lock()
+            .process_visible_snapshot(self.mm_root_slot, self.container_root);
+        let registry_before = visible.ordered();
         let planned_leases = {
-            let mut planned = registry_before.clone();
+            let mut planned = visible.clone();
             unregister_alias_entries(
                 &mut planned,
                 va,
@@ -33014,9 +33292,7 @@ impl HvfVmState {
         }
         alias_registry()
             .lock()
-            .iter()
-            .rev()
-            .find(|alias| {
+            .newest_matching(|alias| {
                 let alias_end = alias.ipa.checked_add(alias.size as u64);
                 semantic_va >= alias.start
                     && semantic_end <= alias.start.saturating_add(alias.size as u64)
@@ -33044,7 +33320,7 @@ impl HvfVmState {
                             alias.owner_generation,
                         ))
             })
-            .map(MappingView::from_alias)
+            .map(|alias| MappingView::from_alias(&alias))
     }
 
     /// Walk the guest's live stage-1 page tables to resolve `va`→IPA (the output
@@ -33335,7 +33611,7 @@ impl HvfVmState {
         // resolve to a freed backing. Registration is creation-complete
         // (every `add_alias` registers; removal happens only on munmap /
         // execve-clear), so absence here means "gone on purpose".
-        let registered_aliases = alias_registry().lock().clone();
+        let registered_aliases = alias_registry().lock().ordered();
         let mut mapped_extents = std::collections::HashSet::new();
         let mut replayed_global_owners = Vec::new();
         for mapping in &self.mappings {
@@ -33861,7 +34137,7 @@ impl HvfTaskState {
                 TrapError::Hypervisor("hvpatch child stage-1 root slot overflow".to_owned())
             })?;
         let mut cursor = request.root_slot_base;
-        let aliases = alias_registry().lock().clone();
+        let aliases = alias_registry().lock().ordered();
         let alias_index = process_alias_index(&aliases, self.mm_root_slot, self.container_root);
         let mut seen_dynamic_aliases = std::collections::HashSet::new();
         let mut source_mappings: Vec<ThreadMappingDesc> = self
@@ -43987,12 +44263,13 @@ pub(crate) fn hvf_set_sys_reg(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod tag_strip_tests {
     use super::{
-        AliasBacking, AliasOwnershipScope, ContainerRootToken, CowArmedSpan, GuestMappingPlan,
-        GuestMappingSharing, HVF_PAGE_SIZE, HvfMappedRegion, InventoryBackingIdentity,
-        ThreadMappingDesc, alias_is_owned_by_process, alias_matches_process_scope, alias_registry,
-        current_process_alias_keys, forget_replay_extent, inherited_fork_inventory_extents,
-        lookup_shared_alias, mapping_is_current_for_process_fork_indexed, missing_process_aliases,
-        process_alias_index, process_alias_key,
+        AliasBacking, AliasOwnershipScope, AliasRegistry, ContainerRootToken, CowArmedSpan,
+        GuestMappingPlan, GuestMappingSharing, HVF_PAGE_SIZE, HvfMappedRegion,
+        InventoryBackingIdentity, ThreadMappingDesc, alias_is_owned_by_process,
+        alias_matches_process_scope, alias_registry, current_process_alias_keys,
+        forget_replay_extent, inherited_fork_inventory_extents, lookup_shared_alias,
+        mapping_is_current_for_process_fork_indexed, missing_process_aliases, process_alias_index,
+        process_alias_key,
     };
     /// Test adapter preserving the retired linear signature over the index.
     fn mapping_is_current_for_process_fork_test(
@@ -44570,11 +44847,11 @@ mod tag_strip_tests {
             retired.is_empty(),
             "a partial semantic unmap must retain its containing stage-2 lease"
         );
-        let mut fragments: Vec<_> = alias_registry()
+        let mut fragments: Vec<AliasBacking> = alias_registry()
             .lock()
             .iter()
-            .copied()
             .filter(|entry| entry.start >= va && entry.start < va + 0xc000)
+            .copied()
             .collect();
         fragments.sort_by_key(|entry| entry.start);
 
@@ -44662,10 +44939,11 @@ mod tag_strip_tests {
             shared_key_offset: 0,
             owner_generation: 0,
         };
-        let mut registry = vec![prefix];
+        let mut registry = AliasRegistry::default();
+        registry.extend([prefix]);
 
         let reused = retained_private_reuse_alias_fragment(
-            &registry,
+            &registry.ordered(),
             va + 0x1000,
             physical_ipa + 0x1000,
             0x1000,
@@ -44691,7 +44969,7 @@ mod tag_strip_tests {
             .is_empty(),
             "unmapping the old sibling must retain the frame owned by the reused page",
         );
-        assert_eq!(registry, vec![reused]);
+        assert_eq!(registry.ordered(), vec![reused]);
         assert_eq!(
             unregister_alias_entries(
                 &mut registry,
@@ -44896,11 +45174,11 @@ mod tag_strip_tests {
         register_shared_alias(alias);
 
         unregister_alias(va, guest_size, None, ContainerRootToken::ROOT);
-        let fragments: Vec<_> = alias_registry()
+        let fragments: Vec<AliasBacking> = alias_registry()
             .lock()
             .iter()
-            .copied()
             .filter(|entry| entry.physical_ipa == ipa)
+            .copied()
             .collect();
         let padding_replay_candidate = lookup_shared_alias(ipa + guest_size as u64);
         let fork_candidates = missing_process_aliases(
@@ -45314,7 +45592,8 @@ mod tag_strip_tests {
         );
 
         // Test unregister_alias_entries across containers
-        let mut registry = vec![alias_c1_root, alias_c2_root];
+        let mut registry = AliasRegistry::default();
+        registry.extend([alias_c1_root, alias_c2_root]);
         let retired =
             unregister_alias_entries(&mut registry, 0x1000_0000, 0x4000, None, container_1);
         assert_eq!(
@@ -45325,7 +45604,7 @@ mod tag_strip_tests {
             )])
         );
         assert_eq!(
-            registry,
+            registry.ordered(),
             vec![alias_c2_root],
             "container 1 unregister must not touch container 2 alias"
         );
