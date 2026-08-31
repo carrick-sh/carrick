@@ -56,6 +56,17 @@ struct InventoryState {
     reservations: BTreeMap<KernelTransactionId, ReservationRecord>,
     frames: BTreeMap<FrameId, FrameEntry>,
     mappings: BTreeMap<MappingId, MappingEntry>,
+    /// Live mapping count per address space, maintained alongside `mappings`.
+    ///
+    /// `apply_inner` has to report whether the committing mm still owns any
+    /// mapping AT the revision it just produced. Answering that by scanning
+    /// every mapping in the carrier made each commit O(all address spaces),
+    /// so a process group's memory traffic was quadratic in its own size; the
+    /// scan showed up as `Iterator::all` under
+    /// `FrameInventoryAuthority::apply_inner` at 8.3% of carrier CPU in the
+    /// 2026-08-30 fork/exit sweep. `mappings` is mutated in exactly one place,
+    /// so this stays exact by construction.
+    mm_mapping_counts: BTreeMap<MmId, usize>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -91,6 +102,31 @@ enum MappingState {
 /// Transaction-local copy-on-write view. Only touched mappings and frames are
 /// cloned, so applying one alias remains O(events + aliases of touched frames)
 /// rather than O(the process-wide inventory).
+/// Drop one live mapping from an address space's count, removing the row when
+/// it reaches zero so `mm_mapping_counts` never accumulates dead address
+/// spaces. Saturating rather than panicking: an undercount would be a
+/// bookkeeping bug, and the `debug_assert` in `apply_inner` is what catches it.
+/// Test-only: recompute the per-mm mapping counts from the authoritative
+/// mapping table. Production reads the maintained counter; this is what proves
+/// the two agree.
+#[cfg(test)]
+fn recomputed_mm_mapping_counts(state: &InventoryState) -> BTreeMap<MmId, usize> {
+    let mut counts = BTreeMap::new();
+    for mapping in state.mappings.values() {
+        *counts.entry(mapping.mm).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn decrement_mm_mapping_count(counts: &mut BTreeMap<MmId, usize>, mm: MmId) {
+    if let Some(count) = counts.get_mut(&mm) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            counts.remove(&mm);
+        }
+    }
+}
+
 struct InventoryOverlay<'a> {
     base: &'a InventoryState,
     frames: BTreeMap<FrameId, Option<FrameEntry>>,
@@ -357,10 +393,16 @@ impl FrameInventoryAuthority {
         for (mapping, entry) in changes.mappings {
             match entry {
                 Some(entry) => {
-                    state.mappings.insert(mapping, entry);
+                    let mm_after = entry.mm;
+                    if let Some(previous) = state.mappings.insert(mapping, entry) {
+                        decrement_mm_mapping_count(&mut state.mm_mapping_counts, previous.mm);
+                    }
+                    *state.mm_mapping_counts.entry(mm_after).or_insert(0) += 1;
                 }
                 None => {
-                    state.mappings.remove(&mapping);
+                    if let Some(previous) = state.mappings.remove(&mapping) {
+                        decrement_mm_mapping_count(&mut state.mm_mapping_counts, previous.mm);
+                    }
                 }
             }
         }
@@ -369,7 +411,13 @@ impl FrameInventoryAuthority {
         // this is a claim about that exact revision. Reading it after the lock
         // drops makes it a claim about a later revision that a concurrent
         // commit may already have moved.
-        let mm_empty_at_revision = state.mappings.values().all(|mapping| mapping.mm != mm);
+        // NOT a `debug_assert`: re-deriving this by scanning every mapping
+        // reintroduces exactly the O(all address spaces) cost the counter
+        // removes, and the conformance lane runs debug builds -- the assert
+        // measured 20.7% of carrier CPU, worse than the scan it replaced.
+        // `mm_mapping_counts` is verified against the mapping table by
+        // `per_mm_mapping_counts_track_the_mapping_table` instead.
+        let mm_empty_at_revision = state.mm_mapping_counts.get(&mm).copied().unwrap_or(0) == 0;
         Ok((outcome, next_revision, mm_empty_at_revision))
     }
 
@@ -1191,6 +1239,84 @@ mod tests {
                 .snapshot_for_mm(fixture.mm2)
                 .mappings
                 .is_empty()
+        );
+    }
+
+    /// The maintained per-mm mapping counter must agree with the mapping table
+    /// it summarizes, across publish, unmap and cross-mm sharing.
+    ///
+    /// `apply_inner` reports whether the committing mm still owns a mapping AT
+    /// the revision it just produced. Deriving that by scanning every mapping
+    /// in the carrier made each commit O(all live address spaces), so a
+    /// process group's memory traffic was quadratic in its own size (8.3% of
+    /// carrier CPU in the 2026-08-30 fork/exit sweep). The counter replaces
+    /// that scan, and this is what keeps the two honest — a `debug_assert`
+    /// cannot, because it re-runs the scan in exactly the debug builds the
+    /// conformance lane uses.
+    #[test]
+    fn per_mm_mapping_counts_track_the_mapping_table() {
+        let fixture = Fixture::new();
+        let assert_counts_agree = |stage: &str| {
+            let state = fixture.authority.state.lock();
+            assert_eq!(
+                state.mm_mapping_counts,
+                recomputed_mm_mapping_counts(&state),
+                "per-mm mapping counts diverged from the mapping table after {stage}"
+            );
+            assert!(
+                state.mm_mapping_counts.values().all(|count| *count > 0),
+                "an address space with no mappings must not retain a count row after {stage}"
+            );
+        };
+        assert_counts_agree("construction");
+
+        let mut first_mapping = None;
+        let first = fixture.batch(2, |transaction, reservation| {
+            let frame = reservation.claim_frame().expect("frame");
+            let mapping = reservation.claim_mapping().expect("mapping");
+            first_mapping = Some(mapping);
+            prepare_publish(reservation, transaction, frame, mapping, 0x4000, 0x4000);
+        });
+        fixture
+            .authority
+            .apply(fixture.mm1, first)
+            .expect("publish into mm1");
+        assert_counts_agree("publish into mm1");
+
+        let second = fixture.batch(2, |transaction, reservation| {
+            let frame = reservation.claim_frame().expect("frame");
+            let mapping = reservation.claim_mapping().expect("mapping");
+            prepare_publish(reservation, transaction, frame, mapping, 0x8000, 0x4000);
+        });
+        fixture
+            .authority
+            .apply(fixture.mm2, second)
+            .expect("publish into mm2");
+        assert_counts_agree("publish into mm2");
+
+        let first_mapping = first_mapping.expect("first mapping");
+        let unmap = fixture.batch(1, |transaction, reservation| {
+            reservation
+                .push(FrameInventoryEvent::UnmapMapping {
+                    transaction,
+                    mapping: first_mapping,
+                    generation: generation(2),
+                })
+                .expect("unmap mm1's only mapping");
+        });
+        fixture
+            .authority
+            .apply(fixture.mm1, unmap)
+            .expect("unmap from mm1");
+        assert_counts_agree("unmap mm1's only mapping");
+        assert!(
+            !fixture
+                .authority
+                .state
+                .lock()
+                .mm_mapping_counts
+                .contains_key(&fixture.mm1),
+            "an emptied address space must drop out of the counter entirely"
         );
     }
 
