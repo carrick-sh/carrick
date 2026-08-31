@@ -124,17 +124,17 @@
     "excluded": false,
     "runner": "conformance_bridge_udp_sendto_unreachable"
   },
-  "budget_two_proc": {
-    "class": "conformance",
-    "excluded": false,
-    "runner": "generic"
-  },
   "brkheapgrow": {
     "class": "conformance",
     "excluded": false,
     "runner": "generic"
   },
   "bsd_signal_xlate": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "budget_two_proc": {
     "class": "conformance",
     "excluded": false,
     "runner": "generic"
@@ -399,17 +399,17 @@
     "excluded": false,
     "runner": "generic"
   },
+  "etchostnamefile": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "eventfdsignalmatrix": {
     "class": "conformance",
     "excluded": false,
     "runner": "generic"
   },
   "eventwaitmatrix": {
-    "class": "conformance",
-    "excluded": false,
-    "runner": "generic"
-  },
-  "etchostnamefile": {
     "class": "conformance",
     "excluded": false,
     "runner": "generic"
@@ -639,17 +639,17 @@
     "excluded": false,
     "runner": "generic"
   },
-  "forkstackstorm": {
-    "class": "conformance",
-    "excluded": false,
-    "runner": "generic"
-  },
   "forksnapshot": {
     "class": "conformance",
     "excluded": false,
     "runner": "generic"
   },
   "forksplicestage": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "forkstackstorm": {
     "class": "conformance",
     "excluded": false,
     "runner": "generic"
@@ -914,12 +914,12 @@
     "excluded": false,
     "runner": "generic"
   },
-  "linkatflag": {
+  "lifecycleflagmatrix": {
     "class": "conformance",
     "excluded": false,
     "runner": "generic"
   },
-  "lifecycleflagmatrix": {
+  "linkatflag": {
     "class": "conformance",
     "excluded": false,
     "runner": "generic"
@@ -1704,6 +1704,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "ptracepoketext": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "production_rx_poketext_executes_warm_patched_instruction"
+  },
   "ptracesequence": {
     "class": "conformance",
     "excluded": false,
@@ -1734,12 +1739,12 @@
     "excluded": false,
     "runner": "generic"
   },
-  "ptyflagmatrix": {
+  "ptyfionread": {
     "class": "conformance",
     "excluded": false,
     "runner": "generic"
   },
-  "ptyfionread": {
+  "ptyflagmatrix": {
     "class": "conformance",
     "excluded": false,
     "runner": "generic"
@@ -1959,12 +1964,12 @@
     "excluded": false,
     "runner": "generic"
   },
-  "sharedanonfutexfork": {
+  "shared_buffer_mmap": {
     "class": "conformance",
     "excluded": false,
     "runner": "generic"
   },
-  "shared_buffer_mmap": {
+  "sharedanonfutexfork": {
     "class": "conformance",
     "excluded": false,
     "runner": "generic"
@@ -2064,12 +2069,12 @@
     "excluded": false,
     "runner": "generic"
   },
-  "sigsuspendxthread": {
+  "sigstopjobcontrol": {
     "class": "conformance",
     "excluded": false,
     "runner": "generic"
   },
-  "sigstopjobcontrol": {
+  "sigsuspendxthread": {
     "class": "conformance",
     "excluded": false,
     "runner": "generic"
@@ -2379,12 +2384,12 @@
     "excluded": false,
     "runner": "generic"
   },
-  "vmsplicepipe": {
+  "vfs_mount_rw": {
     "class": "conformance",
     "excluded": false,
     "runner": "generic"
   },
-  "vfs_mount_rw": {
+  "vmsplicepipe": {
     "class": "conformance",
     "excluded": false,
     "runner": "generic"

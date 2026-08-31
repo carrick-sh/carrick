@@ -2859,12 +2859,19 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// The authoritative inventory contains 490 probe sources: 464 conformance
 /// sources (442 generic, 22 dedicated), 25 performance sources, and one helper.
 /// Both libc lanes therefore gate 928 conformance rows.
-const PROBE_SOURCE_COUNT: usize = 490;
+const PROBE_SOURCE_COUNT: usize = 491;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
 /// prevents an allowlist and a name-to-runner table from drifting separately.
 const DEDICATED_PROBE_RUNNERS: &[(&str, &str)] = &[
+    // `ptracepoketext` has no generic-shard row: it needs a signed guest that
+    // ptrace-pokes warm patched text, so `carrick-conformance-next`'s
+    // `ptrace_poketext_signed` suite owns it.
+    (
+        "ptracepoketext",
+        "production_rx_poketext_executes_warm_patched_instruction",
+    ),
     ("bridge_compose_client", "conformance_bridge_compose_pair"),
     ("bridge_compose_server", "conformance_bridge_compose_pair"),
     ("bridge_dns_epoll_wake", "conformance_bridge_dns_epoll_wake"),
@@ -4566,13 +4573,13 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     }
 
     let sources = all_probe_source_names();
-    assert_eq!(DEDICATED_PROBE_RUNNERS.len(), 22);
+    assert_eq!(DEDICATED_PROBE_RUNNERS.len(), 23);
     assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
     let generic = validate_closure_probe_rows(&inventory(), &sources)
         .expect("checked-in closure probe inventory must match the source denominator");
     assert_eq!(generic.len(), 442);
-    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 464);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 928);
+    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 465);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 930);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")

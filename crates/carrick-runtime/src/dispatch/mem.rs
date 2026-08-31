@@ -5606,6 +5606,22 @@ impl SyscallDispatcher {
             if flags & !(LINUX_MREMAP_MAYMOVE | LINUX_MREMAP_FIXED | LINUX_MREMAP_DONTUNMAP) != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
+            // `man 2 mremap`: `old_address` must be page aligned, and EINVAL is
+            // documented for "old_address was not page aligned". Carrick
+            // validated the MREMAP_FIXED `new_address` alignment but never the
+            // source, so a misaligned request ran the whole move: it published
+            // the destination, then could not reclaim the misaligned source
+            // (`MemoryError::Unsupported`) and hit the fail-stop `abort()`
+            // below, taking the carrier down. `memflagmatrix` is an
+            // argument-matrix probe and asks for exactly this
+            // (`old_address = 0x6000006001`, `old_size = 4096`,
+            // `new_size = 8192`), so the whole shard-2 executable aborted.
+            // Ordering against the other EINVAL well-formedness checks is
+            // unobservable — they all yield EINVAL — but this must precede the
+            // size rounding below, which answers ENOMEM.
+            if !old_address.0.is_multiple_of(page_size) {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
             let Some(old_size) = align_up_u64(old_size, page_size) else {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             };
@@ -6561,10 +6577,16 @@ impl SyscallDispatcher {
                     if let Err(first) = memory.unmap_range(old_address.0, old_len)
                         && let Err(retry) = memory.unmap_range(old_address.0, old_len)
                     {
-                        let _ = (first, retry);
                         // The destination is already published; returning would
                         // expose two owners while reporting failure. Retain
-                        // fail-stop semantics so host teardown reclaims both.
+                        // fail-stop semantics so host teardown reclaims both --
+                        // but SAY WHY. This aborted with no output at all, so
+                        // locating it needed a 7.5 GiB core; an abort that
+                        // prints nothing is indistinguishable from a crash.
+                        eprintln!(
+                            "carrick: FATAL: mremap MOVE published                              0x{new_addr:x}+0x{new_size:x} but could not reclaim source                              0x{:x}+0x{old_len:x}: {first}; retry: {retry}",
+                            old_address.0
+                        );
                         std::process::abort();
                     }
                     mark_range_unmapped(memory, old_address.0, old_len);
