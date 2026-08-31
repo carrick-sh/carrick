@@ -42,30 +42,18 @@ const KNOWN_PROBE_GAPS: &[&str] = &[
     // passes fail the gate so they are removed from this list when the runtime
     // closes the gap.
     //
-    // `execthreads` and `vforkexecthread` still ABORT: the exec path drops an
-    // MM authority whose inventory is published but never exactly retired
-    // (holders `registration-cleanup` and `exec-rebind`).
+    // `execthreads` still ABORTS at `HvpatchTaskRegistration::cleanup`: every
+    // thread of a process shares one MM authority, and the last sibling to
+    // clean up drops a still-published inventory. Retiring it there -- the
+    // symmetric fix to the one that closed `vforkexecthread` -- removes the
+    // abort but hangs 2 runs in 3, so the missing retirement belongs upstream,
+    // before the registrations tear down.
     //
-    // `execfromthread` no longer aborts -- it reaches stage 2 and its first two
-    // lines match. Its third diverges for a reason that is NOT exec-specific,
-    // traced 2026-08-31: `getpid` is pid-namespace translated and `gettid` is
-    // not. The identity page publishes `ns_self_pid_for(task)` (task 5 -> ns
-    // pid 4 in a container), while both `gettid` paths -- the dispatcher arm
-    // and the EL1 CONTEXTIDR_EL1 fast path -- publish the raw kernel-graph tid.
-    // Inside any pid namespace the two numbering spaces are offset, so a
-    // thread-group leader observes `gettid() != getpid()`, which no Linux
-    // process can. exec merely exposes it, because the survivor is promoted to
-    // leader and then asks both questions.
-    //
-    // It is not a one-line translation: `host_to_ns` maps HOST pids, and a
-    // Linux tid here is a kernel-graph id with no thread registration in the
-    // namespace region to translate through. Publishing an untranslated or
-    // zero id through a fast path the guest reads with no vm exit is worse than
-    // the current wrong answer. Closing it needs thread ids represented in the
-    // pid namespace, alongside `ns_self_pid_for`.
+    // `execfromthread` no longer aborts and reaches stage 2; only its
+    // `gettid()==getpid()` line diverges, for the pid-namespace reason recorded
+    // at the `ns_visible` note below.
     "execthreads",
     "execfromthread",
-    "vforkexecthread",
     // Audit remediation program.
     // Each probe encodes a confirmed, dynamically-validated finding whose fix is
     // scheduled for the cited milestone; removed from this list when the fix lands

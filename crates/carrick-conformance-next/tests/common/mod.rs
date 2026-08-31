@@ -592,7 +592,6 @@ pub const MUSL_BASELINE_GAPS: &[&str] = &[
     "lifecycleflagmatrix",
     "memfdsealmatrix",
     "memflagmatrix",
-    "vforkexecthread",
 ];
 
 pub const GNU_BASELINE_GAPS: &[&str] = &[
@@ -602,7 +601,6 @@ pub const GNU_BASELINE_GAPS: &[&str] = &[
     "lifecycleflagmatrix",
     "memfdsealmatrix",
     "memflagmatrix",
-    "vforkexecthread",
 ];
 
 pub fn needs_live_oracle(probe: &str) -> bool {
