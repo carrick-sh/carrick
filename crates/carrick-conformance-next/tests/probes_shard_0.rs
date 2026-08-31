@@ -380,13 +380,13 @@ fn test_probe_binary_locator_and_gap_counts() {
     let gnu_shard_gaps = expected_shard_gaps(common::GNU_BASELINE_GAPS);
     assert_eq!(
         musl_shard_gaps.len(),
-        9,
-        "musl shard 0 must contain exactly 9 baseline gaps"
+        13,
+        "musl shard 0 must contain exactly 13 baseline gaps"
     );
     assert_eq!(
         gnu_shard_gaps.len(),
-        7,
-        "gnu shard 0 must contain exactly 7 baseline gaps"
+        11,
+        "gnu shard 0 must contain exactly 11 baseline gaps"
     );
 }
 
