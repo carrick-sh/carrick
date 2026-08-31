@@ -143,3 +143,36 @@ was changed. Final scoped cleanup reported zero processes for run id
 Task 9 does not claim host-fork transport, IPC equivalence, full file-table
 lifecycle binding, or close-family migration. Those remain Wave 3/4 work under
 the approved atomic migration and the runtime-abstraction controller.
+
+## PTRACE acceptance closure
+
+Ruling: prove the structural-vvar fork fix through the production host-only
+foreign-MM COW transaction on the exact prepared child ledger, rather than
+fabricating an `HvfVmState` or starting an HVF VM from a host unit test. This
+must demonstrate the original semantics at vvar + 24: child-private mutation
+succeeds and parent bytes remain unchanged. If wrong, the unit test could miss
+integration that exists only in `refresh_fork_process_state`; the signed public
+probe and full ecosystem gates therefore remain mandatory on the exact landed
+artifact.
+
+PTRACE closure: fix round 1/5 (one finding addressed, two open). Exact
+structural permission authentication is resolved. A different stage-1 IPA must
+also have an authenticated overlay owner rather than bypassing the error, and
+the vvar test must use privileged-internal COW while preserving guest-read-only
+authority; the ordinary foreign-COW substitute was rejected by review.
+
+PTRACE closure: fix round 2/5 (two prior findings addressed, one new finding
+open). Exact overlay ownership, exact-custody task COW, canonical lookup reuse,
+privileged vvar refresh, read-only AP, parent preservation, child-private
+ownership, disarm, and one flush are all covered. Review found that overlay
+authorization sampled only the candidate base; a partial overlay could hide an
+unowned later leaf. Round 3 requires full-range authorization and a red-first
+partial-overlay regression.
+
+Ruling: stop the PTRACE perfection loop and use the signed public conformance
+probes plus exhaustive ecosystem suite as the landing authority, per the
+user's explicit direction. The incomplete round-3 experiment was removed while
+the probe-blocking round-2 structural-vvar fix was retained. If wrong, a stale
+coarse mapping with only a partially authenticated replacement overlay remains
+a fail-open fork edge; it is recorded here rather than silently represented as
+closed.
