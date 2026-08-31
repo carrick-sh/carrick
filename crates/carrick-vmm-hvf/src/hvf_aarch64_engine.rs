@@ -1917,8 +1917,12 @@ mod task_only_materializer_tests {
             .split_once("\n    pub fn retire(self)")
             .expect("end of task-only child activation")
             .0;
+        // Match the CALL, not one spelling of its error handling: activation
+        // stopped being `activate()?;` when it grew an
+        // `unregister_foreign_mm()` rollback arm, and this assertion is about
+        // ORDER, not about how the error propagates.
         let activate = activate_child
-            .find("self._backend.activate()?;")
+            .find("self._backend.activate()")
             .expect("inventory activation");
         let publish = activate_child
             .find("task.publish_pending_fork_frame_receipts();")
