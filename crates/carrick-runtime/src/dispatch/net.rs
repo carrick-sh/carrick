@@ -6928,6 +6928,9 @@ impl SyscallDispatcher {
             } else {
                 match read_kernel_struct::<LinuxTimespec>(memory, timeout_address) {
                     Ok(timespec) => {
+                        if !super::linux_timeout_timespec_is_valid(timespec) {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        }
                         let sec = timespec.tv_sec;
                         let nsec = timespec.tv_nsec;
                         let ms = sec.saturating_mul(1000).saturating_add(nsec / 1_000_000);

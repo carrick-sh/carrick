@@ -130,7 +130,14 @@ impl SyscallDispatcher {
     define_syscall! {
         fn timerfd_create(this, cx, clock_id: u64, flags: u64) {
             let clock = Arc::clone(cx.kernel.task().container().clock());
-            if linux_clock_duration(&clock, clock_id).is_none()
+            // A timerfd accepts a strictly SMALLER set of clocks than
+            // `clock_gettime` does. carrick admitted anything it could read,
+            // so `timerfd_create(CLOCK_PROCESS_CPUTIME_ID)` succeeded where
+            // Linux answers EINVAL (`eventwaitmatrix`
+            // `timerfd_create_cputime_einval`). The CPU-time and the
+            // coarse/raw clocks are readable but not armable.
+            if !linux_timerfd_clock_is_supported(clock_id)
+                || linux_clock_duration(&clock, clock_id).is_none()
                 || flags & !LinuxTfdFlags::CREATE_SUPPORTED != 0
             {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
@@ -328,6 +335,22 @@ impl SyscallDispatcher {
 
         fn clock_settime(this, cx, clock_id: u64, address: GuestPtr) {
             let memory = &*cx.memory;
+            // CAP_SYS_TIME is checked BEFORE any argument validation.
+            // Oracle-derived (`eventwaitmatrix`): a container without the
+            // capability -- Docker's default profile, which denies
+            // `clock_settime`/`clock_adjtime` outright -- answers EPERM for an
+            // unknown clock id, a NULL `timespec`, a negative `tv_nsec`, an
+            // out-of-range `tv_nsec` and a non-settable clock alike. carrick
+            // validated arguments first and so reported EINVAL/EFAULT for all
+            // five. With the capability present every check below still runs
+            // in its original order, which is what `clocksettimevdso`
+            // (`--cap-add SYS_TIME`) exercises.
+            if !super::creds::has_effective_capability(
+                cx.kernel,
+                crate::namespace::process::CAP_SYS_TIME,
+            ) {
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
+            }
             if !linux_clock_is_known(clock_id) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
@@ -338,12 +361,6 @@ impl SyscallDispatcher {
             }
             if !linux_clock_is_settable(clock_id) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            }
-            if !super::creds::has_effective_capability(
-                cx.kernel,
-                crate::namespace::process::CAP_SYS_TIME,
-            ) {
-                return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
             if clock_id == LINUX_CLOCK_REALTIME {
                 let target_secs = timespec.tv_sec.max(0) as u64;
@@ -776,14 +793,30 @@ impl SyscallDispatcher {
 
         fn clock_adjtime(this, cx, clock_id: u64, address: GuestPtr) {
             let memory = &mut *cx.memory;
-            if clock_id != LINUX_CLOCK_REALTIME {
+            // `clock_adjtime` orders its checks differently from
+            // `clock_settime`, and the oracle shows all three steps:
+            //   - an UNKNOWN clock id is EINVAL;
+            //   - a bad `timex` pointer is EFAULT;
+            //   - a KNOWN but non-adjustable clock (CLOCK_MONOTONIC,
+            //     CLOCK_BOOTTIME, CLOCK_PROCESS_CPUTIME_ID) is EOPNOTSUPP, not
+            //     EINVAL -- carrick answered EINVAL for all of them.
+            // The capability only gates an actual adjustment, which
+            // `adjtimex_bootstrap` already handles, so it is NOT checked first
+            // here the way `clock_settime` checks it.
+            if !linux_clock_is_known(clock_id) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let clock = Arc::clone(cx.kernel.task().container().clock());
+            if address.0 == 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            }
+            if !linux_clock_is_settable(clock_id) {
+                return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+            }
             let can_adjust = super::creds::has_effective_capability(
                 cx.kernel,
                 crate::namespace::process::CAP_SYS_TIME,
             );
+            let clock = Arc::clone(cx.kernel.task().container().clock());
             Ok(adjtimex_bootstrap(&clock, memory, address.0, can_adjust))
         }
 

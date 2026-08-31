@@ -2189,7 +2189,45 @@ impl SyscallDispatcher {
             };
             let flags = operation & !LINUX_FUTEX_CMD_MASK;
             let futex_flags = LinuxFutexFlags::from_bits_retain(flags);
+            // Unknown OPERATION outranks bad flags: Linux switches on the
+            // command first and falls through to ENOSYS, so `op = 99999`
+            // (command 31 plus unsupported flag bits) is ENOSYS, not the EINVAL
+            // the flag mask below would give (`eventwaitmatrix`
+            // `futex_invalid_op_enosys`).
+            if !linux_futex_command_is_known(raw_command) {
+                return Ok(DispatchOutcome::errno(LINUX_ENOSYS));
+            }
             if flags & !LinuxFutexFlags::SUPPORTED_MASK != 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            // Well-formedness, before the futex word is read or any wait is
+            // set up. Oracle-derived (`eventwaitmatrix`); carrick accepted all
+            // four and either waited or reported the wrong errno.
+            //
+            // A futex word is a naturally aligned 32-bit object, so a
+            // misaligned `uaddr` is EINVAL rather than a wait on a torn word.
+            if !address.0.is_multiple_of(4) {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            // The BITSET forms take a mask in `val3`; an all-zero mask can
+            // match nothing, and Linux rejects it instead of parking forever.
+            if matches!(
+                raw_command,
+                LINUX_FUTEX_WAIT_BITSET | LINUX_FUTEX_WAKE_BITSET
+            ) && args.0[5] as u32 == 0
+            {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            // A timeout is validated before the wait, not folded into a
+            // duration: a negative or >= 1s `tv_nsec` is EINVAL.
+            if timeout_address.0 != 0
+                && matches!(
+                    raw_command,
+                    LINUX_FUTEX_WAIT | LINUX_FUTEX_WAIT_BITSET
+                )
+                && let Ok(timespec) = read_timespec(memory, timeout_address.0)
+                && !super::linux_timeout_timespec_is_valid(timespec)
+            {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             // Only WAIT / CMP_REQUEUE / PI ops consult the futex VALUE; WAKE and
