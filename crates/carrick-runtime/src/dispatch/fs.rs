@@ -4309,6 +4309,16 @@ impl SyscallDispatcher {
                         }
                     })
                     .collect();
+                // A VFS mount answers `readdir` from its OWN view, which cannot
+                // know about mounts layered inside it: `DevVfs` owns `/dev` and
+                // has no idea `/dev/shm` is a separate bind mount, so `shm`
+                // resolved and opened but never appeared in `readdir("/dev")`
+                // (`vfs_mount_rw` `parent_readdir_has_mount`). The rootfs
+                // listing path already injects mount children; do the same for
+                // synthetic mounts so a mount point is listed by whichever
+                // filesystem owns its parent.
+                let mut rootfs_entries = rootfs_entries;
+                self.inject_mount_dir_entries(&path, &mut rootfs_entries);
                 let metadata = RootFsMetadata {
                     path: std::path::Path::new(&path).to_path_buf(),
                     kind: RootFsEntryKind::Directory,
