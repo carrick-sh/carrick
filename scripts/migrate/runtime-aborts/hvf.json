@@ -5,15 +5,6 @@
   "rows": [
     {
       "file": "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs",
-      "function": "HvpatchTaskOnlyEngineState::activate_child",
-      "ordinal_in_function": 1,
-      "fingerprint": "978a53d430da2298817a66724f5e437f763b4e907dc0ae838be651e8ddbb690d",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::task_activation",
-      "rationale": "Replacing an existing resident parked task in activate_child after backend activation and frame publication occurred indicates concurrent activation race; dropping the displaced task would leave orphaned carrier registrations."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs",
       "function": "<HvpatchTaskOnlyEngineState as Drop>::drop",
       "ordinal_in_function": 1,
       "fingerprint": "b2c2ac538b100b36a346d1628e52314706645354cd7b039dfa577a0373df8932",
@@ -29,6 +20,15 @@
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::executor_boundary",
       "rationale": "Task-only HVPatch materialization allocated executor-local vCPU or mailbox resources without an executor lease, violating task-only executor isolation."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs",
+      "function": "HvpatchTaskOnlyEngineState::activate_child",
+      "ordinal_in_function": 1,
+      "fingerprint": "978a53d430da2298817a66724f5e437f763b4e907dc0ae838be651e8ddbb690d",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::task_activation",
+      "rationale": "Replacing an existing resident parked task in activate_child after backend activation and frame publication occurred indicates concurrent activation race; dropping the displaced task would leave orphaned carrier registrations."
     },
     {
       "file": "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs",
@@ -122,12 +122,750 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "<GlobalFrameOwnerRollback as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "697c7408378e00a951b78c08d9da5073e3538d15aeaad5a2cf87fcad2cd57343",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Failure to retire global frame host owner during rollback leaves the global frame host-owner generation registry corrupted or desynchronized."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "<HvpatchPreparedCarrierTaskState as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "fc5081e4303088bc012fb8fc9c04aada2b75a568211ce4442a5752c2cd103f88",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::task_backend_lifecycle",
+      "rationale": "Prepared carrier state was present without corresponding task authority during drop, indicating asymmetric state ownership on drop."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "<HvpatchPreparedCarrierTaskState as Drop>::drop",
+      "ordinal_in_function": 2,
+      "fingerprint": "fc5081e4303088bc012fb8fc9c04aada2b75a568211ce4442a5752c2cd103f88",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::task_backend_lifecycle",
+      "rationale": "Aborting deferred task and carrier state failed during drop, leaving unrolled-back stage-2 translations or orphaned carrier task state."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "<HvpatchTaskMmAuthority as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "27ed1a8abdc68e51ff5495c988a1e946725855bbd837cc832972858297f1117c",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::mm_authority",
+      "rationale": "Dropping MM authority failed to roll back unpublished inventory mappings, corrupting carrier frame inventory and stage-2 mapping state."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "<PendingExecStage2Cleanup as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "cc7b65afa58710f688545235cc817287f245a91d11ce2fdd6635f87dcff7bb40",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::exec_commit",
+      "rationale": "Failure during drop to retire predecessor stage-2 memory mappings leaves stale stage-2 translations and physical frame bindings active in the carrier."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "<PersistentCarrierMappings as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "7fbb84505b7cfcf2fead225c480f323464b425faed87a75f95de0c114ed05e61",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::host_alias",
+      "rationale": "Failure during drop to unmap persistent carrier stage-2 mappings leaves dangling stage-2 translations referencing freed host memory. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited (alias state partitioned by ownership scope and indexed, page-table pre-images journalled instead of cloned), which is what moved the fingerprint."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "AliasPublicationReceipt::retire_exact",
+      "ordinal_in_function": 1,
+      "fingerprint": "99bb3c622d6ab1a8ee59c6c33a81ac60db92f95746eae3db98ca892aaf0ddc48",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::host_alias",
+      "rationale": "Version ID discovered in alias version chain was unexpectedly missing when resolving its index during exact retirement, indicating corrupted version chain state. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited (alias state partitioned by ownership scope and indexed, page-table pre-images journalled instead of cloned), which is what moved the fingerprint."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "AliasPublicationReceipt::retire_exact",
+      "ordinal_in_function": 2,
+      "fingerprint": "99bb3c622d6ab1a8ee59c6c33a81ac60db92f95746eae3db98ca892aaf0ddc48",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::host_alias",
+      "rationale": "Alias epoch counter overflow when retiring an alias publication version prevents safe invalidation and epoch advancement in the alias version registry. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited (alias state partitioned by ownership scope and indexed, page-table pre-images journalled instead of cloned), which is what moved the fingerprint."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "AliasPublicationReceipt::retire_exact",
+      "ordinal_in_function": 3,
+      "fingerprint": "99bb3c622d6ab1a8ee59c6c33a81ac60db92f95746eae3db98ca892aaf0ddc48",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::host_alias",
+      "rationale": "Version ID discovered in replay chain was missing when indexing during exact retirement, indicating corrupted replay version chain state. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited (alias state partitioned by ownership scope and indexed, page-table pre-images journalled instead of cloned), which is what moved the fingerprint."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "AliasPublicationReceipt::retire_exact",
+      "ordinal_in_function": 4,
+      "fingerprint": "99bb3c622d6ab1a8ee59c6c33a81ac60db92f95746eae3db98ca892aaf0ddc48",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::host_alias",
+      "rationale": "Replay epoch counter overflow when retiring a replay version prevents safe invalidation in the replay version registry. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited (alias state partitioned by ownership scope and indexed, page-table pre-images journalled instead of cloned), which is what moved the fingerprint."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "AliasPublicationReceipt::retire_exact",
+      "ordinal_in_function": 5,
+      "fingerprint": "99bb3c622d6ab1a8ee59c6c33a81ac60db92f95746eae3db98ca892aaf0ddc48",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::host_alias",
+      "rationale": "The alias version chain named by a retiring version id was absent from the keyed chain map. retire_exact now finds a chain through alias_version_owner (an id -> key index) instead of scanning every chain's version list, so an id present in the index with no chain behind it is a torn alias-version registry, not a lookup miss. Aborting keeps the previous behaviour of the unwrap_or_else(abort) this replaced."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "AliasPublicationReceipt::retire_exact",
+      "ordinal_in_function": 6,
+      "fingerprint": "99bb3c622d6ab1a8ee59c6c33a81ac60db92f95746eae3db98ca892aaf0ddc48",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::host_alias",
+      "rationale": "As #5 for the REPLAY half: a version id present in replay_version_owner whose ReplayVersionChain is missing means the replay version registry and its index disagree."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfTaskState::perform_frame_cow",
+      "ordinal_in_function": 1,
+      "fingerprint": "61d736c4c849ab31fcee04c562cf363f3df5827f543f1287f9ec3014c5ce3ec7",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::cow_token",
+      "rationale": "Corrupted COW task identity, MM, or ASID authority was rejected by trigger receipt construction before physical mutation, indicating invalid carrier MM identity that cannot proceed as local typed error debt. Re-reviewed 2026-08-31: unchanged abort, re-attributed from HvfVmState to HvfTaskState (the enclosing impl the discovery walks) and re-fingerprinted after the per-fault armed-range clone was removed."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfTaskState::perform_frame_cow",
+      "ordinal_in_function": 2,
+      "fingerprint": "bb5ba18dacc84f11f2cd2811428cdf264c7853955be86439ec418e820f43b165",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::cow_token",
+      "rationale": "Invalid live task identity or ASID was discovered during frame COW receipt construction after global-frame owner registration and COW inventory split staging, so the carrier transaction cannot safely unwind or continue. Re-reviewed 2026-08-31: unchanged abort, re-attributed from HvfVmState to HvfTaskState (the enclosing impl the discovery walks) and re-fingerprinted after the per-fault armed-range clone was removed."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfTaskState::perform_frame_cow",
+      "ordinal_in_function": 3,
+      "fingerprint": "d48900d91c5b15cb171b5f8356c27dc1db8cfecba45b9a708e07a09d28aa1215",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::mm_authority",
+      "rationale": "Stage-1 TLB invalidation failed during frame COW rollback, leaving hardware TLBs with inconsistent stage-1 translations. Re-reviewed 2026-08-31: unchanged abort, re-attributed from HvfVmState to HvfTaskState (the enclosing impl the discovery walks) and re-fingerprinted after the per-fault armed-range clone was removed."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfTaskState::perform_frame_cow",
+      "ordinal_in_function": 4,
+      "fingerprint": "f79e586f528bed32546918c1efc813d42a33c779bbc1f1e6a04d6fb1e75a1bdd",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::mm_authority",
+      "rationale": "Stage-1 TLB invalidation failed after publishing frame COW stage-1 page table entries, leaving stale translations in the hardware TLB. Re-reviewed 2026-08-31: unchanged abort, re-attributed from HvfVmState to HvfTaskState (the enclosing impl the discovery walks) and re-fingerprinted after the per-fault armed-range clone was removed."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfTaskState::perform_frame_cow",
+      "ordinal_in_function": 5,
+      "fingerprint": "b7129589f3a75db8efd61932db2c2ccc38e7c54be54898ffdc69e9f57dcf1bac",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Committing frame inventory reservation to Kernel authority failed after installing COW stage-1 and stage-2 mappings, desynchronizing frame inventory authority. Re-reviewed 2026-08-31: unchanged abort, re-attributed from HvfVmState to HvfTaskState (the enclosing impl the discovery walks) and re-fingerprinted after the per-fault armed-range clone was removed."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfTaskState::perform_frame_cow",
+      "ordinal_in_function": 6,
+      "fingerprint": "703bb0f84b5eeb0b9d9067b0ffd49ae981031d07e40e32ce0e145b920f43a8ad",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Committing backend COW inventory split or retiring predecessor stage-2 extent failed after Kernel commit, desynchronizing backend ledger from Kernel authority. Re-reviewed 2026-08-31: unchanged abort, re-attributed from HvfVmState to HvfTaskState (the enclosing impl the discovery walks) and re-fingerprinted after the per-fault armed-range clone was removed."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfTaskState::perform_frame_cow",
+      "ordinal_in_function": 7,
+      "fingerprint": "7c67cd5d66afbe696dc5310242a5437f3109260fd3e17cbbf7a273974f3920ff",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Internal compound-size invariant failed after frame COW inventory commit, preventing authentication of the already-committed mapping. Re-reviewed 2026-08-31: unchanged abort, re-attributed from HvfVmState to HvfTaskState (the enclosing impl the discovery walks) and re-fingerprinted after the per-fault armed-range clone was removed."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfTaskState::perform_frame_cow",
+      "ordinal_in_function": 8,
+      "fingerprint": "918dbf1979683a956f882eb5a1f232ce127d632d8f6745f9c3836c6877111e9b",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::cow_token",
+      "rationale": "Authenticated COW mapping was absent from COW authority immediately after commit, indicating lost or uncommitted frame mapping state. Re-reviewed 2026-08-31: unchanged abort, re-attributed from HvfVmState to HvfTaskState (the enclosing impl the discovery walks) and re-fingerprinted after the per-fault armed-range clone was removed."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfTaskState::perform_frame_cow",
+      "ordinal_in_function": 9,
+      "fingerprint": "918dbf1979683a956f882eb5a1f232ce127d632d8f6745f9c3836c6877111e9b",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::cow_token",
+      "rationale": "Error authenticating newly committed COW mapping against COW authority indicates corrupted COW registry state. Re-reviewed 2026-08-31: unchanged abort, re-attributed from HvfVmState to HvfTaskState (the enclosing impl the discovery walks) and re-fingerprinted after the per-fault armed-range clone was removed."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfTaskState::publish_pending_fork_frame_receipts_with",
+      "ordinal_in_function": 1,
+      "fingerprint": "3db2139983efa13583cbe1eaff94527df95d599c3a04c001e28e2a79406808dc",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::cow_token",
+      "rationale": "Missing COW authority while publishing pending fork-frame receipts prevents authenticating shared child frame mappings before guest execution."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfTaskState::publish_pending_fork_frame_receipts_with",
+      "ordinal_in_function": 2,
+      "fingerprint": "c860261f7d8367d67127e34345acfdc8e837e9c673e45dd1ef37898b86c44f01",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::cow_token",
+      "rationale": "Missing COW identity while publishing pending fork-frame receipts leaves fork publication identity tracking ambiguous across carrier tasks."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfTaskState::publish_pending_fork_frame_receipts_with",
+      "ordinal_in_function": 3,
+      "fingerprint": "cf76f4de0a853505492ac91e24b933c62a1328b2982772e273fb86ec0de32944",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::fork_publication",
+      "rationale": "Zero-length extent in pending fork-frame receipt indicates corrupted fork transaction metadata during receipt publication."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfTaskState::publish_pending_fork_frame_receipts_with",
+      "ordinal_in_function": 4,
+      "fingerprint": "cf76f4de0a853505492ac91e24b933c62a1328b2982772e273fb86ec0de32944",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::fork_publication",
+      "rationale": "Child mapping in fork-frame receipt is not live in the COW authority, indicating stale or unauthenticated frame sharing publication."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfTaskState::publish_pending_fork_frame_receipts_with",
+      "ordinal_in_function": 5,
+      "fingerprint": "cf76f4de0a853505492ac91e24b933c62a1328b2982772e273fb86ec0de32944",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::cow_token",
+      "rationale": "Error querying mapping liveness against COW authority during fork receipt publication indicates corrupted COW registry state."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfTaskState::publish_pending_fork_frame_receipts_with",
+      "ordinal_in_function": 6,
+      "fingerprint": "cf76f4de0a853505492ac91e24b933c62a1328b2982772e273fb86ec0de32944",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::fork_publication",
+      "rationale": "Constructing authenticated fork-frame receipt probe event failed due to invalid receipt parameters after frame staging."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::add_alias_with_sharing",
+      "ordinal_in_function": 1,
+      "fingerprint": "1fe4f5ebcf0c75234571929dedec61a234e3a88a14e6e412a779174dbba2292d",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Alias was mapped into hypervisor stage-2 without a frame inventory reservation, leaving physical mappings installed without inventory accounting."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::add_alias_with_sharing",
+      "ordinal_in_function": 2,
+      "fingerprint": "1fe4f5ebcf0c75234571929dedec61a234e3a88a14e6e412a779174dbba2292d",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Staging frame inventory failed after installing hypervisor stage-2 alias mapping, leaving stage-2 translations diverged from inventory authority."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::execve_rebuild_inner",
+      "ordinal_in_function": 1,
+      "fingerprint": "acb33cd56903a141c2223488b27be0984b23be66a43f478bc2b399679bfa7d3e",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::exec_commit",
+      "rationale": "Pre-exec authority rollback verification failed after switch_exec_stage2_transaction error, leaving carrier stage-2 authority corrupted."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::execve_rebuild_inner",
+      "ordinal_in_function": 2,
+      "fingerprint": "acb33cd56903a141c2223488b27be0984b23be66a43f478bc2b399679bfa7d3e",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Staging frame inventory retirement failed after stage-2 physical unmap was committed, desynchronizing stage-2 state from frame inventory."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::execve_rebuild_inner",
+      "ordinal_in_function": 3,
+      "fingerprint": "bcf47e881cb3659c0252150c9f60fda6cdad64c0a9f5053e7ce2ce7132813c97",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::exec_commit",
+      "rationale": "Overlapping detached exec predecessor cleanup on task state indicates concurrent exec or abandoned predecessor stage-2 retirement."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::execve_rebuild_inner",
+      "ordinal_in_function": 4,
+      "fingerprint": "b013dfac9fc0532ae4574d089b99d89bb95ae0b96bc40e304c664b67576150bd",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Publishing global-frame host owner failed after stage-2 mappings were installed, desynchronizing global frame owner registry from carrier memory."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::execve_rebuild_inner",
+      "ordinal_in_function": 5,
+      "fingerprint": "4fec3fa0336e2eb7d546dc767e2f79d3ff922c6b255fcc413cf8b48ac52bd7b3",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Region in carrier mappings has invalid physical host offset when computing stage-2 owner identity during exec inventory staging."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::execve_rebuild_inner",
+      "ordinal_in_function": 6,
+      "fingerprint": "4fec3fa0336e2eb7d546dc767e2f79d3ff922c6b255fcc413cf8b48ac52bd7b3",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Staging replacement frame inventory failed after stage-2 mappings were installed, leaving physical stage-2 memory unrepresented in inventory ledger."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::execve_rebuild_inner",
+      "ordinal_in_function": 7,
+      "fingerprint": "4fec3fa0336e2eb7d546dc767e2f79d3ff922c6b255fcc413cf8b48ac52bd7b3",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Invalid physical host offset when collecting carrier stage-2 lease owner hosts during exec registration rebind."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::execve_rebuild_inner",
+      "ordinal_in_function": 8,
+      "fingerprint": "4fec3fa0336e2eb7d546dc767e2f79d3ff922c6b255fcc413cf8b48ac52bd7b3",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Collecting carrier stage-2 lease owners failed with conflicting or duplicate host owners during exec registration rebind."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::execve_rebuild_inner",
+      "ordinal_in_function": 9,
+      "fingerprint": "4fec3fa0336e2eb7d546dc767e2f79d3ff922c6b255fcc413cf8b48ac52bd7b3",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Registering carrier stage-2 leases in the carrier registry failed during exec rebind, leaving replacement stage-2 leases unmanaged."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::execve_rebuild_inner",
+      "ordinal_in_function": 10,
+      "fingerprint": "4fec3fa0336e2eb7d546dc767e2f79d3ff922c6b255fcc413cf8b48ac52bd7b3",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::task_backend_lifecycle",
+      "rationale": "Missing task registration during HVPatch exec authority rebind leaves the replacement MM unbound from carrier task tracking."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::execve_rebuild_inner",
+      "ordinal_in_function": 11,
+      "fingerprint": "4fec3fa0336e2eb7d546dc767e2f79d3ff922c6b255fcc413cf8b48ac52bd7b3",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::task_backend_lifecycle",
+      "rationale": "Rebinding exec MM authority into the carrier task registration failed, leaving the carrier task with stale or missing MM authority."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::execve_rebuild_inner",
+      "ordinal_in_function": 12,
+      "fingerprint": "a467ae545003d2c6af669aa61d24c721ee4d7f730172acc2f8674c84ca4d779c",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::exec_commit",
+      "rationale": "Register, sysreg, or mailbox initialization failed after exec memory and inventory publication was committed; state is irrevocable and cannot roll back safely."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::from_process_spec",
+      "ordinal_in_function": 1,
+      "fingerprint": "db6000c32f34f65748a028c4db6a0934fd32e9ac6cd23777df04f7f7f8ce8607",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Rollback of staged unpublished inventory mappings failed during process materialization from spec, leaving frame inventory in a corrupted state."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::inventory_generation",
+      "ordinal_in_function": 1,
+      "fingerprint": "4eb4db2726735e59d64b1863d0e6370a0b788c3d4214e9d50dd05e2c8c8db49e",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Zero mapping generation counter in inventory generation conversion indicates uninitialized or corrupted mapping generation authority."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::materialize_retired_reuse",
+      "ordinal_in_function": 1,
+      "fingerprint": "bc9fc8c841df5767b11f2befcab1ad37cd67b0ec8efc1898881d54e39bdfea88",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::mm_authority",
+      "rationale": "Stage-1 TLB invalidation failed during retained-reuse rollback, leaving stale stage-1 translations in the hardware TLB. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited (alias state partitioned by ownership scope and indexed, page-table pre-images journalled instead of cloned), which is what moved the fingerprint."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::materialize_retired_reuse",
+      "ordinal_in_function": 2,
+      "fingerprint": "a2e622e0c76f172242e53cfac756cf92c1f16f68d6d06684046135cedb05a07a",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::mm_authority",
+      "rationale": "Stage-1 TLB invalidation failed after publishing retained reuse page table updates, leaving hardware TLB out of sync with published stage-1 translations."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::materialize_retired_reuse",
+      "ordinal_in_function": 3,
+      "fingerprint": "5f3b9f498716b81e9fba6df50ce23a4e8b0d5778337b0cf295d93bd4878b266c",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Committing frame inventory reservation failed after retained reuse mappings were installed, desynchronizing carrier memory from Kernel inventory authority."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::materialize_retired_reuse",
+      "ordinal_in_function": 4,
+      "fingerprint": "25fc13b22281eb6f0eda3597d057f47ffd58793f5e0f1f1e44915690a3532771",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Internal compound-size invariant failed after retained-reuse inventory commit, preventing authentication of the already-committed mapping."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::materialize_retired_reuse",
+      "ordinal_in_function": 5,
+      "fingerprint": "25fc13b22281eb6f0eda3597d057f47ffd58793f5e0f1f1e44915690a3532771",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::cow_token",
+      "rationale": "Retained reuse mapping is absent from COW authority immediately after inventory commit, indicating lost or unauthenticated frame mapping state."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::materialize_retired_reuse",
+      "ordinal_in_function": 6,
+      "fingerprint": "25fc13b22281eb6f0eda3597d057f47ffd58793f5e0f1f1e44915690a3532771",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::cow_token",
+      "rationale": "Error authenticating newly committed retained reuse mapping against COW authority indicates corrupted COW registry state."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::materialize_sparse_mmap_extent",
+      "ordinal_in_function": 1,
+      "fingerprint": "dc00b4955e46138deb9a7f9fc9b6647ee73629609d462598a8606f5c9d128572",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::mm_authority",
+      "rationale": "Stage-1 TLB invalidation failed during sparse mmap rollback, leaving stale stage-1 translations cached in hardware vCPU TLB. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited (alias state partitioned by ownership scope and indexed, page-table pre-images journalled instead of cloned), which is what moved the fingerprint."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::materialize_sparse_mmap_extent",
+      "ordinal_in_function": 2,
+      "fingerprint": "6915e0db907a2a25f76504bc62d96ba50e2a6f2920a0bbf0cca0e819d5b7ea62",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::mm_authority",
+      "rationale": "Stage-1 TLB invalidation failed after publishing sparse mmap stage-1 page tables, leaving hardware TLB out of sync with published stage-1 state."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::materialize_sparse_mmap_extent",
+      "ordinal_in_function": 3,
+      "fingerprint": "03bee4f0de9ebcb5ae49b9c9c499adcff0bcd49983b508be3926a6e8d597698c",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Committing frame inventory reservation failed after stage-1 and stage-2 mappings were installed, desynchronizing carrier memory from Kernel inventory authority."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::materialize_sparse_mmap_extent",
+      "ordinal_in_function": 4,
+      "fingerprint": "5ff9cb42d634ff3630b29749dc118013e4e01e4232428f9953afa5ad5faa8421",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Zero physical extent length when authenticating committed sparse mmap mapping indicates corrupted mapping extent metadata."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::materialize_sparse_mmap_extent",
+      "ordinal_in_function": 5,
+      "fingerprint": "5ff9cb42d634ff3630b29749dc118013e4e01e4232428f9953afa5ad5faa8421",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::cow_token",
+      "rationale": "Sparse mmap mapping is absent from COW authority immediately after inventory commit, indicating lost or unauthenticated frame mapping state."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::materialize_sparse_mmap_extent",
+      "ordinal_in_function": 6,
+      "fingerprint": "5ff9cb42d634ff3630b29749dc118013e4e01e4232428f9953afa5ad5faa8421",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::cow_token",
+      "rationale": "Error authenticating newly committed sparse mmap mapping against COW authority indicates corrupted COW registry state."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::observe_frame_cow_protection",
+      "ordinal_in_function": 1,
+      "fingerprint": "b92ca23c0b682d437109c0dae42169c1561d18fc984cf816f98fdcb4a7d555fa",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::cow_token",
+      "rationale": "Impossible fragment-width conversion for leading non-overlapping span after authenticated receipts were drained indicates internal receipt-bound invariant failure."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::observe_frame_cow_protection",
+      "ordinal_in_function": 2,
+      "fingerprint": "b92ca23c0b682d437109c0dae42169c1561d18fc984cf816f98fdcb4a7d555fa",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::cow_token",
+      "rationale": "Impossible fragment-width conversion for trailing non-overlapping span after authenticated receipts were drained indicates internal receipt-bound invariant failure."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::observe_frame_cow_protection",
+      "ordinal_in_function": 3,
+      "fingerprint": "b92ca23c0b682d437109c0dae42169c1561d18fc984cf816f98fdcb4a7d555fa",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::cow_token",
+      "rationale": "Arithmetic overflow when recalculating expected IPA for split trailing pending COW publication indicates corrupted address translation state."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::prepare_task_only_plan",
+      "ordinal_in_function": 1,
+      "fingerprint": "1bb902b8c83018e471f00c781dc304408ae24d09c3956d1a62d8dad440bafc21",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Rollback of staged unpublished inventory mappings failed during task-only child process preparation, leaving frame inventory in a corrupted state."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::private_backing_identity",
+      "ordinal_in_function": 1,
+      "fingerprint": "8fd42c918b267d79fd86f6be734aab45ddafd9540130c38e7cd2c11cbf6008ee",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Counter overflow when generating private backing identity serial causes backing ID collisions across private allocations in the carrier."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::retire_task_state_process_mappings",
+      "ordinal_in_function": 1,
+      "fingerprint": "be06335dea59ce61abf5efd66d1670d7d71f8a69ea273540a5cbcd0aa2670e8f",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Validated retirement reservation disappeared from inventory ledger during process mapping retirement, indicating concurrent state mutation or broken transaction atomicity."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::shared_anon_backing_identity",
+      "ordinal_in_function": 1,
+      "fingerprint": "5be1c345a2497e0c72187b0d29af6267c122beb7985fe8c74f2ec29e2e7d934d",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Counter overflow when generating shared anonymous backing identity serial causes backing ID collisions across shared anonymous allocations in the carrier."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::swap_persistent_executor_local",
+      "ordinal_in_function": 1,
+      "fingerprint": "8e11b946becccd86883c2ef3169c22337ca8f95b999e69dc5827d4b5b017b323",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::executor_boundary",
+      "rationale": "Swapping persistent executor-local state across mismatched carrier foreign MM transport instances would cross carrier transport isolation boundaries and corrupt subsequent executor memory operations."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::unregister_process_alias",
+      "ordinal_in_function": 1,
+      "fingerprint": "fdb990d1eb6a2f8114f40765e88e43771a6dafee9d9e62f3052c1a6da3c56f94",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::host_alias",
+      "rationale": "Global alias registry mutated unexpectedly under topology lock during alias unregistration, corrupting planned alias and stage-2 lease retirement."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::unregister_process_alias",
+      "ordinal_in_function": 2,
+      "fingerprint": "07d7e86979792d4f42a65210bac7a980927b24fba403cc18282dc0cf9250151e",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Applying alias retirement inventory commit to Kernel authority failed after unregistering aliases, desynchronizing alias state from Kernel frame inventory authority."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::unregister_process_alias",
+      "ordinal_in_function": 3,
+      "fingerprint": "8c2c7890e7ddbcfc1fdcb2ee0a74b2e2cd78d9c4dd9d6ecd0c94af222be26d46",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Committing alias lease retirement to backend inventory ledger failed after Kernel commit, leaving carrier ledger and Kernel authority diverged."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvpatchCarrierTaskStateDirectory::publish_inner",
+      "ordinal_in_function": 1,
+      "fingerprint": "06b5213ef444c5b836168c51e4b88ac214ee89018e449d4c0239b2566f2f51e6",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Carrier frame registry authority was missing when constructing live sibling carrier MM authority during directory publication."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvpatchCarrierTaskStateDirectory::publish_inner",
+      "ordinal_in_function": 2,
+      "fingerprint": "06b5213ef444c5b836168c51e4b88ac214ee89018e449d4c0239b2566f2f51e6",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Carrier frame registry authority was missing when constructing shared process carrier MM authority during directory publication."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvpatchCarrierTaskStateDirectory::publish_inner",
+      "ordinal_in_function": 3,
+      "fingerprint": "06b5213ef444c5b836168c51e4b88ac214ee89018e449d4c0239b2566f2f51e6",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Carrier frame registry authority was missing when constructing new process carrier MM authority during directory publication."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvpatchCarrierTaskStateDirectory::publish_inner",
+      "ordinal_in_function": 4,
+      "fingerprint": "4d4d128d08d3b908123d17293cb0d5f516556f09b053e67e19e699ef3f300c53",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::task_backend_lifecycle",
+      "rationale": "Duplicate carrier task key collision in task state directory indicates corrupt task token generation or split directory tracking."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvpatchCarrierTaskStateDirectory::publish_inner",
+      "ordinal_in_function": 5,
+      "fingerprint": "456c20b8ab215871b7e7b86805c94d6cc341870e948cd4f3fe56256e76bb9833",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::task_backend_lifecycle",
+      "rationale": "Just-inserted carrier task row was missing from directory during failpoint rollback, indicating concurrent mutation of directory state."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvpatchCarrierTaskStateDirectory::publish_inner",
+      "ordinal_in_function": 6,
+      "fingerprint": "456c20b8ab215871b7e7b86805c94d6cc341870e948cd4f3fe56256e76bb9833",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::task_backend_lifecycle",
+      "rationale": "Rollback of task and carrier MM authority failed after directory publication failure, leaving orphaned carrier bindings in the VM."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvpatchFrameInventoryState::cancel_alias_inventory",
       "ordinal_in_function": 1,
       "fingerprint": "43047e0dc4946b246bae2c0809334f05169dcc0b276e9f63d1ddaa6d9997f44f",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Failed rollback of staged unpublished alias mappings leaves the frame inventory ledger and physical stage-2 mappings in a diverged state."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvpatchPreparedCarrierTaskState::abort",
+      "ordinal_in_function": 1,
+      "fingerprint": "06478fe591bbbab2b8e3fe71ddea81ff747bbbdb58301999afb40071f760194c",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::task_backend_lifecycle",
+      "rationale": "Prepared carrier task state was present without corresponding task authority during abort, indicating split or asymmetric prepared state ownership."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvpatchPreparedCarrierTaskState::commit",
+      "ordinal_in_function": 1,
+      "fingerprint": "111c909bbc52cf4350c30c36a38f237390d5e78bffa679c2b44e00f7aa7077b1",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::task_backend_commit",
+      "rationale": "Missing carrier state during prepared task commit indicates duplicate commit or split ownership of prepared task state."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvpatchPreparedCarrierTaskState::commit",
+      "ordinal_in_function": 2,
+      "fingerprint": "0ed5c42d670617e9719f974e0b1f7ab867e8d5a232300f6bf281797852d774a3",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::task_backend_commit",
+      "rationale": "Missing task authority during prepared task commit indicates duplicate commit or split ownership of prepared task authority."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvpatchTaskInventoryAuthority::apply_process_inventory",
+      "ordinal_in_function": 1,
+      "fingerprint": "21ca6f0a1d05d50b29d6ba8e9c9c8d22fff43935b81a5f71bb676c92db0335da",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Kernel reported successful process inventory commit but returned a receipt failing MM challenge authentication, desynchronizing Kernel and carrier frame authority."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvpatchTaskInventoryAuthority::apply_retirement",
+      "ordinal_in_function": 1,
+      "fingerprint": "b19c3069dfce9ad7bdfea47d5a2640dea1c15caf8a5421e9f3dfe4a82211d8a0",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Kernel committed inventory retirement but returned a malformed retirement receipt failing challenge or mapping authentication, desynchronizing frame inventory."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvpatchTaskOnlyBackendState::cleanup_exact",
+      "ordinal_in_function": 1,
+      "fingerprint": "dab69855bb7b0b0c316e5f04c479cd479fee74f719c85dafe1f03de5f0438714",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::task_backend_lifecycle",
+      "rationale": "Deferred task registration cleanup failed during task backend teardown, leaving corrupted or leaked registrations in the carrier task directory."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "abort_prepared_task_and_carrier",
+      "ordinal_in_function": 1,
+      "fingerprint": "ba30680f381a26b6f7df404dc933344fba162e4965204257b7901c79a33850de",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Rollback of prepared unpublished inventory failed during carrier task abort, leaving stage-2 translations and frame inventory in an indeterminate state."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "emit_global_frame_stage2",
+      "ordinal_in_function": 1,
+      "fingerprint": "ef9be990019fc8e48db2ca13ab08291a60087b90523f4cf9ad1e93be18fac92a",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Physical stage-2 mapping or unmapping transition already completed in the hypervisor while typed receipt construction failed, leaving the physical boundary unpublishable and unverifiable."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "mutate_external_alias_state",
+      "ordinal_in_function": 1,
+      "fingerprint": "b9cb966a83c16a140af604c58059830341fc29a0fe8323a6d3d49fb0b223938b",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::host_alias",
+      "rationale": "Counter overflow in alias version epoch during external alias state mutation risks alias version collision and invalid receipt invalidation. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited (alias state partitioned by ownership scope and indexed, page-table pre-images journalled instead of cloned), which is what moved the fingerprint."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "mutate_external_alias_state",
+      "ordinal_in_function": 2,
+      "fingerprint": "a5a945583edc3df0039bdb8e36b685890c3599ca48ae8558c454fbc1bbb00df8",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::host_alias",
+      "rationale": "Counter overflow in replay version epoch during external alias state mutation risks replay version collision and invalid alias replay. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited (alias state partitioned by ownership scope and indexed, page-table pre-images journalled instead of cloned), which is what moved the fingerprint."
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
@@ -286,10 +1024,10 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "perform_foreign_cow_transaction",
       "ordinal_in_function": 18,
-      "fingerprint": "8ddbcb9f2acb0e4145f0ceae3ebedff48bbc05385ee90e4e90ccb07c167e8b5a",
+      "fingerprint": "52444d67e21c56f57341b2eab124a4a9a0b0f18221123b98fbab44e5752bd2bb",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
-      "rationale": "Failed to retrieve registered global frame host owner Arc when retaining foreign extent for lease guard."
+      "rationale": "Failed to retrieve registered global frame host owner Arc when retaining foreign extent for lease guard. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited (alias state partitioned by ownership scope and indexed, page-table pre-images journalled instead of cloned), which is what moved the fingerprint."
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
@@ -302,300 +1040,39 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "<PendingExecStage2Cleanup as Drop>::drop",
+      "function": "retire_process_aliases_in",
       "ordinal_in_function": 1,
-      "fingerprint": "cc7b65afa58710f688545235cc817287f245a91d11ce2fdd6635f87dcff7bb40",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::exec_commit",
-      "rationale": "Failure during drop to retire predecessor stage-2 memory mappings leaves stale stage-2 translations and physical frame bindings active in the carrier."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfTaskState::publish_pending_fork_frame_receipts_with",
-      "ordinal_in_function": 1,
-      "fingerprint": "3db2139983efa13583cbe1eaff94527df95d599c3a04c001e28e2a79406808dc",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::cow_token",
-      "rationale": "Missing COW authority while publishing pending fork-frame receipts prevents authenticating shared child frame mappings before guest execution."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfTaskState::publish_pending_fork_frame_receipts_with",
-      "ordinal_in_function": 2,
-      "fingerprint": "c860261f7d8367d67127e34345acfdc8e837e9c673e45dd1ef37898b86c44f01",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::cow_token",
-      "rationale": "Missing COW identity while publishing pending fork-frame receipts leaves fork publication identity tracking ambiguous across carrier tasks."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfTaskState::publish_pending_fork_frame_receipts_with",
-      "ordinal_in_function": 3,
-      "fingerprint": "cf76f4de0a853505492ac91e24b933c62a1328b2982772e273fb86ec0de32944",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::fork_publication",
-      "rationale": "Zero-length extent in pending fork-frame receipt indicates corrupted fork transaction metadata during receipt publication."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfTaskState::publish_pending_fork_frame_receipts_with",
-      "ordinal_in_function": 4,
-      "fingerprint": "cf76f4de0a853505492ac91e24b933c62a1328b2982772e273fb86ec0de32944",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::fork_publication",
-      "rationale": "Child mapping in fork-frame receipt is not live in the COW authority, indicating stale or unauthenticated frame sharing publication."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfTaskState::publish_pending_fork_frame_receipts_with",
-      "ordinal_in_function": 5,
-      "fingerprint": "cf76f4de0a853505492ac91e24b933c62a1328b2982772e273fb86ec0de32944",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::cow_token",
-      "rationale": "Error querying mapping liveness against COW authority during fork receipt publication indicates corrupted COW registry state."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfTaskState::publish_pending_fork_frame_receipts_with",
-      "ordinal_in_function": 6,
-      "fingerprint": "cf76f4de0a853505492ac91e24b933c62a1328b2982772e273fb86ec0de32944",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::fork_publication",
-      "rationale": "Constructing authenticated fork-frame receipt probe event failed due to invalid receipt parameters after frame staging."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::swap_persistent_executor_local",
-      "ordinal_in_function": 1,
-      "fingerprint": "8e11b946becccd86883c2ef3169c22337ca8f95b999e69dc5827d4b5b017b323",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::executor_boundary",
-      "rationale": "Swapping persistent executor-local state across mismatched carrier foreign MM transport instances would cross carrier transport isolation boundaries and corrupt subsequent executor memory operations."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "<PersistentCarrierMappings as Drop>::drop",
-      "ordinal_in_function": 1,
-      "fingerprint": "ded1056db87e611de1704e9145808aa7412ee35d18d302d341bda73688d48a10",
+      "fingerprint": "07395066e9c374d8607a1bd7ad74a0792c38a29df5891fb27aeb39c97f24440a",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
-      "rationale": "Failure during drop to unmap persistent carrier stage-2 mappings leaves dangling stage-2 translations referencing freed host memory."
+      "rationale": "Counter overflow when incrementing an alias version epoch during process-exit alias retirement risks alias version collision and stale readers. Same condition and verdict as the epoch aborts in mutate_external_alias_state; this path exists because process exit now removes its own scope bucket instead of diffing whole-registry snapshots."
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvpatchTaskOnlyBackendState::cleanup_exact",
-      "ordinal_in_function": 1,
-      "fingerprint": "dab69855bb7b0b0c316e5f04c479cd479fee74f719c85dafe1f03de5f0438714",
+      "function": "retire_process_aliases_in",
+      "ordinal_in_function": 2,
+      "fingerprint": "47878bc6e81becbc5adca2399a4eaf308ee097c1065269cd8f61500dc78700ac",
       "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::task_backend_lifecycle",
-      "rationale": "Deferred task registration cleanup failed during task backend teardown, leaving corrupted or leaked registrations in the carrier task directory."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvpatchTaskInventoryAuthority::apply_process_inventory",
-      "ordinal_in_function": 1,
-      "fingerprint": "21ca6f0a1d05d50b29d6ba8e9c9c8d22fff43935b81a5f71bb676c92db0335da",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Kernel reported successful process inventory commit but returned a receipt failing MM challenge authentication, desynchronizing Kernel and carrier frame authority."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvpatchTaskInventoryAuthority::apply_retirement",
-      "ordinal_in_function": 1,
-      "fingerprint": "b19c3069dfce9ad7bdfea47d5a2640dea1c15caf8a5421e9f3dfe4a82211d8a0",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Kernel committed inventory retirement but returned a malformed retirement receipt failing challenge or mapping authentication, desynchronizing frame inventory."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "<HvpatchTaskMmAuthority as Drop>::drop",
-      "ordinal_in_function": 1,
-      "fingerprint": "27ed1a8abdc68e51ff5495c988a1e946725855bbd837cc832972858297f1117c",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::mm_authority",
-      "rationale": "Dropping MM authority failed to roll back unpublished inventory mappings, corrupting carrier frame inventory and stage-2 mapping state."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "abort_prepared_task_and_carrier",
-      "ordinal_in_function": 1,
-      "fingerprint": "ba30680f381a26b6f7df404dc933344fba162e4965204257b7901c79a33850de",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Rollback of prepared unpublished inventory failed during carrier task abort, leaving stage-2 translations and frame inventory in an indeterminate state."
+      "failure_domain": "hvpatch::host_alias",
+      "rationale": "Counter overflow when incrementing a replay version epoch during process-exit alias retirement. Replay-side counterpart of #1, same verdict and same reason for existing."
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "scoped_alias_epoch_update",
       "ordinal_in_function": 1,
-      "fingerprint": "a0cd35189f5c69fac701f55ee9c0812c572f5eccb8f718163b2daada090eb22c",
+      "fingerprint": "661a829b847bd3fddd88fea13b48d9d1a1b8a20859937b623ca14ee0dd655c81",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
-      "rationale": "Counter overflow when incrementing external alias version epoch risks version ID collision and stale receipt authentication across carrier tasks."
+      "rationale": "Counter overflow when incrementing external alias version epoch risks version ID collision and stale receipt authentication across carrier tasks. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited (alias state partitioned by ownership scope and indexed, page-table pre-images journalled instead of cloned), which is what moved the fingerprint."
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "scoped_alias_epoch_update",
       "ordinal_in_function": 2,
-      "fingerprint": "a9f10b952f03572861ffcedf6c3c9b4f9348a87b9a645cb1d59730d8c3e65638",
+      "fingerprint": "f910d53530e0aec3813b6080ac9aee931cfb555ad32d8c8726517543ec746e62",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
-      "rationale": "Counter overflow when incrementing external replay version epoch risks replay collision and invalid alias restoration across carrier tasks."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "mutate_external_alias_state",
-      "ordinal_in_function": 1,
-      "fingerprint": "bddb0d67d7054629e330ca3ef7388dc0cfe8c4e8960477153beb56cbbdecfd5d",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::host_alias",
-      "rationale": "Counter overflow in alias version epoch during external alias state mutation risks alias version collision and invalid receipt invalidation."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "mutate_external_alias_state",
-      "ordinal_in_function": 2,
-      "fingerprint": "4a98ac879637ea94f3c823c2b20cf2621be78e14e22fcfa34e2b9d51b2fcf86d",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::host_alias",
-      "rationale": "Counter overflow in replay version epoch during external alias state mutation risks replay version collision and invalid alias replay."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "AliasPublicationReceipt::retire_exact",
-      "ordinal_in_function": 1,
-      "fingerprint": "212e2518254913bb3fe74271dfa9cad23dd40ed8fc141a9469b0baf60d54c991",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::host_alias",
-      "rationale": "Version ID discovered in alias version chain was unexpectedly missing when resolving its index during exact retirement, indicating corrupted version chain state."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "AliasPublicationReceipt::retire_exact",
-      "ordinal_in_function": 2,
-      "fingerprint": "212e2518254913bb3fe74271dfa9cad23dd40ed8fc141a9469b0baf60d54c991",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::host_alias",
-      "rationale": "Alias epoch counter overflow when retiring an alias publication version prevents safe invalidation and epoch advancement in the alias version registry."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "AliasPublicationReceipt::retire_exact",
-      "ordinal_in_function": 3,
-      "fingerprint": "212e2518254913bb3fe74271dfa9cad23dd40ed8fc141a9469b0baf60d54c991",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::host_alias",
-      "rationale": "Version ID discovered in replay chain was missing when indexing during exact retirement, indicating corrupted replay version chain state."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "AliasPublicationReceipt::retire_exact",
-      "ordinal_in_function": 4,
-      "fingerprint": "212e2518254913bb3fe74271dfa9cad23dd40ed8fc141a9469b0baf60d54c991",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::host_alias",
-      "rationale": "Replay epoch counter overflow when retiring a replay version prevents safe invalidation in the replay version registry."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvpatchPreparedCarrierTaskState::commit",
-      "ordinal_in_function": 1,
-      "fingerprint": "111c909bbc52cf4350c30c36a38f237390d5e78bffa679c2b44e00f7aa7077b1",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::task_backend_commit",
-      "rationale": "Missing carrier state during prepared task commit indicates duplicate commit or split ownership of prepared task state."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvpatchPreparedCarrierTaskState::commit",
-      "ordinal_in_function": 2,
-      "fingerprint": "0ed5c42d670617e9719f974e0b1f7ab867e8d5a232300f6bf281797852d774a3",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::task_backend_commit",
-      "rationale": "Missing task authority during prepared task commit indicates duplicate commit or split ownership of prepared task authority."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvpatchPreparedCarrierTaskState::abort",
-      "ordinal_in_function": 1,
-      "fingerprint": "06478fe591bbbab2b8e3fe71ddea81ff747bbbdb58301999afb40071f760194c",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::task_backend_lifecycle",
-      "rationale": "Prepared carrier task state was present without corresponding task authority during abort, indicating split or asymmetric prepared state ownership."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "<HvpatchPreparedCarrierTaskState as Drop>::drop",
-      "ordinal_in_function": 1,
-      "fingerprint": "fc5081e4303088bc012fb8fc9c04aada2b75a568211ce4442a5752c2cd103f88",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::task_backend_lifecycle",
-      "rationale": "Prepared carrier state was present without corresponding task authority during drop, indicating asymmetric state ownership on drop."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "<HvpatchPreparedCarrierTaskState as Drop>::drop",
-      "ordinal_in_function": 2,
-      "fingerprint": "fc5081e4303088bc012fb8fc9c04aada2b75a568211ce4442a5752c2cd103f88",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::task_backend_lifecycle",
-      "rationale": "Aborting deferred task and carrier state failed during drop, leaving unrolled-back stage-2 translations or orphaned carrier task state."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvpatchCarrierTaskStateDirectory::publish_inner",
-      "ordinal_in_function": 1,
-      "fingerprint": "06b5213ef444c5b836168c51e4b88ac214ee89018e449d4c0239b2566f2f51e6",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Carrier frame registry authority was missing when constructing live sibling carrier MM authority during directory publication."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvpatchCarrierTaskStateDirectory::publish_inner",
-      "ordinal_in_function": 2,
-      "fingerprint": "06b5213ef444c5b836168c51e4b88ac214ee89018e449d4c0239b2566f2f51e6",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Carrier frame registry authority was missing when constructing shared process carrier MM authority during directory publication."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvpatchCarrierTaskStateDirectory::publish_inner",
-      "ordinal_in_function": 3,
-      "fingerprint": "06b5213ef444c5b836168c51e4b88ac214ee89018e449d4c0239b2566f2f51e6",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Carrier frame registry authority was missing when constructing new process carrier MM authority during directory publication."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvpatchCarrierTaskStateDirectory::publish_inner",
-      "ordinal_in_function": 4,
-      "fingerprint": "4d4d128d08d3b908123d17293cb0d5f516556f09b053e67e19e699ef3f300c53",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::task_backend_lifecycle",
-      "rationale": "Duplicate carrier task key collision in task state directory indicates corrupt task token generation or split directory tracking."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvpatchCarrierTaskStateDirectory::publish_inner",
-      "ordinal_in_function": 5,
-      "fingerprint": "456c20b8ab215871b7e7b86805c94d6cc341870e948cd4f3fe56256e76bb9833",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::task_backend_lifecycle",
-      "rationale": "Just-inserted carrier task row was missing from directory during failpoint rollback, indicating concurrent mutation of directory state."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvpatchCarrierTaskStateDirectory::publish_inner",
-      "ordinal_in_function": 6,
-      "fingerprint": "456c20b8ab215871b7e7b86805c94d6cc341870e948cd4f3fe56256e76bb9833",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::task_backend_lifecycle",
-      "rationale": "Rollback of task and carrier MM authority failed after directory publication failure, leaving orphaned carrier bindings in the VM."
+      "rationale": "Counter overflow when incrementing external replay version epoch risks replay collision and invalid alias restoration across carrier tasks. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited (alias state partitioned by ownership scope and indexed, page-table pre-images journalled instead of cloned), which is what moved the fingerprint."
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
@@ -623,447 +1100,6 @@
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::exec_commit",
       "rationale": "Re-installing predecessor stage-2 mappings failed during exec transaction rollback, leaving predecessor memory unmapped."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "<GlobalFrameOwnerRollback as Drop>::drop",
-      "ordinal_in_function": 1,
-      "fingerprint": "697c7408378e00a951b78c08d9da5073e3538d15aeaad5a2cf87fcad2cd57343",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Failure to retire global frame host owner during rollback leaves the global frame host-owner generation registry corrupted or desynchronized."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::inventory_generation",
-      "ordinal_in_function": 1,
-      "fingerprint": "4eb4db2726735e59d64b1863d0e6370a0b788c3d4214e9d50dd05e2c8c8db49e",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Zero mapping generation counter in inventory generation conversion indicates uninitialized or corrupted mapping generation authority."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::private_backing_identity",
-      "ordinal_in_function": 1,
-      "fingerprint": "8fd42c918b267d79fd86f6be734aab45ddafd9540130c38e7cd2c11cbf6008ee",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Counter overflow when generating private backing identity serial causes backing ID collisions across private allocations in the carrier."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::shared_anon_backing_identity",
-      "ordinal_in_function": 1,
-      "fingerprint": "5be1c345a2497e0c72187b0d29af6267c122beb7985fe8c74f2ec29e2e7d934d",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Counter overflow when generating shared anonymous backing identity serial causes backing ID collisions across shared anonymous allocations in the carrier."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::retire_task_state_process_mappings",
-      "ordinal_in_function": 1,
-      "fingerprint": "be06335dea59ce61abf5efd66d1670d7d71f8a69ea273540a5cbcd0aa2670e8f",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Validated retirement reservation disappeared from inventory ledger during process mapping retirement, indicating concurrent state mutation or broken transaction atomicity."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::materialize_sparse_mmap_extent",
-      "ordinal_in_function": 1,
-      "fingerprint": "17a4b3067a831e1840670a4c2bc815d2cd6abad0a5ea728ade0d018fb38faa16",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::mm_authority",
-      "rationale": "Stage-1 TLB invalidation failed during sparse mmap rollback, leaving stale stage-1 translations cached in hardware vCPU TLB."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::materialize_sparse_mmap_extent",
-      "ordinal_in_function": 2,
-      "fingerprint": "6915e0db907a2a25f76504bc62d96ba50e2a6f2920a0bbf0cca0e819d5b7ea62",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::mm_authority",
-      "rationale": "Stage-1 TLB invalidation failed after publishing sparse mmap stage-1 page tables, leaving hardware TLB out of sync with published stage-1 state."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::materialize_sparse_mmap_extent",
-      "ordinal_in_function": 3,
-      "fingerprint": "03bee4f0de9ebcb5ae49b9c9c499adcff0bcd49983b508be3926a6e8d597698c",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Committing frame inventory reservation failed after stage-1 and stage-2 mappings were installed, desynchronizing carrier memory from Kernel inventory authority."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::materialize_sparse_mmap_extent",
-      "ordinal_in_function": 4,
-      "fingerprint": "5ff9cb42d634ff3630b29749dc118013e4e01e4232428f9953afa5ad5faa8421",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Zero physical extent length when authenticating committed sparse mmap mapping indicates corrupted mapping extent metadata."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::materialize_sparse_mmap_extent",
-      "ordinal_in_function": 5,
-      "fingerprint": "5ff9cb42d634ff3630b29749dc118013e4e01e4232428f9953afa5ad5faa8421",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::cow_token",
-      "rationale": "Sparse mmap mapping is absent from COW authority immediately after inventory commit, indicating lost or unauthenticated frame mapping state."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::materialize_sparse_mmap_extent",
-      "ordinal_in_function": 6,
-      "fingerprint": "5ff9cb42d634ff3630b29749dc118013e4e01e4232428f9953afa5ad5faa8421",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::cow_token",
-      "rationale": "Error authenticating newly committed sparse mmap mapping against COW authority indicates corrupted COW registry state."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::materialize_retired_reuse",
-      "ordinal_in_function": 1,
-      "fingerprint": "e6b92d666f254aec02b6c1887b5751a2ad954ba64a835017639e9ee94a1fe67a",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::mm_authority",
-      "rationale": "Stage-1 TLB invalidation failed during retained-reuse rollback, leaving stale stage-1 translations in the hardware TLB."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::materialize_retired_reuse",
-      "ordinal_in_function": 2,
-      "fingerprint": "a2e622e0c76f172242e53cfac756cf92c1f16f68d6d06684046135cedb05a07a",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::mm_authority",
-      "rationale": "Stage-1 TLB invalidation failed after publishing retained reuse page table updates, leaving hardware TLB out of sync with published stage-1 translations."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::materialize_retired_reuse",
-      "ordinal_in_function": 3,
-      "fingerprint": "5f3b9f498716b81e9fba6df50ce23a4e8b0d5778337b0cf295d93bd4878b266c",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Committing frame inventory reservation failed after retained reuse mappings were installed, desynchronizing carrier memory from Kernel inventory authority."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::materialize_retired_reuse",
-      "ordinal_in_function": 4,
-      "fingerprint": "25fc13b22281eb6f0eda3597d057f47ffd58793f5e0f1f1e44915690a3532771",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Internal compound-size invariant failed after retained-reuse inventory commit, preventing authentication of the already-committed mapping."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::materialize_retired_reuse",
-      "ordinal_in_function": 5,
-      "fingerprint": "25fc13b22281eb6f0eda3597d057f47ffd58793f5e0f1f1e44915690a3532771",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::cow_token",
-      "rationale": "Retained reuse mapping is absent from COW authority immediately after inventory commit, indicating lost or unauthenticated frame mapping state."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::materialize_retired_reuse",
-      "ordinal_in_function": 6,
-      "fingerprint": "25fc13b22281eb6f0eda3597d057f47ffd58793f5e0f1f1e44915690a3532771",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::cow_token",
-      "rationale": "Error authenticating newly committed retained reuse mapping against COW authority indicates corrupted COW registry state."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::perform_frame_cow",
-      "ordinal_in_function": 1,
-      "fingerprint": "61d736c4c849ab31fcee04c562cf363f3df5827f543f1287f9ec3014c5ce3ec7",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::cow_token",
-      "rationale": "Corrupted COW task identity, MM, or ASID authority was rejected by trigger receipt construction before physical mutation, indicating invalid carrier MM identity that cannot proceed as local typed error debt."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::perform_frame_cow",
-      "ordinal_in_function": 2,
-      "fingerprint": "bb5ba18dacc84f11f2cd2811428cdf264c7853955be86439ec418e820f43b165",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::cow_token",
-      "rationale": "Invalid live task identity or ASID was discovered during frame COW receipt construction after global-frame owner registration and COW inventory split staging, so the carrier transaction cannot safely unwind or continue."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::perform_frame_cow",
-      "ordinal_in_function": 3,
-      "fingerprint": "a0754451483d6839a9b41c9a81a0faefb0df3710617fc399afe0ba3ea3f1ab81",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::mm_authority",
-      "rationale": "Stage-1 TLB invalidation failed during frame COW rollback, leaving hardware TLBs with inconsistent stage-1 translations."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::perform_frame_cow",
-      "ordinal_in_function": 4,
-      "fingerprint": "f79e586f528bed32546918c1efc813d42a33c779bbc1f1e6a04d6fb1e75a1bdd",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::mm_authority",
-      "rationale": "Stage-1 TLB invalidation failed after publishing frame COW stage-1 page table entries, leaving stale translations in the hardware TLB."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::perform_frame_cow",
-      "ordinal_in_function": 5,
-      "fingerprint": "b7129589f3a75db8efd61932db2c2ccc38e7c54be54898ffdc69e9f57dcf1bac",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Committing frame inventory reservation to Kernel authority failed after installing COW stage-1 and stage-2 mappings, desynchronizing frame inventory authority."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::perform_frame_cow",
-      "ordinal_in_function": 6,
-      "fingerprint": "3582d076aea35d7c03d505ce7fdac73ff7ff7aeaeb9539766ede2a3a455c6281",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Committing backend COW inventory split or retiring predecessor stage-2 extent failed after Kernel commit, desynchronizing backend ledger from Kernel authority."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::perform_frame_cow",
-      "ordinal_in_function": 7,
-      "fingerprint": "7c67cd5d66afbe696dc5310242a5437f3109260fd3e17cbbf7a273974f3920ff",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Internal compound-size invariant failed after frame COW inventory commit, preventing authentication of the already-committed mapping."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::perform_frame_cow",
-      "ordinal_in_function": 8,
-      "fingerprint": "918dbf1979683a956f882eb5a1f232ce127d632d8f6745f9c3836c6877111e9b",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::cow_token",
-      "rationale": "Authenticated COW mapping was absent from COW authority immediately after commit, indicating lost or uncommitted frame mapping state."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::perform_frame_cow",
-      "ordinal_in_function": 9,
-      "fingerprint": "918dbf1979683a956f882eb5a1f232ce127d632d8f6745f9c3836c6877111e9b",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::cow_token",
-      "rationale": "Error authenticating newly committed COW mapping against COW authority indicates corrupted COW registry state."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::observe_frame_cow_protection",
-      "ordinal_in_function": 1,
-      "fingerprint": "b92ca23c0b682d437109c0dae42169c1561d18fc984cf816f98fdcb4a7d555fa",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::cow_token",
-      "rationale": "Impossible fragment-width conversion for leading non-overlapping span after authenticated receipts were drained indicates internal receipt-bound invariant failure."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::observe_frame_cow_protection",
-      "ordinal_in_function": 2,
-      "fingerprint": "b92ca23c0b682d437109c0dae42169c1561d18fc984cf816f98fdcb4a7d555fa",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::cow_token",
-      "rationale": "Impossible fragment-width conversion for trailing non-overlapping span after authenticated receipts were drained indicates internal receipt-bound invariant failure."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::observe_frame_cow_protection",
-      "ordinal_in_function": 3,
-      "fingerprint": "b92ca23c0b682d437109c0dae42169c1561d18fc984cf816f98fdcb4a7d555fa",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::cow_token",
-      "rationale": "Arithmetic overflow when recalculating expected IPA for split trailing pending COW publication indicates corrupted address translation state."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::add_alias_with_sharing",
-      "ordinal_in_function": 1,
-      "fingerprint": "1fe4f5ebcf0c75234571929dedec61a234e3a88a14e6e412a779174dbba2292d",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Alias was mapped into hypervisor stage-2 without a frame inventory reservation, leaving physical mappings installed without inventory accounting."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::add_alias_with_sharing",
-      "ordinal_in_function": 2,
-      "fingerprint": "1fe4f5ebcf0c75234571929dedec61a234e3a88a14e6e412a779174dbba2292d",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Staging frame inventory failed after installing hypervisor stage-2 alias mapping, leaving stage-2 translations diverged from inventory authority."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::unregister_process_alias",
-      "ordinal_in_function": 1,
-      "fingerprint": "fdb990d1eb6a2f8114f40765e88e43771a6dafee9d9e62f3052c1a6da3c56f94",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::host_alias",
-      "rationale": "Global alias registry mutated unexpectedly under topology lock during alias unregistration, corrupting planned alias and stage-2 lease retirement."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::unregister_process_alias",
-      "ordinal_in_function": 2,
-      "fingerprint": "07d7e86979792d4f42a65210bac7a980927b24fba403cc18282dc0cf9250151e",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Applying alias retirement inventory commit to Kernel authority failed after unregistering aliases, desynchronizing alias state from Kernel frame inventory authority."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::unregister_process_alias",
-      "ordinal_in_function": 3,
-      "fingerprint": "8c2c7890e7ddbcfc1fdcb2ee0a74b2e2cd78d9c4dd9d6ecd0c94af222be26d46",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Committing alias lease retirement to backend inventory ledger failed after Kernel commit, leaving carrier ledger and Kernel authority diverged."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::prepare_task_only_plan",
-      "ordinal_in_function": 1,
-      "fingerprint": "1bb902b8c83018e471f00c781dc304408ae24d09c3956d1a62d8dad440bafc21",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Rollback of staged unpublished inventory mappings failed during task-only child process preparation, leaving frame inventory in a corrupted state."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::from_process_spec",
-      "ordinal_in_function": 1,
-      "fingerprint": "db6000c32f34f65748a028c4db6a0934fd32e9ac6cd23777df04f7f7f8ce8607",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Rollback of staged unpublished inventory mappings failed during process materialization from spec, leaving frame inventory in a corrupted state."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::execve_rebuild_inner",
-      "ordinal_in_function": 1,
-      "fingerprint": "acb33cd56903a141c2223488b27be0984b23be66a43f478bc2b399679bfa7d3e",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::exec_commit",
-      "rationale": "Pre-exec authority rollback verification failed after switch_exec_stage2_transaction error, leaving carrier stage-2 authority corrupted."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::execve_rebuild_inner",
-      "ordinal_in_function": 2,
-      "fingerprint": "acb33cd56903a141c2223488b27be0984b23be66a43f478bc2b399679bfa7d3e",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Staging frame inventory retirement failed after stage-2 physical unmap was committed, desynchronizing stage-2 state from frame inventory."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::execve_rebuild_inner",
-      "ordinal_in_function": 3,
-      "fingerprint": "bcf47e881cb3659c0252150c9f60fda6cdad64c0a9f5053e7ce2ce7132813c97",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::exec_commit",
-      "rationale": "Overlapping detached exec predecessor cleanup on task state indicates concurrent exec or abandoned predecessor stage-2 retirement."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::execve_rebuild_inner",
-      "ordinal_in_function": 4,
-      "fingerprint": "b013dfac9fc0532ae4574d089b99d89bb95ae0b96bc40e304c664b67576150bd",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Publishing global-frame host owner failed after stage-2 mappings were installed, desynchronizing global frame owner registry from carrier memory."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::execve_rebuild_inner",
-      "ordinal_in_function": 5,
-      "fingerprint": "4fec3fa0336e2eb7d546dc767e2f79d3ff922c6b255fcc413cf8b48ac52bd7b3",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Region in carrier mappings has invalid physical host offset when computing stage-2 owner identity during exec inventory staging."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::execve_rebuild_inner",
-      "ordinal_in_function": 6,
-      "fingerprint": "4fec3fa0336e2eb7d546dc767e2f79d3ff922c6b255fcc413cf8b48ac52bd7b3",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Staging replacement frame inventory failed after stage-2 mappings were installed, leaving physical stage-2 memory unrepresented in inventory ledger."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::execve_rebuild_inner",
-      "ordinal_in_function": 7,
-      "fingerprint": "4fec3fa0336e2eb7d546dc767e2f79d3ff922c6b255fcc413cf8b48ac52bd7b3",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Invalid physical host offset when collecting carrier stage-2 lease owner hosts during exec registration rebind."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::execve_rebuild_inner",
-      "ordinal_in_function": 8,
-      "fingerprint": "4fec3fa0336e2eb7d546dc767e2f79d3ff922c6b255fcc413cf8b48ac52bd7b3",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Collecting carrier stage-2 lease owners failed with conflicting or duplicate host owners during exec registration rebind."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::execve_rebuild_inner",
-      "ordinal_in_function": 9,
-      "fingerprint": "4fec3fa0336e2eb7d546dc767e2f79d3ff922c6b255fcc413cf8b48ac52bd7b3",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Registering carrier stage-2 leases in the carrier registry failed during exec rebind, leaving replacement stage-2 leases unmanaged."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::execve_rebuild_inner",
-      "ordinal_in_function": 10,
-      "fingerprint": "4fec3fa0336e2eb7d546dc767e2f79d3ff922c6b255fcc413cf8b48ac52bd7b3",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::task_backend_lifecycle",
-      "rationale": "Missing task registration during HVPatch exec authority rebind leaves the replacement MM unbound from carrier task tracking."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::execve_rebuild_inner",
-      "ordinal_in_function": 11,
-      "fingerprint": "4fec3fa0336e2eb7d546dc767e2f79d3ff922c6b255fcc413cf8b48ac52bd7b3",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::task_backend_lifecycle",
-      "rationale": "Rebinding exec MM authority into the carrier task registration failed, leaving the carrier task with stale or missing MM authority."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::execve_rebuild_inner",
-      "ordinal_in_function": 12,
-      "fingerprint": "a467ae545003d2c6af669aa61d24c721ee4d7f730172acc2f8674c84ca4d779c",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::exec_commit",
-      "rationale": "Register, sysreg, or mailbox initialization failed after exec memory and inventory publication was committed; state is irrevocable and cannot roll back safely."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "emit_global_frame_stage2",
-      "ordinal_in_function": 1,
-      "fingerprint": "ef9be990019fc8e48db2ca13ab08291a60087b90523f4cf9ad1e93be18fac92a",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Physical stage-2 mapping or unmapping transition already completed in the hypervisor while typed receipt construction failed, leaving the physical boundary unpublishable and unverifiable."
     }
   ]
 }
