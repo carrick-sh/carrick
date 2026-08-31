@@ -131,6 +131,20 @@ const ROBUST_LIST_HEAD_SIZE: u64 = 24;
 /// of one carrier — so translating them through the pid-namespace region and
 /// handing the result to Darwin asked the host about a number that means
 /// something else in its own namespace.
+/// Render a session or process-group id in the caller's PID-namespace view.
+///
+/// A session/group id IS its leader's pid, so it belongs to the same domain
+/// `getpid` reports and must be translated the same way. Returning the raw
+/// `TaskId` made a forked child see `setsid() != getpid()`; the numbering
+/// domains coincide for the first process, which is why only a probe with a
+/// SECOND live process exposes it.
+fn ns_visible_identity_id(context: &crate::kernel::KernelContext, leader_pid: i32) -> i32 {
+    let Ok(raw) = u32::try_from(leader_pid) else {
+        return leader_pid;
+    };
+    i32::try_from(crate::namespace::pid::host_to_ns_or_self_for(context, raw)).unwrap_or(leader_pid)
+}
+
 fn identity_target_task(
     context: &crate::kernel::KernelContext,
     pid: Pid,
@@ -2966,9 +2980,14 @@ impl SyscallDispatcher {
         /// and already-execed-child rules `libc::setpgid` could only enforce
         /// against host state that no guest process actually occupies.
         fn setpgid(this, cx, pid: Pid, pgid: Pid) {
-            // Linux orders these two before any lookup: a negative pgid is
-            // EINVAL (LTP setpgid02 case 1), a negative pid is ESRCH.
-            if pgid.0 < 0 {
+            // `pgid == 0` means "use `pid` as the group id", and that
+            // substitution happens BEFORE the range check -- so `setpgid(-1, 0)`
+            // asks for group -1 and is EINVAL, not the ESRCH a negative pid
+            // alone would give (`lifecycleflagmatrix`
+            // `setpgid_neg_pid_einval`). Resolving in this order keeps LTP
+            // setpgid02's ESRCH case, which passes a nonexistent POSITIVE pid.
+            let effective_pgid = if pgid.0 == 0 { pid.0 } else { pgid.0 };
+            if effective_pgid < 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if pid.0 < 0 {
@@ -3013,7 +3032,10 @@ impl SyscallDispatcher {
             };
             match cx.kernel.kernel().process_identity(target) {
                 Some(identity) => Ok(DispatchOutcome::Returned {
-                    value: i64::from(identity.process_group.raw()),
+                    value: i64::from(ns_visible_identity_id(
+                        cx.kernel,
+                        identity.process_group.raw(),
+                    )),
                 }),
                 None => Ok(DispatchOutcome::errno(LINUX_ESRCH)),
             }
@@ -3028,7 +3050,7 @@ impl SyscallDispatcher {
             };
             match cx.kernel.kernel().process_identity(target) {
                 Some(identity) => Ok(DispatchOutcome::Returned {
-                    value: i64::from(identity.session.raw()),
+                    value: i64::from(ns_visible_identity_id(cx.kernel, identity.session.raw())),
                 }),
                 None => Ok(DispatchOutcome::errno(LINUX_ESRCH)),
             }
@@ -3040,8 +3062,16 @@ impl SyscallDispatcher {
         /// every other guest process would then observe.
         fn setsid(this, cx) {
             match cx.kernel.kernel().create_session(cx.kernel.task().key().id, None) {
+                // A session/group id IS a leader's pid, so it must be reported
+                // in the caller's PID-namespace view exactly as `getpid` is.
+                // These returned the raw `TaskId`, so a forked child saw
+                // `setsid() != getpid()` and `getpgrp()`/`getsid()` disagreeing
+                // with its own pid (`lifecycleflagmatrix`
+                // `setsid_in_child_*`). The mismatch is invisible whenever the
+                // two numbering domains happen to coincide, which is why the
+                // single-process lane never caught it.
                 Ok(sid) => Ok(DispatchOutcome::Returned {
-                    value: i64::from(sid.raw()),
+                    value: i64::from(ns_visible_identity_id(cx.kernel, sid.raw())),
                 }),
                 Err(error) => Ok(DispatchOutcome::errno(
                     crate::hvpatch::identity_operation_errno(error),
