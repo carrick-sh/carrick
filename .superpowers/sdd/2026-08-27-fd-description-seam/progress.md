@@ -485,3 +485,57 @@ of rescanning per mapping; (3) give `CowArmedRanges` an interval index and stop
 cloning it per fault; (4) revisit the per-COW-fault carrier-global
 serialization; (5) `run_state::find_record`; (6) replace the retire backoff
 spin with a queued wait.
+
+### Landed 2026-08-30 — three horizontal hot-path fixes
+
+| commit | what | contract test |
+|---|---|---|
+| `3172754f1` | process retirement stops re-deriving touched keys by diffing whole global snapshots; `AliasVersionRegistry` keyed on every lookup axis | `retiring_one_owner_does_not_scan_foreign_alias_rows` |
+| `db6bac478` | fork overlay-owner question indexed once per fork instead of O(M^2 * I) rescan | `fork_overlay_owner_lookup_does_not_rescan_every_source_mapping` |
+| `9e43ecd02` | alias registry partitioned by ownership scope; exit, `munmap` and five scoped lookups become O(that process) | contract above tightened to 16 visited rows |
+
+`futexforkrequeue` went from a hard failure at its 40 s reap bound to
+3/3 signed passes at 98.8 s / 81.6 s / 79.3 s for the shard.
+
+Two regressions were introduced and caught by the gate on the way, both now
+documented at the code they broke:
+
+1. Iterating the partitioned registry in BUCKET order silently broke
+   `lookup_shared_alias`: a thousand processes aliasing one shared futex page
+   at the same IPA got different `host_addr`s for the same word, so wakes were
+   lost (`timeout_count_zero=false`, 2/2). Order-sensitive callers now use
+   explicit `oldest_matching` / `newest_matching`.
+2. Fixing that by materializing global order per lookup made
+   `AliasRegistry::ordered` 89.6% of carrier CPU and the probe still failed —
+   children could no longer enrol on the futex inside the probe's window. The
+   ordering primitives are single passes with no allocation.
+
+The second one is the lesson worth keeping: on this workload a correctness fix
+that costs a sort per lookup fails the SAME assertion as the correctness bug
+did, so "the probe is still red" was not evidence the ordering theory was
+wrong. Profiling, not re-reasoning, separated them.
+
+### Remaining ranked list (profile after the three fixes, 169,860 samples)
+
+Everything that led the original sweep is gone: `retain_external_aliases`
+(37.1%), `fork_source_translation_has_overlay_owner` (13.3%),
+`HvpatchRuntimeDirectory::continuation` (13.2%) and `Task::thread` (9.8%) no
+longer appear in the top ranks. What replaced them:
+
+| share | frame | shape |
+|---|---|---|
+| 34.4% | `AliasPublicationReceipt::commit` | per-publication work, not yet dissected |
+| 14.4% | `fork_translation_has_overlay_owner` | the `ProcessMappingDesc` SIBLING of the function fixed in `db6bac478`, same O(M^2) shape, untouched |
+| 8.3% | `kernel::frame_inventory::FrameInventory...` | not yet dissected |
+| 6.8% | `alias_matches_process_scope` | the predicate of the remaining whole-registry scans |
+| 5.1% + 4.0% | `AliasRegistry::iter` / `iter_mut` closures | callers that still walk the carrier |
+| 3.7% + 2.7% | `missing_process_aliases` | scope-filtered scan over the whole registry |
+| 3.0% | `process_alias_index` | builds a map over all aliases, then filters by scope |
+
+Plus the COW fault path, still untouched and still per-operation quadratic:
+`CowArmedRanges` is a flat `Vec` whose `span_for` linearly filters every armed
+range per COW fault and whose `disarm` rebuilds the whole `Vec` per fault, and
+`perform_frame_cow` takes a stop-the-world quiesce AND the carrier-global
+topology lock on EVERY page fault.
+
+Not yet run on this branch: the full unfiltered probe gate and `just ci`.
