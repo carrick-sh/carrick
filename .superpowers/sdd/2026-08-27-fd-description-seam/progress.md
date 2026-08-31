@@ -218,3 +218,132 @@ zero residual Carrick processes.
 
 The complete public probe gate and exhaustive ecosystem gate remain the final
 acceptance authority for the exact committed and signed artifact.
+
+## Session handoff — 2026-08-30 final-gate pause
+
+The user explicitly paused all work so the landing can resume in a new session.
+All delegated agents were interrupted, no guest or DTrace consumer remains
+active, and local `main` is the only integration branch. Nothing was pushed.
+
+### Landed on local main
+
+- `a1f568917` — `hvpatch: bound deferred owner retirement`;
+- `6ac2c6b8d` — `test(conformance): refresh final probe expectations`; and
+- `968c01c78` — `trace: attribute executor signal-mask amplification`.
+
+`6ac2c6b8d` removed six musl gaps only after the public shard reported them as
+unexpected fixes, then reached the GNU lane and removed the five independently
+proven GNU gaps. The combined musl/GNU filter
+`cluster10errno,mqnotifycrossproc,ppid,procpeermem,shmnestedfork,sysinfo` passed
+three consecutive signed repetitions. It also rebuilt `memflagmatrix` for both
+arm64 libc targets and re-blessed the Docker oracle bodies; the old musl cache
+had ended in `Segmentation fault`, so changing only its hash header was
+explicitly rejected. All three shard host/cache tests pass. The stale shard-0
+gap-count assertion was corrected to match its already-explicit exact sets.
+
+`968c01c78` extends the durable fork caller-attribution D script with the live
+Darwin `syscall::__pthread_sigmask:entry` provider. The script ran successfully
+through `carrick trace` with a nonzero, error-free receipt.
+
+### Probe blocker attribution
+
+The first unfiltered public probe run had no new shard-1 regression. It stopped
+on the newly fixed gaps above, the stale `memflagmatrix` source hash, and one
+real `futexforkrequeue` mismatch. In the mismatch every futex, wake, and shared
+counter assertion is true; only `children_exited_all` and
+`children_exit_count_ok` are false. A private diagnostic reported 623 normal
+exits, zero abnormal statuses, zero wait errors, and 377 children still live at
+the probe's 40-second reap bound.
+
+This is not introduced by `a1f568917`: an isolated signed `06279ae9b` artifact
+reproduced the same exit-only failure in 75.41 seconds. `7a982b540` cannot reach
+the comparison because it fails immediately at the older root-slot collision.
+The current optimized release CLI passes the exact probe; the failure belongs
+to the unoptimized signed conformance test profile.
+
+A clean, single-variable ablation restored baseline executor code and ran the
+focused signed shard with `CARGO_PROFILE_TEST_OPT_LEVEL=2`. Both arm64 musl and
+GNU `futexforkrequeue` passed in 29.63 seconds and the unentitled negative
+control passed. Scoped cleanup reported zero. No Cargo profile change is
+committed yet. The next session should test the narrowest package-scoped
+`[profile.test.package.*]` optimization covering the product runtime/HVF
+dependencies; it must not weaken ASID invalidation, topology locking, retirement
+ordering, or extend the probe timeout.
+
+### Carrick trace and LLDB evidence
+
+The release amplification capture at
+`/private/tmp/fd-final-futex-trace.log` completed 1,001 forks with
+`bounded=0`, `errors=0`, 7,046 stage-2 maps, 7,041 unmaps, and 827,281 host
+syscalls. It counted 510,946 host `__pthread_sigmask` calls. The durable caller
+capture at `/private/tmp/fd-final-futex-callers.log` reported 443,872 stacks,
+`bounded=0`, `errors=0`, and 303,089 `__pthread_sigmask` calls. `atos` bound the
+two dominant 146,199-call stacks to the pre-claim and post-save
+`WorkerBoundaryAudit::audit_runtime` sites. These calls only query the Darwin
+pthread mask; guest Linux signal masks remain Carrick kernel state.
+
+A temporary, uncommitted split that omitted only the pre-claim mask query
+reduced a signed debug-profile trace to 102,154 mask calls, 91,738 at post-save,
+but the probe still failed in 78.54 seconds. That experiment was restored and
+is not in `main`.
+
+The same temporary debug artifact was captured at the 35-second deadline with
+`carrick debug lldb-run`. Durable artifacts are:
+
+- `target/conformance/logs/lldb-runs/fd-final-futex-lldb.manifest.txt`;
+- `target/conformance/logs/lldb-runs/fd-final-futex-lldb.lldb.txt`;
+- `target/conformance/logs/lldb-runs/fd-final-futex-lldb.37157.core`
+  (modified-memory, approximately 2.2 GiB); and
+- the corresponding `.ps.txt` and empty pre-flush `.guest.log`.
+
+The event ring was valid (`total=69685`, showing 8,192, `errors=0`). At the
+deadline all ten executor pthreads were in one terminal-retirement convoy: five
+were waiting in `acquire_process_retire_topology_lock_servicing`, three were
+waiting for cross-executor invalidation acknowledgements, one was retiring the
+detached address space, and one was releasing the topology guard and waking the
+scheduler. This explains the debug-profile sensitivity without showing a
+product semantic failure. The ring already records exit-publication
+begin/complete but not the intervening invalidation/topology/cleanup phases.
+
+The LLDB kernel census also failed closed with:
+
+`kernel snapshot invariant violated: file-table functional state disagrees with live classification`
+
+An interrupted red-first experiment was intentionally not committed. Its test
+name was `published_file_table_predecessor_is_explicitly_retirement_pending`;
+it modeled the publication-to-`retire_file_table_generation` window and expected
+the retained predecessor row to be `Draining`, `functional_refs_active`,
+`retirement_pending`, with its retained owner also classified `Draining`.
+Resume by reproducing that red test, then either classify the legal transient
+or report the exact inconsistent object/owner; never make the snapshot accept
+actual corruption.
+
+### Exact resume sequence and non-completion conditions
+
+1. Confirm `git status --short --branch` is clean on local `main` at
+   `968c01c78` (or its exact fast-forward descendant). Do not read, search, or
+   consult Linux kernel source.
+2. Add and test the narrowest explicit optimized test profile that makes the
+   signed in-process conformance runtime representative of the shipped product.
+   Re-run `futexforkrequeue` signed at least three times for both libc lanes.
+3. Complete the kernel snapshot red-first invariant above and add cheap fixed
+   event-ring phases for terminal invalidation, topology wait/acquire/release,
+   detached cleanup, settlement, and waitability; update
+   `scripts/carrick_lldb.py` in lockstep. No allocation, formatting, or syscall
+   is allowed in the ring recorder.
+4. Run host tests, Clippy, formatting, and diff checks for those changes, review
+   them, and commit each coherent milestone directly on local `main`.
+5. Rebuild and sign one exact release CLI. Record HEAD, SHA-256, CDHash,
+   LC_UUID, hypervisor entitlement, and `__dof_carrick` from that final file.
+6. Run the complete unfiltered `just conformance-probes` with a scoped
+   `CARRICK_RUN_ID`; require exit zero and scoped cleanup zero. Focused reducers
+   and the earlier partial run do not satisfy this gate.
+7. Without relinking or re-signing the CLI, run the exhaustive 2,127-row full
+   ecosystem suite against that same file. Require its gating verdicts to pass,
+   preserve any legitimate canonical oracle refresh, and prove scoped cleanup.
+
+The goal is not complete at this pause: the post-refresh public probe gate has
+not reached exit zero, the exhaustive ecosystem suite has not started, and the
+current release binary has been re-signed during diagnostics so its earlier
+identity receipt is no longer the final artifact receipt. The executable bits
+on `scripts/test-signed.sh` and `scripts/build-signed.sh` remain `0755`.
