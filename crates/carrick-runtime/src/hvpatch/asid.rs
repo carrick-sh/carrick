@@ -134,6 +134,16 @@ impl AsidResidency {
         })
     }
 
+    /// Whether this generation has stopped admitting executor loads.
+    ///
+    /// A load rejected because the generation is retiring is not a failure of
+    /// the loading executor: some other thread's `execve` (or the process's
+    /// exit) is tearing this address space down, which on Linux terminates
+    /// every other thread in the group.
+    pub(crate) fn is_retiring(&self) -> bool {
+        self.state.lock().lifecycle != ResidencyLifecycle::Live
+    }
+
     pub(crate) fn residents(&self) -> Vec<ExecutorId> {
         self.state.lock().residents.iter().copied().collect()
     }

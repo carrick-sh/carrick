@@ -37,11 +37,23 @@ static CONFORMANCE_LOCK: Mutex<()> = Mutex::new(());
 /// FAILS so we remove it from this list — that's the signal the gap was
 /// fixed. Each entry must cite the gap.
 const KNOWN_PROBE_GAPS: &[&str] = &[
-    // These exec-from-thread reducers abort in the HVPatch MM-authority
-    // retirement path. They remain on the out-of-process legacy lane because
-    // the abort would poison a shared embedded test process. Unexpected passes
-    // fail the gate so they are removed from this list when the runtime closes
-    // the gap.
+    // exec-from-thread reducers. They remain on the out-of-process legacy lane
+    // because an abort would poison a shared embedded test process. Unexpected
+    // passes fail the gate so they are removed from this list when the runtime
+    // closes the gap.
+    //
+    // `execthreads` and `vforkexecthread` still ABORT: the exec path drops an
+    // MM authority whose inventory is published but never exactly retired
+    // (holders `registration-cleanup` and `exec-rebind`).
+    //
+    // `execfromthread` no longer aborts -- it reaches stage 2 and its first two
+    // lines match -- but its third still diverges: with a second thread alive,
+    // the exec survivor's `gettid()` must equal `getpid()`, because Linux makes
+    // the execing thread the group leader permanently. carrick reports it
+    // correctly under the volume-mount transport and wrongly under the
+    // container-injection transport this gate uses, which is exactly the
+    // "presentation-only alias" the probe was written to catch. Closing it
+    // needs the survivor re-keyed in the kernel graph, not a wider alias.
     "execthreads",
     "execfromthread",
     "vforkexecthread",

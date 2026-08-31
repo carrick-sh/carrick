@@ -5152,6 +5152,11 @@ pub enum ExecutionFailure {
     SnapshotSaveFailed,
     SnapshotRestoreFailed,
     SnapshotGenerationMismatch,
+    /// The thread's address space was retired out from under its load: another
+    /// thread in the group called `execve`, or the process exited. Linux
+    /// terminates every other thread in the group at that point, so this thread
+    /// never runs again -- it is a normal end, not a broken executor.
+    AddressSpaceRetired,
 }
 
 /// Public observation of a thread's scheduler-owned execution state.
