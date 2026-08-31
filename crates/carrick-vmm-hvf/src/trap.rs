@@ -7077,6 +7077,111 @@ mod task_only_carrier_directory_tests {
     /// generic mutation path. This is what keeps the total honest — a
     /// `debug_assert` inside `len` cannot, because it would reintroduce the
     /// very sum it replaces in the debug builds the conformance lane runs.
+    /// The window indexes must answer exactly what a full scan answers, after
+    /// every kind of mutation.
+    ///
+    /// `lookup_live_alias_by_va_any_scope`, the IPA mapping lookup and the
+    /// shared-futex location lookup take the FIRST or LAST match across all
+    /// scopes, on paths a guest hits per fault and per futex operation. They
+    /// used to walk every live process's rows; they now range-query an index
+    /// keyed by window start. An index that drifts from its buckets is silent,
+    /// so the unindexed scans are kept as the oracle here.
+    #[test]
+    fn window_indexed_lookups_match_a_full_scan() {
+        let scope_a = AliasOwnershipScope::MmRootSlot {
+            base: 0x1000_0000,
+            size: 0x4000,
+        };
+        let scope_b = AliasOwnershipScope::MmRootSlot {
+            base: 0x2000_0000,
+            size: 0x4000,
+        };
+        let row = |scope, start: u64, ipa: u64, size: usize| {
+            let mut entry = alias(0x7000_0000, 1);
+            entry.ownership_scope = scope;
+            entry.start = start;
+            entry.ipa = ipa;
+            entry.size = size;
+            entry
+        };
+        // Deliberately overlapping windows, repeated starts and differing
+        // widths, so "first" and "last" are distinguishable and the
+        // widest-window bound actually has to reach back.
+        let seed = vec![
+            row(scope_a, 0x10_0000, 0x90_0000, 0x4000),
+            row(scope_a, 0x10_0000, 0x90_4000, 0x8000),
+            row(scope_b, 0x10_2000, 0x90_2000, 0x2000),
+            row(scope_a, 0x0f_0000, 0x8f_0000, 0x40000),
+            row(AliasOwnershipScope::Global, 0x11_0000, 0x91_0000, 0x1000),
+            row(scope_b, 0x12_0000, 0x92_0000, 0x10000),
+        ];
+        let mut registry = AliasRegistry::default();
+        for entry in &seed {
+            registry.push(*entry);
+        }
+
+        let probes: Vec<u64> = (0x0e_0000_u64..0x14_0000).step_by(0x800).collect();
+        let ipa_probes: Vec<u64> = (0x8e_0000_u64..0x94_0000).step_by(0x800).collect();
+        let check = |registry: &AliasRegistry, stage: &str| {
+            for &va in &probes {
+                let contains_va = |entry: &AliasBacking| {
+                    va >= entry.start && va < entry.start.saturating_add(entry.size as u64)
+                };
+                assert_eq!(
+                    registry.newest_containing_va(va, contains_va),
+                    registry.newest_matching(contains_va),
+                    "VA index disagreed with a full scan at 0x{va:x} after {stage}"
+                );
+            }
+            for &ipa in &ipa_probes {
+                let contains_ipa = |entry: &AliasBacking| {
+                    ipa >= entry.ipa && ipa < entry.ipa.saturating_add(entry.size as u64)
+                };
+                assert_eq!(
+                    registry.newest_containing_ipa(ipa, contains_ipa),
+                    registry.newest_matching(contains_ipa),
+                    "IPA index disagreed with a full scan (newest) at 0x{ipa:x} after {stage}"
+                );
+                assert_eq!(
+                    registry.oldest_containing_ipa(ipa, contains_ipa),
+                    registry.oldest_matching(contains_ipa),
+                    "IPA index disagreed with a full scan (oldest) at 0x{ipa:x} after {stage}"
+                );
+            }
+        };
+
+        check(&registry, "push");
+        let _ = registry.upsert_by_key(row(scope_a, 0x13_0000, 0x90_0000, 0x2000));
+        check(&registry, "upsert replacing an existing key");
+        let _ = registry.upsert_by_key(row(scope_a, 0x13_8000, 0x93_8000, 0x2000));
+        check(&registry, "upsert of a new key");
+        registry.retain_in_scope(scope_b, |entry| entry.start != 0x12_0000);
+        check(&registry, "retain_in_scope");
+        registry.rebuild_scope_rows(scope_a, |rows| {
+            rows.into_iter()
+                .flat_map(|(seq, entry)| {
+                    let mut half = entry;
+                    half.size = entry.size / 2;
+                    let mut tail = entry;
+                    tail.start = entry.start + (entry.size as u64) / 2;
+                    tail.ipa = entry.ipa + (entry.size as u64) / 2;
+                    tail.size = entry.size / 2;
+                    [(seq, half), (seq, tail)]
+                })
+                .collect()
+        });
+        check(&registry, "rebuild_scope_rows splitting every row");
+        registry.remove_scope(scope_a);
+        check(&registry, "remove_scope");
+        registry.retain(|entry| entry.ownership_scope == AliasOwnershipScope::Global);
+        check(&registry, "retain");
+
+        let snapshot = registry.process_visible_snapshot(None, ContainerRootToken::ROOT);
+        check(&snapshot, "process_visible_snapshot");
+        registry.clear();
+        check(&registry, "clear");
+    }
+
     #[test]
     fn alias_registry_row_total_tracks_its_buckets() {
         let mut registry = AliasRegistry::default();
@@ -9049,10 +9154,126 @@ struct AliasRegistry {
     next_seq: u64,
     /// Maintained total of every bucket's length; see [`Self::len`].
     rows: usize,
+    /// Rows keyed by guest-VA window start, and by IPA window start.
+    ///
+    /// Three lookups ask "the row registered LAST whose window contains X"
+    /// without a scope to narrow by: `lookup_live_alias_by_va_any_scope`, the
+    /// IPA mapping lookup, and the shared-futex location lookup. Answering
+    /// those by walking every bucket is O(all live processes) per call on
+    /// paths a guest hits per fault and per futex operation — 23.3% of carrier
+    /// CPU once the bigger scans were gone. A row can contain X only if it
+    /// starts in `[X - widest, X]`, so these turn the walk into a bounded
+    /// range query; the exact containment test is unchanged.
+    by_va_start: std::collections::BTreeMap<u64, Vec<(u64, AliasBacking)>>,
+    by_ipa_start: std::collections::BTreeMap<u64, Vec<(u64, AliasBacking)>>,
+    /// Widest window ever indexed, per axis. Only ever grows: a stale-wide
+    /// bound makes a query walk further than needed, never miss a row.
+    widest_va: u64,
+    widest_ipa: u64,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl AliasRegistry {
+    fn index_insert(&mut self, seq: u64, alias: AliasBacking) {
+        self.by_va_start
+            .entry(alias.start)
+            .or_default()
+            .push((seq, alias));
+        self.widest_va = self.widest_va.max(alias.size as u64);
+        self.by_ipa_start
+            .entry(alias.ipa)
+            .or_default()
+            .push((seq, alias));
+        self.widest_ipa = self.widest_ipa.max(alias.size as u64);
+    }
+
+    fn index_remove(&mut self, seq: u64, alias: AliasBacking) {
+        if let Some(rows) = self.by_va_start.get_mut(&alias.start) {
+            if let Some(at) = rows.iter().position(|row| *row == (seq, alias)) {
+                rows.remove(at);
+            }
+            if rows.is_empty() {
+                self.by_va_start.remove(&alias.start);
+            }
+        }
+        if let Some(rows) = self.by_ipa_start.get_mut(&alias.ipa) {
+            if let Some(at) = rows.iter().position(|row| *row == (seq, alias)) {
+                rows.remove(at);
+            }
+            if rows.is_empty() {
+                self.by_ipa_start.remove(&alias.ipa);
+            }
+        }
+    }
+
+    /// Rebuild both window indexes from the buckets. Used where a registry is
+    /// constructed directly rather than through the mutators.
+    fn reindex(&mut self) {
+        self.by_va_start.clear();
+        self.by_ipa_start.clear();
+        self.widest_va = 0;
+        self.widest_ipa = 0;
+        let rows: Vec<(u64, AliasBacking)> = self
+            .by_scope
+            .values()
+            .flat_map(|rows| rows.iter().copied())
+            .collect();
+        for (seq, alias) in rows {
+            self.index_insert(seq, alias);
+        }
+    }
+
+    /// The row registered LAST whose window contains `probe`, among the rows
+    /// an index keyed by window start holds.
+    fn newest_containing(
+        index: &std::collections::BTreeMap<u64, Vec<(u64, AliasBacking)>>,
+        widest: u64,
+        probe: u64,
+        mut matches: impl FnMut(&AliasBacking) -> bool,
+    ) -> Option<AliasBacking> {
+        index
+            .range(probe.saturating_sub(widest)..=probe)
+            .flat_map(|(_, rows)| rows)
+            .filter(|(_, alias)| matches(alias))
+            .max_by_key(|(seq, _)| *seq)
+            .map(|(_, alias)| *alias)
+    }
+
+    /// [`Self::newest_matching`] for a predicate that requires the row's
+    /// guest-VA window to contain `va`.
+    fn newest_containing_va(
+        &self,
+        va: u64,
+        matches: impl FnMut(&AliasBacking) -> bool,
+    ) -> Option<AliasBacking> {
+        Self::newest_containing(&self.by_va_start, self.widest_va, va, matches)
+    }
+
+    /// [`Self::oldest_matching`] for a predicate that requires the row's IPA
+    /// window to contain `ipa`.
+    fn oldest_containing_ipa(
+        &self,
+        ipa: u64,
+        mut matches: impl FnMut(&AliasBacking) -> bool,
+    ) -> Option<AliasBacking> {
+        self.by_ipa_start
+            .range(ipa.saturating_sub(self.widest_ipa)..=ipa)
+            .flat_map(|(_, rows)| rows)
+            .filter(|(_, alias)| matches(alias))
+            .min_by_key(|(seq, _)| *seq)
+            .map(|(_, alias)| *alias)
+    }
+
+    /// [`Self::newest_matching`] for a predicate that requires the row's IPA
+    /// window to contain `ipa`.
+    fn newest_containing_ipa(
+        &self,
+        ipa: u64,
+        matches: impl FnMut(&AliasBacking) -> bool,
+    ) -> Option<AliasBacking> {
+        Self::newest_containing(&self.by_ipa_start, self.widest_ipa, ipa, matches)
+    }
+
     fn push(&mut self, alias: AliasBacking) {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
@@ -9061,6 +9282,7 @@ impl AliasRegistry {
             .or_default()
             .push((seq, alias));
         self.rows = self.rows.saturating_add(1);
+        self.index_insert(seq, alias);
     }
 
     #[cfg(test)]
@@ -9079,6 +9301,10 @@ impl AliasRegistry {
 
     fn clear(&mut self) {
         self.by_scope.clear();
+        self.by_va_start.clear();
+        self.by_ipa_start.clear();
+        self.widest_va = 0;
+        self.widest_ipa = 0;
         self.rows = 0;
         // `next_seq` is deliberately NOT reset: sequence numbers are identity
         // for ordering comparisons that may outlive a clear.
@@ -9150,6 +9376,13 @@ impl AliasRegistry {
     }
 
     /// The matching row registered FIRST, in global insertion order.
+    ///
+    /// Superseded on every production path by the window-indexed lookups, and
+    /// retained as their ORACLE: `window_indexed_lookups_match_a_full_scan`
+    /// asserts the two agree across mutations, because an index that drifts
+    /// from its buckets fails silently — which is exactly how the first
+    /// partitioning attempt lost `futexforkrequeue`'s futex wakes.
+    #[cfg(test)]
     fn oldest_matching(
         &self,
         mut matches: impl FnMut(&AliasBacking) -> bool,
@@ -9162,8 +9395,9 @@ impl AliasRegistry {
             .map(|(_, alias)| *alias)
     }
 
-    /// The matching row registered LAST, in global insertion order — the
-    /// answer the historical `registry.iter().rev().find(..)` lookups want.
+    /// The matching row registered LAST, in global insertion order. Oracle
+    /// for the window-indexed lookups; see [`Self::oldest_matching`].
+    #[cfg(test)]
     fn newest_matching(
         &self,
         mut matches: impl FnMut(&AliasBacking) -> bool,
@@ -9204,7 +9438,12 @@ impl AliasRegistry {
         let Some(slot) = rows.get_mut(position) else {
             return false;
         };
+        let seq = slot.0;
+        let previous = slot.1;
         update(&mut slot.1);
+        let updated = slot.1;
+        self.index_remove(seq, previous);
+        self.index_insert(seq, updated);
         true
     }
 
@@ -9234,10 +9473,19 @@ impl AliasRegistry {
     }
 
     fn retain(&mut self, mut keep: impl FnMut(&AliasBacking) -> bool) {
+        let mut dropped = Vec::new();
         for rows in self.by_scope.values_mut() {
-            let before = rows.len();
-            rows.retain(|(_, alias)| keep(alias));
-            self.rows = self.rows.saturating_sub(before - rows.len());
+            rows.retain(|row| {
+                let survives = keep(&row.1);
+                if !survives {
+                    dropped.push(*row);
+                }
+                survives
+            });
+        }
+        self.rows = self.rows.saturating_sub(dropped.len());
+        for (seq, alias) in dropped {
+            self.index_remove(seq, alias);
         }
         self.by_scope.retain(|_, rows| !rows.is_empty());
     }
@@ -9249,6 +9497,9 @@ impl AliasRegistry {
             return Vec::new();
         };
         self.rows = self.rows.saturating_sub(rows.len());
+        for &(seq, alias) in &rows {
+            self.index_remove(seq, alias);
+        }
         rows.into_iter().map(|(_, alias)| alias).collect()
     }
 
@@ -9258,21 +9509,24 @@ impl AliasRegistry {
         scope: AliasOwnershipScope,
         mut keep: impl FnMut(&AliasBacking) -> bool,
     ) -> Vec<AliasBacking> {
-        let mut removed = Vec::new();
+        let mut dropped = Vec::new();
         if let Some(rows) = self.by_scope.get_mut(&scope) {
-            rows.retain(|(_, alias)| {
-                let survives = keep(alias);
+            rows.retain(|row| {
+                let survives = keep(&row.1);
                 if !survives {
-                    removed.push(*alias);
+                    dropped.push(*row);
                 }
                 survives
             });
-            self.rows = self.rows.saturating_sub(removed.len());
+            self.rows = self.rows.saturating_sub(dropped.len());
             if rows.is_empty() {
                 self.by_scope.remove(&scope);
             }
         }
-        removed
+        for &(seq, alias) in &dropped {
+            self.index_remove(seq, alias);
+        }
+        dropped.into_iter().map(|(_, alias)| alias).collect()
     }
 
     /// Rebuild one scope's rows, sequences included, keeping the row total
@@ -9287,13 +9541,20 @@ impl AliasRegistry {
         let Some(rows) = self.by_scope.get_mut(&scope) else {
             return;
         };
-        let before = rows.len();
-        let replacement = rebuild(std::mem::take(rows));
+        let previous = std::mem::take(rows);
+        let before = previous.len();
+        let replacement = rebuild(previous.clone());
         self.rows = self
             .rows
             .saturating_sub(before)
             .saturating_add(replacement.len());
-        *rows = replacement;
+        *rows = replacement.clone();
+        for (seq, alias) in previous {
+            self.index_remove(seq, alias);
+        }
+        for (seq, alias) in replacement {
+            self.index_insert(seq, alias);
+        }
         self.drop_empty_scope(scope);
     }
 
@@ -9328,7 +9589,10 @@ impl AliasRegistry {
             note_alias_state_rows_scanned(rows.len());
             if let Some(slot) = rows.iter_mut().find(|(_, entry)| entry.ipa == alias.ipa) {
                 let previous = slot.1;
+                let seq = slot.0;
                 slot.1 = alias;
+                self.index_remove(seq, previous);
+                self.index_insert(seq, alias);
                 return Some(previous);
             }
         }
@@ -9367,9 +9631,8 @@ impl AliasRegistry {
         container_root: ContainerRootToken,
     ) -> Self {
         let mut snapshot = Self {
-            by_scope: std::collections::BTreeMap::new(),
             next_seq: self.next_seq,
-            rows: 0,
+            ..Self::default()
         };
         for scope in Self::process_visible_scopes(mm_root_slot, container_root) {
             if let Some(rows) = self.by_scope.get(&scope) {
@@ -9377,6 +9640,7 @@ impl AliasRegistry {
                 snapshot.by_scope.insert(scope, rows.clone());
             }
         }
+        snapshot.reindex();
         snapshot
     }
 
@@ -12094,7 +12358,7 @@ fn alias_backing_is_live(host_addr: usize) -> bool {
 /// Find the registered alias whose `hv_vm_map`'d IPA window contains `ipa`.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn lookup_shared_alias(ipa: u64) -> Option<AliasBacking> {
-    alias_registry().lock().oldest_matching(|e| {
+    alias_registry().lock().oldest_containing_ipa(ipa, |e| {
         ipa >= e.ipa
             && ipa < e.ipa.saturating_add(e.size as u64)
             && alias_backing_is_live(e.host_addr)
@@ -12304,7 +12568,7 @@ fn lookup_shared_alias_by_va(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn lookup_live_alias_by_va_any_scope(va: u64, len: usize) -> Option<AliasBacking> {
     let end = va.saturating_add(len as u64);
-    alias_registry().lock().newest_matching(|entry| {
+    alias_registry().lock().newest_containing_va(va, |entry| {
         va >= entry.start
             && end <= entry.start.saturating_add(entry.size as u64)
             && alias_backing_is_live(entry.host_addr.saturating_add((va - entry.start) as usize))
@@ -20657,7 +20921,7 @@ pub mod foreign_cow_test_support {
         pub fn source_guest_writable_for_test(&self) -> Result<bool, String> {
             let aliases = alias_registry().lock();
             aliases
-                .newest_matching(|alias| alias.start == TEST_VA)
+                .newest_containing_va(TEST_VA, |alias| alias.start == TEST_VA)
                 .map(|alias| alias.guest_writable)
                 .ok_or_else(|| "production carrier source alias is absent".to_owned())
         }
@@ -21320,7 +21584,7 @@ impl HvfTaskState {
             }) {
                 return Some(mapping.view());
             }
-            if let Some(alias) = alias_registry().lock().newest_matching(|alias| {
+            if let Some(alias) = alias_registry().lock().newest_containing_ipa(ipa, |alias| {
                 ipa >= alias.ipa
                     && ipa < alias.ipa.saturating_add(alias.size as u64)
                     && alias_is_live(alias)
@@ -32742,12 +33006,15 @@ impl HvfVmState {
         // A shared-file alias installed by another sibling may be absent from
         // this thread's mapping Vec. Its global IPA is nevertheless unique and
         // the live alias registry owns the same translated backing identity.
-        if let Some(alias) = alias_registry().lock().newest_matching(|alias| {
-            alias.sharing.has_shared_futex_identity()
-                && backing_gpa >= alias.ipa
-                && backing_gpa.saturating_add(4) <= alias.ipa.saturating_add(alias.size as u64)
-                && alias_backing_is_live(alias.host_addr)
-        }) {
+        if let Some(alias) = alias_registry()
+            .lock()
+            .newest_containing_ipa(backing_gpa, |alias| {
+                alias.sharing.has_shared_futex_identity()
+                    && backing_gpa >= alias.ipa
+                    && backing_gpa.saturating_add(4) <= alias.ipa.saturating_add(alias.size as u64)
+                    && alias_backing_is_live(alias.host_addr)
+            })
+        {
             return MappingView::from_alias(&alias).shared_futex_location_for_ipa(backing_gpa);
         }
         None
