@@ -283,12 +283,10 @@ fn clock_nanosleep_accepts_relative_and_absolute_timespecs() {
 }
 
 #[test]
-fn clock_settime_bootstrap_returns_eperm_for_realtime_and_einval_for_unknown() {
+fn clock_settime_bootstrap_returns_eperm_before_validating_arguments() {
     const LINUX_CLOCK_REALTIME: u64 = 0;
     const LINUX_CLOCK_MONOTONIC: u64 = 1;
     const LINUX_EPERM: LinuxErrno = LinuxErrno::new(1);
-    const LINUX_EFAULT: LinuxErrno = LinuxErrno::new(14);
-    const LINUX_EINVAL: LinuxErrno = LinuxErrno::new(22);
 
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
     let reporter = CompatReporter::default();
@@ -314,7 +312,13 @@ fn clock_settime_bootstrap_returns_eperm_for_realtime_and_einval_for_unknown() {
         DispatchOutcome::Errno { errno: LINUX_EPERM }
     );
 
-    // CLOCK_MONOTONIC is not settable.
+    // CLOCK_MONOTONIC is not settable -- but EPERM still wins, because
+    // `clock_settime` checks CAP_SYS_TIME BEFORE it validates arguments. The
+    // `eventwaitmatrix` probe's Docker oracle returns EPERM here (and for an
+    // unknown clock id, a NULL timespec, and an out-of-range `tv_nsec`) in a
+    // container without the capability, which is Docker's default profile.
+    // This assertion previously expected EINVAL, which is what carrick
+    // answered while it validated arguments first.
     assert_eq!(
         dispatcher
             .dispatch(
@@ -327,12 +331,13 @@ fn clock_settime_bootstrap_returns_eperm_for_realtime_and_einval_for_unknown() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno {
-            errno: LINUX_EINVAL
-        }
+        DispatchOutcome::Errno { errno: LINUX_EPERM }
     );
 
-    // Unknown clock id.
+    // Unknown clock id -- EPERM, for the same reason: unprivileged
+    // `clock_settime` never reaches the argument checks. The EINVAL arm is
+    // still there, behind CAP_SYS_TIME, and is what `clocksettimevdso`
+    // (`--cap-add SYS_TIME`) exercises.
     assert_eq!(
         dispatcher
             .dispatch(
@@ -342,12 +347,11 @@ fn clock_settime_bootstrap_returns_eperm_for_realtime_and_einval_for_unknown() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno {
-            errno: LINUX_EINVAL
-        }
+        DispatchOutcome::Errno { errno: LINUX_EPERM }
     );
 
-    // Bad timespec pointer → EFAULT.
+    // A bad timespec pointer is EPERM here too, not EFAULT: the pointer is
+    // never dereferenced without the capability.
     assert_eq!(
         dispatcher
             .dispatch(
@@ -360,12 +364,12 @@ fn clock_settime_bootstrap_returns_eperm_for_realtime_and_einval_for_unknown() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno {
-            errno: LINUX_EFAULT
-        }
+        DispatchOutcome::Errno { errno: LINUX_EPERM }
     );
 
-    // Invalid tv_nsec → EINVAL.
+    // And an out-of-range tv_nsec, completing the set the oracle showed
+    // collapsing to EPERM: unknown clock, non-settable clock, bad pointer,
+    // bad tv_nsec.
     memory
         .write_bytes(0x4010, LinuxTimespec::new(0, 1_000_000_000).as_bytes())
         .unwrap();
@@ -381,9 +385,7 @@ fn clock_settime_bootstrap_returns_eperm_for_realtime_and_einval_for_unknown() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno {
-            errno: LINUX_EINVAL
-        }
+        DispatchOutcome::Errno { errno: LINUX_EPERM }
     );
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
@@ -617,6 +619,7 @@ fn adjtimex_and_clock_adjtime_return_eperm() {
     const LINUX_EPERM: LinuxErrno = LinuxErrno::new(1);
     const LINUX_EFAULT: LinuxErrno = LinuxErrno::new(14);
     const LINUX_EINVAL: LinuxErrno = LinuxErrno::new(22);
+    const LINUX_EOPNOTSUPP: LinuxErrno = LinuxErrno::new(95);
 
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
     let reporter = CompatReporter::default();
@@ -685,7 +688,12 @@ fn adjtimex_and_clock_adjtime_return_eperm() {
         DispatchOutcome::Errno { errno: LINUX_EPERM }
     );
 
-    // clock_adjtime with CLOCK_MONOTONIC → EINVAL.
+    // clock_adjtime with CLOCK_MONOTONIC → EOPNOTSUPP, not EINVAL. The clock
+    // is KNOWN but not adjustable, and `clock_adjtime` distinguishes the two
+    // where carrick used to answer EINVAL for both. EINVAL is reserved for an
+    // unknown clock id, asserted below. Oracle: the `eventwaitmatrix` probe,
+    // which covers CLOCK_MONOTONIC, CLOCK_BOOTTIME and
+    // CLOCK_PROCESS_CPUTIME_ID.
     assert_eq!(
         dispatcher
             .dispatch(
@@ -699,7 +707,7 @@ fn adjtimex_and_clock_adjtime_return_eperm() {
             )
             .unwrap(),
         DispatchOutcome::Errno {
-            errno: LINUX_EINVAL
+            errno: LINUX_EOPNOTSUPP
         }
     );
 
@@ -718,6 +726,22 @@ fn adjtimex_and_clock_adjtime_return_eperm() {
             .unwrap(),
         DispatchOutcome::Errno {
             errno: LINUX_EFAULT
+        }
+    );
+
+    // An UNKNOWN clock id keeps EINVAL, which is the distinction the
+    // EOPNOTSUPP arm above exists to make. Nothing covered this arm before.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(266, SyscallArgs::from([99, 0x4000, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_EINVAL
         }
     );
 
