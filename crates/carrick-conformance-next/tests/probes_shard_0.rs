@@ -253,32 +253,16 @@ fn test_shard_0_expected_gaps_derivation() {
 
     let expected_musl_set = BTreeSet::from([
         "budget_two_proc",
-        "childsubreaper",
         "eventwaitmatrix",
         "execfromthread",
-        "futexforkwakegroups",
         "memfdsealmatrix",
-        "mprotectexec",
-        "pidnsroot",
-        "procpeerdir",
-        "siginfo",
-        "sigpairrace",
-        "sigtimedwaitintr",
-        "sigwaitblock",
     ]);
 
     let expected_gnu_set = BTreeSet::from([
         "budget_two_proc",
-        "childsubreaper",
         "eventwaitmatrix",
         "execfromthread",
-        "killchld",
         "memfdsealmatrix",
-        "pidnsroot",
-        "procpeerdir",
-        "siginfo",
-        "sigpairrace",
-        "sigwaitblock",
     ]);
 
     assert_eq!(
@@ -380,13 +364,13 @@ fn test_probe_binary_locator_and_gap_counts() {
     let gnu_shard_gaps = expected_shard_gaps(common::GNU_BASELINE_GAPS);
     assert_eq!(
         musl_shard_gaps.len(),
-        13,
-        "musl shard 0 must contain exactly 13 baseline gaps"
+        4,
+        "musl shard 0 must contain exactly 4 baseline gaps"
     );
     assert_eq!(
         gnu_shard_gaps.len(),
-        11,
-        "gnu shard 0 must contain exactly 11 baseline gaps"
+        4,
+        "gnu shard 0 must contain exactly 4 baseline gaps"
     );
 }
 

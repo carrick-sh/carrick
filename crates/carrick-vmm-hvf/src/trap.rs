@@ -13871,7 +13871,13 @@ fn create_with_no_resources_backpressure_bounded<T>(
                         start.elapsed(),
                     );
                 }
-                return Err(hvf_error(e));
+                // Name the operation. This loop already carries `what` for
+                // its trace output and then dropped it on the error path, so a
+                // real failure surfaced as a bare "owning resource is busy
+                // (error 0xfae94002)" with nothing saying WHICH call — the
+                // concurrent container-gate failure had to be chased from a
+                // 7.5 GiB core to find out.
+                return Err(TrapError::Hypervisor(format!("{what}: {e}")));
             }
         }
     }
@@ -13911,7 +13917,9 @@ fn create_vcpu(
             vcpu_created();
             Ok(vcpu)
         }
-        Err(e) => Err(hvf_error(e)),
+        Err(e) => Err(TrapError::Hypervisor(format!(
+            "hv_vcpu_create (existing carrier VM): {e}"
+        ))),
     }
 }
 
@@ -13961,7 +13969,9 @@ impl PendingCarrierVmCreation {
             });
         }
         record_vm_resident();
-        CARRIER_VM_LIVE.store(true, std::sync::atomic::Ordering::Release);
+        // `CARRIER_VM_LIVE` is published by `create_vm_with_admission` now, at
+        // the moment the VM actually exists; publishing it here left a window
+        // in which a VM was live but `carrier_vm_live()` still said no.
         crate::probes::vm_lifecycle(1, self.probe_code);
         self.armed = false;
         Ok(())
@@ -14255,17 +14265,34 @@ fn create_vm_with_admission(
         })
     };
     match create_result {
-        Ok(vm) => Ok((
-            vm,
-            permit,
-            PendingCarrierVmCreation {
-                custody: std::sync::Arc::clone(custody),
-                generation,
-                probe_code: admission.probe_code(),
-                vcpu_id: None,
-                armed: true,
-            },
-        )),
+        Ok(vm) => {
+            // Publish "this carrier owns a VM" the instant `hv_vm_create`
+            // succeeds, which is what this flag has always DOCUMENTED ("set on
+            // the single create funnel's success"). It used to be published by
+            // `PendingCarrierVmCreation::commit`, far later in root setup, and
+            // `carrier_root_boot_gate` is released as soon as the create
+            // returns -- so a second root could take the gate, still read
+            // `carrier_vm_live() == false`, and issue its own `hv_vm_create`.
+            // HVF allows one VM per process, so that second create returned
+            // HV_BUSY and the container failed to start: the concurrent
+            // `conformance_container_gate` lane failed with alpha never
+            // reaching its rendezvous. A rolled-back creation clears the flag
+            // through `record_vm_released` once `hv_vm_destroy` succeeds, and
+            // if that destroy fails the flag correctly stays set -- a VM does
+            // still exist.
+            CARRIER_VM_LIVE.store(true, std::sync::atomic::Ordering::Release);
+            Ok((
+                vm,
+                permit,
+                PendingCarrierVmCreation {
+                    custody: std::sync::Arc::clone(custody),
+                    generation,
+                    probe_code: admission.probe_code(),
+                    vcpu_id: None,
+                    armed: true,
+                },
+            ))
+        }
         Err(error) => {
             custody
                 .abort_create(generation)
