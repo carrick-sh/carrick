@@ -3841,6 +3841,7 @@ where
         if terminal_retirement.is_some() && pending_exec_cleanup {
             std::process::abort();
         }
+        let exec_cleanup_ran = pending_exec_retirement.is_some() || pending_exec_cleanup;
         if let Some(retirement) = pending_exec_retirement.take() {
             match control.invalidate_after_exec(
                 &retirement,
@@ -3904,6 +3905,25 @@ where
                 );
                 return Err(with_settlement_error(
                     format!("shared-MM exec detached predecessor cleanup failed: {error}"),
+                    settlement,
+                ));
+            }
+        }
+        if exec_cleanup_ran {
+            // Exec cleanup may drop the last foreign-MM registration after the
+            // post-save audit above. Run the named idle maintenance boundary
+            // now, while no topology guard or task binding is loaded, so an
+            // all-idle executor pool cannot strand its retry request forever.
+            if let Err(error) = boundary.audit_runtime(backend) {
+                let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                    resolver.as_ref(),
+                    scheduler,
+                    running,
+                    ExecutionFailure::SnapshotRestoreFailed,
+                    receipts,
+                );
+                return Err(with_settlement_error(
+                    format!("post-exec-cleanup executor audit failed: {error}"),
                     settlement,
                 ));
             }
@@ -3993,6 +4013,23 @@ where
                 ));
             }
             drop(_topology);
+            // `retirement.complete()` can drop the terminal registration while
+            // the topology guard is held. Backend maintenance is forbidden in
+            // Drop and under that guard, so service its custody-local request
+            // immediately after releasing topology authority.
+            if let Err(error) = boundary.audit_runtime(backend) {
+                let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                    resolver.as_ref(),
+                    scheduler,
+                    running,
+                    ExecutionFailure::SnapshotRestoreFailed,
+                    receipts,
+                );
+                return Err(with_settlement_error(
+                    format!("post-terminal-cleanup executor audit failed: {error}"),
+                    settlement,
+                ));
+            }
         }
         if let Some(authority) = submission_authority.take() {
             if let Err(authority) = resolver.restore_submission_authority(authority) {

@@ -2264,7 +2264,7 @@ mod foreign_mm_tests {
     }
 
     #[test]
-    fn retained_old_token_keeps_physical_backing_after_production_retirement_and_binding_reuse() {
+    fn retained_old_token_drop_only_enqueues_before_the_executor_safe_point() {
         let _guard = FOREIGN_MM_TEST_LOCK.lock();
         let transport = CarrierForeignMmTransport::new();
         let InstalledMm {
@@ -2322,7 +2322,6 @@ mod foreign_mm_tests {
                 "production cleanup must place each retained owner into pending retirement while foreign lease is active",
             );
         }
-        drop(owners);
         drop(state);
 
         let replacement_snapshot = TestSnapshot {
@@ -2346,11 +2345,36 @@ mod foreign_mm_tests {
         assert!(receipt.authenticates(&snapshot));
 
         drop(lease);
-        drain_and_retry_pending_global_frame_retirements()
-            .expect("drain must succeed after foreign lease drop");
         assert!(
-            global_frame_host_owners().lock().is_empty(),
-            "directory must be drained after foreign lease drop",
+            owners.0.iter().all(|key| global_frame_host_owners()
+                .lock()
+                .get(key)
+                .is_some_and(|entry| entry.is_pending())),
+            "foreign lease drop must release pins and enqueue retirement without backend unmap",
+        );
+        let turn = retry_pending_global_frame_retirements_at_idle_in_using(
+            &transport.custody,
+            &mut unmap_global_frame_stage2_record,
+        );
+        assert!(turn.inspected_directory <= 16);
+        for _ in 0..2 {
+            if owners
+                .0
+                .iter()
+                .all(|key| !global_frame_host_owners().lock().contains_key(key))
+            {
+                break;
+            }
+            let _ = retry_pending_global_frame_retirements_at_idle_in_using(
+                &transport.custody,
+                &mut unmap_global_frame_stage2_record,
+            );
+        }
+        assert!(
+            owners
+                .0
+                .iter()
+                .all(|key| !global_frame_host_owners().lock().contains_key(key))
         );
     }
 
@@ -3070,7 +3094,9 @@ mod foreign_mm_tests {
         );
         {
             let mut state = transport.custody.state.lock();
-            state.lifecycle = CarrierVmLifecycle::Creating(CarrierVmGeneration(2));
+            state.lifecycle = CarrierVmLifecycle::Creating(CarrierVmGeneration(
+                identity.vm_generation.0.wrapping_add(1),
+            ));
         }
         assert!(
             inherited_fork_inventory_extents_in(&transport.custody, &desc, &inventory).is_empty(),
@@ -4186,6 +4212,7 @@ mod foreign_mm_tests {
             len as usize,
         )
         .expect("publish borrowed structural owner");
+        let identity = *owner.retained.record_identity.lock();
         let owner_generation = owner.epoch().raw();
         let mut plan = ProcessSpecPlan {
             mappings: vec![ProcessMappingDesc {
@@ -4515,7 +4542,27 @@ mod foreign_mm_tests {
             retained.is_ok(),
             "copied child must retain every authenticated borrowed structural owner: {retained:?}"
         );
+        drop(retained);
+        drop(state);
+        drop(grandchild_prepared);
+        drop(grandchild_overlay);
+        drop(child_source);
+        drop(prepared);
         drop(owner);
+        retry_structural_backing_identities_in_using(
+            &transport.custody,
+            &[identity],
+            &mut unmap_global_frame_stage2_record,
+            &mut release_retired_stage2_ipa,
+        )
+        .expect("retire copied-child structural fixture");
+        assert!(
+            transport
+                .custody
+                .stage2_record_snapshot(identity.record_id)
+                .is_none(),
+            "copied-child fixture must not leak a retired structural record",
+        );
     }
 
     #[test]
@@ -8728,6 +8775,7 @@ pub(crate) enum GlobalFrameOwnerEntry {
         owner: std::sync::Arc<GlobalFrameHostOwner>,
         #[allow(dead_code)]
         error: Option<String>,
+        in_flight: bool,
     },
 }
 
@@ -8737,6 +8785,18 @@ impl GlobalFrameOwnerEntry {
         match self {
             Self::Live(owner) | Self::RetirementPending { owner, .. } => owner,
         }
+    }
+
+    fn live_owner(&self) -> Option<&std::sync::Arc<GlobalFrameHostOwner>> {
+        match self {
+            Self::Live(owner) => Some(owner),
+            Self::RetirementPending { .. } => None,
+        }
+    }
+
+    fn is_live_exact(&self, expected: &std::sync::Arc<GlobalFrameHostOwner>) -> bool {
+        self.live_owner()
+            .is_some_and(|owner| std::sync::Arc::ptr_eq(owner, expected))
     }
 
     #[allow(dead_code)]
@@ -9005,7 +9065,10 @@ fn global_frame_host_owner_identity_in(
         .global_frame_host_owners
         .lock()
         .get(&(ipa, length))
-        .map(|entry| (entry.owner().host_addr(), entry.owner().generation()))
+        .and_then(|entry| match entry {
+            GlobalFrameOwnerEntry::Live(owner) => Some((owner.host_addr(), owner.generation())),
+            GlobalFrameOwnerEntry::RetirementPending { .. } => None,
+        })
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -9084,7 +9147,7 @@ impl carrick_hal::FrameCowOwnerLease for CarrierFrameCowOwnerLease {
                 .global_frame_host_owners
                 .lock()
                 .get(&self.key)
-                .is_some_and(|current| std::sync::Arc::ptr_eq(current.owner(), &self.pin.owner))
+                .is_some_and(|current| current.is_live_exact(&self.pin.owner))
         })
     }
 }
@@ -9109,7 +9172,10 @@ impl carrick_hal::FrameCowOwnerInventory for CarrierFrameCowOwnerInventory {
             .global_frame_host_owners
             .lock()
             .get(&key)
-            .map(|e| std::sync::Arc::clone(e.owner()))
+            .and_then(|entry| match entry {
+                GlobalFrameOwnerEntry::Live(owner) => Some(std::sync::Arc::clone(owner)),
+                GlobalFrameOwnerEntry::RetirementPending { .. } => None,
+            })
             .ok_or_else(|| std::io::Error::other("foreign COW extent has no current host owner"))?;
         let generation = std::num::NonZeroU64::new(owner.generation())
             .map(carrick_hal::ForeignOwnerGeneration::from_backend_counter)
@@ -9466,10 +9532,7 @@ fn register_global_frame_host_owner_in_using(
             CarrierStage2RetireOutcome::RetiredUnmapped
             | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
                 if finalize_global_frame_owner_record(custody, &owner).is_err() {
-                    custody
-                        .pending_global_frame_owners
-                        .lock()
-                        .insert(record_identity.record_id, owner);
+                    retain_pending_global_frame_owner(custody, owner);
                 }
             }
             CarrierStage2RetireOutcome::DeferredActivePins
@@ -9478,10 +9541,7 @@ fn register_global_frame_host_owner_in_using(
             | CarrierStage2RetireOutcome::OwnerIdentityMismatch
             | CarrierStage2RetireOutcome::OwnerGenerationMismatch
             | CarrierStage2RetireOutcome::VmGenerationMismatch => {
-                custody
-                    .pending_global_frame_owners
-                    .lock()
-                    .insert(record_identity.record_id, owner);
+                retain_pending_global_frame_owner(custody, owner);
             }
         }
         return Err(TrapError::Hypervisor(format!(
@@ -10114,10 +10174,16 @@ fn reconcile_global_frame_owners_after_replay_in_using(
             ));
         }
         if snapshot.pin_count != 0 {
+            let owner_generation = owner.generation();
             custody.global_frame_host_owners.lock().insert(
                 key,
-                GlobalFrameOwnerEntry::RetirementPending { owner, error: None },
+                GlobalFrameOwnerEntry::RetirementPending {
+                    owner,
+                    error: None,
+                    in_flight: false,
+                },
             );
+            custody.enqueue_directory_global_frame_retirement(key, owner_generation);
             report.deferred += 1;
             continue;
         }
@@ -10144,6 +10210,10 @@ fn reconcile_global_frame_owners_after_replay_in_using(
                 .pending_global_frame_owners
                 .lock()
                 .remove(&owner.record_identity.record_id);
+            custody
+                .pending_global_frame_detached_retries
+                .lock()
+                .complete(owner.record_identity.record_id);
             continue;
         };
         if !snapshot.terminalized_by_vm_destroy || snapshot.pin_count != 0 {
@@ -10155,6 +10225,10 @@ fn reconcile_global_frame_owners_after_replay_in_using(
             .pending_global_frame_owners
             .lock()
             .remove(&owner.record_identity.record_id);
+        custody
+            .pending_global_frame_detached_retries
+            .lock()
+            .complete(owner.record_identity.record_id);
         report.retired += 1;
     }
 
@@ -10332,7 +10406,13 @@ pub(crate) fn retire_global_frame_host_owner_if_generation_in(
     length: u64,
     expected_generation: u64,
 ) -> GlobalFrameRetirementOutcome {
-    retire_global_frame_host_owner_inner_in(custody, ipa, length, Some(expected_generation))
+    retire_global_frame_host_owner_if_generation_in_using(
+        custody,
+        ipa,
+        length,
+        expected_generation,
+        &mut unmap_global_frame_stage2_record,
+    )
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -10351,7 +10431,7 @@ fn retire_global_frame_host_owner_inner_in(
     )
 }
 
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn retire_global_frame_host_owner_if_generation_in_using(
     custody: &CarrierVmCustody,
     ipa: u64,
@@ -10376,134 +10456,224 @@ fn retire_global_frame_host_owner_inner_in_using(
     expected_generation: Option<u64>,
     unmap: &mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
 ) -> GlobalFrameRetirementOutcome {
-    // Lifecycle debug: CARRICK_FORK_DEBUG_IPA=<hex> logs every owner
-    // retirement overlapping that IPA, with the caller. Retiring an owner
-    // drops its OwnedHostMapping — macOS can recycle the host VA immediately —
-    // so a retire while a live process still references the frame is the
-    // scrubbed-shared-granule bug's trigger shape.
-    if let Some(debug_ipa) = fork_debug_ipa()
-        && ipa <= debug_ipa
-        && debug_ipa < ipa.saturating_add(length)
-    {
-        eprintln!(
-            "[FORKDBG] retire_global_frame_host_owner ipa={ipa:#x} len={length:#x}\n{}",
-            std::backtrace::Backtrace::force_capture(),
-        );
-    }
-    // Hold the exact directory slot through record retirement, terminal IPA
-    // finalization, and directory removal. This makes the terminal publication
-    // one serialized transaction: a concurrent caller can only observe the
-    // incumbent before it begins or the empty/successor slot after it commits.
-    let mut owners = custody.global_frame_host_owners.lock();
-    let owner = match owners.get(&(ipa, length)) {
-        Some(entry) => std::sync::Arc::clone(entry.owner()),
-        None => return GlobalFrameRetirementOutcome::NotFound { ipa, length },
-    };
-    if let Some(expected) = expected_generation {
-        if owner.generation() != expected {
-            return GlobalFrameRetirementOutcome::MismatchedGeneration {
-                ipa,
-                length,
-                current_generation: owner.generation(),
-                expected_generation: expected,
-            };
+    let outcome = (|| {
+        // Lifecycle debug: CARRICK_FORK_DEBUG_IPA=<hex> logs every owner
+        // retirement overlapping that IPA, with the caller. Retiring an owner
+        // drops its OwnedHostMapping — macOS can recycle the host VA immediately —
+        // so a retire while a live process still references the frame is the
+        // scrubbed-shared-granule bug's trigger shape.
+        if let Some(debug_ipa) = fork_debug_ipa()
+            && ipa <= debug_ipa
+            && debug_ipa < ipa.saturating_add(length)
+        {
+            eprintln!(
+                "[FORKDBG] retire_global_frame_host_owner ipa={ipa:#x} len={length:#x}\n{}",
+                std::backtrace::Backtrace::force_capture(),
+            );
         }
-    }
-    let generation = owner.generation();
-    if owner.mapping.pin_count() != 0 {
-        let outcome = custody.request_stage2_record_retirement(owner.record_identity);
-        if outcome != CarrierStage2RetireOutcome::DeferredActivePins {
-            return GlobalFrameRetirementOutcome::RetryPending {
-                ipa,
-                length,
-                generation,
-                error: format!("carrier stage-2 retirement request failed: {outcome:?}"),
-            };
-        }
-        owners.insert(
-            (ipa, length),
-            GlobalFrameOwnerEntry::RetirementPending { owner, error: None },
-        );
-        return GlobalFrameRetirementOutcome::DeferredActivePins {
-            ipa,
-            length,
-            generation,
+        let key = (ipa, length);
+        // Claim the exact directory slot before record retirement, but do not hold
+        // the directory lock across the backend unmap. The backend also retires
+        // replay/alias state, whose lock order can meet a concurrent semantic owner
+        // lookup in the opposite direction. `RetirementPending` is the exclusive
+        // publication: readers and successor registration reject it until this
+        // transaction either removes the exact Arc or records a retryable failure.
+        let mut owners = custody.global_frame_host_owners.lock();
+        let owner = match owners.get(&key) {
+            Some(GlobalFrameOwnerEntry::Live(owner))
+            | Some(GlobalFrameOwnerEntry::RetirementPending {
+                owner,
+                in_flight: false,
+                ..
+            }) => std::sync::Arc::clone(owner),
+            Some(entry) => {
+                return GlobalFrameRetirementOutcome::RetryPending {
+                    ipa,
+                    length,
+                    generation: entry.owner().generation(),
+                    error: "global frame owner retirement is already claimed".to_owned(),
+                };
+            }
+            None => return GlobalFrameRetirementOutcome::NotFound { ipa, length },
         };
-    }
-    let outcome = custody.retire_stage2_record_using(owner.record_identity, unmap);
-    match outcome {
-        CarrierStage2RetireOutcome::RetiredUnmapped
-        | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
-            let terminalized =
-                matches!(outcome, CarrierStage2RetireOutcome::TerminalizedByVmDestroy);
-            if let Err(error) = finalize_global_frame_owner_record(custody, &owner) {
-                owners.insert(
-                    (ipa, length),
-                    GlobalFrameOwnerEntry::RetirementPending {
-                        owner,
-                        error: Some(error.to_string()),
-                    },
-                );
+        if let Some(expected) = expected_generation {
+            if owner.generation() != expected {
+                return GlobalFrameRetirementOutcome::MismatchedGeneration {
+                    ipa,
+                    length,
+                    current_generation: owner.generation(),
+                    expected_generation: expected,
+                };
+            }
+        }
+        let generation = owner.generation();
+        if owner.mapping.pin_count() != 0 {
+            let outcome = custody.request_stage2_record_retirement(owner.record_identity);
+            if outcome != CarrierStage2RetireOutcome::DeferredActivePins {
                 return GlobalFrameRetirementOutcome::RetryPending {
                     ipa,
                     length,
                     generation,
-                    error: error.to_string(),
+                    error: format!("carrier stage-2 retirement request failed: {outcome:?}"),
                 };
             }
-            if owners
-                .get(&(ipa, length))
-                .is_some_and(|entry| std::sync::Arc::ptr_eq(entry.owner(), &owner))
-            {
-                owners.remove(&(ipa, length));
-            }
-            if terminalized {
-                GlobalFrameRetirementOutcome::TerminalizedByVmDestroy {
-                    ipa,
-                    length,
-                    generation,
-                }
-            } else {
-                GlobalFrameRetirementOutcome::RetiredUnmapped {
-                    ipa,
-                    length,
-                    generation,
-                }
-            }
-        }
-        CarrierStage2RetireOutcome::DeferredActivePins => {
-            owners.insert(
-                (ipa, length),
-                GlobalFrameOwnerEntry::RetirementPending { owner, error: None },
-            );
-            GlobalFrameRetirementOutcome::DeferredActivePins {
-                ipa,
-                length,
-                generation,
-            }
-        }
-        CarrierStage2RetireOutcome::RetryPending(error) => {
             owners.insert(
                 (ipa, length),
                 GlobalFrameOwnerEntry::RetirementPending {
                     owner,
-                    error: Some(format!("{error:?}")),
+                    error: None,
+                    in_flight: false,
                 },
             );
-            GlobalFrameRetirementOutcome::RetryPending {
+            return GlobalFrameRetirementOutcome::DeferredActivePins {
                 ipa,
                 length,
                 generation,
-                error: format!("{error:?}"),
+            };
+        }
+        owners.insert(
+            key,
+            GlobalFrameOwnerEntry::RetirementPending {
+                owner: std::sync::Arc::clone(&owner),
+                error: None,
+                in_flight: true,
+            },
+        );
+        drop(owners);
+
+        let outcome = custody.retire_stage2_record_using(owner.record_identity, unmap);
+        let mut owners = custody.global_frame_host_owners.lock();
+        if !matches!(
+            owners.get(&key),
+            Some(GlobalFrameOwnerEntry::RetirementPending {
+                owner: pending,
+                in_flight: true,
+                ..
+            }) if std::sync::Arc::ptr_eq(pending, &owner)
+        ) {
+            drop(owners);
+            retain_pending_global_frame_owner(custody, std::sync::Arc::clone(&owner));
+            return GlobalFrameRetirementOutcome::RetryPending {
+                ipa,
+                length,
+                generation,
+                error: "global frame owner changed during exact retirement".to_owned(),
+            };
+        }
+        match outcome {
+            CarrierStage2RetireOutcome::RetiredUnmapped
+            | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
+                let terminalized =
+                    matches!(outcome, CarrierStage2RetireOutcome::TerminalizedByVmDestroy);
+                if let Err(error) = finalize_global_frame_owner_record(custody, &owner) {
+                    owners.insert(
+                        (ipa, length),
+                        GlobalFrameOwnerEntry::RetirementPending {
+                            owner,
+                            error: Some(error.to_string()),
+                            in_flight: false,
+                        },
+                    );
+                    return GlobalFrameRetirementOutcome::RetryPending {
+                        ipa,
+                        length,
+                        generation,
+                        error: error.to_string(),
+                    };
+                }
+                owners.remove(&key);
+                if terminalized {
+                    GlobalFrameRetirementOutcome::TerminalizedByVmDestroy {
+                        ipa,
+                        length,
+                        generation,
+                    }
+                } else {
+                    GlobalFrameRetirementOutcome::RetiredUnmapped {
+                        ipa,
+                        length,
+                        generation,
+                    }
+                }
+            }
+            CarrierStage2RetireOutcome::DeferredActivePins => {
+                owners.insert(
+                    (ipa, length),
+                    GlobalFrameOwnerEntry::RetirementPending {
+                        owner,
+                        error: None,
+                        in_flight: false,
+                    },
+                );
+                GlobalFrameRetirementOutcome::DeferredActivePins {
+                    ipa,
+                    length,
+                    generation,
+                }
+            }
+            CarrierStage2RetireOutcome::RetryPending(error) => {
+                owners.insert(
+                    (ipa, length),
+                    GlobalFrameOwnerEntry::RetirementPending {
+                        owner,
+                        error: Some(format!("{error:?}")),
+                        in_flight: false,
+                    },
+                );
+                GlobalFrameRetirementOutcome::RetryPending {
+                    ipa,
+                    length,
+                    generation,
+                    error: format!("{error:?}"),
+                }
+            }
+            unexpected => {
+                let error = format!("carrier stage-2 record identity failure: {unexpected:?}");
+                owners.insert(
+                    key,
+                    GlobalFrameOwnerEntry::RetirementPending {
+                        owner,
+                        error: Some(error.clone()),
+                        in_flight: false,
+                    },
+                );
+                GlobalFrameRetirementOutcome::RetryPending {
+                    ipa,
+                    length,
+                    generation,
+                    error,
+                }
             }
         }
-        unexpected => GlobalFrameRetirementOutcome::RetryPending {
+    })();
+    match outcome {
+        GlobalFrameRetirementOutcome::DeferredActivePins {
             ipa,
             length,
             generation,
-            error: format!("carrier stage-2 record identity failure: {unexpected:?}"),
-        },
+        }
+        | GlobalFrameRetirementOutcome::RetryPending {
+            ipa,
+            length,
+            generation,
+            ..
+        } => custody.enqueue_directory_global_frame_retirement((ipa, length), generation),
+        GlobalFrameRetirementOutcome::RetiredUnmapped {
+            ipa,
+            length,
+            generation,
+        }
+        | GlobalFrameRetirementOutcome::TerminalizedByVmDestroy {
+            ipa,
+            length,
+            generation,
+        } => custody
+            .pending_global_frame_directory_retries
+            .lock()
+            .complete(((ipa, length), generation)),
+        _ => {}
     }
+    outcome
 }
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
@@ -10557,10 +10727,16 @@ fn retry_pending_global_frame_retirements_in_using(
         .global_frame_host_owners
         .lock()
         .iter()
-        .filter_map(|(&key, entry)| {
-            entry
-                .is_pending()
-                .then_some((key, entry.owner().generation()))
+        .filter_map(|(&key, entry)| match entry {
+            GlobalFrameOwnerEntry::RetirementPending {
+                owner,
+                in_flight: false,
+                ..
+            } => Some((key, owner.generation())),
+            GlobalFrameOwnerEntry::Live(_)
+            | GlobalFrameOwnerEntry::RetirementPending {
+                in_flight: true, ..
+            } => None,
         })
         .collect::<Vec<_>>();
     for ((ipa, length), generation) in pending_directory {
@@ -10610,6 +10786,257 @@ fn retry_pending_global_frame_retirements_in_using(
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PENDING_GLOBAL_FRAME_RETIREMENTS_PER_IDLE_TURN: usize = 32;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PENDING_GLOBAL_FRAME_RETIREMENTS_PER_CLASS_PER_IDLE_TURN: usize =
+    PENDING_GLOBAL_FRAME_RETIREMENTS_PER_IDLE_TURN / 2;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct PendingGlobalFrameRetirementQueue<K: Copy + Ord> {
+    next_sequence: u64,
+    by_sequence: std::collections::BTreeMap<u64, K>,
+    by_item: std::collections::BTreeMap<K, Option<u64>>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl<K: Copy + Ord> Default for PendingGlobalFrameRetirementQueue<K> {
+    fn default() -> Self {
+        Self {
+            next_sequence: 1,
+            by_sequence: std::collections::BTreeMap::new(),
+            by_item: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl<K: Copy + Ord> PendingGlobalFrameRetirementQueue<K> {
+    fn allocate_sequence(&mut self) -> u64 {
+        loop {
+            let sequence = self.next_sequence;
+            self.next_sequence = self.next_sequence.wrapping_add(1);
+            if !self.by_sequence.contains_key(&sequence) {
+                return sequence;
+            }
+        }
+    }
+
+    fn enqueue(&mut self, item: K) {
+        if !self.by_item.contains_key(&item) {
+            let sequence = self.allocate_sequence();
+            self.by_sequence.insert(sequence, item);
+            self.by_item.insert(item, Some(sequence));
+        }
+    }
+
+    fn pop_front(&mut self) -> Option<K> {
+        let (_, item) = self.by_sequence.pop_first()?;
+        self.by_item.insert(item, None);
+        Some(item)
+    }
+
+    fn requeue(&mut self, item: K) {
+        if self.by_item.get(&item) == Some(&None) {
+            let sequence = self.allocate_sequence();
+            self.by_sequence.insert(sequence, item);
+            self.by_item.insert(item, Some(sequence));
+        }
+    }
+
+    fn complete(&mut self, item: K) {
+        if let Some(Some(sequence)) = self.by_item.remove(&item) {
+            self.by_sequence.remove(&sequence);
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.by_item.len()
+    }
+
+    #[cfg(test)]
+    fn storage_len(&self) -> usize {
+        self.by_sequence.len()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PendingGlobalFrameRetirementTurnReport {
+    remaining: usize,
+    inspected_directory: usize,
+    inspected_detached: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl PartialEq<usize> for PendingGlobalFrameRetirementTurnReport {
+    fn eq(&self, other: &usize) -> bool {
+        self.remaining == *other
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn retain_pending_global_frame_owner(
+    custody: &CarrierVmCustody,
+    owner: std::sync::Arc<GlobalFrameHostOwner>,
+) {
+    let record_id = owner.record_identity.record_id;
+    custody
+        .pending_global_frame_owners
+        .lock()
+        .insert(record_id, owner);
+    custody.enqueue_detached_global_frame_retirement(record_id);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct PendingGlobalFrameRetirementTurn<'a>(&'a CarrierVmCustody);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for PendingGlobalFrameRetirementTurn<'_> {
+    fn drop(&mut self) {
+        self.0
+            .pending_global_frame_retirement_turn_in_flight
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Perform one bounded carrier-idle retry turn. The caller is the named
+/// persistent-executor idle boundary, after task/binding/topology authority has
+/// been released. Failed or excess work remains explicitly requested for the
+/// next idle turn.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn retry_pending_global_frame_retirements_at_idle_in_using(
+    custody: &CarrierVmCustody,
+    unmap: &mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+) -> PendingGlobalFrameRetirementTurnReport {
+    if !custody.take_global_frame_retirement_retry_request() {
+        return PendingGlobalFrameRetirementTurnReport::default();
+    }
+    if custody
+        .pending_global_frame_retirement_turn_in_flight
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        custody.request_global_frame_retirement_retry();
+        return PendingGlobalFrameRetirementTurnReport {
+            remaining: custody.pending_global_frame_directory_retries.lock().len()
+                + custody.pending_global_frame_detached_retries.lock().len(),
+            ..PendingGlobalFrameRetirementTurnReport::default()
+        };
+    }
+    let _turn = PendingGlobalFrameRetirementTurn(custody);
+    let mut report = PendingGlobalFrameRetirementTurnReport::default();
+    let directory_attempts = custody
+        .pending_global_frame_directory_retries
+        .lock()
+        .len()
+        .min(PENDING_GLOBAL_FRAME_RETIREMENTS_PER_CLASS_PER_IDLE_TURN);
+    for _ in 0..directory_attempts {
+        let Some((key @ (ipa, length), generation)) = custody
+            .pending_global_frame_directory_retries
+            .lock()
+            .pop_front()
+        else {
+            break;
+        };
+        report.inspected_directory += 1;
+        let exact_retryable = custody
+            .global_frame_host_owners
+            .lock()
+            .get(&key)
+            .is_some_and(|entry| {
+                matches!(entry, GlobalFrameOwnerEntry::RetirementPending { owner, in_flight: false, .. }
+                    if owner.generation() == generation)
+            });
+        if !exact_retryable {
+            custody
+                .pending_global_frame_directory_retries
+                .lock()
+                .complete((key, generation));
+            continue;
+        }
+        let outcome = retire_global_frame_host_owner_inner_in_using(
+            custody,
+            ipa,
+            length,
+            Some(generation),
+            unmap,
+        );
+        let mut retries = custody.pending_global_frame_directory_retries.lock();
+        if matches!(
+            outcome,
+            GlobalFrameRetirementOutcome::DeferredActivePins { .. }
+                | GlobalFrameRetirementOutcome::RetryPending { .. }
+        ) {
+            retries.requeue((key, generation));
+        } else {
+            retries.complete((key, generation));
+        }
+    }
+
+    let detached_attempts = custody
+        .pending_global_frame_detached_retries
+        .lock()
+        .len()
+        .min(PENDING_GLOBAL_FRAME_RETIREMENTS_PER_CLASS_PER_IDLE_TURN);
+    for _ in 0..detached_attempts {
+        let Some(record_id) = custody
+            .pending_global_frame_detached_retries
+            .lock()
+            .pop_front()
+        else {
+            break;
+        };
+        report.inspected_detached += 1;
+        let Some(owner) = custody
+            .pending_global_frame_owners
+            .lock()
+            .get(&record_id)
+            .cloned()
+        else {
+            custody
+                .pending_global_frame_detached_retries
+                .lock()
+                .complete(record_id);
+            continue;
+        };
+        let outcome = custody.retire_stage2_record_using(owner.record_identity, &mut *unmap);
+        let completed = matches!(
+            outcome,
+            CarrierStage2RetireOutcome::RetiredUnmapped
+                | CarrierStage2RetireOutcome::TerminalizedByVmDestroy
+        ) && finalize_global_frame_owner_record(custody, &owner).is_ok();
+        if completed {
+            custody
+                .pending_global_frame_owners
+                .lock()
+                .remove(&record_id);
+            custody
+                .pending_global_frame_detached_retries
+                .lock()
+                .complete(record_id);
+        } else {
+            custody
+                .pending_global_frame_detached_retries
+                .lock()
+                .requeue(record_id);
+        }
+    }
+
+    report.remaining = custody.pending_global_frame_directory_retries.lock().len()
+        + custody.pending_global_frame_detached_retries.lock().len();
+    if report.remaining != 0 {
+        custody.request_global_frame_retirement_retry();
+    }
+    report
+}
+
 /// Authenticate a non-owning mapping/alias row against the exact live global
 /// owner, not merely against the current host VM map.
 ///
@@ -10631,7 +11058,10 @@ fn global_frame_host_owner_matches_in(
         .global_frame_host_owners
         .lock()
         .get(&(ipa, length))
-        .map(|entry| (entry.owner().host_addr(), entry.owner().generation()));
+        .map(|entry| match entry {
+            GlobalFrameOwnerEntry::Live(owner) => Some((owner.host_addr(), owner.generation())),
+            GlobalFrameOwnerEntry::RetirementPending { .. } => None,
+        });
     // The GENERATION is what turns this into an identity. Without it the triple
     // re-authenticates against a DIFFERENT incarnation of the same recycled
     // `(IPA, length, host VA)`, which is measured to happen every single time.
@@ -10644,11 +11074,14 @@ fn global_frame_host_owner_matches_in(
     let matches = match (owner, generation) {
         // Owned extent: the row must name that exact host mapping, and — when
         // it recorded an incarnation — that exact incarnation.
-        (Some((owner_host_addr, owner_generation)), _) => {
+        (Some(Some((owner_host_addr, owner_generation))), _) => {
             owner_host_addr != 0
                 && owner_host_addr == host_addr
                 && (generation == 0 || owner_generation == generation)
         }
+        // A pending extent still owns its host mapping for rollback/retry, but
+        // it is no longer live authority and cannot authenticate new access.
+        (Some(None), _) => false,
         // Unowned extent and a row that recorded no incarnation either. This
         // predicate has no owner to authenticate against, and absence of an
         // authority is not a rejection: it is the same unowned state the row was
@@ -10667,7 +11100,9 @@ fn global_frame_host_owner_matches_in(
             ipa,
             length,
             host_addr as u64,
-            owner.map_or(0, |(owner_host_addr, _)| owner_host_addr) as u64,
+            owner
+                .flatten()
+                .map_or(0, |(owner_host_addr, _)| owner_host_addr) as u64,
         );
     }
     matches
@@ -10686,11 +11121,18 @@ fn copy_from_global_frame_owner_in(
     let length = u64::try_from(dst.len()).ok()?;
     let end = ipa.checked_add(length)?;
     let owners = custody.global_frame_host_owners.lock();
-    let (&(owner_ipa, owner_length), entry) = owners
-        .iter()
-        .find(|((base, size), _)| ipa >= *base && end <= base.saturating_add(*size))?;
+    let (&(owner_ipa, owner_length), owner) =
+        owners.iter().find_map(|(key @ (base, size), entry)| {
+            if ipa < *base || end > base.saturating_add(*size) {
+                return None;
+            }
+            match entry {
+                GlobalFrameOwnerEntry::Live(owner) => Some((key, owner)),
+                GlobalFrameOwnerEntry::RetirementPending { .. } => None,
+            }
+        })?;
     let offset = usize::try_from(ipa.checked_sub(owner_ipa)?).ok()?;
-    let host = entry.owner().as_ptr();
+    let host = owner.as_ptr();
     unsafe {
         volatile_copy_from_guest(host.add(offset), dst.as_mut_ptr(), dst.len());
     }
@@ -12250,6 +12692,9 @@ pub fn destroy_persistent_vm_at_carrier_exit() -> Result<(), TrapError> {
                 Some(PersistentCarrierCellEntry::Published(carrier));
             return Err(error);
         }
+        carrier
+            .carrier_mappings
+            .mark_vm_destroyed_after_custody_commit()?;
         drop(carrier);
         return Ok(());
     }
@@ -12278,6 +12723,9 @@ pub fn destroy_persistent_vm_at_carrier_exit() -> Result<(), TrapError> {
         *persistent_carrier_cell().lock() = Some(PersistentCarrierCellEntry::Published(carrier));
         return Err(error);
     }
+    carrier
+        .carrier_mappings
+        .mark_vm_destroyed_after_custody_commit()?;
     drop(carrier);
     Ok(())
 }
@@ -13985,6 +14433,12 @@ pub(crate) struct CarrierVmCustody {
     pending_global_frame_owners: parking_lot::Mutex<
         std::collections::BTreeMap<CarrierStage2RecordId, std::sync::Arc<GlobalFrameHostOwner>>,
     >,
+    pending_global_frame_retirement_retry: std::sync::atomic::AtomicBool,
+    pending_global_frame_retirement_turn_in_flight: std::sync::atomic::AtomicBool,
+    pending_global_frame_directory_retries:
+        parking_lot::Mutex<PendingGlobalFrameRetirementQueue<((u64, u64), u64)>>,
+    pending_global_frame_detached_retries:
+        parking_lot::Mutex<PendingGlobalFrameRetirementQueue<CarrierStage2RecordId>>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -14011,7 +14465,41 @@ impl CarrierVmCustody {
             carrier_stage2_records: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             global_frame_host_owners: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             pending_global_frame_owners: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
+            pending_global_frame_retirement_retry: std::sync::atomic::AtomicBool::new(false),
+            pending_global_frame_retirement_turn_in_flight: std::sync::atomic::AtomicBool::new(
+                false,
+            ),
+            pending_global_frame_directory_retries: parking_lot::Mutex::new(
+                PendingGlobalFrameRetirementQueue::default(),
+            ),
+            pending_global_frame_detached_retries: parking_lot::Mutex::new(
+                PendingGlobalFrameRetirementQueue::default(),
+            ),
         }
+    }
+
+    fn request_global_frame_retirement_retry(&self) {
+        self.pending_global_frame_retirement_retry
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn enqueue_directory_global_frame_retirement(&self, key: (u64, u64), generation: u64) {
+        self.pending_global_frame_directory_retries
+            .lock()
+            .enqueue((key, generation));
+        self.request_global_frame_retirement_retry();
+    }
+
+    fn enqueue_detached_global_frame_retirement(&self, record_id: CarrierStage2RecordId) {
+        self.pending_global_frame_detached_retries
+            .lock()
+            .enqueue(record_id);
+        self.request_global_frame_retirement_retry();
+    }
+
+    fn take_global_frame_retirement_retry_request(&self) -> bool {
+        self.pending_global_frame_retirement_retry
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 
     #[cfg(any(test, feature = "foreign-cow-test-support"))]
@@ -14951,6 +15439,9 @@ struct CarrierForeignMmRegistration {
 impl Drop for CarrierForeignMmRegistration {
     fn drop(&mut self) {
         self.transport.unregister_exact(self);
+        self.transport
+            .custody
+            .request_global_frame_retirement_retry();
     }
 }
 
@@ -15056,6 +15547,41 @@ mod carrier_vm_custody_tests {
     }
 
     #[test]
+    fn executor_cleanup_funnels_guarantee_a_post_drop_idle_maintenance_turn_static_audit() {
+        let source = include_str!("../../carrick-runtime/src/vcpu_loop/executor.rs");
+        let exec_cleanup = source
+            .split("let exec_cleanup_ran =")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("if let Some(retirement) = terminal_retirement")
+                    .next()
+            })
+            .expect("exec cleanup lifecycle slice");
+        assert!(
+            exec_cleanup.contains("boundary.audit_runtime(backend)"),
+            "exec predecessor cleanup must run the idle maintenance boundary after Drop",
+        );
+        assert!(
+            exec_cleanup.contains("fail_running_and_retire::<F::TaskBinding"),
+            "a failed post-exec audit must settle the still-running task",
+        );
+
+        let terminal_cleanup = source.split("drop(_topology);").find(|tail| {
+            tail.contains("terminal registration")
+                && tail.contains("boundary.audit_runtime(backend)")
+        });
+        assert!(
+            terminal_cleanup.is_some(),
+            "terminal cleanup must release topology before its idle maintenance boundary",
+        );
+        assert!(
+            terminal_cleanup
+                .is_some_and(|tail| { tail.contains("fail_running_and_retire::<F::TaskBinding") }),
+            "a failed post-terminal audit must settle the still-running task",
+        );
+    }
+
+    #[test]
     fn vm_rebuild_funnels_reconcile_owner_generation_before_guest_entry_static_audit() {
         let source = include_str!("trap.rs");
         let shared_wait = source
@@ -15146,10 +15672,19 @@ mod carrier_vm_custody_tests {
             u64::from(applevisor::memory::MemPerms::ReadWrite),
         )
         .expect("register pinned global owner");
+        let exact_owner =
+            std::sync::Arc::clone(custody.global_frame_host_owners.lock()[&key].owner());
         let pin = custody.global_frame_host_owners.lock()[&key]
             .owner()
             .pin()
             .expect("pin exact global owner record");
+        let retained_lease = super::CarrierFrameCowOwnerLease {
+            key,
+            pin,
+            generation: carrick_hal::ForeignOwnerGeneration::from_backend_counter(
+                std::num::NonZeroU64::new(generation).expect("nonzero owner generation"),
+            ),
+        };
         let mut unmap_calls = 0_u32;
 
         assert!(matches!(
@@ -15167,19 +15702,588 @@ mod carrier_vm_custody_tests {
         ));
         assert_eq!(unmap_calls, 0);
         assert!(super::alias_backing_is_live(host_addr));
+        assert!(
+            !carrick_hal::FrameCowOwnerLease::is_current(&retained_lease),
+            "a lease retained before retirement must stop authenticating once pending is published"
+        );
 
-        drop(pin);
+        drop(retained_lease);
         let injected = super::CarrierStage2BackendError::HvReturn(0xfae9_4001);
         assert!(matches!(
-            super::retry_pending_global_frame_retirements_in_using(&custody, &mut |_, _| Err(
-                injected
-            ),),
-            Err(super::TrapError::Hypervisor(_))
+            super::retire_global_frame_host_owner_if_generation_in_using(
+                &custody,
+                key.0,
+                key.1,
+                generation,
+                &mut |_, _| {
+                    unmap_calls += 1;
+                    Err(injected)
+                },
+            ),
+            super::GlobalFrameRetirementOutcome::RetryPending { .. }
         ));
+        assert_eq!(unmap_calls, 1);
+        assert!(super::alias_backing_is_live(host_addr));
+        {
+            let owners = custody.global_frame_host_owners.lock();
+            match owners.get(&key) {
+                Some(super::GlobalFrameOwnerEntry::RetirementPending {
+                    owner,
+                    error: Some(error),
+                    ..
+                }) if std::sync::Arc::ptr_eq(owner, &exact_owner) => {
+                    assert!(error.contains("HvReturn"));
+                }
+                other => panic!(
+                    "failed backend retirement must preserve the exact pending owner and error, got {other:?}"
+                ),
+            }
+        }
+
+        let replacement_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            key.1 as usize,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate refused pending-owner replacement");
+        let mut replacement_lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
+        replacement_lease.mark_test_mapped_without_backend();
+        assert!(
+            super::register_global_frame_host_owner_in_using(
+                &custody,
+                replacement_lease,
+                replacement_mapping,
+                u64::from(applevisor::memory::MemPerms::ReadWrite),
+                &mut |_, _| Ok(()),
+            )
+            .is_err(),
+            "a successor must not replace an exact owner with pending backend retirement"
+        );
+        assert!(matches!(
+            custody.global_frame_host_owners.lock().get(&key),
+            Some(super::GlobalFrameOwnerEntry::RetirementPending { owner, .. })
+                if std::sync::Arc::ptr_eq(owner, &exact_owner)
+        ));
+        drop(exact_owner);
+
+        assert!(matches!(
+            super::retire_global_frame_host_owner_if_generation_in_using(
+                &custody,
+                key.0,
+                key.1,
+                generation,
+                &mut |_, _| {
+                    unmap_calls += 1;
+                    Ok(())
+                },
+            ),
+            super::GlobalFrameRetirementOutcome::RetiredUnmapped { .. }
+        ));
+        assert_eq!(unmap_calls, 2);
+        assert!(!super::alias_backing_is_live(host_addr));
+    }
+
+    #[test]
+    fn global_owner_retirement_publishes_pending_before_backend_unmap_without_holding_directory() {
+        let (custody, _) = live_custody();
+        let key = (0xa081_1800_0000, 0x4000);
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            key.1 as usize,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate global owner retirement lock-order fixture");
+        let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
+        lease.mark_mapped();
+        let generation = super::register_global_frame_host_owner_in(
+            &custody,
+            lease,
+            mapping,
+            u64::from(applevisor::memory::MemPerms::ReadWrite),
+        )
+        .expect("register global owner retirement lock-order fixture");
+        let exact_owner =
+            std::sync::Arc::clone(custody.global_frame_host_owners.lock()[&key].owner());
+
+        let outcome = super::retire_global_frame_host_owner_if_generation_in_using(
+            &custody,
+            key.0,
+            key.1,
+            generation,
+            &mut |ipa, len| {
+                assert_eq!((ipa, len as u64), key);
+                let owners = custody
+                    .global_frame_host_owners
+                    .try_lock()
+                    .expect("backend unmap must run without holding the owner directory");
+                match owners.get(&key) {
+                    Some(super::GlobalFrameOwnerEntry::RetirementPending {
+                        owner,
+                        error: None,
+                        in_flight: true,
+                    }) if std::sync::Arc::ptr_eq(owner, &exact_owner) => {}
+                    other => panic!(
+                        "backend unmap must observe the exact owner published pending, got {other:?}"
+                    ),
+                }
+                assert!(
+                    !owners
+                        .get(&key)
+                        .is_some_and(|entry| entry.is_live_exact(&exact_owner)),
+                    "the shared live-owner predicate must reject pending"
+                );
+                drop(owners);
+                assert!(
+                    matches!(
+                        exact_owner.pin(),
+                        Err(super::CarrierStage2PinError::RetirementRequested)
+                    ),
+                    "a pre-cloned owner Arc must not admit a pin after pending publication"
+                );
+                let mut nested_unmap_calls = 0_u32;
+                assert!(matches!(
+                    super::retire_global_frame_host_owner_if_generation_in_using(
+                        &custody,
+                        key.0,
+                        key.1,
+                        generation,
+                        &mut |_, _| {
+                            nested_unmap_calls += 1;
+                            Ok(())
+                        },
+                    ),
+                    super::GlobalFrameRetirementOutcome::RetryPending { .. }
+                ));
+                assert_eq!(
+                    nested_unmap_calls, 0,
+                    "a second ordinary retirement cannot enter backend unmap while the claimant is active"
+                );
+                assert_eq!(
+                    super::global_frame_host_owner_identity_in(&custody, key.0, key.1),
+                    None,
+                    "pending retirement must not publish a live owner identity"
+                );
+                assert!(
+                    !super::global_frame_host_owner_matches_in(
+                        &custody,
+                        key.0,
+                        key.1,
+                        exact_owner.host_addr(),
+                        exact_owner.generation(),
+                    ),
+                    "pending retirement must not authenticate a mapping row"
+                );
+                let mut copied = [0_u8; 1];
+                assert_eq!(
+                    super::copy_from_global_frame_owner_in(&custody, key.0, &mut copied),
+                    None,
+                    "pending retirement must not remain copyable"
+                );
+                let inventory = super::CarrierFrameCowOwnerInventory {
+                    custody: std::sync::Arc::clone(&custody),
+                };
+                let length = carrick_hal::FrameLength::from_mapping_extent(
+                    std::num::NonZeroU64::new(key.1).unwrap(),
+                );
+                assert!(
+                    carrick_hal::FrameCowOwnerInventory::retain_current(
+                        &inventory,
+                        carrick_guest_mem::Gpa(key.0),
+                        length,
+                    )
+                    .is_err(),
+                    "pending retirement must not admit a new COW owner pin"
+                );
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            outcome,
+            super::GlobalFrameRetirementOutcome::RetiredUnmapped { .. }
+        ));
+        assert!(
+            !custody.global_frame_host_owners.lock().contains_key(&key),
+            "successful retirement must remove the exact pending slot"
+        );
+    }
+
+    #[test]
+    fn later_exact_retirement_retries_a_transient_backend_failure_once() {
+        let (custody, _) = live_custody();
+        let key = (0xa081_1a00_0000, 0x4000);
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            key.1 as usize,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate exclusive retirement fixture");
+        let host_addr = mapping.as_ptr() as usize;
+        let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
+        lease.mark_mapped();
+        let generation = super::register_global_frame_host_owner_in(
+            &custody,
+            lease,
+            mapping,
+            u64::from(applevisor::memory::MemPerms::ReadWrite),
+        )
+        .expect("register exclusive retirement fixture");
+        let injected = super::CarrierStage2BackendError::HvReturn(0xfae9_4001);
+        let mut first_calls = 0_u32;
+        assert!(matches!(
+            super::retire_global_frame_host_owner_if_generation_in_using(
+                &custody,
+                key.0,
+                key.1,
+                generation,
+                &mut |_, _| {
+                    first_calls += 1;
+                    Err(injected)
+                },
+            ),
+            super::GlobalFrameRetirementOutcome::RetryPending { .. }
+        ));
+        assert_eq!(first_calls, 1);
+
+        let mut retry_calls = 0_u32;
+        assert!(matches!(
+            super::retire_global_frame_host_owner_if_generation_in_using(
+                &custody,
+                key.0,
+                key.1,
+                generation,
+                &mut |_, _| {
+                    retry_calls += 1;
+                    Ok(())
+                },
+            ),
+            super::GlobalFrameRetirementOutcome::RetiredUnmapped { .. }
+        ));
+        assert_eq!(retry_calls, 1);
+        assert!(!super::alias_backing_is_live(host_addr));
+    }
+
+    #[test]
+    fn foreign_mm_drop_release_only_enqueues_until_the_executor_idle_safe_point() {
+        let (custody, _) = live_custody();
+        let key = (0xa081_1b00_0000, 0x4000);
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            key.1 as usize,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate foreign-MM release safe-point fixture");
+        let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
+        lease.mark_mapped();
+        let generation = super::register_global_frame_host_owner_in(
+            &custody,
+            lease,
+            mapping,
+            u64::from(applevisor::memory::MemPerms::ReadWrite),
+        )
+        .expect("register foreign-MM release safe-point fixture");
+        let pin = custody.global_frame_host_owners.lock()[&key]
+            .owner()
+            .pin()
+            .expect("retain the final foreign-MM owner pin");
+        let mut backing = super::RetainedForeignMmBacking {
+            extents: vec![super::RetainedForeignExtent {
+                key,
+                owner: super::RetainedPhysicalOwner::Global(pin),
+            }],
+        };
+        let mut unmap_calls = 0_u32;
+        assert!(matches!(
+            super::retire_global_frame_host_owner_if_generation_in_using(
+                &custody,
+                key.0,
+                key.1,
+                generation,
+                &mut |_, _| {
+                    unmap_calls += 1;
+                    Ok(())
+                },
+            ),
+            super::GlobalFrameRetirementOutcome::DeferredActivePins { .. }
+        ));
+        assert_eq!(unmap_calls, 0);
+
+        backing.extents.clear();
+        custody.request_global_frame_retirement_retry();
+        assert!(backing.extents.is_empty());
+        assert_eq!(unmap_calls, 0, "pin release/Drop must not call the backend");
+        assert!(custody.global_frame_host_owners.lock()[&key].is_pending());
+
+        assert_eq!(
+            super::retry_pending_global_frame_retirements_at_idle_in_using(
+                &custody,
+                &mut |_, _| {
+                    unmap_calls += 1;
+                    Ok(())
+                },
+            ),
+            0,
+            "the executor-idle turn must fully drain this exact pending owner",
+        );
+        assert_eq!(unmap_calls, 1);
+        assert!(!custody.global_frame_host_owners.lock().contains_key(&key));
+    }
+
+    #[test]
+    fn executor_idle_safe_point_requeues_one_transient_backend_failure() {
+        let (custody, _) = live_custody();
+        let key = (0xa081_1b80_0000, 0x4000);
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            key.1 as usize,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate foreign-MM transient retry fixture");
+        let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
+        lease.mark_mapped();
+        let generation = super::register_global_frame_host_owner_in(
+            &custody,
+            lease,
+            mapping,
+            u64::from(applevisor::memory::MemPerms::ReadWrite),
+        )
+        .expect("register foreign-MM transient retry fixture");
+        let injected = super::CarrierStage2BackendError::HvReturn(0xfae9_4001);
+        assert!(matches!(
+            super::retire_global_frame_host_owner_if_generation_in_using(
+                &custody,
+                key.0,
+                key.1,
+                generation,
+                &mut |_, _| Err(injected),
+            ),
+            super::GlobalFrameRetirementOutcome::RetryPending { .. }
+        ));
+        let mut retry_calls = 0_u32;
+        assert_eq!(
+            super::retry_pending_global_frame_retirements_at_idle_in_using(
+                &custody,
+                &mut |_, _| {
+                    retry_calls += 1;
+                    Err(injected)
+                },
+            ),
+            1,
+            "the first idle-turn failure must remain queued",
+        );
+        assert_eq!(retry_calls, 1);
+        assert!(custody.global_frame_host_owners.lock()[&key].is_pending());
+
+        assert_eq!(
+            super::retry_pending_global_frame_retirements_at_idle_in_using(
+                &custody,
+                &mut |_, _| {
+                    retry_calls += 1;
+                    Ok(())
+                },
+            ),
+            0,
+            "the next idle turn must drain the requeued exact owner",
+        );
+        assert_eq!(retry_calls, 2);
+        assert!(!custody.global_frame_host_owners.lock().contains_key(&key));
+    }
+
+    #[test]
+    fn synchronous_retirement_removes_queued_storage_before_key_reuse() {
+        let (custody, _) = live_custody();
+        let make_pending = |key: (u64, u64)| {
+            let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                key.1 as usize,
+                crate::host_mapping::HostMappingKind::PerMmKernelState,
+            )
+            .expect("allocate removable FIFO fixture");
+            let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
+            lease.mark_mapped();
+            let generation = super::register_global_frame_host_owner_in(
+                &custody,
+                lease,
+                mapping,
+                u64::from(applevisor::memory::MemPerms::ReadWrite),
+            )
+            .expect("register removable FIFO fixture");
+            assert!(matches!(
+                super::retire_global_frame_host_owner_if_generation_in_using(
+                    &custody,
+                    key.0,
+                    key.1,
+                    generation,
+                    &mut |_, _| Err(super::CarrierStage2BackendError::ConcurrentRetirement),
+                ),
+                super::GlobalFrameRetirementOutcome::RetryPending { .. }
+            ));
+            generation
+        };
+
+        let old_key = (0xa081_1be0_0000, 0x4000);
+        let old_generation = make_pending(old_key);
+        assert_eq!(
+            custody
+                .pending_global_frame_directory_retries
+                .lock()
+                .storage_len(),
+            1,
+        );
+        assert!(matches!(
+            super::retire_global_frame_host_owner_if_generation_in_using(
+                &custody,
+                old_key.0,
+                old_key.1,
+                old_generation,
+                &mut |_, _| Ok(()),
+            ),
+            super::GlobalFrameRetirementOutcome::RetiredUnmapped { .. }
+        ));
+        assert_eq!(
+            custody
+                .pending_global_frame_directory_retries
+                .lock()
+                .storage_len(),
+            0,
+            "ordinary exact completion must remove queued storage immediately",
+        );
+
+        let real_key = (old_key.0 + 0x4000, old_key.1);
+        make_pending(real_key);
+        let mut calls = 0_u32;
+        let turn = super::retry_pending_global_frame_retirements_at_idle_in_using(
+            &custody,
+            &mut |ipa, _| {
+                assert_eq!(ipa, real_key.0, "idle turn must not inspect a ghost item");
+                calls += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(turn.inspected_directory, 1);
+        assert_eq!(calls, 1);
+        assert_eq!(
+            custody
+                .pending_global_frame_directory_retries
+                .lock()
+                .storage_len(),
+            0,
+        );
+    }
+
+    #[test]
+    fn executor_idle_safe_point_never_duplicates_an_in_flight_turn() {
+        let (custody, _) = live_custody();
+        let key = (0xa081_1bc0_0000, 0x4000);
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            key.1 as usize,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate concurrent idle-turn fixture");
+        let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
+        lease.mark_mapped();
+        let generation = super::register_global_frame_host_owner_in(
+            &custody,
+            lease,
+            mapping,
+            u64::from(applevisor::memory::MemPerms::ReadWrite),
+        )
+        .expect("register concurrent idle-turn fixture");
+        assert!(matches!(
+            super::retire_global_frame_host_owner_if_generation_in_using(
+                &custody,
+                key.0,
+                key.1,
+                generation,
+                &mut |_, _| Err(super::CarrierStage2BackendError::ConcurrentRetirement),
+            ),
+            super::GlobalFrameRetirementOutcome::RetryPending { .. }
+        ));
+
+        custody
+            .pending_global_frame_retirement_turn_in_flight
+            .store(true, std::sync::atomic::Ordering::Release);
+        let mut calls = 0_u32;
+        assert_eq!(
+            super::retry_pending_global_frame_retirements_at_idle_in_using(
+                &custody,
+                &mut |_, _| {
+                    calls += 1;
+                    Ok(())
+                },
+            ),
+            1,
+        );
+        assert_eq!(
+            calls, 0,
+            "a second idle turn must not duplicate backend work"
+        );
+        assert!(custody.global_frame_host_owners.lock()[&key].is_pending());
+
+        custody
+            .pending_global_frame_retirement_turn_in_flight
+            .store(false, std::sync::atomic::Ordering::Release);
+        assert_eq!(
+            super::retry_pending_global_frame_retirements_at_idle_in_using(
+                &custody,
+                &mut |_, _| {
+                    calls += 1;
+                    Ok(())
+                },
+            ),
+            0,
+        );
+        assert_eq!(calls, 1);
+        assert!(!custody.global_frame_host_owners.lock().contains_key(&key));
+    }
+
+    #[test]
+    fn retirement_retains_backing_if_the_claimed_directory_slot_disappears() {
+        let (custody, _) = live_custody();
+        let key = (0xa081_1c00_0000, 0x4000);
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            key.1 as usize,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate disappearing retirement slot fixture");
+        let host_addr = mapping.as_ptr() as usize;
+        let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
+        lease.mark_mapped();
+        let generation = super::register_global_frame_host_owner_in(
+            &custody,
+            lease,
+            mapping,
+            u64::from(applevisor::memory::MemPerms::ReadWrite),
+        )
+        .expect("register disappearing retirement slot fixture");
+        let record_id = custody.global_frame_host_owners.lock()[&key]
+            .owner()
+            .record_identity
+            .record_id;
+        let injected = super::CarrierStage2BackendError::HvReturn(0xfae9_4001);
+
+        assert!(matches!(
+            super::retire_global_frame_host_owner_if_generation_in_using(
+                &custody,
+                key.0,
+                key.1,
+                generation,
+                &mut |_, _| {
+                    custody.global_frame_host_owners.lock().remove(&key);
+                    Err(injected)
+                },
+            ),
+            super::GlobalFrameRetirementOutcome::RetryPending { .. }
+        ));
+        assert_eq!(
+            custody.pending_global_frame_owner_count(),
+            1,
+            "a lost directory claim must retain the backing in detached custody"
+        );
+        assert!(
+            custody
+                .stage2_record_snapshot(record_id)
+                .is_some_and(|snapshot| snapshot.mapped && snapshot.backend_map_installed),
+            "the failed backend retirement remains mapped"
+        );
         assert!(super::alias_backing_is_live(host_addr));
 
         super::retry_pending_global_frame_retirements_in_using(&custody, &mut |_, _| Ok(()))
-            .expect("explicit safe point retries final owner retirement");
+            .expect("detached custody retries the lost directory claim");
+        assert_eq!(custody.pending_global_frame_owner_count(), 0);
         assert!(!super::alias_backing_is_live(host_addr));
     }
 
@@ -15211,6 +16315,7 @@ mod carrier_vm_custody_tests {
         let mut candidate_lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
         candidate_lease.mark_mapped();
         let injected = super::CarrierStage2BackendError::HvReturn(0xfae9_4001);
+        let mut rollback_calls = 0_u32;
 
         assert!(
             super::register_global_frame_host_owner_in_using(
@@ -15218,7 +16323,10 @@ mod carrier_vm_custody_tests {
                 candidate_lease,
                 candidate_mapping,
                 u64::from(applevisor::memory::MemPerms::ReadWrite),
-                &mut |_, _| Err(injected),
+                &mut |_, _| {
+                    rollback_calls += 1;
+                    Err(injected)
+                },
             )
             .is_err()
         );
@@ -15229,15 +16337,260 @@ mod carrier_vm_custody_tests {
         );
         assert_eq!(custody.pending_global_frame_owner_count(), 1);
         assert!(super::alias_backing_is_live(candidate_host));
+        assert_eq!(
+            rollback_calls, 1,
+            "collision rollback and owner Drop must not invoke a second backend callback",
+        );
 
-        super::retry_pending_global_frame_retirements_in_using(&custody, &mut |_, _| Ok(()))
-            .expect("safe point retires colliding candidate");
+        assert_eq!(
+            super::retry_pending_global_frame_retirements_at_idle_in_using(
+                &custody,
+                &mut |_, _| {
+                    rollback_calls += 1;
+                    Ok(())
+                },
+            ),
+            0,
+            "production idle turn retires the enqueued colliding candidate",
+        );
+        assert_eq!(rollback_calls, 2);
         assert_eq!(custody.pending_global_frame_owner_count(), 0);
         assert!(!super::alias_backing_is_live(candidate_host));
         assert_eq!(
             super::global_frame_host_owner_generation_in(&custody, key.0, key.1),
             incumbent_generation
         );
+    }
+
+    #[test]
+    fn bounded_idle_retry_rotates_past_persistent_prefix_and_services_detached_work() {
+        let (custody, _) = live_custody();
+        let mut live = Vec::new();
+        for index in 0..128_u64 {
+            let key = (0xa081_8000_0000 + index * 0x4000, 0x4000);
+            let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                key.1 as usize,
+                crate::host_mapping::HostMappingKind::PerMmKernelState,
+            )
+            .expect("allocate large live-directory backing");
+            let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
+            lease.mark_test_mapped_without_backend();
+            let generation = super::register_global_frame_host_owner_in(
+                &custody,
+                lease,
+                mapping,
+                u64::from(applevisor::memory::MemPerms::ReadWrite),
+            )
+            .expect("register large live-directory owner");
+            live.push((key, generation));
+        }
+        let mut directory = Vec::new();
+        for index in 0..33_u64 {
+            let key = (0xa082_0000_0000 + index * 0x4000, 0x4000);
+            let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                key.1 as usize,
+                crate::host_mapping::HostMappingKind::PerMmKernelState,
+            )
+            .expect("allocate fair-retry directory backing");
+            let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
+            lease.mark_mapped();
+            let generation = super::register_global_frame_host_owner_in(
+                &custody,
+                lease,
+                mapping,
+                u64::from(applevisor::memory::MemPerms::ReadWrite),
+            )
+            .expect("register fair-retry directory owner");
+            assert!(matches!(
+                super::retire_global_frame_host_owner_if_generation_in_using(
+                    &custody,
+                    key.0,
+                    key.1,
+                    generation,
+                    &mut |_, _| Err(super::CarrierStage2BackendError::ConcurrentRetirement),
+                ),
+                super::GlobalFrameRetirementOutcome::RetryPending { .. }
+            ));
+            directory.push((key, generation));
+        }
+
+        let collision_key = (0xa083_0000_0000, 0x4000);
+        let incumbent_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            collision_key.1 as usize,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate fair-retry incumbent");
+        let mut incumbent_lease =
+            super::GlobalFrameStage2Lease::fixed(collision_key.0, collision_key.1);
+        incumbent_lease.mark_test_mapped_without_backend();
+        let incumbent_generation = super::register_global_frame_host_owner_in(
+            &custody,
+            incumbent_lease,
+            incumbent_mapping,
+            u64::from(applevisor::memory::MemPerms::ReadWrite),
+        )
+        .expect("register fair-retry incumbent");
+        let candidate_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            collision_key.1 as usize,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate fair-retry detached candidate");
+        let mut candidate_lease =
+            super::GlobalFrameStage2Lease::fixed(collision_key.0, collision_key.1);
+        candidate_lease.mark_mapped();
+        assert!(
+            super::register_global_frame_host_owner_in_using(
+                &custody,
+                candidate_lease,
+                candidate_mapping,
+                u64::from(applevisor::memory::MemPerms::ReadWrite),
+                &mut |_, _| Err(super::CarrierStage2BackendError::ConcurrentRetirement),
+            )
+            .is_err()
+        );
+
+        let ready_key = directory[32].0;
+        for _ in 0..3 {
+            let turn = super::retry_pending_global_frame_retirements_at_idle_in_using(
+                &custody,
+                &mut |ipa, _| {
+                    if ipa == ready_key.0 || ipa == collision_key.0 {
+                        Ok(())
+                    } else {
+                        Err(super::CarrierStage2BackendError::ConcurrentRetirement)
+                    }
+                },
+            );
+            assert!(turn.inspected_directory <= 16);
+            assert!(turn.inspected_detached <= 16);
+        }
+        assert!(
+            !custody
+                .global_frame_host_owners
+                .lock()
+                .contains_key(&ready_key),
+            "the 33rd directory owner must not starve behind a failing prefix",
+        );
+        assert_eq!(
+            custody.pending_global_frame_owner_count(),
+            0,
+            "detached ready work must receive bounded service despite directory failures",
+        );
+
+        let replacement_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            ready_key.1 as usize,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate reused ready-key backing");
+        let mut replacement_lease = super::GlobalFrameStage2Lease::fixed(ready_key.0, ready_key.1);
+        replacement_lease.mark_test_mapped_without_backend();
+        let replacement_generation = super::register_global_frame_host_owner_in(
+            &custody,
+            replacement_lease,
+            replacement_mapping,
+            u64::from(applevisor::memory::MemPerms::ReadWrite),
+        )
+        .expect("reuse retired ready key");
+
+        while super::retry_pending_global_frame_retirements_at_idle_in_using(
+            &custody,
+            &mut |_, _| Ok(()),
+        ) != 0
+        {}
+        assert_eq!(
+            super::global_frame_host_owner_generation_in(&custody, ready_key.0, ready_key.1),
+            replacement_generation,
+            "a deleted queue identity must not retire a successor at the reused key",
+        );
+        assert!(matches!(
+            super::retire_global_frame_host_owner_if_generation_in_using(
+                &custody,
+                ready_key.0,
+                ready_key.1,
+                replacement_generation,
+                &mut |_, _| Ok(()),
+            ),
+            super::GlobalFrameRetirementOutcome::RetiredUnmapped { .. }
+        ));
+        for (key, generation) in live {
+            assert!(matches!(
+                super::retire_global_frame_host_owner_if_generation_in_using(
+                    &custody,
+                    key.0,
+                    key.1,
+                    generation,
+                    &mut |_, _| Ok(()),
+                ),
+                super::GlobalFrameRetirementOutcome::RetiredUnmapped { .. }
+            ));
+        }
+        assert!(matches!(
+            super::retire_global_frame_host_owner_if_generation_in_using(
+                &custody,
+                collision_key.0,
+                collision_key.1,
+                incumbent_generation,
+                &mut |_, _| Ok(()),
+            ),
+            super::GlobalFrameRetirementOutcome::RetiredUnmapped { .. }
+        ));
+    }
+
+    #[test]
+    fn reconcile_deferred_owner_enqueues_for_idle_retry_after_pin_drop() {
+        let (custody, _) = live_custody();
+        let key = (0xa084_0000_0000, 0x4000);
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            key.1 as usize,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate reconcile-deferred backing");
+        let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
+        lease.mark_test_mapped_without_backend();
+        super::register_global_frame_host_owner_in(
+            &custody,
+            lease,
+            mapping,
+            u64::from(applevisor::memory::MemPerms::ReadWrite),
+        )
+        .expect("register reconcile-deferred owner");
+        let pin = custody.global_frame_host_owners.lock()[&key]
+            .owner()
+            .pin()
+            .expect("pin reconcile-deferred owner");
+
+        destroy_vm_with_custody_using(&custody, "deferred G1 destroy", || 0, || {})
+            .expect("destroy deferred G1");
+        let g2 = custody.begin_create().expect("begin deferred G2");
+        custody.commit_create(g2).expect("publish deferred G2");
+        let report = super::reconcile_global_frame_owners_after_replay_in_using(
+            &custody,
+            &[],
+            true,
+            &mut |_, _| Ok(()),
+        )
+        .expect("defer pinned terminal owner");
+        assert_eq!(report.deferred, 1);
+        assert!(custody.global_frame_host_owners.lock()[&key].is_pending());
+
+        drop(pin);
+        let mut backend_calls = 0_u32;
+        assert_eq!(
+            super::retry_pending_global_frame_retirements_at_idle_in_using(
+                &custody,
+                &mut |_, _| {
+                    backend_calls += 1;
+                    Ok(())
+                },
+            ),
+            0,
+            "reconcile must enqueue the deferred owner without a manual retry bit",
+        );
+        assert_eq!(
+            backend_calls, 0,
+            "terminalized retirement needs no backend unmap"
+        );
+        assert!(!custody.global_frame_host_owners.lock().contains_key(&key));
     }
 
     #[test]
@@ -16119,14 +17472,14 @@ mod carrier_vm_custody_tests {
                 &mut |_, _| panic!("serialized second retirement must not unmap"),
             )
         });
+        assert!(matches!(
+            second.join().expect("second retirement thread"),
+            super::GlobalFrameRetirementOutcome::RetryPending { .. }
+        ));
         resume_tx.send(()).expect("finish first retirement");
         assert!(matches!(
             first.join().expect("first retirement thread"),
             super::GlobalFrameRetirementOutcome::RetiredUnmapped { .. }
-        ));
-        assert!(matches!(
-            second.join().expect("second retirement thread"),
-            super::GlobalFrameRetirementOutcome::NotFound { .. }
         ));
         assert!(custody.global_frame_host_owners.lock().get(&key).is_none());
     }
@@ -17098,7 +18451,7 @@ impl MmAccessState {
             }
             let owner = if let Some(global) = global_owners
                 .get(&owner_key)
-                .map(|e| e.owner())
+                .and_then(GlobalFrameOwnerEntry::live_owner)
                 .filter(|owner| {
                     owner.generation() != 0
                         && owner.generation() == expected.generation
@@ -17469,6 +18822,15 @@ impl std::fmt::Debug for CarrierForeignMmReadLease {
         f.debug_struct("CarrierForeignMmReadLease")
             .field("retained", &self.inner.lock().retained)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for CarrierForeignMmReadLease {
+    fn drop(&mut self) {
+        let inner = self.inner.get_mut();
+        inner.backing.extents.clear();
+        self.custody.request_global_frame_retirement_retry();
     }
 }
 
@@ -17943,8 +19305,8 @@ fn perform_foreign_cow_transaction(
         .global_frame_host_owners
         .lock()
         .get(&(new_physical_ipa, CowArmedRanges::COMPOUND_SIZE))
-        .is_some_and(|entry| {
-            let owner = entry.owner();
+        .and_then(GlobalFrameOwnerEntry::live_owner)
+        .is_some_and(|owner| {
             owner.generation() == owner_generation && std::ptr::eq(owner.as_ptr(), new_host_ptr)
         });
     if !owner_is_live {
@@ -18049,8 +19411,8 @@ fn perform_foreign_cow_transaction(
         .global_frame_host_owners
         .lock()
         .get(&(new_physical_ipa, CowArmedRanges::COMPOUND_SIZE))
-        .is_some_and(|entry| {
-            let owner = entry.owner();
+        .and_then(GlobalFrameOwnerEntry::live_owner)
+        .is_some_and(|owner| {
             owner.generation() == owner_generation && std::ptr::eq(owner.as_ptr(), new_host_ptr)
         });
     if !owner_is_live {
@@ -18077,7 +19439,8 @@ fn perform_foreign_cow_transaction(
         .global_frame_host_owners
         .lock()
         .get(&(new_physical_ipa, CowArmedRanges::COMPOUND_SIZE))
-        .map(|entry| std::sync::Arc::clone(entry.owner()))
+        .and_then(GlobalFrameOwnerEntry::live_owner)
+        .cloned()
         .unwrap_or_else(|| std::process::abort());
     let new_owner_pin = new_owner_arc
         .pin()
@@ -18276,7 +19639,7 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
             .try_lock_until(deadline)
             .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?
             .get(&extent_key)
-            .map(|e| e.owner())
+            .and_then(GlobalFrameOwnerEntry::live_owner)
             .filter(|owner| {
                 owner.generation() == expected_generation
                     && owner.host_addr() == inventory_extent.stage2_owner.host_addr
@@ -20771,11 +22134,16 @@ fn persistent_executor_carrier_mappings(mappings: &[HvfMappedRegion]) -> Vec<Thr
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 struct PersistentCarrierMappings {
     mappings: Vec<HvfMappedRegion>,
+    custody: std::sync::Arc<CarrierVmCustody>,
+    vm_destroyed_after_custody_commit: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl PersistentCarrierMappings {
-    fn extract(task_mappings: &mut Vec<HvfMappedRegion>) -> Result<Self, TrapError> {
+    fn extract(
+        task_mappings: &mut Vec<HvfMappedRegion>,
+        custody: std::sync::Arc<CarrierVmCustody>,
+    ) -> Result<Self, TrapError> {
         let mut carrier = Vec::with_capacity(5);
         let mut task = Vec::with_capacity(task_mappings.len());
         for mapping in std::mem::take(task_mappings) {
@@ -20786,7 +22154,11 @@ impl PersistentCarrierMappings {
             }
         }
         *task_mappings = task;
-        let authority = Self { mappings: carrier };
+        let authority = Self {
+            mappings: carrier,
+            custody,
+            vm_destroyed_after_custody_commit: std::sync::atomic::AtomicBool::new(false),
+        };
         authority.audit()?;
         if authority.mappings.len() != 5 {
             return Err(TrapError::Hypervisor(format!(
@@ -20795,6 +22167,22 @@ impl PersistentCarrierMappings {
             )));
         }
         Ok(authority)
+    }
+
+    fn mark_vm_destroyed_after_custody_commit(&self) -> Result<(), TrapError> {
+        let committed = matches!(
+            self.custody.state.lock().lifecycle,
+            CarrierVmLifecycle::Vacant
+        );
+        if !committed {
+            return Err(TrapError::Hypervisor(
+                "persistent carrier mappings cannot retire before exact VM custody destroy commits"
+                    .to_owned(),
+            ));
+        }
+        self.vm_destroyed_after_custody_commit
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
     }
 
     fn maintenance_root(&self) -> carrick_mem::memory::CarrierMaintenanceRoot {
@@ -20836,10 +22224,13 @@ unsafe impl Sync for PersistentCarrierMappings {}
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl Drop for PersistentCarrierMappings {
     fn drop(&mut self) {
+        let vm_destroyed = self
+            .vm_destroyed_after_custody_commit
+            .load(std::sync::atomic::Ordering::Acquire);
         for mut mapping in self.mappings.drain(..) {
             if let Some(lease) = mapping.stage2_lease.take() {
                 drop(lease);
-            } else {
+            } else if !vm_destroyed {
                 let rc =
                     unsafe { inventory_hv_vm_unmap(mapping.physical_ipa, mapping.physical_size) };
                 if rc != 0 {
@@ -31705,8 +33096,11 @@ impl HvfVmState {
                 )),
             };
         }
-        let carrier_mappings =
-            std::sync::Arc::new(PersistentCarrierMappings::extract(&mut self.mappings)?);
+        let custody = std::sync::Arc::clone(&self.carrier_foreign_mm_transport.custody);
+        let carrier_mappings = std::sync::Arc::new(PersistentCarrierMappings::extract(
+            &mut self.mappings,
+            custody,
+        )?);
         let spec = PersistentExecutorSpec {
             vm: (*self._vm).clone(),
             carrier_mappings,
@@ -31797,7 +33191,15 @@ impl HvfVmState {
                     "persistent executor lost carrier mapping authority".to_owned(),
                 )
             })?
-            .audit()
+            .audit()?;
+        // Maintenance failures remain recorded on the exact Pending owner and
+        // re-arm the custody-local request bit. They must not kill an otherwise
+        // clean persistent worker; the next executor-idle boundary retries.
+        let _remaining = retry_pending_global_frame_retirements_at_idle_in_using(
+            &self.carrier_foreign_mm_transport.custody,
+            &mut unmap_global_frame_stage2_record,
+        );
+        Ok(())
     }
 
     pub(crate) fn carrier_maintenance_root(
@@ -39283,11 +40685,19 @@ mod frame_inventory_backend_tests {
                 "owner entry must be in RetirementPending state"
             );
             assert_eq!(entry.owner().generation(), owner_generation);
+            assert_eq!(entry.owner().host_addr(), host_addr);
+            assert!(matches!(
+                entry,
+                GlobalFrameOwnerEntry::RetirementPending {
+                    in_flight: false,
+                    ..
+                }
+            ));
         }
         assert_eq!(
             global_frame_host_owner_identity(key.0, key.1),
-            Some((host_addr, owner_generation)),
-            "authoritative identity lookup must remain visible during pending retirement",
+            None,
+            "pending custody must not authenticate as a live owner identity",
         );
         assert!(
             ScopedStage2MapTestStub::is_mapped(key.0, key.1 as usize),
@@ -39317,9 +40727,17 @@ mod frame_inventory_backend_tests {
         );
         assert_eq!(
             global_frame_host_owner_identity(key.0, key.1),
-            Some((host_addr, owner_generation)),
-            "prior pending owner must NOT be replaced or dropped on collision",
+            None,
+            "collision must not republish pending custody as a live identity",
         );
+        assert!(matches!(
+            global_frame_host_owners().lock().get(&key),
+            Some(GlobalFrameOwnerEntry::RetirementPending {
+                owner,
+                in_flight: false,
+                ..
+            }) if owner.host_addr() == host_addr && owner.generation() == owner_generation
+        ));
 
         // Mismatched generation on retry fails with MismatchedGeneration and preserves custody
         let wrong_gen = owner_generation.wrapping_add(1);
@@ -41899,8 +43317,11 @@ mod thread_sibling_tests {
             "Kernel MM inventory must never acquire carrier control extents"
         );
 
-        let authority = PersistentCarrierMappings::extract(&mut task_mappings)
-            .expect("extract exact carrier mapping authority");
+        let authority = PersistentCarrierMappings::extract(
+            &mut task_mappings,
+            std::sync::Arc::new(CarrierVmCustody::new_live_fixture()),
+        )
+        .expect("extract exact carrier mapping authority");
         assert_eq!(
             task_mappings.len(),
             1,
@@ -41929,6 +43350,35 @@ mod thread_sibling_tests {
         assert!(drop_observations.iter().all(|(host, observed)| {
             observed.load(std::sync::atomic::Ordering::SeqCst) && !alias_backing_is_live(*host)
         }));
+    }
+
+    #[test]
+    fn persistent_carrier_mapping_drop_after_exact_custody_destroy_skips_live_unmap() {
+        let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+        let start = crate::memory::LINUX_EL0_TRAMPOLINE_BASE;
+        let mut mapping = mapped_region(
+            start,
+            start + crate::memory::LINUX_EL0_TRAMPOLINE_SIZE,
+            start,
+        );
+        mapping.physical_ipa = start;
+        mapping.physical_size = usize::try_from(crate::memory::LINUX_EL0_TRAMPOLINE_SIZE).unwrap();
+        let authority = PersistentCarrierMappings {
+            mappings: vec![mapping],
+            custody: std::sync::Arc::clone(&custody),
+            vm_destroyed_after_custody_commit: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        destroy_vm_with_custody_using(&custody, "terminal carrier mapping fixture", || 0, || {})
+            .expect("exact custody destroy commits");
+        authority
+            .mark_vm_destroyed_after_custody_commit()
+            .expect("only the exact terminal custody may disarm live unmap");
+
+        // A raw no-lease mapping would call hv_vm_unmap here. The exact
+        // destroy receipt must instead make Drop release only its host owner;
+        // an unsigned host test has no VM, so a stray unmap aborts the test.
+        drop(authority);
     }
 
     #[test]
