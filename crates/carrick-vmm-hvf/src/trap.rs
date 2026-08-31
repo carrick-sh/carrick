@@ -427,6 +427,7 @@ mod foreign_mm_tests {
     struct TestForeignCowAuthority {
         live: Arc<parking_lot::RwLock<TestSnapshot>>,
         old_frame: carrick_hal::FrameId,
+        allow_quiesce: bool,
         serial: std::sync::atomic::AtomicU64,
         published:
             parking_lot::Mutex<Option<(carrick_hal::MappingId, carrick_hal::FrameId, Gpa, u64)>>,
@@ -446,6 +447,7 @@ mod foreign_mm_tests {
             Self {
                 live: Arc::clone(&installed.live.0),
                 old_frame,
+                allow_quiesce: false,
                 serial: std::sync::atomic::AtomicU64::new(
                     installed.snapshot.mm.get().saturating_mul(1_000),
                 ),
@@ -467,7 +469,11 @@ mod foreign_mm_tests {
             &self,
         ) -> Result<Box<dyn carrick_hal::FrameCowQuiesce>, Box<dyn std::error::Error + Send + Sync>>
         {
-            panic!("foreign backend must not reacquire frame-COW quiesce")
+            if self.allow_quiesce {
+                Ok(Box::new(()))
+            } else {
+                panic!("foreign backend must not reacquire frame-COW quiesce")
+            }
         }
 
         fn reserve(
@@ -2972,6 +2978,757 @@ mod foreign_mm_tests {
             &mut release_retired_stage2_ipa,
         )
         .expect("retire initial fixed mapping fixture");
+    }
+
+    #[test]
+    fn structural_vvar_fork_inheritance_requires_exact_live_custody() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let _stage2_stub = ScopedStage2MapTestStub::enable();
+        let transport = Arc::new(CarrierForeignMmTransport::new());
+        let ipa = crate::vdso::LINUX_VVAR_BASE;
+        let len = 0x4000_u64;
+        let mapping = GuestMapping {
+            guest_start: ipa,
+            ipa_start: ipa,
+            mapped_size: len,
+            offset_in_mapping: 0,
+            payload_size: 0x1000,
+            perms: carrick_mem::elf::SegmentPerms {
+                read: true,
+                write: false,
+                execute: false,
+            },
+            shared: false,
+            image: Arc::new(vec![0; 0x1000]),
+            private_file_backing: None,
+        };
+        let region = map_region_raw_in(&transport.custody, &mapping, false, true)
+            .expect("map structural vvar fixture");
+        let owner = region
+            .structural_owner
+            .as_ref()
+            .cloned()
+            .expect("structural vvar owner");
+        let identity = *owner.retained.record_identity.lock();
+        let desc = ThreadMappingDesc::from_region(&region);
+        let exact_owner = InventoryStage2OwnerIdentity {
+            host_addr: desc.physical_host_addr as usize,
+            generation: desc.owner_generation,
+        };
+        let extent = InventoryExtent {
+            frame: carrick_hal::FrameId::from_kernel_allocation(NonZeroU64::new(860).unwrap()),
+            mapping: carrick_hal::MappingId::from_kernel_allocation(NonZeroU64::new(861).unwrap()),
+            backing: InventoryBackingIdentity::Private(862),
+            stage2_base: desc.physical_ipa,
+            stage2_length: desc.physical_size as u64,
+            stage2_owner: exact_owner,
+        };
+        let inventory = std::collections::BTreeMap::from([(
+            (desc.physical_ipa, desc.physical_size as u64),
+            extent,
+        )]);
+
+        let inherited = inherited_fork_inventory_extents_in(&transport.custody, &desc, &inventory);
+        assert_eq!(
+            inherited.len(),
+            1,
+            "an exact current structural vvar owner must remain a fork source",
+        );
+        assert_eq!(
+            inherited[0].0,
+            (desc.physical_ipa, desc.physical_size as u64),
+        );
+        assert_eq!(inherited[0].1.mapping, extent.mapping);
+
+        let mut wrong_epoch = desc.clone();
+        wrong_epoch.owner_generation = wrong_epoch.owner_generation.saturating_add(1);
+        assert!(
+            inherited_fork_inventory_extents_in(&transport.custody, &wrong_epoch, &inventory)
+                .is_empty(),
+            "a drifted structural epoch must fail closed",
+        );
+        let mut wrong_host = desc.clone();
+        wrong_host.physical_host_addr = wrong_host.physical_host_addr.wrapping_add(0x1000);
+        assert!(
+            inherited_fork_inventory_extents_in(&transport.custody, &wrong_host, &inventory)
+                .is_empty(),
+            "a drifted structural host must fail closed",
+        );
+        let mut wrong_perms = desc.clone();
+        wrong_perms.perms = applevisor::memory::MemPerms::ReadWrite;
+        assert!(
+            inherited_fork_inventory_extents_in(&transport.custody, &wrong_perms, &inventory)
+                .is_empty(),
+            "drifted structural permissions must fail closed",
+        );
+        let mut missing_owner = desc.clone();
+        missing_owner.structural_owner = None;
+        assert!(
+            inherited_fork_inventory_extents_in(&transport.custody, &missing_owner, &inventory)
+                .is_empty(),
+            "a structural generation without its exact owner Arc must fail closed",
+        );
+        {
+            let mut state = transport.custody.state.lock();
+            state.lifecycle = CarrierVmLifecycle::Creating(CarrierVmGeneration(2));
+        }
+        assert!(
+            inherited_fork_inventory_extents_in(&transport.custody, &desc, &inventory).is_empty(),
+            "a structural owner outside its custody generation must fail closed",
+        );
+        {
+            let mut state = transport.custody.state.lock();
+            state.lifecycle = CarrierVmLifecycle::Live(identity.vm_generation);
+            state
+                .stage2_records
+                .get_mut(&identity.record_id)
+                .expect("structural vvar custody record")
+                .snapshot
+                .terminalized_by_vm_destroy = true;
+        }
+        assert!(
+            inherited_fork_inventory_extents_in(&transport.custody, &desc, &inventory).is_empty(),
+            "a terminal structural custody record must fail closed",
+        );
+        {
+            let mut state = transport.custody.state.lock();
+            state
+                .stage2_records
+                .get_mut(&identity.record_id)
+                .expect("structural vvar custody record")
+                .snapshot
+                .terminalized_by_vm_destroy = false;
+        }
+        owner
+            .retained
+            .owner_retired
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(
+            inherited_fork_inventory_extents_in(&transport.custody, &desc, &inventory).is_empty(),
+            "a retired structural owner must fail closed",
+        );
+
+        drop(desc);
+        drop(region);
+        drop(owner);
+        retry_structural_backing_identities_in_using(
+            &transport.custody,
+            &[identity],
+            &mut unmap_global_frame_stage2_record,
+            &mut release_retired_stage2_ipa,
+        )
+        .expect("retire structural vvar fork fixture");
+    }
+
+    #[test]
+    fn production_fork_plan_retains_structural_vvar_semantic_authority() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let _external_alias_restore = ExternalAliasStateRestore::capture();
+        let _stage2_stub = ScopedStage2MapTestStub::enable();
+        let transport = Arc::new(CarrierForeignMmTransport::new());
+        let vvar_ipa = crate::vdso::LINUX_VVAR_BASE;
+        let vvar_len = 0x4000_u64;
+        let vvar_mapping = GuestMapping {
+            guest_start: vvar_ipa,
+            ipa_start: vvar_ipa,
+            mapped_size: vvar_len,
+            offset_in_mapping: 0,
+            payload_size: 0x1000,
+            perms: carrick_mem::elf::SegmentPerms {
+                read: true,
+                write: false,
+                execute: false,
+            },
+            shared: false,
+            image: Arc::new(vec![0; 0x1000]),
+            private_file_backing: None,
+        };
+        let vvar = map_region_raw_in(&transport.custody, &vvar_mapping, false, true)
+            .expect("map production-shape structural vvar");
+        let vvar_owner = vvar
+            .structural_owner
+            .as_ref()
+            .cloned()
+            .expect("production-shape vvar owner");
+        let vvar_identity = *vvar_owner.retained.record_identity.lock();
+        let overlay_ipa = vvar_ipa + vvar_len;
+        let overlay_mapping = GuestMapping {
+            guest_start: vvar_ipa,
+            ipa_start: overlay_ipa,
+            mapped_size: vvar_len,
+            offset_in_mapping: 0,
+            payload_size: 0x1000,
+            perms: carrick_mem::elf::SegmentPerms {
+                read: true,
+                write: false,
+                execute: false,
+            },
+            shared: false,
+            image: Arc::new(vec![0; 0x1000]),
+            private_file_backing: None,
+        };
+        let overlay = map_region_raw_in(&transport.custody, &overlay_mapping, false, true)
+            .expect("map authenticated structural vvar overlay");
+        let overlay_owner = overlay
+            .structural_owner
+            .as_ref()
+            .cloned()
+            .expect("production-shape vvar overlay owner");
+        let overlay_identity = *overlay_owner.retained.record_identity.lock();
+        let page_tables_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            crate::memory::LINUX_PAGE_TABLES_SIZE as usize,
+            crate::host_mapping::HostMappingKind::PrivateAnon,
+        )
+        .expect("parent page-table backing");
+        let page_tables_host_addr = page_tables_host.as_ptr();
+        let page_tables = HvfMappedRegion {
+            start: crate::memory::LINUX_PAGE_TABLES_BASE,
+            ipa: crate::memory::LINUX_PAGE_TABLES_BASE,
+            physical_ipa: crate::memory::LINUX_PAGE_TABLES_BASE,
+            end: crate::memory::LINUX_PAGE_TABLES_BASE + crate::memory::LINUX_PAGE_TABLES_SIZE,
+            host_addr: page_tables_host_addr,
+            size: crate::memory::LINUX_PAGE_TABLES_SIZE as usize,
+            physical_size: crate::memory::LINUX_PAGE_TABLES_SIZE as usize,
+            perms: applevisor::memory::MemPerms::ReadWrite,
+            memory: None,
+            host_mapping: Some(page_tables_host),
+            structural_owner: None,
+            stage2_lease: None,
+            is_dynamic_alias: false,
+            sharing: GuestMappingSharing::Private,
+            guest_writable: true,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: 0,
+        };
+        let parent_inventory = Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
+        let initial_transaction =
+            carrick_hal::KernelTransactionId::from_kernel_allocation(NonZeroU64::new(869).unwrap());
+        let mut initial_reservation =
+            carrick_hal::FrameInventoryReservation::from_kernel_candidates(
+                carrick_hal::FrameInventoryProvenance::from_kernel_entropy([0x86; 32]),
+                carrick_hal::FrameInventoryBatch::prepare(
+                    initial_transaction,
+                    carrick_hal::FrameEventCapacity::for_event_count(4)
+                        .expect("initial vvar inventory event capacity"),
+                )
+                .expect("prepare initial vvar inventory batch"),
+                vec![
+                    carrick_hal::FrameId::from_kernel_allocation(NonZeroU64::new(870).unwrap()),
+                    carrick_hal::FrameId::from_kernel_allocation(NonZeroU64::new(873).unwrap()),
+                ],
+                vec![
+                    carrick_hal::MappingId::from_kernel_allocation(NonZeroU64::new(871).unwrap()),
+                    carrick_hal::MappingId::from_kernel_allocation(NonZeroU64::new(874).unwrap()),
+                ],
+            );
+        let vvar_extent = {
+            let mut inventory = parent_inventory.lock();
+            let extent = HvfVmState::stage_mapping_in(
+                &transport.custody,
+                &mut inventory,
+                &mut initial_reservation,
+                InventoryMappingStage {
+                    gpa: vvar.physical_ipa,
+                    length: vvar.physical_size as u64,
+                    permissions: HvfVmState::region_permissions(&vvar),
+                    backing: InventoryBackingIdentity::Private(872),
+                    inherited_frame: None,
+                    stage2_lease: None,
+                    stage2_owner: mapped_region_stage2_owner_identity(&vvar)
+                        .expect("initial vvar structural owner identity"),
+                },
+            )
+            .expect("stage initial vvar inventory through production path");
+            inventory.initialized = true;
+            extent
+        };
+        let overlay_extent = {
+            let mut inventory = parent_inventory.lock();
+            HvfVmState::stage_mapping_in(
+                &transport.custody,
+                &mut inventory,
+                &mut initial_reservation,
+                InventoryMappingStage {
+                    gpa: overlay.physical_ipa,
+                    length: overlay.physical_size as u64,
+                    permissions: HvfVmState::region_permissions(&overlay),
+                    backing: InventoryBackingIdentity::Private(875),
+                    inherited_frame: None,
+                    stage2_lease: None,
+                    stage2_owner: mapped_region_stage2_owner_identity(&overlay)
+                        .expect("authenticated overlay structural owner identity"),
+                },
+            )
+            .expect("stage authenticated overlay through production path")
+        };
+        let initial_commit = initial_reservation.commit(());
+        assert_eq!(
+            initial_commit.batch().transaction(),
+            initial_transaction,
+            "the production initial inventory transaction must publish the vvar extent",
+        );
+        let published_vvar_extent = parent_inventory
+            .lock()
+            .extents
+            .get(&(vvar.physical_ipa, vvar.physical_size as u64))
+            .copied()
+            .expect("published initial vvar inventory extent");
+        assert_eq!(published_vvar_extent.mapping, vvar_extent.mapping);
+        assert_eq!(published_vvar_extent.frame, vvar_extent.frame);
+        assert_eq!(published_vvar_extent.stage2_owner, vvar_extent.stage2_owner);
+        let mut parent = HvfTaskState {
+            mappings: vec![page_tables, vvar, overlay],
+            mm_root_slot: Some((0x9a00_2000_0000, 0x20_0000)),
+            container_root: ContainerRootToken::from_raw(1),
+            pending_exec_mm_root_slot: None,
+            pending_exec_asid: None,
+            pending_exec_predecessor_identity: None,
+            pending_exec_stage2_cleanup: None,
+            shared_process_mm: false,
+            mm_access: MmAccessState::new(
+                Arc::new(parking_lot::Mutex::new(None)),
+                Arc::new(MemoryProtections::default()),
+                parent_inventory,
+                Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
+                Arc::new(parking_lot::Mutex::new(Vec::new())),
+            ),
+            last_exit_class: 0,
+            last_fault_esr: 0,
+            is_forked_child: false,
+            forked_no_exec: false,
+            last_syscall_nr: None,
+            last_syscall_orig_x0: 0,
+            persistent_vm_lifecycle: true,
+            cow_authority: Some(Arc::new(
+                task_only_carrier_directory_tests::TestCowAuthority,
+            )),
+            cow_identity: Some(carrick_hal::FrameCowIdentity {
+                linux_pid: 870,
+                linux_tid: 870,
+                mm: 870,
+                asid: 1,
+            }),
+            pending_fork_frame_receipts: Vec::new(),
+            pending_process_aliases: Vec::new(),
+            fail_next_begin_exec_inventory: false,
+            cow_rollback_scratch: None,
+            registration: None,
+        };
+        let root_slot_base = crate::memory::LINUX_HVPATCH_ROOT_SLOT_BASE + 0x40_0000;
+        let root_slot_size = 0x20_0000_u64;
+        let make_request = || carrick_hal::ProcessForkRequest {
+            entry: carrick_hal::GuestEntryRegs::default(),
+            child_ttbr0: root_slot_base,
+            root_slot_base,
+            root_slot_size,
+            plan: carrick_hal::ForkProjectionPlan::Copied {
+                parent_mm: 870,
+                child_mm: 871,
+                ranges: Arc::from([]),
+            },
+            child_tid: carrick_hal::ThreadId::synthetic_for_tests(871),
+            forking_tid: carrick_hal::ThreadId::synthetic_for_tests(870),
+        };
+        let make_child_page_tables = |translated_ipa| {
+            let mut child_page_tables = crate::page_table::PageTableManager::new(
+                carrick_mem::memory::stage1_hvpatch_page_tables(),
+                crate::memory::LINUX_PAGE_TABLES_BASE,
+            );
+            child_page_tables
+                .map_aliased(vvar_ipa, translated_ipa, vvar_len, false)
+                .expect("map child vvar translation");
+            child_page_tables
+                .rebase(root_slot_base)
+                .expect("rebase child page tables");
+            child_page_tables
+        };
+        let cow_ranges = [carrick_aarch64::vmm::ForkCowRange {
+            va: vvar_ipa,
+            len: vvar_len as usize,
+            executable: false,
+            kernel_only: false,
+        }];
+        let generation_address = vvar_ipa + crate::vdso::VVAR_OFF_RNG_GENERATION as u64;
+        let parent_generation_ptr = vvar_owner
+            .ptr()
+            .wrapping_add(crate::vdso::VVAR_OFF_RNG_GENERATION);
+        let parent_generation_seed = 0x1122_3344_5566_7788_u64;
+        unsafe {
+            parent_generation_ptr
+                .cast::<u64>()
+                .write_unaligned(parent_generation_seed);
+        }
+
+        let parent_vvar = parent
+            .mappings
+            .iter_mut()
+            .find(|mapping| mapping.start == vvar_ipa)
+            .expect("parent vvar mapping");
+        let exact_owner = parent_vvar
+            .structural_owner
+            .take()
+            .expect("parent structural vvar owner");
+        let mut overlay_child_page_tables = make_child_page_tables(overlay_ipa);
+        let overlay_plan = parent
+            .build_process_plan(
+                make_request(),
+                &mut overlay_child_page_tables,
+                &cow_ranges,
+                Arc::new(MailboxSlotAllocator::new()),
+                HvfSyscallTransport::Mailbox,
+                Arc::clone(&transport),
+            )
+            .expect("an authenticated stage-1 overlay must supersede the stale coarse vvar row");
+        assert!(
+            overlay_plan.mappings.iter().any(|mapping| {
+                mapping.start == vvar_ipa
+                    && mapping.ipa == overlay_ipa
+                    && mapping.inherited_frame == Some(overlay_extent.frame)
+            }),
+            "fork planning must retain the exact authenticated overlay owner",
+        );
+
+        let mut arbitrary_child_page_tables = make_child_page_tables(overlay_ipa + vvar_len);
+        let error = match parent.build_process_plan(
+            make_request(),
+            &mut arbitrary_child_page_tables,
+            &cow_ranges,
+            Arc::new(MailboxSlotAllocator::new()),
+            HvfSyscallTransport::Mailbox,
+            Arc::clone(&transport),
+        ) {
+            Ok(_) => {
+                panic!("an arbitrary translated IPA without an overlay owner must fail closed")
+            }
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("has no authenticated inherited inventory extent"),
+            "unexpected arbitrary translated-IPA failure: {error}",
+        );
+
+        let mut unauthenticated_child_page_tables = make_child_page_tables(vvar_ipa);
+        let error = match parent.build_process_plan(
+            make_request(),
+            &mut unauthenticated_child_page_tables,
+            &cow_ranges,
+            Arc::new(MailboxSlotAllocator::new()),
+            HvfSyscallTransport::Mailbox,
+            Arc::clone(&transport),
+        ) {
+            Ok(_) => panic!("a live vvar PTE without its structural owner must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("has no authenticated inherited inventory extent"),
+            "unexpected unauthenticated vvar failure: {error}",
+        );
+        parent
+            .mappings
+            .iter_mut()
+            .find(|mapping| mapping.start == vvar_ipa)
+            .expect("parent vvar mapping")
+            .structural_owner = Some(exact_owner);
+
+        let mut child_page_tables = make_child_page_tables(vvar_ipa);
+        let mut plan = parent
+            .build_process_plan(
+                make_request(),
+                &mut child_page_tables,
+                &cow_ranges,
+                Arc::new(MailboxSlotAllocator::new()),
+                HvfSyscallTransport::Mailbox,
+                Arc::clone(&transport),
+            )
+            .expect("build child plan with structural vvar");
+        assert!(
+            plan.mappings
+                .iter()
+                .any(|mapping| mapping.start == vvar_ipa),
+            "production fork planning must retain the vvar semantic descriptor",
+        );
+        let ids = std::sync::atomic::AtomicU64::new(880);
+        plan.stage_with_reservation_factory(|frames, mappings, capacity| {
+            let next =
+                || NonZeroU64::new(ids.fetch_add(1, std::sync::atomic::Ordering::SeqCst)).unwrap();
+            Ok(
+                carrick_hal::FrameInventoryReservation::from_kernel_candidates(
+                    carrick_hal::FrameInventoryProvenance::from_kernel_entropy([0x88; 32]),
+                    carrick_hal::FrameInventoryBatch::prepare(
+                        carrick_hal::KernelTransactionId::from_kernel_allocation(next()),
+                        capacity,
+                    )
+                    .unwrap(),
+                    (0..frames)
+                        .map(|_| carrick_hal::FrameId::from_kernel_allocation(next()))
+                        .collect(),
+                    (0..mappings)
+                        .map(|_| carrick_hal::MappingId::from_kernel_allocation(next()))
+                        .collect(),
+                ),
+            )
+        })
+        .expect("reserve child inventory");
+        let (carrier, mut prepared) =
+            HvfVmState::prepare_task_only_plan_for_test(plan).expect("prepare task-only child");
+        let mut projected = HvfTaskState::neutral();
+        projected.persistent_vm_lifecycle = true;
+        projected.mappings = prepared
+            .mappings
+            .iter()
+            .map(HvpatchTaskMappingState::unowned_runtime_region)
+            .collect();
+        assert!(
+            projected.mappings.iter().any(|mapping| {
+                mapping.contains_range(generation_address, core::mem::size_of::<u64>())
+                    && mapping
+                        .structural_owner
+                        .as_ref()
+                        .is_some_and(|owner| Arc::ptr_eq(owner, &vvar_owner))
+            }),
+            "task-only projection must resolve the child RNG-generation stamp",
+        );
+        let child_page_table_host = prepared
+            .mappings
+            .iter()
+            .find(|mapping| mapping.start == crate::memory::LINUX_PAGE_TABLES_BASE)
+            .expect("prepared child page-table mapping")
+            .host_addr;
+        unsafe {
+            child_page_tables.sync_to_host(child_page_table_host);
+        }
+        let child_inventory = prepared
+            .inventory
+            .shared_runtime_ledger()
+            .expect("prepared child inventory ledger");
+        let child_cow_armed = prepared
+            .cow_armed
+            .as_ref()
+            .cloned()
+            .expect("prepared child COW arms");
+        let child_deferred_publications = prepared
+            .cow_deferred_publications
+            .as_ref()
+            .cloned()
+            .expect("prepared child deferred COW publications");
+        let child_page_tables_authority =
+            Arc::new(parking_lot::Mutex::new(Some(child_page_tables)));
+        let child_state = MmAccessState::new(
+            Arc::clone(&child_page_tables_authority),
+            Arc::new(MemoryProtections::default()),
+            Arc::clone(&child_inventory),
+            child_cow_armed,
+            child_deferred_publications,
+        );
+        for mapping in &prepared.mappings {
+            if let Some(owner) = &mapping.structural_owner {
+                child_state.install_structural_owner(Arc::clone(owner));
+            }
+        }
+        let child_snapshot = TestSnapshot {
+            mm: NonZeroU64::new(871).unwrap(),
+            asid: NonZeroU16::new(2).unwrap(),
+            stage1_root: Gpa(root_slot_base),
+            backend_revision: carrick_hal::ForeignBackendRevision::from_authority_raw(1),
+            vma_revision: carrick_hal::ForeignVmaRevision::from_authority_raw(1),
+            frame_inventory_revision:
+                carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(1),
+            mapping_ids: child_inventory
+                .lock()
+                .extents
+                .values()
+                .map(|extent| extent.mapping)
+                .collect(),
+            executable_ranges: Vec::new(),
+        };
+        let child_live =
+            TestLiveAuthority(Arc::new(parking_lot::RwLock::new(child_snapshot.clone())));
+        let cow_authority = Arc::new(TestForeignCowAuthority {
+            live: Arc::clone(&child_live.0),
+            old_frame: vvar_extent.frame,
+            allow_quiesce: true,
+            serial: std::sync::atomic::AtomicU64::new(871_000),
+            published: parking_lot::Mutex::new(None),
+        });
+        child_state.bind_cow_runtime(MmCowRuntimeBinding {
+            authority: cow_authority.clone(),
+            identity: carrick_hal::FrameCowIdentity {
+                linux_pid: 871,
+                linux_tid: 871,
+                mm: 871,
+                asid: 2,
+            },
+            mm_root_slot: prepared.mm_root_slot,
+            container_root: prepared.container_root,
+            persistent_vm_lifecycle: true,
+        });
+        let prepared_vvar = prepared
+            .mappings
+            .iter()
+            .find(|mapping| mapping.start == vvar_ipa)
+            .expect("prepared child vvar mapping");
+        assert!(
+            !prepared_vvar.guest_writable,
+            "vvar must remain guest read-only"
+        );
+        const AP_MASK: u64 = 0b11 << 6;
+        const AP_USER_RO: u64 = 0b11 << 6;
+        assert_eq!(
+            child_page_tables_authority
+                .lock()
+                .as_ref()
+                .expect("prepared child page tables")
+                .debug_walk(generation_address)[3]
+                & AP_MASK,
+            AP_USER_RO,
+            "prepared child vvar leaf must begin guest read-only",
+        );
+        let mut child_task = HvfTaskState {
+            mappings: prepared
+                .mappings
+                .iter()
+                .map(HvpatchTaskMappingState::unowned_runtime_region)
+                .collect(),
+            mm_root_slot: prepared.mm_root_slot,
+            container_root: prepared.container_root,
+            pending_exec_mm_root_slot: None,
+            pending_exec_asid: None,
+            pending_exec_predecessor_identity: None,
+            pending_exec_stage2_cleanup: None,
+            shared_process_mm: false,
+            mm_access: Arc::clone(&child_state),
+            last_exit_class: 0,
+            last_fault_esr: 0,
+            is_forked_child: false,
+            forked_no_exec: false,
+            last_syscall_nr: None,
+            last_syscall_orig_x0: 0,
+            persistent_vm_lifecycle: true,
+            cow_authority: Some(cow_authority),
+            cow_identity: Some(carrick_hal::FrameCowIdentity {
+                linux_pid: 871,
+                linux_tid: 871,
+                mm: 871,
+                asid: 2,
+            }),
+            pending_fork_frame_receipts: Vec::new(),
+            pending_process_aliases: Vec::new(),
+            fail_next_begin_exec_inventory: false,
+            cow_rollback_scratch: None,
+            registration: None,
+        };
+        assert!(
+            child_task
+                .mapping_for_range_in(
+                    &transport.custody,
+                    generation_address,
+                    core::mem::size_of::<u64>(),
+                )
+                .is_some_and(|mapping| !mapping.guest_writable),
+            "production mapping resolution must find the read-only prepared child vvar",
+        );
+        let mut flushes = 0;
+        child_task
+            .refresh_fork_process_state_in(&transport.custody, &mut || {
+                flushes += 1;
+                Ok(())
+            })
+            .expect("production privileged child vvar refresh");
+        assert_eq!(flushes, 1, "child vvar refresh must publish stage-1 once");
+        let parent_generation = unsafe { parent_generation_ptr.cast::<u64>().read_unaligned() };
+        assert_eq!(
+            parent_generation, parent_generation_seed,
+            "child refresh must not mutate the parent's structural vvar bytes",
+        );
+        let refreshed = child_task
+            .mapping_for_range_in(
+                &transport.custody,
+                generation_address,
+                core::mem::size_of::<u64>(),
+            )
+            .expect("refreshed child-private vvar mapping");
+        assert!(
+            !refreshed.guest_writable,
+            "vvar semantic mapping must stay read-only"
+        );
+        assert_eq!(
+            child_page_tables_authority
+                .lock()
+                .as_ref()
+                .expect("refreshed child page tables")
+                .debug_walk(generation_address)[3]
+                & AP_MASK,
+            AP_USER_RO,
+            "privileged internal COW must preserve the guest read-only AP",
+        );
+        assert!(
+            child_task
+                .cow_armed
+                .lock()
+                .span_for(generation_address)
+                .is_none(),
+            "successful privileged refresh must disarm the child vvar span",
+        );
+        let child_private_key = (
+            align_down(refreshed.ipa, CowArmedRanges::COMPOUND_SIZE),
+            CowArmedRanges::COMPOUND_SIZE,
+        );
+        let child_private_owner = transport.custody.global_frame_host_owners.lock()
+            [&child_private_key]
+            .owner()
+            .clone();
+        let child_generation_offset = generation_address - refreshed.start;
+        let child_generation = unsafe {
+            child_private_owner
+                .as_ptr()
+                .add(child_generation_offset as usize)
+                .cast::<u64>()
+                .read_unaligned()
+        };
+        assert_ne!(child_generation, parent_generation_seed);
+        assert_eq!(
+            unsafe {
+                child_private_owner
+                    .as_ptr()
+                    .add(child_generation_offset as usize)
+                    .cast::<u64>()
+                    .read_unaligned()
+            },
+            child_generation,
+            "the fresh generation must land in the child-private COW owner",
+        );
+        drop(child_task);
+        prepared.inventory = HvpatchTaskInventoryAuthority::Absent;
+        drop(child_state);
+        drop(child_inventory);
+        let retired = retire_global_frame_host_owner_if_generation_in(
+            &transport.custody,
+            child_private_key.0,
+            child_private_key.1,
+            child_private_owner.generation(),
+        );
+        assert!(
+            retired.is_retired(),
+            "retire child-private vvar COW fixture: {retired:?}",
+        );
+        drop(child_private_owner);
+        carrier.abort().expect("retire child carrier fixture");
+        drop(projected);
+        drop(parent);
+        drop(vvar_owner);
+        drop(overlay_owner);
+        retry_structural_backing_identities_in_using(
+            &transport.custody,
+            &[vvar_identity, overlay_identity],
+            &mut unmap_global_frame_stage2_record,
+            &mut release_retired_stage2_ipa,
+        )
+        .expect("retire production vvar fixture");
     }
 
     #[test]
@@ -18216,6 +18973,15 @@ impl HvfTaskState {
     }
 
     pub(crate) fn physical_cow_source(&self, semantic_va: u64, ipa: u64) -> Option<(*mut u8, u64)> {
+        self.physical_cow_source_in(self.custody(), semantic_va, ipa)
+    }
+
+    fn physical_cow_source_in(
+        &self,
+        custody: &CarrierVmCustody,
+        semantic_va: u64,
+        ipa: u64,
+    ) -> Option<(*mut u8, u64)> {
         let physical_ipa = align_down(ipa, CowArmedRanges::COMPOUND_SIZE);
         let physical_end = physical_ipa.checked_add(CowArmedRanges::COMPOUND_SIZE)?;
         if let Some(alias) = alias_registry().lock().iter().rev().find(|alias| {
@@ -18241,7 +19007,7 @@ impl HvfTaskState {
                     )
                 {
                     global_frame_host_owner_matches_in(
-                        self.custody(),
+                        custody,
                         alias.physical_ipa,
                         alias.physical_size as u64,
                         alias.physical_host_addr,
@@ -18271,10 +19037,142 @@ impl HvfTaskState {
                         mapping.physical_ipa,
                         mapping.physical_size as u64,
                     )
-                    || global_frame_region_owner_matches_in(self.custody(), mapping))
+                    || global_frame_region_owner_matches_in(custody, mapping))
         })?;
         let offset = usize::try_from(physical_ipa - mapping.ipa).ok()?;
         Some((unsafe { mapping.host_addr.add(offset) }, physical_ipa))
+    }
+
+    fn translate_va_for_cow(&self, va: u64) -> Option<u64> {
+        self.page_tables_authority().lock().as_ref()?.translate(va)
+    }
+
+    fn mapping_for_range_in(
+        &self,
+        custody: &CarrierVmCustody,
+        address: u64,
+        length: usize,
+    ) -> Option<MappingView> {
+        let address = strip_pointer_tag(address);
+        let stage1_ipa = self.translate_va_for_cow(address);
+        let region_is_live = |mapping: &HvfMappedRegion| {
+            !self.persistent_vm_lifecycle
+                || !is_reusable_global_frame_extent(
+                    mapping.physical_ipa,
+                    mapping.physical_size as u64,
+                )
+                || global_frame_region_owner_matches_in(custody, mapping)
+        };
+        let alias_is_live = |alias: &AliasBacking| {
+            !self.persistent_vm_lifecycle
+                || !is_reusable_global_frame_extent(alias.physical_ipa, alias.physical_size as u64)
+                || global_frame_host_owner_matches_in(
+                    custody,
+                    alias.physical_ipa,
+                    alias.physical_size as u64,
+                    alias.physical_host_addr,
+                    alias.owner_generation,
+                )
+        };
+        if let Some(ipa) = stage1_ipa {
+            if let Some(mapping) = self.mappings.iter().rev().find(|mapping| {
+                ipa >= mapping.ipa
+                    && ipa < mapping.ipa.saturating_add(mapping.size as u64)
+                    && mapping.contains_range(address, length)
+                    && region_is_live(mapping)
+            }) {
+                return Some(mapping.view());
+            }
+            if let Some(alias) = alias_registry()
+                .lock()
+                .iter()
+                .rev()
+                .find(|alias| {
+                    ipa >= alias.ipa
+                        && ipa < alias.ipa.saturating_add(alias.size as u64)
+                        && alias_is_live(alias)
+                })
+                .copied()
+            {
+                return Some(MappingView::from_alias(&alias));
+            }
+        }
+        if let Some(mapping) = self
+            .mappings
+            .iter()
+            .rev()
+            .find(|mapping| mapping.contains_range(address, length) && region_is_live(mapping))
+        {
+            return Some(mapping.view());
+        }
+        if !self.protections.range_no_access(address, length) {
+            let end = address.saturating_add(length as u64);
+            if let Some(alias) = alias_registry()
+                .lock()
+                .iter()
+                .rev()
+                .find(|alias| {
+                    alias_matches_process_scope(
+                        alias.ownership_scope,
+                        self.mm_root_slot,
+                        self.container_root,
+                    ) && address >= alias.start
+                        && end <= alias.start.saturating_add(alias.size as u64)
+                        && alias_is_live(alias)
+                })
+                .copied()
+            {
+                return Some(MappingView::from_alias(&alias));
+            }
+        }
+        None
+    }
+
+    fn supersede_cow_receipts_for_cow(&self, va: u64, len: u64) {
+        let Some(end) = va.checked_add(len) else {
+            return;
+        };
+        let mut receipts = self.cow_deferred_publications.lock();
+        let mut remaining = Vec::with_capacity(receipts.len());
+        for receipt in receipts.drain(..) {
+            let receipt_end = receipt.va.saturating_add(receipt.len as u64);
+            if receipt_end <= va || receipt.va >= end {
+                remaining.push(receipt);
+                continue;
+            }
+            let overlap_start = receipt.va.max(va);
+            let overlap_end = receipt_end.min(end);
+            if receipt.va < overlap_start
+                && let Ok(prefix) = usize::try_from(overlap_start - receipt.va)
+            {
+                remaining.push(PendingFrameCowPublication {
+                    va: receipt.va,
+                    len: prefix,
+                    expected_ipa: receipt.expected_ipa,
+                });
+            }
+            if overlap_end < receipt_end
+                && let Ok(suffix) = usize::try_from(receipt_end - overlap_end)
+                && let Some(expected_ipa) =
+                    receipt.expected_ipa.checked_add(overlap_end - receipt.va)
+            {
+                remaining.push(PendingFrameCowPublication {
+                    va: overlap_end,
+                    len: suffix,
+                    expected_ipa,
+                });
+            }
+        }
+        *receipts = remaining;
+    }
+
+    fn retire_stage2_extent_for_cow(
+        &mut self,
+        custody: &CarrierVmCustody,
+        ipa: u64,
+        length: u64,
+    ) -> Result<(), TrapError> {
+        HvfVmState::retire_stage2_extent_from_mappings_in(custody, &mut self.mappings, ipa, length)
     }
 
     fn neutral() -> Self {
@@ -19908,6 +20806,58 @@ fn process_mapping_needs_child_alias_authority(mapping: &ProcessMappingDesc) -> 
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn structural_fork_owner_identity_in(
+    custody: &CarrierVmCustody,
+    mapping: &ThreadMappingDesc,
+) -> Option<InventoryStage2OwnerIdentity> {
+    let owner = mapping.structural_owner.as_ref()?;
+    let owner_custody = owner.custody.upgrade()?;
+    if !std::ptr::eq(owner_custody.as_ref(), custody)
+        || owner.ptr() != mapping.physical_host_addr
+        || owner.len() != mapping.physical_size
+        || owner.physical_ipa != mapping.physical_ipa
+        || owner.physical_size != mapping.physical_size
+        || owner.epoch().raw() != mapping.owner_generation
+        || owner
+            .retained
+            .owner_retired
+            .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return None;
+    }
+    let identity = *owner.retained.record_identity.lock();
+    if custody
+        .structural_backings
+        .lock()
+        .get(&identity.record_id)
+        .is_none_or(|retained| !std::sync::Arc::ptr_eq(retained, &owner.retained))
+    {
+        return None;
+    }
+    let snapshot = custody.stage2_record_snapshot(identity.record_id)?;
+    let logical_owner = CarrierLogicalOwner {
+        id: mapping.owner_generation,
+        generation: mapping.owner_generation,
+    };
+    (identity.vm_generation == snapshot.vm_generation
+        && identity.logical_owner == Some(logical_owner)
+        && custody.setup_generation() == Some(snapshot.vm_generation)
+        && snapshot.ipa == mapping.physical_ipa
+        && snapshot.len == mapping.physical_size
+        && snapshot.host_addr == mapping.physical_host_addr as usize
+        && snapshot.perms == u64::from(mapping.perms)
+        && snapshot.logical_owner == Some(logical_owner)
+        && snapshot.mapped
+        && snapshot.backend_map_installed
+        && !snapshot.retirement_requested
+        && !snapshot.terminalized_by_vm_destroy)
+        .then_some(InventoryStage2OwnerIdentity {
+            host_addr: mapping.physical_host_addr as usize,
+            generation: mapping.owner_generation,
+        })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn inherited_fork_inventory_extents_in(
     custody: &CarrierVmCustody,
     mapping: &ThreadMappingDesc,
@@ -19917,11 +20867,21 @@ fn inherited_fork_inventory_extents_in(
         host_addr: mapping.physical_host_addr as usize,
         generation: mapping.owner_generation,
     });
-    let live_owner = global_frame_host_owner_identity_in(
-        custody,
-        mapping.physical_ipa,
-        mapping.physical_size as u64,
-    );
+    let live_owner = if mapping.owner_generation == 0 {
+        None
+    } else if is_reusable_global_frame_extent(mapping.physical_ipa, mapping.physical_size as u64) {
+        global_frame_host_owner_identity_in(
+            custody,
+            mapping.physical_ipa,
+            mapping.physical_size as u64,
+        )
+        .map(|(host_addr, generation)| InventoryStage2OwnerIdentity {
+            host_addr,
+            generation,
+        })
+    } else {
+        structural_fork_owner_identity_in(custody, mapping)
+    };
     inventory
         .iter()
         .filter(|(_, extent)| {
@@ -19929,14 +20889,35 @@ fn inherited_fork_inventory_extents_in(
                 == (mapping.physical_ipa, mapping.physical_size as u64)
                 && (mapping.owner_generation == 0
                     || (expected_owner == Some(extent.stage2_owner)
-                        && live_owner
-                            == Some((
-                                extent.stage2_owner.host_addr,
-                                extent.stage2_owner.generation,
-                            ))))
+                        && live_owner == Some(extent.stage2_owner)))
         })
         .map(|(&key, &extent)| (key, extent))
         .collect()
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn thread_mapping_semantic_ipa_at(mapping: &ThreadMappingDesc, address: u64) -> Option<u64> {
+    let offset = address.checked_sub(mapping.start)?;
+    if offset >= mapping.size as u64 {
+        return None;
+    }
+    mapping.ipa.checked_add(offset)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn fork_source_translation_has_overlay_owner(
+    custody: &CarrierVmCustody,
+    mappings: &[ThreadMappingDesc],
+    candidate_index: usize,
+    va: u64,
+    translated: u64,
+    inventory: &std::collections::BTreeMap<(u64, u64), InventoryExtent>,
+) -> bool {
+    mappings.iter().enumerate().any(|(index, overlay)| {
+        index != candidate_index
+            && thread_mapping_semantic_ipa_at(overlay, va) == Some(translated)
+            && !inherited_fork_inventory_extents_in(custody, overlay, inventory).is_empty()
+    })
 }
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
@@ -24717,25 +25698,9 @@ impl HvfVmState {
         &mut self,
         flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
     ) -> Result<(), TrapError> {
-        // A logical HVPatch child shares Carrick's host PID with its parent, so
-        // the historical post-host-fork PID stamp cannot distinguish their
-        // inherited vDSO getrandom states. Split the child's private vvar frame
-        // before stamping a fresh generation; direct backing writes would
-        // otherwise mutate the parent's still-shared frame as well. The runtime
-        // invokes this only after it publishes the child inventory and binds
-        // exact MM/COW authority, but before the start-gated vCPU enters guest
-        // code.
-        let generation_address =
-            crate::vdso::LINUX_VVAR_BASE + crate::vdso::VVAR_OFF_RNG_GENERATION as u64;
-        self.ensure_frame_cow_write(
-            generation_address,
-            core::mem::size_of::<u64>(),
-            carrick_aarch64::vmm::FrameCowWriteIntent::PrivilegedInternal,
-            flush_stage1,
-        )?;
-        self.stamp_rng_generation().map_err(|error| {
-            TrapError::Hypervisor(format!("stamp HVPatch child vDSO RNG generation: {error}"))
-        })
+        let custody = std::sync::Arc::clone(&self.carrier_foreign_mm_transport.custody);
+        self.task
+            .refresh_fork_process_state_in(&custody, flush_stage1)
     }
 
     pub(crate) fn abort_process_materialization(&mut self) -> Result<(), TrapError> {
@@ -27082,9 +28047,13 @@ impl HvfVmState {
         });
         Ok(Some(span_end))
     }
+}
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvfTaskState {
     fn live_stage1_names_writable_private_mapping(
         &self,
+        custody: &CarrierVmCustody,
         fault_va: u64,
         mapping: MappingView,
     ) -> Result<bool, TrapError> {
@@ -27103,7 +28072,8 @@ impl HvfVmState {
             })?)
             .ok_or_else(|| TrapError::Hypervisor("HVPatch winner PTE IPA overflow".to_owned()))?;
         let page_table_host = self
-            .mapping_for_range(
+            .mapping_for_range_in(
+                custody,
                 crate::memory::LINUX_PAGE_TABLES_BASE,
                 carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
             )
@@ -27132,6 +28102,7 @@ impl HvfVmState {
 
     fn perform_frame_cow(
         &mut self,
+        custody: &std::sync::Arc<CarrierVmCustody>,
         fault_va: u64,
         intent: carrick_aarch64::vmm::FrameCowWriteIntent,
         trigger: FrameCowTrigger,
@@ -27160,14 +28131,14 @@ impl HvfVmState {
             (cow_armed.span_for(fault_va), cow_armed.ranges.clone())
         };
         let Some(span) = span else {
-            let mapping = self.mapping_for_range(fault_va, 1);
+            let mapping = self.mapping_for_range_in(custody, fault_va, 1);
             let write_denied = self.protections.range_write_denied(fault_va, 1);
             let private_writable_mapping = mapping.is_some_and(|mapping| {
                 mapping.guest_writable && mapping.sharing == GuestMappingSharing::Private
             });
             let live_leaf_is_writable = match mapping {
                 Some(mapping) if private_writable_mapping && !write_denied => {
-                    self.live_stage1_names_writable_private_mapping(fault_va, mapping)?
+                    self.live_stage1_names_writable_private_mapping(custody, fault_va, mapping)?
                 }
                 _ => false,
             };
@@ -27227,7 +28198,7 @@ impl HvfVmState {
         // the page-table publication below deliberately preserves the denied
         // descriptor until mmap's later `protect_range` commit.
         let source_guest_writable = self
-            .mapping_for_range(fault_va, 1)
+            .mapping_for_range_in(custody, fault_va, 1)
             .ok_or_else(|| {
                 TrapError::Hypervisor(format!(
                     "HVPatch COW VA 0x{fault_va:x} has no semantic mapping authority"
@@ -27247,8 +28218,8 @@ impl HvfVmState {
         // that the exact byte translated; backing maintenance may intentionally
         // start from an invalid munmap descriptor, so the mapping-metadata
         // fallback is authoritative for that pre-publication transaction.
-        let old_fault_ipa = self.translate_va(fault_va).or_else(|| {
-            let mapping = self.mapping_for_range(fault_va, 1)?;
+        let old_fault_ipa = self.translate_va_for_cow(fault_va).or_else(|| {
+            let mapping = self.mapping_for_range_in(custody, fault_va, 1)?;
             mapping
                 .ipa
                 .checked_add(fault_va.checked_sub(mapping.start)?)
@@ -27273,13 +28244,13 @@ impl HvfVmState {
                 ))
             })?;
         let (old_host, old_physical_ipa) = self
-            .physical_cow_source(span.va, old_ipa)
+            .physical_cow_source_in(custody, span.va, old_ipa)
             .ok_or_else(|| {
-                TrapError::Hypervisor(format!(
-                    "HVPatch COW VA 0x{:x} IPA 0x{old_ipa:x} has no matching 16 KiB physical backing",
-                    span.va
-                ))
-            })?;
+            TrapError::Hypervisor(format!(
+                "HVPatch COW VA 0x{:x} IPA 0x{old_ipa:x} has no matching 16 KiB physical backing",
+                span.va
+            ))
+        })?;
         // The semantic span sits at `old_offset` WITHIN its 16 KiB compound.
         // The COW replacement must preserve that intra-compound offset: the
         // 2026-08-23 wedge2 change flattened `new_ipa`/`semantic_host` to the
@@ -27307,7 +28278,7 @@ impl HvfVmState {
             retirement,
         } = {
             let inventory = self.frame_inventory.lock();
-            Self::cow_inventory_split_shape(
+            HvfVmState::cow_inventory_split_shape(
                 &inventory,
                 old_physical_ipa,
                 retain_old_compound,
@@ -27324,7 +28295,8 @@ impl HvfVmState {
         // run while the engine's mapping metadata is being rebuilt; failing
         // here must leave no staged MappingId for terminal retirement to see.
         let page_table_host = self
-            .mapping_for_range(
+            .mapping_for_range_in(
+                custody,
                 crate::memory::LINUX_PAGE_TABLES_BASE,
                 carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
             )
@@ -27415,16 +28387,15 @@ impl HvfVmState {
             )));
         }
         new_lease.mark_mapped();
-        let custody = self.carrier_vm_custody();
         let owner_generation = register_global_frame_host_owner_in(
-            &custody,
+            custody,
             new_lease,
             new_host,
             u64::from(stage2_perms),
         )?;
 
-        let backing = Self::private_backing_identity();
-        let split = match Self::stage_cow_inventory_split(
+        let backing = HvfVmState::private_backing_identity();
+        let split = match HvfVmState::stage_cow_inventory_split(
             &mut reservation,
             old_inventory_key,
             old_inventory_extent,
@@ -27442,7 +28413,7 @@ impl HvfVmState {
             Ok(split) => split,
             Err(error) => {
                 let _ = retire_global_frame_host_owner_in(
-                    self.custody(),
+                    custody,
                     new_physical_ipa,
                     CowArmedRanges::COMPOUND_SIZE,
                 );
@@ -27505,8 +28476,11 @@ impl HvfVmState {
             // written to both the manager shadow and live backing.  Preserve a
             // complete pre-edit image: a cloned manager's dirty list alone is
             // not a rollback log, because `sync_to_host` drains the NEW edits.
-            rollback_page_tables = Some(Self::rollback_pre_image(&mut rollback_scratch, manager));
-            Self::refresh_stage1_exclusivity(manager);
+            rollback_page_tables = Some(HvfVmState::rollback_pre_image(
+                &mut rollback_scratch,
+                manager,
+            ));
+            HvfVmState::refresh_stage1_exclusivity(manager);
             if span.kernel_only {
                 manager
                     .map_kernel_aliased(span.va, new_ipa, span.len as u64)
@@ -27627,7 +28601,7 @@ impl HvfVmState {
                 }
             }
             let _ = retire_global_frame_host_owner_in(
-                self.custody(),
+                custody,
                 new_physical_ipa,
                 CowArmedRanges::COMPOUND_SIZE,
             );
@@ -27648,8 +28622,12 @@ impl HvfVmState {
         let inventory_ledger = std::sync::Arc::clone(&self.frame_inventory.ledger);
         let retired_old_stage2 = {
             let mut inventory = inventory_ledger.lock();
-            Self::commit_cow_inventory_split(&mut inventory, &split, || {
-                self.retire_stage2_extent(split.old.stage2_base, split.old.stage2_length)
+            HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || {
+                self.retire_stage2_extent_for_cow(
+                    custody,
+                    split.old.stage2_base,
+                    split.old.stage2_length,
+                )
             })
             .unwrap_or_else(|error| {
                 eprintln!(
@@ -27733,7 +28711,7 @@ impl HvfVmState {
         // `mmap`, whose leaves are deliberately invalid until the protection
         // commit — is now a false promise, and would fail the authentication
         // that completes this mapping.
-        self.supersede_cow_receipts("frame-cow", span.va, span.len as u64);
+        self.supersede_cow_receipts_for_cow(span.va, span.len as u64);
         if let Some((va, leaf, expected_ipa, expected_ap)) = preserved_protection_receipt {
             crate::probes::pt_alias_receipt(va, leaf, expected_ipa, expected_ap, 3);
             if intent == carrick_aarch64::vmm::FrameCowWriteIntent::BackingMaintenance {
@@ -27806,6 +28784,60 @@ impl HvfVmState {
         Ok(true)
     }
 
+    fn refresh_fork_process_state_in(
+        &mut self,
+        custody: &std::sync::Arc<CarrierVmCustody>,
+        flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+    ) -> Result<(), TrapError> {
+        let generation_address =
+            crate::vdso::LINUX_VVAR_BASE + crate::vdso::VVAR_OFF_RNG_GENERATION as u64;
+        if self.cow_armed.lock().span_for(generation_address).is_none() {
+            return Err(TrapError::Hypervisor(
+                "HVPatch child vvar generation has no COW arm".to_owned(),
+            ));
+        }
+        if !self.perform_frame_cow(
+            custody,
+            generation_address,
+            carrick_aarch64::vmm::FrameCowWriteIntent::PrivilegedInternal,
+            FrameCowTrigger {
+                class:
+                    carrick_observability::probes::HvpatchFrameCowTriggerClass::PrivilegedInternal,
+                syndrome: 0,
+                far: generation_address,
+                ttbr0: 0,
+            },
+            flush_stage1,
+        )? {
+            return Err(TrapError::Hypervisor(
+                "HVPatch child vvar generation COW was not resolved".to_owned(),
+            ));
+        }
+        let mapping = self
+            .mapping_for_range_in(custody, generation_address, core::mem::size_of::<u64>())
+            .ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "HVPatch child vvar generation has no semantic mapping authority after COW"
+                        .to_owned(),
+                )
+            })?;
+        let offset = usize::try_from(generation_address - mapping.start).map_err(|_| {
+            TrapError::Hypervisor("HVPatch child vvar generation offset overflow".to_owned())
+        })?;
+        let generation = next_vdso_rng_generation().to_le_bytes();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                generation.as_ptr(),
+                mapping.host_addr.add(offset),
+                generation.len(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvfVmState {
     pub(crate) fn resolve_frame_cow_fault(
         &mut self,
         syndrome: u64,
@@ -27817,7 +28849,9 @@ impl HvfVmState {
             return Ok(carrick_hal::CowFaultResolution::NotCow);
         }
         let fault_va = strip_pointer_tag(far);
-        let resolved = self.perform_frame_cow(
+        let custody = std::sync::Arc::clone(&self.carrier_foreign_mm_transport.custody);
+        let resolved = self.task.perform_frame_cow(
+            &custody,
             fault_va,
             carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible,
             FrameCowTrigger {
@@ -27993,7 +29027,9 @@ impl HvfVmState {
                             carrick_observability::probes::HvpatchFrameCowTriggerClass::PrivilegedInternal
                         }
                     };
-                    if !self.perform_frame_cow(
+                    let custody = std::sync::Arc::clone(&self.carrier_foreign_mm_transport.custody);
+                    if !self.task.perform_frame_cow(
+                        &custody,
                         current,
                         intent,
                         FrameCowTrigger {
@@ -29718,94 +30754,8 @@ impl HvfVmState {
     /// (the "read/wait: bad address" EFAULT). Both `_range` and `_range_mut`
     /// resolve identically — no accessor mutates the region itself.
     fn mapping_for_range(&self, address: u64, length: usize) -> Option<MappingView> {
-        let address = strip_pointer_tag(address);
-        let stage1_ipa = self.translate_va(address);
-        let region_is_live = |mapping: &HvfMappedRegion| {
-            !self.persistent_vm_lifecycle
-                || !is_reusable_global_frame_extent(
-                    mapping.physical_ipa,
-                    mapping.physical_size as u64,
-                )
-                || global_frame_region_owner_matches_in(self.custody(), mapping)
-        };
-        let alias_is_live = |alias: &AliasBacking| {
-            !self.persistent_vm_lifecycle
-                || !is_reusable_global_frame_extent(alias.physical_ipa, alias.physical_size as u64)
-                || global_frame_host_owner_matches_in(
-                    self.custody(),
-                    alias.physical_ipa,
-                    alias.physical_size as u64,
-                    alias.physical_host_addr,
-                    alias.owner_generation,
-                )
-        };
-        // First honor the exact output address in the authoritative stage-1
-        // graph. This is required for low-VA fork-COW overlays as well as the
-        // historical high-VA aliases: a sibling vCPU may not carry the overlay
-        // in its local metadata Vec even though it shares this mm's tables.
-        if let Some(ipa) = stage1_ipa {
-            if let Some((_, mapping)) =
-                self.mappings.iter().enumerate().rev().find(|(_, mapping)| {
-                    Self::region_owns_ipa(mapping, ipa)
-                        && mapping.contains_range(address, length)
-                        && region_is_live(mapping)
-                })
-            {
-                return Some(mapping.view());
-            }
-            if let Some(b) = alias_registry()
-                .lock()
-                .iter()
-                .rev()
-                .find(|alias| {
-                    ipa >= alias.ipa
-                        && ipa < alias.ipa.saturating_add(alias.size as u64)
-                        && alias_is_live(alias)
-                })
-                .copied()
-            {
-                return Some(MappingView::from_alias(&b));
-            }
-        }
-        if let Some(mapping) = self
-            .mappings
-            .iter()
-            .rev()
-            .find(|mapping| mapping.contains_range(address, length) && region_is_live(mapping))
-        {
-            return Some(mapping.view());
-        }
-        // VA-keyed fallback for when the IPA key is unavailable. `translate_va`
-        // reads THIS thread's software stage-1 model, which can lack a high-VA
-        // arena page a sibling vCPU freshly MAP_FIXED-committed (Go reserves its
-        // heap arena PROT_NONE, then MAP_FIXEDs RW sub-regions; a goroutine on
-        // another vCPU then reads/writes a buffer there). `add_alias` already
-        // registered that backing keyed by guest VA, so resolve it by VA. Gate on
-        // `!range_no_access` so a still-PROT_NONE reservation page EFAULTs as it
-        // must; `lookup_shared_alias_by_va` requires the whole range in one entry
-        // and picks newest-first, so it never resolves a partial or stale backing.
-        // This closes the intermittent Go "read/write: bad address" EFAULT.
-        if !self.range_no_access(address, length) {
-            let end = address.saturating_add(length as u64);
-            if let Some(b) = alias_registry()
-                .lock()
-                .iter()
-                .rev()
-                .find(|alias| {
-                    alias_matches_process_scope(
-                        alias.ownership_scope,
-                        self.mm_root_slot,
-                        self.container_root,
-                    ) && address >= alias.start
-                        && end <= alias.start.saturating_add(alias.size as u64)
-                        && alias_is_live(alias)
-                })
-                .copied()
-            {
-                return Some(MappingView::from_alias(&b));
-            }
-        }
-        None
+        let custody = self.carrier_vm_custody();
+        self.task.mapping_for_range_in(&custody, address, length)
     }
 
     fn mapping_for_range_mut(&mut self, address: u64, length: usize) -> Option<MappingView> {
@@ -31039,6 +31989,33 @@ impl HvfTaskState {
                 // per-mm mapping coverage after every compound in that stage-2
                 // lease was repointed. It is no longer a fork source.
                 let Some((_, parent_extent)) = inherited.first().copied() else {
+                    let live_translation = page_tables
+                        .translate(mapping.start)
+                        .or_else(|| page_tables.translate_retained_output(mapping.start));
+                    let candidate_translation =
+                        thread_mapping_semantic_ipa_at(mapping, mapping.start);
+                    let authenticated_overlay = live_translation.is_some_and(|translated| {
+                        fork_source_translation_has_overlay_owner(
+                            &carrier_foreign_mm_transport.custody,
+                            &source_mappings,
+                            index,
+                            mapping.start,
+                            translated,
+                            &parent_inventory,
+                        )
+                    });
+                    if fork_mapping_requires_base_translation(
+                        mapping.start,
+                        mapping.size,
+                        mapping.is_dynamic_alias,
+                    ) && live_translation.is_some()
+                        && (live_translation == candidate_translation || !authenticated_overlay)
+                    {
+                        return Err(TrapError::Hypervisor(format!(
+                            "hvpatch live fork mapping VA 0x{:x} IPA 0x{:x} has no authenticated inherited inventory extent",
+                            mapping.start, mapping.physical_ipa,
+                        )));
+                    }
                     continue;
                 };
                 let raw = u64::from(mapping.perms);
@@ -42222,7 +43199,7 @@ mod tag_strip_tests {
     fn thread_mapping_desc_from_region_and_fork_inheritance_with_offset() {
         static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
         let _test_lock = TEST_LOCK.lock();
-        let physical_ipa = 0x9b00_2000_0000_u64;
+        let physical_ipa = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x20_0000;
         let physical_len = 0x8000_usize;
         let semantic_offset = 0x4000_u64;
         let semantic_ipa = physical_ipa + semantic_offset;
