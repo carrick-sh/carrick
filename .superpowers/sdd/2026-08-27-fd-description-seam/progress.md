@@ -447,3 +447,41 @@ rows, so a per-process operation pays for every other process.
    instead of filtering the whole set.
 
 Only after that is the test-profile question worth re-asking.
+
+### Horizontal hot-path sweep (2026-08-30, after the retirement fix)
+
+`scripts/dtrace/hvpatch-carrier-user-cpu-ranking.d` (new durable artifact),
+attached to the carrier under the same `futexforkrequeue` fork/exit storm.
+213,029 samples, `errors=0`, unbounded. Ranked by innermost Carrick frame over
+the top-120 stack population (42,535 samples):
+
+| share | frame | shape |
+|---|---|---|
+| 22.5% + 14.6% | `retain_external_aliases` and its closure | O(all alias rows) per process exit |
+| 13.3% | `fork_source_translation_has_overlay_owner` | O(M) inside a loop over M mappings = **O(M^2) per fork** |
+| 13.2% | `HvpatchRuntimeDirectory::continuation...` | not yet dissected |
+| 9.8% | `kernel::objects::Task::thread` | map `get`, but a mutex acquire + `Arc::clone` per lookup |
+| 8.6% | `thread_mapping_semantic_ipa_at` | O(1) itself; its share IS the fork quadratic above |
+| 6.8% | `AliasOwnershipScope as Ord` | comparison cost of the new keyed maps; shrinks with the registry fix |
+| 1.3% | `run_state::find_record` | linear scan over ALL process records |
+
+Found statically, not rankable from this profile because they sit inside the
+serialized sections:
+
+- `CowArmedRanges` is a flat `Vec`: `span_for` linearly filters every armed
+  range PER COW FAULT, `disarm` rebuilds the whole `Vec` per fault, and
+  `ranges.clone()` heap-copies it per fault largely to feed a debug `len()`.
+  A fork arms every private writable range, so resolving them is O(A^2).
+- `perform_frame_cow` takes a stop-the-world sibling quiesce AND the
+  carrier-global topology lock on EVERY COW page fault (10,896 acquisitions,
+  42.7 s aggregate wait in one run) — whole-VM serialization per page fault.
+- `acquire_process_retire_topology_lock_servicing` still spins: 201,813
+  try-misses against 2,333 successes, on a 50 us -> 5 ms sleep backoff rather
+  than a queued wait.
+
+Ranked plan: (1) key the alias registry by ownership scope so exit is O(own
+rows); (2) index fork source mappings by translated IPA once per fork instead
+of rescanning per mapping; (3) give `CowArmedRanges` an interval index and stop
+cloning it per fault; (4) revisit the per-COW-fault carrier-global
+serialization; (5) `run_state::find_record`; (6) replace the retire backoff
+spin with a queued wait.
