@@ -209,7 +209,7 @@ test *ARGS:
         # that do NOT need the HVF runtime or Docker; those belong to a
         # guest-capable lane (`just conformance*`,
         # `cargo test -p carrick-cli --test <name>`).
-        cargo test --workspace --exclude carrick-runtime --exclude carrick-cli --exclude carrick-native-darwin --exclude carrick-host --lib --bins {{ARGS}}
+        cargo test --workspace --exclude carrick-runtime --exclude carrick-cli --exclude carrick-native-darwin --exclude carrick-host --exclude carrick-vmm-hvf --lib --bins {{ARGS}}
         # The authenticated jit-shape builders/parsers have measured >1 MiB
         # debug frames. Several tests need two in one body; libtest's ~2 MiB
         # default has repeatedly been tipped over by unrelated additions. Keep
@@ -232,6 +232,20 @@ test *ARGS:
         # hang, not a slow test.
         env RUST_TEST_THREADS=1 cargo test -p carrick-host --lib {{ARGS}}
         env RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib {{ARGS}}
+        # carrick-vmm-hvf is serial for a THIRD reason, and it is structural
+        # rather than a test-hygiene lapse: the carrier is process-global by
+        # design, so its alias registry, replay mappings, global-frame owner
+        # table and IPA allocator are one carrier's worth of state shared by
+        # every test in the process. Two tests on different harness threads
+        # therefore see each other's rows -- one clearing the alias registry
+        # makes another's `alias_backing_is_live` false -- and the loser fails.
+        # Measured: ~1 in 6 parallel runs failed, in a DIFFERENT test each
+        # time; serializing the 35 tests that name the alias registry on a
+        # shared lock made it WORSE (9 of 15), because it only re-ordered the
+        # interleavings and exposed the frame-owner and custody registries
+        # too. Serial: 0 of 8. A per-registry lock would have to cover every
+        # carrier global to work, which is what one test process already is.
+        env RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf --lib {{ARGS}}
         exit 0
     fi
     # Off-macOS: run the lib tests of THIS host's own crates only (-p list from

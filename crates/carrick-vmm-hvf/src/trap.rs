@@ -6933,6 +6933,11 @@ mod task_only_carrier_directory_tests {
             rollbacks,
             order: Some(Arc::clone(&order)),
         };
+        // Deliberately NOT `prepared_task()`: this asserts only the order in
+        // which abort tears the two authorities down, and the fixture custody
+        // is a LIVE one, so handing it here drives the abort into real
+        // structural-backing retirement -- an `hv_*` call an unentitled unit
+        // test cannot make.
         let task = HvpatchPreparedTaskAuthority {
             abort_order: Some(Arc::clone(&order)),
             ..HvpatchPreparedTaskAuthority::default()
@@ -6941,6 +6946,23 @@ mod task_only_carrier_directory_tests {
         abort_prepared_task_and_carrier(task, state).unwrap();
 
         assert_eq!(&*order.lock(), &["inventory", "carrier"]);
+    }
+
+    /// A prepared task shaped the way production always builds one.
+    ///
+    /// Every production construction of `HvpatchPreparedTaskAuthority` --
+    /// `from_process_spec`, the sibling/shared-process paths -- sets `custody`
+    /// explicitly and uses `..default()` only for the remaining fields, so
+    /// `custody: None` is a state the runtime cannot reach. `publish_inner`
+    /// enforces that, which is why a fixture built from a bare `default()`
+    /// fails at "prepared HVPatch task has no carrier custody" before reaching
+    /// the behaviour under test. Take the carrier custody from the same live
+    /// fixture the rest of this module's carrier state comes from.
+    fn prepared_task() -> HvpatchPreparedTaskAuthority {
+        HvpatchPreparedTaskAuthority {
+            custody: Some(Arc::clone(legacy_test_carrier_vm_custody_arc())),
+            ..HvpatchPreparedTaskAuthority::default()
+        }
     }
 
     fn owner_key(
@@ -6962,19 +6984,11 @@ mod task_only_carrier_directory_tests {
         let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
         let rollbacks = Arc::new(AtomicUsize::new(0));
         let first = directory
-            .publish(
-                identity(1),
-                test_state(&rollbacks),
-                HvpatchPreparedTaskAuthority::default(),
-            )
+            .publish(identity(1), test_state(&rollbacks), prepared_task())
             .unwrap();
         assert!(
             directory
-                .publish(
-                    identity(1),
-                    test_state(&rollbacks),
-                    HvpatchPreparedTaskAuthority::default(),
-                )
+                .publish(identity(1), test_state(&rollbacks), prepared_task(),)
                 .is_err()
         );
         assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
@@ -6982,11 +6996,7 @@ mod task_only_carrier_directory_tests {
         drop(first);
         assert_eq!(rollbacks.load(Ordering::SeqCst), 2);
         let successor = directory
-            .publish(
-                identity(2),
-                test_state(&rollbacks),
-                HvpatchPreparedTaskAuthority::default(),
-            )
+            .publish(identity(2), test_state(&rollbacks), prepared_task())
             .unwrap();
         assert_ne!(first_key, successor.registration.as_ref().unwrap().key);
         drop(successor);
@@ -7011,7 +7021,7 @@ mod task_only_carrier_directory_tests {
                         test_state(&rollbacks),
                         HvpatchPreparedTaskAuthority {
                             pending_aliases: vec![replacement],
-                            ..HvpatchPreparedTaskAuthority::default()
+                            ..prepared_task()
                         },
                         failpoint
                     )
@@ -7907,7 +7917,7 @@ mod task_only_carrier_directory_tests {
                         receipt,
                         retirement: None,
                     },
-                    ..HvpatchPreparedTaskAuthority::default()
+                    ..prepared_task()
                 },
             )
             .unwrap();
@@ -7979,7 +7989,7 @@ mod task_only_carrier_directory_tests {
                         inventory: HvpatchTaskInventoryAuthority::SharedProcess {
                             ledger: Arc::clone(&ledger),
                         },
-                        ..HvpatchPreparedTaskAuthority::default()
+                        ..prepared_task()
                     },
                 )
                 .unwrap()
@@ -8068,7 +8078,7 @@ mod task_only_carrier_directory_tests {
                             .into_iter()
                             .collect(),
                         drop_order: Some(Arc::clone(&order)),
-                        ..HvpatchPreparedTaskAuthority::default()
+                        ..prepared_task()
                     },
                 )
                 .unwrap()
@@ -8107,7 +8117,7 @@ mod task_only_carrier_directory_tests {
     }
 
     #[test]
-    fn process_descriptor_drops_real_lease_while_host_backing_is_live() {
+    fn process_descriptor_lease_retires_while_host_backing_is_live() {
         let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
             0x4000,
             crate::host_mapping::HostMappingKind::PrivateAnon,
@@ -8117,7 +8127,7 @@ mod task_only_carrier_directory_tests {
         let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut lease = GlobalFrameStage2Lease::fixed(0x1234_0000, 0x4000);
         lease.drop_backing_audit = Some((host_addr as usize, Arc::clone(&observed)));
-        let descriptor = ProcessMappingDesc {
+        let mut descriptor = ProcessMappingDesc {
             start: 0x1000,
             ipa: 0x1234_0000,
             end: 0x5000,
@@ -8137,8 +8147,24 @@ mod task_only_carrier_directory_tests {
             inherited_frame: None,
             owner_generation: 0,
         };
+        // Retirement is EXPLICIT. Dropping a lease has not unmapped stage-2
+        // since `901945f82` made carrier custody generation-safe -- an implicit
+        // unmap during teardown can outlive the VM it would unmap into, so
+        // `Drop` now only releases the IPA reservation. The invariant this
+        // guards is unchanged and is what the retirement point must honour:
+        // stage-2 goes away while the host backing is still live, never after
+        // `ProcessMappingHost::Owned` has released it.
+        descriptor
+            .stage2_lease
+            .as_mut()
+            .expect("descriptor owns its stage-2 lease")
+            .try_retire()
+            .expect("retire the descriptor's stage-2 lease");
+        assert!(
+            observed.load(Ordering::SeqCst),
+            "stage-2 must retire while the host backing is still live"
+        );
         drop(descriptor);
-        assert!(observed.load(Ordering::SeqCst));
         assert!(!alias_backing_is_live(host_addr as usize));
     }
 
@@ -8149,11 +8175,7 @@ mod task_only_carrier_directory_tests {
         let rollbacks = Arc::new(AtomicUsize::new(0));
         assert!(
             directory
-                .publish(
-                    identity(9),
-                    test_state(&rollbacks),
-                    HvpatchPreparedTaskAuthority::default(),
-                )
+                .publish(identity(9), test_state(&rollbacks), prepared_task(),)
                 .is_err()
         );
         assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
@@ -8166,11 +8188,7 @@ mod task_only_carrier_directory_tests {
         let second = Arc::new(HvpatchCarrierTaskStateDirectory::default());
         let rollbacks = Arc::new(AtomicUsize::new(0));
         let binding = first
-            .publish(
-                identity(11),
-                test_state(&rollbacks),
-                HvpatchPreparedTaskAuthority::default(),
-            )
+            .publish(identity(11), test_state(&rollbacks), prepared_task())
             .unwrap();
         let key = binding.registration.as_ref().unwrap().key;
         assert!(second.retire(key).is_err());
@@ -8184,22 +8202,14 @@ mod task_only_carrier_directory_tests {
         let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
         let rollbacks = Arc::new(AtomicUsize::new(0));
         let binding = directory
-            .publish(
-                identity(12),
-                test_state(&rollbacks),
-                HvpatchPreparedTaskAuthority::default(),
-            )
+            .publish(identity(12), test_state(&rollbacks), prepared_task())
             .unwrap();
         let mut mismatched = identity(12);
         mismatched.linux_tid += 1;
         mismatched.asid += 1;
         assert!(
             directory
-                .publish(
-                    mismatched,
-                    test_state(&rollbacks),
-                    HvpatchPreparedTaskAuthority::default(),
-                )
+                .publish(mismatched, test_state(&rollbacks), prepared_task(),)
                 .is_err()
         );
         assert_eq!(directory.inner.lock().states.len(), 1);
@@ -8217,21 +8227,21 @@ mod task_only_carrier_directory_tests {
         let armed = || Arc::new(parking_lot::Mutex::new(CowArmedRanges::default()));
         let publications = || Arc::new(parking_lot::Mutex::new(Vec::new()));
 
-        HvpatchPreparedTaskAuthority::default()
+        prepared_task()
             .validate_cow_authority_pairing()
             .expect("neither half present is a complete, COW-less authority");
 
         HvpatchPreparedTaskAuthority {
             cow_armed: Some(armed()),
             cow_deferred_publications: Some(publications()),
-            ..HvpatchPreparedTaskAuthority::default()
+            ..prepared_task()
         }
         .validate_cow_authority_pairing()
         .expect("both halves present is a complete COW authority");
 
         let error = HvpatchPreparedTaskAuthority {
             cow_armed: Some(armed()),
-            ..HvpatchPreparedTaskAuthority::default()
+            ..prepared_task()
         }
         .validate_cow_authority_pairing()
         .expect_err("arming without a publication slot must fail closed");
@@ -8244,7 +8254,7 @@ mod task_only_carrier_directory_tests {
 
         let error = HvpatchPreparedTaskAuthority {
             cow_deferred_publications: Some(publications()),
-            ..HvpatchPreparedTaskAuthority::default()
+            ..prepared_task()
         }
         .validate_cow_authority_pairing()
         .expect_err("a publication slot without arming must fail closed");
@@ -8272,7 +8282,7 @@ mod task_only_carrier_directory_tests {
                     inventory: HvpatchTaskInventoryAuthority::SiblingShared {
                         ledger: Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
                     },
-                    ..HvpatchPreparedTaskAuthority::default()
+                    ..prepared_task()
                 },
             )
             .unwrap();
@@ -22726,6 +22736,21 @@ impl GlobalFrameStage2Lease {
         (self.base, self.length)
     }
 
+    /// Disarm the backend unmap because the VM that held this stage-2 mapping
+    /// is already gone.
+    ///
+    /// Retiring a lease normally issues `hv_vm_unmap`, but an exact custody
+    /// destroy takes the whole VM's stage-2 with it, so that call would fail
+    /// against a destroyed VM. The IPA reservation is still this lease's to
+    /// release, which `Drop` then does.
+    fn forget_backend_mapping(&mut self) {
+        self.mapped = false;
+        #[cfg(any(test, feature = "foreign-cow-test-support"))]
+        {
+            self.backend_map_installed = false;
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn try_retire(&mut self) -> Result<(), TrapError> {
         if !self.active {
@@ -23153,8 +23178,27 @@ impl Drop for PersistentCarrierMappings {
             .vm_destroyed_after_custody_commit
             .load(std::sync::atomic::Ordering::Acquire);
         for mut mapping in self.mappings.drain(..) {
-            if let Some(lease) = mapping.stage2_lease.take() {
-                drop(lease);
+            if let Some(mut lease) = mapping.stage2_lease.take() {
+                // Retire EXPLICITLY. Dropping a lease does not unmap stage-2 --
+                // it only releases the IPA reservation and (in a debug build)
+                // asserts the lease was not mapped. This is the carrier
+                // authority's own terminal point, which is why the lease-less
+                // branch below issues the same `hv_vm_unmap`; leaving the
+                // leased branch to `drop` alone unmapped nothing while the
+                // `OwnedHostMapping` below still released the backing, so the
+                // guest kept a stage-2 route to freed host memory.
+                if vm_destroyed {
+                    lease.forget_backend_mapping();
+                    drop(lease);
+                } else {
+                    lease.try_retire().unwrap_or_else(|error| {
+                        eprintln!(
+                            "carrick: FATAL: retire persistent carrier stage-2 lease at IPA 0x{:x} size {}: {error}",
+                            mapping.physical_ipa, mapping.physical_size
+                        );
+                        std::process::abort();
+                    });
+                }
             } else if !vm_destroyed {
                 let rc =
                     unsafe { inventory_hv_vm_unmap(mapping.physical_ipa, mapping.physical_size) };

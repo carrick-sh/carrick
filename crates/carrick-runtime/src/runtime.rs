@@ -2284,7 +2284,14 @@ mod tests {
             ("kernel/mm_access.rs", [0, 0, 1]),
             ("network/socket_namespace.rs", [7, 0, 0]),
             ("run_state.rs", [1, 0, 0]),
-            ("vcpu_loop/signal.rs", [1, 0, 0]),
+            // Both are unit tests that fork a child to BE the tracee, because
+            // a ptrace stop needs a real host parent/child pair:
+            // 1. `ptrace_signal_stop_queued_host_sigkill_remains_terminal`
+            // 2. `synchronous_fault_stops_for_ptrace_before_default_termination`
+            // (added by `ac13739db` without moving this row). Neither is a
+            // production host-process creation, which is what this inventory
+            // is shrinking toward zero.
+            ("vcpu_loop/signal.rs", [2, 0, 0]),
         ]);
         let patterns = [
             ["unsafe { libc::", "fork()"].concat(),
