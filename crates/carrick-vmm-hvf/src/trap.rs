@@ -30145,17 +30145,15 @@ impl HvfVmState {
             )?
         };
         let inventory_entry = ((physical_ipa, physical_len), inventory_mapping);
-        // Fill the recycled pre-image buffer rather than allocating a fresh
-        // 1.75 MiB one per transaction (see `cow_rollback_scratch`).
-        let mut rollback_scratch = self.cow_rollback_scratch.take();
-        let mut rollback_page_tables = None;
+        // Journal this transaction's descriptor pre-images rather than
+        // cloning the whole 1.75 MiB table region (see `begin_undo`).
         let publication = (|| {
             let page_tables_authority = self.page_tables_authority();
             let mut page_tables = page_tables_authority.lock();
             let manager = page_tables.as_mut().ok_or_else(|| {
                 TrapError::Hypervisor("sparse HVPatch mmap page tables are absent".to_owned())
             })?;
-            rollback_page_tables = Some(Self::rollback_pre_image(&mut rollback_scratch, manager));
+            manager.begin_undo();
             Self::refresh_stage1_exclusivity(manager);
             let aligned_start = align_up(start, TWO_MIB)?.min(end);
             if start < aligned_start {
@@ -30227,19 +30225,21 @@ impl HvfVmState {
             Ok::<(), TrapError>(())
         })();
         if let Err(error) = publication {
-            if let Some(snapshot) = rollback_page_tables {
-                {
-                    let page_tables_authority = self.page_tables_authority();
-                    let mut page_tables = page_tables_authority.lock();
-                    unsafe { snapshot.restore_quiesced_snapshot_to_host(page_table_host) };
-                    *page_tables = Some(snapshot);
+            {
+                let page_tables_authority = self.page_tables_authority();
+                let mut page_tables = page_tables_authority.lock();
+                if let Some(manager) = page_tables.as_mut() {
+                    // SAFETY: the COW quiesce and topology guards remain held,
+                    // so no vCPU can walk or edit this mm while the journalled
+                    // pre-images are replayed into its live backing.
+                    unsafe { manager.rollback_undo(page_table_host) };
                 }
-                if let Err(flush_error) = flush_stage1() {
-                    eprintln!(
-                        "carrick: FATAL: sparse HVPatch mmap rollback TLBI failed: {flush_error}"
-                    );
-                    std::process::abort();
-                }
+            }
+            if let Err(flush_error) = flush_stage1() {
+                eprintln!(
+                    "carrick: FATAL: sparse HVPatch mmap rollback TLBI failed: {flush_error}"
+                );
+                std::process::abort();
             }
             Self::rollback_unpublished_mappings(
                 &mut self.frame_inventory.lock(),
@@ -30247,9 +30247,14 @@ impl HvfVmState {
             )?;
             return Err(error);
         }
-        // Publication succeeded: nothing needs the pre-image any more, so hand
-        // its buffer back to the recycler for the next transaction.
-        self.cow_rollback_scratch = rollback_page_tables.take().or(rollback_scratch);
+        // Publication succeeded: the journalled pre-images are no longer needed.
+        {
+            let page_tables_authority = self.page_tables_authority();
+            let mut page_tables = page_tables_authority.lock();
+            if let Some(manager) = page_tables.as_mut() {
+                manager.commit_undo();
+            }
+        }
         if let Err(error) = flush_stage1() {
             eprintln!("carrick: FATAL: sparse HVPatch mmap TLBI failed: {error}");
             std::process::abort();
@@ -30614,17 +30619,15 @@ impl HvfVmState {
             inventory_mapping,
         );
 
-        // Fill the recycled pre-image buffer rather than allocating a fresh
-        // 1.75 MiB one per transaction (see `cow_rollback_scratch`).
-        let mut rollback_scratch = self.cow_rollback_scratch.take();
-        let mut rollback_page_tables = None;
+        // Journal this transaction's descriptor pre-images rather than
+        // cloning the whole 1.75 MiB table region (see `begin_undo`).
         let publication = (|| {
             let page_tables_authority = self.page_tables_authority();
             let mut page_tables = page_tables_authority.lock();
             let manager = page_tables.as_mut().ok_or_else(|| {
                 TrapError::Hypervisor("HVPatch retained reuse page tables are absent".to_owned())
             })?;
-            rollback_page_tables = Some(Self::rollback_pre_image(&mut rollback_scratch, manager));
+            manager.begin_undo();
             Self::refresh_stage1_exclusivity(manager);
             manager
                 .repoint_preserving_attributes(page_va, new_ipa, span_len as u64)
@@ -30674,17 +30677,17 @@ impl HvfVmState {
             Ok::<(), TrapError>(())
         })();
         if let Err(error) = publication {
-            if let Some(snapshot) = rollback_page_tables {
-                {
-                    let page_tables_authority = self.page_tables_authority();
-                    let mut page_tables = page_tables_authority.lock();
-                    unsafe { snapshot.restore_quiesced_snapshot_to_host(page_table_host) };
-                    *page_tables = Some(snapshot);
+            {
+                let page_tables_authority = self.page_tables_authority();
+                let mut page_tables = page_tables_authority.lock();
+                if let Some(manager) = page_tables.as_mut() {
+                    // SAFETY: the COW quiesce and topology guards remain held.
+                    unsafe { manager.rollback_undo(page_table_host) };
                 }
-                if let Err(flush_error) = flush_stage1() {
-                    eprintln!("carrick: FATAL: retained reuse rollback TLBI failed: {flush_error}");
-                    std::process::abort();
-                }
+            }
+            if let Err(flush_error) = flush_stage1() {
+                eprintln!("carrick: FATAL: retained reuse rollback TLBI failed: {flush_error}");
+                std::process::abort();
             }
             Self::rollback_unpublished_mappings(
                 &mut self.frame_inventory.lock(),
@@ -30692,9 +30695,14 @@ impl HvfVmState {
             )?;
             return Err(error);
         }
-        // Publication succeeded: nothing needs the pre-image any more, so hand
-        // its buffer back to the recycler for the next transaction.
-        self.cow_rollback_scratch = rollback_page_tables.take().or(rollback_scratch);
+        // Publication succeeded: the journalled pre-images are no longer needed.
+        {
+            let page_tables_authority = self.page_tables_authority();
+            let mut page_tables = page_tables_authority.lock();
+            if let Some(manager) = page_tables.as_mut() {
+                manager.commit_undo();
+            }
+        }
         if let Err(error) = flush_stage1() {
             eprintln!("carrick: FATAL: retained reuse stage-1 TLBI failed: {error}");
             std::process::abort();
@@ -31217,10 +31225,8 @@ impl HvfTaskState {
             crate::probes::hvpatch_frame_cow(event);
         };
         emit_cow(carrick_observability::probes::HvpatchFrameCowPhase::Stage2Mapped);
-        // Fill the recycled pre-image buffer rather than allocating a fresh
-        // 1.75 MiB one per transaction (see `cow_rollback_scratch`).
-        let mut rollback_scratch = self.cow_rollback_scratch.take();
-        let mut rollback_page_tables = None;
+        // Journal this transaction's descriptor pre-images rather than
+        // cloning the whole 1.75 MiB table region (see `begin_undo`).
         let mut preserved_protection_receipt = None;
         let page_table_result = (|| {
             const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000;
@@ -31235,13 +31241,26 @@ impl HvfTaskState {
                 TrapError::Hypervisor("HVPatch COW page-table manager is absent".to_owned())
             })?;
             // The transaction can fail after one or more descriptors were
-            // written to both the manager shadow and live backing.  Preserve a
-            // complete pre-edit image: a cloned manager's dirty list alone is
-            // not a rollback log, because `sync_to_host` drains the NEW edits.
-            rollback_page_tables = Some(HvfVmState::rollback_pre_image(
-                &mut rollback_scratch,
-                manager,
-            ));
+            // written to both the manager shadow and live backing, so it needs
+            // a rollback log; the manager's `dirty` list is not one, because
+            // `sync_to_host` drains the NEW edits. `begin_undo` journals the
+            // pre-image of every descriptor this transaction writes.
+            manager.begin_undo();
+            // The leaf authentication below needs the AP bits each page held
+            // BEFORE this transaction, which it used to read by walking a full
+            // cloned pre-image. The span is a single 16 KiB compound, so
+            // capturing just those bits is exact and costs a handful of walks
+            // instead of a 1.75 MiB copy.
+            let mut pre_edit_ap: std::collections::BTreeMap<u64, u64> =
+                std::collections::BTreeMap::new();
+            {
+                let span_end = span.va.saturating_add(span.len as u64);
+                let mut probe_va = span.va & !(PAGE_SIZE - 1);
+                while probe_va < span_end {
+                    pre_edit_ap.insert(probe_va, manager.debug_walk(probe_va)[3] & AP_MASK);
+                    probe_va = probe_va.saturating_add(PAGE_SIZE);
+                }
+            }
             HvfVmState::refresh_stage1_exclusivity(manager);
             if span.kernel_only {
                 manager
@@ -31305,14 +31324,11 @@ impl HvfTaskState {
                 } else if page_should_be_writable {
                     AP_USER_RW
                 } else {
-                    rollback_page_tables
-                        .as_ref()
-                        .map(|snapshot| snapshot.debug_walk(page_va)[3] & AP_MASK)
-                        .ok_or_else(|| {
-                            TrapError::Hypervisor(
-                                "HVPatch COW rollback pre-image is absent".to_owned(),
-                            )
-                        })?
+                    pre_edit_ap.get(&page_va).copied().ok_or_else(|| {
+                        TrapError::Hypervisor(format!(
+                            "HVPatch COW pre-edit AP bits are absent for VA 0x{page_va:x}"
+                        ))
+                    })?
                 };
                 let expected_ipa = new_ipa
                     .checked_add(page_va.checked_sub(span.va).ok_or_else(|| {
@@ -31345,22 +31361,21 @@ impl HvfTaskState {
             Ok::<(), TrapError>(())
         })();
         if let Err(error) = page_table_result {
-            if let Some(snapshot) = rollback_page_tables {
-                {
-                    let page_tables_authority = self.page_tables_authority();
-                    let mut page_tables = page_tables_authority.lock();
+            {
+                let page_tables_authority = self.page_tables_authority();
+                let mut page_tables = page_tables_authority.lock();
+                if let Some(manager) = page_tables.as_mut() {
                     // SAFETY: the COW quiesce and topology guards remain held;
-                    // no vCPU can walk or edit this mm while the complete
-                    // pre-transaction image replaces its live backing.
-                    unsafe { snapshot.restore_quiesced_snapshot_to_host(page_table_host) };
-                    *page_tables = Some(snapshot);
+                    // no vCPU can walk or edit this mm while the journalled
+                    // pre-images are replayed into its live backing.
+                    unsafe { manager.rollback_undo(page_table_host) };
                 }
-                if let Err(flush_error) = flush_stage1() {
-                    eprintln!(
-                        "carrick: FATAL: HVPatch COW rollback stage-1 TLBI failed: {flush_error}"
-                    );
-                    std::process::abort();
-                }
+            }
+            if let Err(flush_error) = flush_stage1() {
+                eprintln!(
+                    "carrick: FATAL: HVPatch COW rollback stage-1 TLBI failed: {flush_error}"
+                );
+                std::process::abort();
             }
             let _ = retire_global_frame_host_owner_in(
                 custody,
@@ -31369,9 +31384,14 @@ impl HvfTaskState {
             );
             return Err(error);
         }
-        // Publication succeeded: nothing needs the pre-image any more, so hand
-        // its buffer back to the recycler for the next transaction.
-        self.cow_rollback_scratch = rollback_page_tables.take().or(rollback_scratch);
+        // Publication succeeded: the journalled pre-images are no longer needed.
+        {
+            let page_tables_authority = self.page_tables_authority();
+            let mut page_tables = page_tables_authority.lock();
+            if let Some(manager) = page_tables.as_mut() {
+                manager.commit_undo();
+            }
+        }
         if let Err(error) = flush_stage1() {
             eprintln!("carrick: FATAL: HVPatch COW stage-1 TLBI failed: {error}");
             std::process::abort();
