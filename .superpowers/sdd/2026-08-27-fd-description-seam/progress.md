@@ -613,3 +613,62 @@ to chase for a gate that is green every time rather than most times.
 A separate one-off: an `inventory owner absent` fatal during process
 retirement in `forkstackstorm`, seen once in ten gate runs and not reproducible
 in 3 filtered plus 2 full-shard runs.
+
+## 2026-08-31 (cont.) — closing conformance gaps
+
+Gate green again (`cn-fullgate-11`, exit 0, 818 probe runs, 0 aborts, 0
+failures). Declared gaps: **9 -> 7**, and two of the survivors shrank
+substantially. Only 4 of the 7 are actually executable — `execfromthread`,
+`execthreads` and `vforkexecthread` are `OUT_OF_PROCESS_PROBES`, excluded from
+the cached lane, so they never run.
+
+### Closed
+
+**`eventwaitmatrix`** (13 divergences). All ordering/coverage of argument and
+permission validation:
+- `clock_settime` checked CAP_SYS_TIME LAST. Without the capability — Docker's
+  default profile denies the syscall — Linux answers EPERM for an unknown clock
+  id, a NULL `timespec`, a negative `tv_nsec`, an out-of-range `tv_nsec` and a
+  non-settable clock alike; carrick reported EINVAL/EFAULT for all five.
+- `clock_adjtime` orders its checks DIFFERENTLY and the oracle shows all three
+  steps: unknown id EINVAL, NULL `timex` EFAULT, known-but-non-adjustable clock
+  EOPNOTSUPP. carrick said EINVAL for every one.
+- `timerfd_create` admitted any clock it could READ, so
+  `CLOCK_PROCESS_CPUTIME_ID` returned a working fd.
+- `ppoll` folded its timeout `timespec` into milliseconds without validating it.
+- `futex` gained four validations it never had (misaligned `uaddr`, unknown op
+  ENOSYS, zero BITSET mask, timeout validation). The ENOSYS check must PRECEDE
+  the flag-mask check, and the same gate had to go in `dispatch_threaded_futex`
+  — a guest thread reaches that path, so validating only the `proc.rs` handler
+  left every check unreachable, which is why the first attempt moved nothing.
+
+**`vfs_mount_rw`**. A VFS mount answers `readdir` from its own view and cannot
+know about mounts layered inside it: `DevVfs` owns `/dev` and has no idea
+`/dev/shm` is a separate bind mount, so `shm` resolved and opened but was never
+listed. The rootfs path already injected mount children; synthetic mounts now
+do too, which covers any `-v` bind under a synthetic parent.
+
+### Reduced
+
+**`lifecycleflagmatrix` 9 -> 4.** A session/process-group id IS its leader's
+pid, so it belongs to the domain `getpid` reports; `setsid`, `getpgid` and
+`getsid` returned the raw `TaskId`. This is the
+`docs/identity-and-scope-domains.md` class behaving exactly as that document
+predicts: the numbering domains coincide while only one process is live, so it
+is invisible to a single-process lane and appears the moment a probe forks and
+compares a child's ids against its own pid. Also `setpgid(-1, 0)`: `pgid == 0`
+means "use `pid`", and that substitution precedes the range check, so the call
+asks for group -1 and is EINVAL.
+
+**`memflagmatrix` 9 -> 7.** `mmap` rejected unknown protection bits; `mmap` and
+`mprotect` differ here and the probe asserts both. `mremap` with `old_size == 0`
+rounded the zero up instead of requiring MREMAP_MAYMOVE.
+
+### What is left, and why each is not a quick fix
+
+| probe | remaining | shape |
+|---|---|---|
+| `memflagmatrix` | 7 | MADV_WIPEONFORK/MADV_DONTFORK lifecycle, the madvise hint matrix, `mincore` accuracy (lifecycle + sparse multipage), MREMAP_FIXED relocation, MREMAP_DONTUNMAP — all unimplemented FEATURES, not validation |
+| `lifecycleflagmatrix` | 4 | `process_vm_writev` into a child (2), `ptrace_attach_init_eperm`, `waitid_no_children_echild` |
+| `memfdsealmatrix` | 1 | a write through an existing `MAP_SHARED` memfd mapping is not visible to `pread` on that fd — shared-mapping/file coherence |
+| `budget_two_proc` | 1 | `parent_pid=9` (Docker) vs `2` (carrick). An ABSOLUTE pid value that depends on how many processes the runtime happened to start first; matching it would mean burning pids to imitate Docker's count, not fixing a semantic |
