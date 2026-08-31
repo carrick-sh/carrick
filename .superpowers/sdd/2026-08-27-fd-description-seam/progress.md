@@ -176,3 +176,45 @@ the probe-blocking round-2 structural-vvar fix was retained. If wrong, a stale
 coarse mapping with only a partially authenticated replacement overlay remains
 a fail-open fork edge; it is recorded here rather than silently represented as
 closed.
+
+## Final conformance landing
+
+The signed `procladder_mt` reducer exposed a three-lock retirement cycle:
+global-owner custody -> replay inventory -> alias inventory -> global-owner
+custody. The landing fix publishes an exact `RetirementPending` claim before
+backend unmap, drops directory custody across replay/backend work, makes pending
+owners unavailable to live readers and successor publication, and retries only
+from named executor-idle boundaries after task, binding, and topology authority
+has been released. Foreign-MM `Drop` paths now only release pins/registration
+and enqueue work; they never invoke HVF or replay callbacks.
+
+Pending retirement maintenance is carrier-scoped, exact, and bounded. It uses
+deduplicated removable FIFO indexes keyed by `((IPA, length), generation)` and
+detached record id, attempts at most 16 items per class per turn, tail-requeues
+deferred/transient work, removes synchronous completions without tombstones,
+and prevents concurrent maintenance turns from duplicating backend work. The
+executor guarantees an immediate turn after exec cleanup and after terminal
+topology release; invariant failures still settle the active scheduler claim.
+
+The final host receipts are:
+
+- carrier custody: 48/48;
+- foreign-MM: 42/42, with the signed-HVF-only case intentionally ignored in the
+  unsigned host executable;
+- two-crate all-target Clippy with `-D warnings`: pass;
+- formatting and `git diff --check`: pass; and
+- two independent final queue reviews plus the terminal-custody review: CLEAN.
+
+The focused signed reducer passed `procladder_mt` for arm64 musl and glibc in
+2.59 seconds and the entitlement negative control passed. The retained CLI
+contract then found a separate deterministic carrier-exit defect: after exact
+custody had committed raw VM destruction, the final persistent-carrier mapping
+owner attempted a redundant `hv_vm_unmap`, received `HV_NO_DEVICE`, and
+aborted. Persistent carrier mappings now accept only an exact post-commit
+terminal receipt; live-VM unmap failures remain fatal and no generic
+`HV_NO_DEVICE` exception was introduced. The direct signed `true` reducer now
+exits 0, all five CLI exit/stream cases pass, and both scoped cleanups report
+zero residual Carrick processes.
+
+The complete public probe gate and exhaustive ecosystem gate remain the final
+acceptance authority for the exact committed and signed artifact.
