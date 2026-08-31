@@ -3067,8 +3067,11 @@ mod foreign_mm_tests {
         }
 
         let before = hot_path_rows_scanned(HotPathScan::ForkMappings);
-        let index =
-            ForkOverlayOwnerIndex::build(legacy_test_carrier_vm_custody(), &mappings, &inventory);
+        let index = ForkOverlayOwnerIndex::build(
+            legacy_test_carrier_vm_custody(),
+            &mappings,
+            &index_fork_inventory_by_stage2(&inventory),
+        );
         // One query per mapping, exactly as the fork loop issues them.
         for (candidate, mapping) in mappings.iter().enumerate() {
             let translated = thread_mapping_semantic_ipa_at(mapping, mapping.start)
@@ -3140,7 +3143,9 @@ mod foreign_mm_tests {
             extent,
         )]);
 
-        let inherited = inherited_fork_inventory_extents_in(&transport.custody, &desc, &inventory);
+        let inventory_index = index_fork_inventory_by_stage2(&inventory);
+        let inherited =
+            inherited_fork_inventory_extents_indexed(&transport.custody, &desc, &inventory_index);
         assert_eq!(
             inherited.len(),
             1,
@@ -3155,29 +3160,45 @@ mod foreign_mm_tests {
         let mut wrong_epoch = desc.clone();
         wrong_epoch.owner_generation = wrong_epoch.owner_generation.saturating_add(1);
         assert!(
-            inherited_fork_inventory_extents_in(&transport.custody, &wrong_epoch, &inventory)
-                .is_empty(),
+            inherited_fork_inventory_extents_indexed(
+                &transport.custody,
+                &wrong_epoch,
+                &inventory_index,
+            )
+            .is_empty(),
             "a drifted structural epoch must fail closed",
         );
         let mut wrong_host = desc.clone();
         wrong_host.physical_host_addr = wrong_host.physical_host_addr.wrapping_add(0x1000);
         assert!(
-            inherited_fork_inventory_extents_in(&transport.custody, &wrong_host, &inventory)
-                .is_empty(),
+            inherited_fork_inventory_extents_indexed(
+                &transport.custody,
+                &wrong_host,
+                &inventory_index,
+            )
+            .is_empty(),
             "a drifted structural host must fail closed",
         );
         let mut wrong_perms = desc.clone();
         wrong_perms.perms = applevisor::memory::MemPerms::ReadWrite;
         assert!(
-            inherited_fork_inventory_extents_in(&transport.custody, &wrong_perms, &inventory)
-                .is_empty(),
+            inherited_fork_inventory_extents_indexed(
+                &transport.custody,
+                &wrong_perms,
+                &inventory_index,
+            )
+            .is_empty(),
             "drifted structural permissions must fail closed",
         );
         let mut missing_owner = desc.clone();
         missing_owner.structural_owner = None;
         assert!(
-            inherited_fork_inventory_extents_in(&transport.custody, &missing_owner, &inventory)
-                .is_empty(),
+            inherited_fork_inventory_extents_indexed(
+                &transport.custody,
+                &missing_owner,
+                &inventory_index,
+            )
+            .is_empty(),
             "a structural generation without its exact owner Arc must fail closed",
         );
         {
@@ -3187,7 +3208,8 @@ mod foreign_mm_tests {
             ));
         }
         assert!(
-            inherited_fork_inventory_extents_in(&transport.custody, &desc, &inventory).is_empty(),
+            inherited_fork_inventory_extents_indexed(&transport.custody, &desc, &inventory_index)
+                .is_empty(),
             "a structural owner outside its custody generation must fail closed",
         );
         {
@@ -3201,7 +3223,8 @@ mod foreign_mm_tests {
                 .terminalized_by_vm_destroy = true;
         }
         assert!(
-            inherited_fork_inventory_extents_in(&transport.custody, &desc, &inventory).is_empty(),
+            inherited_fork_inventory_extents_indexed(&transport.custody, &desc, &inventory_index)
+                .is_empty(),
             "a terminal structural custody record must fail closed",
         );
         {
@@ -3218,7 +3241,8 @@ mod foreign_mm_tests {
             .owner_retired
             .store(true, std::sync::atomic::Ordering::Release);
         assert!(
-            inherited_fork_inventory_extents_in(&transport.custody, &desc, &inventory).is_empty(),
+            inherited_fork_inventory_extents_indexed(&transport.custody, &desc, &inventory_index)
+                .is_empty(),
             "a retired structural owner must fail closed",
         );
 
@@ -7048,6 +7072,82 @@ mod task_only_carrier_directory_tests {
     ///
     /// The bound below is deliberately generous: it only has to separate
     /// "proportional to this process" from "proportional to the carrier".
+    /// `AliasRegistry::len` reads a maintained total instead of summing every
+    /// bucket, because summing is O(live processes) and it is read on the
+    /// generic mutation path. This is what keeps the total honest — a
+    /// `debug_assert` inside `len` cannot, because it would reintroduce the
+    /// very sum it replaces in the debug builds the conformance lane runs.
+    #[test]
+    fn alias_registry_row_total_tracks_its_buckets() {
+        let mut registry = AliasRegistry::default();
+        let scope_a = AliasOwnershipScope::MmRootSlot {
+            base: 0x1000_0000,
+            size: 0x4000,
+        };
+        let scope_b = AliasOwnershipScope::MmRootSlot {
+            base: 0x2000_0000,
+            size: 0x4000,
+        };
+        let row = |scope, ipa: u64, start: u64| {
+            let mut entry = alias(0x7000_0000, 1);
+            entry.ownership_scope = scope;
+            entry.ipa = ipa;
+            entry.start = start;
+            entry
+        };
+        let check = |registry: &AliasRegistry, stage: &str| {
+            assert_eq!(
+                registry.len(),
+                registry.recomputed_len(),
+                "row total diverged from the buckets after {stage}"
+            );
+        };
+
+        check(&registry, "construction");
+        registry.push(row(scope_a, 0x10_0000, 0x20_0000));
+        registry.push(row(scope_a, 0x11_0000, 0x21_0000));
+        registry.push(row(scope_b, 0x12_0000, 0x22_0000));
+        registry.push(row(AliasOwnershipScope::Global, 0x13_0000, 0x23_0000));
+        check(&registry, "push");
+        assert_eq!(registry.len(), 4);
+
+        // Replacing an existing key must not change the total; a new key must.
+        let _ = registry.upsert_by_key(row(scope_a, 0x10_0000, 0x2f_0000));
+        check(&registry, "upsert replacing an existing key");
+        assert_eq!(registry.len(), 4);
+        let _ = registry.upsert_by_key(row(scope_a, 0x14_0000, 0x24_0000));
+        check(&registry, "upsert of a new key");
+        assert_eq!(registry.len(), 5);
+
+        assert_eq!(
+            registry
+                .retain_in_scope(scope_a, |entry| entry.ipa != 0x11_0000)
+                .len(),
+            1
+        );
+        check(&registry, "retain_in_scope");
+        assert_eq!(registry.remove_scope(scope_b).len(), 1);
+        check(&registry, "remove_scope");
+        assert!(registry.remove_scope(scope_b).is_empty());
+        check(&registry, "remove_scope on an absent scope");
+
+        registry.rebuild_scope_rows(scope_a, |rows| {
+            // Split every row in two, exactly as a partial unmap does.
+            rows.into_iter()
+                .flat_map(|(seq, entry)| [(seq, entry), (seq, entry)])
+                .collect()
+        });
+        check(&registry, "rebuild_scope_rows growing a bucket");
+        registry.rebuild_scope_rows(scope_a, |_| Vec::new());
+        check(&registry, "rebuild_scope_rows emptying a bucket");
+
+        registry.retain(|_| false);
+        check(&registry, "retain removing everything");
+        assert_eq!(registry.len(), 0);
+        registry.clear();
+        check(&registry, "clear");
+    }
+
     #[test]
     fn retiring_one_owner_does_not_scan_foreign_alias_rows() {
         const FOREIGN_OWNERS: usize = 512;
@@ -8947,6 +9047,8 @@ fn alias_registry() -> &'static parking_lot::Mutex<AliasRegistry> {
 struct AliasRegistry {
     by_scope: std::collections::BTreeMap<AliasOwnershipScope, Vec<(u64, AliasBacking)>>,
     next_seq: u64,
+    /// Maintained total of every bucket's length; see [`Self::len`].
+    rows: usize,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -8958,6 +9060,7 @@ impl AliasRegistry {
             .entry(alias.ownership_scope)
             .or_default()
             .push((seq, alias));
+        self.rows = self.rows.saturating_add(1);
     }
 
     #[cfg(test)]
@@ -8976,11 +9079,27 @@ impl AliasRegistry {
 
     fn clear(&mut self) {
         self.by_scope.clear();
+        self.rows = 0;
         // `next_seq` is deliberately NOT reset: sequence numbers are identity
         // for ordering comparisons that may outlive a clear.
     }
 
+    /// Total live rows.
+    ///
+    /// Summing the buckets makes this O(live processes), and it is read on
+    /// every generic mutation; that showed up as `AliasRegistry::len` at 4.2%
+    /// of carrier CPU once the bigger scans were gone.
     fn len(&self) -> usize {
+        self.rows
+    }
+
+    /// Test-only: the total recomputed from the buckets. Production reads the
+    /// maintained `rows`; `alias_registry_row_total_tracks_its_buckets` proves
+    /// the two agree. Deliberately NOT a `debug_assert` inside `len`, which
+    /// would re-sum every bucket in exactly the debug builds the conformance
+    /// lane runs — the same mistake the frame-inventory counter made.
+    #[cfg(test)]
+    fn recomputed_len(&self) -> usize {
         self.by_scope.values().map(Vec::len).sum()
     }
 
@@ -9107,12 +9226,6 @@ impl AliasRegistry {
             .map(|(_, alias)| *alias)
     }
 
-    fn iter_mut(&mut self) -> impl Iterator<Item = &mut AliasBacking> {
-        self.by_scope
-            .values_mut()
-            .flat_map(|rows| rows.iter_mut().map(|(_, alias)| alias))
-    }
-
     #[cfg(test)]
     fn contains(&self, alias: &AliasBacking) -> bool {
         self.scope_rows(alias.ownership_scope)
@@ -9122,7 +9235,9 @@ impl AliasRegistry {
 
     fn retain(&mut self, mut keep: impl FnMut(&AliasBacking) -> bool) {
         for rows in self.by_scope.values_mut() {
+            let before = rows.len();
             rows.retain(|(_, alias)| keep(alias));
+            self.rows = self.rows.saturating_sub(before - rows.len());
         }
         self.by_scope.retain(|_, rows| !rows.is_empty());
     }
@@ -9130,10 +9245,11 @@ impl AliasRegistry {
     /// Remove every row of one scope and return them, oldest first. This is
     /// the process-retirement primitive: O(that scope's rows), not O(carrier).
     fn remove_scope(&mut self, scope: AliasOwnershipScope) -> Vec<AliasBacking> {
-        self.by_scope
-            .remove(&scope)
-            .map(|rows| rows.into_iter().map(|(_, alias)| alias).collect())
-            .unwrap_or_default()
+        let Some(rows) = self.by_scope.remove(&scope) else {
+            return Vec::new();
+        };
+        self.rows = self.rows.saturating_sub(rows.len());
+        rows.into_iter().map(|(_, alias)| alias).collect()
     }
 
     /// Retain within one scope, returning the removed rows oldest first.
@@ -9151,6 +9267,7 @@ impl AliasRegistry {
                 }
                 survives
             });
+            self.rows = self.rows.saturating_sub(removed.len());
             if rows.is_empty() {
                 self.by_scope.remove(&scope);
             }
@@ -9158,14 +9275,26 @@ impl AliasRegistry {
         removed
     }
 
-    /// Mutable access to one scope's rows, sequences included, for callers
-    /// that rebuild a bucket in place (a VA unmap splits rows into fragments
-    /// that must inherit their parent's sequence).
-    fn scope_rows_mut(
+    /// Rebuild one scope's rows, sequences included, keeping the row total
+    /// exact. A VA unmap splits rows into fragments that must inherit their
+    /// parent's sequence, so the caller needs the sequences, not just the
+    /// aliases.
+    fn rebuild_scope_rows(
         &mut self,
         scope: AliasOwnershipScope,
-    ) -> Option<&mut Vec<(u64, AliasBacking)>> {
-        self.by_scope.get_mut(&scope)
+        rebuild: impl FnOnce(Vec<(u64, AliasBacking)>) -> Vec<(u64, AliasBacking)>,
+    ) {
+        let Some(rows) = self.by_scope.get_mut(&scope) else {
+            return;
+        };
+        let before = rows.len();
+        let replacement = rebuild(std::mem::take(rows));
+        self.rows = self
+            .rows
+            .saturating_sub(before)
+            .saturating_add(replacement.len());
+        *rows = replacement;
+        self.drop_empty_scope(scope);
     }
 
     fn drop_empty_scope(&mut self, scope: AliasOwnershipScope) {
@@ -9188,20 +9317,23 @@ impl AliasRegistry {
             .map(|(_, entry)| *entry)
     }
 
-    /// Replace the first row for `alias`'s `(ipa, scope)`, or append it.
+    /// Replace the first row for `alias`'s `(ipa, scope)`, or append it, and
+    /// report the row that was replaced.
     /// Same first-occurrence semantics as [`Self::find_by_key`]; a replaced
     /// row keeps its sequence, so it keeps its place in the global order
     /// exactly as an in-place `Vec` write did.
-    fn upsert_by_key(&mut self, alias: AliasBacking) {
+    fn upsert_by_key(&mut self, alias: AliasBacking) -> Option<AliasBacking> {
         let scope = alias.ownership_scope;
         if let Some(rows) = self.by_scope.get_mut(&scope) {
             note_alias_state_rows_scanned(rows.len());
             if let Some(slot) = rows.iter_mut().find(|(_, entry)| entry.ipa == alias.ipa) {
+                let previous = slot.1;
                 slot.1 = alias;
-                return;
+                return Some(previous);
             }
         }
         self.push(alias);
+        None
     }
 
     /// Every row one process can see, in global insertion order.
@@ -9237,9 +9369,11 @@ impl AliasRegistry {
         let mut snapshot = Self {
             by_scope: std::collections::BTreeMap::new(),
             next_seq: self.next_seq,
+            rows: 0,
         };
         for scope in Self::process_visible_scopes(mm_root_slot, container_root) {
             if let Some(rows) = self.by_scope.get(&scope) {
+                snapshot.rows = snapshot.rows.saturating_add(rows.len());
                 snapshot.by_scope.insert(scope, rows.clone());
             }
         }
@@ -11867,21 +12001,17 @@ fn register_shared_alias(b: AliasBacking) {
         had_other || !had_exact
     };
     if replay_rows_changed {
-        // At most a handful of rows share one physical IPA; this bounded
-        // retain replaces the old full-set walk.
-        replay.retain(|(ipa, _, _, _)| *ipa != b.physical_ipa);
+        // At most a handful of rows share one physical IPA. `BTreeSet::retain`
+        // still walks the WHOLE set to find them, so remove exactly the rows
+        // the range query names.
+        for row in replay_rows_for_ipa(&replay, b.physical_ipa) {
+            replay.remove(&row);
+        }
         replay.insert(key);
     }
-    let mut old_entry = None;
-    if let Some(entry) = registry
-        .iter_mut()
-        .find(|entry| entry.ipa == b.ipa && entry.ownership_scope == b.ownership_scope)
-    {
-        old_entry = Some(*entry);
-        *entry = b;
-    } else {
-        registry.push(b);
-    }
+    // Bucket-scoped: this used to scan every live process's alias rows to find
+    // one `(ipa, scope)`, on a path every shared-alias registration takes.
+    let old_entry = registry.upsert_by_key(b);
     let entry_changed = old_entry != Some(b);
     let mut versions = alias_version_registry().lock();
     let mut replay_ipas: Vec<u64> = Vec::new();
@@ -12204,46 +12334,44 @@ fn unregister_alias_entries(
     // draining and rebuilding the whole carrier-global registry per unmap.
     let scopes = AliasRegistry::process_visible_scopes(mm_root_slot, container_root);
     for scope in scopes {
-        let Some(rows) = registry.scope_rows_mut(scope) else {
-            continue;
-        };
-        note_alias_state_rows_scanned(rows.len());
-        let mut replacement = Vec::with_capacity(rows.len().saturating_add(1));
-        for (seq, entry) in rows.drain(..) {
-            let entry_end = entry.start.saturating_add(entry.size as u64);
-            if entry_end <= va || entry.start >= end {
-                replacement.push((seq, entry));
-                continue;
+        registry.rebuild_scope_rows(scope, |rows| {
+            note_alias_state_rows_scanned(rows.len());
+            let mut replacement = Vec::with_capacity(rows.len().saturating_add(1));
+            for (seq, entry) in rows {
+                let entry_end = entry.start.saturating_add(entry.size as u64);
+                if entry_end <= va || entry.start >= end {
+                    replacement.push((seq, entry));
+                    continue;
+                }
+                candidates.insert((entry.physical_ipa, entry.physical_size as u64));
+                // Fragments inherit the parent's sequence: they occupy its place in
+                // the global order, and `AliasRegistry::ordered` sorts stably.
+                if entry.start < va {
+                    replacement.push((
+                        seq,
+                        AliasBacking {
+                            size: usize::try_from(va - entry.start).unwrap_or_default(),
+                            ..entry
+                        },
+                    ));
+                }
+                if entry_end > end {
+                    let delta = end.saturating_sub(entry.start);
+                    replacement.push((
+                        seq,
+                        AliasBacking {
+                            start: end,
+                            ipa: entry.ipa.saturating_add(delta),
+                            host_addr: entry.host_addr.saturating_add(delta as usize),
+                            size: usize::try_from(entry_end - end).unwrap_or_default(),
+                            shared_key_offset: entry.shared_key_offset.saturating_add(delta),
+                            ..entry
+                        },
+                    ));
+                }
             }
-            candidates.insert((entry.physical_ipa, entry.physical_size as u64));
-            // Fragments inherit the parent's sequence: they occupy its place in
-            // the global order, and `AliasRegistry::ordered` sorts stably.
-            if entry.start < va {
-                replacement.push((
-                    seq,
-                    AliasBacking {
-                        size: usize::try_from(va - entry.start).unwrap_or_default(),
-                        ..entry
-                    },
-                ));
-            }
-            if entry_end > end {
-                let delta = end.saturating_sub(entry.start);
-                replacement.push((
-                    seq,
-                    AliasBacking {
-                        start: end,
-                        ipa: entry.ipa.saturating_add(delta),
-                        host_addr: entry.host_addr.saturating_add(delta as usize),
-                        size: usize::try_from(entry_end - end).unwrap_or_default(),
-                        shared_key_offset: entry.shared_key_offset.saturating_add(delta),
-                        ..entry
-                    },
-                ));
-            }
-        }
-        *rows = replacement;
-        registry.drop_empty_scope(scope);
+            replacement
+        });
     }
     // A candidate extent is reclaimable only when NO row this process can see
     // still names it. Collect the survivors once instead of rescanning the
@@ -23020,11 +23148,45 @@ fn structural_fork_owner_identity_in(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn inherited_fork_inventory_extents_in(
+/// The parent frame inventory grouped by the stage-2 extent an inherited
+/// mapping is matched on.
+///
+/// `inherited_fork_inventory_extents_in` selects rows whose
+/// `(stage2_base, stage2_length)` equals the mapping's physical extent, but it
+/// found them by walking the WHOLE inventory. It is called once per source
+/// mapping — twice, counting the overlay index — so a fork paid O(M * I).
+/// Grouping once per fork turns each of those into a lookup.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+type ForkInventoryByStage2 =
+    std::collections::BTreeMap<(u64, u64), Vec<((u64, u64), InventoryExtent)>>;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn index_fork_inventory_by_stage2(
+    inventory: &std::collections::BTreeMap<(u64, u64), InventoryExtent>,
+) -> ForkInventoryByStage2 {
+    let mut index = ForkInventoryByStage2::new();
+    for (&key, &extent) in inventory {
+        index
+            .entry((extent.stage2_base, extent.stage2_length))
+            .or_default()
+            .push((key, extent));
+    }
+    index
+}
+
+/// [`inherited_fork_inventory_extents_in`] against a pre-grouped inventory.
+/// The owner authentication is unchanged and still per-mapping; only the
+/// search for candidate rows is indexed.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn inherited_fork_inventory_extents_indexed(
     custody: &CarrierVmCustody,
     mapping: &ThreadMappingDesc,
-    inventory: &std::collections::BTreeMap<(u64, u64), InventoryExtent>,
+    index: &ForkInventoryByStage2,
 ) -> Vec<((u64, u64), InventoryExtent)> {
+    let extent_key = (mapping.physical_ipa, mapping.physical_size as u64);
+    let Some(candidates) = index.get(&extent_key) else {
+        return Vec::new();
+    };
     let expected_owner = (mapping.owner_generation != 0).then_some(InventoryStage2OwnerIdentity {
         host_addr: mapping.physical_host_addr as usize,
         generation: mapping.owner_generation,
@@ -23044,16 +23206,14 @@ fn inherited_fork_inventory_extents_in(
     } else {
         structural_fork_owner_identity_in(custody, mapping)
     };
-    inventory
+    candidates
         .iter()
         .filter(|(_, extent)| {
-            (extent.stage2_base, extent.stage2_length)
-                == (mapping.physical_ipa, mapping.physical_size as u64)
-                && (mapping.owner_generation == 0
-                    || (expected_owner == Some(extent.stage2_owner)
-                        && live_owner == Some(extent.stage2_owner)))
+            mapping.owner_generation == 0
+                || (expected_owner == Some(extent.stage2_owner)
+                    && live_owner == Some(extent.stage2_owner))
         })
-        .map(|(&key, &extent)| (key, extent))
+        .copied()
         .collect()
 }
 
@@ -23106,12 +23266,12 @@ impl ForkOverlayOwnerIndex {
     fn build(
         custody: &CarrierVmCustody,
         mappings: &[ThreadMappingDesc],
-        inventory: &std::collections::BTreeMap<(u64, u64), InventoryExtent>,
+        inventory: &ForkInventoryByStage2,
     ) -> Self {
         note_hot_path_rows(HotPathScan::ForkMappings, mappings.len());
         let mut index = Self::default();
         for (position, overlay) in mappings.iter().enumerate() {
-            if inherited_fork_inventory_extents_in(custody, overlay, inventory).is_empty() {
+            if inherited_fork_inventory_extents_indexed(custody, overlay, inventory).is_empty() {
                 continue;
             }
             let delta = overlay.ipa.wrapping_sub(overlay.start);
@@ -23171,7 +23331,11 @@ fn inherited_fork_inventory_extents(
     mapping: &ThreadMappingDesc,
     inventory: &std::collections::BTreeMap<(u64, u64), InventoryExtent>,
 ) -> Vec<((u64, u64), InventoryExtent)> {
-    inherited_fork_inventory_extents_in(legacy_test_carrier_vm_custody(), mapping, inventory)
+    inherited_fork_inventory_extents_indexed(
+        legacy_test_carrier_vm_custody(),
+        mapping,
+        &index_fork_inventory_by_stage2(inventory),
+    )
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -25270,7 +25434,7 @@ impl AliasPublicationReceipt {
             }
             replay.insert(replay_mapping_key(*alias));
             note_alias_state_rows_scanned(registry.len());
-            registry.upsert_by_key(*alias);
+            let _ = registry.upsert_by_key(*alias);
             receipt.versions.push(id);
         }
         Ok(receipt)
@@ -33497,7 +33661,7 @@ impl HvfVmState {
         }
         alias_registry()
             .lock()
-            .newest_matching(|alias| {
+            .newest_matching_for_process(self.mm_root_slot, self.container_root, |alias| {
                 let alias_end = alias.ipa.checked_add(alias.size as u64);
                 semantic_va >= alias.start
                     && semantic_end <= alias.start.saturating_add(alias.size as u64)
@@ -34510,10 +34674,13 @@ impl HvfTaskState {
         });
         // Built once for the whole fork; the per-mapping loop below only
         // queries it. See `ForkOverlayOwnerIndex`.
+        // Grouped once for the whole fork and shared by the overlay index and
+        // the per-mapping inheritance test below.
+        let parent_inventory_by_stage2 = index_fork_inventory_by_stage2(&parent_inventory);
         let overlay_owner_index = ForkOverlayOwnerIndex::build(
             &carrier_foreign_mm_transport.custody,
             &source_mappings,
-            &parent_inventory,
+            &parent_inventory_by_stage2,
         );
         for index in order {
             let mapping = &source_mappings[index];
@@ -34523,10 +34690,10 @@ impl HvfTaskState {
                 ForkMappingDisposition::SharedFrameWritable
                     | ForkMappingDisposition::SharedFrameReadOnly
             ) {
-                let inherited = inherited_fork_inventory_extents_in(
+                let inherited = inherited_fork_inventory_extents_indexed(
                     &carrier_foreign_mm_transport.custody,
                     mapping,
-                    &parent_inventory,
+                    &parent_inventory_by_stage2,
                 );
                 // Fork lineage debug: CARRICK_FORK_DEBUG_VA=<hex guest VA>
                 // prints, for the mapping covering that VA, every inherited
