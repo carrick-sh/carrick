@@ -940,10 +940,6 @@ fn fault_range_intersections(
         .collect()
 }
 
-fn mincore_page_is_mapped(memory: &impl CurrentMmMemory, page: u64) -> bool {
-    memory.host_ptr_for_read(page, 1).is_some() || memory.read_bytes(page, 1).is_ok()
-}
-
 fn ranges_overlap(a_start: u64, a_len: u64, b_start: u64, b_end: u64) -> bool {
     let Some(a_end) = a_start.checked_add(a_len) else {
         return true;
@@ -5576,32 +5572,30 @@ impl SyscallDispatcher {
             if length == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
-            if !mincore_page_is_mapped(memory, address.0) {
-                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-            }
             // Linux returns ENOMEM unless the WHOLE [address, address+length)
-            // range is mapped. Validate the last page first to reject overflow
-            // and bound the residency vec below — without it a guest-controlled
-            // `length` (up to u64::MAX) forces a petabyte `vec![1u8; pages]`
-            // that aborts the carrick process (alloc failure is not a
-            // catchable panic). Then walk each page start so mapped first+last
-            // pages with a hole in the middle still report ENOMEM.
-            let last_page = match address.0.checked_add(length - 1) {
-                Some(end) => page_floor(end, page_size),
-                None => return Ok(DispatchOutcome::errno(LINUX_ENOMEM)),
-            };
-            if !mincore_page_is_mapped(memory, last_page) {
+            // range is mapped. Ask the VMA table, which is carrick's authority
+            // for what is mapped, rather than probing whether a read happens to
+            // succeed: a read can succeed through backing whose VMA is gone --
+            // which is exactly what `MADV_DONTFORK` leaves behind in a child,
+            // where Linux answers ENOMEM -- and probing guest memory to answer
+            // a query is itself a side effect. It also bounds the work by the
+            // VMA count instead of the page count, so a guest-controlled
+            // `length` no longer walks page by page.
+            //
+            // Reject the overflowing range before anything else, and note
+            // that coverage is also what BOUNDS the residency vector below: no
+            // VMA spans a guest-controlled `length` near `u64::MAX`, so such a
+            // call answers ENOMEM here instead of reaching a petabyte
+            // `vec![1u8; pages]` and an uncatchable allocation abort.
+            if address.0.checked_add(length - 1).is_none() {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
-            let mut page = address.0;
-            while page <= last_page {
-                if !mincore_page_is_mapped(memory, page) {
+            {
+                let mem_authority = this.mem();
+                let mem = mem_authority.lock();
+                if !guest_vma_covers_locked(&mem, address.0, length) {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
-                page = match page.checked_add(page_size) {
-                    Some(next) => next,
-                    None => return Ok(DispatchOutcome::errno(LINUX_ENOMEM)),
-                };
             }
             let pages = length.div_ceil(page_size);
             let bytes = this

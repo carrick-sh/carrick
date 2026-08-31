@@ -22357,6 +22357,76 @@ enum ForkMappingDisposition {
     /// fresh per-mm frame before entry rather than depending on recovery from a
     /// current-EL write-permission fault.
     IndependentKernelState,
+    /// `MADV_WIPEONFORK`: the child must see this guest mapping as fresh zero
+    /// pages while the parent keeps its contents, so it cannot share the
+    /// parent's frame even read-only. The child gets its own frame, seeded with
+    /// the parent's bytes and then zeroed across exactly the wiped sub-ranges
+    /// -- the frame can be wider than the semantic window and can carry other
+    /// aliases' bytes, which must survive.
+    IndependentGuestZeroed,
+}
+
+/// What the dispatcher's fork projection says about ONE VMM mapping's span.
+///
+/// `derive_fork_projection` turns the `madvise` fork policies into per-VMA
+/// `ForkLeafDisposition`s and `ProcessForkRequest` carries them all the way
+/// here, but the VMM used to derive every disposition from the mapping's own
+/// properties and never read the plan -- so `MADV_DONTFORK`/`MADV_WIPEONFORK`
+/// changed carrick's metadata while the child still inherited the pages.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ProjectedForkSpan {
+    /// No omitted or zeroed range touches this mapping.
+    Preserve,
+    /// `MADV_DONTFORK` covers the WHOLE span: the child gets no mapping here.
+    Omit,
+    /// `MADV_WIPEONFORK` covers part or all of the span. Byte ranges are
+    /// relative to the mapping's semantic start.
+    Zero { wiped: Vec<(u64, u64)> },
+    /// `MADV_DONTFORK` covers only PART of the span. A hole inside one physical
+    /// mapping is not representable in a single descriptor, and silently
+    /// preserving the range would hand the child memory the guest asked it not
+    /// to inherit, so this fails closed instead.
+    PartialOmit,
+}
+
+/// Intersect one VMM mapping's semantic span with the fork projection.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn projected_fork_span(
+    ranges: &[carrick_hal::ForkProjectionRange],
+    start: u64,
+    end: u64,
+) -> ProjectedForkSpan {
+    if end <= start {
+        return ProjectedForkSpan::Preserve;
+    }
+    let mut omitted: u64 = 0;
+    let mut wiped: Vec<(u64, u64)> = Vec::new();
+    for range in ranges {
+        let range_end = range.va.saturating_add(range.len);
+        let lo = range.va.max(start);
+        let hi = range_end.min(end);
+        if hi <= lo {
+            continue;
+        }
+        match range.disposition {
+            carrick_hal::ForkLeafDisposition::Omit => omitted = omitted.saturating_add(hi - lo),
+            carrick_hal::ForkLeafDisposition::Zero => wiped.push((lo - start, hi - lo)),
+            carrick_hal::ForkLeafDisposition::Preserve => {}
+        }
+    }
+    if omitted > 0 {
+        return if omitted == end - start {
+            ProjectedForkSpan::Omit
+        } else {
+            ProjectedForkSpan::PartialOmit
+        };
+    }
+    if wiped.is_empty() {
+        ProjectedForkSpan::Preserve
+    } else {
+        ProjectedForkSpan::Zero { wiped }
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -22377,6 +22447,37 @@ fn fork_mapping_disposition(
     }
 }
 
+/// Apply the dispatcher's fork projection on top of the mapping's own
+/// disposition.
+///
+/// The projection describes GUEST VMAs, so it may only redirect a mapping that
+/// would otherwise be shared with the child. Carrick's own per-mm state (the
+/// stage-1 tables and the EL1 control frame) keeps its disposition: those
+/// ranges have no semantic VMA and must exist in every child.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn projected_fork_mapping_disposition(
+    mapping: &ThreadMappingDesc,
+    shares_mm: bool,
+    ranges: &[carrick_hal::ForkProjectionRange],
+) -> Result<Option<(ForkMappingDisposition, Vec<(u64, u64)>)>, ProjectedForkSpan> {
+    let base = fork_mapping_disposition(mapping, shares_mm);
+    if !matches!(
+        base,
+        ForkMappingDisposition::SharedFrameWritable | ForkMappingDisposition::SharedFrameReadOnly
+    ) {
+        return Ok(Some((base, Vec::new())));
+    }
+    match projected_fork_span(ranges, mapping.start, mapping.end) {
+        ProjectedForkSpan::Preserve => Ok(Some((base, Vec::new()))),
+        ProjectedForkSpan::Omit => Ok(None),
+        ProjectedForkSpan::Zero { wiped } => Ok(Some((
+            ForkMappingDisposition::IndependentGuestZeroed,
+            wiped,
+        ))),
+        ProjectedForkSpan::PartialOmit => Err(ProjectedForkSpan::PartialOmit),
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn fork_frame_receipt_kind(
     disposition: ForkMappingDisposition,
@@ -22394,7 +22495,10 @@ fn fork_frame_receipt_kind(
         }
         ForkMappingDisposition::SharedFrameReadOnly
         | ForkMappingDisposition::IndependentPageTables
-        | ForkMappingDisposition::IndependentKernelState => None,
+        | ForkMappingDisposition::IndependentKernelState
+        // A wiped mapping shares no frame with the parent, so there is no
+        // fork-frame receipt to publish for it.
+        | ForkMappingDisposition::IndependentGuestZeroed => None,
     }
 }
 
@@ -35040,9 +35144,28 @@ impl HvfTaskState {
             &source_mappings,
             &parent_inventory_by_stage2,
         );
+        let projection_ranges = std::sync::Arc::clone(request.projection_plan());
         for index in order {
             let mapping = &source_mappings[index];
-            let disposition = fork_mapping_disposition(mapping, request.shares_mm());
+            let (disposition, wiped_subranges) = match projected_fork_mapping_disposition(
+                mapping,
+                request.shares_mm(),
+                &projection_ranges,
+            ) {
+                // `MADV_DONTFORK`: the child gets no mapping, no stage-1 leaf
+                // and no inventory row here, which is what makes its `mincore`
+                // answer ENOMEM the way Linux's does.
+                Ok(None) => continue,
+                Ok(Some(resolved)) => resolved,
+                Err(_) => {
+                    return Err(TrapError::Hypervisor(format!(
+                        "hvpatch fork: MADV_DONTFORK covers only part of the physical mapping \
+                         at VA 0x{:x}..0x{:x}; a hole inside one mapping is not representable, \
+                         and inheriting it would hand the child memory the guest excluded",
+                        mapping.start, mapping.end,
+                    )));
+                }
+            };
             if matches!(
                 disposition,
                 ForkMappingDisposition::SharedFrameWritable
@@ -35245,7 +35368,8 @@ impl HvfTaskState {
                         )),
                     )
                 }
-                ForkMappingDisposition::IndependentKernelState => {
+                ForkMappingDisposition::IndependentKernelState
+                | ForkMappingDisposition::IndependentGuestZeroed => {
                     let lease = GlobalFrameStage2Lease::reserve(
                         mapping.physical_size as u64,
                         CowArmedRanges::COMPOUND_SIZE,
@@ -35270,6 +35394,9 @@ impl HvfTaskState {
                 ForkMappingDisposition::IndependentKernelState => {
                     crate::host_mapping::HostMappingKind::PerMmKernelState
                 }
+                ForkMappingDisposition::IndependentGuestZeroed => {
+                    crate::host_mapping::HostMappingKind::PrivateAnon
+                }
                 ForkMappingDisposition::SharedFrameWritable
                 | ForkMappingDisposition::SharedFrameReadOnly => {
                     return Err(TrapError::Hypervisor(
@@ -35286,6 +35413,52 @@ impl HvfTaskState {
                     "allocate HVPatch child per-mm kernel backing: {error}"
                 ))
             })?;
+            if disposition == ForkMappingDisposition::IndependentGuestZeroed {
+                // Seed with the parent's frame, THEN zero the wiped window.
+                // `physical_size` can exceed the semantic span, and the extra
+                // bytes belong to other aliases of the same frame -- copying
+                // first is what keeps them intact while `MADV_WIPEONFORK`
+                // still gives the child zeroes exactly where it asked.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        mapping.physical_host_addr,
+                        host.as_ptr(),
+                        mapping.physical_size,
+                    );
+                }
+                let window = mapping
+                    .ipa
+                    .checked_sub(mapping.physical_ipa)
+                    .ok_or_else(|| {
+                        TrapError::Hypervisor(format!(
+                            "HVPatch wiped alias IPA 0x{:x} precedes physical IPA 0x{:x}",
+                            mapping.ipa, mapping.physical_ipa
+                        ))
+                    })?;
+                for (offset, len) in &wiped_subranges {
+                    let frame_offset = window.checked_add(*offset).and_then(|start| {
+                        usize::try_from(start).ok().filter(|start| {
+                            usize::try_from(*len)
+                                .ok()
+                                .and_then(|len| start.checked_add(len))
+                                .is_some_and(|end| end <= mapping.physical_size)
+                        })
+                    });
+                    let (Some(frame_offset), Ok(len)) = (frame_offset, usize::try_from(*len))
+                    else {
+                        return Err(TrapError::Hypervisor(format!(
+                            "HVPatch MADV_WIPEONFORK range +0x{offset:x}+0x{len:x} escapes the \
+                             frame at VA 0x{:x} (physical size 0x{:x})",
+                            mapping.start, mapping.physical_size
+                        )));
+                    };
+                    // SAFETY: bounds-checked against `physical_size` above, and
+                    // `host` is this child's freshly allocated frame.
+                    unsafe {
+                        std::ptr::write_bytes(host.as_ptr().add(frame_offset), 0, len);
+                    }
+                }
+            }
             if disposition == ForkMappingDisposition::IndependentKernelState {
                 // Preserve the fork boundary's coherent control-state image;
                 // child identity/mailbox rebinding mutates this independent
@@ -43436,6 +43609,117 @@ mod frame_inventory_backend_tests {
             fork_mapping_disposition(&kernel_state, false),
             ForkMappingDisposition::SharedFrameReadOnly,
             "EL1-only per-mm control state must not enter fault-driven guest COW",
+        );
+
+        // The fork projection is what carries `MADV_DONTFORK`/`MADV_WIPEONFORK`
+        // into the child. Before this was consumed the VMM derived every
+        // disposition from the mapping alone, so both advices changed only
+        // carrick's metadata while the child still inherited the pages.
+        let guest = mapping(GuestMappingSharing::Private);
+        let span = |disposition| {
+            [carrick_hal::ForkProjectionRange {
+                va: guest.start,
+                len: guest.end - guest.start,
+                disposition,
+            }]
+        };
+        assert_eq!(
+            projected_fork_mapping_disposition(&guest, false, &[]),
+            Ok(Some((
+                ForkMappingDisposition::SharedFrameReadOnly,
+                Vec::new()
+            ))),
+            "an empty projection must leave the mapping's own disposition alone",
+        );
+        assert_eq!(
+            projected_fork_mapping_disposition(
+                &guest,
+                false,
+                &span(carrick_hal::ForkLeafDisposition::Omit)
+            ),
+            Ok(None),
+            "MADV_DONTFORK must drop the mapping from the child entirely",
+        );
+        assert_eq!(
+            projected_fork_mapping_disposition(
+                &guest,
+                false,
+                &span(carrick_hal::ForkLeafDisposition::Zero)
+            ),
+            Ok(Some((
+                ForkMappingDisposition::IndependentGuestZeroed,
+                vec![(0, guest.end - guest.start)]
+            ))),
+            "MADV_WIPEONFORK must give the child its own frame, not a shared one",
+        );
+
+        // Carrick's own per-mm state has no semantic VMA, so a projection can
+        // never redirect it -- a child without page tables cannot run.
+        let mut tables = mapping(GuestMappingSharing::Private);
+        tables.start = crate::memory::LINUX_PAGE_TABLES_BASE;
+        tables.end = tables.start + size;
+        assert_eq!(
+            projected_fork_mapping_disposition(
+                &tables,
+                false,
+                &[carrick_hal::ForkProjectionRange {
+                    va: tables.start,
+                    len: tables.end - tables.start,
+                    disposition: carrick_hal::ForkLeafDisposition::Omit,
+                }]
+            ),
+            Ok(Some((
+                ForkMappingDisposition::IndependentPageTables,
+                Vec::new()
+            ))),
+        );
+
+        // A partial MADV_DONTFORK cannot be a hole inside one descriptor, and
+        // inheriting it anyway would hand the child excluded memory.
+        assert_eq!(
+            projected_fork_mapping_disposition(
+                &guest,
+                false,
+                &[carrick_hal::ForkProjectionRange {
+                    va: guest.start,
+                    len: (guest.end - guest.start) / 2,
+                    disposition: carrick_hal::ForkLeafDisposition::Omit,
+                }]
+            ),
+            Err(ProjectedForkSpan::PartialOmit),
+        );
+
+        // A partial WIPEONFORK IS representable: the child's own frame is
+        // seeded from the parent and zeroed across exactly the advised bytes.
+        let half = (guest.end - guest.start) / 2;
+        assert_eq!(
+            projected_fork_mapping_disposition(
+                &guest,
+                false,
+                &[carrick_hal::ForkProjectionRange {
+                    va: guest.start + half,
+                    len: half,
+                    disposition: carrick_hal::ForkLeafDisposition::Zero,
+                }]
+            ),
+            Ok(Some((
+                ForkMappingDisposition::IndependentGuestZeroed,
+                vec![(half, half)]
+            ))),
+        );
+
+        // A projection range that does not reach this mapping changes nothing.
+        assert_eq!(
+            projected_fork_span(
+                &[carrick_hal::ForkProjectionRange {
+                    va: guest.end,
+                    len: size,
+                    disposition: carrick_hal::ForkLeafDisposition::Omit,
+                }],
+                guest.start,
+                guest.end,
+            ),
+            ProjectedForkSpan::Preserve,
         );
         let inherited_private = inherited_fork_inventory_extents(
             &mapping(GuestMappingSharing::Private),
