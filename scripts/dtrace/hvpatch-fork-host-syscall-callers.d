@@ -19,6 +19,10 @@
  *   `atos` resolution cannot silently use a different build;
  * - the predicate follows Carrick descendants because a raw HVPatch run may
  *   place the VM carrier in a child of the launched process.
+ * - `syscall::__pthread_sigmask:entry` is the exact Darwin provider name for
+ *   pthread_sigmask traffic on this host (macOS 27.0, 2026-08-30); the
+ *   amplification census observed it as the dominant host syscall before it
+ *   was added to this caller attribution.
  *
  * Perturbation: VERY HIGH — a 32-frame user stack on every matched host
  * syscall. Only caller SHARES and RANKS are citable; elapsed time under this
@@ -61,7 +65,8 @@ syscall::read:entry,
 syscall::write:entry,
 syscall::close:entry,
 syscall::thread_selfusage:entry,
-syscall::sigaltstack:entry
+syscall::sigaltstack:entry,
+syscall::__pthread_sigmask:entry
 /pid == $target || progenyof($target)/
 {
 	stacks++;
