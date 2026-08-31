@@ -536,10 +536,10 @@
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "function": "SyscallDispatcher::mremap",
       "ordinal_in_function": 6,
-      "fingerprint": "be89e576cee83386c37cc2efa1c788ff936603d151637cce4ebddfd988187cd1",
+      "fingerprint": "2b24135799d7c59b63cba8b3756a4f95eb43adb6fe4ee98819f0e52eeaf09efb",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mremap",
-      "rationale": "Unmapping old source address range failed after destination was already published in mremap; leaves duplicate active owners."
+      "rationale": "Unmapping old source address range failed after destination was already published in mremap; leaves duplicate active owners. Re-reviewed 2026-08-31: the abort is unchanged and still correct, but it now PRINTS the published destination, the source it could not reclaim and both unmap errors before aborting. It used to print nothing at all, so the one time it fired -- a misaligned old_address, which the handler now rejects with EINVAL up front as man 2 mremap requires -- locating it needed a 7.5 GiB core dump."
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",

@@ -289,37 +289,37 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
       "function": "run_executor_loop",
       "ordinal_in_function": 1,
-      "fingerprint": "8d94d5a7008a6e339dded08d49a175e41070b07002f0c44b80e8f50672c90632",
+      "fingerprint": "12e37c006178b1198c353776b4c80ba84c15cc8963eea8d6e46482fd6304c83b",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::executor_exec_transfer",
-      "rationale": "Backend task retarget failed during exec transfer; allowing old binding to receive state would split MM/ASID identity."
+      "rationale": "Backend task retarget failed during exec transfer; allowing old binding to receive state would split MM/ASID identity. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited by the hot-path work (process retirement, fork overlay indexing, alias registry partitioning), which is what moved the fingerprint."
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
       "function": "run_executor_loop",
       "ordinal_in_function": 2,
-      "fingerprint": "8d94d5a7008a6e339dded08d49a175e41070b07002f0c44b80e8f50672c90632",
+      "fingerprint": "12e37c006178b1198c353776b4c80ba84c15cc8963eea8d6e46482fd6304c83b",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::executor_exec_transfer",
-      "rationale": "Worker-owned exec retarget failed after kernel published successor image; returning would orphan active successor."
+      "rationale": "Worker-owned exec retarget failed after kernel published successor image; returning would orphan active successor. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited by the hot-path work (process retirement, fork overlay indexing, alias registry partitioning), which is what moved the fingerprint."
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
       "function": "run_executor_loop",
       "ordinal_in_function": 3,
-      "fingerprint": "8d94d5a7008a6e339dded08d49a175e41070b07002f0c44b80e8f50672c90632",
+      "fingerprint": "12e37c006178b1198c353776b4c80ba84c15cc8963eea8d6e46482fd6304c83b",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::mm_retirement",
-      "rationale": "Conflicting address space retirement state encountered during exec cleanup; MM lifecycle state is inconsistent."
+      "rationale": "Conflicting address space retirement state encountered during exec cleanup; MM lifecycle state is inconsistent. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited by the hot-path work (process retirement, fork overlay indexing, alias registry partitioning), which is what moved the fingerprint."
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
       "function": "run_executor_loop",
       "ordinal_in_function": 4,
-      "fingerprint": "8d94d5a7008a6e339dded08d49a175e41070b07002f0c44b80e8f50672c90632",
+      "fingerprint": "12e37c006178b1198c353776b4c80ba84c15cc8963eea8d6e46482fd6304c83b",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::executor_boundary",
-      "rationale": "Kick handle remains bound after settlement transaction; kick target is inconsistent with successor state."
+      "rationale": "Kick handle remains bound after settlement transaction; kick target is inconsistent with successor state. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited by the hot-path work (process retirement, fork overlay indexing, alias registry partitioning), which is what moved the fingerprint."
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",

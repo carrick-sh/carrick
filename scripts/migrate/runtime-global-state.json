@@ -1943,9 +1943,9 @@
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "alias_registry::CELL",
-      "fingerprint": "1c1320dc2a97d075a20a511b88434fcb06ea0274c4b166e95a3d9dccba16a4c1",
+      "fingerprint": "0b112ae2d9ce6f7660c20ba9713904fa09b484fc664ee681d5dad7d7d0a7f616",
       "classification": "carrier_infra",
-      "rationale": "Carrier-wide host infrastructure static alias_registry::CELL in crates/carrick-vmm-hvf/src/trap.rs maintaining host process lifecycle or VM resources."
+      "rationale": "Carrier-wide host infrastructure static alias_registry::CELL in crates/carrick-vmm-hvf/src/trap.rs maintaining host process lifecycle or VM resources. Re-reviewed 2026-08-31: the container changed from a flat Vec<AliasBacking> to AliasRegistry, which partitions the same rows by AliasOwnershipScope and indexes them by guest-VA and IPA window. Scope is unchanged -- still carrier-wide, still one row per live alias -- but the partitioning is what makes a per-process operation cost O(that process) instead of O(every live process), which is why guest process exit was O(N^2)."
     },
     {
       "kind": "static",
@@ -2322,6 +2322,22 @@
       "fingerprint": "d7a80eaeabb4a73206d52e64bec9c974ce8f2453dc622c3656d77b3e1d002232",
       "classification": "carrier_infra",
       "rationale": "Host thread-local cell THREAD_MAILBOX_SLOT_CLAIMS_TOTAL in crates/carrick-vmm-hvf/src/syscall_mailbox.rs maintaining per-host-thread execution state for the carrier."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "ALIAS_STATE_ROWS_SCANNED",
+      "fingerprint": "41bb64410f90ebaee726eb9a9e71e5bb46f2ec92855206b9c49efa1e3de63d3d",
+      "classification": "carrier_infra",
+      "rationale": "Host thread-local counter of rows visited by linear passes over the carrier-global alias/replay/version state, so an algorithmic-complexity regression is a TEST failure rather than a timing observation (retiring_one_owner_does_not_scan_foreign_alias_rows). Deliberately PER HOST THREAD and not process-global: a process-global counter is polluted by every other guest thread and by concurrently running tests, which made the same work report 1,539 rows under cargo test's default parallelism and 513 in isolation. It describes the measuring thread's own work and carries no Linux process semantics."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "FORK_MAPPING_ROWS_SCANNED",
+      "fingerprint": "b0ba0e3973249673260a1e2c0fdff13885cd881a80a7b76ddc1f11f243c2d2af",
+      "classification": "carrier_infra",
+      "rationale": "Host thread-local counter of source-mapping rows visited while answering the fork overlay-owner question, backing fork_overlay_owner_lookup_does_not_rescan_every_source_mapping. Same per-host-thread scope and rationale as ALIAS_STATE_ROWS_SCANNED: it measures the forking thread's own work and carries no Linux process semantics."
     },
     {
       "kind": "thread_local",
