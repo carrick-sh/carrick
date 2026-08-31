@@ -3004,6 +3004,94 @@ mod foreign_mm_tests {
         .expect("retire initial fixed mapping fixture");
     }
 
+    /// A fork must not re-derive every source mapping's inherited-extent
+    /// status once per (candidate, overlay) PAIR.
+    ///
+    /// Asserted on visited rows, not wall time, so it is deterministic under
+    /// load. The shape it pins was measured on 2026-08-30: with the overlay
+    /// question answered by a full rescan,
+    /// `fork_source_translation_has_overlay_owner` plus the O(1)
+    /// `thread_mapping_semantic_ipa_at` it calls were ~22% of all carrier CPU
+    /// under a fork/exit storm, because each of the M scans also recomputed a
+    /// mapping's inherited inventory extents — a fresh allocation and a full
+    /// inventory pass — giving O(M^2 * I) per fork.
+    #[test]
+    fn fork_overlay_owner_lookup_does_not_rescan_every_source_mapping() {
+        const MAPPINGS: usize = 512;
+        // `owner_generation == 0` short-circuits the live-owner authentication
+        // in `inherited_fork_inventory_extents_in`, so this fixture exercises
+        // the SCAN shape without needing real stage-2 custody.
+        let mut mappings = Vec::with_capacity(MAPPINGS);
+        let mut inventory = std::collections::BTreeMap::new();
+        for index in 0..MAPPINGS {
+            let start = 0x1_0000_0000 + (index as u64) * 0x1_0000;
+            let physical_ipa = 0x8_0000_0000 + (index as u64) * 0x1_0000;
+            let mut desc = ThreadMappingDesc {
+                start,
+                ipa: 0x4_0000_0000 + (index as u64) * 0x1_0000,
+                end: start + 0x4000,
+                host_addr: std::ptr::null_mut(),
+                size: 0x4000,
+                physical_ipa,
+                physical_host_addr: std::ptr::null_mut(),
+                physical_size: 0x4000,
+                perms: applevisor::memory::MemPerms::RW,
+                is_dynamic_alias: false,
+                sharing: GuestMappingSharing::Private,
+                guest_writable: true,
+                shared_key_base: 0,
+                shared_key_offset: 0,
+                owner_generation: 0,
+                structural_owner: None,
+            };
+            desc.end = desc.start + desc.size as u64;
+            inventory.insert(
+                (physical_ipa, desc.physical_size as u64),
+                InventoryExtent {
+                    frame: carrick_hal::FrameId::from_kernel_allocation(
+                        NonZeroU64::new(1 + index as u64).unwrap(),
+                    ),
+                    mapping: carrick_hal::MappingId::from_kernel_allocation(
+                        NonZeroU64::new(1 + index as u64).unwrap(),
+                    ),
+                    backing: InventoryBackingIdentity::Private(1 + index as u64),
+                    stage2_base: physical_ipa,
+                    stage2_length: desc.physical_size as u64,
+                    stage2_owner: InventoryStage2OwnerIdentity {
+                        host_addr: 0,
+                        generation: 0,
+                    },
+                },
+            );
+            mappings.push(desc);
+        }
+
+        let before = hot_path_rows_scanned(HotPathScan::ForkMappings);
+        let index =
+            ForkOverlayOwnerIndex::build(legacy_test_carrier_vm_custody(), &mappings, &inventory);
+        // One query per mapping, exactly as the fork loop issues them.
+        for (candidate, mapping) in mappings.iter().enumerate() {
+            let translated = thread_mapping_semantic_ipa_at(mapping, mapping.start)
+                .expect("fixture mapping translates its own base");
+            assert!(
+                !index.has_overlay_owner(&mappings, candidate, mapping.start, translated),
+                "each fixture mapping is its own only owner, so no OTHER mapping \
+                 may claim its translation"
+            );
+        }
+        let scanned = hot_path_rows_scanned(HotPathScan::ForkMappings) - before;
+
+        let rows = MAPPINGS as u64;
+        assert!(
+            scanned <= 4 * rows,
+            "a fork over {rows} source mappings visited {scanned} mapping rows; \
+             the overlay-owner question must be indexed once per fork, not \
+             re-asked against every mapping per candidate (the rescan shape \
+             visits {} rows)",
+            rows * rows
+        );
+    }
+
     #[test]
     fn structural_vvar_fork_inheritance_requires_exact_live_custody() {
         let _guard = FOREIGN_MM_TEST_LOCK.lock();
@@ -22633,20 +22721,104 @@ fn thread_mapping_semantic_ipa_at(mapping: &ThreadMappingDesc, address: u64) -> 
     mapping.ipa.checked_add(offset)
 }
 
+/// Fork-source mappings that own inherited inventory extents, indexed by the
+/// translation they produce.
+///
+/// A mapping satisfies `thread_mapping_semantic_ipa_at(overlay, va) ==
+/// Some(translated)` only if `overlay.ipa - overlay.start == translated - va`
+/// and `va` lies inside it. The first half is independent of `va`, so it is an
+/// index key; the second half stays an exact per-candidate check, so the
+/// predicate is unchanged.
+///
+/// This exists because the previous shape asked the question by scanning EVERY
+/// source mapping and, for each one, recomputing its inherited inventory
+/// extents — a fresh `Vec` allocation and a full pass over the parent frame
+/// inventory. Inside the per-mapping fork loop that is O(M^2 * I) for a
+/// process with M mappings and an I-row inventory: measured 2026-08-30 at
+/// 13.3% of carrier CPU in this function plus 8.6% in the O(1)
+/// `thread_mapping_semantic_ipa_at` it calls, i.e. ~22% of a fork/exit storm
+/// spent re-deriving facts that do not depend on the candidate at all. Fork is
+/// the most horizontal path there is, so this cost compounds into every
+/// workload that forks.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn fork_source_translation_has_overlay_owner(
-    custody: &CarrierVmCustody,
-    mappings: &[ThreadMappingDesc],
-    candidate_index: usize,
-    va: u64,
-    translated: u64,
-    inventory: &std::collections::BTreeMap<(u64, u64), InventoryExtent>,
-) -> bool {
-    mappings.iter().enumerate().any(|(index, overlay)| {
-        index != candidate_index
-            && thread_mapping_semantic_ipa_at(overlay, va) == Some(translated)
-            && !inherited_fork_inventory_extents_in(custody, overlay, inventory).is_empty()
-    })
+#[derive(Debug, Default)]
+struct ForkOverlayOwnerIndex {
+    /// `(translation delta, mapping start) -> source mapping indexes`, for the
+    /// mappings that own inherited inventory extents. The value is a list
+    /// because two source mappings may legitimately share a start and a delta
+    /// while differing in size; collapsing them to one index would let the
+    /// surviving row be the candidate itself and silently answer "no owner".
+    by_delta_and_start: std::collections::BTreeMap<(u64, u64), Vec<usize>>,
+    /// Largest mapping size present per delta, so a query walks back only as
+    /// far as a mapping could possibly reach.
+    widest_by_delta: std::collections::BTreeMap<u64, u64>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ForkOverlayOwnerIndex {
+    /// Build once per fork. Each mapping's inherited-extent status is computed
+    /// exactly ONCE here rather than once per (candidate, overlay) pair.
+    fn build(
+        custody: &CarrierVmCustody,
+        mappings: &[ThreadMappingDesc],
+        inventory: &std::collections::BTreeMap<(u64, u64), InventoryExtent>,
+    ) -> Self {
+        note_hot_path_rows(HotPathScan::ForkMappings, mappings.len());
+        let mut index = Self::default();
+        for (position, overlay) in mappings.iter().enumerate() {
+            if inherited_fork_inventory_extents_in(custody, overlay, inventory).is_empty() {
+                continue;
+            }
+            let delta = overlay.ipa.wrapping_sub(overlay.start);
+            index
+                .by_delta_and_start
+                .entry((delta, overlay.start))
+                .or_default()
+                .push(position);
+            let widest = index.widest_by_delta.entry(delta).or_insert(0);
+            *widest = (*widest).max(overlay.size as u64);
+        }
+        index
+    }
+
+    /// True when some OTHER source mapping that owns inherited inventory
+    /// extents also translates `va` to `translated`.
+    fn has_overlay_owner(
+        &self,
+        mappings: &[ThreadMappingDesc],
+        candidate_index: usize,
+        va: u64,
+        translated: u64,
+    ) -> bool {
+        let delta = translated.wrapping_sub(va);
+        let Some(&widest) = self.widest_by_delta.get(&delta) else {
+            return false;
+        };
+        // Only a mapping starting in `[va - widest, va]` can contain `va`, so
+        // this is a bounded range walk rather than a pass over the bucket. The
+        // delta alone is NOT selective enough: a process whose mappings sit at
+        // a constant ipa-to-va offset puts every one of them in one bucket,
+        // which is the common case and would restore the linear scan.
+        let lower = va.saturating_sub(widest);
+        let mut visited = 0usize;
+        let mut found = false;
+        'search: for (&(_, start), positions) in
+            self.by_delta_and_start.range((delta, lower)..=(delta, va))
+        {
+            debug_assert!(start <= va);
+            for &position in positions {
+                visited += 1;
+                if position != candidate_index
+                    && thread_mapping_semantic_ipa_at(&mappings[position], va) == Some(translated)
+                {
+                    found = true;
+                    break 'search;
+                }
+            }
+        }
+        note_hot_path_rows(HotPathScan::ForkMappings, visited);
+        found
+    }
 }
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
@@ -24141,9 +24313,22 @@ fn alias_version_registry() -> &'static parking_lot::Mutex<AliasVersionRegistry>
     CELL.get_or_init(|| parking_lot::Mutex::new(AliasVersionRegistry::default()))
 }
 
+/// Hot paths whose cost must be a function of the operation, not of the
+/// carrier. Each variant owns one per-thread visited-row counter.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HotPathScan {
+    /// Linear passes over the carrier-global alias registry, replay set and
+    /// alias version chains.
+    AliasState,
+    /// Passes over one forking process's source mappings.
+    ForkMappings,
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 thread_local! {
     static ALIAS_STATE_ROWS_SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static FORK_MAPPING_ROWS_SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Account one linear pass over the CARRIER-GLOBAL alias / replay / version
@@ -24173,7 +24358,27 @@ thread_local! {
 /// work. Per-thread also attributes the cost to the executor that paid it.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn note_alias_state_rows_scanned(rows: usize) {
-    ALIAS_STATE_ROWS_SCANNED.with(|counter| counter.set(counter.get().saturating_add(rows as u64)));
+    note_hot_path_rows(HotPathScan::AliasState, rows);
+}
+
+/// Account one pass over a hot-path container. See [`HotPathScan`].
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn note_hot_path_rows(scan: HotPathScan, rows: usize) {
+    let counter = match scan {
+        HotPathScan::AliasState => &ALIAS_STATE_ROWS_SCANNED,
+        HotPathScan::ForkMappings => &FORK_MAPPING_ROWS_SCANNED,
+    };
+    counter.with(|cell| cell.set(cell.get().saturating_add(rows as u64)));
+}
+
+/// Visited rows for one hot path on the CALLING thread. Monotonic; callers
+/// compare two reads around the operation under test.
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn hot_path_rows_scanned(scan: HotPathScan) -> u64 {
+    match scan {
+        HotPathScan::AliasState => ALIAS_STATE_ROWS_SCANNED.with(std::cell::Cell::get),
+        HotPathScan::ForkMappings => FORK_MAPPING_ROWS_SCANNED.with(std::cell::Cell::get),
+    }
 }
 
 /// Total rows visited by linear passes over the carrier-global alias state.
@@ -24184,7 +24389,7 @@ fn note_alias_state_rows_scanned(rows: usize) {
 /// value has no production consumer yet.
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn alias_state_rows_scanned() -> u64 {
-    ALIAS_STATE_ROWS_SCANNED.with(std::cell::Cell::get)
+    hot_path_rows_scanned(HotPathScan::AliasState)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -33818,6 +34023,13 @@ impl HvfTaskState {
         order.sort_by_key(|&index| {
             u8::from(source_mappings[index].start != crate::memory::LINUX_PAGE_TABLES_BASE)
         });
+        // Built once for the whole fork; the per-mapping loop below only
+        // queries it. See `ForkOverlayOwnerIndex`.
+        let overlay_owner_index = ForkOverlayOwnerIndex::build(
+            &carrier_foreign_mm_transport.custody,
+            &source_mappings,
+            &parent_inventory,
+        );
         for index in order {
             let mapping = &source_mappings[index];
             let disposition = fork_mapping_disposition(mapping, request.shares_mm());
@@ -33921,13 +34133,11 @@ impl HvfTaskState {
                     let candidate_translation =
                         thread_mapping_semantic_ipa_at(mapping, mapping.start);
                     let authenticated_overlay = live_translation.is_some_and(|translated| {
-                        fork_source_translation_has_overlay_owner(
-                            &carrier_foreign_mm_transport.custody,
+                        overlay_owner_index.has_overlay_owner(
                             &source_mappings,
                             index,
                             mapping.start,
                             translated,
-                            &parent_inventory,
                         )
                     });
                     if fork_mapping_requires_base_translation(
