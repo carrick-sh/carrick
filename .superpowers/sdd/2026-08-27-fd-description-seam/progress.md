@@ -347,3 +347,103 @@ not reached exit zero, the exhaustive ecosystem suite has not started, and the
 current release binary has been re-signed during diagnostics so its earlier
 identity receipt is no longer the final artifact receipt. The executable bits
 on `scripts/test-signed.sh` and `scripts/build-signed.sh` remain `0755`.
+
+## 2026-08-30 resume — `futexforkrequeue` root-caused as an O(N²) exit path
+
+Resumed in worktree `.worktrees/conformance-next-landing`
+(`fix/conformance-next-lifecycle`, branched from `edaa79455`). The previous
+session's proposed landing was to make the signed conformance test profile
+optimized so the probe stops failing. Measurement says that would have hidden a
+real product defect: the failure is not a constant-factor slowdown, it is
+quadratic work on the guest process-exit path.
+
+### Deterministic reproduction
+
+`CARRICK_PROBE_FILTER=futexforkrequeue scripts/test-signed.sh
+carrick-conformance-next generic_probe_shard_2` fails on arm64 musl in ~96 s
+with exactly `children_exited_all=false` and `children_exit_count_ok=false`;
+every futex, requeue, wake and return assertion matches the Docker oracle. All
+1,000 children reach `_exit(0)`; the parent cannot reap them all inside the
+probe's 40 s bound.
+
+### Attribution
+
+The conformance-next lane is NOT USDT-dark. The `__dof_carrick` section is
+registered by dyld, so the VM CARRIER — a grandchild carrying the
+`carrick:<run-id>:` proctitle, not the `test-signed.sh` process — exposes 150
+probes including `hvpatch-topology-lock`. `register_dtrace_probes()` is a CLI
+call and is not required for USDT visibility.
+
+`scripts/dtrace/hvpatch-phase4-topology-lock.d` attached to that carrier
+(`-p <carrier-pid>`), one failing run:
+
+- carrier-global topology mutex held **70.3 s of an ~85 s run (~83%)**;
+- `ProcessRetire`: 2,004 acquisitions, **44.47 s held**, mean 22.2 ms, max 88 ms;
+- `ProcessRetire`: **271,629 try-misses** against 2,004 successes (135:1) — the
+  50 µs→5 ms backoff spin in
+  `acquire_process_retire_topology_lock_servicing`;
+- `InProcessFork` 18.27 s / 901 holds; `FrameCow` waits total 19.4 s, max
+  212 ms — fork and COW are starved behind the retire convoy.
+
+New durable instrument
+`scripts/dtrace/hvpatch-process-retire-critical-section.d` brackets the
+ProcessRetire hold window and splits it on-CPU / off-CPU / host-syscall:
+
+- 2,004 holds, 45.41 s held, **89,434 on-CPU samples at 1997 Hz = 44.8 s
+  on-CPU (98.6%)**, only 0.32 s off-CPU. The section is compute-bound, which is
+  exactly why an unoptimized build fails it and a release build does not.
+- Instrument trap, now recorded in the script header: keying the hold window on
+  `self->` reported **zero** on-CPU samples. `self->` resolves against the
+  wrong thread in the macOS `profile` provider; keying on `tid` explicitly
+  gives the true 89,434. The first reading was a broken instrument, not a
+  blocked holder — control counters (`profile_ticks`, `target_ticks`) are now
+  printed unconditionally so that cannot recur silently.
+
+### The defect is quadratic, not slow
+
+Per-hold duration against wall time across the run's 2,004 holds:
+
+| decile | mean hold | max hold |
+|---|---|---|
+| 0 (≈1000 children live) | 38.70 ms | 87.95 ms |
+| 5 | 19.97 ms | 45.39 ms |
+| 9 (few children live) | 5.34 ms | 14.45 ms |
+
+Monotonic and ~7×: retirement cost is **linear in the number of live guest
+processes**, so total exit cost is O(N²), fully serialized on one carrier-wide
+mutex.
+
+Ranked by innermost Carrick frame inside the critical section (top-15 stack
+population, 8,854 samples):
+
+- **89.8 % `carrick_vmm_hvf::trap::mutate_external_alias_state`** — clones the
+  entire replay set and alias registry per mutation, then rebuilds
+  `before_by_key`/`after_by_key`/`alias_keys` over the whole registry and
+  regroups both replay sides by IPA, to discover keys the caller already knows;
+- **10.2 % `AliasPublicationReceipt::retire_exact`** — per retired version id,
+  linear `position`/`find` over `versions.aliases`, `versions.replays`,
+  `alias_epochs`, `replay_epochs` and the whole `alias_registry` Vec.
+
+`scoped_alias_epoch_update` already exists and its comment names this exact
+workload, but it was only wired into the two per-COW-fault mutators. The
+process-retirement mutation at `trap.rs:27850` still goes through the generic
+clone-and-diff path.
+
+This is the scope-domain defect class from
+`docs/identity-and-scope-domains.md`: carrier-global `Vec`s holding per-process
+rows, so a per-process operation pays for every other process.
+
+### Landing plan
+
+1. Cost-accounting interface so complexity is testable without timing: an
+   always-on scanned-row counter over the global alias/replay/version state,
+   with a red-first unit test asserting that retiring one owner among many
+   foreign owners scans a bounded number of rows.
+2. Index `AliasVersionRegistry` by key (`aliases`, `replays`, `alias_epochs`,
+   `replay_epochs` → maps; add version-id → key indexes for `retire_exact`).
+3. Replace the process-retirement clone-and-diff with a delta-reporting
+   mutation, as the COW path already does.
+4. Rebuild replay chain bases with a `BTreeSet` range query on the leading IPA
+   instead of filtering the whole set.
+
+Only after that is the test-profile question worth re-asking.
