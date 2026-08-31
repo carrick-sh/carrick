@@ -628,6 +628,12 @@ fn mm_lock_msync_mincore_stubs_validate_args_and_succeed() {
             .unwrap();
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
+    // Tell the dispatcher about the mapping, as every sibling fixture does.
+    // `mincore` now answers ENOMEM from the VMA table rather than from whether
+    // a probe read happens to succeed, so a fixture that never publishes its
+    // regions is a process with no mappings -- which is exactly what Linux
+    // reports ENOMEM for.
+    publish_address_space_regions(&mut dispatcher, &memory);
 
     assert_eq!(
         dispatcher
