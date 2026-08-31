@@ -714,6 +714,16 @@ pub trait PersistentTaskBinding {
 
     fn after_terminal_settlement(&self) {}
 
+    /// Whether this binding's address space has stopped admitting loads.
+    ///
+    /// Asked only to classify a REJECTED load: `true` means another thread in
+    /// the group is retiring the address space (an `execve` or an exit), which
+    /// on Linux terminates this thread. Backends without a retiring address
+    /// space answer `false` and keep the failure fatal.
+    fn address_space_is_retiring(&self) -> bool {
+        false
+    }
+
     fn mark_exec_transferred(&self) -> Result<(), TrapError> {
         Err(TrapError::Hypervisor(
             "task binding has no exec-transfer terminal authority".to_owned(),
@@ -756,6 +766,10 @@ impl PersistentTaskBinding for crate::vcpu_loop::continuation::HvpatchTaskBindin
 
     fn after_terminal_settlement(&self) {
         crate::vcpu_loop::continuation::HvpatchTaskBinding::after_terminal_settlement(self);
+    }
+
+    fn address_space_is_retiring(&self) -> bool {
+        crate::vcpu_loop::continuation::HvpatchTaskBinding::address_space_is_retiring(self)
     }
 
     fn mark_exec_transferred(&self) -> Result<(), TrapError> {
@@ -3539,6 +3553,25 @@ where
             }
         };
         if let Err(error) = backend.load(&task) {
+            // A load refused because the address space is retiring is not this
+            // executor's failure: another thread in the group called `execve`
+            // (or the process exited), and Linux terminates every other thread
+            // at that point -- this one is already dead, it just had a claim in
+            // flight. Settling it and taking the next task is the whole
+            // correction. Killing the worker here is what turned an ordinary
+            // exec-from-a-thread race into a carrier abort: the dying worker
+            // dropped an MM authority whose inventory was published but not yet
+            // exactly retired, and that Drop aborts the process.
+            if task.binding().address_space_is_retiring() {
+                let _settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                    resolver.as_ref(),
+                    scheduler,
+                    running,
+                    ExecutionFailure::AddressSpaceRetired,
+                    receipts,
+                );
+                continue;
+            }
             let settlement = fail_running_and_retire::<F::TaskBinding, _>(
                 resolver.as_ref(),
                 scheduler,

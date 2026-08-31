@@ -223,6 +223,12 @@ impl Stage1MmLease {
             .unwrap_or_else(|| std::process::abort())
     }
 
+    /// Whether this lease has stopped admitting executor loads, for either
+    /// reason: the lease itself is retiring, or its ASID generation is.
+    pub(crate) fn is_retiring(&self) -> bool {
+        *self.lifecycle.lock() != Stage1MmLeaseLifecycle::Live || self.residency.is_retiring()
+    }
+
     pub(crate) fn begin_asid_load(
         &self,
         executor: crate::kernel::objects::ExecutorId,

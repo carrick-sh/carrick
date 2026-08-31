@@ -3557,6 +3557,20 @@ impl HvpatchTaskBinding {
         })
     }
 
+    /// Whether this binding's address space has stopped admitting loads.
+    ///
+    /// Asked AFTER a rejected load to classify it: a rejection here means some
+    /// other thread's `execve` or exit is retiring this address space, which
+    /// on Linux terminates this thread -- an ordinary outcome, not a failure of
+    /// the executor that tried to run it. The generation only moves forward
+    /// (Live -> RetirementPrepared -> Retired), so a `true` answer after the
+    /// rejection is sound: it was already retiring when the load was refused.
+    pub(crate) fn address_space_is_retiring(&self) -> bool {
+        self.stage1_mm
+            .as_ref()
+            .is_none_or(|stage1_mm| stage1_mm.is_retiring())
+    }
+
     pub(crate) fn begin_asid_load(
         &self,
         executor: crate::kernel::objects::ExecutorId,
