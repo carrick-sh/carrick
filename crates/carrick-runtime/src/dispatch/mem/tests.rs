@@ -2999,7 +2999,7 @@ fn private_overlay_mremap_shrink_carves_source_tail_and_reuses_only_storage() {
 }
 
 #[test]
-fn mremap_fixed_is_rejected_before_source_or_destination_mutation() {
+fn mremap_fixed_relocates_to_the_named_destination_and_reclaims_the_source() {
     const SYS_MMAP: u64 = 222;
     const SYS_MREMAP: u64 = 216;
     const MREMAP_MAYMOVE: u64 = 0x01;
@@ -3084,22 +3084,29 @@ fn mremap_fixed_is_rejected_before_source_or_destination_mutation() {
             ]),
         ),
     );
-    assert_eq!(outcome, DispatchOutcome::errno(LINUX_EOPNOTSUPP));
-    assert_eq!(memory.read_bytes(source, 4).unwrap(), b"move");
-    assert_eq!(memory.read_bytes(destination, 4).unwrap(), &[0; 4]);
+    // MREMAP_FIXED relocates to the address the guest named: the bytes are at
+    // the destination, the source is unmapped, and the call returns the
+    // destination (Linux never returns the old address for a fixed move).
+    assert_eq!(
+        outcome,
+        DispatchOutcome::Returned {
+            value: destination as i64
+        }
+    );
+    assert_eq!(memory.read_bytes(destination, 4).unwrap(), b"move");
     assert!(
-        !memory
+        memory
             .protections
             .range_unmapped(source, LINUX_PAGE_SIZE as usize)
     );
     let mem_authority_111 = dispatcher.mem();
     let mem = mem_authority_111.lock();
-    assert!(mem.dynamic_maps.iter().any(|map| map.start == source));
-    assert!(!mem.dynamic_maps.iter().any(|map| map.start == destination));
+    assert!(!mem.dynamic_maps.iter().any(|map| map.start == source));
+    assert!(mem.dynamic_maps.iter().any(|map| map.start == destination));
 }
 
 #[test]
-fn mremap_dontunmap_is_rejected_before_source_or_allocator_mutation() {
+fn mremap_dontunmap_moves_contents_and_leaves_the_source_zeroed() {
     const SYS_MMAP: u64 = 222;
     const SYS_MREMAP: u64 = 216;
     const MREMAP_MAYMOVE: u64 = 0x01;
@@ -3165,12 +3172,18 @@ fn mremap_dontunmap_is_rejected_before_source_or_allocator_mutation() {
             ]),
         ),
     );
-    assert_eq!(outcome, DispatchOutcome::errno(LINUX_EOPNOTSUPP));
-    assert_eq!(memory.read_bytes(source, 4).unwrap(), b"keep");
+    // MREMAP_DONTUNMAP moves the contents and KEEPS the source mapped, as
+    // fresh zero-filled anonymous memory: two live mappings afterwards, the
+    // bytes at the destination, and the old address reading back zero rather
+    // than faulting.
+    let destination = returned(outcome) as u64;
+    assert_ne!(destination, source);
+    assert_eq!(memory.read_bytes(destination, 4).unwrap(), b"keep");
+    assert_eq!(memory.read_bytes(source, 4).unwrap(), &[0; 4]);
     let mem_authority_112 = dispatcher.mem();
     let mem = mem_authority_112.lock();
-    assert_eq!(mem.dynamic_maps.len(), 1);
-    assert_eq!(mem.dynamic_maps[0].start, source);
+    assert!(mem.dynamic_maps.iter().any(|map| map.start == source));
+    assert!(mem.dynamic_maps.iter().any(|map| map.start == destination));
 }
 
 #[test]
