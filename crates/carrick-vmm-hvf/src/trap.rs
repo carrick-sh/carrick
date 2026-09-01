@@ -26604,6 +26604,14 @@ impl HvpatchTaskRegistration {
             // flickering under gnu). One root cause, three symptoms
             // (`execthreads`, `execfromthread`, CLONE_VM child exit); the fix
             // is the upstream retirement above, not a per-symptom patch.
+            //
+            // Re-measured 2026-09-01 with the shared-mm key dedupe landed:
+            // the symmetric last-holder retire here removes the abort but the
+            // exec'd image then dies SILENTLY before producing output in 4/4
+            // runs (worse than the 1-in-3 clean pass the abort leaves). The
+            // retirement must run at exec sibling-drain completion, where the
+            // exec'ing thread still holds kernel context -- not from this
+            // teardown path.
             drop(task_mm);
         }
         Ok(())
@@ -26877,17 +26885,32 @@ impl HvpatchCarrierTaskStateDirectory {
                 "injected carrier task-state failure after alias commit".to_owned(),
             ));
         }
-        let mm_key = HvpatchMmAuthorityKey {
-            // A concrete root slot is the exact MM identity and is shared by
-            // every thread binding. Root/no-slot tasks fall back to the task
-            // serial so unrelated roots never alias one MM authority.
-            task_serial: if task.shared_kernel_mm.is_some() {
-                0
-            } else {
-                task.mm_root_slot.map_or(identity.task_serial, |_| 0)
-            },
-            mm_root_slot: task.mm_root_slot,
-            shared_kernel_mm: task.shared_kernel_mm,
+        // A concrete root slot is the exact MM identity and is shared by
+        // every binding of that mm -- thread siblings AND `CLONE_VM`/vfork
+        // process sharers alike. Keeping `shared_kernel_mm` in the key split
+        // the owner ({slot, None}) from its sharer ({slot, Some(mm)}), so the
+        // sharer's registration missed the dedupe and minted a SECOND carrier
+        // MM authority over the same stage-2; retiring the sharer's row then
+        // unmapped the owner's live memory (a `clone(CLONE_VM|SIGCHLD)` child
+        // exiting SIGSEGV'd its parent). The slot-only form also matches what
+        // `rebind_exec_task_mm` publishes. Root/no-slot tasks fall back to the
+        // task serial so unrelated roots never alias one MM authority.
+        let mm_key = if task.mm_root_slot.is_some() {
+            HvpatchMmAuthorityKey {
+                task_serial: 0,
+                mm_root_slot: task.mm_root_slot,
+                shared_kernel_mm: None,
+            }
+        } else {
+            HvpatchMmAuthorityKey {
+                task_serial: if task.shared_kernel_mm.is_some() {
+                    0
+                } else {
+                    identity.task_serial
+                },
+                mm_root_slot: None,
+                shared_kernel_mm: task.shared_kernel_mm,
+            }
         };
         let process_owner = matches!(
             task.inventory,
