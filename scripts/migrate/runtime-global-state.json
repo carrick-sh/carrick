@@ -2,926 +2,6 @@
   "schema": 1,
   "rows": [
     {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/core_dump.rs",
-      "symbol": "oracle_validation::emit_core_for_an_independent_reader::CARRICK_CORE_EMIT_PATH",
-      "fingerprint": "d8ee42ecf76e59cc9835069e066ffb892f3b505fd354b1875956be680e9fea1a",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_CORE_EMIT_PATH read in oracle_validation::emit_core_for_an_independent_reader::CARRICK_CORE_EMIT_PATH (crates/carrick-runtime/src/core_dump.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/core_dump.rs",
-      "symbol": "oracle_validation::emit_pn_xnum_core_for_an_independent_reader::CARRICK_CORE_EMIT_PN_XNUM_PATH",
-      "fingerprint": "fc0bcfe4a6d50d5f07cea406829610969fe3e38555a6407f266175e919c31009",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_CORE_EMIT_PN_XNUM_PATH read in oracle_validation::emit_pn_xnum_core_for_an_independent_reader::CARRICK_CORE_EMIT_PN_XNUM_PATH (crates/carrick-runtime/src/core_dump.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/deadlock_watchdog.rs",
-      "symbol": "window_ms::CARRICK_DEADLOCK_WATCHDOG_MS",
-      "fingerprint": "2fdbff72de644671485c53733abc818ae8e29060e65c623ee535a1055fd52bb1",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_DEADLOCK_WATCHDOG_MS read in window_ms::CARRICK_DEADLOCK_WATCHDOG_MS (crates/carrick-runtime/src/deadlock_watchdog.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "symbol": "debug_mmap_next_lowering::CARRICK_FORK_DEBUG_VA",
-      "fingerprint": "d1a34eb1d01a21e24a1fe67ec5f906a675b02b4c687d50e7e9bbcafbb6808b70",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FORK_DEBUG_VA read in debug_mmap_next_lowering::CARRICK_FORK_DEBUG_VA (crates/carrick-runtime/src/dispatch/mem.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "symbol": "free_regions_insert::CARRICK_FORK_DEBUG_VA",
-      "fingerprint": "d1a34eb1d01a21e24a1fe67ec5f906a675b02b4c687d50e7e9bbcafbb6808b70",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FORK_DEBUG_VA read in free_regions_insert::CARRICK_FORK_DEBUG_VA (crates/carrick-runtime/src/dispatch/mem.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "symbol": "next_mmap_address::CARRICK_FORK_DEBUG_VA",
-      "fingerprint": "d1a34eb1d01a21e24a1fe67ec5f906a675b02b4c687d50e7e9bbcafbb6808b70",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FORK_DEBUG_VA read in next_mmap_address::CARRICK_FORK_DEBUG_VA (crates/carrick-runtime/src/dispatch/mem.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "symbol": "publish_core_atomic::CARRICK_CORE_FAILPOINT",
-      "fingerprint": "33a4c376d77e54b0f5f77e36519780e96feea8fcce87baaf8b1ade4443192589",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_CORE_FAILPOINT read in publish_core_atomic::CARRICK_CORE_FAILPOINT (crates/carrick-runtime/src/dispatch/mod.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "symbol": "watch_addr::CARRICK_WATCH_ADDR",
-      "fingerprint": "42b2e84a656a95d08fdf542b45cd94f833b8b7ced38daf82353c603572ee747b",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_WATCH_ADDR read in watch_addr::CARRICK_WATCH_ADDR (crates/carrick-runtime/src/dispatch/mod.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/dispatch/proctitle.rs",
-      "symbol": "run_id::CARRICK_RUN_ID",
-      "fingerprint": "953114542a4126bc26109153a15da1a6aab9eace9d9e6bdcc2819659a277157a",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_RUN_ID read in run_id::CARRICK_RUN_ID (crates/carrick-runtime/src/dispatch/proctitle.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/event_ring.rs",
-      "symbol": "dir::CARRICK_EVENTRING",
-      "fingerprint": "848bb7eaeede7522988b8e1d1d0365d8dda85785b89b671b0bfddf598ec1acdd",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_EVENTRING read in dir::CARRICK_EVENTRING (crates/carrick-runtime/src/event_ring.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/exec_helpers.rs",
-      "symbol": "stop_for_debug_signal::CARRICK_DEBUG_STOP_ON_SIGNAL",
-      "fingerprint": "6cd191fd69f24c95c5e75d17b6c719981679c49b3bec9ae56d9aca05e1e437a2",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_DEBUG_STOP_ON_SIGNAL read in stop_for_debug_signal::CARRICK_DEBUG_STOP_ON_SIGNAL (crates/carrick-runtime/src/exec_helpers.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "symbol": "fast_fs_enabled::CARRICK_FAST_FS",
-      "fingerprint": "96ca06b880ff8098bca574f0a3b5def3654a1571488e234607b5a7c5407728de",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FAST_FS read in fast_fs_enabled::CARRICK_FAST_FS (crates/carrick-runtime/src/fs_backend.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "symbol": "overlay_enabled::CARRICK_FS_OVERLAY",
-      "fingerprint": "3ae130f3fa0fc49685d6010a720265b73ebdd58b2faf96171d676b30949c0f40",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FS_OVERLAY read in overlay_enabled::CARRICK_FS_OVERLAY (crates/carrick-runtime/src/fs_backend.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "symbol": "stat_cache_enabled::CARRICK_FS_STATCACHE",
-      "fingerprint": "b16c7c1b5f4416fbfbeb65325342c905d6bb273050817180ef0318d722c2294a",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FS_STATCACHE read in stat_cache_enabled::CARRICK_FS_STATCACHE (crates/carrick-runtime/src/fs_backend.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/kernel/container.rs",
-      "symbol": "from_process_env::CARRICK_CONTAINER_ID",
-      "fingerprint": "1b67e5b5b134ab1ff2cca6220975a5fca2164042ec673eeff0f92b11be2833b1",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_CONTAINER_ID read in from_process_env::CARRICK_CONTAINER_ID (crates/carrick-runtime/src/kernel/container.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/kernel/container.rs",
-      "symbol": "from_process_env::CARRICK_EXEC_OVERLAY",
-      "fingerprint": "e5876a6c43141b1fa085753ff7b75bf345c7b4ee71af774a2ab725be1e61b5af",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_EXEC_OVERLAY read in from_process_env::CARRICK_EXEC_OVERLAY (crates/carrick-runtime/src/kernel/container.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/kernel/container.rs",
-      "symbol": "from_process_env::CARRICK_LAUNCH_AUTHORIZATION",
-      "fingerprint": "5402cc31982f88978b45fa4fc6fb17033e9512bb9badc27cbd206bfa58747707",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_LAUNCH_AUTHORIZATION read in from_process_env::CARRICK_LAUNCH_AUTHORIZATION (crates/carrick-runtime/src/kernel/container.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/kernel/container.rs",
-      "symbol": "from_process_env::CARRICK_RUN_ID",
-      "fingerprint": "953114542a4126bc26109153a15da1a6aab9eace9d9e6bdcc2819659a277157a",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_RUN_ID read in from_process_env::CARRICK_RUN_ID (crates/carrick-runtime/src/kernel/container.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/kernel/container.rs",
-      "symbol": "tests::with_env::key",
-      "fingerprint": "d0eab53b3bdca61a0d38973031cf88d0ea84564679fdf423da6ef171543335b5",
-      "classification": "test_only",
-      "rationale": "Test-only fixture or lock tests::with_env::key in crates/carrick-runtime/src/kernel/container.rs scoped strictly to test harness execution."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/kernel/debug/endpoint.rs",
-      "symbol": "for_current_run::CARRICK_RUN_ID",
-      "fingerprint": "953114542a4126bc26109153a15da1a6aab9eace9d9e6bdcc2819659a277157a",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_RUN_ID read in for_current_run::CARRICK_RUN_ID (crates/carrick-runtime/src/kernel/debug/endpoint.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/runtime.rs",
-      "symbol": "hardware_tso_for_debug::CARRICK_DISABLE_TSO",
-      "fingerprint": "3a3cc89abe55008d1ed8ce4e4bfd9baf81b5f71ac099625513aedebb8a7b2036",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_DISABLE_TSO read in hardware_tso_for_debug::CARRICK_DISABLE_TSO (crates/carrick-runtime/src/runtime.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/runtime.rs",
-      "symbol": "run_address_space_with_hvf_and_dispatcher::CARRICK_CONTAINER_ID",
-      "fingerprint": "1b67e5b5b134ab1ff2cca6220975a5fca2164042ec673eeff0f92b11be2833b1",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_CONTAINER_ID read in run_address_space_with_hvf_and_dispatcher::CARRICK_CONTAINER_ID (crates/carrick-runtime/src/runtime.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/threaded_loop.rs",
-      "symbol": "run_threaded_loop_inner::CARRICK_CONTAINER_ID",
-      "fingerprint": "1b67e5b5b134ab1ff2cca6220975a5fca2164042ec673eeff0f92b11be2833b1",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_CONTAINER_ID read in run_threaded_loop_inner::CARRICK_CONTAINER_ID (crates/carrick-runtime/src/threaded_loop.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/threaded_loop.rs",
-      "symbol": "run_threaded_loop_inner::CARRICK_LAUNCH_AUTHORIZATION",
-      "fingerprint": "5402cc31982f88978b45fa4fc6fb17033e9512bb9badc27cbd206bfa58747707",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_LAUNCH_AUTHORIZATION read in run_threaded_loop_inner::CARRICK_LAUNCH_AUTHORIZATION (crates/carrick-runtime/src/threaded_loop.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vcpu_loop/exec.rs",
-      "symbol": "hvpatch_exec_inventory_failure_injection::CARRICK_HVPATCH_EXEC_INVENTORY_FAILURE",
-      "fingerprint": "e658cdd1bcfe96145c9bc9e449122f918a4b17489accf8f9fa1f4442f77d8d64",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_HVPATCH_EXEC_INVENTORY_FAILURE read in hvpatch_exec_inventory_failure_injection::CARRICK_HVPATCH_EXEC_INVENTORY_FAILURE (crates/carrick-runtime/src/vcpu_loop/exec.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "symbol": "trap_watchdog_wall_window::CARRICK_MAX_WALL_MS",
-      "fingerprint": "2b16120d75fc0b213af7e4ea5d07d3b8e9ee2f9912e6f35a1b0b60901a0cd0a5",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_MAX_WALL_MS read in trap_watchdog_wall_window::CARRICK_MAX_WALL_MS (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vdso_policy.rs",
-      "symbol": "vdso_debug_mode::CARRICK_DISABLE_VDSO",
-      "fingerprint": "50d9306ef0f992272a2c4c6776c1a2566d149ea7bd29ab3824ea4a3014278448",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_DISABLE_VDSO read in vdso_debug_mode::CARRICK_DISABLE_VDSO (crates/carrick-runtime/src/vdso_policy.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vdso_policy.rs",
-      "symbol": "vdso_debug_mode::CARRICK_VDSO_MODE",
-      "fingerprint": "9b7303b8b91080ab3c18db2ba785de553bafb7200635ca59742a15a0f416c0b3",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_VDSO_MODE read in vdso_debug_mode::CARRICK_VDSO_MODE (crates/carrick-runtime/src/vdso_policy.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-vmm-hvf/src/bin/hvf_kernel_memory_probe.rs",
-      "symbol": "platform::run::CARRICK_RUN_ID",
-      "fingerprint": "e958d165c4cf8d0886b3b843126990ebe591e5c7fa2b9fdabcee43ff1376eb08",
-      "classification": "test_only",
-      "rationale": "Test-only fixture or lock platform::run::CARRICK_RUN_ID in crates/carrick-vmm-hvf/src/bin/hvf_kernel_memory_probe.rs scoped strictly to test harness execution."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-vmm-hvf/src/bin/hvf_kernel_memory_probe.rs",
-      "symbol": "platform::run::CARRICK_SOURCE_COMMIT",
-      "fingerprint": "30a7fbf54d9f66a2eb1ea6efdb749859259e604480e0e32a676e184dcbcac298",
-      "classification": "test_only",
-      "rationale": "Test-only fixture or lock platform::run::CARRICK_SOURCE_COMMIT in crates/carrick-vmm-hvf/src/bin/hvf_kernel_memory_probe.rs scoped strictly to test harness execution."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs",
-      "symbol": "hvf_vcpu_reclaim_enabled::CARRICK_HVF_VCPU_RECLAIM",
-      "fingerprint": "5bc60d9e4c097ce1c91b2f65b4d74e267b0207ad56c845b056865ed8f76d2f86",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_HVF_VCPU_RECLAIM read in hvf_vcpu_reclaim_enabled::CARRICK_HVF_VCPU_RECLAIM (crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "atomic_permit_enabled::CARRICK_HVF_ATOMIC_PERMIT",
-      "fingerprint": "7c1104910ed6f736c037002331d4485a6a5586982025257244ca54fb28cd25cf",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_HVF_ATOMIC_PERMIT read in atomic_permit_enabled::CARRICK_HVF_ATOMIC_PERMIT (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "exec_stage2_fail_after_maps::CARRICK_HVPATCH_EXEC_FAIL_AFTER_MAPS",
-      "fingerprint": "7f4067c3ebd1a2fb346239d411c4c7966b024cdd7beb2939f3d49a0451111d5c",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_HVPATCH_EXEC_FAIL_AFTER_MAPS read in exec_stage2_fail_after_maps::CARRICK_HVPATCH_EXEC_FAIL_AFTER_MAPS (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "fork_debug_ipa::CARRICK_FORK_DEBUG_IPA",
-      "fingerprint": "5e78b2d6dddad4dc3afd74d2be47b360264cc9793a9177baf3b5cd0ef5cfc297",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FORK_DEBUG_IPA read in fork_debug_ipa::CARRICK_FORK_DEBUG_IPA (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "fork_debug_va::CARRICK_FORK_DEBUG_VA",
-      "fingerprint": "8a486c4772ae04c4c4a61fa8a71ef4fda067bbaa29ac55d8f8869ea1f6ef02d7",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FORK_DEBUG_VA read in fork_debug_va::CARRICK_FORK_DEBUG_VA (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-kernel/src/process.rs",
-      "symbol": "release_claimed::CARRICK_RUNSTATE_DEBUG",
-      "fingerprint": "79a6006c8e3006cf39645157a139b2df108aa84b7cc2646b9e644374db87e73a",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_RUNSTATE_DEBUG read in release_claimed::CARRICK_RUNSTATE_DEBUG (crates/carrick-kernel/src/process.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/apfs.rs",
-      "symbol": "resolve_scratch_root::CARRICK_HOME",
-      "fingerprint": "d1720a160950ff9e3f25ca1f7b4cb0dedabb26a79cb7a56c44377a1f0ef275f1",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_HOME read in resolve_scratch_root::CARRICK_HOME (crates/carrick-runtime/src/apfs.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/apfs.rs",
-      "symbol": "resolve_scratch_root::HOME",
-      "fingerprint": "acfd587978b264cd239ffe761be7c7c1d9743018e8f0e8e0d5ca0beab221b5d2",
-      "classification": "config_debug",
-      "rationale": "Environment variable HOME read in resolve_scratch_root::HOME (crates/carrick-runtime/src/apfs.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/carrier.rs",
-      "symbol": "shutdown::crate::vm_lifecycle::VM_LIFECYCLE_ARTIFACT_PATH_ENV",
-      "fingerprint": "eb3706692052bb42ba87ae30c5ef15712e1923b63801aeefdbfab37ea965ecc9",
-      "classification": "config_debug",
-      "rationale": "Environment variable VM_LIFECYCLE_ARTIFACT_PATH_ENV read in shutdown::crate::vm_lifecycle::VM_LIFECYCLE_ARTIFACT_PATH_ENV (crates/carrick-runtime/src/carrier.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "symbol": "ficlone_errno::CARRICK_FICLONE_DEBUG",
-      "fingerprint": "d81b6311036aa8db461da744b96b226a6a1aff08042108d1e97536d4328f9c4f",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FICLONE_DEBUG read in ficlone_errno::CARRICK_FICLONE_DEBUG (crates/carrick-runtime/src/dispatch/fs.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "symbol": "ioctl::CARRICK_FICLONE_DEBUG",
-      "fingerprint": "d81b6311036aa8db461da744b96b226a6a1aff08042108d1e97536d4328f9c4f",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FICLONE_DEBUG read in ioctl::CARRICK_FICLONE_DEBUG (crates/carrick-runtime/src/dispatch/fs.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "symbol": "trusted_fs_lane_enabled::CARRICK_FS_TRUSTED_LANE",
-      "fingerprint": "2d8b98ce0979b1e11b266d37f3240be459bc06655f7c405419ccb62cdebd6331",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FS_TRUSTED_LANE read in trusted_fs_lane_enabled::CARRICK_FS_TRUSTED_LANE (crates/carrick-runtime/src/dispatch/fs.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/fs/sendfile.rs",
-      "symbol": "darwin_copyfile_fast_path_disabled::CARRICK_DARWIN_COPYFILE_FAST_PATH",
-      "fingerprint": "e5b9013e2aab0b65661da1af07c483a3a62b130764cb6b1e436711a17dafedca",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_DARWIN_COPYFILE_FAST_PATH read in darwin_copyfile_fast_path_disabled::CARRICK_DARWIN_COPYFILE_FAST_PATH (crates/carrick-runtime/src/dispatch/fs/sendfile.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
-      "symbol": "strict_durability_enabled::CARRICK_STRICT_DURABILITY",
-      "fingerprint": "f3814f075ae168bea59b99647f7a4fd37ef9e7d97ac8b1e8c28e1a1e26402c68",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_STRICT_DURABILITY read in strict_durability_enabled::CARRICK_STRICT_DURABILITY (crates/carrick-runtime/src/dispatch/fs/state.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "symbol": "mmap::CARRICK_FAULT_DEBUG",
-      "fingerprint": "4fd4e6d485b718f27cdea4b4c0b45a7d31cb4315060db3bb0c3189664414eb65",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FAULT_DEBUG read in mmap::CARRICK_FAULT_DEBUG (crates/carrick-runtime/src/dispatch/mem.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "symbol": "mmap_file_backed_lowering_enabled::CARRICK_MMAP_FILE_BACKED",
-      "fingerprint": "19774f51dd70100293a802b7f7ba9b5ca4a3e9815e728ed56850b06e97bb3e2c",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_MMAP_FILE_BACKED read in mmap_file_backed_lowering_enabled::CARRICK_MMAP_FILE_BACKED (crates/carrick-runtime/src/dispatch/mem.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "symbol": "mremap::CARRICK_FAULT_DEBUG",
-      "fingerprint": "4fd4e6d485b718f27cdea4b4c0b45a7d31cb4315060db3bb0c3189664414eb65",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FAULT_DEBUG read in mremap::CARRICK_FAULT_DEBUG (crates/carrick-runtime/src/dispatch/mem.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "symbol": "next_mmap_address::CARRICK_MMAP_GRANT_DEBUG",
-      "fingerprint": "80c748ba662570f06454f1cac60f540e89547595e0d2450b758d1f396f4774c4",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_MMAP_GRANT_DEBUG read in next_mmap_address::CARRICK_MMAP_GRANT_DEBUG (crates/carrick-runtime/src/dispatch/mem.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "symbol": "connect::CARRICK_NET_DEBUG",
-      "fingerprint": "98c2cd114e70f3b1193a7cffd5318f2768b3b06f6a75304226df2a01185675eb",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_NET_DEBUG read in connect::CARRICK_NET_DEBUG (crates/carrick-runtime/src/dispatch/net.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "symbol": "connect::CARRICK_NET_DEBUG#2",
-      "fingerprint": "98c2cd114e70f3b1193a7cffd5318f2768b3b06f6a75304226df2a01185675eb",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_NET_DEBUG read in connect::CARRICK_NET_DEBUG#2 (crates/carrick-runtime/src/dispatch/net.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "symbol": "queue_socket_error_after_send::CARRICK_NET_DEBUG",
-      "fingerprint": "98c2cd114e70f3b1193a7cffd5318f2768b3b06f6a75304226df2a01185675eb",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_NET_DEBUG read in queue_socket_error_after_send::CARRICK_NET_DEBUG (crates/carrick-runtime/src/dispatch/net.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "symbol": "sendto::CARRICK_NET_DEBUG",
-      "fingerprint": "98c2cd114e70f3b1193a7cffd5318f2768b3b06f6a75304226df2a01185675eb",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_NET_DEBUG read in sendto::CARRICK_NET_DEBUG (crates/carrick-runtime/src/dispatch/net.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "symbol": "sendto::CARRICK_NET_DEBUG#2",
-      "fingerprint": "98c2cd114e70f3b1193a7cffd5318f2768b3b06f6a75304226df2a01185675eb",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_NET_DEBUG read in sendto::CARRICK_NET_DEBUG#2 (crates/carrick-runtime/src/dispatch/net.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "symbol": "sendto::CARRICK_NET_DEBUG#3",
-      "fingerprint": "98c2cd114e70f3b1193a7cffd5318f2768b3b06f6a75304226df2a01185675eb",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_NET_DEBUG read in sendto::CARRICK_NET_DEBUG#3 (crates/carrick-runtime/src/dispatch/net.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "symbol": "set_socket_error_after_send::CARRICK_NET_DEBUG",
-      "fingerprint": "98c2cd114e70f3b1193a7cffd5318f2768b3b06f6a75304226df2a01185675eb",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_NET_DEBUG read in set_socket_error_after_send::CARRICK_NET_DEBUG (crates/carrick-runtime/src/dispatch/net.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/net/sctp.rs",
-      "symbol": "begin_send::CARRICK_SCTP_DEBUG",
-      "fingerprint": "62788aa1da2b993a700596e57ad8d6a3403f373b3f96a24c607a3dc5b937c9fb",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_SCTP_DEBUG read in begin_send::CARRICK_SCTP_DEBUG (crates/carrick-runtime/src/dispatch/net/sctp.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/net/sctp.rs",
-      "symbol": "begin_send::CARRICK_SCTP_DEBUG#2",
-      "fingerprint": "62788aa1da2b993a700596e57ad8d6a3403f373b3f96a24c607a3dc5b937c9fb",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_SCTP_DEBUG read in begin_send::CARRICK_SCTP_DEBUG#2 (crates/carrick-runtime/src/dispatch/net/sctp.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/net/sctp.rs",
-      "symbol": "complete_read::CARRICK_SCTP_DEBUG",
-      "fingerprint": "62788aa1da2b993a700596e57ad8d6a3403f373b3f96a24c607a3dc5b937c9fb",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_SCTP_DEBUG read in complete_read::CARRICK_SCTP_DEBUG (crates/carrick-runtime/src/dispatch/net/sctp.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "symbol": "wait4::CARRICK_SIG_DEBUG",
-      "fingerprint": "c3ebac26552821dc161b816d5870e2a482bba18de94aa6b15d568d126be9d8fe",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_SIG_DEBUG read in wait4::CARRICK_SIG_DEBUG (crates/carrick-runtime/src/dispatch/proc.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "symbol": "wait4::CARRICK_SIG_DEBUG#2",
-      "fingerprint": "c3ebac26552821dc161b816d5870e2a482bba18de94aa6b15d568d126be9d8fe",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_SIG_DEBUG read in wait4::CARRICK_SIG_DEBUG#2 (crates/carrick-runtime/src/dispatch/proc.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "symbol": "ipc_set_tests::proc_sysvipc_rendering_races_attachment_cleanup_and_paired_mutation_without_deadlock::CARRICK_SYSVIPC_TEST_CHILD",
-      "fingerprint": "e28376f20995e878ba99603697a82582e826926b3fec69ce4d2cf26aaeb05157",
-      "classification": "test_only",
-      "rationale": "Test-only subprocess sentinel isolates the proc_sysvipc deadlock regression test and is absent from production builds."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "symbol": "ipc_set_tests::remapped_shmat_same_shmid_does_not_deadlock_and_preserves_accounting::CARRICK_SAME_SHMID_TEST_CHILD",
-      "fingerprint": "5ce33d23c6269f3e9d7b296cc5ad1d97c03659130da4ada9048d434d10412736",
-      "classification": "test_only",
-      "rationale": "Test-only subprocess sentinel isolates the same-shmid remapped shmat deadlock watchdog regression test and is absent from production builds."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "symbol": "ipc_set_tests::watchdog_kills_and_reaps_on_deadlock_timeout::CARRICK_SYSVIPC_TEST_CHILD_DEADLOCK",
-      "fingerprint": "e050f8de716dc76a296742adc56a973f60c4915aefd51b0a44653218cf8da7d2",
-      "classification": "test_only",
-      "rationale": "Test-only subprocess sentinel for negative watchdog termination and child reaping verification."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/exec_stamps.rs",
-      "symbol": "stamp_record::CARRICK_EXEC_STAMPS",
-      "fingerprint": "857b733af0acdc35b398e51cf338091b3948d948728d2bcecabe8ce4ac86a6c1",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_EXEC_STAMPS read in stamp_record::CARRICK_EXEC_STAMPS (crates/carrick-runtime/src/exec_stamps.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/execute.rs",
-      "symbol": "cached_lower_enabled::CARRICK_FS_CACHED_LOWER",
-      "fingerprint": "faff57998e21a3a8bd94e07383da4ad5e866b977c407fbab0b8ee689f8d2705f",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FS_CACHED_LOWER read in cached_lower_enabled::CARRICK_FS_CACHED_LOWER (crates/carrick-runtime/src/execute.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/execute.rs",
-      "symbol": "rosetta_license_notice::CARRICK_NO_ROSETTA_NOTICE",
-      "fingerprint": "e724c9ed3dee5f6236a4d8c3a2d6487930d175b388429b9beab2826bd918d01a",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_NO_ROSETTA_NOTICE read in rosetta_license_notice::CARRICK_NO_ROSETTA_NOTICE (crates/carrick-runtime/src/execute.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/execute.rs",
-      "symbol": "rosetta_license_notice::ROSETTA_ACCEPT_ENV",
-      "fingerprint": "1c54b6efd2effd257e3e0f41827da03a7a6cf6f304f927d0c994a2592eb3081c",
-      "classification": "config_debug",
-      "rationale": "Environment variable ROSETTA_ACCEPT_ENV read in rosetta_license_notice::ROSETTA_ACCEPT_ENV (crates/carrick-runtime/src/execute.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/execute.rs",
-      "symbol": "seed_guest_baseline::CARRICK_SEED_APT_MIRRORS",
-      "fingerprint": "3ba6133ba7a2d92c37e0c8757f280a450c24ad330f4a71dcf7945e2fdd64f3eb",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_SEED_APT_MIRRORS read in seed_guest_baseline::CARRICK_SEED_APT_MIRRORS (crates/carrick-runtime/src/execute.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "symbol": "default_scratch_root::HOME",
-      "fingerprint": "acfd587978b264cd239ffe761be7c7c1d9743018e8f0e8e0d5ca0beab221b5d2",
-      "classification": "config_debug",
-      "rationale": "Environment variable HOME read in default_scratch_root::HOME (crates/carrick-runtime/src/fs_backend.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "symbol": "default_scratch_root::TMPDIR",
-      "fingerprint": "394164c8b4a8b59042322562ebc871f687aa9d65310d19e7a33627c7b6f3fe8c",
-      "classification": "config_debug",
-      "rationale": "Environment variable TMPDIR read in default_scratch_root::TMPDIR (crates/carrick-runtime/src/fs_backend.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/kernel/control/endpoint.rs",
-      "symbol": "for_container_id::CARRICK_CONTROL_DIR",
-      "fingerprint": "33141ab28f135648083af6855a3a55ae9a2ea045ec945ff1925de040dbbe7881",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_CONTROL_DIR read in for_container_id::CARRICK_CONTROL_DIR (crates/carrick-runtime/src/kernel/control/endpoint.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/kernel/debug/endpoint.rs",
-      "symbol": "base_directory::BASE_DIR_ENV",
-      "fingerprint": "b22671436a90593b2a6cf5e38ea89268074463dd166be57269ed653c5718e430",
-      "classification": "config_debug",
-      "rationale": "Environment variable BASE_DIR_ENV read in base_directory::BASE_DIR_ENV (crates/carrick-runtime/src/kernel/debug/endpoint.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/kernel/debug/server.rs",
-      "symbol": "install::DISABLE_ENV",
-      "fingerprint": "74a10faac7acd44b2a482888e2c4ab78e4f4976ecc57aa0f8be30f5d095f97f0",
-      "classification": "config_debug",
-      "rationale": "Environment variable DISABLE_ENV read in install::DISABLE_ENV (crates/carrick-runtime/src/kernel/debug/server.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "symbol": "tests::production_carrier_budget_one_full_occupancy_defers_caller_self_ack_to_entry::ISOLATED_ENV",
-      "fingerprint": "db47b947bff4c3855c8dadde05cd337b2537f37926863719961a524d914ad7de",
-      "classification": "test_only",
-      "rationale": "Test-only subprocess sentinel isolates the one-vCPU full-occupancy handshake case and is absent from production builds."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "symbol": "post_signal_to_authorized_target_inner::CARRICK_SIG_DEBUG",
-      "fingerprint": "c3ebac26552821dc161b816d5870e2a482bba18de94aa6b15d568d126be9d8fe",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_SIG_DEBUG read in post_signal_to_authorized_target_inner::CARRICK_SIG_DEBUG (crates/carrick-runtime/src/kernel/operations.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "symbol": "post_signal_to_task_key::CARRICK_SIG_DEBUG",
-      "fingerprint": "c3ebac26552821dc161b816d5870e2a482bba18de94aa6b15d568d126be9d8fe",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_SIG_DEBUG read in post_signal_to_task_key::CARRICK_SIG_DEBUG (crates/carrick-runtime/src/kernel/operations.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/lib.rs",
-      "symbol": "rosetta_interpreter_path::CARRICK_ROSETTA_PATH",
-      "fingerprint": "9794d75b53c43f933aeaec14d92a8aecbdf24db7e0d56b6f16731c3cc308aec5",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_ROSETTA_PATH read in rosetta_interpreter_path::CARRICK_ROSETTA_PATH (crates/carrick-runtime/src/lib.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/run_state.rs",
-      "symbol": "debug_run_state::CARRICK_RUNSTATE_DEBUG",
-      "fingerprint": "79a6006c8e3006cf39645157a139b2df108aa84b7cc2646b9e644374db87e73a",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_RUNSTATE_DEBUG read in debug_run_state::CARRICK_RUNSTATE_DEBUG (crates/carrick-runtime/src/run_state.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/run_state.rs",
-      "symbol": "published::CARRICK_RUNSTATE_DEBUG",
-      "fingerprint": "79a6006c8e3006cf39645157a139b2df108aa84b7cc2646b9e644374db87e73a",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_RUNSTATE_DEBUG read in published::CARRICK_RUNSTATE_DEBUG (crates/carrick-runtime/src/run_state.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/run_state.rs",
-      "symbol": "published::CARRICK_RUNSTATE_DEBUG#2",
-      "fingerprint": "79a6006c8e3006cf39645157a139b2df108aa84b7cc2646b9e644374db87e73a",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_RUNSTATE_DEBUG read in published::CARRICK_RUNSTATE_DEBUG#2 (crates/carrick-runtime/src/run_state.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "symbol": "resume::CARRICK_SIG_DEBUG",
-      "fingerprint": "c3ebac26552821dc161b816d5870e2a482bba18de94aa6b15d568d126be9d8fe",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_SIG_DEBUG read in resume::CARRICK_SIG_DEBUG (crates/carrick-runtime/src/vcpu_loop/continuation.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/exec.rs",
-      "symbol": "drive_execve::CARRICK_HVPATCH_VERIFY_EXEC_CODE",
-      "fingerprint": "8503a39ce1f115acdbbf5c79739fc75f6f2a17bba342dd635f1fdcf360bfc3aa",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_HVPATCH_VERIFY_EXEC_CODE read in drive_execve::CARRICK_HVPATCH_VERIFY_EXEC_CODE (crates/carrick-runtime/src/vcpu_loop/exec.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/exec.rs",
-      "symbol": "prepare_execve::CARRICK_FAULT_DEBUG",
-      "fingerprint": "4fd4e6d485b718f27cdea4b4c0b45a7d31cb4315060db3bb0c3189664414eb65",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FAULT_DEBUG read in prepare_execve::CARRICK_FAULT_DEBUG (crates/carrick-runtime/src/vcpu_loop/exec.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/exec.rs",
-      "symbol": "prepare_execve::CARRICK_SIG_DEBUG",
-      "fingerprint": "c3ebac26552821dc161b816d5870e2a482bba18de94aa6b15d568d126be9d8fe",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_SIG_DEBUG read in prepare_execve::CARRICK_SIG_DEBUG (crates/carrick-runtime/src/vcpu_loop/exec.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "symbol": "capture_core_for_publication::CARRICK_CORE_FAILPOINT",
-      "fingerprint": "34c3962e24aba6a29e286438c9bac6f6ee26cbdf96f0f764f889d448384605f9",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_CORE_FAILPOINT read in capture_core_for_publication::CARRICK_CORE_FAILPOINT (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "symbol": "capture_core_for_publication::CARRICK_CORE_FAILPOINT#10",
-      "fingerprint": "34c3962e24aba6a29e286438c9bac6f6ee26cbdf96f0f764f889d448384605f9",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_CORE_FAILPOINT read in capture_core_for_publication::CARRICK_CORE_FAILPOINT#10 (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "symbol": "capture_core_for_publication::CARRICK_CORE_FAILPOINT#2",
-      "fingerprint": "34c3962e24aba6a29e286438c9bac6f6ee26cbdf96f0f764f889d448384605f9",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_CORE_FAILPOINT read in capture_core_for_publication::CARRICK_CORE_FAILPOINT#2 (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "symbol": "capture_core_for_publication::CARRICK_CORE_FAILPOINT#3",
-      "fingerprint": "34c3962e24aba6a29e286438c9bac6f6ee26cbdf96f0f764f889d448384605f9",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_CORE_FAILPOINT read in capture_core_for_publication::CARRICK_CORE_FAILPOINT#3 (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "symbol": "capture_core_for_publication::CARRICK_CORE_FAILPOINT#4",
-      "fingerprint": "34c3962e24aba6a29e286438c9bac6f6ee26cbdf96f0f764f889d448384605f9",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_CORE_FAILPOINT read in capture_core_for_publication::CARRICK_CORE_FAILPOINT#4 (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "symbol": "capture_core_for_publication::CARRICK_CORE_FAILPOINT#5",
-      "fingerprint": "34c3962e24aba6a29e286438c9bac6f6ee26cbdf96f0f764f889d448384605f9",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_CORE_FAILPOINT read in capture_core_for_publication::CARRICK_CORE_FAILPOINT#5 (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "symbol": "capture_core_for_publication::CARRICK_CORE_FAILPOINT#6",
-      "fingerprint": "34c3962e24aba6a29e286438c9bac6f6ee26cbdf96f0f764f889d448384605f9",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_CORE_FAILPOINT read in capture_core_for_publication::CARRICK_CORE_FAILPOINT#6 (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "symbol": "capture_core_for_publication::CARRICK_CORE_FAILPOINT#7",
-      "fingerprint": "34c3962e24aba6a29e286438c9bac6f6ee26cbdf96f0f764f889d448384605f9",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_CORE_FAILPOINT read in capture_core_for_publication::CARRICK_CORE_FAILPOINT#7 (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "symbol": "capture_core_for_publication::CARRICK_CORE_FAILPOINT#8",
-      "fingerprint": "34c3962e24aba6a29e286438c9bac6f6ee26cbdf96f0f764f889d448384605f9",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_CORE_FAILPOINT read in capture_core_for_publication::CARRICK_CORE_FAILPOINT#8 (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "symbol": "capture_core_for_publication::CARRICK_CORE_FAILPOINT#9",
-      "fingerprint": "34c3962e24aba6a29e286438c9bac6f6ee26cbdf96f0f764f889d448384605f9",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_CORE_FAILPOINT read in capture_core_for_publication::CARRICK_CORE_FAILPOINT#9 (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "symbol": "macos_helper_stubs::execve_trace_filter::CARRICK_EXECVE_TRACE",
-      "fingerprint": "b829ed5ee882b3a9fe4e21b7229378adc7ff7b6f6e295a71af3510cb6d53254e",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_EXECVE_TRACE read in macos_helper_stubs::execve_trace_filter::CARRICK_EXECVE_TRACE (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "symbol": "new::CARRICK_TRACE_TRAPS",
-      "fingerprint": "e790d772c83fe2d155d2d470c8e3b30b3ecedad7cc4fbd7ae9c5d8dea0f32deb",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_TRACE_TRAPS read in new::CARRICK_TRACE_TRAPS (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "symbol": "poll_with_engine::CARRICK_FAULT_DEBUG",
-      "fingerprint": "4fd4e6d485b718f27cdea4b4c0b45a7d31cb4315060db3bb0c3189664414eb65",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FAULT_DEBUG read in poll_with_engine::CARRICK_FAULT_DEBUG (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "symbol": "poll_with_engine::CARRICK_FAULT_DEBUG#2",
-      "fingerprint": "4fd4e6d485b718f27cdea4b4c0b45a7d31cb4315060db3bb0c3189664414eb65",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FAULT_DEBUG read in poll_with_engine::CARRICK_FAULT_DEBUG#2 (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "symbol": "poll_with_engine::CARRICK_SIG_DEBUG",
-      "fingerprint": "c3ebac26552821dc161b816d5870e2a482bba18de94aa6b15d568d126be9d8fe",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_SIG_DEBUG read in poll_with_engine::CARRICK_SIG_DEBUG (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "symbol": "publish_crash_registers_if_requested::CARRICK_CORE_FAILPOINT",
-      "fingerprint": "34c3962e24aba6a29e286438c9bac6f6ee26cbdf96f0f764f889d448384605f9",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_CORE_FAILPOINT read in publish_crash_registers_if_requested::CARRICK_CORE_FAILPOINT (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "symbol": "service_outcome::CARRICK_SIG_DEBUG",
-      "fingerprint": "c3ebac26552821dc161b816d5870e2a482bba18de94aa6b15d568d126be9d8fe",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_SIG_DEBUG read in service_outcome::CARRICK_SIG_DEBUG (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "symbol": "wake_all_tasks_for_process_signal::CARRICK_SIG_DEBUG",
-      "fingerprint": "c3ebac26552821dc161b816d5870e2a482bba18de94aa6b15d568d126be9d8fe",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_SIG_DEBUG read in wake_all_tasks_for_process_signal::CARRICK_SIG_DEBUG (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
-      "symbol": "deliver_fault_signal::CARRICK_FAULT_DEBUG",
-      "fingerprint": "4fd4e6d485b718f27cdea4b4c0b45a7d31cb4315060db3bb0c3189664414eb65",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FAULT_DEBUG read in deliver_fault_signal::CARRICK_FAULT_DEBUG (crates/carrick-runtime/src/vcpu_loop/signal.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/threads.rs",
-      "symbol": "publish_persistent_sibling_stop::CARRICK_SIG_DEBUG",
-      "fingerprint": "c3ebac26552821dc161b816d5870e2a482bba18de94aa6b15d568d126be9d8fe",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_SIG_DEBUG read in publish_persistent_sibling_stop::CARRICK_SIG_DEBUG (crates/carrick-runtime/src/vcpu_loop/threads.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-vmm-hvf/src/host_signal.rs",
-      "symbol": "invoke_process_signal_wake_hook::CARRICK_SIG_DEBUG",
-      "fingerprint": "c3ebac26552821dc161b816d5870e2a482bba18de94aa6b15d568d126be9d8fe",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_SIG_DEBUG read in invoke_process_signal_wake_hook::CARRICK_SIG_DEBUG (crates/carrick-vmm-hvf/src/host_signal.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs",
-      "symbol": "run::CARRICK_TIDSTAMP_DEBUG",
-      "fingerprint": "b08dacc2138e865374ed526d3e3aabb8181ee2c9ebd960295680ed2a06f02e3b",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_TIDSTAMP_DEBUG read in run::CARRICK_TIDSTAMP_DEBUG (crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs",
-      "symbol": "stamp_guest_thread_id::CARRICK_TIDSTAMP_DEBUG",
-      "fingerprint": "b08dacc2138e865374ed526d3e3aabb8181ee2c9ebd960295680ed2a06f02e3b",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_TIDSTAMP_DEBUG read in stamp_guest_thread_id::CARRICK_TIDSTAMP_DEBUG (crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-vmm-hvf/src/syscall_mailbox.rs",
-      "symbol": "from_env::HVF_SYSCALL_TRANSPORT_ENV",
-      "fingerprint": "00ecba304b999381fcbc6ed7f1000ac0a75cdd59e2f0c11d4642ecf236435cc6",
-      "classification": "config_debug",
-      "rationale": "Environment variable HVF_SYSCALL_TRANSPORT_ENV read in from_env::HVF_SYSCALL_TRANSPORT_ENV (crates/carrick-vmm-hvf/src/syscall_mailbox.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "admission_trace_enabled::CARRICK_HVF_ADMISSION_TRACE",
-      "fingerprint": "09f321bcbff20b05517fe0a4b38ab213512a637e4ce8d99cd27f025e0d2f6f87",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_HVF_ADMISSION_TRACE read in admission_trace_enabled::CARRICK_HVF_ADMISSION_TRACE (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "exec_private_file_cache_enabled::CARRICK_HVPATCH_EXEC_PRIVATE_FILE_CACHE",
-      "fingerprint": "931b0171ed8676aebdab76e043eb81a34bbe39080ebecdd84606053168c4b276",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_HVPATCH_EXEC_PRIVATE_FILE_CACHE read in exec_private_file_cache_enabled::CARRICK_HVPATCH_EXEC_PRIVATE_FILE_CACHE (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "fpsimd_save_enabled::CARRICK_NO_FPSIMD",
-      "fingerprint": "a3914e10f7177b1a3edf81904459d94c3c07cb2295413b522876e4ddb44fa3a1",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_NO_FPSIMD read in fpsimd_save_enabled::CARRICK_NO_FPSIMD (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "from_address_space::CARRICK_HVPATCH_SHARE_EXEC_PAYLOAD",
-      "fingerprint": "1357cf78f5861bad30288ff0d2aab454e3d90331512adf0ba53a1d44b9dcd505",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_HVPATCH_SHARE_EXEC_PAYLOAD read in from_address_space::CARRICK_HVPATCH_SHARE_EXEC_PAYLOAD (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "from_address_space::CARRICK_HVPATCH_SPARSE_EXEC_STACK",
-      "fingerprint": "63723637515fd90dcfbccd79091db164dd893a05c6210831a669f790286a8136",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_HVPATCH_SPARSE_EXEC_STACK read in from_address_space::CARRICK_HVPATCH_SPARSE_EXEC_STACK (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "lazy_exec_page_tables_enabled::CARRICK_HVPATCH_LAZY_EXEC_PAGE_TABLES",
-      "fingerprint": "0cf902e86dd15cce376d7459d8b960e42afcf28a2af5ae4408d90f8cc01e3fad",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_HVPATCH_LAZY_EXEC_PAGE_TABLES read in lazy_exec_page_tables_enabled::CARRICK_HVPATCH_LAZY_EXEC_PAGE_TABLES (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "tag_strip_tests::guest_mapping_plan_payload_sharing_hatch_restores_deep_copy::CARRICK_HVPATCH_SHARE_EXEC_PAYLOAD",
-      "fingerprint": "fdb935da923d0387bd758fc1663b763193697ffd32ef5be9644304ce07758269",
-      "classification": "test_only",
-      "rationale": "Test-only fixture or lock tag_strip_tests::guest_mapping_plan_payload_sharing_hatch_restores_deep_copy::CARRICK_HVPATCH_SHARE_EXEC_PAYLOAD in crates/carrick-vmm-hvf/src/trap.rs scoped strictly to test harness execution."
-    },
-    {
       "kind": "static",
       "file": "crates/carrick-kernel/src/arena.rs",
       "symbol": "ARENA_FILE_COUNTER",
@@ -938,12 +18,36 @@
       "rationale": "Carrier-wide host infrastructure static GLOBAL in crates/carrick-kernel/src/arena.rs maintaining host process lifecycle or VM resources."
     },
     {
+      "kind": "env_var_os",
+      "file": "crates/carrick-kernel/src/process.rs",
+      "symbol": "release_claimed::CARRICK_RUNSTATE_DEBUG",
+      "fingerprint": "79a6006c8e3006cf39645157a139b2df108aa84b7cc2646b9e644374db87e73a",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_RUNSTATE_DEBUG read in release_claimed::CARRICK_RUNSTATE_DEBUG (crates/carrick-kernel/src/process.rs) configuring carrier behavior or debug logging."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-runtime/src/apfs.rs",
       "symbol": "preferred_scratch_root::CACHE",
       "fingerprint": "deb4a6f3d86dd5d03d3bb79957457973ec2c4b7268e4c98b9f332055b99944a6",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static preferred_scratch_root::CACHE in crates/carrick-runtime/src/apfs.rs maintaining host process lifecycle or VM resources."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/apfs.rs",
+      "symbol": "resolve_scratch_root::CARRICK_HOME",
+      "fingerprint": "d1720a160950ff9e3f25ca1f7b4cb0dedabb26a79cb7a56c44377a1f0ef275f1",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_HOME read in resolve_scratch_root::CARRICK_HOME (crates/carrick-runtime/src/apfs.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/apfs.rs",
+      "symbol": "resolve_scratch_root::HOME",
+      "fingerprint": "acfd587978b264cd239ffe761be7c7c1d9743018e8f0e8e0d5ca0beab221b5d2",
+      "classification": "config_debug",
+      "rationale": "Environment variable HOME read in resolve_scratch_root::HOME (crates/carrick-runtime/src/apfs.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "static",
@@ -978,12 +82,36 @@
       "rationale": "Carrier-wide host infrastructure static SHUTDOWN_DONE in crates/carrick-runtime/src/carrier.rs maintaining host process lifecycle or VM resources."
     },
     {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/carrier.rs",
+      "symbol": "shutdown::crate::vm_lifecycle::VM_LIFECYCLE_ARTIFACT_PATH_ENV",
+      "fingerprint": "eb3706692052bb42ba87ae30c5ef15712e1923b63801aeefdbfab37ea965ecc9",
+      "classification": "config_debug",
+      "rationale": "Environment variable VM_LIFECYCLE_ARTIFACT_PATH_ENV read in shutdown::crate::vm_lifecycle::VM_LIFECYCLE_ARTIFACT_PATH_ENV (crates/carrick-runtime/src/carrier.rs) configuring carrier behavior or debug logging."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-runtime/src/container.rs",
       "symbol": "lifecycle_lock_stripe::STRIPES",
       "fingerprint": "84c0d46673aeddef669239b10b3ea8d8ee97ef0c1f41f49c76cc1fc965871597",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static lifecycle_lock_stripe::STRIPES in crates/carrick-runtime/src/container.rs maintaining host process lifecycle or VM resources."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/core_dump.rs",
+      "symbol": "oracle_validation::emit_core_for_an_independent_reader::CARRICK_CORE_EMIT_PATH",
+      "fingerprint": "d8ee42ecf76e59cc9835069e066ffb892f3b505fd354b1875956be680e9fea1a",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_CORE_EMIT_PATH read in oracle_validation::emit_core_for_an_independent_reader::CARRICK_CORE_EMIT_PATH (crates/carrick-runtime/src/core_dump.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/core_dump.rs",
+      "symbol": "oracle_validation::emit_pn_xnum_core_for_an_independent_reader::CARRICK_CORE_EMIT_PN_XNUM_PATH",
+      "fingerprint": "fc0bcfe4a6d50d5f07cea406829610969fe3e38555a6407f266175e919c31009",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_CORE_EMIT_PN_XNUM_PATH read in oracle_validation::emit_pn_xnum_core_for_an_independent_reader::CARRICK_CORE_EMIT_PN_XNUM_PATH (crates/carrick-runtime/src/core_dump.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "static",
@@ -1026,6 +154,14 @@
       "rationale": "Carrier-wide host infrastructure static counter::COUNTER in crates/carrick-runtime/src/deadlock_watchdog.rs maintaining host process lifecycle or VM resources."
     },
     {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/deadlock_watchdog.rs",
+      "symbol": "window_ms::CARRICK_DEADLOCK_WATCHDOG_MS",
+      "fingerprint": "2fdbff72de644671485c53733abc818ae8e29060e65c623ee535a1055fd52bb1",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_DEADLOCK_WATCHDOG_MS read in window_ms::CARRICK_DEADLOCK_WATCHDOG_MS (crates/carrick-runtime/src/deadlock_watchdog.rs) configuring carrier behavior or debug logging."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-runtime/src/deadlock_watchdog.rs",
       "symbol": "window_ms::CELL",
@@ -1058,12 +194,52 @@
       "rationale": "Carrier-wide host infrastructure static FD_OPEN_PATH_LOOKUPS in crates/carrick-runtime/src/dispatch/fs.rs maintaining host process lifecycle or VM resources."
     },
     {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+      "symbol": "ficlone_errno::CARRICK_FICLONE_DEBUG",
+      "fingerprint": "d81b6311036aa8db461da744b96b226a6a1aff08042108d1e97536d4328f9c4f",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_FICLONE_DEBUG read in ficlone_errno::CARRICK_FICLONE_DEBUG (crates/carrick-runtime/src/dispatch/fs.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+      "symbol": "ioctl::CARRICK_FICLONE_DEBUG",
+      "fingerprint": "d81b6311036aa8db461da744b96b226a6a1aff08042108d1e97536d4328f9c4f",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_FICLONE_DEBUG read in ioctl::CARRICK_FICLONE_DEBUG (crates/carrick-runtime/src/dispatch/fs.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+      "symbol": "trusted_fs_lane_enabled::CARRICK_FS_TRUSTED_LANE",
+      "fingerprint": "2d8b98ce0979b1e11b266d37f3240be459bc06655f7c405419ccb62cdebd6331",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_FS_TRUSTED_LANE read in trusted_fs_lane_enabled::CARRICK_FS_TRUSTED_LANE (crates/carrick-runtime/src/dispatch/fs.rs) configuring carrier behavior or debug logging."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
       "symbol": "trusted_fs_lane_enabled::ENABLED",
       "fingerprint": "810e6edc6ac71f37c4eb86f28b68168eb8d1faac13e5facea0127a51501d3002",
       "classification": "config_debug",
       "rationale": "Process-global configuration or failpoint cache trusted_fs_lane_enabled::ENABLED in crates/carrick-runtime/src/dispatch/fs.rs initialized from environment flags."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/dispatch/fs/fd_helpers.rs",
+      "symbol": "OPEN_FD_NUMBERS_CALLS",
+      "fingerprint": "0e35528151ec05afe88f94ff04d8674b9532c027b68aff8211ef9d2c74457a7e",
+      "classification": "carrier_infra",
+      "rationale": "Host thread-local cell OPEN_FD_NUMBERS_CALLS in crates/carrick-runtime/src/dispatch/fs/fd_helpers.rs maintaining per-host-thread execution state for the carrier."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/dispatch/fs/pathres.rs",
+      "symbol": "DOTDOT_RESOLVE_DEPTH",
+      "fingerprint": "9b73d356e114a12775c765c295df65cdbacd2c313a6e1f4ce0caa18e4887b77f",
+      "classification": "carrier_infra",
+      "rationale": "Host thread-local cell DOTDOT_RESOLVE_DEPTH in crates/carrick-runtime/src/dispatch/fs/pathres.rs maintaining per-host-thread execution state for the carrier."
     },
     {
       "kind": "static",
@@ -1074,12 +250,100 @@
       "rationale": "Carrier-wide monotonic allocator NEXT_PIPE_ID in crates/carrick-runtime/src/dispatch/fs/pipe.rs generating unique IDs across the host process."
     },
     {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/fs/sendfile.rs",
+      "symbol": "darwin_copyfile_fast_path_disabled::CARRICK_DARWIN_COPYFILE_FAST_PATH",
+      "fingerprint": "e5b9013e2aab0b65661da1af07c483a3a62b130764cb6b1e436711a17dafedca",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_DARWIN_COPYFILE_FAST_PATH read in darwin_copyfile_fast_path_disabled::CARRICK_DARWIN_COPYFILE_FAST_PATH (crates/carrick-runtime/src/dispatch/fs/sendfile.rs) configuring carrier behavior or debug logging."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-runtime/src/dispatch/fs/sendfile.rs",
       "symbol": "darwin_copyfile_fast_path_disabled::DISABLED",
       "fingerprint": "47024f1401e55b3c40f997c52dc7f57d4772d38419e4452b7ca43075a1507e96",
       "classification": "config_debug",
       "rationale": "Process-global configuration or failpoint cache darwin_copyfile_fast_path_disabled::DISABLED in crates/carrick-runtime/src/dispatch/fs/sendfile.rs initialized from environment flags."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
+      "symbol": "strict_durability_enabled::CARRICK_STRICT_DURABILITY",
+      "fingerprint": "f3814f075ae168bea59b99647f7a4fd37ef9e7d97ac8b1e8c28e1a1e26402c68",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_STRICT_DURABILITY read in strict_durability_enabled::CARRICK_STRICT_DURABILITY (crates/carrick-runtime/src/dispatch/fs/state.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "symbol": "debug_mmap_next_lowering::CARRICK_FORK_DEBUG_VA",
+      "fingerprint": "d1a34eb1d01a21e24a1fe67ec5f906a675b02b4c687d50e7e9bbcafbb6808b70",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_FORK_DEBUG_VA read in debug_mmap_next_lowering::CARRICK_FORK_DEBUG_VA (crates/carrick-runtime/src/dispatch/mem.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "symbol": "free_regions_insert::CARRICK_FORK_DEBUG_VA",
+      "fingerprint": "d1a34eb1d01a21e24a1fe67ec5f906a675b02b4c687d50e7e9bbcafbb6808b70",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_FORK_DEBUG_VA read in free_regions_insert::CARRICK_FORK_DEBUG_VA (crates/carrick-runtime/src/dispatch/mem.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "symbol": "madvise::CARRICK_MINCORE_EXACT",
+      "fingerprint": "4a6206a3e2aa3f4e04f5c34445cd1c90feb37bd6c3bd184e83a49cad3b165ad6",
+      "classification": "config_debug",
+      "rationale": "CARRICK_MINCORE_EXACT is the bisection hatch for first-touch residency observation, which arms a fault on each private anonymous page so mincore(2) can tell a written page from an untouched one. Default ON; =0 restores the previous behaviour, where every page of a live VMA reported resident. Read-only configuration selecting whether the arm runs; it carries no per-process state, so it is carrier-wide by construction and cannot be a scope defect."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "symbol": "mmap::CARRICK_FAULT_DEBUG",
+      "fingerprint": "4fd4e6d485b718f27cdea4b4c0b45a7d31cb4315060db3bb0c3189664414eb65",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_FAULT_DEBUG read in mmap::CARRICK_FAULT_DEBUG (crates/carrick-runtime/src/dispatch/mem.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "symbol": "mmap::CARRICK_MINCORE_EXACT",
+      "fingerprint": "4a6206a3e2aa3f4e04f5c34445cd1c90feb37bd6c3bd184e83a49cad3b165ad6",
+      "classification": "config_debug",
+      "rationale": "CARRICK_MINCORE_EXACT is the bisection hatch for first-touch residency observation, which arms a fault on each private anonymous page so mincore(2) can tell a written page from an untouched one. Default ON; =0 restores the previous behaviour, where every page of a live VMA reported resident. Read-only configuration selecting whether the arm runs; it carries no per-process state, so it is carrier-wide by construction and cannot be a scope defect."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "symbol": "mmap_file_backed_lowering_enabled::CARRICK_MMAP_FILE_BACKED",
+      "fingerprint": "19774f51dd70100293a802b7f7ba9b5ca4a3e9815e728ed56850b06e97bb3e2c",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_MMAP_FILE_BACKED read in mmap_file_backed_lowering_enabled::CARRICK_MMAP_FILE_BACKED (crates/carrick-runtime/src/dispatch/mem.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "symbol": "mremap::CARRICK_FAULT_DEBUG",
+      "fingerprint": "4fd4e6d485b718f27cdea4b4c0b45a7d31cb4315060db3bb0c3189664414eb65",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_FAULT_DEBUG read in mremap::CARRICK_FAULT_DEBUG (crates/carrick-runtime/src/dispatch/mem.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "symbol": "next_mmap_address::CARRICK_FORK_DEBUG_VA",
+      "fingerprint": "d1a34eb1d01a21e24a1fe67ec5f906a675b02b4c687d50e7e9bbcafbb6808b70",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_FORK_DEBUG_VA read in next_mmap_address::CARRICK_FORK_DEBUG_VA (crates/carrick-runtime/src/dispatch/mem.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "symbol": "next_mmap_address::CARRICK_MMAP_GRANT_DEBUG",
+      "fingerprint": "80c748ba662570f06454f1cac60f540e89547595e0d2450b758d1f396f4774c4",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_MMAP_GRANT_DEBUG read in next_mmap_address::CARRICK_MMAP_GRANT_DEBUG (crates/carrick-runtime/src/dispatch/mem.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "static",
@@ -1114,12 +378,92 @@
       "rationale": "Carrier-wide monotonic allocator internal::NEXT_INTERNAL_WAIT in crates/carrick-runtime/src/dispatch/mod.rs generating unique IDs across the host process."
     },
     {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "symbol": "publish_core_atomic::CARRICK_CORE_FAILPOINT",
+      "fingerprint": "33a4c376d77e54b0f5f77e36519780e96feea8fcce87baaf8b1ade4443192589",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_CORE_FAILPOINT read in publish_core_atomic::CARRICK_CORE_FAILPOINT (crates/carrick-runtime/src/dispatch/mod.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "symbol": "watch_addr::CARRICK_WATCH_ADDR",
+      "fingerprint": "42b2e84a656a95d08fdf542b45cd94f833b8b7ced38daf82353c603572ee747b",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_WATCH_ADDR read in watch_addr::CARRICK_WATCH_ADDR (crates/carrick-runtime/src/dispatch/mod.rs) configuring carrier behavior or debug logging."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
       "symbol": "watch_addr::WATCH_ADDR",
       "fingerprint": "7d730e654a9685c3a6d5e3af8c3450f36ea242df7a16dda72b34a88ae9bbf0e9",
       "classification": "config_debug",
       "rationale": "Process-global configuration or failpoint cache watch_addr::WATCH_ADDR in crates/carrick-runtime/src/dispatch/mod.rs initialized from environment flags."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "symbol": "connect::CARRICK_NET_DEBUG",
+      "fingerprint": "98c2cd114e70f3b1193a7cffd5318f2768b3b06f6a75304226df2a01185675eb",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_NET_DEBUG read in connect::CARRICK_NET_DEBUG (crates/carrick-runtime/src/dispatch/net.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "symbol": "connect::CARRICK_NET_DEBUG#2",
+      "fingerprint": "98c2cd114e70f3b1193a7cffd5318f2768b3b06f6a75304226df2a01185675eb",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_NET_DEBUG read in connect::CARRICK_NET_DEBUG#2 (crates/carrick-runtime/src/dispatch/net.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "symbol": "description_readiness::VISITED",
+      "fingerprint": "f408f8c0ae0cb4b9200f22f10fafea3dfd5630f6080f4126702024046a4d6374",
+      "classification": "carrier_infra",
+      "rationale": "Host thread-local cell description_readiness::VISITED in crates/carrick-runtime/src/dispatch/net.rs maintaining per-host-thread execution state for the carrier."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "symbol": "queue_socket_error_after_send::CARRICK_NET_DEBUG",
+      "fingerprint": "98c2cd114e70f3b1193a7cffd5318f2768b3b06f6a75304226df2a01185675eb",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_NET_DEBUG read in queue_socket_error_after_send::CARRICK_NET_DEBUG (crates/carrick-runtime/src/dispatch/net.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "symbol": "sendto::CARRICK_NET_DEBUG",
+      "fingerprint": "98c2cd114e70f3b1193a7cffd5318f2768b3b06f6a75304226df2a01185675eb",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_NET_DEBUG read in sendto::CARRICK_NET_DEBUG (crates/carrick-runtime/src/dispatch/net.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "symbol": "sendto::CARRICK_NET_DEBUG#2",
+      "fingerprint": "98c2cd114e70f3b1193a7cffd5318f2768b3b06f6a75304226df2a01185675eb",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_NET_DEBUG read in sendto::CARRICK_NET_DEBUG#2 (crates/carrick-runtime/src/dispatch/net.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "symbol": "sendto::CARRICK_NET_DEBUG#3",
+      "fingerprint": "98c2cd114e70f3b1193a7cffd5318f2768b3b06f6a75304226df2a01185675eb",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_NET_DEBUG read in sendto::CARRICK_NET_DEBUG#3 (crates/carrick-runtime/src/dispatch/net.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "symbol": "set_socket_error_after_send::CARRICK_NET_DEBUG",
+      "fingerprint": "98c2cd114e70f3b1193a7cffd5318f2768b3b06f6a75304226df2a01185675eb",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_NET_DEBUG read in set_socket_error_after_send::CARRICK_NET_DEBUG (crates/carrick-runtime/src/dispatch/net.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "static",
@@ -1152,6 +496,30 @@
       "fingerprint": "2d984e907b3f8bb3567fbacb1133196145727ca939307fe09f0bfb6cb7509ab5",
       "classification": "host_kernel_object",
       "rationale": "Host-kernel-object table STREAMS tracking SCTP association streams keyed by host socket descriptor."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/net/sctp.rs",
+      "symbol": "begin_send::CARRICK_SCTP_DEBUG",
+      "fingerprint": "62788aa1da2b993a700596e57ad8d6a3403f373b3f96a24c607a3dc5b937c9fb",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_SCTP_DEBUG read in begin_send::CARRICK_SCTP_DEBUG (crates/carrick-runtime/src/dispatch/net/sctp.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/net/sctp.rs",
+      "symbol": "begin_send::CARRICK_SCTP_DEBUG#2",
+      "fingerprint": "62788aa1da2b993a700596e57ad8d6a3403f373b3f96a24c607a3dc5b937c9fb",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_SCTP_DEBUG read in begin_send::CARRICK_SCTP_DEBUG#2 (crates/carrick-runtime/src/dispatch/net/sctp.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/net/sctp.rs",
+      "symbol": "complete_read::CARRICK_SCTP_DEBUG",
+      "fingerprint": "62788aa1da2b993a700596e57ad8d6a3403f373b3f96a24c607a3dc5b937c9fb",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_SCTP_DEBUG read in complete_read::CARRICK_SCTP_DEBUG (crates/carrick-runtime/src/dispatch/net/sctp.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "static",
@@ -1192,6 +560,22 @@
       "fingerprint": "2dcab7e6cee9ad4cb20ed056f5c33b9f15c698bed825ef25104a485d6b01b852",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static wall_ns::BASE in crates/carrick-runtime/src/dispatch/perf.rs maintaining host process lifecycle or VM resources."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+      "symbol": "wait4::CARRICK_SIG_DEBUG",
+      "fingerprint": "c3ebac26552821dc161b816d5870e2a482bba18de94aa6b15d568d126be9d8fe",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_SIG_DEBUG read in wait4::CARRICK_SIG_DEBUG (crates/carrick-runtime/src/dispatch/proc.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+      "symbol": "wait4::CARRICK_SIG_DEBUG#2",
+      "fingerprint": "c3ebac26552821dc161b816d5870e2a482bba18de94aa6b15d568d126be9d8fe",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_SIG_DEBUG read in wait4::CARRICK_SIG_DEBUG#2 (crates/carrick-runtime/src/dispatch/proc.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "static",
@@ -1242,12 +626,44 @@
       "rationale": "Carrier-wide host infrastructure static linux_capture::CAPTURE_CTOR in crates/carrick-runtime/src/dispatch/proctitle.rs maintaining host process lifecycle or VM resources."
     },
     {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/dispatch/proctitle.rs",
+      "symbol": "run_id::CARRICK_RUN_ID",
+      "fingerprint": "953114542a4126bc26109153a15da1a6aab9eace9d9e6bdcc2819659a277157a",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_RUN_ID read in run_id::CARRICK_RUN_ID (crates/carrick-runtime/src/dispatch/proctitle.rs) configuring carrier behavior or debug logging."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-runtime/src/dispatch/pty_registry.rs",
       "symbol": "MASTERS",
       "fingerprint": "d7f2a30d982a2018c6464651323a6b9cd6316d982618fac68d36437285257014",
       "classification": "host_kernel_object",
       "rationale": "Host devpts master registry MASTERS mapping host pts indices to master host file descriptions."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/dispatch/resources.rs",
+      "symbol": "ACTIVE_CONTEXT",
+      "fingerprint": "c46f8e2eedabfaaaac35ac1547027e06aa622c2fd9ab8bee3c28afad325fe7bd",
+      "classification": "carrier_infra",
+      "rationale": "Host thread-local cell ACTIVE_CONTEXT in crates/carrick-runtime/src/dispatch/resources.rs maintaining per-host-thread execution state for the carrier."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/dispatch/resources.rs",
+      "symbol": "CAPTURED_RESOURCES",
+      "fingerprint": "7ecab6ee6e0726c019f74800ac1f03a578f1dc599d2fc9a78dacac320db5aed1",
+      "classification": "carrier_infra",
+      "rationale": "Host thread-local cell CAPTURED_RESOURCES in crates/carrick-runtime/src/dispatch/resources.rs maintaining per-host-thread execution state for the carrier."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/dispatch/resources.rs",
+      "symbol": "RETIRING_FILE_TABLES",
+      "fingerprint": "2cc918379a57db7975609207948c53efdcba6855485beac1be91c6789881bc35",
+      "classification": "carrier_infra",
+      "rationale": "Host thread-local cell RETIRING_FILE_TABLES in crates/carrick-runtime/src/dispatch/resources.rs maintaining per-host-thread execution state for the carrier."
     },
     {
       "kind": "static",
@@ -1258,12 +674,44 @@
       "rationale": "Test-only fixture or lock tests::XSIG_RING_TEST_LOCK in crates/carrick-runtime/src/dispatch/signal.rs scoped strictly to test harness execution."
     },
     {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+      "symbol": "MSG_QUEUE_FD_CACHE",
+      "fingerprint": "86bd1f420337ed19f6377584f908fd98a6075fd364dbae7140405a5c29abac75",
+      "classification": "carrier_infra",
+      "rationale": "Host thread-local cell MSG_QUEUE_FD_CACHE in crates/carrick-runtime/src/dispatch/sysv.rs maintaining per-host-thread execution state for the carrier."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
       "symbol": "SETALL_INTERLEAVING_HOOK",
       "fingerprint": "c2adb22c84c943cdd36986311d36dfbbe022f140d191d276d55896f407d12da1",
       "classification": "test_only",
       "rationale": "Test-only synchronization hook allows deterministic testing of SETALL prepare-to-finalize interleaving and permission revalidation."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+      "symbol": "ipc_set_tests::proc_sysvipc_rendering_races_attachment_cleanup_and_paired_mutation_without_deadlock::CARRICK_SYSVIPC_TEST_CHILD",
+      "fingerprint": "e28376f20995e878ba99603697a82582e826926b3fec69ce4d2cf26aaeb05157",
+      "classification": "test_only",
+      "rationale": "Test-only subprocess sentinel isolates the proc_sysvipc deadlock regression test and is absent from production builds."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+      "symbol": "ipc_set_tests::remapped_shmat_same_shmid_does_not_deadlock_and_preserves_accounting::CARRICK_SAME_SHMID_TEST_CHILD",
+      "fingerprint": "5ce33d23c6269f3e9d7b296cc5ad1d97c03659130da4ada9048d434d10412736",
+      "classification": "test_only",
+      "rationale": "Test-only subprocess sentinel isolates the same-shmid remapped shmat deadlock watchdog regression test and is absent from production builds."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+      "symbol": "ipc_set_tests::watchdog_kills_and_reaps_on_deadlock_timeout::CARRICK_SYSVIPC_TEST_CHILD_DEADLOCK",
+      "fingerprint": "e050f8de716dc76a296742adc56a973f60c4915aefd51b0a44653218cf8da7d2",
+      "classification": "test_only",
+      "rationale": "Test-only subprocess sentinel for negative watchdog termination and child reaping verification."
     },
     {
       "kind": "static",
@@ -1306,6 +754,14 @@
       "rationale": "Carrier-wide host infrastructure static WATCHDOG in crates/carrick-runtime/src/event_ring.rs maintaining host process lifecycle or VM resources."
     },
     {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/event_ring.rs",
+      "symbol": "dir::CARRICK_EVENTRING",
+      "fingerprint": "848bb7eaeede7522988b8e1d1d0365d8dda85785b89b671b0bfddf598ec1acdd",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_EVENTRING read in dir::CARRICK_EVENTRING (crates/carrick-runtime/src/event_ring.rs) configuring carrier behavior or debug logging."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-runtime/src/event_ring.rs",
       "symbol": "dir::DIR",
@@ -1322,12 +778,52 @@
       "rationale": "Carrier-wide host infrastructure static SLAB in crates/carrick-runtime/src/eventfd_shm.rs maintaining host process lifecycle or VM resources."
     },
     {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/exec_helpers.rs",
+      "symbol": "stop_for_debug_signal::CARRICK_DEBUG_STOP_ON_SIGNAL",
+      "fingerprint": "6cd191fd69f24c95c5e75d17b6c719981679c49b3bec9ae56d9aca05e1e437a2",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_DEBUG_STOP_ON_SIGNAL read in stop_for_debug_signal::CARRICK_DEBUG_STOP_ON_SIGNAL (crates/carrick-runtime/src/exec_helpers.rs) configuring carrier behavior or debug logging."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-runtime/src/exec_stamps.rs",
       "symbol": "FORK_LINK_SEQUENCE",
       "fingerprint": "777a6d48c3506202086f9fc345b08be454afb46b0c0a02fd9671d56c1dcabdfa",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static FORK_LINK_SEQUENCE in crates/carrick-runtime/src/exec_stamps.rs maintaining host process lifecycle or VM resources."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/exec_stamps.rs",
+      "symbol": "stamp_record::CARRICK_EXEC_STAMPS",
+      "fingerprint": "857b733af0acdc35b398e51cf338091b3948d948728d2bcecabe8ce4ac86a6c1",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_EXEC_STAMPS read in stamp_record::CARRICK_EXEC_STAMPS (crates/carrick-runtime/src/exec_stamps.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/execute.rs",
+      "symbol": "cached_lower_enabled::CARRICK_FS_CACHED_LOWER",
+      "fingerprint": "faff57998e21a3a8bd94e07383da4ad5e866b977c407fbab0b8ee689f8d2705f",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_FS_CACHED_LOWER read in cached_lower_enabled::CARRICK_FS_CACHED_LOWER (crates/carrick-runtime/src/execute.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/execute.rs",
+      "symbol": "rosetta_license_notice::CARRICK_NO_ROSETTA_NOTICE",
+      "fingerprint": "e724c9ed3dee5f6236a4d8c3a2d6487930d175b388429b9beab2826bd918d01a",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_NO_ROSETTA_NOTICE read in rosetta_license_notice::CARRICK_NO_ROSETTA_NOTICE (crates/carrick-runtime/src/execute.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/execute.rs",
+      "symbol": "rosetta_license_notice::ROSETTA_ACCEPT_ENV",
+      "fingerprint": "1c54b6efd2effd257e3e0f41827da03a7a6cf6f304f927d0c994a2592eb3081c",
+      "classification": "config_debug",
+      "rationale": "Environment variable ROSETTA_ACCEPT_ENV read in rosetta_license_notice::ROSETTA_ACCEPT_ENV (crates/carrick-runtime/src/execute.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "static",
@@ -1338,12 +834,36 @@
       "rationale": "Carrier-wide host infrastructure static rosetta_license_notice::SHOWN in crates/carrick-runtime/src/execute.rs maintaining host process lifecycle or VM resources."
     },
     {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/execute.rs",
+      "symbol": "seed_guest_baseline::CARRICK_SEED_APT_MIRRORS",
+      "fingerprint": "3ba6133ba7a2d92c37e0c8757f280a450c24ad330f4a71dcf7945e2fdd64f3eb",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_SEED_APT_MIRRORS read in seed_guest_baseline::CARRICK_SEED_APT_MIRRORS (crates/carrick-runtime/src/execute.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/fanotify.rs",
+      "symbol": "INTERNAL_OPEN_DEPTH",
+      "fingerprint": "85793fdcc85f1929b4d3479f4d68a7044de0dffcd666777ee05855a5f0b3fd59",
+      "classification": "carrier_infra",
+      "rationale": "Host thread-local cell INTERNAL_OPEN_DEPTH in crates/carrick-runtime/src/fanotify.rs maintaining per-host-thread execution state for the carrier."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-runtime/src/fs_backend.rs",
       "symbol": "ANON_FD_COUNTER",
       "fingerprint": "265b5d787ac9fe2eaac10f158c9096a6db3f0e2931b862923ba6e07e6df5e9df",
       "classification": "monotonic_allocator",
       "rationale": "Carrier-wide monotonic allocator ANON_FD_COUNTER in crates/carrick-runtime/src/fs_backend.rs generating unique IDs across the host process."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/fs_backend.rs",
+      "symbol": "EXCLUSIVE_ARCHIVE_GATES",
+      "fingerprint": "f2d82442711502ce92f2b201cce414a32749146c1a91c11fb4843e7483c3a8a4",
+      "classification": "carrier_infra",
+      "rationale": "Host thread-local cell EXCLUSIVE_ARCHIVE_GATES in crates/carrick-runtime/src/fs_backend.rs maintaining per-host-thread execution state for the carrier."
     },
     {
       "kind": "static",
@@ -1354,12 +874,52 @@
       "rationale": "Carrier-wide monotonic allocator SCRATCH_TRASH_COUNTER in crates/carrick-runtime/src/fs_backend.rs generating unique IDs across the host process."
     },
     {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/fs_backend.rs",
+      "symbol": "default_scratch_root::HOME",
+      "fingerprint": "acfd587978b264cd239ffe761be7c7c1d9743018e8f0e8e0d5ca0beab221b5d2",
+      "classification": "config_debug",
+      "rationale": "Environment variable HOME read in default_scratch_root::HOME (crates/carrick-runtime/src/fs_backend.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/fs_backend.rs",
+      "symbol": "default_scratch_root::TMPDIR",
+      "fingerprint": "394164c8b4a8b59042322562ebc871f687aa9d65310d19e7a33627c7b6f3fe8c",
+      "classification": "config_debug",
+      "rationale": "Environment variable TMPDIR read in default_scratch_root::TMPDIR (crates/carrick-runtime/src/fs_backend.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/fs_backend.rs",
+      "symbol": "fast_fs_enabled::CARRICK_FAST_FS",
+      "fingerprint": "96ca06b880ff8098bca574f0a3b5def3654a1571488e234607b5a7c5407728de",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_FAST_FS read in fast_fs_enabled::CARRICK_FAST_FS (crates/carrick-runtime/src/fs_backend.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/fs_backend.rs",
+      "symbol": "overlay_enabled::CARRICK_FS_OVERLAY",
+      "fingerprint": "3ae130f3fa0fc49685d6010a720265b73ebdd58b2faf96171d676b30949c0f40",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_FS_OVERLAY read in overlay_enabled::CARRICK_FS_OVERLAY (crates/carrick-runtime/src/fs_backend.rs) configuring carrier behavior or debug logging."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-runtime/src/fs_backend.rs",
       "symbol": "scratch_cleanup_sender::SENDER",
       "fingerprint": "5e774260b6700d3db8ed18e8ac5d4651fd2d3e3e1d370a6f5e653f7235b5c507",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static scratch_cleanup_sender::SENDER in crates/carrick-runtime/src/fs_backend.rs maintaining host process lifecycle or VM resources."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/fs_backend.rs",
+      "symbol": "stat_cache_enabled::CARRICK_FS_STATCACHE",
+      "fingerprint": "b16c7c1b5f4416fbfbeb65325342c905d6bb273050817180ef0318d722c2294a",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_FS_STATCACHE read in stat_cache_enabled::CARRICK_FS_STATCACHE (crates/carrick-runtime/src/fs_backend.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "static",
@@ -1402,12 +962,76 @@
       "rationale": "Carrier-wide monotonic allocator NEXT_CONTAINER_ID in crates/carrick-runtime/src/kernel/container.rs generating unique IDs across the host process."
     },
     {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/kernel/container.rs",
+      "symbol": "from_process_env::CARRICK_CONTAINER_ID",
+      "fingerprint": "1b67e5b5b134ab1ff2cca6220975a5fca2164042ec673eeff0f92b11be2833b1",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_CONTAINER_ID read in from_process_env::CARRICK_CONTAINER_ID (crates/carrick-runtime/src/kernel/container.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/kernel/container.rs",
+      "symbol": "from_process_env::CARRICK_EXEC_OVERLAY",
+      "fingerprint": "e5876a6c43141b1fa085753ff7b75bf345c7b4ee71af774a2ab725be1e61b5af",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_EXEC_OVERLAY read in from_process_env::CARRICK_EXEC_OVERLAY (crates/carrick-runtime/src/kernel/container.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/kernel/container.rs",
+      "symbol": "from_process_env::CARRICK_LAUNCH_AUTHORIZATION",
+      "fingerprint": "5402cc31982f88978b45fa4fc6fb17033e9512bb9badc27cbd206bfa58747707",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_LAUNCH_AUTHORIZATION read in from_process_env::CARRICK_LAUNCH_AUTHORIZATION (crates/carrick-runtime/src/kernel/container.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/kernel/container.rs",
+      "symbol": "from_process_env::CARRICK_RUN_ID",
+      "fingerprint": "953114542a4126bc26109153a15da1a6aab9eace9d9e6bdcc2819659a277157a",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_RUN_ID read in from_process_env::CARRICK_RUN_ID (crates/carrick-runtime/src/kernel/container.rs) configuring carrier behavior or debug logging."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-runtime/src/kernel/container.rs",
       "symbol": "tests::ENV_LOCK",
       "fingerprint": "d3e8fa8c63e53fe4921dbba7c17f1ebe992389c0367e7e1c2a7aad79f0477143",
       "classification": "test_only",
       "rationale": "Test-only fixture or lock tests::ENV_LOCK in crates/carrick-runtime/src/kernel/container.rs scoped strictly to test harness execution."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/kernel/container.rs",
+      "symbol": "tests::with_env::key",
+      "fingerprint": "d0eab53b3bdca61a0d38973031cf88d0ea84564679fdf423da6ef171543335b5",
+      "classification": "test_only",
+      "rationale": "Test-only fixture or lock tests::with_env::key in crates/carrick-runtime/src/kernel/container.rs scoped strictly to test harness execution."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/kernel/control/endpoint.rs",
+      "symbol": "for_container_id::CARRICK_CONTROL_DIR",
+      "fingerprint": "33141ab28f135648083af6855a3a55ae9a2ea045ec945ff1925de040dbbe7881",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_CONTROL_DIR read in for_container_id::CARRICK_CONTROL_DIR (crates/carrick-runtime/src/kernel/control/endpoint.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/kernel/debug/endpoint.rs",
+      "symbol": "base_directory::BASE_DIR_ENV",
+      "fingerprint": "b22671436a90593b2a6cf5e38ea89268074463dd166be57269ed653c5718e430",
+      "classification": "config_debug",
+      "rationale": "Environment variable BASE_DIR_ENV read in base_directory::BASE_DIR_ENV (crates/carrick-runtime/src/kernel/debug/endpoint.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/kernel/debug/endpoint.rs",
+      "symbol": "for_current_run::CARRICK_RUN_ID",
+      "fingerprint": "953114542a4126bc26109153a15da1a6aab9eace9d9e6bdcc2819659a277157a",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_RUN_ID read in for_current_run::CARRICK_RUN_ID (crates/carrick-runtime/src/kernel/debug/endpoint.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "static",
@@ -1418,12 +1042,28 @@
       "rationale": "Carrier-wide host infrastructure static INSTALLED in crates/carrick-runtime/src/kernel/debug/server.rs maintaining host process lifecycle or VM resources."
     },
     {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/kernel/debug/server.rs",
+      "symbol": "install::DISABLE_ENV",
+      "fingerprint": "74a10faac7acd44b2a482888e2c4ab78e4f4976ecc57aa0f8be30f5d095f97f0",
+      "classification": "config_debug",
+      "rationale": "Environment variable DISABLE_ENV read in install::DISABLE_ENV (crates/carrick-runtime/src/kernel/debug/server.rs) configuring carrier behavior or debug logging."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-runtime/src/kernel/ids.rs",
       "symbol": "NEXT_FILE_DESCRIPTION_ID",
       "fingerprint": "e5de473ba863b6f4206b47d69226d2dbe46e9f2b22d11a52622aea523cfa8623",
       "classification": "monotonic_allocator",
       "rationale": "Carrier-wide monotonic allocator NEXT_FILE_DESCRIPTION_ID in crates/carrick-runtime/src/kernel/ids.rs generating unique IDs across the host process."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
+      "symbol": "tests::production_carrier_budget_one_full_occupancy_defers_caller_self_ack_to_entry::ISOLATED_ENV",
+      "fingerprint": "db47b947bff4c3855c8dadde05cd337b2537f37926863719961a524d914ad7de",
+      "classification": "test_only",
+      "rationale": "Test-only subprocess sentinel isolates the one-vCPU full-occupancy handshake case and is absent from production builds."
     },
     {
       "kind": "static",
@@ -1452,6 +1092,22 @@
       "rationale": "Carrier-wide monotonic allocator NEXT_FILE_SLOT_GENERATION in crates/carrick-runtime/src/kernel/objects.rs generating unique IDs across the host process."
     },
     {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "symbol": "post_signal_to_authorized_target_inner::CARRICK_SIG_DEBUG",
+      "fingerprint": "c3ebac26552821dc161b816d5870e2a482bba18de94aa6b15d568d126be9d8fe",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_SIG_DEBUG read in post_signal_to_authorized_target_inner::CARRICK_SIG_DEBUG (crates/carrick-runtime/src/kernel/operations.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "symbol": "post_signal_to_task_key::CARRICK_SIG_DEBUG",
+      "fingerprint": "c3ebac26552821dc161b816d5870e2a482bba18de94aa6b15d568d126be9d8fe",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_SIG_DEBUG read in post_signal_to_task_key::CARRICK_SIG_DEBUG (crates/carrick-runtime/src/kernel/operations.rs) configuring carrier behavior or debug logging."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-runtime/src/kernel/tty.rs",
       "symbol": "slot::SLOT",
@@ -1466,6 +1122,14 @@
       "fingerprint": "be74cb5b68663042ef31d41c120e4754c786d129fd9d3a7eafd4dbea60560ea6",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static reflink_or_copy_file::FALLBACK_FLAGGED in crates/carrick-runtime/src/layer_cache.rs maintaining host process lifecycle or VM resources."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/lib.rs",
+      "symbol": "rosetta_interpreter_path::CARRICK_ROSETTA_PATH",
+      "fingerprint": "9794d75b53c43f933aeaec14d92a8aecbdf24db7e0d56b6f16731c3cc308aec5",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_ROSETTA_PATH read in rosetta_interpreter_path::CARRICK_ROSETTA_PATH (crates/carrick-runtime/src/lib.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "static",
@@ -1572,6 +1236,38 @@
       "rationale": "Carrier-wide host infrastructure static MY_SLOT in crates/carrick-runtime/src/run_state.rs maintaining host process lifecycle or VM resources."
     },
     {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/run_state.rs",
+      "symbol": "debug_run_state::CARRICK_RUNSTATE_DEBUG",
+      "fingerprint": "79a6006c8e3006cf39645157a139b2df108aa84b7cc2646b9e644374db87e73a",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_RUNSTATE_DEBUG read in debug_run_state::CARRICK_RUNSTATE_DEBUG (crates/carrick-runtime/src/run_state.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/run_state.rs",
+      "symbol": "published::CARRICK_RUNSTATE_DEBUG",
+      "fingerprint": "79a6006c8e3006cf39645157a139b2df108aa84b7cc2646b9e644374db87e73a",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_RUNSTATE_DEBUG read in published::CARRICK_RUNSTATE_DEBUG (crates/carrick-runtime/src/run_state.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/run_state.rs",
+      "symbol": "published::CARRICK_RUNSTATE_DEBUG#2",
+      "fingerprint": "79a6006c8e3006cf39645157a139b2df108aa84b7cc2646b9e644374db87e73a",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_RUNSTATE_DEBUG read in published::CARRICK_RUNSTATE_DEBUG#2 (crates/carrick-runtime/src/run_state.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/runtime.rs",
+      "symbol": "hardware_tso_for_debug::CARRICK_DISABLE_TSO",
+      "fingerprint": "3a3cc89abe55008d1ed8ce4e4bfd9baf81b5f71ac099625513aedebb8a7b2036",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_DISABLE_TSO read in hardware_tso_for_debug::CARRICK_DISABLE_TSO (crates/carrick-runtime/src/runtime.rs) configuring carrier behavior or debug logging."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-runtime/src/runtime.rs",
       "symbol": "rosetta_binary_bytes::CACHE",
@@ -1586,6 +1282,30 @@
       "fingerprint": "3c13ec3261cdbf3ca309bd9fd863023dabca93ee7c6addfd1401bc8a5fe7cd61",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static rosetta_license_blob::CACHE in crates/carrick-runtime/src/runtime.rs maintaining host process lifecycle or VM resources."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/runtime.rs",
+      "symbol": "run_address_space_with_hvf_and_dispatcher::CARRICK_CONTAINER_ID",
+      "fingerprint": "1b67e5b5b134ab1ff2cca6220975a5fca2164042ec673eeff0f92b11be2833b1",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_CONTAINER_ID read in run_address_space_with_hvf_and_dispatcher::CARRICK_CONTAINER_ID (crates/carrick-runtime/src/runtime.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/threaded_loop.rs",
+      "symbol": "run_threaded_loop_inner::CARRICK_CONTAINER_ID",
+      "fingerprint": "1b67e5b5b134ab1ff2cca6220975a5fca2164042ec673eeff0f92b11be2833b1",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_CONTAINER_ID read in run_threaded_loop_inner::CARRICK_CONTAINER_ID (crates/carrick-runtime/src/threaded_loop.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/threaded_loop.rs",
+      "symbol": "run_threaded_loop_inner::CARRICK_LAUNCH_AUTHORIZATION",
+      "fingerprint": "5402cc31982f88978b45fa4fc6fb17033e9512bb9badc27cbd206bfa58747707",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_LAUNCH_AUTHORIZATION read in run_threaded_loop_inner::CARRICK_LAUNCH_AUTHORIZATION (crates/carrick-runtime/src/threaded_loop.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "static",
@@ -1618,6 +1338,46 @@
       "fingerprint": "fec5516a1c3b36f64558f4b6f2e518a7079351a7f20371dd20f558d9dda99d7e",
       "classification": "monotonic_allocator",
       "rationale": "Carrier-wide monotonic allocator NEXT_RUNNER_JOB_ID in crates/carrick-runtime/src/vcpu_loop/continuation.rs generating unique IDs across the host process."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
+      "symbol": "resume::CARRICK_SIG_DEBUG",
+      "fingerprint": "c3ebac26552821dc161b816d5870e2a482bba18de94aa6b15d568d126be9d8fe",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_SIG_DEBUG read in resume::CARRICK_SIG_DEBUG (crates/carrick-runtime/src/vcpu_loop/continuation.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/exec.rs",
+      "symbol": "drive_execve::CARRICK_HVPATCH_VERIFY_EXEC_CODE",
+      "fingerprint": "8503a39ce1f115acdbbf5c79739fc75f6f2a17bba342dd635f1fdcf360bfc3aa",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_HVPATCH_VERIFY_EXEC_CODE read in drive_execve::CARRICK_HVPATCH_VERIFY_EXEC_CODE (crates/carrick-runtime/src/vcpu_loop/exec.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/vcpu_loop/exec.rs",
+      "symbol": "hvpatch_exec_inventory_failure_injection::CARRICK_HVPATCH_EXEC_INVENTORY_FAILURE",
+      "fingerprint": "e658cdd1bcfe96145c9bc9e449122f918a4b17489accf8f9fa1f4442f77d8d64",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_HVPATCH_EXEC_INVENTORY_FAILURE read in hvpatch_exec_inventory_failure_injection::CARRICK_HVPATCH_EXEC_INVENTORY_FAILURE (crates/carrick-runtime/src/vcpu_loop/exec.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/exec.rs",
+      "symbol": "prepare_execve::CARRICK_FAULT_DEBUG",
+      "fingerprint": "4fd4e6d485b718f27cdea4b4c0b45a7d31cb4315060db3bb0c3189664414eb65",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_FAULT_DEBUG read in prepare_execve::CARRICK_FAULT_DEBUG (crates/carrick-runtime/src/vcpu_loop/exec.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/exec.rs",
+      "symbol": "prepare_execve::CARRICK_SIG_DEBUG",
+      "fingerprint": "c3ebac26552821dc161b816d5870e2a482bba18de94aa6b15d568d126be9d8fe",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_SIG_DEBUG read in prepare_execve::CARRICK_SIG_DEBUG (crates/carrick-runtime/src/vcpu_loop/exec.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "static",
@@ -1668,6 +1428,86 @@
       "rationale": "Carrier-wide host infrastructure static VCPU_RECLAIM_RESUME_NS in crates/carrick-runtime/src/vcpu_loop/mod.rs maintaining host process lifecycle or VM resources."
     },
     {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "symbol": "capture_core_for_publication::CARRICK_CORE_FAILPOINT",
+      "fingerprint": "34c3962e24aba6a29e286438c9bac6f6ee26cbdf96f0f764f889d448384605f9",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_CORE_FAILPOINT read in capture_core_for_publication::CARRICK_CORE_FAILPOINT (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "symbol": "capture_core_for_publication::CARRICK_CORE_FAILPOINT#10",
+      "fingerprint": "34c3962e24aba6a29e286438c9bac6f6ee26cbdf96f0f764f889d448384605f9",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_CORE_FAILPOINT read in capture_core_for_publication::CARRICK_CORE_FAILPOINT#10 (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "symbol": "capture_core_for_publication::CARRICK_CORE_FAILPOINT#2",
+      "fingerprint": "34c3962e24aba6a29e286438c9bac6f6ee26cbdf96f0f764f889d448384605f9",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_CORE_FAILPOINT read in capture_core_for_publication::CARRICK_CORE_FAILPOINT#2 (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "symbol": "capture_core_for_publication::CARRICK_CORE_FAILPOINT#3",
+      "fingerprint": "34c3962e24aba6a29e286438c9bac6f6ee26cbdf96f0f764f889d448384605f9",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_CORE_FAILPOINT read in capture_core_for_publication::CARRICK_CORE_FAILPOINT#3 (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "symbol": "capture_core_for_publication::CARRICK_CORE_FAILPOINT#4",
+      "fingerprint": "34c3962e24aba6a29e286438c9bac6f6ee26cbdf96f0f764f889d448384605f9",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_CORE_FAILPOINT read in capture_core_for_publication::CARRICK_CORE_FAILPOINT#4 (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "symbol": "capture_core_for_publication::CARRICK_CORE_FAILPOINT#5",
+      "fingerprint": "34c3962e24aba6a29e286438c9bac6f6ee26cbdf96f0f764f889d448384605f9",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_CORE_FAILPOINT read in capture_core_for_publication::CARRICK_CORE_FAILPOINT#5 (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "symbol": "capture_core_for_publication::CARRICK_CORE_FAILPOINT#6",
+      "fingerprint": "34c3962e24aba6a29e286438c9bac6f6ee26cbdf96f0f764f889d448384605f9",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_CORE_FAILPOINT read in capture_core_for_publication::CARRICK_CORE_FAILPOINT#6 (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "symbol": "capture_core_for_publication::CARRICK_CORE_FAILPOINT#7",
+      "fingerprint": "34c3962e24aba6a29e286438c9bac6f6ee26cbdf96f0f764f889d448384605f9",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_CORE_FAILPOINT read in capture_core_for_publication::CARRICK_CORE_FAILPOINT#7 (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "symbol": "capture_core_for_publication::CARRICK_CORE_FAILPOINT#8",
+      "fingerprint": "34c3962e24aba6a29e286438c9bac6f6ee26cbdf96f0f764f889d448384605f9",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_CORE_FAILPOINT read in capture_core_for_publication::CARRICK_CORE_FAILPOINT#8 (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "symbol": "capture_core_for_publication::CARRICK_CORE_FAILPOINT#9",
+      "fingerprint": "34c3962e24aba6a29e286438c9bac6f6ee26cbdf96f0f764f889d448384605f9",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_CORE_FAILPOINT read in capture_core_for_publication::CARRICK_CORE_FAILPOINT#9 (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "symbol": "carrier_tasks::NEXT_DIRECTORY",
@@ -1684,12 +1524,92 @@
       "rationale": "Carrier-wide monotonic allocator issue_hvpatch_child_token::NEXT_AUTHORITY_ID in crates/carrick-runtime/src/vcpu_loop/mod.rs generating unique IDs across the host process."
     },
     {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "symbol": "macos_helper_stubs::execve_trace_filter::CARRICK_EXECVE_TRACE",
+      "fingerprint": "b829ed5ee882b3a9fe4e21b7229378adc7ff7b6f6e295a71af3510cb6d53254e",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_EXECVE_TRACE read in macos_helper_stubs::execve_trace_filter::CARRICK_EXECVE_TRACE (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "symbol": "macos_helper_stubs::execve_trace_filter::FILTER",
       "fingerprint": "b923ff80052568fdb6c4792712f6be7a453c07ebf58f04f189ceb0dc88189d07",
       "classification": "config_debug",
       "rationale": "Process-global configuration or failpoint cache macos_helper_stubs::execve_trace_filter::FILTER in crates/carrick-runtime/src/vcpu_loop/mod.rs initialized from environment flags."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "symbol": "new::CARRICK_TRACE_TRAPS",
+      "fingerprint": "e790d772c83fe2d155d2d470c8e3b30b3ecedad7cc4fbd7ae9c5d8dea0f32deb",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_TRACE_TRAPS read in new::CARRICK_TRACE_TRAPS (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "symbol": "poll_with_engine::CARRICK_FAULT_DEBUG",
+      "fingerprint": "4fd4e6d485b718f27cdea4b4c0b45a7d31cb4315060db3bb0c3189664414eb65",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_FAULT_DEBUG read in poll_with_engine::CARRICK_FAULT_DEBUG (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "symbol": "poll_with_engine::CARRICK_FAULT_DEBUG#2",
+      "fingerprint": "4fd4e6d485b718f27cdea4b4c0b45a7d31cb4315060db3bb0c3189664414eb65",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_FAULT_DEBUG read in poll_with_engine::CARRICK_FAULT_DEBUG#2 (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "symbol": "poll_with_engine::CARRICK_SIG_DEBUG",
+      "fingerprint": "c3ebac26552821dc161b816d5870e2a482bba18de94aa6b15d568d126be9d8fe",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_SIG_DEBUG read in poll_with_engine::CARRICK_SIG_DEBUG (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "symbol": "publish_crash_registers_if_requested::CARRICK_CORE_FAILPOINT",
+      "fingerprint": "34c3962e24aba6a29e286438c9bac6f6ee26cbdf96f0f764f889d448384605f9",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_CORE_FAILPOINT read in publish_crash_registers_if_requested::CARRICK_CORE_FAILPOINT (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "symbol": "service_outcome::CARRICK_SIG_DEBUG",
+      "fingerprint": "c3ebac26552821dc161b816d5870e2a482bba18de94aa6b15d568d126be9d8fe",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_SIG_DEBUG read in service_outcome::CARRICK_SIG_DEBUG (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "symbol": "trap_watchdog_wall_window::CARRICK_MAX_WALL_MS",
+      "fingerprint": "2b16120d75fc0b213af7e4ea5d07d3b8e9ee2f9912e6f35a1b0b60901a0cd0a5",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_MAX_WALL_MS read in trap_watchdog_wall_window::CARRICK_MAX_WALL_MS (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "symbol": "wake_all_tasks_for_process_signal::CARRICK_SIG_DEBUG",
+      "fingerprint": "c3ebac26552821dc161b816d5870e2a482bba18de94aa6b15d568d126be9d8fe",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_SIG_DEBUG read in wake_all_tasks_for_process_signal::CARRICK_SIG_DEBUG (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
+      "symbol": "EXACT_MM_STAGE1",
+      "fingerprint": "1831bf5d7c756e3b61f4c1029d96d250a26dae7fcad2141c09e88c86e8db501e",
+      "classification": "carrier_infra",
+      "rationale": "Per-host-service-thread weak lookup stack supports synchronous re-entry into an exact live MM stage-1 lease; authority remains in the upgraded lease and exact executor census rather than the thread-local observation."
     },
     {
       "kind": "static",
@@ -1700,12 +1620,52 @@
       "rationale": "Cfg(test)-only mutex serializes foreign-COW handshake fixtures that share process-wide test controls; it is absent from production builds."
     },
     {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
+      "symbol": "SIGNAL_PROGRESS",
+      "fingerprint": "7755e08c063b13aa58b05d249ee9449b42430aeb6fce85646cf2bb3f9a460ad5",
+      "classification": "carrier_infra",
+      "rationale": "Host thread-local cell SIGNAL_PROGRESS in crates/carrick-runtime/src/vcpu_loop/signal.rs maintaining per-host-thread execution state for the carrier."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
+      "symbol": "deliver_fault_signal::CARRICK_FAULT_DEBUG",
+      "fingerprint": "4fd4e6d485b718f27cdea4b4c0b45a7d31cb4315060db3bb0c3189664414eb65",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_FAULT_DEBUG read in deliver_fault_signal::CARRICK_FAULT_DEBUG (crates/carrick-runtime/src/vcpu_loop/signal.rs) configuring carrier behavior or debug logging."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
       "symbol": "tests::PTRACE_SIGNAL_TEST_LOCK",
       "fingerprint": "e38f595f6e8bc2ee4fc3f9fc01b1c1bc93d9eff2a6e7fb4e6889d90ef35bf947",
       "classification": "test_only",
       "rationale": "Test-only fixture or lock tests::PTRACE_SIGNAL_TEST_LOCK in crates/carrick-runtime/src/vcpu_loop/signal.rs scoped strictly to test harness execution."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/threads.rs",
+      "symbol": "publish_persistent_sibling_stop::CARRICK_SIG_DEBUG",
+      "fingerprint": "c3ebac26552821dc161b816d5870e2a482bba18de94aa6b15d568d126be9d8fe",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_SIG_DEBUG read in publish_persistent_sibling_stop::CARRICK_SIG_DEBUG (crates/carrick-runtime/src/vcpu_loop/threads.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/vdso_policy.rs",
+      "symbol": "vdso_debug_mode::CARRICK_DISABLE_VDSO",
+      "fingerprint": "50d9306ef0f992272a2c4c6776c1a2566d149ea7bd29ab3824ea4a3014278448",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_DISABLE_VDSO read in vdso_debug_mode::CARRICK_DISABLE_VDSO (crates/carrick-runtime/src/vdso_policy.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/vdso_policy.rs",
+      "symbol": "vdso_debug_mode::CARRICK_VDSO_MODE",
+      "fingerprint": "9b7303b8b91080ab3c18db2ba785de553bafb7200635ca59742a15a0f416c0b3",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_VDSO_MODE read in vdso_debug_mode::CARRICK_VDSO_MODE (crates/carrick-runtime/src/vdso_policy.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "static",
@@ -1746,6 +1706,22 @@
       "fingerprint": "40b8970e818bec9f531cb54e89d9a49a90f8e3427579225e5dd882564bed316e",
       "classification": "test_only",
       "rationale": "Test-only fixture or lock imp::SIGNAL_HITS in crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs scoped strictly to test harness execution."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-vmm-hvf/src/bin/hvf_kernel_memory_probe.rs",
+      "symbol": "platform::run::CARRICK_RUN_ID",
+      "fingerprint": "e958d165c4cf8d0886b3b843126990ebe591e5c7fa2b9fdabcee43ff1376eb08",
+      "classification": "test_only",
+      "rationale": "Test-only fixture or lock platform::run::CARRICK_RUN_ID in crates/carrick-vmm-hvf/src/bin/hvf_kernel_memory_probe.rs scoped strictly to test harness execution."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-vmm-hvf/src/bin/hvf_kernel_memory_probe.rs",
+      "symbol": "platform::run::CARRICK_SOURCE_COMMIT",
+      "fingerprint": "30a7fbf54d9f66a2eb1ea6efdb749859259e604480e0e32a676e184dcbcac298",
+      "classification": "test_only",
+      "rationale": "Test-only fixture or lock platform::run::CARRICK_SOURCE_COMMIT in crates/carrick-vmm-hvf/src/bin/hvf_kernel_memory_probe.rs scoped strictly to test harness execution."
     },
     {
       "kind": "static",
@@ -1828,6 +1804,14 @@
       "rationale": "Carrier-wide host infrastructure static THREAD_WAITERS in crates/carrick-vmm-hvf/src/host_signal.rs maintaining host process lifecycle or VM resources."
     },
     {
+      "kind": "env_var_os",
+      "file": "crates/carrick-vmm-hvf/src/host_signal.rs",
+      "symbol": "invoke_process_signal_wake_hook::CARRICK_SIG_DEBUG",
+      "fingerprint": "c3ebac26552821dc161b816d5870e2a482bba18de94aa6b15d568d126be9d8fe",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_SIG_DEBUG read in invoke_process_signal_wake_hook::CARRICK_SIG_DEBUG (crates/carrick-vmm-hvf/src/host_signal.rs) configuring carrier behavior or debug logging."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs",
       "symbol": "TASK_ONLY_MATERIALIZATIONS",
@@ -1836,12 +1820,36 @@
       "rationale": "Carrier-wide host infrastructure static TASK_ONLY_MATERIALIZATIONS in crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs maintaining host process lifecycle or VM resources."
     },
     {
+      "kind": "env_var",
+      "file": "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs",
+      "symbol": "hvf_vcpu_reclaim_enabled::CARRICK_HVF_VCPU_RECLAIM",
+      "fingerprint": "5bc60d9e4c097ce1c91b2f65b4d74e267b0207ad56c845b056865ed8f76d2f86",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_HVF_VCPU_RECLAIM read in hvf_vcpu_reclaim_enabled::CARRICK_HVF_VCPU_RECLAIM (crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs) configuring carrier behavior or debug logging."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs",
       "symbol": "hvf_vcpu_reclaim_enabled::ENABLED",
       "fingerprint": "d3bce58c23c5a39148597c742d4efc3d23c0c671f159649ee582aae719dda689",
       "classification": "config_debug",
       "rationale": "Process-global configuration or failpoint cache hvf_vcpu_reclaim_enabled::ENABLED in crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs initialized from environment flags."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs",
+      "symbol": "run::CARRICK_TIDSTAMP_DEBUG",
+      "fingerprint": "b08dacc2138e865374ed526d3e3aabb8181ee2c9ebd960295680ed2a06f02e3b",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_TIDSTAMP_DEBUG read in run::CARRICK_TIDSTAMP_DEBUG (crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs",
+      "symbol": "stamp_guest_thread_id::CARRICK_TIDSTAMP_DEBUG",
+      "fingerprint": "b08dacc2138e865374ed526d3e3aabb8181ee2c9ebd960295680ed2a06f02e3b",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_TIDSTAMP_DEBUG read in stamp_guest_thread_id::CARRICK_TIDSTAMP_DEBUG (crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "static",
@@ -1868,12 +1876,36 @@
       "rationale": "Carrier-wide monotonic allocator NEXT_GENERATION in crates/carrick-vmm-hvf/src/syscall_mailbox.rs generating unique IDs across the host process."
     },
     {
+      "kind": "thread_local",
+      "file": "crates/carrick-vmm-hvf/src/syscall_mailbox.rs",
+      "symbol": "THREAD_MAILBOX_SLOT_CLAIMS_TOTAL",
+      "fingerprint": "d7a80eaeabb4a73206d52e64bec9c974ce8f2453dc622c3656d77b3e1d002232",
+      "classification": "carrier_infra",
+      "rationale": "Host thread-local cell THREAD_MAILBOX_SLOT_CLAIMS_TOTAL in crates/carrick-vmm-hvf/src/syscall_mailbox.rs maintaining per-host-thread execution state for the carrier."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-vmm-hvf/src/syscall_mailbox.rs",
+      "symbol": "from_env::HVF_SYSCALL_TRANSPORT_ENV",
+      "fingerprint": "00ecba304b999381fcbc6ed7f1000ac0a75cdd59e2f0c11d4642ecf236435cc6",
+      "classification": "config_debug",
+      "rationale": "Environment variable HVF_SYSCALL_TRANSPORT_ENV read in from_env::HVF_SYSCALL_TRANSPORT_ENV (crates/carrick-vmm-hvf/src/syscall_mailbox.rs) configuring carrier behavior or debug logging."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "ALIAS_REMAP_COUNT",
       "fingerprint": "807136604cd04dc311fd05591e30f4013d620ab30a5e4229690ae406941bedea",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static ALIAS_REMAP_COUNT in crates/carrick-vmm-hvf/src/trap.rs maintaining host process lifecycle or VM resources."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "ALIAS_STATE_ROWS_SCANNED",
+      "fingerprint": "41bb64410f90ebaee726eb9a9e71e5bb46f2ec92855206b9c49efa1e3de63d3d",
+      "classification": "carrier_infra",
+      "rationale": "Host thread-local counter of rows visited by linear passes over the carrier-global alias/replay/version state, so an algorithmic-complexity regression is a TEST failure rather than a timing observation (retiring_one_owner_does_not_scan_foreign_alias_rows). Deliberately PER HOST THREAD and not process-global: a process-global counter is polluted by every other guest thread and by concurrently running tests, which made the same work report 1,539 rows under cargo test's default parallelism and 513 in isolation. It describes the measuring thread's own work and carries no Linux process semantics."
     },
     {
       "kind": "static",
@@ -1892,6 +1924,14 @@
       "rationale": "Carrier-wide host infrastructure static EL1_KICK_RESUMED in crates/carrick-vmm-hvf/src/trap.rs maintaining host process lifecycle or VM resources."
     },
     {
+      "kind": "thread_local",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "FORK_MAPPING_ROWS_SCANNED",
+      "fingerprint": "b0ba0e3973249673260a1e2c0fdff13885cd881a80a7b76ddc1f11f243c2d2af",
+      "classification": "carrier_infra",
+      "rationale": "Host thread-local counter of source-mapping rows visited while answering the fork overlay-owner question, backing fork_overlay_owner_lookup_does_not_rescan_every_source_mapping. Same per-host-thread scope and rationale as ALIAS_STATE_ROWS_SCANNED: it measures the forking thread's own work and carries no Linux process semantics."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "INJECT_AT_EL1",
@@ -1908,12 +1948,28 @@
       "rationale": "Carrier-wide host infrastructure static KICK_PATH_INJECT in crates/carrick-vmm-hvf/src/trap.rs maintaining host process lifecycle or VM resources."
     },
     {
+      "kind": "thread_local",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "STAGE2_AUDIT_STATE",
+      "fingerprint": "f4a8dd5e57f884559783cd3de35e10deac5ea59dfd6c204ad6ecdf6f75b88658",
+      "classification": "test_only",
+      "rationale": "Test-only thread-local cell STAGE2_AUDIT_STATE in crates/carrick-vmm-hvf/src/trap.rs enabling hypervisor stage-2 audit and failure injection in unit tests."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "STRUCTURAL_EPOCH_ALLOCATOR",
       "fingerprint": "a7481b4fb92940c93b18cc3e9b4d1f52a042ff99da74a5b5afd8918fb204b5d2",
       "classification": "monotonic_allocator",
       "rationale": "Carrier-wide monotonic allocator STRUCTURAL_EPOCH_ALLOCATOR in crates/carrick-vmm-hvf/src/trap.rs generating unique structural epoch IDs across the host process."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "THREAD_VCPU_CREATED_TOTAL",
+      "fingerprint": "d4c0c2b4d0434b284b08ad53be54942e8a78fe5ab78362a24ab33dbb97953d8e",
+      "classification": "carrier_infra",
+      "rationale": "Host thread-local cell THREAD_VCPU_CREATED_TOTAL in crates/carrick-vmm-hvf/src/trap.rs maintaining per-host-thread execution state for the carrier."
     },
     {
       "kind": "static",
@@ -1930,6 +1986,14 @@
       "fingerprint": "2b50670b08f7ef0ad214fe1fc6304ecd1172ab9eb28ebf9e4751b520387ffe4a",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static VCPU_LIVE in crates/carrick-vmm-hvf/src/trap.rs maintaining host process lifecycle or VM resources."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "admission_trace_enabled::CARRICK_HVF_ADMISSION_TRACE",
+      "fingerprint": "09f321bcbff20b05517fe0a4b38ab213512a637e4ce8d99cd27f025e0d2f6f87",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_HVF_ADMISSION_TRACE read in admission_trace_enabled::CARRICK_HVF_ADMISSION_TRACE (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "static",
@@ -1954,6 +2018,14 @@
       "fingerprint": "456b68190b77415a62ca701807e2d176e137ccd1bd4117df7a80bb2fb591b7eb",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static alias_version_registry::CELL in crates/carrick-vmm-hvf/src/trap.rs maintaining host process lifecycle or VM resources."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "atomic_permit_enabled::CARRICK_HVF_ATOMIC_PERMIT",
+      "fingerprint": "7c1104910ed6f736c037002331d4485a6a5586982025257244ca54fb28cd25cf",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_HVF_ATOMIC_PERMIT read in atomic_permit_enabled::CARRICK_HVF_ATOMIC_PERMIT (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "static",
@@ -2020,12 +2092,36 @@
       "rationale": "Process-global configuration or failpoint cache exec_private_file_cache::CACHE in crates/carrick-vmm-hvf/src/trap.rs initialized from environment flags."
     },
     {
+      "kind": "env_var_os",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "exec_private_file_cache_enabled::CARRICK_HVPATCH_EXEC_PRIVATE_FILE_CACHE",
+      "fingerprint": "931b0171ed8676aebdab76e043eb81a34bbe39080ebecdd84606053168c4b276",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_HVPATCH_EXEC_PRIVATE_FILE_CACHE read in exec_private_file_cache_enabled::CARRICK_HVPATCH_EXEC_PRIVATE_FILE_CACHE (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "exec_stage2_fail_after_maps::CARRICK_HVPATCH_EXEC_FAIL_AFTER_MAPS",
+      "fingerprint": "7f4067c3ebd1a2fb346239d411c4c7966b024cdd7beb2939f3d49a0451111d5c",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_HVPATCH_EXEC_FAIL_AFTER_MAPS read in exec_stage2_fail_after_maps::CARRICK_HVPATCH_EXEC_FAIL_AFTER_MAPS (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "foreign_mm_tests::FOREIGN_MM_TEST_LOCK",
       "fingerprint": "93502987434aeab58511d7c5865a095b1819487990ad883ce0ebc4eca2fae982",
       "classification": "test_only",
       "rationale": "Test-module mutex serializes production-carrier foreign-MM fixtures that share global frame and failpoint controls; it is absent from production builds."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "fork_debug_ipa::CARRICK_FORK_DEBUG_IPA",
+      "fingerprint": "5e78b2d6dddad4dc3afd74d2be47b360264cc9793a9177baf3b5cd0ef5cfc297",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_FORK_DEBUG_IPA read in fork_debug_ipa::CARRICK_FORK_DEBUG_IPA (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "static",
@@ -2036,12 +2132,28 @@
       "rationale": "Process-global configuration or failpoint cache fork_debug_ipa::CELL in crates/carrick-vmm-hvf/src/trap.rs initialized from environment flags."
     },
     {
+      "kind": "env_var",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "fork_debug_va::CARRICK_FORK_DEBUG_VA",
+      "fingerprint": "8a486c4772ae04c4c4a61fa8a71ef4fda067bbaa29ac55d8f8869ea1f6ef02d7",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_FORK_DEBUG_VA read in fork_debug_va::CARRICK_FORK_DEBUG_VA (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "fork_debug_va::CELL",
       "fingerprint": "cc3f21d07848ecf292592d67a15c1705782e6f022e25f6936acd6d67fc592f23",
       "classification": "config_debug",
       "rationale": "Process-global configuration or failpoint cache fork_debug_va::CELL in crates/carrick-vmm-hvf/src/trap.rs initialized from environment flags."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "fpsimd_save_enabled::CARRICK_NO_FPSIMD",
+      "fingerprint": "a3914e10f7177b1a3edf81904459d94c3c07cb2295413b522876e4ddb44fa3a1",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_NO_FPSIMD read in fpsimd_save_enabled::CARRICK_NO_FPSIMD (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "static",
@@ -2068,6 +2180,22 @@
       "rationale": "Test-only fixture or lock frame_inventory_backend_tests::global_frame_allocator_test_lock::LOCK in crates/carrick-vmm-hvf/src/trap.rs scoped strictly to test harness execution."
     },
     {
+      "kind": "env_var_os",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "from_address_space::CARRICK_HVPATCH_SHARE_EXEC_PAYLOAD",
+      "fingerprint": "1357cf78f5861bad30288ff0d2aab454e3d90331512adf0ba53a1d44b9dcd505",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_HVPATCH_SHARE_EXEC_PAYLOAD read in from_address_space::CARRICK_HVPATCH_SHARE_EXEC_PAYLOAD (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "from_address_space::CARRICK_HVPATCH_SPARSE_EXEC_STACK",
+      "fingerprint": "63723637515fd90dcfbccd79091db164dd893a05c6210831a669f790286a8136",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_HVPATCH_SPARSE_EXEC_STACK read in from_address_space::CARRICK_HVPATCH_SPARSE_EXEC_STACK (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "global_frame_ipa_allocator::ALLOCATOR",
@@ -2082,6 +2210,14 @@
       "fingerprint": "2cfb6ff6c91d9fc94a3f2455fe2f89e335aaf4a15cb778e7c9a9558e881a25ac",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static global_vcpu_permits::PERMITS in crates/carrick-vmm-hvf/src/trap.rs maintaining host process lifecycle or VM resources."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "lazy_exec_page_tables_enabled::CARRICK_HVPATCH_LAZY_EXEC_PAGE_TABLES",
+      "fingerprint": "0cf902e86dd15cce376d7459d8b960e42afcf28a2af5ae4408d90f8cc01e3fad",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_HVPATCH_LAZY_EXEC_PAGE_TABLES read in lazy_exec_page_tables_enabled::CARRICK_HVPATCH_LAZY_EXEC_PAGE_TABLES (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "static",
@@ -2172,6 +2308,14 @@
       "rationale": "Test-only fixture or lock tag_strip_tests::EXEC_PAYLOAD_ENV_LOCK in crates/carrick-vmm-hvf/src/trap.rs scoped strictly to test harness execution."
     },
     {
+      "kind": "env_var_os",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "tag_strip_tests::guest_mapping_plan_payload_sharing_hatch_restores_deep_copy::CARRICK_HVPATCH_SHARE_EXEC_PAYLOAD",
+      "fingerprint": "fdb935da923d0387bd758fc1663b763193697ffd32ef5be9644304ce07758269",
+      "classification": "test_only",
+      "rationale": "Test-only fixture or lock tag_strip_tests::guest_mapping_plan_payload_sharing_hatch_restores_deep_copy::CARRICK_HVPATCH_SHARE_EXEC_PAYLOAD in crates/carrick-vmm-hvf/src/trap.rs scoped strictly to test harness execution."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "tag_strip_tests::thread_mapping_desc_from_region_and_fork_inheritance_with_offset::TEST_LOCK",
@@ -2226,134 +2370,6 @@
       "fingerprint": "ab0b08b97611e117782a41f621e4ace1ab4d3cc389433a60a25ff4abe830222f",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static park_for_slot::GATE_MUTEX in crates/carrick-vmm-hvf/src/trap/vcpu_gate.rs maintaining host process lifecycle or VM resources."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/dispatch/fs/fd_helpers.rs",
-      "symbol": "OPEN_FD_NUMBERS_CALLS",
-      "fingerprint": "0e35528151ec05afe88f94ff04d8674b9532c027b68aff8211ef9d2c74457a7e",
-      "classification": "carrier_infra",
-      "rationale": "Host thread-local cell OPEN_FD_NUMBERS_CALLS in crates/carrick-runtime/src/dispatch/fs/fd_helpers.rs maintaining per-host-thread execution state for the carrier."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/dispatch/fs/pathres.rs",
-      "symbol": "DOTDOT_RESOLVE_DEPTH",
-      "fingerprint": "9b73d356e114a12775c765c295df65cdbacd2c313a6e1f4ce0caa18e4887b77f",
-      "classification": "carrier_infra",
-      "rationale": "Host thread-local cell DOTDOT_RESOLVE_DEPTH in crates/carrick-runtime/src/dispatch/fs/pathres.rs maintaining per-host-thread execution state for the carrier."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "symbol": "description_readiness::VISITED",
-      "fingerprint": "f408f8c0ae0cb4b9200f22f10fafea3dfd5630f6080f4126702024046a4d6374",
-      "classification": "carrier_infra",
-      "rationale": "Host thread-local cell description_readiness::VISITED in crates/carrick-runtime/src/dispatch/net.rs maintaining per-host-thread execution state for the carrier."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/dispatch/resources.rs",
-      "symbol": "ACTIVE_CONTEXT",
-      "fingerprint": "c46f8e2eedabfaaaac35ac1547027e06aa622c2fd9ab8bee3c28afad325fe7bd",
-      "classification": "carrier_infra",
-      "rationale": "Host thread-local cell ACTIVE_CONTEXT in crates/carrick-runtime/src/dispatch/resources.rs maintaining per-host-thread execution state for the carrier."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/dispatch/resources.rs",
-      "symbol": "CAPTURED_RESOURCES",
-      "fingerprint": "7ecab6ee6e0726c019f74800ac1f03a578f1dc599d2fc9a78dacac320db5aed1",
-      "classification": "carrier_infra",
-      "rationale": "Host thread-local cell CAPTURED_RESOURCES in crates/carrick-runtime/src/dispatch/resources.rs maintaining per-host-thread execution state for the carrier."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/dispatch/resources.rs",
-      "symbol": "RETIRING_FILE_TABLES",
-      "fingerprint": "2cc918379a57db7975609207948c53efdcba6855485beac1be91c6789881bc35",
-      "classification": "carrier_infra",
-      "rationale": "Host thread-local cell RETIRING_FILE_TABLES in crates/carrick-runtime/src/dispatch/resources.rs maintaining per-host-thread execution state for the carrier."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "symbol": "MSG_QUEUE_FD_CACHE",
-      "fingerprint": "86bd1f420337ed19f6377584f908fd98a6075fd364dbae7140405a5c29abac75",
-      "classification": "carrier_infra",
-      "rationale": "Host thread-local cell MSG_QUEUE_FD_CACHE in crates/carrick-runtime/src/dispatch/sysv.rs maintaining per-host-thread execution state for the carrier."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/fanotify.rs",
-      "symbol": "INTERNAL_OPEN_DEPTH",
-      "fingerprint": "85793fdcc85f1929b4d3479f4d68a7044de0dffcd666777ee05855a5f0b3fd59",
-      "classification": "carrier_infra",
-      "rationale": "Host thread-local cell INTERNAL_OPEN_DEPTH in crates/carrick-runtime/src/fanotify.rs maintaining per-host-thread execution state for the carrier."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "symbol": "EXCLUSIVE_ARCHIVE_GATES",
-      "fingerprint": "f2d82442711502ce92f2b201cce414a32749146c1a91c11fb4843e7483c3a8a4",
-      "classification": "carrier_infra",
-      "rationale": "Host thread-local cell EXCLUSIVE_ARCHIVE_GATES in crates/carrick-runtime/src/fs_backend.rs maintaining per-host-thread execution state for the carrier."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
-      "symbol": "EXACT_MM_STAGE1",
-      "fingerprint": "1831bf5d7c756e3b61f4c1029d96d250a26dae7fcad2141c09e88c86e8db501e",
-      "classification": "carrier_infra",
-      "rationale": "Per-host-service-thread weak lookup stack supports synchronous re-entry into an exact live MM stage-1 lease; authority remains in the upgraded lease and exact executor census rather than the thread-local observation."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
-      "symbol": "SIGNAL_PROGRESS",
-      "fingerprint": "7755e08c063b13aa58b05d249ee9449b42430aeb6fce85646cf2bb3f9a460ad5",
-      "classification": "carrier_infra",
-      "rationale": "Host thread-local cell SIGNAL_PROGRESS in crates/carrick-runtime/src/vcpu_loop/signal.rs maintaining per-host-thread execution state for the carrier."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-vmm-hvf/src/syscall_mailbox.rs",
-      "symbol": "THREAD_MAILBOX_SLOT_CLAIMS_TOTAL",
-      "fingerprint": "d7a80eaeabb4a73206d52e64bec9c974ce8f2453dc622c3656d77b3e1d002232",
-      "classification": "carrier_infra",
-      "rationale": "Host thread-local cell THREAD_MAILBOX_SLOT_CLAIMS_TOTAL in crates/carrick-vmm-hvf/src/syscall_mailbox.rs maintaining per-host-thread execution state for the carrier."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "ALIAS_STATE_ROWS_SCANNED",
-      "fingerprint": "41bb64410f90ebaee726eb9a9e71e5bb46f2ec92855206b9c49efa1e3de63d3d",
-      "classification": "carrier_infra",
-      "rationale": "Host thread-local counter of rows visited by linear passes over the carrier-global alias/replay/version state, so an algorithmic-complexity regression is a TEST failure rather than a timing observation (retiring_one_owner_does_not_scan_foreign_alias_rows). Deliberately PER HOST THREAD and not process-global: a process-global counter is polluted by every other guest thread and by concurrently running tests, which made the same work report 1,539 rows under cargo test's default parallelism and 513 in isolation. It describes the measuring thread's own work and carries no Linux process semantics."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "FORK_MAPPING_ROWS_SCANNED",
-      "fingerprint": "b0ba0e3973249673260a1e2c0fdff13885cd881a80a7b76ddc1f11f243c2d2af",
-      "classification": "carrier_infra",
-      "rationale": "Host thread-local counter of source-mapping rows visited while answering the fork overlay-owner question, backing fork_overlay_owner_lookup_does_not_rescan_every_source_mapping. Same per-host-thread scope and rationale as ALIAS_STATE_ROWS_SCANNED: it measures the forking thread's own work and carries no Linux process semantics."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "STAGE2_AUDIT_STATE",
-      "fingerprint": "f4a8dd5e57f884559783cd3de35e10deac5ea59dfd6c204ad6ecdf6f75b88658",
-      "classification": "test_only",
-      "rationale": "Test-only thread-local cell STAGE2_AUDIT_STATE in crates/carrick-vmm-hvf/src/trap.rs enabling hypervisor stage-2 audit and failure injection in unit tests."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "THREAD_VCPU_CREATED_TOTAL",
-      "fingerprint": "d4c0c2b4d0434b284b08ad53be54942e8a78fe5ab78362a24ab33dbb97953d8e",
-      "classification": "carrier_infra",
-      "rationale": "Host thread-local cell THREAD_VCPU_CREATED_TOTAL in crates/carrick-vmm-hvf/src/trap.rs maintaining per-host-thread execution state for the carrier."
     }
   ]
 }
