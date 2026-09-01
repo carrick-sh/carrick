@@ -42,18 +42,15 @@ const KNOWN_PROBE_GAPS: &[&str] = &[
     // passes fail the gate so they are removed from this list when the runtime
     // closes the gap.
     //
-    // `execthreads` still ABORTS at `HvpatchTaskRegistration::cleanup`: every
-    // thread of a process shares one MM authority, and the last sibling to
-    // clean up drops a still-published inventory. Retiring it there -- the
-    // symmetric fix to the one that closed `vforkexecthread` -- removes the
-    // abort but hangs 2 runs in 3, so the missing retirement belongs upstream,
-    // before the registrations tear down.
-    //
     // `execfromthread` CLOSED 2026-09-01: the exec-from-thread abort became a
     // benign `AddressSpaceRetired` path and the `gettid()==getpid()` line was
     // the fork/gettid pid-namespace unification -- sampled 4x musl + 2x gnu
     // line-exact MATCH.
-    "execthreads",
+    //
+    // `execthreads` moved to `KNOWN_FLAKY_PROBE_GAPS` 2026-09-01: its verdict
+    // is load-probabilistic (measured 1 clean MATCH in 3 runs), so it fits
+    // neither this list (a MATCH trips the unexpected-pass guard) nor removal
+    // (a DIFF fails the gate).
     // Audit remediation program.
     // Each probe encodes a confirmed, dynamically-validated finding whose fix is
     // scheduled for the cited milestone; removed from this list when the fix lands
@@ -3698,6 +3695,26 @@ fn run_one_probe(
 /// match. Lane-scoped (NOT global `KNOWN_PROBE_GAPS`) so the aarch64 lane, whose
 /// LinuxKit oracle differs, is unaffected. Like `KNOWN_PROBE_GAPS`, an
 /// UNEXPECTED pass here fails the suite (the oracle improved → un-excuse it).
+/// Probes whose verdict is LOAD-PROBABILISTIC: the same binary produces a
+/// line-exact MATCH on some runs and a known divergence on others, so they fit
+/// neither `KNOWN_PROBE_GAPS` (a MATCH trips the unexpected-pass guard) nor
+/// removal (a DIFF fails the gate). Both outcomes are tolerated and NOTEd.
+///
+/// This list is for defects whose root cause is UNDERSTOOD and recorded; it is
+/// not a parking lot for unexplained flakiness ("load sensitivity is
+/// first-class": classify, don't shrug).
+///
+/// - `execthreads`: exec from a 7-thread process. The sibling registrations
+///   share one MM authority and the LAST cleanup drops a still-published
+///   inventory -> carrier abort ("published HVPatch inventory dropped before
+///   exact retirement") on ~2 runs in 3; the third run's teardown ordering
+///   lets the exec-rebind `Arc::into_inner` retire it first and the probe
+///   MATCHes line-exact. Cleanup-time retirement was re-measured 2026-09-01
+///   and is WORSE (silent exec death 4/4); the fix is retirement at exec
+///   sibling-drain completion, where the exec'ing thread still holds kernel
+///   context.
+const KNOWN_FLAKY_PROBE_GAPS: &[&str] = &["execthreads"];
+
 const KNOWN_LANE_GAPS: &[(&str, &str)] = &[
     // The amd64 oracle box runs Debian 12 / kernel 6.1, predating these syscalls;
     // carrick implements them, so the probe sees carrick-success vs oracle-ENOSYS.
@@ -3728,6 +3745,23 @@ fn classify_probe(
     };
     let known_gap = KNOWN_PROBE_GAPS.contains(&name.as_str())
         || KNOWN_LANE_GAPS.contains(&(lane_label, name.as_str()));
+    // A load-probabilistic gap: both a MATCH and its recorded divergence are
+    // legitimate outcomes for the same binary, so neither one may move the
+    // gate. A NOTE keeps the run's actual verdict visible in the log.
+    if KNOWN_FLAKY_PROBE_GAPS.contains(&name.as_str()) {
+        let outcome = match diff_lines(&carrick_exec.normalized_output, &docker_out) {
+            None => {
+                eprintln!("NOTE flaky known-gap probe {name} MATCHed this run");
+                ProbeOutcome::Pass
+            }
+            Some(diff) => {
+                eprintln!("NOTE flaky known-gap probe {name} DIFFed this run (excused)");
+                let record = format_failure_record(carrick_exec, &diff);
+                ProbeOutcome::Xfail(record)
+            }
+        };
+        return (name, outcome);
+    }
     let outcome = match (
         diff_lines(&carrick_exec.normalized_output, &docker_out),
         known_gap,
