@@ -77,6 +77,12 @@ const LTP_SMOKE: &[&str] = &[
     "sched_getaffinity01",
 ];
 
+/// fd-fill cases that loop `dup` up to RLIMIT_NOFILE. Docker's default is
+/// 1 Mi, and each guest `dup`/`close` costs the HVF trap floor (~1.9 us on
+/// this host, measured 2026-09-01 as a null `getppid`; the fd table itself
+/// is O(touched) per call), so a full fill is ~4.4 s against the gate's
+/// 2x-oracle+2 s budget. The same bound applies to the oracle command, so
+/// both sides measure dup-at-exhaustion semantics rather than trap cost.
 const LTP_NOFILE_4096: &[&str] = &["dup03", "dup06", "dup205"];
 
 /// Exact LTP command overrides that must survive manifest regeneration. Keep

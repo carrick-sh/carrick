@@ -1538,26 +1538,41 @@ impl SyscallDispatcher {
 
     pub(in crate::dispatch) fn detach_fd_from_epolls(&self, fd: i32) {
         let detached_host_fd = self.host_fd_for_poll(fd);
-        let (detached_description, descriptions, should_auto_detach) = {
+        let (detached_description, owners, should_auto_detach) = {
             let files = self.captured_file_table();
             let table = files.read_open_files();
             let detached_description = table.get(&fd).map(|file| file.description.clone());
             let logical_refs = detached_description
                 .as_ref()
                 .map_or(1, |target| target.fd_ref_count());
-            let descriptions: Vec<Arc<crate::kernel::FileDescription>> =
-                table.values().map(|of| of.description.clone()).collect();
+            // Only the epoll instances registered on the closing description
+            // can hold an entry for it, and the description records them at
+            // EPOLL_CTL_ADD; a table-wide walk here made every non-final
+            // alias close cost the size of the fd table. A bare inherited
+            // stdio fd is registered without a table-backed description
+            // (`target: None`, matched by number), so only that case still
+            // scans the table's epoll descriptions; any other number absent
+            // from the table can hold no registration at all.
+            let owners: Vec<Arc<crate::kernel::FileDescription>> = match &detached_description {
+                Some(target) => target.epoll_owners(),
+                None if is_stdio_fd(fd) => table
+                    .values()
+                    .filter(|of| of.description.is_epoll())
+                    .map(|of| of.description.clone())
+                    .collect(),
+                None => Vec::new(),
+            };
             // Linux retains every registration for an open description until
             // its final fd slot closes, including registrations installed
             // through a dup alias whose numeric slot closed earlier.
             let should_auto_detach = logical_refs == 1;
-            (detached_description, descriptions, should_auto_detach)
+            (detached_description, owners, should_auto_detach)
         };
         if should_auto_detach && let Some(target) = &detached_description {
             self.detach_description_from_all_epolls(target, detached_host_fd);
             return;
         }
-        for description in descriptions {
+        for description in owners {
             let Some(mut guard) = description.write() else {
                 continue;
             };

@@ -1156,8 +1156,8 @@ pub(crate) fn check_cpu_limits(
 // the `u64` guest limit) even though clippy sees them as redundant on
 // targets where `rlim_t` already is `u64`.
 #[allow(clippy::unnecessary_cast)]
-fn raise_host_nofile_backing(guest_soft: u64) {
-    // Headroom for native_run's own descriptors: event ring, epoll/kqueue,
+pub fn raise_host_nofile_backing(guest_soft: u64) {
+    // Headroom for the carrier's own descriptors: event ring, epoll/kqueue,
     // host stdio, per-thread waiters, and the dispatcher's transient host fds.
     const HOST_FD_HEADROOM: u64 = 256;
     let mut rl = libc::rlimit {
@@ -1171,14 +1171,21 @@ fn raise_host_nofile_backing(guest_soft: u64) {
     let cur_soft = rl.rlim_cur as u64;
     // The host hard limit ceilings any raise. A non-positive / INFINITY hard
     // value (rlim_max <= 0 when reinterpreted) means "no finite cap" → use the
-    // desired target directly.
+    // desired target directly. The kernel's per-process descriptor ceiling
+    // (`kern.maxfilesperproc` on macOS) sits below an unlimited hard limit
+    // and `setrlimit` rejects anything above it, so clamp to that too: the
+    // guest's 1 Mi default would otherwise leave the host at its startup
+    // value instead of the most backing the host can give.
     let hard = rl.rlim_max;
     let desired = guest_soft.saturating_add(HOST_FD_HEADROOM);
-    let target = if hard > 0 && (hard as u64) < desired {
+    let mut target = if hard > 0 && (hard as u64) < desired {
         hard as u64
     } else {
         desired
     };
+    if let Some(ceiling) = carrick_host::host_facts::per_process_descriptor_ceiling() {
+        target = target.min(ceiling);
+    }
     if target <= cur_soft {
         return;
     }

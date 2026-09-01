@@ -233,6 +233,22 @@ fn select_physical_cpu_count(
     }
 }
 
+/// The host kernel's per-process open-descriptor ceiling, when it is lower
+/// than what `RLIMIT_NOFILE`'s hard limit admits. macOS reports an unlimited
+/// hard limit but `setrlimit` rejects any soft value above
+/// `kern.maxfilesperproc`, so a raise must clamp to it or fail outright.
+/// `None` where the hard rlimit is the only ceiling.
+pub fn per_process_descriptor_ceiling() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        sysctl_u32("kern.maxfilesperproc").map(u64::from)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 /// Read an integer `sysctl` by name into a `u32`. `None` on any failure.
 #[cfg(target_os = "macos")]
 fn sysctl_u32(name: &str) -> Option<u32> {
