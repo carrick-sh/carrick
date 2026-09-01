@@ -1,0 +1,13 @@
+f0334511f71b220f
+rounds_complete=true
+parent_proc_self_names_getpid=true
+every_child_reported=true
+every_child_exited_clean=true
+fork_rc_eq_child_getpid=true
+child_gettid_eq_getpid=true
+child_getppid_eq_parent_getpid=true
+child_proc_self_names_getpid=true
+child_proc_pid_dir_exists=true
+child_proc_pid_oom_score_adj_accessible=true
+child_proc_pid_status_ids_match=true
+proc_lists_child_and_parent=true

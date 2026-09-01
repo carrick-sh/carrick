@@ -1710,35 +1710,32 @@ where
         let child_platform_futex = (self.platform_futex_factory)(Arc::clone(&child_futex));
         let child_threads = Arc::new(parking_lot::Mutex::new(Vec::new()));
 
-        // The pid the GUEST sees for this child, in the parent's pid
-        // namespace. `child_pid` is the kernel task id, and the two numbering
-        // spaces drift apart as soon as creation orders differ (task 5 can be
-        // ns pid 4) -- whether they happened to coincide depended on counter
-        // alignment, which is why `child_getpid_eq_fork_rc` flickered with
-        // load instead of failing outright. The kernel publish that normally
-        // registers the child (`fork_task`'s commit) runs AFTER this copyout,
-        // so the registration is pulled forward here: `fork_task` finds the
-        // mapping already present and keeps it. Fork children always share
-        // the parent's region (CLONE_NEWPID is rejected at clone entry), and
-        // the three failpoint rollbacks below unregister again so a
-        // rolled-back reservation cannot leave a stale mapping behind for a
-        // recycled task id. Every kernel-facing use of `child_pid` (task
-        // identity, wait keys, telemetry) stays in the raw domain.
+        // The pid the GUEST sees for this child is the kernel task id itself:
+        // the kernel graph's `IdRegistry` is the pid domain of the container's
+        // namespace (init is task 1), and every guest-visible rendering --
+        // `getpid`, `gettid`, the `/proc` listing, `/proc/<pid>/*`,
+        // `oom_score_adj` -- draws on that one number. A second, independently
+        // counted ns pid drifted from it whenever a fork retried after a
+        // dropped reservation (a `Topology` retry burns a task id but not a
+        // counter tick), leaving `getpid()` naming a task `/proc` did not
+        // list. The region keeps membership/parent/orphan bookkeeping only.
+        // The kernel publish that normally registers the child (`fork_task`'s
+        // commit) runs AFTER this copyout, so the registration is pulled
+        // forward here: `fork_task` finds the mapping already present and
+        // keeps it. Fork children always share the parent's region
+        // (CLONE_NEWPID is rejected at clone entry), and the three failpoint
+        // rollbacks below unregister again so a rolled-back reservation cannot
+        // leave a stale mapping behind for a recycled task id.
         let ns_region = parent_context.task().pid_ns_region();
         let mut child_ns_registered = false;
-        let guest_child_pid = match (&ns_region, u32::try_from(child_pid)) {
-            (Some(region), Ok(raw)) => {
-                let ns_pid = region.host_to_ns(raw).unwrap_or_else(|| {
-                    let ns_pid = region.alloc_ns_pid();
-                    child_ns_registered = region
-                        .register(raw, ns_pid, parent_task.id.raw() as u32)
-                        .is_some();
-                    ns_pid
-                });
-                i32::try_from(ns_pid).unwrap_or(child_pid)
+        if let (Some(region), Ok(raw)) = (&ns_region, u32::try_from(child_pid)) {
+            if region.host_to_ns(raw).is_none() {
+                child_ns_registered = region
+                    .register(raw, raw, parent_task.id.raw() as u32)
+                    .is_some();
             }
-            _ => child_pid,
-        };
+        }
+        let guest_child_pid = child_pid;
         let unregister_child_ns = |registered: bool| {
             if registered {
                 if let (Some(region), Ok(raw)) = (&ns_region, u32::try_from(child_pid)) {

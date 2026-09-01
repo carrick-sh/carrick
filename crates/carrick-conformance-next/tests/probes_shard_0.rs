@@ -20,7 +20,7 @@ use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-const CACHED_SHARD_0_PROBE_COUNT: usize = 139;
+const CACHED_SHARD_0_PROBE_COUNT: usize = 136;
 
 /// Derive the shard 0 subset from a complete baseline set.
 pub fn expected_shard_gaps(baseline: &[&'static str]) -> BTreeSet<&'static str> {
@@ -224,8 +224,8 @@ fn test_shard_0_inventory() {
     selected_names.sort();
     assert_eq!(
         selected_names.len(),
-        442,
-        "expected exactly 442 conformance generic probes in inventory"
+        443,
+        "expected exactly 443 conformance generic probes in inventory"
     );
 
     let derived_shard_0: Vec<&str> = selected_names
@@ -251,10 +251,9 @@ fn test_shard_0_expected_gaps_derivation() {
     let musl_shard_gaps = expected_shard_gaps(common::MUSL_BASELINE_GAPS);
     let gnu_shard_gaps = expected_shard_gaps(common::GNU_BASELINE_GAPS);
 
-    let expected_musl_set =
-        BTreeSet::from(["budget_two_proc", "execfromthread", "memfdsealmatrix"]);
+    let expected_musl_set = BTreeSet::from(["budget_two_proc", "memfdsealmatrix"]);
 
-    let expected_gnu_set = BTreeSet::from(["budget_two_proc", "execfromthread", "memfdsealmatrix"]);
+    let expected_gnu_set = BTreeSet::from(["budget_two_proc", "memfdsealmatrix"]);
 
     assert_eq!(
         musl_shard_gaps, expected_musl_set,
@@ -355,13 +354,13 @@ fn test_probe_binary_locator_and_gap_counts() {
     let gnu_shard_gaps = expected_shard_gaps(common::GNU_BASELINE_GAPS);
     assert_eq!(
         musl_shard_gaps.len(),
-        3,
-        "musl shard 0 must contain exactly 3 baseline gaps"
+        2,
+        "musl shard 0 must contain exactly 2 baseline gaps"
     );
     assert_eq!(
         gnu_shard_gaps.len(),
-        3,
-        "gnu shard 0 must contain exactly 3 baseline gaps"
+        2,
+        "gnu shard 0 must contain exactly 2 baseline gaps"
     );
 }
 

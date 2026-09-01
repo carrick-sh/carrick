@@ -1509,6 +1509,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "pidtaskdomain": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "pipeextra": {
     "class": "conformance",
     "excluded": false,

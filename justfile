@@ -299,6 +299,15 @@ test-integration:
         cargo test -p carrick-cli --test cli
         cargo test -p carrick-engine
         cargo test -p carrick-image
+        # carrick-conformance-next's shard consistency tests (materialized
+        # shard lists vs probe-inventory.json, cached-oracle completeness,
+        # baseline-gap derivation) need no HVF or Docker, but ran in NO gate
+        # until 2026-09-01: `conformance-probes` filters the signed binaries to
+        # `generic_probe_shard_`/`case_`, so a stale expectation sat unnoticed
+        # at HEAD. Skip only the guest-running tests here.
+        cargo test -p carrick-conformance-next \
+            --test probes_shard_0 --test probes_shard_1 --test probes_shard_2 \
+            -- --skip generic_probe_shard_ --skip case_
         exit 0
     fi
     # Off-macOS: same suites, but with the backend feature set on the crates that
