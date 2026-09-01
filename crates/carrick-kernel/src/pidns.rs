@@ -1,11 +1,15 @@
 //! Per-namespace PID-numbering slots in the kernel arena.
 //!
 //! One `ProcessSection` record table serves every container in the carrier —
-//! Linux's own model: one process table, per-namespace numbering. Each PID
-//! namespace claims one slot here for its numbering state (the `next_ns_pid`
-//! counter and the ns-init identity words) and tags its member records with
-//! its `ns_id` (`ProcessRecord::pid_ns`), so two containers' `ns_to_host(1)`
-//! name two different inits. Slots are claimed by CAS and released only by
+//! Linux's own model: one process table, per-namespace membership. A member's
+//! ns pid is its kernel task id (the kernel graph's `IdRegistry` is the pid
+//! domain of the container's namespace, init being task 1); there is
+//! deliberately no second counter here, because an independently ticked
+//! number drifted from the task id and left `getpid()` naming a task `/proc`
+//! did not list. Each PID namespace claims one slot for its ns-init identity
+//! words and tags its member records with its `ns_id`
+//! (`ProcessRecord::pid_ns`), so two containers' `ns_to_host(1)` name two
+//! different inits. Slots are claimed by CAS and released only by
 //! the exact generation-stamped reference the owner holds, so a stale handle
 //! can never free a slot a later namespace has reused.
 
@@ -19,9 +23,6 @@ use crate::domains::ProcessGeneration;
 /// (`ArenaError::Exhausted`), never a silent fallback to a shared counter.
 pub const PID_NAMESPACE_SLOTS: usize = 64;
 
-/// The first ns-pid handed to a member after the init (ns-pid 1).
-pub const FIRST_MEMBER_NS_PID: u32 = 2;
-
 /// Set in `owner` while the claimant resets the numbering words; readers treat
 /// such a slot as unpublished.
 const CLAIMING: u64 = 1 << 63;
@@ -31,7 +32,6 @@ pub struct PidNamespaceSlot {
     /// `0` = free. Published value is exactly `pack(ns_id, generation)`;
     /// `pack(..) | CLAIMING` while the claimant is still resetting the slot.
     pub owner: AtomicU64,
-    pub next_ns_pid: AtomicU32,
     pub init_host_pid: AtomicU32,
     pub init_host_pgid: AtomicU32,
     pub init_host_sid: AtomicU32,
@@ -57,7 +57,7 @@ fn pack(ns_id: NonZeroU32, generation: ProcessGeneration) -> u64 {
 }
 
 impl PidNamespaceSection {
-    /// Claim a free slot for `ns_id`, reset its numbering state, and publish
+    /// Claim a free slot for `ns_id`, reset its identity words, and publish
     /// the owner word last. Returns the reference the owner must present to
     /// [`Self::release`] and the slot itself (valid until that release).
     pub fn claim(
@@ -74,8 +74,6 @@ impl PidNamespaceSection {
             {
                 continue;
             }
-            slot.next_ns_pid
-                .store(FIRST_MEMBER_NS_PID, Ordering::Relaxed);
             slot.init_host_pid.store(0, Ordering::Relaxed);
             slot.init_host_pgid.store(0, Ordering::Relaxed);
             slot.init_host_sid.store(0, Ordering::Relaxed);
@@ -142,20 +140,17 @@ mod tests {
     }
 
     #[test]
-    fn two_claims_take_disjoint_slots_with_fresh_numbering() {
+    fn two_claims_take_disjoint_slots_with_fresh_identity() {
         let arena = KernelArena::create().unwrap();
         let section = &arena.layout().pid_namespaces;
         let (a, a_slot) = section.claim(ns(2), arena.allocate_generation()).unwrap();
         let (b, b_slot) = section.claim(ns(3), arena.allocate_generation()).unwrap();
         assert_ne!(a.index, b.index);
+        a_slot.init_host_pid.store(4100, Ordering::Release);
         assert_eq!(
-            a_slot.next_ns_pid.fetch_add(1, Ordering::AcqRel),
-            FIRST_MEMBER_NS_PID
-        );
-        assert_eq!(
-            b_slot.next_ns_pid.load(Ordering::Acquire),
-            FIRST_MEMBER_NS_PID,
-            "b's counter is untouched by a's allocation"
+            b_slot.init_host_pid.load(Ordering::Acquire),
+            0,
+            "b's identity is untouched by a's init publication"
         );
         assert!(std::ptr::eq(section.slot(a).unwrap(), a_slot));
         assert_eq!(section.claimed(), 2);
@@ -168,7 +163,7 @@ mod tests {
         let (a, a_slot) = section.claim(ns(2), arena.allocate_generation()).unwrap();
         let (b, _) = section.claim(ns(3), arena.allocate_generation()).unwrap();
         a_slot.init_host_pid.store(4100, Ordering::Relaxed);
-        a_slot.next_ns_pid.store(900, Ordering::Relaxed);
+        a_slot.init_host_pgid.store(4100, Ordering::Relaxed);
         assert!(section.release(a));
         assert!(
             section.slot(a).is_none(),
@@ -178,10 +173,7 @@ mod tests {
         assert_eq!(c.index, a.index, "the freed slot is reused first");
         assert_ne!(c.index, b.index);
         assert_eq!(c_slot.init_host_pid.load(Ordering::Acquire), 0);
-        assert_eq!(
-            c_slot.next_ns_pid.load(Ordering::Acquire),
-            FIRST_MEMBER_NS_PID
-        );
+        assert_eq!(c_slot.init_host_pgid.load(Ordering::Acquire), 0);
         assert!(
             !section.release(a),
             "a stale ref cannot free the reused slot"

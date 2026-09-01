@@ -860,8 +860,7 @@ impl PreparedFork {
                     u32::try_from(child_parent_task.key().id.raw()),
                 ) {
                     if region.host_to_ns(child_pid).is_none() {
-                        let ns_pid = region.alloc_ns_pid();
-                        let _ = region.register(child_pid, ns_pid, parent_pid);
+                        let _ = region.register(child_pid, child_pid, parent_pid);
                     }
                 }
             }

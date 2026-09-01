@@ -585,37 +585,6 @@ pub fn is_orphaned(host_pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-/// Allocate the ns-pid before `fork(2)` so the child's process record can be
-/// fully populated before either process resumes. Identity mode has no active
-/// namespace table, so the caller falls back to the host pid after fork.
-pub fn allocate_child_ns_pid_pre_fork() -> Option<u32> {
-    region().map(|r| r.alloc_ns_pid())
-}
-
-/// Register a freshly-forked child in the active ns: allocate its ns-pid and
-/// record the host↔ns mapping + its ns-parent. Returns the child's ns-pid (to
-/// be handed back to the guest as the `fork`/`clone` return value). When
-/// namespaces are off, returns the host pid unchanged. Called by the parent in
-/// the runtime fork path, which knows both pids (§5.3).
-pub fn register_child(child_host_pid: u32, parent_host_pid: u32) -> u32 {
-    match region() {
-        Some(r) => {
-            // If the parent forks the same child twice (can't happen) or the
-            // child already self-registered, reuse the existing ns-pid.
-            if let Some(existing) = r.host_to_ns(child_host_pid) {
-                return existing;
-            }
-            let ns_pid = r.alloc_ns_pid();
-            // A full table degrades to "no mapping": the child is still a guest
-            // process (visible via the host tree), it just lacks a stable ns-pid
-            // entry; report the allocated number anyway (monotonic, unique).
-            let _ = r.register(child_host_pid, ns_pid, parent_host_pid);
-            ns_pid
-        }
-        None => child_host_pid,
-    }
-}
-
 /// Forget a namespace member after its terminal wait consumed the zombie.
 ///
 /// A dead-but-unreaped child must stay in the table so `wait4(ns_pid)` can still
@@ -685,12 +654,6 @@ pub fn is_execed_child_of_current(target_ns_pid: u32) -> bool {
 }
 
 impl NsSharedRegion {
-    /// Allocate the next ns-pid in THIS namespace (lock-free, monotonic, never
-    /// recycled — gaps are harmless, design §8).
-    pub fn alloc_ns_pid(&self) -> u32 {
-        self.ns.next_ns_pid.fetch_add(1, Ordering::SeqCst)
-    }
-
     /// The init's host pid (ns-pid 1), or 0 if unset.
     pub fn init_host_pid(&self) -> u32 {
         self.ns.init_host_pid.load(Ordering::Acquire)
@@ -1439,9 +1402,7 @@ mod tests {
         assert_eq!(region.register(100, NS_INIT_PID, 0), Some(0));
 
         // a forked child host pid 200, ns-parent 100
-        let ns_pid = region.alloc_ns_pid();
-        assert_eq!(ns_pid, 2);
-        assert!(region.register(200, ns_pid, 100).is_some());
+        assert!(region.register(200, 2, 100).is_some());
 
         assert_eq!(region.host_to_ns(100), Some(1));
         assert_eq!(region.host_to_ns(200), Some(2));
@@ -1506,8 +1467,8 @@ mod tests {
         assert_eq!(region.register(100, NS_INIT_PID, 0), Some(0));
 
         // A namespace member whose parent (300) is itself gone.
-        assert!(region.register(300, region.alloc_ns_pid(), 100).is_some());
-        assert!(region.register(301, region.alloc_ns_pid(), 300).is_some());
+        assert!(region.register(300, 2, 100).is_some());
+        assert!(region.register(301, 3, 300).is_some());
         // A plain child-table record (no ns membership).
         let generation = ProcessGeneration::new(77);
         region
@@ -1538,7 +1499,7 @@ mod tests {
         // An adopted child published its exit status for a LIVE subreaper
         // (parent 100): the record is the subreaper's only way to wait4 it
         // after launchd took the host zombie — it must survive the sweep.
-        assert!(region.register(500, region.alloc_ns_pid(), 100).is_some());
+        assert!(region.register(500, 2, 100).is_some());
         let i = region.slot_of(500).expect("member slot");
         region.section.records[i]
             .exit_ready
@@ -1546,7 +1507,7 @@ mod tests {
 
         // An orphaned, dead ns member with a harvested exit status (§3.4):
         // the live ns-init may still reap it.
-        assert!(region.register(501, region.alloc_ns_pid(), 999).is_some());
+        assert!(region.register(501, 3, 999).is_some());
         region.mark_children_orphaned(999);
         region.mark_dead(501, 7);
 
@@ -1568,7 +1529,7 @@ mod tests {
         let region = test_region();
         region.ns.init_host_pid.store(100, Ordering::Relaxed);
         assert_eq!(region.register(100, NS_INIT_PID, 0), Some(0));
-        assert!(region.register(600, region.alloc_ns_pid(), 100).is_some());
+        assert!(region.register(600, 2, 100).is_some());
 
         // A run-state TID entry can carry a thread id in host_pid; the
         // liveness predicate is meaningless for it and it is owned by the
@@ -1595,8 +1556,7 @@ mod tests {
     fn reaped_member_slot_can_be_reused_without_recycling_ns_pid() {
         let region = test_region();
 
-        let first_ns = region.alloc_ns_pid();
-        assert_eq!(first_ns, 2);
+        let first_ns = 2;
         assert_eq!(region.register(200, first_ns, 100), Some(0));
         region.mark_execed(200);
         assert_eq!(region.execed_of(200), Some(true));
@@ -1607,8 +1567,7 @@ mod tests {
         assert_eq!(region.ns_to_host(first_ns), None);
         assert_eq!(region.host_to_ns(200), None);
 
-        let second_ns = region.alloc_ns_pid();
-        assert_eq!(second_ns, 3);
+        let second_ns = 3;
         assert_eq!(region.register(201, second_ns, 100), Some(0));
         assert_eq!(region.ns_to_host(second_ns), Some(201));
         assert_eq!(region.execed_of(201), Some(false));
@@ -1630,9 +1589,7 @@ mod tests {
         assert_eq!(a.host_to_ns(4200), None, "b's init is not a member of a");
         assert_eq!(b.host_to_ns(4100), None, "a's init is not a member of b");
 
-        let a_child = a.alloc_ns_pid();
-        let b_child = b.alloc_ns_pid();
-        assert_eq!((a_child, b_child), (2, 2), "each namespace numbers from 2");
+        let (a_child, b_child) = (2, 2);
         assert!(a.register(4101, a_child, 4100).is_some());
         assert_eq!(a.host_to_ns(4101), Some(2));
         assert_eq!(a.ns_ppid_for_host(4101), Some(NS_INIT_PID));
@@ -1654,7 +1611,7 @@ mod tests {
         let a_ns_id = a.ns_id();
         let section = a.section;
         a.set_init(4100);
-        assert!(a.register(4101, a.alloc_ns_pid(), 4100).is_some());
+        assert!(a.register(4101, 2, 4100).is_some());
         assert_eq!(arena.layout().pid_namespaces.claimed(), 2);
 
         drop(a);
@@ -1682,7 +1639,6 @@ mod tests {
         assert_ne!(c.ns_id(), a_ns_id);
         assert_eq!(c.ns_to_host(NS_INIT_PID), None, "c starts with no init");
         assert_eq!(c.host_to_ns(4101), None, "a's members were retired on drop");
-        assert_eq!(c.alloc_ns_pid(), 2, "c's counter is fresh");
         assert_eq!(b.ns_to_host(NS_INIT_PID), None, "b was never touched");
     }
 
@@ -1694,7 +1650,7 @@ mod tests {
         let a_ns_id = a.ns_id();
         let section = a.section;
         a.set_init(4100);
-        assert!(a.register(4101, a.alloc_ns_pid(), 4100).is_some());
+        assert!(a.register(4101, 2, 4100).is_some());
         // A second holder, as a live task's `Container` would be at teardown.
         let holder = Arc::clone(&a);
 

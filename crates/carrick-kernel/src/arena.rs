@@ -14,8 +14,10 @@ use crate::process::ProcessSection;
 
 pub const ARENA_MAGIC: u32 = 0x434b_4131;
 /// Bumped to 5 when `pid_namespaces` was appended and `ProcessRecord` gained
-/// `pid_ns`; a version-4 file is refused by `attach` (fail closed).
-pub const ARENA_VERSION: u32 = 5;
+/// `pid_ns`, and to 6 when `PidNamespaceSlot` lost its `next_ns_pid` counter
+/// (ns pids are kernel task ids); an older file is refused by `attach` (fail
+/// closed).
+pub const ARENA_VERSION: u32 = 6;
 
 /// Permit-section constants. These must stay byte-identical to the landed
 /// `SharedPermitTable` in `carrick-vmm-hvf/src/trap.rs`: magic "CRP1",
