@@ -7890,7 +7890,7 @@ impl SyscallDispatcher {
                 }
             }
             178 => DispatchOutcome::Returned {
-                value: i64::from(kernel.thread().key().tid.raw()),
+                value: i64::from(crate::vcpu_loop::ns_visible_guest_tid(self, kernel)),
             },
             449 => {
                 let clock = Arc::clone(kernel.task().container().clock());

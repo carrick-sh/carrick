@@ -1723,7 +1723,9 @@ where
             )
             .map(Some);
         }
-        if let Err(error) = engine.set_guest_thread_id(self.linux_tid.raw() as u64) {
+        if let Err(error) =
+            super::stamp_ns_visible_guest_tid(engine, &kernel.dispatcher, &committed_context)
+        {
             return Self::exec_failed_past_no_return(
                 kernel,
                 engine,

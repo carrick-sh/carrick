@@ -4891,7 +4891,7 @@ mod tests {
             production.contains("bootstrap_hvpatch_process_child(")
                 && production.contains("refresh_fork_process_state")
                 && production.contains("stamp_identity_page")
-                && production.contains("stamp_guest_tid"),
+                && production.contains("stamp_ns_visible_guest_tid"),
             "process child refresh/identity/tid bootstrap is not mandatory on first load"
         );
         for required in [
@@ -4903,7 +4903,7 @@ mod tests {
             "publish_process_terminal(terminal_publication)",
             "ExecutorExit::Quiesced",
             "notify_quiesced_progress",
-            "stamp_guest_tid_checked",
+            "stamp_ns_visible_guest_tid",
             "restore vfork parent identity page",
             "try_claim_persistent_process_exit",
             "clone_admission.subscribe_change",
