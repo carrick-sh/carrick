@@ -6171,8 +6171,10 @@ fn fresh_private_anonymous_mmap_skips_zero_write() {
     assert_eq!(memory.zero_backing_calls.get(), 0);
     assert_eq!(
         memory.protect_calls.get(),
-        1,
-        "fresh mapping should still install the requested guest protection"
+        2,
+        "fresh mapping installs the requested guest protection, then arms the \
+         first-touch residency fault (the second call, PROT_NONE) so `mincore` \
+         can tell a written page from an untouched one"
     );
 }
 
@@ -6231,8 +6233,9 @@ fn reused_private_anonymous_mmap_zeroes_backing_without_zero_write() {
     );
     assert_eq!(
         memory.protect_calls.get(),
-        1,
-        "reused mapping should still install the requested guest protection"
+        2,
+        "reused mapping installs the requested guest protection, then arms the \
+         first-touch residency fault (the second call, PROT_NONE)"
     );
 }
 
