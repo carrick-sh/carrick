@@ -5209,23 +5209,6 @@ impl SyscallDispatcher {
                     format_args!("at {address:#x}+{length:#x} in_arena={in_arena}: {error}"),
                 ));
             }
-            // Observe the FIRST TOUCH of a private anonymous page, so `mincore`
-            // can tell a written page from an untouched one.
-            //
-            // Carrick publishes a mapping valid up front, so the guest's stores
-            // never trap and the dispatcher's metadata cannot distinguish them
-            // -- it reported every page of a live VMA as resident, where Linux
-            // reports only the touched ones. The host cannot answer either:
-            // host pages are 16 KiB against 4 KiB guest pages, so a host-level
-            // residency query (measured live: `mach_vm_page_range_query` is
-            // exact per HOST page) blurs four guest pages into one answer and
-            // reports an untouched page resident because a neighbour was
-            // written. Per-guest-page truth needs a per-guest-page fault.
-            //
-            // That is a real cost -- one trap per anonymous page on first touch
-            // -- paid deliberately, and it is the same mechanism the
-            // shared-anonymous path already uses. `CARRICK_MINCORE_EXACT=0`
-            // turns it off for bisection.
             if let Some(bus_offset) = bus_fault_offset
                 && let Some(bus_start) = address.checked_add(bus_offset)
                 && let Some(bus_len) = length.checked_sub(bus_offset)
