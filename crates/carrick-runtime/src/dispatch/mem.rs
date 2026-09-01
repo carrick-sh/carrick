@@ -4654,6 +4654,51 @@ impl SyscallDispatcher {
                     ));
                 }
                 this.commit_mmap_locked_range(memory, locked_range)?;
+                // Observe the FIRST TOUCH of each page, so `mincore` can tell a
+                // written page from an untouched one.
+                //
+                // carrick publishes a mapping valid up front, so the guest's
+                // stores never trap and the dispatcher's metadata cannot
+                // distinguish them -- it reported every page of a live VMA as
+                // resident where Linux reports only the touched ones. The host
+                // cannot answer either: host pages are 16 KiB against 4 KiB
+                // guest pages, so a host residency query (measured live:
+                // `mach_vm_page_range_query` is exact per HOST page) blurs four
+                // guest pages together and calls an untouched page resident
+                // because a neighbour was written. Per-guest-page truth needs a
+                // per-guest-page fault.
+                //
+                // That is a real cost -- one trap per anonymous page on first
+                // touch -- paid deliberately, and it is the same mechanism the
+                // shared-anonymous path already uses. `CARRICK_MINCORE_EXACT=0`
+                // turns it off for bisection.
+                if map_flags.contains(LinuxMmapFlags::PRIVATE)
+                    && !map_flags.contains(LinuxMmapFlags::POPULATE)
+                    && !prot_flags.is_empty()
+                    && in_arena
+                    && std::env::var("CARRICK_MINCORE_EXACT").as_deref() != Ok("0")
+                    && memory
+                        .resident_pages(GuestVa(address), 1, this.linux_page_size())
+                        .is_none()
+                    && memory.protect_range(address, length_usize, 0).is_ok()
+                {
+                    this.track_resident_fault_range(address, length, prot_flags);
+                    // The temporary inaccessible backing is NOT the guest's VMA
+                    // permission; keep reporting what the guest asked for.
+                    memory.set_mapping_protection(
+                        address,
+                        length_usize,
+                        false,
+                        !prot_flags.contains(LinuxProtFlags::WRITE),
+                    );
+                    if let Some(protections) = memory.protections() {
+                        protections.set_executable(
+                            address,
+                            length_usize,
+                            prot_flags.contains(LinuxProtFlags::EXEC),
+                        );
+                    }
+                }
                 this.record_dynamic_mapping_with_file_offset(
                     address,
                     length,
@@ -5164,6 +5209,23 @@ impl SyscallDispatcher {
                     format_args!("at {address:#x}+{length:#x} in_arena={in_arena}: {error}"),
                 ));
             }
+            // Observe the FIRST TOUCH of a private anonymous page, so `mincore`
+            // can tell a written page from an untouched one.
+            //
+            // Carrick publishes a mapping valid up front, so the guest's stores
+            // never trap and the dispatcher's metadata cannot distinguish them
+            // -- it reported every page of a live VMA as resident, where Linux
+            // reports only the touched ones. The host cannot answer either:
+            // host pages are 16 KiB against 4 KiB guest pages, so a host-level
+            // residency query (measured live: `mach_vm_page_range_query` is
+            // exact per HOST page) blurs four guest pages into one answer and
+            // reports an untouched page resident because a neighbour was
+            // written. Per-guest-page truth needs a per-guest-page fault.
+            //
+            // That is a real cost -- one trap per anonymous page on first touch
+            // -- paid deliberately, and it is the same mechanism the
+            // shared-anonymous path already uses. `CARRICK_MINCORE_EXACT=0`
+            // turns it off for bisection.
             if let Some(bus_offset) = bus_fault_offset
                 && let Some(bus_start) = address.checked_add(bus_offset)
                 && let Some(bus_len) = length.checked_sub(bus_offset)
@@ -7084,6 +7146,36 @@ impl SyscallDispatcher {
                     }
                     if meta.all_private_anon {
                         this.mark_range_nonresident(address.0, length as u64);
+                        // Discarding the pages puts them back where a fresh
+                        // anonymous mapping starts: not resident, and resident
+                        // again on the NEXT touch. Re-arm the first-touch fault
+                        // so that next touch is observed -- without this the
+                        // range stays non-resident forever and `mincore` reports
+                        // a written page as absent, which is the opposite of the
+                        // error it used to make.
+                        if std::env::var("CARRICK_MINCORE_EXACT").as_deref() != Ok("0")
+                            && cx
+                                .memory
+                                .resident_pages(GuestVa(address.0), 1, this.linux_page_size())
+                                .is_none()
+                            && cx.memory.protect_range(address.0, length, 0).is_ok()
+                        {
+                            // `MADV_DONTNEED` requires a readable mapping to
+                            // reach here, and `writable` is the only other axis
+                            // this range can carry.
+                            let prot = if meta.writable {
+                                LinuxProtFlags::READ | LinuxProtFlags::WRITE
+                            } else {
+                                LinuxProtFlags::READ
+                            };
+                            this.track_resident_fault_range(address.0, length as u64, prot);
+                            cx.memory.set_mapping_protection(
+                                address.0,
+                                length,
+                                false,
+                                !meta.writable,
+                            );
+                        }
                     }
                 }
                 // MADV_FREE only applies to private anonymous mappings; a shared
