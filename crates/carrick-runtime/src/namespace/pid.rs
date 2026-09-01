@@ -314,6 +314,42 @@ pub fn refresh_init_host_pgid() {
 /// Translate an ns-pid the guest supplied back to the host pid to operate on.
 /// Identity when namespaces are off. Returns `None` (→ `ESRCH`) for an ns-pid
 /// that names no member.
+/// A positive pid exactly as the GUEST names it, translated into the kernel
+/// task-id number the graph indexes by.
+///
+/// The guest names processes in its pid namespace (`fork` returns ns pids,
+/// `getpid` reports them), while the kernel graph is keyed by task id; the two
+/// numbering domains drift apart the moment a container exists. `None` means
+/// the number names nothing in the guest's namespace (ESRCH/ECHILD at the
+/// caller's discretion). Identity when namespaces are off.
+pub fn guest_pid_to_kernel(pid: i32) -> Option<i32> {
+    let raw = u32::try_from(pid).ok().filter(|raw| *raw != 0)?;
+    let host = ns_to_host_or_self(raw)?;
+    i32::try_from(host).ok()
+}
+
+/// A tid exactly as the GUEST names it, translated into the kernel thread-id
+/// number — with a raw fallback, because tids are a MIXED domain today:
+/// `gettid` reports a thread-group leader by its ns pid but a secondary thread
+/// by its kernel tid (secondary threads are not registered in the region). A
+/// registered number is a leader and translates; an unregistered one is taken
+/// as a kernel tid unchanged. The residual collision (a kernel tid numerically
+/// equal to another process's ns pid) is inherent to the split numbering and
+/// resolves only when thread ids allocate from the namespace, which is the
+/// documented follow-up in `docs/identity-and-scope-domains.md`.
+pub fn guest_tid_to_kernel(tid: i32) -> i32 {
+    let Ok(raw) = u32::try_from(tid) else {
+        return tid;
+    };
+    match region() {
+        Some(r) => r
+            .ns_to_host(raw)
+            .and_then(|host| i32::try_from(host).ok())
+            .unwrap_or(tid),
+        None => tid,
+    }
+}
+
 pub fn ns_to_host_or_self(ns_pid: u32) -> Option<u32> {
     match region() {
         Some(r) => r.ns_to_host(ns_pid),

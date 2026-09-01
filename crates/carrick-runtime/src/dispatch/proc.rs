@@ -1894,7 +1894,7 @@ impl SyscallDispatcher {
                 // get_robust_list01 uses pid 1 for the EPERM case and an unused
                 // pid for ESRCH). Existence is zombie-inclusive because Linux
                 // keeps an unreaped process addressable.
-                let exists = crate::kernel::TaskId::from_abi_positive(pid.0)
+                let exists = guest_pid_to_task_id(pid)
                     .is_ok_and(|task| cx.kernel.kernel().process_identity(task).is_some());
                 return Ok(DispatchOutcome::errno(if exists { LINUX_EPERM } else { LINUX_ESRCH }));
             }
@@ -2545,7 +2545,7 @@ impl SyscallDispatcher {
                 };
                 let kernel = process.kernel_graph();
                 let target = || {
-                    crate::kernel::TaskId::from_abi_positive(pid.0)
+                    guest_pid_to_task_id(pid)
                         .ok()
                         .and_then(|target| kernel.live_task_key(target))
                 };
@@ -2619,9 +2619,7 @@ impl SyscallDispatcher {
                         }
                     }
                     LINUX_PTRACE_PEEKTEXT | LINUX_PTRACE_PEEKDATA => {
-                        let Ok(target_task_id) =
-                            crate::kernel::TaskId::from_abi_positive(pid.0)
-                        else {
+                        let Ok(target_task_id) = guest_pid_to_task_id(pid) else {
                             return Ok(DispatchOutcome::errno(LINUX_ESRCH));
                         };
                         let Some(target_task) = kernel.registry().task(target_task_id) else {
@@ -2702,9 +2700,7 @@ impl SyscallDispatcher {
                         }
                     }
                     LINUX_PTRACE_POKETEXT | LINUX_PTRACE_POKEDATA => {
-                        let Ok(target_task_id) =
-                            crate::kernel::TaskId::from_abi_positive(pid.0)
-                        else {
+                        let Ok(target_task_id) = guest_pid_to_task_id(pid) else {
                             return Ok(DispatchOutcome::errno(LINUX_ESRCH));
                         };
                         let Some(target_task) = kernel.registry().task(target_task_id) else {
@@ -3011,15 +3007,21 @@ impl SyscallDispatcher {
             if pid.0 < 0 {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
-            let target = match (pid.0 != 0)
-                .then(|| crate::kernel::TaskId::from_abi_positive(pid.0))
-                .transpose()
-            {
+            let target = match (pid.0 != 0).then(|| guest_pid_to_task_id(pid)).transpose() {
                 Ok(target) => target,
                 Err(_) => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
             };
+            // A pgid is a leader's pid, so the same ns translation applies. A
+            // number naming no member keeps its raw value: Linux lets setpgid
+            // name a NOT-YET-EXISTING group only when it equals the target's
+            // own pid (handled above by translation), and an unknown group
+            // must fall through to the kernel's own EPERM, not EINVAL here.
             let group = match (pgid.0 != 0)
-                .then(|| crate::kernel::ProcessGroupId::from_abi_positive(pgid.0))
+                .then(|| {
+                    let host = crate::namespace::pid::guest_pid_to_kernel(pgid.0)
+                        .unwrap_or(pgid.0);
+                    crate::kernel::ProcessGroupId::from_abi_positive(host)
+                })
                 .transpose()
             {
                 Ok(group) => group,
@@ -3130,7 +3132,19 @@ impl SyscallDispatcher {
                 let mut group_target = None;
                 let target = match idtype {
                     LINUX_P_ALL => None,
-                    LINUX_P_PID if id > 0 && id <= i32::MAX as u64 => Some(id as i32),
+                    // The id is an ns-pid; the graph waits by task id. A
+                    // number naming no member is ECHILD, same as the range
+                    // check below.
+                    LINUX_P_PID if id > 0 && id <= i32::MAX as u64 => {
+                        match crate::namespace::pid::guest_pid_to_kernel(id as i32) {
+                            Some(host) => Some(host),
+                            None => {
+                                return Ok(DispatchOutcome::errno(
+                                    crate::linux_abi::LINUX_ECHILD,
+                                ));
+                            }
+                        }
+                    }
                     LINUX_P_PID => {
                         return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD));
                     }
@@ -3144,7 +3158,16 @@ impl SyscallDispatcher {
                                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                             }
                         } else {
-                            id as i32
+                            // An ns-pgid; group ids are leader pids, so the
+                            // same pid translation applies. A miss is ECHILD.
+                            match crate::namespace::pid::guest_pid_to_kernel(id as i32) {
+                                Some(host) => host,
+                                None => {
+                                    return Ok(DispatchOutcome::errno(
+                                        crate::linux_abi::LINUX_ECHILD,
+                                    ));
+                                }
+                            }
                         };
                         group_target = Some(group);
                         None
@@ -3591,6 +3614,12 @@ impl SyscallDispatcher {
             if let Some(process) = this.hvpatch_process() {
                 let include_stopped = options.contains(LinuxWaitOptions::WUNTRACED);
                 let include_continued = options.contains(LinuxWaitOptions::WCONTINUED);
+                // The guest names its child by the pid `fork` returned — an
+                // ns-pid — while the kernel graph waits by task id. An ns-pid
+                // that names no member is ECHILD (no such child), exactly as
+                // an untranslated miss would report. The translated value is
+                // also what a park republishes as its exact-child selector.
+                let mut host_target = None;
                 let waited = match pid.0 {
                     -1 => process.wait_child_with_job_control(
                         None,
@@ -3598,12 +3627,20 @@ impl SyscallDispatcher {
                         include_stopped,
                         include_continued,
                     ),
-                    value if value > 0 => process.wait_child_with_job_control(
-                        Some(value),
-                        false,
-                        include_stopped,
-                        include_continued,
-                    ),
+                    value if value > 0 => {
+                        match crate::namespace::pid::guest_pid_to_kernel(value) {
+                            Some(host) => {
+                                host_target = Some(host);
+                                process.wait_child_with_job_control(
+                                    Some(host),
+                                    false,
+                                    include_stopped,
+                                    include_continued,
+                                )
+                            }
+                            None => crate::hvpatch::WaitResult::NoChild,
+                        }
+                    }
                     0 => match process.process_group() {
                         Ok(group) => process.wait_child_in_process_group_with_job_control(
                             group,
@@ -3613,7 +3650,10 @@ impl SyscallDispatcher {
                         ),
                         Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                     },
-                    value => match value.checked_abs() {
+                    value => match value
+                        .checked_abs()
+                        .and_then(crate::namespace::pid::guest_pid_to_kernel)
+                    {
                         Some(group) => process.wait_child_in_process_group_with_job_control(
                             group,
                             false,
@@ -3637,7 +3677,13 @@ impl SyscallDispatcher {
                             memory.write_bytes(rusage_addr.0, rusage.abi_bytes())?;
                         }
                         return Ok(DispatchOutcome::Returned {
-                            value: i64::from(exit.pid().raw()),
+                            // The reaped child's pid in the CALLER's namespace
+                            // view — the probe loop `waitpid(rc) == fork_rc`
+                            // never terminated on the raw task id.
+                            value: i64::from(ns_visible_identity_id(
+                                cx.kernel,
+                                exit.pid().raw(),
+                            )),
                         });
                     }
                     crate::hvpatch::WaitResult::StillRunning => {
@@ -3670,7 +3716,9 @@ impl SyscallDispatcher {
                             // group filter on redispatch. Publishing a
                             // nonpositive value as an exact task id makes the
                             // continuation reject it as `StaleChildSelector`.
-                            target: (pid.0 > 0).then_some(pid.0),
+                            // The selector is the TRANSLATED task id: the
+                            // continuation resolves it in the kernel graph.
+                            target: host_target,
                             sig_mask: carrick_abi::WaitSigMask::Additive(non_interrupting),
                         });
                     }
@@ -4269,6 +4317,21 @@ impl SyscallDispatcher {
             // (CSIGNAL = 0xff). Thread it through so the parent receives the
             // requested signal on child exit instead of a hardcoded SIGCHLD.
             let exit_signal = (flags & 0xff) as u32;
+            // Legacy clone ACCEPTS an out-of-range CSIGNAL (oracle:
+            // `clone(CLONE_VM|0xff)` succeeds on Linux; only clone3 EINVALs
+            // its `exit_signal` field). No real signal bears that number, so
+            // the parent simply gets no exit notification -- lower it to
+            // "no exit signal" rather than letting an unrepresentable number
+            // into the kernel: exit-signal 255 previously reached the fork
+            // path, spawned a child that returned nonzero in BOTH processes,
+            // and ended in a carrier abort (`lifecycleflagmatrix` 1.3, plus
+            // every later line the runaway child chain corrupted).
+            let exit_signal =
+                if crate::dispatch::signal::is_valid_signum(u64::from(exit_signal)) {
+                    exit_signal
+                } else {
+                    0
+                };
             // vfork-for-exec (Go os/exec / glibc posix_spawn): CLONE_VM|CLONE_VFORK
             // without the full THREAD_MASK (excluded above). The child shares the
             // parent's address space and the parent is suspended until the child
@@ -4308,7 +4371,13 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if let Some(process) = this.hvpatch_process() {
-                return Ok(this.open_hvpatch_pidfd(&process, pid.0, flags));
+                // The guest names the target by ns-pid; the graph indexes by
+                // task id. A non-member is ESRCH (`pidfd_open(getpid())`
+                // failed exactly here once `getpid` reported ns pids).
+                let Some(host) = crate::namespace::pid::guest_pid_to_kernel(pid.0) else {
+                    return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+                };
+                return Ok(this.open_hvpatch_pidfd(&process, host, flags));
             }
             // PID namespace (§5.3): the guest names the target by its ns-pid;
             // the pidfd must watch the underlying host pid. A foreign ns-pid is
@@ -5362,7 +5431,15 @@ pub(crate) fn build_hvpatch_waitid_siginfo(
     exit: crate::hvpatch::ChildExit,
 ) -> [u8; crate::linux_abi::LINUX_SIGINFO_SIZE] {
     let (si_code, si_status) = hvpatch_waitid_exit_fields(exit.status());
-    build_linux_sigchld_siginfo(exit.pid().raw(), exit.ruid().raw(), si_code, si_status)
+    // si_pid is read by the GUEST and must name the child as the guest's
+    // namespace does — the raw task id only coincides by counter alignment.
+    let si_pid = u32::try_from(exit.pid().raw())
+        .ok()
+        .map(crate::namespace::pid::host_to_ns_or_self)
+        .and_then(|ns| i32::try_from(ns).ok())
+        .filter(|ns| *ns != 0)
+        .unwrap_or_else(|| exit.pid().raw());
+    build_linux_sigchld_siginfo(si_pid, exit.ruid().raw(), si_code, si_status)
 }
 
 /// Build a Linux `siginfo_t` (SIGCHLD layout) for `waitid` from the fields

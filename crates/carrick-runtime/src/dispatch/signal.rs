@@ -1199,6 +1199,10 @@ impl SyscallDispatcher {
                 caller.process_group()
             } else {
                 match pid.checked_neg().ok_or(()).and_then(|p| {
+                    // `-pid` names an ns-pgid; group ids are leader pids, so
+                    // the pid translation applies. An unknown number keeps its
+                    // raw value and resolves to the same ESRCH below.
+                    let p = crate::namespace::pid::guest_pid_to_kernel(p).unwrap_or(p);
                     crate::kernel::ProcessGroupId::from_abi_positive(p).map_err(|_| ())
                 }) {
                     Ok(group) => group,
@@ -1222,7 +1226,9 @@ impl SyscallDispatcher {
         let info = crate::linux_abi::LinuxSiginfo::kill(
             signum as i32,
             crate::linux_abi::LINUX_SI_USER,
-            caller.key().id.raw(),
+            // The RECEIVER reads si_pid, so it carries the sender's pid in
+            // namespace view, exactly as getpid would report it to the target.
+            ns_visible_sender_pid(ctx.kernel),
             creds.ruid.raw(),
         );
         let mut accepted = 0_usize;
@@ -1334,7 +1340,13 @@ impl SyscallDispatcher {
         signum: u64,
         siginfo: Option<LinuxSiginfo>,
     ) -> Option<DispatchOutcome> {
-        let tid = match crate::kernel::LinuxTid::from_abi_positive(tid) {
+        // A guest tid is mixed-domain: a group leader is named by its ns-pid
+        // (what `gettid` reports for it), a secondary thread by its kernel
+        // tid. `guest_tid_to_kernel` translates the former and passes the
+        // latter through.
+        let tid = match crate::kernel::LinuxTid::from_abi_positive(
+            crate::namespace::pid::guest_tid_to_kernel(tid),
+        ) {
             Ok(tid) => tid,
             Err(_) => return Some(DispatchOutcome::errno(LINUX_ESRCH)),
         };
@@ -1348,7 +1360,9 @@ impl SyscallDispatcher {
                 } else if let Some(target_key) = hvpatch_process_signal_target(kernel, raw) {
                     Some(target_key.id)
                 } else {
-                    match crate::kernel::TaskId::from_abi_positive(raw) {
+                    match crate::kernel::TaskId::from_abi_positive(
+                        crate::namespace::pid::guest_pid_to_kernel(raw).unwrap_or(raw),
+                    ) {
                         Ok(task) => Some(task),
                         Err(_) => return Some(DispatchOutcome::errno(LINUX_ESRCH)),
                     }
@@ -1487,7 +1501,9 @@ impl SyscallDispatcher {
                 crate::linux_abi::LinuxSiginfo::kill(
                     signum as i32,
                     crate::linux_abi::LINUX_SI_USER,
-                    cx.kernel.task().key().id.raw(),
+                    // Namespace view: the target compares si_pid against the
+                    // sender's getpid(), which reports ns pids.
+                    ns_visible_sender_pid(cx.kernel),
                     this.cred_snapshot().ruid.raw(),
                 )
             });
@@ -2567,6 +2583,18 @@ fn hvpatch_owns_specific_process_signal(hvpatch_lane: bool, pid: i32) -> bool {
     hvpatch_lane && pid > 0
 }
 
+/// The calling task's pid as its SIGNAL TARGET will see it — ns-visible,
+/// falling back to the raw task id outside any namespace region.
+fn ns_visible_sender_pid(context: &crate::kernel::KernelContext) -> i32 {
+    let raw = context.task().key().id.raw();
+    u32::try_from(raw)
+        .ok()
+        .map(|raw| crate::namespace::pid::host_to_ns_or_self_for(context, raw))
+        .and_then(|ns| i32::try_from(ns).ok())
+        .filter(|ns| *ns != 0)
+        .unwrap_or(raw)
+}
+
 fn hvpatch_process_signal_target(
     kernel: &crate::kernel::Kernel,
     pid: i32,
@@ -2581,17 +2609,28 @@ fn hvpatch_process_signal_target(
     // there). The real fix is answering getpid from the kernel graph in
     // the HVPatch lane — the documented identity-and-scope migration —
     // after which this arm is dead and must be deleted.
-    let target = if u32::try_from(pid).is_ok_and(|p| p == std::process::id()) {
-        crate::kernel::TaskId::from_abi_positive(carrick_abi::LINUX_BOOTSTRAP_PID as i32).ok()?
+    // The sender names its victim by ns-pid (`kill(fork_rc, ...)`); the graph
+    // is keyed by task id. A number that translates to no MEMBER can still be
+    // a secondary thread's kernel tid (the mixed tid domain `tkill` accepts,
+    // and Linux lets `rt_sigqueueinfo` address a thread by it), so a miss
+    // falls through to the thread lookup instead of concluding ESRCH.
+    let task_target = if u32::try_from(pid).is_ok_and(|p| p == std::process::id()) {
+        crate::kernel::TaskId::from_abi_positive(carrick_abi::LINUX_BOOTSTRAP_PID as i32).ok()
     } else {
-        crate::kernel::TaskId::from_abi_positive(pid).ok()?
+        crate::namespace::pid::guest_pid_to_kernel(pid)
+            .and_then(|host| crate::kernel::TaskId::from_abi_positive(host).ok())
     };
-    kernel.live_task_key(target).or_else(|| {
-        let tid = crate::kernel::LinuxTid::from_abi_positive(pid).ok()?;
-        kernel
-            .live_keys_for_thread(None, tid)
-            .map(|(task, _thread)| task)
-    })
+    task_target
+        .and_then(|target| kernel.live_task_key(target))
+        .or_else(|| {
+            let tid = crate::kernel::LinuxTid::from_abi_positive(
+                crate::namespace::pid::guest_tid_to_kernel(pid),
+            )
+            .ok()?;
+            kernel
+                .live_keys_for_thread(None, tid)
+                .map(|(task, _thread)| task)
+        })
 }
 
 fn hvpatch_signal_observes_zombie(kernel: &crate::kernel::Kernel, pid: i32) -> bool {
@@ -2606,9 +2645,11 @@ fn hvpatch_signal_observes_zombie(kernel: &crate::kernel::Kernel, pid: i32) -> b
     // signum 0 made carrick return ESRCH for a real signal to an unreaped
     // child, which is what LTP's `SAFE_KILL(child, SIGTERM)` teardown does to
     // the one-shot signal helper `create_sig_proc()` spawns.
-    crate::kernel::TaskId::from_abi_positive(pid)
-        .ok()
-        .is_some_and(|target| kernel.registry().zombie(target).is_some())
+    crate::kernel::TaskId::from_abi_positive(
+        crate::namespace::pid::guest_pid_to_kernel(pid).unwrap_or(pid),
+    )
+    .ok()
+    .is_some_and(|target| kernel.registry().zombie(target).is_some())
 }
 
 #[cfg(test)]

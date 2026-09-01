@@ -587,7 +587,6 @@ pub const OUT_OF_PROCESS_PROBES: &[&str] = &["execthreads", "execfromthread", "v
 /// known gap when the deterministic modulo partition moves.
 pub const MUSL_BASELINE_GAPS: &[&str] = &[
     "budget_two_proc",
-    "execfromthread",
     "execthreads",
     "lifecycleflagmatrix",
     "memfdsealmatrix",
@@ -595,7 +594,6 @@ pub const MUSL_BASELINE_GAPS: &[&str] = &[
 
 pub const GNU_BASELINE_GAPS: &[&str] = &[
     "budget_two_proc",
-    "execfromthread",
     "execthreads",
     "lifecycleflagmatrix",
     "memfdsealmatrix",

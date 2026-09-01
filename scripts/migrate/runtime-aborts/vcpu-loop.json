@@ -1126,7 +1126,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 6,
-      "fingerprint": "f465dcd20c71185dd9b96d907eb49384058da781135ca9df2aea4e08bf16d23b",
+      "fingerprint": "020ace794a0c6b695c0c06fa7c4d958c341b0468d47d4e485bcf15c2fd2ae9c9",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_rollback",
       "rationale": "Failed to restore original parent_tid memory bytes during fork copyout rollback; parent memory is corrupted."
@@ -1135,7 +1135,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 7,
-      "fingerprint": "f465dcd20c71185dd9b96d907eb49384058da781135ca9df2aea4e08bf16d23b",
+      "fingerprint": "020ace794a0c6b695c0c06fa7c4d958c341b0468d47d4e485bcf15c2fd2ae9c9",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_rollback",
       "rationale": "Failed to restore original pidfd memory bytes during fork copyout rollback; parent memory is corrupted."
@@ -1144,7 +1144,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 8,
-      "fingerprint": "9b465d0f54e60f9852ed3091d69163f6e7f76c0946f4a03d5dddba8c09b00235",
+      "fingerprint": "572ba5e7d80517ed0bf4bb7b92a60604d530869496e21c743cb249a736466416",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_rollback",
       "rationale": "Failed to restore parent_tid bytes on failpoint rollback; parent memory is corrupted."
@@ -1153,7 +1153,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 9,
-      "fingerprint": "9b465d0f54e60f9852ed3091d69163f6e7f76c0946f4a03d5dddba8c09b00235",
+      "fingerprint": "572ba5e7d80517ed0bf4bb7b92a60604d530869496e21c743cb249a736466416",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_rollback",
       "rationale": "Failed to restore pidfd bytes on failpoint rollback; parent memory is corrupted."
@@ -1162,7 +1162,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 10,
-      "fingerprint": "0ed9c9bb5fe6c06cd3bcd3d824f745e87ff6874a40230d5d6ae14c73e472d9af",
+      "fingerprint": "99bed987321094f4b5b5802a969fa5d125189316f2ce3820e9f9a4e5213aedc9",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_rollback",
       "rationale": "Failed to restore parent_tid memory on child materialization failure; parent memory is corrupted."
@@ -1171,7 +1171,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 11,
-      "fingerprint": "0ed9c9bb5fe6c06cd3bcd3d824f745e87ff6874a40230d5d6ae14c73e472d9af",
+      "fingerprint": "99bed987321094f4b5b5802a969fa5d125189316f2ce3820e9f9a4e5213aedc9",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_rollback",
       "rationale": "Failed to restore pidfd memory on child materialization failure; parent memory is corrupted."
@@ -1351,7 +1351,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 31,
-      "fingerprint": "da6991b3b5f4dee9697a24da7248bd0655c6e7cdfba7ff188beb188e701bb94d",
+      "fingerprint": "d478d177ec59622a61ab4ed7ccec43976f37e43c9f12cf648cacbea724bbe809",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::vfork_suspension",
       "rationale": "Missing child thread activation proof when constructing PreparedVforkSuspension."

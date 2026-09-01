@@ -1710,9 +1710,45 @@ where
         let child_platform_futex = (self.platform_futex_factory)(Arc::clone(&child_futex));
         let child_threads = Arc::new(parking_lot::Mutex::new(Vec::new()));
 
+        // The pid the GUEST sees for this child, in the parent's pid
+        // namespace. `child_pid` is the kernel task id, and the two numbering
+        // spaces drift apart as soon as creation orders differ (task 5 can be
+        // ns pid 4) -- whether they happened to coincide depended on counter
+        // alignment, which is why `child_getpid_eq_fork_rc` flickered with
+        // load instead of failing outright. The kernel publish that normally
+        // registers the child (`fork_task`'s commit) runs AFTER this copyout,
+        // so the registration is pulled forward here: `fork_task` finds the
+        // mapping already present and keeps it. Fork children always share
+        // the parent's region (CLONE_NEWPID is rejected at clone entry), and
+        // the three failpoint rollbacks below unregister again so a
+        // rolled-back reservation cannot leave a stale mapping behind for a
+        // recycled task id. Every kernel-facing use of `child_pid` (task
+        // identity, wait keys, telemetry) stays in the raw domain.
+        let ns_region = parent_context.task().pid_ns_region();
+        let mut child_ns_registered = false;
+        let guest_child_pid = match (&ns_region, u32::try_from(child_pid)) {
+            (Some(region), Ok(raw)) => {
+                let ns_pid = region.host_to_ns(raw).unwrap_or_else(|| {
+                    let ns_pid = region.alloc_ns_pid();
+                    child_ns_registered = region
+                        .register(raw, ns_pid, parent_task.id.raw() as u32)
+                        .is_some();
+                    ns_pid
+                });
+                i32::try_from(ns_pid).unwrap_or(child_pid)
+            }
+            _ => child_pid,
+        };
+        let unregister_child_ns = |registered: bool| {
+            if registered {
+                if let (Some(region), Ok(raw)) = (&ns_region, u32::try_from(child_pid)) {
+                    region.unregister_reaped(raw);
+                }
+            }
+        };
         let parent_outputs_published = request.parent_tid_addr.is_none_or(|address| {
             memory
-                .write_bytes(address, &child_pid.to_le_bytes())
+                .write_bytes(address, &guest_child_pid.to_le_bytes())
                 .is_ok()
         }) && match (request.pidfd_out, installed_pidfd) {
             (Some(address), Some(fd)) => memory.write_bytes(address, &fd.to_le_bytes()).is_ok(),
@@ -1741,6 +1777,7 @@ where
                     std::process::abort();
                 });
             }
+            unregister_child_ns(child_ns_registered);
             if let Err(cleanup_error) =
                 ops.abort_and_rollback_prepared(prepared_backend, memory, !shares_mm)
             {
@@ -1763,6 +1800,7 @@ where
                     .write_bytes(address, bytes)
                     .unwrap_or_else(|_| std::process::abort());
             }
+            unregister_child_ns(child_ns_registered);
             if let Err(cleanup_error) =
                 ops.abort_and_rollback_prepared(prepared_backend, memory, !shares_mm)
             {
@@ -1784,6 +1822,7 @@ where
                     .write_bytes(address, bytes)
                     .unwrap_or_else(|_| std::process::abort());
             }
+            unregister_child_ns(child_ns_registered);
             if let Err(cleanup_error) =
                 ops.abort_and_rollback_prepared(prepared_backend, memory, !shares_mm)
             {
@@ -1949,7 +1988,9 @@ where
             injected_lease,
             bootstrap_process_child: Some((
                 shares_mm,
-                request.child_tid_addr.map(|address| (address, child_pid)),
+                request
+                    .child_tid_addr
+                    .map(|address| (address, guest_child_pid)),
             )),
         })
         .unwrap_or_else(|error| {
@@ -2096,7 +2137,7 @@ where
             let activation = activation.unwrap_or_else(|| std::process::abort());
             return Ok(PreparedInProcessFork::SuspendVfork(
                 PreparedVforkSuspension {
-                    child_pid,
+                    child_pid: guest_child_pid,
                     request,
                     child: child_key,
                     wait,
@@ -2104,7 +2145,9 @@ where
                 },
             ));
         }
-        Ok(PreparedInProcessFork::Complete(Some(i64::from(child_pid))))
+        Ok(PreparedInProcessFork::Complete(Some(i64::from(
+            guest_child_pid,
+        ))))
     }
 }
 

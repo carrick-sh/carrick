@@ -4941,12 +4941,17 @@ impl SyscallDispatcher {
             return Some(std::sync::Arc::clone(context.task()));
         }
         let process = self.hvpatch_process()?;
-        let task = crate::kernel::TaskId::from_abi_positive(pid).ok()?;
+        // ns-pid -> task id: the caller's number is the guest's namespace view.
+        let host = crate::namespace::pid::guest_pid_to_kernel(pid)?;
+        let task = crate::kernel::TaskId::from_abi_positive(host).ok()?;
         process.kernel_graph().live_task(task)
     }
 
     pub(crate) fn guest_process_target(&self, pid: i32) -> Option<GuestProcessTarget> {
         let process = self.hvpatch_process()?;
+        // ns-pid -> task id, with a raw fallback so an unknown number still
+        // reports `Missing` rather than silently un-answering the question.
+        let pid = crate::namespace::pid::guest_pid_to_kernel(pid).unwrap_or(pid);
         let Ok(task) = crate::kernel::TaskId::from_abi_positive(pid) else {
             return None;
         };
