@@ -678,7 +678,11 @@ impl SyscallDispatcher {
                     let pgid = if who.0 == 0 {
                         cx.kernel.task().process_group()
                     } else {
-                        match crate::kernel::TaskId::from_abi_positive(who.0) {
+                        // An ns-pgid: group ids are leader pids, so the pid
+                        // translation applies (raw fallback -> same ESRCH).
+                        match crate::kernel::TaskId::from_abi_positive(
+                            crate::namespace::pid::guest_pid_to_kernel(who.0).unwrap_or(who.0),
+                        ) {
                             Ok(leader) => crate::kernel::ProcessGroupId::from_leader(leader),
                             Err(_) => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
                         }
@@ -789,7 +793,11 @@ impl SyscallDispatcher {
                     let pgid = if who.0 == 0 {
                         cx.kernel.task().process_group()
                     } else {
-                        match crate::kernel::TaskId::from_abi_positive(who.0) {
+                        // An ns-pgid: group ids are leader pids, so the pid
+                        // translation applies (raw fallback -> same ESRCH).
+                        match crate::kernel::TaskId::from_abi_positive(
+                            crate::namespace::pid::guest_pid_to_kernel(who.0).unwrap_or(who.0),
+                        ) {
                             Ok(leader) => crate::kernel::ProcessGroupId::from_leader(leader),
                             Err(_) => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
                         }
@@ -1087,7 +1095,22 @@ impl SyscallDispatcher {
                 // itself, rather than Linux's 0 for a pid-namespace init — the
                 // root task's parentage is a separate open question and this
                 // change deliberately does not move it.
-                .map_or(LINUX_BOOTSTRAP_PID as i64, |parent| i64::from(parent.raw()));
+                .map_or(LINUX_BOOTSTRAP_PID as i64, |parent| {
+                    // Namespace view: the child compares this against the
+                    // parent's getpid(), which reports ns pids
+                    // (`child_getppid_matches_parent_pid`).
+                    let raw = parent.raw();
+                    i64::from(
+                        u32::try_from(raw)
+                            .ok()
+                            .map(|raw| {
+                                crate::namespace::pid::host_to_ns_or_self_for(cx.kernel, raw)
+                            })
+                            .and_then(|ns| i32::try_from(ns).ok())
+                            .filter(|ns| *ns != 0)
+                            .unwrap_or(raw),
+                    )
+                });
             Ok(DispatchOutcome::Returned { value })
         }
 

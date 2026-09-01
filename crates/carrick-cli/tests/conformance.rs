@@ -49,11 +49,11 @@ const KNOWN_PROBE_GAPS: &[&str] = &[
     // abort but hangs 2 runs in 3, so the missing retirement belongs upstream,
     // before the registrations tear down.
     //
-    // `execfromthread` no longer aborts and reaches stage 2; only its
-    // `gettid()==getpid()` line diverges, for the pid-namespace reason recorded
-    // at the `ns_visible` note below.
+    // `execfromthread` CLOSED 2026-09-01: the exec-from-thread abort became a
+    // benign `AddressSpaceRetired` path and the `gettid()==getpid()` line was
+    // the fork/gettid pid-namespace unification -- sampled 4x musl + 2x gnu
+    // line-exact MATCH.
     "execthreads",
-    "execfromthread",
     // Audit remediation program.
     // Each probe encodes a confirmed, dynamically-validated finding whose fix is
     // scheduled for the cited milestone; removed from this list when the fix lands

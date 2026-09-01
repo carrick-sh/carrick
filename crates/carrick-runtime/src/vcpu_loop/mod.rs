@@ -449,6 +449,65 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         ))
     }
 
+    fn attest_foreign_identity_write(
+        &self,
+        semantic_start: carrick_guest_mem::GuestVa,
+        semantic_len: std::num::NonZeroUsize,
+        inventory_revision: u64,
+        mapping: carrick_hal::MappingId,
+        frame: carrick_hal::FrameId,
+        gpa: carrick_guest_mem::Gpa,
+        length: carrick_hal::FrameLength,
+    ) -> Result<
+        (
+            carrick_hal::ForeignCowKernelProof,
+            carrick_hal::ForeignOwnerGeneration,
+        ),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        // No inventory mutation happens for an identity write, so the proof
+        // binds the revision the CALLER's snapshot captured; the mapping must
+        // be live at exactly that revision or the snapshot is stale and the
+        // transport retries. The owner retention pins the current host
+        // incarnation for the duration of the mint, and its generation is the
+        // one the prepared write will re-verify against the extent ledger.
+        let owner = self.owner_inventory.retain_current(gpa, length)?;
+        let owner_generation = owner.generation();
+        if !self
+            .kernel
+            .frame_inventory()
+            .mapping_is_live_exact_at_revision(
+                self.mm,
+                inventory_revision,
+                mapping,
+                frame,
+                gpa,
+                length,
+            )
+            || !owner.is_current()
+        {
+            return Err(Box::new(std::io::Error::other(
+                "identity write attestation: mapping not live at snapshot revision",
+            )));
+        }
+        let proof = KernelForeignCowProof::new(
+            Arc::clone(&self.kernel),
+            self.mm,
+            semantic_start,
+            semantic_len,
+            inventory_revision,
+            mapping,
+            frame,
+            gpa,
+            length,
+            owner_generation,
+        );
+        Ok((
+            carrick_hal::ForeignCowKernelProof::from_runtime_authority(Box::new(proof)),
+            owner_generation,
+        ))
+    }
+
     fn mapping_is_live(
         &self,
         mapping: carrick_hal::MappingId,

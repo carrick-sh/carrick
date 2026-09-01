@@ -1954,6 +1954,33 @@ pub trait FrameCowAuthority: Send + Sync {
         )))
     }
 
+    /// Mint the runtime-private proof for an IDENTITY foreign write: a write
+    /// into a page that is already private to the target mm (nothing to copy,
+    /// no inventory mutation). The authority verifies the exact (mapping,
+    /// frame, physical extent) tuple is live at the snapshot revision the
+    /// caller captured, and binds the CURRENT host-owner generation into the
+    /// proof. The backend carries the proof opaquely, exactly as with
+    /// [`Self::apply_foreign_cow`].
+    #[allow(clippy::too_many_arguments)]
+    fn attest_foreign_identity_write(
+        &self,
+        _semantic_start: carrick_guest_mem::GuestVa,
+        _semantic_len: std::num::NonZeroUsize,
+        _inventory_revision: u64,
+        _mapping: crate::MappingId,
+        _frame: crate::FrameId,
+        _gpa: carrick_guest_mem::Gpa,
+        _length: crate::FrameLength,
+    ) -> Result<
+        (crate::ForeignCowKernelProof, crate::ForeignOwnerGeneration),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "frame COW authority does not attest identity writes",
+        )))
+    }
+
     /// Authenticate that the just-published physical mapping is visible in
     /// the bound mm's kernel-owned graph before the backend advertises a COW
     /// commit or disarms the permission fault.

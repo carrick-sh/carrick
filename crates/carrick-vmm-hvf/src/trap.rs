@@ -19814,6 +19814,142 @@ struct ForeignCowTransactionRequest<'a> {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+/// The IDENTITY foreign-write lane: mint a `CarrierForeignCowReceipt` for a
+/// page that is already private to the target mm, without copying, remapping,
+/// or touching the frame inventory.
+///
+/// Safety comes from three live authorities, checked in order: the page's own
+/// stage-1 leaf must grant the GUEST user write access (a still-COW-shared
+/// page is read-only there, so a `cow_armed` bookkeeping miss can never leak a
+/// write into a shared compound), the protection tracker must not deny the
+/// range, and the kernel authority must attest that the exact (mapping, frame,
+/// physical extent) tuple is live at the caller's snapshot revision with the
+/// current host-owner generation. The receipt then flows through the same
+/// prepared-write validation as a copied compound.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn attest_foreign_identity_write_receipt(
+    lease: &CarrierForeignMmReadLease,
+    lease_guard: &mut CarrierLeaseState,
+    requested: &CarrierForeignMmSnapshot,
+    runtime: &MmCowRuntimeBinding,
+    va: carrick_guest_mem::GuestVa,
+    len: usize,
+    deadline: std::time::Instant,
+) -> Result<CarrierForeignCowReceipt, carrick_hal::ForeignMmTransportError> {
+    const PAGE: u64 = 0x1000;
+    let page_va = va.raw() & !(PAGE - 1);
+    let range_end = va
+        .raw()
+        .checked_add(len as u64)
+        .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
+    // Callers chunk writes at 4 KiB page boundaries; a range crossing the page
+    // has no single leaf to attest.
+    let page_end = page_va
+        .checked_add(PAGE)
+        .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
+    if range_end > page_end {
+        return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
+    }
+    let page_tables_authority = lease.state.page_tables_authority();
+    let (ipa, guest_writable) = {
+        let tables = page_tables_authority
+            .try_lock_until(deadline)
+            .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?;
+        let tables = tables
+            .as_ref()
+            .ok_or(carrick_hal::ForeignMmTransportError::AuthorityUnavailable)?;
+        let ipa = tables
+            .translate_retained_output(page_va)
+            .ok_or(carrick_hal::ForeignMmTransportError::Translation(va))?;
+        // The live leaf's access permissions ARE the guest's own write
+        // authority; only user-RW qualifies for the identity lane.
+        const AP_MASK: u64 = 0b11 << 6;
+        const AP_USER_RW: u64 = 0b01 << 6;
+        let leaf = tables.debug_walk(page_va)[3];
+        (ipa, leaf & AP_MASK == AP_USER_RW)
+    };
+    if !guest_writable
+        || lease
+            .state
+            .protections
+            .range_write_denied(page_va, PAGE as usize)
+    {
+        return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
+    }
+    // The receipt references the inventory extent that already CONTAINS the
+    // page — ordinary private memory lives in extents of arbitrary size, not
+    // the compound-sized splits foreign COW manufactures. The lease must
+    // already retain it (it retains every extent the snapshot published).
+    let _ = lease_guard.backing.extent_for(ipa, len.max(1))?;
+    let (extent_key, mapping, frame, extent_generation) = {
+        let inventory = lease
+            .state
+            .frame_inventory
+            .ledger
+            .try_lock_until(deadline)
+            .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?;
+        let (key, extent) = inventory
+            .extents
+            .iter()
+            .find(|((base, extent_len), _)| {
+                ipa >= *base && ipa.checked_sub(*base).is_some_and(|off| off < *extent_len)
+            })
+            .map(|(key, extent)| (*key, *extent))
+            .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)?;
+        (
+            key,
+            extent.mapping,
+            extent.frame,
+            extent.stage2_owner.generation,
+        )
+    };
+    lease
+        .custody
+        .global_frame_host_owners
+        .try_lock_until(deadline)
+        .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?
+        .get(&extent_key)
+        .and_then(GlobalFrameOwnerEntry::live_owner)
+        .filter(|owner| owner.generation() == extent_generation && owner.length() == extent_key.1)
+        .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)?;
+    let cow_length = carrick_hal::FrameLength::from_mapping_extent(
+        std::num::NonZeroU64::new(extent_key.1)
+            .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)?,
+    );
+    // Statically nonzero: const-evaluated so no runtime failure arm exists.
+    const SEMANTIC_LEN: std::num::NonZeroUsize = match std::num::NonZeroUsize::new(PAGE as usize) {
+        Some(len) => len,
+        None => unreachable!(),
+    };
+    let semantic_len = SEMANTIC_LEN;
+    let (kernel_proof, owner_generation) = runtime
+        .authority
+        .attest_foreign_identity_write(
+            carrick_guest_mem::GuestVa(page_va),
+            semantic_len,
+            requested.frame_inventory_revision.raw_for_probe(),
+            mapping,
+            frame,
+            carrick_guest_mem::Gpa(extent_key.0),
+            cow_length,
+        )
+        .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
+    if owner_generation.raw_for_probe() != extent_generation {
+        return Err(carrick_hal::ForeignMmTransportError::OwnerStale);
+    }
+    Ok(CarrierForeignCowReceipt {
+        snapshot: requested.clone(),
+        start: carrick_guest_mem::GuestVa(page_va),
+        len: PAGE as usize,
+        mapping,
+        frame,
+        physical_base: carrick_guest_mem::Gpa(extent_key.0),
+        physical_len: extent_key.1,
+        owner_generation,
+        kernel_proof,
+    })
+}
+
 fn perform_foreign_cow_transaction(
     lease: &CarrierForeignMmReadLease,
     lease_guard: &mut CarrierLeaseState,
@@ -19869,12 +20005,28 @@ fn perform_foreign_cow_transaction(
             executable: true,
             kernel_only: false,
         },
-        None => lease
-            .state
-            .cow_armed
-            .lock()
-            .span_for(va.raw())
-            .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?,
+        None => match lease.state.cow_armed.lock().span_for(va.raw()) {
+            Some(span) => span,
+            None => {
+                // Not COW-armed: the page is already PRIVATE to this mm — one
+                // the target wrote or mapped after fork, so there is nothing
+                // to copy. `process_vm_writev` into a forked child's own
+                // buffer lands exactly here. Write authority is attested
+                // against the live stage-1 translation instead: the identity
+                // lane below mints a receipt referencing the EXISTING
+                // compound, and the prepared write commits into the live
+                // owner pages the guest itself already writes.
+                return attest_foreign_identity_write_receipt(
+                    lease,
+                    lease_guard,
+                    requested,
+                    &runtime,
+                    va,
+                    len,
+                    deadline,
+                );
+            }
+        },
     };
     let span_end = span
         .va
@@ -20530,7 +20682,12 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
             || cow.vma_revision() != requested.vma_revision
             || cow.frame_inventory_revision() != requested.frame_inventory_revision
             || !requested.mapping_ids.contains(&cow.mapping())
-            || cow.physical_len() != CowArmedRanges::COMPOUND_SIZE
+            // A COPIED compound is always compound-sized; an IDENTITY receipt
+            // names the extent that already contains the page, whatever its
+            // size. Both shapes are pinned exactly by the ledger and owner
+            // lookups below, so the only degenerate shape to reject here is
+            // an empty extent.
+            || cow.physical_len() == 0
         {
             return Err(carrick_hal::ForeignMmTransportError::Retry);
         }
@@ -26437,6 +26594,16 @@ impl HvpatchTaskRegistration {
             // in 3, so the missing retirement belongs further upstream, before
             // the registrations tear down. Measured 2026-08-31; left as the
             // abort rather than traded for a hang.
+            //
+            // The SAME abort fires when a legacy `clone(CLONE_VM|SIGCHLD)`
+            // (share-mm, non-thread) child exits while its parent lives: an
+            // ACTIVE authority for the shared kernel mm drops through this
+            // path mid-run, and the mm teardown corrupts the still-running
+            // parent (`lifecycleflagmatrix`'s 1.3 case is exactly that shape,
+            // observed 2026-08-31 as `clone_thread_no_sighand_einval`
+            // flickering under gnu). One root cause, three symptoms
+            // (`execthreads`, `execfromthread`, CLONE_VM child exit); the fix
+            // is the upstream retirement above, not a per-symptom patch.
             drop(task_mm);
         }
         Ok(())
