@@ -145,6 +145,24 @@ fn ns_visible_identity_id(context: &crate::kernel::KernelContext, leader_pid: i3
     i32::try_from(crate::namespace::pid::host_to_ns_or_self_for(context, raw)).unwrap_or(leader_pid)
 }
 
+/// Resolve a pid the GUEST supplied into carrick's task id.
+///
+/// A guest names processes in its own pid namespace, and carrick's kernel graph
+/// names them by task id -- two domains that share `i32` and are offset the
+/// moment a container exists (task 5 is ns pid 4). Treating the guest's number
+/// as a task id silently addresses a DIFFERENT process, or none: a guest asking
+/// about ITSELF by `getpid()` did not match its own task, so
+/// `process_vm_readv(getpid(), ...)` missed the self-transfer path entirely.
+///
+/// Untranslatable ids stay untranslated rather than becoming zero, so a guest
+/// outside any namespace region is unaffected.
+fn guest_pid_to_task_id(pid: Pid) -> Result<crate::kernel::TaskId, LinuxErrno> {
+    let raw = u32::try_from(pid.0).map_err(|_| LINUX_ESRCH)?;
+    let host = crate::namespace::pid::ns_to_host_or_self(raw).ok_or(LINUX_ESRCH)?;
+    let host = i32::try_from(host).map_err(|_| LINUX_ESRCH)?;
+    crate::kernel::TaskId::from_abi_positive(host).map_err(|_| LINUX_ESRCH)
+}
+
 fn identity_target_task(
     context: &crate::kernel::KernelContext,
     pid: Pid,
@@ -152,7 +170,7 @@ fn identity_target_task(
     if pid.0 == 0 {
         return Ok(context.task().key().id);
     }
-    crate::kernel::TaskId::from_abi_positive(pid.0).map_err(|_| LINUX_ESRCH)
+    guest_pid_to_task_id(pid)
 }
 
 /// Per-Linux-policy priority window for `sched_get_priority_{max,min}`. RT
@@ -4660,7 +4678,7 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::errno(LINUX_ESRCH));
         }
 
-        let Ok(target_task_id) = crate::kernel::TaskId::from_abi_positive(pid.raw()) else {
+        let Ok(target_task_id) = guest_pid_to_task_id(pid) else {
             return Ok(DispatchOutcome::errno(LINUX_ESRCH));
         };
         let Some(target_task) = cx.kernel.kernel().registry().task(target_task_id) else {
