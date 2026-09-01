@@ -6648,19 +6648,10 @@ where
                     // Unclassified EL0 fault: Linux forces the default action
                     // (terminate by SIGSEGV).
                     if std::env::var_os("CARRICK_FAULT_DEBUG").is_some() {
-                        let regs: Vec<String> = (0..=30)
-                            .map(|index| {
-                                engine
-                                    .get_reg(carrick_hal::Reg::X(index))
-                                    .map_or_else(|_| "?".to_owned(), |value| format!("{value:#x}"))
-                            })
-                            .collect();
                         eprintln!(
-                            "[FAULTDBG tid={:?} linux_tid={:?}] UNCLASSIFIED EL0 fault esr={syndrome:#x} ec={ec:#x} elr={elr:#x} far={far:#x} last_syscall={last:?} regs={regs:?} -> SIGSEGV terminate",
+                            "[FAULTDBG tid={:?}] UNCLASSIFIED EL0 fault esr={syndrome:#x} ec={:#x} elr={elr:#x} far={far:#x} -> SIGSEGV terminate",
                             self.state.this_tid,
-                            self.state.linux_tid,
-                            ec = (syndrome >> 26) & 0x3f,
-                            last = engine.last_syscall_nr(),
+                            (syndrome >> 26) & 0x3f
                         );
                     }
                     self.kernel.record_fatal_signal(FatalSignalRecord {
