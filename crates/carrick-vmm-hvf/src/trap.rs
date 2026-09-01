@@ -26604,6 +26604,30 @@ impl HvpatchTaskRegistration {
             // flickering under gnu). One root cause, three symptoms
             // (`execthreads`, `execfromthread`, CLONE_VM child exit); the fix
             // is the upstream retirement above, not a per-symptom patch.
+            //
+            // The CLONE_VM shape was further root-caused 2026-09-01: the
+            // register-time MM key splits an mm's owner ({slot, None}) from
+            // its CLONE_VM/vfork sharer ({slot, Some(mm)}), so the sharer
+            // mints a SECOND carrier MM authority over the same stage-2 and
+            // retiring the sharer's row unmaps the owner's live memory
+            // (parent SIGSEGV, or this abort). Two fixes were built and
+            // MEASURED WORSE, then reverted (`fix(hvf): one carrier MM
+            // authority per mm across CLONE_VM sharers` and its revert):
+            //  - slot-only keys (dedupe the sharer onto the owner's
+            //    authorities) fixed the crash but destabilized the embedded
+            //    probe gate ~1 run in 2 -- late MT probes hit guest
+            //    `mmap(ANON)`=ENOMEM / `clone`=EAGAIN, a carrick-internal
+            //    retention the dedupe introduces (host mmap never fails and
+            //    the global IPA arena stays far from exhausted; the exact
+            //    retained resource was not pinned down);
+            //  - retiring the discarded prepared task's mapping owners on
+            //    the reuse arm released the owner's LIVE extents (the
+            //    sharer's descriptors reference them), and the owner's own
+            //    exit retirement then aborted on the absent owner.
+            // The durable fix needs per-holder retention semantics for the
+            // shared mm's carrier resources (or sharer rows that own nothing
+            // carrier-scoped), settled together with the drain-time exec
+            // retirement above.
             drop(task_mm);
         }
         Ok(())
