@@ -5,12 +5,19 @@ The ceiling is a BURNDOWN target, not a description: it may only be lowered,
 and it is lowered in the same commit that removes the call sites. A family that
 grows is a new legacy escape being added while the cutover is in flight, which
 is the failure mode this gate exists to catch.
+
+Only `production_callsite` taxonomy entries count. The definition modules
+(`kernel/objects.rs`, `dispatch/fd_table.rs`) and `#[cfg(test)]` lines are
+where the authority types and their own unit tests live; a test that exercises
+the write guard's semantics is not a legacy escape from it, and counting one
+made the gate refuse the very test that pins the guard's contract.
 """
 
 from __future__ import annotations
 
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -47,7 +54,12 @@ def main(argv: list[str]) -> int:
     if argv:
         print(f"usage: {Path(sys.argv[0]).name} [--self-test]", file=sys.stderr)
         return 2
-    counts = json.loads(TAXONOMY.read_text())["counts"]
+    taxonomy = json.loads(TAXONOMY.read_text())
+    counts = Counter(
+        entry["migration_family"]
+        for entry in taxonomy["entries"]
+        if entry["scope_kind"] == "production_callsite"
+    )
     ceiling = json.loads(CEILING.read_text())["ceiling"]
     found = violations(counts, ceiling)
     if found:

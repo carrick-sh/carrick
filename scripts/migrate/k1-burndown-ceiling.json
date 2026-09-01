@@ -1,14 +1,15 @@
 {
   "schema": 1,
+  "scope": "production_callsite taxonomy entries only",
   "ceiling": {
-    "create_install": 72,
-    "epoll_wait": 33,
-    "inspect_misc": 144,
-    "lifecycle": 35,
+    "create_install": 69,
+    "epoll_wait": 29,
+    "inspect_misc": 138,
+    "lifecycle": 28,
     "mapping_ring": 11,
-    "read_attempt": 13,
-    "slot_description_mutation": 14,
-    "stream_transfer": 16,
-    "write_attempt": 21
+    "read_attempt": 9,
+    "slot_description_mutation": 13,
+    "stream_transfer": 15,
+    "write_attempt": 17
   }
 }
