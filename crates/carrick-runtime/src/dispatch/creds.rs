@@ -1495,7 +1495,7 @@ mod identity_snapshot_tests {
             "container 2 getpid syscall must return 1"
         );
 
-        // 3. Fork in container 1 produces child with ns-local pid 2 and ppid 1
+        // 3. Fork in container 1 produces a child whose ns pid is its task id
         let plan = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
         let reservation1 = kernel1
             .reserve_fork(&context1, plan, "child1".to_string(), None)
@@ -1509,10 +1509,15 @@ mod identity_snapshot_tests {
             .context(child_id1, LinuxTid::for_task_leader(child_id1))
             .expect("capture child context 1");
 
+        // The ns pid IS the kernel task id (one pid domain); only init is
+        // renamed to 1. The child therefore sees the exact id `fork` handed its
+        // parent, never a second counter's value.
+        let child_pid1 = u32::try_from(child_id1.raw()).expect("child 1 task id fits a pid");
+        assert_ne!(child_pid1, 1, "container 1 child must not alias init");
         assert_eq!(
             d1.identity_snapshot(&child_context1).pid,
-            2,
-            "container 1 child must see pid 2"
+            child_pid1,
+            "container 1 child must see its own task id as its ns pid"
         );
         let child_outcome1 = d1
             .dispatch(
@@ -1523,11 +1528,11 @@ mod identity_snapshot_tests {
             )
             .unwrap();
         assert!(
-            matches!(child_outcome1, DispatchOutcome::Returned { value: 2 }),
-            "container 1 child getpid syscall must return 2"
+            matches!(child_outcome1, DispatchOutcome::Returned { value } if value == i64::from(child_pid1)),
+            "container 1 child getpid syscall must return its task id"
         );
 
-        // 4. Fork in container 2 produces child with ns-local pid 2 and ppid 1
+        // 4. Fork in container 2 produces a child whose ns pid is its task id
         let reservation2 = kernel2
             .reserve_fork(&context2, plan, "child2".to_string(), None)
             .expect("reserve fork 2");
@@ -1540,10 +1545,15 @@ mod identity_snapshot_tests {
             .context(child_id2, LinuxTid::for_task_leader(child_id2))
             .expect("capture child context 2");
 
+        // The ns pid IS the kernel task id (one pid domain); only init is
+        // renamed to 1. The child therefore sees the exact id `fork` handed its
+        // parent, never a second counter's value.
+        let child_pid2 = u32::try_from(child_id2.raw()).expect("child 2 task id fits a pid");
+        assert_ne!(child_pid2, 1, "container 2 child must not alias init");
         assert_eq!(
             d2.identity_snapshot(&child_context2).pid,
-            2,
-            "container 2 child must see pid 2"
+            child_pid2,
+            "container 2 child must see its own task id as its ns pid"
         );
         let child_outcome2 = d2
             .dispatch(
@@ -1554,8 +1564,8 @@ mod identity_snapshot_tests {
             )
             .unwrap();
         assert!(
-            matches!(child_outcome2, DispatchOutcome::Returned { value: 2 }),
-            "container 2 child getpid syscall must return 2"
+            matches!(child_outcome2, DispatchOutcome::Returned { value } if value == i64::from(child_pid2)),
+            "container 2 child getpid syscall must return its task id"
         );
 
         // 5. EL1 identity page stamping stamps ns-pid 1 for container inits
