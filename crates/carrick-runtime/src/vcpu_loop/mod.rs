@@ -2141,29 +2141,60 @@ fn stamp_identity_values<M: CurrentMmMemory>(
     Ok(())
 }
 
-pub(crate) fn stamp_guest_tid_checked<E: ThreadedEngine>(
+/// The tid the guest must observe for this thread, in its OWN pid namespace.
+///
+/// `getpid` is namespace-translated (the identity page publishes
+/// `ns_self_pid_for`), so `gettid` has to be too, or a thread-group leader
+/// observes `gettid() != getpid()` -- which no Linux process can, because a
+/// leader's tid IS its tgid. Inside a container the two numbering spaces are
+/// offset, so every containerized guest saw it.
+///
+/// A leader is answered from the SAME source as `getpid` rather than through a
+/// separate thread registration: the namespace region registers processes, not
+/// threads, so a tid lookup would miss and fall back to the untranslated id.
+/// A non-leader keeps its kernel-graph tid, which is what carrick has to offer
+/// until thread ids are represented in the namespace; `thread_gettid_differs_main_pid`
+/// is the property that still has to hold there, and it does.
+pub(crate) fn ns_visible_guest_tid(
+    dispatcher: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
+) -> u32 {
+    let tid = context.thread().key().tid;
+    if tid == crate::kernel::LinuxTid::for_task_leader(context.task().key().id) {
+        return dispatcher.identity_snapshot(context).pid;
+    }
+    u32::try_from(tid.raw()).unwrap_or(0)
+}
+
+/// Stamp the EL1 `gettid` fast-path register with the NAMESPACE-visible tid.
+///
+/// The guest reads this register in userspace with no vm exit and compares it
+/// against a namespace-translated `getpid`, so publishing the raw kernel-graph
+/// tid here is what let a leader observe `gettid() != getpid()`. See
+/// [`ns_visible_guest_tid`].
+pub(crate) fn stamp_ns_visible_guest_tid<E: ThreadedEngine>(
     engine: &E,
-    _this_tid: ThreadId,
-    _registry: &ThreadRegistry,
-    hvpatch_linux_tid: Option<crate::kernel::LinuxTid>,
+    dispatcher: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
 ) -> Result<(), TrapError> {
-    stamp_guest_tid_with(crate::syscall_shim_enabled(), hvpatch_linux_tid, |tid| {
+    stamp_ns_visible_guest_tid_with(crate::syscall_shim_enabled(), dispatcher, context, |tid| {
         engine.set_guest_thread_id(tid)
     })
 }
 
-fn stamp_guest_tid_with(
+/// The injectable seam under [`stamp_ns_visible_guest_tid`]: a failed stamp is
+/// mandatory to propagate, because a guest whose fast-path register was not
+/// published answers `gettid` from whatever the previous lease left there.
+fn stamp_ns_visible_guest_tid_with(
     shim_enabled: bool,
-    hvpatch_linux_tid: Option<crate::kernel::LinuxTid>,
+    dispatcher: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
     set: impl FnOnce(u64) -> Result<(), TrapError>,
 ) -> Result<(), TrapError> {
     if !shim_enabled {
         return Ok(());
     }
-    if let Some(tid) = hvpatch_linux_tid.and_then(|tid| u32::try_from(tid.raw()).ok()) {
-        set(u64::from(tid))?;
-    }
-    Ok(())
+    set(u64::from(ns_visible_guest_tid(dispatcher, context)))
 }
 
 fn proc_maps_from_address_space(image: &AddressSpace) -> Vec<ProcMapsEntry> {
@@ -3415,13 +3446,7 @@ fn bootstrap_hvpatch_process_child<E: ThreadedEngine>(
         RuntimeError::Configuration("process child bootstrap lost Kernel context".to_owned())
     })?;
     bootstrap_hvpatch_process_child_identity(engine, &kernel.dispatcher, context, shares_mm)?;
-    stamp_guest_tid_checked(
-        engine,
-        state.this_tid,
-        &state.registry,
-        Some(state.linux_tid),
-    )
-    .map_err(RuntimeError::Trap)?;
+    stamp_ns_visible_guest_tid(engine, &kernel.dispatcher, context).map_err(RuntimeError::Trap)?;
     if let Some((address, tid)) = child_settid {
         bootstrap_hvpatch_process_child_tid(engine, address, tid)?;
     }
@@ -9907,8 +9932,8 @@ mod tests {
     #[test]
     fn mandatory_child_contextidr_stamp_propagates_injected_failure() {
         let (_, context) = crate::hvpatch::process_context_for_tests(70_200);
-        let tid = context.thread().key().tid;
-        let error = stamp_guest_tid_with(true, Some(tid), |_| {
+        let dispatcher = crate::dispatch::SyscallDispatcher::new();
+        let error = stamp_ns_visible_guest_tid_with(true, &dispatcher, &context, |_| {
             Err(TrapError::Hypervisor(
                 "injected CONTEXTIDR failure".to_owned(),
             ))
