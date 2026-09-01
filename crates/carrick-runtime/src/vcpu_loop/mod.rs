@@ -4734,11 +4734,20 @@ where
         } = request;
 
         let Some(clone_permit) = self.kernel.try_enroll_thread_clone() else {
+            // A guest-visible resource failure must never be silent: EAGAIN
+            // from thread admission under NO real pressure has meant a leaked
+            // permit/lease before, and the guest's own report ("failed to
+            // spawn thread") cannot say which side refused.
+            tracing::warn!("thread clone admission refused; clone(2) = EAGAIN");
             return Ok(PersistentHvpatchCloneAttempt::Complete(
                 threads::CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EAGAIN),
             ));
         };
         if self.kernel.process_exiting() || clone_permit.is_cancelled() {
+            tracing::warn!(
+                exiting = self.kernel.process_exiting(),
+                "thread clone raced exec/exit cancellation; clone(2) = EAGAIN"
+            );
             return Ok(PersistentHvpatchCloneAttempt::Complete(
                 threads::CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EAGAIN),
             ));
