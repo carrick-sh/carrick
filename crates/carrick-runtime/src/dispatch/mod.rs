@@ -777,6 +777,7 @@ pub mod sysv;
 pub use sysv::SysvWaitState;
 #[macro_use]
 mod time;
+pub use time::raise_host_nofile_backing;
 
 pub use proctitle::{init as proctitle_init, set_host_process_name};
 

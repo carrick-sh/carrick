@@ -4033,13 +4033,21 @@ mod hvpatch_in_process_fork_tests {
         assert_eq!(&*shared_buf.read(), b"initial_data_appended");
 
         // 3. Exec retains non-CLOEXEC file (fd 3) and closes CLOEXEC file (fd 4)
-        child
-            .captured_file_table()
-            .write_open_files()
-            .retain(|_, of| {
-                !carrick_abi::LinuxFdFlags::from_bits_truncate(of.fd_flags)
-                    .contains(carrick_abi::LinuxFdFlags::CLOEXEC)
-            });
+        {
+            let child_files = child.captured_file_table();
+            let mut table = child_files.write_open_files();
+            let cloexec: Vec<i32> = table
+                .iter()
+                .filter(|(_, of)| {
+                    carrick_abi::LinuxFdFlags::from_bits_truncate(of.fd_flags)
+                        .contains(carrick_abi::LinuxFdFlags::CLOEXEC)
+                })
+                .map(|(fd, _)| *fd)
+                .collect();
+            for fd in cloexec {
+                table.remove(&fd);
+            }
+        }
         let child_ft = child.captured_file_table();
         let post_exec_files = child_ft.read_open_files();
         assert!(post_exec_files.contains_key(&3));

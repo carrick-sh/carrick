@@ -1035,6 +1035,22 @@ impl FileDescription {
         }
     }
 
+    /// The live epoll descriptions holding a registration whose target is
+    /// this description, without disturbing the registry. A close that is
+    /// not the description's final reference consults exactly these owners;
+    /// no other epoll instance can hold a registration naming it.
+    pub(crate) fn epoll_owners(&self) -> Vec<Arc<Self>> {
+        let mut owners: Vec<Arc<Self>> = Vec::new();
+        for owner in self.epoll_registrations.lock().values() {
+            if let Some(owner) = owner.upgrade()
+                && !owners.iter().any(|seen| Arc::ptr_eq(seen, &owner))
+            {
+                owners.push(owner);
+            }
+        }
+        owners
+    }
+
     pub(crate) fn take_epoll_owners(&self) -> Vec<(Arc<Self>, i32)> {
         let registrations = std::mem::take(&mut *self.epoll_registrations.lock());
         if !registrations.is_empty() {
@@ -1279,12 +1295,19 @@ impl std::fmt::Debug for FileSlotSubscriptions {
 }
 
 impl FileSlotSubscriptions {
-    fn publish_changes(&self, table: FileTableId, slots: &HashMap<i32, FileSlot>) {
+    /// Retire and notify every listener whose authority no longer resolves to
+    /// its slot. Only the slot numbers in `changed` can have moved, so the
+    /// listeners on every other number are provably still current and are
+    /// not re-examined.
+    fn publish_changes(&self, table: FileTableId, slots: &HashMap<i32, FileSlot>, changed: &[i32]) {
         let callbacks = {
             let mut listeners = self.listeners.lock();
             let stale = listeners
                 .iter()
                 .filter_map(|(id, (authority, _))| {
+                    if !changed.contains(&authority.number.raw()) {
+                        return None;
+                    }
                     let matches = authority.table == table
                         && slots.get(&authority.number.raw()).is_some_and(|slot| {
                             slot.generation == authority.slot_generation
@@ -1613,7 +1636,7 @@ impl FileTable {
         );
         self.revision.publish();
         self.slot_subscriptions
-            .publish_changes(self.id, &open_files);
+            .publish_changes(self.id, &open_files, &[number.raw()]);
         replaced
     }
 
@@ -1721,17 +1744,13 @@ impl FileTable {
     pub(crate) fn write_open_files(&self) -> FileTableWriteGuard<'_> {
         let mutation = self.mutation_lease();
         let guard = self.open_files.write();
-        let original = guard
-            .iter()
-            .map(|(number, slot)| (*number, (slot.generation, slot.description.id())))
-            .collect();
         FileTableWriteGuard {
             guard,
             _mutation: mutation,
             revision: &self.revision,
             table: self.id,
             subscriptions: &self.slot_subscriptions,
-            original,
+            touched: Vec::new(),
         }
     }
 
@@ -1900,13 +1919,24 @@ impl Drop for FileTable {
     }
 }
 
+/// Exclusive access to a table's slots. Mutation goes through the typed
+/// `insert`/`remove`/`get_mut` methods so the guard knows exactly which slot
+/// numbers moved: a `dup`/`open`/`close` costs the slots it touches, not the
+/// size of the table. (The previous design snapshotted every slot on acquire
+/// and re-walked every slot on release to discover changes, which made an
+/// fd-fill loop quadratic — `dup` at 20k open fds cost ~1 ms, 6000x Linux.)
 pub(crate) struct FileTableWriteGuard<'a> {
     guard: RwLockWriteGuard<'a, HashMap<i32, FileSlot>>,
     _mutation: FileTableMutationLease,
     revision: &'a ObjectRevision,
     table: FileTableId,
     subscriptions: &'a FileSlotSubscriptions,
-    original: HashMap<i32, (u64, FileDescriptionId)>,
+    /// Slot numbers this guard mutated. `None` marks an insert or a remove
+    /// (the slot's identity is new or gone either way); `Some(id)` records the
+    /// description a slot carried when it was first borrowed mutably, so an
+    /// in-place description swap is detected on release while an fd-flag
+    /// update keeps the slot's identity.
+    touched: Vec<(i32, Option<FileDescriptionId>)>,
 }
 
 impl Deref for FileTableWriteGuard<'_> {
@@ -1917,27 +1947,67 @@ impl Deref for FileTableWriteGuard<'_> {
     }
 }
 
-impl DerefMut for FileTableWriteGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.guard
+impl FileTableWriteGuard<'_> {
+    fn mark_replaced(&mut self, number: i32) {
+        match self
+            .touched
+            .iter_mut()
+            .find(|(touched, _)| *touched == number)
+        {
+            Some((_, before)) => *before = None,
+            None => self.touched.push((number, None)),
+        }
+    }
+
+    /// Install `slot` at `number`, returning the slot it displaced. The
+    /// installed slot always receives a fresh generation: a number that is
+    /// (re)populated is a new slot identity, whatever the caller built it from.
+    pub(crate) fn insert(&mut self, number: i32, mut slot: FileSlot) -> Option<FileSlot> {
+        slot.generation = next_file_slot_generation();
+        self.mark_replaced(number);
+        self.guard.insert(number, slot)
+    }
+
+    pub(crate) fn remove(&mut self, number: &i32) -> Option<FileSlot> {
+        let removed = self.guard.remove(number);
+        if removed.is_some() {
+            self.mark_replaced(*number);
+        }
+        removed
+    }
+
+    pub(crate) fn get_mut(&mut self, number: &i32) -> Option<&mut FileSlot> {
+        let slot = self.guard.get_mut(number)?;
+        if !self.touched.iter().any(|(touched, _)| touched == number) {
+            self.touched.push((*number, Some(slot.description.id())));
+        }
+        Some(slot)
     }
 }
 
 impl Drop for FileTableWriteGuard<'_> {
     fn drop(&mut self) {
-        for (number, slot) in self.guard.iter_mut() {
-            let unchanged = self
-                .original
-                .get(number)
-                .is_some_and(|(generation, description)| {
-                    *generation == slot.generation && *description == slot.description.id()
-                });
-            if !unchanged {
-                slot.generation = next_file_slot_generation();
+        let mut changed = Vec::with_capacity(self.touched.len());
+        for (number, before) in self.touched.drain(..) {
+            match before {
+                None => changed.push(number),
+                Some(before) => {
+                    let Some(slot) = self.guard.get_mut(&number) else {
+                        changed.push(number);
+                        continue;
+                    };
+                    if slot.description.id() != before {
+                        slot.generation = next_file_slot_generation();
+                        changed.push(number);
+                    }
+                }
             }
         }
         self.revision.publish();
-        self.subscriptions.publish_changes(self.table, &self.guard);
+        if !changed.is_empty() {
+            self.subscriptions
+                .publish_changes(self.table, &self.guard, &changed);
+        }
     }
 }
 
@@ -8600,6 +8670,110 @@ mod tests {
 
         // Resolving on table2 with table1's token returns None.
         assert!(table2.resolve_slot_authority(token1).is_none());
+    }
+
+    /// A write guard settles exactly the slots it mutated: an untouched slot
+    /// keeps its generation and its listener, a flag-only `get_mut` keeps the
+    /// slot's identity, and only a description swap, an insert, or a remove
+    /// mints a generation and retires the listener on that number. The
+    /// previous design re-walked every slot on release, so an fd-fill loop
+    /// paid the table size per `dup`.
+    #[test]
+    fn write_guard_settles_only_touched_slots() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let ids = ObjectIdRegistry::new();
+        let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+        let numbers: Vec<FileSlotNumber> = (3..=5)
+            .map(|fd| FileSlotNumber::for_open_fd(fd).expect("fd"))
+            .collect();
+        for number in &numbers {
+            let desc = Arc::new(FileDescription::regular(
+                ids.file_description_id().expect("desc"),
+            ));
+            table.install(*number, desc, false);
+        }
+        let before: Vec<u64> = numbers
+            .iter()
+            .map(|number| table.slot(*number).expect("slot").generation())
+            .collect();
+        let fired: Vec<Arc<AtomicUsize>> = (0..3).map(|_| Arc::new(AtomicUsize::new(0))).collect();
+        let subscriptions: Vec<_> = numbers
+            .iter()
+            .zip(&fired)
+            .map(|(number, fired)| {
+                let authority = table.capture_slot_authority(*number).expect("authority");
+                let fired = Arc::clone(fired);
+                table
+                    .subscribe_slot_authority(
+                        authority,
+                        Arc::new(move |_| {
+                            fired.fetch_add(1, Ordering::SeqCst);
+                        }),
+                    )
+                    .expect("subscription")
+            })
+            .collect();
+
+        let swapped = Arc::new(FileDescription::regular(
+            ids.file_description_id().expect("swapped desc"),
+        ));
+        let inserted = Arc::new(FileDescription::regular(
+            ids.file_description_id().expect("inserted desc"),
+        ));
+        {
+            let mut guard = table.write_open_files();
+            guard.get_mut(&4).expect("fd 4").fd_flags = carrick_abi::LinuxFdFlags::CLOEXEC.bits();
+            guard.get_mut(&5).expect("fd 5").description = Arc::clone(&swapped);
+            assert!(guard.insert(6, FileSlot::new(inserted, 0)).is_none());
+        }
+
+        let after: Vec<u64> = numbers
+            .iter()
+            .map(|number| table.slot(*number).expect("slot").generation())
+            .collect();
+        assert_eq!(after[0], before[0], "untouched slot keeps its generation");
+        assert_eq!(
+            after[1], before[1],
+            "flag-only mutation keeps the slot identity"
+        );
+        assert_ne!(
+            after[2], before[2],
+            "description swap mints a new generation"
+        );
+        assert_eq!(
+            fired[0].load(Ordering::SeqCst),
+            0,
+            "untouched listener stays"
+        );
+        assert_eq!(
+            fired[1].load(Ordering::SeqCst),
+            0,
+            "flag-only listener stays"
+        );
+        assert_eq!(
+            fired[2].load(Ordering::SeqCst),
+            1,
+            "swapped listener retired"
+        );
+        assert!(
+            table
+                .slot(FileSlotNumber::for_open_fd(6).expect("fd 6"))
+                .is_some()
+        );
+
+        {
+            let mut guard = table.write_open_files();
+            assert!(guard.remove(&3).is_some());
+            assert!(guard.remove(&7).is_none());
+        }
+        assert_eq!(
+            fired[0].load(Ordering::SeqCst),
+            1,
+            "removed listener retired"
+        );
+        assert_eq!(fired[1].load(Ordering::SeqCst), 0);
+        drop(subscriptions);
     }
 
     #[test]
