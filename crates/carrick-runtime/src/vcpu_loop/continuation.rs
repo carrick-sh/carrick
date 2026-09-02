@@ -263,6 +263,17 @@ impl ContinuationAuthority {
         self.execution
     }
 
+    /// Re-stamp the authority onto the lease that held this continuation
+    /// without consuming it. The kernel carries a parked continuation through
+    /// any lease that re-parks before resuming it (an executor refused
+    /// admission during a fork quiesce, an owner control quantum, an exec or
+    /// exit drain); the authority must then name THAT lease, or every such
+    /// re-park adds one generation to the succession `resume_continuation`
+    /// checks and a blameless thread eventually fails `StaleThread`.
+    pub(crate) const fn rebind_execution_generation(&mut self, generation: ExecutionGeneration) {
+        self.execution = generation;
+    }
+
     pub const fn mm(&self) -> MmId {
         self.mm
     }
@@ -1057,6 +1068,15 @@ impl BlockedContinuation {
         &self.state().authority
     }
 
+    /// The lease at `generation` held this continuation and settled without
+    /// consuming it; the continuation now answers to that lease. See
+    /// [`ContinuationAuthority::rebind_execution_generation`].
+    pub(crate) fn carry_through_lease(&mut self, generation: ExecutionGeneration) {
+        self.state_mut()
+            .authority
+            .rebind_execution_generation(generation);
+    }
+
     pub fn deadline(&self) -> Option<Instant> {
         self.state().deadline
     }
@@ -1219,12 +1239,18 @@ impl BlockedContinuation {
     }
 
     pub fn authorize_resume(&self, resume: ResumeContext) -> Result<(), ContinuationResumeError> {
+        use ContinuationResumeError::StaleThread;
         let authority = self.authority();
         if resume.thread != authority.thread()
             || resume.execution != authority.execution_generation()
             || resume.task != authority.task()
         {
-            return Err(ContinuationResumeError::StaleThread);
+            return Err(StaleThread(StaleThreadCause::ResumeIdentity {
+                resume_thread: resume.thread,
+                resume_execution: resume.execution.raw(),
+                authority_thread: authority.thread(),
+                authority_execution: authority.execution_generation().raw(),
+            }));
         }
         if resume.mm != authority.mm() || resume.asid_generation != authority.asid_generation() {
             return Err(ContinuationResumeError::StaleAddressSpace);
@@ -1232,22 +1258,24 @@ impl BlockedContinuation {
         let kernel = authority
             .kernel
             .upgrade()
-            .ok_or(ContinuationResumeError::StaleThread)?;
-        if !kernel.task_key_is_live(authority.task())
-            || kernel
-                .exact_thread_for_scheduler(authority.thread())
-                .is_none()
+            .ok_or(StaleThread(StaleThreadCause::KernelGone))?;
+        if !kernel.task_key_is_live(authority.task()) {
+            return Err(StaleThread(StaleThreadCause::TaskNotLive));
+        }
+        if kernel
+            .exact_thread_for_scheduler(authority.thread())
+            .is_none()
         {
-            return Err(ContinuationResumeError::StaleThread);
+            return Err(StaleThread(StaleThreadCause::ThreadNotSchedulable));
         }
         let current = kernel
             .context(authority.task().id, authority.thread().tid)
-            .map_err(|_| ContinuationResumeError::StaleThread)?;
+            .map_err(|_| StaleThread(StaleThreadCause::ContextUnavailable))?;
         if current.task().key() != authority.task()
             || current.thread().key() != authority.thread()
             || current.shared().mm().id() != authority.mm()
         {
-            return Err(ContinuationResumeError::StaleThread);
+            return Err(StaleThread(StaleThreadCause::ContextMismatch));
         }
         Ok(())
     }
@@ -1633,7 +1661,14 @@ pub fn resume_continuation(
             .checked_add(2)
             .is_some_and(|second| resumed == second);
     if lease.thread_key() != continuation.authority().thread() || !valid_successor {
-        return Err(ContinuationResumeError::StaleThread);
+        return Err(ContinuationResumeError::StaleThread(
+            StaleThreadCause::LeaseSuccession {
+                lease_thread: lease.thread_key(),
+                continuation_thread: continuation.authority().thread(),
+                original_generation: original,
+                resumed_generation: resumed,
+            },
+        ));
     }
     let (current_mm, current_asid) = lease
         .task_state_authority()
@@ -1677,9 +1712,45 @@ impl ResumeContext {
     }
 }
 
+/// Why a blocked continuation refused to resume on the thread that woke it.
+///
+/// A resume is a generation-exact hand-off: the lease that resumes must be
+/// the continuation's own thread at the successor of the lease that last held
+/// the continuation — `+1` when the wake landed during that lease's
+/// settlement, `+2` when the wake bumped a parked thread. A lease that
+/// re-parks without consuming re-stamps the authority
+/// (`BlockedContinuation::carry_through_lease`), so intervening control
+/// quanta or refused admissions never widen the window. Naming which check failed is what
+/// lets a live refusal be attributed to a scheduling defect instead of being
+/// read as an opaque `StaleThread`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StaleThreadCause {
+    /// `resume_continuation`: the lease is not the continuation thread, or
+    /// its generation is not the continuation generation's +1/+2 successor.
+    LeaseSuccession {
+        lease_thread: ThreadKey,
+        continuation_thread: ThreadKey,
+        original_generation: u64,
+        resumed_generation: u64,
+    },
+    /// `authorize_resume`: the resume context names a different thread,
+    /// task or execution generation than the continuation authority.
+    ResumeIdentity {
+        resume_thread: ThreadKey,
+        resume_execution: u64,
+        authority_thread: ThreadKey,
+        authority_execution: u64,
+    },
+    KernelGone,
+    TaskNotLive,
+    ThreadNotSchedulable,
+    ContextUnavailable,
+    ContextMismatch,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContinuationResumeError {
-    StaleThread,
+    StaleThread(StaleThreadCause),
     StaleTaskRevision,
     StaleAddressSpace,
     MissingContinuation,
@@ -6091,6 +6162,87 @@ mod tests {
         );
         fixture.scheduler.settle_exited(destination).expect("exit");
         assert_eq!(fixture.scheduler.queued_len(), 0);
+    }
+
+    /// `vforkexecthread` residual (2026-09-01, traced with
+    /// `hvpatch-executor-claim-sequence.d`): the exec thread parked a
+    /// continuation at generation g, was claimed at g+1 while the leader's
+    /// fork quiesce held executor registrations closed, and so re-parked
+    /// `Blocked(HostWait)` WITHOUT consuming it. The kernel carried the
+    /// continuation through that lease untouched, the release wake bumped
+    /// the generation once more, and the resuming lease at g+3 failed the
+    /// `+1/+2` succession check with `StaleThread` — exit 127 and a fatal
+    /// MM-authority drop for a thread that had done nothing wrong. Every
+    /// settlement that carries an unconsumed continuation must re-stamp its
+    /// authority to the lease that held it, so the succession check stays
+    /// exact instead of accumulating one generation per re-park.
+    #[test]
+    fn continuation_carried_through_unconsumed_lease_resumes_on_next_claim() {
+        let mut fixture = race_fixture(15_140);
+        fixture
+            .scheduler
+            .begin_switch_out(&fixture.running)
+            .expect("switch out");
+        fixture
+            .service
+            .enroll(&mut fixture.registration)
+            .expect("enroll");
+        let token = fixture.registration.wake_token();
+        let parked_generation = fixture.running.generation();
+        fixture
+            .scheduler
+            .settle_blocked_continuation(
+                fixture.running,
+                fixture.continuation,
+                fixture.registration,
+            )
+            .expect("block");
+        fixture.service.publish_ready(token).assert_accepted();
+        let refused = fixture
+            .scheduler
+            .take(&fixture.executor)
+            .expect("claim after wake");
+        assert_eq!(
+            refused
+                .lease()
+                .blocked_continuation()
+                .expect("continuation rides the claiming lease")
+                .authority()
+                .execution_generation(),
+            parked_generation
+        );
+        // The executor could not be admitted (fork quiesce held registration
+        // closed): it re-parks without touching the continuation.
+        fixture
+            .scheduler
+            .settle_blocked(refused, crate::kernel::objects::BlockedReason::HostWait)
+            .expect("re-park without consuming");
+        assert!(matches!(
+            fixture.context.thread().execution_state(),
+            ThreadExecutionState::Blocked { .. }
+        ));
+        let thread = fixture.context.thread().key();
+        fixture.scheduler.wake(thread).expect("release wake");
+        let mut resumed = fixture
+            .scheduler
+            .take(&fixture.executor)
+            .expect("claim after release");
+        let carried = resumed
+            .lease()
+            .blocked_continuation()
+            .expect("continuation still rides the lease");
+        assert_eq!(carried.id(), token.continuation());
+        let result = resume_continuation(
+            resumed.lease_mut(),
+            ContinuationEvent::Timeout,
+            &fixture.context,
+        )
+        .expect("a continuation held across an unconsumed lease resumes on the next claim");
+        assert!(matches!(
+            result.completion,
+            ContinuationCompletion::ReturnWithGuestWrites(0, _)
+        ));
+        fixture.scheduler.settle_exited(resumed).expect("exit");
     }
 
     #[test]

@@ -5387,6 +5387,20 @@ pub enum ThreadExecutionState {
 }
 
 impl ThreadExecutionState {
+    /// Stable probe ordinal for `hvpatch-scheduler-wake` `arg2`.
+    pub(crate) const fn probe_kind(self) -> crate::probes::HvpatchThreadExecutionStateKind {
+        use crate::probes::HvpatchThreadExecutionStateKind as Kind;
+        match self {
+            Self::Uninitialized => Kind::Uninitialized,
+            Self::Runnable { .. } => Kind::Runnable,
+            Self::Running { .. } => Kind::Running,
+            Self::SwitchingOut { .. } => Kind::SwitchingOut,
+            Self::Blocked { .. } => Kind::Blocked,
+            Self::Exited { .. } => Kind::Exited,
+            Self::Failed { .. } => Kind::Failed,
+        }
+    }
+
     pub const fn generation(self) -> Option<ExecutionGeneration> {
         match self {
             Self::Uninitialized => None,
@@ -5471,6 +5485,17 @@ pub(crate) enum ThreadSchedulerAction {
         generation: ExecutionGeneration,
     },
     None,
+}
+
+impl ThreadSchedulerAction {
+    /// The generation a wake queued or kicked, zero when it produced no
+    /// scheduler action (`hvpatch-scheduler-wake` `arg4`).
+    const fn probe_generation(&self) -> u64 {
+        match self {
+            Self::Queue { generation, .. } | Self::Kick { generation, .. } => generation.raw(),
+            Self::None => 0,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -5950,6 +5975,7 @@ impl Thread {
             });
         }
         let mut execution = self.execution.lock();
+        let found = execution.state;
         let action = match execution.state {
             ThreadExecutionState::Blocked {
                 generation: predecessor,
@@ -6041,6 +6067,13 @@ impl Thread {
         };
         drop(execution);
         self.revision.publish();
+        crate::probes::hvpatch_scheduler_wake(
+            self.key.serial.raw(),
+            crate::probes::HvpatchSchedulerWakeKind::Wake,
+            found.probe_kind(),
+            found.generation().map_or(0, ExecutionGeneration::raw),
+            action.probe_generation(),
+        );
         Ok(action)
     }
 
@@ -6059,6 +6092,7 @@ impl Thread {
             });
         }
         let mut execution = self.execution.lock();
+        let found = execution.state;
         // A retry may temporarily park the same quantum as HostWait. Preserve
         // a blocked reason only when there is an actual continuation token to
         // displace and later restore. Fork/clone/job-control retry phases also
@@ -6129,6 +6163,13 @@ impl Thread {
         };
         drop(execution);
         self.revision.publish();
+        crate::probes::hvpatch_scheduler_wake(
+            self.key.serial.raw(),
+            crate::probes::HvpatchSchedulerWakeKind::Control,
+            found.probe_kind(),
+            found.generation().map_or(0, ExecutionGeneration::raw),
+            action.probe_generation(),
+        );
         Ok(action)
     }
 
@@ -6683,7 +6724,23 @@ impl Thread {
             return Err((ThreadExecutionError::SchedulerSettlementRequired, lease));
         }
         let mut action = ThreadSchedulerAction::None;
+        let mut settle_kind = match settlement {
+            ExecutionSettlement::Runnable => crate::probes::HvpatchLeaseSettlementKind::Runnable,
+            ExecutionSettlement::Blocked(_) => crate::probes::HvpatchLeaseSettlementKind::Blocked,
+            ExecutionSettlement::BlockedContinuation(..) => {
+                crate::probes::HvpatchLeaseSettlementKind::BlockedContinuation
+            }
+            ExecutionSettlement::Exited => crate::probes::HvpatchLeaseSettlementKind::Exited,
+        };
+        let mut settle_flags = 0_u32;
+        if wake_pending {
+            settle_flags |= crate::probes::HvpatchLeaseSettleFlag::WakePending.raw();
+        }
+        if control_pending {
+            settle_flags |= crate::probes::HvpatchLeaseSettleFlag::ControlPending.raw();
+        }
         if execution.exec_invalidation_pending {
+            settle_kind = crate::probes::HvpatchLeaseSettlementKind::ExecInvalidated;
             execution.task_state = None;
             let _ = lease.task_state.take();
             cancel_continuation_slot(
@@ -6701,7 +6758,8 @@ impl Thread {
             match settlement {
                 ExecutionSettlement::Runnable => {
                     execution.task_state = lease.task_state.take();
-                    execution.blocked_continuation = lease.blocked_continuation.take();
+                    execution.blocked_continuation =
+                        Self::carry_continuation_through_lease(&mut lease);
                     execution.state = ThreadExecutionState::Runnable { generation };
                     if scheduler_owned {
                         action = ThreadSchedulerAction::Queue {
@@ -6714,7 +6772,8 @@ impl Thread {
                 }
                 ExecutionSettlement::Blocked(reason) => {
                     execution.task_state = lease.task_state.take();
-                    execution.blocked_continuation = lease.blocked_continuation.take();
+                    execution.blocked_continuation =
+                        Self::carry_continuation_through_lease(&mut lease);
                     let generic_wake_ready = wake_pending
                         && execution
                             .blocked_continuation
@@ -6726,6 +6785,8 @@ impl Thread {
                                 continuation.publish_ready_event(
                                     crate::vcpu_loop::continuation::ContinuationEvent::Ready,
                                 );
+                                settle_flags |=
+                                    crate::probes::HvpatchLeaseSettleFlag::ContinuationReady.raw();
                             }
                         }
                         execution.state = ThreadExecutionState::Runnable { generation };
@@ -6756,6 +6817,8 @@ impl Thread {
                             continuation.publish_ready_event(
                                 crate::vcpu_loop::continuation::ContinuationEvent::Ready,
                             );
+                            settle_flags |=
+                                crate::probes::HvpatchLeaseSettleFlag::ContinuationReady.raw();
                         }
                         execution.state = ThreadExecutionState::Runnable { generation };
                         action = ThreadSchedulerAction::Queue {
@@ -6793,7 +6856,25 @@ impl Thread {
         lease.settled = true;
         drop(execution);
         self.revision.publish();
+        crate::probes::hvpatch_lease_settle(
+            self.key.serial.raw(),
+            settle_kind,
+            settle_flags,
+            lease.generation.raw(),
+            generation.raw(),
+        );
         Ok(action)
+    }
+
+    /// Move an unconsumed continuation out of a settling lease, re-stamping
+    /// its authority to that lease so the succession `resume_continuation`
+    /// checks counts from the lease that actually held it.
+    fn carry_continuation_through_lease(
+        lease: &mut ThreadExecutionLease,
+    ) -> Option<Box<crate::vcpu_loop::continuation::BlockedContinuation>> {
+        let mut continuation = lease.blocked_continuation.take()?;
+        continuation.carry_through_lease(lease.generation);
+        Some(continuation)
     }
 
     fn validate_execution_lease_owner(
