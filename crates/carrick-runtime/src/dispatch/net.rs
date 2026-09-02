@@ -849,6 +849,15 @@ mod accept4_flag_tests {
     }
 }
 
+/// One guest poll interest lowered to what the host must watch. See
+/// [`SyscallDispatcher::host_poll_target`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct HostPollTarget {
+    pub(super) host_fd: i32,
+    pub(super) host_events: i16,
+    pub(super) readiness_pipe: bool,
+}
+
 impl SyscallDispatcher {
     /// Whether `fd` is a pollable target for `epoll_ctl(ADD)`. The kernel
     /// returns EPERM when adding an fd whose file has no `->poll` op — regular
@@ -1404,6 +1413,79 @@ impl SyscallDispatcher {
             Ok(s) => Ok(Ok(Some(s))),
             Err(errno) => Ok(Err(errno)),
         }
+    }
+
+    /// Resolve one guest poll interest to the host fd and host event that
+    /// `libc::poll`/`WaitOnFds` must watch for it — the ONE classification
+    /// `ppoll` and `pselect6` share, so neither can drift from the other.
+    ///
+    /// `None` means the fd is synthetic (epoll/timerfd/…) or currently needs
+    /// the per-fd `poll_ready_events` loop (an eventfd asked for `POLLOUT`, a
+    /// pipe with staged splice bytes); the caller must take that loop for the
+    /// whole set. An in-memory pipe or eventfd is host-visible only through
+    /// its READINESS pipe, whose read end becomes readable when the guest fd
+    /// is ready for whatever the guest asked — so the host event is always
+    /// `POLLIN` there, and `readiness_pipe` tells the caller to translate a
+    /// host wake back through `poll_ready_events` instead of using the host
+    /// revents verbatim. Polling that read end for the guest's `POLLOUT`
+    /// never fires: select01 counted a writable pipe end as not ready, and a
+    /// blocking select on a full pipe slept its whole timeout.
+    pub(super) fn host_poll_target(&self, fd: i32, events: i16) -> Option<HostPollTarget> {
+        if ((events & LINUX_POLLOUT) != 0 && self.fd_is_eventfd(fd))
+            || ((events & LINUX_POLLIN) != 0 && self.staged_splice_pipe_bytes(fd) != 0)
+        {
+            return None;
+        }
+        let direct = |host_fd: i32| {
+            Some(HostPollTarget {
+                host_fd,
+                host_events: events,
+                readiness_pipe: false,
+            })
+        };
+        let readiness = |host_fd: i32| {
+            Some(HostPollTarget {
+                host_fd,
+                host_events: libc::POLLIN,
+                readiness_pipe: true,
+            })
+        };
+        if let Some(open_file) = self.open_file(fd) {
+            let open = open_file.description.read()?;
+            return match &*open {
+                OpenDescription::HostPipe { host_fd, .. }
+                | OpenDescription::HostFile { host_fd, .. } => direct(host_fd.raw()),
+                OpenDescription::HostSocket { host_fd, base, .. } => {
+                    if base.pending_socket_error().is_some() {
+                        None
+                    } else {
+                        direct(host_fd.raw())
+                    }
+                }
+                OpenDescription::PipeReader { pipe, .. } => {
+                    pipe.read_poll_fd().and_then(|fd| readiness(fd.raw()))
+                }
+                OpenDescription::PipeWriter { pipe, .. } => {
+                    pipe.write_poll_fd().and_then(|fd| readiness(fd.raw()))
+                }
+                OpenDescription::EventFd { state, .. } => {
+                    state.read_fd.as_ref().and_then(|fd| readiness(fd.raw()))
+                }
+                OpenDescription::Pidfd { kqueue, .. } => direct(kqueue.poll_fd()),
+                OpenDescription::Inotify { state, .. } => direct(state.poll_fd()),
+                OpenDescription::Fanotify { group, .. } => match group.poll_fd() {
+                    fd if fd >= 0 => direct(fd),
+                    _ => None,
+                },
+                _ => None,
+            };
+        }
+        if is_stdio_fd(fd) || fd < 0 {
+            return direct(fd);
+        }
+        // Unknown fd: never pass the guest number through as a host fd (see
+        // `host_fd_for_poll`).
+        None
     }
 
     /// Return the host fd backing a guest fd for ppoll's fast path.
@@ -6690,7 +6772,7 @@ impl SyscallDispatcher {
             // deadlocks. Each fd gets POLLIN/POLLOUT/POLLPRI per its set membership.
             let mut owners: Vec<(i32, i16)> = Vec::new(); // (fd, requested_mask)
             let mut events_list: Vec<i16> = Vec::new();
-            let mut host_map: Vec<Option<i32>> = Vec::new();
+            let mut host_map: Vec<Option<HostPollTarget>> = Vec::new();
             for fd in 0..nfds {
                 let r = read_set.as_ref().is_some_and(|s| fd_set_contains(s, fd));
                 let w = write_set.as_ref().is_some_and(|s| fd_set_contains(s, fd));
@@ -6724,21 +6806,12 @@ impl SyscallDispatcher {
                 }
                 owners.push((fd_i32, req_mask));
                 events_list.push(events);
-                // An eventfd with POLLOUT requested must go the poll_ready_events
-                // path (always-writable); its host read_fd would never report
-                // POLLOUT and the all-host libc::poll would block forever.
-                host_map.push(if (w && this.fd_is_eventfd(fd_i32))
-                    || (r && this.staged_splice_pipe_bytes(fd_i32) != 0)
-                {
-                    None
-                } else {
-                    this.host_fd_for_poll(fd_i32).map(HostFd::get)
-                });
+                host_map.push(this.host_poll_target(fd_i32, events));
             }
 
             // revents per entry, filled by whichever path runs.
             let mut revents: Vec<i16> = vec![0; owners.len()];
-            let all_host: Option<Vec<i32>> = host_map.iter().copied().collect();
+            let all_host: Option<Vec<HostPollTarget>> = host_map.iter().copied().collect();
 
             if owners.is_empty() {
                 if timeout_ms == 0 && sigmask_addr == 0 {
@@ -6770,10 +6843,9 @@ impl SyscallDispatcher {
             } else if let Some(host_fds) = all_host {
                 let mut pollfds: Vec<libc::pollfd> = host_fds
                     .iter()
-                    .zip(events_list.iter())
-                    .map(|(hf, ev)| libc::pollfd {
-                        fd: *hf,
-                        events: *ev,
+                    .map(|t| libc::pollfd {
+                        fd: t.host_fd,
+                        events: t.host_events,
                         revents: 0,
                     })
                     .collect();
@@ -6805,8 +6877,7 @@ impl SyscallDispatcher {
                     };
                     let wait_fds: Vec<(i32, i16)> = host_fds
                         .iter()
-                        .zip(events_list.iter())
-                        .map(|(hf, ev)| (*hf, *ev))
+                        .map(|t| (t.host_fd, t.host_events))
                         .collect();
                     let mut clear_on_timeout: Vec<(u64, usize)> = Vec::new();
                     if let Some(s) = &read_set {
@@ -6832,8 +6903,18 @@ impl SyscallDispatcher {
                         clear_on_timeout,
                     });
                 }
-                for (slot, p) in revents.iter_mut().zip(pollfds.iter()) {
-                    *slot = p.revents;
+                for (i, (slot, p)) in revents.iter_mut().zip(pollfds.iter()).enumerate() {
+                    // A readiness pipe only says "something changed"; the
+                    // guest-visible events come from the description itself.
+                    *slot = if host_fds[i].readiness_pipe {
+                        if p.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                            this.poll_ready_events(owners[i].0, events_list[i])
+                        } else {
+                            0
+                        }
+                    } else {
+                        p.revents
+                    };
                 }
             } else {
                 // Mixed/synthetic: per-fd readiness with nanosleep slicing.
@@ -7096,57 +7177,13 @@ impl SyscallDispatcher {
                 addresses.push(address);
             }
             // Map guest fds → host fds where possible. Fast path requires
-            // every fd be host-backed (stdio bare, HostPipe, HostSocket).
-            // An eventfd with POLLOUT requested goes the poll_ready_events path
-            // (always-writable); its host read_fd never reports POLLOUT.
+            // every fd be host-backed (stdio bare, HostPipe, HostSocket) or
+            // reachable through a readiness pipe; see `host_poll_target`.
             let host_fds: Option<Vec<(i32, i16, bool)>> = fds
                 .iter()
                 .map(|p| {
-                    if ((p.events & LINUX_POLLOUT) != 0 && this.fd_is_eventfd(p.fd))
-                        || ((p.events & LINUX_POLLIN) != 0
-                            && this.staged_splice_pipe_bytes(p.fd) != 0)
-                    {
-                        None
-                    } else if let Some(open_file) = this.open_file(p.fd) {
-                        let open = open_file.description.read()?;
-                        match &*open {
-                            OpenDescription::HostPipe { host_fd, .. }
-                            | OpenDescription::HostFile { host_fd, .. } => {
-                                Some((host_fd.raw(), p.events, false))
-                            }
-                            OpenDescription::HostSocket { host_fd, base, .. } => {
-                                if base.pending_socket_error().is_some() {
-                                    None
-                                } else {
-                                    Some((host_fd.raw(), p.events, false))
-                                }
-                            }
-                            OpenDescription::PipeReader { pipe, .. } => {
-                                pipe.read_poll_fd().map(|fd| (fd.raw(), libc::POLLIN, true))
-                            }
-                            OpenDescription::PipeWriter { pipe, .. } => {
-                                pipe.write_poll_fd().map(|fd| (fd.raw(), libc::POLLIN, true))
-                            }
-                            OpenDescription::EventFd { state, .. } => {
-                                state.read_fd.as_ref().map(|fd| (fd.raw(), libc::POLLIN, true))
-                            }
-                            OpenDescription::Pidfd { kqueue, .. } => {
-                                Some((kqueue.poll_fd(), p.events, false))
-                            }
-                            OpenDescription::Inotify { state, .. } => {
-                                Some((state.poll_fd(), p.events, false))
-                            }
-                            OpenDescription::Fanotify { group, .. } => match group.poll_fd() {
-                                fd if fd >= 0 => Some((fd, p.events, false)),
-                                _ => None,
-                            },
-                            _ => None,
-                        }
-                    } else if is_stdio_fd(p.fd) || p.fd < 0 {
-                        Some((p.fd, p.events, false))
-                    } else {
-                        None
-                    }
+                    this.host_poll_target(p.fd, p.events)
+                        .map(|t| (t.host_fd, t.host_events, t.readiness_pipe))
                 })
                 .collect();
             if let Some(host_fds) = host_fds {
