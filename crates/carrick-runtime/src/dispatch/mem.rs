@@ -2201,10 +2201,18 @@ fn mark_range_unmapped(memory: &mut impl CurrentMmMemory, address: u64, len: usi
 
 /// VMA-metadata answer for a `madvise` range, computed without touching guest
 /// memory. `fully_mapped` is false when any page in the range falls in an
-/// unmapped hole (→ ENOMEM). `writable`/`shared` describe the covering VMAs and
-/// `locked` reports whether the range intersects an mlocked span.
+/// unmapped hole (→ ENOMEM). The per-VMA attributes (`writable`, `shared`,
+/// `all_private_anon`, `any_special`, `any_droppable`) describe EVERY VMA the
+/// range visits — those past a hole included — because madvise(2) walks the
+/// whole range and a visited VMA's rejection (EINVAL) takes precedence over
+/// the hole's ENOMEM (LTP `madvise02` advises 16 pages over one shared page
+/// and expects EINVAL). `covered` lists the mapped `[start, end)` segments
+/// so a page-dropping advice can act on the mapped parts before reporting
+/// the hole, and `locked` reports whether the range intersects an mlocked
+/// span.
 struct MadviseRangeMeta {
     fully_mapped: bool,
+    covered: Vec<(u64, u64)>,
     writable: bool,
     shared: bool,
     all_private_anon: bool,
@@ -2463,19 +2471,27 @@ impl SyscallDispatcher {
         intervals.sort_by_key(|vma| vma.start);
 
         let mut covered_to = start;
+        let mut covered: Vec<(u64, u64)> = Vec::new();
+        let mut fully_mapped = true;
         let mut writable = true;
         let mut shared = false;
         let mut all_private_anon = true;
         let mut any_special = false;
         let mut any_droppable = false;
-        let mut any_vma = false;
 
         for vma in intervals {
             if vma.start > covered_to {
-                break; // gap before this interval → unmapped hole
+                // Gap before this interval → unmapped hole. Keep walking:
+                // the VMAs past the hole still decide the per-VMA verdict.
+                fully_mapped = false;
+                covered_to = vma.start;
             }
             if vma.end > covered_to {
-                any_vma = true;
+                let segment_end = vma.end.min(end);
+                match covered.last_mut() {
+                    Some((_, last_end)) if *last_end == covered_to => *last_end = segment_end,
+                    _ => covered.push((covered_to, segment_end)),
+                }
                 if !vma.write {
                     writable = false;
                 }
@@ -2500,16 +2516,19 @@ impl SyscallDispatcher {
                 break;
             }
         }
-        let fully_mapped = any_vma && covered_to >= end;
+        if covered_to < end {
+            fully_mapped = false;
+        }
         let locked = mem.locked_ranges.iter().any(|r| {
             let (rs, re) = (r.start().raw(), r.end().raw());
             rs < end && re > start
         });
         MadviseRangeMeta {
             fully_mapped,
-            writable: fully_mapped && writable,
+            covered,
+            writable,
             shared,
-            all_private_anon: fully_mapped && all_private_anon,
+            all_private_anon,
             any_special,
             any_droppable,
             locked,
@@ -7279,7 +7298,11 @@ impl SyscallDispatcher {
             // MAP_SHARED file) and false-ENOMEMs a mapped-but-PROT_NONE range
             // (madvise05 MADV_WILLNEED on an mprotect(PROT_NONE) anon region).
             // An unmapped hole anywhere in [address, address+length) → ENOMEM,
-            // matching madvise_walk_vmas.
+            // but only once every visited VMA has accepted the advice: a
+            // per-VMA rejection (EINVAL) is reported first, and an advice that
+            // acts on pages acts on the mapped segments before the hole is
+            // reported (madvise02 expects EINVAL, not ENOMEM, for
+            // MADV_WIPEONFORK over one shared page plus 15 unmapped ones).
             let Some(raw_end) = address.0.checked_add(length as u64) else {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             };
@@ -7287,9 +7310,14 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             };
             let meta = this.madvise_range_meta(address.0, end);
-            if !meta.fully_mapped {
+            if meta.covered.is_empty() {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
+            let hole_verdict = if meta.fully_mapped {
+                DispatchOutcome::Returned { value: 0 }
+            } else {
+                DispatchOutcome::errno(LINUX_ENOMEM)
+            };
             match advice {
                 LINUX_MADV_DONTFORK | LINUX_MADV_DOFORK | LINUX_MADV_WIPEONFORK | LINUX_MADV_KEEPONFORK => {
                     if advice == LINUX_MADV_DOFORK && meta.any_special {
@@ -7310,7 +7338,7 @@ impl SyscallDispatcher {
                     };
                     this.update_madvise_vma_policy(address.0, end - address.0, copy_update, child_update, None);
                     this.mark_vma_dispatch(&mut host_alias_dispatch);
-                    return Ok(DispatchOutcome::Returned { value: 0 });
+                    return Ok(hole_verdict);
                 }
                 LINUX_MADV_DONTDUMP | LINUX_MADV_DODUMP => {
                     // Not an advisory no-op: Linux keeps a DONTDUMP VMA in the
@@ -7331,7 +7359,7 @@ impl SyscallDispatcher {
                         Some(dump_update),
                     );
                     this.mark_vma_dispatch(&mut host_alias_dispatch);
-                    return Ok(DispatchOutcome::Returned { value: 0 });
+                    return Ok(hole_verdict);
                 }
                 LINUX_MADV_DONTNEED => {
                     // Linux can_madv_lru_vma rejects VM_LOCKED (also VM_HUGETLB /
@@ -7352,44 +7380,53 @@ impl SyscallDispatcher {
                     // Linux dropping clean cache pages. zero_backing writes the
                     // host backing directly (same call the MAP_FIXED/munmap-reuse
                     // scrub uses), bypassing the guest write-protection gate.
-                    if meta.writable && !meta.shared {
-                        if cx.memory.zero_backing(address.0, length).is_err() {
+                    // The pages are dropped per mapped segment: the segments
+                    // ahead of and past a hole are still discarded, and the
+                    // hole itself is reported afterwards.
+                    for &(segment_start, segment_end) in &meta.covered {
+                        let Ok(segment_len) = usize::try_from(segment_end - segment_start) else {
                             return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                        };
+                        if meta.writable && !meta.shared {
+                            if cx.memory.zero_backing(segment_start, segment_len).is_err() {
+                                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                            }
+                        }
+                        if meta.all_private_anon {
+                            this.mark_range_nonresident(segment_start, segment_len as u64);
+                            // Discarding the pages puts them back where a fresh
+                            // anonymous mapping starts: not resident, and resident
+                            // again on the NEXT touch. Re-arm the first-touch fault
+                            // so that next touch is observed -- without this the
+                            // range stays non-resident forever and `mincore` reports
+                            // a written page as absent, which is the opposite of the
+                            // error it used to make.
+                            if std::env::var("CARRICK_MINCORE_EXACT").as_deref() != Ok("0")
+                                && cx
+                                    .memory
+                                    .resident_pages(GuestVa(segment_start), 1, this.linux_page_size())
+                                    .is_none()
+                                && cx.memory.protect_range(segment_start, segment_len, 0).is_ok()
+                            {
+                                // `MADV_DONTNEED` requires a readable mapping to
+                                // reach here, and `writable` is the only other axis
+                                // this range can carry.
+                                let prot = if meta.writable {
+                                    LinuxProtFlags::READ | LinuxProtFlags::WRITE
+                                } else {
+                                    LinuxProtFlags::READ
+                                };
+                                this.track_resident_fault_range(segment_start, segment_len as u64, prot);
+                                cx.memory.set_mapping_protection(
+                                    segment_start,
+                                    segment_len,
+                                    false,
+                                    !meta.writable,
+                                );
+                            }
                         }
                     }
-                    if meta.all_private_anon {
-                        this.mark_range_nonresident(address.0, length as u64);
-                        // Discarding the pages puts them back where a fresh
-                        // anonymous mapping starts: not resident, and resident
-                        // again on the NEXT touch. Re-arm the first-touch fault
-                        // so that next touch is observed -- without this the
-                        // range stays non-resident forever and `mincore` reports
-                        // a written page as absent, which is the opposite of the
-                        // error it used to make.
-                        if std::env::var("CARRICK_MINCORE_EXACT").as_deref() != Ok("0")
-                            && cx
-                                .memory
-                                .resident_pages(GuestVa(address.0), 1, this.linux_page_size())
-                                .is_none()
-                            && cx.memory.protect_range(address.0, length, 0).is_ok()
-                        {
-                            // `MADV_DONTNEED` requires a readable mapping to
-                            // reach here, and `writable` is the only other axis
-                            // this range can carry.
-                            let prot = if meta.writable {
-                                LinuxProtFlags::READ | LinuxProtFlags::WRITE
-                            } else {
-                                LinuxProtFlags::READ
-                            };
-                            this.track_resident_fault_range(address.0, length as u64, prot);
-                            cx.memory.set_mapping_protection(
-                                address.0,
-                                length,
-                                false,
-                                !meta.writable,
-                            );
-                        }
-                    }
+                    return Ok(hole_verdict);
                 }
                 // MADV_FREE only applies to private anonymous mappings; a shared
                 // mapping (file- or anon-backed) → EINVAL.
@@ -7398,7 +7435,7 @@ impl SyscallDispatcher {
                 }
                 _ => {}
             }
-            Ok(DispatchOutcome::Returned { value: 0 })
+            Ok(hole_verdict)
         }
 
         mm_mutation fn remap_file_pages(this, cx, addr: u64, size: u64, prot: u64, pgoff: u64, _flags: u64) {

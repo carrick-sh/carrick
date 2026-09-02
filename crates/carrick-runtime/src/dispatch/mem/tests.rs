@@ -7868,6 +7868,67 @@ fn host_alias_map_droppable_reaches_keeponfork_rejection_metadata() {
     assert!(metadata.any_droppable);
 }
 
+/// madvise(2) walks the VMAs it visits and reports a per-VMA rejection
+/// (EINVAL) ahead of the unmapped-hole ENOMEM: LTP `madvise02` maps ONE
+/// shared-anonymous page and advises 16 pages `MADV_WIPEONFORK`, expecting
+/// EINVAL because the visited VMA is not private anonymous — carrick answered
+/// ENOMEM for the hole first. The hole still wins when every visited VMA
+/// accepts the advice (the private-anonymous twin).
+#[test]
+fn madvise_reports_vma_rejection_before_unmapped_hole_enomem() {
+    const SYS_MMAP: u64 = 222;
+    const SYS_MADVISE: u64 = 233;
+    const MAPPED_LENGTH: usize = crate::trap::HVF_PAGE_SIZE as usize;
+
+    let map = |flags: u64, thread: i32| {
+        let dispatcher = SyscallDispatcher::new();
+        let registry = crate::thread::ThreadRegistry::new(
+            crate::thread::ThreadId::synthetic_for_tests(thread),
+        );
+        let reporter = CompatReporter::default();
+        let mut memory =
+            ProtectionTrackingMemory::new(crate::memory::LINUX_SHARED_FILE_BASE, MAPPED_LENGTH);
+        let mapped = returned(threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([0, LINUX_PAGE_SIZE, LINUX_PROT_READ, flags, u64::MAX, 0]),
+            ),
+        )) as u64;
+        threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MADVISE,
+                SyscallArgs([
+                    mapped,
+                    16 * LINUX_PAGE_SIZE,
+                    carrick_abi::LINUX_MADV_WIPEONFORK,
+                    0,
+                    0,
+                    0,
+                ]),
+            ),
+        )
+    };
+
+    assert_eq!(
+        map(LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS, 1070),
+        DispatchOutcome::errno(LINUX_EINVAL),
+        "a visited shared VMA rejects WIPEONFORK ahead of the hole"
+    );
+    assert_eq!(
+        map(LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS, 1071),
+        DispatchOutcome::errno(LINUX_ENOMEM),
+        "every visited VMA accepts the advice, so the hole reports ENOMEM"
+    );
+}
+
 /// `RLIMIT_DATA` (proc(5) `VmData`) charges the brk heap and private
 /// writable mappings only; `RLIMIT_AS` charges the union of every VMA.
 #[test]
