@@ -6124,3 +6124,266 @@ fn pipe_lifecycle_tracks_logical_fd_references_across_dup_and_close() {
         );
     }
 }
+
+#[cfg(test)]
+mod scm_rights_tests {
+    //! `SCM_RIGHTS` must carry EVERY guest fd, not only the host-backed ones.
+    //!
+    //! Guest pipes are carrick-owned (`PipeReader`/`PipeWriter` over a
+    //! `PipeInner`, no host fd), so the multiprocessing forkserver's
+    //! `sendfds(os.pipe())` handoff answered EBADF and every forkserver test
+    //! errored. Linux passes any fd: the receiver gets a NEW fd sharing the
+    //! SAME open file description. Driven through the public `dispatch`
+    //! entry point with aarch64 syscall numbers, exactly as the guest does.
+    use super::*;
+    use crate::compat::CompatReporter;
+    use carrick_abi::{LINUX_SCM_RIGHTS, LINUX_SOL_SOCKET};
+
+    const SYS_CLOSE: u64 = 57;
+    const SYS_PIPE2: u64 = 59;
+    const SYS_READ: u64 = 63;
+    const SYS_WRITE: u64 = 64;
+    const SYS_SOCKETPAIR: u64 = 199;
+    const SYS_SENDMSG: u64 = 211;
+    const SYS_RECVMSG: u64 = 212;
+    const MEM_BASE: u64 = 0x4000_0000;
+    const MEM_LEN: usize = 0x4000;
+    const AF_UNIX: u64 = 1;
+    const SOCK_STREAM: u64 = 1;
+    const O_NONBLOCK: u64 = 0o4000;
+    /// Scratch layout inside the 16 KiB guest window.
+    const SV: u64 = MEM_BASE;
+    const PIPEFD: u64 = MEM_BASE + 0x10;
+    const MSGHDR: u64 = MEM_BASE + 0x100;
+    const IOV: u64 = MEM_BASE + 0x200;
+    const PAYLOAD: u64 = MEM_BASE + 0x300;
+    const CONTROL: u64 = MEM_BASE + 0x400;
+    const DATA: u64 = MEM_BASE + 0x800;
+    const CONTROL_CAP: u64 = 64;
+
+    struct Guest {
+        dispatcher: SyscallDispatcher,
+        reporter: CompatReporter,
+        mem: LinearMemory,
+    }
+
+    impl Guest {
+        fn new() -> Self {
+            Self {
+                dispatcher: SyscallDispatcher::new(),
+                reporter: CompatReporter::default(),
+                mem: LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]),
+            }
+        }
+
+        fn call(&mut self, nr: u64, args: [u64; 6]) -> DispatchOutcome {
+            let kernel = self.dispatcher.capture_one_task_context().unwrap();
+            self.dispatcher
+                .dispatch(
+                    &kernel,
+                    SyscallRequest::new(nr, SyscallArgs(args)),
+                    &mut self.mem,
+                    &self.reporter,
+                )
+                .expect("dispatch")
+        }
+
+        fn ok(&mut self, nr: u64, args: [u64; 6]) -> i64 {
+            match self.call(nr, args) {
+                DispatchOutcome::Returned { value } => value,
+                other => panic!("syscall {nr} failed: {other:?}"),
+            }
+        }
+
+        fn u32_at(&self, addr: u64) -> i32 {
+            let bytes = self.mem.read_bytes(addr, 4).unwrap();
+            i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        }
+
+        /// Write a Linux-layout `msghdr` with one iovec over `PAYLOAD` and
+        /// an `SCM_RIGHTS` cmsg carrying `fds` (empty → no control).
+        fn write_msghdr(&mut self, payload: &[u8], fds: &[i32], controllen: u64) {
+            self.mem.write_bytes(PAYLOAD, payload).unwrap();
+            let mut iov = Vec::new();
+            iov.extend_from_slice(&PAYLOAD.to_ne_bytes());
+            iov.extend_from_slice(&(payload.len() as u64).to_ne_bytes());
+            self.mem.write_bytes(IOV, &iov).unwrap();
+            if !fds.is_empty() {
+                let mut cmsg = Vec::new();
+                cmsg.extend_from_slice(&((16 + 4 * fds.len()) as u64).to_ne_bytes());
+                cmsg.extend_from_slice(&LINUX_SOL_SOCKET.to_ne_bytes());
+                cmsg.extend_from_slice(&LINUX_SCM_RIGHTS.to_ne_bytes());
+                for fd in fds {
+                    cmsg.extend_from_slice(&fd.to_ne_bytes());
+                }
+                while cmsg.len() % 8 != 0 {
+                    cmsg.push(0);
+                }
+                self.mem.write_bytes(CONTROL, &cmsg).unwrap();
+            }
+            let mut hdr = Vec::new();
+            hdr.extend_from_slice(&0u64.to_ne_bytes()); // name
+            hdr.extend_from_slice(&0u64.to_ne_bytes()); // namelen + pad
+            hdr.extend_from_slice(&IOV.to_ne_bytes());
+            hdr.extend_from_slice(&1u64.to_ne_bytes());
+            hdr.extend_from_slice(&CONTROL.to_ne_bytes());
+            hdr.extend_from_slice(&controllen.to_ne_bytes());
+            hdr.extend_from_slice(&0u64.to_ne_bytes()); // flags + pad
+            self.mem.write_bytes(MSGHDR, &hdr).unwrap();
+        }
+
+        fn received_fds(&self) -> Vec<i32> {
+            let controllen =
+                u64::from_ne_bytes(self.mem.read_bytes(MSGHDR + 40, 8).unwrap().try_into().unwrap());
+            let control = self.mem.read_bytes(CONTROL, controllen as usize).unwrap();
+            super::net::support::parse_linux_scm_rights_fds(&control)
+        }
+    }
+
+    #[test]
+    fn carrick_owned_pipe_ends_cross_scm_rights_as_shared_descriptions() {
+        let mut g = Guest::new();
+        assert_eq!(g.ok(SYS_SOCKETPAIR, [AF_UNIX, SOCK_STREAM, 0, SV, 0, 0]), 0);
+        let (sock_a, sock_b) = (g.u32_at(SV), g.u32_at(SV + 4));
+        assert_eq!(g.ok(SYS_PIPE2, [PIPEFD, O_NONBLOCK, 0, 0, 0, 0]), 0);
+        let (pipe_r, pipe_w) = (g.u32_at(PIPEFD), g.u32_at(PIPEFD + 4));
+
+        g.write_msghdr(b"x", &[pipe_r, pipe_w], 24);
+        assert_eq!(
+            g.ok(SYS_SENDMSG, [sock_a as u64, MSGHDR, 0, 0, 0, 0]),
+            1,
+            "sendmsg(SCM_RIGHTS) of carrick-owned pipe ends must succeed"
+        );
+
+        g.write_msghdr(b"\0", &[], CONTROL_CAP);
+        assert_eq!(g.ok(SYS_RECVMSG, [sock_b as u64, MSGHDR, 0, 0, 0, 0]), 1);
+        let got = g.received_fds();
+        assert_eq!(got.len(), 2, "two fds must arrive, got {got:?}");
+        let (recv_r, recv_w) = (got[0], got[1]);
+        assert!(recv_r != pipe_r && recv_w != pipe_w, "received fds are NEW fds");
+
+        // The received ends share the pipe with the originals in both
+        // directions: write through the received writer, read from the
+        // original reader, and vice versa.
+        g.mem.write_bytes(DATA, b"hello").unwrap();
+        assert_eq!(g.ok(SYS_WRITE, [recv_w as u64, DATA, 5, 0, 0, 0]), 5);
+        assert_eq!(g.ok(SYS_READ, [pipe_r as u64, DATA + 0x100, 16, 0, 0, 0]), 5);
+        assert_eq!(&g.mem.read_bytes(DATA + 0x100, 5).unwrap(), b"hello");
+        g.mem.write_bytes(DATA, b"world").unwrap();
+        assert_eq!(g.ok(SYS_WRITE, [pipe_w as u64, DATA, 5, 0, 0, 0]), 5);
+        assert_eq!(g.ok(SYS_READ, [recv_r as u64, DATA + 0x100, 16, 0, 0, 0]), 5);
+        assert_eq!(&g.mem.read_bytes(DATA + 0x100, 5).unwrap(), b"world");
+
+        // Closing the ORIGINAL writer must not EOF the pipe while the
+        // received writer is still open (the description is shared, so its
+        // writer count is 1 until the last reference goes).
+        assert_eq!(g.ok(SYS_CLOSE, [pipe_w as u64, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            g.call(SYS_READ, [recv_r as u64, DATA, 16, 0, 0, 0]),
+            DispatchOutcome::errno(carrick_abi::LINUX_EAGAIN),
+            "a shared writer keeps the pipe open"
+        );
+        assert_eq!(g.ok(SYS_CLOSE, [recv_w as u64, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            g.ok(SYS_READ, [recv_r as u64, DATA, 16, 0, 0, 0]),
+            0,
+            "last writer gone → EOF"
+        );
+    }
+
+    #[test]
+    fn a_host_backed_file_crosses_scm_rights_as_the_same_description() {
+        // A host-backed regular file (anything under `--fs host`, /dev/shm,
+        // /tmp) is what multiprocessing's `Arena` passes to the forkserver
+        // child, which then `mmap`s it PROT_WRITE|MAP_SHARED. Linux hands the
+        // receiver the SAME open file description: identical status flags
+        // (O_RDWR), identical path, writable. Re-wrapping the raw host fd as a
+        // fresh read-only description made that mmap EACCES.
+        use crate::dispatch::fd_table::{HostFdRef, OpenDescriptionBase, OpenFile};
+        use crate::rootfs::{RootFsEntryKind, RootFsMetadata};
+        use carrick_abi::LINUX_O_RDWR;
+        use std::os::fd::IntoRawFd;
+        const SYS_FCNTL: u64 = 25;
+        const SYS_READLINKAT: u64 = 78;
+        const F_GETFL: u64 = 3;
+        const AT_FDCWD: u64 = (-100i64) as u64;
+
+        let mut g = Guest::new();
+        assert_eq!(g.ok(SYS_SOCKETPAIR, [AF_UNIX, SOCK_STREAM, 0, SV, 0, 0]), 0);
+        let (sock_a, sock_b) = (g.u32_at(SV), g.u32_at(SV + 4));
+        let host_fd = tempfile::tempfile().expect("tempfile").into_raw_fd();
+        let description = super::fd_table::kernel_file_description(
+            Arc::new(RwLock::new(OpenDescription::HostFile {
+                base: OpenDescriptionBase::new(LINUX_O_RDWR),
+                host_fd: HostFdRef::new(host_fd),
+                metadata: RootFsMetadata {
+                    path: std::path::PathBuf::from("/tmp/arena"),
+                    kind: RootFsEntryKind::File,
+                    mode: 0o600,
+                    size: 0,
+                },
+                writable: true,
+            })),
+            LINUX_O_RDWR,
+        );
+        let file_fd = g
+            .dispatcher
+            .install_fd_at_or_above(3, OpenFile::new(description, 0))
+            .expect("install");
+
+        g.write_msghdr(b"x", &[file_fd], 20);
+        assert_eq!(g.ok(SYS_SENDMSG, [sock_a as u64, MSGHDR, 0, 0, 0, 0]), 1);
+        g.write_msghdr(b"\0", &[], CONTROL_CAP);
+        assert_eq!(g.ok(SYS_RECVMSG, [sock_b as u64, MSGHDR, 0, 0, 0, 0]), 1);
+        let got = g.received_fds();
+        assert_eq!(got.len(), 1, "one fd must arrive, got {got:?}");
+        let recv_fd = got[0];
+        assert_ne!(recv_fd, file_fd);
+
+        let orig_flags = g.ok(SYS_FCNTL, [file_fd as u64, F_GETFL, 0, 0, 0, 0]);
+        let recv_flags = g.ok(SYS_FCNTL, [recv_fd as u64, F_GETFL, 0, 0, 0, 0]);
+        assert_eq!(
+            recv_flags, orig_flags,
+            "the received fd shares the description's status flags"
+        );
+        assert_eq!(recv_flags & 0o3, LINUX_O_RDWR as i64);
+        g.mem.write_bytes(DATA, b"hello").unwrap();
+        assert_eq!(
+            g.ok(SYS_WRITE, [recv_fd as u64, DATA, 5, 0, 0, 0]),
+            5,
+            "the received fd is writable"
+        );
+
+        // `/proc/self/fd/N` resolves to the file's path, not a placeholder.
+        let link = format!("/proc/self/fd/{recv_fd}\0");
+        g.mem.write_bytes(DATA, link.as_bytes()).unwrap();
+        let n = g.ok(SYS_READLINKAT, [AT_FDCWD, DATA, DATA + 0x100, 64, 0, 0]);
+        assert_eq!(
+            g.mem.read_bytes(DATA + 0x100, n as usize).unwrap(),
+            b"/tmp/arena"
+        );
+    }
+
+    #[test]
+    fn unread_in_flight_rights_are_released_when_the_receiver_never_reads() {
+        // Linux GC's in-flight fds: a passed pipe writer whose message is
+        // never received must not keep the pipe open forever. Send the writer,
+        // close both the sender's copy and the receiving socket (dropping the
+        // in-flight message), and the reader must see EOF.
+        let mut g = Guest::new();
+        assert_eq!(g.ok(SYS_SOCKETPAIR, [AF_UNIX, SOCK_STREAM, 0, SV, 0, 0]), 0);
+        let (sock_a, sock_b) = (g.u32_at(SV), g.u32_at(SV + 4));
+        assert_eq!(g.ok(SYS_PIPE2, [PIPEFD, O_NONBLOCK, 0, 0, 0, 0]), 0);
+        let (pipe_r, pipe_w) = (g.u32_at(PIPEFD), g.u32_at(PIPEFD + 4));
+        g.write_msghdr(b"x", &[pipe_w], 20);
+        assert_eq!(g.ok(SYS_SENDMSG, [sock_a as u64, MSGHDR, 0, 0, 0, 0]), 1);
+        assert_eq!(g.ok(SYS_CLOSE, [pipe_w as u64, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(g.ok(SYS_CLOSE, [sock_b as u64, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(g.ok(SYS_CLOSE, [sock_a as u64, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            g.ok(SYS_READ, [pipe_r as u64, DATA, 16, 0, 0, 0]),
+            0,
+            "the in-flight writer must be collected once nothing can receive it"
+        );
+    }
+}

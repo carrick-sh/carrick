@@ -6742,6 +6742,7 @@ impl SyscallDispatcher {
         let mut fifo_writer_closed = false;
         let mut closing_inotify = None;
         let mut closing_fanotify = false;
+        let mut closing_host_socket = false;
         if last_ref {
             if let Some(open) = open_file.description.read() {
                 // A reuseport membership must never outlive its socket: host fds
@@ -6749,6 +6750,7 @@ impl SyscallDispatcher {
                 // socket's traffic to this group. Removal is by host fd and is a
                 // no-op for a socket that never joined.
                 if let OpenDescription::HostSocket { host_fd, .. } = &*open {
+                    closing_host_socket = true;
                     crate::dispatch::net::reuseport_leave(host_fd.raw());
                     crate::dispatch::net::recverr_close(host_fd.raw());
                     // Drop this connection's SCTP message boundaries while the fd is
@@ -6829,6 +6831,11 @@ impl SyscallDispatcher {
         close_open_file(open_file);
         if is_inmem_stream {
             self.notify_inmem_epoll();
+        }
+        // The socket is gone, and with it any SCM_RIGHTS message still queued
+        // on it: release the descriptions those messages carried in flight.
+        if closing_host_socket {
+            crate::dispatch::net::scm_rights_gc();
         }
         if closing_fanotify {
             self.fs.fanotify_registry.prune_dead_groups();

@@ -3779,6 +3779,46 @@ impl SyscallDispatcher {
         None
     }
 
+    /// Materialize one of the process's bare stdio fds (0/1/2, which have no
+    /// fd-table entry) as a description of its own: `dup`/`fcntl(F_DUPFD)`
+    /// mirror what dup3 does and grab the host fd into a `HostPipe` so future
+    /// reads/writes still hit the right host endpoint (this is what dpkg-query
+    /// needs at startup to redirect its diagnostic fd, and what most glibc
+    /// fork+exec helpers expect to succeed), and `SCM_RIGHTS` parks the same
+    /// description so a passed stdout arrives as a guest description.
+    pub(in crate::dispatch) fn bare_stdio_description(
+        &self,
+        old_fd: i32,
+    ) -> Result<Arc<crate::kernel::FileDescription>, LinuxErrno> {
+        let duped = (unsafe { libc::dup(old_fd) }).host_syscall_errno()?;
+        crate::dispatch::net::set_host_nonblocking(duped);
+        let write_kind = HostWriteKind::for_host_fd(duped);
+        let pty = self.dup_stdio_pty_role(old_fd);
+        let status_flags = if old_fd == 0 {
+            LINUX_O_RDONLY
+        } else {
+            LINUX_O_WRONLY
+        };
+        Ok(kernel_file_description(
+            Arc::new(RwLock::new(OpenDescription::HostPipe {
+                // A duped stdio fd has no separate pipe peer to coordinate
+                // a FASYNC arm/trigger with; the host inode is still a
+                // unique id (FASYNC is not exercised on bare stdio).
+                pipe_id: host_inode_pipe_id(duped),
+                // `duped` is a genuinely NEW host fd, so this fresh owned
+                // handle is its one owner.
+                host_fd: HostFdRef::new(duped),
+                is_read_end: old_fd == 0,
+                base: OpenDescriptionBase::new(0),
+                pty,
+                bidirectional: false,
+                write_kind,
+                stdio_stream: Some(old_fd),
+            })),
+            status_flags,
+        ))
+    }
+
     fn duplicate_fd(&self, old_fd: i32, min_fd: i32, fd_flags: u64) -> DispatchOutcome {
         // The description Arc alone carries the backing host fd's liveness:
         // the OWNED HostFdRef lives inside the description, so `Arc::clone`
@@ -3792,44 +3832,10 @@ impl SyscallDispatcher {
             None if is_stdio_fd(old_fd) && self.stdio_is_closed(old_fd) => {
                 return DispatchOutcome::errno(LINUX_EBADF);
             }
-            None if is_stdio_fd(old_fd) => {
-                // dup/fcntl(F_DUPFD) of the process's bare stdio fds:
-                // mirror what dup3 does and grab the host fd into a
-                // HostPipe so future reads/writes still hit the right
-                // host endpoint (this is what dpkg-query needs at
-                // startup to redirect its diagnostic fd, and what most
-                // glibc fork+exec helpers expect to succeed).
-                let duped = match (unsafe { libc::dup(old_fd) }).host_syscall_errno() {
-                    Ok(duped) => duped,
-                    Err(errno) => return DispatchOutcome::errno(errno),
-                };
-                crate::dispatch::net::set_host_nonblocking(duped);
-                let write_kind = HostWriteKind::for_host_fd(duped);
-                let pty = self.dup_stdio_pty_role(old_fd);
-                let status_flags = if old_fd == 0 {
-                    LINUX_O_RDONLY
-                } else {
-                    LINUX_O_WRONLY
-                };
-                kernel_file_description(
-                    Arc::new(RwLock::new(OpenDescription::HostPipe {
-                        // A duped stdio fd has no separate pipe peer to coordinate
-                        // a FASYNC arm/trigger with; the host inode is still a
-                        // unique id (FASYNC is not exercised on bare stdio).
-                        pipe_id: host_inode_pipe_id(duped),
-                        // `duped` is a genuinely NEW host fd, so this fresh owned
-                        // handle is its one owner.
-                        host_fd: HostFdRef::new(duped),
-                        is_read_end: old_fd == 0,
-                        base: OpenDescriptionBase::new(0),
-                        pty,
-                        bidirectional: false,
-                        write_kind,
-                        stdio_stream: Some(old_fd),
-                    })),
-                    status_flags,
-                )
-            }
+            None if is_stdio_fd(old_fd) => match self.bare_stdio_description(old_fd) {
+                Ok(description) => description,
+                Err(errno) => return DispatchOutcome::errno(errno),
+            },
             None => return DispatchOutcome::errno(LINUX_EBADF),
         };
         let open_file = OpenFile::new(description, fd_flags);
