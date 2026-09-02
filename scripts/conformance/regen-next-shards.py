@@ -169,12 +169,12 @@ def main() -> int:
                 path,
             )
             text = re.sub(
-                r"(\n\s+)\d+(,\n\s+\"musl shard 0 must contain exactly )\d+( baseline gaps\")",
+                r"(\n\s+)\d+(,\n\s+\"musl shard 0 must contain exactly )\d+( baseline gaps?\")",
                 rf"\g<1>{len(musl)}\g<2>{len(musl)}\g<3>",
                 text,
             )
             text = re.sub(
-                r"(\n\s+)\d+(,\n\s+\"gnu shard 0 must contain exactly )\d+( baseline gaps\")",
+                r"(\n\s+)\d+(,\n\s+\"gnu shard 0 must contain exactly )\d+( baseline gaps?\")",
                 rf"\g<1>{len(gnu)}\g<2>{len(gnu)}\g<3>",
                 text,
             )
