@@ -501,6 +501,15 @@ pub(crate) enum WaitResult {
     NoChild,
 }
 
+/// `WNOWAIT` peeks; every other wait reaps.
+fn wait_mode(nowait: bool) -> crate::kernel::WaitMode {
+    if nowait {
+        crate::kernel::WaitMode::Observe
+    } else {
+        crate::kernel::WaitMode::Consume
+    }
+}
+
 impl ProcessContext {
     fn new(
         resources: std::sync::Arc<MmResources>,
@@ -1120,130 +1129,39 @@ impl ProcessContext {
     pub(crate) fn wait_child_with_job_control(
         &self,
         target: Option<i32>,
+        class: crate::kernel::WaitChildClass,
         nowait: bool,
         include_stopped: bool,
         include_continued: bool,
     ) -> WaitResult {
         let target = target.and_then(|raw| crate::kernel::TaskId::from_abi_positive(raw).ok());
-        let mode = if nowait {
-            crate::kernel::WaitMode::Observe
-        } else {
-            crate::kernel::WaitMode::Consume
-        };
-        match self.kernel_graph().wait_child_with_job_control(
+        let outcome = self.kernel_graph().wait_child_with_job_control(
             self.task_id(),
             target,
+            class,
             include_stopped,
             include_continued,
-            mode,
-        ) {
-            Ok(crate::kernel::WaitOutcome::Exited(zombie)) => WaitResult::Exited(ChildExit {
-                pid: zombie.key.id,
-                ruid: zombie.ruid,
-                status: zombie.status.raw(),
-            }),
-            Ok(crate::kernel::WaitOutcome::Stopped { task, signal, ruid }) => {
-                WaitResult::StateChanged(ChildExit {
-                    pid: task,
-                    ruid,
-                    status: (signal.raw() << 8) | 0x7f,
-                })
-            }
-            Ok(crate::kernel::WaitOutcome::Continued { task, ruid }) => {
-                WaitResult::StateChanged(ChildExit {
-                    pid: task,
-                    ruid,
-                    status: 0xffff,
-                })
-            }
-            Ok(crate::kernel::WaitOutcome::StillRunning) => WaitResult::StillRunning,
-            Ok(crate::kernel::WaitOutcome::NoChild) => WaitResult::NoChild,
-            Err(crate::kernel::KernelOperationError::TaskBusy(_)) => {
-                // A reservation is mid-flight — typically THIS process's
-                // own fork holding its task reserved from admission
-                // through child materialization. Report "nothing reapable
-                // yet" instead of parking on the reservation condvar: a
-                // guest `WNOHANG` must return 0 immediately (CPython's
-                // `Pool._join_exited_workers` polls `waitpid(WNOHANG)`
-                // from one thread while another forks the replacement
-                // worker, and blocking here stalled the poll for the
-                // whole fork), and a BLOCKING wait re-dispatches through
-                // the vcpu loop's bounded park, which re-runs this query.
-                // The condvar park was also invisible to fork-quiesce
-                // kicks — an unbounded parking_lot wait inside dispatch.
-                WaitResult::StillRunning
-            }
-            Err(error) => {
-                tracing::error!(pid = self.pid(), %error, "authoritative child wait failed");
-                WaitResult::NoChild
-            }
-        }
+            wait_mode(nowait),
+        );
+        self.wait_result("authoritative child wait failed", outcome)
     }
 
     pub(crate) fn wait_child_key(
         &self,
         target: crate::kernel::TaskKey,
+        class: crate::kernel::WaitChildClass,
         nowait: bool,
     ) -> WaitResult {
-        let mode = if nowait {
-            crate::kernel::WaitMode::Observe
-        } else {
-            crate::kernel::WaitMode::Consume
-        };
-        match self
-            .kernel_graph()
-            .wait_child_key(self.task_id(), target, mode)
-        {
-            Ok(crate::kernel::WaitOutcome::Exited(zombie)) => WaitResult::Exited(ChildExit {
-                pid: zombie.key.id,
-                ruid: zombie.ruid,
-                status: zombie.status.raw(),
-            }),
-            // A P_PIDFD wait runs in Consume mode too, so reporting a
-            // job-control event as "still running" DISCARDS it. Render the
-            // same wait-status encoding `wait_child_with_job_control`
-            // produces and let the caller decide whether it asked for it.
-            Ok(crate::kernel::WaitOutcome::Stopped { task, signal, ruid }) => {
-                WaitResult::StateChanged(ChildExit {
-                    pid: task,
-                    ruid,
-                    status: (signal.raw() << 8) | 0x7f,
-                })
-            }
-            Ok(crate::kernel::WaitOutcome::Continued { task, ruid }) => {
-                WaitResult::StateChanged(ChildExit {
-                    pid: task,
-                    ruid,
-                    status: 0xffff,
-                })
-            }
-            Ok(crate::kernel::WaitOutcome::StillRunning) => WaitResult::StillRunning,
-            Ok(crate::kernel::WaitOutcome::NoChild) => WaitResult::NoChild,
-            Err(crate::kernel::KernelOperationError::TaskBusy(_)) => {
-                // A reservation is mid-flight — typically THIS process's
-                // own fork holding its task reserved from admission
-                // through child materialization. Report "nothing reapable
-                // yet" instead of parking on the reservation condvar: a
-                // guest `WNOHANG` must return 0 immediately (CPython's
-                // `Pool._join_exited_workers` polls `waitpid(WNOHANG)`
-                // from one thread while another forks the replacement
-                // worker, and blocking here stalled the poll for the
-                // whole fork), and a BLOCKING wait re-dispatches through
-                // the vcpu loop's bounded park, which re-runs this query.
-                // The condvar park was also invisible to fork-quiesce
-                // kicks — an unbounded parking_lot wait inside dispatch.
-                WaitResult::StillRunning
-            }
-            Err(error) => {
-                tracing::error!(pid = self.pid(), %error, "authoritative pidfd child wait failed");
-                WaitResult::NoChild
-            }
-        }
+        let outcome =
+            self.kernel_graph()
+                .wait_child_key(self.task_id(), target, class, wait_mode(nowait));
+        self.wait_result("authoritative pidfd child wait failed", outcome)
     }
 
     pub(crate) fn wait_child_in_process_group_with_job_control(
         &self,
         group: i32,
+        class: crate::kernel::WaitChildClass,
         nowait: bool,
         include_stopped: bool,
         include_continued: bool,
@@ -1251,25 +1169,36 @@ impl ProcessContext {
         let Ok(group) = crate::kernel::ProcessGroupId::from_abi_positive(group) else {
             return WaitResult::NoChild;
         };
-        let mode = if nowait {
-            crate::kernel::WaitMode::Observe
-        } else {
-            crate::kernel::WaitMode::Consume
-        };
-        match self
+        let outcome = self
             .kernel_graph()
             .wait_child_in_process_group_with_job_control(
                 self.task_id(),
                 group,
+                class,
                 include_stopped,
                 include_continued,
-                mode,
-            ) {
+                wait_mode(nowait),
+            );
+        self.wait_result("authoritative process-group child wait failed", outcome)
+    }
+
+    /// Lower a kernel-graph wait outcome to the dispatch-side result the
+    /// three wait entry points share.
+    fn wait_result(
+        &self,
+        failure: &'static str,
+        outcome: Result<crate::kernel::WaitOutcome, crate::kernel::KernelOperationError>,
+    ) -> WaitResult {
+        match outcome {
             Ok(crate::kernel::WaitOutcome::Exited(zombie)) => WaitResult::Exited(ChildExit {
                 pid: zombie.key.id,
                 ruid: zombie.ruid,
                 status: zombie.status.raw(),
             }),
+            // A P_PIDFD wait runs in Consume mode too, so reporting a
+            // job-control event as "still running" DISCARDS it. Render the
+            // wait-status encoding and let the caller decide whether it asked
+            // for it.
             Ok(crate::kernel::WaitOutcome::Stopped { task, signal, ruid }) => {
                 WaitResult::StateChanged(ChildExit {
                     pid: task,
@@ -1302,7 +1231,7 @@ impl ProcessContext {
                 WaitResult::StillRunning
             }
             Err(error) => {
-                tracing::error!(pid = self.pid(), %error, "authoritative process-group child wait failed");
+                tracing::error!(pid = self.pid(), %error, "{failure}");
                 WaitResult::NoChild
             }
         }
@@ -1970,15 +1899,25 @@ mod tests {
         // than park: nothing is reapable YET, and blocking here is exactly the
         // WNOHANG violation this contract forbids.
         assert!(matches!(
-            parent.wait_child_with_job_control(Some(child_key.id.raw()), false, false, false),
+            parent.wait_child_with_job_control(
+                Some(child_key.id.raw()),
+                crate::kernel::WaitChildClass::Sigchld,
+                false,
+                false,
+                false,
+            ),
             WaitResult::StillRunning
         ));
         prepared_exit.commit().unwrap();
         // The re-query — what the vcpu loop's bounded park does for a blocking
         // wait — observes the committed zombie.
-        let WaitResult::Exited(exit) =
-            parent.wait_child_with_job_control(Some(child_key.id.raw()), false, false, false)
-        else {
+        let WaitResult::Exited(exit) = parent.wait_child_with_job_control(
+            Some(child_key.id.raw()),
+            crate::kernel::WaitChildClass::Sigchld,
+            false,
+            false,
+            false,
+        ) else {
             panic!("child wait did not observe the committed zombie");
         };
         assert_eq!(exit.pid(), child_key.id);
@@ -3736,7 +3675,13 @@ mod tests {
         assert_eq!(parent.live_process_count(), 2);
         assert_eq!(child.process_group().unwrap(), parent.pid());
         assert!(matches!(
-            parent.wait_child_with_job_control(Some(child.pid()), false, false, false),
+            parent.wait_child_with_job_control(
+                Some(child.pid()),
+                crate::kernel::WaitChildClass::Sigchld,
+                false,
+                false,
+                false,
+            ),
             WaitResult::StillRunning
         ));
 
@@ -3747,7 +3692,11 @@ mod tests {
                 .root_slot(child_context.task().key())
                 .is_none()
         );
-        let WaitResult::Exited(exit) = parent.wait_child_key(child.task_key(), false) else {
+        let WaitResult::Exited(exit) = parent.wait_child_key(
+            child.task_key(),
+            crate::kernel::WaitChildClass::Sigchld,
+            false,
+        ) else {
             panic!("kernel zombie was not visible through adapter wait");
         };
         assert_eq!(exit.pid(), child_id);
@@ -3804,9 +3753,13 @@ mod tests {
                 .kernel_graph()
                 .stop_task_for_job_control(child.task_id(), sigstop, None)
         );
-        let WaitResult::StateChanged(stopped) =
-            parent.wait_child_with_job_control(Some(child.pid()), false, true, false)
-        else {
+        let WaitResult::StateChanged(stopped) = parent.wait_child_with_job_control(
+            Some(child.pid()),
+            crate::kernel::WaitChildClass::Sigchld,
+            false,
+            true,
+            false,
+        ) else {
             panic!("task-scoped stop was not waitable");
         };
         assert_eq!(
@@ -3833,6 +3786,7 @@ mod tests {
         let WaitResult::StateChanged(continued) = parent
             .wait_child_in_process_group_with_job_control(
                 child.process_group().expect("child process group"),
+                crate::kernel::WaitChildClass::Sigchld,
                 false,
                 false,
                 true,
@@ -3852,7 +3806,13 @@ mod tests {
 
         finalize_test_child(&child, 0, child_tid);
         assert!(matches!(
-            parent.wait_child_with_job_control(Some(child.pid()), false, false, false),
+            parent.wait_child_with_job_control(
+                Some(child.pid()),
+                crate::kernel::WaitChildClass::Sigchld,
+                false,
+                false,
+                false,
+            ),
             WaitResult::Exited(_)
         ));
     }

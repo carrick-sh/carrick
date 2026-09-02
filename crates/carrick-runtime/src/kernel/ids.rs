@@ -110,6 +110,53 @@ impl LinuxSignal {
     pub const fn is_realtime(self) -> bool {
         self.0.get() >= 32
     }
+
+    /// `SIGCHLD` (17 on Linux/aarch64): the exit signal an ordinary `fork`
+    /// child delivers, and the one `wait(2)` selects by default.
+    pub const SIGCHLD: Self = Self(NonZeroI32::new(17).unwrap());
+}
+
+/// The signal a task delivers to its parent when it terminates -- the
+/// `CSIGNAL` byte of `clone(2)` flags or `clone3(2)`'s `exit_signal`.
+///
+/// This is task state because Linux `wait(2)` partitions children on it: a
+/// child whose exit signal is anything other than `SIGCHLD` -- a different
+/// signal or none at all -- is a "clone child", visible only to a wait that
+/// passes `__WCLONE` or `__WALL`. A plain `waitpid` on such a child is
+/// `ECHILD`, not a reap (wait(2), "__WCLONE").
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ChildExitSignal {
+    /// Exit signal 0: the parent is not signalled at all.
+    None,
+    Signal(LinuxSignal),
+}
+
+impl ChildExitSignal {
+    pub const SIGCHLD: Self = Self::Signal(LinuxSignal::SIGCHLD);
+
+    /// The exit signal a clone request carries. The dispatch layer has
+    /// already lowered an out-of-range `CSIGNAL` byte to 0, so anything
+    /// other than a valid signal number means "no signal".
+    pub fn for_clone_request(raw: u32) -> Self {
+        i32::try_from(raw)
+            .ok()
+            .and_then(|raw| LinuxSignal::for_signal_number(raw).ok())
+            .map_or(Self::None, Self::Signal)
+    }
+
+    /// Whether `wait(2)` treats this child as a "clone child".
+    pub fn is_clone_child(self) -> bool {
+        self != Self::SIGCHLD
+    }
+
+    /// The raw signal number, 0 for none -- the value `clone3`'s
+    /// `exit_signal` field carries.
+    pub fn raw(self) -> i32 {
+        match self {
+            Self::None => 0,
+            Self::Signal(signal) => signal.raw(),
+        }
+    }
 }
 
 serial_id!(TaskSerial);

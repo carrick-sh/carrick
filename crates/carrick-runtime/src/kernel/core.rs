@@ -9,12 +9,13 @@ use super::address::MmBackend;
 use super::container::{Container, ContainerId};
 use super::frame_inventory::{FrameInventoryAuthority, FrameInventoryReserveError};
 use super::ids::{
-    FileTableId, LinuxTid, ObjectIdError, ObjectIdRegistry, ProcessGroupId, SessionId, TaskId,
+    ChildExitSignal, FileTableId, LinuxTid, ObjectIdError, ObjectIdRegistry, ProcessGroupId,
+    SessionId, TaskId,
 };
 use super::objects::{
     Credentials, FileSlot, FileTable, FsContext, Mm, ObjectGraphError, ProcessGroup, Session,
-    Sighand, Task, TaskKey, TaskLifecycle, TaskRef, TaskShared, Thread, ThreadKey, ThreadRef,
-    ThreadResources, Zombie,
+    Sighand, Task, TaskIdentity, TaskKey, TaskLifecycle, TaskRef, TaskShared, Thread, ThreadKey,
+    ThreadRef, ThreadResources, Zombie,
 };
 use super::registry::{IdError, IdRegistry, TaskClaim, ThreadClaim};
 
@@ -874,11 +875,14 @@ impl Kernel {
         let task = Arc::new(Task::new(
             task_key,
             None,
-            process_group_id,
-            session_id,
+            TaskIdentity {
+                process_group: process_group_id,
+                session: session_id,
+            },
             Arc::clone(&shared),
             resources.credentials(),
             Arc::clone(&container),
+            ChildExitSignal::SIGCHLD,
         ));
         // The container's launch-time grant is the root task's starting
         // capability set; `Task::new` seeds the grant-free Docker default
