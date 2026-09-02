@@ -778,7 +778,9 @@ pub mod sysv;
 pub use sysv::SysvWaitState;
 #[macro_use]
 mod time;
-pub use time::raise_host_nofile_backing;
+pub use time::{
+    HOST_FD_HEADROOM, guest_file_table_max, host_open_descriptor_count, raise_host_nofile_backing,
+};
 
 pub use proctitle::{init as proctitle_init, set_host_process_name};
 
@@ -3645,7 +3647,13 @@ mod core_publication_tests {
             self.inner.rename_overlay_entry(from, to)
         }
 
-        fn open_raw_fd(&self, path: &str, write: bool, create: bool, trunc: bool) -> Option<i32> {
+        fn open_raw_fd(
+            &self,
+            path: &str,
+            write: bool,
+            create: bool,
+            trunc: bool,
+        ) -> crate::fs_backend::HostFdOpen<i32> {
             self.inner.open_raw_fd(path, write, create, trunc)
         }
     }

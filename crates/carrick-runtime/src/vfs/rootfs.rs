@@ -336,12 +336,11 @@ impl RootFsVfs {
                 if want_create && want_excl {
                     return Err(LINUX_EEXIST);
                 }
-                if let Some((host_fd, metadata)) = self.overlay.open_raw_fd_with_metadata(
-                    path,
-                    writable_request,
-                    false,
-                    want_trunc,
-                ) {
+                if let Some((host_fd, metadata)) = self
+                    .overlay
+                    .open_raw_fd_with_metadata(path, writable_request, false, want_trunc)
+                    .lowerable()?
+                {
                     return Ok(OpenDispatchResult::HostFile {
                         host_fd,
                         metadata,
@@ -352,9 +351,10 @@ impl RootFsVfs {
                 let mode = backend_md.as_ref().map(|m| m.mode).unwrap_or(0o644);
                 // Disk-backed overlay (--fs host): hand back a REAL host
                 // fd so reads/writes share the kernel file across fork.
-                if let Some(host_fd) =
-                    self.overlay
-                        .open_raw_fd(path, writable_request, false, want_trunc)
+                if let Some(host_fd) = self
+                    .overlay
+                    .open_raw_fd(path, writable_request, false, want_trunc)
+                    .lowerable()?
                 {
                     let size = if want_trunc {
                         0
@@ -481,9 +481,10 @@ impl RootFsVfs {
                     // an in-memory copy (invisible to forked children and
                     // never persisted), and renames of rootfs files hit EROFS
                     // (dpkg's status/status-old rewrite failed).
-                    if let Some(host_fd) =
-                        self.overlay
-                            .open_raw_fd(path, writable_request, false, want_trunc)
+                    if let Some(host_fd) = self
+                        .overlay
+                        .open_raw_fd(path, writable_request, false, want_trunc)
+                        .lowerable()?
                     {
                         let size = if want_trunc { 0 } else { metadata.size };
                         let md = RootFsMetadata {
@@ -527,6 +528,7 @@ impl RootFsVfs {
                             if let Some((host_fd, host_metadata)) = self
                                 .overlay
                                 .open_raw_fd_with_metadata(path, true, false, false)
+                                .lowerable()?
                             {
                                 return Ok(OpenDispatchResult::HostFile {
                                     host_fd,
@@ -549,6 +551,7 @@ impl RootFsVfs {
                         if let Some((host_fd, host_metadata)) = self
                             .overlay
                             .open_raw_fd_with_metadata(path, true, false, false)
+                            .lowerable()?
                         {
                             return Ok(OpenDispatchResult::HostFile {
                                 host_fd,
@@ -1286,7 +1289,7 @@ mod tests {
     use super::*;
     #[cfg(target_os = "macos")]
     use crate::fs_backend::HostFsBackend;
-    use crate::fs_backend::{BackendError, OverlayEntryKind};
+    use crate::fs_backend::{BackendError, HostFdOpen, OverlayEntryKind};
     use crate::rootfs::LayerSource;
     use std::os::fd::IntoRawFd;
     use std::sync::Arc;
@@ -1726,14 +1729,17 @@ mod tests {
             write: bool,
             _create: bool,
             _trunc: bool,
-        ) -> Option<i32> {
+        ) -> HostFdOpen<i32> {
             self.raw_open_calls.fetch_add(1, Ordering::SeqCst);
             let mut opts = std::fs::OpenOptions::new();
             opts.read(true);
             if write {
                 opts.write(true);
             }
-            opts.open(&self.host_path).ok().map(IntoRawFd::into_raw_fd)
+            match opts.open(&self.host_path) {
+                Ok(file) => HostFdOpen::Served(file.into_raw_fd()),
+                Err(_) => HostFdOpen::Unavailable,
+            }
         }
 
         fn open_raw_fd_with_metadata(
@@ -1742,19 +1748,18 @@ mod tests {
             write: bool,
             _create: bool,
             _trunc: bool,
-        ) -> Option<(i32, RootFsMetadata)> {
+        ) -> HostFdOpen<(i32, RootFsMetadata)> {
             self.combined_open_calls.fetch_add(1, Ordering::SeqCst);
             let mut opts = std::fs::OpenOptions::new();
             opts.read(true);
             if write {
                 opts.write(true);
             }
-            let fd = opts
-                .open(&self.host_path)
-                .ok()
-                .map(IntoRawFd::into_raw_fd)?;
-            Some((
-                fd,
+            let Ok(file) = opts.open(&self.host_path) else {
+                return HostFdOpen::Unavailable;
+            };
+            HostFdOpen::Served((
+                file.into_raw_fd(),
                 RootFsMetadata {
                     path: std::path::Path::new(path).to_path_buf(),
                     kind: RootFsEntryKind::File,

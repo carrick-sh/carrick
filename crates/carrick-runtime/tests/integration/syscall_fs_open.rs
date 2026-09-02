@@ -200,7 +200,13 @@ impl FsBackend for CountingMemoryBackend {
         self.inner.rename_overlay_entry(from, to)
     }
 
-    fn open_raw_fd(&self, path: &str, write: bool, create: bool, trunc: bool) -> Option<i32> {
+    fn open_raw_fd(
+        &self,
+        path: &str,
+        write: bool,
+        create: bool,
+        trunc: bool,
+    ) -> carrick_runtime::fs_backend::HostFdOpen<i32> {
         self.inner.open_raw_fd(path, write, create, trunc)
     }
 }

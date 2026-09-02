@@ -499,6 +499,19 @@ impl KernelThreadLimit {
 
 const DEFAULT_THREADS_MAX: KernelThreadLimit = KernelThreadLimit::new(63_087);
 
+fn sysctl_file_max() -> Vec<u8> {
+    format!("{}\n", crate::dispatch::guest_file_table_max()).into_bytes()
+}
+
+fn sysctl_file_nr() -> Vec<u8> {
+    format!(
+        "{}\t0\t{}\n",
+        crate::dispatch::host_open_descriptor_count(),
+        crate::dispatch::guest_file_table_max()
+    )
+    .into_bytes()
+}
+
 fn sysctl_threads_max() -> Vec<u8> {
     let limit = host_threads_max().unwrap_or(DEFAULT_THREADS_MAX);
     format!("{}\n", limit.raw()).into_bytes()
@@ -764,10 +777,14 @@ const SYSCTL_TABLE: &[(&str, Sysctl)] = &[
     // TCONFs "Path is not writable". 100 is the kernel default and the value
     // the oracle reports.
     ("/proc/sys/vm/vfs_cache_pressure", Sysctl::Static(b"100\n")),
-    // fs.* — file-max/nr_open match NOFILE_HARD (the RLIMIT_NOFILE ceiling
-    // carrick enforces). file-nr is exactly THREE tab-separated ints.
-    ("/proc/sys/fs/file-max", Sysctl::Static(b"1048576\n")),
-    ("/proc/sys/fs/file-nr", Sysctl::Static(b"256\t0\t1048576\n")),
+    // fs.* — nr_open is the RLIMIT_NOFILE ceiling carrick enforces (the
+    // per-process bound a guest may raise itself to). file-max and the third
+    // field of file-nr are the SYSTEM file table, which for a carrier is the
+    // host descriptors it can really hold minus its own headroom — honest,
+    // and therefore dynamic. file-nr is exactly THREE tab-separated ints:
+    // allocated, unused (always 0 on modern Linux), max.
+    ("/proc/sys/fs/file-max", Sysctl::Dynamic(sysctl_file_max)),
+    ("/proc/sys/fs/file-nr", Sysctl::Dynamic(sysctl_file_nr)),
     ("/proc/sys/fs/nr_open", Sysctl::Static(b"1048576\n")),
     ("/proc/sys/fs/aio-max-nr", Sysctl::Static(b"65536\n")),
     ("/proc/sys/fs/pipe-max-size", Sysctl::Static(b"1048576\n")),
@@ -4689,7 +4706,6 @@ mod tests {
             ("/proc/sys/fs/inotify/max_user_watches", "1048576\n"),
             ("/proc/sys/net/ipv4/ip_local_port_range", "32768\t60999\n"),
             ("/proc/sys/net/ipv4/tcp_rmem", "4096\t131072\t6291456\n"),
-            ("/proc/sys/fs/file-nr", "256\t0\t1048576\n"),
             ("/proc/sys/fs/aio-max-nr", "65536\n"),
             ("/proc/sys/kernel/random/entropy_avail", "256\n"),
             // LTP's tst_sys_conf save/restore only TCONFs a test when the leaf
@@ -4702,6 +4718,49 @@ mod tests {
             let got = synthetic_file(path, &ctx()).unwrap();
             assert_eq!(String::from_utf8(got).unwrap(), want, "{path}");
         }
+    }
+
+    /// `file-nr` is three tab-separated integers whose third field equals
+    /// `file-max`, and both describe the host descriptor budget the carrier
+    /// can really back (its `RLIMIT_NOFILE` soft limit minus headroom) —
+    /// never a literal the guest cannot reach. A guest sizing a descriptor
+    /// loop from `file-max` (LTP fork09 via `sysconf(_SC_OPEN_MAX)` is the
+    /// per-process twin) must therefore see `open` refused with `ENFILE`
+    /// at exactly this budget rather than an erased host `EMFILE`.
+    // `rlim_t` is signed on FreeBSD; the cast is load-bearing there.
+    #[allow(clippy::unnecessary_cast)]
+    #[test]
+    fn sysctl_file_table_reports_host_backed_budget() {
+        let file_max =
+            String::from_utf8(synthetic_file("/proc/sys/fs/file-max", &ctx()).unwrap()).unwrap();
+        let file_nr =
+            String::from_utf8(synthetic_file("/proc/sys/fs/file-nr", &ctx()).unwrap()).unwrap();
+        let max: u64 = file_max.trim_end().parse().unwrap();
+        let fields: Vec<&str> = file_nr.trim_end().split('\t').collect();
+        assert_eq!(fields.len(), 3, "{file_nr:?}");
+        let allocated: u64 = fields[0].parse().unwrap();
+        assert_eq!(fields[1], "0");
+        assert_eq!(fields[2].parse::<u64>().unwrap(), max);
+        assert!(
+            allocated >= 3,
+            "this test process holds at least stdio: {file_nr:?}"
+        );
+        let mut rl = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: valid writable rlimit, valid resource.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) }, 0);
+        // Independent recomputation: the soft limit, clamped by the kernel's
+        // per-process ceiling where the host publishes one, minus headroom.
+        let mut backing = rl.rlim_cur as u64;
+        if let Some(ceiling) = carrick_host::host_facts::per_process_descriptor_ceiling() {
+            backing = backing.min(ceiling);
+        }
+        assert_eq!(
+            max,
+            backing.saturating_sub(crate::dispatch::HOST_FD_HEADROOM)
+        );
     }
 
     #[test]

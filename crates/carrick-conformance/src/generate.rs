@@ -77,13 +77,17 @@ const LTP_SMOKE: &[&str] = &[
     "sched_getaffinity01",
 ];
 
-/// fd-fill cases that loop `dup` up to RLIMIT_NOFILE. Docker's default is
-/// 1 Mi, and each guest `dup`/`close` costs the HVF trap floor (~1.9 us on
-/// this host, measured 2026-09-01 as a null `getppid`; the fd table itself
-/// is O(touched) per call), so a full fill is ~4.4 s against the gate's
-/// 2x-oracle+2 s budget. The same bound applies to the oracle command, so
-/// both sides measure dup-at-exhaustion semantics rather than trap cost.
-const LTP_NOFILE_4096: &[&str] = &["dup03", "dup06", "dup205"];
+/// fd-fill cases that loop `dup`/`fopen` up to RLIMIT_NOFILE. Docker's
+/// default is 1 Mi, and each guest `dup`/`close` costs the HVF trap floor
+/// (~1.9 us on this host, measured 2026-09-01 as a null `getppid`; the fd
+/// table itself is O(touched) per call), so a full fill is ~4.4 s against the
+/// gate's 2x-oracle+2 s budget. The same bound applies to the oracle command,
+/// so both sides measure exhaustion semantics rather than trap cost. fork09
+/// additionally creates a real file per fd, and its `sysconf(_SC_OPEN_MAX)`
+/// loop must end in `EMFILE` at the guest's own limit — below the host
+/// descriptor budget carrick advertises as `/proc/sys/fs/file-max`, where
+/// the answer is `ENFILE`.
+const LTP_NOFILE_4096: &[&str] = &["dup03", "dup06", "dup205", "fork09"];
 
 /// Exact LTP command overrides that must survive manifest regeneration. Keep
 /// these narrow: each one documents a known harness/resource mismatch where the
@@ -754,7 +758,7 @@ fn build() -> (Vec<Suite>, (usize, usize, usize)) {
     ltp.sort();
     for b in &ltp {
         let cmd = ltp_cmd(b);
-        let mut suite = mk(
+        suites.push(mk(
             format!("ltp-{b}"),
             Ecosystem::Ltp,
             LTP_IMG,
@@ -765,14 +769,7 @@ fn build() -> (Vec<Suite>, (usize, usize, usize)) {
             ltp_timeout_s(b),
             None,
             None,
-        );
-        if b == "fork09" {
-            // fork09 opens fds to RLIMIT_NOFILE; Docker's default (1048576) is
-            // far above carrick's, so align the oracle to the same bound the
-            // carrick guest sees (same rationale as cpython test_no_leaking).
-            suite.docker_flags = vec![s("--ulimit"), s("nofile=1024:1024")];
-        }
-        suites.push(suite);
+        ));
     }
 
     for s in &mut suites {

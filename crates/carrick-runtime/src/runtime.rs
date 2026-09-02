@@ -704,6 +704,18 @@ pub(crate) fn finish_and_run_image(
     // Arm the one carrier's deadlock watchdog. Logical fork children advance
     // the same carrier-global counter; no host-child re-arm exists.
     crate::deadlock_watchdog::arm();
+    // Back the guest's default fd table with real host descriptors. Every
+    // guest-visible file is a host fd, so the carrier's own `RLIMIT_NOFILE`
+    // (macOS starts at 256) must cover the guest default plus headroom, or
+    // a guest well inside its own limit is refused by the host (libuv's
+    // ~2500 UDP sockets, LTP creat05/fork09). Carrier-lifetime, idempotent,
+    // only ever raises — see the `carrier.rs` ledger. Shared here so the
+    // embedded runner gets it, not only the CLI.
+    crate::dispatch::raise_host_nofile_backing(
+        crate::kernel::objects::RlimitSet::carrick_defaults()
+            .get(carrick_abi::LinuxResource::Nofile)
+            .rlim_cur,
+    );
     // Per-ISA image bytes come from the engine's GuestArch (the x86_64 seam);
     // this file is the macOS/HVF path, so the engine is `HvfTrapEngine`.
     use carrick_hal::GuestArch as _;

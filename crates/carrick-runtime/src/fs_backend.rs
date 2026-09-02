@@ -63,6 +63,127 @@ pub enum BackendError {
     Invalid,
     Io,
     Unsupported,
+    /// The host refused a resource the guest is entitled to (its own
+    /// descriptor, disk space, quota), already translated into the guest's
+    /// errno by [`host_open_refusal`]. Authoritative: the dispatcher returns
+    /// it as-is instead of the generic `EINVAL`/`EIO` it lowers `Io` to.
+    Host(LinuxErrno),
+}
+
+/// Outcome of a backend handing the dispatcher a host fd for a guest open
+/// ([`FsBackend::open_raw_fd`], [`FsBackend::create_raw_fd`],
+/// [`FsBackend::open_raw_fd_with_metadata`]).
+///
+/// Two different "no fd" answers used to share one `Option::None`: "this
+/// backend cannot serve the path from here, keep lowering" and "the host
+/// refused the open outright". The dispatcher lowers the first to the next
+/// backend, then to a create, then to `EINVAL` — so a host `EMFILE` on the
+/// guest's own open reached the guest as `EINVAL` (LTP `fork09` breaks its
+/// fill loop only on `EMFILE` and TBROKs on anything else). The two are now
+/// distinct variants and a refusal carries the guest's errno.
+#[must_use]
+#[derive(Debug)]
+pub enum HostFdOpen<T> {
+    /// The fd IS the guest's open (caller owns it, must close it).
+    Served(T),
+    /// Not servable from this backend: the caller keeps its exact next
+    /// lowering (another layer, the layered resolver, `ENOENT`, a create).
+    /// Deliberately carries no host errno — the fast-path errno rule
+    /// (`docs/fs-host-capstd-amplification.md`) makes only `ENOENT`
+    /// authoritative below the layered view, and every other path-semantic
+    /// host errno is a fact about the HOST's resolution, not the guest's.
+    Unavailable,
+    /// The host refused a resource the guest is entitled to, already
+    /// translated into the guest's errno by [`host_open_refusal`].
+    /// Authoritative: no further lowering may hide it.
+    Refused(LinuxErrno),
+}
+
+impl<T> HostFdOpen<T> {
+    /// The served value, dropping the distinction between `Unavailable` and
+    /// `Refused`. For callers that own no guest-visible errno of their own
+    /// (internal reopen helpers, tests); a dispatcher path must match.
+    pub fn served(self) -> Option<T> {
+        match self {
+            Self::Served(value) => Some(value),
+            Self::Unavailable | Self::Refused(_) => None,
+        }
+    }
+
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> HostFdOpen<U> {
+        match self {
+            Self::Served(value) => HostFdOpen::Served(f(value)),
+            Self::Unavailable => HostFdOpen::Unavailable,
+            Self::Refused(errno) => HostFdOpen::Refused(errno),
+        }
+    }
+
+    /// Lower to the next lowering only when this one was `Unavailable`; a
+    /// refusal is final.
+    pub fn or_else(self, f: impl FnOnce() -> HostFdOpen<T>) -> HostFdOpen<T> {
+        match self {
+            Self::Unavailable => f(),
+            served_or_refused => served_or_refused,
+        }
+    }
+
+    /// For a caller that lowers `Unavailable` to its next lowering but must
+    /// stop on a refusal: `Ok(Some)` served, `Ok(None)` lower further,
+    /// `Err` the guest's final answer.
+    pub fn lowerable(self) -> Result<Option<T>, LinuxErrno> {
+        match self {
+            Self::Served(value) => Ok(Some(value)),
+            Self::Unavailable => Ok(None),
+            Self::Refused(refused) => Err(refused),
+        }
+    }
+
+    /// As a guest errno: `Unavailable` is the caller's own `unavailable`
+    /// errno, a refusal keeps its own.
+    pub fn into_errno(self, unavailable: LinuxErrno) -> Result<T, LinuxErrno> {
+        match self {
+            Self::Served(value) => Ok(value),
+            Self::Unavailable => Err(unavailable),
+            Self::Refused(refused) => Err(refused),
+        }
+    }
+
+    /// As a backend result: `Unavailable` is the backend's own `Io`, a
+    /// refusal keeps its errno.
+    pub fn into_backend_result(self) -> Result<T, BackendError> {
+        match self {
+            Self::Served(value) => Ok(value),
+            Self::Unavailable => Err(BackendError::Io),
+            Self::Refused(refused) => Err(BackendError::Host(refused)),
+        }
+    }
+}
+
+/// Classify a host open failure for the guest's own open: is this a
+/// resource the guest was entitled to (its answer), or a fact about the
+/// host's path resolution (the layered resolver's)?
+///
+/// `EMFILE`/`ENFILE`: the guest is BELOW its own `RLIMIT_NOFILE` — the fd
+/// table enforced that before the host was asked — so what is full is the
+/// system's table, which Linux reports as `ENFILE`. `ENOSPC`/`EDQUOT`/
+/// `ENOMEM`/`EIO`: the host storage is the authority for real I/O and its
+/// refusal is exact. Everything else (`ENOENT`, `ENOTDIR`, `ELOOP`,
+/// `EACCES`, `EISDIR`, `EEXIST`, …) describes the host's view of the path,
+/// which the guest's layered view may legitimately differ from: `None`,
+/// and the caller stays `Unavailable`.
+pub(crate) fn host_open_refusal(host_errno: i32) -> Option<LinuxErrno> {
+    match host_errno {
+        libc::EMFILE | libc::ENFILE => Some(crate::linux_abi::LINUX_ENFILE),
+        libc::ENOSPC | libc::EDQUOT | libc::ENOMEM | libc::EIO => {
+            Some(crate::host_to_linux_errno(host_errno))
+        }
+        _ => None,
+    }
+}
+
+/// [`host_open_refusal`] of an `io::Error` (a cap-std/`std` failure).
+pub(crate) fn io_open_refusal(error: &std::io::Error) -> Option<LinuxErrno> {
+    error.raw_os_error().and_then(host_open_refusal)
 }
 
 /// Durable authority needed to reopen the exact host-filesystem overlay after
@@ -496,9 +617,11 @@ pub trait FsBackend: Send + Sync {
     /// close it). The host fd carries the guest's own access mode; the
     /// dispatcher separately tracks guest-visible writability, and a
     /// consumer needing broader host access asks for it explicitly through
-    /// [`Self::upgrade_host_fd_for_shared_map`]. `MemoryBackend` returns None: an in-memory
-    /// HashMap has no kernel fd and cannot be shared across a real fork, so
-    /// the dispatcher keeps its in-memory File model there.
+    /// [`Self::upgrade_host_fd_for_shared_map`]. `MemoryBackend` returns
+    /// `Unavailable`: an in-memory HashMap has no kernel fd and cannot be
+    /// shared across a real fork, so the dispatcher keeps its in-memory File
+    /// model there. A host resource refusal (`EMFILE`, `ENOSPC`, …) is
+    /// `Refused` with the guest's errno — see [`HostFdOpen`].
     ///
     /// CONTRACT: every host fd a backend hands out — here, from
     /// [`Self::open_raw_fd_with_metadata`], [`Self::create_raw_fd`],
@@ -508,7 +631,7 @@ pub trait FsBackend: Send + Sync {
     /// guest blocking itself, so the backend opens with the flag instead of
     /// the dispatcher paying an `F_GETFL`+`F_SETFL` round trip per open; the
     /// install sites only `debug_assert` it.
-    fn open_raw_fd(&self, path: &str, write: bool, create: bool, trunc: bool) -> Option<i32>;
+    fn open_raw_fd(&self, path: &str, write: bool, create: bool, trunc: bool) -> HostFdOpen<i32>;
 
     /// Re-open the regular file behind `fd` (a host fd this backend handed
     /// out, currently `O_RDONLY`) `O_RDWR` and install the new open IN PLACE
@@ -540,7 +663,7 @@ pub trait FsBackend: Send + Sync {
     /// (the mode is not owner-representable on the host, or the backend
     /// created with its default mode). Default: the plain create-open,
     /// mode not applied.
-    fn create_raw_fd(&self, path: &str, _mode: u32, trunc: bool) -> Option<(i32, bool)> {
+    fn create_raw_fd(&self, path: &str, _mode: u32, trunc: bool) -> HostFdOpen<(i32, bool)> {
         self.open_raw_fd(path, true, true, trunc)
             .map(|fd| (fd, false))
     }
@@ -562,8 +685,8 @@ pub trait FsBackend: Send + Sync {
         _write: bool,
         _create: bool,
         _trunc: bool,
-    ) -> Option<(i32, RootFsMetadata)> {
-        None
+    ) -> HostFdOpen<(i32, RootFsMetadata)> {
+        HostFdOpen::Unavailable
     }
 
     /// Open host vnode descriptors for inotify-style watches. Directory
@@ -1549,11 +1672,17 @@ impl FsBackend for MemoryBackend {
         Ok(true)
     }
 
-    fn open_raw_fd(&self, _path: &str, _write: bool, _create: bool, _trunc: bool) -> Option<i32> {
+    fn open_raw_fd(
+        &self,
+        _path: &str,
+        _write: bool,
+        _create: bool,
+        _trunc: bool,
+    ) -> HostFdOpen<i32> {
         // No kernel fd backs an in-memory HashMap, and a real
         // libc::fork can't share it. The dispatcher uses its in-memory
         // File model for this backend.
-        None
+        HostFdOpen::Unavailable
     }
 
     fn name(&self) -> &'static str {
@@ -1981,6 +2110,10 @@ enum FastGuestOpen {
     /// view — e.g. an intermediate ABSOLUTE symlink resolves against the host
     /// root here but under the guest root on the slow path.
     Fallback,
+    /// The host refused a resource the guest is entitled to (see
+    /// [`host_open_refusal`]) even after carrick reclaimed its own descriptor
+    /// caches. Final: the slow path would only re-ask the same kernel.
+    Refused(LinuxErrno),
 }
 
 /// Result of an immutable host lower's read-only regular-file fast path.
@@ -2854,6 +2987,53 @@ impl HostFsBackend {
         self.dir_cache.lock().clear();
     }
 
+    /// The guest's own host open failed with `host_errno`. If that is
+    /// descriptor exhaustion and carrick's own directory cache (up to 4096
+    /// held dirfds) may be why, reclaim it and report `true`: the caller
+    /// retries ONCE — the move a kernel makes when a cache exhausts its
+    /// resource, and the same one `dir_fd_for` makes for its own opens. A
+    /// second failure is then the guest's answer.
+    #[cfg(target_os = "macos")]
+    fn reclaim_for_host_refusal(&self, host_errno: i32) -> bool {
+        if !matches!(host_errno, libc::EMFILE | libc::ENFILE) {
+            return false;
+        }
+        let mut cache = self.dir_cache.lock();
+        let held = !cache.is_empty();
+        cache.clear();
+        held
+    }
+
+    /// `openat` for the guest's own open, with the one reclaim-and-retry
+    /// [`Self::reclaim_for_host_refusal`] allows. `Err` carries the host
+    /// errno of the final attempt.
+    #[cfg(target_os = "macos")]
+    fn openat_for_guest(
+        &self,
+        dir_fd: i32,
+        name: &std::ffi::CStr,
+        flags: i32,
+        mode: libc::c_uint,
+    ) -> Result<i32, i32> {
+        let raw = unsafe { libc::openat(dir_fd, name.as_ptr(), flags, mode) };
+        if raw >= 0 {
+            return Ok(raw);
+        }
+        let errno = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO);
+        if !self.reclaim_for_host_refusal(errno) {
+            return Err(errno);
+        }
+        let raw = unsafe { libc::openat(dir_fd, name.as_ptr(), flags, mode) };
+        if raw >= 0 {
+            return Ok(raw);
+        }
+        Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO))
+    }
+
     #[cfg(not(target_os = "macos"))]
     fn drop_dir_cache(&self) {}
 
@@ -3145,14 +3325,17 @@ impl HostFsBackend {
         // open for it. A write request failing with its real access mode lets
         // the cap-std path produce the exact error/None it does today.
         let accmode = if write { libc::O_RDWR } else { libc::O_RDONLY };
-        let raw = unsafe { libc::openat(dir_fd, rel_c.as_ptr(), accmode | base, 0) };
-        if raw < 0 {
-            return match std::io::Error::last_os_error().raw_os_error() {
-                Some(libc::ELOOP) => FastGuestOpen::SymlinkLeaf,
-                Some(libc::ENOENT) if !write => FastGuestOpen::Missing,
-                _ => FastGuestOpen::Fallback,
-            };
-        }
+        let raw = match self.openat_for_guest(dir_fd, rel_c, accmode | base, 0) {
+            Ok(raw) => raw,
+            Err(libc::ELOOP) => return FastGuestOpen::SymlinkLeaf,
+            Err(libc::ENOENT) if !write => return FastGuestOpen::Missing,
+            Err(errno) => {
+                return match host_open_refusal(errno) {
+                    Some(refused) => FastGuestOpen::Refused(refused),
+                    None => FastGuestOpen::Fallback,
+                };
+            }
+        };
         // SAFETY: `raw` is a freshly-opened owned fd; OwnedFd closes it on
         // drop, covering every early return below.
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
@@ -3220,12 +3403,14 @@ impl HostFsBackend {
     /// reported `mode_applied = false` so the caller records it via the
     /// xattr override exactly as before.
     #[cfg(target_os = "macos")]
-    fn fast_create_for_guest(&self, rel: &Path, mode: u32, trunc: bool) -> Option<(i32, bool)> {
+    fn fast_create_for_guest(&self, rel: &Path, mode: u32, trunc: bool) -> HostFdOpen<(i32, bool)> {
         use std::os::fd::AsRawFd;
         if !self.fast_fs || self.root_prefix.is_none() {
-            return None;
+            return HostFdOpen::Unavailable;
         }
-        let (parent_fd, name_c) = self.namei_leaf(rel)?;
+        let Some((parent_fd, name_c)) = self.namei_leaf(rel) else {
+            return HostFdOpen::Unavailable;
+        };
         let mode = mode & 0o7777;
         let representable = mode & 0o600 == 0o600;
         let host_mode = if representable { mode } else { mode | 0o600 };
@@ -3244,17 +3429,20 @@ impl HostFsBackend {
         if trunc {
             flags |= libc::O_TRUNC;
         }
-        let raw = unsafe {
-            libc::openat(
-                parent_fd.as_raw_fd(),
-                name_c.as_ptr(),
-                flags,
-                host_mode as libc::c_uint,
-            )
+        let raw = match self.openat_for_guest(
+            parent_fd.as_raw_fd(),
+            &name_c,
+            flags,
+            host_mode as libc::c_uint,
+        ) {
+            Ok(raw) => raw,
+            Err(errno) => {
+                return match host_open_refusal(errno) {
+                    Some(refused) => HostFdOpen::Refused(refused),
+                    None => HostFdOpen::Unavailable,
+                };
+            }
         };
-        if raw < 0 {
-            return None;
-        }
         let mut st: libc::stat = unsafe { core::mem::zeroed() };
         if unsafe { libc::fstat(raw, &mut st) } != 0
             || st.st_mode as u32 & libc::S_IFMT as u32 != libc::S_IFREG as u32
@@ -3264,13 +3452,13 @@ impl HostFsBackend {
             unsafe {
                 libc::close(raw);
             }
-            return None;
+            return HostFdOpen::Unavailable;
         }
         if !self.name_matches_on_disk(rel) {
             unsafe {
                 libc::close(raw);
             }
-            return None;
+            return HostFdOpen::Unavailable;
         }
         // The kernel applied the host umask to `host_mode` and may drop a
         // setuid/setgid/sticky bit at creation; only a requested bit in
@@ -3280,7 +3468,7 @@ impl HostFsBackend {
                 libc::fchmod(raw, mode as libc::mode_t);
             }
         }
-        Some((raw, representable))
+        HostFdOpen::Served((raw, representable))
     }
 
     /// Prove that an ENOENT from `fast_open_for_guest` is a real miss in this
@@ -3397,11 +3585,15 @@ impl HostFsBackend {
                 FastGuestOpen::Missing if self.missing_below_contained_ancestor(rel) => {
                     ImmutableHostFileOpen::Missing
                 }
+                // A host refusal is reported by the exact open the fallback
+                // performs (`open_raw_fd_with_metadata` → `Refused`), where
+                // the dispatcher owns the errno.
                 FastGuestOpen::Served { .. }
                 | FastGuestOpen::SymlinkLeaf
                 | FastGuestOpen::Fifo
                 | FastGuestOpen::Missing
-                | FastGuestOpen::Fallback => ImmutableHostFileOpen::Fallback,
+                | FastGuestOpen::Fallback
+                | FastGuestOpen::Refused(_) => ImmutableHostFileOpen::Fallback,
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -3658,16 +3850,22 @@ impl HostFsBackend {
         write: bool,
         create: bool,
         trunc: bool,
-    ) -> Option<i32> {
+    ) -> HostFdOpen<i32> {
         use std::os::fd::IntoRawFd;
         // Follow symlinks by hand first so an absolute symlink target (which
         // cap-std refuses to traverse) resolves to the file under the guest
         // root rather than opening the link itself.
-        let normalized = self.resolve_following(path)?;
+        let Some(normalized) = self.resolve_following(path) else {
+            return HostFdOpen::Unavailable;
+        };
         // A tombstoned path is "deleted" in the layered view; don't
         // resurrect it via a raw open.
-        let rel = Self::rel_path(&normalized)?;
-        let (dir, at_rel) = self.at(rel).ok()?;
+        let Some(rel) = Self::rel_path(&normalized) else {
+            return HostFdOpen::Unavailable;
+        };
+        let Ok((dir, at_rel)) = self.at(rel) else {
+            return HostFdOpen::Unavailable;
+        };
         use cap_std::fs::OpenOptionsExt as _;
         let mut opts = cap_std::fs::OpenOptions::new();
         opts.read(true).custom_flags(libc::O_NONBLOCK);
@@ -3680,31 +3878,67 @@ impl HostFsBackend {
         // description upgrades it in place through
         // `upgrade_host_fd_for_shared_map` rather than every open paying for
         // an O_RDWR host open it will never use.
-        let file = if !write && !trunc && !create {
-            dir.open_with(&at_rel, &opts).ok()?
-        } else {
-            match dir.open_with(&at_rel, &opts) {
-                Ok(file) => file,
-                // A create-open only needs its ancestors materialised when one
-                // is genuinely missing. Walking them up front cost a full
-                // cap-std ancestor re-open on EVERY create-open, which is the
-                // dominant term in the 32.78 host syscalls a guest `openat`
-                // costs on a cold `go build`; the parent almost always exists.
-                Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
-                    if let Some(parent) = at_rel.parent()
-                        && !parent.as_os_str().is_empty()
-                    {
-                        dir.create_dir_all(parent).ok()?;
-                    }
-                    dir.open_with(&at_rel, &opts).ok()?
+        let file = match self.open_with_for_guest(&dir, &at_rel, &opts) {
+            Ok(file) => file,
+            // A create-open only needs its ancestors materialised when one
+            // is genuinely missing. Walking them up front cost a full
+            // cap-std ancestor re-open on EVERY create-open, which is the
+            // dominant term in the 32.78 host syscalls a guest `openat`
+            // costs on a cold `go build`; the parent almost always exists.
+            Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(parent) = at_rel.parent()
+                    && !parent.as_os_str().is_empty()
+                    && let Err(error) = dir.create_dir_all(parent)
+                {
+                    return match io_open_refusal(&error) {
+                        Some(refused) => HostFdOpen::Refused(refused),
+                        None => HostFdOpen::Unavailable,
+                    };
                 }
-                Err(_) => return None,
+                match self.open_with_for_guest(&dir, &at_rel, &opts) {
+                    Ok(file) => file,
+                    Err(error) => {
+                        return match io_open_refusal(&error) {
+                            Some(refused) => HostFdOpen::Refused(refused),
+                            None => HostFdOpen::Unavailable,
+                        };
+                    }
+                }
+            }
+            Err(error) => {
+                return match io_open_refusal(&error) {
+                    Some(refused) => HostFdOpen::Refused(refused),
+                    None => HostFdOpen::Unavailable,
+                };
             }
         };
         // Hand the kernel fd to the caller. `into_raw_fd` consumes the
         // cap-std File without closing it, so the dispatcher owns the
         // fd lifetime (it closes it on guest close()).
-        Some(file.into_std().into_raw_fd())
+        HostFdOpen::Served(file.into_std().into_raw_fd())
+    }
+
+    /// cap-std `open_with` for the guest's own open, with the one
+    /// reclaim-and-retry [`Self::reclaim_for_host_refusal`] allows (a
+    /// no-op off macOS, where there is no directory cache to reclaim).
+    fn open_with_for_guest(
+        &self,
+        dir: &cap_std::fs::Dir,
+        at_rel: &Path,
+        opts: &cap_std::fs::OpenOptions,
+    ) -> std::io::Result<cap_std::fs::File> {
+        match dir.open_with(at_rel, opts) {
+            Ok(file) => Ok(file),
+            #[cfg(target_os = "macos")]
+            Err(error)
+                if error
+                    .raw_os_error()
+                    .is_some_and(|errno| self.reclaim_for_host_refusal(errno)) =>
+            {
+                dir.open_with(at_rel, opts)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -5569,17 +5803,21 @@ impl FsBackend for HostFsBackend {
         // Optimistic first, ancestor walk only on a genuinely missing parent —
         // the same reason as `make_dir` above: cap-std re-opens every ancestor
         // component on every call, and the parent almost always exists.
-        if let Err(error) = dir.open_with(&at_rel, &opts) {
+        let host_error = |error: std::io::Error| match io_open_refusal(&error) {
+            Some(refused) => BackendError::Host(refused),
+            None => BackendError::Io,
+        };
+        if let Err(error) = self.open_with_for_guest(&dir, &at_rel, &opts) {
             if error.kind() != std::io::ErrorKind::NotFound {
-                return Err(BackendError::Io);
+                return Err(host_error(error));
             }
             if let Some(parent) = at_rel.parent()
                 && !parent.as_os_str().is_empty()
             {
-                dir.create_dir_all(parent).map_err(|_| BackendError::Io)?;
+                dir.create_dir_all(parent).map_err(host_error)?;
             }
-            dir.open_with(&at_rel, &opts)
-                .map_err(|_| BackendError::Io)?;
+            self.open_with_for_guest(&dir, &at_rel, &opts)
+                .map_err(host_error)?;
         }
         self.clear_whiteout_normalized(&normalized);
         Ok(())
@@ -5795,7 +6033,7 @@ impl FsBackend for HostFsBackend {
         }
         let host_fd = self
             .open_raw_fd(path, true, false, false)
-            .ok_or(BackendError::Io)?;
+            .into_backend_result()?;
         let result = (|| {
             let mut written = 0usize;
             while written < bytes.len() {
@@ -6188,7 +6426,7 @@ impl FsBackend for HostFsBackend {
         Ok(true)
     }
 
-    fn open_raw_fd(&self, path: &str, write: bool, create: bool, trunc: bool) -> Option<i32> {
+    fn open_raw_fd(&self, path: &str, write: bool, create: bool, trunc: bool) -> HostFdOpen<i32> {
         // Fd-centric fast path for the common non-creating, non-truncating
         // open: ONE kernel-resolved openat with the real access mode replaces
         // the resolve_following walk + double cap-std open. Creating and
@@ -6203,7 +6441,7 @@ impl FsBackend for HostFsBackend {
             match self.fast_open_for_guest(rel, write) {
                 FastGuestOpen::Served { fd, .. } => {
                     use std::os::fd::IntoRawFd;
-                    return Some(fd.into_raw_fd());
+                    return HostFdOpen::Served(fd.into_raw_fd());
                 }
                 // A FIFO discovered at open time (create race — the
                 // dispatcher normally intercepts FIFOs before this path):
@@ -6212,8 +6450,12 @@ impl FsBackend for HostFsBackend {
                 // O_RDWR for a write request so the open can't ENXIO/block
                 // regardless of reader presence.
                 FastGuestOpen::Fifo => {
-                    return self.open_fifo_nonblock(path, if write { 2 } else { 0 });
+                    return match self.open_fifo_nonblock(path, if write { 2 } else { 0 }) {
+                        Some(fd) => HostFdOpen::Served(fd),
+                        None => HostFdOpen::Unavailable,
+                    };
                 }
+                FastGuestOpen::Refused(refused) => return HostFdOpen::Refused(refused),
                 FastGuestOpen::SymlinkLeaf | FastGuestOpen::Missing | FastGuestOpen::Fallback => {}
             }
         }
@@ -6284,13 +6526,16 @@ impl FsBackend for HostFsBackend {
         true
     }
 
-    fn create_raw_fd(&self, path: &str, mode: u32, trunc: bool) -> Option<(i32, bool)> {
+    fn create_raw_fd(&self, path: &str, mode: u32, trunc: bool) -> HostFdOpen<(i32, bool)> {
         #[cfg(target_os = "macos")]
         if let Some(normalized) = normalize(path)
             && let Some(rel) = Self::rel_path(&normalized)
-            && let Some(created) = self.fast_create_for_guest(rel, mode, trunc)
         {
-            return Some(created);
+            match self.fast_create_for_guest(rel, mode, trunc) {
+                HostFdOpen::Served(created) => return HostFdOpen::Served(created),
+                HostFdOpen::Refused(refused) => return HostFdOpen::Refused(refused),
+                HostFdOpen::Unavailable => {}
+            }
         }
         self.open_raw_fd_capstd(path, true, true, trunc)
             .map(|fd| (fd, false))
@@ -6298,8 +6543,8 @@ impl FsBackend for HostFsBackend {
 
     fn reopen_for_durability(&self, path: &str) -> Result<Option<i32>, BackendError> {
         self.open_raw_fd(path, true, false, false)
+            .into_backend_result()
             .map(Some)
-            .ok_or(BackendError::Io)
     }
 
     fn open_raw_fd_with_metadata(
@@ -6308,7 +6553,7 @@ impl FsBackend for HostFsBackend {
         write: bool,
         create: bool,
         trunc: bool,
-    ) -> Option<(i32, RootFsMetadata)> {
+    ) -> HostFdOpen<(i32, RootFsMetadata)> {
         // Same fast path as `open_raw_fd`, deriving the dispatch metadata
         // from the SAME fd (fstat + one flistxattr-gated xattr pass) so the
         // served open needs no separate lookup/metadata walk at all.
@@ -6325,7 +6570,7 @@ impl FsBackend for HostFsBackend {
                         // routes directories through the Directory arm); the
                         // fd drops (closes) and the caller's `open_raw_fd`
                         // fallback reproduces the historical behavior.
-                        return None;
+                        return HostFdOpen::Unavailable;
                     }
                     use std::os::fd::{AsRawFd, IntoRawFd};
                     let override_mode = if self.serves_plain_metadata() {
@@ -6339,7 +6584,7 @@ impl FsBackend for HostFsBackend {
                     } else {
                         on_disk_mode
                     });
-                    return Some((
+                    return HostFdOpen::Served((
                         fd.into_raw_fd(),
                         RootFsMetadata {
                             path: std::path::Path::new(path).to_path_buf(),
@@ -6352,20 +6597,25 @@ impl FsBackend for HostFsBackend {
                 // Not a regular file: let the caller fall back to its
                 // metadata + `open_raw_fd` sequence (whose own Fifo route
                 // stays non-blocking).
-                FastGuestOpen::Fifo => return None,
+                FastGuestOpen::Fifo => return HostFdOpen::Unavailable,
+                FastGuestOpen::Refused(refused) => return HostFdOpen::Refused(refused),
                 FastGuestOpen::SymlinkLeaf | FastGuestOpen::Missing | FastGuestOpen::Fallback => {}
             }
         }
-        let fd = self.open_raw_fd_capstd(path, write, create, trunc)?;
+        let fd = match self.open_raw_fd_capstd(path, write, create, trunc) {
+            HostFdOpen::Served(fd) => fd,
+            HostFdOpen::Unavailable => return HostFdOpen::Unavailable,
+            HostFdOpen::Refused(refused) => return HostFdOpen::Refused(refused),
+        };
         let mut st: libc::stat = unsafe { core::mem::zeroed() };
         if unsafe { libc::fstat(fd, &mut st) } != 0 {
             unsafe { libc::close(fd) };
-            return None;
+            return HostFdOpen::Unavailable;
         }
         let typ = st.st_mode as u32 & libc::S_IFMT as u32;
         if typ != libc::S_IFREG as u32 {
             unsafe { libc::close(fd) };
-            return None;
+            return HostFdOpen::Unavailable;
         }
         let override_mode = if self.serves_plain_metadata() {
             None
@@ -6378,7 +6628,7 @@ impl FsBackend for HostFsBackend {
         } else {
             on_disk_mode
         });
-        Some((
+        HostFdOpen::Served((
             fd,
             RootFsMetadata {
                 path: std::path::Path::new(path).to_path_buf(),
@@ -6822,8 +7072,9 @@ impl FsBackend for HostFsBackend {
         // write mode, and O_RDWR would EISDIR on a DIRECTORY (test_os
         // test_utime_directory) and EACCES on a read-only file the guest owns.
         let host_fd = match self.open_raw_fd(path, false, false, false) {
-            Some(fd) => fd,
-            None => {
+            HostFdOpen::Served(fd) => fd,
+            HostFdOpen::Refused(refused) => return Err(BackendError::Host(refused)),
+            HostFdOpen::Unavailable => {
                 crate::probes::fs_op("set_times:open_none", path, 30);
                 return Err(BackendError::Io);
             }
@@ -6847,7 +7098,7 @@ impl FsBackend for HostFsBackend {
         // shrink (posix_fallocate semantics).
         let host_fd = self
             .open_raw_fd(path, true, false, false)
-            .ok_or(BackendError::Io)?;
+            .into_backend_result()?;
         let cur = {
             let mut st: libc::stat = unsafe { core::mem::zeroed() };
             if unsafe { libc::fstat(host_fd, &mut st) } < 0 {
@@ -6946,7 +7197,7 @@ impl FsBackend for HostFsBackend {
         let host_fd = self
             .open_raw_fd(path, true, false, false)
             .or_else(|| self.open_raw_fd(path, false, false, false))
-            .ok_or(crate::linux_abi::LINUX_ENODATA)?;
+            .into_errno(crate::linux_abi::LINUX_ENODATA)?;
         let rc = unsafe {
             carrick_portable::fsetxattr(
                 host_fd,
@@ -6996,7 +7247,7 @@ impl FsBackend for HostFsBackend {
         }
         let host_fd = self
             .open_raw_fd(path, false, false, false)
-            .ok_or(crate::linux_abi::LINUX_ENODATA)?;
+            .into_errno(crate::linux_abi::LINUX_ENODATA)?;
         // First call with size 0 to learn the value length.
         let needed = unsafe {
             carrick_portable::fgetxattr(host_fd, cname.as_ptr(), std::ptr::null_mut(), 0)
@@ -7129,7 +7380,7 @@ impl FsBackend for HostFsBackend {
         let host_fd = self
             .open_raw_fd(path, true, false, false)
             .or_else(|| self.open_raw_fd(path, false, false, false))
-            .ok_or(crate::linux_abi::LINUX_ENODATA)?;
+            .into_errno(crate::linux_abi::LINUX_ENODATA)?;
         // macOS fremovexattr; ENOATTR (absent attribute) maps to Linux ENODATA
         // via host_syscall_errno.
         let rc = unsafe { carrick_portable::fremovexattr(host_fd, cname.as_ptr()) };
@@ -7747,6 +7998,7 @@ fn joined(base: &str, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::linux_abi::LINUX_ENFILE;
 
     // -- shared scenarios, run against both backends -----------------
 
@@ -8740,6 +8992,7 @@ mod tests {
         // the same fstat — with no separate lookup/metadata walk.
         let (fd, md) = b
             .open_raw_fd_with_metadata("/dir/file.txt", false, false, false)
+            .served()
             .unwrap();
         assert_eq!(md.kind, RootFsEntryKind::File);
         assert_eq!(md.mode, 0o640, "mode must come from the guest-mode xattr");
@@ -8766,7 +9019,10 @@ mod tests {
             b.fast_open_for_guest(Path::new("link"), false),
             FastGuestOpen::SymlinkLeaf
         ));
-        let fd = b.open_raw_fd("/link", false, false, false).unwrap();
+        let fd = b
+            .open_raw_fd("/link", false, false, false)
+            .served()
+            .unwrap();
         let mut buf = [0u8; 16];
         let n = unsafe { libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
         unsafe { libc::close(fd) };
@@ -8785,7 +9041,7 @@ mod tests {
         ));
         // A read open of a writer-less FIFO must return immediately with a
         // NON-BLOCKING fd — a blocking open here wedges the dispatcher.
-        let fd = b.open_raw_fd("/f", false, false, false).unwrap();
+        let fd = b.open_raw_fd("/f", false, false, false).served().unwrap();
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         let mut st: libc::stat = unsafe { core::mem::zeroed() };
         let rc = unsafe { libc::fstat(fd, &mut st) };
@@ -8807,13 +9063,14 @@ mod tests {
         // work via cap-std.
         let fd = b
             .open_raw_fd("/new/nested/file", true, true, false)
+            .served()
             .unwrap();
         unsafe { libc::close(fd) };
         assert!(b.metadata("/new/nested/file").is_some());
         // O_TRUNC must truncate — the fast path is barred from truncating
         // opens by construction.
         b.set_file_contents("/t.txt", b"contents".to_vec()).unwrap();
-        let fd = b.open_raw_fd("/t.txt", true, false, true).unwrap();
+        let fd = b.open_raw_fd("/t.txt", true, false, true).served().unwrap();
         unsafe { libc::close(fd) };
         assert_eq!(b.metadata("/t.txt").unwrap().size, 0);
     }
@@ -8835,6 +9092,7 @@ mod tests {
         ));
         assert!(
             b.open_raw_fd("/esc/leak.txt", false, false, false)
+                .served()
                 .is_none()
         );
     }
@@ -8926,7 +9184,7 @@ mod tests {
             .map(|(n, _, _)| n)
             .collect();
         assert_eq!(names, vec!["hello.txt".to_owned()]);
-        let fd = b.open_raw_fd(&file, false, false, false).unwrap();
+        let fd = b.open_raw_fd(&file, false, false, false).served().unwrap();
         unsafe { libc::close(fd) };
         assert!(b.remove_entry(&file));
         assert!(b.metadata(&file).is_none());
@@ -9098,7 +9356,10 @@ mod tests {
         // Mirrors the openat(O_CREAT)+fstat path: create+open a real fd, set
         // the guest mode, then read it back from THAT fd (what fstat does).
         let (b, _scratch) = host_backend();
-        let fd = b.open_raw_fd("/g", true, true, true).expect("open_raw_fd");
+        let fd = b
+            .open_raw_fd("/g", true, true, true)
+            .served()
+            .expect("open_raw_fd");
         b.set_mode("/g", 0o041).unwrap();
         assert_eq!(fget_mode_xattr(fd), Some(0o041), "fstat-side xattr read");
         unsafe { libc::close(fd) };
@@ -9112,6 +9373,7 @@ mod tests {
             .unwrap();
         let fd = b
             .open_raw_fd("/g", false, false, false)
+            .served()
             .expect("open_raw_fd");
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
@@ -9493,6 +9755,7 @@ mod tests {
             let name = format!("/d/m{mode:o}");
             let (fd, applied) = b
                 .create_raw_fd(&name, mode, false)
+                .served()
                 .unwrap_or_else(|| panic!("create {name}"));
             assert!(
                 applied,
@@ -9512,7 +9775,7 @@ mod tests {
         // A mode the owner cannot hold natively (0444: carrick could not
         // reopen it for writing) is NOT applied by the create lane; the caller
         // still runs `set_mode`, which parks it in the xattr override.
-        let (fd, applied) = b.create_raw_fd("/d/ro", 0o444, false).unwrap();
+        let (fd, applied) = b.create_raw_fd("/d/ro", 0o444, false).served().unwrap();
         assert!(!applied);
         unsafe { libc::close(fd) };
         b.set_mode("/d/ro", 0o444).unwrap();
@@ -9522,19 +9785,120 @@ mod tests {
         // the dispatcher already proved) is materialised by the cap-std
         // fallback; that arm creates under the host umask, so it reports the
         // mode as NOT applied and the caller's `set_mode` still runs.
-        let (fd, applied) = b.create_raw_fd("/nope/f", 0o644, false).unwrap();
+        let (fd, applied) = b.create_raw_fd("/nope/f", 0o644, false).served().unwrap();
         assert!(!applied);
         unsafe { libc::close(fd) };
         assert!(b.dir.exists("nope/f"));
 
         // A directory at the path is not a file the lane can hand out.
-        assert!(b.create_raw_fd("/d", 0o644, false).is_none());
+        assert!(b.create_raw_fd("/d", 0o644, false).served().is_none());
 
         // O_TRUNC on the create flags is honoured when the lane opens.
-        let (fd, _) = b.create_raw_fd("/d/t", 0o644, true).unwrap();
+        let (fd, _) = b.create_raw_fd("/d/t", 0o644, true).served().unwrap();
         assert_eq!(unsafe { libc::write(fd, b"abc".as_ptr().cast(), 3) }, 3);
         unsafe { libc::close(fd) };
         assert_eq!(b.metadata("/d/t").unwrap().size, 3);
+    }
+
+    /// Pin this process's descriptor table shut for the guard's lifetime:
+    /// every fd below the soft limit is in use, so the next host `open`,
+    /// `dup` or `openat` fails `EMFILE`. Restores the limit on drop.
+    /// Requires the serial `just test` lane (a process-wide limit).
+    struct DescriptorTableShut {
+        saved: libc::rlimit,
+    }
+
+    impl DescriptorTableShut {
+        fn new() -> Self {
+            let mut saved: libc::rlimit = unsafe { core::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut saved) },
+                0
+            );
+            // `dup` hands out the LOWEST free number, so after closing it
+            // again every fd below `probe` is in use and a soft limit of
+            // `probe` leaves the table with no allocatable slot.
+            let probe = unsafe { libc::dup(0) };
+            assert!(probe >= 0);
+            unsafe { libc::close(probe) };
+            let shut = libc::rlimit {
+                rlim_cur: probe as libc::rlim_t,
+                rlim_max: saved.rlim_max,
+            };
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &shut) }, 0);
+            Self { saved }
+        }
+    }
+
+    impl Drop for DescriptorTableShut {
+        fn drop(&mut self) {
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.saved) };
+        }
+    }
+
+    /// A host `EMFILE` on the guest's own open is the guest's answer, not a
+    /// "not servable from here" that the dispatcher lowers to a create (and
+    /// then `EINVAL`). LTP `fork09` opens files until `EMFILE` and TBROKs on
+    /// any other errno; before this lane every host exhaustion surfaced as
+    /// `EINVAL`. The guest is under its own `RLIMIT_NOFILE` (the fd table
+    /// enforced that first), so the honest Linux errno is `ENFILE`.
+    #[test]
+    fn host_descriptor_exhaustion_is_refused_not_unavailable() {
+        let scratch_root = tempfile::TempDir::new().unwrap();
+        let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
+        b.dir.create_dir("d").unwrap();
+        b.dir.write("d/existing", b"x").unwrap();
+        // Nothing cached: a reclaim under exhaustion must find nothing to
+        // free, so the refusal is the only possible outcome.
+        b.drop_dir_cache();
+
+        {
+            let _shut = DescriptorTableShut::new();
+            match b.create_raw_fd("/d/new", 0o644, false) {
+                HostFdOpen::Refused(errno) => assert_eq!(errno, LINUX_ENFILE),
+                HostFdOpen::Served((fd, _)) => {
+                    unsafe { libc::close(fd) };
+                    panic!("create served with the descriptor table shut");
+                }
+                HostFdOpen::Unavailable => panic!("host EMFILE erased to Unavailable"),
+            }
+            match b.open_raw_fd("/d/existing", false, false, false) {
+                HostFdOpen::Refused(errno) => assert_eq!(errno, LINUX_ENFILE),
+                HostFdOpen::Served(fd) => {
+                    unsafe { libc::close(fd) };
+                    panic!("open served with the descriptor table shut");
+                }
+                HostFdOpen::Unavailable => panic!("host EMFILE erased to Unavailable"),
+            }
+            match b.open_raw_fd_with_metadata("/d/existing", false, false, false) {
+                HostFdOpen::Refused(errno) => assert_eq!(errno, LINUX_ENFILE),
+                HostFdOpen::Served((fd, _)) => {
+                    unsafe { libc::close(fd) };
+                    panic!("open-with-metadata served with the descriptor table shut");
+                }
+                HostFdOpen::Unavailable => panic!("host EMFILE erased to Unavailable"),
+            }
+            assert_eq!(
+                b.create_file("/d/new2"),
+                Err(BackendError::Host(LINUX_ENFILE)),
+                "create_file must carry the host refusal, not a bare Io"
+            );
+        }
+
+        // With the table open again the same calls serve, and a genuine
+        // miss stays Unavailable (path semantics belong to the resolver).
+        let (fd, _) = b.create_raw_fd("/d/new", 0o644, false).served().unwrap();
+        unsafe { libc::close(fd) };
+        let fd = b
+            .open_raw_fd("/d/existing", false, false, false)
+            .served()
+            .unwrap();
+        unsafe { libc::close(fd) };
+        assert!(
+            b.open_raw_fd("/d/missing", false, false, false)
+                .served()
+                .is_none()
+        );
     }
 
     /// `lookup_kind_and_metadata` on a plain file or directory is served by
@@ -9646,28 +10010,33 @@ mod tests {
 
         // Non-creating reads and writes (fast lane on macOS, cap-std elsewhere).
         assert!(
-            take(b.open_raw_fd("/d/f", false, false, false).unwrap()),
+            take(b.open_raw_fd("/d/f", false, false, false).served().unwrap()),
             "read open"
         );
         assert!(
-            take(b.open_raw_fd("/d/f", true, false, false).unwrap()),
+            take(b.open_raw_fd("/d/f", true, false, false).served().unwrap()),
             "write open"
         );
         // Truncating and creating opens take the cap-std path.
         assert!(
-            take(b.open_raw_fd("/d/f", true, false, true).unwrap()),
+            take(b.open_raw_fd("/d/f", true, false, true).served().unwrap()),
             "trunc open"
         );
         assert!(
-            take(b.open_raw_fd("/d/new", true, true, false).unwrap()),
+            take(b.open_raw_fd("/d/new", true, true, false).served().unwrap()),
             "create open"
         );
         assert!(
-            take(b.create_raw_fd("/d/created", 0o644, false).unwrap().0),
+            take(
+                b.create_raw_fd("/d/created", 0o644, false)
+                    .served()
+                    .unwrap()
+                    .0
+            ),
             "create_raw_fd"
         );
         assert!(
-            take(b.create_raw_fd("/d/f", 0o644, false).unwrap().0),
+            take(b.create_raw_fd("/d/f", 0o644, false).served().unwrap().0),
             "create_raw_fd over an existing file (cap-std fallback)"
         );
         {
