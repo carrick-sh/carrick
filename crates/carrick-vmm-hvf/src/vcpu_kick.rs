@@ -41,20 +41,81 @@ impl carrick_hal::VcpuKick for VcpuKickHandle {
     }
 }
 
-/// A `Send`/`Sync` handle to a guest thread's vCPU, usable from any thread to
-/// kick it. Wraps `applevisor::vcpu::VcpuHandle` (which holds a `Weak` to the vCPU's
-/// liveness guard, so a kick after the vCPU is destroyed is a safe no-op) on
-/// macOS; an inert placeholder elsewhere.
+/// The vCPU a logical guest thread is loaded on RIGHT NOW, owned by the
+/// thread's task state so it travels with the thread across executors.
+///
+/// HVPatch multiplexes many logical guest threads over a bounded pool of
+/// executor vCPUs, and the scheduler may reload a thread onto a different
+/// executor every quantum. A kick registered once per thread (the registry
+/// captures one [`VcpuKickHandle`] at registration) therefore cannot name a
+/// fixed vCPU: it must name whichever vCPU the thread currently occupies.
+/// Attach publishes the executor's vCPU here, detach clears it, and every
+/// kick reads the slot at kick time. An empty slot means the thread is not
+/// loaded on any vCPU, so there is nothing in `hv_vcpu_run` to interrupt.
+pub struct LiveVcpuSlot {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    inner: parking_lot::Mutex<Option<applevisor::vcpu::VcpuHandle>>,
+}
+
+impl LiveVcpuSlot {
+    /// A slot that is not loaded on any vCPU yet.
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            inner: parking_lot::Mutex::new(None),
+        })
+    }
+
+    /// A slot already holding `handle`: for engines whose vCPU never changes
+    /// hands (a task that owns its vCPU outright, or a freshly built executor).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn holding(handle: applevisor::vcpu::VcpuHandle) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            inner: parking_lot::Mutex::new(Some(handle)),
+        })
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn publish(&self, handle: applevisor::vcpu::VcpuHandle) {
+        *self.inner.lock() = Some(handle);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn clear(&self) {
+        *self.inner.lock() = None;
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn current(&self) -> Option<applevisor::vcpu::VcpuHandle> {
+        self.inner.lock().clone()
+    }
+}
+
+/// A `Send`/`Sync` handle to a guest thread's CURRENT vCPU, usable from any
+/// thread to kick it. It follows a [`LiveVcpuSlot`], so a handle captured at
+/// registration keeps kicking the right vCPU after the scheduler reloads the
+/// thread elsewhere. The slot's `applevisor::vcpu::VcpuHandle` holds a `Weak`
+/// to the vCPU's liveness guard, so a kick after the vCPU is destroyed is a
+/// safe no-op. An inert placeholder off macOS.
 #[derive(Clone)]
 pub struct VcpuKickHandle {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    inner: applevisor::vcpu::VcpuHandle,
+    slot: std::sync::Arc<LiveVcpuSlot>,
 }
 
 impl VcpuKickHandle {
+    /// A handle pinned to one vCPU that never migrates.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub fn new(inner: applevisor::vcpu::VcpuHandle) -> Self {
-        Self { inner }
+        Self {
+            slot: LiveVcpuSlot::holding(inner),
+        }
+    }
+
+    /// A handle that kicks whatever vCPU `slot` names at kick time.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn following(slot: std::sync::Arc<LiveVcpuSlot>) -> Self {
+        Self { slot }
     }
 
     /// Placeholder constructor for platforms without HVF; the threaded vCPU
@@ -78,7 +139,8 @@ pub type VcpuKicker = carrick_hal::GenericVcpuRegistry;
 /// Extract the live vCPU id from a handle, or `None` if the vCPU is gone.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn valid_id(h: &VcpuKickHandle) -> Option<u64> {
-    h.inner.is_valid().then(|| h.inner.id())
+    let handle = h.slot.current()?;
+    handle.is_valid().then(|| handle.id())
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]

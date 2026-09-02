@@ -3437,6 +3437,7 @@ mod foreign_mm_tests {
             forked_no_exec: false,
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
+            live_vcpu: crate::vcpu_kick::LiveVcpuSlot::new(),
             persistent_vm_lifecycle: true,
             cow_authority: Some(Arc::new(
                 task_only_carrier_directory_tests::TestCowAuthority,
@@ -3746,6 +3747,7 @@ mod foreign_mm_tests {
             forked_no_exec: false,
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
+            live_vcpu: crate::vcpu_kick::LiveVcpuSlot::new(),
             persistent_vm_lifecycle: true,
             cow_authority: Some(cow_authority),
             cow_identity: Some(carrick_hal::FrameCowIdentity {
@@ -5136,6 +5138,7 @@ mod foreign_mm_tests {
             forked_no_exec: false,
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
+            live_vcpu: crate::vcpu_kick::LiveVcpuSlot::new(),
             persistent_vm_lifecycle: true,
             cow_authority: Some(Arc::new(
                 task_only_carrier_directory_tests::TestCowAuthority,
@@ -21289,6 +21292,10 @@ pub(crate) struct HvfTaskState {
     /// manager) and the next COW allocates one again.
     cow_rollback_scratch: Option<crate::page_table::PageTableManager>,
     pub(crate) registration: Option<HvpatchTaskRegistration>,
+    /// The executor vCPU this task is loaded on right now. Kick handles
+    /// registered for the task follow this slot, so a kick reaches the vCPU
+    /// the task currently occupies rather than the one it was first loaded on.
+    live_vcpu: std::sync::Arc<crate::vcpu_kick::LiveVcpuSlot>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -21893,6 +21900,7 @@ impl HvfTaskState {
             forked_no_exec: false,
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
+            live_vcpu: crate::vcpu_kick::LiveVcpuSlot::new(),
             persistent_vm_lifecycle: false,
             cow_authority: None,
             cow_identity: None,
@@ -22137,6 +22145,7 @@ pub(crate) fn hvpatch_task_state_test_fixture(
         forked_no_exec: false,
         last_syscall_nr: None,
         last_syscall_orig_x0: 0,
+        live_vcpu: crate::vcpu_kick::LiveVcpuSlot::new(),
         persistent_vm_lifecycle: true,
         cow_authority: Some(cow_authority),
         cow_identity: Some(carrick_hal::FrameCowIdentity {
@@ -26421,6 +26430,7 @@ impl HvpatchTaskRegistration {
             forked_no_exec: false,
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
+            live_vcpu: crate::vcpu_kick::LiveVcpuSlot::new(),
             persistent_vm_lifecycle: true,
             cow_authority: Some(cow_authority),
             cow_identity: Some(cow_identity),
@@ -26614,12 +26624,15 @@ impl HvpatchTaskRegistration {
             // MEASURED WORSE, then reverted (`fix(hvf): one carrier MM
             // authority per mm across CLONE_VM sharers` and its revert):
             //  - slot-only keys (dedupe the sharer onto the owner's
-            //    authorities) fixed the crash but destabilized the embedded
-            //    probe gate ~1 run in 2 -- late MT probes hit guest
-            //    `mmap(ANON)`=ENOMEM / `clone`=EAGAIN, a carrick-internal
-            //    retention the dedupe introduces (host mmap never fails and
-            //    the global IPA arena stays far from exhausted; the exact
-            //    retained resource was not pinned down);
+            //    authorities) fixed the crash but was blamed for a probe
+            //    gate destabilization (~1 run in 2, late MT probes hitting
+            //    guest `mmap(ANON)`=ENOMEM / `clone`=EAGAIN). That failure
+            //    was later traced to an unrelated defect -- the pt-pause
+            //    drain timing out because registered kick handles named the
+            //    vCPU a task first loaded on instead of following it across
+            //    executors (see `HvfTaskState::live_vcpu`) -- so the dedupe
+            //    itself was never shown to retain anything and deserves
+            //    re-measurement on top of that fix;
             //  - retiring the discarded prepared task's mapping owners on
             //    the reuse arm released the owner's LIVE extents (the
             //    sharer's descriptors reference them), and the owner's own
@@ -29803,6 +29816,7 @@ impl HvfVmState {
                 forked_no_exec: false,
                 last_syscall_nr: None,
                 last_syscall_orig_x0: 0,
+                live_vcpu: crate::vcpu_kick::LiveVcpuSlot::new(),
                 persistent_vm_lifecycle: false,
                 cow_authority: None,
                 cow_identity: None,
@@ -29819,6 +29833,7 @@ impl HvfVmState {
             vcpu_id: vcpu.id(),
             vcpu_handle: vcpu.get_handle(),
         };
+        state.publish_live_vcpu();
         state.seed_readonly_spans_from_plan(plan);
 
         // Reuse lane: map the relocated image with owning stage-2 leases (the
@@ -30274,7 +30289,20 @@ impl HvfVmState {
     /// the vCPU, so HVF stashes the handle on every vCPU create (see the
     /// `vcpu_handle` field) and hands it out here.
     pub(crate) fn vcpu_kick_handle(&self) -> crate::vcpu_kick::VcpuKickHandle {
-        crate::vcpu_kick::VcpuKickHandle::new(self.vcpu_handle.clone())
+        crate::vcpu_kick::VcpuKickHandle::following(std::sync::Arc::clone(&self.task.live_vcpu))
+    }
+
+    /// Name this backend's live vCPU as the one the attached task occupies.
+    /// Called on every attach and whenever the vCPU is recreated underneath a
+    /// loaded task, so registered kick handles keep following the task.
+    pub(crate) fn publish_live_vcpu(&self) {
+        self.task.live_vcpu.publish(self.vcpu_handle.clone());
+    }
+
+    /// The task is leaving this vCPU; a kick registered for it now has nothing
+    /// in `hv_vcpu_run` to interrupt until the next attach republishes.
+    pub(crate) fn clear_live_vcpu(&self) {
+        self.task.live_vcpu.clear();
     }
 
     /// Live private semantic mappings that a process fork must arm read-only in
@@ -32669,6 +32697,7 @@ impl HvfVmState {
         enable_el0_counter_access(vcpu.id());
         self.vcpu_id = vcpu.id();
         self.vcpu_handle = vcpu.get_handle();
+        self.publish_live_vcpu();
         let mailbox = self.allocate_mailbox_for_vcpu(&vcpu)?;
         Ok((vcpu, mailbox))
     }
@@ -34487,6 +34516,7 @@ impl HvfVmState {
         Self::configure_executor_invariants(&new_vcpu)?;
         self.vcpu_id = new_vcpu.id();
         self.vcpu_handle = new_vcpu.get_handle();
+        self.publish_live_vcpu();
         std::mem::forget(std::mem::replace(vcpu, new_vcpu));
         self.reacquire_mailbox_after_vcpu_create(vcpu, mailbox, None)?;
         self.reclaim_authority.mark_live_after_recreate()
@@ -34537,6 +34567,7 @@ impl HvfVmState {
         Self::configure_executor_invariants(&new_vcpu)?;
         self.vcpu_id = new_vcpu.id();
         self.vcpu_handle = new_vcpu.get_handle();
+        self.publish_live_vcpu();
         // Replace the destroyed handle WITHOUT running applevisor's panicky Drop on
         // the (already hv_vcpu_destroy'd) old one — mirror the fork rebuild.
         std::mem::forget(std::mem::replace(vcpu, new_vcpu));
@@ -34818,6 +34849,7 @@ impl HvfVmState {
         commit_pending_creation_before_vcpu_handoff(pending_creation)?;
         self.vcpu_id = new_vcpu.id();
         self.vcpu_handle = new_vcpu.get_handle();
+        self.publish_live_vcpu();
         std::mem::forget(std::mem::replace(vcpu, new_vcpu.into_inner()));
         replace_destroyed_vm(self, new_vm.into_inner());
         Ok(())
@@ -34935,6 +34967,7 @@ impl HvfVmState {
             vcpu_id: vcpu.id(),
             vcpu_handle: vcpu.get_handle(),
         };
+        state.publish_live_vcpu();
         Self::configure_executor_invariants(&vcpu)?;
         let mailbox = Self::allocate_persistent_mailbox_for_vcpu(spec, &vcpu)?;
         Self::audit_executor_invariants(&vcpu, mailbox.slot().guest_address())?;
@@ -35118,6 +35151,7 @@ impl HvfVmState {
                 forked_no_exec: false,
                 last_syscall_nr: None,
                 last_syscall_orig_x0: 0,
+                live_vcpu: crate::vcpu_kick::LiveVcpuSlot::new(),
                 persistent_vm_lifecycle,
                 cow_authority,
                 cow_identity,
@@ -35134,6 +35168,7 @@ impl HvfVmState {
             vcpu_id: vcpu.id(),
             vcpu_handle: vcpu.get_handle(),
         };
+        state.publish_live_vcpu();
 
         for mapping in mappings {
             // `hv_vm_map` is VM-global on Hypervisor.framework. The new vCPU is
@@ -36675,6 +36710,7 @@ impl HvfVmState {
                 forked_no_exec: false,
                 last_syscall_nr: None,
                 last_syscall_orig_x0: 0,
+                live_vcpu: crate::vcpu_kick::LiveVcpuSlot::new(),
                 persistent_vm_lifecycle: plan.persistent_vm_lifecycle,
                 cow_authority: None,
                 cow_identity: None,
@@ -36691,6 +36727,7 @@ impl HvfVmState {
             vcpu_id: vcpu.id(),
             vcpu_handle: vcpu.get_handle(),
         };
+        state.publish_live_vcpu();
         let mailbox = match state.allocate_mailbox_for_vcpu(&vcpu) {
             Ok(mailbox) => mailbox,
             Err(error) => {
@@ -37595,6 +37632,7 @@ impl HvfVmState {
             commit_pending_creation_before_vcpu_handoff(pending_creation)?;
             self.vcpu_id = new_vcpu.id();
             self.vcpu_handle = new_vcpu.get_handle();
+            self.publish_live_vcpu();
             std::mem::forget(std::mem::replace(vcpu, new_vcpu.into_inner()));
             replace_destroyed_vm(self, new_vm.into_inner());
         }
