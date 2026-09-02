@@ -62,8 +62,8 @@
 //!     composes with the generation model (token unparks bypass the per-bucket
 //!     generation check).
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use parking_lot::Mutex as ParkingMutex;
@@ -616,16 +616,101 @@ pub enum FutexWaitOutcome {
     Interrupted,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+/// A waiter's place on a futex queue from the instant the dispatcher verified
+/// the word (`prepare_wait`) until a `FUTEX_WAKE` consumes it, the waiter
+/// parks on the legacy path (`wait_prepared*`), the continuation's
+/// subscription is dropped, or the last clone of this token is dropped.
+///
+/// Linux enqueues under the hash-bucket lock BEFORE re-reading the word, so a
+/// wake that runs after the word check always finds the waiter and counts it.
+/// Carrick's continuation model splits "word verified" (dispatch) from
+/// "subscribed for the wake" (continuation install) across syscall locks, and
+/// a wake landing in that window used to find nobody: it returned 0 while the
+/// generation bump still released the subscriber. LTP `pause01`'s
+/// `tst_checkpoint_wake` loops on that 0, re-wakes and consumes the NEXT
+/// round's waiter, and the whole run cascades to `ETIMEDOUT`. Queueing at
+/// `prepare_wait` makes the count exact: a wake either consumes this slot
+/// (counted, `is_woken()`) or leaves it queued (not counted, still waiting).
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct FutexWait {
     pub addr: u64,
-    generation: u64,
+    #[serde(serialize_with = "serialize_queue_ticket")]
+    slot: Arc<FutexQueueSlot>,
 }
 
-impl FutexWait {
-    pub const fn generation(self) -> u64 {
-        self.generation
+fn serialize_queue_ticket<S: serde::Serializer>(
+    slot: &Arc<FutexQueueSlot>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_u64(slot.id)
+}
+
+impl PartialEq for FutexWait {
+    fn eq(&self, other: &Self) -> bool {
+        self.addr == other.addr && self.slot.id == other.slot.id
     }
+}
+
+impl Eq for FutexWait {}
+
+impl FutexWait {
+    /// Queue ticket: monotonic per table, so it is also the FIFO order.
+    pub fn ticket(&self) -> u64 {
+        self.slot.id
+    }
+
+    /// Whether a `FUTEX_WAKE` (or requeue-then-wake) has consumed this slot.
+    /// Stable once true; the wake that set it counted this waiter.
+    pub fn is_woken(&self) -> bool {
+        self.slot.state.load(Ordering::Acquire) == FUTEX_SLOT_WOKEN
+    }
+}
+
+const FUTEX_SLOT_QUEUED: u8 = 0;
+const FUTEX_SLOT_WOKEN: u8 = 1;
+const FUTEX_SLOT_RELEASED: u8 = 2;
+
+/// Shared between every clone of a [`FutexWait`] and (weakly) the table's
+/// queue entry. `state` moves QUEUED → WOKEN (a wake consumed the entry) or
+/// QUEUED → RELEASED (the waiter left without a wake), always under the
+/// table's queue lock, so a wake and a departure never both claim the slot.
+#[derive(Debug)]
+struct FutexQueueSlot {
+    id: u64,
+    state: AtomicU8,
+    queue: Weak<ParkingMutex<FutexQueue>>,
+}
+
+impl Drop for FutexQueueSlot {
+    fn drop(&mut self) {
+        // Last token holder gone while still queued (a dispatcher `EAGAIN`
+        // after `prepare_wait`, a continuation cancelled before it subscribed):
+        // leave the queue so a later wake cannot be charged to a waiter that
+        // no longer exists. Any other state was set by whoever removed the
+        // entry, so there is nothing to take the lock for.
+        if self.state.load(Ordering::Acquire) != FUTEX_SLOT_QUEUED {
+            return;
+        }
+        if let Some(queue) = self.queue.upgrade() {
+            queue.lock().entries.remove(&self.id);
+        }
+    }
+}
+
+/// FIFO of every waiter logically inside `FUTEX_WAIT` under the continuation
+/// model, keyed by ticket. An entry without a callback is queued but not yet
+/// subscribed; a wake consumes it exactly as it does a subscribed one and the
+/// subscriber finds `Ready` when it arrives.
+#[derive(Default)]
+struct FutexQueue {
+    entries: BTreeMap<u64, FutexQueueEntry>,
+    next_ticket: u64,
+}
+
+struct FutexQueueEntry {
+    addr: u64,
+    slot: Weak<FutexQueueSlot>,
+    callback: Option<FutexGenerationCallback>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -646,21 +731,24 @@ impl FutexGenerationEvent {
 
 type FutexGenerationCallback = Arc<dyn Fn(FutexGenerationEvent) + Send + Sync + 'static>;
 
-struct FutexGenerationListener {
-    addr: u64,
-    expected_generation: u64,
-    callback: FutexGenerationCallback,
-}
-
+/// A subscribed waiter's hold on its queue slot. Owns a strong reference so
+/// the slot outlives the [`FutexWait`] token the subscriber passed by value;
+/// dropping the subscription is the waiter leaving the queue.
 pub struct FutexGenerationSubscription {
-    listeners: Weak<ParkingMutex<HashMap<u64, FutexGenerationListener>>>,
-    id: u64,
+    queue: Weak<ParkingMutex<FutexQueue>>,
+    slot: Arc<FutexQueueSlot>,
 }
 
 impl Drop for FutexGenerationSubscription {
     fn drop(&mut self) {
-        if let Some(listeners) = self.listeners.upgrade() {
-            listeners.lock().remove(&self.id);
+        let Some(queue) = self.queue.upgrade() else {
+            return;
+        };
+        let mut queue = queue.lock();
+        if queue.entries.remove(&self.slot.id).is_some() {
+            self.slot
+                .state
+                .store(FUTEX_SLOT_RELEASED, Ordering::Release);
         }
     }
 }
@@ -920,8 +1008,10 @@ pub struct FutexTable {
     /// completing in 420 s to timing out at 600 s. Requeues are rare; this makes
     /// the common answer a single relaxed load.
     outstanding_redirects: AtomicUsize,
-    generation_listeners: Arc<ParkingMutex<HashMap<u64, FutexGenerationListener>>>,
-    next_generation_listener: AtomicU64,
+    /// Continuation-model wait queue (see [`FutexWait`]). One lock per table:
+    /// `wake` already takes it to publish, so queueing at `prepare_wait` adds
+    /// one acquisition per wait, not a new serialization point.
+    queue: Arc<ParkingMutex<FutexQueue>>,
 }
 
 impl FutexTable {
@@ -931,63 +1021,101 @@ impl FutexTable {
             interrupt_generation: AtomicU64::new(0),
             requeue_redirects: ParkingMutex::new(HashMap::new()),
             outstanding_redirects: AtomicUsize::new(0),
-            generation_listeners: Arc::new(ParkingMutex::new(HashMap::new())),
-            next_generation_listener: AtomicU64::new(1),
+            queue: Arc::new(ParkingMutex::new(FutexQueue::default())),
         }
     }
 
+    /// Attach the wake callback to a queued wait. `Ready` means a wake already
+    /// consumed the slot (that wake counted this waiter), so the caller must
+    /// complete without waiting; `Subscribed` keeps the waiter queued until a
+    /// wake fires `callback` or the subscription is dropped.
+    ///
+    /// A slot the waiter already left (`dequeue`, a dropped subscription) is
+    /// reported `Ready`: futex(2) permits a spurious 0 and re-queueing a
+    /// departed waiter would count a later wake against nobody.
     pub fn subscribe_generation(
         &self,
         wait: FutexWait,
         callback: FutexGenerationCallback,
     ) -> FutexGenerationEnrollment {
-        let bucket = self.bucket(wait.addr);
-        let mut listeners = self.generation_listeners.lock();
-        let current = bucket.generation.load(Ordering::Acquire);
-        if current != wait.generation {
-            return FutexGenerationEnrollment::Ready(FutexGenerationEvent {
-                addr: wait.addr,
-                generation: current,
+        let mut queue = self.queue.lock();
+        if wait.slot.state.load(Ordering::Acquire) == FUTEX_SLOT_QUEUED
+            && let Some(entry) = queue.entries.get_mut(&wait.slot.id)
+        {
+            entry.callback = Some(callback);
+            return FutexGenerationEnrollment::Subscribed(FutexGenerationSubscription {
+                queue: Arc::downgrade(&self.queue),
+                slot: Arc::clone(&wait.slot),
             });
         }
-        let id = self
-            .next_generation_listener
-            .fetch_add(1, Ordering::Relaxed);
-        if id == 0 || id == u64::MAX {
-            std::process::abort();
-        }
-        listeners.insert(
-            id,
-            FutexGenerationListener {
-                addr: wait.addr,
-                expected_generation: wait.generation,
-                callback,
-            },
-        );
-        FutexGenerationEnrollment::Subscribed(FutexGenerationSubscription {
-            listeners: Arc::downgrade(&self.generation_listeners),
-            id,
+        drop(queue);
+        FutexGenerationEnrollment::Ready(FutexGenerationEvent {
+            addr: wait.addr,
+            generation: self.bucket(wait.addr).generation.load(Ordering::Acquire),
         })
     }
 
+    /// Whether `wait` has been consumed by a wake. A pure read for the
+    /// continuation reactor's readiness poll; never dequeues.
+    pub fn is_woken(&self, wait: &FutexWait) -> bool {
+        wait.is_woken()
+    }
+
+    /// Leave the queue without subscribing: the legacy park path and the
+    /// single-threaded loops take over with their own accounting from here.
+    /// Returns whether a wake had already consumed the slot (that wake counted
+    /// this waiter, so the caller returns 0 without waiting), and the bucket
+    /// generation to park against, snapshotted under the queue lock so a wake
+    /// that consumed some OTHER slot cannot release this waiter spuriously.
+    fn dequeue(&self, wait: &FutexWait) -> (bool, u64) {
+        let bucket = self.bucket(wait.addr);
+        let mut queue = self.queue.lock();
+        let woken = match wait.slot.state.load(Ordering::Acquire) {
+            FUTEX_SLOT_WOKEN => true,
+            FUTEX_SLOT_QUEUED => {
+                queue.entries.remove(&wait.slot.id);
+                wait.slot
+                    .state
+                    .store(FUTEX_SLOT_RELEASED, Ordering::Release);
+                false
+            }
+            _ => false,
+        };
+        (woken, bucket.generation.load(Ordering::Acquire))
+    }
+
+    /// Whether a wake already consumed `wait`, leaving the queue either way.
+    pub fn take_woken(&self, wait: &FutexWait) -> bool {
+        self.dequeue(wait).0
+    }
+
+    /// Consume up to `limit` queued waiters on `addr` in FIFO order. Each is
+    /// counted whether or not it has subscribed yet: a subscribed one gets its
+    /// callback, an unsubscribed one finds `Ready` when it subscribes. Callbacks
+    /// run with the queue lock released.
     fn publish_generation(&self, addr: u64, generation: u64, limit: u32) -> u32 {
         let callbacks = {
-            let mut listeners = self.generation_listeners.lock();
-            let ids = listeners
+            let mut queue = self.queue.lock();
+            let ids = queue
+                .entries
                 .iter()
-                .filter_map(|(id, listener)| {
-                    (listener.addr == addr && listener.expected_generation != generation)
-                        .then_some(*id)
-                })
+                .filter_map(|(id, entry)| (entry.addr == addr).then_some(*id))
                 .take(usize::try_from(limit).unwrap_or(usize::MAX))
                 .collect::<Vec<_>>();
             ids.into_iter()
-                .filter_map(|id| listeners.remove(&id).map(|listener| listener.callback))
+                .filter_map(|id| {
+                    let entry = queue.entries.remove(&id)?;
+                    // Every token clone is gone but its Drop has not taken the
+                    // lock yet: nobody is waiting, so nobody is woken.
+                    let slot = entry.slot.upgrade()?;
+                    slot.state.store(FUTEX_SLOT_WOKEN, Ordering::Release);
+                    Some(entry.callback)
+                })
                 .collect::<Vec<_>>()
         };
-        let count = u32::try_from(callbacks.len()).unwrap_or(0);
+        let count = u32::try_from(callbacks.len()).unwrap_or(u32::MAX);
         let event = FutexGenerationEvent { addr, generation };
-        for callback in callbacks {
+        for callback in callbacks.into_iter().flatten() {
             callback(event);
         }
         count
@@ -1031,16 +1159,30 @@ impl FutexTable {
         Arc::as_ptr(bucket) as usize
     }
 
-    /// Capture the futex generation immediately after the dispatcher has
-    /// verified the guest word. The runtime later parks against this token
-    /// with syscall locks released; a wake that races in between advances the
-    /// generation and the waiter returns without sleeping.
+    /// Join the wait queue immediately after the dispatcher has verified the
+    /// guest word. From this instant a wake on `addr` finds and counts this
+    /// waiter, exactly as Linux does once the waiter is on the hash bucket. The
+    /// runtime later subscribes (continuation model) or parks (legacy path)
+    /// with syscall locks released; a wake that races in between consumes the
+    /// slot and the waiter completes without sleeping.
     pub fn prepare_wait(&self, addr: u64) -> FutexWait {
-        let bucket = self.bucket(addr);
-        FutexWait {
-            addr,
-            generation: bucket.generation.load(Ordering::Acquire),
-        }
+        let mut queue = self.queue.lock();
+        let id = queue.next_ticket;
+        queue.next_ticket = id.checked_add(1).unwrap_or_else(|| std::process::abort());
+        let slot = Arc::new(FutexQueueSlot {
+            id,
+            state: AtomicU8::new(FUTEX_SLOT_QUEUED),
+            queue: Arc::downgrade(&self.queue),
+        });
+        queue.entries.insert(
+            id,
+            FutexQueueEntry {
+                addr,
+                slot: Arc::downgrade(&slot),
+                callback: None,
+            },
+        );
+        FutexWait { addr, slot }
     }
 
     pub fn wait(
@@ -1090,12 +1232,16 @@ impl FutexTable {
         use std::cell::Cell;
         use std::time::Instant;
 
+        let (woken, generation) = self.dequeue(&wait);
+        if woken {
+            return FutexWaitOutcome::Woken;
+        }
         let bucket = self.bucket(wait.addr);
         let key = Self::bucket_key(&bucket);
         let deadline = timeout.map(|duration| Instant::now() + duration);
 
         loop {
-            if bucket.generation.load(Ordering::Acquire) != wait.generation {
+            if bucket.generation.load(Ordering::Acquire) != generation {
                 return FutexWaitOutcome::Woken;
             }
             // Snapshot BEFORE the full predicate. Signal/fork/exec publishers
@@ -1119,7 +1265,7 @@ impl FutexTable {
             if poll_ns != 0 {
                 let poll_deadline = Instant::now() + std::time::Duration::from_nanos(poll_ns);
                 while Instant::now() < poll_deadline {
-                    if bucket.generation.load(Ordering::Acquire) != wait.generation {
+                    if bucket.generation.load(Ordering::Acquire) != generation {
                         return FutexWaitOutcome::Woken;
                     }
                     if interrupted() {
@@ -1141,7 +1287,7 @@ impl FutexTable {
                     || {
                         #[cfg(test)]
                         let _validation = FutexParkValidationGuard::enter();
-                        if bucket.generation.load(Ordering::Acquire) != wait.generation {
+                        if bucket.generation.load(Ordering::Acquire) != generation {
                             return false;
                         }
                         // The parking_lot validation callback runs with its
@@ -1184,7 +1330,7 @@ impl FutexTable {
                     }
                 }
                 ParkResult::Invalid => {
-                    if bucket.generation.load(Ordering::Acquire) != wait.generation {
+                    if bucket.generation.load(Ordering::Acquire) != generation {
                         return FutexWaitOutcome::Woken;
                     }
                 }
@@ -1521,18 +1667,20 @@ impl FutexTable {
         };
         let woken = (result.unparked_threads as u32 + woken_listeners).min(nr_wake);
 
+        // Queued (continuation-model) waiters move by address rewrite, whether
+        // or not they have subscribed yet; a later wake on `to` consumes them.
         let requeued_listeners = if to_mark > 0 {
-            let mut listeners = self.generation_listeners.lock();
-            let ids = listeners
+            let mut queue = self.queue.lock();
+            let ids = queue
+                .entries
                 .iter()
-                .filter_map(|(id, listener)| (listener.addr == from).then_some(*id))
+                .filter_map(|(id, entry)| (entry.addr == from).then_some(*id))
                 .take(to_mark as usize)
                 .collect::<Vec<_>>();
             let count = ids.len() as u32;
             for id in ids {
-                if let Some(listener) = listeners.get_mut(&id) {
-                    listener.addr = to;
-                    listener.expected_generation = to_bucket.generation.load(Ordering::Acquire);
+                if let Some(entry) = queue.entries.get_mut(&id) {
+                    entry.addr = to;
                 }
             }
             count
@@ -2385,6 +2533,7 @@ mod generation_subscription_tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     #[test]
     fn exact_generation_subscription_publishes_once_and_drop_unregisters() {
@@ -2394,19 +2543,20 @@ mod generation_subscription_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&calls);
         let subscription = match table.subscribe_generation(
-            first,
+            first.clone(),
             Arc::new(move |event| {
                 assert_eq!(event.addr(), addr);
-                assert!(event.generation() > first.generation());
                 observed.fetch_add(1, Ordering::SeqCst);
             }),
         ) {
             FutexGenerationEnrollment::Subscribed(subscription) => subscription,
             FutexGenerationEnrollment::Ready(_) => panic!("unchanged generation is not ready"),
         };
-        table.wake(addr, 1);
+        assert!(!first.is_woken());
+        assert_eq!(table.wake(addr, 1), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        table.wake(addr, 1);
+        assert!(first.is_woken());
+        assert_eq!(table.wake(addr, 1), 0);
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -2420,6 +2570,138 @@ mod generation_subscription_tests {
             table.subscribe_generation(stale, Arc::new(|_| panic!("stale callback"))),
             FutexGenerationEnrollment::Ready(_)
         ));
+    }
+
+    /// `FUTEX_WAKE 1` with two queued waiters consumes exactly the older one
+    /// (FIFO), leaves the younger queued, and the next wake takes the younger.
+    #[test]
+    fn wake_consumes_queued_waiters_fifo_and_exactly() {
+        let table = FutexTable::new();
+        let addr = 0x7abd_0000;
+        let older = table.prepare_wait(addr);
+        let younger = table.prepare_wait(addr);
+        assert_eq!(table.wake(addr, 1), 1);
+        assert!(older.is_woken());
+        assert!(!younger.is_woken());
+        assert!(matches!(
+            table.subscribe_generation(older, Arc::new(|_| panic!("already woken"))),
+            FutexGenerationEnrollment::Ready(_)
+        ));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let subscription = match table.subscribe_generation(
+            younger.clone(),
+            Arc::new(move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }),
+        ) {
+            FutexGenerationEnrollment::Subscribed(subscription) => subscription,
+            FutexGenerationEnrollment::Ready(_) => panic!("younger waiter was not woken"),
+        };
+        assert_eq!(table.wake(addr, 1), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(younger.is_woken());
+        drop(subscription);
+        assert_eq!(table.wake(addr, 1), 0, "queue is empty");
+    }
+
+    /// A waiter that left before subscribing (dispatcher `EAGAIN`, cancelled
+    /// continuation) must not be charged to a later wake.
+    #[test]
+    fn dropped_queued_wait_is_not_counted() {
+        let table = FutexTable::new();
+        let addr = 0x7abf_0000;
+        let abandoned = table.prepare_wait(addr);
+        drop(abandoned);
+        assert_eq!(table.wake(addr, 1), 0);
+        let queued = table.prepare_wait(addr);
+        let queued_clone = queued.clone();
+        drop(queued);
+        assert_eq!(table.wake(addr, 1), 1, "a live clone keeps the slot queued");
+        assert!(queued_clone.is_woken());
+    }
+
+    /// Dropping the subscription leaves the queue: a later wake finds nobody
+    /// and does not count the departed waiter.
+    #[test]
+    fn dropped_subscription_leaves_queue_uncounted() {
+        let table = FutexTable::new();
+        let addr = 0x7ac0_0000;
+        let wait = table.prepare_wait(addr);
+        let subscription = match table
+            .subscribe_generation(wait.clone(), Arc::new(|_| panic!("dropped subscription")))
+        {
+            FutexGenerationEnrollment::Subscribed(subscription) => subscription,
+            FutexGenerationEnrollment::Ready(_) => panic!("fresh waiter is not ready"),
+        };
+        drop(subscription);
+        assert_eq!(table.wake(addr, 1), 0);
+        assert!(!wait.is_woken());
+        assert!(
+            matches!(
+                table.subscribe_generation(wait, Arc::new(|_| panic!("departed"))),
+                FutexGenerationEnrollment::Ready(_)
+            ),
+            "a departed waiter re-subscribing gets a spurious ready, never a second slot"
+        );
+    }
+
+    /// `FUTEX_CMP_REQUEUE` moves a queued-but-unsubscribed waiter to the target
+    /// word; a wake on the target consumes it and the source is empty.
+    #[test]
+    fn requeue_moves_queued_wait_before_it_subscribes() {
+        let table = FutexTable::new();
+        let from = 0x7ac1_0000;
+        let to = 0x7ac1_0100;
+        let wait = table.prepare_wait(from);
+        assert_eq!(table.requeue(from, to, 0, 1), (0, 1));
+        assert_eq!(table.wake(from, 1), 0, "source queue is empty");
+        assert!(!wait.is_woken());
+        assert_eq!(table.wake(to, 1), 1);
+        assert!(wait.is_woken());
+    }
+
+    /// The legacy park path leaves the queue: a wake that already consumed the
+    /// slot returns `Woken` immediately, and a parked waiter is released by a
+    /// later wake without the queue double-counting it.
+    #[test]
+    fn wait_prepared_dequeues_and_honours_prior_wake() {
+        let table = FutexTable::new();
+        let addr = 0x7ac2_0000;
+        let wait = table.prepare_wait(addr);
+        assert_eq!(table.wake(addr, 1), 1);
+        assert_eq!(
+            table.wait_prepared(wait, Some(Duration::ZERO), &|| false),
+            FutexWaitOutcome::Woken
+        );
+        let wait = table.prepare_wait(addr);
+        assert_eq!(
+            table.wait_prepared(wait.clone(), Some(Duration::ZERO), &|| false),
+            FutexWaitOutcome::TimedOut
+        );
+        assert!(!wait.is_woken());
+        assert_eq!(
+            table.wake(addr, 1),
+            0,
+            "a departed park-path waiter is not queued"
+        );
+    }
+
+    /// LTP `pause01` shape: the dispatcher prepared the wait (word verified)
+    /// but the continuation has not subscribed yet when the child's
+    /// `FUTEX_WAKE` lands. Linux counts that waiter (it is on the queue), so
+    /// the wake must return 1 and the subscriber must be released.
+    #[test]
+    fn wake_between_prepare_and_subscribe_is_counted_and_released() {
+        let table = FutexTable::new();
+        let addr = 0x7abe_0000;
+        let queued = table.prepare_wait(addr);
+        assert_eq!(table.wake(addr, 1), 1, "queued waiter is counted");
+        assert!(matches!(
+            table.subscribe_generation(queued, Arc::new(|_| panic!("already woken"))),
+            FutexGenerationEnrollment::Ready(_)
+        ));
+        assert_eq!(table.wake(addr, 1), 0, "nobody left on the queue");
     }
 
     #[test]

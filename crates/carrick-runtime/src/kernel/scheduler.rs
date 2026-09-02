@@ -3182,6 +3182,111 @@ mod tests {
         scheduler.settle_exited(released).unwrap();
     }
 
+    /// `ltp-pause01`: the previous child's `exit_group` posts SIGCHLD to the
+    /// parent while the parent is switching out into a shared `FUTEX_WAIT`
+    /// on the LTP checkpoint word. That generic scheduler wake is not a
+    /// futex wake; publishing `Ready` for it returns 0 from `futex(2)` with
+    /// no counted producer, so the next child's `FUTEX_WAKE` finds nobody
+    /// and `tst_checkpoint_wake` spins to ETIMEDOUT.
+    #[test]
+    fn generic_wake_racing_shared_futex_settlement_cannot_fabricate_wake() {
+        use carrick_guest_mem::{HostVa, SharedFutexLocation};
+        use carrick_thread::platform_futex::carrier_shared_futex_table;
+
+        let (kernel, waiter) = bootstrap(12_123);
+        publish(&waiter, 31);
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+        let wait_service = CarrierWaitService::new(Arc::clone(&scheduler));
+        let executor = scheduler
+            .register_executor(Arc::new(RecordingKick::default()))
+            .unwrap();
+        scheduler.make_runnable(waiter.thread().key()).unwrap();
+        let running = scheduler.take(&executor).unwrap();
+
+        let word = Box::new(std::sync::atomic::AtomicU32::new(0));
+        let waiter_key = word.as_ptr() as usize;
+        let current = waiter
+            .task_binding()
+            .capture(waiter.thread().key().tid)
+            .expect("recapture futex waiter");
+        let continuation = BlockedContinuation::from_dispatch_outcome(
+            crate::dispatch::DispatchOutcome::SharedFutexWait {
+                location: SharedFutexLocation::Direct {
+                    word: HostVa(waiter_key),
+                    waiter_key,
+                },
+                waiter_key,
+                generation: carrier_shared_futex_table().prepare_wait(waiter_key as u64),
+                value: 0,
+                timeout: None,
+            },
+            ContinuationCapture::from_lease(
+                &current,
+                running.lease(),
+                SyscallRequest::new(98, SyscallArgs([0; 6])),
+                RestartClass::RestartSyscall,
+                ContinuationBackend::Hvpatch,
+            )
+            .expect("capture running futex waiter"),
+        )
+        .expect("shared futex continuation");
+        let mut registration = wait_service.prepare_registration(&continuation);
+        wait_service
+            .enroll(&mut registration)
+            .expect("enroll shared futex continuation");
+
+        scheduler
+            .wake(waiter.thread().key())
+            .expect("generic wake races futex switch-out");
+        scheduler
+            .settle_blocked_continuation(running, continuation, registration)
+            .expect("settle futex waiter");
+
+        assert!(
+            matches!(
+                waiter.thread().execution_state(),
+                ThreadExecutionState::Blocked { .. }
+            ),
+            "generic wake_pending must not fabricate a futex wake",
+        );
+        assert_eq!(scheduler.queued_len(), 0);
+
+        assert_eq!(
+            scheduler
+                .wake(waiter.thread().key())
+                .expect("generic wake of blocked futex waiter"),
+            WakeDisposition::Pending,
+        );
+        assert!(matches!(
+            waiter.thread().execution_state(),
+            ThreadExecutionState::Blocked { .. }
+        ));
+        assert_eq!(scheduler.queued_len(), 0);
+
+        assert_eq!(
+            carrier_shared_futex_table().wake(waiter_key as u64, 1),
+            1,
+            "the exact futex wake must still find the parked waiter",
+        );
+        assert!(matches!(
+            waiter.thread().execution_state(),
+            ThreadExecutionState::Runnable { .. }
+        ));
+        assert_eq!(scheduler.queued_len(), 1);
+        let released = scheduler.take(&executor).expect("take woken futex waiter");
+        assert_eq!(
+            released
+                .lease()
+                .blocked_continuation()
+                .expect("woken futex continuation")
+                .ready_event()
+                .expect("exact futex wake event"),
+            crate::vcpu_loop::continuation::ContinuationEvent::Ready,
+        );
+        scheduler.settle_exited(released).unwrap();
+        drop(word);
+    }
+
     #[test]
     fn close_wakes_all_waiters_rejects_new_roots_and_drains_recursive_publication() {
         let (kernel, root) = bootstrap(12_110);

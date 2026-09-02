@@ -684,6 +684,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "futexcheckpointexit": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "futexdeadline": {
     "class": "conformance",
     "excluded": false,
