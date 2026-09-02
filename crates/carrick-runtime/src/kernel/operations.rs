@@ -3892,6 +3892,14 @@ impl Kernel {
         };
         let mut children = task.children();
         children.sort_by_key(|child| child.serial);
+        // The adopter is only a participant when there is something to
+        // reparent. A childless exit changes no parent edge on it, so it is
+        // neither reserved nor revision-bumped: otherwise every leaf exit in
+        // the VM contends with the run root's own in-flight fork/exec
+        // reservations, and a concurrent `reserve_fork` on root observes
+        // `TaskBusy` for an exit that never touches it. The adopter above was
+        // still validated so a stale explicit adopter fails closed.
+        let adopter = adopter.filter(|_| !children.is_empty());
 
         let mut reserved_ids = BTreeSet::from([task_id]);
         let mut affected_revisions = BTreeMap::new();
@@ -8876,6 +8884,73 @@ mod tests {
                 Err(KernelOperationError::TaskBusy(_))
             ));
         }
+    }
+
+    /// A childless task's exit reparents nothing, so it must not reserve the
+    /// run root as adopter. Before this held, EVERY child exit in the VM
+    /// serialized against root's own operations: a Go `os/exec` helper
+    /// exiting while the root forked its next helper made `reserve_fork`
+    /// observe `TaskBusy(root)`, which the guest saw as `fork(2) = EAGAIN`
+    /// (`forkabort-E4`, 2026-09-02). A task WITH children still reserves the
+    /// adopter, because their parent edges really do change.
+    #[test]
+    fn childless_exit_does_not_reserve_the_root_adopter() {
+        let (kernel, root) = bootstrap(339);
+        let plan = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
+        let leaf = kernel
+            .fork_task(
+                &root,
+                plan,
+                ThreadId::synthetic_for_tests(3391),
+                "leaf".to_string(),
+                None,
+            )
+            .expect("leaf child");
+        let middle = kernel
+            .fork_task(
+                &root,
+                plan,
+                ThreadId::synthetic_for_tests(3392),
+                "middle".to_string(),
+                None,
+            )
+            .expect("middle child");
+        let _grandchild = kernel
+            .fork_task(
+                &middle,
+                plan,
+                ThreadId::synthetic_for_tests(3393),
+                "grandchild".to_string(),
+                None,
+            )
+            .expect("grandchild");
+
+        // Root is mid-fork: its task is reserved by the in-flight operation.
+        let in_flight = kernel
+            .reserve_fork(&root, plan, "in-flight root fork".to_string(), None)
+            .expect("root fork reservation");
+
+        let leaf_exit = kernel
+            .prepare_task_exit_key(
+                leaf.task.key(),
+                LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .expect("a childless exit needs no adopter and must not wait on root");
+        drop(leaf_exit);
+
+        assert!(
+            matches!(
+                kernel.prepare_task_exit_key(
+                    middle.task.key(),
+                    LinuxWaitStatus::from_wait_encoding(0),
+                    None,
+                ),
+                Err(KernelOperationError::TaskBusy(id)) if id == root.task.key().id
+            ),
+            "an exit that reparents children still reserves the adopter"
+        );
+        drop(in_flight);
     }
 
     /// `capabilities(7)` / `user_namespaces(7)`: the capability sets and the
