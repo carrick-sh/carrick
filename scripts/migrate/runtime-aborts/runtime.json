@@ -995,7 +995,7 @@
       "file": "crates/carrick-runtime/src/hvpatch/mm_resources.rs",
       "function": "ExecMmReservation::active",
       "ordinal_in_function": 1,
-      "fingerprint": "aec41228e6fe9917f6226192bf7f68551675da9513d1361745b3d69e6aaf4abb",
+      "fingerprint": "ae57cd1fe40d2a4895ab2c32d9e3d8cfba3b26c82f4d26da52a9d5c1903d3e57",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::mm_reservation",
       "rationale": "Attempted to access active components on a settled or fail-closed ExecMmReservation; indicates illegal state transition in MM reservation lifecycle."

@@ -6,8 +6,8 @@ use parking_lot::{Condvar, Mutex};
 
 use super::asid::{AsidError, AsidGeneration, AsidLoad, AsidResidencyError};
 use super::stage1_mm::{
-    PreparedStage1Mm, PreparedStage1MmAbort, PreparedStage1MmRetirement, Stage1MmBackend,
-    Stage1MmError, Stage1MmLease, Stage1MmPool, Stage1MmRetirement,
+    PreparedStage1Mm, PreparedStage1MmAbort, Stage1MmBackend, Stage1MmError, Stage1MmLease,
+    Stage1MmPool, Stage1MmRetirement,
 };
 #[cfg(test)]
 use crate::kernel::ThreadKey;
@@ -66,8 +66,6 @@ pub(crate) enum ExecReservationConstructionFailpoint {
     AfterMarker,
     #[error("injected exec reservation failure after replacement allocation")]
     AfterReplacement,
-    #[error("injected exec reservation failure after predecessor retirement preparation")]
-    AfterFinalRetirement,
 }
 
 #[cfg(test)]
@@ -89,7 +87,6 @@ impl MmStateLinearizationHook {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ExecConstructionRollbackStep {
     ReplacementSettled,
-    PredecessorRestored,
     MarkerCleared,
 }
 
@@ -114,7 +111,6 @@ impl ExecConstructionRollbackTrace {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ExecDispositionSettlementStep {
     ReplacementSettled,
-    PredecessorRestored,
     MarkerCleared,
 }
 
@@ -135,17 +131,19 @@ impl ExecDispositionSettlementTrace {
     }
 }
 
-#[derive(Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) enum ExecMmDisposition {
-    RetainOldMm,
-    RetireOldMm(PreparedStage1MmRetirement),
-}
-
-/// Read-only view of the topology decision pinned by an exec reservation.
+/// The topology decision pinned by an exec reservation.
 ///
 /// This is deliberately exhaustive: consumers must route backend sharing and
 /// retirement inventory from the reservation, never from a later owner count.
+///
+/// Pinning the decision does NOT touch the predecessor: a `RetireOldMm`
+/// reservation leaves the old address space fully loadable until
+/// [`ExecMmReservation::commit`]. The exec'ing thread parks and releases its
+/// executor while its siblings drain (`ExecSiblingDrain`), so its executor
+/// must be admitted back into the predecessor on resume; preparing the
+/// retirement at reservation time refused that reload and externally settled
+/// the exec owner as a silently exited thread. Linux orders it the same way:
+/// the other threads die in the old mm first, then the mm is replaced.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExecMmDispositionKind {
     RetainOldMm,
@@ -153,22 +151,12 @@ pub(crate) enum ExecMmDispositionKind {
 }
 
 #[derive(Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
-enum ExecMmDispositionPlan {
-    RetainOldMm,
-    RetireOldMm,
-}
-
-#[derive(Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 enum ExecMmReservationState {
     Active {
         replacement: PreparedStage1Mm,
-        disposition: ExecMmDisposition,
+        disposition: ExecMmDispositionKind,
     },
-    FailClosed {
-        disposition: ExecMmDisposition,
-    },
+    FailClosed,
     Settled,
 }
 
@@ -268,21 +256,16 @@ impl ExecMmReservation {
         Ok(())
     }
 
-    fn active(&self) -> (&PreparedStage1Mm, &ExecMmDisposition) {
+    fn active(&self) -> (&PreparedStage1Mm, ExecMmDispositionKind) {
         match &self.state {
             ExecMmReservationState::Active {
                 replacement,
                 disposition,
-            } => (replacement, disposition),
-            ExecMmReservationState::FailClosed { .. } | ExecMmReservationState::Settled => {
+            } => (replacement, *disposition),
+            ExecMmReservationState::FailClosed | ExecMmReservationState::Settled => {
                 std::process::abort()
             }
         }
-    }
-
-    #[cfg(test)]
-    fn disposition_for_tests(&self) -> &ExecMmDisposition {
-        self.active().1
     }
 
     pub(crate) fn replacement_asid_generation(&self) -> AsidGeneration {
@@ -290,10 +273,7 @@ impl ExecMmReservation {
     }
 
     pub(crate) fn disposition(&self) -> ExecMmDispositionKind {
-        match self.active().1 {
-            ExecMmDisposition::RetainOldMm => ExecMmDispositionKind::RetainOldMm,
-            ExecMmDisposition::RetireOldMm(_) => ExecMmDispositionKind::RetireOldMm,
-        }
+        self.active().1
     }
 
     pub(crate) fn replacement_backend(&self) -> Arc<Stage1MmBackend> {
@@ -330,28 +310,25 @@ impl ExecMmReservation {
         let settlement = match replacement.abort() {
             Ok(settlement) => settlement,
             Err(error) => {
-                self.state = ExecMmReservationState::FailClosed { disposition };
+                self.state = ExecMmReservationState::FailClosed;
                 return Err(error.into());
             }
         };
         #[cfg(test)]
         self.record_settlement(ExecDispositionSettlementStep::ReplacementSettled);
+        // The predecessor was never touched by the reservation, so both
+        // dispositions restore by merely dropping the replacement.
         let receipt = match disposition {
-            ExecMmDisposition::RetainOldMm => ExecMmAbortReceipt::Retained {
+            ExecMmDispositionKind::RetainOldMm => ExecMmAbortReceipt::Retained {
                 predecessor: Arc::clone(&self.predecessor),
                 replacement: replacement_generation,
                 settlement,
             },
-            ExecMmDisposition::RetireOldMm(retirement) => {
-                drop(retirement);
-                #[cfg(test)]
-                self.record_settlement(ExecDispositionSettlementStep::PredecessorRestored);
-                ExecMmAbortReceipt::RestoredFinal {
-                    predecessor: Arc::clone(&self.predecessor),
-                    replacement: replacement_generation,
-                    settlement,
-                }
-            }
+            ExecMmDispositionKind::RetireOldMm => ExecMmAbortReceipt::RestoredFinal {
+                predecessor: Arc::clone(&self.predecessor),
+                replacement: replacement_generation,
+                settlement,
+            },
         };
         let removed = self
             .resources
@@ -372,6 +349,19 @@ impl ExecMmReservation {
     ) -> Result<ExecMmCommitReceipt, MmResourcesError> {
         let mut resources_state = self.resources.state.lock();
         self.validate(&resources_state)?;
+        // Close the predecessor's load gate only now, after the sibling drain:
+        // its `pending` residency snapshot must name the executors that are
+        // resident at the moment the address space is actually replaced. An
+        // early return past this point drops the preparation and reopens the
+        // predecessor, so the reservation stays abortable.
+        let predecessor_retirement = match self.active().1 {
+            ExecMmDispositionKind::RetainOldMm => None,
+            ExecMmDispositionKind::RetireOldMm => Some(
+                self.resources
+                    .mm_pool
+                    .prepare_retirement(&self.predecessor)?,
+            ),
+        };
         let replacement_binding = self.active().0.publish_stage1_root(stage1_root)?;
         let replacement_backend = self.active().0.backend();
         replacement_backend.publish_binding(replacement_binding);
@@ -380,20 +370,16 @@ impl ExecMmReservation {
         }
 
         let state = std::mem::replace(&mut self.state, ExecMmReservationState::Settled);
-        let ExecMmReservationState::Active {
-            replacement,
-            disposition,
-        } = state
-        else {
+        let ExecMmReservationState::Active { replacement, .. } = state else {
             std::process::abort();
         };
         let replacement = replacement.commit();
-        let receipt = match disposition {
-            ExecMmDisposition::RetainOldMm => ExecMmCommitReceipt::Retained {
+        let receipt = match predecessor_retirement {
+            None => ExecMmCommitReceipt::Retained {
                 predecessor: Arc::clone(&self.predecessor),
                 replacement: Arc::clone(&replacement),
             },
-            ExecMmDisposition::RetireOldMm(retirement) => ExecMmCommitReceipt::Retired {
+            Some(retirement) => ExecMmCommitReceipt::Retired {
                 retirement: retirement.commit(),
                 replacement: Arc::clone(&replacement),
             },
@@ -421,14 +407,8 @@ impl Drop for ExecMmReservation {
     fn drop(&mut self) {
         let reservation_state = std::mem::replace(&mut self.state, ExecMmReservationState::Settled);
         match reservation_state {
-            ExecMmReservationState::Settled => {}
-            ExecMmReservationState::FailClosed { disposition } => {
-                drop(disposition);
-            }
-            ExecMmReservationState::Active {
-                replacement,
-                disposition,
-            } => {
+            ExecMmReservationState::Settled | ExecMmReservationState::FailClosed => {}
+            ExecMmReservationState::Active { replacement, .. } => {
                 let mut resources_state = self.resources.state.lock();
                 let marker_matches = self.validate(&resources_state).is_ok();
                 match replacement.abort() {
@@ -438,19 +418,11 @@ impl Drop for ExecMmReservation {
                     }
                     Err(error) => {
                         tracing::error!(%error, "failed to settle dropped exec MM replacement");
-                        drop(disposition);
                         return;
                     }
                 }
                 #[cfg(test)]
                 self.record_settlement(ExecDispositionSettlementStep::ReplacementSettled);
-                #[cfg(test)]
-                let final_disposition = matches!(disposition, ExecMmDisposition::RetireOldMm(_));
-                drop(disposition);
-                #[cfg(test)]
-                if final_disposition {
-                    self.record_settlement(ExecDispositionSettlementStep::PredecessorRestored);
-                }
                 if marker_matches {
                     self.resources
                         .clear_exec_reservation(&mut resources_state, self.generation);
@@ -993,10 +965,10 @@ impl MmResources {
             return Err(MmResourcesError::InjectedExecReservationFailure(failpoint));
         }
 
-        let disposition_plan = if Self::owner_count(&state, &predecessor) == 1 {
-            ExecMmDispositionPlan::RetireOldMm
+        let disposition = if Self::owner_count(&state, &predecessor) == 1 {
+            ExecMmDispositionKind::RetireOldMm
         } else {
-            ExecMmDispositionPlan::RetainOldMm
+            ExecMmDispositionKind::RetainOldMm
         };
         let replacement = match self.mm_pool.prepare_child() {
             Ok(replacement) => replacement,
@@ -1017,51 +989,6 @@ impl MmResources {
             }
             return Err(MmResourcesError::InjectedExecReservationFailure(failpoint));
         }
-        let disposition = match disposition_plan {
-            ExecMmDispositionPlan::RetireOldMm => {
-                match self.mm_pool.prepare_retirement(&predecessor) {
-                    Ok(retirement) => {
-                        #[cfg(test)]
-                        if failpoint == ExecReservationConstructionFailpoint::AfterFinalRetirement {
-                            let replacement_settlement =
-                                Self::settle_failed_exec_replacement(replacement);
-                            if replacement_settlement.is_ok()
-                                && let Some(trace) = rollback_trace.as_ref()
-                            {
-                                trace.record(ExecConstructionRollbackStep::ReplacementSettled);
-                            }
-                            drop(retirement);
-                            if let Some(trace) = rollback_trace.as_ref() {
-                                trace.record(ExecConstructionRollbackStep::PredecessorRestored);
-                            }
-                            replacement_settlement?;
-                            self.clear_exec_reservation(&mut state, generation);
-                            if let Some(trace) = rollback_trace.as_ref() {
-                                trace.record(ExecConstructionRollbackStep::MarkerCleared);
-                            }
-                            return Err(MmResourcesError::InjectedExecReservationFailure(
-                                failpoint,
-                            ));
-                        }
-                        ExecMmDisposition::RetireOldMm(retirement)
-                    }
-                    Err(error) => {
-                        Self::settle_failed_exec_replacement(replacement)?;
-                        #[cfg(test)]
-                        if let Some(trace) = rollback_trace.as_ref() {
-                            trace.record(ExecConstructionRollbackStep::ReplacementSettled);
-                        }
-                        self.clear_exec_reservation(&mut state, generation);
-                        #[cfg(test)]
-                        if let Some(trace) = rollback_trace.as_ref() {
-                            trace.record(ExecConstructionRollbackStep::MarkerCleared);
-                        }
-                        return Err(error.into());
-                    }
-                }
-            }
-            ExecMmDispositionPlan::RetainOldMm => ExecMmDisposition::RetainOldMm,
-        };
 
         drop(state);
         Ok(ExecMmReservation {
@@ -1374,32 +1301,20 @@ mod tests {
             .unwrap();
 
         let shared = shared_resources.reserve_exec(shared_child).unwrap();
-        assert!(matches!(
-            shared.disposition_for_tests(),
-            ExecMmDisposition::RetainOldMm
-        ));
+        assert!(shared.disposition() == ExecMmDispositionKind::RetainOldMm);
         drop(shared);
         let shared_retry = shared_resources.reserve_exec(shared_child).unwrap();
-        assert!(matches!(
-            shared_retry.disposition_for_tests(),
-            ExecMmDisposition::RetainOldMm
-        ));
+        assert!(shared_retry.disposition() == ExecMmDispositionKind::RetainOldMm);
         drop(shared_retry);
 
         let final_task = task(102, 3);
         let (final_resources, _) = resources(final_task, 2);
         let final_resources = Arc::new(final_resources);
         let final_reservation = final_resources.reserve_exec(final_task).unwrap();
-        assert!(matches!(
-            final_reservation.disposition_for_tests(),
-            ExecMmDisposition::RetireOldMm(_)
-        ));
+        assert!(final_reservation.disposition() == ExecMmDispositionKind::RetireOldMm);
         drop(final_reservation);
         let final_retry = final_resources.reserve_exec(final_task).unwrap();
-        assert!(matches!(
-            final_retry.disposition_for_tests(),
-            ExecMmDisposition::RetireOldMm(_)
-        ));
+        assert!(final_retry.disposition() == ExecMmDispositionKind::RetireOldMm);
     }
 
     #[test]
@@ -1589,6 +1504,58 @@ mod tests {
         resources
             .publish_shared_child(parent, rejected_child)
             .expect("exact-MM publication retries after abort");
+    }
+
+    #[test]
+    fn final_exec_reservation_keeps_predecessor_loadable_until_commit() {
+        // The exec'ing thread parks in `ExecSiblingDrain` and releases its
+        // executor while siblings die. On resume its executor must be able to
+        // load the predecessor address space again: the predecessor retires at
+        // exec commit, after the drain, not at reservation time.
+        let owner = task(135, 1);
+        let (resources, _) = resources(owner, 2);
+        let resources = Arc::new(resources);
+        let predecessor = resources.lease(owner).unwrap();
+        let reservation = resources.reserve_exec(owner).unwrap();
+        assert_eq!(
+            reservation.disposition(),
+            ExecMmDispositionKind::RetireOldMm
+        );
+        assert!(
+            !predecessor.is_retiring(),
+            "final-owner exec reservation closed predecessor loads before commit"
+        );
+        let load = predecessor
+            .begin_asid_load(executor(13_501))
+            .expect("exec owner reloads its own address space during sibling drain");
+        drop(load);
+
+        let root = reservation.replacement_root_slot().unwrap().base() + 0x1000;
+        let receipt = reservation.commit(root).unwrap();
+        let ExecMmCommitReceipt::Retired { retirement, .. } = receipt else {
+            panic!("final-owner commit did not retire the predecessor: {receipt:?}");
+        };
+        assert!(predecessor.is_retiring());
+        assert!(matches!(
+            predecessor.begin_asid_load(executor(13_502)),
+            Err(AsidResidencyError::Retiring)
+        ));
+        retirement.complete().unwrap();
+    }
+
+    #[test]
+    fn aborted_final_exec_reservation_never_touched_predecessor_loads() {
+        let owner = task(136, 1);
+        let (resources, _) = resources(owner, 2);
+        let resources = Arc::new(resources);
+        let predecessor = resources.lease(owner).unwrap();
+        let reservation = resources.reserve_exec(owner).unwrap();
+        let load = predecessor.begin_asid_load(executor(13_601)).unwrap();
+        let receipt = reservation.abort().unwrap();
+        assert!(matches!(receipt, ExecMmAbortReceipt::RestoredFinal { .. }));
+        drop(load);
+        assert!(!predecessor.is_retiring());
+        predecessor.begin_asid_load(executor(13_601)).unwrap();
     }
 
     #[test]
@@ -1835,49 +1802,27 @@ mod tests {
         let expected_root = probe.root_slot();
         drop(probe);
 
+        let trace = ExecConstructionRollbackTrace::default();
         assert!(matches!(
-            resources.reserve_exec_with_failpoint_for_tests(
+            resources.reserve_exec_with_failpoint_and_trace_for_tests(
                 root,
                 ExecReservationConstructionFailpoint::AfterReplacement,
+                trace.clone(),
             ),
             Err(MmResourcesError::InjectedExecReservationFailure(
                 ExecReservationConstructionFailpoint::AfterReplacement,
             ))
         ));
+        assert_eq!(
+            trace.snapshot(),
+            vec![
+                ExecConstructionRollbackStep::ReplacementSettled,
+                ExecConstructionRollbackStep::MarkerCleared,
+            ]
+        );
         assert!(Arc::ptr_eq(&resources.lease(root).unwrap(), &predecessor));
         assert!(predecessor.begin_asid_load(executor(16_002)).is_ok());
         let retry = resources.reserve_exec(root).unwrap();
-        assert_eq!(retry.replacement_asid_generation().asid(), expected_asid);
-        assert_eq!(retry.replacement_root_slot(), expected_root);
-    }
-
-    #[test]
-    fn failure_after_final_retirement_preparation_restores_every_layer_before_retry() {
-        let root = task(162, 1);
-        let (resources, _) = resources(root, 2);
-        let resources = Arc::new(resources);
-        let predecessor = resources.lease(root).unwrap();
-        let probe = resources.prepare_child().unwrap();
-        let expected_asid = probe.asid_generation().asid();
-        let expected_root = probe.root_slot();
-        drop(probe);
-
-        assert!(matches!(
-            resources.reserve_exec_with_failpoint_for_tests(
-                root,
-                ExecReservationConstructionFailpoint::AfterFinalRetirement,
-            ),
-            Err(MmResourcesError::InjectedExecReservationFailure(
-                ExecReservationConstructionFailpoint::AfterFinalRetirement,
-            ))
-        ));
-        assert!(Arc::ptr_eq(&resources.lease(root).unwrap(), &predecessor));
-        assert!(predecessor.begin_asid_load(executor(16_003)).is_ok());
-        let retry = resources.reserve_exec(root).unwrap();
-        assert!(matches!(
-            retry.disposition_for_tests(),
-            ExecMmDisposition::RetireOldMm(_)
-        ));
         assert_eq!(retry.replacement_asid_generation().asid(), expected_asid);
         assert_eq!(retry.replacement_root_slot(), expected_root);
     }
@@ -1919,10 +1864,7 @@ mod tests {
         ));
         reserve_release.wait();
         let reserve_first = reserve_worker.join().unwrap().unwrap();
-        assert!(matches!(
-            reserve_first.disposition_for_tests(),
-            ExecMmDisposition::RetireOldMm(_)
-        ));
+        assert!(reserve_first.disposition() == ExecMmDispositionKind::RetireOldMm);
         assert!(matches!(
             publish_rx.recv_timeout(std::time::Duration::from_secs(2)),
             Ok(Err(MmResourcesError::ExecReservationConflict(_)))
@@ -1968,10 +1910,7 @@ mod tests {
             .unwrap()
             .unwrap();
         reserve_after_publish.join().unwrap();
-        assert!(matches!(
-            publish_first.disposition_for_tests(),
-            ExecMmDisposition::RetainOldMm
-        ));
+        assert!(publish_first.disposition() == ExecMmDispositionKind::RetainOldMm);
         publish_first.abort().unwrap();
     }
 
@@ -2012,10 +1951,7 @@ mod tests {
         ));
         reserve_release.wait();
         let reserve_first = reserve_worker.join().unwrap().unwrap();
-        assert!(matches!(
-            reserve_first.disposition_for_tests(),
-            ExecMmDisposition::RetainOldMm
-        ));
+        assert!(reserve_first.disposition() == ExecMmDispositionKind::RetainOldMm);
         assert!(matches!(
             retire_rx.recv_timeout(std::time::Duration::from_secs(2)),
             Ok(Err(MmResourcesError::ExecReservationConflict(_)))
@@ -2068,10 +2004,7 @@ mod tests {
             .unwrap()
             .unwrap();
         reserve_after_retire.join().unwrap();
-        assert!(matches!(
-            retire_first.disposition_for_tests(),
-            ExecMmDisposition::RetireOldMm(_)
-        ));
+        assert!(retire_first.disposition() == ExecMmDispositionKind::RetireOldMm);
         retire_first.abort().unwrap();
     }
 
@@ -2257,7 +2190,6 @@ mod tests {
             trace.snapshot(),
             vec![
                 ExecDispositionSettlementStep::ReplacementSettled,
-                ExecDispositionSettlementStep::PredecessorRestored,
                 ExecDispositionSettlementStep::MarkerCleared,
             ]
         );
@@ -2288,7 +2220,6 @@ mod tests {
             trace.snapshot(),
             vec![
                 ExecDispositionSettlementStep::ReplacementSettled,
-                ExecDispositionSettlementStep::PredecessorRestored,
                 ExecDispositionSettlementStep::MarkerCleared,
             ]
         );
@@ -2315,10 +2246,7 @@ mod tests {
         let reservation = resources
             .reserve_exec_with_settlement_trace_for_tests(exec_child, trace.clone())
             .unwrap();
-        assert!(matches!(
-            reservation.disposition_for_tests(),
-            ExecMmDisposition::RetainOldMm
-        ));
+        assert!(reservation.disposition() == ExecMmDispositionKind::RetainOldMm);
         let mut load = reservation
             .begin_replacement_asid_load(dirty_executor)
             .unwrap();
@@ -2344,31 +2272,5 @@ mod tests {
             resources.prepare_child(),
             Err(MmResourcesError::AsidExhausted)
         ));
-    }
-
-    #[test]
-    fn final_construction_failure_records_replacement_predecessor_marker_rollback_order() {
-        let root = task(206, 1);
-        let (resources, _) = resources(root, 2);
-        let resources = Arc::new(resources);
-        let trace = ExecConstructionRollbackTrace::default();
-        assert!(matches!(
-            resources.reserve_exec_with_failpoint_and_trace_for_tests(
-                root,
-                ExecReservationConstructionFailpoint::AfterFinalRetirement,
-                trace.clone(),
-            ),
-            Err(MmResourcesError::InjectedExecReservationFailure(
-                ExecReservationConstructionFailpoint::AfterFinalRetirement,
-            ))
-        ));
-        assert_eq!(
-            trace.snapshot(),
-            vec![
-                ExecConstructionRollbackStep::ReplacementSettled,
-                ExecConstructionRollbackStep::PredecessorRestored,
-                ExecConstructionRollbackStep::MarkerCleared,
-            ]
-        );
     }
 }

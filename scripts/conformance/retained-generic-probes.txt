@@ -1,5 +1,4 @@
 clockgetres
-execthreads
 execfromthread
 forksleepfork
 futexextra
