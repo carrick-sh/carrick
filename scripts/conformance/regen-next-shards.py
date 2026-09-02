@@ -135,6 +135,19 @@ def main() -> int:
             rf"\g<1>{len(probes)}\g<2>",
             text,
         )
+        # Fail closed: every size assertion naming this shard must now carry
+        # the derived size. A message phrased outside the patterns above would
+        # otherwise keep a stale literal that only the test run catches.
+        stale = [
+            literal
+            for literal in re.findall(rf"shard {n}\b[^\"\n]*?must (?:have|contain) (?:exactly )?(\d+)", text)
+            if int(literal) != size
+        ]
+        if stale:
+            raise SystemExit(
+                f"{path}: shard {n} size assertions {stale} were not rewritten to {size}; "
+                "phrase them as `shard N must have exactly N` / `derived shard N must have N items`"
+            )
         if n == 0:
             shard_set = set(shards[0])
             musl = sorted(musl_gaps & shard_set)
