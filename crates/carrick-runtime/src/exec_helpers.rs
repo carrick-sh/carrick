@@ -444,9 +444,10 @@ where
 /// must continue.
 pub(crate) fn stop_for_ptrace_signal(dispatcher: &SyscallDispatcher, signum: i32) -> bool {
     if let Some(process) = dispatcher.hvpatch_process() {
-        if !dispatcher.is_ptrace_traceme() {
-            return false;
-        }
+        // The kernel graph's `ptrace_tracer` is the only authority on whether
+        // this task is traced: a `PTRACE_ATTACH`ed tracee never set the
+        // per-process TRACEME flag, and `stop_for_ptrace` already answers
+        // false for an untraced task.
         if process.consume_ptrace_resume_signal(signum) {
             return false;
         }
@@ -499,9 +500,6 @@ pub(crate) fn stop_for_ptrace_fault(
     let Some(process) = dispatcher.hvpatch_process() else {
         return stop_for_ptrace_signal(dispatcher, fault.signal.raw());
     };
-    if !dispatcher.is_ptrace_traceme() {
-        return false;
-    }
     if process.consume_ptrace_resume_signal(fault.signal.raw()) {
         return false;
     }

@@ -3281,6 +3281,12 @@ pub struct Task {
     key: TaskKey,
     parent: Mutex<Option<TaskKey>>,
     children: Mutex<BTreeSet<TaskKey>>,
+    /// Tasks this task traces (`PTRACE_TRACEME` children and `PTRACE_ATTACH`
+    /// targets). A tracee's own `ptrace_tracer` stays authoritative; this set
+    /// only lets the tracer's `wait` and exit find its tracees without a
+    /// registry sweep, so an entry that no longer names this task as tracer
+    /// is stale and ignored.
+    ptrace_tracees: Mutex<BTreeSet<TaskKey>>,
     identity: Mutex<TaskIdentity>,
     lifecycle: Mutex<TaskLifecycle>,
     /// Process-directed signal permission uses the last published thread-group
@@ -3513,6 +3519,7 @@ impl Task {
             key,
             parent: Mutex::new(parent),
             children: Mutex::new(BTreeSet::new()),
+            ptrace_tracees: Mutex::new(BTreeSet::new()),
             identity: Mutex::new(TaskIdentity {
                 process_group,
                 session,
@@ -4036,6 +4043,26 @@ impl Task {
         *self.children.lock() = children;
     }
 
+    pub(super) fn ptrace_tracer(&self) -> Option<TaskKey> {
+        self.job_control.lock().ptrace_tracer
+    }
+
+    pub(super) fn add_ptrace_tracee(&self, tracee: TaskKey) -> bool {
+        self.ptrace_tracees.lock().insert(tracee)
+    }
+
+    pub(super) fn remove_ptrace_tracee(&self, tracee: TaskKey) -> bool {
+        self.ptrace_tracees.lock().remove(&tracee)
+    }
+
+    pub(super) fn ptrace_tracees(&self) -> Vec<TaskKey> {
+        self.ptrace_tracees.lock().iter().copied().collect()
+    }
+
+    pub(super) fn take_ptrace_tracees(&self) -> BTreeSet<TaskKey> {
+        std::mem::take(&mut *self.ptrace_tracees.lock())
+    }
+
     /// This task's process group — the value `getpgrp(2)` reports, and the
     /// membership key `killpg(2)` resolves against.
     pub fn process_group(&self) -> ProcessGroupId {
@@ -4126,7 +4153,7 @@ impl Task {
         Ok(result)
     }
 
-    pub(super) fn claim_ptrace_traceme(&self, tracer: TaskKey) -> bool {
+    pub(super) fn claim_ptrace_tracer(&self, tracer: TaskKey) -> bool {
         let lifecycle = self.lifecycle.lock();
         if *lifecycle != TaskLifecycle::Live {
             return false;
@@ -8012,7 +8039,7 @@ mod tests {
         let stage_early_resume = || {
             let fixture = Fixture::new();
             let tracer = fixture.task.key();
-            assert!(fixture.task.claim_ptrace_traceme(tracer));
+            assert!(fixture.task.claim_ptrace_tracer(tracer));
             assert!(fixture.task.stop_for_ptrace(stop_signal));
             assert!(fixture.task.resume_from_ptrace(tracer, Some(kill_signal)));
             fixture
