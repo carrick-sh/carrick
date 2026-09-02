@@ -1739,7 +1739,7 @@
       "file": "crates/carrick-runtime/src/runtime.rs",
       "function": "run_combined_syscall_loop_with_dispatcher",
       "ordinal_in_function": 1,
-      "fingerprint": "c47f8a8cdbefe49c18af252db2f2dadd353d5fe9100f1dc7b25d452968b65f00",
+      "fingerprint": "c0abbe0553d64478e5f88dc82306f3d2d58967fe3bb26933840e5982165b6710",
       "verdict": "carrier_fault",
       "failure_domain": "runtime::host_alias_mapping",
       "rationale": "runtime.map_host_alias backend failure during alias installation; leaves hardware page tables and stage-2 mappings in an unrecoverable split state."
@@ -1748,7 +1748,7 @@
       "file": "crates/carrick-runtime/src/runtime.rs",
       "function": "run_combined_syscall_loop_with_dispatcher",
       "ordinal_in_function": 2,
-      "fingerprint": "c47f8a8cdbefe49c18af252db2f2dadd353d5fe9100f1dc7b25d452968b65f00",
+      "fingerprint": "c0abbe0553d64478e5f88dc82306f3d2d58967fe3bb26933840e5982165b6710",
       "verdict": "carrier_fault",
       "failure_domain": "runtime::host_alias_mapping",
       "rationale": "Host alias mapping length overflowed usize after backend mapping was installed; cannot apply memory protection to live mapping."
@@ -1757,7 +1757,7 @@
       "file": "crates/carrick-runtime/src/runtime.rs",
       "function": "run_combined_syscall_loop_with_dispatcher",
       "ordinal_in_function": 3,
-      "fingerprint": "c47f8a8cdbefe49c18af252db2f2dadd353d5fe9100f1dc7b25d452968b65f00",
+      "fingerprint": "c0abbe0553d64478e5f88dc82306f3d2d58967fe3bb26933840e5982165b6710",
       "verdict": "carrier_fault",
       "failure_domain": "runtime::host_alias_mapping",
       "rationale": "runtime.protect_range failed to apply PROT_NONE to installed host alias mapping; continuing would leave inaccessible memory readable."
@@ -1766,7 +1766,7 @@
       "file": "crates/carrick-runtime/src/runtime.rs",
       "function": "run_combined_syscall_loop_with_dispatcher",
       "ordinal_in_function": 4,
-      "fingerprint": "c47f8a8cdbefe49c18af252db2f2dadd353d5fe9100f1dc7b25d452968b65f00",
+      "fingerprint": "c0abbe0553d64478e5f88dc82306f3d2d58967fe3bb26933840e5982165b6710",
       "verdict": "carrier_fault",
       "failure_domain": "runtime::host_alias_mapping",
       "rationale": "Host alias bus fault length overflowed usize after backend mapping was installed; cannot apply bus-fault guard protection."
@@ -1775,7 +1775,7 @@
       "file": "crates/carrick-runtime/src/runtime.rs",
       "function": "run_combined_syscall_loop_with_dispatcher",
       "ordinal_in_function": 5,
-      "fingerprint": "c47f8a8cdbefe49c18af252db2f2dadd353d5fe9100f1dc7b25d452968b65f00",
+      "fingerprint": "c0abbe0553d64478e5f88dc82306f3d2d58967fe3bb26933840e5982165b6710",
       "verdict": "carrier_fault",
       "failure_domain": "runtime::host_alias_mapping",
       "rationale": "runtime.protect_range failed to apply guard protection to bus fault range of host alias mapping; leaves invalid file region accessible."
@@ -1784,7 +1784,7 @@
       "file": "crates/carrick-runtime/src/runtime.rs",
       "function": "run_combined_syscall_loop_with_dispatcher",
       "ordinal_in_function": 6,
-      "fingerprint": "c47f8a8cdbefe49c18af252db2f2dadd353d5fe9100f1dc7b25d452968b65f00",
+      "fingerprint": "c0abbe0553d64478e5f88dc82306f3d2d58967fe3bb26933840e5982165b6710",
       "verdict": "carrier_fault",
       "failure_domain": "runtime::host_alias_mapping",
       "rationale": "dispatcher.commit_host_alias_install failed after backend host mapping was installed; leaves uncommitted alias mapping in guest address space."
