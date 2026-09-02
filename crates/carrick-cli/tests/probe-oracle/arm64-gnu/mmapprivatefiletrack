@@ -1,0 +1,13 @@
+9c4c91b3979da925
+memfd_created=true
+memfd_private_map_ok=true
+memfd_initial_contents=true
+memfd_store_not_in_file=true
+memfd_clean_page_sees_file_write=true
+memfd_dirty_page_keeps_cow_copy=true
+file_created=true
+file_private_map_ok=true
+file_initial_contents=true
+file_store_not_in_file=true
+file_clean_page_sees_file_write=true
+file_dirty_page_keeps_cow_copy=true

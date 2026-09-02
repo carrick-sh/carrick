@@ -1014,6 +1014,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "memfdsharedcoherence": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "memflagmatrix": {
     "class": "conformance",
     "excluded": false,
@@ -1080,6 +1085,11 @@
     "runner": "generic"
   },
   "mmapmunmap": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mmapprivatefiletrack": {
     "class": "conformance",
     "excluded": false,
     "runner": "generic"

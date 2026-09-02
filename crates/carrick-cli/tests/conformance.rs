@@ -2866,10 +2866,15 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// and signals) and `fileaccessmode` (open access mode is authoritative for
 /// `F_GETFL`, `mprotect` ceilings on file-backed maps, and `MAP_SHARED`
 /// write admission) are both `generic`.
-/// The authoritative inventory contains 493 probe sources: 467 conformance
-/// sources (444 generic, 23 dedicated), 25 performance sources, and one helper.
-/// Both libc lanes therefore gate 934 conformance rows.
-const PROBE_SOURCE_COUNT: usize = 493;
+/// `memfdsharedcoherence` (a memfd is one inode: stores through a
+/// `MAP_SHARED` mapping, `pwrite` on any fd, and a forked child's writes all
+/// observe the same bytes) and `mmapprivatefiletrack` (a clean `MAP_PRIVATE`
+/// page keeps tracking the file; a dirtied page keeps its private copy) are
+/// both `generic`, moving the denominator from 493 to 495.
+/// The authoritative inventory contains 495 probe sources: 469 conformance
+/// sources (446 generic, 23 dedicated), 25 performance sources, and one helper.
+/// Both libc lanes therefore gate 938 conformance rows.
+const PROBE_SOURCE_COUNT: usize = 495;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
@@ -4624,9 +4629,9 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
     let generic = validate_closure_probe_rows(&inventory(), &sources)
         .expect("checked-in closure probe inventory must match the source denominator");
-    assert_eq!(generic.len(), 444);
-    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 467);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 934);
+    assert_eq!(generic.len(), 446);
+    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 469);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 938);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")

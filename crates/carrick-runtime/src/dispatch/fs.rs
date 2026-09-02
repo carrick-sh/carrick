@@ -1212,14 +1212,7 @@ fn fd_open_path_inserts() -> usize {
     FD_OPEN_PATH_INSERTS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// True if `path` is the synthetic sentinel carrick stamps on an ANONYMOUS file
-/// description — an `O_TMPFILE` inode (`/__carrick_o_tmpfile`) or a
-/// `memfd_create` inode (`/memfd:<name>`). Such a file has no real directory
-/// entry, so `linkat(/proc/self/fd/<n>, AT_SYMLINK_FOLLOW)` must MATERIALIZE it
-/// at the target rather than hard-link a nonexistent source path.
-fn is_anon_overlay_path(path: &str) -> bool {
-    path == "/__carrick_o_tmpfile" || path.starts_with("/memfd:")
-}
+use super::fd_table::is_anon_overlay_path;
 
 fn proc_self_fd_number(path: &str) -> Option<i32> {
     let rest = path
@@ -2287,11 +2280,13 @@ impl SyscallDispatcher {
                         }
                         contents.truncate(0);
                         metadata.size = 0;
-                        truncated_path = Some(path.clone());
+                        if !is_anon_overlay_path(path) {
+                            truncated_path = Some(path.clone());
+                        }
                     }
                 }
                 // Sync the empty contents to the overlay backing so a later
-                // fstat (which resolves the memfd's `/memfd:` path) reports 0.
+                // path-stat agrees; an anonymous inode has no overlay path.
                 if let Some(path) = truncated_path {
                     let _ = self
                         .fs
@@ -6015,7 +6010,8 @@ impl SyscallDispatcher {
                         outcome = DispatchOutcome::Returned {
                             value: bytes.len() as i64,
                         };
-                        writeback = Some((path.clone(), write_offset, contents.len()));
+                        writeback = (!is_anon_overlay_path(path))
+                            .then(|| (path.clone(), write_offset, contents.len()));
                     }
                     _ => return DispatchOutcome::errno(LINUX_EBADF),
                 }
@@ -9378,8 +9374,7 @@ impl SyscallDispatcher {
                         {
                             return Ok(DispatchOutcome::errno(LINUX_EPERM));
                         }
-                        // In-memory model (--fs memory): grow the cached bytes.
-                        if new_size > crate::vfs::MAX_IN_MEMORY_FILE_SIZE {
+                        if !contents.accepts_len(new_size) {
                             return Ok(DispatchOutcome::errno(LINUX_EFBIG));
                         }
                         if new_size as usize > contents.len() {
@@ -9387,27 +9382,41 @@ impl SyscallDispatcher {
                             metadata.size = contents.len();
                         }
                         // Sync the grown contents to the overlay backing so a
-                        // later fstat (which resolves the memfd's path) agrees
-                        // (memfd_create01 CHECK_MFD_GROWABLE fstats the new size).
-                        writeback = Some((path.clone(), contents.to_vec()));
+                        // later fstat of the path agrees. Anonymous files
+                        // (memfd, O_TMPFILE) have no overlay path to sync.
+                        writeback =
+                            (!is_anon_overlay_path(path)).then(|| (path.clone(), contents.to_vec()));
                         outcome = DispatchOutcome::Returned { value: 0 };
                     }
-                    OpenDescription::File { writable, .. } => {
+                    OpenDescription::File {
+                        contents, writable, ..
+                    } => {
                         if !*writable {
                             return Ok(DispatchOutcome::errno(LINUX_EBADF));
                         }
                         // A hole punch modifies content, so F_SEAL_WRITE blocks it
                         // (memfd_create01 check_mfd_non_writeable). A plain
                         // KEEP_SIZE preallocate changes nothing and is unaffected.
-                        if mode & LINUX_FALLOC_FL_PUNCH_HOLE != 0
-                            && let Err(errno) = memfd_seal_write_check(
+                        if mode & LINUX_FALLOC_FL_PUNCH_HOLE != 0 {
+                            if let Err(errno) = memfd_seal_write_check(
                                 open_file.description.common().seals(),
                                 0,
                                 0,
                                 0,
-                            )
-                        {
-                            return Ok(DispatchOutcome::errno(errno));
+                            ) {
+                                return Ok(DispatchOutcome::errno(errno));
+                            }
+                            // The punched range reads back as zeros; the
+                            // apparent size never changes (KEEP_SIZE is
+                            // mandatory with PUNCH_HOLE).
+                            let cur_len = contents.len();
+                            let start = (offset as usize).min(cur_len);
+                            let end = (offset as usize).saturating_add(length as usize).min(cur_len);
+                            if end > start
+                                && let Err(errno) = contents.write_at(start, &vec![0u8; end - start])
+                            {
+                                return Ok(DispatchOutcome::errno(errno));
+                            }
                         }
                         // KEEP_SIZE: don't change apparent size.
                         writeback = None;
@@ -9523,7 +9532,7 @@ impl SyscallDispatcher {
                             // (handled by open_file→None above).
                             return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                         }
-                        if length as u64 > crate::vfs::MAX_IN_MEMORY_FILE_SIZE {
+                        if !contents.accepts_len(length as u64) {
                             return Ok(DispatchOutcome::errno(LINUX_EFBIG));
                         }
                         let new_len = length as usize;
@@ -9545,7 +9554,8 @@ impl SyscallDispatcher {
                             }
                         }
                         metadata.size = contents.len();
-                        writeback = Some((path.clone(), contents.to_vec()));
+                        writeback =
+                            (!is_anon_overlay_path(path)).then(|| (path.clone(), contents.to_vec()));
                         outcome = DispatchOutcome::Returned { value: 0 };
                     }
                     OpenDescription::InMemoryFile {
@@ -11350,13 +11360,15 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(errno));
                     }
                     metadata.size = contents.len();
-                    let writeback = (path.clone(), contents.to_vec());
+                    let writeback = (!is_anon_overlay_path(path)).then(|| (path.clone(), contents.len()));
                     drop(open);
-                    let _ = this
-                        .fs
-                        .rootfs_vfs
-                        .overlay
-                        .set_file_contents(&writeback.0, writeback.1);
+                    if let Some((path, final_size)) = writeback {
+                        let _ = this
+                            .fs
+                            .rootfs_vfs
+                            .overlay
+                            .write_file_range(&path, write_at, &bytes, final_size);
+                    }
                     return Ok(DispatchOutcome::Returned {
                         value: bytes.len() as i64,
                     });
@@ -13575,11 +13587,13 @@ impl SyscallDispatcher {
                             outcome = DispatchOutcome::Returned {
                                 value: written as i64,
                             };
-                            writeback = Some(FileWriteback::Range {
-                                path: path.clone(),
-                                offset: write_offset,
-                                bytes,
-                                final_size: contents.len(),
+                            writeback = (!is_anon_overlay_path(path)).then(|| {
+                                FileWriteback::Range {
+                                    path: path.clone(),
+                                    offset: write_offset,
+                                    bytes,
+                                    final_size: contents.len(),
+                                }
                             });
                         }
                         OpenDescription::SyntheticFile { path, .. }
@@ -14093,11 +14107,13 @@ impl SyscallDispatcher {
                                 outcome = DispatchOutcome::Returned {
                                     value: written as i64,
                                 };
-                                writeback = Some(FileWriteback::Range {
-                                    path: path.clone(),
-                                    offset: write_offset,
-                                    bytes,
-                                    final_size: contents.len(),
+                                writeback = (!is_anon_overlay_path(path)).then(|| {
+                                    FileWriteback::Range {
+                                        path: path.clone(),
+                                        offset: write_offset,
+                                        bytes,
+                                        final_size: contents.len(),
+                                    }
                                 });
                             }
                             _ => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
@@ -15131,6 +15147,15 @@ impl SyscallDispatcher {
             // the description carry write access (FMODE_WRITE).
             let common = Arc::new(crate::kernel::DescriptionCommon::new(LINUX_O_RDWR));
             common.set_seals(Some(initial_seals));
+            // The bytes live in an unlinked host regular file rather than a
+            // carrick-private buffer: a memfd's defining use is `MAP_SHARED`
+            // (shared memory across fork, ring buffers, dmabuf-style
+            // exchange), where every mapping and every fd read/write must see
+            // one set of pages. Only a host inode gives a guest mapping a live
+            // view; an in-memory buffer can only be snapshotted into a mapping.
+            let Some(host_file) = super::fd_table::create_unlinked_host_file("memfd") else {
+                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+            };
             let description = OpenDescription::File {
                 metadata: RootFsMetadata {
                     path: Path::new(&path).to_path_buf(),
@@ -15139,7 +15164,7 @@ impl SyscallDispatcher {
                     size: 0,
                 },
                 path,
-                contents: FileContents::dense(Vec::new()),
+                contents: FileContents::host_backed(host_file),
                 offset: 0,
                 base: OpenDescriptionBase::new(0),
                 writable: true,

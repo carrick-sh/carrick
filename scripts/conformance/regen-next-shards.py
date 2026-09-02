@@ -101,6 +101,7 @@ def main() -> int:
             f"const CACHED_SHARD_{n}_PROBE_COUNT: usize = {cached[n]};",
             path,
         )
+        text = re.sub(r"(Hard-assert exactly )\d+( sorted unique names)", rf"\g<1>{size}\g<2>", text)
         text = re.sub(
             rf"(shard {n} must (?:have|contain) exactly )\d+",
             rf"\g<1>{size}",

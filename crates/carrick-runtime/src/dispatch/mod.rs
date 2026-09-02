@@ -8149,7 +8149,7 @@ fn write_into_file_contents(
     bytes: &[u8],
 ) -> Result<(), LinuxErrno> {
     let end = (*offset).checked_add(bytes.len()).ok_or(LINUX_EFBIG)?;
-    if end as u64 > crate::vfs::MAX_IN_MEMORY_FILE_SIZE {
+    if !contents.accepts_len(end as u64) {
         return Err(LINUX_EFBIG);
     }
     contents.write_at(*offset, bytes)?;
