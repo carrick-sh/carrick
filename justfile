@@ -140,6 +140,18 @@ lint-domains:
     python3 scripts/migrate/check-k1-file-authority-taxonomy.py
     python3 scripts/migrate/check-k1-burndown.py
 
+# Re-bind the line-pinned `lint-domains` inventories (runtime-abort
+# fingerprints, host-authority spans, dispatch-lock lines, K1 operation
+# inventory and callsite taxonomy) after an edit that only MOVED reviewed
+# sites. Refuses any change that adds or removes a site — that is a review
+# decision, made by hand in the inventory concerned. Review the resulting
+# `git diff` (positions only), then commit it as
+# `chore: reconcile the line-pinned inventories for <change>`.
+#
+# Rebind the line-pinned lint-domains inventories after a pure code move.
+reconcile-inventories:
+    python3 scripts/migrate/reconcile-line-pinned-inventories.py
+
 
 # Dependency license / bans / sources gate (matches CI). Enforces the deny.toml
 # allowlist. Install once with `cargo install cargo-deny`.
