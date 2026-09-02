@@ -130,6 +130,28 @@ def cfg_test_module_lines(lines: list[str]) -> set[int]:
     return inside
 
 
+def is_out_of_line_test_module(path: Path) -> bool:
+    """`path` is a whole-file test module: its parent declares it as
+    `#[cfg(test)] mod <stem>;` (`dispatch/fs.rs` → `dispatch/fs/tests.rs`),
+    `#[cfg(test)] #[path = "…"] mod <stem>;` or `#[cfg(test)]
+    include!("<stem>.rs")`.
+
+    `cfg_test_module_lines` only sees inline `mod … { … }` blocks, so every
+    line of such a file counted as a production callsite and the burndown
+    ceiling refused new unit tests of the very guards it tracks.
+    """
+    parents = [path.parent.with_suffix(".rs"), path.parent / "mod.rs"]
+    declaration = re.compile(
+        r"#\[cfg\(test\)\]\s*(?:#\[[^\]]*\]\s*)*(?:"
+        r"(?:pub(?:\([^)]*\))?\s+)?mod\s+" + re.escape(path.stem) + r"\s*;"
+        r"|include!\(\"(?:[^\"]*/)?" + re.escape(path.name) + r"\"\))"
+    )
+    return any(
+        parent.is_file() and declaration.search(parent.read_text())
+        for parent in parents
+    )
+
+
 def generate() -> dict[str, Any]:
     entries: list[dict[str, Any]] = []
     for path in sorted(SOURCE.rglob("*.rs")):
@@ -142,6 +164,7 @@ def generate() -> dict[str, Any]:
         relative = str(path.relative_to(ROOT))
         lines = path.read_text().splitlines()
         test_lines = cfg_test_module_lines(lines)
+        whole_file_test = is_out_of_line_test_module(path)
         for number, line in enumerate(lines, 1):
             categories = [name for name, pattern in PATTERNS.items() if pattern.search(line)]
             if categories:
@@ -156,6 +179,7 @@ def generate() -> dict[str, Any]:
                             "test_or_definition"
                             if "#[cfg(test)]" in text
                             or number in test_lines
+                            or whole_file_test
                             or relative.endswith("/kernel/objects.rs")
                             or relative.endswith("/dispatch/fd_table.rs")
                             else "production_callsite"
