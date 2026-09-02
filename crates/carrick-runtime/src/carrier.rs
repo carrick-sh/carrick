@@ -17,7 +17,7 @@
 //! | Deadlock watchdog thread | `deadlock_watchdog::arm` (`ARMED` swap) | guarded | process exit |
 //! | vCPU admission scheduler | `vcpu_sched::install_for_budget` (`OnceLock`) | first wins | process exit |
 //! | `TimerDelivery` handle | `timer_delivery::register_delivery` (`OnceLock`; `HvfTimerDelivery` is a unit struct) | first wins | process exit |
-//! | `RLIMIT_NOFILE` soft raise | `carrick-cli/main.rs` at startup; `dispatch/time.rs::raise_host_nofile_backing` | only ever raises | process exit |
+//! | `RLIMIT_NOFILE` soft raise | `runtime::finish_and_run_image` (every `run_*` entry, CLI and embed); `dispatch/time.rs::raise_host_nofile_backing` | only ever raises | process exit |
 //! | VM lifecycle ledger terminal + artifact | [`shutdown`] | single terminal per carrier | — |
 //!
 //! Per-container state (pid namespace root and region, rootfs + mount table,

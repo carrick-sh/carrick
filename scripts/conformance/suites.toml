@@ -11239,13 +11239,12 @@ carrick_flags = ["--fs", "host"]
 name = "ltp-fork09"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
-cmd = ["/opt/ltp/testcases/bin/fork09"]
+cmd = ["ulimit -n 4096; /opt/ltp/testcases/bin/fork09"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
 carrick_flags = ["--fs", "host"]
-docker_flags = ["--ulimit", "nofile=1024:1024"]
 
 [[suite]]
 name = "ltp-fork10"

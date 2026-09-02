@@ -309,15 +309,6 @@ fn configure_process_environment() {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
 
-    // Raise our own RLIMIT_NOFILE soft limit so we can back a guest that opens
-    // many fds (e.g. libuv's watcher_cross_stop opens ~2500 UDP sockets, each a
-    // host fd; LTP creat05 fills its whole soft limit). macOS's default soft
-    // limit (often 256) would EMFILE the host long before the guest's emulated
-    // limit. The guest starts at Docker's 1 Mi default, so ask for that and
-    // let the raise clamp to what the host kernel admits
-    // (`kern.maxfilesperproc`). Best-effort: the limit is left alone on failure.
-    carrick_runtime::dispatch::raise_host_nofile_backing(1024 * 1024);
-
     // Relocate `environ` onto the heap so the contiguous argv/env stack
     // bytes become a wider writable buffer for `set_host_process_name`.
     // MUST run BEFORE any setenv: the first setenv on the pristine env

@@ -2080,7 +2080,7 @@ impl SyscallDispatcher {
             .overlay
             .open_raw_fd(&resolved, true, false, false)
         {
-            Some(host_fd) => {
+            crate::fs_backend::HostFdOpen::Served(host_fd) => {
                 let err = unsafe { libc::ftruncate(host_fd, length as libc::off_t) }
                     .host_syscall_errno()
                     .err();
@@ -2091,7 +2091,8 @@ impl SyscallDispatcher {
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
             }
-            None => Ok(DispatchOutcome::errno(LINUX_EROFS)),
+            crate::fs_backend::HostFdOpen::Refused(refused) => Ok(DispatchOutcome::errno(refused)),
+            crate::fs_backend::HostFdOpen::Unavailable => Ok(DispatchOutcome::errno(LINUX_EROFS)),
         }
     }
 
@@ -2845,12 +2846,24 @@ impl SyscallDispatcher {
                     }
                 }
                 let stamp_owner = !create_uid.is_root() || !create_gid.is_root();
-                if let Some((host_fd, mode_applied)) =
-                    self.fs
+                // A host refusal (`ENFILE`: the host would not give carrick
+                // the descriptor the guest is entitled to) is the guest's
+                // errno — never lowered to the in-memory create below, whose
+                // own failure is the backend's `EINVAL`.
+                let created =
+                    match self
+                        .fs
                         .rootfs_vfs
                         .overlay
                         .create_raw_fd(&path, create_mode, want_trunc)
-                {
+                    {
+                        crate::fs_backend::HostFdOpen::Served(created) => Some(created),
+                        crate::fs_backend::HostFdOpen::Refused(refused) => {
+                            return Ok(DispatchOutcome::errno(refused));
+                        }
+                        crate::fs_backend::HostFdOpen::Unavailable => None,
+                    };
+                if let Some((host_fd, mode_applied)) = created {
                     debug_assert!(crate::dispatch::net::host_fd_is_nonblocking(host_fd));
                     // A backend that created with the host umask (or could not
                     // represent the mode natively) still needs the guest mode
@@ -2877,8 +2890,12 @@ impl SyscallDispatcher {
                         writable: writable_request,
                     }
                 } else {
-                    if self.fs.rootfs_vfs.overlay.create_file(&path).is_err() {
-                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    match self.fs.rootfs_vfs.overlay.create_file(&path) {
+                        Ok(()) => {}
+                        Err(crate::fs_backend::BackendError::Host(refused)) => {
+                            return Ok(DispatchOutcome::errno(refused));
+                        }
+                        Err(_) => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
                     }
                     let _ = self.fs.rootfs_vfs.overlay.set_mode(&path, create_mode);
                     if stamp_owner {

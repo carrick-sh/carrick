@@ -1145,47 +1145,102 @@ pub(crate) fn check_cpu_limits(
     Ok(())
 }
 
-/// Raise the HOST (native_run) process's soft `RLIMIT_NOFILE` so the guest's
-/// host-backed descriptors have real fds to sit on when the guest raises its own
-/// `RLIMIT_NOFILE`. `guest_soft` is the guest's new fd soft cap; we target that
-/// plus headroom for carrick's internal fds, clamped to the host's hard limit.
-/// Only ever raises — never lowers the host soft limit (which could starve
-/// carrick's own descriptors) — and is a no-op if the host already covers it.
+/// Headroom the carrier keeps for its own descriptors on top of what it
+/// advertises to guests as the file table: event ring, epoll/kqueue and
+/// per-thread waiters, host stdio, the macOS trusted-dirfd cache (up to 4096
+/// dirfds), and the dispatcher's transient host fds. Sized so a guest that
+/// fills the whole advertised table still leaves the carrier able to open
+/// its own files; 256 was measured too small once the dirfd cache existed.
+pub const HOST_FD_HEADROOM: u64 = 8192;
+
+/// The most host descriptors this carrier process can hold: the finite
+/// `RLIMIT_NOFILE` hard limit, further clamped by the kernel's per-process
+/// ceiling (`kern.maxfilesperproc` on macOS, which sits below an unlimited
+/// hard limit and which `setrlimit` refuses to exceed). `None` when the host
+/// reports no finite bound at all.
+// `rlim_t` is `u64` on macOS/Linux/NetBSD but `i64` on FreeBSD — the `as u64`
+// casts are load-bearing for portability even where clippy sees them as
+// redundant.
+#[allow(clippy::unnecessary_cast)]
+fn host_descriptor_budget(rl: &libc::rlimit) -> Option<u64> {
+    let hard = rl.rlim_max;
+    let finite_hard =
+        (hard > 0 && (hard as u64) != libc::RLIM_INFINITY as u64).then_some(hard as u64);
+    let ceiling = carrick_host::host_facts::per_process_descriptor_ceiling();
+    match (finite_hard, ceiling) {
+        (Some(h), Some(c)) => Some(h.min(c)),
+        (Some(h), None) => Some(h),
+        (None, c) => c,
+    }
+}
+
+/// Read the carrier's current `RLIMIT_NOFILE`; `None` if the host refuses.
+fn host_nofile() -> Option<libc::rlimit> {
+    let mut rl = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `rl` is a valid, writable rlimit; RLIMIT_NOFILE is a valid resource.
+    (unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } == 0).then_some(rl)
+}
+
+/// The open-file table a guest can honestly be told about: the descriptors
+/// the carrier can actually hold minus [`HOST_FD_HEADROOM`]. "Actually hold"
+/// is the current `RLIMIT_NOFILE` soft limit (after
+/// [`raise_host_nofile_backing`]) clamped by [`host_descriptor_budget`]: a
+/// launchd/shell soft limit above `kern.maxfilesperproc` is accepted by
+/// `setrlimit` but the kernel still refuses the open at the ceiling
+/// (measured: soft 1048576, `open` fails at 122880). This is what
+/// `/proc/sys/fs/file-max` and the third field of `file-nr` report, so a
+/// guest sizing itself from those leaves sees the budget the host will really
+/// grant instead of a literal it can never reach. It is deliberately NOT the
+/// guest's `RLIMIT_NOFILE` (Docker's 1 Mi default): a guest below its own
+/// per-process limit whose open is refused by this budget gets `ENFILE` —
+/// Linux's answer for a full system file table.
+#[allow(clippy::unnecessary_cast)]
+pub fn guest_file_table_max() -> u64 {
+    host_nofile()
+        .map(|rl| {
+            let soft = rl.rlim_cur as u64;
+            host_descriptor_budget(&rl)
+                .map_or(soft, |budget| soft.min(budget))
+                .saturating_sub(HOST_FD_HEADROOM)
+        })
+        .unwrap_or(0)
+}
+
+/// Number of descriptors the carrier currently holds — the first field of
+/// `/proc/sys/fs/file-nr`. Counted through the host's own descriptor listing
+/// (`/dev/fd`, `/proc/self/fd` on Linux); `0` if the host cannot list them.
+pub fn host_open_descriptor_count() -> u64 {
+    #[cfg(target_os = "linux")]
+    let listing = "/proc/self/fd";
+    #[cfg(not(target_os = "linux"))]
+    let listing = "/dev/fd";
+    std::fs::read_dir(listing)
+        .map(|entries| entries.filter(|entry| entry.is_ok()).count() as u64)
+        .unwrap_or(0)
+}
+
+/// Raise the carrier's own `RLIMIT_NOFILE` soft limit so it can back a guest
+/// whose fd soft cap is `guest_soft`: target that plus [`HOST_FD_HEADROOM`],
+/// clamped to [`host_descriptor_budget`]. Only ever raises — never lowers the
+/// host soft limit (which could starve carrick's own descriptors) — and is a
+/// no-op if the host already covers it. Called once per carrier at boot for
+/// the guest default (`RlimitSet::carrick_defaults`) and again from guest
+/// `setrlimit(RLIMIT_NOFILE)`; best-effort, the limit is left alone on failure.
 // `rlim_t` is `u64` on macOS/Linux/NetBSD but `i64` on FreeBSD — the `as u64`
 // casts below are load-bearing for portability (comparing/assigning against
 // the `u64` guest limit) even though clippy sees them as redundant on
 // targets where `rlim_t` already is `u64`.
 #[allow(clippy::unnecessary_cast)]
 pub fn raise_host_nofile_backing(guest_soft: u64) {
-    // Headroom for the carrier's own descriptors: event ring, epoll/kqueue,
-    // host stdio, per-thread waiters, and the dispatcher's transient host fds.
-    const HOST_FD_HEADROOM: u64 = 256;
-    let mut rl = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: `rl` is a valid, writable rlimit; RLIMIT_NOFILE is a valid resource.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {
+    let Some(rl) = host_nofile() else {
         return;
-    }
-    let cur_soft = rl.rlim_cur as u64;
-    // The host hard limit ceilings any raise. A non-positive / INFINITY hard
-    // value (rlim_max <= 0 when reinterpreted) means "no finite cap" → use the
-    // desired target directly. The kernel's per-process descriptor ceiling
-    // (`kern.maxfilesperproc` on macOS) sits below an unlimited hard limit
-    // and `setrlimit` rejects anything above it, so clamp to that too: the
-    // guest's 1 Mi default would otherwise leave the host at its startup
-    // value instead of the most backing the host can give.
-    let hard = rl.rlim_max;
-    let desired = guest_soft.saturating_add(HOST_FD_HEADROOM);
-    let mut target = if hard > 0 && (hard as u64) < desired {
-        hard as u64
-    } else {
-        desired
     };
-    if let Some(ceiling) = carrick_host::host_facts::per_process_descriptor_ceiling() {
-        target = target.min(ceiling);
-    }
+    let cur_soft = rl.rlim_cur as u64;
+    let desired = guest_soft.saturating_add(HOST_FD_HEADROOM);
+    let target = host_descriptor_budget(&rl).map_or(desired, |budget| desired.min(budget));
     if target <= cur_soft {
         return;
     }
