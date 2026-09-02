@@ -32,6 +32,16 @@ const NON_GLOBAL: u64 = 1 << 11;
 // matching Linux. PXN (bit 53, already in USER_*_FLAGS) keeps EL1 from fetching.
 const UXN: u64 = 1 << 54;
 
+// Software-reserved descriptor bit (IGNORED by the MMU, bits [58:55] are
+// implementation-defined/software use). Set on an INVALID leaf whose retained
+// output address names a stage-2 lease that `munmap` has RETIRED, as opposed to
+// a `PROT_NONE`/`MADV_DONTNEED`/first-touch-armed leaf whose frame is still
+// owned by this mm. Only the retired kind may be dropped by the spare-table
+// reclaim sweep; the live kind is the normal shape of every untouched mapping
+// and freeing its table loses the outputs the next protection commit
+// republishes. Cleared whenever the leaf is revalidated or rewritten.
+const SW_RETIRED: u64 = 1 << 55;
+
 // PA field masks per level (identical to memory.rs).
 const PA_MASK_1GIB: u64 = 0x0000_FFFF_C000_0000;
 const PA_MASK_2MIB: u64 = 0x0000_FFFF_FFE0_0000;
@@ -105,8 +115,12 @@ const SPARE_START_OFFSET: u64 = 8 * PT_PAGE;
 /// A protection change applied to a guest VA range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PtOp {
-    /// Clear the valid bit — any access faults (SEGV_MAPERR).
+    /// Clear the valid bit — any access faults (SEGV_MAPERR). The output
+    /// address is retained and still names a frame this mm owns.
     Invalidate,
+    /// `munmap`: clear the valid bit AND mark the retained output RETIRED
+    /// (`SW_RETIRED`), so the table it sits in becomes reclaimable.
+    Retire,
     /// Valid, AP=read-only. `exec` clears UXN (PROT_EXEC); else UXN set (NX).
     ReadOnly { exec: bool },
     /// Fork-COW read-only plus nG. Unlike an ordinary protection edit this must
@@ -958,10 +972,20 @@ impl PageTableManager {
         // was invalid. (Getting this wrong silently revalidated PROT_NONE
         // reservations and broke Go's page-summary region.)
         let parent_valid = block & VALID != 0;
+        // An EMPTY invalid parent (output field zero: never populated, or
+        // cleared by a table reclaim) records nothing, so its children record
+        // nothing either. Minting `i * stride` outputs from a zero base would
+        // hand every child a fabricated address that the in-place protection
+        // edit then preserves — and publishes as a VALID leaf.
+        let parent_empty = !parent_valid && base_pa == 0;
 
         let table_pa = self.alloc_table()?;
         let table_off = self.pa_to_off(table_pa)?;
         for i in 0..512u64 {
+            if parent_empty {
+                self.write_desc(table_off + (i as usize) * 8, 0);
+                continue;
+            }
             let child_pa = base_pa + i * child_stride;
             let mut desc = (child_pa & child_pa_mask) | attrs | child_type;
             if !parent_valid {
@@ -1122,6 +1146,16 @@ impl PageTableManager {
         }
     }
 
+    /// Whether a terminal descriptor at `level` carries an output address at
+    /// all. A descriptor whose output field is zero is EMPTY — never populated,
+    /// or cleared by a table reclaim — and records nothing a protection edit
+    /// may preserve; it must be rebuilt, never edited in place, and it must
+    /// never seed children when its block is split.
+    fn records_output(desc: u64, level: usize) -> bool {
+        let (_, mask) = Self::level_span(level);
+        desc & mask != 0
+    }
+
     /// Build the leaf descriptor for `op` covering `base_pa` at `level`.
     fn desc_for(&self, op: PtOp, base_pa: u64, level: usize) -> u64 {
         let (_, mask) = Self::level_span(level);
@@ -1149,6 +1183,7 @@ impl PageTableManager {
         let uxn = |exec: bool| if exec { 0 } else { UXN };
         match op {
             PtOp::Invalidate => base | (flags & !VALID) | scope,
+            PtOp::Retire => base | (flags & !VALID) | scope | SW_RETIRED,
             PtOp::ReadWrite { exec } => base | flags | uxn(exec) | scope,
             PtOp::ReadOnly { exec } => base | (flags & !AP_MASK) | AP_RO | uxn(exec) | scope,
             PtOp::ForkReadOnly { exec } => {
@@ -1165,10 +1200,19 @@ impl PageTableManager {
 
     /// Does a leaf with `(valid, ap, uxn_set)` already satisfy `op`? Includes the
     /// UXN (execute) bit so a re-protect that only flips PROT_EXEC still applies.
-    fn satisfies(&self, op: PtOp, valid: bool, ap: u64, uxn_set: bool, non_global: bool) -> bool {
+    fn satisfies(
+        &self,
+        op: PtOp,
+        valid: bool,
+        ap: u64,
+        uxn_set: bool,
+        non_global: bool,
+        retired: bool,
+    ) -> bool {
         let scoped = !self.asid_scoped_leaves || non_global;
         match op {
             PtOp::Invalidate => !valid && scoped,
+            PtOp::Retire => !valid && scoped && retired,
             PtOp::ReadWrite { exec } => valid && ap == AP_RW && uxn_set != exec && scoped,
             PtOp::ReadOnly { exec } => valid && ap == AP_RO && uxn_set != exec && scoped,
             PtOp::ForkReadOnly { exec } => ap == AP_RO && uxn_set != exec && non_global,
@@ -1193,13 +1237,24 @@ impl PageTableManager {
             let block_start = cur & mask;
             let block_end = block_start + span;
             let desc = self.read_desc(off);
-            if self.satisfies(
-                op,
-                desc & VALID != 0,
-                desc & AP_MASK,
-                desc & UXN != 0,
-                desc & NON_GLOBAL != 0,
-            ) {
+            let empty = !Self::records_output(desc, level);
+            let already = match op {
+                // An EMPTY descriptor is already as invalid as it can be, and
+                // nothing about it (nG, retirement) survives to a revalidation
+                // — which rebuilds it from scratch. Writing anything into it
+                // would turn "no output recorded" into a descriptor that a
+                // later in-place edit or split treats as carrying one.
+                PtOp::Invalidate | PtOp::Retire if empty => true,
+                _ => self.satisfies(
+                    op,
+                    desc & VALID != 0,
+                    desc & AP_MASK,
+                    desc & UXN != 0,
+                    desc & NON_GLOBAL != 0,
+                    desc & SW_RETIRED != 0,
+                ),
+            };
+            if already {
                 // The covering block is ALREADY at the target — skip its whole
                 // span with no split (this is what keeps RW-on-already-RW, and a
                 // re-protect of an unchanged range, free).
@@ -1216,23 +1271,31 @@ impl PageTableManager {
                 // private-overlay leaf — it preserves the recorded IPA instead
                 // of clobbering it with a meaningless identity PA (which would
                 // silently repoint a private overlay back at the SHARED page).
-                // Only a never-populated descriptor (0: no address recorded)
-                // is rebuilt from the identity VA, preserving the historical
-                // arena behaviour.
+                // Only an EMPTY descriptor (no address recorded — see
+                // `records_output`) is rebuilt from the identity VA,
+                // preserving the historical arena behaviour. `desc != 0` is
+                // NOT that test: an invalidated-then-split empty block once
+                // left `index * stride | flags` children here, and this branch
+                // published them as VALID leaves at IPA 0x5000.
                 let new_desc = match op {
-                    PtOp::Invalidate => {
-                        (desc & !VALID)
-                            | if self.asid_scoped_leaves {
-                                NON_GLOBAL
-                            } else {
-                                0
-                            }
+                    PtOp::Invalidate | PtOp::Retire => {
+                        let scope = if self.asid_scoped_leaves {
+                            NON_GLOBAL
+                        } else {
+                            0
+                        };
+                        let retired = if matches!(op, PtOp::Retire) {
+                            SW_RETIRED
+                        } else {
+                            0
+                        };
+                        (desc & !VALID) | scope | retired
                     }
                     PtOp::ReadOnly { exec }
                     | PtOp::ForkReadOnly { exec }
                     | PtOp::ReadWrite { exec }
                     | PtOp::KernelReadOnly { exec }
-                        if desc != 0 =>
+                        if !empty =>
                     {
                         let ap = match op {
                             PtOp::ReadOnly { .. } | PtOp::ForkReadOnly { .. } => AP_RO,
@@ -1251,7 +1314,16 @@ impl PageTableManager {
                         } else {
                             VALID
                         };
-                        (desc & !AP_MASK & !UXN) | ap | uxn | non_global | validity
+                        // A revalidated output is live again by definition;
+                        // retirement only survives an edit that keeps the
+                        // leaf invalid.
+                        let retired = if validity == 0 { desc & SW_RETIRED } else { 0 };
+                        (desc & !AP_MASK & !UXN & !SW_RETIRED)
+                            | ap
+                            | uxn
+                            | non_global
+                            | validity
+                            | retired
                     }
                     PtOp::ReadOnly { .. }
                     | PtOp::ForkReadOnly { .. }
@@ -1293,10 +1365,16 @@ impl PageTableManager {
         self.apply(va, len, PtOp::Invalidate)
     }
 
-    /// Alias for `set_prot_none`, used by `munmap` (the freed range faults
-    /// until reused).
+    /// `munmap`: invalidate `[va, va+len)` (the freed range faults until
+    /// reused) AND mark each leaf's retained output RETIRED. The output address
+    /// stays readable through `translate_retained_output` — same-VA reuse
+    /// consults it to tell a retired lease from a live one — but a table
+    /// holding only retired/empty/identity leaves becomes reclaimable, unlike
+    /// one whose invalid leaves (`set_prot_none`) still name frames this mm
+    /// owns.
     pub fn invalidate(&mut self, va: u64, len: usize) -> Result<bool, PageTableError> {
-        self.set_prot_none(va, len)
+        self.reclaim_pending = true;
+        self.apply(va, len, PtOp::Retire)
     }
 
     /// `munmap` of a HIGH-VA alias: invalidate the range AND reclaim any spare
@@ -1312,7 +1390,7 @@ impl PageTableManager {
     /// the munmap path, PMR-gated under multi-vCPU); reclaim is additionally
     /// gated single-vCPU/PMR inside (see `reclaim_invalid_tables`).
     pub fn unmap_aliased(&mut self, va: u64, len: usize) -> Result<bool, PageTableError> {
-        let changed = self.set_prot_none(va, len)?;
+        let changed = self.invalidate(va, len)?;
         let reclaimed = self.reclaim_invalid_tables(va, len);
         Ok(changed || reclaimed)
     }
@@ -1375,19 +1453,21 @@ impl PageTableManager {
                 let Ok(l2_off) = self.pa_to_off(l2_pa) else {
                     continue;
                 };
+                let l2_table_va = ((l0 as u64) << 39) | ((l1 as u64) << 30);
                 for l2 in 0..512usize {
                     let l2_entry = l2_off + l2 * 8;
+                    let l3_table_va = l2_table_va | ((l2 as u64) << 21);
                     if let Some(l3_pa) = self.child_table_pa(l2_entry)
                         && self.is_spare_table(l3_pa)
                         && let Ok(l3_off) = self.pa_to_off(l3_pa)
-                        && self.table_all_invalid(l3_off)
+                        && self.table_reclaimable(l3_off, l3_table_va, 3)
                     {
                         self.write_desc(l2_entry, 0);
                         self.free_table(l3_pa);
                         freed = true;
                     }
                 }
-                if self.is_spare_table(l2_pa) && self.table_all_invalid(l2_off) {
+                if self.is_spare_table(l2_pa) && self.table_reclaimable(l2_off, l2_table_va, 2) {
                     self.write_desc(l1_entry, 0);
                     self.free_table(l2_pa);
                     freed = true;
@@ -1415,7 +1495,7 @@ impl PageTableManager {
             if let Some(l3_pa) = self.child_table_pa(l2_entry)
                 && self.is_spare_table(l3_pa)
                 && let Ok(l3_off) = self.pa_to_off(l3_pa)
-                && self.table_all_invalid(l3_off)
+                && self.table_reclaimable(l3_off, va & !((1 << 21) - 1), 3)
             {
                 self.write_desc(l2_entry, 0);
                 self.free_table(l3_pa);
@@ -1426,7 +1506,7 @@ impl PageTableManager {
         if let Some(l2_pa) = self.child_table_pa(l1_entry)
             && self.is_spare_table(l2_pa)
             && let Ok(l2_off) = self.pa_to_off(l2_pa)
-            && self.table_all_invalid(l2_off)
+            && self.table_reclaimable(l2_off, va & !((1 << 30) - 1), 2)
         {
             self.write_desc(l1_entry, 0);
             self.free_table(l2_pa);
@@ -1435,8 +1515,38 @@ impl PageTableManager {
         freed
     }
 
-    fn table_all_invalid(&self, table_off: usize) -> bool {
-        (0..512usize).all(|i| self.read_desc(table_off + i * 8) & VALID == 0)
+    /// Whether the table at `table_off`, whose entries are terminal
+    /// descriptors at `level` covering `[table_va, table_va + 512 * span)`,
+    /// records nothing a rebuild could not reproduce — so freeing it (and
+    /// zeroing the parent entry) loses no information.
+    ///
+    /// "All entries VALID-clear" is NOT that test. An invalid leaf that
+    /// retains a non-identity output is the normal shape of every
+    /// armed-but-untouched sparse-arena page, of every `PROT_NONE`/
+    /// `MADV_DONTNEED` page whose frame the mm still owns, and of every
+    /// pending materialization receipt: the next protection commit
+    /// republishes exactly that output in place. Freeing such a table and
+    /// re-splitting the emptied parent later handed those pages fabricated
+    /// outputs (`cpython-concurrent_futures`' fork child validator: "stage-1
+    /// VA 0x6008405000 resolves to IPA 0x5000, expected 0x9c19205000"; the
+    /// parent had been reading and writing IPA 0x5000 silently).
+    ///
+    /// Reclaimable entries are: empty (no output), identity (a rebuild yields
+    /// the same address), or RETIRED by `munmap` (the lease is gone; the
+    /// retained address is only a reuse signal).
+    fn table_reclaimable(&self, table_off: usize, table_va: u64, level: usize) -> bool {
+        let (span, mask) = Self::level_span(level);
+        (0..512usize).all(|i| {
+            let desc = self.read_desc(table_off + i * 8);
+            if desc & VALID != 0 {
+                return false;
+            }
+            if !Self::records_output(desc, level) || desc & SW_RETIRED != 0 {
+                return true;
+            }
+            let entry_va = table_va + (i as u64) * span;
+            desc & mask == entry_va & mask
+        })
     }
 
     /// Mark `[va, va+len)` valid read-only (AP=RO). `exec` clears UXN
@@ -3150,6 +3260,154 @@ mod tests {
             shrunk_leaf & VALID,
             0,
             "shrunk heap page must return to invalid"
+        );
+    }
+
+    /// The HVPatch tables as the runtime leaves them at boot: ASID-scoped, with
+    /// the sparse mmap arena reserved `PROT_NONE` (identity-invalid blocks).
+    fn hvpatch_manager() -> PageTableManager {
+        let mut mgr = PageTableManager::new(stage1_hvpatch_page_tables(), LINUX_PAGE_TABLES_BASE);
+        mgr.set_prot_none(LINUX_MMAP_BASE, mmap_arena_size() as usize)
+            .expect("reserve sparse arena");
+        mgr
+    }
+
+    /// Fill the spare pool so the next allocation must run the last-resort
+    /// reclaim sweep: burn every remaining table on 4 KiB splits of untouched
+    /// arena blocks well away from `keep_out`.
+    fn exhaust_spare_pool(mgr: &mut PageTableManager, keep_out: u64) {
+        const TWO_MIB: u64 = 2 * 1024 * 1024;
+        let mut block = keep_out + 64 * TWO_MIB;
+        loop {
+            let (_, free, _) = mgr.pool_stats();
+            let spare = mgr.spare_tables_available();
+            if spare == 0 && free == 0 {
+                break;
+            }
+            // A one-page RW edit inside a 2 MiB block bisects it: one L3 table
+            // (plus an L2 the first time a fresh 1 GiB is entered).
+            if mgr.set_rw(block + 0x1000, 0x1000, false).is_err() {
+                break;
+            }
+            block += TWO_MIB;
+        }
+    }
+
+    #[test]
+    fn reclaim_sweep_keeps_tables_whose_invalid_leaves_retain_live_outputs() {
+        // The sparse HVPatch arena publishes every armed-but-untouched page as
+        // an INVALID leaf that retains its semantic IPA (`materialize` +
+        // `set_prot_none`), and `MADV_DONTNEED`/`PROT_NONE` put touched pages
+        // back into that state while their frames stay owned. A whole 2 MiB of
+        // such leaves is therefore the NORMAL shape of a fresh thread stack.
+        // The pool-exhaustion sweep must not mistake it for an empty table:
+        // freeing it loses every retained output, and the next protection
+        // commit then revalidates whatever the re-split parent minted.
+        const TWO_MIB: u64 = 2 * 1024 * 1024;
+        let mut mgr = hvpatch_manager();
+        mgr.declare_offline_private_image();
+        let va = LINUX_MMAP_BASE + 8 * TWO_MIB;
+        let ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x1234_5000;
+        let probe = va + 0x5000;
+        // 4 KiB granules force an L3 table; the leaves then go invalid-retained.
+        mgr.map_private_aliased(va, ipa, TWO_MIB - 0x1000, true)
+            .expect("publish sparse extent");
+        mgr.set_prot_none(va, (TWO_MIB - 0x1000) as usize)
+            .expect("arm first touch");
+        assert_eq!(mgr.translate_retained_output(probe), Some(ipa + 0x5000));
+
+        exhaust_spare_pool(&mut mgr, va);
+        let reclaimed = mgr.reclaim_all_invalid_tables();
+        assert_eq!(
+            mgr.translate_retained_output(probe),
+            Some(ipa + 0x5000),
+            "sweep (freed={reclaimed}) must keep a table whose invalid leaves still \
+             retain live outputs"
+        );
+        // And the protection commit that follows a touch must publish the
+        // retained frame, never a minted address.
+        mgr.set_rw(probe, 0x1000, false)
+            .expect("commit resident page");
+        assert_eq!(mgr.translate(probe), Some(ipa + 0x5000));
+    }
+
+    #[test]
+    fn munmap_retires_leaves_so_the_reclaim_sweep_can_free_their_table() {
+        // `munmap` (`invalidate`) retires the frame lease, so its retained
+        // output is a reuse SIGNAL, not a live claim: a table holding only
+        // retired/empty leaves is the one the sweep exists to recover.
+        const TWO_MIB: u64 = 2 * 1024 * 1024;
+        let mut mgr = hvpatch_manager();
+        mgr.declare_offline_private_image();
+        let va = LINUX_MMAP_BASE + 8 * TWO_MIB;
+        let ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x1234_5000;
+        mgr.map_private_aliased(va, ipa, TWO_MIB - 0x1000, true)
+            .expect("publish sparse extent");
+        let (in_use_before, _, _) = mgr.pool_stats();
+        mgr.invalidate(va, (TWO_MIB - 0x1000) as usize)
+            .expect("munmap");
+        assert_eq!(
+            mgr.translate_retained_output(va + 0x5000),
+            Some(ipa + 0x5000),
+            "munmap keeps the retained output until the table is reclaimed"
+        );
+        assert!(
+            mgr.reclaim_all_invalid_tables(),
+            "the retired table is reclaimable"
+        );
+        let (in_use_after, _, _) = mgr.pool_stats();
+        // The retired L3 goes, and so does the L2 above it: its other entries
+        // are identity-invalid reservation blocks, which a rebuild reproduces.
+        assert_eq!(in_use_after, in_use_before - 2);
+        assert_eq!(mgr.translate_retained_output(va + 0x5000), None);
+
+        // The freed table left an EMPTY L2 entry. Bisecting it (a one-page
+        // PROT_NONE at the next reuse) must not manufacture `index * 4 KiB`
+        // outputs that the next protection commit publishes as real IPAs.
+        mgr.set_prot_none(va + 0x1000, 0x1000)
+            .expect("bisect empty entry");
+        assert_eq!(mgr.translate_retained_output(va + 0x5000), None);
+        mgr.set_rw(va + 0x5000, 0x1000, false).expect("revalidate");
+        assert_ne!(mgr.translate(va + 0x5000), Some(0x5000));
+    }
+
+    #[test]
+    fn empty_descriptors_never_mint_an_output_address() {
+        // Invalidating a never-populated block and then bisecting it must not
+        // manufacture `index * stride` output addresses that a later in-place
+        // revalidation publishes as a VALID leaf at IPA 0x5000 (the fork-child
+        // validator's `resolves to IPA 0x5000, expected 0x9c...` signature).
+        const TWO_MIB: u64 = 2 * 1024 * 1024;
+        let mut mgr = hvpatch_manager();
+        let block = LINUX_MMAP_BASE + 40 * TWO_MIB;
+        let probe = block + 0x5000;
+        // One published page carves a fresh L3 table whose 511 neighbours are
+        // EMPTY descriptors. Invalidating the block must leave them empty.
+        mgr.map_private_aliased(
+            block,
+            LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x7000,
+            0x1000,
+            true,
+        )
+        .expect("publish one page");
+        assert_eq!(
+            terminal_descriptor(mgr.debug_walk(probe)),
+            0,
+            "neighbour starts empty"
+        );
+        mgr.set_prot_none(block, TWO_MIB as usize)
+            .expect("PROT_NONE the block");
+        assert_eq!(
+            terminal_descriptor(mgr.debug_walk(probe)),
+            0,
+            "invalidating an empty descriptor keeps it empty"
+        );
+        assert_eq!(mgr.translate_retained_output(probe), None);
+        mgr.set_rw(probe, 0x1000, false).expect("revalidate");
+        assert_ne!(
+            mgr.translate(probe),
+            Some(0),
+            "revalidating an empty leaf must not publish output address 0"
         );
     }
 }

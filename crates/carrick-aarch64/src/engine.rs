@@ -59,7 +59,7 @@ pub fn asid_maintenance_bytes() -> Vec<u8> {
 pub fn reserve_hvpatch_process_apertures(
     manager: &mut PageTableManager,
 ) -> Result<bool, PageTableError> {
-    manager.invalidate(
+    manager.set_prot_none(
         carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE,
         (carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_ARENA_SIZE
             + carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_SIZE) as usize,
