@@ -4643,3 +4643,117 @@ fn fcntl_pipe_host_pipe_accounting_and_set_capacity() {
         .expect("fcntl get");
     assert_eq!(get_res, DispatchOutcome::Returned { value: 131072 });
 }
+
+/// `select(2)` on an in-memory pipe must count BOTH ends: after one byte is
+/// written the read end is readable and the write end still writable, so
+/// `select(r in readfds, w in writefds)` returns 2 (LTP `select01` "system
+/// pipe"). The write end's host poll target is the pipe's readiness pipe,
+/// whose READ end is what becomes readable when the guest side is writable;
+/// polling that host fd for `POLLOUT` never fires and dropped the count to 1.
+#[test]
+fn pselect6_counts_in_memory_pipe_write_end_writable() {
+    const SYS_PSELECT6: u64 = 72;
+    let mut rig = SpliceTestRig::new(0x10000);
+    let (read_fd, write_fd) = rig.pipe2(0x4200);
+    rig.memory.write_bytes(0x5000, b"x").unwrap();
+    assert_eq!(
+        rig.run(SpliceTestRig::SYS_WRITE, [write_fd, 0x5000, 1, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 1 },
+    );
+
+    let readfds_addr = 0x6000u64;
+    let writefds_addr = 0x6100u64;
+    let timeout_addr = 0x6200u64;
+    let mut set = [0u8; 128];
+    set[(read_fd / 8) as usize] |= 1 << (read_fd % 8);
+    rig.memory.write_bytes(readfds_addr, &set).unwrap();
+    let mut set = [0u8; 128];
+    set[(write_fd / 8) as usize] |= 1 << (write_fd % 8);
+    rig.memory.write_bytes(writefds_addr, &set).unwrap();
+    // struct timespec { 0, 100 ms }: the same non-zero budget select01 uses,
+    // so a wrong answer cannot hide behind the timeout-0 short circuit.
+    let mut ts = [0u8; 16];
+    ts[8..16].copy_from_slice(&100_000_000i64.to_ne_bytes());
+    rig.memory.write_bytes(timeout_addr, &ts).unwrap();
+
+    let nfds = read_fd.max(write_fd) + 1;
+    assert_eq!(
+        rig.run(
+            SYS_PSELECT6,
+            [nfds, readfds_addr, writefds_addr, 0, timeout_addr, 0]
+        ),
+        DispatchOutcome::Returned { value: 2 },
+    );
+    let readfds = rig.memory.read_bytes(readfds_addr, 128).unwrap();
+    assert_ne!(
+        readfds[(read_fd / 8) as usize] & (1 << (read_fd % 8)),
+        0,
+        "read end must be reported readable"
+    );
+    let writefds = rig.memory.read_bytes(writefds_addr, 128).unwrap();
+    assert_ne!(
+        writefds[(write_fd / 8) as usize] & (1 << (write_fd % 8)),
+        0,
+        "write end must be reported writable"
+    );
+}
+
+/// A blocking `select` on a FULL in-memory pipe's write end must park on the
+/// pipe's readiness fd with the event that fd actually delivers (`POLLIN` on
+/// the readiness pipe's read end), exactly as `ppoll` does. Parking with the
+/// guest's `POLLOUT` on that read end never wakes, so the guest slept out its
+/// whole timeout after the reader drained the pipe.
+#[test]
+fn pselect6_parks_full_pipe_write_end_on_readiness_pipe_pollin() {
+    const SYS_PSELECT6: u64 = 72;
+    let mut rig = SpliceTestRig::new(0x20000);
+    let (_read_fd, write_fd) = rig.pipe2(0x4200);
+    let room = rig
+        .dispatcher
+        .splice_pipe_write_room(write_fd as i32)
+        .expect("in-memory pipe reports room");
+    rig.memory.write_bytes(0x8000, &vec![0xa5u8; room]).unwrap();
+    assert_eq!(
+        rig.run(
+            SpliceTestRig::SYS_WRITE,
+            [write_fd, 0x8000, room as u64, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: room as i64 },
+    );
+    let write_poll_fd = match &*rig
+        .dispatcher
+        .open_file(write_fd as i32)
+        .expect("write file")
+        .description
+        .read()
+        .expect("open description")
+    {
+        OpenDescription::PipeWriter { pipe, .. } => pipe
+            .write_poll_fd()
+            .expect("pipe must have write poll fd")
+            .raw(),
+        other => panic!("unexpected open description: {other:?}"),
+    };
+
+    let writefds_addr = 0x6100u64;
+    let timeout_addr = 0x6200u64;
+    let mut set = [0u8; 128];
+    set[(write_fd / 8) as usize] |= 1 << (write_fd % 8);
+    rig.memory.write_bytes(writefds_addr, &set).unwrap();
+    let mut ts = [0u8; 16];
+    ts[0..8].copy_from_slice(&5i64.to_ne_bytes());
+    rig.memory.write_bytes(timeout_addr, &ts).unwrap();
+
+    let outcome = rig.run(
+        SYS_PSELECT6,
+        [write_fd + 1, 0, writefds_addr, 0, timeout_addr, 0],
+    );
+    let DispatchOutcome::WaitOnFdsSelect { fds, .. } = outcome else {
+        panic!("expected select on a full pipe to park, got {outcome:?}");
+    };
+    assert_eq!(
+        fds.first(),
+        Some((write_poll_fd, libc::POLLIN)),
+        "must park on the readiness pipe with the event it delivers"
+    );
+}
