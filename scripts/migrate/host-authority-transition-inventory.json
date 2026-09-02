@@ -8715,8 +8715,8 @@
     "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:7517 in `bind`, `std::fs::remove_file` accesses only the registered AF_UNIX backing path used by `bind`.",
     "review_id": "HA-000328",
     "source": {
-      "byte_end": 332165,
-      "byte_start": 332145,
+      "byte_end": 332174,
+      "byte_start": 332154,
       "column": 33,
       "column_end": 53,
       "column_start": 33,
@@ -8742,8 +8742,8 @@
     "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:7618 in `bind`, `std::fs::remove_file` accesses only the registered AF_UNIX backing path used by `bind`.",
     "review_id": "HA-000329",
     "source": {
-      "byte_end": 337499,
-      "byte_start": 337479,
+      "byte_end": 337508,
+      "byte_start": 337488,
       "column": 33,
       "column_end": 53,
       "column_start": 33,
@@ -10384,8 +10384,8 @@
     "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:7514 in `bind`, `std::fs::symlink_metadata` accesses only the registered AF_UNIX backing path used by `bind`.",
     "review_id": "HA-000390",
     "source": {
-      "byte_end": 331997,
-      "byte_start": 331972,
+      "byte_end": 332006,
+      "byte_start": 331981,
       "column": 33,
       "column_end": 58,
       "column_start": 33,
@@ -10411,8 +10411,8 @@
     "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:7614 in `bind`, `std::fs::symlink_metadata` accesses only the registered AF_UNIX backing path used by `bind`.",
     "review_id": "HA-000391",
     "source": {
-      "byte_end": 337314,
-      "byte_start": 337289,
+      "byte_end": 337323,
+      "byte_start": 337298,
       "column": 37,
       "column_end": 62,
       "column_start": 37,
@@ -13153,18 +13153,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/fs.rs:5094 in `send_async_owner_signal`, the host result from `std::process::id` determines the guest self-thread signal-target decision used by `send_async_owner_signal`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/fs.rs:5105 in `send_async_owner_signal`, the host result from `std::process::id` determines the guest self-thread signal-target decision used by `send_async_owner_signal`.",
     "review_id": "HA-000492",
     "source": {
-      "byte_end": 224562,
-      "byte_start": 224546,
+      "byte_end": 225493,
+      "byte_start": 225477,
       "column": 97,
       "column_end": 113,
       "column_start": 97,
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5094,
-      "line_end": 5094,
-      "line_start": 5094
+      "line": 5105,
+      "line_end": 5105,
+      "line_start": 5105
     }
   },
   {
@@ -13180,18 +13180,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/fs.rs:5095 in `send_async_owner_signal`, the host result from `std::process::id` determines the guest self-process signal-target decision used by `send_async_owner_signal`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/fs.rs:5106 in `send_async_owner_signal`, the host result from `std::process::id` determines the guest self-process signal-target decision used by `send_async_owner_signal`.",
     "review_id": "HA-000493",
     "source": {
-      "byte_end": 224681,
-      "byte_start": 224665,
+      "byte_end": 225612,
+      "byte_start": 225596,
       "column": 100,
       "column_end": 116,
       "column_start": 100,
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5095,
-      "line_end": 5095,
-      "line_start": 5095
+      "line": 5106,
+      "line_end": 5106,
+      "line_start": 5106
     }
   },
   {
@@ -13480,8 +13480,8 @@
     "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:7490 in `bind`, the host result from `std::process::id` determines the guest-visible synthetic netlink bind PID used by `bind`.",
     "review_id": "HA-000504",
     "source": {
-      "byte_end": 330616,
-      "byte_start": 330600,
+      "byte_end": 330625,
+      "byte_start": 330609,
       "column": 21,
       "column_end": 37,
       "column_start": 21,
@@ -13507,8 +13507,8 @@
     "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:8341 in `sendto`, `std::process::id` acts only on the current carrier network-debug event used by `sendto`; no guest identity selects its host target.",
     "review_id": "HA-000505",
     "source": {
-      "byte_end": 373849,
-      "byte_start": 373833,
+      "byte_end": 373858,
+      "byte_start": 373842,
       "column": 21,
       "column_end": 37,
       "column_start": 21,
