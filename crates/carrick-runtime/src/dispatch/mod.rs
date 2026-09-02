@@ -3291,7 +3291,7 @@ pub struct SyscallDispatcher {
     /// fail-closes the one shape that breaks this (publishing from under a
     /// SHARED dispatch guard).
     /// Owned process subsystem state (executable path, personality,
-    /// dumpable flag, task comm name). See [`proc::ProcState`].
+    /// task comm name). See [`proc::ProcState`].
     proc: Mutex<proc::ProcState>,
     /// Owned filesystem subsystem state (unified VFS mount table plus
     /// the `/` rootfs + writable overlay). See [`fs::FsState`]. Handlers
@@ -6120,7 +6120,7 @@ impl SyscallDispatcher {
         }
         let comm = linux_task_name_to_string(&proc.task_name);
         let psargs = proc.argv.join(" ");
-        let dumpable = proc.dumpable != 0;
+        let dumpable = context.task().dumpable() == crate::kernel::DumpableMode::User;
         let maps = mem::project_core_maps(&mem);
         let file_mappings = mem.core_file_mappings.clone();
         let dump_omitted = mem

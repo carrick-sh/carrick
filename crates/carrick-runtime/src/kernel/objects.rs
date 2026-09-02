@@ -3286,6 +3286,49 @@ pub enum TaskWakeEnrollment {
     Subscribed(TaskWakeSubscription),
 }
 
+/// A process's `PR_SET_DUMPABLE` attribute (prctl(2)): whether it can be
+/// core-dumped and — the guest-visible half — whether it is `ptrace`-attachable
+/// by a same-uid caller. `Disable` means only `CAP_SYS_PTRACE` may attach.
+///
+/// This is process state in the kernel graph, not a dispatcher cell, because
+/// `attach_task_for_ptrace` has to read the TARGET's attribute, and the target
+/// is another Linux process whose dispatcher the caller cannot see.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(i32)]
+pub enum DumpableMode {
+    /// `SUID_DUMP_DISABLE`: not dumpable, not attachable without
+    /// `CAP_SYS_PTRACE`.
+    Disable = 0,
+    /// `SUID_DUMP_USER` (the default): dumpable and attachable by a uid match.
+    User = 1,
+}
+
+impl DumpableMode {
+    /// The value a guest wrote through `prctl(PR_SET_DUMPABLE, arg2)`. Linux
+    /// accepts only 0 and 1 (`SUID_DUMP_ROOT` is root-only via `/proc/sys` and
+    /// rejected here with EINVAL, exactly as the oracle does).
+    pub fn from_prctl(raw: u64) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Disable),
+            1 => Some(Self::User),
+            _ => None,
+        }
+    }
+
+    /// The value `prctl(PR_GET_DUMPABLE)` returns.
+    pub fn to_prctl(self) -> i64 {
+        i64::from(self as i32)
+    }
+
+    fn from_atomic(raw: i32) -> Self {
+        if raw == Self::Disable as i32 {
+            Self::Disable
+        } else {
+            Self::User
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Task {
     key: TaskKey,
@@ -3340,6 +3383,11 @@ pub struct Task {
     /// process's file and reads it back (`tst_memutils.c:set_oom_score_adj`),
     /// which a shared cell cannot model.
     oom_score_adj: AtomicI32,
+    /// `PR_SET_DUMPABLE` (prctl(2)): inherited across fork, reset to
+    /// [`DumpableMode::User`] by exec (carrick has no set-uid exec, so the
+    /// `suid_dumpable` exception never applies), and shared by every thread.
+    /// Read by ptrace attach permission checks for the TARGET task.
+    dumpable: AtomicI32,
     /// This process's nice value (`getpriority`/`setpriority`): range
     /// [-20, 19], default 0. Inherited across fork and preserved across exec.
     ///
@@ -3552,6 +3600,7 @@ impl Task {
             wake_listeners: Arc::new(Mutex::new(BTreeMap::new())),
             next_wake_listener: AtomicU64::new(1),
             oom_score_adj: AtomicI32::new(0),
+            dumpable: AtomicI32::new(DumpableMode::User as i32),
             nice: AtomicI32::new(0),
             ioprio: AtomicU32::new(Task::DEFAULT_IOPRIO),
             keyrings: Mutex::new(ProcessKeyrings::default()),
@@ -3608,6 +3657,8 @@ impl Task {
         // oom_score_adj is inherited across fork and independent thereafter
         // (`proc(5)`).
         self.set_oom_score_adj(parent.oom_score_adj());
+        // The dumpable attribute is inherited across fork (prctl(2)).
+        self.set_dumpable(parent.dumpable());
         // nice is inherited across fork (`fork(2)`: "the child's nice value is
         // the same as the parent's").
         self.set_nice(parent.nice());
@@ -3868,6 +3919,24 @@ impl Task {
     /// parent's value into the child at creation.
     pub fn set_oom_score_adj(&self, value: i32) {
         self.oom_score_adj.store(value, Ordering::Relaxed);
+    }
+
+    /// This process's `PR_GET_DUMPABLE` attribute.
+    pub fn dumpable(&self) -> DumpableMode {
+        DumpableMode::from_atomic(self.dumpable.load(Ordering::Relaxed))
+    }
+
+    /// `prctl(PR_SET_DUMPABLE)`; fork inheritance copies the parent's value
+    /// and exec resets it through [`Task::reset_dumpable_for_exec`].
+    pub fn set_dumpable(&self, mode: DumpableMode) {
+        self.dumpable.store(mode as i32, Ordering::Relaxed);
+    }
+
+    /// exec restores the default (prctl(2): "the dumpable attribute is reset
+    /// to 1 across execve"). Carrick has no set-uid or unreadable-image exec
+    /// that would instead apply `/proc/sys/fs/suid_dumpable`.
+    pub(super) fn reset_dumpable_for_exec(&self) {
+        self.set_dumpable(DumpableMode::User);
     }
 
     /// Publish the lane's wake vehicle for this task, replacing any previous

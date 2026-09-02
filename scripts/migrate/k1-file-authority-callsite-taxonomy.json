@@ -3252,7 +3252,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 1202,
+      "line": 1199,
       "categories": [
         "table_guard"
       ],
@@ -3263,7 +3263,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 1226,
+      "line": 1223,
       "categories": [
         "description_guard"
       ],
@@ -3274,7 +3274,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 1260,
+      "line": 1257,
       "categories": [
         "description_guard"
       ],
@@ -3285,7 +3285,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 4257,
+      "line": 4256,
       "categories": [
         "description_guard"
       ],
@@ -3933,7 +3933,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 8609,
+      "line": 8678,
       "categories": [
         "table_guard"
       ],
@@ -3944,7 +3944,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 8621,
+      "line": 8690,
       "categories": [
         "table_guard"
       ],
@@ -3955,7 +3955,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 8780,
+      "line": 8849,
       "categories": [
         "table_guard"
       ],
@@ -3966,7 +3966,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 8821,
+      "line": 8890,
       "categories": [
         "table_guard"
       ],
@@ -3977,7 +3977,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "line": 2655,
+      "line": 2667,
       "categories": [
         "table_guard"
       ],
@@ -3988,7 +3988,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "line": 5504,
+      "line": 5516,
       "categories": [
         "table_guard"
       ],
@@ -3999,7 +3999,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "line": 5535,
+      "line": 5547,
       "categories": [
         "table_guard"
       ],

@@ -541,6 +541,7 @@ impl Kernel {
         record
             .task
             .replace_process_credentials(prepared.resources.credentials());
+        record.task.reset_dumpable_for_exec();
         for (tid, (_, thread)) in &old_threads {
             if *tid == leader_tid {
                 continue;

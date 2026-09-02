@@ -29,7 +29,7 @@
 //! ## prctl: mostly a faithful register file
 //!
 //! Most `prctl` options have no host effect; carrick's job is to RECORD them so
-//! the matching `PR_GET_*` reads back exactly what was set (dumpable, task comm
+//! the matching `PR_GET_*` reads back exactly what was set (task comm
 //! name, pdeathsig, keepcaps, child-subreaper, no-new-privs, timerslack). These
 //! round-trip even when the modulated behavior is a follow-up, because real
 //! programs (init systems, libcap, seccomp installers) feature-check by setting
@@ -625,8 +625,6 @@ pub(super) struct ProcState {
     pub guest_hostname: String,
     /// `personality(2)` execution-domain flags, recorded and echoed back.
     pub personality: u64,
-    /// `prctl(PR_SET_DUMPABLE)` flag (default 1).
-    pub dumpable: i64,
     /// `prctl(PR_SET_NAME)` task comm name (16 bytes, NUL-padded).
     pub task_name: [u8; LINUX_TASK_COMM_LEN],
     /// `prctl(PR_SET_PDEATHSIG)` parent-death signal (0 = none). Recorded and
@@ -810,7 +808,6 @@ impl ProcState {
             env: Vec::new(),
             guest_hostname: crate::execute::guest_hostname().to_string(),
             personality: 0,
-            dumpable: 1,
             task_name: linux_task_name_from_bytes(b"exe"),
             pdeathsig: 0,
             keepcaps: 0,
@@ -1457,14 +1454,16 @@ impl SyscallDispatcher {
         fn prctl(this, cx, option: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) {
             let memory = &mut *cx.memory;
             Ok(match option {
+                // Dumpable lives on the kernel `Task`, not in `ProcState`: a
+                // ptrace attach reads the TARGET process's attribute.
                 LINUX_PR_GET_DUMPABLE => DispatchOutcome::Returned {
-                    value: this.proc.lock().dumpable,
+                    value: cx.kernel.task().dumpable().to_prctl(),
                 },
                 LINUX_PR_SET_DUMPABLE => {
-                    if arg2 > 1 {
+                    let Some(mode) = crate::kernel::DumpableMode::from_prctl(arg2) else {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                    }
-                    this.proc.lock().dumpable = arg2 as i64;
+                    };
+                    cx.kernel.task().set_dumpable(mode);
                     DispatchOutcome::Returned { value: 0 }
                 }
                 LINUX_PR_SET_NAME => {
