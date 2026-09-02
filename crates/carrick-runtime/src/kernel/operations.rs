@@ -948,6 +948,10 @@ impl PreparedFork {
         }
         .publish();
 
+        // The child inherited its parent's RLIMIT_CPU; a finite one must be
+        // watched from the moment the child is visible.
+        kernel.cpu_limit_watch().ensure_watching(&kernel, &child);
+
         if let Some(budget) = child.container().budget() {
             let _ = budget.check_process_creation();
         }

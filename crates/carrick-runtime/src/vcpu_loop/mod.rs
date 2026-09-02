@@ -6705,6 +6705,9 @@ where
         }
         self.state
             .publish_thread_run_state(crate::run_state::RunState::Running, 'R');
+        if let Some(thread) = self.state.kernel_thread.as_ref() {
+            thread.begin_guest_run();
+        }
         let next = engine.next_syscall();
         if let Some(thread) = self.state.kernel_thread.as_ref() {
             thread.charge_user_ns(engine.take_guest_run_receipt_ns());

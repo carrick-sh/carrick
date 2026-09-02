@@ -7,6 +7,7 @@ use parking_lot::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::address::MmBackend;
 use super::container::{Container, ContainerId};
+use super::cpu_limit::CpuLimitWatch;
 use super::frame_inventory::{FrameInventoryAuthority, FrameInventoryReserveError};
 use super::ids::{
     ChildExitSignal, FileTableId, LinuxTid, ObjectIdError, ObjectIdRegistry, ProcessGroupId,
@@ -384,6 +385,8 @@ pub struct Kernel {
     containers: Mutex<BTreeMap<ContainerId, Arc<Container>>>,
     /// The container the root task was booted into.
     root_container: Arc<Container>,
+    /// `RLIMIT_CPU` watchdog; see [`super::cpu_limit`].
+    cpu_limit_watch: CpuLimitWatch,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -965,6 +968,7 @@ impl Kernel {
             controlling_tty: Mutex::new(None),
             containers: Mutex::new(BTreeMap::from([(container.id(), Arc::clone(&container))])),
             root_container: container,
+            cpu_limit_watch: CpuLimitWatch::default(),
         });
         let context = KernelContext::capture(kernel.clone(), task, leader, TaskRevision::INITIAL);
         Ok((kernel, context))
@@ -973,6 +977,11 @@ impl Kernel {
     /// The container the root task was booted into.
     pub fn root_container(&self) -> &Arc<Container> {
         &self.root_container
+    }
+
+    /// The kernel's `RLIMIT_CPU` watchdog.
+    pub(crate) fn cpu_limit_watch(&self) -> &CpuLimitWatch {
+        &self.cpu_limit_watch
     }
 
     pub fn container(&self, id: ContainerId) -> Option<Arc<Container>> {

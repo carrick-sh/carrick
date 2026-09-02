@@ -1075,6 +1075,15 @@ impl SyscallDispatcher {
                 let limit = LinuxRlimit::new(soft, rlim_max);
                 // Published on the TARGET task, which is the whole point.
                 let _ = target.replace_rlimit(resource, |_current| Ok::<_, ()>(limit));
+                if resource == carrick_abi::LinuxResource::Cpu {
+                    // A finite CPU limit is enforced by the kernel's watchdog,
+                    // not on the syscall path: a target that never traps again
+                    // must still get SIGXCPU/SIGKILL on time.
+                    cx.kernel
+                        .kernel()
+                        .cpu_limit_watch()
+                        .ensure_watching(cx.kernel.kernel(), &target);
+                }
                 if resource == carrick_abi::LinuxResource::Nofile {
                     // Back the guest's fd soft limit with real host descriptors.
                     // Host-backed opens (regular files, /dev/null and other char
@@ -1094,33 +1103,17 @@ impl SyscallDispatcher {
     }
 }
 
-/// Check the task's user CPU time against RLIMIT_CPU and container budget quota.
+/// Check the task's CPU time against its container's budget quota.
 ///
-/// Guest CPU time is wall-clock duration inside `hv_vcpu_run`.
+/// `RLIMIT_CPU` itself is NOT judged here: it is enforced by the kernel's
+/// watchdog (`kernel::cpu_limit`) so that a process which never makes another
+/// syscall still gets `SIGXCPU`/`SIGKILL` on time.
 #[allow(clippy::result_large_err)]
 pub(crate) fn check_cpu_limits(
     kernel: &crate::kernel::KernelContext,
 ) -> Result<(), DispatchOutcome> {
     let task = kernel.task();
-    let cpu_limit = task.rlimit(carrick_abi::LinuxResource::Cpu);
     let user_cpu_us = task.self_cpu_us();
-    let user_cpu_s = user_cpu_us / 1_000_000;
-
-    // Check hard limit (SIGKILL)
-    if cpu_limit.rlim_max != LINUX_RLIM_INFINITY && user_cpu_s >= cpu_limit.rlim_max {
-        return Err(DispatchOutcome::SignalDeath {
-            signum: carrick_abi::LINUX_SIGKILL,
-        });
-    }
-
-    // Check soft limit (SIGXCPU)
-    if cpu_limit.rlim_cur != LINUX_RLIM_INFINITY && user_cpu_s >= cpu_limit.rlim_cur {
-        if let Ok(sig) = crate::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGXCPU) {
-            let _ = kernel
-                .kernel()
-                .post_signal_to_task_key(task.key(), sig, None);
-        }
-    }
 
     // Check container resource budget CPU limit
     if let Some(budget) = task.container().budget() {
@@ -1430,7 +1423,7 @@ mod rlimit_tests {
     }
 
     #[test]
-    fn check_cpu_limits_enforces_hard_limit() {
+    fn check_cpu_limits_leaves_rlimit_cpu_to_the_watchdog() {
         let dispatcher = SyscallDispatcher::new();
         let context = dispatcher.capture_one_task_context().expect("task context");
         context
@@ -1439,17 +1432,11 @@ mod rlimit_tests {
                 Ok::<_, ()>(LinuxRlimit::new(10, 20))
             })
             .expect("set cpu limit");
-
-        // Below soft limit (0 µs < 10 s): passes
-        assert!(check_cpu_limits(&context).is_ok());
-
-        // Above hard limit (25 s >= 20 s)
+        // Past the hard limit the syscall path still returns: RLIMIT_CPU is
+        // the watchdog's job (`kernel::cpu_limit`), which does not depend on
+        // the guest ever trapping again.
         context.thread().charge_user_ns(25_000_000_000);
-        let outcome = check_cpu_limits(&context);
-        assert!(matches!(
-            outcome,
-            Err(DispatchOutcome::SignalDeath { signum }) if signum == carrick_abi::LINUX_SIGKILL
-        ));
+        assert!(check_cpu_limits(&context).is_ok());
     }
 
     #[test]

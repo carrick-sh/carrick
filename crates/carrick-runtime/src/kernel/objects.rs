@@ -4051,6 +4051,41 @@ impl Task {
         live.saturating_add(self.cpu.exited_threads_us.load(Ordering::Acquire))
     }
 
+    /// This task's own user CPU (ns) including every guest run its threads are
+    /// inside right now. This is what `RLIMIT_CPU` must be judged against: a
+    /// thread that spins never traps, so its committed [`Self::self_cpu_us`]
+    /// stops advancing exactly when the limit matters most.
+    pub fn self_cpu_ns_including_active(&self) -> u64 {
+        self.sample_cpu_including_active().cpu_ns
+    }
+
+    /// [`Self::self_cpu_ns_including_active`] together with the rate at which
+    /// it can grow: how many of this task's threads are inside a guest run at
+    /// this instant. A watcher sleeping until the task could have reached a CPU
+    /// point must scale wall time by that, not by thread membership.
+    pub fn sample_cpu_including_active(&self) -> TaskCpuSample {
+        let (live, running_guest_threads) =
+            self.threads
+                .lock()
+                .values()
+                .fold((0_u64, 0_u64), |(cpu_ns, running), (_, thread)| {
+                    let sample = thread.sample_cpu_including_active();
+                    (
+                        cpu_ns.saturating_add(sample.cpu_ns),
+                        running.saturating_add(u64::from(sample.running_guest)),
+                    )
+                });
+        TaskCpuSample {
+            cpu_ns: live.saturating_add(
+                self.cpu
+                    .exited_threads_us
+                    .load(Ordering::Acquire)
+                    .saturating_mul(1000),
+            ),
+            running_guest_threads,
+        }
+    }
+
     /// This task's own SYSTEM CPU (µs): carrick's CPU spent servicing this
     /// task's syscalls, across its live threads plus the ones that have exited.
     /// The counterpart to [`Self::self_cpu_us`], which is user time.
@@ -5819,6 +5854,41 @@ pub struct Thread {
 struct ThreadCpuAccounting {
     user_ns: AtomicU64,
     system_ns: AtomicU64,
+    /// `guest_run_clock_ns()` at which this thread entered guest execution, or
+    /// 0 while it is not executing guest code. A vCPU commits its run into
+    /// `user_ns` only when it traps back to the runtime, and a guest that
+    /// spins never traps — so a reader that must see the CPU the guest is
+    /// burning RIGHT NOW (the `RLIMIT_CPU` watchdog, a CPU itimer) adds the
+    /// open interval instead of waiting for a trap that will not come.
+    active_since_ns: AtomicU64,
+}
+
+/// One thread's guest user CPU at an instant: see
+/// [`Thread::sample_cpu_including_active`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ThreadCpuSample {
+    /// Committed user CPU plus the open guest run, if any.
+    pub cpu_ns: u64,
+    /// Whether the thread is inside a guest run right now.
+    pub running_guest: bool,
+}
+
+/// One task's guest user CPU at an instant: see
+/// [`Task::sample_cpu_including_active`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskCpuSample {
+    /// Every live thread's [`ThreadCpuSample::cpu_ns`] plus exited threads'.
+    pub cpu_ns: u64,
+    /// How many threads are inside a guest run right now — the number of
+    /// host CPUs this figure can be growing on.
+    pub running_guest_threads: u64,
+}
+
+/// Monotonic host clock for the open guest-run interval, in nanoseconds.
+/// Only differences between two readings are ever used; the time source is
+/// the host's to own, so this holds no state of its own.
+fn guest_run_clock_ns() -> u64 {
+    carrick_host::clock::host_clock_uptime_ns()
 }
 
 #[derive(Debug)]
@@ -7117,13 +7187,50 @@ impl Thread {
         self.cpu_accounting.user_ns.load(Ordering::Acquire) / 1000
     }
 
-    /// Charge guest execution CPU directly to this logical thread. Executor
-    /// slots are intentionally not accounting identities.
+    /// Mark this thread as executing guest code from now until its next
+    /// [`Self::charge_user_ns`], which commits the run and closes the interval.
+    pub fn begin_guest_run(&self) {
+        self.cpu_accounting
+            .active_since_ns
+            .store(guest_run_clock_ns().max(1), Ordering::Release);
+    }
+
+    /// Charge guest execution CPU directly to this logical thread and close
+    /// any open guest-run interval. Executor slots are intentionally not
+    /// accounting identities.
     pub fn charge_user_ns(&self, delta_ns: u64) {
         if delta_ns != 0 {
             self.cpu_accounting
                 .user_ns
                 .fetch_add(delta_ns, Ordering::AcqRel);
+        }
+        self.cpu_accounting
+            .active_since_ns
+            .store(0, Ordering::Release);
+    }
+
+    /// Guest USER CPU (ns) including the guest run this thread is inside right
+    /// now, if any. The committed total alone lags a spinning guest by the
+    /// whole of its current run.
+    pub fn cpu_ns_including_active(&self) -> u64 {
+        self.sample_cpu_including_active().cpu_ns
+    }
+
+    /// [`Self::cpu_ns_including_active`] plus whether the thread is inside a
+    /// guest run right now (so the figure is still growing).
+    pub fn sample_cpu_including_active(&self) -> ThreadCpuSample {
+        let committed = self.cpu_accounting.user_ns.load(Ordering::Acquire);
+        let since = self.cpu_accounting.active_since_ns.load(Ordering::Acquire);
+        if since == 0 {
+            ThreadCpuSample {
+                cpu_ns: committed,
+                running_guest: false,
+            }
+        } else {
+            ThreadCpuSample {
+                cpu_ns: committed.saturating_add(guest_run_clock_ns().saturating_sub(since)),
+                running_guest: true,
+            }
         }
     }
 

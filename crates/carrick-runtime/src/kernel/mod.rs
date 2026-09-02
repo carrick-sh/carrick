@@ -8,6 +8,7 @@ pub mod clone_plan;
 pub mod container;
 pub mod control;
 pub mod core;
+pub(crate) mod cpu_limit;
 pub mod crash_capture;
 pub mod debug;
 pub mod exec;

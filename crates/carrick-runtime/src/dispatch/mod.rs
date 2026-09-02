@@ -4789,6 +4789,10 @@ impl SyscallDispatcher {
         context
             .task()
             .inherit_fork_attributes_from(inherited.task());
+        context
+            .kernel()
+            .cpu_limit_watch()
+            .ensure_watching(context.kernel(), context.task());
         // A host fork copies only the calling thread. Preserve its blocked
         // mask, altstack and active handler-frame restoration state while
         // clearing both task- and thread-directed pending signals, exactly as

@@ -196,13 +196,26 @@ impl ProcessTimerDelivery {
         signum: i32,
     ) {
         if carrick_timer_core::itimer::is_cpu_timer(which) {
-            let mut cpu_due_ns =
-                carrick_host::guest_cpu::total_ns_including_active().saturating_add(spec.value);
+            // ITIMER_VIRTUAL/PROF measure THIS process's CPU. Under HVPatch
+            // every guest process shares the carrier, so the carrier-wide
+            // counters would charge siblings' CPU to this timer; read the
+            // task's own threads instead. A vanished task ends the timer.
+            let cpu_now = || {
+                target
+                    .task()
+                    .map(|task| task.self_cpu_ns_including_active())
+            };
+            let Some(start_ns) = cpu_now() else {
+                return;
+            };
+            let mut cpu_due_ns = start_ns.saturating_add(spec.value);
             loop {
                 if !slot.generation_matches(generation) {
                     return;
                 }
-                let now_ns = carrick_host::guest_cpu::total_ns_including_active();
+                let Some(now_ns) = cpu_now() else {
+                    return;
+                };
                 if now_ns >= cpu_due_ns {
                     if !target.deliver(signum) {
                         return;
