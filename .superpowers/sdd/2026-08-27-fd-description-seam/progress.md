@@ -672,3 +672,99 @@ rounded the zero up instead of requiring MREMAP_MAYMOVE.
 | `lifecycleflagmatrix` | 4 | `process_vm_writev` into a child (2), `ptrace_attach_init_eperm`, `waitid_no_children_echild` |
 | `memfdsealmatrix` | 1 | a write through an existing `MAP_SHARED` memfd mapping is not visible to `pread` on that fd — shared-mapping/file coherence |
 | `budget_two_proc` | 1 | `parent_pid=9` (Docker) vs `2` (carrick). An ABSOLUTE pid value that depends on how many processes the runtime happened to start first; matching it would mean burning pids to imitate Docker's count, not fixing a semantic |
+
+## 2026-09-02 defect-B status (fork install under pause-capable stage-1 authority)
+
+Uncommitted in `crates/carrick-runtime/src/vcpu_loop/quiesce.rs`: the
+`prepare_in_process_fork` install now takes
+`acquire_mm_stage1_authority(&mut mm_executor, tid, PtPauseBudget::DEFAULT)`
+(Sole or Paused) instead of demanding instantaneous sole exact-MM census.
+Live 4-lane `forkabort.sh B`: EAGAIN 29→0-2 per lane, but every lane exits
+134 with two signatures:
+
+1. `install_failure=Some(TimedOut)` at exact 30 s spacing — pt-barrier
+   ELECTION timeout: another P coordinator holds the carrier-global
+   `pt_barrier()` ≥30 s while the forker (holding frame-inventory
+   reservation + topology lock + fork barrier) waits.
+   `FrameInventoryAuthority::reserve` (frame_inventory.rs:216) does NOT
+   block, so the ABBA is not through the inventory map. Remaining
+   candidates: `wait_for_reservation_change` loops (operations.rs:1147
+   `reserve_publication_eventually` "task operation → topology →
+   registry publication"; dispatch/mod.rs:5322 exit_thread TaskBusy) or
+   the topology lock itself. NEXT: re-run `forkabort.sh C`, and during a
+   30 s stall `sudo lldb -p <carrier> -o "process save-core
+   target/perf/forkabort/core-C" -o detach`, then `bt all` grepped for
+   `try_become_coordinator|park_until|drain_exact_mm|topology|
+   wait_for_reservation_change` to name the coordinator's blocked frame.
+2. `publish hvpatch child root slot failed ... hvpatch exec reservation for
+   task TaskKey{..} already owns MM generation AsidGeneration{asid:1,gen:1}`
+   → abort. B2 shows it with NO preceding EAGAIN, so it may be independent
+   of (1); attribute on the pre-B binary (`git checkout ce1822593 --
+   crates/carrick-runtime/src/vcpu_loop/quiesce.rs`, `just build`) before
+   fixing.
+
+Do not ff main with the dirty quiesce.rs: it crashes live. Defect A
+(`ce1822593`) is committed and needs `just ci` + ff on its own if B stalls.
+
+### 2026-09-02 — signature (1) ROOT CAUSE CONFIRMED (live lldb `bt all`, `target/perf/forkabort/bt-C.txt`)
+
+ABBA between fork and the mmap editors:
+- thread #7 `carrick-executor-1` (forker, tid 4): `prepare_in_process_fork`
+  holds the topology lock (`try_acquire_topology_lock(InProcessFork)`,
+  quiesce.rs:1481) and the frame-inventory reservation, then waits in
+  `acquire_mm_stage1_authority → begin_pt_pause → PtQuiesce::park_until`
+  (quiesce.rs:1668/590) because it LOST the pt-barrier election.
+- thread #15 `carrick-executor-9` (pid 358 tid 380 `munmap`): holds P
+  (`SyscallMmPhase::Mutation` coordinator) and blocks in
+  `unmap_range → HvfVmState::unregister_process_alias →
+  acquire_topology_lock(AliasUnmap)` (trap.rs:34980, fork_quiesce.rs:281)
+  on the mutex the forker holds.
+- threads #9/#12/#14 are parked in `park_servicing_exact_invalidation`
+  (paused by #15's coordinator); thread #8 process-retire spins in
+  `acquire_process_retire_topology_lock_servicing` on the same lock.
+Order: fork = topology→P, editors = P→topology. The 30 s election budget
+is what turns the cycle into a stall + EAGAIN instead of a hang.
+
+FIX (not yet done): make fork P-first like the editors — take
+`mm_executor` (quiesce.rs:1645) and `acquire_mm_stage1_authority` BEFORE
+`try_acquire_topology_lock` (1481) / `reserve_frame_inventory` (1460), and
+hold the Sole|Paused authority through `prepare_fork_mm` (1578),
+`ops.prepare` (1595) and the install. First check that neither
+`prepare_fork_mm` nor `ops.prepare` itself takes P or an executor
+participation (self-deadlock), and that a Paused authority does not stall
+the child-lease / `subscribe_lease_drain` path. Add a lock-order test
+(source-text: the authority call precedes the topology acquire) red-first.
+Signature (2) still needs attribution on the pre-B binary.
+Precondition audited 2026-09-02: neither `SyscallDispatcher::prepare_fork_mm`
+(dispatch/mod.rs) nor the HVF `ops.prepare` chain (`memory.build_process_spec`
+trap.rs:36080, `cancel_process_inventory`, `rollback_process_fork`,
+`commit_process_fork`, `fresh_fork_kicker`) takes `begin_pt_pause`,
+`with_sole_mm_stage1`, `pt_barrier()` or `acquire_topology_lock` — they only
+take their own internal mutexes (`frame_inventory.lock()`), so holding the
+Sole|Paused stage-1 authority across them does not self-deadlock. The
+P-first reorder in `prepare_in_process_fork` is therefore safe to attempt.
+
+### 2026-09-02 — defect B CLOSED (four commits, all load-verified)
+
+The dirty-quiesce warning above is obsolete. The chain landed as:
+
+1. `457c43e97`-era fork install under pause-capable, P-first stage-1
+   authority (signature 1 above: fork now orders P → topology like the
+   editors, so the election cycle is gone).
+2. `0b681910d` — childless exit no longer reserves the root adopter
+   (`fork(2) = EAGAIN` via `TaskBusy(root)`).
+3. `b75ba94e2` — clones/forks park behind a transient Fork admission close
+   instead of `EAGAIN`; exit takes the owner-set-edit hold against a
+   sibling exec reservation BEFORE publishing (was an abort at
+   `retire persistent failure MM/ASID`).
+4. `8e395c991` — the wedge that surfaced once nothing bailed out: an ABBA
+   between exec retarget (`generation → kick.binding → directory.bindings`)
+   and clone activation (`directory.bindings → kick.binding` via
+   `has_running`). `activate` now publishes outside the directory lock.
+
+Evidence: `target/perf/forkabort/H3-btall.txt` (the convoy),
+`forkabort.sh I` and `J` on the rebuilt signed binary — 8/8 lanes PASS,
+`eagain=0 crash=0 silent=0`, no wedge. Reading of the executor lock order
+for future work: **scheduler generation mutex → executor kick binding →
+`HvpatchTaskBindingDirectory::bindings` → run-queue state**; never enter
+the scheduler from under the directory.
