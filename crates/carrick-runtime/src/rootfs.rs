@@ -159,6 +159,10 @@ enum LowerListing {
     /// Not a plain directory of the lower (a symlink, a file, unreadable):
     /// every lookup under it keeps taking the exact per-path probe.
     Opaque,
+    /// The directory itself is absent from the lower, so is everything
+    /// beneath it — an upper-only tree (the guest's own `mkdir /tmp/x`),
+    /// where every fresh name would otherwise re-walk the lower per lookup.
+    Absent,
 }
 
 /// Second miss in one directory ⇒ list it (see [`ImmutableHostRoot::listings`]).
@@ -1184,6 +1188,7 @@ fn lower_listing_says_absent(host: &ImmutableHostRoot, normalized: &Path) -> boo
     let listings = host.listings.lock();
     match listings.get(parent) {
         Some(LowerListing::Names(names)) => !names.contains(leaf),
+        Some(LowerListing::Absent) => true,
         _ => false,
     }
 }
@@ -1192,14 +1197,28 @@ fn lower_listing_says_absent(host: &ImmutableHostRoot, normalized: &Path) -> boo
 /// at the threshold, list that directory. The listing is taken only for a
 /// plain directory of the lower (`follow = false` kind `Directory`, itself
 /// memoised): a symlinked parent (merged-usr `/bin -> usr/bin`) resolves per
-/// path instead, so listing and probe can never disagree.
+/// path instead, so listing and probe can never disagree. A parent the lower
+/// has no entry for at all is [`LowerListing::Absent`]: its `NotFound` came
+/// through this same memoised resolution, and the lower never changes, so
+/// every name beneath it is provably absent without a further probe.
 fn note_lower_miss(host: &ImmutableHostRoot, normalized: &Path) {
     let Some(parent) = normalized.parent() else {
         return;
     };
+    // A parent already proven absent — by its own memoised negative lookup
+    // or by ITS parent's listing — needs no miss count: the first name
+    // beneath it settles the whole directory.
+    let parent_known_absent = matches!(
+        host.dcache.lock().get(&(parent.to_path_buf(), false)),
+        Some(None)
+    ) || lower_listing_says_absent(host, parent);
     {
         let mut listings = host.listings.lock();
         match listings.get_mut(parent) {
+            None if parent_known_absent => {
+                listings.insert(parent.to_path_buf(), LowerListing::Absent);
+                return;
+            }
             None => {
                 listings.insert(parent.to_path_buf(), LowerListing::Misses(1));
                 return;
@@ -1213,21 +1232,18 @@ fn note_lower_miss(host: &ImmutableHostRoot, normalized: &Path) {
             Some(_) => return,
         }
     }
-    let parent_is_plain_dir = matches!(
-        host_metadata(host, parent, false),
+    let listing = match host_metadata(host, parent, false) {
         Ok(RootFsMetadata {
             kind: RootFsEntryKind::Directory,
             ..
-        })
-    );
-    let listing = if parent_is_plain_dir {
-        host.backend
+        }) => host
+            .backend
             .child_name_set(&display_rootfs_path(parent))
             .map_or(LowerListing::Opaque, |names| {
                 LowerListing::Names(Arc::new(names))
-            })
-    } else {
-        LowerListing::Opaque
+            }),
+        Err(RootFsError::NotFound(_)) => LowerListing::Absent,
+        Ok(_) | Err(_) => LowerListing::Opaque,
     };
     host.listings.lock().insert(parent.to_path_buf(), listing);
 }
@@ -1361,6 +1377,7 @@ mod tests {
             LowerListing::Misses(_) => "misses",
             LowerListing::Names(_) => "names",
             LowerListing::Opaque => "opaque",
+            LowerListing::Absent => "absent",
         })
     }
 
@@ -1403,6 +1420,42 @@ mod tests {
             RootFsEntryKind::File
         );
         assert!(rootfs.symlink_metadata("/bin/nope2").is_err());
+    }
+
+    /// A directory the lower LACKS (the guest's own `mkdir -p /tmp/LTP_x`,
+    /// which exists only in the upper) proves every child absent: once its
+    /// absence is known no lookup beneath it may probe the host again.
+    /// `ltp-creat05` ran 8x the oracle because this parent was memoised as
+    /// `Opaque`, so each of its 4,096 fresh `creat05_N` names re-walked the
+    /// lower three times per guest `open`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn immutable_lower_absent_parent_proves_every_child_absent() {
+        let lower = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(lower.path().join("tmp")).unwrap();
+        let rootfs = RootFs::from_immutable_host_dir(lower.path()).unwrap();
+
+        assert!(rootfs.symlink_metadata("/tmp/ltp_x/creat_0").is_err());
+        assert!(rootfs.symlink_metadata("/tmp/ltp_x/creat_1").is_err());
+        assert_eq!(lower_listing_state(&rootfs, "tmp/ltp_x"), Some("absent"));
+
+        // Planted on the host AFTER the answer: the lower is immutable by
+        // contract, so a probe here would be both wasted and wrong.
+        std::fs::create_dir_all(lower.path().join("tmp/ltp_x")).unwrap();
+        std::fs::write(lower.path().join("tmp/ltp_x/creat_2"), b"p").unwrap();
+        assert!(rootfs.symlink_metadata("/tmp/ltp_x/creat_2").is_err());
+        assert!(rootfs.metadata("/tmp/ltp_x/creat_2").is_err());
+        assert!(rootfs.symlink_metadata("/tmp/ltp_x").is_err());
+        // The absent parent proves its whole subtree absent, not one level.
+        assert!(
+            rootfs
+                .symlink_metadata("/tmp/ltp_x/deeper/creat_3")
+                .is_err()
+        );
+        assert_eq!(
+            lower_listing_state(&rootfs, "tmp/ltp_x/deeper"),
+            Some("absent")
+        );
     }
 
     #[test]
