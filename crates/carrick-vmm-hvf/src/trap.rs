@@ -5946,6 +5946,225 @@ mod foreign_mm_tests {
         drop(new_lease);
     }
 
+    /// A fork that is abandoned after `prepare` (the dispatcher install losing
+    /// sole exact-MM authority answers `EAGAIN`) must leave the PARENT's
+    /// reusable global frames exactly as they were. The prepared child borrows
+    /// those frames COW with the parent's live owner generation stamped on the
+    /// descriptor; retiring that owner on abort unmaps the parent's stage-2
+    /// backing under a live process, and its next write fails the
+    /// owner-liveness check (the go `os/exec` crash after a load-induced
+    /// `fork(2) = EAGAIN`).
+    #[test]
+    fn abort_prepared_child_preserves_borrowed_parent_global_frame_owner() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let _stage2_stub = ScopedStage2MapTestStub::enable();
+        let transport = Arc::new(CarrierForeignMmTransport::new());
+        let custody = Arc::clone(&transport.custody);
+
+        // The parent's live reusable global frame (a private heap arena).
+        let parent_len = 0x4000u64;
+        let parent_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            parent_len as usize,
+            crate::host_mapping::HostMappingKind::PrivateAnon,
+        )
+        .expect("parent heap host mapping");
+        let parent_addr = parent_host.as_ptr();
+        let mut parent_lease = GlobalFrameStage2Lease::reserve(parent_len, parent_len)
+            .expect("reserve parent global-frame IPA");
+        let parent_ipa = parent_lease.base;
+        assert!(is_reusable_global_frame_extent(parent_ipa, parent_len));
+        assert_eq!(
+            unsafe { inventory_hv_vm_map(parent_addr.cast(), parent_ipa, parent_len as usize, 3) },
+            0
+        );
+        parent_lease.mark_mapped();
+        let parent_gen =
+            register_global_frame_host_owner_in(&custody, parent_lease, parent_host, 3)
+                .expect("register parent heap owner");
+        assert_ne!(parent_gen, 0);
+
+        // A prepared fork child: its own root slot plus a COW borrow of the
+        // parent's heap frame, stamped with the parent's owner generation.
+        let pt_ipa = 0x9a00_6000_0000u64;
+        let pt_len = 0x20_0000u64;
+        let pt_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            pt_len as usize,
+            crate::host_mapping::HostMappingKind::PrivateAnon,
+        )
+        .expect("child page-table host mapping");
+        let pt_host_addr = pt_host.as_ptr();
+        let parent_frame =
+            carrick_hal::FrameId::from_kernel_allocation(std::num::NonZeroU64::new(41).unwrap());
+        let parent_mapping =
+            carrick_hal::MappingId::from_kernel_allocation(std::num::NonZeroU64::new(42).unwrap());
+        let mut plan = ProcessSpecPlan {
+            mappings: vec![
+                ProcessMappingDesc {
+                    start: crate::memory::LINUX_PAGE_TABLES_BASE,
+                    ipa: pt_ipa,
+                    end: pt_ipa + pt_len,
+                    stage2_lease: Some(GlobalFrameStage2Lease::fixed(pt_ipa, pt_len)),
+                    host: ProcessMappingHost::Owned(pt_host),
+                    size: pt_len as usize,
+                    physical_ipa: pt_ipa,
+                    physical_host_addr: pt_host_addr,
+                    physical_size: pt_len as usize,
+                    inventory_backing: InventoryBackingIdentity::Private(1),
+                    perms: applevisor::memory::MemPerms::ReadWrite,
+                    is_dynamic_alias: false,
+                    sharing: GuestMappingSharing::Private,
+                    guest_writable: true,
+                    inherited_frame: None,
+                    shared_key_base: 0,
+                    shared_key_offset: 0,
+                    owner_generation: 0,
+                },
+                ProcessMappingDesc {
+                    start: 0x0080_0000,
+                    ipa: parent_ipa,
+                    end: 0x0080_0000 + parent_len,
+                    stage2_lease: None,
+                    host: ProcessMappingHost::Borrowed {
+                        pointer: parent_addr,
+                        structural_owner: None,
+                    },
+                    size: parent_len as usize,
+                    physical_ipa: parent_ipa,
+                    physical_host_addr: parent_addr,
+                    physical_size: parent_len as usize,
+                    inventory_backing: InventoryBackingIdentity::Private(2),
+                    perms: applevisor::memory::MemPerms::ReadWrite,
+                    is_dynamic_alias: false,
+                    sharing: GuestMappingSharing::Private,
+                    guest_writable: false,
+                    inherited_frame: Some(parent_frame),
+                    shared_key_base: 0,
+                    shared_key_offset: 0,
+                    owner_generation: parent_gen,
+                },
+            ],
+            inventory_mappings: vec![
+                ProcessInventoryDesc {
+                    gpa: pt_ipa,
+                    length: pt_len,
+                    permissions: carrick_hal::MemPerms {
+                        read: true,
+                        write: true,
+                        exec: false,
+                    },
+                    inherited_frame: None,
+                    inherited_mapping: None,
+                    backing: InventoryBackingIdentity::Private(1),
+                    stage2_lease: (pt_ipa, pt_len),
+                    stage2_owner: InventoryStage2OwnerIdentity {
+                        host_addr: pt_host_addr as usize,
+                        generation: 0,
+                    },
+                    fork_frame_receipt_kind: None,
+                },
+                ProcessInventoryDesc {
+                    gpa: parent_ipa,
+                    length: parent_len,
+                    permissions: carrick_hal::MemPerms {
+                        read: true,
+                        write: false,
+                        exec: false,
+                    },
+                    inherited_frame: Some(parent_frame),
+                    inherited_mapping: Some(parent_mapping),
+                    backing: InventoryBackingIdentity::Private(2),
+                    stage2_lease: (parent_ipa, parent_len),
+                    stage2_owner: InventoryStage2OwnerIdentity {
+                        host_addr: parent_addr as usize,
+                        generation: parent_gen,
+                    },
+                    fork_frame_receipt_kind: Some(
+                        carrick_observability::probes::HvpatchForkFrameKind::PrivateCow,
+                    ),
+                },
+            ],
+            protections: Arc::new(MemoryProtections::default()),
+            mailbox_slots: Arc::new(MailboxSlotAllocator::new()),
+            syscall_transport: HvfSyscallTransport::Mailbox,
+            persistent_vm_lifecycle: true,
+            mm_root_slot: (pt_ipa, pt_len),
+            container_root: ContainerRootToken::from_raw(1),
+            frame_inventory: Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
+            cow_armed: Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
+            carrier_foreign_mm_transport: Arc::clone(&transport),
+        };
+        let ids = std::sync::atomic::AtomicU64::new(900);
+        plan.stage_with_reservation_factory(|frames, mappings, capacity| {
+            let next = || {
+                std::num::NonZeroU64::new(ids.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+                    .unwrap()
+            };
+            Ok(
+                carrick_hal::FrameInventoryReservation::from_kernel_candidates(
+                    carrick_hal::FrameInventoryProvenance::from_kernel_entropy([0x91; 32]),
+                    carrick_hal::FrameInventoryBatch::prepare(
+                        carrick_hal::KernelTransactionId::from_kernel_allocation(next()),
+                        capacity,
+                    )
+                    .unwrap(),
+                    (0..frames)
+                        .map(|_| carrick_hal::FrameId::from_kernel_allocation(next()))
+                        .collect(),
+                    (0..mappings)
+                        .map(|_| carrick_hal::MappingId::from_kernel_allocation(next()))
+                        .collect(),
+                ),
+            )
+        })
+        .expect("stage abandoned-fork child reservation");
+        let (carrier, prepared) = HvfVmState::prepare_task_only_plan_for_test(plan)
+            .expect("prepare abandoned-fork child");
+        let borrowed = prepared
+            .mappings
+            .iter()
+            .find(|mapping| mapping.start == 0x0080_0000)
+            .expect("prepared borrowed heap mapping");
+        assert_eq!(borrowed.owner_generation, parent_gen);
+        assert!(borrowed.host_mapping.is_none());
+
+        // The dispatcher install lost sole exact-MM authority: unwind the child.
+        abort_prepared_task_and_carrier(prepared, carrier).expect("abort abandoned fork child");
+
+        // The parent's frame must be untouched: live owner, same generation,
+        // stage-2 still installed, host backing still live.
+        let live = custody
+            .global_frame_host_owners
+            .lock()
+            .get(&(parent_ipa, parent_len))
+            .and_then(GlobalFrameOwnerEntry::live_owner)
+            .map(|owner| owner.generation());
+        assert_eq!(
+            live,
+            Some(parent_gen),
+            "abandoning a prepared fork child must not retire the parent's borrowed global frame owner",
+        );
+        assert!(
+            ScopedStage2MapTestStub::is_mapped(parent_ipa, parent_len as usize),
+            "parent stage-2 backing must survive the abandoned fork",
+        );
+        assert!(
+            alias_backing_is_live(parent_addr as usize),
+            "parent host backing must survive the abandoned fork",
+        );
+        assert!(
+            !ScopedStage2MapTestStub::is_mapped(pt_ipa, pt_len as usize),
+            "the child's own root slot must be unmapped by the abort",
+        );
+
+        // The parent retires its own frame exactly once, at its own exit.
+        assert!(matches!(
+            retire_global_frame_host_owner_if_generation_in(
+                &custody, parent_ipa, parent_len, parent_gen
+            ),
+            GlobalFrameRetirementOutcome::RetiredUnmapped { .. }
+        ));
+    }
+
     #[test]
     fn foreign_mm_failure_injection_at_composition_boundaries() {
         let _guard = FOREIGN_MM_TEST_LOCK.lock();
@@ -23467,6 +23686,8 @@ impl ThreadMappingDesc {
             shared_key_base: self.shared_key_base,
             shared_key_offset: self.shared_key_offset,
             owner_generation: self.owner_generation,
+            // A CLONE_VM edge views rows its process already owns.
+            global_frame_owner_role: GlobalFrameOwnerRole::Borrowed,
         }
     }
 
@@ -24922,6 +25143,28 @@ pub(crate) struct HvpatchMmAuthorityKey {
     shared_kernel_mm: Option<u64>,
 }
 
+/// Who holds the reusable global-frame owner row a task mapping names.
+///
+/// Reusable global frames are shared by IPA across processes: a forked child
+/// borrows the parent's private frames COW, a CLONE_VM sibling views every row
+/// of its process, and an exec rebind re-describes the process's own live rows.
+/// The `owner_generation` stamped on such a descriptor is ANOTHER authority's
+/// live generation, so it is never permission to retire the row. Only the
+/// preparation that registered a row may retire it when that preparation
+/// unwinds; reading the stamped generation as ownership retired live parent
+/// heap frames under a running process whenever a fork was abandoned after
+/// `prepare` (the go `os/exec` crash after a load-induced `fork(2) = EAGAIN`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GlobalFrameOwnerRole {
+    /// Not a reusable global frame, or its owner row belongs to another
+    /// authority. Unwinding this task must leave the row alone.
+    Borrowed,
+    /// `prepare_task_only_plan` registered `owner_generation` for this task;
+    /// unwinding the preparation retires exactly that generation.
+    Registered,
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[allow(dead_code)] // consumed by the worker-side binding load transaction in the next slice
 struct HvpatchTaskMappingState {
@@ -24942,6 +25185,7 @@ struct HvpatchTaskMappingState {
     shared_key_base: u64,
     shared_key_offset: u64,
     owner_generation: u64,
+    global_frame_owner_role: GlobalFrameOwnerRole,
 }
 unsafe impl Send for HvpatchTaskMappingState {}
 // SAFETY: these pointers are immutable address metadata naming MM-owned host
@@ -25746,9 +25990,11 @@ fn abort_prepared_task_and_carrier(
     let mut owner_rollback_error = None;
     if let Some(custody) = custody.as_ref() {
         for mapping in &task.mappings {
-            if is_reusable_global_frame_extent(mapping.physical_ipa, mapping.physical_size as u64)
-                && mapping.owner_generation != 0
-            {
+            // Retire only the owner rows THIS preparation registered. Borrowed
+            // rows (a forked child's COW view of its parent's frames, a
+            // CLONE_VM sibling's view of its process) stay live for their
+            // owner; retiring them here unmapped a running parent's heap.
+            if mapping.global_frame_owner_role == GlobalFrameOwnerRole::Registered {
                 let outcome = retire_global_frame_host_owner_if_generation_in(
                     custody,
                     mapping.physical_ipa,
@@ -36843,7 +37089,7 @@ impl HvfVmState {
                     rebind_inherited_alias_to_process(alias, plan.mm_root_slot)
                 });
             }
-            let (host_mapping, structural_owner, stage2_lease, owner_generation) =
+            let (host_mapping, structural_owner, stage2_lease, owner_generation, owner_role) =
                 if is_reusable_global_frame_extent(
                     mapping.physical_ipa,
                     mapping.physical_size as u64,
@@ -36856,12 +37102,27 @@ impl HvfVmState {
                                 host_mapping,
                                 u64::from(mapping.perms),
                             )?;
-                            (None, None, None, owner_generation)
+                            (
+                                None,
+                                None,
+                                None,
+                                owner_generation,
+                                GlobalFrameOwnerRole::Registered,
+                            )
                         }
                         (None, ProcessMappingHost::Borrowed { .. }) => {
-                            // An unowned reference to an already-registered global frame owner.
-                            // The owner_generation stamped on the mapping is preserved.
-                            (None, None, None, mapping.owner_generation)
+                            // A COW/shared reference to a frame whose owner row
+                            // another process registered (a forked child's view
+                            // of its parent's private frames). The parent's live
+                            // generation is preserved for authentication only;
+                            // unwinding this preparation must never retire it.
+                            (
+                                None,
+                                None,
+                                None,
+                                mapping.owner_generation,
+                                GlobalFrameOwnerRole::Borrowed,
+                            )
                         }
                         (Some(_), ProcessMappingHost::Borrowed { .. }) => {
                             return Err(TrapError::Hypervisor(format!(
@@ -36900,7 +37161,13 @@ impl HvfVmState {
                                 (mapping.physical_ipa, mapping.physical_size),
                                 std::sync::Arc::clone(&owner),
                             );
-                            (None, Some(owner), None, owner_generation)
+                            (
+                                None,
+                                Some(owner),
+                                None,
+                                owner_generation,
+                                GlobalFrameOwnerRole::Borrowed,
+                            )
                         }
                         ProcessMappingHost::Borrowed {
                             pointer,
@@ -36927,6 +37194,7 @@ impl HvfVmState {
                                 Some(structural_owner),
                                 mapping.stage2_lease,
                                 mapping.owner_generation,
+                                GlobalFrameOwnerRole::Borrowed,
                             )
                         }
                     }
@@ -36952,6 +37220,7 @@ impl HvfVmState {
                 shared_key_base: mapping.shared_key_base,
                 shared_key_offset: mapping.shared_key_offset,
                 owner_generation,
+                global_frame_owner_role: owner_role,
             });
         }
         let mut process_reservation = plan
@@ -37032,10 +37301,7 @@ impl HvfVmState {
                             }
                         }
                         for mapping in &mapped {
-                            if is_reusable_global_frame_extent(
-                                mapping.physical_ipa,
-                                mapping.physical_size as u64,
-                            ) {
+                            if mapping.global_frame_owner_role == GlobalFrameOwnerRole::Registered {
                                 let outcome = retire_global_frame_host_owner_if_generation_in(
                                     &plan.carrier_foreign_mm_transport.custody,
                                     mapping.physical_ipa,
@@ -38097,6 +38363,9 @@ impl HvfVmState {
                         shared_key_base: mapping.shared_key_base,
                         shared_key_offset: mapping.shared_key_offset,
                         owner_generation: mapping.owner_generation,
+                        // Exec re-describes rows this process's live authority
+                        // already owns; the replacement never registers them.
+                        global_frame_owner_role: GlobalFrameOwnerRole::Borrowed,
                     })
                     .collect();
 
