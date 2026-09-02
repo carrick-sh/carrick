@@ -1860,10 +1860,11 @@ impl SyscallDispatcher {
         {
             return Ok(self.stat_record_with_device(&path, &real));
         }
-        {
+        if crate::vfs::may_be_synthetic_virtual_path(&path) {
             // One context assembly serves both consults: it takes the proc lock
             // and snapshots the address space, so building it twice per stat
-            // would double a hot path's cost.
+            // would double a hot path's cost — and an ordinary path skips it
+            // entirely.
             let proc_ctx = self.synthetic_proc_context(context);
             if let Some(contents) = crate::vfs::proc::synthetic_file(&path, &proc_ctx) {
                 return Ok(StatRecord::synthetic(
@@ -2055,7 +2056,7 @@ impl SyscallDispatcher {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::errno(errno)),
         };
-        if crate::vfs::is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context(context)) {
+        if self.is_synthetic_virtual_path(context, &resolved) {
             return Ok(DispatchOutcome::errno(LINUX_EROFS));
         }
         // Layered metadata (overlay/disk first, then rootfs) — not rootfs-only,
@@ -2772,7 +2773,7 @@ impl SyscallDispatcher {
                 metadata,
                 writable,
             }) => {
-                crate::dispatch::net::set_host_nonblocking(host_fd);
+                debug_assert!(crate::dispatch::net::host_fd_is_nonblocking(host_fd));
                 OpenDescription::HostFile {
                     host_fd: HostFdRef::new(host_fd),
                     metadata,
@@ -2809,12 +2810,6 @@ impl SyscallDispatcher {
                 // O_CREAT path: validate the parent directory exists,
                 // create the empty overlay entry, return a writable
                 // File description.
-                if let Some(parent) = Path::new(&path).parent() {
-                    let parent_str = display_rootfs_path(parent);
-                    if !self.path_is_directory(&parent_str) {
-                        return Ok(DispatchOutcome::errno(LINUX_ENOENT));
-                    }
-                }
                 // O_CREAT mode: the requested mode masked by the guest umask,
                 // exactly like the kernel (`mode & ~umask`). Only applies to a
                 // freshly-created file (this branch only runs when no file
@@ -2837,30 +2832,37 @@ impl SyscallDispatcher {
                 // owner. Root (0,0) is the default, so only stamp non-root.
                 let create_uid = creds.fsuid;
                 let mut create_gid = creds.fsgid;
-                // A new file in a SETGID directory inherits THAT directory's
-                // group, not the creator's fsgid (creat08/open10/mknod05). The
-                // file's own setgid bit is carried by `mode`; here we only fix
-                // the owning group.
+                // ONE layered lookup of the parent answers both questions:
+                // it must be a directory (ENOENT otherwise), and a SETGID
+                // directory hands the new file ITS group, not the creator's
+                // fsgid (creat08/open10/mknod05). The file's own setgid bit
+                // is carried by `mode`; here we only fix the owning group.
                 if let Some(parent) = Path::new(&path).parent() {
                     let parent_str = display_rootfs_path(parent);
-                    if let Ok(pmd) = self.layered_metadata(&parent_str)
-                        && pmd.mode & 0o2000 != 0
+                    let parent_md = match self.layered_metadata(&parent_str) {
+                        Ok(md) if md.kind == RootFsEntryKind::Directory => md,
+                        _ => return Ok(DispatchOutcome::errno(LINUX_ENOENT)),
+                    };
+                    if parent_md.mode & 0o2000 != 0
                         && let Some((_, pgid)) = self.fs.rootfs_vfs.overlay.get_owner(&parent_str)
                     {
                         create_gid = pgid;
                     }
                 }
                 let stamp_owner = !create_uid.is_root() || !create_gid.is_root();
-                if let Some(host_fd) = self
-                    .fs
-                    .rootfs_vfs
-                    .overlay
-                    .open_raw_fd(&path, true, true, want_trunc)
+                if let Some((host_fd, mode_applied)) =
+                    self.fs
+                        .rootfs_vfs
+                        .overlay
+                        .create_raw_fd(&path, create_mode, want_trunc)
                 {
-                    crate::dispatch::net::set_host_nonblocking(host_fd);
-                    // The host create used the host process umask; force the
-                    // guest-requested mode onto the new file.
-                    let _ = self.fs.rootfs_vfs.overlay.set_mode(&path, create_mode);
+                    debug_assert!(crate::dispatch::net::host_fd_is_nonblocking(host_fd));
+                    // A backend that created with the host umask (or could not
+                    // represent the mode natively) still needs the guest mode
+                    // forced onto the new file.
+                    if !mode_applied {
+                        let _ = self.fs.rootfs_vfs.overlay.set_mode(&path, create_mode);
+                    }
                     if stamp_owner {
                         let _ = self.fs.rootfs_vfs.overlay.set_owner(
                             &path,
@@ -3097,7 +3099,7 @@ impl SyscallDispatcher {
             crate::fs_backend::ImmutableHostFileOpen::Fallback => return None,
         };
         let raw = file.into_raw_fd();
-        crate::dispatch::net::set_host_nonblocking(raw);
+        debug_assert!(crate::dispatch::net::host_fd_is_nonblocking(raw));
         crate::probes::path_open(path, metadata.size as u64, 0);
         let description = OpenDescription::HostFile {
             host_fd: HostFdRef::new(raw),
@@ -3251,15 +3253,14 @@ impl SyscallDispatcher {
         // Mirrors `fast_open_for_guest`: O_NONBLOCK so a racing FIFO can
         // never block the dispatcher; O_NOFOLLOW so a symlink child is ELOOP
         // (the slow path re-roots its target under the GUEST root); O_NOCTTY
-        // defensively; RW-first even for read-only requests (HVF rejects
-        // hv_vm_map of a MAP_SHARED file VMA whose backing fd caps
-        // max-protection at read).
+        // defensively; and the guest's OWN access mode (a live MAP_SHARED
+        // alias of a read-only description upgrades the host fd in place at
+        // map time — `FsBackend::upgrade_host_fd_for_shared_map`).
         let base = libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NOCTTY;
         let last_errno = || std::io::Error::last_os_error().raw_os_error();
-        // A read-only O_DIRECTORY request (every walker's dir open) needs no
-        // RW-first probe: directories always refuse O_RDWR with EISDIR, so
-        // the probe was a guaranteed wasted openat. Open the directory
-        // directly; the kernel's O_DIRECTORY gives authoritative ENOTDIR.
+        // A read-only O_DIRECTORY request (every walker's dir open) opens the
+        // directory directly; the kernel's O_DIRECTORY gives authoritative
+        // ENOTDIR.
         let raw = if open_flags.contains(LinuxOpenFlags::DIRECTORY) && !write {
             let raw = unsafe {
                 libc::openat(
@@ -3284,33 +3285,20 @@ impl SyscallDispatcher {
             }
             raw
         } else {
-            let mut raw =
-                unsafe { libc::openat(host_dir.raw(), name_c.as_ptr(), libc::O_RDWR | base, 0) };
+            let accmode = if write { libc::O_RDWR } else { libc::O_RDONLY };
+            let raw = unsafe { libc::openat(host_dir.raw(), name_c.as_ptr(), accmode | base, 0) };
             if raw < 0 {
-                if last_errno() == Some(libc::ELOOP) {
-                    return None; // symlink child → full path (guest O_NOFOLLOW → ELOOP there)
-                }
-                if write {
-                    // A missing name is AUTHORITATIVE under a trusted dir: the
-                    // scratch is the merged truth, no mount claims the path,
-                    // and O_CREAT was excluded above. Every other error →
-                    // slow path.
-                    return if last_errno() == Some(libc::ENOENT) {
-                        Some(DispatchOutcome::errno(LINUX_ENOENT))
-                    } else {
-                        None
-                    };
-                }
-                raw = unsafe {
-                    libc::openat(host_dir.raw(), name_c.as_ptr(), libc::O_RDONLY | base, 0)
+                // A missing name is AUTHORITATIVE under a trusted dir: the
+                // scratch is the merged truth, no mount claims the path, and
+                // O_CREAT was excluded above. A symlink child goes to the full
+                // path (guest O_NOFOLLOW → ELOOP there), as does every other
+                // error (a write-intent open of a directory lands on the slow
+                // path's exact EISDIR).
+                return if last_errno() == Some(libc::ENOENT) {
+                    Some(DispatchOutcome::errno(LINUX_ENOENT))
+                } else {
+                    None
                 };
-                if raw < 0 {
-                    return if last_errno() == Some(libc::ENOENT) {
-                        Some(DispatchOutcome::errno(LINUX_ENOENT))
-                    } else {
-                        None
-                    };
-                }
             }
             raw
         };
@@ -3391,13 +3379,10 @@ impl SyscallDispatcher {
             } else {
                 on_disk_mode
             });
-        // Clear the probe-only O_NONBLOCK, then track host-side nonblocking
-        // exactly as the slow HostFile arm does; the guest's OWN flags live
-        // in the description, not the host fd.
-        unsafe {
-            libc::fcntl(raw, libc::F_SETFL, 0);
-        }
-        crate::dispatch::net::set_host_nonblocking(raw);
+        // Opened O_NONBLOCK above, which is exactly the host-fd invariant
+        // every other install site enforces; the guest's OWN flags live in
+        // the description, not the host fd.
+        debug_assert!(crate::dispatch::net::host_fd_is_nonblocking(raw));
         crate::probes::path_open(&full, st.st_size as u64, 0);
         let metadata = RootFsMetadata {
             path: Path::new(&full).to_path_buf(),
@@ -3949,9 +3934,13 @@ impl SyscallDispatcher {
             let files = self.captured_file_table();
             let mut table = files.write_open_files();
             let replaced = table.remove(&new_fd).map(|replaced| {
-                let alias_remains = table
-                    .values()
-                    .any(|slot| Arc::ptr_eq(&slot.description, &replaced.description));
+                // Only an mqueue description needs the alias walk (see
+                // `mqueue_owner_alias_closed`); for everything else the
+                // observation is unused and the walk is O(table) per dup2.
+                let alias_remains = Self::close_needs_mqueue_alias_scan(&replaced)
+                    && table
+                        .values()
+                        .any(|slot| Arc::ptr_eq(&slot.description, &replaced.description));
                 (Arc::clone(&files), replaced, alias_remains)
             });
             retain_open_file(&description);
@@ -6195,13 +6184,9 @@ impl SyscallDispatcher {
         }
         let resolved_old = self.resolve_at_path(olddirfd, &old)?;
         let resolved_new = self.resolve_at_path(newdirfd, &new_path)?;
-        if crate::vfs::is_synthetic_virtual_file(
-            &resolved_old,
-            &self.synthetic_proc_context(context),
-        ) || crate::vfs::is_synthetic_virtual_file(
-            &resolved_new,
-            &self.synthetic_proc_context(context),
-        ) {
+        if self.is_synthetic_virtual_path(context, &resolved_old)
+            || self.is_synthetic_virtual_path(context, &resolved_new)
+        {
             return Ok(DispatchOutcome::errno(LINUX_EROFS));
         }
         // RENAME_EXCHANGE: atomically swap two EXISTING entries. Both must
@@ -7066,7 +7051,7 @@ impl SyscallDispatcher {
         // AT_SYMLINK_NOFOLLOW stays unmodeled on the disk-authoritative backend;
         // a dangling/failed follow falls back to the link path unchanged.)
         let resolved = self.canonicalize_following(&resolved).unwrap_or(resolved);
-        if crate::vfs::is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context(context)) {
+        if self.is_synthetic_virtual_path(context, &resolved) {
             return Ok(DispatchOutcome::Returned { value: 0 });
         }
         if let Err(errno) = self.layered_metadata(&resolved) {
@@ -7297,6 +7282,15 @@ impl SyscallDispatcher {
             return Err(LINUX_EFBIG);
         }
         Ok(len.min((limit - offset) as usize))
+    }
+
+    /// The root bypass shared by [`Self::guest_can_modify_dir`] and
+    /// [`Self::guest_sticky_delete_ok`], for callers to test BEFORE paying the
+    /// existence probe those checks are conditioned on: for the default root
+    /// guest the probe was a full host path walk per `unlink`/`mkdir` whose
+    /// answer was then discarded.
+    fn guest_dac_root_bypass(&self) -> bool {
+        self.cred_snapshot().euid.is_root()
     }
 
     /// Linux DAC: may the calling guest create/remove an entry in directory
@@ -7923,35 +7917,20 @@ impl SyscallDispatcher {
                 }
                 LINUX_F_GETFL => {
                     if let Some(open_file) = this.open_file(fd.0) {
+                        // The guest's status flags are the answer. The host
+                        // fd behind a regular file is carrick's business: it
+                        // is O_NONBLOCK from open (the FIFO-never-blocks-the-
+                        // dispatcher rule) whether or not the guest asked, and
+                        // the write path mirrors guest O_APPEND onto it lazily
+                        // — neither may leak into what the guest reads back
+                        // (probe fileaccessmode: an O_RDONLY open reports
+                        // exactly O_RDONLY|O_LARGEFILE, as Linux does).
                         let mut flags =
                             reportable_status_flags(open_file.description.common().status_flags());
-                        if let Some(open) = open_file.description.read() {
-                            if let OpenDescription::HostFile { host_fd, .. } = &*open {
-                                let host_flags = match (unsafe {
-                                    libc::fcntl(host_fd.raw(), libc::F_GETFL, 0)
-                                })
-                                .host_syscall_errno()
-                                {
-                                    Ok(value) => value,
-                                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                                };
-                                if flags & LINUX_O_APPEND != 0 && host_flags & libc::O_APPEND == 0 {
-                                    unsafe {
-                                        libc::fcntl(
-                                            host_fd.raw(),
-                                            libc::F_SETFL,
-                                            host_flags | libc::O_APPEND,
-                                        )
-                                    };
-                                }
-                                flags &= !LINUX_O_NONBLOCK;
-                                if host_flags & libc::O_NONBLOCK != 0 {
-                                    flags |= LINUX_O_NONBLOCK;
-                                }
-                            }
-                            if matches!(&*open, OpenDescription::HostPipe { pty: Some(_), .. }) {
-                                flags |= LINUX_O_RDWR;
-                            }
+                        if let Some(open) = open_file.description.read()
+                            && matches!(&*open, OpenDescription::HostPipe { pty: Some(_), .. })
+                        {
+                            flags |= LINUX_O_RDWR;
                         }
                         return Ok(DispatchOutcome::Returned {
                             value: flags as i64,
@@ -14318,7 +14297,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_ENOENT));
             }
             let resolved = this.resolve_at_path(dirfd, &path)?;
-            if crate::vfs::is_synthetic_virtual_file(&resolved, &this.synthetic_proc_context(cx.kernel)) {
+            if this.is_synthetic_virtual_path(cx.kernel, &resolved) {
                 return Ok(DispatchOutcome::errno(LINUX_EEXIST));
             }
             // Existence check must consult the layered view (overlay/disk
@@ -14493,7 +14472,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_ENOENT));
             }
             let resolved = this.resolve_at_path(dirfd, &path)?;
-            if crate::vfs::is_synthetic_virtual_file(&resolved, &this.synthetic_proc_context(cx.kernel)) {
+            if this.is_synthetic_virtual_path(cx.kernel, &resolved) {
                 return Ok(DispatchOutcome::errno(LINUX_EEXIST));
             }
             if let Some(m) = this.fs.vfs_mounts.resolve(&resolved) {
@@ -14519,7 +14498,8 @@ impl SyscallDispatcher {
             // (mkdir04). Only when the target doesn't already exist — an
             // existing target is EEXIST (returned by mkdir below), which the
             // kernel reports before the permission error.
-            if this.layered_metadata(&resolved).is_err()
+            if !this.guest_dac_root_bypass()
+                && this.layered_metadata(&resolved).is_err()
                 && let Some(parent) = Path::new(&resolved).parent()
                 && !this.guest_can_modify_dir(&display_rootfs_path(parent))
             {
@@ -14739,7 +14719,7 @@ impl SyscallDispatcher {
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 Err(errno) => {
-                    if crate::vfs::is_synthetic_virtual_file(&resolved, &this.synthetic_proc_context(cx.kernel))
+                    if this.is_synthetic_virtual_path(cx.kernel, &resolved)
                     {
                         Ok(DispatchOutcome::Returned { value: 0 })
                     } else {
@@ -14841,7 +14821,7 @@ impl SyscallDispatcher {
             } else {
                 let resolved = this.resolve_at_path(olddirfd, &old)?;
                 let exists =
-                    crate::vfs::is_synthetic_virtual_file(&resolved, &this.synthetic_proc_context(cx.kernel))
+                    this.is_synthetic_virtual_path(cx.kernel, &resolved)
                         || this.layered_metadata(&resolved).is_ok()
                         || this.fs.vfs_mounts.resolve(&resolved).is_some_and(|m| m.vfs.lookup(&m.full_path).is_ok())
                         // An anon fd's magic symlink has no layered metadata; its
@@ -14862,7 +14842,7 @@ impl SyscallDispatcher {
                 Some(resolved)
             };
             let resolved_new = this.resolve_at_path(newdirfd, &new_path)?;
-            if crate::vfs::is_synthetic_virtual_file(&resolved_new, &this.synthetic_proc_context(cx.kernel))
+            if this.is_synthetic_virtual_path(cx.kernel, &resolved_new)
                 || this.layered_metadata(&resolved_new).is_ok()
             {
                 return Ok(DispatchOutcome::errno(LINUX_EEXIST));
@@ -14945,10 +14925,7 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EXDEV));
                 }
                 (None, None) => {
-                    if crate::vfs::is_synthetic_virtual_file(
-                        &src,
-                        &this.synthetic_proc_context(cx.kernel),
-                    ) {
+                    if this.is_synthetic_virtual_path(cx.kernel, &src) {
                         return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EXDEV));
                     }
                 }
@@ -15005,7 +14982,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_ENOENT));
             }
             let resolved_link = this.resolve_at_path(newdirfd, &link)?;
-            if crate::vfs::is_synthetic_virtual_file(&resolved_link, &this.synthetic_proc_context(cx.kernel)) {
+            if this.is_synthetic_virtual_path(cx.kernel, &resolved_link) {
                 return Ok(DispatchOutcome::errno(LINUX_EEXIST));
             }
             // If the link path already exists (anywhere in the layered
@@ -15241,7 +15218,7 @@ impl SyscallDispatcher {
             let resolved = this.resolve_at_path(dirfd, &path)?;
             let remove_dir = at_flags.contains(carrick_abi::LinuxAtFlags::REMOVEDIR);
             // Synthetic /proc /sys paths can't be unlinked.
-            if crate::vfs::is_synthetic_virtual_file(&resolved, &this.synthetic_proc_context(cx.kernel)) {
+            if this.is_synthetic_virtual_path(cx.kernel, &resolved) {
                 return Ok(DispatchOutcome::errno(LINUX_EROFS));
             }
             use crate::vfs::Vfs as _;
@@ -15251,7 +15228,8 @@ impl SyscallDispatcher {
             // or the dir (rmdir03 case 2 → EPERM). Only when the target exists
             // (a missing one is ENOENT) and on the rootfs path (not the
             // carrick-internal bind-mount IPC paths).
-            if this.fs.vfs_mounts.resolve(&resolved).is_none()
+            if !this.guest_dac_root_bypass()
+                && this.fs.vfs_mounts.resolve(&resolved).is_none()
                 && this.layered_metadata(&resolved).is_ok()
                 && let Some(parent) = Path::new(&resolved).parent()
             {
@@ -15448,7 +15426,7 @@ impl SyscallDispatcher {
             match this.layered_metadata(&path) {
                 Ok(_) => {}
                 Err(errno) => {
-                    if crate::vfs::is_synthetic_virtual_file(&path, &this.synthetic_proc_context(cx.kernel)) {
+                    if this.is_synthetic_virtual_path(cx.kernel, &path) {
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
                     crate::probes::fs_op("utimensat:meta_err", &path, errno.get());
@@ -15624,7 +15602,7 @@ impl SyscallDispatcher {
             }
 
             let path = this.resolve_at_path(dirfd, &path)?;
-            {
+            if crate::vfs::may_be_synthetic_virtual_path(&path) {
                 // One context assembly for both consults — see the twin block
                 // in `path_stat_record`, including why the kernel task graph is
                 // the only thing that can settle a peer's `/proc/<pid>`.

@@ -1865,6 +1865,18 @@ pub(in crate::dispatch) fn set_host_nonblocking(fd: i32) {
     }
 }
 
+/// Debug-only check of the `FsBackend::open_raw_fd` contract: a host fd the
+/// filesystem backend opened for the guest arrives already `O_NONBLOCK`, so
+/// the install site pays no `fcntl` at all in release builds. Always true
+/// outside debug builds so it can sit inside a `debug_assert!`.
+pub(in crate::dispatch) fn host_fd_is_nonblocking(fd: i32) -> bool {
+    if !cfg!(debug_assertions) {
+        return true;
+    }
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    flags >= 0 && flags & libc::O_NONBLOCK != 0
+}
+
 fn linux_cmsg_align(n: usize) -> usize {
     n.div_ceil(LINUX_CMSG_ALIGN) * LINUX_CMSG_ALIGN
 }

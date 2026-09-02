@@ -9864,6 +9864,18 @@ impl SyscallDispatcher {
         self.synthetic_proc_context_observed(context, || {})
     }
 
+    /// Classify `path` as a synthetic `/proc`/`/sys` file without paying for
+    /// the render context unless the path can name one — see
+    /// [`crate::vfs::may_be_synthetic_virtual_path`].
+    fn is_synthetic_virtual_path(
+        &self,
+        context: &crate::kernel::KernelContext,
+        path: &str,
+    ) -> bool {
+        crate::vfs::may_be_synthetic_virtual_path(path)
+            && crate::vfs::is_synthetic_virtual_file(path, &self.synthetic_proc_context(context))
+    }
+
     fn synthetic_proc_context_observed(
         &self,
         context: &crate::kernel::KernelContext,

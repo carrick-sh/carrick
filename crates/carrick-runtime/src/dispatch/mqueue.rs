@@ -403,11 +403,24 @@ impl SyscallDispatcher {
         files: &Arc<crate::kernel::FileTable>,
         open_file: &OpenFile,
     ) {
+        // Only a message-queue description has a registration to retire, so
+        // only that one pays the whole-table alias walk. Walking it for every
+        // close made closing N held fds O(N^2): 5.3 us per close against a
+        // 20k-entry table, the single largest CPU term of a create/close loop.
+        if !Self::close_needs_mqueue_alias_scan(open_file) {
+            return;
+        }
         let alias_remains = files
             .read_open_files()
             .values()
             .any(|slot| Arc::ptr_eq(&slot.description, &open_file.description));
         self.mqueue_owner_alias_closed_known(files.id(), open_file, alias_remains);
+    }
+
+    /// Whether retiring `open_file` from a FileTable requires the alias walk
+    /// over that table: true only for a POSIX message-queue description.
+    pub(in crate::dispatch) fn close_needs_mqueue_alias_scan(open_file: &OpenFile) -> bool {
+        Self::mqueue_description_queue(&open_file.description).is_some()
     }
 
     /// Variant for dup replacement, whose caller already owns the FileTable
@@ -422,12 +435,12 @@ impl SyscallDispatcher {
         if alias_remains {
             return;
         }
-        let kernel = self
-            .hvpatch_process()
-            .map(|process| Arc::clone(process.kernel_graph()));
         let Some(queue) = Self::mqueue_description_queue(&open_file.description) else {
             return;
         };
+        let kernel = self
+            .hvpatch_process()
+            .map(|process| Arc::clone(process.kernel_graph()));
         let registration = MqueueRegistration {
             file_table,
             description: open_file.description.id(),
@@ -1458,6 +1471,71 @@ mod tests {
             self.bytes_when_woken.store(queued, Ordering::SeqCst);
             self.wakes.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    /// Closing a non-mqueue fd must not walk the FileTable: the alias scan is
+    /// owed only to message-queue registrations. The test holds the table's
+    /// WRITE lock while retiring a pipe end; a walk would block on the read
+    /// lock, which the timeout reports as the regression.
+    #[test]
+    fn closing_a_plain_fd_never_walks_the_file_table() {
+        let dispatcher = Arc::new(SyscallDispatcher::new());
+        let (process, _) = crate::hvpatch::process_context_for_tests(83_020);
+        dispatcher.bind_hvpatch_process(process);
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x6000]);
+        assert_eq!(
+            dispatch_call(
+                &dispatcher,
+                &context,
+                &mut memory,
+                59,
+                [0x1000, 0, 0, 0, 0, 0]
+            ),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let read_end =
+            i32::from_le_bytes(memory.read_bytes(0x1000, 4).unwrap().try_into().unwrap());
+        let mqd = open_test_queue(&dispatcher, &context, &mut memory, 0x1100, b"plain_close\0");
+        let files = context.resources().files();
+        let pipe_open = files
+            .read_open_files()
+            .get(&read_end)
+            .cloned()
+            .expect("pipe slot");
+        let mqueue_open = files
+            .read_open_files()
+            .get(&mqd)
+            .cloned()
+            .expect("mqd slot");
+        assert!(!SyscallDispatcher::close_needs_mqueue_alias_scan(
+            &pipe_open
+        ));
+        assert!(SyscallDispatcher::close_needs_mqueue_alias_scan(
+            &mqueue_open
+        ));
+
+        let guard = files.write_open_files();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = {
+            let dispatcher = Arc::clone(&dispatcher);
+            let files = Arc::clone(&files);
+            std::thread::spawn(move || {
+                super::super::resources::with_captured_resources(&context, || {
+                    dispatcher.mqueue_owner_alias_closed(&files, &pipe_open);
+                });
+                let _ = done_tx.send(());
+            })
+        };
+        let retired = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_ok();
+        drop(guard);
+        assert!(
+            retired,
+            "retiring a pipe end walked the file table (blocked on its read lock)"
+        );
+        worker.join().unwrap();
     }
 
     #[test]

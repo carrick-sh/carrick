@@ -1158,11 +1158,13 @@ impl Vfs for RootFsVfs {
     fn unlink(&self, path: &str) -> Result<(), VfsError> {
         // Layered: overlay first (a tombstone short-circuits to
         // ENOENT). Then rootfs via symlink_metadata so symlinks are
-        // identified as such (not followed).
-        let (kind, in_overlay, in_rootfs) = match self.overlay.lookup(path) {
-            Some(OverlayEntry::Deleted) => return Err(LINUX_ENOENT),
-            Some(OverlayEntry::Dir) => (RootFsEntryKind::Directory, true, false),
-            Some(OverlayEntry::File(_)) => (RootFsEntryKind::File, true, false),
+        // identified as such (not followed). Only the KIND is needed here:
+        // `lookup` would read the whole file back off disk just to drop it,
+        // which for an unlink of a large file is the dominant cost.
+        let (kind, in_overlay, in_rootfs) = match self.overlay.lookup_kind(path) {
+            Some(OverlayEntryKind::Deleted) => return Err(LINUX_ENOENT),
+            Some(OverlayEntryKind::Dir) => (RootFsEntryKind::Directory, true, false),
+            Some(OverlayEntryKind::File) => (RootFsEntryKind::File, true, false),
             None => match self
                 .rootfs
                 .as_ref()
@@ -1198,10 +1200,10 @@ impl Vfs for RootFsVfs {
     }
 
     fn rmdir(&self, path: &str) -> Result<(), VfsError> {
-        let (kind, in_overlay, in_rootfs) = match self.overlay.lookup(path) {
-            Some(OverlayEntry::Deleted) => return Err(LINUX_ENOENT),
-            Some(OverlayEntry::Dir) => (RootFsEntryKind::Directory, true, false),
-            Some(OverlayEntry::File(_)) => (RootFsEntryKind::File, true, false),
+        let (kind, in_overlay, in_rootfs) = match self.overlay.lookup_kind(path) {
+            Some(OverlayEntryKind::Deleted) => return Err(LINUX_ENOENT),
+            Some(OverlayEntryKind::Dir) => (RootFsEntryKind::Directory, true, false),
+            Some(OverlayEntryKind::File) => (RootFsEntryKind::File, true, false),
             None => match self
                 .rootfs
                 .as_ref()
@@ -1520,8 +1522,8 @@ mod tests {
         assert_ne!(flags, -1);
         assert_eq!(
             flags & libc::O_ACCMODE,
-            libc::O_RDWR,
-            "the immutable lower must reuse the contained fd-centric open instead of the cap-std read-only walk"
+            libc::O_RDONLY,
+            "an immutable-lower file is served with the guest's read-only access mode"
         );
     }
 

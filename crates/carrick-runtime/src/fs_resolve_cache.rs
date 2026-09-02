@@ -32,6 +32,9 @@ const PATH_GENERATION_SLOT: usize = 0;
 /// the SAME page as the path generation so one `mmap` serves both and both are
 /// equally fork-shared.
 const DIR_GENERATION_SLOT: usize = 1;
+/// Index of the sandbox-root MARKER generation within the shared page — see
+/// [`current_marker_generation`].
+const MARKER_GENERATION_SLOT: usize = 2;
 
 /// The shared generation words, one `MAP_SHARED` page, shared with every
 /// host-forked descendant so a mutation in any process invalidates every
@@ -54,21 +57,23 @@ fn generation_word_at(slot: usize) -> &'static AtomicU64 {
             // mmap failing at boot means the host is already OOM; fall back to a
             // leaked process-local array (cross-fork coherence lost, but the
             // run is failing anyway).
-            let fallback: Box<[AtomicU64; 2]> = Box::new([AtomicU64::new(1), AtomicU64::new(1)]);
+            let fallback: Box<[AtomicU64; 3]> =
+                Box::new([AtomicU64::new(1), AtomicU64::new(1), AtomicU64::new(1)]);
             return Box::into_raw(fallback) as usize;
         }
-        // SAFETY: `p` is a writable 4 KiB page; two AtomicU64 fit at its start.
-        // Start at 1 so a freshly-stamped entry (gen 1) is valid until the first
-        // mutation; 0 is reserved as "never stamped".
+        // SAFETY: `p` is a writable 4 KiB page; three AtomicU64 fit at its
+        // start. Start at 1 so a freshly-stamped entry (gen 1) is valid until
+        // the first mutation; 0 is reserved as "never stamped".
         unsafe {
             (*(p as *mut AtomicU64).add(PATH_GENERATION_SLOT)).store(1, Ordering::SeqCst);
             (*(p as *mut AtomicU64).add(DIR_GENERATION_SLOT)).store(1, Ordering::SeqCst);
+            (*(p as *mut AtomicU64).add(MARKER_GENERATION_SLOT)).store(1, Ordering::SeqCst);
         }
         p as usize
     });
-    // SAFETY: `base` points at a live [AtomicU64; 2] valid for the whole
+    // SAFETY: `base` points at a live [AtomicU64; 3] valid for the whole
     // process; MAP_SHARED makes it the SAME physical memory in every
-    // host-forked descendant. `slot` is one of the two module constants.
+    // host-forked descendant. `slot` is one of the three module constants.
     unsafe { &*(base as *const AtomicU64).add(slot) }
 }
 
@@ -121,6 +126,28 @@ pub fn current_dir_generation() -> u64 {
 /// one). See [`current_dir_generation`] for why the set is this narrow.
 pub fn bump_dir_generation() {
     generation_word_at(DIR_GENERATION_SLOT).fetch_add(1, Ordering::SeqCst);
+}
+
+/// Current sandbox-root MARKER generation — the one the host backend's
+/// "no FIFO / marker node / metadata xattr / whiteout / symlink anywhere in
+/// the upper" answers are stamped with.
+///
+/// A third, near-static counter. Those answers are read from durable root
+/// xattrs that only ever go absent → present, and only a marker STAMP
+/// (`stamp_root_marker`) can change one; a file creation or unlink cannot.
+/// Keying the absent readings on [`current_generation`] instead made every
+/// structural mutation invalidate all five, so a create/unlink loop re-read
+/// the root xattr (`openat`+`fgetxattr`+`close`) several times per guest
+/// syscall — 3 of the 12 host opens behind one guest `unlink`.
+pub fn current_marker_generation() -> u64 {
+    generation_word_at(MARKER_GENERATION_SLOT).load(Ordering::SeqCst)
+}
+
+/// Invalidate every process's absent-marker readings. Call ONLY after a root
+/// marker xattr has been stamped present (the stamp first, then the bump, so
+/// a reader that sampled the old generation before the stamp is born stale).
+pub fn bump_marker_generation() {
+    generation_word_at(MARKER_GENERATION_SLOT).fetch_add(1, Ordering::SeqCst);
 }
 
 /// Per-process resolve cache, validated against the shared generation. The map

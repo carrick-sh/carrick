@@ -116,9 +116,65 @@ pub struct RootFs {
     immutable_host: Option<ImmutableHostRoot>,
 }
 
+/// Lower-layer lookup memo keyed by `(path, follow)`; `None` records that
+/// the lower has no such path.
+type LowerDcache = HashMap<(PathBuf, bool), Option<LowerEntry>>;
+
 #[derive(Debug, Clone)]
 struct ImmutableHostRoot {
     backend: Arc<HostFsBackend>,
+    /// The lower's dcache: every `(path, follow)` the layered view has ever
+    /// asked this lower about, positive AND negative, answered once.
+    ///
+    /// The published cache entry is never mutated for the lifetime of the
+    /// container, so an entry here never goes stale and needs no generation
+    /// stamp — this is the one place in the fs where a negative lookup can
+    /// be memoised outright. Without it every `unlink`/`creat` of an
+    /// upper-only file paid a host `openat`+`fstat`+`close` of the lower to
+    /// re-learn that the lower has no such path, which was one third of the
+    /// host opens per guest `unlink` of a freshly created file. Bounded by
+    /// [`LOWER_DCACHE_MAX_ENTRIES`]; on overflow the whole map is dropped
+    /// rather than evicted, since a refill is one lookup each.
+    dcache: Arc<parking_lot::Mutex<LowerDcache>>,
+    /// Per-directory child listings of the lower, filled ADAPTIVELY: a
+    /// directory is listed once it has answered "absent" twice, because a
+    /// second miss in the same directory is the signature of a workload
+    /// creating its own files there (a build tree, `/tmp`), where every
+    /// further creat/unlink would otherwise pay a host probe of the lower per
+    /// name. A single miss never lists, so a positive-heavy walk of the image
+    /// (`find /usr`) keeps its one-stat-per-path cost instead of paying a
+    /// directory read per directory it touches. Membership is byte-exact,
+    /// which is both Linux's rule and the host's own (the lower lives on a
+    /// case-sensitive volume, [`crate::apfs`] refuses `--fs host` otherwise).
+    listings: Arc<parking_lot::Mutex<HashMap<PathBuf, LowerListing>>>,
+}
+
+/// What the lower knows about one directory's children.
+#[derive(Debug, Clone)]
+enum LowerListing {
+    /// Probed `misses` absent names here so far; not yet worth a listing.
+    Misses(u8),
+    /// The complete, immutable child-name set: absence is answered from it.
+    Names(Arc<HashSet<std::ffi::OsString>>),
+    /// Not a plain directory of the lower (a symlink, a file, unreadable):
+    /// every lookup under it keeps taking the exact per-path probe.
+    Opaque,
+}
+
+/// Second miss in one directory ⇒ list it (see [`ImmutableHostRoot::listings`]).
+const LOWER_LISTING_MISS_THRESHOLD: u8 = 2;
+
+/// Cap on [`ImmutableHostRoot::dcache`] — generous for a build tree, small
+/// against the extraction it describes.
+const LOWER_DCACHE_MAX_ENTRIES: usize = 1 << 16;
+
+/// The immutable facts [`host_metadata`] reports about one lower entry:
+/// exactly the [`RootFsMetadata`] fields, minus the path the key carries.
+#[derive(Debug, Clone, Copy)]
+struct LowerEntry {
+    kind: RootFsEntryKind,
+    mode: u32,
+    size: usize,
 }
 
 impl PartialEq for RootFs {
@@ -451,6 +507,13 @@ impl RootFs {
     /// deliberately exposes no mutation methods for the lower.
     pub(crate) fn from_immutable_host_dir(path: &Path) -> Result<Self, RootFsError> {
         let backend = HostFsBackend::attach(path)?;
+        // The cache entry root carries no metadata-xattr root marker (the
+        // extraction wrote per-entry xattrs directly); its CLEAN sentinel file
+        // is the only proof that none exist. Absent sentinel = assume xattrs,
+        // so the lower's stat lanes keep probing per entry.
+        if !path.join(crate::layer_cache::CLEAN_META_MARKER).exists() {
+            backend.assume_meta_xattrs();
+        }
         let authority = backend.native_reexec_authority()?;
         if authority.cleanup_on_drop {
             return Err(std::io::Error::new(
@@ -465,6 +528,8 @@ impl RootFs {
             symlinks: HashMap::new(),
             immutable_host: Some(ImmutableHostRoot {
                 backend: Arc::new(backend),
+                dcache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+                listings: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             }),
         })
     }
@@ -1109,20 +1174,99 @@ fn host_real_stat(host: &ImmutableHostRoot, path: &Path, follow: bool) -> Option
         .real_stat(&display_rootfs_path(&normalized), follow)
 }
 
+/// Whether the lower's memoised listing of `normalized`'s parent proves the
+/// name absent — the zero-host-call answer. A name that IS listed, or a
+/// parent that has no listing yet, says nothing and the caller probes.
+fn lower_listing_says_absent(host: &ImmutableHostRoot, normalized: &Path) -> bool {
+    let (Some(parent), Some(leaf)) = (normalized.parent(), normalized.file_name()) else {
+        return false;
+    };
+    let listings = host.listings.lock();
+    match listings.get(parent) {
+        Some(LowerListing::Names(names)) => !names.contains(leaf),
+        _ => false,
+    }
+}
+
+/// Record one exact "absent" answer for a child of `normalized`'s parent and,
+/// at the threshold, list that directory. The listing is taken only for a
+/// plain directory of the lower (`follow = false` kind `Directory`, itself
+/// memoised): a symlinked parent (merged-usr `/bin -> usr/bin`) resolves per
+/// path instead, so listing and probe can never disagree.
+fn note_lower_miss(host: &ImmutableHostRoot, normalized: &Path) {
+    let Some(parent) = normalized.parent() else {
+        return;
+    };
+    {
+        let mut listings = host.listings.lock();
+        match listings.get_mut(parent) {
+            None => {
+                listings.insert(parent.to_path_buf(), LowerListing::Misses(1));
+                return;
+            }
+            Some(LowerListing::Misses(n)) => {
+                *n = n.saturating_add(1);
+                if *n < LOWER_LISTING_MISS_THRESHOLD {
+                    return;
+                }
+            }
+            Some(_) => return,
+        }
+    }
+    let parent_is_plain_dir = matches!(
+        host_metadata(host, parent, false),
+        Ok(RootFsMetadata {
+            kind: RootFsEntryKind::Directory,
+            ..
+        })
+    );
+    let listing = if parent_is_plain_dir {
+        host.backend
+            .child_name_set(&display_rootfs_path(parent))
+            .map_or(LowerListing::Opaque, |names| {
+                LowerListing::Names(Arc::new(names))
+            })
+    } else {
+        LowerListing::Opaque
+    };
+    host.listings.lock().insert(parent.to_path_buf(), listing);
+}
+
 fn host_metadata(
     host: &ImmutableHostRoot,
     path: &Path,
     follow: bool,
 ) -> Result<RootFsMetadata, RootFsError> {
     let normalized = normalize_rootfs_path(path)?;
-    let display = display_rootfs_path(&normalized);
-    let stat =
-        host_real_stat(host, path, follow).ok_or_else(|| RootFsError::NotFound(display.clone()))?;
+    let key = (normalized, follow);
+    let cached = host.dcache.lock().get(&key).copied();
+    let entry = match cached {
+        Some(entry) => entry,
+        None if lower_listing_says_absent(host, &key.0) => None,
+        None => {
+            let entry = host_real_stat(host, path, follow).map(|stat| LowerEntry {
+                kind: stat.kind,
+                mode: stat.mode,
+                size: usize::try_from(stat.size).unwrap_or(usize::MAX),
+            });
+            if entry.is_none() {
+                note_lower_miss(host, &key.0);
+            }
+            let mut dcache = host.dcache.lock();
+            if dcache.len() >= LOWER_DCACHE_MAX_ENTRIES {
+                dcache.clear();
+            }
+            dcache.insert(key.clone(), entry);
+            entry
+        }
+    };
+    let (normalized, _) = key;
+    let entry = entry.ok_or_else(|| RootFsError::NotFound(display_rootfs_path(&normalized)))?;
     Ok(RootFsMetadata {
         path: normalized,
-        kind: stat.kind,
-        mode: stat.mode,
-        size: usize::try_from(stat.size).unwrap_or(usize::MAX),
+        kind: entry.kind,
+        mode: entry.mode,
+        size: entry.size,
     })
 }
 
@@ -1208,6 +1352,58 @@ fn insert_child_name(names: &mut BTreeSet<String>, dir: &Path, child: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    fn lower_listing_state(rootfs: &RootFs, dir: &str) -> Option<&'static str> {
+        let host = rootfs.immutable_host.as_ref().unwrap();
+        let listings = host.listings.lock();
+        listings.get(Path::new(dir)).map(|state| match state {
+            LowerListing::Misses(_) => "misses",
+            LowerListing::Names(_) => "names",
+            LowerListing::Opaque => "opaque",
+        })
+    }
+
+    /// The immutable lower answers a directory's absences from ONE listing
+    /// once that directory has missed twice, stays exact for present names,
+    /// and never lists through a symlinked parent.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn immutable_lower_lists_a_directory_after_two_misses() {
+        let lower = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(lower.path().join("usr/bin")).unwrap();
+        std::fs::create_dir_all(lower.path().join("tmp")).unwrap();
+        std::fs::write(lower.path().join("tmp/kept"), b"k").unwrap();
+        std::fs::write(lower.path().join("usr/bin/sh"), b"#!").unwrap();
+        std::os::unix::fs::symlink("usr/bin", lower.path().join("bin")).unwrap();
+        let rootfs = RootFs::from_immutable_host_dir(lower.path()).unwrap();
+
+        assert!(rootfs.symlink_metadata("/tmp/fs_new_0").is_err());
+        assert_eq!(lower_listing_state(&rootfs, "tmp"), Some("misses"));
+        assert!(rootfs.symlink_metadata("/tmp/fs_new_1").is_err());
+        assert_eq!(lower_listing_state(&rootfs, "tmp"), Some("names"));
+
+        // Now planted on the host AFTER the listing: the lower is immutable
+        // by contract, so the memo — not the disk — is the authority.
+        std::fs::write(lower.path().join("tmp/planted"), b"p").unwrap();
+        assert!(rootfs.symlink_metadata("/tmp/planted").is_err());
+        // Present names are still answered exactly (kind, size, mode).
+        let kept = rootfs.symlink_metadata("/tmp/kept").unwrap();
+        assert_eq!(kept.kind, RootFsEntryKind::File);
+        assert_eq!(kept.size, 1);
+        // Byte-exact: a case variant of a present name is absent, as on Linux.
+        assert!(rootfs.symlink_metadata("/tmp/KEPT").is_err());
+
+        // A symlinked parent resolves per path and is never listed.
+        assert!(rootfs.symlink_metadata("/bin/nope0").is_err());
+        assert!(rootfs.symlink_metadata("/bin/nope1").is_err());
+        assert_eq!(lower_listing_state(&rootfs, "bin"), Some("opaque"));
+        assert_eq!(
+            rootfs.symlink_metadata("/bin/sh").unwrap().kind,
+            RootFsEntryKind::File
+        );
+        assert!(rootfs.symlink_metadata("/bin/nope2").is_err());
+    }
 
     #[test]
     fn symlink_target_with_parent_dir_resolves_within_root() {

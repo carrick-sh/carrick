@@ -112,7 +112,18 @@ pub use sys::SysVfs;
 pub const MAX_IN_MEMORY_FILE_SIZE: u64 = 512 * 1024 * 1024;
 
 pub(crate) fn is_synthetic_virtual_file(path: &str, ctx: &SyntheticProcContext) -> bool {
-    proc::synthetic_file(path, ctx).is_some() || sys::synthetic_file(path).is_some()
+    may_be_synthetic_virtual_path(path)
+        && (proc::synthetic_file(path, ctx).is_some() || sys::synthetic_file(path).is_some())
+}
+
+/// Whether `path` can name a synthetic `/proc` or `/sys` object at all. Every
+/// synthetic file, directory and magic link lives under one of those two
+/// roots, so a caller that only needs to CLASSIFY a path checks this before
+/// assembling a [`SyntheticProcContext`] — that assembly snapshots the address
+/// space, walks the task graph and reads `/etc/passwd`+`/etc/group` from the
+/// rootfs, which was ~7 host `openat`s per guest `unlink` of an ordinary file.
+pub(crate) fn may_be_synthetic_virtual_path(path: &str) -> bool {
+    path.starts_with("/proc") || path.starts_with("/sys")
 }
 
 use std::path::PathBuf;
