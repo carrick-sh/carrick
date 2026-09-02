@@ -1,7 +1,7 @@
 use super::*;
 use crate::linux_abi::LINUX_PROT_EXEC;
 use crate::memory::{LINUX_HEAP_BASE, LINUX_MMAP_BASE};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 #[test]
 fn vma_snapshot_projects_permissions_and_splits_kernel_hidden_coverage() {
@@ -185,6 +185,7 @@ struct CountingMmapMemory {
     write_bytes_total: Cell<usize>,
     zero_backing_calls: Cell<usize>,
     protect_calls: Cell<usize>,
+    protect_log: RefCell<Vec<(u64, usize, u64)>>,
 }
 
 #[test]
@@ -256,6 +257,7 @@ impl CountingMmapMemory {
             write_bytes_total: Cell::new(0),
             zero_backing_calls: Cell::new(0),
             protect_calls: Cell::new(0),
+            protect_log: RefCell::new(Vec::new()),
         }
     }
 
@@ -298,8 +300,9 @@ impl GuestMemory for CountingMmapMemory {
         Ok(())
     }
 
-    fn protect_range(&mut self, _address: u64, _len: usize, _prot: u64) -> Result<(), MemoryError> {
+    fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
         self.protect_calls.set(self.protect_calls.get() + 1);
+        self.protect_log.borrow_mut().push((address, len, prot));
         Ok(())
     }
 }
@@ -5044,6 +5047,264 @@ fn growdown_metadata_is_trimmed_with_mapping_teardown() {
             },
         }]
     );
+}
+
+/// Two guest threads first-touch the same armed page. The winner commits the
+/// page under MM mutation authority and retires its fault range; the loser's
+/// fault was already taken against the invalid leaf, so its read-only
+/// classification runs AFTER the commit. It must still route to the mutation
+/// authority (where the live leaf is authenticated and the access retried),
+/// never straight to `SIGSEGV` (go-crypto_md5 under 4-way load: 3/12 SEGV).
+#[test]
+fn committed_first_touch_page_still_routes_to_mutation_authority() {
+    let dispatcher = SyscallDispatcher::new();
+    let page = dispatcher.linux_page_size();
+    let base = LINUX_MMAP_BASE;
+    dispatcher.record_dynamic_mapping(
+        base,
+        page * 2,
+        LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+        ProcMapSharing::Private,
+        String::new(),
+    );
+    dispatcher.track_resident_fault_range(
+        base,
+        page * 2,
+        LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+    );
+    assert!(dispatcher.fault_requires_mm_mutation(base + 16));
+
+    dispatcher
+        .with_resident_fault_plan_for_test(base + 16, |plan| {
+            assert_eq!(plan.page(), base);
+            dispatcher.commit_resident_fault(plan);
+        })
+        .expect("first-touch plan");
+    assert!(
+        dispatcher
+            .with_resident_fault_plan_for_test(base + 16, |plan| drop(plan))
+            .is_none(),
+        "a committed page has no pending stage-1 edit"
+    );
+
+    assert!(
+        dispatcher.fault_requires_mm_mutation(base + 16),
+        "the losing sibling's fault on the committed page must reach the authority"
+    );
+    assert!(dispatcher.fault_requires_mm_mutation(base + page));
+
+    dispatcher.with_vma_dispatch_for_test(|_vma_dispatch| {
+        dispatcher.remove_mapping_metadata(base, page * 2);
+    });
+    assert!(
+        !dispatcher.fault_requires_mm_mutation(base + 16),
+        "unmapping retires the tracked extent"
+    );
+}
+
+/// `mprotect` over an armed first-touch range must not silently make the
+/// pending pages accessible: the leaf stays invalid (so the first touch is
+/// still observed for `mincore`) and the recorded protection follows the new
+/// VMA permission, so the eventual fault installs what the guest asked for
+/// last -- never the stale arming-time protection.
+#[test]
+fn mprotect_over_armed_first_touch_page_keeps_the_leaf_invalid_with_new_prot() {
+    const SYS_MPROTECT: u64 = 226;
+    let dispatcher = SyscallDispatcher::new();
+    let page = dispatcher.linux_page_size();
+    let base = LINUX_MMAP_BASE;
+    let rw = LinuxProtFlags::READ | LinuxProtFlags::WRITE;
+    dispatcher.record_dynamic_mapping(base, page * 2, rw, ProcMapSharing::Private, String::new());
+    dispatcher.track_resident_fault_range(base, page * 2, rw);
+    let registry =
+        crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1171));
+    let reporter = CompatReporter::default();
+    let mut memory = CountingMmapMemory::new(base, (page * 2) as usize);
+
+    let outcome = threaded_memory_call(
+        &dispatcher,
+        &mut memory,
+        &registry,
+        &reporter,
+        SyscallRequest::new(
+            SYS_MPROTECT,
+            SyscallArgs([base, page, LINUX_PROT_READ, 0, 0, 0]),
+        ),
+    );
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+
+    let prot = dispatcher
+        .with_resident_fault_plan_for_test(base + 16, |plan| plan.prot())
+        .expect("the untouched page stays armed");
+    assert_eq!(
+        prot, LINUX_PROT_READ,
+        "the pending edit carries the NEW protection"
+    );
+    let sibling = dispatcher
+        .with_resident_fault_plan_for_test(base + page + 16, |plan| plan.prot())
+        .expect("the page outside the mprotect range stays armed");
+    assert_eq!(sibling, rw.bits());
+    let log = memory.protect_log.borrow();
+    assert_eq!(
+        log.last().copied(),
+        Some((base, page as usize, 0)),
+        "the armed page must be re-protected to an invalid leaf after the VMA edit: {log:?}"
+    );
+}
+
+/// `mprotect(PROT_NONE)` over an armed page retires its pending edit: a later
+/// fault must be delivered as SIGSEGV, not resolved by installing the
+/// arming-time RW leaf. The extent stays routed to the authority so a fault
+/// there still asks the live stage-1 leaf before delivery, and a later
+/// accessible `mprotect` re-arms the still-untouched page.
+#[test]
+fn mprotect_none_over_armed_first_touch_page_retires_and_rearms_the_pending_edit() {
+    const SYS_MPROTECT: u64 = 226;
+    let dispatcher = SyscallDispatcher::new();
+    let page = dispatcher.linux_page_size();
+    let base = LINUX_MMAP_BASE;
+    let rw = LinuxProtFlags::READ | LinuxProtFlags::WRITE;
+    dispatcher.record_dynamic_mapping(base, page * 2, rw, ProcMapSharing::Private, String::new());
+    dispatcher.track_resident_fault_range(base, page * 2, rw);
+    let registry =
+        crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1172));
+    let reporter = CompatReporter::default();
+    let mut memory = CountingMmapMemory::new(base, (page * 2) as usize);
+
+    let outcome = threaded_memory_call(
+        &dispatcher,
+        &mut memory,
+        &registry,
+        &reporter,
+        SyscallRequest::new(SYS_MPROTECT, SyscallArgs([base, page, 0, 0, 0, 0])),
+    );
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+    assert!(
+        dispatcher
+            .with_resident_fault_plan_for_test(base + 16, |plan| drop(plan))
+            .is_none(),
+        "a PROT_NONE page has no pending accessible edit to install"
+    );
+    assert!(
+        dispatcher.fault_requires_mm_mutation(base + 16),
+        "the tracked extent still routes to the authority"
+    );
+    assert!(
+        dispatcher
+            .with_resident_fault_plan_for_test(base + page + 16, |plan| drop(plan))
+            .is_some(),
+        "the neighbouring page keeps its pending edit"
+    );
+
+    let outcome = threaded_memory_call(
+        &dispatcher,
+        &mut memory,
+        &registry,
+        &reporter,
+        SyscallRequest::new(
+            SYS_MPROTECT,
+            SyscallArgs([base, page, LINUX_PROT_READ, 0, 0, 0]),
+        ),
+    );
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+    let prot = dispatcher
+        .with_resident_fault_plan_for_test(base + 16, |plan| plan.prot())
+        .expect("an accessible mprotect re-arms the still-untouched page");
+    assert_eq!(prot, LINUX_PROT_READ);
+    let log = memory.protect_log.borrow();
+    assert_eq!(
+        log.last().copied(),
+        Some((base, page as usize, 0)),
+        "{log:?}"
+    );
+}
+
+/// A page the guest has already touched is resident; `mprotect` over it must
+/// publish the new leaf and leave it valid -- only the untouched remainder
+/// of the tracked extent is re-armed.
+#[test]
+fn mprotect_over_committed_first_touch_page_does_not_rearm_it() {
+    const SYS_MPROTECT: u64 = 226;
+    let dispatcher = SyscallDispatcher::new();
+    let page = dispatcher.linux_page_size();
+    let base = LINUX_MMAP_BASE;
+    let rw = LinuxProtFlags::READ | LinuxProtFlags::WRITE;
+    dispatcher.record_dynamic_mapping(base, page * 2, rw, ProcMapSharing::Private, String::new());
+    dispatcher.track_resident_fault_range(base, page * 2, rw);
+    dispatcher
+        .with_resident_fault_plan_for_test(base + 16, |plan| dispatcher.commit_resident_fault(plan))
+        .expect("first-touch plan");
+    let registry =
+        crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1173));
+    let reporter = CompatReporter::default();
+    let mut memory = CountingMmapMemory::new(base, (page * 2) as usize);
+
+    let outcome = threaded_memory_call(
+        &dispatcher,
+        &mut memory,
+        &registry,
+        &reporter,
+        SyscallRequest::new(
+            SYS_MPROTECT,
+            SyscallArgs([base, page * 2, LINUX_PROT_READ, 0, 0, 0]),
+        ),
+    );
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+    assert!(
+        dispatcher
+            .with_resident_fault_plan_for_test(base + 16, |plan| drop(plan))
+            .is_none(),
+        "a resident page is never re-armed"
+    );
+    let prot = dispatcher
+        .with_resident_fault_plan_for_test(base + page + 16, |plan| plan.prot())
+        .expect("the untouched page stays armed");
+    assert_eq!(prot, LINUX_PROT_READ);
+    let log = memory.protect_log.borrow().clone();
+    assert_eq!(
+        log,
+        vec![
+            (base, (page * 2) as usize, LINUX_PROT_READ),
+            (base + page, page as usize, 0),
+        ],
+        "only the untouched page returns to an invalid leaf"
+    );
+}
+
+/// Same race on the grow-down stack: the winner lowers `current` to its page,
+/// so the loser's page no longer satisfies `page < current`. The whole
+/// grow-down extent stays routed to the authority.
+#[test]
+fn committed_growdown_page_still_routes_to_mutation_authority() {
+    let dispatcher = SyscallDispatcher::new();
+    let page = dispatcher.linux_page_size();
+    let start = 0x10_000;
+    dispatcher.record_dynamic_mapping(
+        start,
+        page * 4,
+        LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+        ProcMapSharing::Private,
+        "stack".to_owned(),
+    );
+    dispatcher.record_growdown_mapping(start, page * 4);
+    assert!(dispatcher.fault_requires_mm_mutation(start - page * 2 + 8));
+    dispatcher
+        .with_mmap_growdown_fault_plan_for_test(start - page * 2, |plan| {
+            dispatcher.commit_mmap_growdown(plan);
+        })
+        .expect("grow-down plan");
+    assert!(
+        dispatcher
+            .with_mmap_growdown_fault_plan_for_test(start - page, |plan| drop(plan))
+            .is_none(),
+        "the committed extent has no pending grow-down edit"
+    );
+    assert!(
+        dispatcher.fault_requires_mm_mutation(start - page + 8),
+        "the losing sibling's fault inside the committed extent must reach the authority"
+    );
+    assert!(dispatcher.fault_requires_mm_mutation(start + page * 3));
+    assert!(!dispatcher.fault_requires_mm_mutation(start + page * 4));
 }
 
 #[test]

@@ -6752,6 +6752,7 @@ where
                             "capture synchronous-fault signal context: {error}"
                         ))
                     })?;
+                let faulting_tid = self.state.linux_tid;
                 if self.kernel.dispatcher.fault_requires_mm_mutation(si_addr)
                     && self
                         .state
@@ -6760,9 +6761,12 @@ where
                                 &self.kernel.dispatcher,
                                 engine,
                                 si_addr,
+                                signal::el0_fault_access(syndrome),
+                                faulting_tid,
                                 mutation,
                             )
                         })?
+                        .map_err(RuntimeError::Trap)?
                 {
                     return Ok(executor::ExecutorExit::Syscall);
                 }
@@ -6803,6 +6807,7 @@ where
                             "capture guest-fault signal context: {error}"
                         ))
                     })?;
+                let faulting_tid = self.state.linux_tid;
                 if self
                     .kernel
                     .dispatcher
@@ -6810,13 +6815,19 @@ where
                     && self
                         .state
                         .with_mm_mutation_authority(&self.kernel, |mutation| {
+                            // The ISA-neutral triple carries no syndrome, so
+                            // the access class is unknown here: a stale fault
+                            // on this arm is delivered rather than retried.
                             signal::resolve_mutating_fault(
                                 &self.kernel.dispatcher,
                                 engine,
                                 fault_addr,
+                                None,
+                                faulting_tid,
                                 mutation,
                             )
                         })?
+                        .map_err(RuntimeError::Trap)?
                 {
                     return Ok(executor::ExecutorExit::Syscall);
                 }

@@ -2330,6 +2330,21 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
         None
     }
 
+    /// Under MM mutation authority, decide whether an EL0 fault at `far` is
+    /// STALE: the live stage-1 leaf already permits `access`, so a sibling
+    /// thread committed the page between this thread's fault and its arrival
+    /// here (or its TLB entry is stale). `Ok(true)` means the backend flushed
+    /// its stage-1 translations and the faulting instruction must be retried;
+    /// `Ok(false)` leaves ordinary signal delivery unchanged. Backends without
+    /// host-readable guest page tables keep the default and always deliver.
+    fn resolve_stale_stage1_fault(
+        &mut self,
+        _far: u64,
+        _access: carrick_mem::page_table::LeafAccess,
+    ) -> Result<bool, TrapError> {
+        Ok(false)
+    }
+
     /// Select a backend lifecycle in which guest exec/fork operations retain
     /// one host VM and replace only per-process address-space state. Backends
     /// without shared-VM process support keep the default no-op; callers still

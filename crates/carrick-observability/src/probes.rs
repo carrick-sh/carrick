@@ -2246,6 +2246,8 @@ mod hvpatch_guest_probe_abi {
             "fn hvpatch__guest__fault(_: u64, _: u64, _: u64, _: i32, _: i32) {}",
             "fn hvpatch__guest__fault__asid(_: i32, _: i32, _: u32) {}",
             "stub!(hvpatch_guest_fault(event: super::HvpatchGuestFault));",
+            "fn hvpatch__stale__stage1__retry(_: u64, _: u32, _: i32) {}",
+            "stub!(hvpatch_stale_stage1_retry(far: u64, access: u32, tid: i32));",
             "fn hvpatch__guest__address__space(_: i32, _: u32, _: u64, _: u64, _: u64) {}",
             "stub!(hvpatch_guest_address_space(event: super::HvpatchGuestAddressSpace));",
         ] {
@@ -4787,6 +4789,12 @@ mod real {
         fn hvpatch__guest__fault(_: u64, _: u64, _: u64, _: i32, _: i32) {}
         /// Companion identity for `hvpatch__guest__fault`: PID, TID, ASID.
         fn hvpatch__guest__fault__asid(_: i32, _: i32, _: u32) {}
+        /// An EL0 fault that the software model no longer names, resolved by
+        /// reading the LIVE stage-1 leaf: a sibling thread committed the page
+        /// first, so the faulting thread flushes stage-1 and retries instead
+        /// of receiving SIGSEGV. Args: FAR, decoded access (0 read, 1 write,
+        /// 2 execute), guest TID.
+        fn hvpatch__stale__stage1__retry(_: u64, _: u32, _: i32) {}
         /// HVPatch frame-COW intent. Emitted immediately before identity/data.
         /// Args: 0 guest-visible, 1 backing maintenance, 2 privileged internal.
         fn hvpatch__frame__cow__intent(_: u32) {}
@@ -5918,6 +5926,11 @@ mod real {
                 event.detail()
             ));
         }
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_stale_stage1_retry(far: u64, access: u32, tid: i32) {
+        carrick_usdt::hvpatch__stale__stage1__retry!(|| (far, access, tid));
     }
 
     #[inline(never)]
@@ -7789,6 +7802,7 @@ mod stub {
     stub!(lifecycle(phase: u32));
     stub!(hvpatch_guest_lifecycle(event: super::HvpatchGuestLifecycle));
     stub!(hvpatch_guest_fault(event: super::HvpatchGuestFault));
+    stub!(hvpatch_stale_stage1_retry(far: u64, access: u32, tid: i32));
     stub!(hvpatch_frame_cow(event: super::HvpatchFrameCow));
     stub!(hvpatch_frame_cow_trigger(event: super::HvpatchFrameCowTrigger));
     stub!(hvpatch_frame_cow_copy(old_frame: u64, old_ipa: u64, source: &[u8], dest: &[u8]));
