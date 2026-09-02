@@ -1,0 +1,26 @@
+b974b0b710035cc9
+setup=true
+round=0 wait=woken wake_first_nonzero=1 wake_max=1 wake_loop_terminated=true
+round=1 wait=woken wake_first_nonzero=1 wake_max=1 wake_loop_terminated=true
+round=2 wait=woken wake_first_nonzero=1 wake_max=1 wake_loop_terminated=true
+round=3 wait=woken wake_first_nonzero=1 wake_max=1 wake_loop_terminated=true
+round=4 wait=woken wake_first_nonzero=1 wake_max=1 wake_loop_terminated=true
+round=5 wait=woken wake_first_nonzero=1 wake_max=1 wake_loop_terminated=true
+round=6 wait=woken wake_first_nonzero=1 wake_max=1 wake_loop_terminated=true
+round=7 wait=woken wake_first_nonzero=1 wake_max=1 wake_loop_terminated=true
+round=8 wait=woken wake_first_nonzero=1 wake_max=1 wake_loop_terminated=true
+round=9 wait=woken wake_first_nonzero=1 wake_max=1 wake_loop_terminated=true
+round=10 wait=woken wake_first_nonzero=1 wake_max=1 wake_loop_terminated=true
+round=11 wait=woken wake_first_nonzero=1 wake_max=1 wake_loop_terminated=true
+round=0 child=exit0
+round=1 child=exit0
+round=2 child=exit0
+round=3 child=exit0
+round=4 child=exit0
+round=5 child=exit0
+round=6 child=exit0
+round=7 child=exit0
+round=8 child=exit0
+round=9 child=exit0
+round=10 child=exit0
+round=11 child=exit0

@@ -2873,10 +2873,13 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// observe the same bytes) and `mmapprivatefiletrack` (a clean `MAP_PRIVATE`
 /// page keeps tracking the file; a dirtied page keeps its private copy) are
 /// both `generic`, moving the denominator from 493 to 495.
-/// The authoritative inventory contains 495 probe sources: 469 conformance
-/// sources (446 generic, 23 dedicated), 25 performance sources, and one helper.
-/// Both libc lanes therefore gate 938 conformance rows.
-const PROBE_SOURCE_COUNT: usize = 495;
+/// `futexcheckpointexit` (a sibling's exit landing on a parent parked in a
+/// cross-process `FUTEX_WAIT` must not release the wait — the `ltp-pause01`
+/// checkpoint shape) is `generic`, moving the denominator from 495 to 496.
+/// The authoritative inventory contains 496 probe sources: 470 conformance
+/// sources (447 generic, 23 dedicated), 25 performance sources, and one helper.
+/// Both libc lanes therefore gate 940 conformance rows.
+const PROBE_SOURCE_COUNT: usize = 496;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
@@ -4626,9 +4629,9 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
     let generic = validate_closure_probe_rows(&inventory(), &sources)
         .expect("checked-in closure probe inventory must match the source denominator");
-    assert_eq!(generic.len(), 446);
-    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 469);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 938);
+    assert_eq!(generic.len(), 447);
+    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 470);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 940);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")

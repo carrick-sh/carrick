@@ -27,7 +27,7 @@ use crate::kernel::{
     Kernel, KernelContext, MmId, Scheduler, Task, TaskKey, TaskRevision, VforkParentWait,
 };
 use crate::linux_abi::{LINUX_EAGAIN, LINUX_EINTR, LINUX_ETIMEDOUT, LinuxErrno};
-use crate::thread::{FutexTable, FutexWait, FutexWaitOutcome};
+use crate::thread::{FutexTable, FutexWait};
 
 static NEXT_CONTINUATION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_REGISTRATION_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -1045,11 +1045,28 @@ impl BlockedContinuation {
 
     /// Whether a generic scheduler wake is itself a completion edge.
     ///
-    /// A vfork parent has exactly one producer: its child's exec/exit release
-    /// gate. Retry, signal, and task-event wakes may schedule control work but
-    /// must never manufacture guest readiness for that continuation.
+    /// Families that resume with `Redispatch` re-run the syscall and re-check
+    /// their own readiness, so a spurious `Ready` costs one extra dispatch.
+    /// The families listed here instead resume with a *result* that asserts
+    /// a producer fired: a vfork parent has exactly one producer (its child's
+    /// exec/exit release gate) and a futex wait returns 0 only for a counted
+    /// `FUTEX_WAKE`. Their exact producers — the futex table subscription,
+    /// the task-wake/signal subscription and the reactor deadline — publish
+    /// into the registration before calling `Scheduler::wake`, so retry,
+    /// signal and task-event wakes must never manufacture readiness for them.
+    /// `ltp-pause01` is the witness: a sibling child's exit posted SIGCHLD to
+    /// the parent mid-switch-out, the settlement fabricated `Ready` for the
+    /// parent's shared checkpoint `FUTEX_WAIT`, and the next child's
+    /// `FUTEX_WAKE` counted 0 waiters forever.
     pub(crate) const fn accepts_generic_scheduler_wake(&self) -> bool {
-        !matches!(self, Self::VforkParent(_))
+        !matches!(
+            self,
+            Self::VforkParent(_)
+                | Self::FutexWait(_)
+                | Self::FutexWaitv(_)
+                | Self::SharedFutexWait(_)
+                | Self::SharedFutexWaitv(_)
+        )
     }
 
     /// Whether the scheduler may queue this continuation for the current wake.
@@ -1140,7 +1157,7 @@ impl BlockedContinuation {
             } => {
                 fingerprint ^=
                     location.wait_addr().raw() as u64 ^ *waiter_key as u64 ^ u64::from(*value);
-                fingerprint ^= generation.generation();
+                fingerprint ^= generation.ticket();
                 fingerprint ^= index.unwrap_or(0) as u64;
             }
             ContinuationDetail::SharedWord {
@@ -1152,7 +1169,7 @@ impl BlockedContinuation {
             } => {
                 fingerprint ^=
                     location.wait_addr().raw() as u64 ^ *waiter_key as u64 ^ u64::from(*value);
-                fingerprint ^= generation.generation();
+                fingerprint ^= generation.ticket();
                 fingerprint ^= sysv.as_ref().map_or(0, |state| {
                     state.blocked_id() as u64 ^ state.wait_word_fd() as u64
                 });
@@ -2367,7 +2384,7 @@ impl ReadinessProbe {
                 ..
             } => Self::SharedWord {
                 location: *location,
-                generation: *generation,
+                generation: generation.clone(),
                 value: *value,
                 deadline: state.deadline,
             },
@@ -2411,7 +2428,7 @@ impl ReadinessProbe {
                 },
                 |table| Self::Futex {
                     table: table.clone(),
-                    wait: *wait,
+                    wait: wait.clone(),
                     deadline: state.deadline,
                 },
             ),
@@ -2437,11 +2454,9 @@ impl ReadinessProbe {
                 if let Some(event) = deadline_event(*deadline) {
                     return Some(event);
                 }
-                (table
-                    .0
-                    .wait_prepared(*wait, Some(Duration::ZERO), &|| false)
-                    == FutexWaitOutcome::Woken)
-                    .then_some(ContinuationEvent::Ready)
+                // Never dequeue here: the reactor's poll is a pure read and
+                // the queue slot must stay live for `FUTEX_WAKE` to count it.
+                table.0.is_woken(wait).then_some(ContinuationEvent::Ready)
             }
             Self::Fds {
                 registrations,
@@ -2468,12 +2483,15 @@ impl ReadinessProbe {
             }
             Self::SharedWord {
                 location,
-                generation: _,
+                generation,
                 value,
                 deadline,
             } => {
                 if let Some(event) = deadline_event(*deadline) {
                     return Some(event);
+                }
+                if generation.is_woken() {
+                    return Some(ContinuationEvent::Ready);
                 }
                 // SAFETY: the continuation pins the exact MM generation and
                 // owns the wait token; cancellation precedes MM teardown.
@@ -3087,10 +3105,10 @@ impl CarrierWaitService {
         };
         let weak = Arc::downgrade(&self.inner);
         let futex_source = match &probe {
-            ReadinessProbe::Futex { table, wait, .. } => Some((table.0.clone(), *wait)),
+            ReadinessProbe::Futex { table, wait, .. } => Some((table.0.clone(), wait.clone())),
             ReadinessProbe::SharedWord { generation, .. } => Some((
                 Arc::clone(carrick_thread::platform_futex::carrier_shared_futex_table()),
-                *generation,
+                generation.clone(),
             )),
             _ => None,
         };
@@ -5778,7 +5796,7 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let (mut fixture, _futex) = control_quantum_fixture(15_140 + offset as i32, family);
+            let (mut fixture, futex) = control_quantum_fixture(15_140 + offset as i32, family);
             fixture
                 .scheduler
                 .begin_switch_out(&fixture.running)
@@ -5831,13 +5849,26 @@ mod tests {
                 .settle_blocked(running, quantum.blocked_reason.expect("blocked reason"))
                 .expect("repark exact continuation");
 
-            assert_eq!(
-                fixture
-                    .scheduler
-                    .wake(fixture.context.thread().key())
-                    .expect("real producer wake"),
-                crate::kernel::WakeDisposition::Queued
-            );
+            if let Some(table) = futex.as_ref() {
+                // A futex wait resumes with `Return(0)`, which asserts a
+                // counted `FUTEX_WAKE`; a generic scheduler wake is not one.
+                assert_eq!(
+                    fixture
+                        .scheduler
+                        .wake(fixture.context.thread().key())
+                        .expect("generic wake of parked futex waiter"),
+                    crate::kernel::WakeDisposition::Pending
+                );
+                assert_eq!(table.wake(0xcafe, 1), 1, "exact futex producer");
+            } else {
+                assert_eq!(
+                    fixture
+                        .scheduler
+                        .wake(fixture.context.thread().key())
+                        .expect("real producer wake"),
+                    crate::kernel::WakeDisposition::Queued
+                );
+            }
             let ready = fixture
                 .scheduler
                 .take(&fixture.executor)

@@ -1104,8 +1104,7 @@ where
                 // root cause of LTP pause01 TBROKing on
                 // `tst_checkpoint_wake ETIMEDOUT`.
                 let prewoken = carrick_thread::platform_futex::carrier_shared_futex_table()
-                    .wait_prepared(generation, Some(Duration::ZERO), &|| false)
-                    == crate::thread::FutexWaitOutcome::Woken;
+                    .take_woken(&generation);
                 let retval = if prewoken {
                     0
                 } else {
@@ -1123,8 +1122,7 @@ where
                 index,
             } => {
                 let prewoken = carrick_thread::platform_futex::carrier_shared_futex_table()
-                    .wait_prepared(generation, Some(Duration::ZERO), &|| false)
-                    == crate::thread::FutexWaitOutcome::Woken;
+                    .take_woken(&generation);
                 let retval = if prewoken {
                     0
                 } else {
@@ -1142,8 +1140,7 @@ where
                 mut sysv,
             } => loop {
                 let prewoken = carrick_thread::platform_futex::carrier_shared_futex_table()
-                    .wait_prepared(generation, Some(Duration::ZERO), &|| false)
-                    == crate::thread::FutexWaitOutcome::Woken;
+                    .take_woken(&generation);
                 let retval = if prewoken {
                     0
                 } else {
@@ -1637,8 +1634,7 @@ fn dispatch_single_threaded_syscall<M: CurrentMmMemory>(
                 sysv,
             } => {
                 let prewoken = carrick_thread::platform_futex::carrier_shared_futex_table()
-                    .wait_prepared(generation, Some(Duration::ZERO), &|| false)
-                    == crate::thread::FutexWaitOutcome::Woken;
+                    .take_woken(&generation);
                 let retval = if prewoken {
                     0
                 } else {
