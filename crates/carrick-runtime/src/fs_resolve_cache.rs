@@ -35,6 +35,11 @@ const DIR_GENERATION_SLOT: usize = 1;
 /// Index of the sandbox-root MARKER generation within the shared page — see
 /// [`current_marker_generation`].
 const MARKER_GENERATION_SLOT: usize = 2;
+/// Index of the guest-METADATA generation within the shared page — see
+/// [`current_meta_generation`].
+const META_GENERATION_SLOT: usize = 3;
+/// Number of generation words in the shared page.
+const GENERATION_SLOTS: usize = 4;
 
 /// The shared generation words, one `MAP_SHARED` page, shared with every
 /// host-forked descendant so a mutation in any process invalidates every
@@ -57,23 +62,24 @@ fn generation_word_at(slot: usize) -> &'static AtomicU64 {
             // mmap failing at boot means the host is already OOM; fall back to a
             // leaked process-local array (cross-fork coherence lost, but the
             // run is failing anyway).
-            let fallback: Box<[AtomicU64; 3]> =
-                Box::new([AtomicU64::new(1), AtomicU64::new(1), AtomicU64::new(1)]);
+            let fallback: Box<[AtomicU64; GENERATION_SLOTS]> =
+                Box::new(std::array::from_fn(|_| AtomicU64::new(1)));
             return Box::into_raw(fallback) as usize;
         }
-        // SAFETY: `p` is a writable 4 KiB page; three AtomicU64 fit at its
-        // start. Start at 1 so a freshly-stamped entry (gen 1) is valid until
-        // the first mutation; 0 is reserved as "never stamped".
+        // SAFETY: `p` is a writable 4 KiB page; `GENERATION_SLOTS` AtomicU64s
+        // fit at its start. Start at 1 so a freshly-stamped entry (gen 1) is
+        // valid until the first mutation; 0 is reserved as "never stamped".
         unsafe {
-            (*(p as *mut AtomicU64).add(PATH_GENERATION_SLOT)).store(1, Ordering::SeqCst);
-            (*(p as *mut AtomicU64).add(DIR_GENERATION_SLOT)).store(1, Ordering::SeqCst);
-            (*(p as *mut AtomicU64).add(MARKER_GENERATION_SLOT)).store(1, Ordering::SeqCst);
+            for slot in 0..GENERATION_SLOTS {
+                (*(p as *mut AtomicU64).add(slot)).store(1, Ordering::SeqCst);
+            }
         }
         p as usize
     });
-    // SAFETY: `base` points at a live [AtomicU64; 3] valid for the whole
-    // process; MAP_SHARED makes it the SAME physical memory in every
-    // host-forked descendant. `slot` is one of the three module constants.
+    debug_assert!(slot < GENERATION_SLOTS);
+    // SAFETY: `base` points at a live [AtomicU64; GENERATION_SLOTS] valid for
+    // the whole process; MAP_SHARED makes it the SAME physical memory in every
+    // host-forked descendant. `slot` is one of the module constants.
     unsafe { &*(base as *const AtomicU64).add(slot) }
 }
 
@@ -148,6 +154,31 @@ pub fn current_marker_generation() -> u64 {
 /// a reader that sampled the old generation before the stamp is born stale).
 pub fn bump_marker_generation() {
     generation_word_at(MARKER_GENERATION_SLOT).fetch_add(1, Ordering::SeqCst);
+}
+
+/// Current guest-METADATA generation — the one the host backend's stat cache
+/// stamps each entry with.
+///
+/// A cached `RealStat` carries fields the host inode cannot answer: the guest
+/// mode override, owner uid/gid, and the AF_UNIX-socket marker, all read from
+/// carrick's own `user.carrick.*` xattrs. Their ONLY writers are carrick's
+/// own metadata helpers, and every one bumps this word after writing. So an
+/// entry stamped with the current value still holds those fields even when
+/// the inode's ctime/mtime/size moved — a directory gaining or losing a
+/// child, a file being appended — and revalidation can serve it with just the
+/// fresh volatile fields instead of refilling (a second `fstatat` plus an
+/// `openat`+`flistxattr`+`close` xattr pass). A create/unlink loop used to pay
+/// that refill for the parent directory on every iteration.
+pub fn current_meta_generation() -> u64 {
+    generation_word_at(META_GENERATION_SLOT).load(Ordering::SeqCst)
+}
+
+/// Invalidate every process's cached guest-metadata readings. Call from every
+/// writer of a `user.carrick.*` metadata xattr (mode/uid/gid/socket/rdev), set
+/// OR remove, AFTER the write lands — a reader that stamped the old generation
+/// before the write then revalidates through a refill.
+pub fn bump_meta_generation() {
+    generation_word_at(META_GENERATION_SLOT).fetch_add(1, Ordering::SeqCst);
 }
 
 /// Per-process resolve cache, validated against the shared generation. The map

@@ -1934,10 +1934,21 @@ struct StatCacheEntry {
     /// supersedes could not see a rename performed by a SIBLING process; the
     /// generation lives in a `MAP_SHARED` word and can.
     dir_generation: u64,
+    /// Guest-metadata generation the xattr-derived fields (`mode_override`,
+    /// `real.uid`/`gid`, the socket kind) were read at. While it still equals
+    /// [`crate::fs_resolve_cache::current_meta_generation`], no carrick writer
+    /// has touched ANY metadata xattr since the fill, so an inode whose
+    /// timestamps moved for other reasons (child churn, an append) is served
+    /// with those fields intact and only the volatile ones refreshed.
+    meta_generation: u64,
+    /// The `user.carrick.mode` override at fill time; `None` means the guest
+    /// mode IS the on-disk mode and is re-read from the fresh `fstatat`.
+    mode_override: Option<u32>,
     ino: u64,
-    ctime: (i64, i64),
-    mtime: (i64, i64),
-    size: i64,
+    /// `st_birthtime` at fill time. APFS never reuses an inode number, but the
+    /// pair (ino, birthtime) identifies the inode on any host filesystem, so
+    /// a name re-created over a recycled number is a miss, not a stale hit.
+    birth: (i64, i64),
     real: RealStat,
 }
 
@@ -4062,6 +4073,7 @@ impl HostFsBackend {
         //     revalidation cannot see that — the inode, ctime and size are all
         //     unchanged at the new location.
         let me = unsafe { libc::getpid() } as u32;
+        let meta_generation = crate::fs_resolve_cache::current_meta_generation();
         let cached = {
             use std::sync::atomic::Ordering::Relaxed;
             let mut map = self.stat_cache.lock();
@@ -4074,9 +4086,18 @@ impl HostFsBackend {
             }
             map.get(rel)
                 .filter(|e| e.dir_generation == dir_generation)
-                .map(|e| (e.parent_fd.clone(), e.ino, e.ctime, e.mtime, e.size, e.real))
+                .map(|e| {
+                    (
+                        e.parent_fd.clone(),
+                        e.ino,
+                        e.birth,
+                        e.meta_generation,
+                        e.mode_override,
+                        e.real,
+                    )
+                })
         };
-        if let Some((parent_fd, ino, ctime, mtime, size, real)) = cached {
+        if let Some((parent_fd, ino, birth, entry_meta_generation, mode_override, real)) = cached {
             let mut st: libc::stat = unsafe { core::mem::zeroed() };
             let ok = unsafe {
                 libc::fstatat(
@@ -4087,19 +4108,36 @@ impl HostFsBackend {
                 )
             } == 0;
             let typ = st.st_mode as u32 & libc::S_IFMT as u32;
+            let is_dir = real.kind == RootFsEntryKind::Directory;
+            let same_type = if is_dir {
+                typ == libc::S_IFDIR as u32
+            } else {
+                typ == libc::S_IFREG as u32
+            };
+            // The same inode, still the same type, and no carrick metadata
+            // writer since the fill ⇒ the xattr-derived fields (mode override,
+            // owner, socket marker) still hold. Everything else the guest can
+            // observe — size, times, nlink, an on-disk (override-less) mode —
+            // is answered by the fresh `fstatat` itself. This is deliberately
+            // NOT a timestamp comparison: a directory's ctime/mtime/size move
+            // on every child create/unlink and a file's on every append, and
+            // treating that as stale re-ran the whole xattr pass per lookup.
             if ok
                 && st.st_ino == ino
-                && (st.st_ctime, carrick_portable::stat_ctime_nsec(&st)) == ctime
-                && (st.st_mtime, carrick_portable::stat_mtime_nsec(&st)) == mtime
-                && st.st_size == size
-                && typ != libc::S_IFLNK as u32
+                && (st.st_birthtime, st.st_birthtime_nsec) == birth
+                && same_type
+                && entry_meta_generation == meta_generation
             {
-                // Identity unchanged ⇒ kind/mode/owner still valid; the only
-                // mutators of those (chmod/chown/hardlink) all bump ctime, which
-                // we just checked. Refresh the volatile fields (incl. atime).
+                let on_disk_mode = st.st_mode as u32 & 0o7777;
+                let default_mode = if is_dir { 0o755 } else { 0o644 };
                 return Some(RealStat {
                     ino: st.st_ino,
                     nlink: st.st_nlink as u32,
+                    mode: mode_override.unwrap_or(if on_disk_mode == 0 {
+                        default_mode
+                    } else {
+                        on_disk_mode
+                    }),
                     size: st.st_size as u64,
                     atime: (st.st_atime, carrick_portable::stat_atime_nsec(&st)),
                     mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(&st)),
@@ -4107,7 +4145,8 @@ impl HostFsBackend {
                     ..real
                 });
             }
-            // Stale (changed / removed / now a symlink): drop and re-fill.
+            // Stale (replaced / removed / now a symlink / metadata rewritten):
+            // drop and re-fill.
             self.stat_cache.lock().remove(rel);
         }
 
@@ -4152,6 +4191,10 @@ impl HostFsBackend {
         // that needs an xattr stamps the marker BEFORE writing it, and the
         // write itself bumps the inode's ctime, so an entry cached under the
         // plain reading revalidates stale and refills through the xattr pass.
+        // Sampled BEFORE the xattr read: a writer landing between the read
+        // and the insert bumps past this value, so the entry is born stale
+        // and refills on its first hit instead of serving the pre-write bytes.
+        let meta_generation = crate::fs_resolve_cache::current_meta_generation();
         let (override_mode, uid, gid, is_socket) = if self.serves_plain_metadata() {
             (None, None, None, false)
         } else {
@@ -4200,10 +4243,10 @@ impl HostFsBackend {
             StatCacheEntry {
                 parent_fd,
                 dir_generation,
+                meta_generation,
+                mode_override: override_mode,
                 ino: st.st_ino,
-                ctime: (st.st_ctime, carrick_portable::stat_ctime_nsec(&st)),
-                mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(&st)),
-                size: st.st_size,
+                birth: (st.st_birthtime, st.st_birthtime_nsec),
                 real,
             },
         );
@@ -4635,6 +4678,7 @@ fn fremove_xattr(fd: std::os::fd::RawFd, name: &[u8]) {
     unsafe {
         carrick_portable::fremovexattr(fd, name.as_ptr().cast());
     }
+    crate::fs_resolve_cache::bump_meta_generation();
 }
 
 #[cfg(target_os = "macos")]
@@ -4663,6 +4707,7 @@ fn fset_u32_xattr(fd: std::os::fd::RawFd, name: &[u8], val: u32) {
             0,
         );
     }
+    crate::fs_resolve_cache::bump_meta_generation();
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -4697,6 +4742,7 @@ fn fset_u64_xattr(fd: std::os::fd::RawFd, name: &[u8], val: u64) {
             0,
         );
     }
+    crate::fs_resolve_cache::bump_meta_generation();
 }
 
 fn fget_u64_xattr(fd: std::os::fd::RawFd, name: &[u8]) -> Option<u64> {
@@ -4997,6 +5043,7 @@ fn symlink_set_u32_xattr(dir: &cap_std::fs::Dir, rel: &Path, name: &[u8], val: u
             0,
         );
     }
+    crate::fs_resolve_cache::bump_meta_generation();
 }
 
 /// Path-based u32 xattr WRITE (macOS, following symlinks). Like
@@ -5023,6 +5070,7 @@ fn path_set_u32_xattr(dir: &cap_std::fs::Dir, rel: &Path, name: &[u8], val: u32)
             0,
         );
     }
+    crate::fs_resolve_cache::bump_meta_generation();
 }
 
 /// Prefix for a per-symlink xattr SIDECAR file (non-macOS). Linux (and every
@@ -5128,6 +5176,7 @@ fn symlink_set_u32_xattr(dir: &cap_std::fs::Dir, rel: &Path, name: &[u8], val: u
     // failure): a write error leaves the owner unset and `lstat` falls back to
     // the host uid, exactly as before this sidecar existed.
     let _ = dir.write(&sidecar, val.to_le_bytes());
+    crate::fs_resolve_cache::bump_meta_generation();
 }
 
 /// Remove any xattr sidecars belonging to the symlink `rel` (called from the
@@ -8757,6 +8806,91 @@ mod tests {
 
         assert_ne!(flags, -1);
         assert_ne!(flags & libc::O_NONBLOCK, 0);
+    }
+
+    /// A cached entry whose inode is unchanged must be served from the cache
+    /// across content churn -- a directory gaining/losing children, a file
+    /// being appended -- with only the revalidating `fstatat`, never a refill.
+    ///
+    /// Revalidation used to treat any ctime/mtime/size change as "stale" and
+    /// re-fill: `dir_fd_for` + a second `fstatat` + `openat` + `flistxattr` +
+    /// `close`. But those timestamps change on EVERY child create/unlink of a
+    /// directory, so a create/unlink loop (LTP `creat05`: 4096 `creat` +
+    /// `unlinkat`, 1,229 ms vs 410 ms under Docker) paid the whole xattr pass
+    /// TWICE per iteration for a parent whose kind/mode/owner never moved.
+    /// The only writers of the cached xattr-derived fields (mode override,
+    /// uid/gid, socket marker) are carrick's own, and each one bumps the
+    /// shared metadata generation; an entry stamped with the current
+    /// generation therefore still holds, and only its volatile fields
+    /// (size/times/nlink/on-disk mode) need the fresh `fstatat`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stat_cache_serves_unchanged_inodes_across_content_churn() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let scratch_root = tempfile::TempDir::new().unwrap();
+        let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
+        assert!(b.stat_cache_active());
+        b.dir.create_dir("work").unwrap();
+        // 0o555 keeps the owner below rwx, so the guest mode lives in the
+        // xattr override -- the field a refill would re-read.
+        b.set_mode("/work", 0o555).unwrap();
+        b.dir.write("work/log", b"x").unwrap();
+        b.set_mode("/work/log", 0o444).unwrap();
+
+        assert_eq!(b.stat_cache_lookup("/work").unwrap().mode, 0o555);
+        assert_eq!(b.stat_cache_lookup("/work/log").unwrap().size, 1);
+
+        // Churn: the directory's mtime/ctime/size move, the file's mtime/
+        // ctime/size move. Neither inode's identity or guest metadata does.
+        b.dir.write("work/child", b"y").unwrap();
+        b.dir.remove_file("work/child").unwrap();
+        b.dir.write("work/log", b"hello").unwrap();
+
+        // Rewrite the overrides BEHIND the backend -- no carrick writer, so no
+        // generation bump. A refill would read these; a cache hit must not.
+        let raw = |rel: &str, mode: u32| {
+            let abs = Path::new(b.root_prefix.as_deref().unwrap()).join(rel);
+            let cpath = std::ffi::CString::new(abs.as_os_str().as_bytes()).unwrap();
+            let v = mode.to_le_bytes();
+            let rc = unsafe {
+                carrick_portable::setxattr(
+                    cpath.as_ptr(),
+                    CARRICK_MODE_XATTR.as_ptr() as *const libc::c_char,
+                    v.as_ptr() as *const libc::c_void,
+                    v.len(),
+                    0,
+                )
+            };
+            assert_eq!(
+                rc,
+                0,
+                "raw setxattr {rel}: {:?}",
+                std::io::Error::last_os_error()
+            );
+        };
+        raw("work", 0o511);
+        raw("work/log", 0o400);
+
+        let dir = b.stat_cache_lookup("/work").unwrap();
+        assert_eq!(dir.kind, RootFsEntryKind::Directory);
+        assert_eq!(
+            dir.mode, 0o555,
+            "a churning directory must be served, not refilled"
+        );
+        let file = b.stat_cache_lookup("/work/log").unwrap();
+        assert_eq!(
+            file.mode, 0o444,
+            "an appended file must be served, not refilled"
+        );
+        assert_eq!(file.size, 5, "...with its volatile fields fresh");
+
+        // A carrick writer publishes through the generation: the next lookup
+        // refills and sees the new override.
+        b.set_mode("/work", 0o511).unwrap();
+        b.set_mode("/work/log", 0o400).unwrap();
+        assert_eq!(b.stat_cache_lookup("/work").unwrap().mode, 0o511);
+        assert_eq!(b.stat_cache_lookup("/work/log").unwrap().mode, 0o400);
     }
 
     /// One cached directory must be anchored by exactly ONE host dirfd, however

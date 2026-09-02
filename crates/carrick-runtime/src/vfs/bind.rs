@@ -251,6 +251,9 @@ fn write_u32_xattr(host: &Path, name: &str, value: u32, nofollow: bool) -> Resul
     if rc < 0 {
         return Err(host_open_errno());
     }
+    // The bind mount just rewrote a carrick metadata xattr on a node the
+    // `--fs host` stat cache may already hold; publish that.
+    crate::fs_resolve_cache::bump_meta_generation();
     Ok(())
 }
 
