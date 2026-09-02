@@ -26597,50 +26597,30 @@ impl HvpatchTaskRegistration {
         self.directory.retire(self.key)?;
         if let Some(task_mm) = self.task_mm.take() {
             task_mm.record_holder(HvpatchTaskMmHolder::RegistrationCleanup);
-            // NOTE: this drop is where `execthreads` aborts -- seven sibling
-            // registrations share one MM authority and the last one drops a
-            // still-published inventory. Retiring it here (the symmetric fix to
-            // the `exec-rebind` path below) removes the abort but HANGS 2 runs
-            // in 3, so the missing retirement belongs further upstream, before
-            // the registrations tear down. Measured 2026-08-31; left as the
-            // abort rather than traded for a hang.
+            // NOTE (history, re-verified 2026-09-01): this drop is where the
+            // "published HVPatch inventory dropped before exact retirement"
+            // abort fired for `execthreads` and for a `clone(CLONE_VM|SIGCHLD)`
+            // child exiting under a live parent. The root cause was NOT here:
+            // `reserve_exec_inner` retired the predecessor mm at RESERVATION
+            // time, so an exec owner suspended in the sibling drain resumed
+            // into a `Retiring` mm (fixed by preparing that retirement inside
+            // `ExecMmReservation::commit`). Retiring the inventory from this
+            // drop instead was measured to HANG 2 runs in 3 and is not the fix.
             //
-            // The SAME abort fires when a legacy `clone(CLONE_VM|SIGCHLD)`
-            // (share-mm, non-thread) child exits while its parent lives: an
-            // ACTIVE authority for the shared kernel mm drops through this
-            // path mid-run, and the mm teardown corrupts the still-running
-            // parent (`lifecycleflagmatrix`'s 1.3 case is exactly that shape,
-            // observed 2026-08-31 as `clone_thread_no_sighand_einval`
-            // flickering under gnu). One root cause, three symptoms
-            // (`execthreads`, `execfromthread`, CLONE_VM child exit); the fix
-            // is the upstream retirement above, not a per-symptom patch.
-            //
-            // The CLONE_VM shape was further root-caused 2026-09-01: the
-            // register-time MM key splits an mm's owner ({slot, None}) from
-            // its CLONE_VM/vfork sharer ({slot, Some(mm)}), so the sharer
-            // mints a SECOND carrier MM authority over the same stage-2 and
-            // retiring the sharer's row unmaps the owner's live memory
-            // (parent SIGSEGV, or this abort). Two fixes were built and
-            // MEASURED WORSE, then reverted (`fix(hvf): one carrier MM
-            // authority per mm across CLONE_VM sharers` and its revert):
-            //  - slot-only keys (dedupe the sharer onto the owner's
-            //    authorities) fixed the crash but was blamed for a probe
-            //    gate destabilization (~1 run in 2, late MT probes hitting
-            //    guest `mmap(ANON)`=ENOMEM / `clone`=EAGAIN). That failure
-            //    was later traced to an unrelated defect -- the pt-pause
-            //    drain timing out because registered kick handles named the
-            //    vCPU a task first loaded on instead of following it across
-            //    executors (see `HvfTaskState::live_vcpu`) -- so the dedupe
-            //    itself was never shown to retain anything and deserves
-            //    re-measurement on top of that fix;
-            //  - retiring the discarded prepared task's mapping owners on
-            //    the reuse arm released the owner's LIVE extents (the
-            //    sharer's descriptors reference them), and the owner's own
-            //    exit retirement then aborted on the absent owner.
-            // The durable fix needs per-holder retention semantics for the
-            // shared mm's carrier resources (or sharer rows that own nothing
-            // carrier-scoped), settled together with the drain-time exec
-            // retirement above.
+            // The register-time MM key still splits an mm's owner
+            // ({slot, None}) from its CLONE_VM/vfork sharer ({slot, Some(mm)}),
+            // so a sharer registers a second carrier MM authority over the
+            // same stage-2. That second authority is INERT by construction:
+            // the `SharedProcess` arm mints it with no stage-2 leases (its
+            // drop retires nothing) and a `SharedProcess` inventory rolls back
+            // as `Ok(())`. Measured at HEAD: 1,800 CLONE_VM sharer lifecycles
+            // (owner verifying a 64 MiB heap after, and concurrently with,
+            // every sharer exit) plus the callee-saved-register check, zero
+            // faults. A slot-only key that dedupes the sharer onto the owner
+            // was tried twice and showed no measurable effect (its gate
+            // destabilization was the stale kick-handle defect, see
+            // `HvfTaskState::live_vcpu`); collapse the key only with a red
+            // reproducer in hand.
             drop(task_mm);
         }
         Ok(())

@@ -20,9 +20,12 @@ must therefore only ever contain line numbers, byte offsets, fingerprints and
 `At <file>:<line>` prefixes — `git diff -U0` should show nothing else.
 
 Usage:
+    git commit ...        # the code move first: the host-authority capture
+                          # refuses a dirty tracked tree
     python3 scripts/migrate/reconcile-line-pinned-inventories.py
-    # review `git diff`, commit as `chore: reconcile the line-pinned
-    # inventories for <change>`, then `just lint-domains` on the clean tree.
+    # review `git diff` (positions only), fold it into that commit with
+    # `git commit --fixup` + autosquash or commit as `chore: reconcile the
+    # line-pinned inventories for <change>`, then `just lint-domains`.
 
 The host-authority step launches Cargo (`--refresh-candidate` compiles the
 macOS product profiles); the rest read source directly.
@@ -109,6 +112,21 @@ def reconcile_host_authority() -> int:
             stderr=subprocess.DEVNULL,
         )
         if not candidate.is_file():
+            dirty = subprocess.run(
+                ["git", "status", "--porcelain", "--untracked-files=no"],
+                cwd=ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            if dirty:
+                # The compiler capture only accepts clean tracked inputs, so
+                # the code move has to be committed first; fold the rebind in
+                # afterwards (`git commit --fixup` + autosquash).
+                raise RefusedError(
+                    "host-authority: the authoritative capture needs a clean tracked "
+                    "tree -- commit the code change first, then rerun"
+                )
             raise RefusedError("host-authority: --refresh-candidate produced no candidate")
         result = subprocess.run(
             [
