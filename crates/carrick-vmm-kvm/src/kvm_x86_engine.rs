@@ -29,12 +29,13 @@
 //! the sigframe carries). `KERNEL_GS_BASE` (the SWAPGS shadow) is not used by
 //! the ring-3-only guest, so `get/set_gs_base` operate on `sregs.gs.base`.
 
-use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex, RwLock};
 
 use carrick_abi::LinuxProtFlags;
 use carrick_guest_mem::{Gpa, GuestVa, HostVa, MemoryError, RepointPrivateError};
-use carrick_hal::{GuestVmBackend, SharedFutexLocation, TrapError};
+use carrick_hal::{
+    GuestVmBackend, HostAliasBacking, HostAliasSharing, SharedFutexLocation, TrapError,
+};
 use carrick_mem::memory::AddressSpace;
 use carrick_mem::pml4::{Pml4Manager, walk_descriptors};
 use carrick_x86::{
@@ -297,13 +298,8 @@ impl X86Vmm for KvmVmm {
         ipa: Gpa,
         len: u64,
         payload: &[u8],
-        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
+        backing: HostAliasBacking,
     ) -> Result<(), TrapError> {
-        use crate::guest_setup::AliasBacking;
-        let file = file.map(|(fd, offset, prot)| {
-            // SAFETY: dispatcher-to-backend alias setup transfers this dup.
-            (unsafe { OwnedFd::from_raw_fd(fd) }, offset, prot)
-        });
         use carrick_mem::memory::{LINUX_ALIAS_IPA_BASE, LINUX_ALIAS_IPA_SIZE};
 
         let (va, ipa) = (va.raw(), ipa.raw());
@@ -319,20 +315,13 @@ impl X86Vmm for KvmVmm {
             )));
         }
         let gpa = ipa;
-        let writable = match file.as_ref() {
-            Some((_, _, prot)) => *prot & libc::PROT_WRITE != 0,
-            None => true,
-        };
-        let backing = match file {
-            Some((fd, offset, prot)) => AliasBacking::File { fd, offset, prot },
-            None => AliasBacking::Anon { payload },
-        };
+        let writable = crate::guest_setup::alias_leaf_writable(&backing);
         let pt_host = self
             .ram
             .host_ptr(X86_PML4_BASE, carrick_x86::X86_PML4_CAPACITY as usize)
             .ok_or_else(|| TrapError::Hypervisor("kvm-x86: PML4 backing not mapped".into()))?;
         self.ram
-            .add_alias(&mut self.vm, va, gpa, len, backing)
+            .add_alias(&mut self.vm, va, gpa, len, payload, backing)
             .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
         let mut page_tables = self.page_tables.lock().unwrap_or_else(|e| e.into_inner());
         page_tables
@@ -421,8 +410,6 @@ impl X86Vmm for KvmVmm {
     }
 
     fn back_fixed_anon(&mut self, va: u64, len: usize, writable: bool) -> Result<(), MemoryError> {
-        use crate::guest_setup::AliasBacking;
-
         // Back a MAP_FIXED|MAP_PRIVATE|MAP_ANON at an arbitrary VA that the PML4
         // does not yet map (outside the eager arena/image). Allocate a fresh
         // identity-GPA slot (GPA==VA) backed by zeroed anon host memory, then
@@ -437,7 +424,10 @@ impl X86Vmm for KvmVmm {
                 va,
                 va,
                 len_u64,
-                AliasBacking::Anon { payload: &[] },
+                &[],
+                HostAliasBacking::Anonymous {
+                    sharing: HostAliasSharing::Private,
+                },
             )
             .map_err(|e| {
                 MemoryError::HostMap(format!("kvm-x86: back_fixed_anon add_alias: {e}"))

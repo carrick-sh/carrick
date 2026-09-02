@@ -37,7 +37,6 @@
 //! `run_vcpu_until_exit`.
 
 use std::collections::BTreeMap;
-use std::os::fd::IntoRawFd;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -8468,142 +8467,135 @@ where
                     ipa,
                     len,
                     payload,
-                    file,
-                    shared,
+                    backing,
                     prot,
                     prot_none,
                 } if kernel.hvpatch_process.is_some() => {
-                    let file = file.map(|(fd, offset, prot)| (fd.into_owned_fd(), offset, prot));
+                    let shared = backing.is_shared();
                     let coordinator = kernel.dispatcher.mm_mutation_coordinator();
-                    let install_alias =
-                        |permit: &crate::dispatch::mm_mutation::HostAliasPermit<'_>| {
-                            let Some(install) = transaction.claim(permit) else {
-                                drop(file);
-                                return Ok(DispatchOutcome::Returned {
-                                    value: crate::linux_abi::LINUX_ENOMEM.guest_retval(),
-                                });
-                            };
-
-                            // The dispatch transaction is exclusively claimed, but no
-                            // backend mutation has started. Allocate every ID and event
-                            // slot before arming the backend's topology-locked staging.
-                            let capacity = carrick_hal::FrameEventCapacity::for_event_count(2)
-                                .map_err(crate::kernel::FrameInventoryReserveError::from)?;
-                            let reservation = kernel_context
-                                .kernel()
-                                .reserve_frame_inventory(1, 1, capacity)?;
-                            let inventory_transaction = reservation.transaction();
-                            let process = kernel.hvpatch_process.as_ref().ok_or_else(|| {
-                                RuntimeError::Configuration(
-                                    "HVPatch alias inventory has no process context".to_owned(),
-                                )
-                            })?;
-                            let topology = crate::fork_quiesce::acquire_topology_lock(
-                                carrick_observability::probes::HvpatchTopologyOperation::AliasMap,
-                                process.pid(),
-                                self.this_tid.raw(),
-                            );
-                            if let Err(error) = engine.begin_alias_inventory(reservation) {
-                                let abandoned = kernel_context
-                                    .kernel()
-                                    .frame_inventory()
-                                    .abandon(inventory_transaction);
-                                debug_assert!(abandoned);
-                                return Err(error.into());
-                            }
-
-                            if let Err(error) = engine.map_host_alias_with_sharing(
-                                va,
-                                ipa,
-                                len,
-                                &payload,
-                                file.map(|(fd, offset, prot)| (fd.into_raw_fd(), offset, prot)),
-                                shared,
-                            ) {
-                                // A failed alias install is guest-argument-reachable
-                                // (an oversized/awkwardly-placed mmap can exhaust the
-                                // global frame IPA arena or fail hv_vm_map), so it must
-                                // lower to a guest errno, never abort the VM carrier —
-                                // one Linux process's bad mmap would otherwise kill
-                                // EVERY process multiplexed into this carrier.
-                                //
-                                // Stage-1/stage-2 unwind is the backend's own (RAII host
-                                // mappings and global-frame IPA leases); this arm rolls
-                                // back the two publications it armed itself: the
-                                // backend's alias staging — without which the NEXT guest
-                                // mmap fails as an "overlapping HVPatch alias inventory
-                                // transaction" — and the kernel's frame-inventory
-                                // transaction. `install` is dropped unclaimed, which
-                                // aborts the dispatcher's pending VMA commit and wakes
-                                // blocked sibling mapping syscalls.
-                                engine.abandon_alias_inventory();
-                                let abandoned = kernel_context
-                                    .kernel()
-                                    .frame_inventory()
-                                    .abandon(inventory_transaction);
-                                debug_assert!(abandoned);
-                                drop(topology);
-                                drop(install);
-                                tracing::error!(
-                                    va = format_args!("{:#x}", va.raw()),
-                                    len = format_args!("{len:#x}"),
-                                    shared,
-                                    %error,
-                                    "HVPatch alias install failed; guest mmap lowered to ENOMEM"
-                                );
-                                return Ok(DispatchOutcome::Returned {
-                                    value: crate::linux_abi::LINUX_ENOMEM.guest_retval(),
-                                });
-                            }
-                            let Some(commit) = engine.take_alias_inventory() else {
-                                std::process::abort();
-                            };
-                            // Serialize both the reservation slot and raw HVF topology
-                            // mutation. Authority publication takes its own lock only
-                            // after the topology lock and backend locks are released.
-                            drop(topology);
-                            if apply_alias_frame_inventory(&kernel_context, commit).is_err() {
-                                std::process::abort();
-                            }
-
-                            let Ok(len) = usize::try_from(len) else {
-                                std::process::abort();
-                            };
-                            if prot_none && engine.protect_range(va.raw(), len, 0).is_err() {
-                                std::process::abort();
-                            }
-                            engine.set_mapping_protection_and_sharing(
-                                va.raw(),
-                                len,
-                                prot_none,
-                                !carrick_abi::LinuxProtFlags::from_bits_truncate(prot)
-                                    .contains(carrick_abi::LinuxProtFlags::WRITE),
-                                if shared {
-                                    carrick_guest_mem::MappingSharing::Shared
-                                } else {
-                                    carrick_guest_mem::MappingSharing::Private
-                                },
-                            );
-                            if let Some((bus_start, bus_len)) = install.bus_fault_range() {
-                                let Ok(bus_len) = usize::try_from(bus_len) else {
-                                    std::process::abort();
-                                };
-                                if engine.protect_range(bus_start, bus_len, 0).is_err() {
-                                    std::process::abort();
-                                }
-                                engine.set_no_access(bus_start, bus_len, true);
-                            }
-                            if kernel
-                                .dispatcher
-                                .commit_host_alias_install(install)
-                                .is_err()
-                            {
-                                std::process::abort();
-                            }
-                            Ok(DispatchOutcome::Returned {
-                                value: success_retval,
-                            })
+                    let install_alias = |permit: &crate::dispatch::mm_mutation::HostAliasPermit<
+                        '_,
+                    >| {
+                        let Some(install) = transaction.claim(permit) else {
+                            drop(backing);
+                            return Ok(DispatchOutcome::Returned {
+                                value: crate::linux_abi::LINUX_ENOMEM.guest_retval(),
+                            });
                         };
+
+                        // The dispatch transaction is exclusively claimed, but no
+                        // backend mutation has started. Allocate every ID and event
+                        // slot before arming the backend's topology-locked staging.
+                        let capacity = carrick_hal::FrameEventCapacity::for_event_count(2)
+                            .map_err(crate::kernel::FrameInventoryReserveError::from)?;
+                        let reservation = kernel_context
+                            .kernel()
+                            .reserve_frame_inventory(1, 1, capacity)?;
+                        let inventory_transaction = reservation.transaction();
+                        let process = kernel.hvpatch_process.as_ref().ok_or_else(|| {
+                            RuntimeError::Configuration(
+                                "HVPatch alias inventory has no process context".to_owned(),
+                            )
+                        })?;
+                        let topology = crate::fork_quiesce::acquire_topology_lock(
+                            carrick_observability::probes::HvpatchTopologyOperation::AliasMap,
+                            process.pid(),
+                            self.this_tid.raw(),
+                        );
+                        if let Err(error) = engine.begin_alias_inventory(reservation) {
+                            let abandoned = kernel_context
+                                .kernel()
+                                .frame_inventory()
+                                .abandon(inventory_transaction);
+                            debug_assert!(abandoned);
+                            return Err(error.into());
+                        }
+
+                        if let Err(error) = engine.map_host_alias(va, ipa, len, &payload, backing) {
+                            // A failed alias install is guest-argument-reachable
+                            // (an oversized/awkwardly-placed mmap can exhaust the
+                            // global frame IPA arena or fail hv_vm_map), so it must
+                            // lower to a guest errno, never abort the VM carrier —
+                            // one Linux process's bad mmap would otherwise kill
+                            // EVERY process multiplexed into this carrier.
+                            //
+                            // Stage-1/stage-2 unwind is the backend's own (RAII host
+                            // mappings and global-frame IPA leases); this arm rolls
+                            // back the two publications it armed itself: the
+                            // backend's alias staging — without which the NEXT guest
+                            // mmap fails as an "overlapping HVPatch alias inventory
+                            // transaction" — and the kernel's frame-inventory
+                            // transaction. `install` is dropped unclaimed, which
+                            // aborts the dispatcher's pending VMA commit and wakes
+                            // blocked sibling mapping syscalls.
+                            engine.abandon_alias_inventory();
+                            let abandoned = kernel_context
+                                .kernel()
+                                .frame_inventory()
+                                .abandon(inventory_transaction);
+                            debug_assert!(abandoned);
+                            drop(topology);
+                            drop(install);
+                            tracing::error!(
+                                va = format_args!("{:#x}", va.raw()),
+                                len = format_args!("{len:#x}"),
+                                shared,
+                                %error,
+                                "HVPatch alias install failed; guest mmap lowered to ENOMEM"
+                            );
+                            return Ok(DispatchOutcome::Returned {
+                                value: crate::linux_abi::LINUX_ENOMEM.guest_retval(),
+                            });
+                        }
+                        let Some(commit) = engine.take_alias_inventory() else {
+                            std::process::abort();
+                        };
+                        // Serialize both the reservation slot and raw HVF topology
+                        // mutation. Authority publication takes its own lock only
+                        // after the topology lock and backend locks are released.
+                        drop(topology);
+                        if apply_alias_frame_inventory(&kernel_context, commit).is_err() {
+                            std::process::abort();
+                        }
+
+                        let Ok(len) = usize::try_from(len) else {
+                            std::process::abort();
+                        };
+                        if prot_none && engine.protect_range(va.raw(), len, 0).is_err() {
+                            std::process::abort();
+                        }
+                        engine.set_mapping_protection_and_sharing(
+                            va.raw(),
+                            len,
+                            prot_none,
+                            !carrick_abi::LinuxProtFlags::from_bits_truncate(prot)
+                                .contains(carrick_abi::LinuxProtFlags::WRITE),
+                            if shared {
+                                carrick_guest_mem::MappingSharing::Shared
+                            } else {
+                                carrick_guest_mem::MappingSharing::Private
+                            },
+                        );
+                        if let Some((bus_start, bus_len)) = install.bus_fault_range() {
+                            let Ok(bus_len) = usize::try_from(bus_len) else {
+                                std::process::abort();
+                            };
+                            if engine.protect_range(bus_start, bus_len, 0).is_err() {
+                                std::process::abort();
+                            }
+                            engine.set_no_access(bus_start, bus_len, true);
+                        }
+                        if kernel
+                            .dispatcher
+                            .commit_host_alias_install(install)
+                            .is_err()
+                        {
+                            std::process::abort();
+                        }
+                        Ok(DispatchOutcome::Returned {
+                            value: success_retval,
+                        })
+                    };
                     let stage1_authority = match &mut mm_phase {
                         SyscallMmPhase::Mutation(authority) => authority,
                         SyscallMmPhase::Ordinary(_) => {

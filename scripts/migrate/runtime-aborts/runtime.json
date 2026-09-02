@@ -374,7 +374,7 @@
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "function": "SyscallDispatcher::mmap",
       "ordinal_in_function": 1,
-      "fingerprint": "c54fbcdc505ab714679133a28032511773fe0c92c1d4f2719fc08d425ae94769",
+      "fingerprint": "7d19e66b638a256b37d91cfebcee105bd4ad1d03317fa8f011f3dee33755e5cd",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mmap_ioring",
       "rationale": "io_uring file description missing concrete IoUringBacking during mmap dispatch; description backing is corrupted."
@@ -491,7 +491,7 @@
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "function": "SyscallDispatcher::mremap",
       "ordinal_in_function": 1,
-      "fingerprint": "4f383c8b92bd0f55d7e236552145a0783862d6a52e0a7bcdd00ee878ad3630dc",
+      "fingerprint": "2b83c384a7a9db840fcd52b3b90b48285c7fe16ed876e33706232fb76930f387",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mremap",
       "rationale": "Source alias and metadata were retired before destination projection, so projection failure leaves neither authoritative source nor destination publication. Re-reviewed 2026-08-31: the abort is unchanged; the surrounding handler gained MREMAP_FIXED/MREMAP_DONTUNMAP relocation and the first-touch residency arm, which is what moved the fingerprint. Re-reviewed 2026-09-01: the abort is unchanged; the handler now carries the read-only shared-file mprotect ceiling across the relocation (`range_is_read_only_shared_file`), which is what moved the fingerprint."
@@ -500,7 +500,7 @@
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "function": "SyscallDispatcher::mremap",
       "ordinal_in_function": 2,
-      "fingerprint": "4f383c8b92bd0f55d7e236552145a0783862d6a52e0a7bcdd00ee878ad3630dc",
+      "fingerprint": "2b83c384a7a9db840fcd52b3b90b48285c7fe16ed876e33706232fb76930f387",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mremap_shared",
       "rationale": "restore_shared_identity failed on expanded shared mapping range during mremap; leaves page tables in inconsistent state. Re-reviewed 2026-08-31: the abort is unchanged; the surrounding handler gained MREMAP_FIXED/MREMAP_DONTUNMAP relocation and the first-touch residency arm, which is what moved the fingerprint. Re-reviewed 2026-09-01: the abort is unchanged; the handler now carries the read-only shared-file mprotect ceiling across the relocation (`range_is_read_only_shared_file`), which is what moved the fingerprint."
@@ -509,7 +509,7 @@
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "function": "SyscallDispatcher::mremap",
       "ordinal_in_function": 3,
-      "fingerprint": "4f383c8b92bd0f55d7e236552145a0783862d6a52e0a7bcdd00ee878ad3630dc",
+      "fingerprint": "2b83c384a7a9db840fcd52b3b90b48285c7fe16ed876e33706232fb76930f387",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mremap_shared",
       "rationale": "mark_identity_restored failed on expanded shared range in shared aperture tracking during mremap. Re-reviewed 2026-08-31: the abort is unchanged; the surrounding handler gained MREMAP_FIXED/MREMAP_DONTUNMAP relocation and the first-touch residency arm, which is what moved the fingerprint. Re-reviewed 2026-09-01: the abort is unchanged; the handler now carries the read-only shared-file mprotect ceiling across the relocation (`range_is_read_only_shared_file`), which is what moved the fingerprint."
@@ -518,7 +518,7 @@
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "function": "SyscallDispatcher::mremap",
       "ordinal_in_function": 4,
-      "fingerprint": "4f383c8b92bd0f55d7e236552145a0783862d6a52e0a7bcdd00ee878ad3630dc",
+      "fingerprint": "2b83c384a7a9db840fcd52b3b90b48285c7fe16ed876e33706232fb76930f387",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mremap_shared",
       "rationale": "Shrinking shared aperture allocation in mremap failed after backend tail unmap completed; allocation bookkeeping is corrupted. Re-reviewed 2026-08-31: the abort is unchanged; the surrounding handler gained MREMAP_FIXED/MREMAP_DONTUNMAP relocation and the first-touch residency arm, which is what moved the fingerprint. Re-reviewed 2026-09-01: the abort is unchanged; the handler now carries the read-only shared-file mprotect ceiling across the relocation (`range_is_read_only_shared_file`), which is what moved the fingerprint."
@@ -527,7 +527,7 @@
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "function": "SyscallDispatcher::mremap",
       "ordinal_in_function": 5,
-      "fingerprint": "4f383c8b92bd0f55d7e236552145a0783862d6a52e0a7bcdd00ee878ad3630dc",
+      "fingerprint": "2b83c384a7a9db840fcd52b3b90b48285c7fe16ed876e33706232fb76930f387",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mremap_overlay",
       "rationale": "Carving source overlay range in mremap failed after backend tail unmap completed; overlay allocation state is corrupted. Re-reviewed 2026-08-31: the abort is unchanged; the surrounding handler gained MREMAP_FIXED/MREMAP_DONTUNMAP relocation and the first-touch residency arm, which is what moved the fingerprint. Re-reviewed 2026-09-01: the abort is unchanged; the handler now carries the read-only shared-file mprotect ceiling across the relocation (`range_is_read_only_shared_file`), which is what moved the fingerprint."
@@ -545,7 +545,7 @@
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "function": "SyscallDispatcher::mprotect",
       "ordinal_in_function": 1,
-      "fingerprint": "bb58bb7cb93be2e0603cfe5010089c3e228f703aace79dfdd714c24c224275aa",
+      "fingerprint": "1fcb0054b1d6697ac7b47319e1362261a9df8eb3592c0f2976c0eda842b583fd",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mprotect",
       "rationale": "Stored reservation fork semantics contradict selected VMA subrange, corrupting semantic-VMA authority during host alias transaction commit."
@@ -1712,7 +1712,7 @@
       "file": "crates/carrick-runtime/src/runtime.rs",
       "function": "run_combined_syscall_loop_with_dispatcher",
       "ordinal_in_function": 1,
-      "fingerprint": "5a706a5fda5fb0ad90cd4e73704db5c4613afb0913b8e75175b3f42e302a2ab2",
+      "fingerprint": "c47f8a8cdbefe49c18af252db2f2dadd353d5fe9100f1dc7b25d452968b65f00",
       "verdict": "carrier_fault",
       "failure_domain": "runtime::host_alias_mapping",
       "rationale": "runtime.map_host_alias backend failure during alias installation; leaves hardware page tables and stage-2 mappings in an unrecoverable split state."
@@ -1721,7 +1721,7 @@
       "file": "crates/carrick-runtime/src/runtime.rs",
       "function": "run_combined_syscall_loop_with_dispatcher",
       "ordinal_in_function": 2,
-      "fingerprint": "5a706a5fda5fb0ad90cd4e73704db5c4613afb0913b8e75175b3f42e302a2ab2",
+      "fingerprint": "c47f8a8cdbefe49c18af252db2f2dadd353d5fe9100f1dc7b25d452968b65f00",
       "verdict": "carrier_fault",
       "failure_domain": "runtime::host_alias_mapping",
       "rationale": "Host alias mapping length overflowed usize after backend mapping was installed; cannot apply memory protection to live mapping."
@@ -1730,7 +1730,7 @@
       "file": "crates/carrick-runtime/src/runtime.rs",
       "function": "run_combined_syscall_loop_with_dispatcher",
       "ordinal_in_function": 3,
-      "fingerprint": "5a706a5fda5fb0ad90cd4e73704db5c4613afb0913b8e75175b3f42e302a2ab2",
+      "fingerprint": "c47f8a8cdbefe49c18af252db2f2dadd353d5fe9100f1dc7b25d452968b65f00",
       "verdict": "carrier_fault",
       "failure_domain": "runtime::host_alias_mapping",
       "rationale": "runtime.protect_range failed to apply PROT_NONE to installed host alias mapping; continuing would leave inaccessible memory readable."
@@ -1739,7 +1739,7 @@
       "file": "crates/carrick-runtime/src/runtime.rs",
       "function": "run_combined_syscall_loop_with_dispatcher",
       "ordinal_in_function": 4,
-      "fingerprint": "5a706a5fda5fb0ad90cd4e73704db5c4613afb0913b8e75175b3f42e302a2ab2",
+      "fingerprint": "c47f8a8cdbefe49c18af252db2f2dadd353d5fe9100f1dc7b25d452968b65f00",
       "verdict": "carrier_fault",
       "failure_domain": "runtime::host_alias_mapping",
       "rationale": "Host alias bus fault length overflowed usize after backend mapping was installed; cannot apply bus-fault guard protection."
@@ -1748,7 +1748,7 @@
       "file": "crates/carrick-runtime/src/runtime.rs",
       "function": "run_combined_syscall_loop_with_dispatcher",
       "ordinal_in_function": 5,
-      "fingerprint": "5a706a5fda5fb0ad90cd4e73704db5c4613afb0913b8e75175b3f42e302a2ab2",
+      "fingerprint": "c47f8a8cdbefe49c18af252db2f2dadd353d5fe9100f1dc7b25d452968b65f00",
       "verdict": "carrier_fault",
       "failure_domain": "runtime::host_alias_mapping",
       "rationale": "runtime.protect_range failed to apply guard protection to bus fault range of host alias mapping; leaves invalid file region accessible."
@@ -1757,7 +1757,7 @@
       "file": "crates/carrick-runtime/src/runtime.rs",
       "function": "run_combined_syscall_loop_with_dispatcher",
       "ordinal_in_function": 6,
-      "fingerprint": "5a706a5fda5fb0ad90cd4e73704db5c4613afb0913b8e75175b3f42e302a2ab2",
+      "fingerprint": "c47f8a8cdbefe49c18af252db2f2dadd353d5fe9100f1dc7b25d452968b65f00",
       "verdict": "carrier_fault",
       "failure_domain": "runtime::host_alias_mapping",
       "rationale": "dispatcher.commit_host_alias_install failed after backend host mapping was installed; leaves uncommitted alias mapping in guest address space."

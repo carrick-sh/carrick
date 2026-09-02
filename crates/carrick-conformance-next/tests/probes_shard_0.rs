@@ -251,9 +251,9 @@ fn test_shard_0_expected_gaps_derivation() {
     let musl_shard_gaps = expected_shard_gaps(common::MUSL_BASELINE_GAPS);
     let gnu_shard_gaps = expected_shard_gaps(common::GNU_BASELINE_GAPS);
 
-    let expected_musl_set = BTreeSet::from(["mmapprivatefiletrack"]);
+    let expected_musl_set = BTreeSet::from([]);
 
-    let expected_gnu_set = BTreeSet::from(["mmapprivatefiletrack"]);
+    let expected_gnu_set = BTreeSet::from([]);
 
     assert_eq!(
         musl_shard_gaps, expected_musl_set,
@@ -354,13 +354,13 @@ fn test_probe_binary_locator_and_gap_counts() {
     let gnu_shard_gaps = expected_shard_gaps(common::GNU_BASELINE_GAPS);
     assert_eq!(
         musl_shard_gaps.len(),
-        1,
-        "musl shard 0 must contain exactly 1 baseline gap"
+        0,
+        "musl shard 0 must contain exactly 0 baseline gap"
     );
     assert_eq!(
         gnu_shard_gaps.len(),
-        1,
-        "gnu shard 0 must contain exactly 1 baseline gap"
+        0,
+        "gnu shard 0 must contain exactly 0 baseline gap"
     );
 }
 

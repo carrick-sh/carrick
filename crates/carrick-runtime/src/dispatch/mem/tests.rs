@@ -5782,13 +5782,93 @@ fn next_mmap_address_reuses_freed_arena_region() {
         free_regions_insert(&mut mem.free_regions, freed, 2 * LINUX_PAGE_SIZE);
     }
 
-    let first = dispatcher.next_mmap_address(0, LINUX_PAGE_SIZE, 0, 0);
+    let first = dispatcher.next_mmap_address(0, LINUX_PAGE_SIZE, 0, 0, MmapGrantCongruence::Any);
     assert_eq!(first, Some((freed, true)));
 
-    let second = dispatcher.next_mmap_address(0, LINUX_PAGE_SIZE, 0, 0);
+    let second = dispatcher.next_mmap_address(0, LINUX_PAGE_SIZE, 0, 0, MmapGrantCongruence::Any);
     assert_eq!(second, Some((freed + LINUX_PAGE_SIZE, true)));
 
     assert!(dispatcher.mem().lock().free_regions.is_empty());
+}
+
+/// A page-cache view of a file needs `address ≡ offset (mod host page)`,
+/// so an eligible hint-less `mmap(MAP_PRIVATE, fd, offset)` grant must land
+/// on a congruent address — on both the bump path and the freed-region
+/// path — and the skipped prefix must be parked for reuse, not stranded.
+/// Linux only promises page alignment for a hint-less grant, so choosing
+/// the residue is ABI-legal.
+#[test]
+fn next_mmap_address_honours_file_offset_congruence() {
+    let host_page = crate::page_profile::host_page_size();
+    if host_page <= LINUX_PAGE_SIZE {
+        // A 4K host has nothing to be congruent to; `for_file_offset` is `Any`.
+        assert!(matches!(
+            MmapGrantCongruence::for_file_offset(3 * LINUX_PAGE_SIZE, LINUX_PAGE_SIZE),
+            MmapGrantCongruence::Any
+        ));
+        return;
+    }
+    let residue = 3 * LINUX_PAGE_SIZE % host_page;
+    assert_ne!(
+        residue, 0,
+        "fixture offset must not already be host-page aligned"
+    );
+    let congruence = MmapGrantCongruence::for_file_offset(3 * LINUX_PAGE_SIZE, LINUX_PAGE_SIZE);
+
+    // Bump path: the arena base is host-page aligned, so the grant skips
+    // `residue` bytes, which are parked as a free region.
+    let dispatcher = SyscallDispatcher::new();
+    let (address, reused) = dispatcher
+        .next_mmap_address(0, LINUX_PAGE_SIZE, 0, 0, congruence)
+        .expect("bump grant");
+    assert_eq!(address % host_page, residue);
+    assert_eq!(address, LINUX_MMAP_BASE + residue);
+    assert!(!reused);
+    assert_eq!(
+        dispatcher.mem().lock().free_regions,
+        vec![(LINUX_MMAP_BASE, residue)],
+        "the skipped congruence prefix is parked, not stranded"
+    );
+
+    // Freed-region path: a hole that starts host-page aligned is entered at
+    // its first congruent address; the prefix and the tail both survive.
+    let dispatcher = SyscallDispatcher::new();
+    let hole = LINUX_MMAP_BASE + 8 * host_page;
+    let hole_len = 2 * host_page;
+    {
+        let mem_authority = dispatcher.mem();
+        let mut mem = mem_authority.lock();
+        free_regions_insert(&mut mem.free_regions, hole, hole_len);
+    }
+    let (address, reused) = dispatcher
+        .next_mmap_address(0, LINUX_PAGE_SIZE, 0, 0, congruence)
+        .expect("free-region grant");
+    assert_eq!(address, hole + residue);
+    assert!(reused);
+    assert_eq!(
+        dispatcher.mem().lock().free_regions,
+        vec![
+            (hole, residue),
+            (
+                hole + residue + LINUX_PAGE_SIZE,
+                hole_len - residue - LINUX_PAGE_SIZE
+            ),
+        ]
+    );
+
+    // A hole too short to hold a congruent fit is skipped rather than
+    // misplaced: the grant falls through to the bump cursor.
+    let dispatcher = SyscallDispatcher::new();
+    {
+        let mem_authority = dispatcher.mem();
+        let mut mem = mem_authority.lock();
+        free_regions_insert(&mut mem.free_regions, hole, residue);
+    }
+    let (address, reused) = dispatcher
+        .next_mmap_address(0, LINUX_PAGE_SIZE, 0, 0, congruence)
+        .expect("bump fallback");
+    assert_eq!(address, LINUX_MMAP_BASE + residue);
+    assert!(!reused);
 }
 
 /// A `PROT_NONE` reservation cannot hold a guest-written byte, so it must
@@ -5807,7 +5887,7 @@ fn a_prot_none_reserve_does_not_raise_the_writable_watermark() {
 
     // A large PROT_NONE reserve: allocated, never writable.
     let reserve = dispatcher
-        .next_mmap_address(0, 16 * LINUX_PAGE_SIZE, 0, 0)
+        .next_mmap_address(0, 16 * LINUX_PAGE_SIZE, 0, 0, MmapGrantCongruence::Any)
         .expect("reserve");
     assert!(!reserve.1, "a fresh bump allocation is never reused");
     assert_eq!(
@@ -5820,7 +5900,7 @@ fn a_prot_none_reserve_does_not_raise_the_writable_watermark() {
     // the same span again. Nothing could have written it, so no scrub.
     dispatcher.mem().lock().mmap_next = reserve.0;
     let again = dispatcher
-        .next_mmap_address(0, 16 * LINUX_PAGE_SIZE, 0, 0)
+        .next_mmap_address(0, 16 * LINUX_PAGE_SIZE, 0, 0, MmapGrantCongruence::Any)
         .expect("re-allocate");
     assert_eq!(again.0, reserve.0);
     assert!(
@@ -5838,7 +5918,13 @@ fn a_writable_mapping_raises_the_watermark_and_forces_a_later_scrub() {
     let dispatcher = SyscallDispatcher::new();
 
     let writable = dispatcher
-        .next_mmap_address(0, 16 * LINUX_PAGE_SIZE, LINUX_PROT_WRITE, 0)
+        .next_mmap_address(
+            0,
+            16 * LINUX_PAGE_SIZE,
+            LINUX_PROT_WRITE,
+            0,
+            MmapGrantCongruence::Any,
+        )
         .expect("writable mapping");
     assert!(!writable.1, "a fresh bump allocation is never reused");
     assert!(
@@ -5848,7 +5934,13 @@ fn a_writable_mapping_raises_the_watermark_and_forces_a_later_scrub() {
 
     dispatcher.mem().lock().mmap_next = writable.0;
     let again = dispatcher
-        .next_mmap_address(0, 16 * LINUX_PAGE_SIZE, LINUX_PROT_WRITE, 0)
+        .next_mmap_address(
+            0,
+            16 * LINUX_PAGE_SIZE,
+            LINUX_PROT_WRITE,
+            0,
+            MmapGrantCongruence::Any,
+        )
         .expect("re-allocate");
     assert_eq!(again.0, writable.0);
     assert!(
@@ -5882,7 +5974,7 @@ fn reset_memory_state_on_execve_resets_arenas_and_preserves_auxv_snapshot() {
         assert_eq!(mem.linux_auxv_image, vec![1, 2, 3, 4]);
     }
     assert_eq!(
-        dispatcher.next_mmap_address(0, LINUX_PAGE_SIZE, 0, 0),
+        dispatcher.next_mmap_address(0, LINUX_PAGE_SIZE, 0, 0, MmapGrantCongruence::Any),
         Some((LINUX_MMAP_BASE, false))
     );
 }
@@ -6757,13 +6849,13 @@ fn dropping_unconsumed_host_alias_outcome_closes_fd_and_aborts_transaction() {
         ipa: Gpa(crate::memory::LINUX_ALIAS_IPA_BASE),
         len: LINUX_PAGE_SIZE,
         payload: Vec::new(),
-        file: Some((
+        backing: HostAliasBacking::File {
             // SAFETY: the successful pipe read end is uniquely transferred.
-            unsafe { HostAliasOwnedFd::from_raw_fd(read_fd) },
-            0,
-            libc::PROT_READ,
-        )),
-        shared: true,
+            fd: HostAliasOwnedFd::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(read_fd) }),
+            offset: 0,
+            host_prot: libc::PROT_READ,
+            sharing: HostAliasSharing::Shared,
+        },
         prot: crate::linux_abi::LINUX_PROT_READ,
         prot_none: false,
     };
@@ -6944,7 +7036,7 @@ fn high_va_private_anonymous_mmap_returns_empty_alias_payload() {
         va: mapped_va,
         len,
         payload,
-        file,
+        backing,
         ..
     } = outcome
     else {
@@ -6952,7 +7044,10 @@ fn high_va_private_anonymous_mmap_returns_empty_alias_payload() {
     };
     assert_eq!(mapped_va, GuestVa(va));
     assert_eq!(len, LINUX_PAGE_SIZE);
-    assert!(file.is_none(), "anonymous alias should not carry a file");
+    assert!(
+        !backing.is_file(),
+        "anonymous alias should not carry a file"
+    );
     assert!(
         payload.is_empty(),
         "fresh high-VA anonymous mmap should use the zeroed host anon alias without carrying a zero payload"
@@ -7047,7 +7142,7 @@ fn alias_window_advisory_hint_is_honored_without_consuming_low_arena() {
         .expect("munmap dispatch should succeed");
     assert_eq!(unmap_outcome, DispatchOutcome::Returned { value: 0 });
     assert_eq!(
-        dispatcher.next_mmap_address(0, LINUX_PAGE_SIZE, 0, 0),
+        dispatcher.next_mmap_address(0, LINUX_PAGE_SIZE, 0, 0, MmapGrantCongruence::Any),
         Some((LINUX_MMAP_BASE, false)),
         "alias-window advisory reservations must not consume the low mmap arena"
     );
@@ -7087,7 +7182,7 @@ fn alias_window_advisory_hint_with_protection_maps_alias() {
         va: mapped_va,
         len: mapped_len,
         payload,
-        file,
+        backing,
         ..
     } = outcome
     else {
@@ -7096,9 +7191,9 @@ fn alias_window_advisory_hint_with_protection_maps_alias() {
     assert_eq!(mapped_va, GuestVa(va));
     assert_eq!(mapped_len, len);
     assert!(payload.is_empty());
-    assert!(file.is_none());
+    assert!(!backing.is_file());
     assert_eq!(
-        dispatcher.next_mmap_address(0, LINUX_PAGE_SIZE, 0, 0),
+        dispatcher.next_mmap_address(0, LINUX_PAGE_SIZE, 0, 0, MmapGrantCongruence::Any),
         Some((LINUX_MMAP_BASE, false)),
         "alias-window advisory aliases must not consume the low mmap arena"
     );
@@ -7147,7 +7242,7 @@ fn lazy_high_va_commit_preserves_shared_reservation_provenance() {
 
     let DispatchOutcome::MapHostAlias {
         success_retval,
-        shared,
+        backing,
         transaction,
         ..
     } = outcome
@@ -7158,7 +7253,10 @@ fn lazy_high_va_commit_preserves_shared_reservation_provenance() {
         success_retval, 0,
         "mprotect must return success, not an address"
     );
-    assert!(shared, "lazy commit must retain MAP_SHARED provenance");
+    assert!(
+        backing.is_shared(),
+        "lazy commit must retain MAP_SHARED provenance"
+    );
     assert!(
         !dispatcher.range_has_host_alias_backing(address, LINUX_PAGE_SIZE),
         "dispatch alone must not predict backend publication"
@@ -7271,11 +7369,11 @@ fn shared_anonymous_high_advisory_hint_is_selected_then_committed_lazily() {
             &reporter,
         )
         .expect("lazy high advisory commit");
-    let DispatchOutcome::MapHostAlias { va, shared, .. } = commit else {
+    let DispatchOutcome::MapHostAlias { va, backing, .. } = commit else {
         panic!("shared high advisory hint must commit through a host alias: {commit:?}");
     };
     assert_eq!(va, GuestVa(address));
-    assert!(shared);
+    assert!(backing.is_shared());
 }
 
 /// The `mmap` handler must not be able to hand the guest a `MAP_FAILED` it

@@ -9,9 +9,12 @@
 //! `set_memory_model` and `map_host_alias` carry portable defaults so non-HVF
 //! backends inherit sane behavior.
 
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+
 use carrick_abi::{CanonicalNr, LinuxSiginfo, NativeNr};
 use carrick_guest_mem::{Gpa, GuestVa};
 use carrick_mem::memory::AddressSpace;
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::error::OsError;
@@ -234,19 +237,21 @@ pub trait SyscallTrap {
         let _ = tso;
         Ok(())
     }
-    /// Back a dynamic high-VA mmap (`DispatchOutcome::MapHostAlias`): map host
-    /// memory at `ipa` and build the VA→IPA stage-1 path.
+    /// Back a dynamic mmap (`DispatchOutcome::MapHostAlias`): map host memory
+    /// at `ipa` and build the VA→IPA stage-1 path for `[va, va+len)`.
     ///
-    /// Ownership/failure contract: `file`, when present, is an owned dup that
-    /// the implementation must close on every success, error, and unwind path.
-    /// Until backends can prove that `Err` means no mutation occurred, the
-    /// generic runtime fail-stops on every claimed installation failure; it does
-    /// not attempt a recoverable cleanup and resume. If a host `MAP_FIXED` has
-    /// already replaced a prior owner, process teardown is the ownership backstop.
+    /// `backing` names the host memory that must sit behind the alias — see
+    /// [`HostAliasBacking`]. A file backing transfers an owned dup that the
+    /// implementation closes (by dropping it) on every success, error, and
+    /// unwind path. Until backends can prove that `Err` means no mutation
+    /// occurred, the generic runtime fail-stops on every claimed installation
+    /// failure; it does not attempt a recoverable cleanup and resume. If a host
+    /// `MAP_FIXED` has already replaced a prior owner, process teardown is the
+    /// ownership backstop.
     ///
     /// The dispatcher only emits `DispatchOutcome::MapHostAlias` for engines that
-    /// can back a high-VA alias, so reaching this default is a carrick coverage
-    /// bug — an engine received an outcome it cannot service — never a recoverable
+    /// can back an alias, so reaching this default is a carrick coverage bug —
+    /// an engine received an outcome it cannot service — never a recoverable
     /// runtime condition. Fail LOUD at the call site (with the offending
     /// va/ipa/len) instead of returning a soft error that would propagate far
     /// away and surface as a generic "unsupported platform" at process exit,
@@ -258,12 +263,11 @@ pub trait SyscallTrap {
         ipa: Gpa,
         len: u64,
         payload: &[u8],
-        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
+        backing: HostAliasBacking,
     ) -> Result<(), TrapError> {
         let _ = payload;
-        if let Some((fd, _, _)) = file {
-            unsafe { libc::close(fd) };
-        }
+        // Dropping the backing closes a file dup.
+        drop(backing);
         let (va, ipa) = (va.raw(), ipa.raw());
         // A genuine, immediate abort (SIGABRT) — the codebase's deterministic
         // failure mechanism (see the panic-backstop note in the workspace
@@ -279,20 +283,125 @@ pub trait SyscallTrap {
         );
         std::process::abort()
     }
+}
 
-    /// As [`Self::map_host_alias`], with the dispatcher's authoritative
-    /// anonymous-mapping sharing classification. Backends that do not have a
-    /// host-fork distinction retain the historical implementation.
-    fn map_host_alias_with_sharing(
-        &mut self,
-        va: GuestVa,
-        ipa: Gpa,
-        len: u64,
-        payload: &[u8],
-        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
-        _shared: bool,
-    ) -> Result<(), TrapError> {
-        self.map_host_alias(va, ipa, len, payload, file)
+/// Whether a dynamic host-alias backing is visible across guest `fork`.
+///
+/// This is the dispatcher's authoritative `MAP_SHARED`/`MAP_PRIVATE`
+/// classification of the guest mapping, carried as a named domain rather than
+/// a bare `bool` so a backend cannot swap it with `prot_none` or a writability
+/// bit. For a file backing it also selects the HOST mapping kind: `Shared` is a
+/// host `MAP_SHARED` of the file (guest stores reach the page cache), `Private`
+/// is a host `MAP_PRIVATE` (Linux per-page COW: a clean page keeps tracking the
+/// file, a dirtied page detaches). A backend that cannot honour `Private` for a
+/// file MUST refuse rather than silently map the file shared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostAliasSharing {
+    /// `MAP_PRIVATE`: copy-on-write, per guest process.
+    Private,
+    /// `MAP_SHARED`: one backing visible to every sharer (and across fork).
+    Shared,
+}
+
+impl HostAliasSharing {
+    pub fn is_shared(self) -> bool {
+        matches!(self, Self::Shared)
+    }
+}
+
+/// Owned host fd transferred with a [`HostAliasBacking::File`].
+///
+/// Keeping ownership in the non-cloneable backing closes the dispatch/runtime
+/// gap: dropping an unconsumed outcome closes the dup as well as aborting its
+/// alias transaction. Consumers move the [`OwnedFd`] out exactly once.
+pub struct HostAliasOwnedFd(OwnedFd);
+
+impl HostAliasOwnedFd {
+    /// Take ownership of a successful `dup(2)`/open result.
+    pub fn new(fd: OwnedFd) -> Self {
+        Self(fd)
+    }
+
+    pub fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
+
+    pub fn into_owned_fd(self) -> OwnedFd {
+        self.0
+    }
+}
+
+impl From<OwnedFd> for HostAliasOwnedFd {
+    fn from(fd: OwnedFd) -> Self {
+        Self(fd)
+    }
+}
+
+impl std::fmt::Debug for HostAliasOwnedFd {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("HostAliasOwnedFd")
+            .field(&self.as_raw_fd())
+            .finish()
+    }
+}
+
+impl PartialEq for HostAliasOwnedFd {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_raw_fd() == other.as_raw_fd()
+    }
+}
+
+impl Eq for HostAliasOwnedFd {}
+
+impl Serialize for HostAliasOwnedFd {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_i32(self.as_raw_fd())
+    }
+}
+
+/// The host memory a dynamic alias (`DispatchOutcome::MapHostAlias`) is backed
+/// by. One typed value replaces the former `file: Option<(fd, off, prot)>` +
+/// `shared: bool` pair, whose two-field encoding let a backend map every file
+/// alias `MAP_SHARED` regardless of the guest's `MAP_PRIVATE`.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostAliasBacking {
+    /// Fresh anonymous host memory (zeroed), optionally seeded from the
+    /// outcome's `payload` at offset 0. `Shared` anonymous backing stays
+    /// coherent across guest `fork`; `Private` is COW per process.
+    Anonymous { sharing: HostAliasSharing },
+    /// A live host file mapping: the memory at `ipa` is
+    /// `mmap(host_prot, MAP_<sharing>, fd, offset)`. `host_prot` is the guest's
+    /// requested prot translated to `PROT_*` — it MUST match the fd's access
+    /// mode for a `Shared` mapping (a `PROT_WRITE` MAP_SHARED of a read-only fd
+    /// is EACCES). The fd is a dup the backend owns and closes after mapping.
+    /// The outcome's `payload` is ignored: the page cache is the content.
+    File {
+        fd: HostAliasOwnedFd,
+        offset: libc::off_t,
+        host_prot: libc::c_int,
+        sharing: HostAliasSharing,
+    },
+}
+
+impl HostAliasBacking {
+    pub fn sharing(&self) -> HostAliasSharing {
+        match self {
+            Self::Anonymous { sharing } | Self::File { sharing, .. } => *sharing,
+        }
+    }
+
+    pub fn is_shared(&self) -> bool {
+        self.sharing().is_shared()
+    }
+
+    pub fn is_file(&self) -> bool {
+        matches!(self, Self::File { .. })
     }
 }
 

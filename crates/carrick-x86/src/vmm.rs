@@ -17,7 +17,9 @@ use std::sync::Arc;
 use carrick_guest_mem::{
     Gpa, GuestVa, MappingSharing, MemoryError, RepointPrivateError, X8664SyscallFrame,
 };
-use carrick_hal::{GuestVmBackend, SharedFutexLocation, TrapError, VcpuKick, VcpuRegistry};
+use carrick_hal::{
+    GuestVmBackend, HostAliasBacking, SharedFutexLocation, TrapError, VcpuKick, VcpuRegistry,
+};
 
 use crate::bringup_fns::{self, BringupLayout, X86VcpuSnapshot};
 
@@ -296,22 +298,20 @@ pub trait X86Vmm: Sized + GuestVmBackend {
 
     /// Back a dynamic high-VA mapping and install the VA→GPA page-table path.
     /// Backends that can receive `DispatchOutcome::MapHostAlias` override this.
-    /// `file` transfers ownership of a dup and must be closed on every
-    /// return/unwind path. Until `Err` certifies that no backend/page-table
-    /// mutation occurred, the generic runtime fail-stops every claimed install
-    /// failure instead of returning recoverably to the guest.
+    /// A file `backing` owns a dup that closes with it on every return/unwind
+    /// path. Until `Err` certifies that no backend/page-table mutation
+    /// occurred, the generic runtime fail-stops every claimed install failure
+    /// instead of returning recoverably to the guest.
     fn map_host_alias(
         &mut self,
         va: GuestVa,
         ipa: Gpa,
         len: u64,
         payload: &[u8],
-        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
+        backing: HostAliasBacking,
     ) -> Result<(), TrapError> {
         let _ = (ipa, payload);
-        if let Some((fd, _, _)) = file {
-            unsafe { libc::close(fd) };
-        }
+        drop(backing);
         Err(TrapError::Hypervisor(format!(
             "carrick-x86: map_host_alias not implemented for this backend (va=0x{:x} len=0x{len:x})",
             va.raw()

@@ -38,8 +38,8 @@ use carrick_guest_mem::protections::MemoryProtections;
 use carrick_guest_mem::{Gpa, MemoryError, SharedFutexLocation};
 use carrick_hal::threaded::Aarch64TaskCpuStateV1;
 use carrick_hal::{
-    GuestEntryRegs, GuestVmBackend, ProcessForkRequest, Reg, SlotId, SysReg, TrapError,
-    VcpuRegistry,
+    GuestEntryRegs, GuestVmBackend, HostAliasBacking, ProcessForkRequest, Reg, SlotId, SysReg,
+    TrapError, VcpuRegistry,
 };
 use carrick_mem::memory::AddressSpace;
 
@@ -1171,6 +1171,18 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.ensure_sparse_mmap_backing(va, len, flush_stage1)
     }
 
+    fn materialize_private_file_backing(
+        &mut self,
+        va: u64,
+        len: usize,
+        fd: std::os::fd::BorrowedFd<'_>,
+        offset: u64,
+        flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+    ) -> Result<bool, TrapError> {
+        self.state
+            .materialize_private_file_backing(va, len, fd, offset, flush_stage1)
+    }
+
     fn frame_inventory_extent_count(&self) -> usize {
         self.state.frame_inventory_extent_count()
     }
@@ -1467,7 +1479,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         ipa: u64,
         len: u64,
         payload: &[u8],
-        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
+        backing: HostAliasBacking,
     ) -> Result<(u64, bool), TrapError> {
         // HVF maps the alias at the IPA the DISPATCHER already allocated from the
         // global alias arena (passed through `MapHostAlias`/the engine) — NOT the
@@ -1475,20 +1487,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         // the arena, the dynamic-loader fault). The stage-2 `hv_vm_map` + the
         // alias-registry registration happen here; the engine then builds the SHARED
         // stage-1 `map_aliased(va, gpa, writable)`.
-        self.state.add_alias(va, ipa, len, payload, file)
-    }
-
-    fn add_alias_with_sharing(
-        &mut self,
-        va: u64,
-        ipa: u64,
-        len: u64,
-        payload: &[u8],
-        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
-        shared: bool,
-    ) -> Result<(u64, bool), TrapError> {
-        self.state
-            .add_alias_with_sharing(va, ipa, len, payload, file, shared)
+        self.state.add_alias(va, ipa, len, payload, backing)
     }
 
     // ── vCPU lifecycle ──

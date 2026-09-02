@@ -46,13 +46,15 @@
 #![cfg(target_arch = "x86_64")]
 
 use std::ffi::c_int;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex};
 
 use carrick_abi::LinuxProtFlags;
 use carrick_guest_mem::{Gpa, GuestVa, HostVa, MappingSharing, MemoryError, RepointPrivateError};
 use carrick_hal::GuestVmBackend;
+use carrick_hal::HostAliasBacking;
+use carrick_hal::HostAliasSharing;
 use carrick_hal::OsError;
 use carrick_hal::SharedFutexLocation;
 use carrick_hal::TrapError;
@@ -1768,13 +1770,9 @@ impl X86Vmm for BhyveVmm {
         _ipa: Gpa,
         len: u64,
         payload: &[u8],
-        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
+        backing: HostAliasBacking,
     ) -> Result<(), TrapError> {
         let va = va.raw();
-        let file = file.map(|(fd, offset, prot)| {
-            // SAFETY: the dispatcher transfers sole ownership of this dup.
-            (unsafe { OwnedFd::from_raw_fd(fd) }, offset, prot)
-        });
         // bhyve IGNORES the dispatcher's `ipa` (it bumps its own GPA in the single
         // sysmem segment, which is already kernel-backed and host-visible via
         // map_gpa). The alias content is COPIED into that backing RAM: an anon
@@ -1785,10 +1783,20 @@ impl X86Vmm for BhyveVmm {
         // not coherent across a COW fork. The vmmapi memseg model can't back a
         // guest segment with a host fd from userspace, so durable/shared-aperture
         // coherence on bhyve is a known follow-up. Enough for a guest that READS
-        // its initial aperture content (the common startup case).
-        let writable = match file.as_ref() {
-            Some((_, _, prot)) => *prot & libc::PROT_WRITE != 0,
-            None => true,
+        // its initial aperture content (the common startup case). A
+        // `HostAliasSharing::Private` file alias is the same copy: Linux's
+        // per-page COW tracking of later file writes is NOT reproduced here.
+        let writable = match &backing {
+            HostAliasBacking::File {
+                host_prot,
+                sharing: HostAliasSharing::Shared,
+                ..
+            } => *host_prot & libc::PROT_WRITE != 0,
+            HostAliasBacking::File {
+                sharing: HostAliasSharing::Private,
+                ..
+            }
+            | HostAliasBacking::Anonymous { .. } => true,
         };
         let gpa = self
             .ram
@@ -1798,8 +1806,9 @@ impl X86Vmm for BhyveVmm {
             TrapError::Hypervisor(format!("bhyve map_host_alias: map_gpa 0x{gpa:x} unmapped"))
         })?;
         let mut retained_file = None;
-        match file {
-            Some((fd, offset, _prot)) => {
+        match backing {
+            HostAliasBacking::File { fd, offset, .. } => {
+                let fd = fd.into_owned_fd();
                 let raw_fd = fd.as_raw_fd();
                 // The dispatcher's alias `len` is page-aligned to the alias-IPA
                 // arena granularity (`HVF_PAGE_SIZE` = 16 KiB), but the backing
@@ -1866,7 +1875,7 @@ impl X86Vmm for BhyveVmm {
                 // this owned fd before dropping the RAM lock.
                 retained_file = Some((fd, offset, file_size as usize, file_id));
             }
-            None => {
+            HostAliasBacking::Anonymous { .. } => {
                 let n = payload.len().min(len as usize);
                 // SAFETY: `host` is live sysmem of `len`; n ≤ len.
                 unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), host, n) };
@@ -2537,7 +2546,9 @@ mod tests {
                 Gpa(0),
                 initial.len() as u64,
                 &initial,
-                None,
+                HostAliasBacking::Anonymous {
+                    sharing: HostAliasSharing::Private,
+                },
             )
             .expect("install compact shared window");
         engine
@@ -2596,7 +2607,9 @@ mod tests {
                 Gpa(0),
                 (2 * GRANULE) as u64,
                 &shared_stale,
-                None,
+                HostAliasBacking::Anonymous {
+                    sharing: HostAliasSharing::Private,
+                },
             )
             .expect("install reusable compact shared window");
         let private_bytes = vec![0x99; 2 * GRANULE];

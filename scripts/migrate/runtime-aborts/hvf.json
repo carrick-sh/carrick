@@ -374,7 +374,7 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::add_alias_with_sharing",
+      "function": "HvfVmState::add_alias",
       "ordinal_in_function": 1,
       "fingerprint": "1fe4f5ebcf0c75234571929dedec61a234e3a88a14e6e412a779174dbba2292d",
       "verdict": "carrier_fault",
@@ -383,7 +383,7 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::add_alias_with_sharing",
+      "function": "HvfVmState::add_alias",
       "ordinal_in_function": 2,
       "fingerprint": "1fe4f5ebcf0c75234571929dedec61a234e3a88a14e6e412a779174dbba2292d",
       "verdict": "carrier_fault",
@@ -677,6 +677,15 @@
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Validated retirement reservation disappeared from inventory ledger during process mapping retirement, indicating concurrent state mutation or broken transaction atomicity."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::private_file_view_backing_identity",
+      "ordinal_in_function": 1,
+      "fingerprint": "e65087ecba6f9613f4dd390c4bcc053850db52a764a4d4f56b99ab55d6c1d9c5",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Counter overflow when generating private file-view backing identity serial causes backing ID collisions across MAP_PRIVATE file-view extents in the carrier."
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",

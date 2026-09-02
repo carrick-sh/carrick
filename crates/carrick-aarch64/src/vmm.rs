@@ -22,8 +22,8 @@ use carrick_guest_mem::protections::MemoryProtections;
 use carrick_guest_mem::{Aarch64SyscallFrame, Gpa, MemoryError, SharedFutexLocation};
 use carrick_hal::threaded::Aarch64TaskCpuStateV1;
 use carrick_hal::{
-    GuestEntryRegs, GuestVmBackend, MemPerms, ProcessForkRequest, Reg, SlotId, SysReg, TrapError,
-    VcpuKick, VcpuRegistry,
+    GuestEntryRegs, GuestVmBackend, HostAliasBacking, MemPerms, ProcessForkRequest, Reg, SlotId,
+    SysReg, TrapError, VcpuKick, VcpuRegistry,
 };
 use carrick_mem::memory::AddressSpace;
 use carrick_mem::page_table::PageTableManager;
@@ -310,6 +310,23 @@ pub struct ForkCowRange {
     /// ordinary user AP bits makes PSTATE.PAN reject the EL1 syscall vector's
     /// mailbox stores.
     pub kernel_only: bool,
+    /// How much of the armed range one write fault privatizes.
+    pub granule: CowGranule,
+}
+
+/// How much of a host compound one stage-1 permission fault privatizes.
+///
+/// Fork arms a whole private anonymous frame: every 4 KiB page of a 16 KiB
+/// host compound is the same private backing, so privatizing the compound at
+/// once is exact. A `MAP_PRIVATE` file view is different: Linux tracks later
+/// `write(2)`s per clean 4 KiB page, so dirtying one page must leave its
+/// clean siblings on the page-cache view.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CowGranule {
+    /// One 16 KiB host compound.
+    Compound,
+    /// One 4 KiB Linux page.
+    Page,
 }
 
 /// Why Carrick is about to modify a fork-COW-backed byte.
@@ -424,6 +441,24 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         _flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
     ) -> Result<(), TrapError> {
         Ok(())
+    }
+
+    /// Materialize a committed sparse mmap range as a `MAP_PRIVATE` file
+    /// mapping whose clean pages read the file's live page cache (Linux:
+    /// a later `write(2)` is visible through a never-written private page)
+    /// and whose first guest store privatizes exactly one 4 KiB page.
+    /// `Ok(false)` means the backend cannot take the lowering for this range
+    /// and the caller MUST fall back to the eager snapshot; the default is
+    /// every backend without page-granular frame COW.
+    fn materialize_private_file_backing(
+        &mut self,
+        _va: u64,
+        _len: usize,
+        _fd: std::os::fd::BorrowedFd<'_>,
+        _offset: u64,
+        _flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+    ) -> Result<bool, TrapError> {
+        Ok(false)
     }
 
     /// Bind the one stage-1 editor shared by the neutral engine and backend
@@ -714,36 +749,23 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         None
     }
 
-    /// Back a dynamic high-VA mmap (`DispatchOutcome::MapHostAlias`): mmap the host
-    /// file/anon backing and register a fresh stage-2 alias slot, returning the
-    /// `(gpa, writable)` the engine then threads into the SHARED stage-1
-    /// `map_aliased` edit. KVM derives the alias GPA from the VA inside its <1 TiB
-    /// arena; HVF maps at a low alias IPA. The STAGE-1 path stays in the engine.
-    /// `file` transfers ownership of a dup: every backend must close it on every
-    /// return/unwind path. Until a returned error certifies zero mutation, the
-    /// generic runtime fail-stops rather than resuming the guest after cleanup.
+    /// Back a dynamic mmap (`DispatchOutcome::MapHostAlias`): mmap the host
+    /// file/anon backing described by `backing` and register a fresh stage-2
+    /// alias slot, returning the `(gpa, writable)` the engine then threads into
+    /// the SHARED stage-1 `map_aliased` edit. KVM derives the alias GPA from the
+    /// VA inside its <1 TiB arena; HVF maps at a low alias IPA. The STAGE-1 path
+    /// stays in the engine. A file backing transfers ownership of a dup: every
+    /// backend closes it (by dropping it) on every return/unwind path. Until a
+    /// returned error certifies zero mutation, the generic runtime fail-stops
+    /// rather than resuming the guest after cleanup.
     fn add_alias(
         &mut self,
         va: u64,
         ipa: u64,
         len: u64,
         payload: &[u8],
-        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
+        backing: HostAliasBacking,
     ) -> Result<(u64, bool), TrapError>;
-
-    /// Install an alias using the dispatcher-provided anonymous sharing mode.
-    /// Backends without a host-fork distinction preserve their existing path.
-    fn add_alias_with_sharing(
-        &mut self,
-        va: u64,
-        ipa: u64,
-        len: u64,
-        payload: &[u8],
-        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
-        _shared: bool,
-    ) -> Result<(u64, bool), TrapError> {
-        self.add_alias(va, ipa, len, payload, file)
-    }
 
     /// Called by the engine's `unmap_range`/`unmap_alias_range` only AFTER the
     /// checked stage-1 edit and TLBI complete, so an edit failure leaves a

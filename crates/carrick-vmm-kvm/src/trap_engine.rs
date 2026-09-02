@@ -43,7 +43,7 @@ mod execve_tests {
     //! via its public API (accessors + the `*_for_test` setters) rather than the
     //! private fields the old hand-rolled engine exposed.
     use carrick_aarch64::Aarch64Vcpu;
-    use carrick_hal::{Reg, RegAccess, SyscallTrap};
+    use carrick_hal::{HostAliasBacking, HostAliasSharing, Reg, RegAccess, SyscallTrap};
     use carrick_mem::memory::{AddressSpace, LINUX_EL1_VECTORS_BASE, LINUX_PAGE_TABLES_BASE};
 
     use super::*;
@@ -428,7 +428,15 @@ mod execve_tests {
         let va = LINUX_HIGH_VA_THRESHOLD + 0x20_0000;
         let payload = b"carrick alias payload".to_vec();
         engine
-            .map_host_alias(GuestVa(va), Gpa(0), 0x1000, &payload, None)
+            .map_host_alias(
+                GuestVa(va),
+                Gpa(0),
+                0x1000,
+                &payload,
+                HostAliasBacking::Anonymous {
+                    sharing: HostAliasSharing::Private,
+                },
+            )
             .expect("map_host_alias anon");
         let got = engine.read_bytes(va, payload.len()).expect("read alias VA");
         assert_eq!(
@@ -437,8 +445,8 @@ mod execve_tests {
         );
     }
 
-    /// `map_host_alias` with `file=Some(..)` maps a host fd MAP_SHARED; the alias
-    /// VA reads back the file's bytes (the MAP_SHARED-file coherence path).
+    /// `map_host_alias` with a shared file backing maps a host fd MAP_SHARED; the
+    /// alias VA reads back the file's bytes (the MAP_SHARED-file coherence path).
     #[test]
     fn kvm_map_host_alias_file_roundtrips() {
         use carrick_guest_mem::{Gpa, GuestMemory, GuestVa};
@@ -465,7 +473,16 @@ mod execve_tests {
                 Gpa(0),
                 0x1000,
                 &[],
-                Some((dup, 0, libc::PROT_READ | libc::PROT_WRITE)),
+                HostAliasBacking::File {
+                    // SAFETY: `dup` is a fresh descriptor owned by this test and
+                    // handed to the engine exactly once.
+                    fd: carrick_hal::HostAliasOwnedFd::new(unsafe {
+                        std::os::fd::OwnedFd::from_raw_fd(dup)
+                    }),
+                    offset: 0,
+                    host_prot: libc::PROT_READ | libc::PROT_WRITE,
+                    sharing: HostAliasSharing::Shared,
+                },
             )
             .expect("map_host_alias file");
         let got = engine
@@ -491,7 +508,15 @@ mod execve_tests {
         let mut engine = engine_for(INITIAL_ELF);
         // 1 TiB + ~6.4 TiB: well past the 64 GiB arena.
         let va = LINUX_HIGH_VA_THRESHOLD + 0x10_0000_0000u64 * 100;
-        let r = engine.map_host_alias(GuestVa(va), Gpa(0), 0x1000, &[1, 2, 3], None);
+        let r = engine.map_host_alias(
+            GuestVa(va),
+            Gpa(0),
+            0x1000,
+            &[1, 2, 3],
+            HostAliasBacking::Anonymous {
+                sharing: HostAliasSharing::Private,
+            },
+        );
         assert!(
             r.is_err(),
             "a VA outside the alias arena must be rejected, not corrupt memory"

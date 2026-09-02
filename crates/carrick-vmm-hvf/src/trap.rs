@@ -164,7 +164,7 @@ use carrick_aarch64::Aarch64VcpuSnapshot;
 use carrick_guest_mem::MemoryError;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 
 mod sysreg;
 use sysreg::*;
@@ -199,6 +199,7 @@ pub use carrick_hal::aarch64::{
     is_aarch64_hvc_exception, is_aarch64_hvc_fault, is_aarch64_hvc_maintenance,
     is_aarch64_svc_exception, is_aarch64_syscall_exception,
 };
+use carrick_hal::trap::{HostAliasBacking, HostAliasSharing};
 pub use carrick_hal::trap::{RawSyscall, SyscallTrap, TrapError};
 
 pub const HVF_PAGE_SIZE: u64 = 0x4000;
@@ -881,6 +882,7 @@ mod foreign_mm_tests {
                 len: data_key.1 as usize,
                 executable: false,
                 kernel_only: false,
+                granule: carrick_aarch64::vmm::CowGranule::Compound,
             }]);
         let authority = Arc::new(TestForeignCowAuthority::new(installed));
         installed.state.bind_cow_runtime(MmCowRuntimeBinding {
@@ -1403,6 +1405,7 @@ mod foreign_mm_tests {
                 len: 0x1000,
                 executable: false,
                 kernel_only: false,
+                granule: carrick_aarch64::vmm::CowGranule::Compound,
             }]);
         let authority = Arc::new(TestForeignCowAuthority::new(&child));
         child.state.bind_cow_runtime(MmCowRuntimeBinding {
@@ -3487,6 +3490,7 @@ mod foreign_mm_tests {
             len: vvar_len as usize,
             executable: false,
             kernel_only: false,
+            granule: carrick_aarch64::vmm::CowGranule::Compound,
         }];
         let generation_address = vvar_ipa + crate::vdso::VVAR_OFF_RNG_GENERATION as u64;
         let parent_generation_ptr = vvar_owner
@@ -5193,6 +5197,7 @@ mod foreign_mm_tests {
             len: 0x4000,
             executable: false,
             kernel_only: false,
+            granule: carrick_aarch64::vmm::CowGranule::Compound,
         }];
 
         let mut plan = parent_task
@@ -14642,11 +14647,36 @@ enum InventoryBackingIdentity {
     /// never looked up globally or deduplicated across independently-created
     /// mappings.
     SharedAnon(u64),
+    /// One `MAP_PRIVATE` file mapping whose clean pages are a read-only host
+    /// `MAP_SHARED` view of the file's page cache, so later `write(2)`s reach
+    /// the guest until a page is dirtied. The host bytes are NOT private: a
+    /// maintenance write must materialize a private replacement rather than
+    /// write through the view, and every guest page starts fork-COW armed at
+    /// 4 KiB granularity. Like `SharedAnon` it is never deduplicated.
+    PrivateFileView(u64),
     SharedFile {
         device: u64,
         inode: u64,
         offset: u64,
         length: u64,
+    },
+}
+
+/// What backs a freshly materialized sparse-arena extent.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy)]
+enum SparseExtentBacking<'a> {
+    /// Fresh zero-filled private anonymous frames.
+    Anon,
+    /// A `MAP_PRIVATE` file mapping. The first `view_len` bytes of the extent
+    /// are a read-only host `MAP_SHARED` view of `fd` starting at file
+    /// `offset` (Linux's clean-page semantics: later `write(2)`s stay
+    /// visible until the page is dirtied); any remainder is zero-filled anon
+    /// and sits beyond EOF, where the dispatcher publishes BUS faults.
+    FileView {
+        fd: std::os::fd::BorrowedFd<'a>,
+        offset: u64,
+        view_len: u64,
     },
 }
 
@@ -14886,6 +14916,7 @@ struct CowArmedRanges {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl CowArmedRanges {
     const COMPOUND_SIZE: u64 = 16 * 1024;
+    const PAGE_SIZE: u64 = 4 * 1024;
 
     fn arm(&mut self, ranges: &[carrick_aarch64::vmm::ForkCowRange]) {
         self.ranges.extend_from_slice(ranges);
@@ -14902,8 +14933,6 @@ impl CowArmedRanges {
     }
 
     fn span_for(&self, va: u64) -> Option<CowArmedSpan> {
-        let compound_start = va & !(Self::COMPOUND_SIZE - 1);
-        let compound_end = compound_start.checked_add(Self::COMPOUND_SIZE)?;
         // A boot arena row can remain as a broad structural mapping while
         // exact post-COW/post-unmap alias fragments overlap it. The live
         // stage-1 leaf belongs to the most-specific fragment: greatest start,
@@ -14923,16 +14952,44 @@ impl CowArmedRanges {
                 left.va
                     .cmp(&right.va)
                     .then_with(|| right.len.cmp(&left.len))
+                    // A page-granular arm (private file view) over the same
+                    // range as a fork's compound arm must win: privatizing one
+                    // 4 KiB page keeps its clean siblings on the page-cache
+                    // view AND still armed for the fork peer, which is exact
+                    // for both; privatizing the compound stops the siblings
+                    // tracking the file.
+                    .then_with(|| {
+                        let page = |range: &carrick_aarch64::vmm::ForkCowRange| {
+                            range.granule == carrick_aarch64::vmm::CowGranule::Page
+                        };
+                        page(left).cmp(&page(right))
+                    })
             })?;
         let range_end = range.va.checked_add(range.len as u64)?;
-        let start = range.va.max(compound_start);
-        let end = range_end.min(compound_end);
+        let granule = match range.granule {
+            carrick_aarch64::vmm::CowGranule::Compound => Self::COMPOUND_SIZE,
+            carrick_aarch64::vmm::CowGranule::Page => Self::PAGE_SIZE,
+        };
+        let granule_start = va & !(granule - 1);
+        let granule_end = granule_start.checked_add(granule)?;
+        let start = range.va.max(granule_start);
+        let end = range_end.min(granule_end);
         Some(CowArmedSpan {
             va: start,
             len: usize::try_from(end.checked_sub(start)?).ok()?,
             executable: range.executable,
             kernel_only: range.kernel_only,
         })
+    }
+
+    /// The lowest armed range start strictly above `va`, so an unarmed write
+    /// can advance to exactly where the next armed page begins.
+    fn next_armed_start_after(&self, va: u64) -> Option<u64> {
+        self.ranges
+            .iter()
+            .map(|range| range.va)
+            .filter(|start| *start > va)
+            .min()
     }
 
     fn disarm(&mut self, span: CowArmedSpan) {
@@ -14950,6 +15007,7 @@ impl CowArmedRanges {
                     len: usize::try_from(span.va - range.va).unwrap_or_default(),
                     executable: range.executable,
                     kernel_only: range.kernel_only,
+                    granule: range.granule,
                 });
             }
             if range_end > span_end {
@@ -14958,6 +15016,7 @@ impl CowArmedRanges {
                     len: usize::try_from(range_end - span_end).unwrap_or_default(),
                     executable: range.executable,
                     kernel_only: range.kernel_only,
+                    granule: range.granule,
                 });
             }
         }
@@ -14977,6 +15036,7 @@ impl CowArmedRanges {
                     len: usize::try_from(overlap_end - start).unwrap_or_default(),
                     executable: range.executable,
                     kernel_only: range.kernel_only,
+                    granule: range.granule,
                 })
             })
             .collect()
@@ -21208,6 +21268,7 @@ pub mod foreign_cow_test_support {
                     len: shape.data_len as usize,
                     executable: false,
                     kernel_only: false,
+                    granule: carrick_aarch64::vmm::CowGranule::Compound,
                 }]);
             state.bind_cow_runtime(MmCowRuntimeBinding {
                 authority,
@@ -22947,20 +23008,35 @@ fn next_frame_cow_write_probe(
     intent: carrick_aarch64::vmm::FrameCowWriteIntent,
     current: u64,
     end: u64,
+    armed_span_end: Option<u64>,
+    next_armed_start: Option<u64>,
 ) -> u64 {
     // A 16 KiB physical frame may carry four independently mapped Linux 4 KiB
     // pages. Backing maintenance runs while reused leaves are invalid, and
     // those four outputs can therefore name a mixture of live, shared, and
-    // retired owners. Classify each Linux page. Guest-visible writes retain the
-    // compound step because one armed COW transaction resolves that whole span.
-    let granule = if intent == carrick_aarch64::vmm::FrameCowWriteIntent::BackingMaintenance {
-        0x1000
-    } else {
-        CowArmedRanges::COMPOUND_SIZE
+    // retired owners. Classify each Linux page.
+    if intent == carrick_aarch64::vmm::FrameCowWriteIntent::BackingMaintenance {
+        return align_down(current, 0x1000).saturating_add(0x1000).min(end);
+    }
+    // A guest-visible write advances by exactly what the armed COW
+    // transaction resolved: the span itself (one 16 KiB compound for a fork
+    // arm, one 4 KiB page for a private file view whose clean siblings must
+    // keep tracking the file). An unarmed page advances to the end of its
+    // compound, but never past the next armed range: a page privatized out
+    // of a compound leaves its siblings armed, and stepping over them would
+    // write straight into a shared frame or a read-only page-cache view.
+    let next = match armed_span_end {
+        Some(span_end) if span_end > current => span_end,
+        _ => {
+            let compound_end = align_down(current, CowArmedRanges::COMPOUND_SIZE)
+                .saturating_add(CowArmedRanges::COMPOUND_SIZE);
+            match next_armed_start {
+                Some(start) if start > current => compound_end.min(start),
+                _ => compound_end,
+            }
+        }
     };
-    align_down(current, granule)
-        .saturating_add(granule)
-        .min(end)
+    next.max(current.saturating_add(1)).min(end)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -28434,6 +28510,16 @@ impl HvfVmState {
         InventoryBackingIdentity::Private(serial)
     }
 
+    fn private_file_view_backing_identity() -> InventoryBackingIdentity {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if serial == 0 {
+            eprintln!("carrick: FATAL: HVPatch private file-view backing identity exhausted");
+            std::process::abort();
+        }
+        InventoryBackingIdentity::PrivateFileView(serial)
+    }
+
     fn shared_anon_backing_identity() -> InventoryBackingIdentity {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -30592,6 +30678,7 @@ impl HvfVmState {
                     mapping.start,
                     semantic_extent_size(mapping.start, mapping.end),
                 ),
+                granule: carrick_aarch64::vmm::CowGranule::Compound,
             })
             .collect();
         let local_aliases = current_process_alias_keys(
@@ -30617,6 +30704,7 @@ impl HvfVmState {
                 len: mapping.size,
                 executable: mapping.perms & 4 != 0,
                 kernel_only: is_kernel_only_stage1_range(mapping.start, mapping.size),
+                granule: carrick_aarch64::vmm::CowGranule::Compound,
             }),
         );
         ranges.sort_by_key(|range| (range.va, range.len));
@@ -30825,8 +30913,17 @@ impl HvfVmState {
         // Barrier hung when a shared semaphore page was privatized here).
         // Only a PRIVATE backing observed by more than one mm is fork-COW
         // sharing that a maintenance write must not write through.
-        if !matches!(extent.backing, InventoryBackingIdentity::Private(_)) {
-            return false;
+        //
+        // A private FILE VIEW never carries an exclusive claim: its host
+        // bytes are the file's page cache, so a direct maintenance write
+        // would either fail (the view is `PROT_READ`) or, worse, be the file.
+        // The maintenance write must materialize the page privately, exactly
+        // like a guest write to a clean page.
+        match extent.backing {
+            InventoryBackingIdentity::PrivateFileView(_) => return true,
+            InventoryBackingIdentity::Private(_) => {}
+            InventoryBackingIdentity::SharedAnon(_)
+            | InventoryBackingIdentity::SharedFile { .. } => return false,
         }
         inventory
             .frames
@@ -30903,15 +31000,141 @@ impl HvfVmState {
                 .chain(next_alias)
                 .min()
                 .unwrap_or(end);
-            current = self.materialize_sparse_mmap_extent(current, hole_end, flush_stage1)?;
+            current = self.materialize_sparse_mmap_extent(
+                current,
+                hole_end,
+                SparseExtentBacking::Anon,
+                flush_stage1,
+            )?;
         }
         Ok(())
+    }
+
+    /// Materialize a `MAP_PRIVATE` file mapping in the sparse arena with
+    /// Linux's clean-page semantics: every page starts as a read-only view of
+    /// the file's page cache and stays fork-COW armed at 4 KiB granularity, so
+    /// a later `write(2)` to the file is visible through every page the guest
+    /// has not yet dirtied, while the first guest write to a page privatizes
+    /// exactly that page (`mmapprivatefiletrack`).
+    ///
+    /// Darwin's own `MAP_PRIVATE` cannot express this — it is a snapshot at
+    /// map time (`overlay_shared_file_view_tracks_later_file_writes` is the
+    /// receipt) — so the view is a host `MAP_SHARED|PROT_READ` overlay and the
+    /// copy-on-write is Carrick's frame COW.
+    ///
+    /// Returns `Ok(false)` when the request cannot take this shape and the
+    /// dispatcher must fall back to its eager snapshot: outside the sparse
+    /// arena, a VA/offset pair that is not congruent modulo the 16 KiB host
+    /// page (the view must land on whole host pages and a fork-COW compound
+    /// must not straddle two physical compounds), an offset at/after EOF, or
+    /// a range that is not entirely a hole (`MAP_FIXED` over live pages).
+    pub(crate) fn materialize_private_file_backing(
+        &mut self,
+        va: u64,
+        len: usize,
+        fd: std::os::fd::BorrowedFd<'_>,
+        offset: u64,
+        flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+    ) -> Result<bool, TrapError> {
+        const PAGE_SIZE: u64 = 4 * 1024;
+        if !self.persistent_vm_lifecycle || len == 0 {
+            return Ok(false);
+        }
+        let arena_start = crate::memory::LINUX_MMAP_BASE;
+        let arena_end = arena_start
+            .checked_add(crate::memory::mmap_arena_size())
+            .ok_or_else(|| TrapError::Hypervisor("HVPatch mmap arena overflow".to_owned()))?;
+        let end = va
+            .checked_add(len as u64)
+            .ok_or_else(|| TrapError::Hypervisor("private file view range overflow".to_owned()))?;
+        if va < arena_start
+            || end > arena_end
+            || !va.is_multiple_of(PAGE_SIZE)
+            || !end.is_multiple_of(PAGE_SIZE)
+            || !offset.is_multiple_of(PAGE_SIZE)
+            || va & (HVF_PAGE_SIZE - 1) != offset & (HVF_PAGE_SIZE - 1)
+        {
+            return Ok(false);
+        }
+        let file_len = {
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: `fstat` writes a `libc::stat` into the provided buffer.
+            let rc = unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) };
+            if rc != 0 {
+                return Ok(false);
+            }
+            // SAFETY: `fstat` succeeded and initialized the buffer.
+            let stat = unsafe { stat.assume_init() };
+            u64::try_from(stat.st_size).unwrap_or(0)
+        };
+        if offset >= file_len {
+            return Ok(false);
+        }
+        let view_len = (file_len - offset).min(end - va);
+        let view_end = va + view_len;
+
+        // The whole range must be a hole: a live mapping or a live
+        // process-scoped alias anywhere inside it means `MAP_FIXED` over
+        // occupied pages, which the eager path replaces byte-wise in place.
+        let mut page = va;
+        while page < end {
+            if self.mapping_for_range(page, 1).is_some() {
+                return Ok(false);
+            }
+            page = page.saturating_add(PAGE_SIZE);
+        }
+        let alias_overlaps = alias_registry().lock().iter().any(|alias| {
+            alias_matches_process_scope(
+                alias.ownership_scope,
+                self.mm_root_slot,
+                self.container_root,
+            ) && alias.start < end
+                && alias.start.saturating_add(alias.size as u64) > va
+                && alias_backing_is_live(alias.physical_host_addr)
+        });
+        if alias_overlaps {
+            return Ok(false);
+        }
+
+        let mut current = va;
+        while current < end {
+            if self.mapping_for_range(current, 1).is_some() {
+                // The hole check above ran outside the topology lock; a
+                // mapping appearing here means a sibling publication raced
+                // this mmap. Fail closed: the dispatcher's snapshot fallback
+                // rewrites the bytes and the extents already materialized
+                // privatize on that write.
+                return Err(TrapError::Hypervisor(format!(
+                    "private file view at VA 0x{current:x} overlapped a mapping published mid-materialization"
+                )));
+            }
+            let hole_end = if current < view_end { view_end } else { end };
+            let backing = if current < view_end {
+                SparseExtentBacking::FileView {
+                    fd,
+                    offset: offset + (current - va),
+                    view_len: view_end - current,
+                }
+            } else {
+                SparseExtentBacking::Anon
+            };
+            let next =
+                self.materialize_sparse_mmap_extent(current, hole_end, backing, flush_stage1)?;
+            if next <= current {
+                return Err(TrapError::Hypervisor(format!(
+                    "private file view materialization made no progress at VA 0x{current:x}"
+                )));
+            }
+            current = next;
+        }
+        Ok(true)
     }
 
     fn materialize_sparse_mmap_extent(
         &mut self,
         start: u64,
         end: u64,
+        backing: SparseExtentBacking<'_>,
         flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
     ) -> Result<u64, TrapError> {
         const PAGE_SIZE: u64 = 4 * 1024;
@@ -31052,12 +31275,69 @@ impl HvfVmState {
         })?;
         let physical_host = host_mapping.as_ptr();
         let semantic_host = unsafe { physical_host.add(physical_offset as usize) };
+        // A file view replaces whole 16 KiB host pages of the anonymous
+        // backing with a read-only page-cache view BEFORE stage-2 sees the
+        // range: the physical host bytes under a live `hv_vm_map` are never
+        // remapped. Congruence (`start ≡ offset mod 16 KiB`, enforced by the
+        // driver) makes the host page containing `start` the host page
+        // containing the file page at `offset`.
+        let (stage2_perms, inventory_backing, page_granular_arm) = match backing {
+            SparseExtentBacking::Anon => (
+                applevisor::memory::MemPerms::ReadWriteExec,
+                Self::private_backing_identity(),
+                false,
+            ),
+            SparseExtentBacking::FileView {
+                fd,
+                offset,
+                view_len,
+            } => {
+                let delta = start & (HVF_PAGE_SIZE - 1);
+                if offset & (HVF_PAGE_SIZE - 1) != delta {
+                    return Err(TrapError::Hypervisor(format!(
+                        "private file view VA 0x{start:x} not congruent with offset 0x{offset:x}"
+                    )));
+                }
+                let host_at = physical_offset - delta;
+                let view_len = view_len.min(end - start);
+                let view_host_len =
+                    align_up(delta + view_len, HVF_PAGE_SIZE)?.min(physical_len - host_at);
+                let view_host_size = usize::try_from(view_host_len)
+                    .map_err(|_| TrapError::MappingTooLarge(view_host_len))?;
+                let file_offset = libc::off_t::try_from(offset - delta).map_err(|_| {
+                    TrapError::Hypervisor(format!("private file view offset 0x{offset:x} overflow"))
+                })?;
+                host_mapping
+                    .overlay_shared_file_view(
+                        usize::try_from(host_at)
+                            .map_err(|_| TrapError::MappingTooLarge(host_at))?,
+                        fd,
+                        file_offset,
+                        view_host_size,
+                    )
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!(
+                            "overlay private file view at VA 0x{start:x}: {error}"
+                        ))
+                    })?;
+                // The view is host `PROT_READ`; a stage-2 write permission
+                // would let a stray guest store fault the CARRIER instead of
+                // the guest. Guest stores never reach stage-2 anyway: every
+                // page is armed and the stage-1 leaf is read-only until the
+                // frame COW moves it to private backing. Host writes route
+                // through `ensure_frame_cow_write`, which sees the arm.
+                (
+                    applevisor::memory::MemPerms::ReadExec,
+                    Self::private_file_view_backing_identity(),
+                    true,
+                )
+            }
+        };
         let mut lease = GlobalFrameStage2Lease::reserve(physical_len, TWO_MIB)?;
         let physical_ipa = lease.base;
         let semantic_ipa = physical_ipa
             .checked_add(physical_offset)
             .ok_or_else(|| TrapError::Hypervisor("sparse mmap IPA overflow".to_owned()))?;
-        let stage2_perms = applevisor::memory::MemPerms::ReadWriteExec;
         let map_result = unsafe {
             inventory_hv_vm_map(
                 physical_host.cast(),
@@ -31093,10 +31373,10 @@ impl HvfVmState {
                     length: physical_len,
                     permissions: carrick_hal::MemPerms {
                         read: true,
-                        write: true,
+                        write: !page_granular_arm,
                         exec: true,
                     },
-                    backing: Self::private_backing_identity(),
+                    backing: inventory_backing,
                     inherited_frame: None,
                     stage2_lease: Some((physical_ipa, physical_len)),
                     stage2_owner: InventoryStage2OwnerIdentity {
@@ -31259,7 +31539,7 @@ impl HvfVmState {
             guest_writable: true,
             sharing,
             ownership_scope: alias_ownership_scope(sharing, self.mm_root_slot, self.container_root),
-            inventory_backing: Self::private_backing_identity(),
+            inventory_backing,
             shared_key_base: 0,
             shared_key_offset: 0,
             owner_generation,
@@ -31284,6 +31564,21 @@ impl HvfVmState {
             shared_key_offset: 0,
             owner_generation,
         });
+        if page_granular_arm {
+            // Every page of the view starts clean: the first guest (or host
+            // syscall) write to a page must move THAT page, and only that
+            // page, off the page-cache view. The anonymous beyond-EOF tail of
+            // this extent is armed the same way so the extent is uniform.
+            self.cow_armed
+                .lock()
+                .arm(&[carrick_aarch64::vmm::ForkCowRange {
+                    va: start,
+                    len: semantic_len,
+                    executable: false,
+                    kernel_only: false,
+                    granule: carrick_aarch64::vmm::CowGranule::Page,
+                }]);
+        }
         self.supersede_cow_receipts("sparse-mmap-extent", start, semantic_len as u64);
         self.cow_deferred_publications
             .lock()
@@ -32636,7 +32931,16 @@ impl HvfVmState {
         let mut current = start;
         let mut stalled: Option<(u64, u32)> = None;
         while current < end {
-            let armed = self.cow_armed.lock().span_for(current).is_some();
+            let (armed_span_end, next_armed_start) = {
+                let cow_armed = self.cow_armed.lock();
+                (
+                    cow_armed
+                        .span_for(current)
+                        .map(|span| span.va.saturating_add(span.len as u64)),
+                    cow_armed.next_armed_start_after(current),
+                )
+            };
+            let armed = armed_span_end.is_some();
             let (retained_output_has_no_physical_source, retained_output_source_is_shared) =
                 if intent == carrick_aarch64::vmm::FrameCowWriteIntent::BackingMaintenance
                     && self.persistent_vm_lifecycle
@@ -32791,7 +33095,8 @@ impl HvfVmState {
                 }
                 FrameCowWriteRoute::Direct => {}
             }
-            current = next_frame_cow_write_probe(intent, current, end);
+            current =
+                next_frame_cow_write_probe(intent, current, end, armed_span_end, next_armed_start);
         }
         Ok(())
     }
@@ -32854,6 +33159,26 @@ impl HvfVmState {
                 (AP_USER_RO, 6, false)
             };
 
+        // `protect_range` re-downgrades every armed span to read-only after
+        // granting PROT_WRITE (fork COW arms and the page-granular arms a
+        // lowered MAP_PRIVATE file view carries), so a page inside an armed
+        // range is authentic at `AP_USER_RO` even when the guest asked for
+        // write access. Snapshot the arms before taking the page-table lock:
+        // the two locks are never nested the other way round.
+        let armed = if expected_ap == AP_USER_RW {
+            self.cow_armed.lock().overlapping(va, len)
+        } else {
+            Vec::new()
+        };
+        let armed_covers = |page: u64| {
+            armed.iter().any(|range| {
+                range
+                    .va
+                    .checked_add(range.len as u64)
+                    .is_some_and(|range_end| page >= range.va && page < range_end)
+            })
+        };
+
         let page_tables_authority = self.page_tables_authority();
         let page_tables = page_tables_authority.lock();
         let manager = page_tables.as_ref().ok_or_else(|| {
@@ -32889,6 +33214,11 @@ impl HvfVmState {
                     manager.translate(page)
                 } else {
                     manager.translate_retained_output(page)
+                };
+                let expected_ap = if armed_covers(page) {
+                    AP_USER_RO
+                } else {
+                    expected_ap
                 };
                 if shadow != live
                     || translated != Some(expected_ipa)
@@ -33196,50 +33526,52 @@ impl HvfVmState {
         rc == 0
     }
 
-    /// Back a dynamic high-VA `mmap` (`DispatchOutcome::MapHostAlias`): allocate
-    /// the low alias IPA, `hv_vm_map` the host file/anon backing there, register
-    /// the alias process-globally, and add the per-thread region — returning the
+    /// Back a dynamic `mmap` (`DispatchOutcome::MapHostAlias`) with host
+    /// memory: `hv_vm_map` the host backing at the alias IPA, register the
+    /// alias process-globally, and add the per-thread region — returning the
     /// `(gpa = ipa, writable)` the engine then threads into the SHARED stage-1
     /// `map_aliased`. RWX so a JIT (Rosetta) can write+execute it; the guest may
     /// `mprotect` afterwards.
     ///
-    /// Mirrors the old `map_host_alias`, with the IPA derived HERE (the dispatcher
-    /// no longer supplies it through the shared `map_host_alias` seam): the same
-    /// `crate::memory::alloc_alias_ipa` the dispatcher used.
+    /// `backing` selects the host object, and the sharing it carries is the
+    /// VMA's own: a deferred `mprotect` commit must preserve MAP_SHARED across
+    /// host fork rather than silently substituting private COW backing. A
+    /// `MAP_PRIVATE` file backing is refused outright: a Darwin `MAP_PRIVATE`
+    /// file view is a map-time snapshot, so it cannot honour the Linux clause
+    /// that clean private pages track later writes (`mmapprivatefiletrack`);
+    /// that shape is served only by the sparse-arena page-cache view plus
+    /// carrick-owned page COW (`materialize_private_file_backing`).
     pub(crate) fn add_alias(
         &mut self,
         va: u64,
         ipa: u64,
         len: u64,
         payload: &[u8],
-        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
+        backing: HostAliasBacking,
     ) -> Result<(u64, bool), TrapError> {
-        self.add_alias_with_sharing(va, ipa, len, payload, file, false)
-    }
-
-    /// Back a high-VA alias with the anonymous sharing mode carried by the
-    /// original VMA. A deferred `mprotect` commit must preserve MAP_SHARED
-    /// across host fork rather than silently substituting private COW backing.
-    pub(crate) fn add_alias_with_sharing(
-        &mut self,
-        va: u64,
-        ipa: u64,
-        len: u64,
-        payload: &[u8],
-        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
-        shared: bool,
-    ) -> Result<(u64, bool), TrapError> {
-        let file = file.map(|(fd, offset, prot)| {
-            // SAFETY: dispatcher-to-backend alias setup transfers this dup.
-            (unsafe { OwnedFd::from_raw_fd(fd) }, offset, prot)
-        });
-        let sharing = match (file.as_ref(), shared) {
-            (Some(_), _) => GuestMappingSharing::GlobalShared,
-            (None, true) => GuestMappingSharing::ForkSharedAnonymous,
-            (None, false) => GuestMappingSharing::Private,
+        let sharing = match &backing {
+            HostAliasBacking::File {
+                sharing: HostAliasSharing::Shared,
+                ..
+            } => GuestMappingSharing::GlobalShared,
+            HostAliasBacking::Anonymous {
+                sharing: HostAliasSharing::Shared,
+            } => GuestMappingSharing::ForkSharedAnonymous,
+            HostAliasBacking::File {
+                sharing: HostAliasSharing::Private,
+                ..
+            }
+            | HostAliasBacking::Anonymous {
+                sharing: HostAliasSharing::Private,
+            } => GuestMappingSharing::Private,
         };
-        let inventory_backing = match file.as_ref() {
-            Some((fd, offset, _)) => {
+        let inventory_backing = match &backing {
+            HostAliasBacking::File {
+                fd,
+                offset,
+                sharing: HostAliasSharing::Shared,
+                ..
+            } => {
                 let mut stat: libc::stat = unsafe { std::mem::zeroed() };
                 if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } != 0 {
                     return Err(TrapError::Hypervisor(format!(
@@ -33259,10 +33591,18 @@ impl HvfVmState {
                     length: len,
                 }
             }
-            None if sharing == GuestMappingSharing::ForkSharedAnonymous => {
-                Self::shared_anon_backing_identity()
+            HostAliasBacking::Anonymous {
+                sharing: HostAliasSharing::Shared,
+            } => Self::shared_anon_backing_identity(),
+            // A private file mapping is a private frame: its host object is a
+            // per-mapping COW view of the file, never shared with another alias.
+            HostAliasBacking::File {
+                sharing: HostAliasSharing::Private,
+                ..
             }
-            None => Self::private_backing_identity(),
+            | HostAliasBacking::Anonymous {
+                sharing: HostAliasSharing::Private,
+            } => Self::private_backing_identity(),
         };
         // Mature VMM/root uses the IPA the dispatcher allocated from the global
         // alias arena. An in-process hvpatch mm relocates non-global aliases into
@@ -33283,57 +33623,107 @@ impl HvfVmState {
             guest_start: va,
             mapped_size: len,
         })?;
-        // The host page is mapped at the guest's actual prot (map_shared_file),
-        // so a PROT_READ file alias has a read-only host backing. Track the
-        // guest-intended writability so the syscall write-path returns EFAULT
-        // instead of SIGBUS-ing the host. Anon aliases are RW-backed.
-        let alias_guest_writable = match file.as_ref() {
-            Some((_, _, prot)) => *prot & libc::PROT_WRITE != 0,
-            None => true,
+        // A shared file's host page is mapped at the guest's actual prot
+        // (map_shared_file), so a PROT_READ file alias has a read-only host
+        // backing. Track the guest-intended writability so the syscall
+        // write-path returns EFAULT instead of SIGBUS-ing the host. Anon and
+        // private-file aliases are RW-backed (a private file view is a COW
+        // copy, so host PROT_WRITE never reaches the file).
+        let alias_guest_writable = match &backing {
+            HostAliasBacking::File {
+                host_prot,
+                sharing: HostAliasSharing::Shared,
+                ..
+            } => *host_prot & libc::PROT_WRITE != 0,
+            HostAliasBacking::File {
+                sharing: HostAliasSharing::Private,
+                ..
+            }
+            | HostAliasBacking::Anonymous { .. } => true,
         };
-        let (shared_key_base, shared_key_offset) = match file.as_ref() {
-            Some((fd, offset, _)) => (
+        let (shared_key_base, shared_key_offset) = match &backing {
+            HostAliasBacking::File {
+                fd,
+                offset,
+                sharing: HostAliasSharing::Shared,
+                ..
+            } => (
                 shared_file_key_base(fd.as_raw_fd()),
                 u64::try_from(*offset).unwrap_or_default(),
             ),
-            None => (0, 0),
+            HostAliasBacking::File {
+                sharing: HostAliasSharing::Private,
+                ..
+            }
+            | HostAliasBacking::Anonymous { .. } => (0, 0),
         };
-        let host_mapping = match file.as_ref() {
+        let host_mapping = match &backing {
             // Live MAP_SHARED file: back the guest region with the file's page
             // cache directly, so writes are coherent with other openers and
             // survive fork. The dispatcher handed us a dup'd fd it owns; mmap
-            // takes its own reference, so close the dup once mapped.
-            Some((fd, offset, prot)) => crate::host_mapping::OwnedHostMapping::map_shared_file(
+            // takes its own reference, so the dup closes with `backing`.
+            HostAliasBacking::File {
+                fd,
+                offset,
+                host_prot,
+                sharing: HostAliasSharing::Shared,
+            } => crate::host_mapping::OwnedHostMapping::map_shared_file(
                 fd.as_raw_fd(),
                 *offset,
                 requested_physical_size,
-                *prot,
+                *host_prot,
             )
             .map_err(|e| {
                 TrapError::Hypervisor(format!(
-                    "alias MAP_SHARED file (fd={} off={offset} size={requested_physical_size} prot={prot}) failed: {e}",
+                    "alias MAP_SHARED file (fd={} off={offset} size={requested_physical_size} prot={host_prot}) failed: {e}",
                     fd.as_raw_fd()
                 ))
             })?,
-            None => crate::host_mapping::OwnedHostMapping::map_shared_anon(
-                requested_physical_size,
-                if sharing.shares_across_fork() {
-                    crate::host_mapping::HostMappingKind::SharedAnon
-                } else {
-                    crate::host_mapping::HostMappingKind::PrivateAnon
-                },
-            )
-            .map_err(|e| {
-                TrapError::Hypervisor(format!(
-                    "alias mmap (size={requested_physical_size}) failed: {e}"
-                ))
-            })?,
+            // MAP_PRIVATE file: refuse. A Darwin `MAP_PRIVATE` file view is a
+            // snapshot of the file at mmap time (measured by
+            // `overlay_shared_file_view_tracks_later_file_writes`), so it
+            // cannot give Linux's clean-page-tracks-`write(2)` semantics; the
+            // contract says a backend that cannot honour `Private` for a file
+            // MUST refuse rather than silently map a snapshot. Arena-resident
+            // MAP_PRIVATE file mappings take the page-granular
+            // `materialize_private_file_backing` lane instead; no dispatcher
+            // site produces this shape for a high-VA alias.
+            HostAliasBacking::File {
+                fd,
+                offset,
+                sharing: HostAliasSharing::Private,
+                ..
+            } => {
+                return Err(TrapError::Hypervisor(format!(
+                    "alias MAP_PRIVATE file (fd={} off={offset} size={requested_physical_size}) unsupported: a Darwin MAP_PRIVATE file view is a snapshot",
+                    fd.as_raw_fd()
+                )));
+            }
+            HostAliasBacking::Anonymous { .. } => {
+                crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                    requested_physical_size,
+                    if sharing.shares_across_fork() {
+                        crate::host_mapping::HostMappingKind::SharedAnon
+                    } else {
+                        crate::host_mapping::HostMappingKind::PrivateAnon
+                    },
+                )
+                .map_err(|e| {
+                    TrapError::Hypervisor(format!(
+                        "alias mmap (size={requested_physical_size}) failed: {e}"
+                    ))
+                })?
+            }
         };
+        // The host mapping holds its own reference to the file; the
+        // dispatcher's dup is closed here, on every path below, by drop.
+        let seed_payload = !backing.is_file();
+        drop(backing);
         let host = host_mapping.as_ptr();
         let physical_size = host_mapping.len();
-        // Seed the file content (empty for anon — the anon mapping is zeroed; a
-        // live MAP_SHARED file mapping is already backed by the page cache).
-        if file.is_none() && !payload.is_empty() {
+        // Seed the anon content (a file mapping is already backed by the file's
+        // pages; an anon mapping is zeroed and takes the dispatcher's payload).
+        if seed_payload && !payload.is_empty() {
             let n = payload.len().min(guest_size);
             unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), host, n) };
         }
@@ -40280,12 +40670,14 @@ mod frame_inventory_backend_tests {
             len: 0x20_000,
             executable: false,
             kernel_only: false,
+            granule: carrick_aarch64::vmm::CowGranule::Compound,
         };
         let exact = carrick_aarch64::vmm::ForkCowRange {
             va: 0x4000_8000,
             len: 0x4000,
             executable: false,
             kernel_only: false,
+            granule: carrick_aarch64::vmm::CowGranule::Compound,
         };
         let mut armed = CowArmedRanges::default();
         armed.arm(&[broad]);
@@ -44524,6 +44916,8 @@ mod frame_inventory_backend_tests {
                 FrameCowWriteIntent::BackingMaintenance,
                 compound,
                 compound + CowArmedRanges::COMPOUND_SIZE,
+                Some(compound + CowArmedRanges::COMPOUND_SIZE),
+                None,
             ),
             compound + 0x1000,
             "backing maintenance must inspect every 4 KiB Linux page in a mixed HVF compound",
@@ -44533,9 +44927,44 @@ mod frame_inventory_backend_tests {
                 FrameCowWriteIntent::GuestVisible,
                 compound,
                 compound + CowArmedRanges::COMPOUND_SIZE,
+                Some(compound + CowArmedRanges::COMPOUND_SIZE),
+                None,
             ),
             compound + CowArmedRanges::COMPOUND_SIZE,
-            "ordinary guest-visible writes retain compound-granular progress",
+            "a fork-armed guest-visible write retains compound-granular progress",
+        );
+        assert_eq!(
+            next_frame_cow_write_probe(
+                FrameCowWriteIntent::GuestVisible,
+                compound,
+                compound + CowArmedRanges::COMPOUND_SIZE,
+                Some(compound + 0x1000),
+                None,
+            ),
+            compound + 0x1000,
+            "a page-granular (private file view) span advances one Linux page",
+        );
+        assert_eq!(
+            next_frame_cow_write_probe(
+                FrameCowWriteIntent::GuestVisible,
+                compound,
+                compound + CowArmedRanges::COMPOUND_SIZE,
+                None,
+                Some(compound + 0x2000),
+            ),
+            compound + 0x2000,
+            "an unarmed page must stop at the next armed sibling inside its compound",
+        );
+        assert_eq!(
+            next_frame_cow_write_probe(
+                FrameCowWriteIntent::GuestVisible,
+                compound + 0x1000,
+                compound + CowArmedRanges::COMPOUND_SIZE,
+                None,
+                Some(compound + 0x8000),
+            ),
+            compound + CowArmedRanges::COMPOUND_SIZE,
+            "an unarmed page with no armed sibling in its compound advances to the compound end",
         );
 
         let va = 0x0600_000a_9000;
@@ -44545,6 +44974,7 @@ mod frame_inventory_backend_tests {
             len: 0x5000,
             executable: true,
             kernel_only: false,
+            granule: carrick_aarch64::vmm::CowGranule::Compound,
         }]);
         armed.disarm(CowArmedSpan {
             va,
@@ -44571,6 +45001,7 @@ mod frame_inventory_backend_tests {
             len: 4 * CowArmedRanges::COMPOUND_SIZE as usize,
             executable: false,
             kernel_only: false,
+            granule: carrick_aarch64::vmm::CowGranule::Compound,
         }]);
         let writer = armed
             .span_for(base + CowArmedRanges::COMPOUND_SIZE + 8)
@@ -44596,6 +45027,7 @@ mod frame_inventory_backend_tests {
             len: CowArmedRanges::COMPOUND_SIZE as usize,
             executable: false,
             kernel_only: false,
+            granule: carrick_aarch64::vmm::CowGranule::Compound,
         }]);
 
         assert!(
@@ -44616,18 +45048,21 @@ mod frame_inventory_backend_tests {
                 len: 0x8000_0000,
                 executable: false,
                 kernel_only: false,
+                granule: carrick_aarch64::vmm::CowGranule::Compound,
             },
             carrick_aarch64::vmm::ForkCowRange {
                 va: alias,
                 len: 0x2000,
                 executable: false,
                 kernel_only: false,
+                granule: carrick_aarch64::vmm::CowGranule::Compound,
             },
             carrick_aarch64::vmm::ForkCowRange {
                 va: alias + 0x2000,
                 len: 0x2000,
                 executable: false,
                 kernel_only: false,
+                granule: carrick_aarch64::vmm::CowGranule::Compound,
             },
         ]);
 

@@ -589,21 +589,9 @@ pub const OUT_OF_PROCESS_PROBES: &[&str] = &["execfromthread", "vforkexecthread"
 /// Complete arm64 baseline mismatch inventory. Every shard derives its local
 /// subset from these global lists so adding a probe cannot silently orphan a
 /// known gap when the deterministic modulo partition moves.
-pub const MUSL_BASELINE_GAPS: &[&str] = &[
-    // HVPatch materializes `mmap(MAP_PRIVATE, fd)` as a map-time snapshot
-    // (`map_private_file_backed` is refused for stage-2 backings), so a clean
-    // private page does not track a later write(2) to the file. Both inode
-    // kinds (memfd and regular file) diverge on exactly that clause.
-    "mmapprivatefiletrack",
-];
+pub const MUSL_BASELINE_GAPS: &[&str] = &[];
 
-pub const GNU_BASELINE_GAPS: &[&str] = &[
-    // HVPatch materializes `mmap(MAP_PRIVATE, fd)` as a map-time snapshot
-    // (`map_private_file_backed` is refused for stage-2 backings), so a clean
-    // private page does not track a later write(2) to the file. Both inode
-    // kinds (memfd and regular file) diverge on exactly that clause.
-    "mmapprivatefiletrack",
-];
+pub const GNU_BASELINE_GAPS: &[&str] = &[];
 
 pub fn needs_live_oracle(probe: &str) -> bool {
     LIVE_ORACLE_PROBES.contains(&probe)

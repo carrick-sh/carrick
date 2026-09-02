@@ -32,8 +32,8 @@ use carrick_guest_mem::{
 use carrick_hal::guest_arch::GuestArch as _;
 use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
 use carrick_hal::{
-    GuestEntryRegs, OsError, ProcessForkRequest, RawSyscall, Reg, SlotId, SysReg, SyscallTrap,
-    ThreadedEngine, TrapError,
+    GuestEntryRegs, HostAliasBacking, OsError, ProcessForkRequest, RawSyscall, Reg, SlotId, SysReg,
+    SyscallTrap, ThreadedEngine, TrapError,
 };
 use carrick_mem::memory::AddressSpace;
 use carrick_mem::page_table::{PageTableError, PageTableManager};
@@ -1686,6 +1686,40 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         location
     }
 
+    /// `mmap(MAP_PRIVATE, fd)` inside the sparse arena: hand the hole to the
+    /// backend so it can materialize a page-cache view with page-granular COW
+    /// instead of an eager snapshot. Everything outside the arena (or a backend
+    /// without the lane) answers `Ok(false)` and the dispatcher snapshots.
+    fn map_private_file_backed(
+        &mut self,
+        va: u64,
+        len: usize,
+        host_fd: std::os::fd::BorrowedFd<'_>,
+        offset: u64,
+    ) -> Result<bool, MemoryError> {
+        let in_sparse_arena = self.process_asid.is_some()
+            && self.vm.sparse_mmap_arena_enabled()
+            && va >= carrick_mem::memory::LINUX_MMAP_BASE
+            && va.checked_add(len as u64).is_some_and(|end| {
+                end <= carrick_mem::memory::LINUX_MMAP_BASE
+                    .saturating_add(carrick_mem::memory::mmap_arena_size())
+            });
+        if !in_sparse_arena || len == 0 {
+            return Ok(false);
+        }
+        // Same editor precondition as `ensure_sparse_mmap_backing`: a fresh
+        // materialization needs the software stage-1 editor.
+        let editor_present = self.page_tables.lock().is_some();
+        ensure_sparse_page_table_editor(editor_present, || self.pt_edit(|_| Ok(false)))?;
+        let vm = &mut self.vm;
+        let vcpu = &mut self.vcpu;
+        let process_asid = self.process_asid;
+        let carrier_root = vm.carrier_maintenance_root().ok();
+        let mut flush = || Self::run_stage1_maintenance_on(vcpu, process_asid, carrier_root);
+        vm.materialize_private_file_backing(va, len, host_fd, offset, &mut flush)
+            .map_err(|error| MemoryError::HostMap(format!("HVPatch private file backing: {error}")))
+    }
+
     /// Make a guest `mprotect`/`mmap`'s protection GUEST-visible by editing the
     /// live stage-1 tables. PROT_EXEC clears UXN (executable); its absence sets UXN
     /// (NX / W^X), matching Linux — so the dynamic loader's freshly-mapped library
@@ -2136,33 +2170,22 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         ipa: Gpa,
         len: u64,
         payload: &[u8],
-        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
-    ) -> Result<(), TrapError> {
-        self.map_host_alias_with_sharing(va, ipa, len, payload, file, false)
-    }
-
-    fn map_host_alias_with_sharing(
-        &mut self,
-        va: GuestVa,
-        ipa: Gpa,
-        len: u64,
-        payload: &[u8],
-        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
-        shared: bool,
+        backing: HostAliasBacking,
     ) -> Result<(), TrapError> {
         // Back a dynamic alias mapping and return the authoritative GPA, then
-        // install the guest VA -> GPA stage-1 PTE. HVPatch uses `shared` to
-        // distinguish anonymous fork sharing from its VM-global shared-file
-        // namespace; backends without that distinction retain `add_alias`.
+        // install the guest VA -> GPA stage-1 PTE. `backing` carries the
+        // dispatcher's sharing classification: HVPatch uses it to distinguish
+        // anonymous fork sharing from its VM-global shared-file namespace and
+        // to choose MAP_PRIVATE vs MAP_SHARED host file backing.
         //
         // Alias VAs are not necessarily fresh: deferred commitment replaces a
         // PROT_NONE reservation, and MAP_FIXED can replace an older alias. The
         // vCPU may therefore retain an invalid walk-cache entry or a stale leaf.
         // Publish through the same edit + TLBI path as mprotect/munmap before the
         // guest resumes; a successful stage-2 hv_vm_map alone is not sufficient.
-        let (gpa, writable) =
-            self.vm
-                .add_alias_with_sharing(va.raw(), ipa.raw(), len, payload, file, shared)?;
+        let (gpa, writable) = self
+            .vm
+            .add_alias(va.raw(), ipa.raw(), len, payload, backing)?;
         let mut descriptors = [0_u64; 4];
         let page_table_result = self.pt_edit_and_flush(|mgr| {
             let changed = mgr.map_aliased(va.raw(), gpa, len, writable)?;
@@ -2183,7 +2206,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         }
         if let Err(error) = page_table_result {
             // Roll the alias inventory staging back BEFORE tearing the mapping
-            // down. `add_alias_with_sharing` has already staged an extent that
+            // down. `add_alias` has already staged an extent that
             // names a freshly claimed MappingId, and the authority does not
             // learn about that mapping until the commit is applied — which has
             // not happened yet, and now never will.

@@ -795,13 +795,19 @@ pub trait GuestMemory {
         Ok(())
     }
 
-    /// Replace `[address, address+len)` with a host `MAP_PRIVATE|MAP_FIXED`
-    /// FILE mapping of `host_fd` at `offset`, so a guest
-    /// `mmap(MAP_PRIVATE, fd)` demand-pages from the host's buffer cache
-    /// instead of being eagerly materialized (full-length zeroed buffer +
-    /// `pread` + copy — three whole-length amplifications per guest call;
-    /// Move-3 E1). Returns `Ok(true)` when the backing was replaced: the
-    /// mapping is installed host-RW and the caller then publishes protection,
+    /// Back `[address, address+len)` with a demand-paged view of `host_fd` at
+    /// `offset` for a guest `mmap(MAP_PRIVATE, fd)`, instead of eagerly
+    /// materializing it (full-length zeroed buffer + `pread` + copy — three
+    /// whole-length amplifications per guest call; Move-3 E1). The Linux
+    /// contract the backing must honour is the full one: a page the guest has
+    /// not written keeps tracking later `write(2)`s to the file
+    /// (`mmapprivatefiletrack`), and a written page detaches. On Darwin a host
+    /// `MAP_PRIVATE` file view is a map-time snapshot (see
+    /// `overlay_shared_file_view_tracks_later_file_writes`), so an
+    /// implementation that lowers to one does NOT honour that clause; the
+    /// HVPatch stage-2 backing instead overlays a `MAP_SHARED` read-only
+    /// page-cache view and privatizes written pages itself. Returns `Ok(true)`
+    /// when the backing was installed: the caller then publishes protection,
     /// sharing and the beyond-EOF `BUS_ADRERR` tail exactly as it would after
     /// an eager load. `Ok(false)` means this backend (or this range) cannot
     /// take the lowering and the caller MUST fall back to the eager snapshot —

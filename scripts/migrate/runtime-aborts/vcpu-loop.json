@@ -919,7 +919,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ThreadRuntimeState<E>::service_threaded_syscall_for_executor",
       "ordinal_in_function": 1,
-      "fingerprint": "916c32acf4f3c5842a7d107649c1ed215cd5726445c8e4ac11f176f5699c4d58",
+      "fingerprint": "6cb80d28b20f43d3e247e6f6ede8366ecb710528d5441794bdf38666d02ead9c",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::mm_stage1_authority",
       "rationale": "Syscall requiring MM mutation dispatch lacks outer stage-1 authority phase; proceeding would mutate page tables without exclusive stage-1 pause or sole lease."
@@ -928,7 +928,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ThreadRuntimeState<E>::service_threaded_syscall_for_executor",
       "ordinal_in_function": 2,
-      "fingerprint": "916c32acf4f3c5842a7d107649c1ed215cd5726445c8e4ac11f176f5699c4d58",
+      "fingerprint": "6cb80d28b20f43d3e247e6f6ede8366ecb710528d5441794bdf38666d02ead9c",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::mm_stage1_authority",
       "rationale": "Ordinary syscall dispatch unexpectedly holds stage-1 mutation authority; indicates phase desynchronization between syscall classifier and MM executor."
@@ -937,7 +937,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ThreadRuntimeState<E>::service_threaded_syscall_for_executor",
       "ordinal_in_function": 3,
-      "fingerprint": "916c32acf4f3c5842a7d107649c1ed215cd5726445c8e4ac11f176f5699c4d58",
+      "fingerprint": "6cb80d28b20f43d3e247e6f6ede8366ecb710528d5441794bdf38666d02ead9c",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "Engine missing host alias inventory commit on mmap alias installation."
@@ -946,7 +946,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ThreadRuntimeState<E>::service_threaded_syscall_for_executor",
       "ordinal_in_function": 4,
-      "fingerprint": "916c32acf4f3c5842a7d107649c1ed215cd5726445c8e4ac11f176f5699c4d58",
+      "fingerprint": "6cb80d28b20f43d3e247e6f6ede8366ecb710528d5441794bdf38666d02ead9c",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "Failed to apply host alias frame inventory to kernel context."
@@ -955,7 +955,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ThreadRuntimeState<E>::service_threaded_syscall_for_executor",
       "ordinal_in_function": 5,
-      "fingerprint": "916c32acf4f3c5842a7d107649c1ed215cd5726445c8e4ac11f176f5699c4d58",
+      "fingerprint": "6cb80d28b20f43d3e247e6f6ede8366ecb710528d5441794bdf38666d02ead9c",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "Mapping length overflowed usize during alias protection setup."
@@ -964,7 +964,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ThreadRuntimeState<E>::service_threaded_syscall_for_executor",
       "ordinal_in_function": 6,
-      "fingerprint": "916c32acf4f3c5842a7d107649c1ed215cd5726445c8e4ac11f176f5699c4d58",
+      "fingerprint": "6cb80d28b20f43d3e247e6f6ede8366ecb710528d5441794bdf38666d02ead9c",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "Failed to set hardware memory protection on alias range."
@@ -973,7 +973,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ThreadRuntimeState<E>::service_threaded_syscall_for_executor",
       "ordinal_in_function": 7,
-      "fingerprint": "916c32acf4f3c5842a7d107649c1ed215cd5726445c8e4ac11f176f5699c4d58",
+      "fingerprint": "6cb80d28b20f43d3e247e6f6ede8366ecb710528d5441794bdf38666d02ead9c",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "Bus fault range length overflowed usize during alias protection setup."
@@ -982,7 +982,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ThreadRuntimeState<E>::service_threaded_syscall_for_executor",
       "ordinal_in_function": 8,
-      "fingerprint": "916c32acf4f3c5842a7d107649c1ed215cd5726445c8e4ac11f176f5699c4d58",
+      "fingerprint": "6cb80d28b20f43d3e247e6f6ede8366ecb710528d5441794bdf38666d02ead9c",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "Failed to protect bus fault range on hardware engine."
@@ -991,7 +991,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ThreadRuntimeState<E>::service_threaded_syscall_for_executor",
       "ordinal_in_function": 9,
-      "fingerprint": "916c32acf4f3c5842a7d107649c1ed215cd5726445c8e4ac11f176f5699c4d58",
+      "fingerprint": "6cb80d28b20f43d3e247e6f6ede8366ecb710528d5441794bdf38666d02ead9c",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "Failed to commit host alias install record to dispatcher."
@@ -1000,7 +1000,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ThreadRuntimeState<E>::service_threaded_syscall_for_executor",
       "ordinal_in_function": 10,
-      "fingerprint": "916c32acf4f3c5842a7d107649c1ed215cd5726445c8e4ac11f176f5699c4d58",
+      "fingerprint": "6cb80d28b20f43d3e247e6f6ede8366ecb710528d5441794bdf38666d02ead9c",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::mm_stage1_authority",
       "rationale": "Host-alias installation phase lacks outer stage-1 authority; proceeding would install host alias without stage-1 mutation permit."

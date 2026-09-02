@@ -19,11 +19,11 @@
 //! The IO doorbell exit returns `io.npc` (the next-PC; the kernel does NOT
 //! advance RIP — proven in M0), so `run()` fills `resume_pc = exit.io.npc`.
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex, RwLock};
 
 use carrick_guest_mem::{Gpa, GuestVa};
-use carrick_hal::{GuestVmBackend, TrapError};
+use carrick_hal::{GuestVmBackend, HostAliasBacking, HostAliasSharing, TrapError};
 use carrick_mem::memory::AddressSpace;
 use carrick_x86::{
     BringupLayout, FAULT_DOORBELL_PORT, ForkRamStrategy, MsrInstall, WindowPlan, WindowRegion,
@@ -640,14 +640,10 @@ impl X86Vmm for NvmmVmm {
         ipa: Gpa,
         len: u64,
         payload: &[u8],
-        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
+        backing: HostAliasBacking,
     ) -> Result<(), TrapError> {
         use carrick_mem::memory::{LINUX_ALIAS_IPA_BASE, LINUX_ALIAS_IPA_SIZE};
 
-        let file = file.map(|(fd, offset, prot)| {
-            // SAFETY: dispatcher-to-backend alias setup transfers this dup.
-            (unsafe { OwnedFd::from_raw_fd(fd) }, offset, prot)
-        });
         let (va, ipa) = (va.raw(), ipa.raw());
 
         let aligned_len = len
@@ -671,8 +667,14 @@ impl X86Vmm for NvmmVmm {
             )
             .ok_or_else(|| TrapError::Hypervisor("nvmm-x86: PML4 backing not mapped".into()))?;
         let (mapped_ipa, hva, prot, backing, writable, register_existing, record_region) =
-            match file {
-                Some((fd, offset, host_prot)) => {
+            match backing {
+                HostAliasBacking::File {
+                    fd,
+                    offset,
+                    host_prot,
+                    sharing,
+                } => {
+                    let fd = fd.into_owned_fd();
                     let raw_fd = fd.as_raw_fd();
                     let mut prot = 0;
                     if host_prot & libc::PROT_READ != 0 {
@@ -685,7 +687,11 @@ impl X86Vmm for NvmmVmm {
                         prot |= NVMM_PROT_EXEC;
                     }
                     let writable = host_prot & libc::PROT_WRITE != 0;
-                    if !writable {
+                    // A private file alias is a snapshot too: the guest owns its
+                    // copy, so it is always writable, but Linux's per-page
+                    // tracking of later file writes is not reproduced on NVMM.
+                    let private = matches!(sharing, HostAliasSharing::Private);
+                    if !writable || private {
                         // NetBSD/NVMM registers regular file HVAs successfully but
                         // exposes zero-filled pages to the guest. Read-only shared
                         // mappings are safe to snapshot. Keep those snapshots in
@@ -711,7 +717,7 @@ impl X86Vmm for NvmmVmm {
                             std::ptr::null_mut(),
                             0,
                             NvmmRamBacking::Private,
-                            writable,
+                            writable || private,
                             false,
                             false,
                         )
@@ -742,7 +748,7 @@ impl X86Vmm for NvmmVmm {
                         )
                     }
                 }
-                None => {
+                HostAliasBacking::Anonymous { .. } => {
                     let prot = NVMM_PROT_READ | NVMM_PROT_WRITE | NVMM_PROT_EXEC;
                     let hva =
                         self.map_private_ram(ipa, aligned_len, prot, "private-payload-alias")?;

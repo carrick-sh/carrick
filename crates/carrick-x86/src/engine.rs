@@ -28,8 +28,8 @@ use carrick_hal::threaded::{
 };
 use carrick_hal::x8664_arch::{SegmentBaseRegs, SyscallNorm, X8664GuestArch, service_arch_prctl};
 use carrick_hal::{
-    GuestEntryRegs, OsError, RawSyscall, Reg, SysReg, SyscallTrap, ThreadedEngine, TrapError,
-    X86SignalXstate, X86XstateCapabilities,
+    GuestEntryRegs, HostAliasBacking, OsError, RawSyscall, Reg, SysReg, SyscallTrap,
+    ThreadedEngine, TrapError, X86SignalXstate, X86XstateCapabilities,
 };
 use carrick_mem::memory::{AddressSpace, LINUX_NULL_GUARD_END};
 
@@ -1279,14 +1279,13 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
         ipa: Gpa,
         len: u64,
         payload: &[u8],
-        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
+        backing: HostAliasBacking,
     ) -> Result<(), TrapError> {
         // Mapping provenance is published by the runtime only after this
         // backend install and every requested leaf protection succeed. Do not
-        // infer it from `file` here: anonymous MAP_SHARED aliases and private
-        // file snapshots are both valid, and the dispatch outcome is the
+        // infer it from `backing` here: the dispatch outcome is the
         // authoritative source of protection + sharing.
-        self.vm.map_host_alias(va, ipa, len, payload, file)
+        self.vm.map_host_alias(va, ipa, len, payload, backing)
     }
 
     #[allow(clippy::too_many_arguments)]

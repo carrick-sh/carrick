@@ -2302,6 +2302,14 @@
     {
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "private_file_view_backing_identity::NEXT",
+      "fingerprint": "a9778af5ccd1c6630d44c1e80c649fc3ac982ad5cc21d72bb30a021510749473",
+      "classification": "monotonic_allocator",
+      "rationale": "Carrier-wide monotonic allocator private_file_view_backing_identity::NEXT in crates/carrick-vmm-hvf/src/trap.rs generating unique IDs across the host process."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "shared_anon_backing_identity::NEXT",
       "fingerprint": "a9778af5ccd1c6630d44c1e80c649fc3ac982ad5cc21d72bb30a021510749473",
       "classification": "monotonic_allocator",
