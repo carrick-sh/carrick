@@ -577,7 +577,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::settle_persistent_thread_exit",
       "ordinal_in_function": 1,
-      "fingerprint": "2728a2472381fd309a195616e6bdf22cfed03b05d47da7fcf1e27a1c587d032b",
+      "fingerprint": "55b01bbd4412189eb2eacc35b387dcd9bea4eb10c539549decde3fcbe93a3650",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::thread_settlement",
       "rationale": "Unhandled thread exit disposition during persistent thread settlement."
@@ -604,7 +604,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::begin_persistent_process_terminal",
       "ordinal_in_function": 2,
-      "fingerprint": "8a5a000135906f07ef0165326ba83a7a4dc801f60cc323e2d04f5d86be2c96d9",
+      "fingerprint": "f1cc44d708a5694a308ea651e06bea34f2cbead327386abebac684e7cba605e1",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::terminal_settlement",
       "rationale": "Missing task execution context when initiating terminal process teardown."
@@ -613,7 +613,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::begin_persistent_process_terminal",
       "ordinal_in_function": 3,
-      "fingerprint": "8a5a000135906f07ef0165326ba83a7a4dc801f60cc323e2d04f5d86be2c96d9",
+      "fingerprint": "f1cc44d708a5694a308ea651e06bea34f2cbead327386abebac684e7cba605e1",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::terminal_settlement",
       "rationale": "Failure recording terminal state on persistent process."

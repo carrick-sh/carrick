@@ -303,12 +303,20 @@ where
             .iter()
             .map(VcpuThreadHandle::completion)
             .collect::<Vec<_>>();
-        Ok(continuation::ProcessDrain::for_scheduler(
+        let members = completions.len();
+        let drain = continuation::ProcessDrain::for_scheduler(
             thread.key(),
             &scheduler,
             current,
             completions,
-        ))
+        );
+        tracing::debug!(
+            tid = self.this_tid.raw(),
+            members,
+            pending = drain.remaining(),
+            "HVPatch persistent sibling drain prepared"
+        );
+        Ok(drain)
     }
 
     fn publish_persistent_sibling_stop(&self, kernel: &Kernel) -> Result<(), RuntimeError> {
@@ -366,7 +374,14 @@ where
         &self,
         current: continuation::JobId,
     ) -> Result<(), RuntimeError> {
-        finish_persistent_process_handles(&self.threads, current)
+        let published = finish_persistent_process_handles(&self.threads, current)?;
+        if published > 0 {
+            self.trace_hvpatch_thread_terminal(
+                carrick_observability::probes::HvpatchThreadTerminalReason::MembersDrainedByOwner,
+                i32::try_from(published).unwrap_or(i32::MAX),
+            );
+        }
+        Ok(())
     }
 
     /// Logical HVPatch exit while the physical vCPU remains owned by the
