@@ -4534,18 +4534,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/net/support.rs:1412 in `unix_socket_host_path`, `std::fs::create_dir_all` accesses only the run-scoped network backing directory used by `unix_socket_host_path`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/net/support.rs:1420 in `unix_socket_host_path`, `std::fs::create_dir_all` accesses only the run-scoped network backing directory used by `unix_socket_host_path`.",
     "review_id": "HA-000172",
     "source": {
-      "byte_end": 62749,
-      "byte_start": 62726,
+      "byte_end": 63268,
+      "byte_start": 63245,
       "column": 13,
       "column_end": 36,
       "column_start": 13,
       "file": "crates/carrick-runtime/src/dispatch/net/support.rs",
-      "line": 1412,
-      "line_end": 1412,
-      "line_start": 1412
+      "line": 1420,
+      "line_end": 1420,
+      "line_start": 1420
     }
   },
   {
@@ -4561,18 +4561,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/net/support.rs:1450 in `autobind_unix_host_path`, `std::fs::create_dir_all` accesses only the run-scoped network backing directory used by `autobind_unix_host_path`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/net/support.rs:1458 in `autobind_unix_host_path`, `std::fs::create_dir_all` accesses only the run-scoped network backing directory used by `autobind_unix_host_path`.",
     "review_id": "HA-000173",
     "source": {
-      "byte_end": 64522,
-      "byte_start": 64499,
+      "byte_end": 65041,
+      "byte_start": 65018,
       "column": 13,
       "column_end": 36,
       "column_start": 13,
       "file": "crates/carrick-runtime/src/dispatch/net/support.rs",
-      "line": 1450,
-      "line_end": 1450,
-      "line_start": 1450
+      "line": 1458,
+      "line_end": 1458,
+      "line_start": 1458
     }
   },
   {
@@ -6103,18 +6103,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/hvpatch/mod.rs:1657 in `run_static_hvpatch`, `std::fs::read` accesses only the selected guest interpreter image used by `run_static_hvpatch`.",
+    "rationale": "At crates/carrick-runtime/src/hvpatch/mod.rs:1663 in `run_static_hvpatch`, `std::fs::read` accesses only the selected guest interpreter image used by `run_static_hvpatch`.",
     "review_id": "HA-000231",
     "source": {
-      "byte_end": 60565,
-      "byte_start": 60552,
+      "byte_end": 60979,
+      "byte_start": 60966,
       "column": 16,
       "column_end": 29,
       "column_start": 16,
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 1657,
-      "line_end": 1657,
-      "line_start": 1657
+      "line": 1663,
+      "line_end": 1663,
+      "line_start": 1663
     }
   },
   {
@@ -6130,18 +6130,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/hvpatch/mod.rs:1665 in `run_static_hvpatch`, `std::fs::read` accesses only the selected guest executable image used by `run_static_hvpatch`.",
+    "rationale": "At crates/carrick-runtime/src/hvpatch/mod.rs:1671 in `run_static_hvpatch`, `std::fs::read` accesses only the selected guest executable image used by `run_static_hvpatch`.",
     "review_id": "HA-000232",
     "source": {
-      "byte_end": 61044,
-      "byte_start": 61031,
+      "byte_end": 61458,
+      "byte_start": 61445,
       "column": 29,
       "column_end": 42,
       "column_start": 29,
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 1665,
-      "line_end": 1665,
-      "line_start": 1665
+      "line": 1671,
+      "line_end": 1671,
+      "line_start": 1671
     }
   },
   {
@@ -8685,18 +8685,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:7486 in `bind`, `std::fs::remove_file` accesses only the registered AF_UNIX backing path used by `bind`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:7517 in `bind`, `std::fs::remove_file` accesses only the registered AF_UNIX backing path used by `bind`.",
     "review_id": "HA-000328",
     "source": {
-      "byte_end": 331128,
-      "byte_start": 331108,
+      "byte_end": 332165,
+      "byte_start": 332145,
       "column": 33,
       "column_end": 53,
       "column_start": 33,
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 7486,
-      "line_end": 7486,
-      "line_start": 7486
+      "line": 7517,
+      "line_end": 7517,
+      "line_start": 7517
     }
   },
   {
@@ -8712,18 +8712,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:7587 in `bind`, `std::fs::remove_file` accesses only the registered AF_UNIX backing path used by `bind`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:7618 in `bind`, `std::fs::remove_file` accesses only the registered AF_UNIX backing path used by `bind`.",
     "review_id": "HA-000329",
     "source": {
-      "byte_end": 336462,
-      "byte_start": 336442,
+      "byte_end": 337499,
+      "byte_start": 337479,
       "column": 33,
       "column_end": 53,
       "column_start": 33,
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 7587,
-      "line_end": 7587,
-      "line_start": 7587
+      "line": 7618,
+      "line_end": 7618,
+      "line_start": 7618
     }
   },
   {
@@ -10354,18 +10354,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:7483 in `bind`, `std::fs::symlink_metadata` accesses only the registered AF_UNIX backing path used by `bind`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:7514 in `bind`, `std::fs::symlink_metadata` accesses only the registered AF_UNIX backing path used by `bind`.",
     "review_id": "HA-000390",
     "source": {
-      "byte_end": 330960,
-      "byte_start": 330935,
+      "byte_end": 331997,
+      "byte_start": 331972,
       "column": 33,
       "column_end": 58,
       "column_start": 33,
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 7483,
-      "line_end": 7483,
-      "line_start": 7483
+      "line": 7514,
+      "line_end": 7514,
+      "line_start": 7514
     }
   },
   {
@@ -10381,18 +10381,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:7583 in `bind`, `std::fs::symlink_metadata` accesses only the registered AF_UNIX backing path used by `bind`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:7614 in `bind`, `std::fs::symlink_metadata` accesses only the registered AF_UNIX backing path used by `bind`.",
     "review_id": "HA-000391",
     "source": {
-      "byte_end": 336277,
-      "byte_start": 336252,
+      "byte_end": 337314,
+      "byte_start": 337289,
       "column": 37,
       "column_end": 62,
       "column_start": 37,
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 7583,
-      "line_end": 7583,
-      "line_start": 7583
+      "line": 7614,
+      "line_end": 7614,
+      "line_start": 7614
     }
   },
   {
@@ -13423,18 +13423,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:2439 in `netlink_send`, the host result from `std::process::id` determines the guest-visible synthetic netlink reply PID used by `netlink_send`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:2521 in `netlink_send`, the host result from `std::process::id` determines the guest-visible synthetic netlink reply PID used by `netlink_send`.",
     "review_id": "HA-000503",
     "source": {
-      "byte_end": 104975,
-      "byte_start": 104959,
+      "byte_end": 108688,
+      "byte_start": 108672,
       "column": 57,
       "column_end": 73,
       "column_start": 57,
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 2439,
-      "line_end": 2439,
-      "line_start": 2439
+      "line": 2521,
+      "line_end": 2521,
+      "line_start": 2521
     }
   },
   {
@@ -13450,18 +13450,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:7459 in `bind`, the host result from `std::process::id` determines the guest-visible synthetic netlink bind PID used by `bind`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:7490 in `bind`, the host result from `std::process::id` determines the guest-visible synthetic netlink bind PID used by `bind`.",
     "review_id": "HA-000504",
     "source": {
-      "byte_end": 329579,
-      "byte_start": 329563,
+      "byte_end": 330616,
+      "byte_start": 330600,
       "column": 21,
       "column_end": 37,
       "column_start": 21,
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 7459,
-      "line_end": 7459,
-      "line_start": 7459
+      "line": 7490,
+      "line_end": 7490,
+      "line_start": 7490
     }
   },
   {
@@ -13477,18 +13477,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:8310 in `sendto`, `std::process::id` acts only on the current carrier network-debug event used by `sendto`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:8341 in `sendto`, `std::process::id` acts only on the current carrier network-debug event used by `sendto`; no guest identity selects its host target.",
     "review_id": "HA-000505",
     "source": {
-      "byte_end": 372812,
-      "byte_start": 372796,
+      "byte_end": 373849,
+      "byte_start": 373833,
       "column": 21,
       "column_end": 37,
       "column_start": 21,
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 8310,
-      "line_end": 8310,
-      "line_start": 8310
+      "line": 8341,
+      "line_end": 8341,
+      "line_start": 8341
     }
   },
   {
@@ -13963,18 +13963,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/hvpatch/mod.rs:1303 in `initialize_root_process`, `std::process::id` acts only on the current carrier identity passed to the deliberately ignored HVPatch bootstrap seam used by `initialize_root_process`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/hvpatch/mod.rs:1309 in `initialize_root_process`, `std::process::id` acts only on the current carrier identity passed to the deliberately ignored HVPatch bootstrap seam used by `initialize_root_process`; no guest identity selects its host target.",
     "review_id": "HA-000523",
     "source": {
-      "byte_end": 47638,
-      "byte_start": 47622,
+      "byte_end": 48052,
+      "byte_start": 48036,
       "column": 44,
       "column_end": 60,
       "column_start": 44,
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 1303,
-      "line_end": 1303,
-      "line_start": 1303
+      "line": 1309,
+      "line_end": 1309,
+      "line_start": 1309
     }
   },
   {
