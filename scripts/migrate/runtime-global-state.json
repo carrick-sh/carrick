@@ -898,6 +898,14 @@
       "rationale": "Environment variable CARRICK_FAST_FS read in fast_fs_enabled::CARRICK_FAST_FS (crates/carrick-runtime/src/fs_backend.rs) configuring carrier behavior or debug logging."
     },
     {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/fs_backend.rs",
+      "symbol": "host_umask::HOST_UMASK",
+      "fingerprint": "a3d209ef8cddc394e3f52a16455105d2d8f926d36d2e4619c8062bc332d2925a",
+      "classification": "host_kernel_object",
+      "rationale": "Carrier process file-creation mask (Darwin per-process umask) read once in host_umask::HOST_UMASK (crates/carrick-runtime/src/fs_backend.rs); it describes the host carrier, never a guest task, whose umask lives in the kernel graph."
+    },
+    {
       "kind": "env_var",
       "file": "crates/carrick-runtime/src/fs_backend.rs",
       "symbol": "overlay_enabled::CARRICK_FS_OVERLAY",

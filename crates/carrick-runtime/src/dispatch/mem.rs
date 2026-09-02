@@ -161,32 +161,36 @@ impl MmapRequest {
             offset,
         } = self;
         match refusal {
-            MmapRefusal::Spec(reason) => tracing::debug!(
-                target: "carrick::mmap",
-                reason,
-                errno = errno.get(),
-                addr = format_args!("{addr:#x}"),
-                length = format_args!("{length:#x}"),
-                prot = format_args!("{prot:#x}"),
-                flags = format_args!("{flags:#x}"),
-                fd,
-                offset = format_args!("{offset:#x}"),
-                cause,
-                "mmap refused: invalid request",
-            ),
-            MmapRefusal::Internal(reason) => tracing::warn!(
-                target: "carrick::mmap",
-                reason,
-                errno = errno.get(),
-                addr = format_args!("{addr:#x}"),
-                length = format_args!("{length:#x}"),
-                prot = format_args!("{prot:#x}"),
-                flags = format_args!("{flags:#x}"),
-                fd,
-                offset = format_args!("{offset:#x}"),
-                cause,
-                "mmap refused: carrick internal limit",
-            ),
+            MmapRefusal::Spec(reason) => {
+                tracing::debug!(
+                    target: "carrick::mmap",
+                    reason,
+                    errno = errno.get(),
+                    addr = format_args!("{addr:#x}"),
+                    length = format_args!("{length:#x}"),
+                    prot = format_args!("{prot:#x}"),
+                    flags = format_args!("{flags:#x}"),
+                    fd,
+                    offset = format_args!("{offset:#x}"),
+                    cause,
+                    "mmap refused: invalid request",
+                )
+            }
+            MmapRefusal::Internal(reason) => {
+                tracing::warn!(
+                    target: "carrick::mmap",
+                    reason,
+                    errno = errno.get(),
+                    addr = format_args!("{addr:#x}"),
+                    length = format_args!("{length:#x}"),
+                    prot = format_args!("{prot:#x}"),
+                    flags = format_args!("{flags:#x}"),
+                    fd,
+                    offset = format_args!("{offset:#x}"),
+                    cause,
+                    "mmap refused: carrick internal limit",
+                )
+            }
         }
         DispatchOutcome::errno(errno)
     }
@@ -2029,16 +2033,18 @@ fn shared_file_bus_offset(file_len: u64, offset: u64, length: u64, page_size: u6
 /// `max_protection` includes write. The requested protection is NOT the
 /// discriminator: a `PROT_READ` mapping of an `O_RDWR` fd maps fine.
 ///
-/// carrick already prefers an `O_RDWR` host fd even for a guest `O_RDONLY`
-/// open (`fs_backend::fast_open_for_guest`, `open_raw_fd_capstd`,
-/// `dispatch::fs`'s trusted-dirfd lane) precisely for this reason. Files
-/// served from the IMMUTABLE shared layer cache are the case that preference
-/// cannot cover, and deliberately so: that store is content-addressed and
-/// shared across containers and runs, so handing a guest an RWX stage-2 view
-/// of it would let one guest corrupt every other run's cache and would defeat
-/// the overlay's copy-up. Such a mapping falls back to the snapshot path
-/// instead — observationally equivalent for a read-only mapping of a layer
-/// that cannot change under it.
+/// Host opens carry the guest's own access mode (an `O_RDWR` APFS open costs
+/// ~1.7x an `O_RDONLY` one, and most guest opens are read-only), so a
+/// guest-read-only description normally fails this check; the mmap alias path
+/// then asks the backend to re-open the fd `O_RDWR` in place
+/// (`FsBackend::upgrade_host_fd_for_shared_map`) before giving up. Files
+/// served from the IMMUTABLE shared layer cache are the case the upgrade
+/// refuses, and deliberately so: that store is content-addressed and shared
+/// across containers and runs, so handing a guest an RWX stage-2 view of it
+/// would let one guest corrupt every other run's cache and would defeat the
+/// overlay's copy-up. Such a mapping falls back to the snapshot path instead
+/// — observationally equivalent for a read-only mapping of a layer that
+/// cannot change under it.
 ///
 /// Only Darwin/HVF carries this constraint; other hosts keep the live alias.
 #[cfg(target_os = "macos")]
@@ -3882,6 +3888,32 @@ impl SyscallDispatcher {
                 ));
             }
 
+            // mprotect(2) EACCES ceiling: a MAP_SHARED mapping of a file opened
+            // read-only can never be made PROT_WRITE, and asking for PROT_WRITE
+            // at map time is EACCES outright. Decided here from the GUEST's
+            // status flags — the host fd's access mode is carrick's business
+            // (a live alias upgrades it to O_RDWR below) and must never leak
+            // into this answer — and recorded on the mapping because the
+            // backing fd can be closed long before the mprotect. MAP_PRIVATE
+            // is deliberately excluded: Linux keeps VM_MAYWRITE for a private
+            // map of a read-only file, since its stores are COW and never
+            // reach the file.
+            let mut mmap_read_only_shared_file = false;
+            if map_sharing == MmapSharing::Shared
+                && !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
+                && let Some(open_file) = this.open_file(fd.0)
+            {
+                mmap_read_only_shared_file = (open_file.description.common().status_flags()
+                    & carrick_abi::LINUX_O_ACCMODE)
+                    == carrick_abi::LINUX_O_RDONLY;
+            }
+            if mmap_read_only_shared_file && prot_flags.contains(LinuxProtFlags::WRITE) {
+                return Ok(request.refused(
+                    MmapRefusal::Spec("MAP_SHARED|PROT_WRITE of a read-only descriptor"),
+                    LINUX_EACCES,
+                ));
+            }
+
             // A memfd sealed F_SEAL_WRITE (or F_SEAL_FUTURE_WRITE) cannot back a
             // shared, writable mapping — Linux returns EPERM (memfd_create01
             // check_mmap_fail). A private (MAP_PRIVATE) writable mapping is fine:
@@ -4187,7 +4219,11 @@ impl SyscallDispatcher {
                             LINUX_EBADF,
                         ));
                     };
-                    let open = open_file.description.read();
+                    // The WRITE guard: an in-place host-fd upgrade below copies
+                    // the file offset across the swap, and read/write hold
+                    // this same guard across their host I/O, so no offset
+                    // can move underneath it.
+                    let open = open_file.description.write();
                     match open.as_deref() {
                         Some(OpenDescription::HostFile { host_fd, .. }) => {
                             // Two named preconditions decide the live alias, so
@@ -4196,12 +4232,25 @@ impl SyscallDispatcher {
                             // must not run past EOF (that tail is BUS_ADRERR,
                             // served by the snapshot path below), and the host
                             // fd must be able to carry a write max-protection.
+                            // A guest-read-only description holds an O_RDONLY
+                            // host fd (opens carry the guest's own access
+                            // mode); this is the one place that needs more, so
+                            // the backend re-opens it O_RDWR in place when the
+                            // file is one it may vouch for. The guest's own
+                            // view stays read-only: `mmap_read_only_shared_file`
+                            // above already refused PROT_WRITE and pins the
+                            // mprotect ceiling on the commit.
                             if host_fd_file_len(host_fd.raw())
                                 .and_then(|len| {
                                     shared_file_bus_offset(len, offset, length, page_size)
                                 })
                                 .is_some()
-                                || !host_fd_can_back_shared_alias(host_fd.raw())
+                                || (!host_fd_can_back_shared_alias(host_fd.raw())
+                                    && !this
+                                        .fs
+                                        .rootfs_vfs
+                                        .overlay
+                                        .upgrade_host_fd_for_shared_map(host_fd.raw()))
                             {
                                 None
                             } else {
@@ -4314,7 +4363,7 @@ impl SyscallDispatcher {
                             resident: true,
                             bus_fault: None,
                             write_sealed_shared: false,
-                            read_only_shared_file: false,
+                            read_only_shared_file: mmap_read_only_shared_file,
                             secretmem: false,
                             writable_memfd: None,
                             shared_file_alias: alias_description,
@@ -4729,21 +4778,6 @@ impl SyscallDispatcher {
             // read-only here (a writable one already returned EPERM above); record
             // it so a later mprotect(PROT_WRITE) is rejected.
             let mut mmap_write_sealed_shared = false;
-            // mprotect(2) EACCES ceiling: a MAP_SHARED mapping of a file opened
-            // read-only can never be made PROT_WRITE. Decided here, at map time,
-            // because the backing fd can be closed long before the mprotect.
-            // MAP_PRIVATE is deliberately excluded — Linux keeps VM_MAYWRITE for
-            // a private map of a read-only file, since its stores are COW and
-            // never reach the file.
-            let mut mmap_read_only_shared_file = false;
-            if map_sharing == MmapSharing::Shared
-                && !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
-                && let Some(open_file) = this.open_file(fd.0)
-            {
-                mmap_read_only_shared_file = (open_file.description.common().status_flags()
-                    & carrick_abi::LINUX_O_ACCMODE)
-                    == carrick_abi::LINUX_O_RDONLY;
-            }
             // A live MAP_SHARED, PROT_WRITE mapping of an (unsealed) memfd — its
             // backing description is recorded so F_ADD_SEALS F_SEAL_WRITE can
             // EBUSY while it is mapped.
@@ -6061,6 +6095,11 @@ impl SyscallDispatcher {
                     // mmap then fails the transaction aborts and the guest has
                     // lost the source mapping, where Linux would have kept it —
                     // a divergence confined to that failure path.
+                    // The mprotect(PROT_WRITE) ceiling of a read-only shared
+                    // file map moves with the mapping; read it before the
+                    // source's metadata is removed.
+                    let read_only_shared_file =
+                        this.range_is_read_only_shared_file(old_address.0, old_size);
                     if let Ok(old_len) = usize::try_from(old_size)
                         && old_len > 0
                     {
@@ -6087,7 +6126,7 @@ impl SyscallDispatcher {
                             resident: true,
                             bus_fault: None,
                             write_sealed_shared: false,
-                            read_only_shared_file: false,
+                            read_only_shared_file,
                             secretmem: false,
                             writable_memfd: None,
                             shared_file_alias: Some(Arc::clone(&description)),

@@ -493,12 +493,57 @@ pub trait FsBackend: Send + Sync {
     ///
     /// `write` -> guest requested write access; `create` -> +O_CREAT;
     /// `trunc` -> +O_TRUNC. Returns the raw fd (caller owns it, must
-    /// close it). A disk backend may internally open read-only guest fds
-    /// with broader host access when safe; the dispatcher separately tracks
-    /// guest-visible writability. `MemoryBackend` returns None: an in-memory
+    /// close it). The host fd carries the guest's own access mode; the
+    /// dispatcher separately tracks guest-visible writability, and a
+    /// consumer needing broader host access asks for it explicitly through
+    /// [`Self::upgrade_host_fd_for_shared_map`]. `MemoryBackend` returns None: an in-memory
     /// HashMap has no kernel fd and cannot be shared across a real fork, so
     /// the dispatcher keeps its in-memory File model there.
+    ///
+    /// CONTRACT: every host fd a backend hands out — here, from
+    /// [`Self::open_raw_fd_with_metadata`], [`Self::create_raw_fd`],
+    /// [`Self::open_file_readonly`] and `ImmutableHostFileOpen::Served` — is
+    /// already `O_NONBLOCK`. The dispatcher keeps every host-backed fd
+    /// non-blocking (`dispatch::net::set_host_nonblocking`) and emulates
+    /// guest blocking itself, so the backend opens with the flag instead of
+    /// the dispatcher paying an `F_GETFL`+`F_SETFL` round trip per open; the
+    /// install sites only `debug_assert` it.
     fn open_raw_fd(&self, path: &str, write: bool, create: bool, trunc: bool) -> Option<i32>;
+
+    /// Re-open the regular file behind `fd` (a host fd this backend handed
+    /// out, currently `O_RDONLY`) `O_RDWR` and install the new open IN PLACE
+    /// with `dup2`, so every holder of the fd NUMBER — the shared
+    /// `OpenDescription::HostFile`, its `HostFdRef` views, the dispatcher's
+    /// bookkeeping — sees a writable host fd without a description swap. The
+    /// file offset carries over. Returns `false`, leaving `fd` untouched,
+    /// when the backend cannot vouch for the file: it is not a regular file
+    /// under the backend's writable root (the immutable layer store is
+    /// deliberately outside it — a guest must never hold a writable host
+    /// view of content shared across runs), or the host refuses the write
+    /// open.
+    ///
+    /// The one consumer is the dispatcher's live `MAP_SHARED` alias of a
+    /// guest-read-only description: Darwin caps a shared file mapping's
+    /// max-protection at the fd's access mode and HVF refuses a read-capped
+    /// region, so the alias needs a writable host fd even though the guest's
+    /// own view stays read-only (the guest's `PROT_WRITE`/`mprotect` refusals
+    /// are decided from its status flags, never from this fd). Upgrading at
+    /// map time — rare — keeps every ordinary read-only open at the cheaper
+    /// host `O_RDONLY`. Default: `false` (fall back to the snapshot path).
+    fn upgrade_host_fd_for_shared_map(&self, _fd: i32) -> bool {
+        false
+    }
+
+    /// Create-open a NEW regular file with the guest's (umask-applied) `mode`
+    /// and return the raw fd plus whether that mode is already the file's
+    /// guest-visible mode. `false` means the caller must still `set_mode`
+    /// (the mode is not owner-representable on the host, or the backend
+    /// created with its default mode). Default: the plain create-open,
+    /// mode not applied.
+    fn create_raw_fd(&self, path: &str, _mode: u32, trunc: bool) -> Option<(i32, bool)> {
+        self.open_raw_fd(path, true, true, trunc)
+            .map(|fd| (fd, false))
+    }
 
     /// Reopen an already-written artifact so the caller can issue `fsync(2)`.
     /// `Ok(None)` means this backend has no host descriptor (for example the
@@ -1706,11 +1751,11 @@ pub struct HostFsBackend {
     /// sibling), so the truth lives in [`CARRICK_HAS_FIFO_XATTR`] on the
     /// scratch root and this is only a cache of a `true` reading.
     fifo_seen: std::sync::atomic::AtomicBool,
-    /// The shared fs-structure generation ([`crate::fs_resolve_cache`]) at
-    /// which this process last read the root marker as ABSENT. FIFO creation
-    /// is a structural mutation (guest `mknodat`; `create_fifo` also bumps
-    /// directly), so "generation unchanged since the last absent reading"
-    /// proves no FIFO appeared anywhere — the per-open
+    /// The shared root-MARKER generation
+    /// ([`crate::fs_resolve_cache::current_marker_generation`]) at which this
+    /// process last read the root marker as ABSENT. `stamp_root_marker` bumps
+    /// it after every stamp, so "marker generation unchanged since the last
+    /// absent reading" proves no FIFO appeared anywhere — the per-open
     /// `may_have_fifo_nodes` check is then one shared-atomic load, zero
     /// syscalls. `0` = never checked (generation starts at 1).
     fifo_absent_gen: std::sync::atomic::AtomicU64,
@@ -1722,10 +1767,10 @@ pub struct HostFsBackend {
     /// durable truth is [`CARRICK_HAS_MARKER_NODES_XATTR`] on the scratch
     /// root; this bool caches only a `true` reading.
     marker_seen: std::sync::atomic::AtomicBool,
-    /// Shared fs-structure generation at which this process last read the
+    /// Shared root-marker generation at which this process last read the
     /// marker-node root xattr as ABSENT; mirrors `fifo_absent_gen`
-    /// (`create_socket`/`create_device` stamp the marker and bump the
-    /// generation BEFORE creating the node).
+    /// (`create_socket`/`create_device` stamp the marker BEFORE creating the
+    /// node).
     marker_absent_gen: std::sync::atomic::AtomicU64,
     /// Sticky fast answer for "does any entry carry guest metadata xattrs"
     /// (mode/uid/gid): mirrors `marker_seen`/`marker_absent_gen` over
@@ -1735,8 +1780,8 @@ pub struct HostFsBackend {
     meta_xattr_absent_gen: std::sync::atomic::AtomicU64,
     /// Sticky cache of the durable host-upper whiteout marker. The marker and
     /// adjacent sidecars make sparse-upper deletions visible across real host
-    /// forks and native self-reexecs; the shared fs generation makes an
-    /// absent reading safe to cache in each process.
+    /// forks and native self-reexecs; the shared root-marker generation
+    /// makes an absent reading safe to cache in each process.
     whiteout_seen: std::sync::atomic::AtomicBool,
     whiteout_absent_gen: std::sync::atomic::AtomicU64,
     /// Durable upper-symlink marker cache. Any symlink permanently disables
@@ -2934,14 +2979,54 @@ impl HostFsBackend {
         Some((fd, st, kind))
     }
 
-    /// Thin wrapper over [`HostFsBackend::fast_open_contained`] for callers that
-    /// only need `(stat, kind)` — the fd is closed immediately on drop.
+    /// [`HostFsBackend::fast_open_contained`] for callers that only need
+    /// `(stat, kind)`, with the same acceptance set (a plain regular file or
+    /// directory; everything else is `None` for the exact slow path).
+    ///
+    /// On the `!follow` arm with a cached parent this is ONE
+    /// `fstatat(parent, leaf, AT_SYMLINK_NOFOLLOW)`: a single component that
+    /// cannot traverse a symlink beneath an already-contained dirfd is
+    /// contained by the same structural argument the open lane relies on, and
+    /// a stat records no access, so nothing the `O_EVTONLY` open provided is
+    /// lost. That open was `openat`+`fstat`+`close` for a KIND — three host
+    /// calls per `lookup_kind`, which is the first probe of every ordinary
+    /// guest `open`, `unlink` and `mkdir`. The follow arm keeps the open: a
+    /// followed leaf symlink can land anywhere and its target must be proven
+    /// contained on the fd.
     #[cfg(target_os = "macos")]
     fn fast_lstat_contained(
         &self,
         rel: &Path,
         follow: bool,
     ) -> Option<(libc::stat, RootFsEntryKind)> {
+        use std::os::fd::AsRawFd;
+        if !follow
+            && self.fast_fs
+            && self.root_prefix.is_some()
+            && let Some((parent_fd, name_c)) = self.namei_leaf(rel)
+        {
+            let mut st: libc::stat = unsafe { core::mem::zeroed() };
+            let rc = unsafe {
+                libc::fstatat(
+                    parent_fd.as_raw_fd(),
+                    name_c.as_ptr(),
+                    &mut st,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if rc != 0 {
+                return None;
+            }
+            let typ = st.st_mode as u32 & libc::S_IFMT as u32;
+            let kind = if typ == libc::S_IFDIR as u32 {
+                RootFsEntryKind::Directory
+            } else if typ == libc::S_IFREG as u32 {
+                RootFsEntryKind::File
+            } else {
+                return None;
+            };
+            return Some((st, kind));
+        }
         self.fast_open_contained(rel, follow)
             .map(|(_fd, st, kind)| (st, kind))
     }
@@ -2955,6 +3040,31 @@ impl HostFsBackend {
     #[cfg(target_os = "macos")]
     fn fast_metadata_contained(&self, normalized: &Path, rel: &Path) -> Option<RootFsMetadata> {
         use std::os::fd::AsRawFd;
+
+        // A repeat lookup of a plain file/directory is ONE revalidating
+        // `fstatat` through the cached contained parent (see `stat_cache`),
+        // not an open+fstat+xattr pass: `open(2)` of an existing file looked
+        // its leaf up this way before opening it, so the probe cost as much
+        // as the open. Symlink leaves and exotic types return None from the
+        // cache and take the contained-open path below unchanged.
+        if self.stat_cache_active()
+            && let Some(real) = self.stat_cache_get_or_fill(rel)
+        {
+            if !self.name_matches_on_disk(rel) {
+                return None;
+            }
+            let is_dir = real.kind == RootFsEntryKind::Directory;
+            return Some(RootFsMetadata {
+                path: normalized.to_path_buf(),
+                kind: real.kind,
+                mode: real.mode,
+                size: if is_dir {
+                    0
+                } else {
+                    usize::try_from(real.size).unwrap_or(usize::MAX)
+                },
+            });
+        }
 
         let (fd, st, kind) = self.fast_open_contained(rel, false)?;
         if !self.name_matches_on_disk(rel) {
@@ -3024,36 +3134,24 @@ impl HostFsBackend {
         // containment check rejects it, and that probe must never acquire a
         // controlling terminal.
         let base = libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NOCTTY;
-        // RW-first even for a read-only request, mirroring the slow path's
-        // rw_opts preference: HVF rejects hv_vm_map of a MAP_SHARED file VMA
-        // whose backing fd caps max-protection at read, so a guest O_RDONLY
-        // open still prefers an O_RDWR host fd (guest-visible writability is
-        // tracked separately in OpenDescription::HostFile). Scratch files are
-        // kept owner-writable (see CARRICK_MODE_XATTR), so the first attempt
-        // nearly always succeeds; the O_RDONLY retry covers directories
-        // (EISDIR) and genuinely host-read-only files.
-        let mut raw = unsafe { libc::openat(dir_fd, rel_c.as_ptr(), libc::O_RDWR | base, 0) };
+        // The host open carries the guest's OWN access mode. An O_RDWR open of
+        // an APFS file costs ~1.7x an O_RDONLY one (10.8 vs 6.3 us measured
+        // 2026-09-01), and the majority of guest opens are read-only, so a
+        // read request is exactly one O_RDONLY openat — no RW probe. The one
+        // consumer that needs a writable host fd behind a guest O_RDONLY
+        // description, a live MAP_SHARED alias (HVF caps the alias at the
+        // fd's max-protection), upgrades the fd in place at map time through
+        // `FsBackend::upgrade_host_fd_for_shared_map` instead of taxing every
+        // open for it. A write request failing with its real access mode lets
+        // the cap-std path produce the exact error/None it does today.
+        let accmode = if write { libc::O_RDWR } else { libc::O_RDONLY };
+        let raw = unsafe { libc::openat(dir_fd, rel_c.as_ptr(), accmode | base, 0) };
         if raw < 0 {
-            let error = std::io::Error::last_os_error().raw_os_error();
-            if error == Some(libc::ELOOP) {
-                return FastGuestOpen::SymlinkLeaf;
-            }
-            if write {
-                // A write open that failed with its real access mode: let the
-                // cap-std path produce the exact error/None it does today.
-                return FastGuestOpen::Fallback;
-            }
-            if error == Some(libc::ENOENT) {
-                return FastGuestOpen::Missing;
-            }
-            raw = unsafe { libc::openat(dir_fd, rel_c.as_ptr(), libc::O_RDONLY | base, 0) };
-            if raw < 0 {
-                return match std::io::Error::last_os_error().raw_os_error() {
-                    Some(libc::ELOOP) => FastGuestOpen::SymlinkLeaf,
-                    Some(libc::ENOENT) => FastGuestOpen::Missing,
-                    _ => FastGuestOpen::Fallback,
-                };
-            }
+            return match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::ELOOP) => FastGuestOpen::SymlinkLeaf,
+                Some(libc::ENOENT) if !write => FastGuestOpen::Missing,
+                _ => FastGuestOpen::Fallback,
+            };
         }
         // SAFETY: `raw` is a freshly-opened owned fd; OwnedFd closes it on
         // drop, covering every early return below.
@@ -3091,15 +3189,98 @@ impl HostFsBackend {
             // exact slow path.
             return FastGuestOpen::Fallback;
         };
-        // Clear the probe-only O_NONBLOCK so the served fd's status flags
-        // match a plain open(2). Regular files ignore O_NONBLOCK for I/O
-        // either way, and the guest's OWN requested flags (including its
-        // O_NONBLOCK, O_APPEND emulation) are tracked by the dispatcher in
-        // the OpenDescription, not read back from the host fd.
-        unsafe {
-            libc::fcntl(raw, libc::F_SETFL, 0);
-        }
+        // The fd stays O_NONBLOCK: that is the dispatcher's invariant for
+        // every host-backed fd (see the `open_raw_fd` contract), and the
+        // guest's OWN requested flags (its O_NONBLOCK, the O_APPEND
+        // emulation) live in the OpenDescription, never on the host fd.
         FastGuestOpen::Served { fd, stat: st, kind }
+    }
+
+    /// Create-open of a NEW regular file as ONE `openat(O_CREAT)` against the
+    /// cached, containment-proven parent dirfd, sibling of
+    /// [`Self::fast_open_for_guest`] for the creating case.
+    ///
+    /// The `O_CREAT` sandbox finding in docs/fs-host-capstd-amplification.md
+    /// is about a MULTI-component `openat(root_fd, "link/file", O_CREAT)`:
+    /// `O_NOFOLLOW` guards only the leaf, so an intermediate symlink creates
+    /// the file outside the root before any containment check can run. That
+    /// shape cannot occur here: the parent comes from the kernel directory
+    /// cache, which walked it one `O_NOFOLLOW|O_DIRECTORY` component at a
+    /// time and proved it under the root, and the leaf is a single slash-free
+    /// component opened `O_NOFOLLOW` — the create lands in exactly that
+    /// directory. Without a cached parent there is no proven anchor and the
+    /// caller keeps the cap-std path (which also materialises missing
+    /// ancestors).
+    ///
+    /// The guest's umask-applied `mode` is applied on the held fd (`fchmod`
+    /// only when the host umask would have masked a requested bit), so the
+    /// file needs no path-based `set_mode` afterwards — that was a stat, an
+    /// open+fchmod and an open+fremovexattr per `creat(2)`. A mode carrick
+    /// cannot represent natively (no owner rw) is created owner-rw and
+    /// reported `mode_applied = false` so the caller records it via the
+    /// xattr override exactly as before.
+    #[cfg(target_os = "macos")]
+    fn fast_create_for_guest(&self, rel: &Path, mode: u32, trunc: bool) -> Option<(i32, bool)> {
+        use std::os::fd::AsRawFd;
+        if !self.fast_fs || self.root_prefix.is_none() {
+            return None;
+        }
+        let (parent_fd, name_c) = self.namei_leaf(rel)?;
+        let mode = mode & 0o7777;
+        let representable = mode & 0o600 == 0o600;
+        let host_mode = if representable { mode } else { mode | 0o600 };
+        // O_EXCL: the layered view proved the path absent, so a host entry
+        // there is a shape this lane does not describe (EEXIST → the exact
+        // cap-std path, which opens it as before). It also makes "created
+        // now" a kernel fact rather than an inference, so the mode fix-up
+        // below can never touch a pre-existing file's mode.
+        let mut flags = libc::O_RDWR
+            | libc::O_CREAT
+            | libc::O_EXCL
+            | libc::O_NOFOLLOW
+            | libc::O_CLOEXEC
+            | libc::O_NOCTTY
+            | libc::O_NONBLOCK;
+        if trunc {
+            flags |= libc::O_TRUNC;
+        }
+        let raw = unsafe {
+            libc::openat(
+                parent_fd.as_raw_fd(),
+                name_c.as_ptr(),
+                flags,
+                host_mode as libc::c_uint,
+            )
+        };
+        if raw < 0 {
+            return None;
+        }
+        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+        if unsafe { libc::fstat(raw, &mut st) } != 0
+            || st.st_mode as u32 & libc::S_IFMT as u32 != libc::S_IFREG as u32
+        {
+            // A raced-in FIFO/device/socket at the leaf: not the regular file
+            // this lane promises; the exact cap-std path decides.
+            unsafe {
+                libc::close(raw);
+            }
+            return None;
+        }
+        if !self.name_matches_on_disk(rel) {
+            unsafe {
+                libc::close(raw);
+            }
+            return None;
+        }
+        // The kernel applied the host umask to `host_mode` and may drop a
+        // setuid/setgid/sticky bit at creation; only a requested bit in
+        // those classes needs the fchmod.
+        if representable && mode & (host_umask() | 0o7000) != 0 {
+            unsafe {
+                libc::fchmod(raw, mode as libc::mode_t);
+            }
+        }
+        Some((raw, representable))
     }
 
     /// Prove that an ENOENT from `fast_open_for_guest` is a real miss in this
@@ -3288,6 +3469,21 @@ impl HostFsBackend {
             fset_u32_xattr(fd.as_raw_fd(), name, 1);
         }
         seen.store(true, std::sync::atomic::Ordering::Relaxed);
+        // After the xattr is durable: every process's cached ABSENT reading of
+        // any root marker is now stale (see `current_marker_generation`).
+        crate::fs_resolve_cache::bump_marker_generation();
+    }
+
+    /// Record that entries under this root MAY carry guest metadata xattrs
+    /// without the root itself carrying the durable marker. A published
+    /// layer-cache entry is such a root: its per-entry mode xattrs were
+    /// written by the extraction, not by `set_mode`, and only its
+    /// `CLEAN_META_MARKER` file (absent = conservative) says whether any
+    /// exist. This backend never mutates, so the sticky in-process reading is
+    /// the complete truth for it and `serves_plain_metadata` fails closed.
+    pub(crate) fn assume_meta_xattrs(&self) {
+        self.meta_xattr_seen
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Stamp the durable FIFO marker on the sandbox root. Called by
@@ -3310,7 +3506,7 @@ impl HostFsBackend {
         if self.whiteout_seen.load(Relaxed) {
             return true;
         }
-        let now = crate::fs_resolve_cache::current_generation();
+        let now = crate::fs_resolve_cache::current_marker_generation();
         if self.whiteout_absent_gen.load(Relaxed) == now {
             return false;
         }
@@ -3334,7 +3530,7 @@ impl HostFsBackend {
         if self.symlink_seen.load(Relaxed) {
             return true;
         }
-        let now = crate::fs_resolve_cache::current_generation();
+        let now = crate::fs_resolve_cache::current_marker_generation();
         if self.symlink_absent_gen.load(Relaxed) == now {
             return false;
         }
@@ -3472,22 +3668,20 @@ impl HostFsBackend {
         // resurrect it via a raw open.
         let rel = Self::rel_path(&normalized)?;
         let (dir, at_rel) = self.at(rel).ok()?;
+        use cap_std::fs::OpenOptionsExt as _;
         let mut opts = cap_std::fs::OpenOptions::new();
-        opts.read(true);
+        opts.read(true).custom_flags(libc::O_NONBLOCK);
         if write {
             opts.write(true);
         }
         opts.create(create).truncate(trunc);
+        // The host fd carries the guest's own access mode (see
+        // `fast_open_for_guest`); a live MAP_SHARED alias of a guest-read-only
+        // description upgrades it in place through
+        // `upgrade_host_fd_for_shared_map` rather than every open paying for
+        // an O_RDWR host open it will never use.
         let file = if !write && !trunc && !create {
-            // HVF rejects hv_vm_map of a MAP_SHARED file VMA whose backing fd
-            // only allows read max-protection. Prefer an O_RDWR host fd for
-            // Carrick-owned scratch files, while still recording guest
-            // writability separately in OpenDescription::HostFile.
-            let mut rw_opts = cap_std::fs::OpenOptions::new();
-            rw_opts.read(true).write(true);
-            dir.open_with(&at_rel, &rw_opts)
-                .or_else(|_| dir.open_with(&at_rel, &opts))
-                .ok()?
+            dir.open_with(&at_rel, &opts).ok()?
         } else {
             match dir.open_with(&at_rel, &opts) {
                 Ok(file) => file,
@@ -3716,15 +3910,26 @@ impl HostFsBackend {
         }
 
         // Metadata via one flistxattr-gated fd pass (O_NOFOLLOW: confirmed
-        // non-symlink; O_EVTONLY: no atime bump).
-        let leaf_flags = O_EVTONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
-        let leaf_raw =
-            unsafe { libc::openat(parent_fd.as_raw_fd(), name_c.as_ptr(), leaf_flags, 0) };
-        if leaf_raw < 0 {
-            return None;
-        }
-        let leaf_fd = unsafe { OwnedFd::from_raw_fd(leaf_raw) };
-        let (override_mode, uid, gid, is_socket) = fd_carrick_meta(leaf_fd.as_raw_fd());
+        // non-symlink; O_EVTONLY: no atime bump). Skipped outright while the
+        // root markers prove no entry anywhere carries a mode/owner xattr or
+        // a socket/device marker: the inode alone is then the complete guest
+        // answer, and a cold file costs one fstatat instead of fstatat +
+        // openat + flistxattr + close. The first `set_mode`/`set_owner`
+        // that needs an xattr stamps the marker BEFORE writing it, and the
+        // write itself bumps the inode's ctime, so an entry cached under the
+        // plain reading revalidates stale and refills through the xattr pass.
+        let (override_mode, uid, gid, is_socket) = if self.serves_plain_metadata() {
+            (None, None, None, false)
+        } else {
+            let leaf_flags = O_EVTONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+            let leaf_raw =
+                unsafe { libc::openat(parent_fd.as_raw_fd(), name_c.as_ptr(), leaf_flags, 0) };
+            if leaf_raw < 0 {
+                return None;
+            }
+            let leaf_fd = unsafe { OwnedFd::from_raw_fd(leaf_raw) };
+            fd_carrick_meta(leaf_fd.as_raw_fd())
+        };
         let kind = if is_dir {
             RootFsEntryKind::Directory
         } else if is_socket {
@@ -4001,6 +4206,31 @@ impl HostFsBackend {
     /// established on-disk entry, and re-walking every ancestor on every
     /// stat would be quadratic; the leaf is where guest-supplied freshly-
     /// normalized names actually bite — the unicode-filename tests.)
+    /// The byte-exact child names of `dir` from ONE directory read — no
+    /// per-entry stat, no kind, no size. `None` when `dir` cannot be read as
+    /// a directory. This is the listing the immutable lower memoises to
+    /// answer "does the lower have `dir/leaf`?" without a host call per
+    /// leaf; the guest path bytes and the on-disk names agree byte-for-byte
+    /// (see [`normalize`] and [`Self::name_matches_on_disk`]), so
+    /// membership here is exactly the host's own answer.
+    pub(crate) fn child_name_set(&self, dir: &str) -> Option<HashSet<std::ffi::OsString>> {
+        let normalized = normalize(dir)?;
+        let read = match Self::rel_path(&normalized) {
+            Some(rel) => self.at(rel).and_then(|(dir, at_rel)| dir.read_dir(&at_rel)),
+            None => self.dir.entries(),
+        }
+        .ok()?;
+        let mut out = HashSet::new();
+        for entry in read.flatten() {
+            let name = entry.file_name();
+            if is_internal_sidecar_name(&name.to_string_lossy()) {
+                continue;
+            }
+            out.insert(name);
+        }
+        Some(out)
+    }
+
     fn name_matches_on_disk(&self, rel: &Path) -> bool {
         use std::os::unix::ffi::OsStrExt;
         let Some(file_name) = rel.file_name() else {
@@ -4576,6 +4806,22 @@ const LINK_XATTR_SIDECAR_PREFIX: &str = ".carrick-lnkxattr.";
 /// exact leaf so directory merging can recover it and reject corruption.
 const HOST_WHITEOUT_SIDECAR_PREFIX: &str = ".carrick-whiteout.";
 
+/// The carrier's file-creation mask, read once. `umask(2)` is get-and-set,
+/// so the read briefly sets 0 and restores; carrick's own scratch creations
+/// pass explicit modes, so a creation racing that window gets exactly the
+/// mode it asked for.
+#[cfg(target_os = "macos")]
+fn host_umask() -> u32 {
+    static HOST_UMASK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *HOST_UMASK.get_or_init(|| {
+        let previous = unsafe { libc::umask(0) };
+        unsafe {
+            libc::umask(previous);
+        }
+        u32::from(previous) & 0o777
+    })
+}
+
 /// True iff `name` is one of carrick's internal per-symlink sidecar files.
 /// Directory enumeration must hide these regardless of backend: they are
 /// metadata storage, not guest-visible files.
@@ -5112,37 +5358,19 @@ impl FsBackend for HostFsBackend {
         #[cfg(target_os = "macos")]
         if let Some(normalized) = normalize(path)
             && let Some(rel) = Self::rel_path(&normalized)
-            && let Some((fd, st, kind)) = self.fast_open_contained(rel, false)
         {
-            use std::os::fd::AsRawFd;
-            if !self.name_matches_on_disk(rel) {
-                // Host-aliased (Unicode-normalized) name: the Linux view is
-                // "no such entry", exactly as `lookup_kind`/`metadata` report.
-                return (None, None);
+            // `fast_metadata_contained` answers a plain file/directory from
+            // the stat cache (one revalidating fstatat) or one contained fd;
+            // a Unicode-aliased name is None there too, which is exactly the
+            // "no such entry" the Linux view reports.
+            if let Some(metadata) = self.fast_metadata_contained(&normalized, rel) {
+                let entry_kind = if metadata.kind == RootFsEntryKind::Directory {
+                    OverlayEntryKind::Dir
+                } else {
+                    OverlayEntryKind::File
+                };
+                return (Some(entry_kind), Some(metadata));
             }
-            let is_dir = kind == RootFsEntryKind::Directory;
-            let (override_mode, _uid, _gid, is_socket) = fd_carrick_meta(fd.as_raw_fd());
-            let entry_kind = if is_dir {
-                OverlayEntryKind::Dir
-            } else {
-                OverlayEntryKind::File
-            };
-            let md_kind = if !is_dir && is_socket {
-                RootFsEntryKind::Socket
-            } else {
-                kind
-            };
-            let on_disk = st.st_mode as u32 & 0o7777;
-            let default = if is_dir { 0o755 } else { 0o644 };
-            return (
-                Some(entry_kind),
-                Some(RootFsMetadata {
-                    path: normalized,
-                    kind: md_kind,
-                    mode: override_mode.unwrap_or(if on_disk == 0 { default } else { on_disk }),
-                    size: if is_dir { 0 } else { st.st_size as usize },
-                }),
-            );
         }
         match self.lookup_kind(path) {
             None => (None, None),
@@ -5158,12 +5386,12 @@ impl FsBackend for HostFsBackend {
         // Layer extraction never materialises FIFOs (special tar entries are
         // skipped — see `extract_layer_entries`/`extract_to_dir`), so the only
         // way a FIFO appears under this root is `create_fifo`, which stamps
-        // the durable root marker BEFORE creating the node and bumps the
-        // shared fs generation. Reading the generation first and the marker
-        // second makes the absent-stamp sound: a stamp taken at generation G
-        // proves the marker was absent at some point ≥ the G bump, and any
-        // later FIFO creation bumps past G.
-        let now = crate::fs_resolve_cache::current_generation();
+        // the durable root marker BEFORE creating the node; the stamp bumps
+        // the shared marker generation. Reading the generation first and the
+        // marker second makes the absent-stamp sound: a stamp taken at
+        // generation G proves the marker was absent at some point ≥ the G
+        // bump, and any later FIFO creation bumps past G.
+        let now = crate::fs_resolve_cache::current_marker_generation();
         if self.fifo_absent_gen.load(Relaxed) == now {
             return false;
         }
@@ -5191,7 +5419,7 @@ impl FsBackend for HostFsBackend {
         if self.meta_xattr_seen.load(Relaxed) {
             return false;
         }
-        let now = crate::fs_resolve_cache::current_generation();
+        let now = crate::fs_resolve_cache::current_marker_generation();
         let meta_absent = self.meta_xattr_absent_gen.load(Relaxed) == now
             || match self.root_marker_xattr(CARRICK_HAS_META_XATTRS_XATTR) {
                 RootMarker::Present => {
@@ -5213,16 +5441,16 @@ impl FsBackend for HostFsBackend {
         // can make a raw host directory stream lie is a MARKER node (socket/
         // device — a regular file whose guest type lives in xattrs). Tracked
         // root-level like the FIFO marker: `create_socket`/`create_device`
-        // stamp the durable root xattr and bump the shared generation BEFORE
-        // creating the node, so "generation unchanged since the last absent
-        // reading" proves no marker node appeared anywhere. Coarse (any
+        // stamp the durable root xattr (bumping the shared marker generation)
+        // BEFORE creating the node, so "marker generation unchanged since the
+        // last absent reading" proves no marker node appeared anywhere. Coarse (any
         // marker node anywhere disables streaming everywhere) but exact —
         // and walk workloads do not bind sockets or mknod devices.
         use std::sync::atomic::Ordering::Relaxed;
         if self.marker_seen.load(Relaxed) {
             return true;
         }
-        let now = crate::fs_resolve_cache::current_generation();
+        let now = crate::fs_resolve_cache::current_marker_generation();
         if self.marker_absent_gen.load(Relaxed) == now {
             return false;
         }
@@ -5285,7 +5513,10 @@ impl FsBackend for HostFsBackend {
         let normalized = self.resolve_following(path)?;
         let rel = Self::rel_path(&normalized)?;
         let (dir, at_rel) = self.at(rel).ok()?;
-        let file = dir.open(&at_rel).ok()?.into_std();
+        use cap_std::fs::OpenOptionsExt as _;
+        let mut opts = cap_std::fs::OpenOptions::new();
+        opts.read(true).custom_flags(libc::O_NONBLOCK);
+        let file = dir.open_with(&at_rel, &opts).ok()?.into_std();
         let metadata = file.metadata().ok()?;
         metadata.is_file().then_some(file)
     }
@@ -5989,6 +6220,82 @@ impl FsBackend for HostFsBackend {
         self.open_raw_fd_capstd(path, write, create, trunc)
     }
 
+    #[cfg(target_os = "macos")]
+    fn upgrade_host_fd_for_shared_map(&self, fd: i32) -> bool {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let Some(root_prefix) = self.root_prefix.as_deref() else {
+            return false;
+        };
+        let mut buf = [0u8; libc::PATH_MAX as usize];
+        if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr() as *mut libc::c_char) } < 0 {
+            return false;
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        let Ok(path) = std::ffi::CString::new(&buf[..end]) else {
+            return false;
+        };
+        // Containment is checked on the fd ALREADY held (its vnode's cached
+        // path), and the re-open is pinned to that same inode below, so the
+        // path is only a handle for the kernel to reach the vnode again —
+        // a rename or replacement between the two steps is caught by the
+        // identity comparison, never served.
+        if !fd_contained_under(fd, root_prefix) {
+            return false;
+        }
+        let Ok(old_identity) = host_dir_identity(fd) else {
+            return false;
+        };
+        let raw = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDWR
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC
+                    | libc::O_NOFOLLOW
+                    | libc::O_NOCTTY,
+            )
+        };
+        if raw < 0 {
+            return false;
+        }
+        // SAFETY: freshly-opened owned fd; drop closes it on every early
+        // return and after the dup2 below has copied it onto `fd`.
+        let new = unsafe { OwnedFd::from_raw_fd(raw) };
+        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+        if unsafe { libc::fstat(new.as_raw_fd(), &mut st) } != 0
+            || st.st_mode as u32 & libc::S_IFMT as u32 != libc::S_IFREG as u32
+            || (st.st_dev as u64, st.st_ino) != old_identity
+        {
+            return false;
+        }
+        let offset = unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
+        if offset < 0 || unsafe { libc::lseek(new.as_raw_fd(), offset, libc::SEEK_SET) } < 0 {
+            return false;
+        }
+        // dup2 atomically replaces the open behind the number; the caller
+        // holds the description's write guard, so no read/write can move the
+        // offset between the copy above and the swap.
+        if unsafe { libc::dup2(new.as_raw_fd(), fd) } < 0 {
+            return false;
+        }
+        // dup2 clears FD_CLOEXEC on the target; restore the dispatcher's
+        // host-fd invariant.
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        true
+    }
+
+    fn create_raw_fd(&self, path: &str, mode: u32, trunc: bool) -> Option<(i32, bool)> {
+        #[cfg(target_os = "macos")]
+        if let Some(normalized) = normalize(path)
+            && let Some(rel) = Self::rel_path(&normalized)
+            && let Some(created) = self.fast_create_for_guest(rel, mode, trunc)
+        {
+            return Some(created);
+        }
+        self.open_raw_fd_capstd(path, true, true, trunc)
+            .map(|fd| (fd, false))
+    }
+
     fn reopen_for_durability(&self, path: &str) -> Result<Option<i32>, BackendError> {
         self.open_raw_fd(path, true, false, false)
             .map(Some)
@@ -6021,7 +6328,11 @@ impl FsBackend for HostFsBackend {
                         return None;
                     }
                     use std::os::fd::{AsRawFd, IntoRawFd};
-                    let (override_mode, _uid, _gid, _is_socket) = fd_carrick_meta(fd.as_raw_fd());
+                    let override_mode = if self.serves_plain_metadata() {
+                        None
+                    } else {
+                        fd_carrick_meta(fd.as_raw_fd()).0
+                    };
                     let on_disk_mode = stat.st_mode as u32 & 0o7777;
                     let mode = override_mode.unwrap_or(if on_disk_mode == 0 {
                         0o644
@@ -6056,7 +6367,11 @@ impl FsBackend for HostFsBackend {
             unsafe { libc::close(fd) };
             return None;
         }
-        let (override_mode, _uid, _gid, _is_socket) = fd_carrick_meta(fd);
+        let override_mode = if self.serves_plain_metadata() {
+            None
+        } else {
+            fd_carrick_meta(fd).0
+        };
         let on_disk_mode = st.st_mode as u32 & 0o7777;
         let mode = override_mode.unwrap_or(if on_disk_mode == 0 {
             0o644
@@ -6846,6 +7161,20 @@ impl FsBackend for HostFsBackend {
             let Ok(parent_c) = std::ffi::CString::new(parent.as_os_str().as_bytes()) else {
                 return ParentResolve::Slow;
             };
+            // The kernel directory cache first: a hit is a dirfd for exactly
+            // this parent that was reached one `O_NOFOLLOW | O_DIRECTORY`
+            // component at a time from the sandbox root and is still current
+            // at the directory-topology generation — which is the
+            // `AllDirsNoSymlink` verdict, already proven, for zero host calls.
+            // Before this every path resolution re-proved it with
+            // `openat`+`F_GETPATH`+`close` even when the same directory had
+            // just been resolved for the previous call. A miss (an
+            // intermediate symlink, a parent the sparse upper does not hold)
+            // takes the explicit proof below, whose verdict also classifies
+            // the miss.
+            if self.dir_fd_for(parent).is_some() {
+                return ParentResolve::AllDirsNoSymlink;
+            }
             let dir_fd = self.dir.as_raw_fd();
             // ONE openat: the kernel walks every intermediate. O_DIRECTORY makes a
             // non-directory parent (or any non-dir intermediate) fail ENOTDIR.
@@ -8397,14 +8726,11 @@ mod tests {
                 assert_eq!(stat.st_size, 5);
                 let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
                 assert_ne!(flags, -1);
-                // The probe-only O_NONBLOCK is cleared before the fd is
-                // served; regular files ignore it for I/O but the served
-                // fd's status flags stay faithful to a plain open(2).
-                assert_eq!(flags & libc::O_NONBLOCK, 0);
-                // RW-first host access even for a guest read-only request
-                // (HVF MAP_SHARED max-protection; guest writability is
-                // tracked separately by the dispatcher).
-                assert_eq!(flags & libc::O_ACCMODE, libc::O_RDWR);
+                // Served O_NONBLOCK: the dispatcher's invariant for every
+                // host-backed fd (the guest's own flags live in the
+                // description), and with the guest's own access mode.
+                assert_ne!(flags & libc::O_NONBLOCK, 0);
+                assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
             }
             _ => panic!("a plain regular file must take the fast path"),
         }
@@ -8780,7 +9106,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn host_readonly_open_prefers_writable_host_fd() {
+    fn host_readonly_open_upgrades_in_place_for_shared_map() {
         let (b, _scratch) = host_backend();
         b.set_file_contents("/g", b"hvf maxprot\n".to_vec())
             .unwrap();
@@ -8788,7 +9114,53 @@ mod tests {
             .open_raw_fd("/g", false, false, false)
             .expect("open_raw_fd");
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        assert_eq!(flags & libc::O_ACCMODE, libc::O_RDWR);
+        assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
+        let identity = host_dir_identity(fd).unwrap();
+        // Consume four bytes so the upgrade has an offset to carry over.
+        let mut head = [0u8; 4];
+        assert_eq!(unsafe { libc::read(fd, head.as_mut_ptr().cast(), 4) }, 4);
+
+        assert!(b.upgrade_host_fd_for_shared_map(fd));
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert_eq!(
+            flags & libc::O_ACCMODE,
+            libc::O_RDWR,
+            "same number, now writable"
+        );
+        assert_ne!(flags & libc::O_NONBLOCK, 0);
+        assert_ne!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        assert_eq!(
+            host_dir_identity(fd).unwrap(),
+            identity,
+            "pinned to the same inode"
+        );
+        assert_eq!(
+            unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) },
+            4,
+            "offset carried over"
+        );
+        let mut rest = [0u8; 8];
+        assert_eq!(unsafe { libc::read(fd, rest.as_mut_ptr().cast(), 8) }, 8);
+        assert_eq!(&rest, b"maxprot\n");
+        // Idempotent on an already-writable fd.
+        assert!(b.upgrade_host_fd_for_shared_map(fd));
+        unsafe { libc::close(fd) };
+
+        // A regular file OUTSIDE the backend's root (the shape of the
+        // immutable layer store) is refused and left untouched.
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let path = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(
+            outside.path().as_os_str(),
+        ))
+        .unwrap();
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        assert!(fd >= 0);
+        assert!(!b.upgrade_host_fd_for_shared_map(fd));
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
         unsafe { libc::close(fd) };
     }
 
@@ -9096,5 +9468,221 @@ mod tests {
             "metadata kind should be File, got {:?}",
             meta.kind
         );
+    }
+
+    /// The guest's `open(O_CREAT, mode)` must land in ONE host `openat` that
+    /// carries the guest mode, with the umask-masked bits fixed up on the
+    /// held fd -- not a host create under the host umask followed by a
+    /// path re-walk in `set_mode` (two more opens per guest creat on the
+    /// `fsops` ubench). The mode the guest asked for is what stat reports,
+    /// whatever the host umask says.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn create_raw_fd_applies_the_guest_mode_on_the_held_fd() {
+        let scratch_root = tempfile::TempDir::new().unwrap();
+        let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
+        b.dir.create_dir("d").unwrap();
+
+        let host_mode = |name: &str| -> u32 {
+            let st = b.dir.metadata(name).unwrap();
+            use cap_std::fs::MetadataExt as _;
+            st.mode() & 0o7777
+        };
+
+        for mode in [0o644u32, 0o666, 0o777, 0o600, 0o755, 0o2664] {
+            let name = format!("/d/m{mode:o}");
+            let (fd, applied) = b
+                .create_raw_fd(&name, mode, false)
+                .unwrap_or_else(|| panic!("create {name}"));
+            assert!(
+                applied,
+                "{name}: an owner-representable mode is applied natively"
+            );
+            unsafe { libc::close(fd) };
+            assert_eq!(
+                host_mode(&name[1..]),
+                mode,
+                "{name}: exact guest mode on disk"
+            );
+            let md = b.metadata(&name).unwrap();
+            assert_eq!(md.kind, RootFsEntryKind::File);
+            assert_eq!(md.mode & 0o7777, mode, "{name}: exact guest mode reported");
+        }
+
+        // A mode the owner cannot hold natively (0444: carrick could not
+        // reopen it for writing) is NOT applied by the create lane; the caller
+        // still runs `set_mode`, which parks it in the xattr override.
+        let (fd, applied) = b.create_raw_fd("/d/ro", 0o444, false).unwrap();
+        assert!(!applied);
+        unsafe { libc::close(fd) };
+        b.set_mode("/d/ro", 0o444).unwrap();
+        assert_eq!(b.metadata("/d/ro").unwrap().mode & 0o7777, 0o444);
+
+        // A parent missing from the upper (present only in the lower, which
+        // the dispatcher already proved) is materialised by the cap-std
+        // fallback; that arm creates under the host umask, so it reports the
+        // mode as NOT applied and the caller's `set_mode` still runs.
+        let (fd, applied) = b.create_raw_fd("/nope/f", 0o644, false).unwrap();
+        assert!(!applied);
+        unsafe { libc::close(fd) };
+        assert!(b.dir.exists("nope/f"));
+
+        // A directory at the path is not a file the lane can hand out.
+        assert!(b.create_raw_fd("/d", 0o644, false).is_none());
+
+        // O_TRUNC on the create flags is honoured when the lane opens.
+        let (fd, _) = b.create_raw_fd("/d/t", 0o644, true).unwrap();
+        assert_eq!(unsafe { libc::write(fd, b"abc".as_ptr().cast(), 3) }, 3);
+        unsafe { libc::close(fd) };
+        assert_eq!(b.metadata("/d/t").unwrap().size, 3);
+    }
+
+    /// `lookup_kind_and_metadata` on a plain file or directory is served by
+    /// the stat cache -- one revalidating `fstatat` -- not by opening the
+    /// entry. The reported kind/mode/size must still be exact.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lookup_kind_and_metadata_is_served_from_the_stat_cache() {
+        let scratch_root = tempfile::TempDir::new().unwrap();
+        let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
+        assert!(b.stat_cache_active());
+        b.dir.create_dir("pkg").unwrap();
+        b.dir.write("pkg/f", b"hello").unwrap();
+        b.set_mode("/pkg/f", 0o640).unwrap();
+
+        let (kind, md) = b.lookup_kind_and_metadata("/pkg/f");
+        assert_eq!(kind, Some(OverlayEntryKind::File));
+        let md = md.expect("metadata comes with the kind");
+        assert_eq!(md.kind, RootFsEntryKind::File);
+        assert_eq!(md.mode & 0o7777, 0o640);
+        assert_eq!(md.size, 5);
+        assert!(
+            b.stat_cache.lock().contains_key(Path::new("pkg/f")),
+            "the lookup must have gone through (and filled) the stat cache"
+        );
+
+        let (kind, md) = b.lookup_kind_and_metadata("/pkg");
+        assert_eq!(kind, Some(OverlayEntryKind::Dir));
+        let md = md.unwrap();
+        assert_eq!(md.kind, RootFsEntryKind::Directory);
+        assert_eq!(md.size, 0);
+
+        // The revalidating fstatat sees a change made behind the cache.
+        b.dir.write("pkg/f", b"hello, world").unwrap();
+        let (_, md) = b.lookup_kind_and_metadata("/pkg/f");
+        assert_eq!(md.unwrap().size, 12);
+
+        // Deleted behind the cache: absent, not a stale hit.
+        b.dir.remove_file("pkg/f").unwrap();
+        assert_eq!(b.lookup_kind_and_metadata("/pkg/f"), (None, None));
+    }
+
+    /// While the root markers prove the tree plain, a stat-cache fill is the
+    /// leaf `fstatat` alone: the inode IS the guest answer and no xattr pass
+    /// runs (a mode xattr planted without the marker is therefore invisible —
+    /// the marker, stamped by every writer before its first xattr, is the
+    /// authority). The first marker stamp flips the lane and the xattr pass
+    /// is honoured again, including for entries cached under the plain
+    /// reading.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn plain_tree_stat_fill_is_the_inode_alone() {
+        use std::os::fd::AsRawFd;
+        let scratch_root = tempfile::TempDir::new().unwrap();
+        let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
+        assert!(b.stat_cache_active());
+        assert!(b.serves_plain_metadata(), "fresh scratch is plain");
+        b.dir.create_dir("pkg").unwrap();
+        b.dir.write("pkg/f", b"hello").unwrap();
+        let on_disk = b.dir.metadata("pkg/f").unwrap();
+        let on_disk_mode = cap_std::fs::MetadataExt::mode(&on_disk) & 0o7777;
+        assert_ne!(on_disk_mode, 0o400);
+
+        // Plant an override xattr WITHOUT stamping the root marker.
+        {
+            let f = b.dir.open("pkg/f").unwrap();
+            fset_u32_xattr(f.as_raw_fd(), CARRICK_MODE_XATTR, 0o400);
+        }
+        let real = b.stat_cache_get_or_fill(Path::new("pkg/f")).unwrap();
+        assert_eq!(real.mode, on_disk_mode, "plain fill trusts the inode");
+        assert_eq!(real.uid, NsUid::ROOT);
+        assert_eq!(real.kind, RootFsEntryKind::File);
+        let (_, md) = b.lookup_kind_and_metadata("/pkg/f");
+        assert_eq!(md.unwrap().mode & 0o7777, on_disk_mode);
+
+        // The first metadata writer stamps the marker before its xattr; the
+        // planted override is now honoured, even for the cached entry.
+        b.dir.write("pkg/g", b"x").unwrap();
+        b.set_owner("/pkg/g", Some(NsUid::new(7)), None).unwrap();
+        assert!(!b.serves_plain_metadata());
+        // A ctime bump makes the cached plain entry revalidate stale.
+        b.dir.write("pkg/f", b"hello!").unwrap();
+        let real = b.stat_cache_get_or_fill(Path::new("pkg/f")).unwrap();
+        assert_eq!(real.mode, 0o400, "marked tree honours the override");
+        let g = b.stat_cache_get_or_fill(Path::new("pkg/g")).unwrap();
+        assert_eq!(g.uid, NsUid::new(7));
+    }
+
+    /// The `open_raw_fd` contract: every host fd the backend hands out is
+    /// already `O_NONBLOCK`, across the fast lane, the cap-std path
+    /// (create/truncate), `create_raw_fd`, `open_file_readonly` and the
+    /// immutable-lower open, so the dispatcher's install sites never pay a
+    /// `fcntl` to establish its host-fd invariant.
+    #[test]
+    fn backend_fds_arrive_nonblocking() {
+        fn is_nonblocking(fd: i32) -> bool {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            flags >= 0 && flags & libc::O_NONBLOCK != 0
+        }
+        fn take(fd: i32) -> bool {
+            let ok = is_nonblocking(fd);
+            unsafe { libc::close(fd) };
+            ok
+        }
+        let scratch_root = tempfile::TempDir::new().unwrap();
+        let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
+        b.dir.create_dir("d").unwrap();
+        b.dir.write("d/f", b"hello").unwrap();
+
+        // Non-creating reads and writes (fast lane on macOS, cap-std elsewhere).
+        assert!(
+            take(b.open_raw_fd("/d/f", false, false, false).unwrap()),
+            "read open"
+        );
+        assert!(
+            take(b.open_raw_fd("/d/f", true, false, false).unwrap()),
+            "write open"
+        );
+        // Truncating and creating opens take the cap-std path.
+        assert!(
+            take(b.open_raw_fd("/d/f", true, false, true).unwrap()),
+            "trunc open"
+        );
+        assert!(
+            take(b.open_raw_fd("/d/new", true, true, false).unwrap()),
+            "create open"
+        );
+        assert!(
+            take(b.create_raw_fd("/d/created", 0o644, false).unwrap().0),
+            "create_raw_fd"
+        );
+        assert!(
+            take(b.create_raw_fd("/d/f", 0o644, false).unwrap().0),
+            "create_raw_fd over an existing file (cap-std fallback)"
+        );
+        {
+            use std::os::fd::AsRawFd as _;
+            let file = b.open_file_readonly("/d/f").unwrap();
+            assert!(is_nonblocking(file.as_raw_fd()), "open_file_readonly");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd as _;
+            let ImmutableHostFileOpen::Served { file, .. } = b.open_immutable_file_readonly("/d/f")
+            else {
+                panic!("immutable-lower open should be served");
+            };
+            assert!(is_nonblocking(file.as_raw_fd()), "immutable-lower open");
+        }
     }
 }

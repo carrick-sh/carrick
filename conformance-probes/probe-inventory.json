@@ -574,6 +574,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "fileaccessmode": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "flocklock": {
     "class": "conformance",
     "excluded": false,

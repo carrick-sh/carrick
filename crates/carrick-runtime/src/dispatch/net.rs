@@ -364,7 +364,7 @@ pub(in crate::dispatch) fn recverr_close(host_fd: i32) {
 }
 
 use support::*;
-pub(super) use support::{drain_netlink_queue, set_host_nonblocking};
+pub(super) use support::{drain_netlink_queue, host_fd_is_nonblocking, set_host_nonblocking};
 
 fn remove_epoll_interest(
     interest: &mut HashMap<i32, EpollInterest>,

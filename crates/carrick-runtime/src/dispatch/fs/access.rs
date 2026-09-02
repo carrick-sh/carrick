@@ -560,6 +560,9 @@ impl SyscallDispatcher {
         path: &str,
         mode: u64,
     ) -> Option<DispatchOutcome> {
+        if !crate::vfs::may_be_synthetic_virtual_path(path) {
+            return None;
+        }
         let proc_ctx = self.synthetic_proc_context(context);
         if crate::vfs::is_synthetic_virtual_file(path, &proc_ctx) {
             return Some(synthetic_readonly_access_for_path(path, mode));

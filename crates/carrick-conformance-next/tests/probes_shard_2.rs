@@ -97,16 +97,16 @@ pub fn probe_campaign_dir(repo_root: &Path, target: &str) -> Option<PathBuf> {
 
 #[test]
 fn test_shard_2_inventory_definition() {
-    // 1. Hard-assert 147 sorted unique names.
+    // 1. Hard-assert 148 sorted unique names.
     assert_eq!(
         SHARD_2_PROBES.len(),
-        147,
-        "shard 2 must contain exactly 147 probes"
+        148,
+        "shard 2 must contain exactly 148 probes"
     );
     let probe_set: BTreeSet<&str> = SHARD_2_PROBES.iter().copied().collect();
     assert_eq!(
         probe_set.len(),
-        147,
+        148,
         "shard 2 probes list must contain no duplicate entries"
     );
     for window in SHARD_2_PROBES.windows(2) {
@@ -155,8 +155,8 @@ fn test_shard_2_inventory_definition() {
     generic_conformance_probes.dedup();
     assert_eq!(
         generic_conformance_probes.len(),
-        443,
-        "expected exactly 443 generic conformance probes across all shards"
+        444,
+        "expected exactly 444 generic conformance probes across all shards"
     );
 
     let derived_shard_2: Vec<&str> = generic_conformance_probes
@@ -168,8 +168,8 @@ fn test_shard_2_inventory_definition() {
 
     assert_eq!(
         derived_shard_2.len(),
-        147,
-        "derived shard 2 must have 147 items"
+        148,
+        "derived shard 2 must have 148 items"
     );
     assert_eq!(
         derived_shard_2.as_slice(),
