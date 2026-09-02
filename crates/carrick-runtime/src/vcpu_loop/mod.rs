@@ -1262,6 +1262,31 @@ struct CloneAdmissionGate {
     changed: Condvar,
 }
 
+/// Outcome of asking the gate to admit a clone or a process fork.
+enum CloneEnrollment {
+    Admitted(CloneAdmissionPermit),
+    /// A sibling process fork has closed admission while it reserves and
+    /// publishes its child. The close lifts when that fork's
+    /// `ForkCloneAdmission` drops, which bumps the change epoch; wait on
+    /// `observed_epoch` and enroll again. Linux serializes these clones and
+    /// never reports `EAGAIN` for them.
+    Deferred {
+        observed_epoch: u64,
+    },
+    /// Exec or exit closed admission for the rest of this process's life.
+    Refused,
+}
+
+impl CloneEnrollment {
+    #[cfg(test)]
+    fn admitted(self) -> Option<CloneAdmissionPermit> {
+        match self {
+            Self::Admitted(permit) => Some(permit),
+            Self::Deferred { .. } | Self::Refused => None,
+        }
+    }
+}
+
 struct CloneAdmissionChangeSubscription {
     gate: Weak<CloneAdmissionGate>,
     id: u64,
@@ -1313,13 +1338,24 @@ impl CloneAdmissionGate {
         })
     }
 
-    fn try_enroll_kind(self: &Arc<Self>, kind: CloneAdmissionKind) -> Option<CloneAdmissionPermit> {
+    fn enroll_kind(self: &Arc<Self>, kind: CloneAdmissionKind) -> CloneEnrollment {
         let mut state = self.state.lock();
-        if state.closing.is_some() {
-            return None;
+        match state.closing {
+            Some(CloneAdmissionClose::Fork { .. }) => {
+                return CloneEnrollment::Deferred {
+                    observed_epoch: state.change_epoch,
+                };
+            }
+            Some(CloneAdmissionClose::Exec { .. } | CloneAdmissionClose::Exit) => {
+                return CloneEnrollment::Refused;
+            }
+            None => {}
         }
-        state.in_flight = state.in_flight.checked_add(1)?;
-        Some(CloneAdmissionPermit {
+        let Some(in_flight) = state.in_flight.checked_add(1) else {
+            return CloneEnrollment::Refused;
+        };
+        state.in_flight = in_flight;
+        CloneEnrollment::Admitted(CloneAdmissionPermit {
             gate: Arc::clone(self),
             generation: state.generation,
             kind,
@@ -1327,15 +1363,25 @@ impl CloneAdmissionGate {
         })
     }
 
-    fn try_enroll_thread_clone(self: &Arc<Self>) -> Option<CloneAdmissionPermit> {
-        self.try_enroll_kind(CloneAdmissionKind::ThreadClone)
+    fn enroll_thread_clone(self: &Arc<Self>) -> CloneEnrollment {
+        self.enroll_kind(CloneAdmissionKind::ThreadClone)
     }
 
-    pub(crate) fn try_enroll_process_fork(
-        self: &Arc<Self>,
-        owner: ThreadId,
-    ) -> Option<CloneAdmissionPermit> {
-        self.try_enroll_kind(CloneAdmissionKind::ProcessFork { owner })
+    pub(crate) fn enroll_process_fork(self: &Arc<Self>, owner: ThreadId) -> CloneEnrollment {
+        self.enroll_kind(CloneAdmissionKind::ProcessFork { owner })
+    }
+
+    /// Advance the change epoch and detach every listener; the caller runs
+    /// the returned callbacks after releasing the state lock.
+    fn publish_change(state: &mut CloneAdmissionState) -> Vec<CloneAdmissionListener> {
+        state.change_epoch = state
+            .change_epoch
+            .checked_add(1)
+            .unwrap_or_else(|| std::process::abort());
+        std::mem::take(&mut state.listeners)
+            .into_values()
+            .map(|(_, callback)| callback)
+            .collect()
     }
 
     fn close_for_exec(
@@ -1475,14 +1521,7 @@ impl Drop for CloneAdmissionPermit {
         };
         state.in_flight = in_flight;
         self.active = false;
-        state.change_epoch = state
-            .change_epoch
-            .checked_add(1)
-            .unwrap_or_else(|| std::process::abort());
-        let callbacks = std::mem::take(&mut state.listeners)
-            .into_values()
-            .map(|(_, callback)| callback)
-            .collect::<Vec<_>>();
+        let callbacks = CloneAdmissionGate::publish_change(&mut state);
         if state.in_flight == 0 || state.closing.is_some() {
             self.gate.changed.notify_all();
         }
@@ -1503,13 +1542,22 @@ impl Drop for ForkCloneAdmission {
     fn drop(&mut self) {
         let mut state = self.gate.state.lock();
         if state.closing
-            == Some(CloneAdmissionClose::Fork {
+            != Some(CloneAdmissionClose::Fork {
                 owner: self.owner,
                 generation: self.generation,
             })
         {
-            state.closing = None;
-            self.gate.changed.notify_all();
+            return;
+        }
+        state.closing = None;
+        // Reopening is a change every deferred clone/fork waits on; the
+        // permit drop that follows is too late for a waiter that enrolled
+        // against this exact close.
+        let callbacks = CloneAdmissionGate::publish_change(&mut state);
+        self.gate.changed.notify_all();
+        drop(state);
+        for callback in callbacks {
+            callback();
         }
     }
 }
@@ -1902,8 +1950,8 @@ impl KernelState {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    fn try_enroll_thread_clone(&self) -> Option<CloneAdmissionPermit> {
-        self.clone_admission.try_enroll_thread_clone()
+    fn enroll_thread_clone(&self) -> CloneEnrollment {
+        self.clone_admission.enroll_thread_clone()
     }
 
     fn close_clone_admission_for_exec(
@@ -2742,7 +2790,7 @@ enum HvpatchProductionPhase {
         frame: carrick_hal::RawSyscall,
         request: HvpatchCloneThreadRequest,
         prepared: Option<crate::kernel::PreparedThreadClone>,
-        _subscription: Option<crate::kernel::ReservationChangeSubscription>,
+        _subscription: CloneRetrySubscription,
     },
     /// A guest thread exit found the kernel task reservation held
     /// (`ProcessThreadExit::Busy`). The job parked with a
@@ -2775,9 +2823,22 @@ enum HvpatchProductionPhase {
     TerminalRetireRetry {
         terminal: PersistentTerminal,
         context: crate::kernel::KernelContext,
-        _subscription: carrick_thread::fork_quiesce::TopologyReleaseSubscription,
+        _subscription: TerminalRetireSubscription,
     },
     Complete,
+}
+
+/// What a parked process terminal waits on before retrying its retirement.
+enum TerminalRetireSubscription {
+    /// The carrier-wide topology lock (another fork/exec/exit mid-edit).
+    Topology {
+        _subscription: carrick_thread::fork_quiesce::TopologyReleaseSubscription,
+    },
+    /// A sibling's exec reservation owns this process's MM generation; the
+    /// exit's owner-set edit is admitted once it settles.
+    ExecSettlement {
+        _subscription: crate::hvpatch::ExecSettlementSubscription,
+    },
 }
 
 #[cfg(test)]
@@ -2951,7 +3012,20 @@ enum PersistentHvpatchCloneAttempt {
     Complete(threads::CloneThreadSpawn),
     Wait {
         prepared: Option<crate::kernel::PreparedThreadClone>,
-        subscription: Option<crate::kernel::ReservationChangeSubscription>,
+        subscription: CloneRetrySubscription,
+    },
+}
+
+/// What a parked thread clone waits on before it is retried.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+enum CloneRetrySubscription {
+    /// The kernel task reservation (parent busy in another transaction).
+    Reservation {
+        _subscription: Option<crate::kernel::ReservationChangeSubscription>,
+    },
+    /// A sibling process fork's transient clone-admission close.
+    Admission {
+        _subscription: Option<CloneAdmissionChangeSubscription>,
     },
 }
 
@@ -4022,6 +4096,66 @@ where
             .hvpatch_process
             .as_ref()
             .unwrap_or_else(|| std::process::abort());
+        let wake_scheduler = || {
+            self.kernel
+                .hvpatch_runtime
+                .as_ref()
+                .unwrap_or_else(|| std::process::abort())
+                .continuation_services(terminal_context.kernel())
+                .0
+        };
+        // Retiring this process's MM edge is an owner-set edit on its
+        // generation. A vfork sibling mid-exec has that generation reserved
+        // and its owner set frozen; admit the edit against the reservation
+        // here, where a refusal is a parkable wait, rather than at
+        // `begin_address_space_retirement` after the kernel exit
+        // publication, where it is only an abort. The hold itself is taken
+        // before the topology lock and never held across a park.
+        let owner_set_edit = loop {
+            let settlement = process.mm_resources().exec_settlement_epoch();
+            match process
+                .mm_resources()
+                .hold_owner_set_edit(terminal_context.task().key())
+            {
+                Ok(hold) => break Some(hold),
+                Err(crate::hvpatch::MmResourcesError::UnknownTask(_)) => break None,
+                Err(crate::hvpatch::MmResourcesError::ExecReservationConflict(conflict)) => {
+                    let scheduler = wake_scheduler();
+                    let thread = terminal_context.thread().key();
+                    match process.mm_resources().subscribe_exec_settlement(
+                        settlement,
+                        Arc::new(move |_| {
+                            let _ = scheduler.wake(thread);
+                        }),
+                    ) {
+                        crate::hvpatch::ExecSettlementEnrollment::Ready => continue,
+                        crate::hvpatch::ExecSettlementEnrollment::Subscribed(subscription) => {
+                            tracing::debug!(
+                                ?conflict,
+                                "process exit deferred behind a sibling's exec reservation"
+                            );
+                            self.phase = HvpatchProductionPhase::TerminalRetireRetry {
+                                terminal,
+                                context: terminal_context,
+                                _subscription: TerminalRetireSubscription::ExecSettlement {
+                                    _subscription: subscription,
+                                },
+                            };
+                            return self.suspend(
+                                HvpatchLoopSuspension::TerminalSiblingDrain,
+                                executor::ExecutorExit::Blocked(
+                                    crate::kernel::objects::BlockedReason::HostWait,
+                                ),
+                            );
+                        }
+                    }
+                }
+                Err(failure) => {
+                    tracing::error!(%failure, "admit persistent terminal MM retirement");
+                    std::process::abort();
+                }
+            }
+        };
         let topology = loop {
             let observed = crate::fork_quiesce::topology_release_generation();
             if let Some(topology) = crate::fork_quiesce::try_acquire_topology_lock(
@@ -4031,13 +4165,7 @@ where
             ) {
                 break topology;
             }
-            let scheduler = self
-                .kernel
-                .hvpatch_runtime
-                .as_ref()
-                .unwrap_or_else(|| std::process::abort())
-                .continuation_services(terminal_context.kernel())
-                .0;
+            let scheduler = wake_scheduler();
             let thread = terminal_context.thread().key();
             match crate::fork_quiesce::subscribe_topology_release(
                 observed,
@@ -4049,10 +4177,15 @@ where
                 carrick_thread::fork_quiesce::TopologyReleaseEnrollment::Subscribed(
                     subscription,
                 ) => {
+                    // Release the admission while parked: the topology
+                    // holder may be the exec'er this hold is excluding.
+                    drop(owner_set_edit);
                     self.phase = HvpatchProductionPhase::TerminalRetireRetry {
                         terminal,
                         context: terminal_context,
-                        _subscription: subscription,
+                        _subscription: TerminalRetireSubscription::Topology {
+                            _subscription: subscription,
+                        },
                     };
                     return self.suspend(
                         HvpatchLoopSuspension::TerminalSiblingDrain,
@@ -4251,6 +4384,7 @@ where
                     std::process::abort();
                 }),
         );
+        drop(owner_set_edit);
         drop(topology);
         self.kernel.publish_process_terminal(terminal_publication);
         self.finish(terminal.into_result())
@@ -4761,15 +4895,45 @@ where
             clear_child_tid_addr,
         } = request;
 
-        let Some(clone_permit) = self.kernel.try_enroll_thread_clone() else {
-            // A guest-visible resource failure must never be silent: EAGAIN
-            // from thread admission under NO real pressure has meant a leaked
-            // permit/lease before, and the guest's own report ("failed to
-            // spawn thread") cannot say which side refused.
-            tracing::warn!("thread clone admission refused; clone(2) = EAGAIN");
-            return Ok(PersistentHvpatchCloneAttempt::Complete(
-                threads::CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EAGAIN),
-            ));
+        let clone_permit = match self.kernel.enroll_thread_clone() {
+            CloneEnrollment::Admitted(permit) => permit,
+            CloneEnrollment::Deferred { observed_epoch } => {
+                // A sibling's process fork has admission closed while it
+                // publishes its child. Linux serializes the two; park until
+                // that close lifts and enroll again, keeping any prepared
+                // clone state for the retry.
+                let scheduler = self
+                    .kernel
+                    .hvpatch_runtime
+                    .as_ref()
+                    .unwrap_or_else(|| std::process::abort())
+                    .continuation_services(parent_context.kernel())
+                    .0;
+                let thread = parent_context.thread().key();
+                let subscription = self.kernel.clone_admission.subscribe_change(
+                    observed_epoch,
+                    Arc::new(move || {
+                        let _ = scheduler.wake(thread);
+                    }),
+                );
+                tracing::debug!("thread clone deferred behind a sibling fork's admission close");
+                return Ok(PersistentHvpatchCloneAttempt::Wait {
+                    prepared: retry_prepared,
+                    subscription: CloneRetrySubscription::Admission {
+                        _subscription: subscription,
+                    },
+                });
+            }
+            CloneEnrollment::Refused => {
+                // A guest-visible resource failure must never be silent: EAGAIN
+                // from thread admission under NO real pressure has meant a leaked
+                // permit/lease before, and the guest's own report ("failed to
+                // spawn thread") cannot say which side refused.
+                tracing::warn!("thread clone admission refused; clone(2) = EAGAIN");
+                return Ok(PersistentHvpatchCloneAttempt::Complete(
+                    threads::CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EAGAIN),
+                ));
+            }
         };
         if self.kernel.process_exiting() || clone_permit.is_cancelled() {
             tracing::warn!(
@@ -4809,7 +4973,9 @@ where
                 .subscribe_reservation_change(observed, callback);
             PersistentHvpatchCloneAttempt::Wait {
                 prepared,
-                subscription,
+                subscription: CloneRetrySubscription::Reservation {
+                    _subscription: subscription,
+                },
             }
         };
         let prepared = if let Some(prepared) = retry_prepared {
@@ -11723,7 +11889,8 @@ mod tests {
         );
         let clone = kernel
             .clone_admission
-            .try_enroll_thread_clone()
+            .enroll_thread_clone()
+            .admitted()
             .expect("model admitted clone");
         let owner = ThreadId::synthetic_for_tests(70_300);
         assert_eq!(
@@ -11793,7 +11960,8 @@ mod tests {
         let gate = Arc::new(CloneAdmissionGate::default());
         let owner = ThreadId::synthetic_for_tests(1003);
         let process_fork = gate
-            .try_enroll_process_fork(owner)
+            .enroll_process_fork(owner)
+            .admitted()
             .expect("process fork admission");
 
         std::thread::scope(|scope| {
@@ -11802,7 +11970,7 @@ mod tests {
                 std::thread::yield_now();
             }
             assert!(
-                gate.try_enroll_thread_clone().is_none(),
+                matches!(gate.enroll_thread_clone(), CloneEnrollment::Refused),
                 "new process forks must be rejected after exec closes admission"
             );
             drop(process_fork);
@@ -11812,7 +11980,157 @@ mod tests {
                     .expect("exec admission drain"),
             );
         });
-        assert!(gate.try_enroll_thread_clone().is_some());
+        assert!(gate.enroll_thread_clone().admitted().is_some());
+    }
+
+    /// A fork close is transient: it lifts when the forking thread's
+    /// `ForkCloneAdmission` drops. A clone or a second fork arriving inside
+    /// that window must wait on the gate's change epoch, not fail. Refusing
+    /// it surfaced as silent `fork/exec … EAGAIN` in Go `os/exec` under load
+    /// (`forkabort-G2`, 2026-09-02) — Linux serializes such clones, it never
+    /// reports `EAGAIN` for them.
+    #[test]
+    fn clone_enrollment_defers_behind_a_fork_close_and_wakes_on_reopen() {
+        let gate = Arc::new(CloneAdmissionGate::default());
+        let owner = ThreadId::synthetic_for_tests(1005);
+        let CloneEnrollment::Admitted(process_fork) = gate.enroll_process_fork(owner) else {
+            panic!("process fork admission");
+        };
+        let fork_close = process_fork
+            .try_close_for_fork(owner)
+            .expect("fork close")
+            .expect("no clone in flight");
+
+        let CloneEnrollment::Deferred { observed_epoch } = gate.enroll_thread_clone() else {
+            panic!("a clone inside a fork close waits");
+        };
+        assert!(
+            matches!(
+                gate.enroll_process_fork(ThreadId::synthetic_for_tests(1006)),
+                CloneEnrollment::Deferred { .. }
+            ),
+            "a second fork inside a fork close waits"
+        );
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wake = Arc::clone(&wakes);
+        let subscription = gate.subscribe_change(
+            observed_epoch,
+            Arc::new(move || {
+                wake.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }),
+        );
+        assert!(
+            subscription.is_some(),
+            "epoch unchanged while the close holds"
+        );
+        drop(fork_close);
+        assert_eq!(
+            wakes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "reopening the gate wakes the deferred clone"
+        );
+        assert!(matches!(
+            gate.enroll_thread_clone(),
+            CloneEnrollment::Admitted(_)
+        ));
+        drop(process_fork);
+
+        let CloneEnrollment::Admitted(exec_fork) = gate.enroll_process_fork(owner) else {
+            panic!("process fork admission");
+        };
+        std::thread::scope(|scope| {
+            let exec = scope.spawn(|| gate.close_for_exec(owner));
+            while !exec_fork.is_cancelled() {
+                std::thread::yield_now();
+            }
+            assert!(
+                matches!(gate.enroll_thread_clone(), CloneEnrollment::Refused),
+                "an exec close is terminal for the process, not a wait"
+            );
+            drop(exec_fork);
+            drop(exec.join().expect("exec closer").expect("exec drain"));
+        });
+    }
+
+    /// The production thread-clone path must park a `Deferred` enrollment
+    /// on the gate's change epoch rather than lower it to `EAGAIN`.
+    /// A process exit retires its MM edge; that is an owner-set edit and
+    /// must be admitted against a sibling's exec reservation exactly as a
+    /// shared fork is — before the topology lock, and long before the
+    /// kernel exit publication after which a refusal is only an abort.
+    #[test]
+    fn process_exit_admits_its_retirement_against_exec_reservations() {
+        let source = include_str!("mod.rs");
+        let finalize = source
+            .split("fn finalize_persistent_process_terminal(")
+            .nth(1)
+            .unwrap_or_else(|| std::process::abort())
+            .split("\n    fn ")
+            .next()
+            .unwrap_or_else(|| std::process::abort());
+        let hold_at = finalize
+            .find(".hold_owner_set_edit(terminal_context.task().key())")
+            .expect("exit admits its owner-set edit");
+        let topology_at = finalize
+            .find("try_acquire_topology_lock(")
+            .expect("exit takes the topology lock");
+        let publish_at = finalize
+            .find(".publish_exit_status(")
+            .expect("exit publishes into the kernel graph");
+        let retire_at = finalize
+            .find(".begin_address_space_retirement(")
+            .expect("exit retires its MM edge");
+        assert!(
+            hold_at < topology_at,
+            "admission precedes the topology lock"
+        );
+        assert!(
+            hold_at < publish_at,
+            "admission precedes kernel publication"
+        );
+        assert!(finalize.contains("TerminalRetireSubscription::ExecSettlement"));
+        assert!(finalize.contains(".subscribe_exec_settlement("));
+        // The hold is also dropped when parking on the topology lock; the
+        // final release follows the retirement.
+        let release_at = finalize
+            .rfind("drop(owner_set_edit);")
+            .expect("the hold is released explicitly after retirement");
+        assert!(retire_at < release_at);
+        let park_release_at = finalize
+            .find("drop(owner_set_edit);")
+            .expect("the hold is dropped before parking on topology");
+        assert!(
+            park_release_at
+                < topology_at
+                    + finalize[topology_at..]
+                        .find("return self.suspend(")
+                        .unwrap()
+        );
+    }
+
+    #[test]
+    fn deferred_thread_clone_parks_on_the_admission_epoch() {
+        let source = include_str!("mod.rs");
+        let spawn = source
+            .split("fn spawn_persistent_hvpatch_clone_thread")
+            .nth(1)
+            .unwrap_or_else(|| std::process::abort())
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap_or_else(|| std::process::abort());
+        let deferred_at = spawn
+            .find("CloneEnrollment::Deferred { observed_epoch }")
+            .expect("thread clone handles a deferred enrollment");
+        let refused_at = spawn
+            .find("CloneEnrollment::Refused")
+            .expect("thread clone handles a refused enrollment");
+        let eagain_at = spawn
+            .find("thread clone admission refused; clone(2) = EAGAIN")
+            .expect("refusal is the only EAGAIN");
+        assert!(deferred_at < refused_at && refused_at < eagain_at);
+        assert!(spawn[deferred_at..refused_at].contains("CloneRetrySubscription::Admission"));
+        assert!(spawn[deferred_at..refused_at].contains("clone_admission.subscribe_change("));
+        assert!(!spawn[deferred_at..refused_at].contains("LINUX_EAGAIN"));
     }
 
     #[test]
@@ -11820,10 +12138,12 @@ mod tests {
         let gate = Arc::new(CloneAdmissionGate::default());
         let owner = ThreadId::synthetic_for_tests(1004);
         let process_fork = gate
-            .try_enroll_process_fork(owner)
+            .enroll_process_fork(owner)
+            .admitted()
             .expect("process fork admission");
         let existing_clone = gate
-            .try_enroll_thread_clone()
+            .enroll_thread_clone()
+            .admitted()
             .expect("existing clone admission");
 
         assert!(
@@ -11831,7 +12151,7 @@ mod tests {
             "fork close must yield while an admitted clone publishes"
         );
         assert!(
-            gate.try_enroll_thread_clone().is_none(),
+            matches!(gate.enroll_thread_clone(), CloneEnrollment::Deferred { .. }),
             "new clones wait behind fork"
         );
         assert!(
@@ -11847,7 +12167,7 @@ mod tests {
         drop(fork);
 
         drop(process_fork);
-        assert!(gate.try_enroll_thread_clone().is_some());
+        assert!(gate.enroll_thread_clone().admitted().is_some());
     }
 
     #[test]

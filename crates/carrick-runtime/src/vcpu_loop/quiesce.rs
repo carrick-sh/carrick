@@ -12,6 +12,10 @@ enum PreparedHvpatchProcessMm {
     Shared {
         parent_task: crate::kernel::TaskKey,
         lease: Arc<crate::hvpatch::Stage1MmLease>,
+        /// Admission against the shared generation's exec reservations, held
+        /// until `publish_shared_child` so an exec cannot freeze the owner
+        /// set between admission and publication.
+        hold: crate::hvpatch::OwnerSetEditHold,
     },
 }
 
@@ -493,8 +497,15 @@ impl<const N: usize> Drop for InventoryAbandon<'_, N> {
 
 enum ProcessForkStart {
     Busy,
+    /// Exec or exit closed admission for good: `EAGAIN`.
     AdmissionClosed,
-    Admitted { admission: CloneAdmissionPermit },
+    /// A sibling process fork's transient close; retry when it lifts.
+    AdmissionDeferred {
+        observed_epoch: u64,
+    },
+    Admitted {
+        admission: CloneAdmissionPermit,
+    },
 }
 
 /// Serialize process forks before enrolling the winner in clone admission.
@@ -511,11 +522,17 @@ fn try_begin_hvpatch_process_fork_with_admission(
     if !barrier.try_begin_fork() {
         return ProcessForkStart::Busy;
     }
-    let Some(admission) = admission_gate.try_enroll_process_fork(tid) else {
-        barrier.end_fork();
-        return ProcessForkStart::AdmissionClosed;
-    };
-    ProcessForkStart::Admitted { admission }
+    match admission_gate.enroll_process_fork(tid) {
+        CloneEnrollment::Admitted(admission) => ProcessForkStart::Admitted { admission },
+        CloneEnrollment::Deferred { observed_epoch } => {
+            barrier.end_fork();
+            ProcessForkStart::AdmissionDeferred { observed_epoch }
+        }
+        CloneEnrollment::Refused => {
+            barrier.end_fork();
+            ProcessForkStart::AdmissionClosed
+        }
+    }
 }
 
 /// Process-wide page-table-edit Pause-Modify-Resume barrier.
@@ -946,6 +963,16 @@ pub(super) enum ProcessForkRetrySubscription {
     Reservation {
         _subscription: Option<crate::kernel::ReservationChangeSubscription>,
     },
+    /// A process fork that found a sibling fork's transient clone-admission
+    /// close; woken when that close lifts.
+    Admission {
+        _subscription: Option<super::CloneAdmissionChangeSubscription>,
+    },
+    /// A shared-MM fork refused while a sibling's exec reservation owns the
+    /// parent's generation; woken when that reservation settles.
+    ExecSettlement {
+        _subscription: crate::hvpatch::ExecSettlementSubscription,
+    },
 }
 
 struct ProcessForkRelease {
@@ -1123,6 +1150,31 @@ where
         // A losing process forker becomes a blocked logical task. It owns no
         // admission permit, pthread, or vCPU while waiting for the current
         // coordinator's exact barrier publication.
+        // A fork that finds a sibling fork's transient admission close is
+        // ordering, not exhaustion: Linux runs the two forks back to back.
+        // Park on the close's change epoch and start over.
+        let defer_on_admission = |observed_epoch, request, external_exec| {
+            let wake_scheduler = Arc::clone(&scheduler);
+            let subscription = kernel.clone_admission.subscribe_change(
+                observed_epoch,
+                Arc::new(move || {
+                    let _ = if is_external_exec {
+                        wake_scheduler.wake_control(wake_thread)
+                    } else {
+                        wake_scheduler.wake(wake_thread)
+                    };
+                }),
+            );
+            tracing::debug!("hvpatch fork deferred behind a sibling fork's admission close");
+            PreparedInProcessFork::Retry {
+                request,
+                coordinator: None,
+                external_exec,
+                _subscription: ProcessForkRetrySubscription::Admission {
+                    _subscription: subscription,
+                },
+            }
+        };
         let mut coordinator = match coordinator {
             Some(coordinator) => coordinator,
             None => match try_begin_hvpatch_process_fork_with_admission(
@@ -1137,6 +1189,9 @@ where
                     return Ok(PreparedInProcessFork::Complete(Some(
                         crate::linux_abi::LINUX_EAGAIN.guest_retval(),
                     )));
+                }
+                ProcessForkStart::AdmissionDeferred { observed_epoch } => {
+                    return Ok(defer_on_admission(observed_epoch, request, external_exec));
                 }
                 ProcessForkStart::Busy => {
                     let subscription = subscribe_barrier();
@@ -1153,6 +1208,10 @@ where
                             return Ok(PreparedInProcessFork::Complete(Some(
                                 crate::linux_abi::LINUX_EAGAIN.guest_retval(),
                             )));
+                        }
+                        ProcessForkStart::AdmissionDeferred { observed_epoch } => {
+                            drop(subscription);
+                            return Ok(defer_on_admission(observed_epoch, request, external_exec));
                         }
                         ProcessForkStart::Busy => {
                             return Ok(PreparedInProcessFork::Retry {
@@ -1361,6 +1420,7 @@ where
         // a cycle with a sibling which starts exit concurrently: the fork owns
         // the task and waits for the sibling registration, while the sibling
         // remains registered waiting for the task reservation.
+        let observed_reservation_epoch = parent_process.kernel_graph().reservation_epoch();
         let reservation_result = if is_external_exec {
             parent_process.kernel_graph().reserve_external_peer_root(
                 parent_context,
@@ -1377,6 +1437,36 @@ where
         };
         let reservation = match reservation_result {
             Ok(reservation) => reservation,
+            Err(crate::kernel::KernelOperationError::TaskBusy(busy)) => {
+                // Another kernel transaction (a sibling's exit, a wait, an
+                // exec) holds one of the tasks this fork reserves. That is
+                // ordering, not exhaustion: wait for the reservation epoch to
+                // move, as the clone-admission close above does, instead of
+                // handing the guest `EAGAIN` for a condition it cannot act on.
+                let wake_scheduler = Arc::clone(&scheduler);
+                let subscription = parent_process.kernel_graph().subscribe_reservation_change(
+                    observed_reservation_epoch,
+                    Arc::new(move || {
+                        let _ = if is_external_exec {
+                            wake_scheduler.wake_control(wake_thread)
+                        } else {
+                            wake_scheduler.wake(wake_thread)
+                        };
+                    }),
+                );
+                tracing::debug!(
+                    ?busy,
+                    "hvpatch fork deferred behind a kernel task reservation"
+                );
+                return Ok(PreparedInProcessFork::Retry {
+                    request,
+                    coordinator: None,
+                    external_exec,
+                    _subscription: ProcessForkRetrySubscription::Reservation {
+                        _subscription: subscription,
+                    },
+                });
+            }
             Err(error) => {
                 tracing::warn!(%error, "hvpatch kernel child reservation failed; fork(2) = EAGAIN");
                 return Ok(PreparedInProcessFork::Complete(Some(
@@ -1389,8 +1479,63 @@ where
         let child_pid = child_id.raw();
         let parent_task = parent_context.task().key();
         let prepared_mm = if shares_mm {
+            // A shared-MM child joins the parent's owner set, which an exec on
+            // ANY task sharing that generation freezes for its duration (the
+            // reservation pins RetainOldMm/RetireOldMm). The per-process
+            // clone-admission gate cannot see that exec: it belongs to the
+            // sibling vfork child's own `KernelState`. Admit against the MM
+            // scope instead, BEFORE kernel publication, so a conflict is a
+            // woken retry (Go os/exec vforks concurrently from several
+            // threads) and never the post-publication abort it used to be.
+            let hold = loop {
+                let settlement = parent_process.mm_resources().exec_settlement_epoch();
+                match parent_process
+                    .mm_resources()
+                    .hold_owner_set_edit(parent_task)
+                {
+                    Ok(hold) => break hold,
+                    Err(crate::hvpatch::MmResourcesError::ExecReservationConflict(conflict)) => {
+                        let wake_scheduler = Arc::clone(&scheduler);
+                        match parent_process.mm_resources().subscribe_exec_settlement(
+                            settlement,
+                            Arc::new(move |_| {
+                                let _ = if is_external_exec {
+                                    wake_scheduler.wake_control(wake_thread)
+                                } else {
+                                    wake_scheduler.wake(wake_thread)
+                                };
+                            }),
+                        ) {
+                            crate::hvpatch::ExecSettlementEnrollment::Ready => continue,
+                            crate::hvpatch::ExecSettlementEnrollment::Subscribed(subscription) => {
+                                tracing::debug!(
+                                    ?conflict,
+                                    "shared-MM fork deferred behind a sibling exec reservation"
+                                );
+                                return Ok(PreparedInProcessFork::Retry {
+                                    request,
+                                    coordinator: None,
+                                    external_exec,
+                                    _subscription: ProcessForkRetrySubscription::ExecSettlement {
+                                        _subscription: subscription,
+                                    },
+                                });
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        return Err(RuntimeError::Configuration(format!(
+                            "admit exact shared HVPatch MM for vfork: {error}"
+                        )));
+                    }
+                }
+            };
             match parent_process.mm_resources().lease(parent_task) {
-                Ok(lease) => PreparedHvpatchProcessMm::Shared { parent_task, lease },
+                Ok(lease) => PreparedHvpatchProcessMm::Shared {
+                    parent_task,
+                    lease,
+                    hold,
+                },
                 Err(error) => {
                     return Err(RuntimeError::Configuration(format!(
                         "retain exact shared HVPatch MM for vfork: {error}"
@@ -1449,6 +1594,55 @@ where
             })?;
         }
         let child_mm_id = prepared_fork.child_mm_id();
+        // Page-table authority over the PARENT MM comes FIRST, before the
+        // frame-inventory reservation and the backend topology lock, so fork
+        // orders P -> topology exactly like the mmap/munmap/mprotect editors
+        // (`SyscallMmPhase::Mutation` pauses, then `unmap_range` takes the
+        // topology lock for alias teardown). Taking the topology lock first
+        // and pausing later inverted that order: a sibling `munmap` holding
+        // the pt-barrier coordinator blocked in `acquire_topology_lock(
+        // AliasUnmap)` on the lock this forker held while the forker parked
+        // in the election, and only the 30 s election budget turned the
+        // cycle into fork(2) = EAGAIN instead of a hang (`bt all` of the
+        // stalled carrier, 2026-09-02).
+        //
+        // Sole exact-MM authority is the cheap arm, but it is only ever
+        // instantaneous: the process fork barrier parks siblings by DURABLE
+        // task membership, while the executor census is transient, so a
+        // sibling that withdrew its vCPU lease into a lease-releasing host
+        // wait, or is between wake and park, still counts. A multithreaded
+        // parent (every Go program) therefore lost sole authority on a
+        // steady fraction of forks and lowered fork(2) to EAGAIN -- 27-33
+        // per go os/exec run under four concurrent lanes -- for a condition
+        // Linux never reports. Pause-modify-resume is the same authority the
+        // editors use against live siblings, so take it here too; only a
+        // real pause failure remains EAGAIN. Every early return below drops
+        // the authority (ending the pause) before the retry re-enters.
+        let mut admitted_mm_executor = None;
+        let mm_executor: &mut crate::dispatch::MmExecutorParticipation =
+            match self.guest_execution.as_mut() {
+                Some(participation) => participation,
+                None => admitted_mm_executor.insert(
+                    kernel.dispatcher.enter_mm_executor().map_err(|error| {
+                        RuntimeError::Configuration(format!(
+                            "admit exact-MM fork publication authority: {error}"
+                        ))
+                    })?,
+                ),
+            };
+        let coordinator = kernel.dispatcher.mm_mutation_coordinator();
+        let parent_mm_id = parent_context.shared().mm().id();
+        let mut install_authority =
+            acquire_mm_stage1_authority(mm_executor, self.this_tid, PtPauseBudget::DEFAULT);
+        if let Err(install_failure) = install_authority.as_ref() {
+            tracing::warn!(
+                ?install_failure,
+                "dispatcher fork install could not pause the parent MM; fork(2) = EAGAIN"
+            );
+            return Ok(PreparedInProcessFork::Complete(Some(
+                crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+            )));
+        }
         let mut inventory_transaction = None;
         let mut inventory_reserve =
             |frame_candidates: usize,
@@ -1641,42 +1835,37 @@ where
             child_pid,
         );
 
-        let restore_mm_executor = self.guest_execution.is_some();
-        let mut mm_executor = match self.guest_execution.take() {
-            Some(participation) => participation,
-            None => kernel.dispatcher.enter_mm_executor().map_err(|error| {
-                RuntimeError::Configuration(format!(
-                    "admit exact-MM fork publication authority: {error}"
-                ))
-            })?,
-        };
-        let coordinator = kernel.dispatcher.mm_mutation_coordinator();
-        let parent_mm_id = parent_context.shared().mm().id();
-        let child_dispatcher =
-            crate::vcpu_loop::with_sole_mm_stage1(&mut mm_executor, |authority| {
-                let mutation = crate::dispatch::mm_mutation::from_sole_executor(
-                    authority,
+        // Install the child's MM under the page-table authority taken above,
+        // before the topology lock.
+        let child_dispatcher = install_authority.as_mut().ok().map(|authority| {
+            let mutation = match authority {
+                MmStage1Authority::Sole(sole) => crate::dispatch::mm_mutation::from_sole_executor(
+                    sole,
                     coordinator,
                     parent_mm_id,
-                );
-                let permit = mutation.host_alias_permit();
-                kernel.dispatcher.fork_clone_with_prepared_mm_authorized(
-                    parent_mm_id,
-                    child_mm_id,
-                    parent_process.pid() as u32,
-                    child_pid as u32,
-                    prepared_dispatch_mm,
-                    &permit,
-                )
-            });
-        if restore_mm_executor {
-            self.guest_execution = Some(mm_executor);
-        }
+                ),
+                MmStage1Authority::Paused(pause) => {
+                    crate::dispatch::mm_mutation::from_pt_pause(pause)
+                }
+            };
+            let permit = mutation.host_alias_permit();
+            kernel.dispatcher.fork_clone_with_prepared_mm_authorized(
+                parent_mm_id,
+                child_mm_id,
+                parent_process.pid() as u32,
+                child_pid as u32,
+                prepared_dispatch_mm,
+                &permit,
+            )
+        });
+        let install_failure = install_authority.as_ref().err().copied();
+        drop(install_authority);
         let mut child_dispatcher = match child_dispatcher {
             Some(Ok(dispatcher)) => dispatcher,
             None => {
                 tracing::warn!(
-                    "dispatcher fork install lost sole exact-MM authority; fork(2) = EAGAIN"
+                    ?install_failure,
+                    "dispatcher fork install could not pause the parent MM; fork(2) = EAGAIN"
                 );
                 if let Err(error) =
                     ops.abort_and_rollback_prepared(prepared_backend, memory, !shares_mm)
@@ -1866,9 +2055,18 @@ where
             PreparedHvpatchProcessMm::Copied(prepared) => parent_process
                 .mm_resources()
                 .publish_child(child_context.task().key(), prepared),
-            PreparedHvpatchProcessMm::Shared { parent_task, .. } => parent_process
-                .mm_resources()
-                .publish_shared_child(parent_task, child_context.task().key()),
+            PreparedHvpatchProcessMm::Shared {
+                parent_task, hold, ..
+            } => {
+                let published = parent_process
+                    .mm_resources()
+                    .publish_shared_child(parent_task, child_context.task().key());
+                // Release the admission only once the owner edge is published;
+                // a waiting exec then recomputes its disposition over the
+                // complete owner set.
+                drop(hold);
+                published
+            }
         };
         let child_backend = match child_backend_result {
             Ok(backend) => backend,
@@ -2564,6 +2762,131 @@ mod pt_pause_tests {
         assert!(!prepare.contains("ProcessForkRetrySubscription::Progress"));
     }
 
+    /// The child-MM install runs under pause-capable page-table authority.
+    /// Sole exact-MM authority is transient (a sibling in a lease-releasing
+    /// host wait still counts), so demanding it lowered a healthy fork(2) to
+    /// EAGAIN on multithreaded parents; the install must take the same
+    /// pause-modify-resume arm the stage-1 editors use.
+    #[test]
+    fn process_fork_install_pauses_peer_executors_instead_of_eagain() {
+        let source = include_str!("quiesce.rs");
+        let prepare = source
+            .split("pub(super) fn prepare_in_process_fork")
+            .nth(1)
+            .unwrap_or_else(|| std::process::abort())
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap_or_else(|| std::process::abort());
+
+        assert!(prepare.contains("acquire_mm_stage1_authority(mm_executor"));
+        // Lock order P -> topology: the stage-1 authority is taken before the
+        // frame-inventory reservation and the backend topology lock, matching
+        // the mmap/munmap editors, so a paused editor can never wait on a
+        // topology lock the forker holds while the forker waits for P.
+        let authority_at = prepare
+            .find("acquire_mm_stage1_authority(mm_executor")
+            .expect("fork install acquires stage-1 authority");
+        let reserve_at = prepare
+            .find(".reserve_frame_inventory(")
+            .expect("fork reserves frame inventory");
+        let topology_at = prepare
+            .find("try_acquire_topology_lock(")
+            .expect("fork takes the topology lock");
+        assert!(
+            authority_at < reserve_at,
+            "authority must precede the inventory reservation"
+        );
+        assert!(
+            authority_at < topology_at,
+            "authority must precede the topology lock"
+        );
+        assert!(prepare.contains("MmStage1Authority::Paused(pause)"));
+        assert!(prepare.contains("mm_mutation::from_pt_pause(pause)"));
+        assert!(!prepare.contains("with_sole_mm_stage1"));
+        assert!(!prepare.contains("lost sole exact-MM authority"));
+    }
+
+    #[test]
+    fn shared_mm_fork_admits_against_exec_reservations_before_kernel_publication() {
+        let source = include_str!("quiesce.rs");
+        let prepare = source
+            .split("pub(super) fn prepare_in_process_fork")
+            .nth(1)
+            .unwrap_or_else(|| std::process::abort())
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap_or_else(|| std::process::abort());
+
+        // The exec reservation is MM-generation scoped and shared by every
+        // vfork sibling; the per-process clone-admission gate cannot observe
+        // it. The fork must take its shared-publication hold before the
+        // stage-1 authority (so a refusal drops nothing) and long before the
+        // kernel publishes the child, and a refusal must be a woken Retry.
+        let hold_at = prepare
+            .find(".hold_owner_set_edit(parent_task)")
+            .expect("shared fork admits against the parent's MM generation");
+        let authority_at = prepare
+            .find("acquire_mm_stage1_authority(mm_executor")
+            .expect("fork install acquires stage-1 authority");
+        let publish_at = prepare
+            .find(".publish_shared_child(parent_task")
+            .expect("shared fork publishes its owner edge");
+        assert!(hold_at < authority_at, "admission precedes the P authority");
+        assert!(hold_at < publish_at, "admission precedes publication");
+        assert!(prepare.contains("ProcessForkRetrySubscription::ExecSettlement"));
+        assert!(prepare.contains(".subscribe_exec_settlement("));
+        let release_at = prepare
+            .find("drop(hold);")
+            .expect("the hold is released explicitly after publication");
+        assert!(publish_at < release_at, "hold outlives publication");
+    }
+
+    /// `TaskBusy` from the kernel fork reservation means another operation
+    /// (a sibling exit, a parent wait, an exec) is mid-transaction on one of
+    /// the reserved tasks. That is a transient ordering condition the fork
+    /// must wait out on the reservation epoch, exactly as the clone-admission
+    /// close does; surfacing it as `fork(2) = EAGAIN` made Go's `os/exec`
+    /// helpers fail under load (`forkabort-E4`, 2026-09-02).
+    #[test]
+    fn fork_reservation_task_busy_is_retried_on_the_reservation_epoch() {
+        let source = include_str!("quiesce.rs");
+        let prepare = source
+            .split("pub(super) fn prepare_in_process_fork")
+            .nth(1)
+            .unwrap_or_else(|| std::process::abort())
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap_or_else(|| std::process::abort());
+        let reserve_at = prepare
+            .find("let reservation = match reservation_result {")
+            .expect("fork matches its kernel reservation result");
+        let arm = &prepare[reserve_at..reserve_at + 2_000];
+        let busy_at = arm
+            .find("Err(crate::kernel::KernelOperationError::TaskBusy(")
+            .expect("TaskBusy is matched explicitly at the reservation");
+        let eagain_at = arm
+            .find("LINUX_EAGAIN")
+            .expect("other reservation failures still lower to EAGAIN");
+        assert!(
+            busy_at < eagain_at,
+            "TaskBusy is handled before the EAGAIN fallback"
+        );
+        assert!(
+            arm[busy_at..eagain_at].contains("ProcessForkRetrySubscription::Reservation"),
+            "TaskBusy is a Retry on the reservation epoch"
+        );
+        let epoch_at = prepare[..reserve_at]
+            .rfind("kernel_graph().reservation_epoch()")
+            .expect("the observed epoch is captured before the reservation");
+        let reserve_call_at = prepare[..reserve_at]
+            .rfind("let reservation_result = ")
+            .expect("reservation call precedes its match");
+        assert!(
+            epoch_at < reserve_call_at,
+            "epoch observed before reserving"
+        );
+    }
+
     #[test]
     fn fork_lease_wait_wakes_on_terminal_unregister_without_barrier_progress() {
         let registry = GenericVcpuRegistry::new();
@@ -2679,6 +3002,57 @@ mod pt_pause_tests {
             "the loser owns no admission permit"
         );
         barrier.end_fork();
+    }
+
+    /// A second process fork arriving inside a sibling fork's transient
+    /// admission close releases the barrier token it won and reports the
+    /// close's epoch so the caller can park on it; only exec/exit closes
+    /// are `EAGAIN`.
+    #[test]
+    fn process_fork_behind_a_sibling_fork_close_is_deferred_with_the_barrier_released() {
+        let barrier: &'static crate::fork_quiesce::QuiesceBarrier =
+            Box::leak(Box::new(crate::fork_quiesce::QuiesceBarrier::new()));
+        let gate = Arc::new(CloneAdmissionGate::default());
+        let owner = tid(1_613);
+        let sibling = gate
+            .enroll_process_fork(owner)
+            .admitted()
+            .expect("sibling fork admission");
+        let close = sibling
+            .try_close_for_fork(owner)
+            .expect("fork close")
+            .expect("no clones in flight");
+
+        let outcome = try_begin_hvpatch_process_fork_with_admission(barrier, tid(1_614), &gate);
+        assert!(
+            matches!(outcome, ProcessForkStart::AdmissionDeferred { .. }),
+            "a transient fork close defers, never EAGAIN"
+        );
+        assert!(
+            barrier.try_begin_fork(),
+            "the deferred forker released the barrier token"
+        );
+        barrier.end_fork();
+        drop(close);
+        drop(sibling);
+        let outcome = try_begin_hvpatch_process_fork_with_admission(barrier, tid(1_614), &gate);
+        assert!(matches!(outcome, ProcessForkStart::Admitted { .. }));
+        barrier.end_fork();
+    }
+
+    #[test]
+    fn deferred_process_fork_parks_on_the_admission_epoch() {
+        let source = include_str!("quiesce.rs");
+        let prepare = source
+            .split("pub(super) fn prepare_in_process_fork")
+            .nth(1)
+            .unwrap_or_else(|| std::process::abort())
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap_or_else(|| std::process::abort());
+        assert!(prepare.contains("ProcessForkStart::AdmissionDeferred { observed_epoch }"));
+        assert!(prepare.contains("ProcessForkRetrySubscription::Admission"));
+        assert!(prepare.contains("kernel.clone_admission.subscribe_change("));
     }
 
     #[test]

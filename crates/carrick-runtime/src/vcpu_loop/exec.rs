@@ -379,7 +379,8 @@ mod exec_image_verification_tests {
         let gate = std::sync::Arc::new(super::super::CloneAdmissionGate::default());
         let owner = carrick_hal::ThreadId::synthetic_for_tests(19_100);
         let process_fork = gate
-            .try_enroll_process_fork(owner)
+            .enroll_process_fork(owner)
+            .admitted()
             .expect("process fork admission");
         let (after_close_tx, after_close_rx) = std::sync::mpsc::channel();
 
