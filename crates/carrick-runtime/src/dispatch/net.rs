@@ -7309,12 +7309,18 @@ impl SyscallDispatcher {
             if family == LINUX_AF_NETLINK {
                 return Ok(this.netlink_socket(type_, protocol));
             }
+            // Reject Linux-invalid (family,type,protocol) tuples with the
+            // canonical errno first: protocol selection precedes the
+            // capability check on Linux, so a raw socket naming no protocol
+            // is EPROTONOSUPPORT for root and non-root alike (socket01).
+            let base_type = type_ & !LinuxSocketTypeFlags::SUPPORTED_MASK;
+            if let Some(errno) = canonical_socket_errno(family, base_type, protocol) {
+                return Ok(DispatchOutcome::errno(errno));
+            }
             // A packet-crafting socket needs CAP_NET_RAW (socket(2),
             // capabilities(7)). Docker's default set grants it, so container
             // root keeps working; a guest that has setuid'd away from root
-            // has lost every capability and must get EPERM — LTP socket01
-            // pins exactly that row ("raw open as non-root").
-            let base_type = type_ & !LinuxSocketTypeFlags::SUPPORTED_MASK;
+            // has lost every capability and must get EPERM.
             if base_type == LINUX_SOCK_RAW
                 && !super::creds::has_effective_capability(
                     cx.kernel,
@@ -7344,18 +7350,6 @@ impl SyscallDispatcher {
             // answers EOPNOTSUPP. (socketpair01)
             if let Some(errno) = canonical_socket_errno(family, base_type, protocol) {
                 return Ok(DispatchOutcome::errno(errno));
-            }
-            // Unlike socket(2), an INET raw socketpair with the unspecified
-            // protocol is rejected during protocol selection. Linux reports
-            // EPROTONOSUPPORT before reaching the later unsupported-pair
-            // check; Darwin skips that distinction and reports EOPNOTSUPP.
-            if matches!(family, LINUX_AF_INET | LINUX_AF_INET6)
-                && base_type == LINUX_SOCK_RAW
-                && protocol == 0
-            {
-                return Ok(DispatchOutcome::errno(
-                    crate::linux_abi::LINUX_EPROTONOSUPPORT,
-                ));
             }
             let host_family = linux_to_host_af(family);
             let host_type = host_socktype_backing(family, base_type);

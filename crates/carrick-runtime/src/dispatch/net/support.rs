@@ -553,6 +553,14 @@ pub(super) fn canonical_socket_errno(
             LINUX_SOCK_RAW if !(0..=u8::MAX as i32).contains(&protocol) => {
                 return Some(LINUX_EINVAL);
             }
+            // The unspecified protocol selects no raw transport, and Linux
+            // refuses it during protocol selection — before the CAP_NET_RAW
+            // check, so even container root sees EPROTONOSUPPORT (LTP
+            // `socket01` "raw open as non-root", `socketpair01`). Darwin would
+            // instead hand root a wildcard raw socket and everyone else EPERM.
+            LINUX_SOCK_RAW if protocol == 0 => {
+                return Some(crate::linux_abi::LINUX_EPROTONOSUPPORT);
+            }
             _ => {}
         }
     }
@@ -2346,6 +2354,21 @@ mod tests {
     fn inet_raw_socket_uses_unprivileged_datagram_carrier() {
         assert_eq!(
             canonical_socket_errno(LINUX_AF_INET, LINUX_SOCK_RAW, 1),
+            None
+        );
+        // The unspecified protocol names no raw transport: Linux refuses it
+        // during protocol selection even for a CAP_NET_RAW holder (LTP
+        // `socket01` "raw open as non-root" passes 9/9 under root Docker).
+        assert_eq!(
+            canonical_socket_errno(LINUX_AF_INET, LINUX_SOCK_RAW, 0),
+            Some(crate::linux_abi::LINUX_EPROTONOSUPPORT)
+        );
+        assert_eq!(
+            canonical_socket_errno(LINUX_AF_INET6, LINUX_SOCK_RAW, 0),
+            Some(crate::linux_abi::LINUX_EPROTONOSUPPORT)
+        );
+        assert_eq!(
+            canonical_socket_errno(LINUX_AF_UNIX, LINUX_SOCK_RAW, 0),
             None
         );
         #[cfg(carrick_bsd)]
