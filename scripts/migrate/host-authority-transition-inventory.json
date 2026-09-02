@@ -2492,18 +2492,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/rootfs.rs:310 in `extract_layer_paths_to_dir`, `std::fs::File::open` accesses only the selected OCI rootfs object used by `extract_layer_paths_to_dir`.",
+    "rationale": "At crates/carrick-runtime/src/rootfs.rs:314 in `extract_layer_paths_to_dir`, `std::fs::File::open` accesses only the selected OCI rootfs object used by `extract_layer_paths_to_dir`.",
     "review_id": "HA-000095",
     "source": {
-      "byte_end": 13319,
-      "byte_start": 13305,
+      "byte_end": 13556,
+      "byte_start": 13542,
       "column": 20,
       "column_end": 34,
       "column_start": 20,
       "file": "crates/carrick-runtime/src/rootfs.rs",
-      "line": 310,
-      "line_end": 310,
-      "line_start": 310
+      "line": 314,
+      "line_end": 314,
+      "line_start": 314
     }
   },
   {
@@ -6238,18 +6238,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/rootfs.rs:1275 in `from_path`, `std::fs::read` accesses only the selected OCI rootfs object used by `from_path`.",
+    "rationale": "At crates/carrick-runtime/src/rootfs.rs:1291 in `from_path`, `std::fs::read` accesses only the selected OCI rootfs object used by `from_path`.",
     "review_id": "HA-000236",
     "source": {
-      "byte_end": 52454,
-      "byte_start": 52446,
+      "byte_end": 53513,
+      "byte_start": 53505,
       "column": 21,
       "column_end": 29,
       "column_start": 21,
       "file": "crates/carrick-runtime/src/rootfs.rs",
-      "line": 1275,
-      "line_end": 1275,
-      "line_start": 1275
+      "line": 1291,
+      "line_end": 1291,
+      "line_start": 1291
     }
   },
   {
