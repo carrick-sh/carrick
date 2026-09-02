@@ -93,6 +93,29 @@ pub(crate) fn el0_fault_signal(esr: u64) -> Option<(i32, i32)> {
     }
 }
 
+/// The EL0 access direction behind a translation or permission fault
+/// `ESR_EL1`, for authenticating a possibly stale fault against the live
+/// stage-1 leaf. `None` for every other fault class (alignment, access-flag,
+/// address-size, external abort): those never resolve by retry.
+pub(crate) fn el0_fault_access(esr: u64) -> Option<carrick_mem::page_table::LeafAccess> {
+    use carrick_mem::page_table::LeafAccess;
+    const WNR: u64 = 1 << 6;
+    let ec = (esr >> 26) & 0x3f;
+    let dfsc = esr & 0x3f;
+    if !((0x04..=0x07).contains(&dfsc) || (0x0c..=0x0f).contains(&dfsc)) {
+        return None;
+    }
+    match ec {
+        0x20 | 0x21 => Some(LeafAccess::Execute),
+        0x24 | 0x25 => Some(if esr & WNR != 0 {
+            LeafAccess::Write
+        } else {
+            LeafAccess::Read
+        }),
+        _ => None,
+    }
+}
+
 // `el0_debug_signal` (a pure AArch64 ESR_EL1 architectural fact) moved to
 // `carrick_dsr_aarch64::esr` with the DSR translator extraction (its exit
 // dispatch is a second consumer); re-exported so the HVF lowering below and
@@ -295,15 +318,25 @@ pub(super) fn deliver_fault_signal<E: ThreadedEngine>(
     }
 }
 
-/// Resolve a fault whose read-only outer classification found a pending
-/// stage-1 edit. This entry point cannot be called without structural mutation
-/// authority and is kept separate from ordinary signal delivery.
+/// Resolve a fault whose read-only outer classification placed it inside a
+/// first-touch or grow-down extent. This entry point cannot be called without
+/// structural mutation authority and is kept separate from ordinary signal
+/// delivery. `Ok(true)` means the faulting instruction must be retried.
+///
+/// When no pending edit names the page, the fault may still be stale: a
+/// sibling thread faulted on the same page, won the authority first and
+/// committed it, so this thread's fault predates a leaf that is now valid.
+/// The engine answers that from the LIVE stage-1 leaf for the exact access
+/// the syndrome decoded; a fault whose access class the caller could not
+/// decode is delivered as before.
 pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
     dispatcher: &crate::dispatch::SyscallDispatcher,
     engine: &mut E,
     address: u64,
+    access: Option<carrick_mem::page_table::LeafAccess>,
+    tid: crate::kernel::LinuxTid,
     mutation: &mut crate::dispatch::mm_mutation::MmMutationGuard<'_>,
-) -> bool {
+) -> Result<bool, TrapError> {
     {
         let permit = mutation.host_alias_permit();
         if let Some(plan) = dispatcher.resident_fault_plan(&permit, address)
@@ -316,23 +349,32 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                 .is_ok()
         {
             dispatcher.commit_resident_fault(plan);
-            return true;
+            return Ok(true);
         }
     }
-    let permit = mutation.host_alias_permit();
-    if let Some(plan) = dispatcher.mmap_growdown_fault_plan(&permit, address)
-        && engine
-            .protect_range(
-                plan.start(),
-                plan.len(),
-                crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE,
-            )
-            .is_ok()
     {
-        dispatcher.commit_mmap_growdown(plan);
-        return true;
+        let permit = mutation.host_alias_permit();
+        if let Some(plan) = dispatcher.mmap_growdown_fault_plan(&permit, address)
+            && engine
+                .protect_range(
+                    plan.start(),
+                    plan.len(),
+                    crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE,
+                )
+                .is_ok()
+        {
+            dispatcher.commit_mmap_growdown(plan);
+            return Ok(true);
+        }
     }
-    false
+    let Some(access) = access else {
+        return Ok(false);
+    };
+    let retried = engine.resolve_stale_stage1_fault(address, access)?;
+    if retried {
+        crate::probes::hvpatch_stale_stage1_retry(address, access as u32, tid.raw());
+    }
+    Ok(retried)
 }
 
 impl<E: ThreadedEngine + 'static> ThreadRuntimeState<E>

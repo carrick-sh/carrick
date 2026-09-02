@@ -971,6 +971,28 @@ fn remove_fault_range(ranges: &mut Vec<ResidentFaultRange>, remove: crate::vfs::
     *ranges = out;
 }
 
+/// The pages of `range` that lie inside a first-touch tracked extent and have
+/// not been committed resident: exactly the pages whose leaf must stay
+/// invalid so their first touch is still observed.
+fn tracked_nonresident_subranges(
+    mem: &MemState,
+    range: crate::vfs::GuestMemoryRange,
+) -> Vec<crate::vfs::GuestMemoryRange> {
+    let mut out = Vec::new();
+    for tracked in &mem.resident_tracked_ranges {
+        let start = tracked.start().raw().max(range.start().raw());
+        let end = tracked.end().raw().min(range.end().raw());
+        if let Some(sub) = crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)) {
+            out.push(sub);
+        }
+    }
+    for resident in &mem.resident_ranges {
+        locked_ranges_remove(&mut out, *resident);
+    }
+    out.sort_by_key(|sub| sub.start().raw());
+    out
+}
+
 fn fault_range_intersections(
     ranges: &[ResidentFaultRange],
     populate: crate::vfs::GuestMemoryRange,
@@ -3012,17 +3034,26 @@ impl SyscallDispatcher {
 
     /// Read-only classifier used at the trap boundary before it chooses the
     /// statically separate fault-mutation route.
+    ///
+    /// This routes on the whole first-touch and grow-down EXTENTS, not only on
+    /// the pages whose stage-1 edit is still pending. A sibling thread can take
+    /// its fault against the invalid leaf, lose the MM mutation authority to
+    /// the thread that commits the page, and only then reach this classifier;
+    /// the pending-edit set no longer names its page, but the fault is stale,
+    /// not a `SIGSEGV`. The authority re-asks the exact question against the
+    /// live leaf (`resolve_mutating_fault`) — this classifier only has to keep
+    /// such a fault on that route.
     pub(crate) fn fault_requires_mm_mutation(&self, addr: u64) -> bool {
         let page = page_floor(addr, self.linux_page_size());
         let mem_authority = self.mem();
         let mem = mem_authority.lock();
-        mem.resident_fault_ranges
+        mem.resident_tracked_ranges
             .iter()
-            .any(|fault| page >= fault.range.start().raw() && page < fault.range.end().raw())
+            .any(|range| page >= range.start().raw() && page < range.end().raw())
             || mem
                 .growdown_ranges
                 .iter()
-                .any(|&(low, current, _)| page >= low && page < current)
+                .any(|&(low, _current, end)| page >= low && page < end)
     }
 
     fn record_growdown_mapping(&self, start: u64, len: u64) {
@@ -7166,6 +7197,21 @@ impl SyscallDispatcher {
                     let mut mem = mem_authority_27.lock();
                     mem.mmap_writable_high = mem.mmap_writable_high.max(end);
                 }
+                if let Err(error) = this.rearm_first_touch_after_mprotect(
+                    cx.memory,
+                    address.0,
+                    length,
+                    prot_flags,
+                ) {
+                    tracing::error!(
+                        address = address.0,
+                        length,
+                        prot,
+                        %error,
+                        "mprotect failed to re-arm first-touch residency"
+                    );
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                }
             } else if mprotect_range_in_identity_image(address.0, length, layout) {
                 if cx.memory.protect_range(address.0, len, prot).is_err()
                     && this.page_geometry.native_profile
@@ -7492,6 +7538,56 @@ impl SyscallDispatcher {
             .push(ResidentFaultRange { range, prot });
     }
 
+    /// Keep first-touch residency arming coherent across an arena `mprotect`.
+    ///
+    /// The backend edit above made every leaf in the range carry the new
+    /// permission, including the pages of a tracked extent the guest has
+    /// never touched. Left alone, those pages would become accessible
+    /// without the fault that marks them resident (so `mincore` keeps
+    /// answering "absent" after a write), and their pending edit would keep
+    /// the ARMING-time protection -- a `PROT_NONE` page would be installed
+    /// read-write by the next fault instead of delivering SIGSEGV. So every
+    /// tracked, still-non-resident page inside the range goes back to an
+    /// invalid leaf, and its pending edit is replaced with the new
+    /// protection (or dropped for `PROT_NONE`, which has nothing to install;
+    /// a later accessible `mprotect` re-arms it here again). Resident pages
+    /// keep the valid leaf the edit just published.
+    fn rearm_first_touch_after_mprotect(
+        &self,
+        memory: &mut impl CurrentMmMemory,
+        address: u64,
+        length: u64,
+        prot: LinuxProtFlags,
+    ) -> Result<(), carrick_guest_mem::MemoryError> {
+        let Some(range) = crate::vfs::GuestMemoryRange::new(
+            GuestVa(address),
+            GuestVa(address.saturating_add(length)),
+        ) else {
+            return Ok(());
+        };
+        let untouched = {
+            let mem_authority = self.mem();
+            let mem = mem_authority.lock();
+            tracked_nonresident_subranges(&mem, range)
+        };
+        if untouched.is_empty() {
+            return Ok(());
+        }
+        for sub in &untouched {
+            memory.protect_range(sub.start().raw(), sub.len(), 0)?;
+        }
+        let mem_authority = self.mem();
+        let mut mem = mem_authority.lock();
+        remove_fault_range(&mut mem.resident_fault_ranges, range);
+        if !prot.is_empty() {
+            for sub in untouched {
+                mem.resident_fault_ranges
+                    .push(ResidentFaultRange { range: sub, prot });
+            }
+        }
+        Ok(())
+    }
+
     /// Residency vector for `mincore`, derived from carrick's mapping metadata
     /// rather than host `mincore` (which is useless on macOS — it reports
     /// unmapped/untouched pages as resident). A page inside a post-exec VMA
@@ -7618,6 +7714,17 @@ impl SyscallDispatcher {
             page,
             prot,
             exclusion,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_resident_fault_plan_for_test<T>(
+        &self,
+        addr: u64,
+        use_plan: impl FnOnce(ResidentFaultPlan<'_>) -> T,
+    ) -> Option<T> {
+        super::mm_mutation::test_support::with_permit(self.mm_mutation_coordinator(), |permit| {
+            self.resident_fault_plan(permit, addr).map(use_plan)
         })
     }
 

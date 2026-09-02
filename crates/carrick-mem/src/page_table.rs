@@ -52,6 +52,41 @@ pub fn terminal_descriptor(walk: [u64; 4]) -> u64 {
     0
 }
 const PA_MASK_TABLE: u64 = 0x0000_FFFF_FFFF_F000; // next-level table PA (bits 47:12)
+// AF (Access Flag), bit 10. Carrick never uses hardware AF management, so a
+// leaf with AF clear takes an access-flag fault on every touch.
+const ACCESS_FLAG: u64 = 1 << 10;
+// AP[1] (bit 6): EL0 may access the page at all; AP[2] (bit 7): read-only.
+const AP_EL0_ACCESS: u64 = 1 << 6;
+const AP_READ_ONLY: u64 = 1 << 7;
+
+/// The direction of one EL0 access, as decoded from the fault syndrome.
+/// The discriminants are the wire encoding of the
+/// `hvpatch__stale__stage1__retry` probe's access argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum LeafAccess {
+    Read = 0,
+    Write = 1,
+    Execute = 2,
+}
+
+/// Whether the hardware-visible terminal descriptor of a stage-1 walk lets EL0
+/// perform `access` WITHOUT faulting: valid, access flag set, EL0-accessible,
+/// writable for a write, and UXN clear for an instruction fetch. This is the
+/// exact question a fault handler must ask when the software model no longer
+/// names a pending edit for the page: a sibling thread's commit or a stale
+/// TLB entry leaves a fault whose retry succeeds, while any other descriptor
+/// state is a genuine fault to deliver.
+pub fn terminal_descriptor_permits_el0(descriptor: u64, access: LeafAccess) -> bool {
+    if descriptor & VALID == 0 || descriptor & ACCESS_FLAG == 0 || descriptor & AP_EL0_ACCESS == 0 {
+        return false;
+    }
+    match access {
+        LeafAccess::Read => true,
+        LeafAccess::Write => descriptor & AP_READ_ONLY == 0,
+        LeafAccess::Execute => descriptor & UXN == 0,
+    }
+}
 
 // User leaf flags (must match memory.rs USER_BLOCK_FLAGS / USER_PAGE_FLAGS).
 const USER_BLOCK_FLAGS: u64 = (1u64 << 53) | (1 << 10) | (0b11 << 8) | (0b01 << 6) | 0b01;
@@ -1758,6 +1793,38 @@ impl PageTableManager {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminal_descriptor_permission_tracks_valid_af_ap_and_uxn() {
+        use super::{LeafAccess, terminal_descriptor_permits_el0};
+        let pa = 0x0000_0001_2345_6000_u64;
+        let rw_nx = pa | super::USER_PAGE_FLAGS | super::UXN | super::NON_GLOBAL;
+        let rw_exec = pa | super::USER_PAGE_FLAGS | super::NON_GLOBAL;
+        let ro_nx = (rw_nx & !super::AP_MASK) | super::AP_RO;
+        let kernel_only = (rw_nx & !super::AP_MASK) | super::AP_PRIV_RO;
+
+        assert!(terminal_descriptor_permits_el0(rw_nx, LeafAccess::Read));
+        assert!(terminal_descriptor_permits_el0(rw_nx, LeafAccess::Write));
+        assert!(!terminal_descriptor_permits_el0(rw_nx, LeafAccess::Execute));
+        assert!(terminal_descriptor_permits_el0(
+            rw_exec,
+            LeafAccess::Execute
+        ));
+        assert!(terminal_descriptor_permits_el0(ro_nx, LeafAccess::Read));
+        assert!(!terminal_descriptor_permits_el0(ro_nx, LeafAccess::Write));
+        for access in [LeafAccess::Read, LeafAccess::Write, LeafAccess::Execute] {
+            assert!(!terminal_descriptor_permits_el0(kernel_only, access));
+            assert!(!terminal_descriptor_permits_el0(
+                rw_exec & !super::VALID,
+                access
+            ));
+            assert!(!terminal_descriptor_permits_el0(
+                rw_exec & !super::ACCESS_FLAG,
+                access
+            ));
+            assert!(!terminal_descriptor_permits_el0(0, access));
+        }
+    }
+
     use super::*;
     use crate::memory::{
         LINUX_ALIAS_IPA_BASE, LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_HIGH_VA_THRESHOLD,

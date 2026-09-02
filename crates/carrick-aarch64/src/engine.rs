@@ -2692,6 +2692,25 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         }))
     }
 
+    fn resolve_stale_stage1_fault(
+        &mut self,
+        far: u64,
+        access: carrick_mem::page_table::LeafAccess,
+    ) -> Result<bool, TrapError> {
+        // Read the HARDWARE-visible leaf, never the software model: the model
+        // is exactly what stopped naming this page when the sibling committed
+        // it, and only the live descriptor says whether a retry can succeed.
+        let Some((_ttbr, walk)) = self.diagnostic_fault_page_tables(far) else {
+            return Ok(false);
+        };
+        let leaf = carrick_mem::page_table::terminal_descriptor(walk);
+        if !carrick_mem::page_table::terminal_descriptor_permits_el0(leaf, access) {
+            return Ok(false);
+        }
+        self.run_stage1_maintenance()?;
+        Ok(true)
+    }
+
     fn set_persistent_vm_lifecycle(&mut self, enabled: bool) {
         self.vm.set_persistent_vm_lifecycle(enabled);
     }
@@ -3719,6 +3738,7 @@ mod tests {
             "fn repoint_private",
             "fn refresh_fork_process_state",
             "fn resolve_frame_cow_fault",
+            "fn resolve_stale_stage1_fault",
         ] {
             let body = production
                 .split(live_path)
