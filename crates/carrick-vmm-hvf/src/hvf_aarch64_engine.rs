@@ -2187,7 +2187,7 @@ mod task_only_materializer_tests {
         for required in [
             "mappings: Vec<HvpatchTaskMappingState>",
             "inventory: parking_lot::Mutex<HvpatchTaskInventoryAuthority>",
-            "pending_receipts: Vec<PendingForkFrameReceipt>",
+            "pending_receipts: parking_lot::Mutex<Vec<PendingForkFrameReceipt>>",
             "alias_receipts: parking_lot::Mutex<Vec<AliasPublicationReceipt>>",
         ] {
             assert!(mm_authority_shape.contains(required), "MM lacks {required}");

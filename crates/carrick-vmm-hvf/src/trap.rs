@@ -2797,7 +2797,7 @@ mod foreign_mm_tests {
             cow_deferred_publications: Some(Arc::new(parking_lot::Mutex::new(Vec::new()))),
             mm_access: parking_lot::Mutex::new(None),
             pending_publication_receipts: parking_lot::Mutex::new(Vec::new()),
-            pending_receipts: Vec::new(),
+            pending_receipts: parking_lot::Mutex::new(Vec::new()),
             alias_receipts: parking_lot::Mutex::new(Vec::new()),
             last_holder: parking_lot::Mutex::new(HvpatchTaskMmHolder::Registration),
             drop_order: None,
@@ -6760,7 +6760,7 @@ mod task_only_carrier_directory_tests {
             cow_deferred_publications: Some(Arc::new(parking_lot::Mutex::new(Vec::new()))),
             mm_access: parking_lot::Mutex::new(None),
             pending_publication_receipts: parking_lot::Mutex::new(vec![receipt]),
-            pending_receipts: vec![receipt],
+            pending_receipts: parking_lot::Mutex::new(vec![receipt]),
             alias_receipts: parking_lot::Mutex::new(Vec::new()),
             last_holder: parking_lot::Mutex::new(HvpatchTaskMmHolder::Test),
             drop_order: None,
@@ -6799,7 +6799,7 @@ mod task_only_carrier_directory_tests {
             .unwrap();
 
         assert_eq!(runtime.pending_fork_frame_receipts.len(), 1);
-        assert_eq!(task_mm.pending_receipts.len(), 1);
+        assert_eq!(task_mm.pending_receipts.lock().len(), 1);
         let mut events = Vec::new();
         runtime.publish_pending_fork_frame_receipts_with(&mut |event| events.push(event));
 
@@ -6807,12 +6807,12 @@ mod task_only_carrier_directory_tests {
         assert_eq!(events.len(), 1);
         assert!(runtime.pending_fork_frame_receipts.is_empty());
         assert_eq!(
-            task_mm.pending_receipts.len(),
+            task_mm.pending_receipts.lock().len(),
             1,
             "publication must not consume the authoritative retirement receipts"
         );
-        assert_eq!(task_mm.pending_receipts[0].child_mapping, mapping);
-        assert_eq!(task_mm.pending_receipts[0].frame, frame);
+        assert_eq!(task_mm.pending_receipts.lock()[0].child_mapping, mapping);
+        assert_eq!(task_mm.pending_receipts.lock()[0].frame, frame);
 
         let reloaded = registration
             .runtime_task_state(
@@ -6825,7 +6825,7 @@ mod task_only_carrier_directory_tests {
             "an executor reload must not republish a fork receipt whose mapping may have been superseded by COW",
         );
         assert_eq!(
-            task_mm.pending_receipts.len(),
+            task_mm.pending_receipts.lock().len(),
             1,
             "one-shot publication must not consume retirement authentication",
         );
@@ -7888,7 +7888,7 @@ mod task_only_carrier_directory_tests {
             cow_deferred_publications: None,
             mm_access: parking_lot::Mutex::new(None),
             pending_publication_receipts: parking_lot::Mutex::new(Vec::new()),
-            pending_receipts: Vec::new(),
+            pending_receipts: parking_lot::Mutex::new(Vec::new()),
             alias_receipts: parking_lot::Mutex::new(Vec::new()),
             last_holder: parking_lot::Mutex::new(HvpatchTaskMmHolder::Test),
             drop_order: None,
@@ -7946,7 +7946,7 @@ mod task_only_carrier_directory_tests {
             cow_deferred_publications: None,
             mm_access: parking_lot::Mutex::new(None),
             pending_publication_receipts: parking_lot::Mutex::new(Vec::new()),
-            pending_receipts: Vec::new(),
+            pending_receipts: parking_lot::Mutex::new(Vec::new()),
             alias_receipts: parking_lot::Mutex::new(Vec::new()),
             last_holder: parking_lot::Mutex::new(HvpatchTaskMmHolder::Test),
             drop_order: None,
@@ -7968,6 +7968,166 @@ mod task_only_carrier_directory_tests {
         drop(state);
         drop(old_task_mm);
         assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
+    }
+
+    /// `vforkexecthread`: thread T0 vforks child C (`CLONE_VM|CLONE_VFORK`),
+    /// then sibling thread T1 execs while C is still alive. The Kernel keeps
+    /// mm A for C (`RetainOldMm`), so T1's rebind must hand the `Active`
+    /// inventory authority -- receipt and outstanding fork receipts -- to C's
+    /// `SharedProcess` authority, deterministically, whether or not T0's
+    /// registration still holds the predecessor Arc. Before this, the outcome
+    /// depended on drop order: T1 sole holder -> the receipt was silently
+    /// discarded and C's exit skipped mm A's retirement; T0 still holding ->
+    /// T0's cleanup dropped an `Active` authority and aborted the carrier
+    /// (`holder=registration-cleanup`).
+    #[test]
+    fn owner_exec_hands_active_inventory_to_live_clone_vm_sharer() {
+        let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        let ledger = Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
+        let slot_a = (0x1300_0000, 0x20_0000);
+        let mm_a = std::num::NonZeroU64::new(303).unwrap();
+        let receipt = test_kernel_apply(empty_inventory_commit(303), 303, mm_a, 1, Vec::new());
+        let publish = |task_serial, thread_serial, task: HvpatchPreparedTaskAuthority| {
+            directory
+                .publish(
+                    HvpatchCarrierTaskIdentity {
+                        task_serial,
+                        thread_serial,
+                        execution_generation: 1,
+                        linux_pid: task_serial as i32,
+                        linux_tid: thread_serial as i32,
+                        asid: 9,
+                    },
+                    test_state(&rollbacks),
+                    task,
+                )
+                .unwrap()
+        };
+        let mut owner = publish(
+            301,
+            301,
+            HvpatchPreparedTaskAuthority {
+                mm_root_slot: Some(slot_a),
+                inventory: HvpatchTaskInventoryAuthority::Active {
+                    ledger: Arc::clone(&ledger),
+                    receipt,
+                    retirement: None,
+                },
+                ..prepared_task()
+            },
+        );
+        owner
+            .registration
+            .as_mut()
+            .unwrap()
+            .bind_kernel_mm(mm_a)
+            .unwrap();
+        let mut exec_thread = publish(
+            301,
+            302,
+            HvpatchPreparedTaskAuthority {
+                mm_root_slot: Some(slot_a),
+                inventory: HvpatchTaskInventoryAuthority::SiblingShared {
+                    ledger: Arc::clone(&ledger),
+                },
+                ..prepared_task()
+            },
+        );
+        exec_thread
+            .registration
+            .as_mut()
+            .unwrap()
+            .bind_kernel_mm(mm_a)
+            .unwrap();
+        let mut vfork_child = publish(
+            303,
+            303,
+            HvpatchPreparedTaskAuthority {
+                mm_root_slot: Some(slot_a),
+                shared_kernel_mm: Some(mm_a.get()),
+                inventory: HvpatchTaskInventoryAuthority::SharedProcess {
+                    ledger: Arc::clone(&ledger),
+                },
+                ..prepared_task()
+            },
+        );
+        vfork_child
+            .registration
+            .as_mut()
+            .unwrap()
+            .bind_kernel_mm(mm_a)
+            .unwrap();
+        let task_mm = |state: &HvpatchTaskOnlyBackendState| {
+            Arc::clone(
+                state
+                    .registration
+                    .as_ref()
+                    .unwrap()
+                    .task_mm
+                    .as_ref()
+                    .unwrap(),
+            )
+        };
+        let predecessor = task_mm(&owner);
+        assert!(Arc::ptr_eq(&predecessor, &task_mm(&exec_thread)));
+        let sharer = task_mm(&vfork_child);
+        assert!(!Arc::ptr_eq(&predecessor, &sharer));
+        assert_eq!(sharer.inventory.lock().phase_name(), "shared_process");
+
+        let replacement = Arc::new(HvpatchTaskMmAuthority {
+            container_root: ContainerRootToken::ROOT,
+            mappings: Vec::new(),
+            foreign_mm_transport: None,
+            mm_root_slot: Some((0x1400_0000, 0x20_0000)),
+            inventory: parking_lot::Mutex::new(HvpatchTaskInventoryAuthority::SharedProcess {
+                ledger: Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
+            }),
+            kernel_mm: parking_lot::Mutex::new(None),
+            cow_armed: None,
+            cow_deferred_publications: None,
+            mm_access: parking_lot::Mutex::new(None),
+            pending_publication_receipts: parking_lot::Mutex::new(Vec::new()),
+            pending_receipts: parking_lot::Mutex::new(Vec::new()),
+            alias_receipts: parking_lot::Mutex::new(Vec::new()),
+            last_holder: parking_lot::Mutex::new(HvpatchTaskMmHolder::Test),
+            drop_order: None,
+        });
+        // T0 (`owner`) still holds the predecessor Arc while T1 execs: the
+        // drop-order case that used to abort.
+        exec_thread
+            .registration
+            .as_mut()
+            .unwrap()
+            .rebind_exec_authority(
+                replacement,
+                (0x1400_0000, 0x20_0000),
+                Vec::new(),
+                legacy_test_carrier_vm_custody_arc(),
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(predecessor.inventory.lock().phase_name(), "retired");
+        let inventory = sharer.inventory.lock();
+        assert_eq!(inventory.phase_name(), "active");
+        assert!(
+            inventory
+                .shared_runtime_ledger()
+                .is_some_and(|handed| Arc::ptr_eq(&handed, &ledger))
+        );
+        assert!(!inventory.shares_another_process_inventory());
+        drop(inventory);
+
+        // Every registration drop must now be abort-free regardless of order.
+        drop(owner);
+        drop(exec_thread);
+        drop(predecessor);
+        assert_eq!(sharer.inventory.lock().phase_name(), "active");
+        sharer.retire_exec_predecessor();
+        drop(vfork_child);
+        drop(sharer);
+        assert_eq!(rollbacks.load(Ordering::SeqCst), 3);
     }
 
     #[test]
@@ -8032,7 +8192,7 @@ mod task_only_carrier_directory_tests {
             cow_deferred_publications: None,
             mm_access: parking_lot::Mutex::new(None),
             pending_publication_receipts: parking_lot::Mutex::new(Vec::new()),
-            pending_receipts: Vec::new(),
+            pending_receipts: parking_lot::Mutex::new(Vec::new()),
             alias_receipts: parking_lot::Mutex::new(Vec::new()),
             last_holder: parking_lot::Mutex::new(HvpatchTaskMmHolder::Test),
             drop_order: None,
@@ -25255,7 +25415,10 @@ pub(crate) struct HvpatchTaskMmAuthority {
     /// exact Kernel receipt challenge, but an executor reload must never
     /// republish an older fork mapping after COW or munmap supersedes it.
     pending_publication_receipts: parking_lot::Mutex<Vec<PendingForkFrameReceipt>>,
-    pending_receipts: Vec<PendingForkFrameReceipt>,
+    /// Outstanding fork-inheritance obligations the retirement challenge must
+    /// account for. They move with the inventory phase when an exec hands an
+    /// `Active` authority to a live CLONE_VM sharer.
+    pending_receipts: parking_lot::Mutex<Vec<PendingForkFrameReceipt>>,
     alias_receipts: parking_lot::Mutex<Vec<AliasPublicationReceipt>>,
     last_holder: parking_lot::Mutex<HvpatchTaskMmHolder>,
     #[cfg(test)]
@@ -25281,7 +25444,7 @@ impl HvpatchTaskMmAuthority {
             cow_deferred_publications: prepared.cow_deferred_publications.take(),
             mm_access: parking_lot::Mutex::new(None),
             pending_publication_receipts: parking_lot::Mutex::new(pending_receipts.clone()),
-            pending_receipts,
+            pending_receipts: parking_lot::Mutex::new(pending_receipts),
             alias_receipts: parking_lot::Mutex::new(vec![alias_receipt]),
             last_holder: parking_lot::Mutex::new(HvpatchTaskMmHolder::Registration),
             #[cfg(test)]
@@ -25306,7 +25469,9 @@ impl HvpatchTaskMmAuthority {
     }
 
     fn activate(&self) -> Result<(), TrapError> {
-        self.inventory.lock().activate(&self.pending_receipts)
+        self.inventory
+            .lock()
+            .activate(&self.pending_receipts.lock())
     }
 
     fn shares_another_process_inventory(&self) -> bool {
@@ -25329,13 +25494,72 @@ impl HvpatchTaskMmAuthority {
         let mm = (*self.kernel_mm.lock()).ok_or_else(|| {
             TrapError::Hypervisor("HVPatch MM has no exact Kernel binding".to_owned())
         })?;
-        self.inventory
-            .lock()
-            .apply_retirement(mm, &self.pending_receipts, apply)
+        let pending = self.pending_receipts.lock();
+        self.inventory.lock().apply_retirement(mm, &pending, apply)
     }
 
     fn retire_exec_predecessor(&self) {
         self.inventory.lock().retire_exec_predecessor();
+    }
+
+    /// Is this authority the `Active` owner of a published inventory?
+    fn owns_active_inventory(&self) -> bool {
+        matches!(
+            &*self.inventory.lock(),
+            HvpatchTaskInventoryAuthority::Active { .. }
+        )
+    }
+
+    /// Move this `Active` inventory -- the Kernel apply receipt and every
+    /// outstanding fork-inheritance receipt -- to `sharer`, the CLONE_VM/vfork
+    /// process that keeps the mm after the owner execs (`RetainOldMm`).
+    ///
+    /// The Kernel names the sharer as the mm's surviving owner, so the sharer's
+    /// terminal path is where the exact retirement must be issued from; leaving
+    /// the receipt on the exec'ing owner's authority either discards it (last
+    /// holder, `retire_exec_predecessor`) or aborts the carrier when a sibling
+    /// thread's registration drops it still `Active`. After the hand-off the
+    /// owner's phase is `Retired`, so every remaining holder drops it inertly.
+    fn hand_off_inventory_to_sharer(&self, sharer: &Self) -> Result<(), TrapError> {
+        let mm = (*self.kernel_mm.lock()).ok_or_else(|| {
+            TrapError::Hypervisor(
+                "HVPatch exec predecessor hand-off has no exact Kernel binding".to_owned(),
+            )
+        })?;
+        sharer.bind_kernel_mm(mm)?;
+        let mut inventory = self.inventory.lock();
+        let mut sharer_inventory = sharer.inventory.lock();
+        let ledger = match &*inventory {
+            HvpatchTaskInventoryAuthority::Active {
+                ledger,
+                retirement: None,
+                ..
+            } => std::sync::Arc::clone(ledger),
+            other => {
+                return Err(TrapError::Hypervisor(format!(
+                    "HVPatch exec predecessor hand-off from phase={}",
+                    other.phase_name()
+                )));
+            }
+        };
+        match &*sharer_inventory {
+            HvpatchTaskInventoryAuthority::SharedProcess {
+                ledger: sharer_ledger,
+            } if std::sync::Arc::ptr_eq(sharer_ledger, &ledger) => {}
+            other => {
+                return Err(TrapError::Hypervisor(format!(
+                    "HVPatch exec predecessor hand-off to sharer phase={} on a foreign ledger",
+                    other.phase_name()
+                )));
+            }
+        }
+        *sharer_inventory =
+            std::mem::replace(&mut *inventory, HvpatchTaskInventoryAuthority::Retired);
+        sharer
+            .pending_receipts
+            .lock()
+            .extend(self.pending_receipts.lock().drain(..));
+        Ok(())
     }
 
     fn rollback_unpublished_before_carrier_drop(&self) -> Result<(), TrapError> {
@@ -26286,6 +26510,27 @@ impl HvpatchCarrierTaskStateDirectory {
         task_mm.record_holder(HvpatchTaskMmHolder::CarrierDirectory);
         Ok(())
     }
+
+    /// The live CLONE_VM/vfork sharer authority interned for `mm` on the
+    /// owner's `mm_root_slot`, if one is still registered. Sharers publish
+    /// under `{task_serial: 0, mm_root_slot, shared_kernel_mm: Some(mm)}`
+    /// (`shared_mm_projection`), distinct from the owner's
+    /// `{0, mm_root_slot, None}` row.
+    fn clone_vm_sharer_authority(
+        &self,
+        mm_root_slot: Option<(u64, u64)>,
+        mm: std::num::NonZeroU64,
+    ) -> Option<std::sync::Arc<HvpatchTaskMmAuthority>> {
+        self.inner
+            .lock()
+            .task_mms
+            .get(&HvpatchMmAuthorityKey {
+                task_serial: 0,
+                mm_root_slot,
+                shared_kernel_mm: Some(mm.get()),
+            })
+            .and_then(std::sync::Weak::upgrade)
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -26550,15 +26795,47 @@ impl HvpatchTaskRegistration {
         )?;
         if let Some(old_task_mm) = self.task_mm.take() {
             old_task_mm.record_holder(HvpatchTaskMmHolder::ExecRebind);
-            if retain_shared_predecessor_authority {
-                // "Retain" means another task still shares this predecessor and
-                // owns retiring it. That holds only while another reference
-                // actually exists: if ours is the LAST, nobody is left to
-                // retire it, and dropping a published inventory unretired is
-                // what `HvpatchTaskMmAuthority::drop` aborts the carrier over
-                // (`vforkexecthread`, holder `exec-rebind`). `Arc::into_inner`
-                // answers "am I the last holder" atomically, so this cannot
-                // race a concurrent sharer.
+            if retain_shared_predecessor_authority && old_task_mm.owns_active_inventory() {
+                // The Kernel pinned `RetainOldMm`: a CLONE_VM/vfork process
+                // keeps this mm, and its exit is where the exact retirement
+                // will be issued. Move the `Active` receipt to that sharer now
+                // (`vforkexecthread`). Whether the vfork-suspended leader's
+                // registration has already dropped its Arc must not matter:
+                // before this, a sole holder silently discarded the receipt
+                // and a surviving sibling holder aborted the carrier at its
+                // own cleanup (`holder=registration-cleanup`).
+                let mm = (*old_task_mm.kernel_mm.lock()).ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "HVPatch exec retains a predecessor with no Kernel binding".to_owned(),
+                    )
+                })?;
+                match self
+                    .directory
+                    .clone_vm_sharer_authority(old_task_mm.mm_root_slot, mm)
+                {
+                    Some(sharer) => old_task_mm.hand_off_inventory_to_sharer(&sharer)?,
+                    None => {
+                        // The sharer the Kernel counted at reservation time
+                        // exited during the sibling drain and its registration
+                        // is gone. Its exit was not the final mm edge (this
+                        // task's lease still named the mm), so nobody retires
+                        // these rows: say so rather than aborting a legitimate
+                        // exec.
+                        tracing::error!(
+                            target: "carrick::hvpatch",
+                            mm = mm.get(),
+                            mm_root_slot = ?old_task_mm.mm_root_slot,
+                            "exec retained a shared predecessor mm whose CLONE_VM sharer is \
+                             gone; its frame-inventory rows are abandoned unretired"
+                        );
+                        old_task_mm.retire_exec_predecessor();
+                    }
+                }
+            } else if retain_shared_predecessor_authority {
+                // The predecessor is itself a projection of another process's
+                // inventory (a vfork child exec'ing). That process owns the
+                // retirement; only a LAST holder may retire the projection,
+                // and `Arc::into_inner` answers that atomically.
                 if let Some(sole) = std::sync::Arc::into_inner(old_task_mm) {
                     sole.retire_exec_predecessor();
                 }
@@ -37455,7 +37732,7 @@ impl HvfVmState {
                     )),
                     mm_access: parking_lot::Mutex::new(None),
                     pending_publication_receipts: parking_lot::Mutex::new(Vec::new()),
-                    pending_receipts: Vec::new(),
+                    pending_receipts: parking_lot::Mutex::new(Vec::new()),
                     alias_receipts: parking_lot::Mutex::new(Vec::new()),
                     last_holder: parking_lot::Mutex::new(HvpatchTaskMmHolder::ExecRebind),
                     #[cfg(test)]
@@ -43236,7 +43513,7 @@ mod frame_inventory_backend_tests {
             cow_deferred_publications: None,
             mm_access: parking_lot::Mutex::new(None),
             pending_publication_receipts: parking_lot::Mutex::new(Vec::new()),
-            pending_receipts: Vec::new(),
+            pending_receipts: parking_lot::Mutex::new(Vec::new()),
             alias_receipts: parking_lot::Mutex::new(Vec::new()),
             last_holder: parking_lot::Mutex::new(HvpatchTaskMmHolder::FailpointRollback),
             drop_order: None,
