@@ -182,8 +182,8 @@ fn test_shard_1_inventory_count_and_sorted() {
 
         assert_eq!(
             computed_shard_1.len(),
-            148,
-            "computed shard 1 from probe-inventory.json must have 148 items"
+            149,
+            "derived shard 1 must have 149 items"
         );
         assert_eq!(
             SHARD_1_PROBES,
