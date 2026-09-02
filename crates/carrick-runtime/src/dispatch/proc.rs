@@ -2612,10 +2612,12 @@ impl SyscallDispatcher {
                     }
                     17 => DispatchOutcome::errno(LINUX_EINVAL),
                     LINUX_PTRACE_ATTACH => {
-                        if target().is_some() {
-                            DispatchOutcome::errno(crate::linux_abi::LINUX_EPERM)
-                        } else {
-                            DispatchOutcome::errno(LINUX_ESRCH)
+                        let Ok(target_task_id) = guest_pid_to_task_id(pid) else {
+                            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+                        };
+                        match kernel.attach_task_for_ptrace(cx.kernel, target_task_id) {
+                            Ok(()) => DispatchOutcome::Returned { value: 0 },
+                            Err(errno) => DispatchOutcome::errno(errno),
                         }
                     }
                     LINUX_PTRACE_PEEKTEXT | LINUX_PTRACE_PEEKDATA => {
@@ -7846,6 +7848,7 @@ mod kernel_process_dispatch_tests {
         let child = fork_child(&root, 61_052);
         let root = refreshed(&root);
         let child_pid = child.task().key().id.raw();
+        let root_pid = root.task().key().id.raw();
         let mut memory = LinearMemory::new(INFO_ADDR, vec![0; 0x100]);
 
         assert_eq!(
@@ -7854,9 +7857,10 @@ mod kernel_process_dispatch_tests {
                 &root,
                 &mut memory,
                 SYS_PTRACE,
-                [LINUX_PTRACE_ATTACH, child_pid as u64, 0, 0, 0, 0],
+                [LINUX_PTRACE_ATTACH, root_pid as u64, 0, 0, 0, 0],
             ),
             DispatchOutcome::errno(crate::linux_abi::LINUX_EPERM),
+            "a task cannot attach to itself",
         );
         assert_eq!(
             dispatch(
@@ -7867,6 +7871,27 @@ mod kernel_process_dispatch_tests {
                 [LINUX_PTRACE_ATTACH, 99_999, 0, 0, 0, 0],
             ),
             DispatchOutcome::errno(LINUX_ESRCH),
+        );
+        assert_eq!(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [LINUX_PTRACE_ATTACH, child_pid as u64, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        assert_eq!(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [LINUX_PTRACE_ATTACH, child_pid as u64, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::errno(crate::linux_abi::LINUX_EPERM),
+            "an already-traced task rejects a second attach",
         );
     }
 }

@@ -1589,7 +1589,91 @@ impl Kernel {
         if self.live_task_key(tracer.id) != Some(tracer) {
             return false;
         }
-        context.task().claim_ptrace_traceme(tracer)
+        self.bind_ptrace_tracer(context.task(), tracer)
+    }
+
+    /// Record `tracer` as `tracee`'s exact tracer on both ends. The tracee's
+    /// `ptrace_tracer` is the authority; the tracer's tracee set is the index
+    /// its `wait` and exit consult.
+    fn bind_ptrace_tracer(&self, tracee: &Task, tracer: TaskKey) -> bool {
+        let tracer_task = {
+            let state = self.registry().state.read();
+            let Some(record) = state.tasks.get(&tracer.id) else {
+                return false;
+            };
+            if record.task.key() != tracer || record.task.lifecycle() != TaskLifecycle::Live {
+                return false;
+            }
+            Arc::clone(&record.task)
+        };
+        if !tracee.claim_ptrace_tracer(tracer) {
+            return false;
+        }
+        tracer_task.add_ptrace_tracee(tracee.key());
+        true
+    }
+
+    /// `PTRACE_ATTACH` — ptrace(2): make the caller the tracer of one live
+    /// process it may signal, then send it `SIGSTOP` so it enters a ptrace
+    /// signal-delivery stop the tracer can `wait` for. Attaching to a task in
+    /// the caller's own thread group, an already-traced task, or a task the
+    /// caller could not signal is `EPERM`; a missing task is `ESRCH`. Init is
+    /// attachable: this `SIGSTOP` is ptrace-directed, so the namespace-init
+    /// drop that protects init from an ordinary `kill(1, SIGSTOP)` does not
+    /// apply.
+    pub(crate) fn attach_task_for_ptrace(
+        &self,
+        context: &KernelContext,
+        target: TaskId,
+    ) -> Result<(), carrick_abi::LinuxErrno> {
+        if !std::ptr::eq(self, context.kernel().as_ref()) {
+            return Err(carrick_abi::LINUX_ESRCH);
+        }
+        let tracer = context.task().key();
+        let tracee = {
+            let state = self.registry().state.read();
+            let Some(record) = state.tasks.get(&target) else {
+                return Err(carrick_abi::LINUX_ESRCH);
+            };
+            if record.task.lifecycle() != TaskLifecycle::Live {
+                return Err(carrick_abi::LINUX_ESRCH);
+            }
+            Arc::clone(&record.task)
+        };
+        if tracee.key() == tracer {
+            return Err(carrick_abi::LINUX_EPERM);
+        }
+        let caller_credentials = context.resources().credentials();
+        let target_credentials = tracee.process_credentials();
+        let uid_match = [caller_credentials.ruid(), caller_credentials.euid()]
+            .into_iter()
+            .any(|caller_uid| {
+                caller_uid == target_credentials.ruid() || caller_uid == target_credentials.suid()
+            });
+        if !caller_credentials.is_privileged() && !uid_match {
+            return Err(carrick_abi::LINUX_EPERM);
+        }
+        if !self.bind_ptrace_tracer(&tracee, tracer) {
+            return Err(carrick_abi::LINUX_EPERM);
+        }
+        let Ok(sigstop) = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGSTOP) else {
+            return Err(carrick_abi::LINUX_EINVAL);
+        };
+        if !self.post_signal_to_task_key(tracee.key(), sigstop, None) {
+            return Err(carrick_abi::LINUX_ESRCH);
+        }
+        Ok(())
+    }
+
+    /// Resolve a tracee's exact tracer at the moment a ptrace stop has been
+    /// published, so the tracer's wait vehicle can be woken. The registry lock
+    /// is released before callers invoke the lane waker.
+    fn current_tracer_task(&self, task: &Task) -> Option<TaskRef> {
+        let state = self.registry().state.read();
+        task.ptrace_tracer()
+            .and_then(|key| state.tasks.get(&key.id).map(|record| (key, record)))
+            .filter(|(key, record)| record.task.key() == *key)
+            .map(|(_, record)| Arc::clone(&record.task))
     }
 
     /// Mint authority for one exact settled ptrace stop before any target-MM
@@ -1627,9 +1711,13 @@ impl Kernel {
             return false;
         }
         let parent = self.current_parent_task(&task);
+        let tracer = self.current_tracer_task(&task);
         task.wake();
         if let Some(parent) = parent {
             parent.wake();
+        }
+        if let Some(tracer) = tracer {
+            tracer.wake();
         }
         true
     }
@@ -1653,9 +1741,13 @@ impl Kernel {
             return false;
         }
         let parent = self.current_parent_task(&task);
+        let tracer = self.current_tracer_task(&task);
         task.wake();
         if let Some(parent) = parent {
             parent.wake();
+        }
+        if let Some(tracer) = tracer {
+            tracer.wake();
         }
         true
     }
@@ -1719,6 +1811,9 @@ impl Kernel {
         };
         if !task.detach_from_ptrace(tracer) {
             return false;
+        }
+        if let Some(tracer_task) = self.live_task(tracer.id).filter(|t| t.key() == tracer) {
+            tracer_task.remove_ptrace_tracee(task.key());
         }
         task.wake();
         true
@@ -3832,8 +3927,35 @@ impl Kernel {
                 return Err(KernelOperationError::ExitTopologyChanged(child_key.id));
             }
         }
+        // ptrace(2): a tracer's exit detaches every tracee it still owns, and
+        // a detached stopped tracee resumes. Capture the tracer key before
+        // `begin_exit` clears this task's own tracee-side record so the tracer
+        // can drop its index entry and re-evaluate a wait on this task.
+        let own_tracer = exiting_record.task.ptrace_tracer();
         if !exiting_record.task.begin_exit() {
             return Err(KernelOperationError::AlreadyExiting(prepared.task.id));
+        }
+        let mut released_tracees = Vec::new();
+        for tracee_key in exiting_record.task.take_ptrace_tracees() {
+            if let Some(tracee) = state
+                .tasks
+                .get(&tracee_key.id)
+                .filter(|record| record.task.key() == tracee_key)
+                .map(|record| Arc::clone(&record.task))
+                && tracee.detach_from_ptrace(prepared.task)
+            {
+                released_tracees.push(tracee);
+            }
+        }
+        let own_tracer = own_tracer.and_then(|key| {
+            state
+                .tasks
+                .get(&key.id)
+                .filter(|record| record.task.key() == key)
+                .map(|record| Arc::clone(&record.task))
+        });
+        if let Some(tracer) = &own_tracer {
+            tracer.remove_ptrace_tracee(prepared.task);
         }
         let mut exiting_file_tables = Vec::new();
         for thread_key in exiting_record.task.thread_keys() {
@@ -3926,6 +4048,12 @@ impl Kernel {
         // BlockedContinuation having already consumed this exit's wake edge,
         // wedging forever.
         notify_parent(prepared.result_zombie.parent);
+        for tracee in released_tracees {
+            tracee.wake();
+        }
+        if let Some(tracer) = own_tracer {
+            tracer.wake();
+        }
         for files in &exiting_file_tables {
             self.retire_file_table_if_unreferenced(files);
         }
@@ -4140,13 +4268,24 @@ impl Kernel {
         if mode == WaitMode::Consume {
             ensure_task_unreserved(&state, parent_id)?;
         }
-        let Some((parent, children)) = state
-            .tasks
-            .get(&parent_id)
-            .map(|record| (record.task.key(), record.task.children()))
-        else {
+        let Some((parent, children, tracees)) = state.tasks.get(&parent_id).map(|record| {
+            (
+                record.task.key(),
+                record.task.children(),
+                record.task.ptrace_tracees(),
+            )
+        }) else {
             return Err(KernelOperationError::UnknownTask(parent_id));
         };
+        // ptrace(2): a tracer waits for its tracees' ptrace stops whether or
+        // not it is their parent. Only stop/continue events are reported for
+        // a non-child tracee here; its exit still belongs to the real parent
+        // (Linux would report that exit to the tracer first), so a tracer
+        // waiting on a non-child tracee that exits sees ECHILD instead.
+        let traced_non_children: Vec<TaskKey> = tracees
+            .into_iter()
+            .filter(|key| !children.contains(key))
+            .collect();
         let exited = children.iter().find_map(|child_key| {
             let record = state.zombies.get(&child_key.id)?;
             if record.zombie.key == *child_key
@@ -4225,19 +4364,69 @@ impl Kernel {
                 return Ok(state_change);
             }
         }
+        {
+            let tracee_stop = traced_non_children.iter().find_map(|tracee_key| {
+                let record = state.tasks.get(&tracee_key.id)?;
+                if record.task.key() == *tracee_key
+                    && record.task.ptrace_tracer() == Some(parent)
+                    && process_group.is_none_or(|group| record.task.process_group() == group)
+                    && exact_target.map_or_else(
+                        || target.is_none_or(|target| target == tracee_key.id),
+                        |target| target == *tracee_key,
+                    )
+                {
+                    record
+                        .task
+                        .waitable_job_control_event(
+                            true,
+                            job_control.continued,
+                            mode == WaitMode::Consume,
+                        )
+                        .map(|event| match event {
+                            TaskJobControlEvent::Stopped(signal) => WaitOutcome::Stopped {
+                                task: tracee_key.id,
+                                signal,
+                                ruid: record.task.process_credentials().ruid(),
+                            },
+                            TaskJobControlEvent::Continued => WaitOutcome::Continued {
+                                task: tracee_key.id,
+                                ruid: record.task.process_credentials().ruid(),
+                            },
+                        })
+                } else {
+                    None
+                }
+            });
+            if let Some(tracee_stop) = tracee_stop {
+                return Ok(tracee_stop);
+            }
+        }
 
-        let live_child = children.iter().any(|child_key| {
-            let Some(record) = state.tasks.get(&child_key.id) else {
+        let live_tracee = traced_non_children.iter().any(|tracee_key| {
+            let Some(record) = state.tasks.get(&tracee_key.id) else {
                 return false;
             };
-            record.task.key() == *child_key
-                && record.task.parent() == Some(parent)
+            record.task.key() == *tracee_key
+                && record.task.ptrace_tracer() == Some(parent)
                 && process_group.is_none_or(|group| record.task.process_group() == group)
                 && exact_target.map_or_else(
-                    || target.is_none_or(|target| target == child_key.id),
-                    |target| target == *child_key,
+                    || target.is_none_or(|target| target == tracee_key.id),
+                    |target| target == *tracee_key,
                 )
         });
+        let live_child = live_tracee
+            || children.iter().any(|child_key| {
+                let Some(record) = state.tasks.get(&child_key.id) else {
+                    return false;
+                };
+                record.task.key() == *child_key
+                    && record.task.parent() == Some(parent)
+                    && process_group.is_none_or(|group| record.task.process_group() == group)
+                    && exact_target.map_or_else(
+                        || target.is_none_or(|target| target == child_key.id),
+                        |target| target == *child_key,
+                    )
+            });
         Ok(if live_child {
             WaitOutcome::StillRunning
         } else {
@@ -6254,6 +6443,122 @@ mod tests {
             kernel
                 .wait_child(root.task().key().id, Some(child_id), WaitMode::Observe)
                 .expect("resumed child remains live"),
+            WaitOutcome::StillRunning,
+        );
+    }
+
+    #[test]
+    fn ptrace_attach_stops_a_non_child_and_tracer_exit_detaches_it() {
+        let (kernel, root) = bootstrap(1);
+        let tracer = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(7_094),
+                "ptrace tracer".to_owned(),
+                None,
+            )
+            .expect("fork tracer");
+        let tracee = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(7_095),
+                "ptrace tracee".to_owned(),
+                None,
+            )
+            .expect("fork tracee");
+        let tracer_id = tracer.task().key().id;
+        let tracee_id = tracee.task().key().id;
+        let tracer = kernel
+            .update_credentials(&tracer, |credentials| {
+                credentials.seed_identity(
+                    carrick_abi::NsUid::new(5_001),
+                    carrick_abi::NsGid::new(5_001),
+                );
+            })
+            .expect("unprivileged tracer");
+        let tracee = kernel
+            .update_credentials(&tracee, |credentials| {
+                credentials.seed_identity(
+                    carrick_abi::NsUid::new(6_002),
+                    carrick_abi::NsGid::new(6_002),
+                );
+            })
+            .expect("foreign-uid tracee");
+        let sigstop = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGSTOP).expect("SIGSTOP");
+
+        assert_eq!(
+            kernel.attach_task_for_ptrace(&tracer, tracer_id),
+            Err(carrick_abi::LINUX_EPERM),
+            "a task cannot attach to itself",
+        );
+        assert_eq!(
+            kernel.attach_task_for_ptrace(
+                &tracer,
+                TaskId::from_abi_positive(999_999).expect("unused id")
+            ),
+            Err(carrick_abi::LINUX_ESRCH),
+        );
+        assert_eq!(
+            kernel.attach_task_for_ptrace(&tracer, tracee_id),
+            Err(carrick_abi::LINUX_EPERM),
+            "an unprivileged tracer needs a uid match",
+        );
+        let tracee_ruid = carrick_abi::NsUid::new(5_001);
+        let tracee = kernel
+            .update_credentials(&tracee, |credentials| {
+                credentials.seed_identity(tracee_ruid, carrick_abi::NsGid::new(5_001));
+            })
+            .expect("uid-matched tracee");
+        assert_eq!(kernel.attach_task_for_ptrace(&tracer, tracee_id), Ok(()));
+        assert_eq!(
+            kernel.attach_task_for_ptrace(&root, tracee_id),
+            Err(carrick_abi::LINUX_EPERM),
+            "an already-traced task rejects a second tracer",
+        );
+        assert_eq!(tracee.task().ptrace_tracer(), Some(tracer.task().key()));
+        assert!(
+            tracee
+                .task()
+                .shared()
+                .pending_signals()
+                .take_lowest_in(SigSet::EMPTY.with(sigstop.raw()))
+                .is_some(),
+            "attach posts SIGSTOP to the tracee",
+        );
+        assert_eq!(
+            kernel
+                .wait_child(tracer_id, Some(tracee_id), WaitMode::Observe)
+                .expect("a live tracee is waitable by its tracer"),
+            WaitOutcome::StillRunning,
+        );
+
+        assert!(kernel.stop_task_for_ptrace(tracee_id, sigstop));
+        assert_eq!(
+            kernel
+                .wait_child(tracer_id, Some(tracee_id), WaitMode::Consume)
+                .expect("tracer wait sees the attach stop"),
+            WaitOutcome::Stopped {
+                task: tracee_id,
+                signal: sigstop,
+                ruid: tracee_ruid,
+            }
+        );
+        assert!(tracee.task().is_job_control_stopped());
+
+        kernel
+            .exit_task(tracer_id, LinuxWaitStatus::from_wait_encoding(0), None)
+            .expect("tracer exit");
+        assert_eq!(tracee.task().ptrace_tracer(), None, "tracer exit detaches");
+        assert!(
+            !tracee.task().is_job_control_stopped(),
+            "a detached ptrace-stopped tracee resumes",
+        );
+        assert_eq!(
+            kernel
+                .wait_child(root.task().key().id, Some(tracee_id), WaitMode::Observe)
+                .expect("resumed tracee remains live for its parent"),
             WaitOutcome::StillRunning,
         );
     }
