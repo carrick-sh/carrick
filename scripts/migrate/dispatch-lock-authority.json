@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
   "description": "Reviewed inventory of classified production raw lock acquisitions (fail-closed, shrink-only)",
-  "total_count": 107,
+  "total_count": 105,
   "category_counts": {
-    "proc": 60,
+    "proc": 58,
     "pty_table": 10,
-    "sysv_process": 1,
     "sysv_namespace": 3,
+    "sysv_process": 1,
     "file_table_internals": 33
   },
   "entries": [
@@ -283,7 +283,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::is_forked_guest_process::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 920,
+      "line": 917,
       "item": "SyscallDispatcher::is_forked_guest_process",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -292,7 +292,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::bootstrap_host_pid::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 926,
+      "line": 923,
       "item": "SyscallDispatcher::bootstrap_host_pid",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -301,7 +301,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::is_ptrace_traceme::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 931,
+      "line": 928,
       "item": "SyscallDispatcher::is_ptrace_traceme",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -310,7 +310,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::FnOnce::hvpatch_orphan_adopter::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 954,
+      "line": 951,
       "item": "FnOnce::hvpatch_orphan_adopter",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -319,7 +319,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::FnOnce::install_seccomp_filter::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 1005,
+      "line": 1002,
       "item": "FnOnce::install_seccomp_filter",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -328,7 +328,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::personality::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 1431,
+      "line": 1428,
       "item": "SyscallDispatcher::personality",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -337,7 +337,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::prctl::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 1461,
+      "line": 1480,
       "item": "SyscallDispatcher::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -346,7 +346,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::prctl::proc#2",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 1467,
+      "line": 1493,
       "item": "SyscallDispatcher::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -355,7 +355,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::prctl::proc#3",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 1481,
+      "line": 1501,
       "item": "SyscallDispatcher::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -364,7 +364,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::prctl::proc#4",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 1494,
+      "line": 1505,
       "item": "SyscallDispatcher::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -373,7 +373,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::prctl::proc#5",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 1502,
+      "line": 1517,
       "item": "SyscallDispatcher::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -382,7 +382,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::prctl::proc#6",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 1506,
+      "line": 1527,
       "item": "SyscallDispatcher::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -391,7 +391,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::prctl::proc#7",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 1518,
+      "line": 1531,
       "item": "SyscallDispatcher::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -400,7 +400,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::prctl::proc#8",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 1528,
+      "line": 1584,
       "item": "SyscallDispatcher::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -409,7 +409,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::prctl::proc#9",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 1532,
+      "line": 1592,
       "item": "SyscallDispatcher::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -418,7 +418,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::prctl::proc#10",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 1585,
+      "line": 1600,
       "item": "SyscallDispatcher::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -427,7 +427,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::prctl::proc#11",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 1593,
+      "line": 1604,
       "item": "SyscallDispatcher::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -436,7 +436,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::prctl::proc#12",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 1601,
+      "line": 1609,
       "item": "SyscallDispatcher::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -445,7 +445,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::prctl::proc#13",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 1605,
+      "line": 1620,
       "item": "SyscallDispatcher::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -454,7 +454,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::prctl::proc#14",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 1610,
+      "line": 1631,
       "item": "SyscallDispatcher::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -463,7 +463,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::prctl::proc#15",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 1621,
+      "line": 1637,
       "item": "SyscallDispatcher::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -472,34 +472,16 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::prctl::proc#16",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 1632,
+      "line": 1641,
       "item": "SyscallDispatcher::prctl",
       "category": "proc",
       "expression": ".proc.lock()",
       "ordinal": 16
     },
     {
-      "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::prctl::proc#17",
-      "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 1638,
-      "item": "SyscallDispatcher::prctl",
-      "category": "proc",
-      "expression": ".proc.lock()",
-      "ordinal": 17
-    },
-    {
-      "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::prctl::proc#18",
-      "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 1642,
-      "item": "SyscallDispatcher::prctl",
-      "category": "proc",
-      "expression": ".proc.lock()",
-      "ordinal": 18
-    },
-    {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::getcpu::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 1747,
+      "line": 1746,
       "item": "SyscallDispatcher::getcpu",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -508,7 +490,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::sched_getaffinity::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 1996,
+      "line": 1995,
       "item": "SyscallDispatcher::sched_getaffinity",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -517,7 +499,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::sched_setaffinity::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 2031,
+      "line": 2030,
       "item": "SyscallDispatcher::sched_setaffinity",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -526,7 +508,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::uname::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 2523,
+      "line": 2522,
       "item": "SyscallDispatcher::uname",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -535,7 +517,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::ptrace::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 2554,
+      "line": 2553,
       "item": "SyscallDispatcher::ptrace",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -544,7 +526,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::ptrace::proc#2",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 2879,
+      "line": 2878,
       "item": "SyscallDispatcher::ptrace",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -553,7 +535,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::ptrace::proc#3",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 2898,
+      "line": 2897,
       "item": "SyscallDispatcher::ptrace",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -562,7 +544,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::ptrace::proc#4",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 2970,
+      "line": 2969,
       "item": "SyscallDispatcher::ptrace",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -571,7 +553,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::waitid::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 3327,
+      "line": 3326,
       "item": "SyscallDispatcher::waitid",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -580,7 +562,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/proc.rs::SyscallDispatcher::wait4::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 3837,
+      "line": 3836,
       "item": "SyscallDispatcher::wait4",
       "category": "proc",
       "expression": ".proc.lock()",

@@ -82,13 +82,14 @@ pub use ids::{
 pub use netns::{NetNs, UtsNs};
 pub(crate) use netns::{publish_root_net_view, publish_root_nodename, root_net_ns, root_uts_ns};
 pub use objects::{
-    Credentials, FileDescription, FileDescriptionBackingKind, FileDescriptionBackingSnapshot,
-    FileSlot, FileTable, FsContext, HandlerFrameState, LinuxWaitStatus, Mm, ObjectGraphError,
-    OpenDescriptionBackingSnapshot, PendingQueue, PendingSignal, PidfdTarget, ProcessGroup,
-    RlimitSet, RunnerDirective, Session, Sighand, SignalAuthority, SignalDequeue,
-    SignalDisposition, SignalPendingOwner, Task, TaskKey, TaskLifecycle, TaskParticipantError,
-    TaskPendingSignals, TaskRef, TaskRusage, TaskShared, TaskSharedCloneError, TaskWaker, Thread,
-    ThreadKey, ThreadRef, ThreadResources, ThreadRunner, ThreadSignalState, Zombie,
+    Credentials, DumpableMode, FileDescription, FileDescriptionBackingKind,
+    FileDescriptionBackingSnapshot, FileSlot, FileTable, FsContext, HandlerFrameState,
+    LinuxWaitStatus, Mm, ObjectGraphError, OpenDescriptionBackingSnapshot, PendingQueue,
+    PendingSignal, PidfdTarget, ProcessGroup, RlimitSet, RunnerDirective, Session, Sighand,
+    SignalAuthority, SignalDequeue, SignalDisposition, SignalPendingOwner, Task, TaskKey,
+    TaskLifecycle, TaskParticipantError, TaskPendingSignals, TaskRef, TaskRusage, TaskShared,
+    TaskSharedCloneError, TaskWaker, Thread, ThreadKey, ThreadRef, ThreadResources, ThreadRunner,
+    ThreadSignalState, Zombie,
 };
 #[allow(unused_imports)]
 pub(crate) use objects::{

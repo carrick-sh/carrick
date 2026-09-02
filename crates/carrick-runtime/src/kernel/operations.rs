@@ -18,7 +18,7 @@ use super::ids::{
     ChildExitSignal, LinuxSignal, LinuxTid, MmId, ObjectIdError, ProcessGroupId, SessionId, TaskId,
 };
 use super::objects::{
-    Credentials, FileTable, LinuxWaitStatus, Mm, ObjectGraphError, ProcessGroup,
+    Credentials, DumpableMode, FileTable, LinuxWaitStatus, Mm, ObjectGraphError, ProcessGroup,
     PtraceStopSettlement, PtraceSynchronousFault, Session, Task, TaskJobControlEvent, TaskKey,
     TaskLifecycle, TaskParticipantError, TaskRef, TaskShared, TaskSharedCloneError, ThreadKey,
     ThreadRef, ThreadResources, Zombie,
@@ -1706,15 +1706,27 @@ impl Kernel {
         if tracee.key() == tracer {
             return Err(carrick_abi::LINUX_EPERM);
         }
-        let caller_credentials = context.resources().credentials();
-        let target_credentials = tracee.process_credentials();
-        let uid_match = [caller_credentials.ruid(), caller_credentials.euid()]
-            .into_iter()
-            .any(|caller_uid| {
-                caller_uid == target_credentials.ruid() || caller_uid == target_credentials.suid()
-            });
-        if !caller_credentials.is_privileged() && !uid_match {
-            return Err(carrick_abi::LINUX_EPERM);
+        // ptrace(2) "Ptrace access mode checking", `PTRACE_MODE_ATTACH_REALCREDS`:
+        // the caller's REAL uid/gid must equal the target's real, effective and
+        // saved ids, AND the target's dumpable attribute must be 1. Only
+        // `CAP_SYS_PTRACE` overrides either — the Docker default set lacks it
+        // even for root, so euid 0 is NOT a pass (probe `ptraceattach`).
+        let may_ptrace = context
+            .task()
+            .caps()
+            .has_effective(crate::namespace::process::CAP_SYS_PTRACE);
+        if !may_ptrace {
+            let caller = context.resources().credentials();
+            let target = tracee.process_credentials();
+            let ids_match = [target.ruid(), target.euid(), target.suid()]
+                .into_iter()
+                .all(|uid| uid == caller.ruid())
+                && [target.rgid(), target.egid(), target.sgid()]
+                    .into_iter()
+                    .all(|gid| gid == caller.rgid());
+            if !ids_match || tracee.dumpable() == DumpableMode::Disable {
+                return Err(carrick_abi::LINUX_EPERM);
+            }
         }
         if !self.bind_ptrace_tracer(&tracee, tracer) {
             return Err(carrick_abi::LINUX_EPERM);
@@ -6619,6 +6631,60 @@ mod tests {
                 .expect("resumed tracee remains live for its parent"),
             WaitOutcome::StillRunning,
         );
+    }
+
+    #[test]
+    fn ptrace_attach_denies_a_non_dumpable_target_without_cap_sys_ptrace() {
+        // ptrace(2) `PTRACE_MODE_ATTACH_REALCREDS`: a uid match is not enough
+        // when the target cleared `PR_SET_DUMPABLE`; only `CAP_SYS_PTRACE`
+        // overrides that, and the Docker default set (root included) lacks it
+        // (probe `ptraceattach`: `attach_nondumpable_eperm=true` in the oracle).
+        let (kernel, root) = bootstrap(1);
+        let tracer = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(7_096),
+                "non-dumpable ptrace tracer".to_owned(),
+                None,
+            )
+            .expect("fork tracer");
+        let tracee = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(7_097),
+                "non-dumpable ptrace tracee".to_owned(),
+                None,
+            )
+            .expect("fork tracee");
+        let tracee_id = tracee.task().key().id;
+        assert_eq!(tracee.task().dumpable(), DumpableMode::User);
+        assert!(
+            !tracer
+                .task()
+                .caps()
+                .has_effective(crate::namespace::process::CAP_SYS_PTRACE),
+            "the Docker default capability set lacks CAP_SYS_PTRACE even for root",
+        );
+
+        tracee.task().set_dumpable(DumpableMode::Disable);
+        assert_eq!(
+            kernel.attach_task_for_ptrace(&tracer, tracee_id),
+            Err(carrick_abi::LINUX_EPERM),
+            "a root tracer without CAP_SYS_PTRACE cannot attach to a non-dumpable target",
+        );
+        assert_eq!(tracee.task().ptrace_tracer(), None);
+
+        tracer.task().with_caps(|caps| {
+            caps.effective |= 1u64 << crate::namespace::process::CAP_SYS_PTRACE;
+        });
+        assert_eq!(
+            kernel.attach_task_for_ptrace(&tracer, tracee_id),
+            Ok(()),
+            "CAP_SYS_PTRACE overrides the dumpable check",
+        );
+        assert_eq!(tracee.task().ptrace_tracer(), Some(tracer.task().key()));
     }
 
     #[test]
