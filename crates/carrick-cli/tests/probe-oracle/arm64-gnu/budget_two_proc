@@ -1,7 +1,11 @@
-48629fae4c57c74f
-parent_pid=9
-child_forked=true
+53600497e67d6b7c
+parent_pid_positive=true
+child_ppid_matches=true
 child_ok
+child_forked=true
+child_pid_distinct=true
 child_exited_zero=true
+parent_pid_stable=true
+child_reaped_once=true
 parent_ok
 parent_write_ok=true
