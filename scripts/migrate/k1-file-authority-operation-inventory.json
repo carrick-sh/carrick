@@ -11343,7 +11343,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 6766,
+      "line": 6815,
       "categories": [
         "mapping"
       ],
@@ -11361,7 +11361,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/fs_resolve_cache.rs",
-      "line": 47,
+      "line": 52,
       "categories": [
         "mapping"
       ],
@@ -11370,7 +11370,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/fs_resolve_cache.rs",
-      "line": 57,
+      "line": 62,
       "categories": [
         "mapping"
       ],
