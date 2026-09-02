@@ -1057,6 +1057,42 @@
       "typed_error": "MmResourcesError"
     },
     {
+      "file": "crates/carrick-runtime/src/hvpatch/mm_resources.rs",
+      "function": "ExecMmReservation::abort",
+      "ordinal_in_function": 2,
+      "fingerprint": "fdad1832f285f9202525a88a9f8aed989c4b9b51f38b8bb063ada05ca7ffaf8f",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::mm_reservation",
+      "rationale": "Exec reservation marker vanished between validate and clear under the same resources lock; indicates a corrupted reservation table (validate just proved the marker was ours)."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/mm_resources.rs",
+      "function": "ExecMmReservation::commit",
+      "ordinal_in_function": 2,
+      "fingerprint": "fdad1832f285f9202525a88a9f8aed989c4b9b51f38b8bb063ada05ca7ffaf8f",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::mm_reservation",
+      "rationale": "Exec reservation marker vanished between validate and clear under the same resources lock during commit; indicates a corrupted reservation table."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/mm_resources.rs",
+      "function": "<OwnerSetEditHold as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "85c9c087ed03edf279bfc7356b5398341d8067c89dc93aaeaaa9f22a26fb94d9",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::mm_reservation",
+      "rationale": "Owner-set edit hold count underflow on release; indicates a double-release or corrupted hold accounting for the mm generation."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/mm_resources.rs",
+      "function": "<OwnerSetEditHold as Drop>::drop",
+      "ordinal_in_function": 2,
+      "fingerprint": "85c9c087ed03edf279bfc7356b5398341d8067c89dc93aaeaaa9f22a26fb94d9",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::mm_reservation",
+      "rationale": "Owner-set edit hold released for a generation with no hold entry; indicates the hold table was mutated out from under a live hold."
+    },
+    {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
       "function": "ProcessContext::with_foreign_mm_endpoint",
       "ordinal_in_function": 1,

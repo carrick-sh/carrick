@@ -348,7 +348,9 @@ impl ExecMmReservation {
         let wake = self
             .resources
             .clear_exec_reservation(&mut resources_state, self.generation)
-            .unwrap_or_else(|| panic!("validated exec reservation marker vanished"));
+            // `validate` just proved the marker is ours under this same lock;
+            // its absence here is a broken state authority, not a guest error.
+            .unwrap_or_else(|| std::process::abort());
         #[cfg(test)]
         self.record_settlement(ExecDispositionSettlementStep::MarkerCleared);
         drop(resources_state);
@@ -407,7 +409,9 @@ impl ExecMmReservation {
         let wake = self
             .resources
             .clear_exec_reservation(&mut resources_state, self.generation)
-            .unwrap_or_else(|| panic!("validated exec reservation marker vanished"));
+            // `validate` just proved the marker is ours under this same lock;
+            // its absence here is a broken state authority, not a guest error.
+            .unwrap_or_else(|| std::process::abort());
         drop(resources_state);
         wake.run();
         Ok(receipt)
@@ -497,6 +501,8 @@ pub(crate) enum MmResourcesError {
         generation: AsidGeneration,
         holds: u32,
     },
+    #[error("owner-set edit hold count on MM generation {generation:?} is exhausted")]
+    OwnerSetEditHoldsExhausted { generation: AsidGeneration },
     #[error(transparent)]
     ExecReservationMismatch(#[from] ExecReservationMismatch),
     #[error(transparent)]
@@ -660,10 +666,10 @@ impl MmResources {
     ) -> Option<ExecSettlementWake> {
         state.exec_reservations.remove(&generation)?;
         self.exec_reservation_settled.notify_all();
-        state.exec_settlement_epoch = state
-            .exec_settlement_epoch
-            .checked_add(1)
-            .unwrap_or_else(|| std::process::abort());
+        // The epoch is an equality token (`subscribe_exec_settlement` only
+        // asks "did it move since I read it?"), so wrapping is well-defined:
+        // an alias needs 2^64 settlements between one read and its subscribe.
+        state.exec_settlement_epoch = state.exec_settlement_epoch.wrapping_add(1);
         let epoch = state.exec_settlement_epoch;
         let callbacks = std::mem::take(&mut state.settlement_listeners)
             .into_values()
@@ -687,11 +693,14 @@ impl MmResources {
         if state.exec_settlement_epoch != expected_epoch {
             return ExecSettlementEnrollment::Ready;
         }
-        state.next_settlement_listener = state
-            .next_settlement_listener
-            .checked_add(1)
-            .unwrap_or_else(|| std::process::abort());
-        let id = state.next_settlement_listener;
+        // Listener ids only need to be unique among the listeners currently
+        // enrolled (the map is drained on every settlement), so the counter
+        // wraps and skips any id still live rather than exhausting.
+        let mut id = state.next_settlement_listener.wrapping_add(1);
+        while state.settlement_listeners.contains_key(&id) {
+            id = id.wrapping_add(1);
+        }
+        state.next_settlement_listener = id;
         state.settlement_listeners.insert(
             id,
             ExecSettlementListener {
@@ -730,7 +739,7 @@ impl MmResources {
         let holds = state.owner_set_edit_holds.entry(generation).or_insert(0);
         *holds = holds
             .checked_add(1)
-            .unwrap_or_else(|| std::process::abort());
+            .ok_or(MmResourcesError::OwnerSetEditHoldsExhausted { generation })?;
         Ok(OwnerSetEditHold {
             resources: Arc::clone(self),
             generation,
