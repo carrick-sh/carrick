@@ -47,10 +47,12 @@ const KNOWN_PROBE_GAPS: &[&str] = &[
     // the fork/gettid pid-namespace unification -- sampled 4x musl + 2x gnu
     // line-exact MATCH.
     //
-    // `execthreads` moved to `KNOWN_FLAKY_PROBE_GAPS` 2026-09-01: its verdict
-    // is load-probabilistic (measured 1 clean MATCH in 3 runs), so it fits
-    // neither this list (a MATCH trips the unexpected-pass guard) nor removal
-    // (a DIFF fails the gate).
+    // `execthreads` CLOSED 2026-09-01 (after a day in `KNOWN_FLAKY_PROBE_GAPS`):
+    // the exec mm reservation retired the predecessor address space BEFORE the
+    // sibling drain, so a drain-suspended exec owner's resume load was refused
+    // as Retiring and the exec died silently as ThreadDone. Retirement now
+    // happens at `ExecMmReservation::commit`; the probe moved to the in-process
+    // `carrick-conformance-next` lane (8/8 CLI + 5/5 embedded line-exact).
     // Audit remediation program.
     // Each probe encodes a confirmed, dynamically-validated finding whose fix is
     // scheduled for the cited milestone; removed from this list when the fix lands
@@ -3713,16 +3715,11 @@ fn run_one_probe(
 /// not a parking lot for unexplained flakiness ("load sensitivity is
 /// first-class": classify, don't shrug).
 ///
-/// - `execthreads`: exec from a 7-thread process. The sibling registrations
-///   share one MM authority and the LAST cleanup drops a still-published
-///   inventory -> carrier abort ("published HVPatch inventory dropped before
-///   exact retirement") on ~2 runs in 3; the third run's teardown ordering
-///   lets the exec-rebind `Arc::into_inner` retire it first and the probe
-///   MATCHes line-exact. Cleanup-time retirement was re-measured 2026-09-01
-///   and is WORSE (silent exec death 4/4); the fix is retirement at exec
-///   sibling-drain completion, where the exec'ing thread still holds kernel
-///   context.
-const KNOWN_FLAKY_PROBE_GAPS: &[&str] = &["execthreads"];
+///
+/// Empty since 2026-09-01: `execthreads` (the only entry) was root-caused to
+/// the exec mm reservation retiring the predecessor before the sibling drain
+/// and is fixed at `ExecMmReservation::commit`.
+const KNOWN_FLAKY_PROBE_GAPS: &[&str] = &[];
 
 const KNOWN_LANE_GAPS: &[(&str, &str)] = &[
     // The amd64 oracle box runs Debian 12 / kernel 6.1, predating these syscalls;

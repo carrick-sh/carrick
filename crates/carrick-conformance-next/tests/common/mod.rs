@@ -584,14 +584,13 @@ pub const LIVE_ORACLE_PROBES: &[&str] = &[
 
 /// Probes that cannot share an embedded test process after they fail. Keep
 /// these on the old out-of-process lane until the runtime teardown is fixed.
-pub const OUT_OF_PROCESS_PROBES: &[&str] = &["execthreads", "execfromthread", "vforkexecthread"];
+pub const OUT_OF_PROCESS_PROBES: &[&str] = &["execfromthread", "vforkexecthread"];
 
 /// Complete arm64 baseline mismatch inventory. Every shard derives its local
 /// subset from these global lists so adding a probe cannot silently orphan a
 /// known gap when the deterministic modulo partition moves.
 pub const MUSL_BASELINE_GAPS: &[&str] = &[
     "budget_two_proc",
-    "execthreads",
     // HVPatch materializes `mmap(MAP_PRIVATE, fd)` as a map-time snapshot
     // (`map_private_file_backed` is refused for stage-2 backings), so a clean
     // private page does not track a later write(2) to the file. Both inode
@@ -601,7 +600,6 @@ pub const MUSL_BASELINE_GAPS: &[&str] = &[
 
 pub const GNU_BASELINE_GAPS: &[&str] = &[
     "budget_two_proc",
-    "execthreads",
     // gnu only, exactly `clone_thread_no_sighand_einval=false`: the probe's
     // NULL-stack `clone(CLONE_VM|0xff)` child exits while its parent lives,
     // and the sharer's carrier MM-authority retirement corrupts the owner's
