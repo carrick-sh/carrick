@@ -735,15 +735,6 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "SyscallDispatcher::fork_clone_with_prepared_mm_authorized_observed",
-      "ordinal_in_function": 1,
-      "fingerprint": "2cfe013f5a69171fea944dd0db920adbca4cc96de6d0db1bff76bcf04a7cac4c",
-      "verdict": "carrier_fault",
-      "failure_domain": "dispatch::mm_binding",
-      "rationale": "Active MM authority missing from fork install guard during fork_clone_with_prepared_mm_authorized_observed; cannot validate parent MM state."
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
       "function": "SyscallDispatcher::enter_mm_executor_inner",
       "ordinal_in_function": 1,
       "fingerprint": "33847525eef86c7dff8b8ffd4923ec2610ca6a03f679a5e3457811b797a0065c",

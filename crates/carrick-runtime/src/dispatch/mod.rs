@@ -2992,6 +2992,42 @@ impl DispatchMmBinding {
             drop(guard);
         }
     }
+
+    /// Begin a host-alias dispatch phase on `expected` only if it is still the
+    /// live authority AND `permit` was minted for it.
+    ///
+    /// `begin_dispatch` retries against whatever authority is current, which is
+    /// right for a syscall whose permit came from the same executor turn. A
+    /// fork install is different: its permit and its prepared parent were
+    /// captured BEFORE the copy phase, so an exec promotion racing the copy
+    /// leaves both stale. `MmMutationCoordinator::begin_alias` treats a
+    /// permit for another MM as a broken authority chain and aborts the
+    /// carrier; here staleness is an ordinary outcome, so it is reported as
+    /// `None` and the caller lowers it to a retryable failure.
+    fn begin_dispatch_for<'permit>(
+        &self,
+        permit: &'permit mm_mutation::HostAliasPermit<'_>,
+        expected: &Arc<DispatchMmAuthority>,
+    ) -> Option<HostAliasDispatchGuard<'permit>> {
+        if !permit.authorizes(&expected.mutation_coordinator, expected.mm_id) {
+            return None;
+        }
+        if !Arc::ptr_eq(&self.current.load_full(), expected) {
+            return None;
+        }
+        let guard = expected
+            .host_alias_transactions
+            .begin_dispatch(permit, &expected.mutation_coordinator)
+            .with_authority(Arc::clone(expected));
+        if Arc::ptr_eq(&self.current.load_full(), expected) {
+            Some(guard)
+        } else {
+            // Promotion won between selection and exclusion; the caller's
+            // observation is stale, not merely delayed.
+            drop(guard);
+            None
+        }
+    }
 }
 
 pub(crate) struct PreparedDispatchMmExec {
@@ -5030,15 +5066,15 @@ impl SyscallDispatcher {
         {
             return Err(crate::kernel::SnapshotError::ChangedDuringObservation);
         }
-        let dispatch = self.mm_binding.begin_dispatch(permit, false);
-        let current_authority = dispatch.authority.as_ref().unwrap_or_else(|| {
-            tracing::error!("fork install guard lacks MM authority");
-            std::process::abort();
-        });
-        if !Arc::ptr_eq(current_authority, &prepared_mm.parent_mm) {
-            return Err(crate::kernel::SnapshotError::ChangedDuringObservation);
-        }
-        if current_authority.vma_revision() != prepared_mm.parent_revision {
+        // The permit and the prepared parent were both captured before the
+        // copy phase; an exec promotion during the copy makes them stale
+        // together. Refuse that as a retryable observation failure rather than
+        // letting `begin_alias` abort the carrier over a foreign permit.
+        let dispatch = self
+            .mm_binding
+            .begin_dispatch_for(permit, &prepared_mm.parent_mm)
+            .ok_or(crate::kernel::SnapshotError::ChangedDuringObservation)?;
+        if prepared_mm.parent_mm.vma_revision() != prepared_mm.parent_revision {
             return Err(crate::kernel::SnapshotError::ChangedDuringObservation);
         }
         observe_install(false);
