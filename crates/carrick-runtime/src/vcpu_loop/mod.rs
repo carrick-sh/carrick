@@ -1374,10 +1374,9 @@ impl CloneAdmissionGate {
     /// Advance the change epoch and detach every listener; the caller runs
     /// the returned callbacks after releasing the state lock.
     fn publish_change(state: &mut CloneAdmissionState) -> Vec<CloneAdmissionListener> {
-        state.change_epoch = state
-            .change_epoch
-            .checked_add(1)
-            .unwrap_or_else(|| std::process::abort());
+        // Equality token only (`subscribe_change` asks "did it move?"), so
+        // wrapping is well-defined rather than an exhaustion to abort on.
+        state.change_epoch = state.change_epoch.wrapping_add(1);
         std::mem::take(&mut state.listeners)
             .into_values()
             .map(|(_, callback)| callback)

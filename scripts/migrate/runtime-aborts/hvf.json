@@ -430,7 +430,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::execve_rebuild_inner",
       "ordinal_in_function": 5,
-      "fingerprint": "466ca9d94093f98729b2d8d06e86771c4f5cb12d8d225c1a16be0b897f4d7840",
+      "fingerprint": "a9d290efb7148b6f6d1f3cd8f3830a802e6e08a4b6d942d1e33cec7586c6e76f",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Region in carrier mappings has invalid physical host offset when computing stage-2 owner identity during exec inventory staging."
@@ -439,7 +439,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::execve_rebuild_inner",
       "ordinal_in_function": 6,
-      "fingerprint": "466ca9d94093f98729b2d8d06e86771c4f5cb12d8d225c1a16be0b897f4d7840",
+      "fingerprint": "a9d290efb7148b6f6d1f3cd8f3830a802e6e08a4b6d942d1e33cec7586c6e76f",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Staging replacement frame inventory failed after stage-2 mappings were installed, leaving physical stage-2 memory unrepresented in inventory ledger."
@@ -448,7 +448,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::execve_rebuild_inner",
       "ordinal_in_function": 7,
-      "fingerprint": "466ca9d94093f98729b2d8d06e86771c4f5cb12d8d225c1a16be0b897f4d7840",
+      "fingerprint": "a9d290efb7148b6f6d1f3cd8f3830a802e6e08a4b6d942d1e33cec7586c6e76f",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Invalid physical host offset when collecting carrier stage-2 lease owner hosts during exec registration rebind."
@@ -457,7 +457,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::execve_rebuild_inner",
       "ordinal_in_function": 8,
-      "fingerprint": "466ca9d94093f98729b2d8d06e86771c4f5cb12d8d225c1a16be0b897f4d7840",
+      "fingerprint": "a9d290efb7148b6f6d1f3cd8f3830a802e6e08a4b6d942d1e33cec7586c6e76f",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Collecting carrier stage-2 lease owners failed with conflicting or duplicate host owners during exec registration rebind."
@@ -466,7 +466,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::execve_rebuild_inner",
       "ordinal_in_function": 9,
-      "fingerprint": "466ca9d94093f98729b2d8d06e86771c4f5cb12d8d225c1a16be0b897f4d7840",
+      "fingerprint": "a9d290efb7148b6f6d1f3cd8f3830a802e6e08a4b6d942d1e33cec7586c6e76f",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Registering carrier stage-2 leases in the carrier registry failed during exec rebind, leaving replacement stage-2 leases unmanaged."
@@ -475,7 +475,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::execve_rebuild_inner",
       "ordinal_in_function": 10,
-      "fingerprint": "466ca9d94093f98729b2d8d06e86771c4f5cb12d8d225c1a16be0b897f4d7840",
+      "fingerprint": "a9d290efb7148b6f6d1f3cd8f3830a802e6e08a4b6d942d1e33cec7586c6e76f",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::task_backend_lifecycle",
       "rationale": "Missing task registration during HVPatch exec authority rebind leaves the replacement MM unbound from carrier task tracking."
@@ -484,7 +484,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::execve_rebuild_inner",
       "ordinal_in_function": 11,
-      "fingerprint": "466ca9d94093f98729b2d8d06e86771c4f5cb12d8d225c1a16be0b897f4d7840",
+      "fingerprint": "a9d290efb7148b6f6d1f3cd8f3830a802e6e08a4b6d942d1e33cec7586c6e76f",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::task_backend_lifecycle",
       "rationale": "Rebinding exec MM authority into the carrier task registration failed, leaving the carrier task with stale or missing MM authority."
@@ -655,7 +655,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::prepare_task_only_plan",
       "ordinal_in_function": 1,
-      "fingerprint": "1bb902b8c83018e471f00c781dc304408ae24d09c3956d1a62d8dad440bafc21",
+      "fingerprint": "0dcadba1b7f3733db3a7a02a818cdf0e7770a7c009f92b7e71ab26c15596d873",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Rollback of staged unpublished inventory mappings failed during task-only child process preparation, leaving frame inventory in a corrupted state."

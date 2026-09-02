@@ -377,15 +377,6 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "function": "<CloneAdmissionPermit as Drop>::drop",
-      "ordinal_in_function": 2,
-      "fingerprint": "d13de9365019700659f8ab4fdf905f92cbcc83031e71c2128324f9e81ecb4fe4",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::task_backend_lifecycle",
-      "rationale": "CloneAdmissionPermit missing inner guard cell during teardown indicates double-drop or corrupted lifecycle state."
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "KernelState::register_hvpatch_runtime_endpoint",
       "ordinal_in_function": 1,
       "fingerprint": "5135aed6e2617cf1ab5ed89aa0bab45fabb442dfaae012aff19393e36f7da50e",
@@ -487,15 +478,24 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
       "ordinal_in_function": 2,
-      "fingerprint": "a83fcc3b01635b96fc2b9a15273e6210dcd2d77a090f4954b427218fe1099127",
+      "fingerprint": "d790da189ea83882a7455f4d85544225f8ca745450b8a22f24526922d490e5cb",
       "verdict": "carrier_fault",
-      "failure_domain": "kernel::terminal_settlement",
-      "rationale": "Terminal execution context missing thread handle during finalization."
+      "failure_domain": "hvpatch::task_backend_lifecycle",
+      "rationale": "Missing HVPatch runtime reference when constructing the terminal-retire wake callback."
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
       "ordinal_in_function": 3,
+      "fingerprint": "817d49405a6d39408411425ba046e1719d2d93f4e6d466249ce509795d4d7d82",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::mm_reservation",
+      "rationale": "Admitting the exiting task's owner-set edit failed for a reason other than an unknown task or a sibling exec reservation; the MM lease table no longer describes a live task the kernel graph is retiring."
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
+      "ordinal_in_function": 4,
       "fingerprint": "045fb400c1247181d37c3a57b003f6513de9c1b51805b36cb9c902caf3320201",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::terminal_settlement",
@@ -504,7 +504,7 @@
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
-      "ordinal_in_function": 4,
+      "ordinal_in_function": 5,
       "fingerprint": "c0af55bee658cd661c5d1e82a5d7bfa97b2923273996a5c3da03a6d229d83b1c",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::terminal_settlement",
@@ -513,7 +513,7 @@
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
-      "ordinal_in_function": 5,
+      "ordinal_in_function": 6,
       "fingerprint": "c0af55bee658cd661c5d1e82a5d7bfa97b2923273996a5c3da03a6d229d83b1c",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::terminal_settlement",
@@ -522,7 +522,7 @@
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
-      "ordinal_in_function": 6,
+      "ordinal_in_function": 7,
       "fingerprint": "c0af55bee658cd661c5d1e82a5d7bfa97b2923273996a5c3da03a6d229d83b1c",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::container_scope",
@@ -531,7 +531,7 @@
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
-      "ordinal_in_function": 7,
+      "ordinal_in_function": 8,
       "fingerprint": "a95348949793bbec5e816fc966ee37c03fbf60f5a48c7bb17ed50a197d58b1ea",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::terminal_settlement",
@@ -540,7 +540,7 @@
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
-      "ordinal_in_function": 8,
+      "ordinal_in_function": 9,
       "fingerprint": "353b3bcc1f71de8575a93ede2daef1184d6948ef80aab48912681f71007f4bdf",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::terminal_settlement",
@@ -549,7 +549,7 @@
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
-      "ordinal_in_function": 9,
+      "ordinal_in_function": 10,
       "fingerprint": "3e769b7946d9dd9a96cbe4e496a6faee87fef30e5ba1914e07178337fa7ec9c3",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::terminal_settlement",
@@ -558,7 +558,7 @@
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
-      "ordinal_in_function": 10,
+      "ordinal_in_function": 11,
       "fingerprint": "bbe8fbc5c49d99a7680c6585e557a7653d703c3ae01a3814ef633ff2accd2e90",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::terminal_settlement",
@@ -567,7 +567,7 @@
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
-      "ordinal_in_function": 11,
+      "ordinal_in_function": 12,
       "fingerprint": "a50fbdb73d7cae09396e37b568943805c6e6c02dca3be82b1b9f833ec04e9395",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::terminal_settlement",
@@ -694,15 +694,24 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 1,
-      "fingerprint": "2eb9cc13fa03d16eaf323000686dda278b80bdc834f20973e280cd2e9653be78",
+      "fingerprint": "8c167c3030cf8214892303ca330f8206b7a75791926ab5eb932e9da54220ca6f",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::runtime_binding",
-      "rationale": "Missing HVPatch runtime reference when constructing clone thread wake callback."
+      "rationale": "Missing HVPatch runtime reference when constructing the clone-admission deferral wake callback."
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 2,
+      "fingerprint": "ed3ca7adeb15d8f38ec82cf3f3a14208f4df54908e7ae7a40ed1f9a0b86a521c",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::task_backend_lifecycle",
+      "rationale": "Missing HVPatch runtime reference when constructing the reservation-change wake callback for a deferred thread clone."
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
+      "ordinal_in_function": 3,
       "fingerprint": "2ee6b408845739043260a39e06556092239ee25366f25b9602988805f1d10be9",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::clone_lifecycle",
@@ -711,7 +720,7 @@
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
-      "ordinal_in_function": 3,
+      "ordinal_in_function": 4,
       "fingerprint": "2ee6b408845739043260a39e06556092239ee25366f25b9602988805f1d10be9",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::runtime_binding",
@@ -720,7 +729,7 @@
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
-      "ordinal_in_function": 4,
+      "ordinal_in_function": 5,
       "fingerprint": "2ee6b408845739043260a39e06556092239ee25366f25b9602988805f1d10be9",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::clone_lifecycle",
@@ -729,7 +738,7 @@
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
-      "ordinal_in_function": 5,
+      "ordinal_in_function": 6,
       "fingerprint": "2ee6b408845739043260a39e06556092239ee25366f25b9602988805f1d10be9",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::clone_lifecycle",
@@ -738,7 +747,7 @@
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
-      "ordinal_in_function": 6,
+      "ordinal_in_function": 7,
       "fingerprint": "2ee6b408845739043260a39e06556092239ee25366f25b9602988805f1d10be9",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::clone_lifecycle",
@@ -747,7 +756,7 @@
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
-      "ordinal_in_function": 7,
+      "ordinal_in_function": 8,
       "fingerprint": "2ee6b408845739043260a39e06556092239ee25366f25b9602988805f1d10be9",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::clone_lifecycle",
@@ -756,7 +765,7 @@
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
-      "ordinal_in_function": 8,
+      "ordinal_in_function": 9,
       "fingerprint": "2ee6b408845739043260a39e06556092239ee25366f25b9602988805f1d10be9",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::clone_lifecycle",
@@ -765,7 +774,7 @@
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
-      "ordinal_in_function": 9,
+      "ordinal_in_function": 10,
       "fingerprint": "338fc2e23b7b38f6a2b9b90c9c60ae4a7cbcaa2d1a1040236316d575b06da873",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::runtime_binding",
@@ -774,7 +783,7 @@
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
-      "ordinal_in_function": 10,
+      "ordinal_in_function": 11,
       "fingerprint": "5391889be0df1f2c35f0ecddfc3cdbc0d2d9c3677dcdb5bda047208901edf965",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::clone_lifecycle",
@@ -783,7 +792,7 @@
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
-      "ordinal_in_function": 11,
+      "ordinal_in_function": 12,
       "fingerprint": "5391889be0df1f2c35f0ecddfc3cdbc0d2d9c3677dcdb5bda047208901edf965",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::clone_lifecycle",
