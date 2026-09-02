@@ -1318,24 +1318,50 @@ impl PreparedHvpatchSubmission {
                 "HVPatch activation proof names a different submission".to_owned(),
             ));
         }
-        let mut bindings = self.directory.bindings.lock();
-        let record = bindings.get_mut(&self.key).ok_or_else(|| {
-            TrapError::Hypervisor("missing dormant HVPatch submission".to_owned())
-        })?;
-        if record.active || record.binding.identity() != proof.identity {
-            return Err(TrapError::Hypervisor(
-                "HVPatch dormant binding identity changed before activation".to_owned(),
-            ));
+        // Lock order: the exec retarget path nests `directory.bindings` INSIDE
+        // the scheduler's generation mutex and the executor kick binding lock
+        // (`retarget_running_exec` -> `rebind_exact_with` -> `replace_exec`),
+        // and scheduler publication consults every kick's binding lock
+        // (`enqueue_exact` -> `has_running`). Publishing while this directory
+        // lock is held therefore closes an ABBA cycle against a sibling
+        // exec: a load-dependent whole-carrier wedge, seen as executor-2 in
+        // `replace_exec` vs executor-7 in `activate` on `os_exec.test`.
+        //
+        // The record is made resolvable BEFORE the row is published (an
+        // executor may take the row the instant it lands and must resolve
+        // the binding), the directory lock is released for the publication,
+        // and a rejected publication rolls the record back to dormant so the
+        // armed drop below removes it exactly as before.
+        let publication = {
+            let mut bindings = self.directory.bindings.lock();
+            let record = bindings.get_mut(&self.key).ok_or_else(|| {
+                TrapError::Hypervisor("missing dormant HVPatch submission".to_owned())
+            })?;
+            if record.active || record.binding.identity() != proof.identity {
+                return Err(TrapError::Hypervisor(
+                    "HVPatch dormant binding identity changed before activation".to_owned(),
+                ));
+            }
+            let authority = record
+                .authority
+                .as_ref()
+                .ok_or_else(|| TrapError::Hypervisor("dormant authority missing".to_owned()))?;
+            record.active = true;
+            authority.publication_handle()
+        };
+        match publication.publish_unique(scheduler, thread) {
+            Ok(()) => {
+                self.armed = false;
+                Ok(())
+            }
+            Err(error) => {
+                let mut bindings = self.directory.bindings.lock();
+                if let Some(record) = bindings.get_mut(&self.key) {
+                    record.active = false;
+                }
+                Err(TrapError::Hypervisor(error.to_string()))
+            }
         }
-        record
-            .authority
-            .as_ref()
-            .ok_or_else(|| TrapError::Hypervisor("dormant authority missing".to_owned()))?
-            .publish_unique(scheduler, thread)
-            .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
-        record.active = true;
-        self.armed = false;
-        Ok(())
     }
 }
 
@@ -4446,6 +4472,7 @@ pub(crate) mod tests {
         BlockedReason, ExecutionFailure, ExecutionGeneration, ExecutorId, MigratableTaskState,
         ThreadExecutionLease, ThreadExecutionState,
     };
+    use crate::kernel::scheduler::{ExecutorBinding, ExecutorKick, ExecutorKickToken};
     use crate::kernel::{
         ClonePlan, Kernel, KernelContext, RootBootstrap, Scheduler, SchedulerError,
         SubmissionAuthority, ThreadKey,
@@ -5854,6 +5881,120 @@ pub(crate) mod tests {
         )
         .expect("binding visible only after activation");
         assert!(Arc::ptr_eq(&resolved, &binding));
+    }
+
+    /// An executor kick that records, every time the scheduler consults its
+    /// binding, whether the HVPatch binding directory was free. Exec retarget
+    /// nests `directory.bindings` INSIDE a kick's binding lock
+    /// (`rebind_exact_with` -> `replace_exec`), so any publication that
+    /// consults kicks while holding the directory closes an ABBA cycle.
+    struct DirectoryLockOrderProbeKick {
+        directory: Arc<HvpatchTaskBindingDirectory>,
+        consulted: AtomicUsize,
+        directory_free: AtomicBool,
+    }
+
+    impl std::fmt::Debug for DirectoryLockOrderProbeKick {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("DirectoryLockOrderProbeKick")
+                .field("consulted", &self.consulted.load(Ordering::Acquire))
+                .field(
+                    "directory_free",
+                    &self.directory_free.load(Ordering::Acquire),
+                )
+                .finish()
+        }
+    }
+
+    impl ExecutorKick for DirectoryLockOrderProbeKick {
+        fn try_bind(&self, _binding: ExecutorBinding) -> bool {
+            false
+        }
+
+        fn unbind(&self, _binding: ExecutorBinding) {}
+
+        fn rebind_exact_with(
+            &self,
+            _predecessor: ExecutorBinding,
+            _successor: ExecutorBinding,
+            _publish: &mut dyn FnMut() -> bool,
+        ) -> bool {
+            false
+        }
+
+        fn deliver_exact(&self, _token: ExecutorKickToken) -> bool {
+            false
+        }
+
+        fn current_binding(&self) -> Option<ExecutorBinding> {
+            self.consulted.fetch_add(1, Ordering::AcqRel);
+            if self.directory.bindings.try_lock().is_none() {
+                self.directory_free.store(false, Ordering::Release);
+            }
+            None
+        }
+    }
+
+    #[test]
+    fn exact_activation_publishes_without_holding_the_binding_directory() {
+        let (kernel, context) = bootstrap(13_994);
+        let state = task_state(&context, 94);
+        let generation = context
+            .thread()
+            .publish_initial_task_state(state.clone())
+            .expect("publish root state");
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+        directory.install_scheduler(&scheduler).unwrap();
+        let probe = Arc::new(DirectoryLockOrderProbeKick {
+            directory: Arc::clone(&directory),
+            consulted: AtomicUsize::new(0),
+            directory_free: AtomicBool::new(true),
+        });
+        let registration = scheduler
+            .register_executor(Arc::clone(&probe) as Arc<dyn ExecutorKick>)
+            .expect("register probe executor");
+        let binding = hvpatch_test_binding(&context, &state, 94);
+        let dormant = directory
+            .prepare_submission(
+                &scheduler,
+                HvpatchSubmissionShape::Root,
+                None,
+                Arc::clone(context.thread()),
+                generation,
+                Arc::clone(&binding),
+            )
+            .expect("prepare dormant root");
+
+        activate_hvpatch_test_submission(
+            dormant,
+            &scheduler,
+            &context,
+            &state,
+            generation,
+            binding.as_ref(),
+        );
+
+        assert!(
+            probe.consulted.load(Ordering::Acquire) > 0,
+            "publication must consult the registered executor kicks"
+        );
+        assert!(
+            probe.directory_free.load(Ordering::Acquire),
+            "activation held the binding directory while consulting executor kicks; \
+             exec retarget takes those locks in the opposite order"
+        );
+        assert_eq!(scheduler.queued_len(), 1);
+        assert!(
+            <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+                directory.as_ref(),
+                context.thread().key(),
+                generation,
+            )
+            .is_ok()
+        );
+        scheduler.unregister_executor(&registration).unwrap();
     }
 
     #[test]
