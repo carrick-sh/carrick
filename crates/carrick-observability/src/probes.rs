@@ -267,6 +267,82 @@ impl HvpatchExecutorLifecyclePhase {
     }
 }
 
+/// Which scheduler edge `hvpatch-scheduler-wake` records. Stable DTrace
+/// ABI: append only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchSchedulerWakeKind {
+    /// `Scheduler::wake`: a producer edge that may publish guest readiness.
+    Wake = 0,
+    /// `Scheduler::wake_control`: owner-thread control work that must never
+    /// manufacture guest readiness for a parked continuation.
+    Control = 1,
+}
+
+impl HvpatchSchedulerWakeKind {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Thread execution state as seen by the scheduler probes. Stable DTrace
+/// ABI: append only. `Uninitialized` is the pre-publication state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchThreadExecutionStateKind {
+    Uninitialized = 0,
+    Runnable = 1,
+    Running = 2,
+    SwitchingOut = 3,
+    Blocked = 4,
+    Exited = 5,
+    Failed = 6,
+}
+
+impl HvpatchThreadExecutionStateKind {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// How an execution lease settled in `hvpatch-lease-settle`. Stable DTrace
+/// ABI: append only. `ExecInvalidated` is the exec-replacement override that
+/// retires the lease regardless of the executor's own settlement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchLeaseSettlementKind {
+    Runnable = 0,
+    Blocked = 1,
+    BlockedContinuation = 2,
+    Exited = 3,
+    ExecInvalidated = 4,
+}
+
+impl HvpatchLeaseSettlementKind {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Settlement-time flag bits carried by `hvpatch-lease-settle` `arg2`.
+/// Stable DTrace ABI: append only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchLeaseSettleFlag {
+    /// A `Scheduler::wake` landed while the lease was running.
+    WakePending = 1,
+    /// A `Scheduler::wake_control` requeue landed while the lease was running.
+    ControlPending = 2,
+    /// The settlement published the parked continuation as ready.
+    ContinuationReady = 4,
+}
+
+impl HvpatchLeaseSettleFlag {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
 /// Why one HVPatch host vCPU loop stopped representing a Linux thread.
 ///
 /// The Linux TID and Carrick `ThreadRegistry` ID are deliberately separate in
@@ -2821,6 +2897,39 @@ mod hvpatch_guest_probe_abi {
     }
 
     #[test]
+    fn hvpatch_scheduler_provider_keeps_exact_wake_and_settlement_identity() {
+        assert_eq!(HvpatchSchedulerWakeKind::Wake.raw(), 0);
+        assert_eq!(HvpatchSchedulerWakeKind::Control.raw(), 1);
+        assert_eq!(HvpatchThreadExecutionStateKind::Uninitialized.raw(), 0);
+        assert_eq!(HvpatchThreadExecutionStateKind::Runnable.raw(), 1);
+        assert_eq!(HvpatchThreadExecutionStateKind::Running.raw(), 2);
+        assert_eq!(HvpatchThreadExecutionStateKind::SwitchingOut.raw(), 3);
+        assert_eq!(HvpatchThreadExecutionStateKind::Blocked.raw(), 4);
+        assert_eq!(HvpatchThreadExecutionStateKind::Exited.raw(), 5);
+        assert_eq!(HvpatchThreadExecutionStateKind::Failed.raw(), 6);
+        assert_eq!(HvpatchLeaseSettlementKind::Runnable.raw(), 0);
+        assert_eq!(HvpatchLeaseSettlementKind::Blocked.raw(), 1);
+        assert_eq!(HvpatchLeaseSettlementKind::BlockedContinuation.raw(), 2);
+        assert_eq!(HvpatchLeaseSettlementKind::Exited.raw(), 3);
+        assert_eq!(HvpatchLeaseSettlementKind::ExecInvalidated.raw(), 4);
+        assert_eq!(HvpatchLeaseSettleFlag::WakePending.raw(), 1);
+        assert_eq!(HvpatchLeaseSettleFlag::ControlPending.raw(), 2);
+        assert_eq!(HvpatchLeaseSettleFlag::ContinuationReady.raw(), 4);
+        let source = include_str!("probes.rs");
+        for declaration in [
+            "fn hvpatch__scheduler__wake(_: u64, _: u32, _: u32, _: u64, _: u64) {}",
+            "stub!(hvpatch_scheduler_wake(",
+            "fn hvpatch__lease__settle(_: u64, _: u32, _: u32, _: u64, _: u64) {}",
+            "stub!(hvpatch_lease_settle(",
+        ] {
+            assert!(
+                source.matches(declaration).count() >= 2,
+                "missing scheduler ABI declaration {declaration}"
+            );
+        }
+    }
+
+    #[test]
     fn hvpatch_executor_lifecycle_provider_keeps_exact_claim_and_generation_identity() {
         assert_eq!(HvpatchExecutorLifecyclePhase::Create.raw(), 0);
         assert_eq!(HvpatchExecutorLifecyclePhase::Load.raw(), 1);
@@ -5000,6 +5109,17 @@ mod real {
         /// TaskSerial joins the earlier guest-lifecycle identity without
         /// assuming TaskSerial == ThreadSerial for a process leader.
         fn hvpatch__executor__claim(_: u64, _: u64, _: u32, _: u64, _: u64) {}
+        /// One scheduler wake edge against a kernel thread. Args: ThreadSerial,
+        /// wake kind (`HvpatchSchedulerWakeKind`), the execution state the
+        /// wake found (`HvpatchThreadExecutionStateKind`), that state's
+        /// generation, and the generation the thread was queued/kicked at
+        /// (zero when the wake produced no scheduler action).
+        fn hvpatch__scheduler__wake(_: u64, _: u32, _: u32, _: u64, _: u64) {}
+        /// One execution-lease settlement. Args: ThreadSerial, settlement
+        /// kind (`HvpatchLeaseSettlementKind`), `HvpatchLeaseSettleFlag`
+        /// bits, the settled lease generation, and the successor generation
+        /// published for the thread.
+        fn hvpatch__lease__settle(_: u64, _: u32, _: u32, _: u64, _: u64) {}
         /// Linux clone TID-output publication: reserved tid, stable output-role
         /// ordinal, guest address, and stable backend memory-result ordinal.
         fn mn__clone__tid__output(_: i32, _: u32, _: u64, _: u32) {}
@@ -5691,6 +5811,42 @@ mod real {
             executor,
             execution_generation,
             asid_generation
+        ));
+    }
+
+    /// Exact scheduler wake edge, recorded after the thread state machine
+    /// decided the action so the probe attributes the generation it queued.
+    pub fn hvpatch_scheduler_wake(
+        thread_serial: u64,
+        kind: super::HvpatchSchedulerWakeKind,
+        found_state: super::HvpatchThreadExecutionStateKind,
+        found_generation: u64,
+        queued_generation: u64,
+    ) {
+        carrick_usdt::hvpatch__scheduler__wake!(|| (
+            thread_serial,
+            kind.raw(),
+            found_state.raw(),
+            found_generation,
+            queued_generation
+        ));
+    }
+
+    /// Exact execution-lease settlement, recorded with the wake/control flags
+    /// the settlement consumed so an extra queued generation is attributable.
+    pub fn hvpatch_lease_settle(
+        thread_serial: u64,
+        settlement: super::HvpatchLeaseSettlementKind,
+        flags: u32,
+        lease_generation: u64,
+        successor_generation: u64,
+    ) {
+        carrick_usdt::hvpatch__lease__settle!(|| (
+            thread_serial,
+            settlement.raw(),
+            flags,
+            lease_generation,
+            successor_generation
         ));
     }
 
@@ -7608,6 +7764,20 @@ mod stub {
         executor: u32,
         execution_generation: u64,
         asid_generation: u64
+    ));
+    stub!(hvpatch_scheduler_wake(
+        thread_serial: u64,
+        kind: super::HvpatchSchedulerWakeKind,
+        found_state: super::HvpatchThreadExecutionStateKind,
+        found_generation: u64,
+        queued_generation: u64
+    ));
+    stub!(hvpatch_lease_settle(
+        thread_serial: u64,
+        settlement: super::HvpatchLeaseSettlementKind,
+        flags: u32,
+        lease_generation: u64,
+        successor_generation: u64
     ));
     stub!(hvpatch_thread_terminal(pid: i32, linux_tid: i32, registry_tid: i32, reason: super::HvpatchThreadTerminalReason, detail: i32));
     stub!(mn_clone_tid_output(
