@@ -2,14 +2,14 @@
   "schema": 1,
   "scope": "production_callsite taxonomy entries only",
   "ceiling": {
-    "create_install": 69,
-    "epoll_wait": 29,
-    "inspect_misc": 138,
-    "lifecycle": 28,
-    "mapping_ring": 11,
+    "create_install": 64,
+    "epoll_wait": 17,
+    "inspect_misc": 129,
+    "lifecycle": 12,
+    "mapping_ring": 8,
     "read_attempt": 9,
-    "slot_description_mutation": 13,
+    "slot_description_mutation": 12,
     "stream_transfer": 15,
-    "write_attempt": 17
+    "write_attempt": 16
   }
 }

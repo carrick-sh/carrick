@@ -38,6 +38,98 @@ PATTERNS = {
 }
 
 
+def brace_deltas(source: str) -> list[int]:
+    """Per-line `{`/`}` balance of `source`, skipping braces inside line and
+    (nested) block comments, string literals, raw strings and char literals,
+    so a `'}'`, a multi-line `r#"…"#` fixture or a brace in a comment cannot
+    unbalance the test-module walk."""
+    deltas: list[int] = []
+    delta = 0
+    index = 0
+    length = len(source)
+    while index < length:
+        char = source[index]
+        if char == "\n":
+            deltas.append(delta)
+            delta = 0
+            index += 1
+        elif source.startswith("//", index):
+            newline = source.find("\n", index)
+            index = length if newline < 0 else newline
+        elif source.startswith("/*", index):
+            depth = 1
+            index += 2
+            while index < length and depth:
+                if source.startswith("/*", index):
+                    depth += 1
+                    index += 2
+                elif source.startswith("*/", index):
+                    depth -= 1
+                    index += 2
+                else:
+                    if source[index] == "\n":
+                        deltas.append(delta)
+                        delta = 0
+                    index += 1
+        elif raw := re.compile(r"b?r(#*)\"").match(source, index):
+            terminator = '"' + raw.group(1)
+            close = source.find(terminator, raw.end())
+            close = length if close < 0 else close + len(terminator)
+            newlines = source.count("\n", index, close)
+            if newlines:
+                deltas.extend([delta] + [0] * (newlines - 1))
+                delta = 0
+            index = close
+        elif char == '"' or source.startswith('b"', index):
+            index += 2 if char == "b" else 1
+            while index < length and source[index] != '"':
+                if source[index] == "\\":
+                    index += 1
+                if index < length and source[index] == "\n":
+                    deltas.append(delta)
+                    delta = 0
+                index += 1
+            index += 1
+        elif char == "'" and (match := re.compile(r"'(?:\\.[^']*|[^'\\\n])'").match(source, index)):
+            index = match.end()
+        else:
+            if char == "{":
+                delta += 1
+            elif char == "}":
+                delta -= 1
+            index += 1
+    deltas.append(delta)
+    return deltas
+
+
+def cfg_test_module_lines(lines: list[str]) -> set[int]:
+    """1-based line numbers inside every `#[cfg(test)] mod … { … }` block.
+
+    A unit test that takes a table or description lock is not an authority
+    escape the burndown has to migrate; only the line-text `#[cfg(test)]`
+    check existed before, so such a site inside a test module counted as a
+    production callsite.
+    """
+    deltas = brace_deltas("\n".join(lines))
+    inside: set[int] = set()
+    index = 0
+    while index < len(lines):
+        if lines[index].strip() == "#[cfg(test)]":
+            probe = index + 1
+            while probe < len(lines) and lines[probe].strip().startswith("#["):
+                probe += 1
+            if probe < len(lines) and re.match(r"\s*(pub(\([^)]*\))?\s+)?mod\s+\w+\s*\{", lines[probe]):
+                depth = 0
+                for number in range(probe, len(lines)):
+                    depth += deltas[number]
+                    inside.add(number + 1)
+                    if depth <= 0:
+                        index = number
+                        break
+        index += 1
+    return inside
+
+
 def generate() -> dict[str, Any]:
     entries: list[dict[str, Any]] = []
     for path in sorted(SOURCE.rglob("*.rs")):
@@ -48,7 +140,9 @@ def generate() -> dict[str, Any]:
             # cfg(test)-string sentinel can no longer define this boundary.
             continue
         relative = str(path.relative_to(ROOT))
-        for number, line in enumerate(path.read_text().splitlines(), 1):
+        lines = path.read_text().splitlines()
+        test_lines = cfg_test_module_lines(lines)
+        for number, line in enumerate(lines, 1):
             categories = [name for name, pattern in PATTERNS.items() if pattern.search(line)]
             if categories:
                 text = line.strip()
@@ -61,6 +155,7 @@ def generate() -> dict[str, Any]:
                         "scope_kind": (
                             "test_or_definition"
                             if "#[cfg(test)]" in text
+                            or number in test_lines
                             or relative.endswith("/kernel/objects.rs")
                             or relative.endswith("/dispatch/fd_table.rs")
                             else "production_callsite"
