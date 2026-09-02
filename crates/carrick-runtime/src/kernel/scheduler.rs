@@ -842,6 +842,36 @@ impl SubmissionAuthority {
         self.publish_row(scheduler, thread).map(|_| ())
     }
 
+    #[cfg(test)]
+    fn publish_row(
+        &self,
+        scheduler: &Scheduler,
+        thread: Arc<Thread>,
+    ) -> Result<bool, SchedulerError> {
+        self.publication_handle().publish_row(scheduler, thread)
+    }
+
+    /// A non-owning publication view of this authority: the exact queue and
+    /// key it admitted, detached from the authority's admission lifetime so a
+    /// holder can release the lock guarding the authority before it enters
+    /// the scheduler. Publication takes the run-queue lock and consults every
+    /// executor kick, which nest INSIDE the exec-retarget lock order; the
+    /// handle exists so no caller has to publish from under an outer lock.
+    pub(crate) fn publication_handle(&self) -> SubmissionPublication {
+        SubmissionPublication {
+            queue: Weak::clone(&self.queue),
+            key: self.key,
+        }
+    }
+}
+
+/// See [`SubmissionAuthority::publication_handle`].
+pub(crate) struct SubmissionPublication {
+    queue: Weak<RunQueueInner>,
+    key: QueueKey,
+}
+
+impl SubmissionPublication {
     pub(crate) fn publish_unique(
         &self,
         scheduler: &Scheduler,
