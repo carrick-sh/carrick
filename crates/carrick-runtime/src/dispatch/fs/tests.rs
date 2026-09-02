@@ -4941,3 +4941,49 @@ fn pselect6_parks_full_pipe_write_end_on_readiness_pipe_pollin() {
         "must park on the readiness pipe with the event it delivers"
     );
 }
+
+/// LTP creat05's cleanup probe: `openat(dirfd, name, O_DIRECTORY|O_NOFOLLOW)`
+/// per file, expecting ENOTDIR. Under a trusted dir the host's own
+/// O_DIRECTORY|O_NOFOLLOW refusal answers that exactly — Linux reports
+/// ENOTDIR for a regular file, a FIFO, AND a symlink (to a file or to a
+/// directory) under that flag pair (Docker oracle, 2026-09-02) — so the lane
+/// must serve it instead of falling back to a ~10-host-call resolving walk.
+/// Without guest O_NOFOLLOW a symlink child must still fall back (followed).
+#[cfg(target_os = "macos")]
+#[test]
+fn trusted_dirfd_lane_serves_nofollow_directory_probe_enotdir() {
+    let (_scratch, mut dispatcher) = trusted_lane_fixture();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+    let root = lane_openat(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        "/walk",
+        LINUX_O_DIRECTORY,
+    );
+    assert!(lane_dir_is_trusted(&dispatcher, root));
+    let nofollow_dir = LINUX_O_RDONLY | LINUX_O_DIRECTORY | LinuxOpenFlags::NOFOLLOW.bits();
+    for name in ["file.txt", "link", "fifo"] {
+        let outcome = dispatcher.try_trusted_dirfd_openat(root as u64, name, nofollow_dir);
+        assert!(
+            matches!(outcome, Some(DispatchOutcome::Errno { errno }) if errno == LINUX_ENOTDIR),
+            "{name}: O_DIRECTORY|O_NOFOLLOW must be lane-served ENOTDIR, got {outcome:?}"
+        );
+    }
+    // A directory child is still served as a trusted directory.
+    let sub = lane_openat(
+        &mut dispatcher,
+        &mut memory,
+        root as u64,
+        "sub",
+        nofollow_dir,
+    );
+    assert!(sub >= 0 && lane_dir_is_trusted(&dispatcher, sub));
+    // Without guest O_NOFOLLOW the symlink child must be FOLLOWED by the
+    // slow path, never refused by the lane's probe.
+    assert!(
+        dispatcher
+            .try_trusted_dirfd_openat(root as u64, "link", LINUX_O_RDONLY | LINUX_O_DIRECTORY)
+            .is_none()
+    );
+}

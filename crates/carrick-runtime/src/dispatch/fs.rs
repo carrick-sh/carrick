@@ -3293,16 +3293,24 @@ impl SyscallDispatcher {
                 )
             };
             if raw < 0 {
-                // ONLY a missing name is authoritative. ENOTDIR here does NOT
-                // mean the guest's answer is ENOTDIR: this probe carries
-                // O_NOFOLLOW, and macOS reports ENOTDIR (not ELOOP) for a
-                // SYMLINK-to-directory child under O_DIRECTORY|O_NOFOLLOW —
-                // which the guest, having asked for neither O_NOFOLLOW nor a
-                // refusal, must see FOLLOWED to the target directory. Serving
-                // ENOTDIR broke test_glob's symlink cases. Everything except
-                // ENOENT falls back to the resolving slow path.
+                // A missing name is authoritative. ENOTDIR is authoritative
+                // ONLY when the guest itself asked O_NOFOLLOW: this probe
+                // carries O_NOFOLLOW, and macOS reports ENOTDIR (not ELOOP)
+                // for a SYMLINK-to-directory child under
+                // O_DIRECTORY|O_NOFOLLOW — which a guest that asked for
+                // neither O_NOFOLLOW nor a refusal must see FOLLOWED to the
+                // target directory (serving ENOTDIR there broke test_glob's
+                // symlink cases). A guest that DID ask O_NOFOLLOW gets
+                // ENOTDIR from Linux for every non-directory leaf — regular,
+                // FIFO, and symlink whether to a file or a directory (Docker
+                // oracle, 2026-09-02) — so the host answer is exact and the
+                // ~10-host-call resolving fallback LTP creat05 paid per
+                // cleanup probe is unnecessary. Everything else falls back.
                 return match last_errno() {
                     Some(libc::ENOENT) => Some(DispatchOutcome::errno(LINUX_ENOENT)),
+                    Some(libc::ENOTDIR) if open_flags.contains(LinuxOpenFlags::NOFOLLOW) => {
+                        Some(DispatchOutcome::errno(LINUX_ENOTDIR))
+                    }
                     _ => None,
                 };
             }
