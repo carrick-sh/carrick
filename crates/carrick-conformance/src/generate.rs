@@ -86,8 +86,9 @@ const LTP_SMOKE: &[&str] = &[
 /// additionally creates a real file per fd, and its `sysconf(_SC_OPEN_MAX)`
 /// loop must end in `EMFILE` at the guest's own limit — below the host
 /// descriptor budget carrick advertises as `/proc/sys/fs/file-max`, where
-/// the answer is `ENFILE`.
-const LTP_NOFILE_4096: &[&str] = &["dup03", "dup06", "dup205", "fork09"];
+/// the answer is `ENFILE`. pipe07 opens pipe PAIRS until `EMFILE` at
+/// `getdtablesize()` and expects that exact errno for the same reason.
+const LTP_NOFILE_4096: &[&str] = &["dup03", "dup06", "dup205", "fork09", "pipe07"];
 
 /// Exact LTP command overrides that must survive manifest regeneration. Keep
 /// these narrow: each one documents a known harness/resource mismatch where the
