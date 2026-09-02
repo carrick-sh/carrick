@@ -583,13 +583,12 @@ impl SyscallTrap for ScriptedTrap {
         _ipa: carrick_guest_mem::Gpa,
         _len: u64,
         _payload: &[u8],
-        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
+        backing: carrick_hal::HostAliasBacking,
     ) -> Result<(), TrapError> {
-        if let Some((fd, _, _)) = file {
-            // Ownership is transferred by the trait contract; the scripted
-            // backend installs no host mapping, so close it here.
-            assert_eq!(unsafe { libc::close(fd) }, 0);
-        }
+        // Ownership is transferred by the trait contract; the scripted
+        // backend installs no host mapping, so dropping the backing closes
+        // any owned file descriptor here.
+        drop(backing);
         self.alias_installs += 1;
         Ok(())
     }

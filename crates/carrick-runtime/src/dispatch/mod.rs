@@ -131,11 +131,12 @@
 //! lowest-free-descriptor, capped at the guest's soft `RLIMIT_NOFILE`.
 
 use std::collections::{HashMap, VecDeque};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 // Both traits are consumed only inside `snapshot_native_reexec_fd_table`
 // (`OsStrExt::as_bytes`) and `restore_native_reexec_fd_table`
 
 use std::path::{Component, Path};
+
+pub use carrick_hal::{HostAliasBacking, HostAliasOwnedFd, HostAliasSharing};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1629,58 +1630,6 @@ impl Drop for HostAliasInstallGuard<'_> {
     }
 }
 
-/// Owned host fd transferred with a [`DispatchOutcome::MapHostAlias`].
-///
-/// Keeping ownership in the non-cloneable outcome closes the dispatch/runtime
-/// gap: dropping an unconsumed outcome now closes the dup as well as aborting
-/// its alias transaction. Consumers move the [`OwnedFd`] out exactly once.
-pub struct HostAliasOwnedFd(OwnedFd);
-
-impl HostAliasOwnedFd {
-    /// Take ownership of a successful `dup(2)`/open result.
-    ///
-    /// # Safety
-    /// `fd` must be a live, uniquely owned host descriptor.
-    pub(crate) unsafe fn from_raw_fd(fd: RawFd) -> Self {
-        // SAFETY: forwarded caller contract.
-        Self(unsafe { OwnedFd::from_raw_fd(fd) })
-    }
-
-    pub fn as_raw_fd(&self) -> RawFd {
-        self.0.as_raw_fd()
-    }
-
-    pub fn into_owned_fd(self) -> OwnedFd {
-        self.0
-    }
-}
-
-impl std::fmt::Debug for HostAliasOwnedFd {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_tuple("HostAliasOwnedFd")
-            .field(&self.as_raw_fd())
-            .finish()
-    }
-}
-
-impl PartialEq for HostAliasOwnedFd {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_raw_fd() == other.as_raw_fd()
-    }
-}
-
-impl Eq for HostAliasOwnedFd {}
-
-impl Serialize for HostAliasOwnedFd {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_i32(self.as_raw_fd())
-    }
-}
-
 #[derive(Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DispatchOutcome {
@@ -1794,22 +1743,19 @@ pub enum DispatchOutcome {
         /// nonzero return there reads as failure to every libc wrapper.
         success_retval: i64,
         /// Bytes to copy into the freshly-mapped region at offset 0 (the file
-        /// content for a file-backed mmap; empty for anonymous, which the host
-        /// anon mapping already zeroes). Ignored when `file` is `Some` — a live
-        /// `MAP_SHARED` file mapping is backed by the page cache directly.
+        /// content for a snapshot mmap; empty for anonymous, which the host
+        /// anon mapping already zeroes). Ignored for a file backing — a live
+        /// file mapping is backed by the page cache directly.
         payload: Vec<u8>,
-        /// `Some((fd, offset, host_prot))` for a live `MAP_SHARED` file mapping:
-        /// the host memory at `ipa` is `mmap(host_prot, MAP_SHARED, fd, offset)`,
-        /// so guest writes go to the file's page cache (coherent with other
-        /// openers and across `fork`). `host_prot` is the guest's requested prot
-        /// translated to `PROT_*` — it MUST match the fd's access mode (a
-        /// `PROT_WRITE` MAP_SHARED of a read-only fd is EACCES). The fd is a dup
-        /// the runtime owns and closes after mapping. `None` → anonymous (the
-        /// high-VA / `payload`-snapshot path).
-        file: Option<(HostAliasOwnedFd, libc::off_t, libc::c_int)>,
-        /// Whether an anonymous alias must remain coherent across host `fork`.
-        /// Ignored for a file mapping (its `MAP_SHARED` backing is explicit).
-        shared: bool,
+        /// What backs the host memory at `ipa`: an anonymous mapping (private
+        /// or fork-coherent), or a file mapping — `MAP_SHARED` (guest writes
+        /// reach the page cache, coherent with other openers) or `MAP_PRIVATE`
+        /// (clean pages keep tracking later writes to the file, dirtied pages
+        /// detach, exactly Linux's per-page COW). A shared file's `host_prot`
+        /// MUST match the fd's access mode (a `PROT_WRITE` MAP_SHARED of a
+        /// read-only fd is EACCES). The fd is a dup the backend owns and closes
+        /// after mapping.
+        backing: HostAliasBacking,
         /// Complete Linux `PROT_*` mask. Identity-native backends need all
         /// R/W/X bits to enforce guest accesses and translation eligibility;
         /// VMM backends may continue using `prot_none` for their leaf fast path.

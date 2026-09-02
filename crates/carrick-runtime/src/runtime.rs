@@ -91,7 +91,6 @@
 //!
 //! [`AddressSpace`]: crate::memory::AddressSpace
 
-use std::os::fd::IntoRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -1009,30 +1008,24 @@ where
                 ipa,
                 len,
                 payload,
-                file,
-                shared,
+                backing,
                 prot,
                 prot_none,
             } => {
-                let file = file.map(|(fd, offset, prot)| (fd.into_owned_fd(), offset, prot));
+                let shared = backing.is_shared();
                 let retval = dispatcher.with_mm_executor_mutation(|dispatcher, mutation| {
                     let permit = mutation.host_alias_permit();
                     match transaction.claim(&permit) {
                         None => {
-                            // No backend mutation started; dropping `file` closes the
-                            // owned dup and this pre-install claim failure is recoverable.
-                            drop(file);
+                            // No backend mutation started; dropping `backing` closes
+                            // the owned dup and this pre-install claim failure is
+                            // recoverable.
+                            drop(backing);
                             crate::linux_abi::LINUX_ENOMEM.guest_retval()
                         }
                         Some(install) => {
                             if runtime
-                                .map_host_alias(
-                                    va,
-                                    ipa,
-                                    len,
-                                    &payload,
-                                    file.map(|(fd, offset, prot)| (fd.into_raw_fd(), offset, prot)),
-                                )
+                                .map_host_alias(va, ipa, len, &payload, backing)
                                 .is_err()
                             {
                                 // Backend `Err` does not prove that stage-2/page-table
@@ -2216,9 +2209,9 @@ impl<M: CurrentMmMemory, T: SyscallTrap> SyscallTrap for SplitView<'_, M, T> {
         ipa: Gpa,
         len: u64,
         payload: &[u8],
-        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
+        backing: carrick_hal::HostAliasBacking,
     ) -> Result<(), TrapError> {
-        self.trap.map_host_alias(va, ipa, len, payload, file)
+        self.trap.map_host_alias(va, ipa, len, payload, backing)
     }
 }
 

@@ -27,6 +27,7 @@
 use super::*;
 use crate::linux_abi::{LINUX_EIO, LINUX_ENOMSG, LINUX_ENOSPC, LinuxErrno};
 use carrick_abi::{NsGid, NsUid};
+use std::os::fd::{FromRawFd, OwnedFd};
 
 #[cfg(not(doctest))]
 pub(crate) mod lock_authority;
@@ -2670,14 +2671,14 @@ impl SyscallDispatcher {
                 ipa: Gpa(ipa),
                 len: map_len,
                 payload: Vec::new(),
-                file: Some((
+                backing: HostAliasBacking::File {
                     // SAFETY: `shmat_open_fd` returned a fresh descriptor whose
                     // ownership transfers into this non-cloneable outcome.
-                    unsafe { HostAliasOwnedFd::from_raw_fd(host_fd) },
-                    0,
+                    fd: HostAliasOwnedFd::from(unsafe { OwnedFd::from_raw_fd(host_fd) }),
+                    offset: 0,
                     host_prot,
-                )),
-                shared: true,
+                    sharing: HostAliasSharing::Shared,
+                },
                 prot: if attach_flags.contains(ShmAttachFlags::RDONLY) {
                     crate::linux_abi::LINUX_PROT_READ
                 } else {

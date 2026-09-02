@@ -87,7 +87,10 @@ fn resolve_execution_plan_for_request_for_host(
     }
 }
 
-fn host_page_size() -> u64 {
+/// The host's own page size: the granule a host file view lands on, and
+/// therefore the modulus a demand-paged private file mapping's guest address
+/// must be congruent to its file offset under.
+pub(crate) fn host_page_size() -> u64 {
     let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if size > 0 {
         size as u64

@@ -7,10 +7,12 @@
 // program_sysregs, BroughtUp) are cfg-gated.  Suppress dead_code/unused-import
 // warnings on x86_64 to keep `cargo clippy -- -D warnings` clean.
 #![cfg_attr(not(target_arch = "aarch64"), allow(dead_code, unused_imports))]
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::sync::{Arc, RwLock};
 
-use carrick_hal::{HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg};
+use carrick_hal::{
+    HostAliasBacking, HostAliasSharing, HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg,
+};
 use carrick_mem::memory::{
     AddressSpace, LINUX_EL0_TRAMPOLINE_BASE, LINUX_EL1_MAINT_BASE, LINUX_EL1_VECTORS_BASE,
     LINUX_EL1_VECTORS_SIZE, LINUX_NULL_GUARD_END, LINUX_PAGE_TABLES_BASE,
@@ -529,7 +531,8 @@ impl GuestRam {
         va: u64,
         gpa: u64,
         len: u64,
-        backing: AliasBacking,
+        payload: &[u8],
+        backing: HostAliasBacking,
     ) -> Result<(), OsError> {
         let size = usize::try_from(align_up_slot(len)?)
             .map_err(|_| OsError::new(format!("kvm: alias len {len} too large")))?;
@@ -547,35 +550,53 @@ impl GuestRam {
             )));
         }
         let (host, kind) = match backing {
-            AliasBacking::File { fd, offset, prot } => {
+            HostAliasBacking::File {
+                fd,
+                offset,
+                host_prot,
+                sharing,
+            } => {
                 let raw_fd = fd.as_raw_fd();
                 // MAP_SHARED of the dup'd fd: writes hit the page cache (coherent
-                // with other openers + across fork). We own the dup; mmap takes its
-                // own reference, so close it once mapped.
-                let h = unsafe {
-                    libc::mmap(
-                        std::ptr::null_mut(),
-                        size,
-                        prot,
-                        libc::MAP_SHARED,
-                        raw_fd,
-                        offset,
-                    )
+                // with other openers + across fork). MAP_PRIVATE: a per-mapping
+                // COW view, so clean pages keep tracking the file while stored
+                // pages detach — the host is always RW for that view because
+                // the guest prot is enforced in the stage-1 leaf. We own the
+                // dup; mmap takes its own reference, so close it once mapped.
+                let (flags, prot, kind) = match sharing {
+                    HostAliasSharing::Shared => (libc::MAP_SHARED, host_prot, WindowKind::Shared),
+                    HostAliasSharing::Private => (
+                        libc::MAP_PRIVATE,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        WindowKind::Private,
+                    ),
                 };
+                let h =
+                    unsafe { libc::mmap(std::ptr::null_mut(), size, prot, flags, raw_fd, offset) };
                 if h == libc::MAP_FAILED {
                     return Err(OsError::new(format!(
-                        "kvm: alias MAP_SHARED file (fd={raw_fd} off={offset} size={size} prot={prot}) failed"
+                        "kvm: alias {sharing:?} file (fd={raw_fd} off={offset} size={size} prot={prot}) failed"
                     )));
                 }
-                (h.cast::<u8>(), WindowKind::Shared)
+                (h.cast::<u8>(), kind)
             }
-            AliasBacking::Anon { payload } => {
+            HostAliasBacking::Anonymous { sharing } => {
+                let (flags, kind) = match sharing {
+                    HostAliasSharing::Shared => (
+                        libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                        WindowKind::Shared,
+                    ),
+                    HostAliasSharing::Private => (
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                        WindowKind::Private,
+                    ),
+                };
                 let h = unsafe {
                     libc::mmap(
                         std::ptr::null_mut(),
                         size,
                         libc::PROT_READ | libc::PROT_WRITE,
-                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                        flags,
                         -1,
                         0,
                     )
@@ -589,7 +610,7 @@ impl GuestRam {
                     let n = payload.len().min(size);
                     unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), h.cast::<u8>(), n) };
                 }
-                (h.cast::<u8>(), WindowKind::Private)
+                (h.cast::<u8>(), kind)
             }
         };
         // Register the LIVE KVM slot at the alias GPA. On failure, unmap before
@@ -1258,20 +1279,24 @@ impl VforkShadows {
     }
 }
 
-/// How [`GuestRam::add_alias`] backs a dynamic alias mapping's host memory.
-pub(crate) enum AliasBacking<'a> {
-    /// A guest `mmap(MAP_SHARED, fd)`: `MAP_SHARED` of a dup'd host fd at `offset`
-    /// with host `prot`, so guest writes hit the file's page cache (coherent with
-    /// other openers and inherited across `fork(2)`). `GuestRam::add_alias` owns
-    /// the dup and closes it after the mmap takes its own reference.
-    File {
-        fd: OwnedFd,
-        offset: libc::off_t,
-        prot: libc::c_int,
-    },
-    /// A high-VA anonymous alias: `MAP_PRIVATE|MAP_ANON` seeded with `payload`
-    /// (empty for a zero-filled region).
-    Anon { payload: &'a [u8] },
+/// Whether the stage-1 leaf for an alias may be writable. A shared file is
+/// mapped on the host at the guest's prot, so a read-only host view must not
+/// be reachable through a writable leaf (the host would SIGBUS); private
+/// files and anonymous backings are always RW on the host and the guest prot
+/// is applied by the backend `protect_range` afterwards.
+pub(crate) fn alias_leaf_writable(backing: &HostAliasBacking) -> bool {
+    match backing {
+        HostAliasBacking::File {
+            host_prot,
+            sharing: HostAliasSharing::Shared,
+            ..
+        } => *host_prot & libc::PROT_WRITE != 0,
+        HostAliasBacking::File {
+            sharing: HostAliasSharing::Private,
+            ..
+        }
+        | HostAliasBacking::Anonymous { .. } => true,
+    }
 }
 
 /// Load `image` (a freestanding aarch64 ELF), build the stage-1 identity map +

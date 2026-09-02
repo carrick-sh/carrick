@@ -28,7 +28,10 @@ pub use foreign_mm::{
 pub mod stage1_exclusive;
 
 pub mod trap;
-pub use trap::{ExecInventoryCommits, RawSyscall, SyscallTrap, TrapError};
+pub use trap::{
+    ExecInventoryCommits, HostAliasBacking, HostAliasOwnedFd, HostAliasSharing, RawSyscall,
+    SyscallTrap, TrapError,
+};
 pub mod vm_backend;
 pub use vm_backend::{ForkRamStrategy, GuestVmBackend};
 pub mod hypervisor;

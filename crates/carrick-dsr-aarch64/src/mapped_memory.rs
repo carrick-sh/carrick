@@ -4461,7 +4461,12 @@ impl GuestMemory for NativeMappedMemory {
     /// `MAP_PRIVATE|MAP_FIXED` FILE mapping so a guest `mmap(MAP_PRIVATE, fd)`
     /// demand-pages from the unified buffer cache — the same mechanism
     /// `map_prepared_region_extent` already uses for exec-image regions —
-    /// instead of the dispatcher's eager full-length materialization. Each
+    /// instead of the dispatcher's eager full-length materialization. This
+    /// identity backend is a preserved (non-shipping) building block, and its
+    /// host `MAP_PRIVATE` view is a map-time snapshot on Darwin: it does NOT
+    /// track later `write(2)`s to clean pages the way Linux does
+    /// (`mmapprivatefiletrack`); only the HVPatch stage-2 page-cache view
+    /// honours that clause. Each
     /// `Ok(false)` names an ineligibility and sends the caller back to the
     /// (always-correct) eager snapshot:
     ///   * linux4k subpages: Darwin maps whole 16 KiB host pages, so replacing

@@ -50,6 +50,7 @@
 //! Methods are `impl` blocks on [`SyscallDispatcher`]; see [`super`] for the
 //! dispatcher struct and the normalized dispatch table.
 use super::*;
+use std::os::fd::{FromRawFd, OwnedFd};
 
 syscall_table! {
     /// Per-module syscall routing for the `mem` subsystem (Task A1).
@@ -694,6 +695,51 @@ fn lower_mmap_next(mmap_next: &mut u64, free_regions: &mut Vec<(u64, u64)>, new_
 /// still be holding; leaving it listed lets the first fit hand the same address
 /// out underneath the live fixed mapping — the same double grant
 /// [`lower_mmap_next`] describes, reached from the other direction.
+/// Where a non-`MAP_FIXED` arena grant may land relative to a modulus.
+///
+/// A `mmap(MAP_PRIVATE, fd)` lowered to a host page-cache view needs the guest
+/// address congruent to the file offset modulo the HOST page size (16 KiB on
+/// Apple Silicon): the view maps whole host pages, so an incongruent grant
+/// cannot be backed by the page cache and falls back to an eager snapshot.
+/// Linux only promises page alignment for a hint-less grant, so choosing a
+/// congruent address is ABI-legal and costs at most `modulus - page` of arena
+/// VA, which the allocator parks in its free list rather than stranding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::dispatch) enum MmapGrantCongruence {
+    /// Any page-aligned address.
+    Any,
+    /// `address % modulus == residue` (`modulus` a power of two, `residue`
+    /// page-aligned and below `modulus`).
+    Residue { modulus: u64, residue: u64 },
+}
+
+impl MmapGrantCongruence {
+    /// The congruence a private file mapping at `offset` needs to be lowered to
+    /// a host page-cache view. `Any` when the host page IS the Linux page.
+    pub(in crate::dispatch) fn for_file_offset(offset: u64, linux_page_size: u64) -> Self {
+        let modulus = crate::page_profile::host_page_size();
+        if modulus <= linux_page_size || !modulus.is_power_of_two() {
+            return Self::Any;
+        }
+        Self::Residue {
+            modulus,
+            residue: offset & (modulus - 1),
+        }
+    }
+
+    /// The first address `>= from` that satisfies the congruence.
+    fn first_at_or_after(self, from: u64) -> Option<u64> {
+        match self {
+            Self::Any => Some(from),
+            Self::Residue { modulus, residue } => {
+                let current = from & (modulus - 1);
+                let step = residue.wrapping_sub(current) & (modulus - 1);
+                from.checked_add(step)
+            }
+        }
+    }
+}
+
 fn free_regions_remove_range(regions: &mut Vec<(u64, u64)>, addr: u64, len: u64) {
     let end = addr.saturating_add(len);
     let mut out: Vec<(u64, u64)> = Vec::with_capacity(regions.len() + 1);
@@ -3095,8 +3141,9 @@ impl SyscallDispatcher {
         length: u64,
         prot: u64,
         flags: u64,
+        congruence: MmapGrantCongruence,
     ) -> Option<(u64, bool)> {
-        let granted = self.next_mmap_address_inner(requested, length, prot, flags);
+        let granted = self.next_mmap_address_inner(requested, length, prot, flags, congruence);
         // Grant audit: CARRICK_MMAP_GRANT_DEBUG=1 logs any non-FIXED grant that
         // overlaps a LIVE dynamic mapping, with the allocator state and caller.
         // A double-grant here scrubbed a live CPython interned-dict granule to
@@ -3161,6 +3208,7 @@ impl SyscallDispatcher {
         length: u64,
         prot: u64,
         flags: u64,
+        congruence: MmapGrantCongruence,
     ) -> Option<(u64, bool)> {
         // Only a WRITABLE hand-out can ever leave a non-zero byte behind, so
         // only a writable hand-out raises the watermark. A `PROT_NONE` reserve
@@ -3249,20 +3297,39 @@ impl SyscallDispatcher {
         let mem_authority_12 = self.mem();
 
         let mut mem = mem_authority_12.lock();
-        if let Some(pos) = mem.free_regions.iter().position(|&(_, l)| l >= length) {
-            let (s, l) = mem.free_regions[pos];
-            if l == length {
-                mem.free_regions.remove(pos);
-            } else {
-                mem.free_regions[pos] = (s + length, l - length);
+        // First free region with a congruent fit. The slack before a congruent
+        // start and the remainder after the grant both stay on the free list.
+        let fit = mem
+            .free_regions
+            .iter()
+            .enumerate()
+            .find_map(|(pos, &(s, l))| {
+                let start = congruence.first_at_or_after(s)?;
+                let region_end = s.checked_add(l)?;
+                let end = start.checked_add(length)?;
+                (end <= region_end).then_some((pos, s, start, end, region_end))
+            });
+        if let Some((pos, s, start, end, region_end)) = fit {
+            mem.free_regions.remove(pos);
+            if start > s {
+                free_regions_insert(&mut mem.free_regions, s, start - s);
             }
-            return Some((s, true));
+            if end < region_end {
+                free_regions_insert(&mut mem.free_regions, end, region_end - end);
+            }
+            return Some((start, true));
         }
-        let address = align_up_u64(mem.mmap_next, page_size)?;
+        let cursor = align_up_u64(mem.mmap_next, page_size)?;
+        let address = congruence.first_at_or_after(cursor)?;
         if !range_within(address, length, layout.mmap_base, layout.mmap_size) {
             return None;
         }
         let end = address.checked_add(length)?;
+        // A congruent bump skipped `[cursor, address)`; park it for reuse
+        // rather than stranding it.
+        if address > cursor {
+            free_regions_insert(&mut mem.free_regions, cursor, address - cursor);
+        }
         mem.mmap_next = end;
         // Same dirty-high-water discipline as the hint path: a bump allocation
         // that dips below the high-water (because munmap lowered mmap_next over
@@ -3854,12 +3921,12 @@ impl SyscallDispatcher {
                     ipa: Gpa(ipa),
                     len: length,
                     payload: Vec::new(),
-                    file: Some((
-                        HostAliasOwnedFd(owned_fd),
-                        region_layout.backing_offset as libc::off_t,
+                    backing: HostAliasBacking::File {
+                        fd: HostAliasOwnedFd::from(owned_fd),
+                        offset: region_layout.backing_offset as libc::off_t,
                         host_prot,
-                    )),
-                    shared: true,
+                        sharing: HostAliasSharing::Shared,
+                    },
                     prot,
                     prot_none: prot_flags.is_empty(),
                 });
@@ -4413,15 +4480,15 @@ impl SyscallDispatcher {
                         ipa: Gpa(ipa),
                         len: length,
                         payload: Vec::new(),
-                        file: Some((
+                        backing: HostAliasBacking::File {
                             // SAFETY: `dup_fd` is the successful, uniquely-owned
                             // descriptor created above and is transferred into
                             // the non-cloneable outcome exactly once.
-                            unsafe { HostAliasOwnedFd::from_raw_fd(dup_fd) },
-                            offset as libc::off_t,
+                            fd: HostAliasOwnedFd::from(unsafe { OwnedFd::from_raw_fd(dup_fd) }),
+                            offset: offset as libc::off_t,
                             host_prot,
-                        )),
-                        shared: true,
+                            sharing: HostAliasSharing::Shared,
+                        },
                         prot,
                         prot_none,
                     });
@@ -4601,7 +4668,30 @@ impl SyscallDispatcher {
                 ));
             }
 
-            let (address, reused) = match this.next_mmap_address(requested.0, length, prot, flags) {
+            // Address-independent half of the file-backed lowering check (the
+            // full candidate test follows once the grant is known). It also
+            // picks the grant's congruence: a page-cache view needs
+            // `address ≡ offset (mod host page)`.
+            let file_lowering_eligible = map_sharing == MmapSharing::Private
+                && !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
+                && !map_flags.contains(LinuxMmapFlags::GROWSDOWN)
+                && !prot_flags.contains(LinuxProtFlags::EXEC)
+                && mmap_file_backed_lowering_enabled()
+                && this.open_file(fd.0).is_some_and(|open_file| {
+                    open_file
+                        .description
+                        .read()
+                        .as_deref()
+                        .and_then(OpenDescription::shared_alias_host_fd)
+                        .is_some()
+                });
+            let congruence = if file_lowering_eligible {
+                MmapGrantCongruence::for_file_offset(offset, page_size)
+            } else {
+                MmapGrantCongruence::Any
+            };
+            let (address, reused) =
+                match this.next_mmap_address(requested.0, length, prot, flags, congruence) {
                 Some(pair) => pair,
                 None => {
                     // A length that could not fit an EMPTY arena is a property
@@ -4629,7 +4719,47 @@ impl SyscallDispatcher {
                 memory.read_bytes_raw(address, 1).is_ok(),
                 in_arena,
             );
-            if (reused || fixed_anonymous) && !address_uses_alias {
+            // Move-3 E1: an eligible MAP_PRIVATE file mmap lowers to ONE host
+            // file-backed `MAP_PRIVATE|MAP_FIXED` mapping (demand-paged from
+            // the unified buffer cache) instead of the eager full-length
+            // `vec![0]` + `pread` + arena-copy materialization, whose three
+            // whole-length passes put 36% of the cold build's zero-fill
+            // faults inside guest mmap service windows
+            // (docs/perf-results/2026-08-06-build-lane-amplification-ledger.md §7).
+            // Eligibility is narrow and explicit; every other shape keeps the
+            // snapshot path below, each exclusion for a named reason:
+            //   * Private only (a Shared mapping's stores must reach the file);
+            //   * no GROWSDOWN (stack-shaped file maps stay on the audited path);
+            //   * no PROT_EXEC request (executable content must flow through
+            //     the write path's W^X/translation-invalidation metadata);
+            //   * `OpenDescription::HostFile` only (in-memory VFS contents
+            //     have no host object to map; chardevs keep their zero-fill);
+            //   * a non-alias VA (alias IPAs publish via `MapHostAlias`, whose
+            //     payload transaction owns the backing);
+            //   * the backend's own refusals (identity host ownership,
+            //     host-page alignment, linux4k subpage sharing, may-execute).
+            // The beyond-EOF tail is then published as BUS_ADRERR through the
+            // same bus machinery the Shared path uses — which the eager arena
+            // path never did for private maps (it zero-filled instead; Linux
+            // faults). Probe `mmapprivfile`'s beyond_eof_page clause is the
+            // conformance receipt for that correction.
+            // Opt-out hatch for bisection: CARRICK_MMAP_FILE_BACKED=0.
+            //
+            // Two phases: the CANDIDATE check here (so no snapshot buffer is
+            // materialized for a mapping about to demand-page), and the actual
+            // backend replacement in the general path below — strictly AFTER
+            // `prepare_mmap_locked_range`, the last fallible pre-step, so a
+            // failed mmap still leaves a MAP_FIXED target's prior mapping
+            // intact (Linux's failure atomicity; the eager path gets this for
+            // free by building its buffer before touching backing).
+            let lowering_candidate = file_lowering_eligible && !address_uses_alias;
+            // A lowering candidate defers this scrub: `zero_anonymous_reuse`
+            // materializes anonymous backing under the range, which would turn
+            // the sparse hole the page-cache view needs into live pages and
+            // force the eager snapshot. The lowering block below scrubs on its
+            // fallback path instead, before the `pread` lands.
+            let reuse_scrub_needed = (reused || fixed_anonymous) && !address_uses_alias;
+            if reuse_scrub_needed && !lowering_candidate {
                 // Scrub the reused region's PHYSICAL backing. MUST bypass the
                 // guest-visible permission: a region just reclaimed from munmap
                 // is stage-1-invalidated (no-access) and a PROT_NONE mmap is not
@@ -4819,55 +4949,6 @@ impl SyscallDispatcher {
             // backing description is recorded so F_ADD_SEALS F_SEAL_WRITE can
             // EBUSY while it is mapped.
             let mut writable_memfd_desc: Option<Arc<crate::kernel::FileDescription>> = None;
-            // Move-3 E1: an eligible MAP_PRIVATE file mmap lowers to ONE host
-            // file-backed `MAP_PRIVATE|MAP_FIXED` mapping (demand-paged from
-            // the unified buffer cache) instead of the eager full-length
-            // `vec![0]` + `pread` + arena-copy materialization, whose three
-            // whole-length passes put 36% of the cold build's zero-fill
-            // faults inside guest mmap service windows
-            // (docs/perf-results/2026-08-06-build-lane-amplification-ledger.md §7).
-            // Eligibility is narrow and explicit; every other shape keeps the
-            // snapshot path below, each exclusion for a named reason:
-            //   * Private only (a Shared mapping's stores must reach the file);
-            //   * no GROWSDOWN (stack-shaped file maps stay on the audited path);
-            //   * no PROT_EXEC request (executable content must flow through
-            //     the write path's W^X/translation-invalidation metadata);
-            //   * `OpenDescription::HostFile` only (in-memory VFS contents
-            //     have no host object to map; chardevs keep their zero-fill);
-            //   * a non-alias VA (alias IPAs publish via `MapHostAlias`, whose
-            //     payload transaction owns the backing);
-            //   * the backend's own refusals (identity host ownership,
-            //     host-page alignment, linux4k subpage sharing, may-execute).
-            // The beyond-EOF tail is then published as BUS_ADRERR through the
-            // same bus machinery the Shared path uses — which the eager arena
-            // path never did for private maps (it zero-filled instead; Linux
-            // faults). Probe `mmapprivfile`'s beyond_eof_page clause is the
-            // conformance receipt for that correction.
-            // Opt-out hatch for bisection: CARRICK_MMAP_FILE_BACKED=0.
-            //
-            // Two phases: the CANDIDATE check here (so no snapshot buffer is
-            // materialized for a mapping about to demand-page), and the actual
-            // backend replacement in the general path below — strictly AFTER
-            // `prepare_mmap_locked_range`, the last fallible pre-step, so a
-            // failed mmap still leaves a MAP_FIXED target's prior mapping
-            // intact (Linux's failure atomicity; the eager path gets this for
-            // free by building its buffer before touching backing).
-            let mut lowering_candidate = false;
-            if map_sharing == MmapSharing::Private
-                && !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
-                && !map_flags.contains(LinuxMmapFlags::GROWSDOWN)
-                && !prot_flags.contains(LinuxProtFlags::EXEC)
-                && !address_uses_alias
-                && mmap_file_backed_lowering_enabled()
-                && let Some(open_file) = this.open_file(fd.0)
-            {
-                lowering_candidate = open_file
-                    .description
-                    .read()
-                    .as_deref()
-                    .and_then(OpenDescription::shared_alias_host_fd)
-                    .is_some();
-            }
             let bytes = if map_flags.contains(LinuxMmapFlags::ANONYMOUS) || lowering_candidate {
                 Vec::new()
             } else {
@@ -5158,8 +5239,13 @@ impl SyscallDispatcher {
                     ipa: Gpa(ipa),
                     len: length,
                     payload: bytes,
-                    file: None,
-                    shared: map_sharing == MmapSharing::Shared,
+                    backing: HostAliasBacking::Anonymous {
+                        sharing: if map_sharing == MmapSharing::Shared {
+                            HostAliasSharing::Shared
+                        } else {
+                            HostAliasSharing::Private
+                        },
+                    },
                     prot,
                     prot_none,
                 });
@@ -5219,6 +5305,19 @@ impl SyscallDispatcher {
                     }
                 }
                 if !lowered_file_backed {
+                    if reuse_scrub_needed
+                        && let Err(error) = memory.zero_anonymous_reuse(
+                            address,
+                            length_usize,
+                            map_sharing.guest_mapping_sharing(),
+                        )
+                    {
+                        return Ok(request.refused_by(
+                            MmapRefusal::Internal("anonymous-reuse scrub failed (mmap arena)"),
+                            LINUX_ENOMEM,
+                            format_args!("at {address:#x}+{length:#x}: {error}"),
+                        ));
+                    }
                     let mut fallback = vec![0; length_usize];
                     let n = unsafe {
                         libc::pread(
@@ -6176,15 +6275,15 @@ impl SyscallDispatcher {
                         ipa: Gpa(ipa),
                         len: new_size,
                         payload: Vec::new(),
-                        file: Some((
+                        backing: HostAliasBacking::File {
                             // SAFETY: `dup_fd` is the successful, uniquely-owned
                             // descriptor created just above and is transferred
                             // into the non-cloneable outcome exactly once.
-                            unsafe { HostAliasOwnedFd::from_raw_fd(dup_fd) },
-                            file_offset as libc::off_t,
+                            fd: HostAliasOwnedFd::from(unsafe { OwnedFd::from_raw_fd(dup_fd) }),
+                            offset: file_offset as libc::off_t,
                             host_prot,
-                        )),
-                        shared: true,
+                            sharing: HostAliasSharing::Shared,
+                        },
                         prot: pf.bits(),
                         prot_none: pf.is_empty(),
                     });
@@ -6459,7 +6558,8 @@ impl SyscallDispatcher {
                         new_size,
                         LINUX_PROT_READ | LINUX_PROT_WRITE,
                         0,
-                    ) else {
+                    MmapGrantCongruence::Any,
+                ) else {
                         return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     };
                     let (Ok(new_len), Ok(copy_len)) = (
@@ -6662,6 +6762,7 @@ impl SyscallDispatcher {
                     new_size,
                     LINUX_PROT_READ | LINUX_PROT_WRITE,
                     LINUX_MAP_FIXED,
+                    MmapGrantCongruence::Any,
                 ) {
                     // Treat a fixed destination as reused: it may carry a prior
                     // owner's bytes, and the copy below fills only `copy_len`.
@@ -6674,6 +6775,7 @@ impl SyscallDispatcher {
                     new_size,
                     LINUX_PROT_READ | LINUX_PROT_WRITE,
                     0,
+                    MmapGrantCongruence::Any,
                 ) else {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
@@ -6959,8 +7061,13 @@ impl SyscallDispatcher {
                         ipa: Gpa(ipa),
                         len: length,
                         payload: Vec::new(),
-                        file: None,
-                        shared,
+                        backing: HostAliasBacking::Anonymous {
+                            sharing: if shared {
+                                HostAliasSharing::Shared
+                            } else {
+                                HostAliasSharing::Private
+                            },
+                        },
                         prot,
                         prot_none: false,
                     });

@@ -32,6 +32,12 @@ const fn anonymous_mapping_share_flag(_kind: HostMappingKind) -> libc::c_int {
     libc::MAP_SHARED
 }
 
+fn host_page_size() -> usize {
+    // SAFETY: sysconf has no preconditions.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    usize::try_from(page).unwrap_or(4096)
+}
+
 /// RAII owner for host virtual memory that backs a guest HVF mapping.
 ///
 /// The trap engine still performs `hv_vm_map`/`hv_vm_unmap` explicitly; this
@@ -116,6 +122,74 @@ impl OwnedHostMapping {
             )
         };
         Self::from_mmap_result(host, len, HostMappingKind::PrivateFile)
+    }
+
+    /// Overlay a read-only, page-cache-coherent view of `fd` over
+    /// `[at, at + len)` of this mapping (`MAP_SHARED | MAP_FIXED`,
+    /// `PROT_READ`, file offset `offset`).
+    ///
+    /// This is the host primitive behind a Linux `MAP_PRIVATE` file mapping's
+    /// clean-page contract: a clean page keeps tracking later `write(2)`s to
+    /// the file until a store through the mapping privatizes it. Darwin's own
+    /// `MAP_PRIVATE` cannot express that — it snapshots the file at `mmap`
+    /// time and never observes later writes (measured on macOS 27, see the
+    /// unit test below) — so the view is `MAP_SHARED`, mapped read-only so a
+    /// stray host store can never reach the file, and privatization is
+    /// carrick's own per-page frame COW rather than the kernel's.
+    ///
+    /// The range stays owned by this mapping: its `Drop` releases the view
+    /// together with the surrounding anonymous span, so an HVPatch
+    /// sparse-arena extent can carry a file-backed interior while keeping one
+    /// host owner, one stage-2 lease and one inventory frame.
+    ///
+    /// `at` and `offset` must be host-page aligned and the range must lie
+    /// inside the mapping; both are refused with `InvalidInput` rather than
+    /// handed to the kernel, because a rejected `MAP_FIXED` leaves the
+    /// original anonymous pages in place while a mis-placed one would
+    /// silently replace a neighbour's bytes.
+    pub fn overlay_shared_file_view(
+        &self,
+        at: usize,
+        fd: std::os::fd::BorrowedFd<'_>,
+        offset: libc::off_t,
+        len: usize,
+    ) -> Result<(), std::io::Error> {
+        use std::os::fd::AsRawFd as _;
+        let host_page = host_page_size();
+        let end = at
+            .checked_add(len)
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        if end > self.len
+            || !at.is_multiple_of(host_page)
+            || !len.is_multiple_of(host_page)
+            || offset < 0
+            || !(offset as u64).is_multiple_of(host_page as u64)
+        {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        }
+        let target = unsafe { self.ptr.add(at) }.cast::<libc::c_void>();
+        let host = unsafe {
+            libc::mmap(
+                target,
+                len,
+                libc::PROT_READ,
+                libc::MAP_SHARED | libc::MAP_FIXED,
+                fd.as_raw_fd(),
+                offset,
+            )
+        };
+        if host == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        if host != target {
+            // MAP_FIXED that succeeds returns the requested address; anything
+            // else is a kernel contract violation we cannot recover from
+            // (the stray mapping's owner is unknown).
+            return Err(std::io::Error::other(
+                "MAP_FIXED shared file view landed at an unexpected host address",
+            ));
+        }
+        Ok(())
     }
 
     fn from_mmap_result(
@@ -378,6 +452,78 @@ mod tests {
              engine's map_host_alias likely forgot to close the dispatcher's \
              dup'd fd, or map_shared_file retained a descriptor of its own)"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overlay_shared_file_view_tracks_later_file_writes() {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::fd::AsFd;
+
+        let _serialize = MMAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let page = host_page_size();
+        let span = 4 * page;
+        let mut file = tempfile::tempfile().expect("create overlay fixture");
+        file.write_all(&vec![0xA5; 2 * page])
+            .expect("write fixture");
+        file.seek(SeekFrom::Start(0)).expect("rewind fixture");
+
+        let mapping = OwnedHostMapping::map_shared_anon(span, HostMappingKind::PrivateAnon)
+            .expect("map anonymous span");
+        // Misaligned / out-of-range overlays are refused before mmap.
+        assert!(
+            mapping
+                .overlay_shared_file_view(1, file.as_fd(), 0, page)
+                .is_err()
+        );
+        assert!(
+            mapping
+                .overlay_shared_file_view(page, file.as_fd(), 1, page)
+                .is_err()
+        );
+        assert!(
+            mapping
+                .overlay_shared_file_view(3 * page, file.as_fd(), 0, 2 * page)
+                .is_err()
+        );
+
+        mapping
+            .overlay_shared_file_view(page, file.as_fd(), 0, 2 * page)
+            .expect("overlay shared file view");
+        let bytes = unsafe { std::slice::from_raw_parts_mut(mapping.as_ptr(), span) };
+        assert_eq!(bytes[0], 0, "page 0 stays anonymous zero-fill");
+        assert_eq!(bytes[page], 0xA5, "view page 0 reads the file");
+        assert_eq!(bytes[2 * page], 0xA5, "view page 1 reads the file");
+        assert_eq!(bytes[3 * page], 0, "page 3 stays anonymous zero-fill");
+        // The anonymous neighbours stay host-writable around the view.
+        bytes[0] = 0x11;
+        bytes[3 * page] = 0x22;
+
+        // A later write(2) to the file is visible through the view: this is
+        // the property Darwin MAP_PRIVATE lacks and the guest MAP_PRIVATE
+        // clean-page contract requires.
+        file.seek(SeekFrom::Start(0)).expect("rewind for pwrite");
+        file.write_all(&vec![0x5A; 2 * page])
+            .expect("rewrite fixture");
+        assert_eq!(bytes[page], 0x5A, "view page 0 must track the file write");
+        assert_eq!(
+            bytes[2 * page],
+            0x5A,
+            "view page 1 must track the file write"
+        );
+        assert_eq!(
+            bytes[0], 0x11,
+            "anonymous neighbour keeps its private store"
+        );
+        assert_eq!(
+            bytes[3 * page],
+            0x22,
+            "anonymous neighbour keeps its private store"
+        );
+        drop(file);
+        drop(mapping);
     }
 
     #[cfg(unix)]

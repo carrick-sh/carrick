@@ -21,7 +21,6 @@
 //! `gpa == SENTINEL_GPA` → `Syscall`, `FAULT_SENTINEL_GPA` → `EL0Fault`,
 //! `MAINT_SENTINEL_GPA` → `MaintenanceDone`, and `KVM_RUN` EINTR → `Kicked`.
 
-use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::{Arc, RwLock};
 
 use carrick_aarch64::{
@@ -31,8 +30,8 @@ use carrick_guest_mem::protections::MemoryProtections;
 use carrick_guest_mem::zero_range_chunked;
 use carrick_guest_mem::{Gpa, GuestVa, HostVa, MemoryError, SharedFutexLocation};
 use carrick_hal::{
-    GuestEntryRegs, GuestVmBackend, HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg, TrapError,
-    VcpuExit, VcpuRegistry,
+    GuestEntryRegs, GuestVmBackend, HostAliasBacking, HostAliasSharing, HvVcpu, HvVm, MemPerms,
+    OsError, Reg, SysReg, TrapError, VcpuExit, VcpuRegistry,
 };
 use carrick_mem::memory::AddressSpace;
 
@@ -377,13 +376,9 @@ impl Aarch64Vmm for KvmAarch64Vmm {
         ipa: u64,
         len: u64,
         payload: &[u8],
-        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
+        backing: HostAliasBacking,
     ) -> Result<(u64, bool), TrapError> {
-        use crate::guest_setup::{AliasBacking, KVM_ALIAS_GPA_BASE, KVM_ALIAS_GPA_SIZE};
-        let file = file.map(|(fd, offset, prot)| {
-            // SAFETY: dispatcher-to-backend alias setup transfers this dup.
-            (unsafe { OwnedFd::from_raw_fd(fd) }, offset, prot)
-        });
+        use crate::guest_setup::{KVM_ALIAS_GPA_BASE, KVM_ALIAS_GPA_SIZE};
         use carrick_mem::memory::LINUX_HIGH_VA_THRESHOLD;
         // KVM IGNORES the dispatcher's `ipa` (HVF-shaped: a low IPA at 96 GiB that
         // sits INSIDE KVM's single low-window slot, so it can't be a fresh slot).
@@ -403,18 +398,11 @@ impl Aarch64Vmm for KvmAarch64Vmm {
                 ))
             })?;
         let gpa = KVM_ALIAS_GPA_BASE + off;
-        let writable = match file.as_ref() {
-            Some((_, _, prot)) => *prot & libc::PROT_WRITE != 0,
-            None => true,
-        };
-        let backing = match file {
-            Some((fd, offset, prot)) => AliasBacking::File { fd, offset, prot },
-            None => AliasBacking::Anon { payload },
-        };
+        let writable = crate::guest_setup::alias_leaf_writable(&backing);
         // mmap the host backing + register a live KVM slot at `gpa`, tracked in
         // GuestRam keyed by `va` (so the syscall read/write path resolves it).
         self.ram
-            .add_alias(&mut self.vm, va, gpa, len, backing)
+            .add_alias(&mut self.vm, va, gpa, len, payload, backing)
             .map_err(os_to_trap)?;
         Ok((gpa, writable))
     }
