@@ -2870,6 +2870,27 @@ impl HvpatchProductionPhase {
                 | Self::TerminalRetireRetry { .. }
         )
     }
+
+    /// Stable ordinal for the `hvpatch-thread-terminal` probe's `detail`
+    /// (reason `ExternallySettledWithoutResult`): which phase a job was
+    /// parked in when the executor settled its terminal for it.
+    const fn probe_ordinal(&self) -> i32 {
+        match self {
+            Self::Resident => 0,
+            Self::BootstrapProcessChild { .. } => 1,
+            Self::ResumeForkQuiesce { .. } => 2,
+            Self::ResumeJobControlStop { .. } => 3,
+            Self::RetryProcessFork { .. } => 4,
+            Self::RetryCloneThread { .. } => 5,
+            Self::RetryThreadExit { .. } => 6,
+            Self::ResumeBlocked { .. } => 7,
+            Self::ExecSiblingDrain { .. } => 8,
+            Self::TerminalProcessDrain { .. } => 9,
+            Self::TerminalClaimRetry { .. } => 10,
+            Self::TerminalRetireRetry { .. } => 11,
+            Self::Complete => 12,
+        }
+    }
 }
 
 enum PersistentTerminal {
@@ -4276,6 +4297,10 @@ where
                     // Ownership passed (see the drain gate): the process
                     // terminal or an exec replacement retires this thread's
                     // row; parking would strand past retirement.
+                    self.state.trace_hvpatch_thread_terminal(
+                        carrick_observability::probes::HvpatchThreadTerminalReason::ProcessTerminalLoser,
+                        1,
+                    );
                     return self.finish(Ok(VcpuLoopOutcome::ThreadDone));
                 }
                 self.park_thread_exit_retry(
@@ -4348,6 +4373,10 @@ where
                 std::process::abort();
             }) {
             ProcessExitClaim::LostToExec | ProcessExitClaim::AlreadyOwned => {
+                self.state.trace_hvpatch_thread_terminal(
+                    carrick_observability::probes::HvpatchThreadTerminalReason::ProcessTerminalLoser,
+                    2,
+                );
                 if self.terminal_runtime == PersistentTerminalRuntimeState::Resident {
                     let _ = self.state.handle_persistent_thread_exit(
                         &self.kernel,
@@ -5340,6 +5369,12 @@ where
     }
 
     fn publish_terminal_result(&mut self) {
+        if self.terminal_result.is_none() && !self.terminal_settlement.is_published() {
+            self.state.trace_hvpatch_thread_terminal(
+                carrick_observability::probes::HvpatchThreadTerminalReason::ExternallySettledWithoutResult,
+                self.phase.probe_ordinal(),
+            );
+        }
         self.terminal_settlement
             .publish_terminal(self.terminal_result.take());
     }
@@ -6078,6 +6113,10 @@ where
             );
         }
         if !self.phase.is_terminal_transition() && (self.kernel.process_exiting() || exec_finish) {
+            self.state.trace_hvpatch_thread_terminal(
+                carrick_observability::probes::HvpatchThreadTerminalReason::ExecRegistryGoneAtLoopTop,
+                i32::from(self.kernel.process_exiting()),
+            );
             match self
                 .state
                 .handle_persistent_thread_exit(&self.kernel, engine, 0, self.traps)
@@ -8686,15 +8725,19 @@ impl VcpuThreadHandle {
         }
     }
 
-    fn finish_completed(self, current: continuation::JobId) -> Result<(), RuntimeError> {
+    /// Settle a drained member externally. Returns whether THIS call
+    /// published the member's `ThreadDone` (false for the current job and
+    /// for a member that already finished its own job).
+    fn finish_completed(self, current: continuation::JobId) -> Result<bool, RuntimeError> {
         match self {
             Self::Persistent {
                 terminal_settlement,
-            } if terminal_settlement.completion().id() == current => Ok(()),
+            } if terminal_settlement.completion().id() == current => Ok(false),
             Self::Persistent {
                 terminal_settlement,
             } => {
-                terminal_settlement.publish_member(Ok(VcpuLoopOutcome::ThreadDone))?;
+                let published =
+                    terminal_settlement.publish_member(Ok(VcpuLoopOutcome::ThreadDone))?;
                 if !terminal_settlement.is_published()
                     || !terminal_settlement.completion().is_finished()
                 {
@@ -8703,7 +8746,7 @@ impl VcpuThreadHandle {
                             .to_owned(),
                     ));
                 }
-                Ok(())
+                Ok(published)
             }
         }
     }
@@ -8734,15 +8777,21 @@ fn remove_persistent_process_member(
         .retain(|handle| handle.completion().id() != completion);
 }
 
+/// Settle every enrolled member externally; returns how many member
+/// `ThreadDone` results this drain published (members that never finished
+/// their own job).
 fn finish_persistent_process_handles(
     threads: &Arc<Mutex<Vec<VcpuThreadHandle>>>,
     current: continuation::JobId,
-) -> Result<(), RuntimeError> {
+) -> Result<usize, RuntimeError> {
     let handles = std::mem::take(&mut *threads.lock());
+    let mut published = 0;
     for handle in handles {
-        handle.finish_completed(current)?;
+        if handle.finish_completed(current)? {
+            published += 1;
+        }
     }
-    Ok(())
+    Ok(published)
 }
 
 pub(crate) struct PersistentProcessMemberPublication {
@@ -11878,8 +11927,9 @@ mod tests {
             .publish_member(Ok(VcpuLoopOutcome::ThreadDone))
             .unwrap();
         assert!(drain.is_ready());
-        finish_persistent_process_handles(&handles, exec_completion.id())
+        let published = finish_persistent_process_handles(&handles, exec_completion.id())
             .expect("drain exact leader result without synthesizing one");
+        assert_eq!(published, 0, "the leader settled its own job");
     }
 
     #[test]
@@ -12987,8 +13037,9 @@ mod tests {
             "process-member retention must not point back to binding/quantum/job"
         );
 
-        finish_persistent_process_handles(&handles, owner.completion().id())
+        let published = finish_persistent_process_handles(&handles, owner.completion().id())
             .expect("removed Kernel thread settles without a job repoll");
+        assert_eq!(published, 1);
         assert!(handles.lock().is_empty());
         assert!(removed.result_is_ready());
         assert!(removed_completion.is_finished());
@@ -13022,8 +13073,13 @@ mod tests {
         let consumed_handles = Arc::new(Mutex::new(Vec::new()));
         enroll_persistent_process_member(&consumed_handles, &consumed);
         enroll_persistent_process_member(&consumed_handles, &owner);
-        finish_persistent_process_handles(&consumed_handles, owner.completion().id())
-            .expect("already-consumed result retains durable settlement proof");
+        let published =
+            finish_persistent_process_handles(&consumed_handles, owner.completion().id())
+                .expect("already-consumed result retains durable settlement proof");
+        assert_eq!(
+            published, 0,
+            "an already-consumed member is not republished"
+        );
     }
 
     #[test]

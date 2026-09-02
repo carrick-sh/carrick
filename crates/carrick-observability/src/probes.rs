@@ -286,6 +286,17 @@ pub enum HvpatchThreadTerminalReason {
     VforkParentTerminalCancellation = 3,
     /// Another thread owns process-wide exit or exec teardown.
     ProcessTerminalLoser = 4,
+    /// The process-terminal or exec owner's sibling drain published this
+    /// thread's `ThreadDone` externally (the member never finished its own
+    /// job). Emitted with the OWNER's identity; `detail` counts the member
+    /// settlements it published.
+    MembersDrainedByOwner = 5,
+    /// The executor settled this job's terminal (exited, failed, or
+    /// cancelled dormant) while the job had NOT finished itself: no
+    /// `finish()` ran, so a member role lowers to `ThreadDone`. `detail` is
+    /// the production phase the job was parked in
+    /// (`HvpatchProductionPhase::probe_ordinal`).
+    ExternallySettledWithoutResult = 6,
 }
 
 impl HvpatchThreadTerminalReason {
@@ -2847,6 +2858,11 @@ mod hvpatch_guest_probe_abi {
             3
         );
         assert_eq!(HvpatchThreadTerminalReason::ProcessTerminalLoser.raw(), 4);
+        assert_eq!(HvpatchThreadTerminalReason::MembersDrainedByOwner.raw(), 5);
+        assert_eq!(
+            HvpatchThreadTerminalReason::ExternallySettledWithoutResult.raw(),
+            6
+        );
         let source = include_str!("probes.rs");
         for declaration in [
             "fn hvpatch__thread__terminal(_: i32, _: i32, _: i32, _: u32, _: i32) {}",

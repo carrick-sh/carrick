@@ -4050,6 +4050,11 @@ impl ProcessDrain {
     pub(crate) fn is_ready(&self) -> bool {
         self.state.remaining.load(Ordering::Acquire) == 0
     }
+
+    /// Member jobs this drain is still waiting on.
+    pub(crate) fn remaining(&self) -> usize {
+        self.state.remaining.load(Ordering::Acquire)
+    }
 }
 
 impl Future for ProcessDrain {
