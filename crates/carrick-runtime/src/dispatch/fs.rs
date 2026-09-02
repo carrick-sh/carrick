@@ -700,6 +700,17 @@ pub(crate) struct LogicalRecordLockRequest {
     write: bool,
 }
 
+/// Identity of one blocked `F_SETLKW` request in the wait-for graph.
+///
+/// The graph is keyed by the WAIT, not the owner: one owner (a process) can
+/// have several threads blocked at once, each on a different blocker, and a
+/// per-owner map would silently drop all but the last edge. Each id is minted
+/// once per `LogicalRecordLockWait` and dies with it, so a wait that is
+/// abandoned mid-poll (the reactor dropped its continuation) cannot leave a
+/// stale edge behind for a later waiter to walk into a phantom deadlock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct RecordLockWaitId(u64);
+
 /// The lock set and the wait-for graph, under ONE mutex.
 ///
 /// They must not be separately lockable: `EDEADLK` is decided by walking the
@@ -709,15 +720,35 @@ pub(crate) struct LogicalRecordLockRequest {
 struct LogicalRecordLockState {
     locks: Vec<LogicalRecordLock>,
     flocks: Vec<LogicalFlock>,
-    /// Which owner each currently-BLOCKED owner is waiting on. An entry exists
-    /// only while that owner is parked in `wait_set_interruptibly`.
-    waiting_on: std::collections::HashMap<LogicalRecordLockOwner, LogicalRecordLockOwner>,
+    /// `wait → (waiting owner, owner it is blocked on)` for every request
+    /// that is currently blocked — whether it is parked on a host thread in
+    /// `wait_set_interruptibly` or re-polled by the HVPatch reactor through
+    /// `LogicalRecordLockWait::try_acquire`. Both paths go through
+    /// `poll_set_locked`, the only place an edge is published.
+    waiting_on: std::collections::HashMap<
+        RecordLockWaitId,
+        (LogicalRecordLockOwner, LogicalRecordLockOwner),
+    >,
+}
+
+impl LogicalRecordLockState {
+    /// The owner `owner` is currently blocked on, if any. With several waits
+    /// per owner this is any one of them; it exists for tests and diagnostics,
+    /// the deadlock walk itself enumerates every edge.
+    #[cfg(test)]
+    fn waits_on(&self, owner: LogicalRecordLockOwner) -> Option<LogicalRecordLockOwner> {
+        self.waiting_on
+            .values()
+            .find(|(waiter, _)| *waiter == owner)
+            .map(|(_, blocker)| *blocker)
+    }
 }
 
 #[derive(Default)]
 pub(crate) struct LogicalRecordLocks {
     state: parking_lot::Mutex<LogicalRecordLockState>,
     changed: parking_lot::Condvar,
+    next_wait_id: std::sync::atomic::AtomicU64,
 }
 
 impl LogicalRecordLocks {
@@ -895,28 +926,99 @@ impl LogicalRecordLocks {
     ///
     /// fcntl(2): "EDEADLK — It was detected that the specified F_SETLKW command
     /// would cause a deadlock." Linux walks the wait-for graph over blocked
-    /// POSIX-lock waiters; so do we. Follow the chain from the owner that would
-    /// block us: if it leads back to us, waiting would deadlock.
-    ///
-    /// The hop bound is the number of blocked waiters, which is the longest a
-    /// simple path can be. Exceeding it means the graph contains a cycle we
-    /// entered from outside, so report a deadlock rather than looping.
+    /// POSIX-lock waiters; so do we. Search every chain from the owner that
+    /// would block us: if any leads back to us, waiting would deadlock. An
+    /// owner can have several outgoing edges (one per blocked thread), so
+    /// this is a depth-first search with a visited set, not a single-hop walk.
     fn would_deadlock(
         state: &LogicalRecordLockState,
         me: LogicalRecordLockOwner,
         blocker: LogicalRecordLockOwner,
     ) -> bool {
-        let mut hop = blocker;
-        for _ in 0..=state.waiting_on.len() {
-            if hop == me {
+        let mut visited = std::collections::HashSet::new();
+        let mut frontier = vec![blocker];
+        while let Some(owner) = frontier.pop() {
+            if owner == me {
                 return true;
             }
-            match state.waiting_on.get(&hop) {
-                Some(next) => hop = *next,
-                None => return false,
+            if !visited.insert(owner) {
+                continue;
+            }
+            frontier.extend(
+                state
+                    .waiting_on
+                    .values()
+                    .filter(|(waiter, _)| *waiter == owner)
+                    .map(|(_, next)| *next),
+            );
+        }
+        false
+    }
+
+    fn mint_wait_id(&self) -> RecordLockWaitId {
+        RecordLockWaitId(
+            self.next_wait_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Remove `wait`'s edge. A retracted edge can flip somebody else's
+    /// deadlock verdict, so anyone parked is woken to re-evaluate.
+    fn retract_wait_locked(&self, state: &mut LogicalRecordLockState, wait: RecordLockWaitId) {
+        if state.waiting_on.remove(&wait).is_some() {
+            self.changed.notify_all();
+        }
+    }
+
+    fn retract_wait(&self, wait: RecordLockWaitId) {
+        let mut state = self.state.lock();
+        self.retract_wait_locked(&mut state, wait);
+    }
+
+    /// One step of a blocking `F_SETLKW`: THE primitive that maintains the
+    /// wait-for graph. Both the thread-parking path and the reactor's
+    /// re-poll go through here, so `EDEADLK` is reachable from either.
+    ///
+    /// - no conflict → the lock is taken, the wait's edge retracted, `Ok`;
+    /// - a POSIX-owner cycle → the edge is retracted, `EDEADLK`;
+    /// - otherwise the edge `wait: owner → blocker` is published (refreshed
+    ///   each step, since the owner blocking us changes as locks move) and
+    ///   the caller gets `EAGAIN`, meaning "still blocked, keep waiting".
+    fn poll_set_locked(
+        &self,
+        state: &mut LogicalRecordLockState,
+        request: &LogicalRecordLockRequest,
+        wait: RecordLockWaitId,
+    ) -> Result<(), LinuxErrno> {
+        let Some(blocker) = Self::conflict_locked(&state.locks, request) else {
+            Self::replace_owner_range(
+                &mut state.locks,
+                &request.file,
+                request.owner,
+                request.range,
+            );
+            state.locks.push(LogicalRecordLock {
+                file: request.file.clone(),
+                owner: request.owner,
+                range: request.range,
+                write: request.write,
+            });
+            state.waiting_on.remove(&wait);
+            self.changed.notify_all();
+            return Ok(());
+        };
+        if let (LogicalRecordLockOwner::Process { .. }, LogicalRecordLockOwner::Process { .. }) =
+            (request.owner, blocker.owner)
+        {
+            if Self::would_deadlock(state, request.owner, blocker.owner) {
+                self.retract_wait_locked(state, wait);
+                return Err(crate::linux_abi::LINUX_EDEADLK);
             }
         }
-        true
+        state
+            .waiting_on
+            .insert(wait, (request.owner, blocker.owner));
+        Err(LINUX_EAGAIN)
     }
 
     fn wait_set_interruptibly(
@@ -924,53 +1026,37 @@ impl LogicalRecordLocks {
         request: &LogicalRecordLockRequest,
         tid: crate::thread::ThreadId,
     ) -> Result<(), LinuxErrno> {
+        let wait = self.mint_wait_id();
         let mut state = self.state.lock();
-        // Every exit from the loop must retract this owner's wait-for edge, or
-        // a later waiter would walk a stale one and see a deadlock that no
-        // longer exists. The closure keeps that unmissable across all four
-        // exits (acquired / EDEADLK / EINTR / and any future one).
-        let result = loop {
-            let Some(blocker) = Self::conflict_locked(&state.locks, request) else {
-                Self::replace_owner_range(
-                    &mut state.locks,
-                    &request.file,
-                    request.owner,
-                    request.range,
-                );
-                state.locks.push(LogicalRecordLock {
-                    file: request.file.clone(),
-                    owner: request.owner,
-                    range: request.range,
-                    write: request.write,
-                });
-                self.changed.notify_all();
-                break Ok(());
-            };
-            if let (
-                LogicalRecordLockOwner::Process { .. },
-                LogicalRecordLockOwner::Process { .. },
-            ) = (request.owner, blocker.owner)
-            {
-                if Self::would_deadlock(&state, request.owner, blocker.owner) {
-                    break Err(crate::linux_abi::LINUX_EDEADLK);
-                }
+        loop {
+            match self.poll_set_locked(&mut state, request, wait) {
+                Err(errno) if errno == LINUX_EAGAIN => {}
+                settled => break settled,
             }
-            // Publish the edge only while actually parked, and refresh it each
-            // iteration: the owner that blocks us can change as locks move.
-            state.waiting_on.insert(request.owner, blocker.owner);
             if crate::host_signal::has_unblocked_pending_for(
                 tid.raw(),
                 carrick_abi::SigBlockMask::NONE,
             ) {
+                self.retract_wait_locked(&mut state, wait);
                 break Err(LINUX_EINTR);
             }
             self.changed
                 .wait_for(&mut state, std::time::Duration::from_millis(10));
-        };
-        state.waiting_on.remove(&request.owner);
-        // A retracted edge can unblock somebody else's deadlock verdict.
-        self.changed.notify_all();
-        result
+        }
+    }
+}
+
+/// The wait-for edge a `LogicalRecordLockWait` may hold, retracted when the
+/// last clone of the wait is dropped. The reactor clones its continuation
+/// freely; only the death of the whole wait means "no longer blocked".
+struct RecordLockWaitEdge {
+    locks: Arc<LogicalRecordLocks>,
+    id: RecordLockWaitId,
+}
+
+impl Drop for RecordLockWaitEdge {
+    fn drop(&mut self) {
+        self.locks.retract_wait(self.id);
     }
 }
 
@@ -979,6 +1065,7 @@ pub(crate) struct LogicalRecordLockWait {
     locks: Arc<LogicalRecordLocks>,
     request: LogicalRecordLockRequest,
     tid: crate::thread::ThreadId,
+    edge: Arc<RecordLockWaitEdge>,
 }
 
 impl LogicalRecordLockWait {
@@ -987,19 +1074,32 @@ impl LogicalRecordLockWait {
         request: LogicalRecordLockRequest,
         tid: crate::thread::ThreadId,
     ) -> Self {
+        let edge = Arc::new(RecordLockWaitEdge {
+            locks: Arc::clone(&locks),
+            id: locks.mint_wait_id(),
+        });
         Self {
             locks,
             request,
             tid,
+            edge,
         }
     }
 
+    /// Park the calling host thread until the lock is taken, `EDEADLK`, or a
+    /// pending signal (`EINTR`).
     pub(crate) fn acquire(&self) -> Result<(), LinuxErrno> {
         self.locks.wait_set_interruptibly(&self.request, self.tid)
     }
 
+    /// One reactor step: take the lock if it is free, `EDEADLK` if waiting
+    /// would close a cycle, `EAGAIN` while still blocked. Unlike `F_SETLK`'s
+    /// `try_set`, this publishes the wait's edge in the wait-for graph so the
+    /// deadlock a re-polled waiter is part of is visible to the other side.
     pub(crate) fn try_acquire(&self) -> Result<(), LinuxErrno> {
-        self.locks.try_set(self.request.clone())
+        let mut state = self.locks.state.lock();
+        self.locks
+            .poll_set_locked(&mut state, &self.request, self.edge.id)
     }
 }
 

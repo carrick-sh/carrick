@@ -84,13 +84,13 @@ fn f_setlkw_cycle_reports_edeadlk_instead_of_parking_forever() {
     // Wait for A's edge to appear rather than sleeping a fixed amount.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
-        if locks.state.lock().waiting_on.contains_key(&a.owner) {
+        if locks.state.lock().waits_on(a.owner).is_some() {
             break;
         }
         std::thread::yield_now();
     }
     assert!(
-        locks.state.lock().waiting_on.contains_key(&a.owner),
+        locks.state.lock().waits_on(a.owner).is_some(),
         "owner A should have published a wait-for edge"
     );
 
@@ -106,6 +106,98 @@ fn f_setlkw_cycle_reports_edeadlk_instead_of_parking_forever() {
     locks.unlock(&b.file, b.owner, b.range);
     assert_eq!(waiter.join().expect("waiter thread"), Ok(()));
     assert!(locks.state.lock().waiting_on.is_empty());
+}
+
+/// The HVPatch reactor never parks a thread in `wait_set_interruptibly`: a
+/// blocked `F_SETLKW` is re-polled through `LogicalRecordLockWait::try_acquire`
+/// (`try_drive_blocking_record_lock`). That poll therefore has to be the thing
+/// that publishes the waiter's wait-for edge and checks for a cycle, or the
+/// graph stays empty for every real guest and LTP `fcntl17` reports
+/// `Alarm expired, deadlock not detected` while all three processes sit parked.
+#[test]
+fn reactor_polled_f_setlkw_cycle_reports_edeadlk() {
+    let locks = Arc::new(LogicalRecordLocks::default());
+    let a = logical_lock_request((41, 1), (0, 10), true);
+    let b = logical_lock_request((42, 1), (10, 20), true);
+    assert_eq!(locks.try_set(a.clone()), Ok(()));
+    assert_eq!(locks.try_set(b.clone()), Ok(()));
+
+    // A wants B's range: polled, not acquired, and its edge is now live.
+    let a_wants_b = LogicalRecordLockWait::new(
+        Arc::clone(&locks),
+        logical_lock_request((41, 1), (10, 20), true),
+        crate::thread::ThreadId::synthetic_for_tests(1),
+    );
+    assert_eq!(a_wants_b.try_acquire(), Err(LINUX_EAGAIN));
+    assert!(
+        locks.state.lock().waits_on(a.owner).is_some(),
+        "a polled F_SETLKW must publish its wait-for edge"
+    );
+
+    // B wants A's range: A waits on B, B would wait on A — a cycle. The poll
+    // that would close it must report EDEADLK, and must NOT leave B's edge
+    // behind (B is not blocked; it got an error).
+    let b_wants_a = LogicalRecordLockWait::new(
+        Arc::clone(&locks),
+        logical_lock_request((42, 1), (0, 10), true),
+        crate::thread::ThreadId::synthetic_for_tests(2),
+    );
+    assert_eq!(
+        b_wants_a.try_acquire(),
+        Err(crate::linux_abi::LINUX_EDEADLK),
+        "closing the cycle through the reactor poll must be EDEADLK"
+    );
+    assert!(locks.state.lock().waits_on(b.owner).is_none());
+
+    // The verdict is per-attempt: A is still legitimately blocked, so a
+    // re-poll after B's request failed is still EAGAIN, never EDEADLK.
+    assert_eq!(a_wants_b.try_acquire(), Err(LINUX_EAGAIN));
+
+    // B gives up its lock instead: A's next poll acquires and retracts its edge.
+    locks.unlock(&b.file, b.owner, b.range);
+    assert_eq!(a_wants_b.try_acquire(), Ok(()));
+    assert!(locks.state.lock().waiting_on.is_empty());
+}
+
+/// A waiter that is abandoned without ever acquiring — the continuation is
+/// torn down by EINTR, exit or exec — must retract its edge when the wait is
+/// dropped, or the stale edge would convict a later, unrelated waiter of a
+/// deadlock that no longer exists.
+#[test]
+fn dropped_reactor_record_lock_wait_retracts_its_edge() {
+    let locks = Arc::new(LogicalRecordLocks::default());
+    let a = logical_lock_request((41, 1), (0, 10), true);
+    assert_eq!(locks.try_set(a.clone()), Ok(()));
+
+    let b_wants_a = LogicalRecordLockWait::new(
+        Arc::clone(&locks),
+        logical_lock_request((42, 1), (0, 10), true),
+        crate::thread::ThreadId::synthetic_for_tests(2),
+    );
+    assert_eq!(b_wants_a.try_acquire(), Err(LINUX_EAGAIN));
+    let clone = b_wants_a.clone();
+    drop(b_wants_a);
+    assert!(
+        locks
+            .state
+            .lock()
+            .waits_on(LogicalRecordLockOwner::Process { pid: 42, serial: 1 })
+            .is_some(),
+        "a live clone of the wait keeps the edge published"
+    );
+    drop(clone);
+    assert!(
+        locks.state.lock().waiting_on.is_empty(),
+        "the last handle to an abandoned wait retracts its edge"
+    );
+
+    // With B gone, A asking for what B wanted is trivially not a deadlock.
+    let a_again = LogicalRecordLockWait::new(
+        Arc::clone(&locks),
+        logical_lock_request((41, 1), (0, 10), true),
+        crate::thread::ThreadId::synthetic_for_tests(1),
+    );
+    assert_eq!(a_again.try_acquire(), Ok(()));
 }
 
 #[test]
