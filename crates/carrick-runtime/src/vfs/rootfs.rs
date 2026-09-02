@@ -47,7 +47,7 @@ use crate::linux_abi::{
     LINUX_E2BIG, LINUX_EACCES, LINUX_EEXIST, LINUX_EFBIG, LINUX_EINVAL, LINUX_EISDIR, LINUX_ENOENT,
     LINUX_ENOSYS, LINUX_ENOTDIR, LINUX_ENOTEMPTY, LINUX_EROFS,
 };
-use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
+use crate::rootfs::{RootFs, RootFsEntryKind, RootFsError, RootFsMetadata};
 use std::sync::Arc;
 
 use super::{
@@ -90,10 +90,11 @@ pub enum OpenDispatchResult {
         metadata: RootFsMetadata,
         writable: bool,
     },
-    Directory {
-        metadata: RootFsMetadata,
-        entries: Vec<RootFsDirEntry>,
-    },
+    /// An existing directory. The listing is NOT taken here: the dispatcher
+    /// lists a directory when the guest first reads it (`getdents64`), which
+    /// is when Linux lists it too, and a walk/`*at` anchor never pays for an
+    /// enumeration it never asks for.
+    Directory { metadata: RootFsMetadata },
     /// Returned only when `want_create` was true and the path
     /// doesn't exist. The dispatcher creates the entry in the
     /// overlay itself (it knows the right initial contents / mode).
@@ -434,19 +435,13 @@ impl RootFsVfs {
                 if writable_request {
                     return Err(LINUX_EISDIR);
                 }
-                let entries = crate::overlay::layered_directory_entries(
-                    self.overlay.as_ref(),
-                    self.rootfs.as_ref(),
-                    path,
-                )
-                .map_err(crate::dispatch::rootfs_errno)?;
                 let metadata = RootFsMetadata {
                     path: std::path::Path::new(path).to_path_buf(),
                     kind: RootFsEntryKind::Directory,
                     mode: 0o755,
                     size: 0,
                 };
-                return Ok(OpenDispatchResult::Directory { metadata, entries });
+                return Ok(OpenDispatchResult::Directory { metadata });
             }
             Some(OverlayEntryKind::Deleted) => {}
             _ => {}
@@ -581,13 +576,7 @@ impl RootFsVfs {
                     if want_create && want_excl {
                         return Err(LINUX_EEXIST);
                     }
-                    let entries = crate::overlay::layered_directory_entries(
-                        self.overlay.as_ref(),
-                        self.rootfs.as_ref(),
-                        path,
-                    )
-                    .map_err(crate::dispatch::rootfs_errno)?;
-                    Ok(OpenDispatchResult::Directory { metadata, entries })
+                    Ok(OpenDispatchResult::Directory { metadata })
                 }
                 RootFsEntryKind::Symlink => Err(LINUX_EINVAL),
                 // open(2) of an AF_UNIX socket node → ENXIO on Linux (no device
@@ -2114,21 +2103,32 @@ mod tests {
     }
 
     #[test]
-    fn open_for_dispatch_directory_returns_layered_entries() {
+    fn open_for_dispatch_directory_reports_the_directory_without_listing_it() {
         let v = RootFsVfs::with_rootfs(rootfs_with_files());
         v.mkdir("/etc/extras", 0o755).unwrap();
         let result = v
             .open_for_dispatch("/etc", false, false, false, false)
             .unwrap();
         match result {
-            OpenDispatchResult::Directory { entries, .. } => {
-                let names: std::collections::BTreeSet<_> =
-                    entries.iter().map(|e| e.name.clone()).collect();
-                assert!(names.contains("hosts"));
-                assert!(names.contains("extras"));
+            OpenDispatchResult::Directory { metadata } => {
+                assert_eq!(metadata.kind, RootFsEntryKind::Directory);
+                assert_eq!(metadata.path, std::path::Path::new("/etc"));
             }
             _ => panic!("expected Directory"),
         }
+        // The listing is the dispatcher's job at getdents time; the merge
+        // it will take is the layered one.
+        let names: std::collections::BTreeSet<_> = crate::overlay::layered_directory_entries(
+            v.overlay.as_ref(),
+            v.rootfs.as_ref(),
+            "/etc",
+        )
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+        assert!(names.contains("hosts"));
+        assert!(names.contains("extras"));
     }
 
     #[test]

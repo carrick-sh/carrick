@@ -2777,10 +2777,7 @@ impl SyscallDispatcher {
                     writable,
                 }
             }
-            Ok(crate::vfs::rootfs::OpenDispatchResult::Directory {
-                metadata,
-                mut entries,
-            }) => {
+            Ok(crate::vfs::rootfs::OpenDispatchResult::Directory { metadata }) => {
                 // A directory can never be the target of a write-intent open
                 // (O_WRONLY/O_RDWR) nor of an O_CREAT open — Linux returns
                 // EISDIR in both cases (a directory is never "created" by
@@ -2789,11 +2786,10 @@ impl SyscallDispatcher {
                 if writable_request || want_create {
                     return Ok(DispatchOutcome::errno(LINUX_EISDIR));
                 }
-                self.inject_mount_dir_entries(&path, &mut entries);
                 OpenDescription::Directory {
                     path,
                     metadata,
-                    entries,
+                    listing: DirListing::Pending,
                     offset: 0,
                     base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
                     // The trusted lane (`try_open_trusted_dir`) already
@@ -3178,17 +3174,32 @@ impl SyscallDispatcher {
             // generation around both proofs so a concurrent mutation makes
             // the anchor stale before it can serve a child.
             let generation = crate::fs_resolve_cache::current_generation();
-            if !self.fs.rootfs_vfs.overlay.fast_nofollow_absent(path) {
-                return None;
+            if self.fs.rootfs_vfs.overlay.fast_nofollow_absent(path) {
+                let host_fd = rootfs.open_trusted_dir_fd(path)?;
+                if crate::fs_resolve_cache::current_generation() != generation {
+                    return None;
+                }
+                TrustedHostDir::immutable_lower(HostFdRef::new(host_fd.into_raw_fd()), generation)
+            } else {
+                // The upper holds something here. If the IMMUTABLE lower has
+                // no entry at this path — `NotFound` is the only authoritative
+                // answer; an I/O or shape error keeps the exact path — its
+                // absence is permanent for every descendant, so the upper
+                // directory is the whole merged namespace of that subtree
+                // (LTP `creat05`'s guest-made scratch dir). A whiteouted or
+                // merged directory still takes the layered path.
+                if !matches!(
+                    rootfs.symlink_metadata(path),
+                    Err(crate::rootfs::RootFsError::NotFound(_))
+                ) {
+                    return None;
+                }
+                let host_fd = self.fs.rootfs_vfs.overlay.open_trusted_dir_fd(path)?;
+                TrustedHostDir::merged_upper(HostFdRef::new(host_fd.into_raw_fd()))
             }
-            let host_fd = rootfs.open_trusted_dir_fd(path)?;
-            if crate::fs_resolve_cache::current_generation() != generation {
-                return None;
-            }
-            TrustedHostDir::immutable_lower(HostFdRef::new(host_fd.into_raw_fd()), generation)
         } else {
             let host_fd = self.fs.rootfs_vfs.overlay.open_trusted_dir_fd(path)?;
-            TrustedHostDir::new(HostFdRef::new(host_fd.into_raw_fd()))
+            TrustedHostDir::merged_upper(HostFdRef::new(host_fd.into_raw_fd()))
         };
         crate::probes::path_open(path, 0, 0);
         let metadata = RootFsMetadata {
@@ -3202,7 +3213,7 @@ impl SyscallDispatcher {
         let description = OpenDescription::Directory {
             path: path.to_owned(),
             metadata,
-            entries: Vec::new(),
+            listing: DirListing::Pending,
             offset: 0,
             base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
             trusted_host_dir: Some(trusted),
@@ -3334,18 +3345,13 @@ impl SyscallDispatcher {
             let description = OpenDescription::Directory {
                 path: full,
                 metadata,
-                entries: Vec::new(),
+                listing: DirListing::Pending,
                 offset: 0,
                 base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
                 // Single-component + O_NOFOLLOW under a trusted dir preserves
-                // the byte-exact anchor: the served dir is itself trusted.
-                trusted_host_dir: Some(match trusted_dir.immutable_lower_generation {
-                    Some(generation) => TrustedHostDir::immutable_lower(
-                        HostFdRef::new(fd.into_raw_fd()),
-                        generation,
-                    ),
-                    None => TrustedHostDir::new(HostFdRef::new(fd.into_raw_fd())),
-                }),
+                // the byte-exact anchor: the served dir is itself trusted on
+                // the same layer.
+                trusted_host_dir: Some(trusted_dir.child(HostFdRef::new(fd.into_raw_fd()))),
             };
             let status = flags & !LINUX_O_CLOEXEC;
             let open_file = OpenFile::from_open_description_with_status_flags(
@@ -3450,7 +3456,7 @@ impl SyscallDispatcher {
             if !host_dir.namespace_is_current() {
                 return None;
             }
-            if host_dir.immutable_lower_generation.is_some() {
+            if !host_dir.is_merged_upper() {
                 // A lower dirfd's own identity is now the cache directory's
                 // real host inode either way (`layered_identity_record`), so
                 // this is no longer about which inode to report — it is that
@@ -3500,7 +3506,7 @@ impl SyscallDispatcher {
         if !host_dir.namespace_is_current() {
             return None;
         }
-        if host_dir.immutable_lower_generation.is_some() {
+        if !host_dir.is_merged_upper() {
             return None;
         }
         let full = self.trusted_child_path(&dir_path, name)?;
@@ -3593,33 +3599,38 @@ impl SyscallDispatcher {
         Some(Ok(self.stat_record_with_device(&full, &real)))
     }
 
-    /// Materialize a trusted directory's entries: STREAM the host dirfd (one
+    /// List a directory for a guest read (`getdents64`, or an `lseek` that
+    /// needs the entry count). A trusted MergedUpper dirfd is STREAMED (one
     /// readdir batch — d_name/d_type/d_ino straight off the kernel, zero
     /// per-child stats) when nothing can make the raw stream lie about the
-    /// guest view, else the exact layered merge. Runs once per description
-    /// (again after an lseek-0 rewind refresh).
-    fn materialize_trusted_dir_entries(
+    /// guest view; everything else takes the exact layered merge by path.
+    /// Runs on the first read of a description and again after an lseek-0
+    /// rewind.
+    fn list_directory_entries(
         &self,
         dir_path: &str,
-        trusted: &mut TrustedHostDir,
-        entries: &mut Vec<RootFsDirEntry>,
-    ) {
-        let streamed = if self.fs.rootfs_vfs.rootfs.is_none()
-            && !self
-                .fs
-                .rootfs_vfs
-                .overlay
-                .dir_has_overlay_interference(dir_path)
-        {
-            read_host_dir_entries(trusted.fd.raw(), dir_path)
-        } else {
-            None
+        trusted: Option<&TrustedHostDir>,
+    ) -> Vec<RootFsDirEntry> {
+        let streamed = match trusted {
+            Some(trusted)
+                if trusted.is_merged_upper()
+                    && !self
+                        .fs
+                        .rootfs_vfs
+                        .overlay
+                        .dir_has_overlay_interference(dir_path) =>
+            {
+                read_host_dir_entries(trusted.fd.raw(), dir_path)
+            }
+            _ => None,
         };
-        *entries = match streamed {
+        let mut entries = match streamed {
             Some(list) => list,
-            // Interference (marker nodes) or a stream surprise (DT_UNKNOWN):
-            // the layered path classifies each child exactly, as today. A
-            // directory deleted since the open reads as empty.
+            // Interference (marker nodes), a stream surprise (DT_UNKNOWN) or
+            // an untrusted description: the layered path classifies each
+            // child exactly. A directory deleted or renamed away since the
+            // open reads as empty by its stale path — Linux would list the
+            // inode's live contents; only the trusted stream matches that.
             None => crate::overlay::layered_directory_entries(
                 self.fs.rootfs_vfs.overlay.as_ref(),
                 self.fs.rootfs_vfs.rootfs.as_ref(),
@@ -3627,8 +3638,8 @@ impl SyscallDispatcher {
             )
             .unwrap_or_default(),
         };
-        self.inject_mount_dir_entries(dir_path, entries);
-        trusted.entries_loaded = true;
+        self.inject_mount_dir_entries(dir_path, &mut entries);
+        entries
     }
 
     /// Inject entries for mounts registered below `dir_path` so that injected
@@ -4327,7 +4338,7 @@ impl SyscallDispatcher {
                     Arc::new(RwLock::new(OpenDescription::Directory {
                         path,
                         metadata,
-                        entries: rootfs_entries,
+                        listing: DirListing::Fixed(rootfs_entries),
                         offset: 0,
                         base: OpenDescriptionBase::new(status),
                         // VFS-mount (synthetic) directories never take the
@@ -9906,7 +9917,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
             let OpenDescription::Directory {
-                entries,
+                listing,
                 offset,
                 path,
                 trusted_host_dir,
@@ -9916,16 +9927,19 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
             };
 
-            // Trusted lane: materialize entries LAZILY on the first read —
-            // streamed off the host dirfd (d_type/d_ino straight from the
-            // kernel, zero per-child stats) when nothing interferes, the
-            // exact layered merge otherwise. Directory opens that never call
-            // getdents (walk anchors) pay nothing.
-            if let Some(trusted) = trusted_host_dir
-                && !trusted.entries_loaded
-            {
-                this.materialize_trusted_dir_entries(path, trusted, entries);
+            // The listing is taken LAZILY on the first read (Linux lists at
+            // getdents time, and a walk anchor that never reads pays
+            // nothing): streamed off a trusted host dirfd when nothing
+            // interferes, the exact layered merge otherwise.
+            if matches!(listing, DirListing::Pending) {
+                *listing = DirListing::Loaded(
+                    this.list_directory_entries(path, trusted_host_dir.as_ref()),
+                );
             }
+            let entries = match listing {
+                DirListing::Loaded(entries) | DirListing::Fixed(entries) => entries,
+                DirListing::Pending => unreachable!("listing materialized above"),
+            };
 
             // Real Linux getdents64 always returns `.` (self) and `..` (parent)
             // first. Synthesize them on the READ path only — NOT in
@@ -10047,18 +10061,20 @@ impl SyscallDispatcher {
                 }
             }
 
-            // A trusted directory materializes lazily; a SEEK_END that needs
-            // the entry count must see the real entries first.
+            // A directory lists lazily; a SEEK_END that needs the entry
+            // count must take the listing first.
             if whence == LINUX_SEEK_END
                 && let OpenDescription::Directory {
-                    entries,
+                    listing,
                     path,
-                    trusted_host_dir: Some(trusted),
+                    trusted_host_dir,
                     ..
                 } = &mut *open
-                && !trusted.entries_loaded
+                && matches!(listing, DirListing::Pending)
             {
-                this.materialize_trusted_dir_entries(path, trusted, entries);
+                *listing = DirListing::Loaded(
+                    this.list_directory_entries(path, trusted_host_dir.as_ref()),
+                );
             }
 
             let (current, end) = match &*open {
@@ -10075,8 +10091,11 @@ impl SyscallDispatcher {
                     contents, offset, ..
                 } => (*offset as i64, contents.read().len() as i64),
                 OpenDescription::Directory {
-                    entries, offset, ..
-                } => (*offset as i64, entries.len() as i64),
+                    listing, offset, ..
+                } => (
+                    *offset as i64,
+                    listing.entries().map_or(0, |entries| entries.len()) as i64,
+                ),
                 OpenDescription::SyntheticDevice { .. } => {
                     return match whence {
                         LINUX_SEEK_SET | LINUX_SEEK_CUR | LINUX_SEEK_END => {
@@ -10167,20 +10186,14 @@ impl SyscallDispatcher {
                 | OpenDescription::BpfProg { .. }
                 | OpenDescription::Netlink { .. } => {}
             }
-            // A rewind of a trusted directory drops the materialized snapshot
-            // so the next getdents64 streams a FRESH view (Linux re-reads the
-            // directory after rewinddir; untrusted descriptions keep their
-            // historical open-time snapshot).
+            // A rewind drops a read-time snapshot so the next getdents64
+            // lists a FRESH view (Linux re-reads the directory after
+            // rewinddir). A synthetic mount's fixed listing replays.
             if next == 0
-                && let OpenDescription::Directory {
-                    entries,
-                    trusted_host_dir: Some(trusted),
-                    ..
-                } = &mut *open
-                && trusted.entries_loaded
+                && let OpenDescription::Directory { listing, .. } = &mut *open
+                && matches!(listing, DirListing::Loaded(_))
             {
-                entries.clear();
-                trusted.entries_loaded = false;
+                *listing = DirListing::Pending;
             }
             Ok(DispatchOutcome::Returned { value: next })
 

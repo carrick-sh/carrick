@@ -866,39 +866,96 @@ pub(super) enum PidfdTarget {
 #[derive(Debug, Clone)]
 pub(super) struct TrustedHostDir {
     pub(super) fd: HostFdRef,
-    /// Structural-generation stamp for a directory anchored in the immutable
-    /// cached lower. `None` means the fd belongs to the historical
-    /// materialized host root, which is itself the merged namespace. A lower
-    /// fd is usable directly only while the sparse upper's shared generation
-    /// still matches this stamp.
-    pub(super) immutable_lower_generation: Option<u64>,
-    /// True once `entries` has been materialized from this fd (one streamed
-    /// readdir batch, no per-child stat). Cleared by an `lseek(0, SEEK_SET)`
-    /// rewind so the next `getdents64` takes a FRESH snapshot (matching
-    /// Linux, where a rewound getdents re-reads the directory).
-    pub(super) entries_loaded: bool,
+    /// Which layer the fd anchors, and therefore what it may answer.
+    pub(super) anchor: TrustedAnchor,
+}
+
+/// The layer a [`TrustedHostDir`] fd anchors. Children served through the fd
+/// inherit the anchor: a walk that recurses `openat(dirfd, name)` stays on
+/// whichever layer its root was proven against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TrustedAnchor {
+    /// The fd's directory IS the merged guest namespace for its whole
+    /// subtree: either there is no image lower at all (the historical
+    /// materialized host root), or the immutable lower provably lacks this
+    /// directory — and an immutable lower's absence is permanent for every
+    /// descendant — so the writable upper is the only contributor. Stats,
+    /// F_OK probes and getdents streams may all be answered from the fd.
+    MergedUpper,
+    /// The fd anchors the immutable cached lower. Exact only while the
+    /// sparse upper still contributes nothing at this directory, which the
+    /// shared structural `generation` stamp proves: any upper mutation
+    /// since makes the anchor stale before it can serve a child. Stat and
+    /// access lanes never answer from a lower anchor (guest identity — the
+    /// chmod/chown xattrs — lives in the upper's layered view).
+    ImmutableLower { generation: u64 },
 }
 
 impl TrustedHostDir {
-    pub(super) fn new(fd: HostFdRef) -> Self {
+    pub(super) fn merged_upper(fd: HostFdRef) -> Self {
         Self {
             fd,
-            immutable_lower_generation: None,
-            entries_loaded: false,
+            anchor: TrustedAnchor::MergedUpper,
         }
     }
 
     pub(super) fn immutable_lower(fd: HostFdRef, generation: u64) -> Self {
         Self {
             fd,
-            immutable_lower_generation: Some(generation),
-            entries_loaded: false,
+            anchor: TrustedAnchor::ImmutableLower { generation },
         }
     }
 
+    /// Re-anchor a child fd served through this dir: the child inherits the
+    /// parent's layer proof.
+    pub(super) fn child(&self, fd: HostFdRef) -> Self {
+        Self {
+            fd,
+            anchor: self.anchor,
+        }
+    }
+
+    pub(super) fn is_merged_upper(&self) -> bool {
+        self.anchor == TrustedAnchor::MergedUpper
+    }
+
     pub(super) fn namespace_is_current(&self) -> bool {
-        self.immutable_lower_generation
-            .is_none_or(|generation| crate::fs_resolve_cache::current_generation() == generation)
+        match self.anchor {
+            TrustedAnchor::MergedUpper => true,
+            TrustedAnchor::ImmutableLower { generation } => {
+                crate::fs_resolve_cache::current_generation() == generation
+            }
+        }
+    }
+}
+
+/// The guest-visible listing behind an [`OpenDescription::Directory`].
+///
+/// Linux lists a directory when the guest READS it (`getdents64` walks the
+/// live dentry tree; `rewinddir` re-reads), never when it opens it. An
+/// `open(O_DIRECTORY)` used only as a walk/`*at` anchor therefore costs no
+/// enumeration — LTP `creat05` opened a 4,000-file directory that way and
+/// paid an O(n) per-child stat pass on EVERY open until this was made lazy.
+#[derive(Debug, Clone)]
+pub(super) enum DirListing {
+    /// Not yet read: the first `getdents64` (or an `lseek(SEEK_END)`) lists
+    /// the directory from its live state.
+    Pending,
+    /// A snapshot taken by a read. An `lseek(0, SEEK_SET)` rewind returns
+    /// the listing to [`Self::Pending`] so the next read is fresh.
+    Loaded(Vec<RootFsDirEntry>),
+    /// Entries fixed at open time by a synthetic VFS mount (`/proc`, `/sys`,
+    /// `/dev`, bind targets); a rewind replays the same list.
+    Fixed(Vec<RootFsDirEntry>),
+}
+
+impl DirListing {
+    /// The materialized entries, if any listing has been taken.
+    pub(super) fn entries(&self) -> Option<&[RootFsDirEntry]> {
+        match self {
+            Self::Pending => None,
+            Self::Loaded(entries) | Self::Fixed(entries) => Some(entries),
+        }
     }
 }
 
@@ -923,7 +980,7 @@ pub(super) enum OpenDescription {
         base: OpenDescriptionBase,
         path: String,
         metadata: RootFsMetadata,
-        entries: Vec<RootFsDirEntry>,
+        listing: DirListing,
         offset: usize,
         /// `Some` iff this directory rides the `--fs host` trusted-dirfd fast
         /// lane (see [`TrustedHostDir`]). `None` keeps every historical path:
