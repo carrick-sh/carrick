@@ -791,6 +791,7 @@ pub fn attach_task_engine(
     vcpu: HvfAarch64Vcpu,
 ) -> HvfAarch64Engine {
     state.backend_mut().swap_persistent_executor_local(executor);
+    state.backend_mut().publish_live_vcpu();
     Aarch64EngineCore::from_task_state_and_vcpu(state, vcpu)
 }
 pub fn attach_task_only_engine(
@@ -815,6 +816,7 @@ pub fn attach_task_only_engine(
         .unwrap_or_else(|| std::process::abort());
     let expected_mm_access = parked.mm_access_authority();
     swap_hvpatch_task_state(&mut executor.state.task, &mut parked);
+    executor.state.publish_live_vcpu();
     if !executor.state.task_runtime_authorities_match(
         &expected_mm_access,
         &projection.page_tables,
@@ -887,6 +889,7 @@ pub fn detach_task_only_engine(
         .lock()
         .take()
         .unwrap_or_else(|| std::process::abort());
+    executor.state.clear_live_vcpu();
     swap_hvpatch_task_state(&mut executor.state.task, &mut parked);
     if state.parked_task.lock().replace(parked).is_some() {
         std::process::abort();
@@ -901,6 +904,7 @@ pub fn detach_task_engine(
     executor: &mut HvfAarch64Vmm,
 ) -> (HvpatchTaskEngineState, HvfAarch64Vcpu) {
     let (mut state, vcpu) = engine.into_task_state_and_vcpu();
+    state.backend_mut().clear_live_vcpu();
     state.backend_mut().swap_persistent_executor_local(executor);
     (state, vcpu)
 }
@@ -1018,6 +1022,14 @@ impl HvfAarch64Vmm {
 
     pub fn swap_persistent_executor_local(&mut self, other: &mut Self) {
         self.state.swap_persistent_executor_local(&mut other.state);
+    }
+
+    pub fn publish_live_vcpu(&self) {
+        self.state.publish_live_vcpu();
+    }
+
+    pub fn clear_live_vcpu(&self) {
+        self.state.clear_live_vcpu();
     }
 
     pub fn audit_persistent_executor_idle(&self) -> Result<(), TrapError> {
@@ -1509,11 +1521,12 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     // ── threaded sibling lifecycle ──
 
     fn kick_handle(&self) -> Self::KickHandle {
-        // The engine's `ThreadedEngine::kick_handle` calls this on the OWNING vCPU
-        // thread. HVF's kick mechanism is the vCPU's `hv_vcpus_exit` handle, which
-        // the Vmm doesn't hold directly — so `HvfVmState` stashes a clone of the
-        // live vCPU's `VcpuHandle` on every (re)create (the `vcpu_handle` field)
-        // and hands it out here.
+        // The engine's `ThreadedEngine::kick_handle` calls this once, at
+        // registration. HVF's kick mechanism is `hv_vcpus_exit` on a vCPU, but
+        // an HVPatch task does not own a vCPU: the scheduler may reload it on a
+        // different executor every quantum, so the handle follows the task's
+        // live-vCPU slot (published on attach, cleared on detach) instead of
+        // naming the vCPU it happened to be on when it registered.
         self.state.vcpu_kick_handle()
     }
 
