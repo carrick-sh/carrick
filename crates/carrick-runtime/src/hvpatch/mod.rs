@@ -1270,8 +1270,14 @@ pub(crate) fn identity_operation_errno(
         // and the pre-HVPatch path already returned EACCES; only this errno
         // mapping collapsed it into the neighbouring EPERM cases.
         crate::kernel::KernelOperationError::ChildExeced(_) => crate::linux_abi::LINUX_EACCES,
+        // setsid(2) refuses with EPERM when "the process group ID of any
+        // process equals the PID of the calling process" — not only when the
+        // caller is still that group's member. LTP `setsid01` leaves its own
+        // group behind with a child in it and expects EPERM; the catch-all
+        // below reported EINVAL.
         crate::kernel::KernelOperationError::IdentityPermission
-        | crate::kernel::KernelOperationError::AlreadyProcessGroupLeader => {
+        | crate::kernel::KernelOperationError::AlreadyProcessGroupLeader
+        | crate::kernel::KernelOperationError::IdentityInUseByCallerPid => {
             crate::linux_abi::LINUX_EPERM
         }
         _ => crate::linux_abi::LINUX_EINVAL,

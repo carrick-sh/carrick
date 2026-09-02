@@ -3733,9 +3733,14 @@ impl Kernel {
             return Err(KernelOperationError::TaskChangedBeforeCommit);
         }
         let published_revision = next_revision(current_revision)?;
+        // setsid(2): "EPERM — The process group ID of any process equals the
+        // PID of the calling process." The leader check above only sees the
+        // caller's OWN membership; a group it created and then left keeps
+        // its id while any member survives, and that number is the caller's
+        // pid. A surviving session by that number is the same refusal.
         if state.process_groups.contains_key(&group_id) || state.sessions.contains_key(&session_id)
         {
-            return Err(KernelOperationError::IdentityObjectExists);
+            return Err(KernelOperationError::IdentityInUseByCallerPid);
         }
         check_failpoint(failpoint, KernelFailpoint::BeforePublish)?;
 
@@ -4747,8 +4752,8 @@ pub enum KernelOperationError {
     CrossSessionProcessGroup,
     #[error("task identity changed before the operation committed")]
     TaskChangedBeforeCommit,
-    #[error("process-group or session identity already exists")]
-    IdentityObjectExists,
+    #[error("a live process group or session is already named by the caller's pid")]
+    IdentityInUseByCallerPid,
     #[error("child task {0:?} has completed exec")]
     ChildExeced(TaskId),
     #[error("process-group identity change is not permitted")]
@@ -9470,6 +9475,73 @@ mod tests {
             vec![first.task.key(), second.task.key()]
         );
         assert_eq!(first.task.session(), root.task.session());
+    }
+
+    /// `setsid(2)`: "EPERM — The process group ID of any process equals the
+    /// PID of the calling process." LTP `setsid01` builds exactly that shape:
+    /// a process makes itself a group leader, forks a child that STAYS in
+    /// that group, moves itself back into its parent's group, then calls
+    /// `setsid`. The caller is no longer a leader, so the leader check does
+    /// not fire; the still-populated group whose id is the caller's pid is
+    /// what must refuse, and it must refuse with EPERM, not EINVAL.
+    #[test]
+    fn setsid_refuses_with_eperm_while_a_group_named_by_the_caller_pid_survives() {
+        let (kernel, root) = bootstrap(360);
+        let fork_plan = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
+        let leader = kernel
+            .fork_task(
+                &root,
+                fork_plan,
+                ThreadId::synthetic_for_tests(361),
+                "leader".to_string(),
+                None,
+            )
+            .expect("leader child");
+        let leader_id = leader.task.key().id;
+        let own_group = kernel
+            .create_process_group(leader_id, None)
+            .expect("leader makes its own group");
+        let refreshed_leader = kernel
+            .context(leader_id, leader.thread.key().tid)
+            .expect("refreshed leader context");
+        let member = kernel
+            .fork_task(
+                &refreshed_leader,
+                fork_plan,
+                ThreadId::synthetic_for_tests(362),
+                "member".to_string(),
+                None,
+            )
+            .expect("member child");
+        assert_eq!(member.task.process_group(), own_group);
+
+        // `setpgid(0, getppid())`: the leader leaves, the member stays.
+        kernel
+            .set_process_group(leader_id, None, Some(root.task.process_group()))
+            .expect("leader rejoins the parent's group");
+        assert_eq!(
+            kernel.registry().process_group_members(own_group),
+            vec![member.task.key()]
+        );
+
+        let error = kernel
+            .create_session(leader_id, None)
+            .expect_err("a group named by the caller's pid still has a member");
+        assert_eq!(
+            crate::hvpatch::identity_operation_errno(error),
+            crate::linux_abi::LINUX_EPERM
+        );
+        // Nothing moved: the caller keeps its identity and the group its member.
+        assert_eq!(
+            kernel.registry().process_group_members(own_group),
+            vec![member.task.key()]
+        );
+        assert_eq!(
+            kernel
+                .registry()
+                .process_group_members(root.task.process_group()),
+            vec![root.task.key(), leader.task.key()]
+        );
     }
 
     /// Two live processes must describe THEMSELVES, and an exited one must stay
