@@ -48,6 +48,21 @@ pub(crate) struct ExecReservationConflict {
 #[cfg_attr(not(test), allow(dead_code))]
 struct ExecReservationId(u64);
 
+/// Settlement listeners detached under the table lock, to be run after it.
+#[must_use = "run the settlement wake after releasing the table lock"]
+struct ExecSettlementWake {
+    epoch: u64,
+    callbacks: Vec<Arc<dyn Fn(u64) + Send + Sync + 'static>>,
+}
+
+impl ExecSettlementWake {
+    fn run(self) {
+        for callback in self.callbacks {
+            callback(self.epoch);
+        }
+    }
+}
+
 #[derive(Debug)]
 #[cfg_attr(not(test), allow(dead_code))]
 struct ActiveExecReservation {
@@ -330,16 +345,14 @@ impl ExecMmReservation {
                 settlement,
             },
         };
-        let removed = self
+        let wake = self
             .resources
-            .clear_exec_reservation(&mut resources_state, self.generation);
-        assert!(
-            removed.is_some(),
-            "validated exec reservation marker vanished"
-        );
+            .clear_exec_reservation(&mut resources_state, self.generation)
+            .unwrap_or_else(|| panic!("validated exec reservation marker vanished"));
         #[cfg(test)]
         self.record_settlement(ExecDispositionSettlementStep::MarkerCleared);
         drop(resources_state);
+        wake.run();
         Ok(receipt)
     }
 
@@ -391,14 +404,12 @@ impl ExecMmReservation {
                 .is_some_and(|lease| Arc::ptr_eq(lease, &self.predecessor)),
             "validated exec reservation task edge changed under state authority"
         );
-        let removed = self
+        let wake = self
             .resources
-            .clear_exec_reservation(&mut resources_state, self.generation);
-        assert!(
-            removed.is_some(),
-            "validated exec reservation marker vanished"
-        );
+            .clear_exec_reservation(&mut resources_state, self.generation)
+            .unwrap_or_else(|| panic!("validated exec reservation marker vanished"));
         drop(resources_state);
+        wake.run();
         Ok(receipt)
     }
 }
@@ -424,10 +435,15 @@ impl Drop for ExecMmReservation {
                 #[cfg(test)]
                 self.record_settlement(ExecDispositionSettlementStep::ReplacementSettled);
                 if marker_matches {
-                    self.resources
+                    let wake = self
+                        .resources
                         .clear_exec_reservation(&mut resources_state, self.generation);
                     #[cfg(test)]
                     self.record_settlement(ExecDispositionSettlementStep::MarkerCleared);
+                    drop(resources_state);
+                    if let Some(wake) = wake {
+                        wake.run();
+                    }
                 } else {
                     tracing::error!(
                         task = ?self.task,
@@ -474,6 +490,13 @@ pub(crate) enum MmResourcesError {
     RetirementIncomplete,
     #[error(transparent)]
     ExecReservationConflict(#[from] ExecReservationConflict),
+    #[error(
+        "{holds} admitted owner-set edit(s) (shared fork publication or exit retirement) still in flight on MM generation {generation:?}"
+    )]
+    OwnerSetEditInFlight {
+        generation: AsidGeneration,
+        holds: u32,
+    },
     #[error(transparent)]
     ExecReservationMismatch(#[from] ExecReservationMismatch),
     #[error(transparent)]
@@ -518,6 +541,102 @@ struct MmResourceState {
     /// duplicate cleanup idempotent without permitting a reused numeric PID to
     /// target its successor's root-slot/ASID lease.
     retired: BTreeSet<TaskKey>,
+    /// Admitted-but-unpublished shared forks per MM generation. An exec
+    /// reservation freezes the owner set of its generation, so it must wait
+    /// for every hold to publish or roll back, and a shared fork must take
+    /// its hold BEFORE kernel publication so a refusal is still a plain
+    /// retry rather than a post-publication abort.
+    owner_set_edit_holds: BTreeMap<AsidGeneration, u32>,
+    /// Bumped whenever an exec reservation clears; refused shared forks
+    /// subscribe here so their retry is woken instead of polled.
+    exec_settlement_epoch: u64,
+    next_settlement_listener: u64,
+    settlement_listeners: BTreeMap<u64, ExecSettlementListener>,
+}
+
+struct ExecSettlementListener {
+    expected_epoch: u64,
+    callback: Arc<dyn Fn(u64) + Send + Sync + 'static>,
+}
+
+impl std::fmt::Debug for ExecSettlementListener {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecSettlementListener")
+            .field("expected_epoch", &self.expected_epoch)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Exact admission of one owner-set edit against a task's MM generation: a
+/// shared-MM fork publishing a child edge (held from admission through
+/// `publish_shared_child` or rollback) or a process exit retiring its own
+/// edge (held through `retire`). While it exists, `reserve_exec` on the
+/// same generation waits (`_eventual`) or fails (`OwnerSetEditInFlight`),
+/// and it cannot be taken while an exec reservation owns the generation.
+/// The exec reservation freezes the owner set it observed; both edits are
+/// excluded against it in both directions so neither lands after kernel
+/// publication with no recoverable answer.
+#[derive(Debug)]
+pub(crate) struct OwnerSetEditHold {
+    resources: Arc<MmResources>,
+    generation: AsidGeneration,
+}
+
+impl Drop for OwnerSetEditHold {
+    fn drop(&mut self) {
+        let mut state = self.resources.state.lock();
+        let remaining = match state.owner_set_edit_holds.get_mut(&self.generation) {
+            Some(holds) => {
+                *holds = holds
+                    .checked_sub(1)
+                    .unwrap_or_else(|| std::process::abort());
+                *holds
+            }
+            None => std::process::abort(),
+        };
+        if remaining == 0 {
+            state.owner_set_edit_holds.remove(&self.generation);
+        }
+        self.resources.exec_reservation_settled.notify_all();
+    }
+}
+
+/// Enrollment for a wake once the next exec reservation clears.
+pub(crate) enum ExecSettlementEnrollment {
+    /// The epoch already moved past `expected`; retry immediately.
+    Ready,
+    Subscribed(ExecSettlementSubscription),
+}
+
+pub(crate) struct ExecSettlementSubscription {
+    resources: std::sync::Weak<MmResources>,
+    id: u64,
+    expected_epoch: u64,
+}
+
+impl std::fmt::Debug for ExecSettlementSubscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecSettlementSubscription")
+            .field("id", &self.id)
+            .field("expected_epoch", &self.expected_epoch)
+            .finish()
+    }
+}
+
+impl Drop for ExecSettlementSubscription {
+    fn drop(&mut self) {
+        let Some(resources) = self.resources.upgrade() else {
+            return;
+        };
+        let mut state = resources.state.lock();
+        if state
+            .settlement_listeners
+            .get(&self.id)
+            .is_some_and(|listener| listener.expected_epoch == self.expected_epoch)
+        {
+            state.settlement_listeners.remove(&self.id);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -531,16 +650,99 @@ pub(crate) struct MmResources {
 }
 
 impl MmResources {
+    /// Remove the generation's exec marker and wake every waiter. Settlement
+    /// listeners are collected under the lock and run by the caller after it
+    /// releases `state` (they re-enter schedulers, never this table).
     fn clear_exec_reservation(
         &self,
         state: &mut MmResourceState,
         generation: AsidGeneration,
-    ) -> Option<ActiveExecReservation> {
-        let removed = state.exec_reservations.remove(&generation);
-        if removed.is_some() {
-            self.exec_reservation_settled.notify_all();
+    ) -> Option<ExecSettlementWake> {
+        state.exec_reservations.remove(&generation)?;
+        self.exec_reservation_settled.notify_all();
+        state.exec_settlement_epoch = state
+            .exec_settlement_epoch
+            .checked_add(1)
+            .unwrap_or_else(|| std::process::abort());
+        let epoch = state.exec_settlement_epoch;
+        let callbacks = std::mem::take(&mut state.settlement_listeners)
+            .into_values()
+            .map(|listener| listener.callback)
+            .collect::<Vec<_>>();
+        Some(ExecSettlementWake { epoch, callbacks })
+    }
+
+    pub(crate) fn exec_settlement_epoch(&self) -> u64 {
+        self.state.lock().exec_settlement_epoch
+    }
+
+    /// Subscribe to the next exec-reservation settlement on this table. The
+    /// callback runs on the settling thread with no `MmResources` lock held.
+    pub(crate) fn subscribe_exec_settlement(
+        self: &Arc<Self>,
+        expected_epoch: u64,
+        callback: Arc<dyn Fn(u64) + Send + Sync + 'static>,
+    ) -> ExecSettlementEnrollment {
+        let mut state = self.state.lock();
+        if state.exec_settlement_epoch != expected_epoch {
+            return ExecSettlementEnrollment::Ready;
         }
-        removed
+        state.next_settlement_listener = state
+            .next_settlement_listener
+            .checked_add(1)
+            .unwrap_or_else(|| std::process::abort());
+        let id = state.next_settlement_listener;
+        state.settlement_listeners.insert(
+            id,
+            ExecSettlementListener {
+                expected_epoch,
+                callback,
+            },
+        );
+        ExecSettlementEnrollment::Subscribed(ExecSettlementSubscription {
+            resources: Arc::downgrade(self),
+            id,
+            expected_epoch,
+        })
+    }
+
+    /// Admit one owner-set edit on `task`'s generation — a shared-MM fork of
+    /// `task` before kernel publication, or `task`'s own exit before its
+    /// kernel exit publication and `retire`.
+    ///
+    /// Refused with `ExecReservationConflict` while an exec owns the
+    /// generation: the caller retries after `subscribe_exec_settlement` fires
+    /// rather than editing a frozen owner set.
+    pub(crate) fn hold_owner_set_edit(
+        self: &Arc<Self>,
+        task: TaskKey,
+    ) -> Result<OwnerSetEditHold, MmResourcesError> {
+        let mut state = self.state.lock();
+        let lease = state
+            .leases
+            .get(&task)
+            .cloned()
+            .ok_or(MmResourcesError::UnknownTask(task))?;
+        if let Some(conflict) = Self::exec_conflict(&state, &lease) {
+            return Err(conflict.into());
+        }
+        let generation = lease.asid_generation();
+        let holds = state.owner_set_edit_holds.entry(generation).or_insert(0);
+        *holds = holds
+            .checked_add(1)
+            .unwrap_or_else(|| std::process::abort());
+        Ok(OwnerSetEditHold {
+            resources: Arc::clone(self),
+            generation,
+        })
+    }
+
+    fn owner_set_edit_holds(state: &MmResourceState, generation: AsidGeneration) -> u32 {
+        state
+            .owner_set_edit_holds
+            .get(&generation)
+            .copied()
+            .unwrap_or(0)
     }
 
     fn owner_count(state: &MmResourceState, lease: &Arc<Stage1MmLease>) -> u32 {
@@ -925,15 +1127,27 @@ impl MmResources {
                 .cloned()
                 .ok_or(MmResourcesError::UnknownTask(task))?;
             let generation = predecessor.asid_generation();
-            let Some(marker) = state.exec_reservations.get(&generation) else {
-                break predecessor;
-            };
-            if !wait_for_conflict || marker.task == task {
-                return Err(ExecReservationConflict {
-                    reserving_task: marker.task,
-                    generation,
+            if let Some(marker) = state.exec_reservations.get(&generation) {
+                if !wait_for_conflict || marker.task == task {
+                    return Err(ExecReservationConflict {
+                        reserving_task: marker.task,
+                        generation,
+                    }
+                    .into());
                 }
-                .into());
+                self.exec_reservation_settled.wait(&mut state);
+                continue;
+            }
+            // An admitted owner-set edit (a shared fork publishing its child
+            // edge, a sibling exit retiring its own) completes before this
+            // exec may freeze the owner set; otherwise the edit lands after
+            // kernel publication with no recoverable answer.
+            let holds = Self::owner_set_edit_holds(&state, generation);
+            if holds == 0 {
+                break predecessor;
+            }
+            if !wait_for_conflict {
+                return Err(MmResourcesError::OwnerSetEditInFlight { generation, holds });
             }
             self.exec_reservation_settled.wait(&mut state);
         };
@@ -958,9 +1172,13 @@ impl MmResources {
         assert!(inserted.is_none(), "exec MM reservation marker replaced");
         #[cfg(test)]
         if failpoint == ExecReservationConstructionFailpoint::AfterMarker {
-            self.clear_exec_reservation(&mut state, generation);
+            let wake = self.clear_exec_reservation(&mut state, generation);
             if let Some(trace) = rollback_trace.as_ref() {
                 trace.record(ExecConstructionRollbackStep::MarkerCleared);
+            }
+            drop(state);
+            if let Some(wake) = wake {
+                wake.run();
             }
             return Err(MmResourcesError::InjectedExecReservationFailure(failpoint));
         }
@@ -973,7 +1191,11 @@ impl MmResources {
         let replacement = match self.mm_pool.prepare_child() {
             Ok(replacement) => replacement,
             Err(error) => {
-                self.clear_exec_reservation(&mut state, generation);
+                let wake = self.clear_exec_reservation(&mut state, generation);
+                drop(state);
+                if let Some(wake) = wake {
+                    wake.run();
+                }
                 return Err(error.into());
             }
         };
@@ -983,9 +1205,13 @@ impl MmResources {
             if let Some(trace) = rollback_trace.as_ref() {
                 trace.record(ExecConstructionRollbackStep::ReplacementSettled);
             }
-            self.clear_exec_reservation(&mut state, generation);
+            let wake = self.clear_exec_reservation(&mut state, generation);
             if let Some(trace) = rollback_trace.as_ref() {
                 trace.record(ExecConstructionRollbackStep::MarkerCleared);
+            }
+            drop(state);
+            if let Some(wake) = wake {
+                wake.run();
             }
             return Err(MmResourcesError::InjectedExecReservationFailure(failpoint));
         }
@@ -1315,6 +1541,156 @@ mod tests {
         drop(final_reservation);
         let final_retry = final_resources.reserve_exec(final_task).unwrap();
         assert!(final_retry.disposition() == ExecMmDispositionKind::RetireOldMm);
+    }
+
+    #[test]
+    fn shared_publication_is_refused_at_admission_while_an_exec_reservation_is_active() {
+        // Go's os/exec: vfork child C1 is mid-exec (reservation on the shared
+        // generation) while a sibling thread of the parent vforks C2. C2's
+        // publication must be refused BEFORE the fork publishes into the
+        // kernel graph, and the refusal must be waitable: a settlement
+        // subscription fires once C1's reservation clears.
+        let parent = task(110, 1);
+        let first_child = task(111, 2);
+        let (resources, _) = resources(parent, 3);
+        let resources = Arc::new(resources);
+        resources.publish_shared_child(parent, first_child).unwrap();
+        let generation = resources.lease(parent).unwrap().asid_generation();
+
+        let reservation = resources.reserve_exec(first_child).unwrap();
+        let epoch = resources.exec_settlement_epoch();
+        assert!(matches!(
+            resources.hold_owner_set_edit(parent),
+            Err(MmResourcesError::ExecReservationConflict(conflict))
+                if conflict.reserving_task == first_child && conflict.generation == generation
+        ));
+
+        let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observer = Arc::clone(&fired);
+        let enrollment = resources.subscribe_exec_settlement(
+            epoch,
+            Arc::new(move |_| {
+                observer.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let ExecSettlementEnrollment::Subscribed(subscription) = enrollment else {
+            panic!("settlement epoch moved without any reservation clearing");
+        };
+        assert_eq!(fired.load(Ordering::SeqCst), 0);
+
+        drop(reservation);
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            1,
+            "clearing the exec reservation must wake the refused fork"
+        );
+        assert_ne!(resources.exec_settlement_epoch(), epoch);
+        drop(subscription);
+
+        let hold = resources.hold_owner_set_edit(parent).unwrap();
+        let second_child = task(112, 3);
+        resources
+            .publish_shared_child(parent, second_child)
+            .unwrap();
+        drop(hold);
+        assert_eq!(
+            resources
+                .observe_exec_owners(parent, thread(110, 4))
+                .unwrap()
+                .owner_count(),
+            3
+        );
+    }
+
+    #[test]
+    fn sibling_exit_retirement_is_admitted_through_the_owner_set_edit_hold() {
+        // Go's os/exec again: vfork child C1 is mid-exec (reservation on the
+        // shared generation) while sibling vfork child C2 exits. C2's
+        // `retire` under the reservation is the "retire persistent failure
+        // MM/ASID" abort; the exit must admit itself through the same hold
+        // a shared fork uses, wait on settlement, and retire once admitted.
+        let parent = task(117, 1);
+        let first_child = task(118, 2);
+        let second_child = task(119, 3);
+        let (resources, _) = resources(parent, 3);
+        let resources = Arc::new(resources);
+        resources.publish_shared_child(parent, first_child).unwrap();
+        resources
+            .publish_shared_child(parent, second_child)
+            .unwrap();
+
+        let reservation = resources.reserve_exec(first_child).unwrap();
+        assert!(matches!(
+            resources.retire(second_child),
+            Err(MmResourcesError::ExecReservationConflict(_))
+        ));
+        assert!(matches!(
+            resources.hold_owner_set_edit(second_child),
+            Err(MmResourcesError::ExecReservationConflict(_))
+        ));
+        drop(reservation);
+
+        let hold = resources.hold_owner_set_edit(second_child).unwrap();
+        assert!(matches!(
+            resources.reserve_exec(first_child),
+            Err(MmResourcesError::OwnerSetEditInFlight { .. })
+        ));
+        resources.retire(second_child).unwrap().complete().unwrap();
+        drop(hold);
+        assert_eq!(
+            resources
+                .observe_exec_owners(parent, thread(117, 4))
+                .unwrap()
+                .owner_count(),
+            2
+        );
+        drop(resources.reserve_exec(first_child).unwrap());
+    }
+
+    #[test]
+    fn exec_reservation_waits_for_an_in_flight_shared_publication() {
+        // The mirror image: a shared fork already admitted (holding the
+        // generation) must be published before the exec may freeze the owner
+        // set, otherwise the fork's later `publish_shared_child` collides with
+        // the marker after kernel publication, where the only answer is abort.
+        let parent = task(115, 1);
+        let child = task(116, 2);
+        let (resources, _) = resources(parent, 3);
+        let resources = Arc::new(resources);
+        let generation = resources.lease(parent).unwrap().asid_generation();
+
+        let hold = resources.hold_owner_set_edit(parent).unwrap();
+        assert!(matches!(
+            resources.reserve_exec(parent),
+            Err(MmResourcesError::OwnerSetEditInFlight { generation: held, .. })
+                if held == generation
+        ));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter_resources = Arc::clone(&resources);
+        let waiter = std::thread::spawn(move || {
+            tx.send(waiter_resources.reserve_exec_eventual(parent))
+                .unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "exec froze the owner set under an admitted shared fork",
+        );
+
+        resources.publish_shared_child(parent, child).unwrap();
+        drop(hold);
+        let reservation = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("exec was not woken when the shared publication settled")
+            .unwrap();
+        assert_eq!(
+            reservation.disposition(),
+            ExecMmDispositionKind::RetainOldMm,
+            "the exec must see the child published under the hold",
+        );
+        drop(reservation);
+        waiter.join().unwrap();
     }
 
     #[test]

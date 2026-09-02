@@ -33,7 +33,10 @@ mod stage1_mm;
 
 pub(crate) use asid::{AsidGeneration, AsidLoad, InvalidationAck};
 use mm_resources::MmResources;
-pub(crate) use mm_resources::{ExecMmDispositionKind, ExecMmReservation, RetiredStage1Mm};
+pub(crate) use mm_resources::{
+    ExecMmDispositionKind, ExecMmReservation, ExecSettlementEnrollment, ExecSettlementSubscription,
+    MmResourcesError, OwnerSetEditHold, RetiredStage1Mm,
+};
 #[cfg(test)]
 pub(crate) use stage1_mm::Stage1MmPool;
 pub(crate) use stage1_mm::{
