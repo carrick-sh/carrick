@@ -491,6 +491,14 @@
     },
     {
       "kind": "static",
+      "file": "crates/carrick-runtime/src/dispatch/net/scm_rights.rs",
+      "symbol": "VAULT",
+      "fingerprint": "fddfdafdae736a2a6d292a42db81c441976e505778a4d2f590a6d1fd1f699992",
+      "classification": "host_kernel_object",
+      "rationale": "Host-kernel-object table VAULT parking in-flight SCM_RIGHTS file descriptions keyed by the placeholder host pipe's (st_dev, st_ino); a message may cross guest processes inside one carrier, so the scope is the carrier's host kernel."
+    },
+    {
+      "kind": "static",
       "file": "crates/carrick-runtime/src/dispatch/net/sctp.rs",
       "symbol": "STREAMS",
       "fingerprint": "2d984e907b3f8bb3567fbacb1133196145727ca939307fe09f0bfb6cb7509ab5",

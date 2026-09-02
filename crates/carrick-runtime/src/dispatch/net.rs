@@ -348,7 +348,15 @@ pub(crate) fn sctp_forget(host_fd: i32) {
     sctp::forget(host_fd);
 }
 pub(super) mod reuseport;
+mod scm_rights;
 pub(super) mod support;
+
+/// Release SCM_RIGHTS descriptions whose in-flight message can no longer be
+/// received (see [`scm_rights`]). Called from the close path in `dispatch`
+/// once a host socket has actually closed.
+pub(in crate::dispatch) fn scm_rights_gc() {
+    scm_rights::gc();
+}
 pub(crate) mod unix_pure;
 
 /// Drop `host_fd` from any `SO_REUSEPORT` group. Called from the close path in
@@ -1954,21 +1962,46 @@ impl SyscallDispatcher {
         }
     }
 
-    /// Map a GUEST fd to its backing HOST fd for an `SCM_RIGHTS` send. Only
-    /// real host-backed descriptions (pipe/socket/file) can be passed to a peer
-    /// over the host AF_UNIX socket; anything else (eventfd, pidfd, in-memory
-    /// File, …) has no single host fd to dup into the peer and is rejected with
-    /// EBADF (the closest Linux errno for "can't pass this fd"). The forkserver
-    /// only ever passes os.pipe() ends + inherited sockets, all host-backed.
-    fn host_fd_for_scm(&self, guest_fd: i32) -> Option<i32> {
-        let open_file = self.open_file(guest_fd)?;
-        let open = open_file.description.read()?;
-        match &*open {
-            OpenDescription::HostPipe { host_fd, .. }
-            | OpenDescription::HostSocket { host_fd, .. }
-            | OpenDescription::HostFile { host_fd, .. } => Some(host_fd.raw()),
-            _ => None,
+    /// Add GUEST fd `guest_fd` to an `SCM_RIGHTS` send. A host-backed
+    /// description (pipe/socket/file) travels as its real host fd, which also
+    /// reaches a non-guest peer on the host side of a bind-mounted socket.
+    /// Everything carrick owns itself — guest pipes, eventfds, memfds, … — is
+    /// parked in the carrier's rights vault and travels as a placeholder the
+    /// receiving guest resolves back to the SAME description, exactly the
+    /// dup semantics Linux gives a passed fd (see [`scm_rights`]). Only a
+    /// closed/invalid guest fd is EBADF, as on Linux.
+    /// Queue guest fd `guest_fd` for an `SCM_RIGHTS` send. Every guest fd
+    /// crosses as its `FileDescription` (see [`scm_rights`]): the receiver
+    /// installs the SAME description, exactly like `dup`, so status flags,
+    /// the file offset, the path and writability all travel with it — a
+    /// host-backed file re-wrapped from its raw host fd would arrive as a
+    /// read-only stranger (`F_GETFL` 0, `mmap(PROT_WRITE, MAP_SHARED)`
+    /// EACCES, the forkserver `Arena` failure). Bare stdio (no table entry)
+    /// is materialized first, as `dup` does.
+    fn add_scm_right(
+        &self,
+        rights: &mut scm_rights::InFlightRights,
+        guest_fd: i32,
+    ) -> Result<(), LinuxErrno> {
+        let description = match self.open_file(guest_fd) {
+            Some(open_file) => {
+                if matches!(
+                    open_file.description.read().as_deref(),
+                    Some(OpenDescription::Closed { .. }) | None
+                ) {
+                    return Err(LINUX_EBADF);
+                }
+                open_file.description()
+            }
+            None if is_stdio_fd(guest_fd) && !self.stdio_is_closed(guest_fd) => {
+                self.bare_stdio_description(guest_fd)?
+            }
+            None => return Err(LINUX_EBADF),
+        };
+        if !rights.push_parked(description) {
+            return Err(crate::linux_abi::LINUX_EMFILE);
         }
+        Ok(())
     }
 
     /// Install a HOST fd received via `SCM_RIGHTS` as a fresh GUEST fd, wrapping
@@ -1985,6 +2018,25 @@ impl SyscallDispatcher {
         } else {
             0
         };
+        // MSG_CMSG_CLOEXEC: install the received fd close-on-exec. (audit M3)
+        let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
+        // A placeholder for a description parked by the sending guest (the
+        // way every guest fd crosses): install THAT description (shared, like
+        // dup) and drop the placeholder — the guest never sees the pipe. What
+        // follows only wraps fds a non-guest host peer sent.
+        if kind == libc::S_IFIFO
+            && let Some(description) = scm_rights::claim(scm_rights::PlaceholderKey::from_stat(&st))
+        {
+            unsafe {
+                libc::close(host_fd);
+            }
+            let installed = self
+                .install_fd_at_or_above(3, OpenFile::new(Arc::clone(&description), fd_flags))
+                .ok();
+            // The install took its own reference; the vault's is done.
+            description.release_fd_ref();
+            return installed;
+        }
         let description = if kind == libc::S_IFSOCK {
             // Recover the socket's domain/type so SO_TYPE/SO_DOMAIN report
             // faithfully; default to AF_UNIX/STREAM (the forkserver case).
@@ -2050,8 +2102,6 @@ impl SyscallDispatcher {
                 base: OpenDescriptionBase::new(0),
             }
         };
-        // MSG_CMSG_CLOEXEC: install the received fd close-on-exec. (audit M3)
-        let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
         // On an install failure (EMFILE) the dropped OpenFile's description —
         // the fd's ONE owner — closes the received host fd; the caller must
         // not close it again.
@@ -9615,21 +9665,20 @@ impl SyscallDispatcher {
         // backing host fd, and build a host-layout control buffer for the real
         // sendmsg. This is the multiprocessing forkserver's fd-handoff path.
         let mut host_control: Vec<u8> = Vec::new();
+        // Lives until the host sendmsg has settled: it owns the placeholder
+        // fds named by `host_control` and un-parks them if the send fails.
+        let mut rights = scm_rights::InFlightRights::new();
         if msg.control != 0 && msg.controllen > 0 {
             let raw = memory.read_bytes(msg.control, msg.controllen as usize)?;
             let guest_fds = parse_linux_scm_rights_fds(&raw);
             if !guest_fds.is_empty() {
-                let mut host_fds = Vec::with_capacity(guest_fds.len());
                 for gfd in &guest_fds {
-                    match self.host_fd_for_scm(*gfd) {
-                        Some(h) => host_fds.push(h),
-                        // A passed fd with no backing host fd can't cross the
-                        // socket → EBADF, matching Linux's rejection of an
-                        // invalid fd in an SCM_RIGHTS array.
-                        None => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
+                    if let Err(errno) = self.add_scm_right(&mut rights, *gfd) {
+                        rights.abort();
+                        return Ok(DispatchOutcome::errno(errno));
                     }
                 }
-                host_control = build_host_scm_rights(&host_fds);
+                host_control = build_host_scm_rights(rights.host_fds());
             }
             // IPv6 ancillary cmsgs set on send (IPV6_HOPLIMIT/TCLASS): translate
             // the guest's Linux cmsg types → macOS and append a host-layout
@@ -9708,6 +9757,14 @@ impl SyscallDispatcher {
                 result
             },
         );
+        // A delivered message holds its own dups of the placeholders; anything
+        // else (errno, or a blocking hand-off that will retry WITHOUT this
+        // control buffer) means the parked descriptions can never be claimed.
+        if matches!(outcome, DispatchOutcome::Returned { value } if value >= 0) {
+            drop(rights);
+        } else {
+            rights.abort();
+        }
         Ok(outcome)
     }
 
