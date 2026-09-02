@@ -128,6 +128,7 @@ clippy *ARGS:
 # pending; a partial local pass is not matrix completeness.
 lint-domains:
     python3 scripts/conformance/check-next-strategy.py
+    python3 scripts/conformance/regen-next-shards.py --check
     ./scripts/lint-domains.sh
     python3 scripts/migrate/check-runtime-global-state.py --check
     python3 scripts/migrate/check-runtime-aborts.py --check
