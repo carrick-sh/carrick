@@ -25,9 +25,9 @@ use super::clone_plan::{CloneObjectMode, ClonePlan, CloneTaskMode};
 use super::container::Container;
 use super::crash_capture::{CrashCaptureGeneration, CrashRegisterVote};
 use super::ids::{
-    CredentialsId, FileDescriptionId, FileSlotNumber, FileTableId, FsContextId, LinuxSignal,
-    LinuxTid, MmId, ObjectIdError, ObjectIdRegistry, ProcessGroupId, SessionId, SighandId, TaskId,
-    TaskSerial, ThreadSerial,
+    ChildExitSignal, CredentialsId, FileDescriptionId, FileSlotNumber, FileTableId, FsContextId,
+    LinuxSignal, LinuxTid, MmId, ObjectIdError, ObjectIdRegistry, ProcessGroupId, SessionId,
+    SighandId, TaskId, TaskSerial, ThreadSerial,
 };
 use super::netns::{NetNs, NsProxy, UtsNs};
 use super::registry::{IdRegistry, ProcessGroupClaim, SessionClaim};
@@ -3076,9 +3076,19 @@ impl CoreNoteParticipants {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct TaskIdentity {
-    process_group: ProcessGroupId,
-    session: SessionId,
+pub struct TaskIdentity {
+    pub process_group: ProcessGroupId,
+    pub session: SessionId,
+}
+
+impl TaskIdentity {
+    /// A fresh process group and session both led by `leader`.
+    pub fn led_by(leader: TaskId) -> Self {
+        Self {
+            process_group: ProcessGroupId::from_leader(leader),
+            session: SessionId::from_leader(leader),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3287,6 +3297,12 @@ pub struct Task {
     /// registry sweep, so an entry that no longer names this task as tracer
     /// is stale and ignored.
     ptrace_tracees: Mutex<BTreeSet<TaskKey>>,
+    /// The signal this process delivers to its parent on termination (the
+    /// clone `CSIGNAL` byte / `clone3` `exit_signal`; `SIGCHLD` for `fork`).
+    /// Fixed at creation: it is what `wait(2)` partitions children on, so a
+    /// parent's plain `waitpid` must keep ignoring a `clone(..|0)` child for
+    /// the child's whole life, not only until it exits.
+    exit_signal: ChildExitSignal,
     identity: Mutex<TaskIdentity>,
     lifecycle: Mutex<TaskLifecycle>,
     /// Process-directed signal permission uses the last published thread-group
@@ -3509,21 +3525,19 @@ impl Task {
     pub fn new(
         key: TaskKey,
         parent: Option<TaskKey>,
-        process_group: ProcessGroupId,
-        session: SessionId,
+        identity: TaskIdentity,
         shared: Arc<TaskShared>,
         process_credentials: Arc<Credentials>,
         container: Arc<Container>,
+        exit_signal: ChildExitSignal,
     ) -> Self {
         Self {
             key,
             parent: Mutex::new(parent),
             children: Mutex::new(BTreeSet::new()),
             ptrace_tracees: Mutex::new(BTreeSet::new()),
-            identity: Mutex::new(TaskIdentity {
-                process_group,
-                session,
-            }),
+            exit_signal,
+            identity: Mutex::new(identity),
             lifecycle: Mutex::new(TaskLifecycle::Live),
             process_credentials: ArcSwap::new(process_credentials),
             signal_generation: Mutex::new(()),
@@ -3547,6 +3561,11 @@ impl Task {
             nsproxy: ArcSwap::new(Arc::new(NsProxy::for_container(container))),
             nsproxy_write: Mutex::new(()),
         }
+    }
+
+    /// The signal this process delivers to its parent when it terminates.
+    pub fn exit_signal(&self) -> ChildExitSignal {
+        self.exit_signal
     }
 
     /// What Linux reports for a process that never called `ioprio_set`:
@@ -4071,6 +4090,12 @@ impl Task {
 
     pub fn session(&self) -> SessionId {
         self.identity.lock().session
+    }
+
+    /// Both group memberships read under one lock, so a child inherits a
+    /// consistent (process group, session) pair even if `setsid(2)` races.
+    pub fn identity(&self) -> TaskIdentity {
+        *self.identity.lock()
     }
 
     /// Registry-transaction publication point. Callers must hold the kernel
@@ -7585,6 +7610,8 @@ pub struct Zombie {
     /// Kept separate from `rusage` so `wait4` can report the child's own CPU
     /// while the reaper still charges the whole subtree to its children ledger.
     pub children_rusage: TaskRusage,
+    /// Which `wait(2)` class this zombie belongs to (`__WCLONE`/`__WALL`).
+    pub exit_signal: ChildExitSignal,
     pub diagnostic_name: String,
 }
 
@@ -7614,6 +7641,7 @@ impl Zombie {
                 user_time: Duration::from_micros(children_user_us),
                 system_time: Duration::from_micros(children_system_us),
             },
+            exit_signal: task.exit_signal(),
             diagnostic_name,
         }
     }
@@ -7733,11 +7761,11 @@ mod tests {
             let task = Arc::new(Task::new(
                 key,
                 None,
-                ProcessGroupId::from_leader(task_id),
-                SessionId::from_leader(task_id),
+                TaskIdentity::led_by(task_id),
                 shared,
                 resources.credentials(),
                 container,
+                ChildExitSignal::SIGCHLD,
             ));
             let leader = task
                 .attach_thread(

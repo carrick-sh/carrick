@@ -1,5 +1,7 @@
 use carrick_abi::LinuxCloneFlags;
 
+use super::ChildExitSignal;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CloneObjectMode {
     Share,
@@ -42,9 +44,15 @@ pub struct ClonePlan {
     fork_parent: ForkParentMode,
     vfork: VforkMode,
     pidfd: ForkPidfdMode,
+    exit_signal: ChildExitSignal,
 }
 
 impl ClonePlan {
+    /// Validate the sharing topology in `flags`. The exit signal defaults to
+    /// `SIGCHLD` (plain `fork` semantics); the clone paths override it with
+    /// [`ClonePlan::with_exit_signal`] because the legacy `CSIGNAL` byte and
+    /// `clone3`'s `exit_signal` field arrive through different channels and
+    /// neither is part of `flags` here.
     pub fn from_flags(flags: LinuxCloneFlags) -> Result<Self, ClonePlanError> {
         if flags.contains(LinuxCloneFlags::THREAD) && !flags.contains(LinuxCloneFlags::SIGHAND) {
             return Err(ClonePlanError::ThreadWithoutSighand);
@@ -102,7 +110,18 @@ impl ClonePlan {
             } else {
                 ForkPidfdMode::None
             },
+            exit_signal: ChildExitSignal::SIGCHLD,
         })
+    }
+
+    /// The signal the child delivers to its parent on termination; decides
+    /// whether `wait(2)` sees the child by default or only under
+    /// `__WCLONE`/`__WALL`.
+    pub const fn with_exit_signal(self, exit_signal: ChildExitSignal) -> Self {
+        Self {
+            exit_signal,
+            ..self
+        }
     }
 
     pub const fn task(self) -> CloneTaskMode {
@@ -135,6 +154,10 @@ impl ClonePlan {
 
     pub const fn pidfd(self) -> ForkPidfdMode {
         self.pidfd
+    }
+
+    pub const fn exit_signal(self) -> ChildExitSignal {
+        self.exit_signal
     }
 }
 

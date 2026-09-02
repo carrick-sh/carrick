@@ -600,14 +600,6 @@ pub const MUSL_BASELINE_GAPS: &[&str] = &[
 
 pub const GNU_BASELINE_GAPS: &[&str] = &[
     "budget_two_proc",
-    // gnu only, exactly `clone_thread_no_sighand_einval=false`: the probe's
-    // NULL-stack `clone(CLONE_VM|0xff)` child exits while its parent lives,
-    // and the sharer's carrier MM-authority retirement corrupts the owner's
-    // live stage-2 (the parent's spilled `r1` reads back wrong; the same
-    // build with extra stderr prints SIGSEGVs deterministically). The musl
-    // build keeps the values in registers and MATCHes. Same class as
-    // `execthreads` (`HvpatchTaskRegistration::cleanup` NOTE).
-    "lifecycleflagmatrix",
     // HVPatch materializes `mmap(MAP_PRIVATE, fd)` as a map-time snapshot
     // (`map_private_file_backed` is refused for stage-2 backings), so a clean
     // private page does not track a later write(2) to the file. Both inode

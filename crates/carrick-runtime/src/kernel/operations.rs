@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Weak};
 
-use carrick_abi::{LinuxSiginfo, NsUid};
+use carrick_abi::{LinuxSiginfo, LinuxWaitOptions, NsUid};
 use carrick_hal::{KernelTransactionId, ThreadId};
 use parking_lot::{Condvar, Mutex};
 
@@ -14,7 +14,9 @@ use super::core::{
     TaskExitSubscriber, TaskRecord, TaskRevision, VforkChildRelease, VforkParentWait,
     VforkReleaseReason, ZombieRecord,
 };
-use super::ids::{LinuxSignal, LinuxTid, MmId, ObjectIdError, ProcessGroupId, SessionId, TaskId};
+use super::ids::{
+    ChildExitSignal, LinuxSignal, LinuxTid, MmId, ObjectIdError, ProcessGroupId, SessionId, TaskId,
+};
 use super::objects::{
     Credentials, FileTable, LinuxWaitStatus, Mm, ObjectGraphError, ProcessGroup,
     PtraceStopSettlement, PtraceSynchronousFault, Session, Task, TaskJobControlEvent, TaskKey,
@@ -37,10 +39,71 @@ pub enum WaitMode {
     Consume,
 }
 
+/// Which children a `wait(2)` call can see, by the child's exit signal.
+///
+/// Linux partitions a parent's children into ordinary ones (exit signal
+/// `SIGCHLD`) and "clone children" (any other exit signal, or none). A plain
+/// wait sees only the former; `__WCLONE` selects only the latter and
+/// `__WALL` both (wait(2)). The partition applies to real children in every
+/// arm of the wait -- the zombie scan, job-control state changes, and the
+/// `ECHILD`/block decision -- but not to ptrace tracees a tracer waits on
+/// without being their parent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WaitChildClass {
+    /// The default: children whose exit signal is `SIGCHLD`.
+    Sigchld,
+    /// `__WCLONE`: only clone children.
+    Clone,
+    /// `__WALL`: every child regardless of exit signal.
+    All,
+}
+
+impl WaitChildClass {
+    pub fn from_wait_options(options: LinuxWaitOptions) -> Self {
+        if options.contains(LinuxWaitOptions::WALL) {
+            Self::All
+        } else if options.contains(LinuxWaitOptions::WCLONE) {
+            Self::Clone
+        } else {
+            Self::Sigchld
+        }
+    }
+
+    pub fn admits(self, exit_signal: ChildExitSignal) -> bool {
+        match self {
+            Self::Sigchld => !exit_signal.is_clone_child(),
+            Self::Clone => exit_signal.is_clone_child(),
+            Self::All => true,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct WaitJobControl {
     stopped: bool,
     continued: bool,
+}
+
+/// Which children one wait call may reap: the `pid` argument of
+/// `wait4`/`waitid` lowered to a single typed selector, so a pid, an exact
+/// generation and a process group can never be combined inconsistently.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WaitTarget {
+    Any,
+    Pid(TaskId),
+    Exact(TaskKey),
+    ProcessGroup(ProcessGroupId),
+}
+
+impl WaitTarget {
+    fn admits(self, child: TaskKey, process_group: ProcessGroupId) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Pid(target) => target == child.id,
+            Self::Exact(target) => target == child,
+            Self::ProcessGroup(group) => group == process_group,
+        }
+    }
 }
 
 impl WaitJobControl {
@@ -640,11 +703,11 @@ impl ForkReservation {
         let child = Arc::new(Task::new(
             child_key,
             (!self.external_peer_root).then(|| self.child_parent_task.key()),
-            self.caller_task.process_group(),
-            self.caller_task.session(),
+            self.caller_task.identity(),
             Arc::clone(&child_shared),
             child_resources.credentials(),
             self.caller_task.container(),
+            self.plan.exit_signal(),
         ));
         // oom_score_adj, nice, the inherited keyrings and the capability/userns
         // copy — see `Task::inherit_fork_attributes_from`, which the host-fork
@@ -4171,28 +4234,35 @@ impl Kernel {
         }
     }
 
+    /// A plain `wait`: `SIGCHLD` children only, exit events only.
     pub fn wait_child(
         &self,
         parent_id: TaskId,
         target: Option<TaskId>,
         mode: WaitMode,
     ) -> Result<WaitOutcome, KernelOperationError> {
-        self.wait_child_matching(parent_id, target, None, None, WaitJobControl::NONE, mode)
+        self.wait_child_matching(
+            parent_id,
+            target.map_or(WaitTarget::Any, WaitTarget::Pid),
+            WaitChildClass::Sigchld,
+            WaitJobControl::NONE,
+            mode,
+        )
     }
 
     pub fn wait_child_with_job_control(
         &self,
         parent_id: TaskId,
         target: Option<TaskId>,
+        class: WaitChildClass,
         include_stopped: bool,
         include_continued: bool,
         mode: WaitMode,
     ) -> Result<WaitOutcome, KernelOperationError> {
         self.wait_child_matching(
             parent_id,
-            target,
-            None,
-            None,
+            target.map_or(WaitTarget::Any, WaitTarget::Pid),
+            class,
             WaitJobControl {
                 stopped: include_stopped,
                 continued: include_continued,
@@ -4205,13 +4275,13 @@ impl Kernel {
         &self,
         parent_id: TaskId,
         target: TaskKey,
+        class: WaitChildClass,
         mode: WaitMode,
     ) -> Result<WaitOutcome, KernelOperationError> {
         self.wait_child_matching(
             parent_id,
-            Some(target.id),
-            Some(target),
-            None,
+            WaitTarget::Exact(target),
+            class,
             WaitJobControl::NONE,
             mode,
         )
@@ -4225,9 +4295,8 @@ impl Kernel {
     ) -> Result<WaitOutcome, KernelOperationError> {
         self.wait_child_matching(
             parent_id,
-            None,
-            None,
-            Some(process_group),
+            WaitTarget::ProcessGroup(process_group),
+            WaitChildClass::Sigchld,
             WaitJobControl::NONE,
             mode,
         )
@@ -4237,15 +4306,15 @@ impl Kernel {
         &self,
         parent_id: TaskId,
         process_group: ProcessGroupId,
+        class: WaitChildClass,
         include_stopped: bool,
         include_continued: bool,
         mode: WaitMode,
     ) -> Result<WaitOutcome, KernelOperationError> {
         self.wait_child_matching(
             parent_id,
-            None,
-            None,
-            Some(process_group),
+            WaitTarget::ProcessGroup(process_group),
+            class,
             WaitJobControl {
                 stopped: include_stopped,
                 continued: include_continued,
@@ -4257,9 +4326,8 @@ impl Kernel {
     fn wait_child_matching(
         &self,
         parent_id: TaskId,
-        target: Option<TaskId>,
-        exact_target: Option<TaskKey>,
-        process_group: Option<ProcessGroupId>,
+        target: WaitTarget,
+        class: WaitChildClass,
         job_control: WaitJobControl,
         mode: WaitMode,
     ) -> Result<WaitOutcome, KernelOperationError> {
@@ -4290,11 +4358,8 @@ impl Kernel {
             let record = state.zombies.get(&child_key.id)?;
             if record.zombie.key == *child_key
                 && record.zombie.parent == Some(parent)
-                && process_group.is_none_or(|group| record.zombie.process_group == group)
-                && exact_target.map_or_else(
-                    || target.is_none_or(|target| target == child_key.id),
-                    |target| target == *child_key,
-                )
+                && class.admits(record.zombie.exit_signal)
+                && target.admits(*child_key, record.zombie.process_group)
             {
                 Some((child_key.id, record.zombie.clone()))
             } else {
@@ -4332,11 +4397,8 @@ impl Kernel {
                 let record = state.tasks.get(&child_key.id)?;
                 if record.task.key() == *child_key
                     && record.task.parent() == Some(parent)
-                    && process_group.is_none_or(|group| record.task.process_group() == group)
-                    && exact_target.map_or_else(
-                        || target.is_none_or(|target| target == child_key.id),
-                        |target| target == *child_key,
-                    )
+                    && class.admits(record.task.exit_signal())
+                    && target.admits(*child_key, record.task.process_group())
                 {
                     record
                         .task
@@ -4369,11 +4431,7 @@ impl Kernel {
                 let record = state.tasks.get(&tracee_key.id)?;
                 if record.task.key() == *tracee_key
                     && record.task.ptrace_tracer() == Some(parent)
-                    && process_group.is_none_or(|group| record.task.process_group() == group)
-                    && exact_target.map_or_else(
-                        || target.is_none_or(|target| target == tracee_key.id),
-                        |target| target == *tracee_key,
-                    )
+                    && target.admits(*tracee_key, record.task.process_group())
                 {
                     record
                         .task
@@ -4408,11 +4466,7 @@ impl Kernel {
             };
             record.task.key() == *tracee_key
                 && record.task.ptrace_tracer() == Some(parent)
-                && process_group.is_none_or(|group| record.task.process_group() == group)
-                && exact_target.map_or_else(
-                    || target.is_none_or(|target| target == tracee_key.id),
-                    |target| target == *tracee_key,
-                )
+                && target.admits(*tracee_key, record.task.process_group())
         });
         let live_child = live_tracee
             || children.iter().any(|child_key| {
@@ -4421,11 +4475,8 @@ impl Kernel {
                 };
                 record.task.key() == *child_key
                     && record.task.parent() == Some(parent)
-                    && process_group.is_none_or(|group| record.task.process_group() == group)
-                    && exact_target.map_or_else(
-                        || target.is_none_or(|target| target == child_key.id),
-                        |target| target == *child_key,
-                    )
+                    && class.admits(record.task.exit_signal())
+                    && target.admits(*child_key, record.task.process_group())
             });
         Ok(if live_child {
             WaitOutcome::StillRunning
@@ -5318,7 +5369,12 @@ mod tests {
         assert!(kernel.task_key_is_live(child_b.task().key()));
         assert_eq!(
             kernel
-                .wait_child_key(root.task().key().id, child_a_key, WaitMode::Observe)
+                .wait_child_key(
+                    root.task().key().id,
+                    child_a_key,
+                    WaitChildClass::Sigchld,
+                    WaitMode::Observe,
+                )
                 .expect("exact old-generation wait"),
             WaitOutcome::NoChild
         );
@@ -6361,6 +6417,7 @@ mod tests {
                 .wait_child_with_job_control(
                     root.task().key().id,
                     Some(child_id),
+                    WaitChildClass::Sigchld,
                     true,
                     false,
                     WaitMode::Consume,
@@ -6381,6 +6438,7 @@ mod tests {
                 .wait_child_with_job_control(
                     root.task().key().id,
                     Some(child_id),
+                    WaitChildClass::Sigchld,
                     false,
                     true,
                     WaitMode::Consume,
@@ -6868,6 +6926,7 @@ mod tests {
                 .wait_child_with_job_control(
                     root.task().key().id,
                     Some(child_id),
+                    WaitChildClass::Sigchld,
                     true,
                     false,
                     WaitMode::Consume,
@@ -6950,6 +7009,7 @@ mod tests {
                 .wait_child_with_job_control(
                     root.task().key().id,
                     Some(child_id),
+                    WaitChildClass::Sigchld,
                     false,
                     true,
                     WaitMode::Consume,
@@ -7037,6 +7097,168 @@ mod tests {
         );
     }
 
+    /// wait(2): a child whose exit signal is not `SIGCHLD` is a "clone child"
+    /// that a plain wait must not see -- neither as a zombie nor as a reason
+    /// to block -- while `__WCLONE` sees only it and `__WALL` sees everything.
+    /// The retained `lifecycleflagmatrix` probe depends on the ECHILD arm: its
+    /// parent polls `waitpid(WNOHANG)` on a `clone(CLONE_VM|0xff, stack=NULL)`
+    /// child and, on Linux, gets ECHILD at once and SIGKILLs the child before
+    /// it runs. Reaping it instead let the child run on the parent's stack.
+    #[test]
+    fn wait_partitions_children_by_exit_signal() {
+        let (kernel, root) = bootstrap(1);
+        let root_id = root.task().key().id;
+        let clone_plan = ClonePlan::from_flags(LinuxCloneFlags::VM)
+            .expect("clone plan")
+            .with_exit_signal(ChildExitSignal::None);
+        let clone_child = fork_child_with_plan(&kernel, &root, clone_plan, "clone-child", 21);
+        let fork_child_id = fork_child(&kernel, &root, "fork-child", 22);
+
+        // Both alive: a plain wait blocks only on the SIGCHLD child, a
+        // __WCLONE wait only on the clone child.
+        for (class, expected) in [
+            (WaitChildClass::Sigchld, WaitOutcome::StillRunning),
+            (WaitChildClass::Clone, WaitOutcome::StillRunning),
+            (WaitChildClass::All, WaitOutcome::StillRunning),
+        ] {
+            assert_eq!(
+                kernel
+                    .wait_child_with_job_control(
+                        root_id,
+                        None,
+                        class,
+                        false,
+                        false,
+                        WaitMode::Consume
+                    )
+                    .expect("wait"),
+                expected,
+                "{class:?} with both children live"
+            );
+        }
+        assert_eq!(
+            kernel
+                .wait_child_with_job_control(
+                    root_id,
+                    Some(clone_child),
+                    WaitChildClass::Sigchld,
+                    false,
+                    false,
+                    WaitMode::Consume
+                )
+                .expect("wait"),
+            WaitOutcome::NoChild,
+            "a plain wait naming a live clone child is ECHILD, not a block"
+        );
+        assert_eq!(
+            kernel
+                .wait_child_with_job_control(
+                    root_id,
+                    Some(fork_child_id),
+                    WaitChildClass::Clone,
+                    false,
+                    false,
+                    WaitMode::Consume
+                )
+                .expect("wait"),
+            WaitOutcome::NoChild,
+            "__WCLONE naming a live SIGCHLD child is ECHILD"
+        );
+
+        kernel
+            .exit_task(clone_child, LinuxWaitStatus::from_wait_encoding(0), None)
+            .expect("exit clone child");
+
+        // The clone child's zombie is invisible to a plain wait, which still
+        // blocks on the live fork child ...
+        assert_eq!(
+            kernel
+                .wait_child(root_id, None, WaitMode::Consume)
+                .expect("wait"),
+            WaitOutcome::StillRunning,
+            "plain wait must not reap a clone child"
+        );
+        assert_eq!(
+            kernel
+                .wait_child(root_id, Some(clone_child), WaitMode::Consume)
+                .expect("wait"),
+            WaitOutcome::NoChild,
+            "plain wait naming a clone-child zombie is ECHILD"
+        );
+        // ... and __WCLONE reaps it.
+        let WaitOutcome::Exited(zombie) = kernel
+            .wait_child_with_job_control(
+                root_id,
+                None,
+                WaitChildClass::Clone,
+                false,
+                false,
+                WaitMode::Consume,
+            )
+            .expect("wait")
+        else {
+            panic!("__WCLONE did not reap the clone child");
+        };
+        assert_eq!(zombie.key.id, clone_child);
+        assert_eq!(zombie.exit_signal, ChildExitSignal::None);
+        assert_eq!(
+            kernel
+                .wait_child_with_job_control(
+                    root_id,
+                    None,
+                    WaitChildClass::Clone,
+                    false,
+                    false,
+                    WaitMode::Consume
+                )
+                .expect("wait"),
+            WaitOutcome::NoChild,
+            "no clone children remain"
+        );
+
+        kernel
+            .exit_task(fork_child_id, LinuxWaitStatus::from_wait_encoding(0), None)
+            .expect("exit fork child");
+        let WaitOutcome::Exited(zombie) = kernel
+            .wait_child_with_job_control(
+                root_id,
+                None,
+                WaitChildClass::All,
+                false,
+                false,
+                WaitMode::Consume,
+            )
+            .expect("wait")
+        else {
+            panic!("__WALL did not reap the fork child");
+        };
+        assert_eq!(zombie.key.id, fork_child_id);
+        assert_eq!(zombie.exit_signal, ChildExitSignal::SIGCHLD);
+    }
+
+    #[test]
+    fn wait_child_class_follows_wait_options() {
+        assert_eq!(
+            WaitChildClass::from_wait_options(LinuxWaitOptions::WNOHANG),
+            WaitChildClass::Sigchld
+        );
+        assert_eq!(
+            WaitChildClass::from_wait_options(LinuxWaitOptions::WCLONE),
+            WaitChildClass::Clone
+        );
+        assert_eq!(
+            WaitChildClass::from_wait_options(LinuxWaitOptions::WALL | LinuxWaitOptions::WCLONE),
+            WaitChildClass::All
+        );
+        assert_eq!(ChildExitSignal::for_clone_request(0), ChildExitSignal::None);
+        assert_eq!(
+            ChildExitSignal::for_clone_request(17),
+            ChildExitSignal::SIGCHLD
+        );
+        assert!(ChildExitSignal::for_clone_request(9).is_clone_child());
+        assert!(!ChildExitSignal::SIGCHLD.is_clone_child());
+    }
+
     /// The pending queue of `id`, read the way the task's own drain reads it.
     fn pending_of(
         kernel: &Arc<Kernel>,
@@ -7055,13 +7277,24 @@ mod tests {
     /// Fork `parent` and return the child's id, with its start handshake
     /// completed so the child is a fully published, live task.
     fn fork_child(kernel: &Arc<Kernel>, parent: &KernelContext, name: &str, tid: i32) -> TaskId {
+        fork_child_with_plan(
+            kernel,
+            parent,
+            ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+            name,
+            tid,
+        )
+    }
+
+    fn fork_child_with_plan(
+        kernel: &Arc<Kernel>,
+        parent: &KernelContext,
+        plan: ClonePlan,
+        name: &str,
+        tid: i32,
+    ) -> TaskId {
         let reservation = kernel
-            .reserve_fork(
-                parent,
-                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
-                name.to_owned(),
-                None,
-            )
+            .reserve_fork(parent, plan, name.to_owned(), None)
             .expect("reserve fork");
         let child_id = reservation.child_id();
         let mut prepared = reservation

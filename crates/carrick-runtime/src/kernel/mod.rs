@@ -75,9 +75,9 @@ pub use guest_execution::{
     GuestExecutorCensus, GuestExecutorCensusError, GuestExecutorParticipation,
 };
 pub use ids::{
-    CredentialsId, FileDescriptionId, FileSlotNumber, FileTableId, FsContextId, InvalidFileSlot,
-    InvalidLinuxSignal, LinuxSignal, LinuxTid, MmId, ObjectIdError, ObjectIdRegistry,
-    ProcessGroupId, SessionId, SighandId, TaskId, TaskSerial, ThreadSerial,
+    ChildExitSignal, CredentialsId, FileDescriptionId, FileSlotNumber, FileTableId, FsContextId,
+    InvalidFileSlot, InvalidLinuxSignal, LinuxSignal, LinuxTid, MmId, ObjectIdError,
+    ObjectIdRegistry, ProcessGroupId, SessionId, SighandId, TaskId, TaskSerial, ThreadSerial,
 };
 pub use netns::{NetNs, UtsNs};
 pub(crate) use netns::{publish_root_net_view, publish_root_nodename, root_net_ns, root_uts_ns};
@@ -100,7 +100,8 @@ pub use operations::{
     PreparedFork, PreparedTaskExit, PreparedThreadClone, ProcessIdentity, ProcessState,
     PublishedFork, PublishedThreadClone, ReservedPidfdSubscription, SignalTargetAuthorization,
     StartedFork, StartedThreadClone, TaskIdentity, TaskOperationReservation,
-    ThreadCloneReservation, ThreadPublicationReservationAttempt, WaitMode, WaitOutcome,
+    ThreadCloneReservation, ThreadPublicationReservationAttempt, WaitChildClass, WaitMode,
+    WaitOutcome,
 };
 pub(crate) use operations::{
     CloseRangeUnshare, ExactSignalTargetAuthorization, ExactThreadSignalPost, TtyControlError,

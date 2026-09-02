@@ -3897,6 +3897,7 @@ pub(crate) mod tests {
             .wait_child_key(
                 root.task().key().id,
                 replacement_key,
+                super::super::WaitChildClass::Sigchld,
                 super::super::WaitMode::Consume,
             )
             .expect("reap retired replacement");
@@ -3941,6 +3942,7 @@ pub(crate) mod tests {
             .wait_child_key(
                 root.task().key().id,
                 stale_key,
+                super::super::WaitChildClass::Sigchld,
                 super::super::WaitMode::Consume,
             )
             .expect("reap target");

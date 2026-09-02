@@ -3130,6 +3130,7 @@ impl SyscallDispatcher {
                 let include_stopped = options.contains(LinuxWaitOptions::WSTOPPED);
                 let include_continued = options.contains(LinuxWaitOptions::WCONTINUED);
                 let nowait = options.contains(LinuxWaitOptions::WNOWAIT);
+                let class = crate::kernel::WaitChildClass::from_wait_options(options);
                 let mut pidfd_target = None;
                 let mut group_target = None;
                 let target = match idtype {
@@ -3188,16 +3189,18 @@ impl SyscallDispatcher {
                 };
                 let guest_nohang = options.contains(LinuxWaitOptions::WNOHANG);
                 let waited = match (pidfd_target, group_target) {
-                    (Some(task), _) => process.wait_child_key(task, nowait),
+                    (Some(task), _) => process.wait_child_key(task, class, nowait),
                     (None, Some(group)) => process
                         .wait_child_in_process_group_with_job_control(
                             group,
+                            class,
                             nowait,
                             include_stopped,
                             include_continued,
                         ),
                     (None, None) => process.wait_child_with_job_control(
                         target,
+                        class,
                         nowait,
                         include_stopped,
                         include_continued,
@@ -3616,6 +3619,11 @@ impl SyscallDispatcher {
             if let Some(process) = this.hvpatch_process() {
                 let include_stopped = options.contains(LinuxWaitOptions::WUNTRACED);
                 let include_continued = options.contains(LinuxWaitOptions::WCONTINUED);
+                // wait(2): a child whose exit signal is not SIGCHLD -- a
+                // `clone(CLONE_VM|0)` helper, say -- is a "clone child" that a
+                // plain wait ignores (ECHILD when only such children exist);
+                // `__WCLONE` selects only those and `__WALL` every child.
+                let class = crate::kernel::WaitChildClass::from_wait_options(options);
                 // The guest names its child by the pid `fork` returned — an
                 // ns-pid — while the kernel graph waits by task id. An ns-pid
                 // that names no member is ECHILD (no such child), exactly as
@@ -3625,6 +3633,7 @@ impl SyscallDispatcher {
                 let waited = match pid.0 {
                     -1 => process.wait_child_with_job_control(
                         None,
+                        class,
                         false,
                         include_stopped,
                         include_continued,
@@ -3635,6 +3644,7 @@ impl SyscallDispatcher {
                                 host_target = Some(host);
                                 process.wait_child_with_job_control(
                                     Some(host),
+                                    class,
                                     false,
                                     include_stopped,
                                     include_continued,
@@ -3646,6 +3656,7 @@ impl SyscallDispatcher {
                     0 => match process.process_group() {
                         Ok(group) => process.wait_child_in_process_group_with_job_control(
                             group,
+                            class,
                             false,
                             include_stopped,
                             include_continued,
@@ -3658,6 +3669,7 @@ impl SyscallDispatcher {
                     {
                         Some(group) => process.wait_child_in_process_group_with_job_control(
                             group,
+                            class,
                             false,
                             include_stopped,
                             include_continued,

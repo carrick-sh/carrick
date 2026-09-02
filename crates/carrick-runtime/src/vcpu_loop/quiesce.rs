@@ -1079,8 +1079,13 @@ where
             )
         })?;
         let clone_flags = carrick_abi::LinuxCloneFlags::from_bits_retain(request.flags);
+        // `request.exit_signal` is authoritative for both clone spellings: the
+        // legacy `CSIGNAL` byte was already lowered out of `flags` by dispatch
+        // and `clone3` never carries one there.
         let clone_plan = match crate::kernel::ClonePlan::from_flags(clone_flags) {
-            Ok(plan) => plan,
+            Ok(plan) => plan.with_exit_signal(crate::kernel::ChildExitSignal::for_clone_request(
+                request.exit_signal,
+            )),
             Err(_) => {
                 return Ok(PreparedInProcessFork::Complete(Some(
                     crate::linux_abi::LINUX_EINVAL.guest_retval(),
