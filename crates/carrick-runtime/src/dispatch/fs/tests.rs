@@ -257,7 +257,7 @@ fn test_directory_open_file(path: &str) -> OpenFile {
         Arc::new(RwLock::new(OpenDescription::Directory {
             path: path.to_owned(),
             metadata,
-            entries: Vec::new(),
+            listing: DirListing::Pending,
             offset: 0,
             base: OpenDescriptionBase::new(0),
             trusted_host_dir: None,
@@ -836,6 +836,190 @@ fn trusted_immutable_lower_stat_preserves_layered_guest_identity() {
         .unwrap();
     assert_eq!(fast, slow, "trusted lower stat must equal layered stat");
     assert_eq!(fast.mode & 0o7777, 0o4711);
+}
+
+/// LTP `creat05` shape: the test `mkdir`s its own scratch directory (which
+/// only the WRITABLE upper holds — the immutable lower never had it), fills
+/// it with thousands of files, and then `open(O_DIRECTORY)`s it through the
+/// harness. An upper-only directory under an immutable lower must seed the
+/// trusted lane exactly like a lower-only one: the lower's absence is
+/// permanent, so the upper dirfd IS the merged namespace for that subtree.
+/// Before this landed the open fell to the layered path and enumerated
+/// every child (fstatat + open + flistxattr + close each) on EVERY open.
+#[cfg(target_os = "macos")]
+#[test]
+fn trusted_upper_only_directory_seeds_the_lane_and_streams() {
+    let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+
+    memory.write_bytes(0x4200, b"/walk/scratch\0").unwrap();
+    let mk = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        34,
+        [LINUX_AT_FDCWD, 0x4200, 0o755, 0, 0, 0],
+    );
+    assert_eq!(mk, 0, "mkdirat /walk/scratch: {mk}");
+    for name in ["a.txt", "b.txt"] {
+        let fd = lane_openat(
+            &mut dispatcher,
+            &mut memory,
+            LINUX_AT_FDCWD,
+            &format!("/walk/scratch/{name}"),
+            LINUX_O_CREAT | LINUX_O_WRONLY,
+        );
+        assert!(fd >= 0, "create {name}: {fd}");
+        memory.write_bytes(0x9000, name.as_bytes()).unwrap();
+        let n = lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            64,
+            [fd as u64, 0x9000, name.len() as u64, 0, 0, 0],
+        );
+        assert_eq!(n, name.len() as i64);
+        assert_eq!(
+            lane_syscall(&mut dispatcher, &mut memory, 57, [fd as u64, 0, 0, 0, 0, 0]),
+            0
+        );
+    }
+
+    let dir = lane_openat(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        "/walk/scratch",
+        LINUX_O_DIRECTORY,
+    );
+    assert!(dir >= 0, "open upper-only /walk/scratch: {dir}");
+    assert!(
+        lane_dir_is_trusted(&dispatcher, dir),
+        "an upper-only directory whose lower is permanently absent must seed the trusted lane"
+    );
+
+    // Children resolve through the upper dirfd.
+    let file = lane_openat(&mut dispatcher, &mut memory, dir as u64, "a.txt", 0);
+    assert!(file >= 0, "open a.txt through the upper dirfd: {file}");
+    let n = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        63,
+        [file as u64, 0x9100, 64, 0, 0, 0],
+    );
+    assert_eq!(n, 5);
+    assert_eq!(memory.read_bytes(0x9100, 5).unwrap(), b"a.txt");
+    let missing = lane_openat(&mut dispatcher, &mut memory, dir as u64, "nope", 0);
+    assert_eq!(missing, -i64::from(LINUX_ENOENT.get()));
+
+    // The listing equals the layered truth.
+    let mut streamed = lane_getdents(&mut dispatcher, &mut memory, dir);
+    streamed.retain(|(n, _)| n != "." && n != "..");
+    streamed.sort();
+    let mut layered: Vec<(String, u8)> = crate::overlay::layered_directory_entries(
+        dispatcher.fs.rootfs_vfs.overlay.as_ref(),
+        dispatcher.fs.rootfs_vfs.rootfs.as_ref(),
+        "/walk/scratch",
+    )
+    .unwrap()
+    .into_iter()
+    .map(|e| (e.name, linux_dirent_type(e.metadata.kind)))
+    .collect();
+    layered.sort();
+    assert_eq!(streamed, layered);
+    assert_eq!(streamed.len(), 2);
+
+    // A MERGED directory (lower + upper contributions) still takes the
+    // exact layered path: /walk itself now has an upper child.
+    let merged = lane_openat(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        "/walk",
+        LINUX_O_DIRECTORY,
+    );
+    assert!(merged >= 0);
+    let mut listed = lane_getdents(&mut dispatcher, &mut memory, merged);
+    listed.retain(|(n, _)| n != "." && n != "..");
+    let names: Vec<&str> = listed.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names.contains(&"scratch"), "{names:?}");
+    assert!(names.contains(&"file.txt"), "{names:?}");
+    assert!(names.contains(&"sub"), "{names:?}");
+}
+
+/// A directory listing is taken when the guest READS it, not when it opens
+/// it (Linux `getdents64` walks the live dentry tree; `rewinddir` re-reads).
+/// Two consequences the old open-time snapshot got wrong — and one cost:
+/// every `open(O_DIRECTORY)` walk anchor paid a full enumeration (O(n)
+/// stats) whether or not the guest ever listed it, which is what put
+/// `creat05` at 8x the oracle.
+#[cfg(target_os = "macos")]
+#[test]
+fn directory_listing_is_taken_at_read_time_not_open_time() {
+    let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+    // Shadow a lower file so /walk is a MERGED directory that cannot take
+    // the trusted lane.
+    dispatcher
+        .fs
+        .rootfs_vfs
+        .overlay
+        .set_file_contents("/walk/file.txt", b"upper".to_vec())
+        .unwrap();
+    let dir = lane_openat(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        "/walk",
+        LINUX_O_DIRECTORY,
+    );
+    assert!(dir >= 0);
+    assert!(!lane_dir_is_trusted(&dispatcher, dir));
+    {
+        let open_file = dispatcher.open_file(dir as i32).unwrap();
+        let open = open_file.description.read().unwrap();
+        let OpenDescription::Directory { listing, .. } = &*open else {
+            panic!("expected a directory description");
+        };
+        assert!(
+            matches!(listing, DirListing::Pending),
+            "open(O_DIRECTORY) must not enumerate the directory: {listing:?}"
+        );
+    }
+
+    // Created AFTER the open, BEFORE the first read: visible (Linux).
+    dispatcher
+        .fs
+        .rootfs_vfs
+        .overlay
+        .set_file_contents("/walk/after-open.txt", b"x".to_vec())
+        .unwrap();
+    let first = lane_getdents(&mut dispatcher, &mut memory, dir);
+    assert!(
+        first.iter().any(|(n, _)| n == "after-open.txt"),
+        "a child created before the first getdents must be listed: {first:?}"
+    );
+    assert!(first.iter().any(|(n, _)| n == "file.txt"));
+
+    // Created after the first drain: visible after a rewind (rewinddir).
+    dispatcher
+        .fs
+        .rootfs_vfs
+        .overlay
+        .set_file_contents("/walk/after-drain.txt", b"y".to_vec())
+        .unwrap();
+    let again = lane_getdents(&mut dispatcher, &mut memory, dir);
+    assert!(again.is_empty(), "a drained directory reads EOF: {again:?}");
+    let seek = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        62,
+        [dir as u64, 0, 0, 0, 0, 0],
+    );
+    assert_eq!(seek, 0);
+    let rewound = lane_getdents(&mut dispatcher, &mut memory, dir);
+    assert!(
+        rewound.iter().any(|(n, _)| n == "after-drain.txt"),
+        "a rewound untrusted directory must re-read: {rewound:?}"
+    );
 }
 
 /// The three lanes that publish a file's identity — `stat(path)`,
@@ -4197,7 +4381,7 @@ fn non_pipe_access_mode_readv_writev_and_splice_precedence() {
             mode: 0o755,
             size: 0,
         },
-        entries: vec![],
+        listing: DirListing::Pending,
         offset: 0,
         trusted_host_dir: None,
     };

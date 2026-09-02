@@ -4543,7 +4543,7 @@ mod netlink_readiness_tests {
                     mode: 0o755,
                     size: 0,
                 },
-                entries: Vec::new(),
+                listing: DirListing::Pending,
                 offset: 0,
                 trusted_host_dir: None,
             })),
