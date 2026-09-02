@@ -4212,6 +4212,13 @@ impl SyscallDispatcher {
                 && offset.is_multiple_of(hvf_page)
             {
                 let mut alias_description: Option<Arc<crate::kernel::FileDescription>> = None;
+                // Sealing bookkeeping for a memfd alias, computed exactly as the
+                // snapshot path below computes it: a mapping of a memfd sealed
+                // F_SEAL_WRITE/F_SEAL_FUTURE_WRITE is read-only and must refuse
+                // a later mprotect(PROT_WRITE); a writable mapping of an
+                // unsealed memfd makes F_ADD_SEALS F_SEAL_WRITE EBUSY.
+                let mut alias_write_sealed_shared = false;
+                let mut alias_writable_memfd: Option<Arc<crate::kernel::FileDescription>> = None;
                 let dup_fd = {
                     let Some(open_file) = this.open_file(fd.0) else {
                         return Ok(request.refused(
@@ -4224,8 +4231,18 @@ impl SyscallDispatcher {
                     // this same guard across their host I/O, so no offset
                     // can move underneath it.
                     let open = open_file.description.write();
-                    match open.as_deref() {
-                        Some(OpenDescription::HostFile { host_fd, .. }) => {
+                    // A host regular file (`HostFile`) or a memfd whose bytes
+                    // live in an unlinked host file (`File`/`HostBacked`) both
+                    // have a host inode the guest mapping can view live.
+                    let alias_host_fd = match open.as_deref() {
+                        Some(OpenDescription::HostFile { host_fd, .. }) => Some((host_fd.raw(), true)),
+                        Some(OpenDescription::File { contents, .. }) => {
+                            contents.host_backed_fd().map(|raw| (raw, false))
+                        }
+                        _ => None,
+                    };
+                    match alias_host_fd {
+                        Some((raw_fd, is_host_file)) => {
                             // Two named preconditions decide the live alias, so
                             // neither is discovered as an opaque hypervisor
                             // error deep inside the VMM backend: the mapping
@@ -4239,22 +4256,24 @@ impl SyscallDispatcher {
                             // file is one it may vouch for. The guest's own
                             // view stays read-only: `mmap_read_only_shared_file`
                             // above already refused PROT_WRITE and pins the
-                            // mprotect ceiling on the commit.
-                            if host_fd_file_len(host_fd.raw())
+                            // mprotect ceiling on the commit. A memfd's host
+                            // file is always O_RDWR and has no path to re-open.
+                            let beyond_eof = host_fd_file_len(raw_fd)
                                 .and_then(|len| {
                                     shared_file_bus_offset(len, offset, length, page_size)
                                 })
-                                .is_some()
-                                || (!host_fd_can_back_shared_alias(host_fd.raw())
-                                    && !this
+                                .is_some();
+                            let can_alias = host_fd_can_back_shared_alias(raw_fd)
+                                || (is_host_file
+                                    && this
                                         .fs
                                         .rootfs_vfs
                                         .overlay
-                                        .upgrade_host_fd_for_shared_map(host_fd.raw()))
-                            {
+                                        .upgrade_host_fd_for_shared_map(raw_fd));
+                            if beyond_eof || !can_alias {
                                 None
                             } else {
-                                let d = unsafe { libc::dup(host_fd.raw()) };
+                                let d = unsafe { libc::dup(raw_fd) };
                                 if d < 0 {
                                     None
                                 } else {
@@ -4264,11 +4283,29 @@ impl SyscallDispatcher {
                                     // `mremap` can ask where the file ends.
                                     alias_description =
                                         Some(std::sync::Arc::clone(&open_file.description));
+                                    let seals = open_file
+                                        .description
+                                        .common()
+                                        .seals()
+                                        .and_then(carrick_abi::LinuxMemfdSeals::from_bits);
+                                    alias_write_sealed_shared = matches!(
+                                        seals,
+                                        Some(s) if s.intersects(
+                                            carrick_abi::LinuxMemfdSeals::WRITE
+                                                | carrick_abi::LinuxMemfdSeals::FUTURE_WRITE,
+                                        )
+                                    );
+                                    if prot_flags.contains(LinuxProtFlags::WRITE)
+                                        && seals.is_some()
+                                    {
+                                        alias_writable_memfd =
+                                            Some(std::sync::Arc::clone(&open_file.description));
+                                    }
                                     Some(d)
                                 }
                             }
                         }
-                        _ => None,
+                        None => None,
                     }
                 };
                 if let Some(dup_fd) = dup_fd {
@@ -4362,10 +4399,10 @@ impl SyscallDispatcher {
                             locked: locked_range,
                             resident: true,
                             bus_fault: None,
-                            write_sealed_shared: false,
+                            write_sealed_shared: alias_write_sealed_shared,
                             read_only_shared_file: mmap_read_only_shared_file,
                             secretmem: false,
-                            writable_memfd: None,
+                            writable_memfd: alias_writable_memfd,
                             shared_file_alias: alias_description,
                         },
                     ));
@@ -4824,10 +4861,12 @@ impl SyscallDispatcher {
                 && mmap_file_backed_lowering_enabled()
                 && let Some(open_file) = this.open_file(fd.0)
             {
-                lowering_candidate = matches!(
-                    open_file.description.read().as_deref(),
-                    Some(OpenDescription::HostFile { .. })
-                );
+                lowering_candidate = open_file
+                    .description
+                    .read()
+                    .as_deref()
+                    .and_then(OpenDescription::shared_alias_host_fd)
+                    .is_some();
             }
             let bytes = if map_flags.contains(LinuxMmapFlags::ANONYMOUS) || lowering_candidate {
                 Vec::new()
@@ -5152,25 +5191,26 @@ impl SyscallDispatcher {
                     ));
                 };
                 let open = open_file.description.read();
-                let Some(OpenDescription::HostFile { host_fd, .. }) = open.as_deref() else {
+                let Some(host_fd) = open.as_deref().and_then(OpenDescription::shared_alias_host_fd)
+                else {
                     return Ok(request.refused(
                         MmapRefusal::Internal("file description changed type mid-dispatch (file-backed lowering)"),
                         LINUX_EBADF,
                     ));
                 };
-                if let Some(file_len) = host_fd_file_len(host_fd.raw()) {
+                if let Some(file_len) = host_fd_file_len(host_fd) {
                     bus_fault_offset =
                         shared_file_bus_offset(file_len, offset, length, page_size);
                     if bus_fault_offset.is_some() {
                         bus_fault_debug = Some(format!(
-                            "host path={:?} file_len={file_len} desc=HostFile host_fd={}",
-                            carrick_portable::fd_abs_path(host_fd.raw()),
-                            host_fd.raw()
+                            "host path={:?} file_len={file_len} desc=host-backed host_fd={host_fd}",
+                            carrick_portable::fd_abs_path(host_fd),
                         ));
                     }
                     // SAFETY: the description read guard (`open`) keeps the
-                    // owning `HostFdRef` alive across the borrow.
-                    let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(host_fd.raw()) };
+                    // owning fd (a `HostFdRef`, or the memfd's `OwnedFd`) alive
+                    // across the borrow.
+                    let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(host_fd) };
                     if matches!(
                         memory.map_private_file_backed(address, length_usize, borrowed, offset),
                         Ok(true)
@@ -5182,7 +5222,7 @@ impl SyscallDispatcher {
                     let mut fallback = vec![0; length_usize];
                     let n = unsafe {
                         libc::pread(
-                            host_fd.raw(),
+                            host_fd,
                             fallback.as_mut_ptr() as *mut _,
                             length_usize,
                             offset as libc::off_t,
@@ -5905,8 +5945,10 @@ impl SyscallDispatcher {
                     .checked_mul(crate::core_dump::GUEST_PAGE as u64)?;
                 let open = description.read();
                 let file_len = match open.as_deref() {
-                    Some(OpenDescription::HostFile { host_fd, .. }) => host_fd_file_len(host_fd.raw()),
-                    _ => None,
+                    Some(description) => description
+                        .shared_alias_host_fd()
+                        .and_then(host_fd_file_len),
+                    None => None,
                 }?;
                 Some((file_len, file_offset))
             })();
@@ -6055,14 +6097,10 @@ impl SyscallDispatcher {
                     };
                     let dup_fd = {
                         let open = description.read();
-                        match open.as_deref() {
-                            Some(OpenDescription::HostFile { host_fd, .. }) => {
-                                if host_fd_can_back_shared_alias(host_fd.raw()) {
-                                    let d = unsafe { libc::dup(host_fd.raw()) };
-                                    (d >= 0).then_some(d)
-                                } else {
-                                    None
-                                }
+                        match open.as_deref().and_then(OpenDescription::shared_alias_host_fd) {
+                            Some(raw_fd) if host_fd_can_back_shared_alias(raw_fd) => {
+                                let d = unsafe { libc::dup(raw_fd) };
+                                (d >= 0).then_some(d)
                             }
                             _ => None,
                         }

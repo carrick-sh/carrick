@@ -20,7 +20,7 @@ use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-const CACHED_SHARD_0_PROBE_COUNT: usize = 137;
+const CACHED_SHARD_0_PROBE_COUNT: usize = 134;
 
 /// Derive the shard 0 subset from a complete baseline set.
 pub fn expected_shard_gaps(baseline: &[&'static str]) -> BTreeSet<&'static str> {
@@ -141,11 +141,11 @@ pub fn find_probe_binary_dir(repo_root: &Path, target: &str) -> Option<PathBuf> 
 
 #[test]
 fn test_shard_0_inventory() {
-    // Hard-assert exactly 148 sorted unique names.
+    // Hard-assert exactly 149 sorted unique names.
     assert_eq!(
         SHARD_0_PROBES.len(),
-        148,
-        "shard 0 must have exactly 148 probes"
+        149,
+        "shard 0 must have exactly 149 probes"
     );
 
     let mut sorted_probes = SHARD_0_PROBES.to_vec();
@@ -159,8 +159,8 @@ fn test_shard_0_inventory() {
     let unique_probes: BTreeSet<_> = SHARD_0_PROBES.iter().copied().collect();
     assert_eq!(
         unique_probes.len(),
-        148,
-        "SHARD_0_PROBES must contain 148 unique names"
+        149,
+        "SHARD_0_PROBES must contain 149 unique names"
     );
     assert_eq!(
         SHARD_0_PROBES
@@ -224,8 +224,8 @@ fn test_shard_0_inventory() {
     selected_names.sort();
     assert_eq!(
         selected_names.len(),
-        444,
-        "expected exactly 444 conformance generic probes in inventory"
+        446,
+        "expected exactly 446 conformance generic probes in inventory"
     );
 
     let derived_shard_0: Vec<&str> = selected_names
@@ -236,8 +236,8 @@ fn test_shard_0_inventory() {
 
     assert_eq!(
         derived_shard_0.len(),
-        148,
-        "derived shard 0 must have exactly 148 items"
+        149,
+        "derived shard 0 must have exactly 149 items"
     );
     assert_eq!(
         SHARD_0_PROBES,
@@ -251,9 +251,9 @@ fn test_shard_0_expected_gaps_derivation() {
     let musl_shard_gaps = expected_shard_gaps(common::MUSL_BASELINE_GAPS);
     let gnu_shard_gaps = expected_shard_gaps(common::GNU_BASELINE_GAPS);
 
-    let expected_musl_set = BTreeSet::from(["budget_two_proc"]);
+    let expected_musl_set = BTreeSet::from(["budget_two_proc", "mmapprivatefiletrack"]);
 
-    let expected_gnu_set = BTreeSet::from(["budget_two_proc"]);
+    let expected_gnu_set = BTreeSet::from(["budget_two_proc", "mmapprivatefiletrack"]);
 
     assert_eq!(
         musl_shard_gaps, expected_musl_set,
@@ -354,13 +354,13 @@ fn test_probe_binary_locator_and_gap_counts() {
     let gnu_shard_gaps = expected_shard_gaps(common::GNU_BASELINE_GAPS);
     assert_eq!(
         musl_shard_gaps.len(),
-        1,
-        "musl shard 0 must contain exactly 1 baseline gaps"
+        2,
+        "musl shard 0 must contain exactly 2 baseline gaps"
     );
     assert_eq!(
         gnu_shard_gaps.len(),
-        1,
-        "gnu shard 0 must contain exactly 1 baseline gaps"
+        2,
+        "gnu shard 0 must contain exactly 2 baseline gaps"
     );
 }
 

@@ -491,11 +491,88 @@ pub(super) enum FileContents {
         dirty: BTreeMap<usize, Vec<u8>>,
         len: usize,
     },
+    /// An unlinked host regular file owns the bytes (`memfd_create`). The
+    /// host inode is the single authority every view reads and writes: fd
+    /// I/O goes through `pread`/`pwrite`, a guest `MAP_SHARED`/`MAP_PRIVATE`
+    /// mapping is a live host mapping of the same file, and a clone (dup,
+    /// fork) shares the fd. That is what makes a store through a shared
+    /// mapping visible to `pread` and to every other mapping — the in-memory
+    /// variants can only ever hand a mapping a one-time snapshot.
+    HostBacked {
+        fd: Arc<std::os::fd::OwnedFd>,
+    },
+}
+
+/// Create an anonymous host regular file: `mkstemp` under the host temp
+/// directory (the host picks the unique name, mode 0600), then unlink at once
+/// so only the returned fd keeps the inode alive. `None` when the host
+/// refuses.
+pub(super) fn create_unlinked_host_file(prefix: &str) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let template = std::env::temp_dir().join(format!(".carrick_{prefix}.XXXXXXXX"));
+    let mut c_template = std::ffi::CString::new(template.as_os_str().as_encoded_bytes())
+        .ok()?
+        .into_bytes_with_nul();
+    let fd = unsafe { libc::mkstemp(c_template.as_mut_ptr().cast()) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `fd` is a fresh open owned by nobody else.
+    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+        return None;
+    }
+    if unsafe { libc::unlink(c_template.as_ptr().cast()) } != 0 {
+        // The inode stays anonymous to the guest either way; a leaked name in
+        // the host temp directory is the only consequence and not worth
+        // refusing the guest's memfd over.
+        tracing::debug!(
+            path = %String::from_utf8_lossy(&c_template[..c_template.len() - 1]),
+            "anonymous host file name not unlinked"
+        );
+    }
+    Some(owned)
+}
+
+fn host_file_len(fd: &std::os::fd::OwnedFd) -> usize {
+    use std::os::fd::AsRawFd;
+    let mut st: libc::stat = unsafe { core::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } == 0 {
+        usize::try_from(st.st_size).unwrap_or(0)
+    } else {
+        0
+    }
 }
 
 impl FileContents {
     pub(super) fn dense(bytes: Vec<u8>) -> Self {
         Self::Dense(bytes)
+    }
+
+    pub(super) fn host_backed(fd: std::os::fd::OwnedFd) -> Self {
+        Self::HostBacked { fd: Arc::new(fd) }
+    }
+
+    /// The host fd behind a [`FileContents::HostBacked`] file, for callers
+    /// that map or alias the inode itself rather than copy its bytes.
+    pub(super) fn host_backed_fd(&self) -> Option<i32> {
+        use std::os::fd::AsRawFd;
+        match self {
+            Self::HostBacked { fd } => Some(fd.as_raw_fd()),
+            Self::Dense(_) | Self::RootFsBacked { .. } => None,
+        }
+    }
+
+    /// Whether a file of `len` bytes fits this backing. In-memory variants
+    /// are bounded by [`crate::vfs::MAX_IN_MEMORY_FILE_SIZE`]; a host-backed
+    /// file grows sparsely on the host and carries no such cap.
+    pub(super) fn accepts_len(&self, len: u64) -> bool {
+        match self {
+            Self::HostBacked { .. } => true,
+            Self::Dense(_) | Self::RootFsBacked { .. } => {
+                len <= crate::vfs::MAX_IN_MEMORY_FILE_SIZE
+            }
+        }
     }
 
     pub(super) fn shared_backed(
@@ -510,11 +587,40 @@ impl FileContents {
         match self {
             Self::Dense(bytes) => bytes.len(),
             Self::RootFsBacked { len, .. } => *len,
+            Self::HostBacked { fd } => host_file_len(fd),
         }
     }
 
     pub(super) fn read_at(&self, offset: usize, length: usize) -> Vec<u8> {
         match self {
+            Self::HostBacked { fd } => {
+                use std::os::fd::AsRawFd;
+                let Ok(start) = libc::off_t::try_from(offset) else {
+                    return Vec::new();
+                };
+                let mut out = vec![0u8; length];
+                let mut filled = 0usize;
+                while filled < length {
+                    let n = unsafe {
+                        libc::pread(
+                            fd.as_raw_fd(),
+                            out[filled..].as_mut_ptr().cast(),
+                            length - filled,
+                            start.saturating_add(filled as libc::off_t),
+                        )
+                    };
+                    if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+                    {
+                        continue;
+                    }
+                    if n <= 0 {
+                        break;
+                    }
+                    filled += n as usize;
+                }
+                out.truncate(filled);
+                out
+            }
             Self::Dense(bytes) => bytes
                 .get(offset..)
                 .unwrap_or_default()
@@ -562,6 +668,12 @@ impl FileContents {
                 *len = new_len;
                 prune_dirty_ranges(dirty, new_len);
             }
+            Self::HostBacked { fd } => {
+                use std::os::fd::AsRawFd;
+                if let Ok(len) = libc::off_t::try_from(new_len) {
+                    unsafe { libc::ftruncate(fd.as_raw_fd(), len) };
+                }
+            }
         }
     }
 
@@ -572,15 +684,45 @@ impl FileContents {
                 *len = (*len).min(new_len);
                 prune_dirty_ranges(dirty, *len);
             }
+            Self::HostBacked { .. } => {
+                if new_len < self.len() {
+                    self.resize(new_len);
+                }
+            }
         }
     }
 
     pub(super) fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<(), LinuxErrno> {
         let end = offset.checked_add(bytes.len()).ok_or(LINUX_EFBIG)?;
-        if end as u64 > crate::vfs::MAX_IN_MEMORY_FILE_SIZE {
+        if !self.accepts_len(end as u64) {
             return Err(crate::linux_abi::LINUX_EFBIG);
         }
         match self {
+            Self::HostBacked { fd } => {
+                use std::os::fd::AsRawFd;
+                let start = libc::off_t::try_from(offset).map_err(|_| LINUX_EFBIG)?;
+                let mut written = 0usize;
+                while written < bytes.len() {
+                    let n = unsafe {
+                        libc::pwrite(
+                            fd.as_raw_fd(),
+                            bytes[written..].as_ptr().cast(),
+                            bytes.len() - written,
+                            start.saturating_add(written as libc::off_t),
+                        )
+                    };
+                    if n < 0 {
+                        let errno = std::io::Error::last_os_error()
+                            .raw_os_error()
+                            .unwrap_or(libc::EIO);
+                        if errno == libc::EINTR {
+                            continue;
+                        }
+                        return Err(crate::host_to_linux_errno(errno));
+                    }
+                    written += n as usize;
+                }
+            }
             Self::Dense(contents) => {
                 if end > contents.len() {
                     contents.resize(end, 0);
@@ -1152,7 +1294,28 @@ impl crate::kernel::FileSlot {
     }
 }
 
+/// True if `path` is the synthetic sentinel carrick stamps on an ANONYMOUS file
+/// description — an `O_TMPFILE` inode (`/__carrick_o_tmpfile`) or a
+/// `memfd_create` inode (`/memfd:<name>`). Such a file has no real directory
+/// entry: `linkat(/proc/self/fd/<n>, AT_SYMLINK_FOLLOW)` must MATERIALIZE it
+/// at the target rather than hard-link a nonexistent source path, writes never
+/// sync it to the overlay, and `fstat` answers from the description itself.
+pub(super) fn is_anon_overlay_path(path: &str) -> bool {
+    path == "/__carrick_o_tmpfile" || path.starts_with("/memfd:")
+}
+
 impl OpenDescription {
+    /// The host fd whose inode a guest file mapping may alias live: a host
+    /// regular file, or a memfd whose bytes live in an unlinked host file.
+    /// In-memory contents have no host object and take the snapshot path.
+    pub(super) fn shared_alias_host_fd(&self) -> Option<i32> {
+        match self {
+            Self::HostFile { host_fd, .. } => Some(host_fd.raw()),
+            Self::File { contents, .. } => contents.host_backed_fd(),
+            _ => None,
+        }
+    }
+
     #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
     #[allow(dead_code)]
     pub(super) fn reexec_kind_name(&self) -> &'static str {
@@ -2044,6 +2207,9 @@ impl OpenDescription {
             OpenDescription::Closed { .. } => {
                 tracing::error!("closed file description escaped into fstat");
                 std::process::abort();
+            }
+            OpenDescription::File { path, metadata, .. } if is_anon_overlay_path(path) => {
+                OpenStatSource::Record(StatRecord::from_metadata(metadata))
             }
             OpenDescription::File { path, metadata, .. }
             | OpenDescription::Directory { path, metadata, .. } => OpenStatSource::PathRecord {
