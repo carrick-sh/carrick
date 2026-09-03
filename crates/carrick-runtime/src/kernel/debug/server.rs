@@ -62,18 +62,9 @@ pub struct KernelDebugServer {
 }
 
 impl KernelDebugServer {
-    /// Bind and serve snapshots of `kernel` for the ambient `CARRICK_RUN_ID`.
-    ///
-    /// Returns `Ok(None)` when no run ID is set — an ungated ad-hoc invocation
-    /// has no stable identity to publish under, and inventing one would create
-    /// an endpoint no tool could find. Every other failure is reported.
-    pub fn start(kernel: Arc<Kernel>) -> Result<Option<Self>, ServerError> {
-        let endpoint = match DebugEndpoint::for_current_run() {
-            Ok(endpoint) => endpoint,
-            Err(EndpointError::MissingRunId) => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        Self::start_at(kernel, endpoint).map(Some)
+    /// Bind and serve snapshots for the carrier's immutable cleanup scope.
+    pub fn start(kernel: Arc<Kernel>, carrier_scope: &str) -> Result<Self, ServerError> {
+        Self::start_at(kernel, DebugEndpoint::for_run_id(carrier_scope)?)
     }
 
     /// Bind and serve at an exact endpoint. Used by tests and by callers that
@@ -115,17 +106,14 @@ impl KernelDebugServer {
     /// publish the endpoint is reported and the run continues: the guest
     /// workload is the product, and losing the debugger must not lose the run.
     /// The failure is never silent.
-    pub fn install(kernel: Arc<Kernel>) {
+    pub fn install(kernel: Arc<Kernel>, carrier_scope: &str) {
         if std::env::var_os(DISABLE_ENV).is_some_and(|value| value == "0") {
             return;
         }
-        match Self::start(kernel) {
-            Ok(Some(server)) => {
+        match Self::start(kernel, carrier_scope) {
+            Ok(server) => {
                 let slot = INSTALLED.get_or_init(|| parking_lot::Mutex::new(None));
                 *slot.lock() = Some(server);
-            }
-            Ok(None) => {
-                // No CARRICK_RUN_ID: no stable identity to publish under.
             }
             Err(error) => {
                 tracing::warn!(

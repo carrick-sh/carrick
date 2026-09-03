@@ -1,9 +1,10 @@
 //! Typed failure surface of an embedded run.
 
+use carrick_runtime::dispatch::DispatchError;
 use carrick_runtime::runtime::RuntimeError;
 use carrick_runtime::trap::TrapError;
 
-use crate::Signal;
+use crate::{ContainerId, Signal};
 
 /// The `hv_return_t` of `HV_DENIED` as applevisor's `Display` prints it
 /// (`operation not allowed by the system (error 0xfae94007)`), which
@@ -20,6 +21,18 @@ const HV_DENIED_HEX: &str = "0xfae94007";
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum EmbedError {
+    /// Another explicit or implicit carrier still owns this host process.
+    #[error("an independent Carrick carrier is already active in this host process")]
+    CarrierAlreadyActive,
+    /// The selected carrier has stopped admitting new containers.
+    #[error("the Carrick carrier is closing")]
+    CarrierClosing,
+    /// The selected carrier has completed shutdown.
+    #[error("the Carrick carrier is closed")]
+    CarrierClosed,
+    /// Carrier-wide ownership or teardown failed.
+    #[error("the Carrick carrier failed: {reason}")]
+    CarrierFailed { reason: String },
     /// Image reference parsing, pull/store resolution, or the engine's
     /// request→spec merge failed (`Engine::resolve` reports all three as one
     /// `anyhow::Error`).
@@ -49,6 +62,9 @@ pub enum EmbedError {
     /// Runtime infrastructure failed after preparation succeeded.
     #[error("runtime failure: {0}")]
     Runtime(#[source] RuntimeError),
+    /// A host syscall interceptor panicked while serving this container.
+    #[error("syscall interceptor panicked in container {container_id:?}")]
+    InterceptorPanicked { container_id: ContainerId },
     /// The blocking execute task panicked (`tokio::task::JoinError`).
     #[error("the execute task panicked: {0}")]
     ExecutePanicked(String),
@@ -65,7 +81,17 @@ pub(crate) enum Phase {
 impl EmbedError {
     pub(crate) fn from_runtime(error: RuntimeError, phase: Phase) -> Self {
         match error {
+            RuntimeError::CarrierAlreadyActive => Self::CarrierAlreadyActive,
+            RuntimeError::CarrierClosing => Self::CarrierClosing,
+            RuntimeError::CarrierClosed => Self::CarrierClosed,
+            RuntimeError::CarrierFailed(reason) => Self::CarrierFailed { reason },
+            RuntimeError::ExplicitCarrierBindingRequired => Self::Config(
+                "an explicit carrier is active; use carrier.container(image)".to_owned(),
+            ),
             RuntimeError::TrapLimitExceeded { .. } => Self::TrapLimit,
+            RuntimeError::Dispatch(DispatchError::InterceptorPanicked { container_id }) => {
+                Self::InterceptorPanicked { container_id }
+            }
             RuntimeError::Trap(TrapError::Hypervisor(ref message))
                 if message.contains(HV_DENIED_HEX) =>
             {
@@ -93,6 +119,22 @@ mod tests {
             assert!(matches!(
                 EmbedError::from_runtime(error, phase),
                 EmbedError::TrapLimit
+            ));
+        }
+    }
+
+    #[test]
+    fn interceptor_panic_maps_to_the_typed_container_error_in_both_phases() {
+        for phase in [Phase::Prepare, Phase::Execute] {
+            let expected = crate::ContainerId::allocate();
+            let error = RuntimeError::Dispatch(
+                carrick_runtime::dispatch::DispatchError::InterceptorPanicked {
+                    container_id: expected,
+                },
+            );
+            assert!(matches!(
+                EmbedError::from_runtime(error, phase),
+                EmbedError::InterceptorPanicked { container_id } if container_id == expected
             ));
         }
     }

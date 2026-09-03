@@ -545,6 +545,7 @@ fn tgkill_to_sibling_emits_signalthread() {
         .unwrap()
         .into_context();
     let context = dispatcher.capture_one_task_context().unwrap();
+    install_guest_signal_handler(&context, SIGUSR1 as i32);
     let outcome = dispatcher
         .dispatch_threaded(
             &context,
@@ -597,6 +598,7 @@ fn tgkill_to_sibling_uses_kernel_pending_without_siginfo_sidecar() {
         .unwrap()
         .into_context();
     let context = dispatcher.capture_one_task_context().unwrap();
+    install_guest_signal_handler(&context, SIGUSR1 as i32);
     let outcome = dispatcher
         .dispatch_threaded(
             &context,
@@ -640,6 +642,7 @@ fn tgkill_to_self_raises_locally() {
     let main = context.thread().registry_id();
     let registry = Arc::new(ThreadRegistry::new(main));
     let futex = Arc::new(FutexTable::new());
+    install_guest_signal_handler(&context, SIGUSR1 as i32);
     let outcome = dispatcher
         .dispatch_threaded(
             &context,
@@ -702,6 +705,7 @@ fn tgkill_to_masked_sibling_queues_without_signalthread() {
         .unwrap()
         .into_context();
     let parent_context = dispatcher.capture_one_task_context().unwrap();
+    install_guest_signal_handler(&parent_context, SIGUSR1 as i32);
 
     memory
         .write_bytes(0x10000, &(1_u64 << (SIGUSR1 as i32 - 1)).to_le_bytes())

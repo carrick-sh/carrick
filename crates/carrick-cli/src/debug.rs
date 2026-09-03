@@ -980,20 +980,38 @@ fn run_container_gate(
         image, probe, gate_dir, "beta", probe_mode,
     )))
     .map_err(|error| anyhow::anyhow!("resolve beta: {error:#}"))?;
+    let carrier = carrick_runtime::CarrierRuntime::new_explicit()
+        .map_err(|error| anyhow::anyhow!("create container-gate carrier: {error:#}"))?;
     let started = Instant::now();
     let (alpha_run, beta_run) = match mode {
         ContainerGateMode::Sequential => (
-            carrick_runtime::Runtime::execute(&alpha.spec),
-            carrick_runtime::Runtime::execute(&beta.spec),
+            carrick_runtime::Runtime::execute_on(
+                &carrier,
+                &alpha.spec,
+                carrick_runtime::kernel::LaunchContext::from_process_env()?,
+            ),
+            carrick_runtime::Runtime::execute_on(
+                &carrier,
+                &beta.spec,
+                carrick_runtime::kernel::LaunchContext::from_process_env()?,
+            ),
         ),
         ContainerGateMode::Concurrent => {
+            let alpha_carrier = carrier.clone();
             let alpha_thread = thread::Builder::new()
                 .name("gate-alpha".into())
-                .spawn(move || carrick_runtime::Runtime::execute(&alpha.spec))
+                .spawn(move || {
+                    let launch = carrick_runtime::kernel::LaunchContext::from_process_env()?;
+                    carrick_runtime::Runtime::execute_on(&alpha_carrier, &alpha.spec, launch)
+                })
                 .context("spawn alpha container thread")?;
+            let beta_carrier = carrier.clone();
             let beta_thread = thread::Builder::new()
                 .name("gate-beta".into())
-                .spawn(move || carrick_runtime::Runtime::execute(&beta.spec))
+                .spawn(move || {
+                    let launch = carrick_runtime::kernel::LaunchContext::from_process_env()?;
+                    carrick_runtime::Runtime::execute_on(&beta_carrier, &beta.spec, launch)
+                })
                 .context("spawn beta container thread")?;
             let alpha_run = alpha_thread
                 .join()
@@ -1005,14 +1023,9 @@ fn run_container_gate(
         }
     };
     let elapsed_ms = started.elapsed().as_millis();
-    let snapshot = carrick_runtime::vm_lifecycle::process_snapshot();
-    let vm_creates = snapshot
-        .events
-        .iter()
-        .filter(|event| {
-            event.operation == carrick_runtime::vm_lifecycle::VmLifecycleOperation::CreateSuccess
-        })
-        .count();
+    let snapshot = carrier
+        .snapshot()
+        .map_err(|error| anyhow::anyhow!("snapshot container-gate carrier: {error:#}"))?;
     let receipt = serde_json::json!({
         "schema": "carrick.container-gate.v1",
         "mode": match mode {
@@ -1022,14 +1035,16 @@ fn run_container_gate(
         "carrier_pid": std::process::id(),
         "image": image,
         "elapsed_ms": elapsed_ms,
-        "vm_create_success_events": vm_creates,
-        "live_containers_after": carrick_runtime::carrier::live_container_count(),
+        "vm_create_success_events": snapshot.vm_create_success_events,
+        "live_containers_after": snapshot.live_containers,
         "alpha": container_gate_outcome(&alpha_run),
         "beta": container_gate_outcome(&beta_run),
     });
     fs::write(output, serde_json::to_vec_pretty(&receipt)?)
         .with_context(|| format!("failed to write {}", output.display()))?;
-    carrick_runtime::carrier::shutdown().map_err(|error| anyhow::anyhow!("{error:#}"))?;
+    carrier
+        .shutdown_wait()
+        .map_err(|error| anyhow::anyhow!("{error:#}"))?;
     alpha_run.map_err(|error| anyhow::anyhow!("alpha container: {error:#}"))?;
     beta_run.map_err(|error| anyhow::anyhow!("beta container: {error:#}"))?;
     Ok(())

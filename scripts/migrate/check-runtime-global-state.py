@@ -25,6 +25,9 @@ DEFAULT_SCAN_ROOTS = (
     "crates/carrick-runtime/src",
     "crates/carrick-kernel/src",
     "crates/carrick-vmm-hvf/src",
+    "crates/carrick-thread/src",
+    "crates/carrick-embed/src",
+    "crates/carrick-observability/src",
 )
 
 ALLOWED_CLASSIFICATIONS = frozenset(
@@ -627,6 +630,72 @@ def discover(
     return tuple(sorted(all_findings))
 
 
+def validate_concurrent_source(path: Path, source: str) -> None:
+    """Reject ambient container identity shapes on the concurrent path."""
+    path_text = path.as_posix()
+    findings = scan_source(path, source)
+    for finding in findings:
+        leaf = finding.symbol.rsplit("::", 1)[-1]
+        if finding.kind == "static" and (
+            leaf == "RUN_ID"
+            or leaf == "CONTAINER_ID"
+            or (
+                leaf.startswith("CURRENT_")
+                and ("REGISTRY" in leaf or "FUTEX" in leaf)
+            )
+        ):
+            raise LedgerError(
+                f"ambient run/container static is forbidden on the concurrent path: "
+                f"{path_text}::{finding.symbol}"
+            )
+        if (
+            finding.kind in {"env_var", "env_var_os"}
+            and finding.symbol.endswith("::CARRICK_RUN_ID")
+            and path_text != "crates/carrick-runtime/src/kernel/container.rs"
+            and "/src/bin/" not in path_text
+        ):
+            raise LedgerError(
+                "CARRICK_RUN_ID may only be read at the LaunchContext boundary: "
+                f"{path_text}::{finding.symbol}"
+            )
+
+    tokens = _tokenize(source)
+    for index, token in enumerate(tokens[:-3]):
+        if token.kind != "IDENT" or token.text != "fn":
+            continue
+        name = tokens[index + 1]
+        if name.kind != "IDENT":
+            continue
+        lowered = name.text.lower()
+        if not lowered.startswith("current_") or not (
+            "registry" in lowered or "futex" in lowered
+        ):
+            continue
+        cursor = index + 2
+        while cursor < len(tokens) and tokens[cursor].text != "(":
+            cursor += 1
+        if cursor + 1 < len(tokens) and tokens[cursor + 1].text == ")":
+            raise LedgerError(
+                "no-argument ambient registry/futex accessor is forbidden: "
+                f"{path_text}::{name.text}"
+            )
+
+
+def validate_concurrent_tree(
+    root: Path, scan_roots: Sequence[str] = DEFAULT_SCAN_ROOTS
+) -> None:
+    workspace_root = root.resolve()
+    for rel_root in scan_roots:
+        target_dir = workspace_root / rel_root
+        if not target_dir.is_dir():
+            continue
+        for file_path in sorted(target_dir.rglob("*.rs")):
+            rel_path = file_path.relative_to(workspace_root)
+            validate_concurrent_source(
+                rel_path, file_path.read_text(encoding="utf-8")
+            )
+
+
 def load_ledger(path: Path) -> list[dict[str, Any]]:
     """Load and validate JSON ledger structure."""
     if not path.is_file():
@@ -648,7 +717,10 @@ def load_ledger(path: Path) -> list[dict[str, Any]]:
 
 
 def compare(
-    actual: Sequence[Finding], reviewed: Sequence[dict[str, Any]]
+    actual: Sequence[Finding],
+    reviewed: Sequence[dict[str, Any]],
+    *,
+    require_concurrent_embed_clean: bool = False,
 ) -> None:
     """Compare discovered findings against reviewed rows, failing on any drift or violations."""
     actual_keys: set[tuple[str, str, str]] = set()
@@ -690,6 +762,11 @@ def compare(
         if classification == "container_debt" and not row.get("destination"):
             raise LedgerError(
                 f"reviewed row {idx} with classification 'container_debt' missing 'destination'"
+            )
+        if require_concurrent_embed_clean and classification == "container_debt":
+            raise LedgerError(
+                "concurrent embed path retains container-scoped global state: "
+                f"{row['file']}::{row['symbol']}"
             )
 
         key = (row["kind"], row["file"], row["symbol"])
@@ -773,6 +850,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Workspace root path",
     )
     parser.add_argument(
+        "--require-concurrent-embed-clean",
+        action="store_true",
+        help="Reject all container_debt rows and ambient runtime identity accessors",
+    )
+    parser.add_argument(
         "--ledger",
         type=Path,
         default=LEDGER_PATH,
@@ -799,7 +881,13 @@ def main(argv: list[str] | None = None) -> int:
         try:
             findings = discover(args.root)
             reviewed = load_ledger(args.ledger)
-            compare(findings, reviewed)
+            compare(
+                findings,
+                reviewed,
+                require_concurrent_embed_clean=args.require_concurrent_embed_clean,
+            )
+            if args.require_concurrent_embed_clean:
+                validate_concurrent_tree(args.root)
         except (LedgerError, OSError) as error:
             print(f"error: check-runtime-global-state: {error}", file=sys.stderr)
             return 1

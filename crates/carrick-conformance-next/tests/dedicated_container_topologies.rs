@@ -5,18 +5,18 @@
 //!
 //! # Test Classification & Blocker Inventory
 //!
-//! All 3 legacy tests (covering 5 dedicated probe names) are currently **BLOCKED** from in-process
-//! embed migration because the required topology and carrier verification primitives are not exposed
-//! in `carrick-embed`'s public API without modifying library/runtime crates. Their legacy runners
-//! in `crates/carrick-cli/tests/conformance.rs` remain authoritative.
+//! The container gate is now migrated to a signed, in-process `carrick-embed`
+//! proof. The two network-topology runners remain blocked on public networking
+//! APIs and retain their legacy CLI authority.
 //!
-//! ### 1. `conformance_container_gate` (`container_gate` probe) — BLOCKED
-//! - **Reason**: The legacy test asserts both `vm_create_success_events == 1` (proving both containers
-//!   share exactly one HVF VM in one carrier per sequential/concurrent mode) and `live_containers_after == 0`
-//!   (proving complete container teardown and zero carrier leaks).
-//! - **Missing API**: `carrick-embed` does not expose carrier-level VM lifecycle telemetry
-//!   (`vm_lifecycle::process_snapshot`) or live container census (`carrier::live_container_count`).
-//! - **Authoritative Suite**: `crates/carrick-cli/tests/conformance.rs::conformance_container_gate`.
+//! ### 1. `conformance_container_gate` (`container_gate` probe) — MIGRATED
+//! - **Authoritative Suite**:
+//!   `crates/carrick-embed/tests/guest_smoke.rs::explicit_carrier_runs_two_isolated_containers`.
+//! - **Proof**: the signed test observes two live containers in one public
+//!   `Carrier`, one VM create, one kernel graph/runtime directory, distinct
+//!   internal roots with namespace PID 1, isolated syscall/VFS policy, and
+//!   strict zero retirement before deterministic shutdown.
+//! - **Compatibility Smoke**: the legacy CLI gate remains shipped and green.
 //!
 //! ### 2. `conformance_native_host_gateway` (`host_gateway_client` probe) — BLOCKED
 //! - **Reason**: Requires bridge networking mode (`--net bridge`), bridge gateway address allocation
@@ -55,9 +55,7 @@ pub const DEDICATED_TOPOLOGY_AUDITS: &[DedicatedTestAudit] = &[
     DedicatedTestAudit {
         legacy_test: "conformance_container_gate",
         probe_names: &["container_gate"],
-        status: MigrationStatus::Blocked {
-            reason: "Missing public carrick-embed APIs to verify vm_create_success_events == 1 (single-VM sharing) and live_containers_after == 0 (carrier teardown)",
-        },
+        status: MigrationStatus::Migrated,
     },
     DedicatedTestAudit {
         legacy_test: "conformance_native_host_gateway",
@@ -101,14 +99,14 @@ fn test_dedicated_container_topologies_blocker_audit() {
     }
 
     assert_eq!(
-        migrated_tests.len(),
-        0,
-        "no dedicated topology test can be migrated with full fidelity without library/runtime API extensions: {migrated_tests:?}"
+        migrated_tests,
+        ["conformance_container_gate"],
+        "only the public explicit-carrier topology gate is migrated"
     );
     assert_eq!(
         blocked_tests.len(),
-        3,
-        "all 3 dedicated topology runners must be explicitly classified as blocked"
+        2,
+        "the two network-topology runners must remain explicitly blocked"
     );
     assert_eq!(
         total_probes, 5,

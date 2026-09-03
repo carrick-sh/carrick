@@ -3,10 +3,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use carrick_engine::ResolveWarning;
-use carrick_runtime::Runtime;
 use carrick_runtime::container::{make_id, short_id};
 use carrick_runtime::kernel::container::{LaunchContext, RunId};
 use carrick_runtime::prepare::RuntimeExtensions;
+use carrick_runtime::{CarrierLease, CarrierRuntime, prepare_on};
 use carrick_spec::RunSpec;
 
 use crate::error::Phase;
@@ -25,6 +25,13 @@ pub struct PreparedContainer {
     retired: Arc<AtomicBool>,
     current_generation: Arc<AtomicU64>,
     shared_buffers: Vec<(String, SharedBuffer)>,
+    carrier: PreparedCarrierOwnership,
+}
+
+pub(crate) struct PreparedCarrierOwnership {
+    pub(crate) runtime: CarrierRuntime,
+    pub(crate) lease: CarrierLease,
+    pub(crate) implicit: bool,
 }
 
 impl PreparedContainer {
@@ -34,8 +41,9 @@ impl PreparedContainer {
         extensions: RuntimeExtensions,
         captured: CapturedStreams,
         shared_buffers: Vec<(String, SharedBuffer)>,
+        carrier: PreparedCarrierOwnership,
     ) -> Self {
-        let launch = embedded_launch_context();
+        let launch = carrier.lease.launch().clone();
         let generation = 1;
         let retired = Arc::new(AtomicBool::new(false));
         let current_generation = Arc::new(AtomicU64::new(generation));
@@ -49,6 +57,7 @@ impl PreparedContainer {
             retired,
             current_generation,
             shared_buffers,
+            carrier,
         }
     }
 
@@ -86,15 +95,25 @@ impl PreparedContainer {
     /// Prepare the container on the kernel graph and run it to completion on
     /// the calling thread. Blocking; see [`crate::ContainerBuilder::run`].
     pub fn execute(self) -> Result<ContainerResult, EmbedError> {
-        let launch = self.launch;
+        let carrier = self.carrier.runtime;
+        let carrier_lease = self.carrier.lease;
+        let implicit_carrier = self.carrier.implicit;
         let retired = Arc::clone(&self.retired);
-        let prepared = Runtime::prepare(&self.spec, launch, self.extensions).map_err(|error| {
-            retired.store(true, Ordering::Release);
-            EmbedError::from_runtime(error, Phase::Prepare)
-        })?;
-        let result = prepared.execute();
+        let prepared = prepare_on(&carrier, &self.spec, carrier_lease, self.extensions);
+        let result = match prepared {
+            Ok(prepared) => prepared.execute().map_err(crate::entitlement::classify),
+            Err(error) => Err(EmbedError::from_runtime(error, Phase::Prepare)),
+        };
         retired.store(true, Ordering::Release);
-        let result = result.map_err(crate::entitlement::classify)?;
+        if implicit_carrier {
+            let shutdown = carrier
+                .shutdown_wait()
+                .map_err(|error| EmbedError::from_runtime(error, Phase::Execute));
+            if result.is_ok() {
+                shutdown?;
+            }
+        }
+        let result = result?;
         Ok(ContainerResult::from_run_result(result, self.captured))
     }
 }
@@ -123,10 +142,8 @@ pub(crate) fn run_id_from(explicit: Option<String>) -> String {
     }
 }
 
-fn embedded_launch_context() -> LaunchContext {
-    LaunchContext::unmanaged(RunId::new(run_id_from(
-        std::env::var("CARRICK_RUN_ID").ok(),
-    )))
+pub(crate) fn embedded_launch_context() -> LaunchContext {
+    LaunchContext::unmanaged_from_process_run_id(RunId::new(run_id_from(None)))
 }
 
 #[cfg(test)]

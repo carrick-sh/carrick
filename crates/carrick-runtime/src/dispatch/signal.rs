@@ -712,7 +712,7 @@ impl SyscallDispatcher {
         let info = LinuxSiginfo::kill(
             signum,
             crate::linux_abi::LINUX_SI_TKILL,
-            self.identity_pid() as i32,
+            ns_visible_sender_pid(context),
             self.cred_snapshot().ruid.raw(),
         );
         self.record_pending_siginfo(context, tid, signum, info);
@@ -767,7 +767,7 @@ impl SyscallDispatcher {
             // target, then mirror its in-process delivery half (per-tid
             // siginfo store + per-tid pending mark + host-slot waiter kick)
             // instead of the shared-set publish above.
-            let Some(target) = resolve_xsig_thread_target(target_ns_tid) else {
+            let Some(target) = resolve_xsig_thread_target(context, target_ns_tid) else {
                 // No live thread bears this tid: Linux discards a
                 // thread-directed pending signal at thread exit (it is NOT
                 // redirected to a sibling or the whole thread group), so the
@@ -1185,8 +1185,24 @@ impl SyscallDispatcher {
         debug_assert!(pid <= 0, "kernel group signal requires a group selector");
         let kernel = ctx.kernel.kernel();
         let caller = ctx.kernel.task();
-        let targets = if pid == -1 {
-            kernel.task_keys_for_broadcast(caller.key().id)
+        // Keep selector lookup ahead of invalid-signal reporting: Linux returns
+        // ESRCH for a missing group even when the supplied signal is invalid.
+        // An invalid signal is represented as `None` only while selecting and
+        // authorizing; it is rejected below before any ticket can be posted.
+        let signal = if signum == 0 {
+            None
+        } else {
+            crate::kernel::LinuxSignal::for_signal_number(signum as i32).ok()
+        };
+        let invalid_signal = signum != 0 && signal.is_none();
+        let authorizations = if pid == -1 {
+            kernel
+                .task_keys_for_broadcast(caller.key().id)
+                .into_iter()
+                .map(|target| {
+                    kernel.authorize_signal_target_exact(ctx.kernel, target, None, signal)
+                })
+                .collect()
         } else {
             // pid == 0 is the caller's own group; pid < -1 names `-pid`.
             //
@@ -1195,30 +1211,33 @@ impl SyscallDispatcher {
             // syscall handler is FATAL — one unprivileged call took the whole
             // guest down (LTP kill03). No process group can bear that id, so the
             // overflow lowers to the same ESRCH an unknown group gets.
-            let group = if pid == 0 {
-                caller.process_group()
+            let selected = if pid == 0 {
+                kernel.authorize_current_process_group_signal_targets_exact(ctx.kernel, signal)
             } else {
                 match pid.checked_neg().ok_or(()).and_then(|p| {
-                    // `-pid` names an ns-pgid; group ids are leader pids, so
-                    // the pid translation applies. An unknown number keeps its
-                    // raw value and resolves to the same ESRCH below.
-                    let p = crate::namespace::pid::guest_pid_to_kernel(p).unwrap_or(p);
-                    crate::kernel::ProcessGroupId::from_abi_positive(p).map_err(|_| ())
+                    let p = u32::try_from(p).map_err(|_| ())?;
+                    // Resolve the namespace name and capture exact member
+                    // generations under one registry read. A concurrent reap
+                    // and numeric reuse can make later delivery fail, but can
+                    // never redirect it into the replacement group.
+                    kernel
+                        .authorize_namespace_process_group_signal_targets_exact(
+                            ctx.kernel, p, signal,
+                        )
+                        .ok_or(())
                 }) {
-                    Ok(group) => group,
+                    Ok(targets) => Some(targets),
                     Err(()) => return DispatchOutcome::errno(LINUX_ESRCH),
                 }
             };
-            kernel.task_keys_in_process_group(group)
-        };
-        let signal = if signum == 0 {
-            None
-        } else {
-            match crate::kernel::LinuxSignal::for_signal_number(signum as i32) {
-                Ok(signal) => Some(signal),
-                Err(_) => return DispatchOutcome::errno(LINUX_EINVAL),
+            match selected {
+                Some(targets) => targets,
+                None => return DispatchOutcome::errno(LINUX_ESRCH),
             }
         };
+        if invalid_signal {
+            return DispatchOutcome::errno(LINUX_EINVAL);
+        }
         // Linux fills si_pid/si_uid with the SENDER's identity for a
         // kill(2)-delivered signal, so an SA_SIGINFO handler in the target can
         // tell who signalled it rather than seeing an all-zero SI_USER.
@@ -1233,8 +1252,8 @@ impl SyscallDispatcher {
         );
         let mut accepted = 0_usize;
         let mut denied = 0_usize;
-        for target in targets {
-            match kernel.authorize_signal_target_exact(ctx.kernel, target, None, signal) {
+        for authorization in authorizations {
+            match authorization {
                 crate::kernel::ExactSignalTargetAuthorization::Allowed(ticket) => {
                     if signal.is_none_or(|signal| {
                         kernel.post_signal_to_authorized_target(&ticket, signal, Some(info))
@@ -1270,14 +1289,13 @@ impl SyscallDispatcher {
         if !hvpatch_owns_specific_process_signal(crate::dispatch::hvpatch_lane_active(), pid) {
             return None;
         }
-        let kernel = ctx.kernel.kernel();
         let target_key = if u32::try_from(pid).is_ok_and(|p| p == self.identity_pid()) {
             Some(ctx.kernel.task().key())
         } else {
-            hvpatch_process_signal_target(kernel, pid)
+            hvpatch_process_signal_target(ctx.kernel, pid)
         };
         let Some(target_key) = target_key else {
-            if hvpatch_signal_observes_zombie(kernel, pid) {
+            if hvpatch_signal_observes_zombie(ctx.kernel, pid) {
                 // Addressable but no longer running: the signal is dropped and
                 // the call succeeds, exactly as Linux does for a zombie.
                 return Some(DispatchOutcome::Returned { value: 0 });
@@ -1340,15 +1358,13 @@ impl SyscallDispatcher {
         signum: u64,
         siginfo: Option<LinuxSiginfo>,
     ) -> Option<DispatchOutcome> {
-        // A guest tid is mixed-domain: a group leader is named by its ns-pid
-        // (what `gettid` reports for it), a secondary thread by its kernel
-        // tid. `guest_tid_to_kernel` translates the former and passes the
-        // latter through.
-        let tid = match crate::kernel::LinuxTid::from_abi_positive(
-            crate::namespace::pid::guest_tid_to_kernel(tid),
-        ) {
-            Ok(tid) => tid,
-            Err(_) => return Some(DispatchOutcome::errno(LINUX_ESRCH)),
+        // Leaders and secondary threads share the caller's namespace-local
+        // PID/TID domain. A missing mapping is ESRCH, never a raw-id fallback.
+        let tid = match crate::namespace::pid::guest_tid_to_kernel_for(context, tid)
+            .and_then(|tid| crate::kernel::LinuxTid::from_abi_positive(tid).ok())
+        {
+            Some(tid) => tid,
+            None => return Some(DispatchOutcome::errno(LINUX_ESRCH)),
         };
         let kernel = context.kernel();
         let required_task = match tgid {
@@ -1357,15 +1373,10 @@ impl SyscallDispatcher {
                     || names_self_pid(i64::from(raw))
                 {
                     Some(context.task().key().id)
-                } else if let Some(target_key) = hvpatch_process_signal_target(kernel, raw) {
+                } else if let Some(target_key) = hvpatch_process_signal_target(context, raw) {
                     Some(target_key.id)
                 } else {
-                    match crate::kernel::TaskId::from_abi_positive(
-                        crate::namespace::pid::guest_pid_to_kernel(raw).unwrap_or(raw),
-                    ) {
-                        Ok(task) => Some(task),
-                        Err(_) => return Some(DispatchOutcome::errno(LINUX_ESRCH)),
-                    }
+                    return Some(DispatchOutcome::errno(LINUX_ESRCH));
                 }
             }
             None => None,
@@ -1677,7 +1688,7 @@ impl SyscallDispatcher {
                 crate::linux_abi::LinuxSiginfo::kill(
                     signum as i32,
                     crate::linux_abi::LINUX_SI_TKILL,
-                    cx.kernel.task().key().id.raw(),
+                    ns_visible_sender_pid(cx.kernel),
                     this.cred_snapshot().ruid.raw(),
                 )
             });
@@ -1701,7 +1712,7 @@ impl SyscallDispatcher {
                 crate::linux_abi::LinuxSiginfo::kill(
                     signum as i32,
                     crate::linux_abi::LINUX_SI_TKILL,
-                    cx.kernel.task().key().id.raw(),
+                    ns_visible_sender_pid(cx.kernel),
                     this.cred_snapshot().ruid.raw(),
                 )
             });
@@ -2486,19 +2497,24 @@ fn rt_sigtimedwait_deliver(
 /// a per-call thread registry the way `route_thread_signal` does.
 ///
 /// The main thread's registry key deterministically equals this process's
-/// host pid (`ThreadId::main_from_host_pid`), so when the CURRENT process has
-/// no MT thread registry installed at all (the single-threaded run loop never
-/// calls `set_current_registry` — there is no CLONE_THREAD table to consult)
+/// host pid (`ThreadId::main_from_host_pid`), so when this container has no MT
+/// endpoint installed at all (the single-threaded run loop has no CLONE_THREAD
+/// table to publish)
 /// a `target_ns_tid` naming the main thread still resolves: this is the common
 /// "tid == pid" cross-process case (`bootstrap_signal_send_as`'s `GuestTid`
 /// comment), and it must keep working for a single-threaded target exactly as
 /// it did before this ring carried a tid at all. When a registry IS installed
 /// (an MT process), its `is_live` is authoritative for every tid, including
 /// the main one — deferred to entirely rather than short-circuited, so a
-/// thread-group leader that has since exited is not misreported live.
-fn resolve_xsig_thread_target(target_ns_tid: i32) -> Option<crate::thread::ThreadId> {
+/// thread-group leader that has since exited is not misreported live. The
+/// endpoint lookup is keyed by the calling container, never by ambient host
+/// thread state.
+fn resolve_xsig_thread_target(
+    context: &crate::kernel::KernelContext,
+    target_ns_tid: i32,
+) -> Option<crate::thread::ThreadId> {
     let requested = crate::thread::ThreadId::from_guest_supplied_tid(target_ns_tid);
-    match crate::thread::current_registry_liveness(requested) {
+    match crate::thread::container_registry_liveness(context.container().id(), requested) {
         Some(live) => live.then_some(requested),
         None => (requested == crate::thread::ThreadId::main_from_host_pid()).then_some(requested),
     }
@@ -2524,21 +2540,16 @@ fn names_self_pid(x: i64) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SignalTarget {
     /// One process named by its HOST pid: `kill(pid > 0)` after ns→host
-    /// translation, `pidfd_send_signal`'s registered host pid, fasync
-    /// `F_OWNER_PID` after ns→host translation.
+    /// translation or `pidfd_send_signal`'s registered host pid.
     HostProcess(HostPid),
-    /// A HOST process group: `kill(-pgid)` after ns→host-pgid translation,
-    /// fasync `F_OWNER_PGRP`. Holds the POSITIVE pgid; the kill(2) negative
-    /// encoding exists only inside [`Self::host_kill_encoding`].
+    /// A HOST process group: `kill(-pgid)` after ns→host-pgid translation.
+    /// Holds the POSITIVE pgid; the kill(2) negative encoding exists only
+    /// inside [`Self::host_kill_encoding`].
     HostProcessGroup(HostPid),
     /// `kill(0)`: every process in the CALLER's own process group.
     CallerProcessGroup,
     /// `kill(-1)`: every process the caller has permission to signal.
     Broadcast,
-    /// One thread named by a HOST-domain tid: fasync `F_OWNER_TID` after
-    /// ns→host translation. Cross-process, a main-thread tid is the target
-    /// process's host pid, which is how the host kill reaches it.
-    HostThread(HostPid),
 }
 
 impl SignalTarget {
@@ -2566,7 +2577,7 @@ impl SignalTarget {
     /// operate on this value, so the sign/sentinel semantics live in one place.
     fn host_kill_encoding(self) -> i64 {
         match self {
-            Self::HostProcess(p) | Self::HostThread(p) => i64::from(p.0),
+            Self::HostProcess(p) => i64::from(p.0),
             Self::HostProcessGroup(pg) => -i64::from(pg.0),
             Self::CallerProcessGroup => 0,
             Self::Broadcast => -1,
@@ -2585,18 +2596,23 @@ fn hvpatch_owns_specific_process_signal(hvpatch_lane: bool, pid: i32) -> bool {
 
 /// The calling task's pid as its SIGNAL TARGET will see it — ns-visible,
 /// falling back to the raw task id outside any namespace region.
-fn ns_visible_sender_pid(context: &crate::kernel::KernelContext) -> i32 {
+pub(crate) fn ns_visible_sender_pid(context: &crate::kernel::KernelContext) -> i32 {
     let raw = context.task().key().id.raw();
     u32::try_from(raw)
         .ok()
-        .map(|raw| crate::namespace::pid::host_to_ns_or_self_for(context, raw))
+        .and_then(|raw| crate::namespace::pid::try_ns_self_pid_for(context, raw))
         .and_then(|ns| i32::try_from(ns).ok())
-        .filter(|ns| *ns != 0)
-        .unwrap_or(raw)
+        .unwrap_or_else(|| {
+            tracing::error!(
+                internal_id = raw,
+                "signal sender is missing visible identity"
+            );
+            std::process::abort();
+        })
 }
 
 fn hvpatch_process_signal_target(
-    kernel: &crate::kernel::Kernel,
+    context: &crate::kernel::KernelContext,
     pid: i32,
 ) -> Option<crate::kernel::TaskKey> {
     // TRANSITIONAL identity bridge: in the raw (non-namespaced) lane
@@ -2614,26 +2630,29 @@ fn hvpatch_process_signal_target(
     // a secondary thread's kernel tid (the mixed tid domain `tkill` accepts,
     // and Linux lets `rt_sigqueueinfo` address a thread by it), so a miss
     // falls through to the thread lookup instead of concluding ESRCH.
-    let task_target = if u32::try_from(pid).is_ok_and(|p| p == std::process::id()) {
-        crate::kernel::TaskId::from_abi_positive(carrick_abi::LINUX_BOOTSTRAP_PID as i32).ok()
-    } else {
-        crate::namespace::pid::guest_pid_to_kernel(pid)
-            .and_then(|host| crate::kernel::TaskId::from_abi_positive(host).ok())
-    };
+    let raw = u32::try_from(pid).ok()?;
+    let task_target = crate::namespace::pid::ns_to_kernel_for(context, raw)
+        .and_then(|internal| i32::try_from(internal).ok())
+        .and_then(|internal| crate::kernel::TaskId::from_abi_positive(internal).ok());
     task_target
-        .and_then(|target| kernel.live_task_key(target))
+        .and_then(|target| context.kernel().live_task_key(target))
         .or_else(|| {
-            let tid = crate::kernel::LinuxTid::from_abi_positive(
-                crate::namespace::pid::guest_tid_to_kernel(pid),
-            )
-            .ok()?;
-            kernel
+            let tid = crate::namespace::pid::guest_tid_to_kernel_for(context, pid)
+                .and_then(|tid| crate::kernel::LinuxTid::from_abi_positive(tid).ok())?;
+            context
+                .kernel()
                 .live_keys_for_thread(None, tid)
-                .map(|(task, _thread)| task)
+                .and_then(|(task, _thread)| {
+                    context
+                        .kernel()
+                        .live_task(task.id)
+                        .filter(|task_ref| task_ref.container().id() == context.container().id())
+                        .map(|_| task)
+                })
         })
 }
 
-fn hvpatch_signal_observes_zombie(kernel: &crate::kernel::Kernel, pid: i32) -> bool {
+fn hvpatch_signal_observes_zombie(context: &crate::kernel::KernelContext, pid: i32) -> bool {
     // Linux keeps an exited child addressable until its parent consumes the
     // wait result. Numeric reuse cannot race this lookup: the zombie retains
     // its TaskClaim until that same consuming wait removes it.
@@ -2645,11 +2664,13 @@ fn hvpatch_signal_observes_zombie(kernel: &crate::kernel::Kernel, pid: i32) -> b
     // signum 0 made carrick return ESRCH for a real signal to an unreaped
     // child, which is what LTP's `SAFE_KILL(child, SIGTERM)` teardown does to
     // the one-shot signal helper `create_sig_proc()` spawns.
-    crate::kernel::TaskId::from_abi_positive(
-        crate::namespace::pid::guest_pid_to_kernel(pid).unwrap_or(pid),
-    )
-    .ok()
-    .is_some_and(|target| kernel.registry().zombie(target).is_some())
+    u32::try_from(pid)
+        .ok()
+        .and_then(|pid| crate::namespace::pid::ns_to_kernel_for(context, pid))
+        .and_then(|pid| i32::try_from(pid).ok())
+        .and_then(|pid| crate::kernel::TaskId::from_abi_positive(pid).ok())
+        .and_then(|target| context.kernel().registry().zombie(target))
+        .is_some_and(|zombie| zombie.container == context.container().id())
 }
 
 #[cfg(test)]
@@ -2807,7 +2828,6 @@ mod tests {
             SignalTarget::HostProcessGroup(guest_one),
             SignalTarget::CallerProcessGroup,
             SignalTarget::Broadcast,
-            SignalTarget::HostThread(guest_one),
         ] {
             assert!(
                 !host_signal_transport_allowed(true, target),
@@ -2867,6 +2887,97 @@ mod tests {
     }
 
     #[test]
+    fn kernel_group_signal_finds_surviving_members_after_leader_reap() {
+        use carrick_abi::LinuxCloneFlags;
+        use carrick_kernel::arena::KernelArena;
+
+        let arena = Box::leak(Box::new(KernelArena::create().expect("test kernel arena")));
+        let container = Arc::new(crate::kernel::Container::new(
+            crate::kernel::LaunchContext::unmanaged(crate::kernel::RunId::new(
+                "signal-group-leader-reap",
+            )),
+        ));
+        container
+            .install_pid_ns(
+                crate::namespace::pid::NsSharedRegion::allocate(arena).expect("pid namespace"),
+            )
+            .expect("install pid namespace");
+        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+            4_800,
+            crate::thread::ThreadId::synthetic_for_tests(4_800),
+            "signal-group-init".to_owned(),
+        )
+        .expect("bootstrap")
+        .with_container(Arc::clone(&container));
+        let (kernel, root) = crate::kernel::Kernel::bootstrap_root(bootstrap).expect("root");
+        let plan =
+            crate::kernel::ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
+        let leader = kernel
+            .reserve_fork(&root, plan, "group leader".to_owned(), None)
+            .expect("reserve group leader")
+            .prepare_reference(crate::thread::ThreadId::synthetic_for_tests(4_801))
+            .expect("prepare group leader")
+            .commit()
+            .expect("publish group leader")
+            .into_parts()
+            .expect("start group leader")
+            .0;
+        let group = kernel
+            .create_process_group(leader.task().key().id, None)
+            .expect("group");
+        let member = kernel
+            .reserve_fork(&leader, plan, "group member".to_owned(), None)
+            .expect("reserve group member")
+            .prepare_reference(crate::thread::ThreadId::synthetic_for_tests(4_802))
+            .expect("prepare group member")
+            .commit()
+            .expect("publish group member")
+            .into_parts()
+            .expect("start group member")
+            .0;
+        assert_eq!(member.task().process_group(), group);
+
+        let leader_key = leader.task().key();
+        kernel
+            .exit_task_key_eventually(
+                leader_key,
+                crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
+            )
+            .expect("exit leader");
+        drop(leader);
+        assert!(matches!(
+            kernel.wait_child(
+                root.task().key().id,
+                Some(leader_key.id),
+                crate::kernel::WaitMode::Consume,
+            ),
+            Ok(crate::kernel::WaitOutcome::Exited(_))
+        ));
+
+        let dispatcher = SyscallDispatcher::new();
+        let reporter = crate::compat::CompatReporter::default();
+        let mut memory = crate::dispatch::LinearMemory::new(0, vec![0; 64]);
+        let cx = crate::dispatch::SyscallCtx {
+            kernel: &root,
+            request: crate::dispatch::SyscallRequest::new(
+                129,
+                crate::dispatch::SyscallArgs::from([0, 0, 0, 0, 0, 0]),
+            ),
+            memory: &mut memory,
+            reporter: &reporter,
+            thread: None,
+            execution_lease: None,
+            mm_executor: None,
+        };
+        assert_eq!(
+            dispatcher.kernel_group_signal(&cx, -2, 0),
+            DispatchOutcome::Returned { value: 0 },
+            "kill(-2, 0) must resolve the live group record after its leader PID was reaped",
+        );
+        assert_eq!(kernel.validate_invariants(), Ok(()));
+    }
+
+    #[test]
     fn hvpatch_process_signal_target_accepts_live_member_tid() {
         let dispatcher = SyscallDispatcher::new();
         let root = dispatcher.capture_one_task_context().unwrap();
@@ -2876,7 +2987,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            hvpatch_process_signal_target(root.kernel(), sibling_tid.raw()),
+            hvpatch_process_signal_target(&root, sibling_tid.raw()),
             Some(root.task().key())
         );
     }
@@ -2912,18 +3023,15 @@ mod tests {
             )
             .expect("child exit");
 
-        assert!(hvpatch_process_signal_target(parent.kernel(), child_pid).is_none());
+        assert!(hvpatch_process_signal_target(&parent, child_pid).is_none());
         // Addressable until reaped, for EVERY signal — not just the signum-0
         // existence probe. The predicate no longer takes a signum at all; it
         // used to, and the assertion here demanded that a real signal NOT
         // observe the zombie, pinning the ESRCH bug in place. kill(2): "an
         // existing process might be a zombie ... that has not yet been
         // wait(2)ed for."
-        assert!(hvpatch_signal_observes_zombie(parent.kernel(), child_pid));
-        assert!(!hvpatch_signal_observes_zombie(
-            parent.kernel(),
-            child_pid + 1000,
-        ));
+        assert!(hvpatch_signal_observes_zombie(&parent, child_pid));
+        assert!(!hvpatch_signal_observes_zombie(&parent, child_pid + 1000,));
 
         parent
             .kernel()
@@ -2933,7 +3041,7 @@ mod tests {
                 crate::kernel::WaitMode::Consume,
             )
             .expect("consume child wait");
-        assert!(!hvpatch_signal_observes_zombie(parent.kernel(), child_pid));
+        assert!(!hvpatch_signal_observes_zombie(&parent, child_pid));
     }
 
     #[test]
@@ -2943,6 +3051,9 @@ mod tests {
         let tid = context.thread().registry_id();
         let signum = crate::linux_abi::LINUX_SIGUSR1;
         let info = LinuxSiginfo::rt_queue(signum, 71, 72, 0x1234_5678);
+        let mut caught = LinuxSigaction::empty();
+        caught.sa_handler = 0x4000;
+        SyscallDispatcher::install_signal_action(&context, signum, caught);
 
         assert_eq!(
             dispatcher.hvpatch_exact_process_signal(
@@ -2958,6 +3069,40 @@ mod tests {
             .expect("exact pidfd signal must enter the target task queue");
         assert_eq!(pending.signum, signum);
         assert_eq!(pending.siginfo, Some(info));
+    }
+
+    #[test]
+    fn generated_thread_signal_reports_the_exact_container_visible_sender_pid() {
+        use std::sync::Arc;
+
+        use carrick_kernel::arena::KernelArena;
+
+        use crate::kernel::{Container, Kernel, LaunchContext, RootBootstrap, RunId};
+        use crate::namespace::pid::NsSharedRegion;
+
+        let arena = Box::leak(Box::new(KernelArena::create().expect("test kernel arena")));
+        let container = Arc::new(Container::new(LaunchContext::unmanaged(RunId::new(
+            "signal-visible-sender",
+        ))));
+        container
+            .install_pid_ns(NsSharedRegion::allocate(arena).expect("pid namespace"))
+            .expect("install pid namespace");
+        let bootstrap = RootBootstrap::for_reference_model(
+            8_700,
+            crate::thread::ThreadId::synthetic_for_tests(8_700),
+            "signal-visible-sender-init".to_owned(),
+        )
+        .expect("bootstrap")
+        .with_container(container);
+        let (_kernel, context) = Kernel::bootstrap_root(bootstrap).expect("root");
+        let dispatcher = SyscallDispatcher::new();
+        let signum = crate::linux_abi::LINUX_SIGUSR1;
+
+        dispatcher.record_tkill_siginfo(&context, context.thread().registry_id(), signum);
+        let info = dispatcher
+            .take_pending_siginfo(&context, context.thread().registry_id(), signum)
+            .expect("SI_TKILL provenance");
+        assert_eq!((info.si_addr & 0xffff_ffff) as u32, 1);
     }
 
     #[test]
@@ -3912,25 +4057,36 @@ mod tests {
         assert_eq!((second.siginfo.unwrap().si_addr & 0xffff_ffff) as i32, 7777);
     }
 
-    /// Set up a live registry (main + one sibling) and publish it as the
-    /// process's CURRENT thread registry, so `drain_xsignals_process_directed`'s
-    /// `target_ns_tid` resolution (which consults
-    /// `crate::thread::current_registry_liveness`, the same per-process handle
-    /// `route_thread_signal` reaches via `ctx.thread.registry`) can resolve
+    /// Set up a live registry (main + one sibling) and publish it under this
+    /// dispatcher's exact container id, so `drain_xsignals_process_directed`'s
+    /// `target_ns_tid` resolution can resolve
     /// `main`/`sibling` as live. Registered under the SAME test-shape tids the
     /// pinning tests above use (`ThreadRegistry::new` takes `main` as the
     /// registry's main tid; `register_child` then allocates monotonically from
-    /// `main + 1`, landing exactly on `sibling`). Callers serialise on
-    /// `XSIG_RING_TEST_LOCK`: `CURRENT_REGISTRY` is ALSO a process-global
-    /// singleton, alongside the xsig ring itself.
-    fn install_test_registry(main: crate::thread::ThreadId, sibling: crate::thread::ThreadId) {
+    /// `main + 1`, landing exactly on `sibling`). Callers still serialise on
+    /// `XSIG_RING_TEST_LOCK` because the xsig ring itself is process-global.
+    fn install_test_registry(
+        dispatcher: &SyscallDispatcher,
+        main: crate::thread::ThreadId,
+        sibling: crate::thread::ThreadId,
+    ) -> (
+        std::sync::Arc<crate::thread::ThreadRegistry>,
+        std::sync::Arc<crate::thread::FutexTable>,
+        crate::thread::ContainerRuntimeEndpointRegistration,
+    ) {
         let registry = std::sync::Arc::new(crate::thread::ThreadRegistry::new(main));
         let allocated = registry.register_child(0);
         assert_eq!(
             allocated, sibling,
             "test tids must line up with the registry's next-tid allocation"
         );
-        crate::thread::set_current_registry(registry);
+        let futex = std::sync::Arc::new(crate::thread::FutexTable::new());
+        let registration = crate::thread::register_container_runtime_endpoint(
+            dispatcher.exact_signal_context_for_test().container().id(),
+            &registry,
+            &futex,
+        );
+        (registry, futex, registration)
     }
 
     /// Pins the target_ns_tid resolution + publish half of Task 3: a
@@ -3964,7 +4120,7 @@ mod tests {
             sibling,
             SigSet::EMPTY.with(usr1),
         );
-        install_test_registry(main, sibling);
+        let _endpoint = install_test_registry(&d, main, sibling);
 
         carrick_signal_core::xsig::xsig_init();
         assert!(
@@ -4101,7 +4257,7 @@ mod tests {
         let exited = crate::thread::ThreadId::synthetic_for_tests(6399);
         let usr1 = crate::linux_abi::LINUX_SIGUSR1;
         install_kernel_signal_threads(&d, &[main, sibling]);
-        install_test_registry(main, sibling);
+        let _endpoint = install_test_registry(&d, main, sibling);
 
         carrick_signal_core::xsig::xsig_init();
         assert!(carrick_signal_core::xsig::xsig_enqueue(
@@ -4457,16 +4613,23 @@ mod tests {
         let target_context = d
             .capture_kernel_context(target_tid)
             .expect("target context");
+        let target_visible_tid = crate::vcpu_loop::ns_visible_guest_tid(&d, &target_context)
+            .expect("target must have one namespace-visible tid");
+        let caller_visible_pid = crate::namespace::pid::try_ns_self_pid_for(
+            &caller_context,
+            u32::try_from(caller_context.task().key().id.raw()).expect("positive caller pid"),
+        )
+        .expect("caller must have one namespace-visible pid");
         let futex = crate::thread::FutexTable::new();
         let reporter = crate::compat::CompatReporter::default();
         let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
         let mut send = |number: u64, signum: u64| {
             let args = if number == 130 {
-                [target.raw() as u64, signum, 0, 0, 0, 0]
+                [u64::from(target_visible_tid), signum, 0, 0, 0, 0]
             } else {
                 [
-                    caller_context.task().key().id.raw() as u64,
-                    target.raw() as u64,
+                    u64::from(caller_visible_pid),
+                    u64::from(target_visible_tid),
                     signum,
                     0,
                     0,
@@ -4515,7 +4678,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![32, 32, 33]
         );
-        let sender_pid = caller_context.task().key().id.raw();
+        let sender_pid = i32::try_from(caller_visible_pid).expect("visible pid fits siginfo");
         let sender_uid = caller_context.resources().credentials().ruid().raw();
         for (signum, info) in delivered {
             let info = info.expect("SI_TKILL provenance");
@@ -4528,6 +4691,9 @@ mod tests {
             assert_eq!((si_addr >> 32) as u32, sender_uid);
         }
 
+        let mut caught = LinuxSigaction::empty();
+        caught.sa_handler = 0x4000;
+        SyscallDispatcher::install_signal_action(&caller_context, 10, caught);
         assert!(matches!(
             send(130, 10),
             DispatchOutcome::SignalThread {

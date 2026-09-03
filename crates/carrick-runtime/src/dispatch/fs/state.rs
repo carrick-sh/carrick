@@ -187,6 +187,99 @@ pub(in crate::dispatch) struct FsState {
     pub(in crate::dispatch) classic_record_locks: std::sync::Arc<super::LogicalRecordLocks>,
 }
 
+/// Exclusive terminal ownership of one container's immutable mount-routing
+/// table. Capturing this token seals mount configuration: every dispatcher
+/// fork and archive endpoint keeps an `Arc` alias while it can still perform a
+/// lookup, and retirement succeeds only after all of those aliases have been
+/// joined and dropped. This preserves the lock-free `entries` read path.
+pub(crate) struct MountRetirement {
+    container: crate::kernel::ContainerId,
+    mounts: Option<std::sync::Arc<crate::vfs::VfsMounts>>,
+    prepared: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum MountRetirementError {
+    #[error("mount retirement belongs to container {actual:?}, not {expected:?}")]
+    WrongContainer {
+        expected: crate::kernel::ContainerId,
+        actual: crate::kernel::ContainerId,
+    },
+    #[error("container {container:?} still has {owners} live mount-table owners")]
+    LiveOwners {
+        container: crate::kernel::ContainerId,
+        owners: usize,
+    },
+    #[error("container mount table was already retired")]
+    AlreadyRetired,
+}
+
+impl MountRetirement {
+    pub(crate) fn new(
+        container: crate::kernel::ContainerId,
+        mounts: std::sync::Arc<crate::vfs::VfsMounts>,
+    ) -> Self {
+        Self {
+            container,
+            mounts: Some(mounts),
+            prepared: false,
+        }
+    }
+
+    pub(crate) fn mount_count(&self) -> usize {
+        self.mounts.as_ref().map_or(0, |mounts| mounts.len())
+    }
+
+    /// Prove that the run loop, every forked dispatcher and archive control
+    /// endpoint have relinquished this exact table. Once this succeeds no
+    /// actor remains that could create a new `Arc` alias.
+    pub(crate) fn prepare(&mut self) -> Result<(), MountRetirementError> {
+        let mounts = self
+            .mounts
+            .as_ref()
+            .ok_or(MountRetirementError::AlreadyRetired)?;
+        let owners = std::sync::Arc::strong_count(mounts);
+        if owners != 1 {
+            return Err(MountRetirementError::LiveOwners {
+                container: self.container,
+                owners,
+            });
+        }
+        self.prepared = true;
+        Ok(())
+    }
+
+    pub(crate) fn prepare_for(
+        &mut self,
+        container: crate::kernel::ContainerId,
+    ) -> Result<(), MountRetirementError> {
+        if self.container != container {
+            return Err(MountRetirementError::WrongContainer {
+                expected: container,
+                actual: self.container,
+            });
+        }
+        self.prepare()
+    }
+
+    /// Drain and drop every mount before the teardown receipt is returned.
+    /// `prepare` made the `try_unwrap` invariant stable; failure here means an
+    /// impossible post-quiesce ownership change, so continuing would fabricate
+    /// cleanup evidence.
+    pub(crate) fn clear(&mut self) -> usize {
+        if !self.prepared {
+            std::process::abort();
+        }
+        let mounts = self.mounts.take().unwrap_or_else(|| std::process::abort());
+        let mut mounts = std::sync::Arc::try_unwrap(mounts).unwrap_or_else(|_| {
+            std::process::abort();
+        });
+        let count = mounts.clear_all();
+        self.prepared = false;
+        count
+    }
+}
+
 /// Where a guest's bare fd 1/2 bytes go for the whole run. Chosen at
 /// `Runtime::prepare`, sealed at boot, inherited by every logical child.
 pub enum StdioSink {

@@ -162,13 +162,9 @@ fn synthetic_dir_entries(path: &str) -> Option<Vec<super::DirEnt>> {
 
 /// The `/sys` mount.
 ///
-/// It holds the network NAMESPACE, not a copy of its contents: `/sys/class/net`
-/// is a view of whatever that namespace currently describes, so a republication
-/// (the run's own model replacing the boot-time host mirror) reaches the mount
-/// without remounting it. That is why there is no longer a
-/// `SysVfs::from_network_model` beside `SysVfs::new` — a second constructor was
-/// a second source, and the model-less one was the DEFAULT mount, which is how
-/// `ls /sys/class/net` came to list `awdl0` and `utun0` on the shipping lane.
+/// It holds the network NAMESPACE, not a copy of its contents. The dispatcher
+/// mounts the exact container-owned object before graph publication; later
+/// namespace republication reaches this mount without a remount.
 pub struct SysVfs {
     net_ns: std::sync::Arc<crate::kernel::NetNs>,
 }
@@ -176,15 +172,15 @@ pub struct SysVfs {
 impl SysVfs {
     pub fn new() -> Self {
         Self {
-            net_ns: std::sync::Arc::clone(crate::kernel::root_net_ns()),
+            net_ns: std::sync::Arc::new(crate::kernel::NetNs::from_model(
+                crate::namespace::process::alloc_ns_id(),
+                crate::network::model::LinuxNetworkModel::isolated(),
+            )),
         }
     }
 
-    /// A `/sys` rendering a namespace other than the carrier's root — the shape
-    /// a per-task mount takes once `unshare(CLONE_NEWNET)` is honoured, and the
-    /// only way a test can assert on a view without republishing the root's.
-    #[cfg(test)]
-    fn in_namespace(net_ns: std::sync::Arc<crate::kernel::NetNs>) -> Self {
+    /// A `/sys` rendering exactly this container/task network namespace.
+    pub(crate) fn in_namespace(net_ns: std::sync::Arc<crate::kernel::NetNs>) -> Self {
         Self { net_ns }
     }
 

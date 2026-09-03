@@ -264,6 +264,35 @@ const RAW_HASH: &str = r##" std::env::var_os("IGNORED"); "##;
         good_debt = dict(bad_debt, destination="Container.debt_field")
         compare((finding,), (good_debt,))
 
+    def test_concurrent_mode_rejects_even_destination_backed_container_debt(self):
+        finding = Finding("static", "crates/x/src/lib.rs", "DEBT", "a" * 64)
+        debt = reviewed_row(finding, classification="container_debt")
+        with self.assertRaises(LedgerError):
+            compare((finding,), (debt,), require_concurrent_embed_clean=True)
+
+    def test_concurrent_source_policy_rejects_ambient_runtime_accessors(self):
+        source = "fn current_thread_registry() -> &'static Registry { todo!() }"
+        with self.assertRaises(LedgerError):
+            GATE.validate_concurrent_source(
+                Path("crates/carrick-thread/src/thread.rs"), source
+            )
+
+    def test_concurrent_source_policy_rejects_run_id_env_below_launch_boundary(self):
+        source = 'fn helper() { let _ = std::env::var("CARRICK_RUN_ID"); }'
+        with self.assertRaises(LedgerError):
+            GATE.validate_concurrent_source(
+                Path("crates/carrick-runtime/src/dispatch/proctitle.rs"), source
+            )
+        GATE.validate_concurrent_source(
+            Path("crates/carrick-runtime/src/kernel/container.rs"), source
+        )
+
+    def test_concurrent_source_policy_allows_container_keyed_endpoint_map(self):
+        source = "static RUNTIME_ENDPOINTS: LazyLock<Map<ContainerId, Endpoint>> = init();"
+        GATE.validate_concurrent_source(
+            Path("crates/carrick-thread/src/thread.rs"), source
+        )
+
     def test_requires_rationale_for_all_rows(self):
         finding = Finding("static", "crates/x/src/lib.rs", "INFRA", "a" * 64)
         bad_infra = {

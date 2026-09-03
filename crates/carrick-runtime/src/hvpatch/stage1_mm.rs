@@ -20,6 +20,8 @@ const STAGE1_ROOT_SLOT_SIZE: u64 = 2 * 1024 * 1024;
 const STAGE1_ROOT_SLOT_COUNT: u32 =
     (carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_ARENA_SIZE / STAGE1_ROOT_SLOT_SIZE) as u32;
 
+static NEXT_ROOT_RETIREMENT_NONCE: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct Stage1RootSlot(u32);
 
@@ -32,6 +34,63 @@ impl Stage1RootSlot {
     pub(crate) fn size(self) -> u64 {
         STAGE1_ROOT_SLOT_SIZE
     }
+}
+
+/// One-shot request proving which reusable stage-1 slot the VMM must retire.
+///
+/// The VMM receives only the coordinates. The nonce stays opaque and is moved
+/// into a receipt only after the backend proves the exact stage-2 custody
+/// record is terminal, so allocator reuse cannot race physical retirement.
+#[derive(Debug)]
+pub struct Stage1RootRetirementTicket {
+    slot: Stage1RootSlot,
+    nonce: u64,
+}
+
+impl Stage1RootRetirementTicket {
+    pub(crate) fn base(&self) -> u64 {
+        self.slot.base()
+    }
+
+    pub(crate) fn size(&self) -> u64 {
+        self.slot.size()
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn redeem_vmm(
+        self,
+        proof: carrick_vmm_hvf::hvf_aarch64_engine::HvpatchMmRootRetirementProof,
+    ) -> Result<Stage1RootRetirementReceipt, Stage1MmError> {
+        let base = proof.root_slot_base();
+        let size = proof.root_slot_size();
+        if (base, size) != (self.slot.base(), self.slot.size()) {
+            return Err(Stage1MmError::RootRetirementMismatch {
+                expected_base: self.slot.base(),
+                expected_size: self.slot.size(),
+                actual_base: base,
+                actual_size: size,
+            });
+        }
+        Ok(Stage1RootRetirementReceipt {
+            slot: self.slot,
+            nonce: self.nonce,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_for_test(self) -> Stage1RootRetirementReceipt {
+        Stage1RootRetirementReceipt {
+            slot: self.slot,
+            nonce: self.nonce,
+        }
+    }
+}
+
+/// Opaque proof that the VMM terminalized the exact reusable root slot.
+#[derive(Debug)]
+pub struct Stage1RootRetirementReceipt {
+    slot: Stage1RootSlot,
+    nonce: u64,
 }
 
 #[derive(Debug)]
@@ -638,11 +697,20 @@ impl PreparedStage1MmRetirement {
         *lifecycle = Stage1MmLeaseLifecycle::Retired;
         drop(lifecycle);
         self.finished = true;
+        let root_retirement_nonce = self.root_slot.map(|_| {
+            NEXT_ROOT_RETIREMENT_NONCE
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    current.checked_add(1)
+                })
+                .unwrap_or_else(|_| std::process::abort())
+        });
         Stage1MmRetirement {
             pool: self.pool.clone(),
             asid,
             residency,
             root_slot: self.root_slot,
+            root_retirement_nonce,
+            root_ticket_issued: false,
         }
     }
 }
@@ -810,6 +878,8 @@ pub(crate) struct Stage1MmRetirement {
     asid: RetiredAsid,
     residency: AsidRetirement,
     root_slot: Option<Stage1RootSlot>,
+    root_retirement_nonce: Option<u64>,
+    root_ticket_issued: bool,
 }
 
 impl Stage1MmRetirement {
@@ -825,9 +895,44 @@ impl Stage1MmRetirement {
         self.residency.acknowledge(ack)
     }
 
-    pub(crate) fn complete(self) -> Result<(), Stage1MmError> {
+    pub(crate) fn take_root_retirement_ticket(
+        &mut self,
+    ) -> Result<Option<Stage1RootRetirementTicket>, Stage1MmError> {
+        let Some(slot) = self.root_slot else {
+            return Ok(None);
+        };
+        if self.root_ticket_issued {
+            return Err(Stage1MmError::RootRetirementTicketAlreadyIssued);
+        }
+        let nonce = self
+            .root_retirement_nonce
+            .ok_or(Stage1MmError::RootRetirementTicketUnavailable)?;
+        self.root_ticket_issued = true;
+        Ok(Some(Stage1RootRetirementTicket { slot, nonce }))
+    }
+
+    pub(crate) fn complete(
+        self,
+        root_receipt: Option<Stage1RootRetirementReceipt>,
+    ) -> Result<(), Stage1MmError> {
         if !self.residency.is_complete() {
             return Err(Stage1MmError::RetirementIncomplete);
+        }
+        match (self.root_slot, self.root_retirement_nonce, root_receipt) {
+            (None, None, None) => {}
+            (Some(slot), Some(nonce), Some(receipt))
+                if receipt.slot == slot && receipt.nonce == nonce => {}
+            (Some(slot), _, Some(receipt)) => {
+                return Err(Stage1MmError::RootRetirementMismatch {
+                    expected_base: slot.base(),
+                    expected_size: slot.size(),
+                    actual_base: receipt.slot.base(),
+                    actual_size: receipt.slot.size(),
+                });
+            }
+            (Some(_), _, None) => return Err(Stage1MmError::RootRetirementReceiptMissing),
+            (None, _, Some(_)) => return Err(Stage1MmError::UnexpectedRootRetirementReceipt),
+            (None, Some(_), None) => return Err(Stage1MmError::UnexpectedRootRetirementReceipt),
         }
         let mut inner = self.pool.inner.lock();
         inner.asids.acknowledge_tlb_flush(self.asid)?;
@@ -835,6 +940,14 @@ impl Stage1MmRetirement {
             inner.free_root_slots.insert(root_slot);
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_for_test(mut self) -> Result<(), Stage1MmError> {
+        let receipt = self
+            .take_root_retirement_ticket()?
+            .map(Stage1RootRetirementTicket::complete_for_test);
+        self.complete(receipt)
     }
 }
 
@@ -852,6 +965,23 @@ pub(crate) enum Stage1MmError {
     Retired,
     #[error("hvpatch stage-1 mm retirement still awaits executor invalidation")]
     RetirementIncomplete,
+    #[error("hvpatch stage-1 root retirement ticket was already issued")]
+    RootRetirementTicketAlreadyIssued,
+    #[error("hvpatch stage-1 root retirement ticket is unavailable")]
+    RootRetirementTicketUnavailable,
+    #[error("hvpatch stage-1 root retirement completed without a backend receipt")]
+    RootRetirementReceiptMissing,
+    #[error("hvpatch backend returned a root retirement receipt for a rootless address space")]
+    UnexpectedRootRetirementReceipt,
+    #[error(
+        "hvpatch backend root retirement mismatch: expected ({expected_base:#x}, {expected_size:#x}), got ({actual_base:#x}, {actual_size:#x})"
+    )]
+    RootRetirementMismatch {
+        expected_base: u64,
+        expected_size: u64,
+        actual_base: u64,
+        actual_size: u64,
+    },
     #[error(transparent)]
     Residency(#[from] AsidResidencyError),
 }
@@ -1170,7 +1300,7 @@ mod tests {
         assert_eq!(backend.binding(), initial);
         retired
             .expect("unshared exec retirement")
-            .complete()
+            .complete_for_test()
             .expect("ack retire");
         assert_eq!(backend.binding(), initial);
     }
@@ -1189,7 +1319,33 @@ mod tests {
         assert_eq!(replacement.root_slot(), first_root_slot);
         let lease = replacement.commit();
         let retirement = pool.retire(&lease).expect("retire committed lease");
-        retirement.complete().expect("acknowledge retirement");
+        retirement
+            .complete_for_test()
+            .expect("acknowledge retirement");
+    }
+
+    #[test]
+    fn reusable_root_slot_stays_quarantined_without_backend_retirement_receipt() {
+        let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 3).expect("root pool");
+        let lease = pool.prepare_child().expect("first child").commit();
+        let retired_slot = lease.root_slot().expect("reusable root slot");
+        let retirement = pool.retire(&lease).expect("retire child");
+
+        assert!(matches!(
+            retirement.complete(None),
+            Err(Stage1MmError::RootRetirementReceiptMissing)
+        ));
+
+        let replacement = pool.prepare_child().expect("replacement child");
+        assert_ne!(
+            replacement.root_slot(),
+            Some(retired_slot),
+            "a missing physical-retirement proof must quarantine the numeric slot"
+        );
+        pool.retire(&replacement.commit())
+            .expect("retire replacement")
+            .complete_for_test()
+            .expect("complete replacement retirement");
     }
 
     #[test]
@@ -1218,7 +1374,7 @@ mod tests {
                 retirement.asid_generation(),
             ))
             .expect("owner-thread invalidation ack");
-        retirement.complete().expect("complete retirement");
+        retirement.complete_for_test().expect("complete retirement");
 
         let replacement = pool.prepare_child().expect("replacement child");
         assert_eq!(replacement.binding().asid, binding.asid);
@@ -1257,7 +1413,9 @@ mod tests {
         retirement
             .acknowledge(InvalidationAck::new(resident, first_generation))
             .expect("exact first invalidation acknowledgement");
-        retirement.complete().expect("complete first retirement");
+        retirement
+            .complete_for_test()
+            .expect("complete first retirement");
         let reused = pool.prepare_child().expect("reuse completed root slot");
         assert_eq!(reused.binding().asid, first_binding.asid);
         assert_eq!(reused.root_slot(), Some(first_root));
@@ -1392,7 +1550,9 @@ mod tests {
         retirement
             .acknowledge(InvalidationAck::new(resident, generation))
             .expect("exact invalidation acknowledgement");
-        retirement.complete().expect("complete exact retirement");
+        retirement
+            .complete_for_test()
+            .expect("complete exact retirement");
 
         let replacement = pool.prepare_child().expect("reuse after exact ack");
         assert_eq!(replacement.binding().asid, binding.asid);
@@ -1563,7 +1723,9 @@ mod tests {
         retirement
             .acknowledge(InvalidationAck::new(dirty_executor, generation))
             .expect("exact dirty invalidation acknowledgement");
-        retirement.complete().expect("complete dirty quarantine");
+        retirement
+            .complete_for_test()
+            .expect("complete dirty quarantine");
 
         let replacement = pool.prepare_child().expect("reuse after dirty ack");
         assert_eq!(replacement.binding().asid, binding.asid);
@@ -1602,7 +1764,9 @@ mod tests {
         retirement
             .acknowledge(InvalidationAck::new(dirty_executor, generation))
             .expect("exact raced invalidation acknowledgement");
-        retirement.complete().expect("complete raced quarantine");
+        retirement
+            .complete_for_test()
+            .expect("complete raced quarantine");
     }
 
     #[test]
@@ -1626,7 +1790,7 @@ mod tests {
 
         assert!(retirement.pending().is_empty());
         retirement
-            .complete()
+            .complete_for_test()
             .expect("clean cancellation discharges retirement");
         let replacement = pool.prepare_child().expect("reuse after cancellation");
         assert_eq!(replacement.binding(), binding);
@@ -1657,7 +1821,9 @@ mod tests {
         retirement
             .acknowledge(InvalidationAck::new(resident_executor, generation))
             .expect("exact resident invalidation acknowledgement");
-        retirement.complete().expect("complete resident quarantine");
+        retirement
+            .complete_for_test()
+            .expect("complete resident quarantine");
         assert!(pool.prepare_child().is_ok());
     }
 

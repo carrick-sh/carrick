@@ -38,8 +38,8 @@ pub use clone_plan::{
     VforkMode,
 };
 pub use container::{
-    ClockDomain, Container, ContainerId, LaunchAuthorization, LaunchContext, RegistryContainerId,
-    RunId, SignedDuration, TimeControl, TimeError,
+    CarrierScopeId, ClockDomain, Container, ContainerId, LaunchAuthorization, LaunchContext,
+    RegistryContainerId, RunId, SignedDuration, TimeControl, TimeError,
 };
 pub use crash_capture::{
     CrashCaptureAuthority, CrashCaptureGeneration, CrashGenerationExhausted, CrashQuorum,
@@ -81,7 +81,6 @@ pub use ids::{
     ObjectIdRegistry, ProcessGroupId, SessionId, SighandId, TaskId, TaskSerial, ThreadSerial,
 };
 pub use netns::{NetNs, UtsNs};
-pub(crate) use netns::{publish_root_net_view, publish_root_nodename, root_net_ns, root_uts_ns};
 pub use objects::{
     Credentials, DumpableMode, FileDescription, FileDescriptionBackingKind,
     FileDescriptionBackingSnapshot, FileSlot, FileTable, FsContext, HandlerFrameState,

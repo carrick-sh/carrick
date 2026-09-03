@@ -2944,7 +2944,13 @@ impl SyscallDispatcher {
             let operator = this.identity_pid() as i32;
             let tid = cx.tid();
             let _block_state = (!flags.contains(MsgOpFlags::NOWAIT))
-                .then(|| SysvSemBlockStateGuard::new(sysv_run_state_task_pid(cx.kernel), tid));
+                .then(|| {
+                    SysvSemBlockStateGuard::new(
+                        cx.kernel.container().id(),
+                        sysv_run_state_task_pid(cx.kernel),
+                        tid,
+                    )
+                });
             let mut saw_would_block = false;
             loop {
                 match SysvIpcService::msgsnd(msqid, &creds, msg_type, &payload, operator) {
@@ -3016,7 +3022,13 @@ impl SyscallDispatcher {
             let operator = this.identity_pid() as i32;
             let tid = cx.tid();
             let _block_state = (!flags.contains(MsgOpFlags::NOWAIT))
-                .then(|| SysvSemBlockStateGuard::new(sysv_run_state_task_pid(cx.kernel), tid));
+                .then(|| {
+                    SysvSemBlockStateGuard::new(
+                        cx.kernel.container().id(),
+                        sysv_run_state_task_pid(cx.kernel),
+                        tid,
+                    )
+                });
             let mut saw_would_block = false;
             loop {
                 match SysvIpcService::msgrcv(cx, msqid, &creds, msgp.0, sz, msgtyp, flags, operator) {
@@ -3729,6 +3741,7 @@ impl Drop for SemWaitRegistration {
 /// process reads have exactly the same lifetime as the 'S' state that LTP's
 /// `TST_PROCESS_STATE_WAIT` polls for before reading them.
 struct SysvSemBlockStateGuard {
+    container: crate::kernel::ContainerId,
     task_pid: Option<i32>,
     tid: crate::thread::ThreadId,
     waits: Option<SemWaitRegistration>,
@@ -3762,27 +3775,39 @@ fn publish_sysv_block_run_state(
 }
 
 impl SysvSemBlockStateGuard {
-    fn new(task_pid: Option<i32>, tid: crate::thread::ThreadId) -> Self {
-        Self::with_waits(task_pid, tid, None)
+    fn new(
+        container: crate::kernel::ContainerId,
+        task_pid: Option<i32>,
+        tid: crate::thread::ThreadId,
+    ) -> Self {
+        Self::with_waits(container, task_pid, tid, None)
     }
 
     fn for_semop(
+        container: crate::kernel::ContainerId,
         task_pid: Option<i32>,
         tid: crate::thread::ThreadId,
         counts: &SemWaitCounters,
         sops: &[LinuxSembuf],
     ) -> Self {
-        Self::with_waits(task_pid, tid, Some(SemWaitRegistration::arm(counts, sops)))
+        Self::with_waits(
+            container,
+            task_pid,
+            tid,
+            Some(SemWaitRegistration::arm(counts, sops)),
+        )
     }
 
     fn with_waits(
+        container: crate::kernel::ContainerId,
         task_pid: Option<i32>,
         tid: crate::thread::ThreadId,
         waits: Option<SemWaitRegistration>,
     ) -> Self {
         publish_sysv_block_run_state(task_pid, tid, crate::run_state::RunState::Blocked);
-        crate::thread::set_current_thread_state(tid, 'S');
+        crate::thread::set_container_thread_state(container, tid, 'S');
         Self {
+            container,
             task_pid,
             tid,
             waits,
@@ -3793,7 +3818,7 @@ impl SysvSemBlockStateGuard {
 impl Drop for SysvSemBlockStateGuard {
     fn drop(&mut self) {
         self.waits = None;
-        crate::thread::set_current_thread_state(self.tid, 'R');
+        crate::thread::set_container_thread_state(self.container, self.tid, 'R');
         publish_sysv_block_run_state(self.task_pid, self.tid, crate::run_state::RunState::Running);
     }
 }
@@ -3913,6 +3938,7 @@ fn sysv_semop<M: CurrentMmMemory>(
             }
             if block_state.is_none() {
                 block_state = Some(SysvSemBlockStateGuard::for_semop(
+                    cx.kernel.container().id(),
                     task_pid,
                     cx.tid(),
                     wait_counts,
@@ -3955,7 +3981,7 @@ impl SyscallDispatcher {
         }
         let logical_operator = self
             .hvpatch_process()
-            .map(|_| cx.kernel.task().key().id.raw());
+            .map(|_| crate::dispatch::signal::ns_visible_sender_pid(cx.kernel));
         let tid = cx.tid();
         let interrupted = || {
             crate::host_signal::has_unblocked_pending_for(
@@ -4026,7 +4052,7 @@ impl SyscallDispatcher {
         };
         let caller_pid = self
             .hvpatch_process()
-            .map(|_| cx.kernel.task().key().id.raw())
+            .map(|_| crate::dispatch::signal::ns_visible_sender_pid(cx.kernel))
             .unwrap_or(0);
         let now = unix_now_secs();
 
@@ -4808,6 +4834,85 @@ mod ipc_set_tests {
 
         assert_eq!(parent.logical_last_operator(0), None);
         assert_eq!(parent.logical_last_operator(2), Some(73));
+    }
+
+    #[test]
+    fn semctl_getpid_reports_namespace_visible_operator() {
+        let dispatcher = SyscallDispatcher::new();
+        let (process, _) = crate::hvpatch::process_context_for_tests(83_101);
+        dispatcher.bind_hvpatch_process(process);
+        let parent = dispatcher.capture_one_task_context().expect("root context");
+        let arena = Box::leak(Box::new(
+            carrick_kernel::arena::KernelArena::create().expect("sysv pid namespace arena"),
+        ));
+        parent
+            .container()
+            .install_pid_ns(
+                crate::namespace::pid::NsSharedRegion::allocate(arena).expect("sysv pid namespace"),
+            )
+            .expect("install sysv pid namespace");
+        let child = parent
+            .kernel()
+            .reserve_fork(
+                &parent,
+                crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty())
+                    .expect("fork plan"),
+                "sysv-sempid-child".to_owned(),
+                None,
+            )
+            .expect("reserve child")
+            .prepare_reference(crate::thread::ThreadId::synthetic_for_tests(83_102))
+            .expect("prepare child")
+            .commit()
+            .expect("commit child")
+            .into_parts()
+            .expect("start child")
+            .0;
+        let visible_child = crate::dispatch::signal::ns_visible_sender_pid(&child);
+        assert_eq!(visible_child, 2);
+        assert_ne!(visible_child, child.task().key().id.raw());
+
+        let guest_semid = GuestSemId(9_901);
+        let fixture = InMemSemFixture::new(1);
+        dispatcher.sysv.with_state_mut(|state| {
+            state.semaphores.insert(guest_semid, fixture.set);
+        });
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x1000]);
+        memory
+            .write_bytes(
+                0x1000,
+                &sembuf_bytes(&[LinuxSembuf {
+                    sem_num: 0,
+                    sem_op: 1,
+                    sem_flg: 0,
+                }]),
+            )
+            .expect("stage semop");
+        let reporter = CompatReporter::default();
+        let mut cx = SyscallCtx {
+            kernel: &child,
+            request: SyscallRequest::new(193, SyscallArgs::from([0; 6])),
+            memory: &mut memory,
+            reporter: &reporter,
+            thread: None,
+            execution_lease: None,
+            mm_executor: None,
+        };
+        assert_eq!(
+            dispatcher
+                .sysv_semop(&mut cx, guest_semid.0, 0x1000, 1, None)
+                .expect("semop"),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let creds = dispatcher.cred_snapshot();
+        assert_eq!(
+            dispatcher
+                .sysv_semctl(&mut cx, guest_semid.0, 0, LINUX_GETPID, 0, &creds)
+                .expect("semctl GETPID"),
+            DispatchOutcome::Returned {
+                value: i64::from(visible_child)
+            }
+        );
     }
 
     struct InMemSemFixture {

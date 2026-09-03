@@ -25,13 +25,24 @@ class ClosureProbeScenarioTest(unittest.TestCase):
             (ROOT / "conformance-probes/probe-inventory.json").read_text(encoding="utf-8")
         )
 
-    def test_plan_selects_exactly_twenty_dedicated_sources_and_fourteen_runners(self):
+    def test_plan_selects_exactly_twenty_three_dedicated_sources_and_seventeen_runners(self):
         plan = scenarios.build_plan(self.inventory)
 
-        self.assertEqual(len(plan.sources), 20)
-        self.assertEqual(len(plan.commands), 14)
+        self.assertEqual(len(plan.sources), 23)
+        self.assertEqual(len(plan.commands), 17)
         self.assertEqual(
-            {command.test_target for command in plan.commands}, {"conformance"}
+            {
+                (command.package, command.test_target, command.transport)
+                for command in plan.commands
+            },
+            {
+                ("carrick-cli", "conformance", "cargo"),
+                (
+                    "carrick-conformance-next",
+                    "ptrace_poketext_signed",
+                    "test-signed",
+                ),
+            },
         )
         self.assertEqual(
             [source.name for source in plan.sources], sorted(source.name for source in plan.sources)
@@ -41,7 +52,7 @@ class ClosureProbeScenarioTest(unittest.TestCase):
         plan = scenarios.build_plan(self.inventory)
         rows = scenarios.expected_rows(plan)
 
-        self.assertEqual(len(rows), 40)
+        self.assertEqual(len(rows), 46)
         self.assertEqual({row.libc for row in rows}, {"musl", "gnu"})
         for source in plan.sources:
             self.assertEqual(
@@ -71,7 +82,9 @@ class ClosureProbeScenarioTest(unittest.TestCase):
     def test_runner_classifies_an_oracle_unavailable_note_even_when_cargo_is_green(self):
         command = scenarios.RunnerCommand(
             "conformance_bridge_publish_tcp",
+            "carrick-cli",
             "conformance",
+            "cargo",
             ("bridge_publish_tcp",),
         )
         completed = subprocess.CompletedProcess(
@@ -89,6 +102,69 @@ class ClosureProbeScenarioTest(unittest.TestCase):
 
         self.assertEqual(result.status, "NOTE")
 
+    def test_ptrace_runner_uses_signed_conformance_next_transport_for_requested_libc(self):
+        plan = scenarios.build_plan(self.inventory)
+        command = next(
+            command
+            for command in plan.commands
+            if command.runner
+            == "production_rx_poketext_executes_warm_patched_instruction"
+        )
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=(
+                "running 1 test\n"
+                "test production_rx_poketext_executes_warm_patched_instruction ... ok\n"
+                "test result: ok. 1 passed\n"
+                "running 1 test\n"
+                "test unsigned_executable_maps_hv_denied_to_entitlement ... ok\n"
+                "test result: ok. 1 passed\n"
+            ),
+            stderr="test-signed: OK (carrick-conformance-next: 1 invoked signed executable passed)\n",
+        )
+        with mock.patch.object(
+            scenarios.subprocess, "run", return_value=completed
+        ) as run:
+            result = scenarios._run_command(ROOT, command, "gnu")
+
+        self.assertEqual(result.status, "PASS")
+        args = run.call_args.args[0]
+        self.assertEqual(
+            args,
+            [
+                "scripts/test-signed.sh",
+                "carrick-conformance-next",
+                "production_rx_poketext_executes_warm_patched_instruction",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ],
+        )
+        self.assertEqual(
+            run.call_args.kwargs["env"]["CARRICK_PROBE_SCENARIO_LIBC"], "gnu"
+        )
+
+    def test_ptrace_runner_rejects_green_test_without_signed_transport_receipt(self):
+        plan = scenarios.build_plan(self.inventory)
+        command = next(
+            command
+            for command in plan.commands
+            if command.transport == "test-signed"
+        )
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=(
+                "test production_rx_poketext_executes_warm_patched_instruction ... ok\n"
+            ),
+            stderr="",
+        )
+        with mock.patch.object(scenarios.subprocess, "run", return_value=completed):
+            result = scenarios._run_command(ROOT, command, "musl")
+
+        self.assertEqual(result.status, "ERROR")
+
     def test_plan_runs_later_functions_and_libcs_after_an_early_failure(self):
         plan = scenarios.build_plan(self.inventory)
         calls = []
@@ -101,9 +177,9 @@ class ClosureProbeScenarioTest(unittest.TestCase):
         with redirect_stdout(StringIO()):
             rows = scenarios.run_plan(ROOT, plan, command_runner=fake_runner)
 
-        self.assertEqual(len(calls), 28)
+        self.assertEqual(len(calls), 34)
         self.assertEqual({libc for libc, _runner in calls}, {"gnu", "musl"})
-        self.assertEqual(len(rows), 40)
+        self.assertEqual(len(rows), 46)
         self.assertEqual(
             sum(row.status == "FAIL" for row in rows),
             len(plan.commands[0].sources),

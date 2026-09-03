@@ -240,16 +240,13 @@ pub(crate) fn install_fs_backend(
     Ok(())
 }
 
-/// The nodename of the ROOT UTS namespace — what `uname(2)`,
-/// `/proc/sys/kernel/hostname` and the `/etc/hosts` self-mapping report.
-///
-/// It used to BE the host fact: a direct `gethostname(3)` on every call, which
-/// is a machine answer to a namespace question. The host's short hostname now
-/// only SEEDS the root namespace (see [`crate::kernel::netns`]) under the
-/// `--net host` contract, and every reader goes to the namespace, so a name set
-/// after startup is the name every reader sees.
+/// Default nodename used while constructing a container whose run spec does
+/// not supply `--hostname`. Guest-facing reads never call this function: once
+/// bootstrapped, they resolve the calling task's UTS namespace.
 pub fn guest_hostname() -> String {
-    crate::kernel::root_uts_ns().nodename()
+    carrick_host::host_facts::host_short_hostname()
+        .unwrap_or(crate::linux_abi::CARRICK_HOSTNAME)
+        .to_owned()
 }
 
 pub(crate) fn effective_guest_hostname(spec: &RunSpec) -> Cow<'_, str> {

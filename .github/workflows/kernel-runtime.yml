@@ -1,0 +1,154 @@
+name: Kernel runtime · trusted hardware
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * *"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Focused signed execution on physical Apple Silicon. This is deliberately
+  # separate from public pull-request CI: hosted macOS Arm64 does not support
+  # the nested virtualization HVPatch requires.
+  hvf-kernel:
+    name: HVF · signed embed + cached probes
+    if: ${{ vars.CARRICK_SELF_HOSTED == 'true' }}
+    runs-on: [self-hosted, macos, arm64, carrick-hvf]
+    timeout-minutes: 180
+    concurrency:
+      group: carrick-hvf-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify Apple Silicon host
+        run: |
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          command -v codesign
+          command -v otool
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install just and cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-deny
+
+      - name: Install Semgrep
+        run: brew install semgrep || python3 -m pip install semgrep
+
+      - name: Host-only source gate
+        run: RUST_TEST_THREADS=1 just ci
+
+      - name: Build and codesign HVPatch artifact
+        run: just build
+
+      - name: Verify entitlement and DTrace section
+        run: |
+          codesign -d --entitlements - target/release/carrick 2>&1 \
+            | grep -q com.apple.security.hypervisor
+          otool -l target/release/carrick | grep -q __dof_carrick
+
+      - name: Signed embedded guest tests
+        run: RUST_TEST_THREADS=1 just test-embed
+
+      - name: Cached public probe gate
+        run: RUST_TEST_THREADS=1 CARRICK_PROBE_WORKERS=1 just conformance-probes
+
+  # The focused job above is not suite closure. This separate baseline-free
+  # gate is intentionally expensive, trusted-event-only, and dormant until the
+  # canonical image/oracle host is explicitly enabled.
+  hvf-closure:
+    name: HVF · strict 2,127-suite closure
+    if: >-
+      ${{ vars.CARRICK_SELF_HOSTED == 'true' &&
+          vars.CARRICK_SELF_HOSTED_FULL_CONFORMANCE == 'true' &&
+          (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+    needs: hvf-kernel
+    runs-on: [self-hosted, macos, arm64, carrick-hvf]
+    timeout-minutes: 1440
+    concurrency:
+      group: carrick-hvf-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify canonical closure host
+        run: |
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          command -v codesign
+          command -v otool
+          command -v docker
+          docker version
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: Build and verify frozen closure scope
+        run: |
+          just build
+          just conformance-closure-scope
+
+      - name: Strict 2,127-suite closure
+        run: |
+          just conformance full --closure --force
+          # `just conformance` re-signs its build dependency. Re-check scope on
+          # the exact post-gate artifact rather than relying only on preflight.
+          just conformance-closure-scope
+
+  # A real KVM device is the contract. An incidental or software-emulated
+  # hosted environment is not accepted as this smoke lane.
+  kvm-smoke:
+    name: KVM · real /dev/kvm smoke
+    if: >-
+      ${{ vars.CARRICK_SELF_HOSTED_KVM == 'true' &&
+          (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+    runs-on: [self-hosted, linux, kvm, carrick-kvm]
+    timeout-minutes: 60
+    concurrency:
+      group: carrick-kvm-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify KVM host
+        run: |
+          test "$(uname -s)" = Linux
+          test -c /dev/kvm
+          test -r /dev/kvm
+          test -w /dev/kvm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: KVM smoke fixture
+        run: just kvm-smoke

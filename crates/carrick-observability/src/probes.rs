@@ -7438,6 +7438,10 @@ mod real {
                     (*number, name.as_ref(), *retval, errno.unwrap_or(0))
                 });
             }
+            CompatEvent::SyscallRewrite { .. } => {
+                // The bounded compat section is the rewrite diagnostic sink;
+                // entry probes already carry the effective arguments.
+            }
             CompatEvent::UnhandledSyscall { number, name, args } => {
                 let args_ptr = args as *const SyscallArgs as u64;
                 carrick_usdt::unhandled__syscall!(|| (*number, name.as_str(), args_ptr));

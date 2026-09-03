@@ -19,9 +19,9 @@
 //! mach port (see [`ThreadRegistry::thread_ports`]); the kernel already knows
 //! whether a thread is WAITING in any blocking path, so a hand-maintained
 //! "sleeping" flag would only be a second source of truth to keep wrong. A
-//! process-global handle ([`set_current_registry`]) lets the fs/open `/proc`
-//! synthesis reach this process's registry without threading it through every
-//! syscall; a forked child re-publishes a fresh one.
+//! carrier-wide endpoint map lets filesystem and asynchronous signal callers
+//! reach the exact container's registry without inferring identity from the
+//! current host thread.
 //!
 //! [`FutexTable`] is the futex implementation. The key design decision is that
 //! a PRIVATE futex (`FUTEX_PRIVATE_FLAG`) never touches `__ulock` or a real
@@ -194,94 +194,116 @@ impl ExecSurvivorRekey {
     }
 }
 
-/// Process-global handle to THIS process's live thread registry, so the
-/// `/proc/<tid>/stat` and `/proc/<pid>/task/` synthesis (which runs on the
-/// fs/open path, where the per-syscall registry isn't threaded through) can
-/// read this process's thread tids + states. Set when the vCPU loop creates
-/// its registry and re-set in a forked child (which builds a fresh one).
-static CURRENT_REGISTRY: ParkingMutex<Option<Arc<ThreadRegistry>>> = ParkingMutex::new(None);
-static CURRENT_FUTEX_TABLE: ParkingMutex<Option<Weak<FutexTable>>> = ParkingMutex::new(None);
-#[cfg(test)]
-static CURRENT_FUTEX_TABLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-#[cfg(test)]
-pub(crate) fn current_futex_table_test_guard() -> std::sync::MutexGuard<'static, ()> {
-    CURRENT_FUTEX_TABLE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+#[derive(Clone)]
+struct RuntimeEndpointEntry {
+    generation: u64,
+    registry: Weak<ThreadRegistry>,
+    futex: Weak<FutexTable>,
 }
 
-/// Publish `registry` as this process's current registry. Called by the run
-/// loop at startup and after fork (the child has its own registry).
-pub fn set_current_registry(registry: Arc<ThreadRegistry>) {
-    *CURRENT_REGISTRY.lock() = Some(registry);
+static RUNTIME_ENDPOINTS: std::sync::LazyLock<
+    ParkingMutex<BTreeMap<carrick_hal::ContainerId, RuntimeEndpointEntry>>,
+> = std::sync::LazyLock::new(|| ParkingMutex::new(BTreeMap::new()));
+static NEXT_RUNTIME_ENDPOINT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Exact-generation ownership of one container's weak runtime endpoint.
+/// Dropping a stale token cannot erase a replacement endpoint.
+#[must_use = "the endpoint registration must live as long as its run loop"]
+pub struct ContainerRuntimeEndpointRegistration {
+    container: carrick_hal::ContainerId,
+    generation: u64,
 }
 
-/// Publish the process-private futex table for wake sources that live outside
-/// the runtime loop's `KernelState` (notably fallback timer-delivery threads).
-pub fn set_current_futex_table(table: &Arc<FutexTable>) {
-    *CURRENT_FUTEX_TABLE.lock() = Some(Arc::downgrade(table));
-}
-
-/// Wake private futex waiters for a process-directed signal fired from a helper
-/// thread. If the table has not been installed yet, there is no parked guest
-/// thread to wake.
-pub fn notify_current_futex_signal_pending() {
-    if let Some(table) = CURRENT_FUTEX_TABLE.lock().as_ref().and_then(Weak::upgrade) {
-        table.notify_signal_pending();
+impl Drop for ContainerRuntimeEndpointRegistration {
+    fn drop(&mut self) {
+        let mut endpoints = RUNTIME_ENDPOINTS.lock();
+        if endpoints
+            .get(&self.container)
+            .is_some_and(|entry| entry.generation == self.generation)
+        {
+            endpoints.remove(&self.container);
+        }
     }
-    // Shared futex waiters live in the carrier-wide table, which is never the
-    // CURRENT (per-process) table — a timer-thread signal must reach them too.
+}
+
+/// Install the weak thread/futex endpoint for one exact container generation.
+pub fn register_container_runtime_endpoint(
+    container: carrick_hal::ContainerId,
+    registry: &Arc<ThreadRegistry>,
+    futex: &Arc<FutexTable>,
+) -> ContainerRuntimeEndpointRegistration {
+    let generation = NEXT_RUNTIME_ENDPOINT_GENERATION.fetch_add(1, Ordering::Relaxed);
+    RUNTIME_ENDPOINTS.lock().insert(
+        container,
+        RuntimeEndpointEntry {
+            generation,
+            registry: Arc::downgrade(registry),
+            futex: Arc::downgrade(futex),
+        },
+    );
+    ContainerRuntimeEndpointRegistration {
+        container,
+        generation,
+    }
+}
+
+fn container_runtime_endpoint(
+    container: carrick_hal::ContainerId,
+) -> Option<(Arc<ThreadRegistry>, Arc<FutexTable>)> {
+    let mut endpoints = RUNTIME_ENDPOINTS.lock();
+    let entry = endpoints.get(&container)?.clone();
+    match (entry.registry.upgrade(), entry.futex.upgrade()) {
+        (Some(registry), Some(futex)) => Some((registry, futex)),
+        _ => {
+            if endpoints
+                .get(&container)
+                .is_some_and(|current| current.generation == entry.generation)
+            {
+                endpoints.remove(&container);
+            }
+            None
+        }
+    }
+}
+
+/// Wake only this container's private futex waiters for an asynchronous signal.
+pub fn notify_container_futex_signal_pending(container: carrick_hal::ContainerId) {
+    if let Some((_, futex)) = container_runtime_endpoint(container) {
+        futex.notify_signal_pending();
+    }
     crate::platform_futex::carrier_shared_futex_table().notify_signal_pending();
 }
 
-/// `tid`'s prctl/pthread-set name from the current process's registry, if set.
-/// Used by the `/proc/<pid>/task/<tid>/comm` handler (which has no direct
-/// registry handle) to report per-thread names.
-pub fn current_thread_name(tid: ThreadId) -> Option<[u8; 16]> {
-    CURRENT_REGISTRY
-        .lock()
-        .as_ref()
-        .and_then(|r| r.thread_name(tid))
+pub fn container_thread_name(
+    container: carrick_hal::ContainerId,
+    tid: ThreadId,
+) -> Option<[u8; 16]> {
+    container_runtime_endpoint(container)?.0.thread_name(tid)
 }
 
-/// This process's live `(tid, port)` pairs, or empty if unset. Used by
-/// platform-specific code (carrick-vmm-hvf) to query the kernel for thread states
-/// via mach port, since that API is Darwin-only and cannot live here.
-pub fn current_thread_ports() -> Vec<(ThreadId, ThreadPort)> {
-    CURRENT_REGISTRY
-        .lock()
-        .as_ref()
-        .map(|r| r.thread_ports())
+pub fn container_thread_ports(container: carrick_hal::ContainerId) -> Vec<(ThreadId, ThreadPort)> {
+    container_runtime_endpoint(container)
+        .map(|(registry, _)| registry.thread_ports())
         .unwrap_or_default()
 }
 
-/// This process's live `(tid, proc_state)` pairs, or empty if unset. Used by
-/// non-macOS backends where no Mach thread-state query exists.
-pub fn current_thread_state_chars() -> Vec<(ThreadId, char)> {
-    CURRENT_REGISTRY
-        .lock()
-        .as_ref()
-        .map(|r| r.thread_state_chars())
+pub fn container_thread_state_chars(container: carrick_hal::ContainerId) -> Vec<(ThreadId, char)> {
+    container_runtime_endpoint(container)
+        .map(|(registry, _)| registry.thread_state_chars())
         .unwrap_or_default()
 }
 
-/// Update one live thread's guest-visible `/proc` state in the current process.
-pub fn set_current_thread_state(tid: ThreadId, state: char) {
-    if let Some(registry) = CURRENT_REGISTRY.lock().as_ref() {
+pub fn set_container_thread_state(container: carrick_hal::ContainerId, tid: ThreadId, state: char) {
+    if let Some((registry, _)) = container_runtime_endpoint(container) {
         registry.set_thread_state(tid, state);
     }
 }
 
-/// Is `tid` live in the CURRENT process's thread registry? `None` when no
-/// registry has been installed at all (the single-threaded run loop never
-/// calls [`set_current_registry`] — there is no MT thread table to consult).
-/// Lets a caller with no `SyscallCtx` (an async drain, not a single syscall's
-/// dispatch) resolve a guest-supplied tid the same way
-/// `ThreadRegistry::is_live` does for the in-context `tgkill`/`tkill` route,
-/// without threading a registry reference through every call site.
-pub fn current_registry_liveness(tid: ThreadId) -> Option<bool> {
-    CURRENT_REGISTRY.lock().as_ref().map(|r| r.is_live(tid))
+pub fn container_registry_liveness(
+    container: carrick_hal::ContainerId,
+    tid: ThreadId,
+) -> Option<bool> {
+    container_runtime_endpoint(container).map(|(registry, _)| registry.is_live(tid))
 }
 
 impl ThreadRegistry {
@@ -2324,12 +2346,13 @@ mod tests {
     }
 
     #[test]
-    fn current_futex_signal_notification_interrupts_waiter() {
+    fn container_futex_signal_notification_interrupts_waiter() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let _guard = current_futex_table_test_guard();
+        let container = carrick_hal::ContainerId::allocate();
+        let registry = Arc::new(ThreadRegistry::new(ThreadId::synthetic_for_tests(30_001)));
         let table = Arc::new(FutexTable::new());
-        set_current_futex_table(&table);
+        let _endpoint = register_container_runtime_endpoint(container, &registry, &table);
         let addr = 0xfeed_beef_u64;
         let pending = Arc::new(AtomicBool::new(false));
         let pending2 = Arc::clone(&pending);
@@ -2337,13 +2360,63 @@ mod tests {
         let raiser = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
             pending2.store(true, Ordering::SeqCst);
-            notify_current_futex_signal_pending();
+            notify_container_futex_signal_pending(container);
         });
 
         let outcome = table.wait(addr, None, &|| pending.load(Ordering::SeqCst));
         assert_eq!(outcome, FutexWaitOutcome::Interrupted);
 
         raiser.join().unwrap();
+    }
+
+    #[test]
+    fn container_registry_routes_registry_and_futex_by_exact_container() {
+        let alpha = carrick_hal::ContainerId::allocate();
+        let beta = carrick_hal::ContainerId::allocate();
+        let alpha_tid = ThreadId::synthetic_for_tests(31_001);
+        let beta_tid = ThreadId::synthetic_for_tests(32_001);
+        let alpha_registry = Arc::new(ThreadRegistry::new(alpha_tid));
+        let beta_registry = Arc::new(ThreadRegistry::new(beta_tid));
+        alpha_registry.set_thread_name(alpha_tid, b"alpha-thread");
+        beta_registry.set_thread_name(beta_tid, b"beta-thread");
+        let alpha_futex = Arc::new(FutexTable::new());
+        let beta_futex = Arc::new(FutexTable::new());
+        let _alpha_endpoint =
+            register_container_runtime_endpoint(alpha, &alpha_registry, &alpha_futex);
+        let _beta_endpoint = register_container_runtime_endpoint(beta, &beta_registry, &beta_futex);
+
+        assert_eq!(
+            container_thread_name(alpha, alpha_tid),
+            alpha_registry.thread_name(alpha_tid)
+        );
+        assert_eq!(container_thread_name(alpha, beta_tid), None);
+        assert_eq!(container_registry_liveness(alpha, alpha_tid), Some(true));
+        assert_eq!(container_registry_liveness(alpha, beta_tid), Some(false));
+
+        let alpha_generation = alpha_futex.interrupt_generation();
+        let beta_generation = beta_futex.interrupt_generation();
+        notify_container_futex_signal_pending(alpha);
+        assert_ne!(alpha_futex.interrupt_generation(), alpha_generation);
+        assert_eq!(beta_futex.interrupt_generation(), beta_generation);
+    }
+
+    #[test]
+    fn container_registry_raii_removes_only_its_exact_generation() {
+        let container = carrick_hal::ContainerId::allocate();
+        let old_tid = ThreadId::synthetic_for_tests(33_001);
+        let new_tid = ThreadId::synthetic_for_tests(33_101);
+        let old_registry = Arc::new(ThreadRegistry::new(old_tid));
+        let new_registry = Arc::new(ThreadRegistry::new(new_tid));
+        let old_futex = Arc::new(FutexTable::new());
+        let new_futex = Arc::new(FutexTable::new());
+        let old = register_container_runtime_endpoint(container, &old_registry, &old_futex);
+        let new = register_container_runtime_endpoint(container, &new_registry, &new_futex);
+
+        drop(old);
+        assert_eq!(container_registry_liveness(container, new_tid), Some(true));
+        assert_eq!(container_registry_liveness(container, old_tid), Some(false));
+        drop(new);
+        assert_eq!(container_registry_liveness(container, new_tid), None);
     }
 
     #[test]

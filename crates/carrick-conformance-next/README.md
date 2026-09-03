@@ -1,6 +1,6 @@
 # `carrick-conformance-next`
 
-Self-hosted conformance framework for Carrick built on `carrick-embed`.
+In-process conformance framework for Carrick built on `carrick-embed`.
 
 ## Overview
 
@@ -21,6 +21,10 @@ in-process through `carrick-embed`. Do not add `std::process::Command`, invoke
 `carrick run`, or extend the legacy generic runner. Docker is used deliberately
 to refresh committed oracle results; it is not a dependency of the ordinary
 cached feedback loop.
+
+Committed Docker oracle results remove Docker from the ordinary feedback loop;
+they do not remove the hardware virtualization requirement on the Carrick side.
+On macOS, these tests still boot real HVF guests from signed test executables.
 
 Legacy execution is limited to the reviewed exceptions recorded in
 `scripts/conformance/retained-generic-probes.txt`, audited dedicated runners
@@ -43,3 +47,6 @@ just test-conformance-next
 # or directly:
 ./scripts/test-signed.sh carrick-conformance-next
 ```
+
+On a configured hardware gate, `HV_DENIED`, a missing entitlement, or
+unsupported nested virtualization is a failure, never a successful skip.

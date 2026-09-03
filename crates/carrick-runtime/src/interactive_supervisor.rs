@@ -6,6 +6,7 @@
 
 use std::io;
 use std::os::unix::io::RawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::dispatch::SyscallDispatcher;
 use crate::pty_relay::{PtyPair, PtyRelay};
@@ -13,6 +14,7 @@ use crate::pty_relay::{PtyPair, PtyRelay};
 /// Run-lifetime carrier-local PTY guard. It restores the carrier's original
 /// stdio before stopping the relay, including unwinding/error paths.
 pub struct InteractiveSession {
+    _admission: InteractiveSessionAdmission,
     saved_stdio: [RawFd; 3],
     relay: Option<PtyRelay>,
 }
@@ -27,8 +29,10 @@ impl std::fmt::Debug for InteractiveSession {
 
 impl InteractiveSession {
     pub fn start(dispatcher: &mut SyscallDispatcher) -> io::Result<Self> {
+        let admission = InteractiveSessionAdmission::acquire()?;
         crate::kernel::tty::prepare();
         let mut setup = SessionSetupGuard {
+            admission: Some(admission),
             saved_stdio: [-1; 3],
             owned_fds: Vec::new(),
             relay: None,
@@ -58,6 +62,10 @@ impl InteractiveSession {
         dispatcher.register_controlling_pty(slave_name);
         setup.committed = true;
         Ok(Self {
+            _admission: setup
+                .admission
+                .take()
+                .unwrap_or_else(|| std::process::abort()),
             saved_stdio: setup.saved_stdio,
             relay: setup.relay.take(),
         })
@@ -80,10 +88,37 @@ impl InteractiveSession {
 }
 
 struct SessionSetupGuard {
+    admission: Option<InteractiveSessionAdmission>,
     saved_stdio: [RawFd; 3],
     owned_fds: Vec<RawFd>,
     relay: Option<PtyRelay>,
     committed: bool,
+}
+
+static INTERACTIVE_SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Process-stdio and SIGWINCH routing are host-process resources, so only one
+/// interactive session may own them at a time. Non-interactive containers stay
+/// fully concurrent; a second tty request fails before it can clear or replace
+/// the live relay route.
+#[derive(Debug)]
+struct InteractiveSessionAdmission;
+
+impl InteractiveSessionAdmission {
+    fn acquire() -> io::Result<Self> {
+        INTERACTIVE_SESSION_ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| Self)
+            .map_err(|_| io::Error::from(io::ErrorKind::ResourceBusy))
+    }
+}
+
+impl Drop for InteractiveSessionAdmission {
+    fn drop(&mut self) {
+        if !INTERACTIVE_SESSION_ACTIVE.swap(false, Ordering::AcqRel) {
+            std::process::abort();
+        }
+    }
 }
 
 impl Drop for SessionSetupGuard {
@@ -120,5 +155,21 @@ fn dup_fd(fd: RawFd) -> io::Result<RawFd> {
         Err(io::Error::last_os_error())
     } else {
         Ok(crate::host_signal::relocate_internal_fd(duplicated))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InteractiveSessionAdmission;
+
+    #[test]
+    fn concurrent_interactive_session_admission_is_rejected_and_reusable() {
+        let first = InteractiveSessionAdmission::acquire().expect("first tty session");
+        let error = InteractiveSessionAdmission::acquire().expect_err("second tty must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::ResourceBusy);
+        drop(first);
+        let replacement =
+            InteractiveSessionAdmission::acquire().expect("tty admission released on drop");
+        drop(replacement);
     }
 }

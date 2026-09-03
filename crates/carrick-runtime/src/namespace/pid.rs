@@ -15,8 +15,8 @@
 //! namespaces (Phase 4) extend the same slot model.
 #![allow(dead_code)]
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use carrick_kernel::arena::{ArenaError, KernelArena};
 use carrick_kernel::domains::{HostPid, ProcessGeneration};
@@ -77,6 +77,74 @@ pub struct NsSharedRegion {
     /// Set by whichever of `retire`/`Drop` released the slot first, so the
     /// other is a no-op and a reused slot is never released twice.
     released: AtomicBool,
+    /// One Linux PID/TID number domain per namespace. Allocation is
+    /// monotonic; dropping a preparation burns its number but publishes no
+    /// membership, which is both Linux-compatible and rollback-safe.
+    next_identity: AtomicU32,
+    /// Serializes exact-claim validation with retirement. Once a stale holder
+    /// acquires this lock, it must still prove `claim` names the live arena
+    /// owner before reading or mutating either the slot or member records.
+    lifecycle: Mutex<()>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedNamespaceIdentity {
+    region: Arc<NsSharedRegion>,
+    internal_id: u32,
+    visible_id: u32,
+    parent_internal_id: u32,
+    active: Option<Arc<AtomicBool>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedNamespaceIdentityView {
+    internal_id: u32,
+    visible_id: u32,
+    active: Weak<AtomicBool>,
+}
+
+impl PreparedNamespaceIdentityView {
+    pub(crate) fn visible_for(&self, internal_id: u32) -> Option<u32> {
+        (self.internal_id == internal_id
+            && self
+                .active
+                .upgrade()
+                .is_some_and(|active| active.load(Ordering::Acquire)))
+        .then_some(self.visible_id)
+    }
+}
+
+impl PreparedNamespaceIdentity {
+    pub(crate) const fn visible_id(&self) -> u32 {
+        self.visible_id
+    }
+
+    pub(crate) fn view(&self) -> Option<PreparedNamespaceIdentityView> {
+        Some(PreparedNamespaceIdentityView {
+            internal_id: self.internal_id,
+            visible_id: self.visible_id,
+            active: Arc::downgrade(self.active.as_ref()?),
+        })
+    }
+
+    pub(crate) fn commit(self) -> bool {
+        let committed = self
+            .region
+            .register(self.internal_id, self.visible_id, self.parent_internal_id)
+            .is_some();
+        if let Some(active) = self.active.as_ref() {
+            active.store(false, Ordering::Release);
+        }
+        committed
+    }
+}
+
+impl Drop for PreparedNamespaceIdentity {
+    fn drop(&mut self) {
+        if let Some(active) = self.active.as_ref() {
+            active.store(false, Ordering::Release);
+        }
+    }
 }
 
 impl std::fmt::Debug for NsSharedRegion {
@@ -112,7 +180,66 @@ impl NsSharedRegion {
             ns,
             claim,
             released: AtomicBool::new(false),
+            next_identity: AtomicU32::new(NS_INIT_PID + 1),
+            lifecycle: Mutex::new(()),
         }))
+    }
+
+    fn claim_is_live(&self) -> bool {
+        !self.released.load(Ordering::Acquire)
+            && self
+                .arena
+                .layout()
+                .pid_namespaces
+                .slot(self.claim)
+                .is_some()
+    }
+
+    pub(crate) fn reserve_init_identity(
+        self: &Arc<Self>,
+        internal_id: u32,
+    ) -> Option<PreparedNamespaceIdentity> {
+        let _guard = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.claim_is_live() || self.init_host_pid_locked() != 0 {
+            return None;
+        }
+        Some(PreparedNamespaceIdentity {
+            region: Arc::clone(self),
+            internal_id,
+            visible_id: NS_INIT_PID,
+            parent_internal_id: 0,
+            active: Some(Arc::new(AtomicBool::new(true))),
+        })
+    }
+
+    pub(crate) fn reserve_identity(
+        self: &Arc<Self>,
+        internal_id: u32,
+        parent_internal_id: u32,
+    ) -> Option<PreparedNamespaceIdentity> {
+        let _guard = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.claim_is_live() {
+            return None;
+        }
+        let visible_id = self
+            .next_identity
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (current < i32::MAX as u32).then_some(current + 1)
+            })
+            .ok()?;
+        Some(PreparedNamespaceIdentity {
+            region: Arc::clone(self),
+            internal_id,
+            visible_id,
+            parent_internal_id,
+            active: None,
+        })
     }
 
     /// This namespace's id — the `pid:[N]` inode and the member record tag.
@@ -124,6 +251,17 @@ impl NsSharedRegion {
     /// it as the first member. The init's host process-group/session are
     /// captured so ns-pgid 1 ↔ that group (`host_to_ns_pgid`).
     pub fn set_init(&self, init_host_pid: u32) {
+        let _guard = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.claim_is_live()
+            || self
+                .register_locked(init_host_pid, NS_INIT_PID, 0)
+                .is_none()
+        {
+            return;
+        }
         self.ns
             .init_host_pid
             .store(init_host_pid, Ordering::Relaxed);
@@ -139,7 +277,50 @@ impl NsSharedRegion {
                 .init_host_sid
                 .store(init_host_sid as u32, Ordering::Relaxed);
         }
-        let _ = self.register(init_host_pid, NS_INIT_PID, 0);
+    }
+
+    /// Register a Carrick-kernel init whose task, process-group, and session
+    /// identities share one carrier-global number. Unlike [`Self::set_init`],
+    /// this never consults the host process group/session: multiple container
+    /// roots coexist inside the same host carrier.
+    pub(crate) fn set_kernel_init(&self, internal_task_id: u32) -> bool {
+        let _guard = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.claim_is_live()
+            || self
+                .register_locked(internal_task_id, NS_INIT_PID, 0)
+                .is_none()
+        {
+            return false;
+        }
+        self.ns
+            .init_host_pid
+            .store(internal_task_id, Ordering::Release);
+        self.ns
+            .init_host_pgid
+            .store(internal_task_id, Ordering::Release);
+        self.ns
+            .init_host_sid
+            .store(internal_task_id, Ordering::Release);
+        true
+    }
+
+    pub(crate) fn rollback_kernel_init(&self, internal_task_id: u32) {
+        let _guard = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.claim_is_live() {
+            return;
+        }
+        if self.ns.init_host_pid.load(Ordering::Acquire) == internal_task_id {
+            self.ns.init_host_pid.store(0, Ordering::Release);
+            self.ns.init_host_pgid.store(0, Ordering::Release);
+            self.ns.init_host_sid.store(0, Ordering::Release);
+        }
+        self.unregister_reaped_locked(internal_task_id);
     }
 
     /// Container teardown: retire every member this namespace still tags and
@@ -152,11 +333,19 @@ impl NsSharedRegion {
     }
 
     fn release_slot(&self) -> bool {
-        if self.released.swap(true, Ordering::AcqRel) {
+        let _guard = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.released.load(Ordering::Acquire) {
             return false;
         }
         self.retire_members();
-        self.arena.layout().pid_namespaces.release(self.claim)
+        if !self.arena.layout().pid_namespaces.release(self.claim) {
+            return false;
+        }
+        self.released.store(true, Ordering::Release);
+        true
     }
 
     /// Strip this namespace's identity from every record it tagged and release
@@ -261,11 +450,11 @@ pub fn host_to_ns_pgid(host_pgid: u32) -> u32 {
         Some(r) => {
             // The init's host group is ns-pgid 1 (Docker-style pid-1=pgid-1),
             // even though its host pgid is the launching shell's (a non-member).
-            let init_pgid = r.ns.init_host_pgid.load(Ordering::Acquire);
+            let init_pgid = r.init_host_pgid();
             if init_pgid != 0 && host_pgid == init_pgid {
                 return NS_INIT_PID;
             }
-            let init_sid = r.ns.init_host_sid.load(Ordering::Acquire);
+            let init_sid = r.init_host_sid();
             if init_sid != 0 && host_pgid == init_sid {
                 return NS_INIT_PID;
             }
@@ -284,7 +473,7 @@ pub fn ns_to_host_pgid(ns_pgid: u32) -> Option<u32> {
     match region() {
         Some(r) => {
             if ns_pgid == NS_INIT_PID {
-                let init_pgid = r.ns.init_host_pgid.load(Ordering::Acquire);
+                let init_pgid = r.init_host_pgid();
                 if init_pgid != 0 {
                     return Some(init_pgid);
                 }
@@ -304,10 +493,7 @@ pub fn refresh_init_host_pgid() {
     }
     let pgid = unsafe { libc::getpgrp() };
     if pgid > 0 {
-        region
-            .ns
-            .init_host_pgid
-            .store(pgid as u32, Ordering::Release);
+        region.set_init_host_pgid(pgid as u32);
     }
 }
 
@@ -328,26 +514,16 @@ pub fn guest_pid_to_kernel(pid: i32) -> Option<i32> {
     i32::try_from(host).ok()
 }
 
-/// A tid exactly as the GUEST names it, translated into the kernel thread-id
-/// number — with a raw fallback, because tids are a MIXED domain today:
-/// `gettid` reports a thread-group leader by its ns pid but a secondary thread
-/// by its kernel tid (secondary threads are not registered in the region). A
-/// registered number is a leader and translates; an unregistered one is taken
-/// as a kernel tid unchanged. The residual collision (a kernel tid numerically
-/// equal to another process's ns pid) is inherent to the split numbering and
-/// resolves only when thread ids allocate from the namespace, which is the
-/// documented follow-up in `docs/identity-and-scope-domains.md`.
-pub fn guest_tid_to_kernel(tid: i32) -> i32 {
-    let Ok(raw) = u32::try_from(tid) else {
-        return tid;
-    };
-    match region() {
-        Some(r) => r
-            .ns_to_host(raw)
-            .and_then(|host| i32::try_from(host).ok())
-            .unwrap_or(tid),
-        None => tid,
-    }
+/// Resolve a guest-visible thread id through the exact caller's PID
+/// namespace. A missing mapping never falls back to the carrier-global numeric
+/// id: that can alias another process or a thread the caller's namespace cannot
+/// name.
+pub(crate) fn guest_tid_to_kernel_for(
+    context: &crate::kernel::KernelContext,
+    tid: i32,
+) -> Option<i32> {
+    let raw = u32::try_from(tid).ok().filter(|raw| *raw != 0)?;
+    ns_to_kernel_for(context, raw).and_then(|internal| i32::try_from(internal).ok())
 }
 
 pub fn ns_to_host_or_self(ns_pid: u32) -> Option<u32> {
@@ -485,18 +661,13 @@ pub fn set_init_handler(signum: i32, installed: bool) {
     if bits == 0 {
         return;
     }
-    if installed {
-        r.ns.init_sig_handlers.fetch_or(bits, Ordering::Release);
-    } else {
-        r.ns.init_sig_handlers.fetch_and(!bits, Ordering::Release);
-    }
+    r.set_init_handler_bits(bits, installed);
 }
 
 /// Whether the ns-init has a handler installed for `signum`.
 pub fn init_handles(signum: i32) -> bool {
     match region() {
-        Some(r) => carrick_abi::SigSet::from_raw(r.ns.init_sig_handlers.load(Ordering::Acquire))
-            .contains(signum),
+        Some(r) => carrick_abi::SigSet::from_raw(r.init_handler_bits()).contains(signum),
         _ => false,
     }
 }
@@ -603,7 +774,10 @@ pub fn unregister_reaped(host_pid: u32) {
 /// outside the dispatch scope, so the region comes from the exact task.
 pub fn mark_self_execed_for(context: &crate::kernel::KernelContext) {
     let Some(r) = region_for(context) else { return };
-    r.mark_execed(std::process::id());
+    let Ok(internal) = u32::try_from(context.task().key().id.raw()) else {
+        std::process::abort();
+    };
+    r.mark_execed(internal);
 }
 
 /// [`host_to_ns_or_self`] for a caller outside the dispatch scope that holds
@@ -627,18 +801,105 @@ pub fn host_to_ns_or_self_for(context: &crate::kernel::KernelContext, host_pid: 
     }
 }
 
+/// Translate one carrier-global kernel identity through the exact caller's
+/// container PID namespace. A missing member stays invisible rather than
+/// falling back to a raw ID that may name another container's task.
+pub(crate) fn kernel_to_ns_for(
+    context: &crate::kernel::KernelContext,
+    internal_id: u32,
+) -> Option<u32> {
+    match region_for(context) {
+        Some(region) => region.host_to_ns(internal_id),
+        None => Some(internal_id),
+    }
+}
+
+pub(crate) fn ns_to_kernel_for(
+    context: &crate::kernel::KernelContext,
+    namespace_id: u32,
+) -> Option<u32> {
+    match region_for(context) {
+        Some(region) => region.ns_to_host(namespace_id),
+        None => Some(namespace_id),
+    }
+}
+
+/// Resolve a guest process-group id through the caller's container-scoped
+/// process-group records. Unlike PID membership, this authority remains live
+/// after the group leader is reaped while another member survives.
+pub(crate) fn ns_to_process_group_for(
+    context: &crate::kernel::KernelContext,
+    namespace_id: u32,
+) -> Option<crate::kernel::ProcessGroupId> {
+    context
+        .kernel()
+        .registry()
+        .process_group_from_namespace(context.container().id(), namespace_id)
+}
+
+/// Render an internal process-group key in the caller's container namespace.
+pub(crate) fn process_group_to_ns_for(
+    context: &crate::kernel::KernelContext,
+    group: crate::kernel::ProcessGroupId,
+) -> Option<u32> {
+    context
+        .kernel()
+        .registry()
+        .process_group_to_namespace(context.container().id(), group)
+}
+
+/// Resolve a guest session id through the caller's container-scoped session
+/// records. Kept typed even though current Linux SID-taking syscalls name a
+/// process, so future surfaces cannot accidentally fall back to PID lifetime.
+pub(crate) fn ns_to_session_for(
+    context: &crate::kernel::KernelContext,
+    namespace_id: u32,
+) -> Option<crate::kernel::SessionId> {
+    context
+        .kernel()
+        .registry()
+        .session_from_namespace(context.container().id(), namespace_id)
+}
+
+/// Render an internal session key in the caller's container namespace.
+pub(crate) fn session_to_ns_for(
+    context: &crate::kernel::KernelContext,
+    session: crate::kernel::SessionId,
+) -> Option<u32> {
+    context
+        .kernel()
+        .registry()
+        .session_to_namespace(context.container().id(), session)
+}
+
 /// The pid `host_pid` sees for ITSELF in `context`'s namespace — never zero.
 ///
 /// A miss means the task is not registered in the region, not that its
 /// ns-local pid is 0. `getpid()` never returns 0 on Linux, and this value
 /// reaches the guest both through the trapped handler and through the EL1
 /// identity page's no-exit fast path, so a zero here is a pid no process can
-/// have. Falls back to the untranslated pid, which is exactly what this
-/// namespace layer returns when there is no namespace at all.
+/// have. When no namespace is installed, the internal id is already visible.
 pub fn ns_self_pid_for(context: &crate::kernel::KernelContext, host_pid: u32) -> u32 {
+    try_ns_self_pid_for(context, host_pid).unwrap_or_else(|| {
+        tracing::error!(
+            internal_id = host_pid,
+            container = context.container().id().raw(),
+            "live task is missing its namespace-local identity"
+        );
+        std::process::abort();
+    })
+}
+
+pub(crate) fn try_ns_self_pid_for(
+    context: &crate::kernel::KernelContext,
+    host_pid: u32,
+) -> Option<u32> {
+    if let Some(pid) = context.provisional_namespace_pid_for(host_pid) {
+        return Some(pid);
+    }
     match region_for(context) {
-        Some(r) => r.host_to_ns(host_pid).unwrap_or(host_pid),
-        None => host_pid,
+        Some(r) => r.host_to_ns(host_pid),
+        None => Some(host_pid),
     }
 }
 
@@ -656,15 +917,100 @@ pub fn is_execed_child_of_current(target_ns_pid: u32) -> bool {
 impl NsSharedRegion {
     /// The init's host pid (ns-pid 1), or 0 if unset.
     pub fn init_host_pid(&self) -> u32 {
+        let _guard = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.claim_is_live() {
+            return 0;
+        }
+        self.init_host_pid_locked()
+    }
+
+    fn init_host_pid_locked(&self) -> u32 {
         self.ns.init_host_pid.load(Ordering::Acquire)
+    }
+
+    fn init_host_pgid(&self) -> u32 {
+        let _guard = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.claim_is_live() {
+            self.ns.init_host_pgid.load(Ordering::Acquire)
+        } else {
+            0
+        }
+    }
+
+    fn init_host_sid(&self) -> u32 {
+        let _guard = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.claim_is_live() {
+            self.ns.init_host_sid.load(Ordering::Acquire)
+        } else {
+            0
+        }
+    }
+
+    fn set_init_host_pgid(&self, pgid: u32) {
+        let _guard = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.claim_is_live() {
+            self.ns.init_host_pgid.store(pgid, Ordering::Release);
+        }
+    }
+
+    fn set_init_handler_bits(&self, bits: u64, installed: bool) {
+        let _guard = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.claim_is_live() {
+            return;
+        }
+        if installed {
+            self.ns.init_sig_handlers.fetch_or(bits, Ordering::Release);
+        } else {
+            self.ns
+                .init_sig_handlers
+                .fetch_and(!bits, Ordering::Release);
+        }
+    }
+
+    fn init_handler_bits(&self) -> u64 {
+        let _guard = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.claim_is_live() {
+            self.ns.init_sig_handlers.load(Ordering::Acquire)
+        } else {
+            0
+        }
     }
 
     /// Claim or reuse a process record for a namespace member. Returns the
     /// record index, or `None` if the process section is full.
     pub fn register(&self, host_pid: u32, ns_pid: u32, parent_host_pid: u32) -> Option<usize> {
+        let _guard = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.claim_is_live() {
+            return None;
+        }
+        self.register_locked(host_pid, ns_pid, parent_host_pid)
+    }
+
+    fn register_locked(&self, host_pid: u32, ns_pid: u32, parent_host_pid: u32) -> Option<usize> {
         let transition_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         loop {
-            if let Some(i) = self.slot_of(host_pid) {
+            if let Some(i) = self.slot_of_locked(host_pid) {
                 return Some(i);
             }
             // A task belongs to exactly one PID namespace: a host pid that is
@@ -703,6 +1049,13 @@ impl NsSharedRegion {
     /// host pid is not a member (caller decides the fallback — e.g. 0 for a
     /// parent outside the ns).
     pub fn host_to_ns(&self, host_pid: u32) -> Option<u32> {
+        let _guard = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.claim_is_live() {
+            return None;
+        }
         if host_pid == 0 || host_pid == HOST_PID_REGISTERING {
             return None;
         }
@@ -717,6 +1070,13 @@ impl NsSharedRegion {
     /// Translate an ns-pid to its host pid, or `None` if the ns-pid names no
     /// member (caller maps to `ESRCH`).
     pub fn ns_to_host(&self, ns_pid: u32) -> Option<u32> {
+        let _guard = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.claim_is_live() {
+            return None;
+        }
         for record in self.member_records() {
             if record.ns_pid.load(Ordering::Acquire) == ns_pid {
                 return Some(record.host_pid.load(Ordering::Acquire));
@@ -725,13 +1085,19 @@ impl NsSharedRegion {
         None
     }
 
-    /// All process records. Callers must skip non-members (`ns_pid == 0`).
-    pub fn members(&self) -> &[MemberSlot] {
-        &self.section.records
-    }
-
     /// Find the slot index for a host pid, if registered.
     pub fn slot_of(&self, host_pid: u32) -> Option<usize> {
+        let _guard = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.slot_of_locked(host_pid)
+    }
+
+    fn slot_of_locked(&self, host_pid: u32) -> Option<usize> {
+        if !self.claim_is_live() {
+            return None;
+        }
         if host_pid == 0 || host_pid == HOST_PID_REGISTERING {
             return None;
         }
@@ -761,13 +1127,21 @@ impl NsSharedRegion {
 
     /// The member's flags, or `None` if not registered.
     pub fn flags_of(&self, host_pid: u32) -> Option<u32> {
-        self.slot_of(host_pid)
+        let _guard = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.slot_of_locked(host_pid)
             .map(|i| self.section.records[i].flags.load(Ordering::Acquire))
     }
 
     /// The host pid recorded as this member's namespace parent at fork time.
     pub fn parent_host_pid_of(&self, host_pid: u32) -> Option<u32> {
-        self.slot_of(host_pid).map(|i| {
+        let _guard = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.slot_of_locked(host_pid).map(|i| {
             self.section.records[i]
                 .parent_host_pid
                 .load(Ordering::Acquire)
@@ -776,7 +1150,11 @@ impl NsSharedRegion {
 
     /// Whether the member has successfully executed a new image since fork.
     pub fn execed_of(&self, host_pid: u32) -> Option<bool> {
-        self.slot_of(host_pid).map(|i| {
+        let _guard = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.slot_of_locked(host_pid).map(|i| {
             self.section.records[i]
                 .exec_generation
                 .load(Ordering::Acquire)
@@ -786,7 +1164,11 @@ impl NsSharedRegion {
 
     /// Mark a registered member as having crossed an exec point of no return.
     pub fn mark_execed(&self, host_pid: u32) {
-        if let Some(i) = self.slot_of(host_pid) {
+        let _guard = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(i) = self.slot_of_locked(host_pid) {
             let record = &self.section.records[i];
             let _ = record.exec_generation.fetch_add(1, Ordering::AcqRel);
         }
@@ -795,7 +1177,11 @@ impl NsSharedRegion {
     /// Whether `host_pid` is a direct child of `parent_host_pid` and has
     /// successfully executed a new image.
     pub fn is_execed_child_of(&self, host_pid: u32, parent_host_pid: u32) -> bool {
-        let Some(i) = self.slot_of(host_pid) else {
+        let _guard = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(i) = self.slot_of_locked(host_pid) else {
             return false;
         };
         self.section.records[i]
@@ -810,26 +1196,48 @@ impl NsSharedRegion {
 
     /// Translate a member's recorded parent to the pid its namespace sees.
     pub fn ns_ppid_for_host(&self, host_pid: u32) -> Option<u32> {
-        let ns_pid = self.host_to_ns(host_pid)?;
+        let _guard = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.claim_is_live() {
+            return None;
+        }
+        let i = self.slot_of_locked(host_pid)?;
+        let ns_pid = self.section.records[i].ns_pid.load(Ordering::Acquire);
         if ns_pid == NS_INIT_PID {
             return Some(0);
         }
-        if self
-            .flags_of(host_pid)
-            .is_some_and(|flags| flags & MEMBER_ORPHANED != 0)
-        {
+        if self.section.records[i].flags.load(Ordering::Acquire) & MEMBER_ORPHANED != 0 {
             return Some(NS_INIT_PID);
         }
-        let parent = self.parent_host_pid_of(host_pid)?;
+        let parent = self.section.records[i]
+            .parent_host_pid
+            .load(Ordering::Acquire);
         if parent == 0 {
             return Some(0);
         }
-        Some(self.host_to_ns(parent).unwrap_or(NS_INIT_PID))
+        Some(
+            self.slot_of_locked(parent)
+                .map(|parent_i| {
+                    self.section.records[parent_i]
+                        .ns_pid
+                        .load(Ordering::Acquire)
+                })
+                .unwrap_or(NS_INIT_PID),
+        )
     }
 
     /// Mark every live member whose ns-parent is `dead_host_pid` as orphaned
     /// (design §3.6 step 3).
     pub fn mark_children_orphaned(&self, dead_host_pid: u32) {
+        let _guard = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.claim_is_live() {
+            return;
+        }
         for slot in self.member_records() {
             let host_pid = slot.host_pid.load(Ordering::Acquire);
             if host_pid != 0
@@ -844,7 +1252,11 @@ impl NsSharedRegion {
 
     /// Record a member's death and its exit status (design §3.4).
     pub fn mark_dead(&self, host_pid: u32, exit_status: i32) {
-        if let Some(i) = self.slot_of(host_pid) {
+        let _guard = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(i) = self.slot_of_locked(host_pid) {
             self.section.records[i]
                 .exit_status
                 .store(exit_status as u32 as u64, Ordering::Relaxed);
@@ -858,7 +1270,18 @@ impl NsSharedRegion {
     /// it. The process section is generation-checked, so a stale release cannot
     /// clear a reused record.
     pub fn unregister_reaped(&self, host_pid: u32) -> bool {
-        let Some(i) = self.slot_of(host_pid) else {
+        let _guard = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.claim_is_live() {
+            return false;
+        }
+        self.unregister_reaped_locked(host_pid)
+    }
+
+    fn unregister_reaped_locked(&self, host_pid: u32) -> bool {
+        let Some(i) = self.slot_of_locked(host_pid) else {
             return false;
         };
         let record = &self.section.records[i];
@@ -927,7 +1350,14 @@ impl NsSharedRegion {
     /// kept until that terminal reap (or the parent's own death) happens.
     /// Returns the number of records released.
     pub fn sweep_dead_owner_records(&self, is_gone: &dyn Fn(u32) -> bool) -> usize {
-        let init = self.init_host_pid();
+        let _guard = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.claim_is_live() {
+            return 0;
+        }
+        let init = self.init_host_pid_locked();
         let mut released = 0;
         for (index, record) in self.section.records.iter().enumerate() {
             let host_pid = record.host_pid.load(Ordering::Acquire);
@@ -985,7 +1415,7 @@ impl NsSharedRegion {
             if generation == 0 {
                 continue;
             }
-            if !is_gone(host_pid) || self.awaiting_guest_reap(record, is_gone) {
+            if !is_gone(host_pid) || Self::awaiting_guest_reap(record, is_gone, init) {
                 continue;
             }
             // Generation-checked release: a concurrent reuse of this slot
@@ -1007,7 +1437,11 @@ impl NsSharedRegion {
 
     /// Whether a gone owner's record still carries an exit some LIVE guest
     /// process can consume through `wait4` (see `sweep_dead_owner_records`).
-    fn awaiting_guest_reap(&self, record: &ProcessRecord, is_gone: &dyn Fn(u32) -> bool) -> bool {
+    fn awaiting_guest_reap(
+        record: &ProcessRecord,
+        is_gone: &dyn Fn(u32) -> bool,
+        init_host_pid: u32,
+    ) -> bool {
         let flags = record.flags.load(Ordering::Acquire);
         let consumable = record.exit_ready.load(Ordering::Acquire) != 0
             || (record.ns_pid.load(Ordering::Acquire) != 0 && flags & MEMBER_DEAD != 0);
@@ -1015,7 +1449,7 @@ impl NsSharedRegion {
             return false;
         }
         let waiter = if flags & MEMBER_ORPHANED != 0 {
-            self.init_host_pid()
+            init_host_pid
         } else {
             record.parent_host_pid.load(Ordering::Acquire)
         };
@@ -1678,5 +2112,44 @@ mod tests {
             arena.layout().pid_namespaces.slot(c.claim).is_some(),
             "dropping the last Arc of a retired region does not free c's slot"
         );
+    }
+
+    #[test]
+    fn failed_slot_release_does_not_falsely_mark_the_region_released() {
+        let arena = test_arena();
+        let region = NsSharedRegion::allocate(arena).expect("claim namespace");
+        assert!(arena.layout().pid_namespaces.release(region.claim));
+
+        assert!(!Arc::clone(&region).retire());
+        assert!(
+            !region.released.load(Ordering::Acquire),
+            "a failed arena release must remain retryable and visible as incomplete"
+        );
+    }
+
+    #[test]
+    fn stale_holder_cannot_read_or_mutate_a_reused_namespace_slot() {
+        let arena = test_arena();
+        let original = NsSharedRegion::allocate(arena).expect("claim original namespace");
+        let stale = Arc::clone(&original);
+        let reused_index = original.claim.index;
+        assert!(original.set_kernel_init(4_100));
+        assert!(original.retire());
+
+        let successor = NsSharedRegion::allocate(arena).expect("reuse retired namespace slot");
+        assert_eq!(successor.claim.index, reused_index);
+        assert!(successor.set_kernel_init(4_200));
+
+        assert_eq!(stale.init_host_pid(), 0, "stale read must fail closed");
+        assert_eq!(stale.host_to_ns(4_200), None);
+        assert_eq!(stale.ns_to_host(NS_INIT_PID), None);
+        assert_eq!(stale.register(4_201, 2, 4_200), None);
+        stale.mark_dead(4_200, 19);
+        stale.mark_children_orphaned(4_200);
+        stale.mark_execed(4_200);
+        assert_eq!(successor.host_to_ns(4_200), Some(NS_INIT_PID));
+        assert_eq!(successor.host_to_ns(4_201), None);
+        assert_eq!(successor.flags_of(4_200), Some(MEMBER_ALIVE));
+        assert_eq!(successor.execed_of(4_200), Some(false));
     }
 }

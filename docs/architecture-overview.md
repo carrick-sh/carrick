@@ -1,338 +1,293 @@
-# Carrick Architecture Overview
+# Carrick Kernel Architecture
 
-Carrick runs an unmodified Linux ELF binary as a **native macOS process**, not as a guest
-inside a virtual machine. There is no Linux kernel, no init, no second scheduler, and no
-separate hypervisor RAM pool. Each Linux process is one Darwin process: it forks with
-`libc::fork`, it is scheduled by XNU, it is reaped with `wait4`, and its `getpid()` returns
-the same number the host `ps` shows. What makes the Linux binary *think* it is on Linux is a
-thin slice of hardware — one `Hypervisor.framework` (HVF) virtual CPU per guest thread,
-running the guest's own instructions at EL0 with an identity-mapped MMU — plus a host-side
-Rust translation layer that services every `svc #0` the guest issues.
+Carrick runs Linux user space above Carrick's own kernel graph. There is no
+guest Linux kernel and no one-Darwin-process-per-Linux-process mapping. On the
+reference macOS/Apple Silicon lane, one carrier owns one HVF VM; Linux
+processes, threads, address spaces, namespaces, descriptors, waits, and signals
+are objects and transactions inside Carrick.
 
-The "process, not VM" thesis drives every design decision below. Because the guest pid *is*
-the host pid, process-lifecycle syscalls map almost directly onto Darwin primitives
-(`fork`→`fork`, `kill`→`kill` with signal-number translation, `wait4`→`wait4`). Because
-there is no guest kernel, every Linux syscall is decoded and serviced in host userspace and
-re-expressed as Darwin syscalls. And because the guest executes on real silicon at a real
-exception level, carrick gets genuine hardware enforcement of the guest/host boundary — at
-the cost of one EL0→EL1→EL2→host round-trip per trap, which the rest of this document
-explains how carrick keeps cheap.
+The host operating system and virtualization framework are hardware and
+facility providers. They execute guest instructions, back memory, store files,
+wait for readiness, and transmit bytes. They do not define Linux identity,
+lifecycle, or policy. That separation is the central architectural rule.
 
-This page is the architectural deep-dive. For the syscall-by-syscall translation table see
-[syscalls-emulation-map.md](syscalls-emulation-map.md); for how to observe any of the
-machinery below at runtime see [diagnostics-and-debugging.md](diagnostics-and-debugging.md).
+This page describes the current HVPatch unified-kernel model. See
+[the HAL guide](hal.md) for platform-specific backend details,
+[the syscall map](syscalls-emulation-map.md) for interface coverage, and
+[the conformance guide](conformance-testing.md) for what each test lane proves.
 
 > [!NOTE]
-> This document describes the mature macOS/HVF AArch64 execution path selected
-> with `--exec-backend vmm`, not the user CLI's native DSR default. The
-> platform split for Linux/KVM, FreeBSD/bhyve, NetBSD/NVMM, and the shared
-> x86_64 engine is covered in [hal.md](hal.md). Those backends reuse the same
-> runtime contract but differ in their raw VMM entry, register, memory, and host
-> primitive mechanics.
+> Carrick is experimental and incomplete. The macOS/HVF AArch64 lane is the
+> reference implementation; Linux/KVM, FreeBSD/bhyve, NetBSD/NVMM, and x86_64
+> support remain active bring-up work. None of these paths is a hardened trust
+> boundary.
 
 ---
 
-## 1. The HVF Trap Boundary & CPU Mode Switch
+## 1. One Carrier, One VM, One Kernel Graph
 
-To run a Linux binary, carrick stands up a tiny VM per process via HVF and hands the guest's
-own AArch64 instructions to the hardware. Carrick configures only what is needed to make EL0
-execution and the syscall trap work; it never emulates instructions on the hot path.
+A Carrick runtime instance has three different kinds of state:
 
-1. **CPU state initialization.** The vCPU's EL0 state is seeded with the program counter
-   pointing at the guest entry (the ELF `e_entry`, or the dynamic interpreter's `AT_BASE`)
-   and `SP_EL0` pointing at the guest stack carrick has already populated with `argc`,
-   `argv`, `envp`, and the auxiliary vector. HVF starts a vCPU at EL1h, so carrick installs
-   a one-page **EL0 entry trampoline** whose first instruction is `eret`: it seeds
-   `SPSR_EL1=EL0t` and `ELR_EL1=guest entry`, and the single `eret` drops the vCPU into EL0
-   at the program's first instruction.
+- the **carrier**, a host process that owns process-wide host facilities;
+- the **VM**, supplied by HVF, KVM, bhyve, or NVMM and used to execute guest
+  instructions and project physical memory;
+- the **kernel graph**, Carrick-owned objects for containers, namespaces,
+  processes, tasks, threads, address spaces, files, signals, waits, and IPC.
 
-2. **Exception vectors.** `VBAR_EL1` is programmed to point at a host-built vector-table page
-   (`el1_vectors_bytes`, `crates/carrick-mem/src/memory.rs:1506`). The AArch64 vector table
-   is sixteen 0x80-byte slots; carrick fills the "Lower EL using AArch64, synchronous" slot
-   at offset `0x400` (`AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET`) with a two-instruction stub and
-   makes every other slot a bare `eret` so spurious exceptions just return. When the guest
-   executes a Linux syscall via `svc #0`, the CPU vectors into that synchronous slot.
-
-3. **Hypervisor exit.** The synchronous-slot stub is `hvc #2; eret`
-   (`AARCH64_HVC_SYSCALL_OPCODE`, `crates/carrick-mem/src/memory.rs:133`). The `hvc` forces
-   an immediate VM-exit to EL2, returning control to carrick in host userspace. (`hvc #0` is
-   deliberately *avoided*: HVF can consume an `hvc #0` as an SMCCC hypercall before reporting
-   the exit when `x0` looks like an SMCCC function ID — V8's mmap hints can. `hvc #1` is
-   reserved for the EL1 stage-1 maintenance trampoline described in §2.)
-
-4. **Register inspection & dispatch.** At the exit, carrick reads the exception class.
-   A direct EL0 `svc` surfaces as `EC=0x15` (`AARCH64_SVC_EXCEPTION_CLASS`); the EL1 vector's
-   `hvc` re-trap surfaces as `EC=0x16` (`AARCH64_HVC_EXCEPTION_CLASS`), in which case carrick
-   reads `ESR_EL1` to confirm an underlying SVC and otherwise treats it as a fault
-   (`run_until_syscall`, `crates/carrick-vmm-hvf/src/trap.rs:1956`). On a confirmed syscall it
-   snapshots `x0..x5` and `x8` into an `Aarch64SyscallFrame` (`trap.rs:2068`) — `x8` is the
-   syscall number, `x0..x5` the six arguments — dispatches to the matching Rust handler, and
-   writes the return value back into `x0` (`complete_syscall`, `trap.rs:994`) before resuming
-   the vCPU at the post-`svc` `ELR_EL1`.
-
-```mermaid
-sequenceDiagram
-    participant Guest as Guest EL0 (Linux Process)
-    participant Kern as Guest EL1 (VBAR_EL1 vectors)
-    participant Host as Host EL2 → userspace (carrick runtime)
-
-    Guest->>Kern: svc #0 (Linux syscall, nr in x8, args in x0..x5)
-    Note over Kern: Lower-EL Synchronous slot (VBAR_EL1 + 0x400)
-    Kern->>Host: hvc #2 (VM-exit to EL2)
-    Note over Host: Read EC/ESR_EL1; decode x0..x5,x8;<br/>dispatch to Rust handler
-    Host->>Guest: Write x0 (retval) + resume vCPU at post-svc PC
-```
-
-> [!NOTE]
-> The trap path is also carrick's fault path. Any other lower-EL synchronous exception —
-> an instruction abort (`EC=0x20`), a data abort (`EC=0x24`), an undefined instruction — lands
-> in the same EL1 vector and re-traps via `hvc`; carrick reads `ESR_EL1`, declines to treat
-> `x8` as a syscall number, and instead delivers the appropriate Linux signal (e.g. `SIGSEGV`,
-> `SIGILL`) using the fault `ESR`/`FAR` captured at exit. A handful of EL0 system-register
-> reads (`CTR_EL0`, feature-ID registers Apple Rosetta probes) are emulated inline here so the
-> guest never sees a fatal undef.
-
----
-
-## 2. Identity Mapping & the FEAT_PAN3 Workaround
-
-ARMv8-A exclusive load/store primitives — `ldaxr`/`stlxr`, the backbone of every guest mutex,
-futex fast-path, and atomic — are the load-bearing constraint on how carrick maps guest
-memory.
-
-### Why a page table is mandatory
-
-If the guest ran with the stage-1 MMU disabled (`SCTLR_EL1.M=0`), the architecture forces
-*every* data access to be treated as `Device-nGnRnE`. Exclusive instructions on Device memory
-are architecturally prohibited; Apple's HVF raises an external abort rather than treating it
-as implementation-defined. The very first `ldaxr` musl issues from `pthread_mutex_lock` then
-aborts, and the guest spins forever. Carrick must therefore enable the MMU and tag guest
-memory as **Normal Inner-Shareable Write-Back cacheable** before the guest ever runs.
-
-### The identity map
-
-`stage1_identity_page_tables` (`crates/carrick-mem/src/memory.rs:1250`) builds a coarse
-**stage-1 identity map**: the guest virtual address *is* its intermediate physical address,
-across the whole `0..1 TiB` window that M-series HVF's 40-bit IPA ceiling allows. The trap
-engine programs `MAIR_EL1` slot 0 = Normal WB cacheable, points `TTBR0_EL1`/`TTBR1_EL1` at the
-table root, configures `TCR_EL1` for two active 48-bit halves (4 KiB granule, 40-bit IPS,
-top-byte-ignore for Rosetta pointer tags), and sets `SCTLR_EL1.M=1` on top of `C=1, I=1`
-(caches) plus `UCI`/`UCT`/`DZE` so glibc's EL0 cache-maintenance, `CTR_EL0` read, and
-`DC ZVA` work without trapping (`trap.rs:1377`–`1438`).
-
-The table is mostly coarse blocks (1 GiB at L1, 2 MiB at L2) so it is small and cheap to walk,
-but it is deliberately fine-grained where it must be:
-
-* **The first 2 MiB is split to 4 KiB pages (L3).** `VA 0..0x10000` stays *invalid* as a
-  null guard (matching Linux `mmap_min_addr`), so a guest NULL deref faults cleanly to
-  `SIGSEGV` at stage 1 instead of crashing the vCPU thread on an unbacked stage-2 fault. From
-  `0x10000` up the pages are user-accessible, which lets a low-loading static binary — Go's
-  `go` toolchain links its first segment at `0x10000` — actually run.
-* **A dedicated "kernel hole" at 180 GiB** (`LINUX_KERNEL_REGION_BASE = 0x2D_0000_0000`) holds
-  carrick's EL1-only pages: the EL0 entry trampoline, the `VBAR_EL1` vector table, the page
-  tables themselves, and the EL1 maintenance trampoline. It sits well above any guest image
-  and below the heap/mmap/stack windows.
-
-### The FEAT_PAN3 workaround
-
-On Apple Silicon, HVF starts the vCPU with `PSTATE.PAN=1` (Privileged Access Never) and
-*keeps* it set regardless of what the host writes to `CPSR` via `set_reg`. With FEAT_PAN3
-(mandatory on ARMv8.3+), any EL1 instruction fetch from a page whose descriptor has `AP[1]=1`
-(`AP=01`, user-accessible) raises a permission fault. Carrick never gets to clear PAN, so it
-splits the identity map by *who fetches from each page*:
-
-* **Kernel-only pages** (the entry trampoline, vectors, and page-table region — everything
-  EL1 fetches): `AP=00` (RW at EL1, no EL0 access), `UXN=1` (EL0 can never fetch them). With
-  `AP[1]=0` there is no user-accessible bit for FEAT_PAN3 to trip on. `PXN=0` so EL1 *can*
-  fetch the trampoline/vectors. This is `KERNEL_BLOCK_FLAGS` (`memory.rs:1288`).
-* **User pages** (guest text, interpreter, heap, mmap arena, stack — everything EL0 fetches):
-  `AP=01` (RW at EL0+EL1), `UXN=0` (EL0 may execute), and crucially `PXN=1` — **privileged
-  execute never**. `PXN=1` tells the CPU that EL1 is forbidden from fetching instructions
-  here, so the FEAT_PAN3 check never fires on these otherwise-user-accessible pages. This is
-  `USER_BLOCK_FLAGS`/`USER_PAGE_FLAGS` (`memory.rs:1296`).
-
-A second consequence of the W^X discipline: the anonymous mmap arena's boot blocks default
-`UXN=1` (non-executable), matching Linux's "a `mmap` without `PROT_EXEC` is not executable".
-Only a rare `PROT_EXEC` mapping splits a block to clear `UXN`, so the common RW mmap is a
-no-op in the runtime page-table manager.
-
-> [!IMPORTANT]
-> Carrick uses **stage-1 only**; it does not use HVF's stage-2 (IPA→PA) translation. That
-> avoids stage-2 TLB pressure but means a runtime page-table edit (guest `mmap`/`mprotect`/
-> `munmap`, which the host applies by editing the live stage-1 descriptors) needs explicit
-> maintenance: arm64 public HVF exposes no stage-2 TLB shootdown. Carrick owns guest EL1, so
-> it runs a tiny EL1 maintenance trampoline (`dsb sy; tlbi vmalle1is; dsb sy; isb; hvc #1`,
-> closing with `hvc #1` as its completion marker) on its own vCPU to flush stage-1, gated by
-> the Pause-Modify-Resume barrier in §3.
-
----
-
-## 3. The BKL-free Concurrency Model
-
-Carrick retired its Big Kernel Lock. A multithreaded guest — a web server, a build system,
-CPython's thread pool, the Go runtime — runs every guest thread on its own native CPU,
-concurrently, with no global serialization point.
-
-### One pthread, one vCPU, one shared address space
-
-Each guest thread maps to a native macOS `pthread`, and each pthread builds and owns its **own
-HVF vCPU** for its whole lifetime. When the guest issues a thread-creating `clone`/`clone3`,
-the runtime spawns a `guest-tid-N` thread (`crates/carrick-runtime/src/runtime.rs:1768`) which
-calls `HvfTrapEngine::from_thread_spec` (`crates/carrick-vmm-hvf/src/trap.rs:3496`) to create a
-fresh vCPU **in the same process VM**. `hv_vm_map` is VM-global on HVF, so the new vCPU
-already sees every region the parent mapped — all sibling vCPUs translate the *same* guest
-address space through the *same* page tables. The new vCPU is seeded at the EL0 trampoline
-with `ELR_EL1` = the post-`clone` instruction so its first `eret` resumes the guest thread
-exactly where Linux would.
-
-> [!NOTE]
-> HVF caps concurrent vCPUs (64 on current hardware). carrick binds one vCPU per guest thread,
-> so a guest with more live threads than the cap (CPython `test_queue` spawns 100) blocks the
-> new pthread in `wait_for_vcpu_slot` *after* `clone` already reported success to the guest —
-> matching Linux, which has no such cap — and starts the thread the instant a sibling exits and
-> frees a slot. Without this, a thread that silently failed to get a vCPU would deadlock any
-> `join` on it.
-
-### Subsystem-level locks, not one big lock
-
-The runtime shares its kernel state as a plain `Arc<KernelState>`
-(`runtime.rs:1289`) across every vCPU thread — no `SendKernel`, no `Rc<RefCell>`, no global
-dispatch lock. `KernelState` wraps a single `SyscallDispatcher` whose subsystems are
-*independently* lockable (`crates/carrick-runtime/src/dispatch/mod.rs:929`):
-
-| Subsystem | State | Lock |
-|---|---|---|
-| memory | brk, mmap arena, shared-file IPA window, `/proc/self/maps` regions | `Mutex<mem::MemState>` |
-| process | exe path, personality, dumpable flag, task comm | `Mutex<proc::ProcState>` |
-| credentials | uids/gids, umask | `Mutex<creds::CredState>` |
-| signals | handlers, mask, pending set, alt stack | `Mutex<signal::SignalState>` |
-| filesystem / I/O | VFS mount table, open-fd table, cwd, stdio buffers | `fs::FsState` / `fs::IoState` |
-| SysV IPC | host-file-backed shared-memory registry | `Mutex<sysv::SysvShmState>` |
-
-Two vCPUs in unrelated subsystems run fully in parallel: thread A reading a socket
-(`fs`/`io`) and thread B growing the heap (`mem`) never contend. The futex table and thread
-registry are separate `Arc`-shared structures; a guest `FUTEX_WAIT` parks the host thread on a
-Darwin `__ulock`/kqueue rather than spinning a lock.
-
-### Narrow borrows via `SyscallCtx`
-
-Each dispatched syscall is handed a transient `SyscallCtx<'a, M>`
-(`dispatch/mod.rs:505`) — a scoped borrow of just the guest memory, the compat reporter, and,
-on the threaded path, an optional `ThreadCtx` carrying this thread's Linux tid and the shared
-thread/futex tables. A handler locks only the subsystem(s) it actually touches, for only as
-long as the call runs. The borrow is dropped before the vCPU resumes, so locks are never held
-across guest execution.
-
-### Where the threads *do* synchronize
-
-Two operations are genuinely process-global and use explicit stop-the-world barriers rather
-than the per-subsystem locks (`crates/carrick-vmm-hvf/src/fork_quiesce.rs`):
-
-* **`fork(2)`** must snapshot a coherent address space. The forking thread raises a quiesce
-  flag and kicks every sibling vCPU out of `hv_vcpu_run`; each sibling parks at the lock-safe
-  run-loop top (a Dekker handshake guarantees it either observes the quiesce or hasn't entered
-  the guest yet). Only then does the parent `libc::fork`, after which both parent and child
-  rebuild a fresh vCPU. The child is a real new host process; it inherits the COW'd address
-  space and re-registers its host buffers via `hv_vm_map`.
-* **A runtime page-table edit** (the §2 stage-1 mutation) uses `PtQuiesce`, a
-  Pause-Modify-Resume barrier: pause siblings, edit the live descriptors from the host, run
-  the EL1 maintenance trampoline to flush stage-1, then resume. This is distinct from the fork
-  quiesce (which tears vCPUs down rather than resuming them).
-
----
-
-## 4. Interactive PtyRelay & Terminal Bridging
-
-`carrick run -t` gives the guest an interactive terminal: a real shell with job control,
-line editing, and live window resizing. This needs clean byte propagation, terminal-state
-save/restore, and reliable signal forwarding between the user's terminal and the guest.
-
-### Host pty allocation
-
-Carrick allocates a host pseudo-terminal pair via `posix_openpt` + `grantpt` + `unlockpt` +
-`ptsname` (`HostPty::allocate` → `vfs::devpts::open_master`,
-`crates/carrick-runtime/src/pty_relay.rs:110`). The slave fd is `dup2`'d onto host fds 0, 1,
-and 2 (`crates/carrick-runtime/src/interactive_supervisor.rs:351`) and made the controlling
-terminal with `ioctl(TIOCSCTTY)`; the guest process inherits these as its stdin/stdout/stderr,
-so the guest's terminal *is* the pty slave and gets real line discipline (cooked mode,
-`Ctrl-C`→`SIGINT`, `Ctrl-Z`→`SIGTSTP`).
-
-### The relay thread
-
-A dedicated `PtyRelay` thread (`pty_relay.rs`) runs a bidirectional `poll(2)` loop multiplexing
-several fds:
-
-* **real terminal `stdin` → pty master** — the user's keystrokes reach the guest.
-* **pty master → real terminal `stdout`** — the guest's output reaches the screen.
-* **a shutdown self-pipe** — lets `stop()` break the `poll` for a clean teardown, restoring the
-  saved host-terminal termios.
-
-### SIGWINCH via self-pipe
-
-Window resizes are forwarded without calling unsafe functions in async-signal context. The
-process-level `SIGWINCH` handler does the only async-signal-safe thing — it `write(2)`s a
-single byte to a non-blocking self-pipe (`pty_relay.rs:26`). The `poll` loop sees that pipe
-readable, drains it, reads the new size from the real terminal with `ioctl(TIOCGWINSZ)`, and
-applies it to the pty master with `ioctl(TIOCSWINSZ)` (`propagate_winsize`, `pty_relay.rs:49`)
-so the guest's slave observes the resize and the guest is delivered its own `SIGWINCH`.
-
-> [!NOTE]
-> Known limitations of the current interactive bridge: `ttyname(3)`, `tty(1)`, and `/dev/tty`
-> do not resolve to the pty slave path, and a subset of concurrent shell + child writes can
-> staircase (`\n` reaching the raw host terminal without `\r`) because the macOS pty slave
-> termios is shared between the shell host-process and the forked child host-process during a
-> raw/cooked transition. These are tracked, not fundamental.
-
----
-
-## 5. Embedding
-
-Carrick is also a library. `carrick-embed` — governed by
-[superpowers/specs/2026-08-25-carrick-embed-program-design.md](superpowers/specs/2026-08-25-carrick-embed-program-design.md)
-— runs a containerized Linux workload from a host Rust application through the
-same seam the CLI uses:
+Multiple container roots and Linux process trees can coexist in that graph. A
+Linux PID is a Carrick ID scoped to its container, not the carrier's host PID.
+Creating a guest process does not create another carrier or another VM. Each
+container owns its initial UTS and network namespace objects before its root is
+published, and `uname`, `/sys/class/net`, rtnetlink, and `/proc/net` resolve
+those views through the calling task. This isolates those namespace surfaces;
+it does not turn the experimental runtime into a hardened trust boundary.
 
 ```text
-host application
-  -> carrick_embed::ContainerBuilder
-  -> carrick_engine::RunRequest  ->  Engine::resolve (async; tokio) -> RunSpec
-  -> Runtime::prepare(&RunSpec, LaunchContext, RuntimeExtensions) -> PreparedRun
-  -> PreparedRun::execute() -> RunResult          (sync; spawn_blocking for async)
-  -> HVPatch kernel: ONE carrier / ONE VM / ONE kernel graph
-       `- Container objects on the kernel graph (namespace trees)
+host application or carrick CLI
+  -> RunRequest / RunSpec
+  -> carrier + selected VMM
+  -> Carrick kernel graph
+       |- container / namespace trees
+       |- tasks, threads, process groups, sessions
+       |- address spaces and frame authority
+       |- file descriptions, VFS, sockets, IPC
+       `- waits, signals, timers, and observations
 ```
 
-The CLI and the library both lower into `RunRequest` and both call
-`Runtime::prepare`, so there is one merge path and one execution path. A
-`Container` (`crates/carrick-runtime/src/kernel/container.rs`) is a kernel-graph
-object owning its PID-namespace root, rootfs and mount table, hostname, clock
-domain, granted capabilities and stdio sink — and, in later phases, its observer
-chain and quotas. Carrier-lifetime state (the HVF VM, the `KernelArena`, host
-signal dispositions, the SIGWINCH self-pipe of §4, vCPU leases) stays
-process-scoped and is never aliased to one container; every `KernelContext`
-reaches its container through its task, never through a static. Extensions —
-VFS mounts, observers, time control, fault injection, budgets, network
-interposition, shared buffers — are installed at `prepare` time and sealed at
-`execute`. Guest-running library tests are codesigned test executables run
-serially by `just test-embed`; `HV_DENIED` there is a failure, never a skip.
+The kernel is BKL-free. Subsystems use their own locks and typed transaction
+boundaries rather than a global dispatch lock. Operations that span
+subsystems—fork, exec, address-space publication, task exit—prepare state,
+validate identities and generations, then commit or roll back as one logical
+kernel transition.
 
-Status: experimental, like the rest of Carrick. Phase status, gates and
-non-goals live in the spec; nothing here claims a hardened trust boundary.
+Non-interactive workloads can overlap inside the carrier. Interactive `-t`
+sessions still depend on process-wide host terminal and SIGWINCH facilities,
+so Carrick admits only one interactive session at a time rather than allowing
+one container to overwrite another's route.
 
----
+## 2. Guest Execution and the Trap Boundary
+
+Carrick loads an unmodified Linux ELF image, builds its Linux stack and
+auxiliary vector, and enters guest user mode. On macOS/Apple Silicon, the
+reference path uses `Hypervisor.framework` to execute AArch64 instructions at
+guest EL0. A small Carrick-owned EL1 environment supplies exception vectors,
+page-table maintenance, and selected syscall-shim fast paths; it is not a Linux
+kernel.
+
+The ordinary control flow is:
+
+```text
+guest EL0 instruction stream
+  -> Linux syscall or architectural fault
+  -> Carrick EL1 vector/shim when required
+  -> VMM exit into the carrier
+  -> architecture-neutral syscall/fault frame
+  -> Carrick kernel dispatch
+  -> guest-visible return value, signal, block, or lifecycle transition
+```
+
+The VMM backend owns register access, VM entry/exit, interrupt or kick
+mechanics, and stage-2 projection. The shared guest-ISA engines normalize that
+machine state into Carrick's trap contract. The runtime then evaluates kernel
+policy and dispatches the operation against the current task, address space,
+credentials, file table, namespaces, and other kernel objects.
+
+Syscalls are not forwarded blindly to the host. A handler implements Linux
+semantics and may use a typed host facility underneath—for example kqueue or
+epoll as a wake source, a host socket as a byte transport, or an APFS file as
+storage. Linux error precedence, identity, readiness, and lifetime stay in
+Carrick.
+
+## 3. Kernel-Owned Identity and Lifecycle
+
+Carrick keeps host and guest identity in separate domains. Important identities
+include:
+
+- `TaskKey` and `ThreadKey`, generation-bearing kernel object identities;
+- `MmId`, the identity of a Linux address space;
+- Linux-visible PID, TID, TGID, PGID, and SID values;
+- unrelated host process and pthread identities used only to operate the
+  carrier.
+
+Cross-task operations authenticate the live kernel object and generation
+before acting. A numeric Linux ID is not permission to target a same-numbered
+host process.
+
+Guest `fork`, `clone`, and `clone3` create or share Carrick objects according to
+Linux flag semantics. Process fork prepares child identity, address-space
+inheritance, file descriptions, signals, credentials, namespaces, waits, and
+backend projection before the child becomes runnable. Failure unwinds the
+prepared transaction; it does not leave a half-published task.
+
+`exec` replaces the calling task's image while preserving the Linux process
+identity and applying Linux sibling, signal, close-on-exec, and publication
+rules. Exit and wait publish Carrick-owned lifecycle events. Signal routing,
+process groups, sessions, `/proc`, resource limits, and child accounting read
+the kernel graph rather than synthesizing Linux state from host process tables.
+
+## 4. Non-Identity Memory and Transactional Publication
+
+HVPatch memory is deliberately non-identity. The following domains must never
+be substituted for one another:
+
+- **guest virtual address (VA):** the address Linux user space observes;
+- **stage-1 IPA:** the output of the current Linux address space's stage-1
+  translation;
+- **global-frame IPA:** a reusable VM-wide physical identity for a frame;
+- **host address/backing object:** the carrier resource that stores the bytes;
+- **owner generation:** the authority proving that the current host owner may
+  act on the frame.
+
+A lookup begins with the live address space and its stage-1 translation, then
+authenticates the exact current frame owner generation. Feeding a guest VA into
+an IPA lookup, treating an old alias as current, or accepting an unqualified
+host address would cross authority domains and can corrupt another task.
+
+Anonymous reservations are semantic VMA metadata and materialize private
+backing on demand. Carrick does not reserve a full physical arena per Linux
+process and does not use a VM-wide shared-zero frame as an implicit COW source.
+Fork inheritance records whether each range is shared, copied, preserved,
+zeroed, or omitted. Writable private inheritance is projected through
+stage-1 permission state and Carrick's frame/COW authority.
+
+Publishing a mapping is one rollback-capable transaction across:
+
+1. semantic VMA state;
+2. stage-1 translation;
+3. stage-2/global-frame projection;
+4. frame inventory and owner-generation state.
+
+Page-table coalescing additionally requires both contiguous children and an
+output address aligned for the parent block. A partially published or
+generation-mismatched mapping is an invariant failure, not a best-effort
+condition.
+
+## 5. Threads, Executors, and vCPU Leases
+
+Each logical guest thread has a host pthread representation so it can block on
+host facilities without a global scheduler lock. Hardware vCPUs are different:
+they are bounded, reclaimable leases managed by the carrier rather than
+permanent property of a Linux thread.
+
+A runnable guest thread acquires an appropriate vCPU lease, projects its task
+and address-space state, enters the guest, and returns to Carrick on a trap,
+fault, kick, or lifecycle boundary. Selected long blocking waits release their
+lease even when capacity currently appears available, allowing later runnable
+threads to make progress. The thread reacquires and revalidates execution state
+before returning to guest code.
+
+Fork and exec participate in explicit admission, quiescence, and cancellation
+protocols. Process-fork admission must win before waiting for a child vCPU
+lease; otherwise competing fork operations can consume capacity while each
+waits for another slot. Identity-aware drain/freeze operations prevent new or
+stale registrations from crossing a lifecycle transaction.
+
+Host pthreads and VMM vCPUs are execution resources. Carrick's task registry,
+run state, wait queues, signal state, and scheduler decisions remain the Linux
+authority.
+
+## 6. VFS, Networking, Events, and Host Capabilities
+
+Carrick's VFS merges OCI layers, supplies synthetic kernel filesystems, tracks
+mount and path state, and owns Linux file descriptions and descriptor tables.
+The optional host filesystem mode is capability-scoped through `cap-std`; a
+host path or descriptor is backing, not a substitute for Linux path or file
+lifetime semantics.
+
+Sockets follow the same rule. Host BSD/Linux sockets may carry bytes, while
+Carrick translates Linux address families, options, credentials, descriptor
+sharing, and error precedence. Synthetic interfaces such as `AF_NETLINK` live
+entirely in the runtime.
+
+kqueue and epoll host facilities are readiness sensors and wake mechanisms.
+Carrick owns guest epoll registrations, interest masks, edge/level behavior,
+one-shot state, cross-task visibility, and close semantics. A host wake causes
+the kernel to re-evaluate Carrick state; it is not itself the Linux readiness
+verdict.
+
+The same capability boundary applies to timers, signals, credentials, process
+metadata, and storage. Host calls must sit behind reviewed host-capability or
+HAL seams, while kernel decisions remain keyed by Carrick identity and
+generation.
+
+## 7. Platform HALs and Guest ISAs
+
+The unified kernel is projected through platform-selected backends:
+
+| Host | VMM | Current guest focus | Role |
+| --- | --- | --- | --- |
+| macOS / Apple Silicon | HVF | AArch64 | Release-quality reference lane |
+| Linux | KVM | AArch64 and x86_64 bring-up | Linux host/VMM projection |
+| FreeBSD | bhyve | x86_64 bring-up | BSD host/VMM projection |
+| NetBSD | NVMM | x86_64 bring-up | BSD host/VMM projection |
+
+`carrick-hal` defines the neutral trap, vCPU, memory, timer, signal, and event
+contracts. `carrick-aarch64` and `carrick-x86` own guest-ISA mechanics shared by
+the relevant VMMs. Host crates implement operating-system facilities without
+pulling platform-specific VMM policy back into the kernel.
+
+Cross-compiling a backend proves source and feature closure. It does not prove
+that a guest executed. Runtime claims require real target hardware and the
+named VMM capability.
+
+## 8. Embedding and Conformance
+
+`carrick-embed` is the library front door to the same kernel architecture used
+by the CLI. It resolves a Docker-shaped request, prepares a container object on
+the kernel graph, and executes it in the carrier. Embedded guest processes are
+still Carrick tasks; they are not host subprocesses.
+
+`ContainerBuilder::from_image` owns an implicit, single-use carrier. The public
+`Carrier` API instead admits multiple non-interactive container roots into the
+same VM and kernel graph. Container IDs, root process trees, PID/UTS/network
+namespace views, dispatch extensions, VFS mounts, clocks, stdio, and lifecycle
+are per-container. The VM, vCPU lease pool, frame inventory, kernel graph,
+runtime directory, and shutdown state are carrier-wide. Sharing a host `Arc`
+between builders is deliberate application-level sharing, not an identity
+shortcut inside the kernel.
+
+The signed in-process tests in
+[`../crates/carrick-embed/tests/guest_smoke.rs`](../crates/carrick-embed/tests/guest_smoke.rs)
+exercise two live containers in one VM, isolated hostname/VFS/syscall policy,
+sibling survival after early exit or interceptor panic, and cancellation of a
+live guest during deterministic carrier shutdown. These are focused behavioral
+proofs on entitled hardware, not a claim that the experimental runtime is a
+hardened security boundary.
+
+Carrick uses several evidence layers:
+
+| Evidence | Hardware required | What it proves |
+| --- | --- | --- |
+| Compile-time ABI assertions | No | Linux wire layout and constant invariants |
+| Host unit/integration tests | No | Kernel data structures and host semantics without guest execution |
+| Signed embed/probe tests | Yes | Guest execution through the selected VMM and focused behavioral contracts |
+| Docker differential suites | Yes | Observable Carrick-versus-Linux behavior for the declared workloads |
+| Strict closure mode | Yes | Complete, baseline-free accounting of the frozen 2,127-suite surface |
+
+Committed Docker oracle rows make the ordinary in-process probe loop faster;
+they do not remove the Carrick-side VMM requirement. A skip-capable developer
+test is convenience, not runtime proof. See
+[conformance-testing.md](conformance-testing.md) for commands and CI boundaries.
+
+## 9. Preserved Optimization Primitives
+
+`carrick-dsr`, `carrick-dsr-aarch64`, `carrick-dsr-x86`, and
+`carrick-native-darwin` retain translation caches, ISA-specific rewriting,
+`MAP_JIT` W^X support, and direct binary-patching machinery. These components
+are preserved as possible future optimizations beneath or alongside Carrick's
+kernel architecture.
+
+They are not selectable shipped execution backends. Correctness belongs to the
+HVPatch unified kernel model; an optimization may be wired in only if it
+preserves that model's identity, memory, lifecycle, and evidence contracts.
 
 ## See also
 
-* [../README.md](../README.md) — quickstart, the crate workspace, and the build/codesign gate.
-* [syscalls-emulation-map.md](syscalls-emulation-map.md) — the ~150-syscall translation map
-  (what each Linux syscall lowers to on Darwin).
-* [diagnostics-and-debugging.md](diagnostics-and-debugging.md) — `carrick trace` (in-process
-  libdtrace + USDT probes), the always-on event ring, the carrick-lldb plugin, and the
-  diagnostic env vars used to crack the timing-sensitive bugs in §2–§3.
-* [conformance-testing.md](conformance-testing.md) — running and interpreting the differential
-  Docker-oracle suites and the compile-time no-panic gate.
-* [conformance-coverage.md](conformance-coverage.md) — the active probe-gate map: every
-  syscall-ABI invariant and its owning deterministic probe.
-* [superpowers/specs/2026-08-25-carrick-embed-program-design.md](superpowers/specs/2026-08-25-carrick-embed-program-design.md) — the
-  `carrick-embed` program: library surface, `Container` on the kernel graph, and the
-  per-phase gates (§5).
+- [hal.md](hal.md) — platform and VMM boundaries
+- [host-facility-boundary.md](host-facility-boundary.md) — host capability
+  ownership rules
+- [conformance-testing.md](conformance-testing.md) — testing and oracle method
+- [diagnostics-and-debugging.md](diagnostics-and-debugging.md) — tracing, event
+  ring, LLDB, and crash evidence
+- [syscalls-emulation-map.md](syscalls-emulation-map.md) — syscall support map
+- [`../crates/README.md`](../crates/README.md) — workspace crate map

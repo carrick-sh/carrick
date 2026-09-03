@@ -58,8 +58,39 @@ pub fn set_probe_hook(hook: fn(&CompatEvent)) {
     let _ = PROBE_HOOK.set(hook);
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SyscallArgs(pub [u64; 6]);
+
+pub const MAX_RECORDED_REWRITES: usize = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("syscall argument index {index} is outside 0..6")]
+pub struct SyscallArgIndexError {
+    pub index: usize,
+}
+
+impl SyscallArgs {
+    pub const fn new(words: [u64; 6]) -> Self {
+        Self(words)
+    }
+
+    pub const fn words(self) -> [u64; 6] {
+        self.0
+    }
+
+    pub fn get(self, index: usize) -> Option<u64> {
+        self.0.get(index).copied()
+    }
+
+    pub fn with_arg(mut self, index: usize, value: u64) -> Result<Self, SyscallArgIndexError> {
+        let word = self
+            .0
+            .get_mut(index)
+            .ok_or(SyscallArgIndexError { index })?;
+        *word = value;
+        Ok(self)
+    }
+}
 
 impl From<[u64; 6]> for SyscallArgs {
     fn from(args: [u64; 6]) -> Self {
@@ -124,6 +155,12 @@ pub enum CompatEvent {
         name: Cow<'static, str>,
         retval: i64,
         errno: Option<i32>,
+    },
+    SyscallRewrite {
+        number: u64,
+        name: Cow<'static, str>,
+        original_args: SyscallArgs,
+        effective_args: SyscallArgs,
     },
     UnhandledSyscall {
         number: u64,
@@ -224,11 +261,24 @@ impl CompatEvent {
 /// increments instead of a heap push. The detailed report stays
 /// always-on (the aggregate maps are cheap); only the verbose
 /// per-event stderr trace is opt-in via the `trace-syscalls` feature.
+#[derive(Clone, Debug, Default)]
+struct RewriteDiagnostics {
+    entries: HashMap<(u64, SyscallArgs, SyscallArgs), RewriteValue>,
+    dropped_events: u64,
+}
+
+#[derive(Clone, Debug)]
+struct RewriteValue {
+    name: String,
+    count: u64,
+}
+
 #[derive(Debug)]
 pub struct CompatReporter {
     syscall_entries: AtomicU64,
     syscall_returns_ok: AtomicU64,
     syscall_returns_errno: AtomicU64,
+    syscall_rewrites: Mutex<RewriteDiagnostics>,
     unhandled_syscalls: Mutex<HashMap<(u64, String), u64>>,
     partial_syscalls: Mutex<HashMap<(u64, String, String), u64>>,
     unhandled_ioctls: Mutex<HashMap<u64, u64>>,
@@ -245,6 +295,7 @@ impl Default for CompatReporter {
             syscall_entries: AtomicU64::new(0),
             syscall_returns_ok: AtomicU64::new(0),
             syscall_returns_errno: AtomicU64::new(0),
+            syscall_rewrites: Mutex::new(RewriteDiagnostics::default()),
             unhandled_syscalls: Mutex::new(HashMap::new()),
             partial_syscalls: Mutex::new(HashMap::new()),
             unhandled_ioctls: Mutex::new(HashMap::new()),
@@ -283,6 +334,28 @@ impl CompatReporter {
                     self.syscall_returns_errno.fetch_add(1, Ordering::Relaxed);
                 } else {
                     self.syscall_returns_ok.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            CompatEvent::SyscallRewrite {
+                number,
+                name,
+                original_args,
+                effective_args,
+            } => {
+                let mut rewrites = self.syscall_rewrites.lock();
+                let key = (number, original_args, effective_args);
+                if let Some(entry) = rewrites.entries.get_mut(&key) {
+                    entry.count = entry.count.saturating_add(1);
+                } else if rewrites.entries.len() < MAX_RECORDED_REWRITES {
+                    rewrites.entries.insert(
+                        key,
+                        RewriteValue {
+                            name: name.into_owned(),
+                            count: 1,
+                        },
+                    );
+                } else {
+                    rewrites.dropped_events = rewrites.dropped_events.saturating_add(1);
                 }
             }
             CompatEvent::UnhandledSyscall { number, name, .. } => {
@@ -339,6 +412,7 @@ impl CompatReporter {
         let syscall_entries = self.syscall_entries.load(Ordering::Relaxed);
         let syscall_returns_ok = self.syscall_returns_ok.load(Ordering::Relaxed);
         let syscall_returns_errno = self.syscall_returns_errno.load(Ordering::Relaxed);
+        let rewrite_diagnostics = self.syscall_rewrites.lock().clone();
         let unhandled_raw = self.unhandled_syscalls.lock().clone();
         let partial_syscalls = self.partial_syscalls.lock().clone();
         let unhandled_ioctls = self.unhandled_ioctls.lock().clone();
@@ -375,6 +449,7 @@ impl CompatReporter {
         let unsupported_signals = sorted_signals(unsupported_signals);
         let unknown_flag_invocations = unknown_syscall_flags.values().sum::<u64>();
         let unknown_syscall_flags = sorted_unknown_flags(unknown_syscall_flags);
+        let syscall_rewrites = sorted_rewrites(rewrite_diagnostics.entries);
 
         let fast_path_blind_spots = self.fast_path_blind_spots.lock().clone();
 
@@ -408,6 +483,8 @@ impl CompatReporter {
             sys_read_unimplemented,
             unsupported_signals,
             unknown_syscall_flags,
+            syscall_rewrites,
+            dropped_rewrite_events: rewrite_diagnostics.dropped_events,
             fast_path_blind_spots,
         }
     }
@@ -437,6 +514,12 @@ pub struct CompatReport {
     pub sys_read_unimplemented: Vec<PathCount>,
     pub unsupported_signals: Vec<SignalCount>,
     pub unknown_syscall_flags: Vec<UnknownFlagsCount>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub syscall_rewrites: Vec<SyscallRewriteCount>,
+    /// Rewrite events omitted after the bounded distinct-key table is full.
+    /// Repeated events for the same unretained key are counted repeatedly.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dropped_rewrite_events: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fast_path_blind_spots: Vec<String>,
 }
@@ -551,6 +634,12 @@ impl CompatReport {
                 self.fast_path_blind_spots.join(", ")
             ));
         }
+        if self.dropped_rewrite_events != 0 {
+            out.push_str(&format!(
+                "  dropped syscall rewrite events: {}\n",
+                self.dropped_rewrite_events
+            ));
+        }
         render_section(&mut out, "Unhandled syscalls", &self.unhandled_syscalls);
         render_section(
             &mut out,
@@ -558,6 +647,11 @@ impl CompatReport {
             &self.deferred_syscalls,
         );
         render_section(&mut out, "Partial syscalls", &self.partial_syscalls);
+        render_section(
+            &mut out,
+            "Syscall argument rewrites",
+            &self.syscall_rewrites,
+        );
         render_section(&mut out, "Unhandled ioctls", &self.unhandled_ioctls);
         render_section(
             &mut out,
@@ -571,6 +665,70 @@ impl CompatReport {
         );
         render_section(&mut out, "Unsupported signals", &self.unsupported_signals);
         out
+    }
+}
+
+#[cfg(test)]
+mod rewrite_diagnostic_tests {
+    use super::*;
+
+    fn rewrite(number: u64, original: u64, effective: u64) -> CompatEvent {
+        CompatEvent::SyscallRewrite {
+            number,
+            name: Cow::Borrowed("personality"),
+            original_args: SyscallArgs([original, 0, 0, 0, 0, 0]),
+            effective_args: SyscallArgs([effective, 0, 0, 0, 0, 0]),
+        }
+    }
+
+    #[test]
+    fn rewrite_diagnostic_deduplicates_and_counts_repeats() {
+        let reporter = CompatReporter::default();
+        reporter.record(rewrite(92, 1, 2));
+        reporter.record(rewrite(92, 1, 2));
+
+        let report = reporter.snapshot();
+        assert_eq!(report.syscall_rewrites.len(), 1);
+        assert_eq!(report.syscall_rewrites[0].count, 2);
+        assert_eq!(report.dropped_rewrite_events, 0);
+    }
+
+    #[test]
+    fn rewrite_diagnostic_keeps_128_keys_and_counts_dropped_events() {
+        let reporter = CompatReporter::default();
+        for key in 0..MAX_RECORDED_REWRITES as u64 {
+            reporter.record(rewrite(92, key, key + 1));
+        }
+        reporter.record(rewrite(92, 7, 8));
+        reporter.record(rewrite(92, 10_000, 10_001));
+        reporter.record(rewrite(92, 20_000, 20_001));
+
+        let report = reporter.snapshot();
+        assert_eq!(report.syscall_rewrites.len(), MAX_RECORDED_REWRITES);
+        assert_eq!(
+            report
+                .syscall_rewrites
+                .iter()
+                .find(|entry| entry.original_args.0[0] == 7)
+                .expect("retained existing rewrite")
+                .count,
+            2
+        );
+        assert_eq!(report.dropped_rewrite_events, 2);
+    }
+
+    #[test]
+    fn rewrite_diagnostic_reports_repeated_overflow_as_dropped_events() {
+        let reporter = CompatReporter::default();
+        for key in 0..MAX_RECORDED_REWRITES as u64 {
+            reporter.record(rewrite(92, key, key + 1));
+        }
+        reporter.record(rewrite(92, 10_000, 10_001));
+        reporter.record(rewrite(92, 10_000, 10_001));
+
+        let json = serde_json::to_value(reporter.snapshot()).expect("serialize compat report");
+        assert_eq!(json["dropped_rewrite_events"], 2);
+        assert!(json.get("dropped_distinct_rewrites").is_none());
     }
 }
 
@@ -622,6 +780,15 @@ pub struct PartialSyscallCount {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyscallRewriteCount {
+    pub number: u64,
+    pub name: String,
+    pub original_args: SyscallArgs,
+    pub effective_args: SyscallArgs,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IoctlCount {
     pub request: u64,
     pub count: u64,
@@ -658,6 +825,16 @@ impl std::fmt::Display for PartialSyscallCount {
             f,
             "{} ({}) x{}: {}",
             self.name, self.number, self.count, self.reason
+        )
+    }
+}
+
+impl std::fmt::Display for SyscallRewriteCount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} ({}) x{}: {:?} -> {:?}",
+            self.name, self.number, self.count, self.original_args.0, self.effective_args.0
         )
     }
 }
@@ -705,6 +882,35 @@ fn sorted_partials(counts: HashMap<(u64, String, String), u64>) -> Vec<PartialSy
         .collect::<Vec<_>>();
     rows.sort_by(|a, b| b.count.cmp(&a.count).then(a.number.cmp(&b.number)));
     rows
+}
+
+fn sorted_rewrites(
+    rewrites: HashMap<(u64, SyscallArgs, SyscallArgs), RewriteValue>,
+) -> Vec<SyscallRewriteCount> {
+    let mut rows = rewrites
+        .into_iter()
+        .map(
+            |((number, original_args, effective_args), value)| SyscallRewriteCount {
+                number,
+                name: value.name,
+                original_args,
+                effective_args,
+                count: value.count,
+            },
+        )
+        .collect::<Vec<_>>();
+    rows.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then(a.number.cmp(&b.number))
+            .then(a.original_args.0.cmp(&b.original_args.0))
+            .then(a.effective_args.0.cmp(&b.effective_args.0))
+    });
+    rows
+}
+
+const fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 fn sorted_ioctls(counts: HashMap<u64, u64>) -> Vec<IoctlCount> {

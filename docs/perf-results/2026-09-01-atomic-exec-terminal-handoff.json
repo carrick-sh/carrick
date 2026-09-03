@@ -1,0 +1,2358 @@
+{
+  "accepted": true,
+  "aggregate": {
+    "baseline": {
+      "exec_error_to_terminal": {
+        "median_ns_per_transition": 8.05729,
+        "p95_ns_per_transition": 8.46667
+      },
+      "generic_exit_claim": {
+        "median_ns_per_transition": 3.699165,
+        "p95_ns_per_transition": 3.9175
+      }
+    },
+    "candidate": {
+      "exec_error_to_terminal": {
+        "median_ns_per_transition": 6.82729,
+        "p95_ns_per_transition": 7.04208
+      },
+      "generic_exit_claim": {
+        "median_ns_per_transition": 3.32979,
+        "p95_ns_per_transition": 3.44791
+      }
+    }
+  },
+  "arm_order": [
+    {
+      "label": "A1",
+      "ref": "e3ac9b8db119df4b4a1a6c2358b18b952083728c"
+    },
+    {
+      "label": "B1",
+      "ref": "4341c6b75c561d3d05a6854b38489ec3704c02f7"
+    },
+    {
+      "label": "B2",
+      "ref": "4341c6b75c561d3d05a6854b38489ec3704c02f7"
+    },
+    {
+      "label": "A2",
+      "ref": "e3ac9b8db119df4b4a1a6c2358b18b952083728c"
+    }
+  ],
+  "arms": [
+    {
+      "aggregate": {
+        "exec_error_to_terminal": {
+          "median_ns_per_transition": 8.038955,
+          "p95_ns_per_transition": 8.49
+        },
+        "generic_exit_claim": {
+          "median_ns_per_transition": 3.699165,
+          "p95_ns_per_transition": 3.92
+        }
+      },
+      "build_command": [
+        "cargo",
+        "test",
+        "--release",
+        "-p",
+        "carrick-runtime",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "census": [
+        {
+          "matches": [],
+          "observations": 1,
+          "phase": "before_build"
+        },
+        {
+          "cleanup": {
+            "escalated": false,
+            "process_group_id": 56459,
+            "terminated": false
+          },
+          "matches": [],
+          "observations": 1129,
+          "phase": "build"
+        },
+        {
+          "matches": [],
+          "observations": 1,
+          "phase": "before_reducer"
+        },
+        {
+          "cleanup": {
+            "escalated": false,
+            "process_group_id": 61575,
+            "terminated": false
+          },
+          "matches": [],
+          "observations": 5,
+          "phase": "reducer"
+        },
+        {
+          "matches": [],
+          "observations": 1,
+          "phase": "post_arm"
+        }
+      ],
+      "executable": {
+        "macho_uuid": "5C5DD823-08D0-33DD-A395-CCAD27DBF855",
+        "path": "/private/var/folders/8f/dl9bkkyn1zs5ycl864wv184h0000gn/T/carrick-atomic-handoff-mlreq27r/source/target/release/deps/carrick_runtime-d84348e87b2d541e",
+        "sha256": "bc56e20aa170c3474585ef515205eb57d9143699197d09875c8b865c5e2cc0b7"
+      },
+      "label": "A1",
+      "power_state_after": {
+        "cpu_power_status": "No CPU power status has been recorded",
+        "low_power_mode": "0",
+        "performance_warning": "No performance warning level has been recorded",
+        "power_source": "AC Power",
+        "thermal_warning": "No thermal warning level has been recorded"
+      },
+      "power_state_before": {
+        "cpu_power_status": "No CPU power status has been recorded",
+        "low_power_mode": "0",
+        "performance_warning": "No performance warning level has been recorded",
+        "power_source": "AC Power",
+        "thermal_warning": "No thermal warning level has been recorded"
+      },
+      "rows": [
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 372167,
+          "iterations": 100000,
+          "ns_per_transition": 3.72167,
+          "operation": "generic_exit_claim",
+          "sample": 0
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 367708,
+          "iterations": 100000,
+          "ns_per_transition": 3.67708,
+          "operation": "generic_exit_claim",
+          "sample": 1
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 368000,
+          "iterations": 100000,
+          "ns_per_transition": 3.68,
+          "operation": "generic_exit_claim",
+          "sample": 2
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 367916,
+          "iterations": 100000,
+          "ns_per_transition": 3.67916,
+          "operation": "generic_exit_claim",
+          "sample": 3
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 392000,
+          "iterations": 100000,
+          "ns_per_transition": 3.92,
+          "operation": "generic_exit_claim",
+          "sample": 4
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 368209,
+          "iterations": 100000,
+          "ns_per_transition": 3.68209,
+          "operation": "generic_exit_claim",
+          "sample": 5
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 368459,
+          "iterations": 100000,
+          "ns_per_transition": 3.68459,
+          "operation": "generic_exit_claim",
+          "sample": 6
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 368083,
+          "iterations": 100000,
+          "ns_per_transition": 3.68083,
+          "operation": "generic_exit_claim",
+          "sample": 7
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 367167,
+          "iterations": 100000,
+          "ns_per_transition": 3.67167,
+          "operation": "generic_exit_claim",
+          "sample": 8
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 367250,
+          "iterations": 100000,
+          "ns_per_transition": 3.6725,
+          "operation": "generic_exit_claim",
+          "sample": 9
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 368708,
+          "iterations": 100000,
+          "ns_per_transition": 3.68708,
+          "operation": "generic_exit_claim",
+          "sample": 10
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 372375,
+          "iterations": 100000,
+          "ns_per_transition": 3.72375,
+          "operation": "generic_exit_claim",
+          "sample": 11
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 369167,
+          "iterations": 100000,
+          "ns_per_transition": 3.69167,
+          "operation": "generic_exit_claim",
+          "sample": 12
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 368333,
+          "iterations": 100000,
+          "ns_per_transition": 3.68333,
+          "operation": "generic_exit_claim",
+          "sample": 13
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 370000,
+          "iterations": 100000,
+          "ns_per_transition": 3.7,
+          "operation": "generic_exit_claim",
+          "sample": 14
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 369833,
+          "iterations": 100000,
+          "ns_per_transition": 3.69833,
+          "operation": "generic_exit_claim",
+          "sample": 15
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 368542,
+          "iterations": 100000,
+          "ns_per_transition": 3.68542,
+          "operation": "generic_exit_claim",
+          "sample": 16
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 368875,
+          "iterations": 100000,
+          "ns_per_transition": 3.68875,
+          "operation": "generic_exit_claim",
+          "sample": 17
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 368875,
+          "iterations": 100000,
+          "ns_per_transition": 3.68875,
+          "operation": "generic_exit_claim",
+          "sample": 18
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 370667,
+          "iterations": 100000,
+          "ns_per_transition": 3.70667,
+          "operation": "generic_exit_claim",
+          "sample": 19
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 385042,
+          "iterations": 100000,
+          "ns_per_transition": 3.85042,
+          "operation": "generic_exit_claim",
+          "sample": 20
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 386875,
+          "iterations": 100000,
+          "ns_per_transition": 3.86875,
+          "operation": "generic_exit_claim",
+          "sample": 21
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 384917,
+          "iterations": 100000,
+          "ns_per_transition": 3.84917,
+          "operation": "generic_exit_claim",
+          "sample": 22
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 391750,
+          "iterations": 100000,
+          "ns_per_transition": 3.9175,
+          "operation": "generic_exit_claim",
+          "sample": 23
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 398666,
+          "iterations": 100000,
+          "ns_per_transition": 3.98666,
+          "operation": "generic_exit_claim",
+          "sample": 24
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 382709,
+          "iterations": 100000,
+          "ns_per_transition": 3.82709,
+          "operation": "generic_exit_claim",
+          "sample": 25
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 379958,
+          "iterations": 100000,
+          "ns_per_transition": 3.79958,
+          "operation": "generic_exit_claim",
+          "sample": 26
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 370958,
+          "iterations": 100000,
+          "ns_per_transition": 3.70958,
+          "operation": "generic_exit_claim",
+          "sample": 27
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 374458,
+          "iterations": 100000,
+          "ns_per_transition": 3.74458,
+          "operation": "generic_exit_claim",
+          "sample": 28
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 370209,
+          "iterations": 100000,
+          "ns_per_transition": 3.70209,
+          "operation": "generic_exit_claim",
+          "sample": 29
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 795708,
+          "iterations": 100000,
+          "ns_per_transition": 7.95708,
+          "operation": "exec_error_to_terminal",
+          "sample": 0
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 780250,
+          "iterations": 100000,
+          "ns_per_transition": 7.8025,
+          "operation": "exec_error_to_terminal",
+          "sample": 1
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 795666,
+          "iterations": 100000,
+          "ns_per_transition": 7.95666,
+          "operation": "exec_error_to_terminal",
+          "sample": 2
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 782167,
+          "iterations": 100000,
+          "ns_per_transition": 7.82167,
+          "operation": "exec_error_to_terminal",
+          "sample": 3
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 814417,
+          "iterations": 100000,
+          "ns_per_transition": 8.14417,
+          "operation": "exec_error_to_terminal",
+          "sample": 4
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 796541,
+          "iterations": 100000,
+          "ns_per_transition": 7.96541,
+          "operation": "exec_error_to_terminal",
+          "sample": 5
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 846667,
+          "iterations": 100000,
+          "ns_per_transition": 8.46667,
+          "operation": "exec_error_to_terminal",
+          "sample": 6
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 821042,
+          "iterations": 100000,
+          "ns_per_transition": 8.21042,
+          "operation": "exec_error_to_terminal",
+          "sample": 7
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 819750,
+          "iterations": 100000,
+          "ns_per_transition": 8.1975,
+          "operation": "exec_error_to_terminal",
+          "sample": 8
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 791792,
+          "iterations": 100000,
+          "ns_per_transition": 7.91792,
+          "operation": "exec_error_to_terminal",
+          "sample": 9
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 826791,
+          "iterations": 100000,
+          "ns_per_transition": 8.26791,
+          "operation": "exec_error_to_terminal",
+          "sample": 10
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 792792,
+          "iterations": 100000,
+          "ns_per_transition": 7.92792,
+          "operation": "exec_error_to_terminal",
+          "sample": 11
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 823000,
+          "iterations": 100000,
+          "ns_per_transition": 8.23,
+          "operation": "exec_error_to_terminal",
+          "sample": 12
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 787042,
+          "iterations": 100000,
+          "ns_per_transition": 7.87042,
+          "operation": "exec_error_to_terminal",
+          "sample": 13
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 788166,
+          "iterations": 100000,
+          "ns_per_transition": 7.88166,
+          "operation": "exec_error_to_terminal",
+          "sample": 14
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 803375,
+          "iterations": 100000,
+          "ns_per_transition": 8.03375,
+          "operation": "exec_error_to_terminal",
+          "sample": 15
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 803291,
+          "iterations": 100000,
+          "ns_per_transition": 8.03291,
+          "operation": "exec_error_to_terminal",
+          "sample": 16
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 817625,
+          "iterations": 100000,
+          "ns_per_transition": 8.17625,
+          "operation": "exec_error_to_terminal",
+          "sample": 17
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 798458,
+          "iterations": 100000,
+          "ns_per_transition": 7.98458,
+          "operation": "exec_error_to_terminal",
+          "sample": 18
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 797500,
+          "iterations": 100000,
+          "ns_per_transition": 7.975,
+          "operation": "exec_error_to_terminal",
+          "sample": 19
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 804416,
+          "iterations": 100000,
+          "ns_per_transition": 8.04416,
+          "operation": "exec_error_to_terminal",
+          "sample": 20
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 819084,
+          "iterations": 100000,
+          "ns_per_transition": 8.19084,
+          "operation": "exec_error_to_terminal",
+          "sample": 21
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 795625,
+          "iterations": 100000,
+          "ns_per_transition": 7.95625,
+          "operation": "exec_error_to_terminal",
+          "sample": 22
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 777000,
+          "iterations": 100000,
+          "ns_per_transition": 7.77,
+          "operation": "exec_error_to_terminal",
+          "sample": 23
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 821042,
+          "iterations": 100000,
+          "ns_per_transition": 8.21042,
+          "operation": "exec_error_to_terminal",
+          "sample": 24
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 849000,
+          "iterations": 100000,
+          "ns_per_transition": 8.49,
+          "operation": "exec_error_to_terminal",
+          "sample": 25
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 832917,
+          "iterations": 100000,
+          "ns_per_transition": 8.32917,
+          "operation": "exec_error_to_terminal",
+          "sample": 26
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 850333,
+          "iterations": 100000,
+          "ns_per_transition": 8.50333,
+          "operation": "exec_error_to_terminal",
+          "sample": 27
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 825834,
+          "iterations": 100000,
+          "ns_per_transition": 8.25834,
+          "operation": "exec_error_to_terminal",
+          "sample": 28
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 813917,
+          "iterations": 100000,
+          "ns_per_transition": 8.13917,
+          "operation": "exec_error_to_terminal",
+          "sample": 29
+        }
+      ],
+      "source_commit": "e3ac9b8db119df4b4a1a6c2358b18b952083728c",
+      "test_command": [
+        "/private/var/folders/8f/dl9bkkyn1zs5ycl864wv184h0000gn/T/carrick-atomic-handoff-mlreq27r/source/target/release/deps/carrick_runtime-d84348e87b2d541e",
+        "vcpu_loop::tests::clone_admission_terminal_claim_cost_receipt",
+        "--ignored",
+        "--nocapture",
+        "--exact"
+      ],
+      "worktree": "/var/folders/8f/dl9bkkyn1zs5ycl864wv184h0000gn/T/carrick-atomic-handoff-mlreq27r/source"
+    },
+    {
+      "aggregate": {
+        "exec_error_to_terminal": {
+          "median_ns_per_transition": 6.849584999999999,
+          "p95_ns_per_transition": 7.05
+        },
+        "generic_exit_claim": {
+          "median_ns_per_transition": 3.33479,
+          "p95_ns_per_transition": 3.4575
+        }
+      },
+      "build_command": [
+        "cargo",
+        "test",
+        "--release",
+        "-p",
+        "carrick-runtime",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "census": [
+        {
+          "matches": [],
+          "observations": 1,
+          "phase": "before_build"
+        },
+        {
+          "cleanup": {
+            "escalated": false,
+            "process_group_id": 61589,
+            "terminated": false
+          },
+          "matches": [],
+          "observations": 1133,
+          "phase": "build"
+        },
+        {
+          "matches": [],
+          "observations": 1,
+          "phase": "before_reducer"
+        },
+        {
+          "cleanup": {
+            "escalated": false,
+            "process_group_id": 66632,
+            "terminated": false
+          },
+          "matches": [],
+          "observations": 6,
+          "phase": "reducer"
+        },
+        {
+          "matches": [],
+          "observations": 1,
+          "phase": "post_arm"
+        }
+      ],
+      "executable": {
+        "macho_uuid": "5D0E88AA-C936-3D84-82B8-064F0985C2B9",
+        "path": "/private/var/folders/8f/dl9bkkyn1zs5ycl864wv184h0000gn/T/carrick-atomic-handoff-juqxp5h3/source/target/release/deps/carrick_runtime-d84348e87b2d541e",
+        "sha256": "6c5e946e64d0334a6606451d6e8fc870eebab9ff274d6be787c582bddf579f6a"
+      },
+      "label": "B1",
+      "power_state_after": {
+        "cpu_power_status": "No CPU power status has been recorded",
+        "low_power_mode": "0",
+        "performance_warning": "No performance warning level has been recorded",
+        "power_source": "AC Power",
+        "thermal_warning": "No thermal warning level has been recorded"
+      },
+      "power_state_before": {
+        "cpu_power_status": "No CPU power status has been recorded",
+        "low_power_mode": "0",
+        "performance_warning": "No performance warning level has been recorded",
+        "power_source": "AC Power",
+        "thermal_warning": "No thermal warning level has been recorded"
+      },
+      "rows": [
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 333291,
+          "iterations": 100000,
+          "ns_per_transition": 3.33291,
+          "operation": "generic_exit_claim",
+          "sample": 0
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 332750,
+          "iterations": 100000,
+          "ns_per_transition": 3.3275,
+          "operation": "generic_exit_claim",
+          "sample": 1
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 333083,
+          "iterations": 100000,
+          "ns_per_transition": 3.33083,
+          "operation": "generic_exit_claim",
+          "sample": 2
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 332875,
+          "iterations": 100000,
+          "ns_per_transition": 3.32875,
+          "operation": "generic_exit_claim",
+          "sample": 3
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 331959,
+          "iterations": 100000,
+          "ns_per_transition": 3.31959,
+          "operation": "generic_exit_claim",
+          "sample": 4
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 333625,
+          "iterations": 100000,
+          "ns_per_transition": 3.33625,
+          "operation": "generic_exit_claim",
+          "sample": 5
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 331959,
+          "iterations": 100000,
+          "ns_per_transition": 3.31959,
+          "operation": "generic_exit_claim",
+          "sample": 6
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 333167,
+          "iterations": 100000,
+          "ns_per_transition": 3.33167,
+          "operation": "generic_exit_claim",
+          "sample": 7
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 333083,
+          "iterations": 100000,
+          "ns_per_transition": 3.33083,
+          "operation": "generic_exit_claim",
+          "sample": 8
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 333458,
+          "iterations": 100000,
+          "ns_per_transition": 3.33458,
+          "operation": "generic_exit_claim",
+          "sample": 9
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 333500,
+          "iterations": 100000,
+          "ns_per_transition": 3.335,
+          "operation": "generic_exit_claim",
+          "sample": 10
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 332792,
+          "iterations": 100000,
+          "ns_per_transition": 3.32792,
+          "operation": "generic_exit_claim",
+          "sample": 11
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 344791,
+          "iterations": 100000,
+          "ns_per_transition": 3.44791,
+          "operation": "generic_exit_claim",
+          "sample": 12
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 341083,
+          "iterations": 100000,
+          "ns_per_transition": 3.41083,
+          "operation": "generic_exit_claim",
+          "sample": 13
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 345750,
+          "iterations": 100000,
+          "ns_per_transition": 3.4575,
+          "operation": "generic_exit_claim",
+          "sample": 14
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 336458,
+          "iterations": 100000,
+          "ns_per_transition": 3.36458,
+          "operation": "generic_exit_claim",
+          "sample": 15
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 332125,
+          "iterations": 100000,
+          "ns_per_transition": 3.32125,
+          "operation": "generic_exit_claim",
+          "sample": 16
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 337042,
+          "iterations": 100000,
+          "ns_per_transition": 3.37042,
+          "operation": "generic_exit_claim",
+          "sample": 17
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 332708,
+          "iterations": 100000,
+          "ns_per_transition": 3.32708,
+          "operation": "generic_exit_claim",
+          "sample": 18
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 335250,
+          "iterations": 100000,
+          "ns_per_transition": 3.3525,
+          "operation": "generic_exit_claim",
+          "sample": 19
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 335083,
+          "iterations": 100000,
+          "ns_per_transition": 3.35083,
+          "operation": "generic_exit_claim",
+          "sample": 20
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 333375,
+          "iterations": 100000,
+          "ns_per_transition": 3.33375,
+          "operation": "generic_exit_claim",
+          "sample": 21
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 331959,
+          "iterations": 100000,
+          "ns_per_transition": 3.31959,
+          "operation": "generic_exit_claim",
+          "sample": 22
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 336375,
+          "iterations": 100000,
+          "ns_per_transition": 3.36375,
+          "operation": "generic_exit_claim",
+          "sample": 23
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 334917,
+          "iterations": 100000,
+          "ns_per_transition": 3.34917,
+          "operation": "generic_exit_claim",
+          "sample": 24
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 333500,
+          "iterations": 100000,
+          "ns_per_transition": 3.335,
+          "operation": "generic_exit_claim",
+          "sample": 25
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 335917,
+          "iterations": 100000,
+          "ns_per_transition": 3.35917,
+          "operation": "generic_exit_claim",
+          "sample": 26
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 333375,
+          "iterations": 100000,
+          "ns_per_transition": 3.33375,
+          "operation": "generic_exit_claim",
+          "sample": 27
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 347625,
+          "iterations": 100000,
+          "ns_per_transition": 3.47625,
+          "operation": "generic_exit_claim",
+          "sample": 28
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 342625,
+          "iterations": 100000,
+          "ns_per_transition": 3.42625,
+          "operation": "generic_exit_claim",
+          "sample": 29
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 681083,
+          "iterations": 100000,
+          "ns_per_transition": 6.81083,
+          "operation": "exec_error_to_terminal",
+          "sample": 0
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 682667,
+          "iterations": 100000,
+          "ns_per_transition": 6.82667,
+          "operation": "exec_error_to_terminal",
+          "sample": 1
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 681500,
+          "iterations": 100000,
+          "ns_per_transition": 6.815,
+          "operation": "exec_error_to_terminal",
+          "sample": 2
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 692292,
+          "iterations": 100000,
+          "ns_per_transition": 6.92292,
+          "operation": "exec_error_to_terminal",
+          "sample": 3
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 705000,
+          "iterations": 100000,
+          "ns_per_transition": 7.05,
+          "operation": "exec_error_to_terminal",
+          "sample": 4
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 680959,
+          "iterations": 100000,
+          "ns_per_transition": 6.80959,
+          "operation": "exec_error_to_terminal",
+          "sample": 5
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 680459,
+          "iterations": 100000,
+          "ns_per_transition": 6.80459,
+          "operation": "exec_error_to_terminal",
+          "sample": 6
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 695250,
+          "iterations": 100000,
+          "ns_per_transition": 6.9525,
+          "operation": "exec_error_to_terminal",
+          "sample": 7
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 695750,
+          "iterations": 100000,
+          "ns_per_transition": 6.9575,
+          "operation": "exec_error_to_terminal",
+          "sample": 8
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 709250,
+          "iterations": 100000,
+          "ns_per_transition": 7.0925,
+          "operation": "exec_error_to_terminal",
+          "sample": 9
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 682250,
+          "iterations": 100000,
+          "ns_per_transition": 6.8225,
+          "operation": "exec_error_to_terminal",
+          "sample": 10
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 684750,
+          "iterations": 100000,
+          "ns_per_transition": 6.8475,
+          "operation": "exec_error_to_terminal",
+          "sample": 11
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 682791,
+          "iterations": 100000,
+          "ns_per_transition": 6.82791,
+          "operation": "exec_error_to_terminal",
+          "sample": 12
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 679000,
+          "iterations": 100000,
+          "ns_per_transition": 6.79,
+          "operation": "exec_error_to_terminal",
+          "sample": 13
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 685000,
+          "iterations": 100000,
+          "ns_per_transition": 6.85,
+          "operation": "exec_error_to_terminal",
+          "sample": 14
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 688458,
+          "iterations": 100000,
+          "ns_per_transition": 6.88458,
+          "operation": "exec_error_to_terminal",
+          "sample": 15
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 687709,
+          "iterations": 100000,
+          "ns_per_transition": 6.87709,
+          "operation": "exec_error_to_terminal",
+          "sample": 16
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 685709,
+          "iterations": 100000,
+          "ns_per_transition": 6.85709,
+          "operation": "exec_error_to_terminal",
+          "sample": 17
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 680000,
+          "iterations": 100000,
+          "ns_per_transition": 6.8,
+          "operation": "exec_error_to_terminal",
+          "sample": 18
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 683500,
+          "iterations": 100000,
+          "ns_per_transition": 6.835,
+          "operation": "exec_error_to_terminal",
+          "sample": 19
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 690250,
+          "iterations": 100000,
+          "ns_per_transition": 6.9025,
+          "operation": "exec_error_to_terminal",
+          "sample": 20
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 704208,
+          "iterations": 100000,
+          "ns_per_transition": 7.04208,
+          "operation": "exec_error_to_terminal",
+          "sample": 21
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 704584,
+          "iterations": 100000,
+          "ns_per_transition": 7.04584,
+          "operation": "exec_error_to_terminal",
+          "sample": 22
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 699250,
+          "iterations": 100000,
+          "ns_per_transition": 6.9925,
+          "operation": "exec_error_to_terminal",
+          "sample": 23
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 680708,
+          "iterations": 100000,
+          "ns_per_transition": 6.80708,
+          "operation": "exec_error_to_terminal",
+          "sample": 24
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 687167,
+          "iterations": 100000,
+          "ns_per_transition": 6.87167,
+          "operation": "exec_error_to_terminal",
+          "sample": 25
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 690541,
+          "iterations": 100000,
+          "ns_per_transition": 6.90541,
+          "operation": "exec_error_to_terminal",
+          "sample": 26
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 680834,
+          "iterations": 100000,
+          "ns_per_transition": 6.80834,
+          "operation": "exec_error_to_terminal",
+          "sample": 27
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 684917,
+          "iterations": 100000,
+          "ns_per_transition": 6.84917,
+          "operation": "exec_error_to_terminal",
+          "sample": 28
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 679334,
+          "iterations": 100000,
+          "ns_per_transition": 6.79334,
+          "operation": "exec_error_to_terminal",
+          "sample": 29
+        }
+      ],
+      "source_commit": "4341c6b75c561d3d05a6854b38489ec3704c02f7",
+      "test_command": [
+        "/private/var/folders/8f/dl9bkkyn1zs5ycl864wv184h0000gn/T/carrick-atomic-handoff-juqxp5h3/source/target/release/deps/carrick_runtime-d84348e87b2d541e",
+        "vcpu_loop::tests::clone_admission_terminal_claim_cost_receipt",
+        "--ignored",
+        "--nocapture",
+        "--exact"
+      ],
+      "worktree": "/var/folders/8f/dl9bkkyn1zs5ycl864wv184h0000gn/T/carrick-atomic-handoff-juqxp5h3/source"
+    },
+    {
+      "aggregate": {
+        "exec_error_to_terminal": {
+          "median_ns_per_transition": 6.81708,
+          "p95_ns_per_transition": 6.95416
+        },
+        "generic_exit_claim": {
+          "median_ns_per_transition": 3.32333,
+          "p95_ns_per_transition": 3.42166
+        }
+      },
+      "build_command": [
+        "cargo",
+        "test",
+        "--release",
+        "-p",
+        "carrick-runtime",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "census": [
+        {
+          "matches": [],
+          "observations": 1,
+          "phase": "before_build"
+        },
+        {
+          "cleanup": {
+            "escalated": false,
+            "process_group_id": 66647,
+            "terminated": false
+          },
+          "matches": [],
+          "observations": 4,
+          "phase": "build"
+        },
+        {
+          "matches": [],
+          "observations": 1,
+          "phase": "before_reducer"
+        },
+        {
+          "cleanup": {
+            "escalated": false,
+            "process_group_id": 66655,
+            "terminated": false
+          },
+          "matches": [],
+          "observations": 6,
+          "phase": "reducer"
+        },
+        {
+          "matches": [],
+          "observations": 1,
+          "phase": "post_arm"
+        }
+      ],
+      "executable": {
+        "macho_uuid": "5D0E88AA-C936-3D84-82B8-064F0985C2B9",
+        "path": "/private/var/folders/8f/dl9bkkyn1zs5ycl864wv184h0000gn/T/carrick-atomic-handoff-juqxp5h3/source/target/release/deps/carrick_runtime-d84348e87b2d541e",
+        "sha256": "6c5e946e64d0334a6606451d6e8fc870eebab9ff274d6be787c582bddf579f6a"
+      },
+      "label": "B2",
+      "power_state_after": {
+        "cpu_power_status": "No CPU power status has been recorded",
+        "low_power_mode": "0",
+        "performance_warning": "No performance warning level has been recorded",
+        "power_source": "AC Power",
+        "thermal_warning": "No thermal warning level has been recorded"
+      },
+      "power_state_before": {
+        "cpu_power_status": "No CPU power status has been recorded",
+        "low_power_mode": "0",
+        "performance_warning": "No performance warning level has been recorded",
+        "power_source": "AC Power",
+        "thermal_warning": "No thermal warning level has been recorded"
+      },
+      "rows": [
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 332666,
+          "iterations": 100000,
+          "ns_per_transition": 3.32666,
+          "operation": "generic_exit_claim",
+          "sample": 0
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 332458,
+          "iterations": 100000,
+          "ns_per_transition": 3.32458,
+          "operation": "generic_exit_claim",
+          "sample": 1
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 335583,
+          "iterations": 100000,
+          "ns_per_transition": 3.35583,
+          "operation": "generic_exit_claim",
+          "sample": 2
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 331542,
+          "iterations": 100000,
+          "ns_per_transition": 3.31542,
+          "operation": "generic_exit_claim",
+          "sample": 3
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 332167,
+          "iterations": 100000,
+          "ns_per_transition": 3.32167,
+          "operation": "generic_exit_claim",
+          "sample": 4
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 336291,
+          "iterations": 100000,
+          "ns_per_transition": 3.36291,
+          "operation": "generic_exit_claim",
+          "sample": 5
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 332333,
+          "iterations": 100000,
+          "ns_per_transition": 3.32333,
+          "operation": "generic_exit_claim",
+          "sample": 6
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 332834,
+          "iterations": 100000,
+          "ns_per_transition": 3.32834,
+          "operation": "generic_exit_claim",
+          "sample": 7
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 331375,
+          "iterations": 100000,
+          "ns_per_transition": 3.31375,
+          "operation": "generic_exit_claim",
+          "sample": 8
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 332000,
+          "iterations": 100000,
+          "ns_per_transition": 3.32,
+          "operation": "generic_exit_claim",
+          "sample": 9
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 330875,
+          "iterations": 100000,
+          "ns_per_transition": 3.30875,
+          "operation": "generic_exit_claim",
+          "sample": 10
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 332041,
+          "iterations": 100000,
+          "ns_per_transition": 3.32041,
+          "operation": "generic_exit_claim",
+          "sample": 11
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 332417,
+          "iterations": 100000,
+          "ns_per_transition": 3.32417,
+          "operation": "generic_exit_claim",
+          "sample": 12
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 341166,
+          "iterations": 100000,
+          "ns_per_transition": 3.41166,
+          "operation": "generic_exit_claim",
+          "sample": 13
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 340292,
+          "iterations": 100000,
+          "ns_per_transition": 3.40292,
+          "operation": "generic_exit_claim",
+          "sample": 14
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 342166,
+          "iterations": 100000,
+          "ns_per_transition": 3.42166,
+          "operation": "generic_exit_claim",
+          "sample": 15
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 351750,
+          "iterations": 100000,
+          "ns_per_transition": 3.5175,
+          "operation": "generic_exit_claim",
+          "sample": 16
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 332000,
+          "iterations": 100000,
+          "ns_per_transition": 3.32,
+          "operation": "generic_exit_claim",
+          "sample": 17
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 331083,
+          "iterations": 100000,
+          "ns_per_transition": 3.31083,
+          "operation": "generic_exit_claim",
+          "sample": 18
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 332333,
+          "iterations": 100000,
+          "ns_per_transition": 3.32333,
+          "operation": "generic_exit_claim",
+          "sample": 19
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 332333,
+          "iterations": 100000,
+          "ns_per_transition": 3.32333,
+          "operation": "generic_exit_claim",
+          "sample": 20
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 335417,
+          "iterations": 100000,
+          "ns_per_transition": 3.35417,
+          "operation": "generic_exit_claim",
+          "sample": 21
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 331792,
+          "iterations": 100000,
+          "ns_per_transition": 3.31792,
+          "operation": "generic_exit_claim",
+          "sample": 22
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 331833,
+          "iterations": 100000,
+          "ns_per_transition": 3.31833,
+          "operation": "generic_exit_claim",
+          "sample": 23
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 331458,
+          "iterations": 100000,
+          "ns_per_transition": 3.31458,
+          "operation": "generic_exit_claim",
+          "sample": 24
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 331625,
+          "iterations": 100000,
+          "ns_per_transition": 3.31625,
+          "operation": "generic_exit_claim",
+          "sample": 25
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 332625,
+          "iterations": 100000,
+          "ns_per_transition": 3.32625,
+          "operation": "generic_exit_claim",
+          "sample": 26
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 335375,
+          "iterations": 100000,
+          "ns_per_transition": 3.35375,
+          "operation": "generic_exit_claim",
+          "sample": 27
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 331458,
+          "iterations": 100000,
+          "ns_per_transition": 3.31458,
+          "operation": "generic_exit_claim",
+          "sample": 28
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 331167,
+          "iterations": 100000,
+          "ns_per_transition": 3.31167,
+          "operation": "generic_exit_claim",
+          "sample": 29
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 681000,
+          "iterations": 100000,
+          "ns_per_transition": 6.81,
+          "operation": "exec_error_to_terminal",
+          "sample": 0
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 685708,
+          "iterations": 100000,
+          "ns_per_transition": 6.85708,
+          "operation": "exec_error_to_terminal",
+          "sample": 1
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 685250,
+          "iterations": 100000,
+          "ns_per_transition": 6.8525,
+          "operation": "exec_error_to_terminal",
+          "sample": 2
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 678208,
+          "iterations": 100000,
+          "ns_per_transition": 6.78208,
+          "operation": "exec_error_to_terminal",
+          "sample": 3
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 684541,
+          "iterations": 100000,
+          "ns_per_transition": 6.84541,
+          "operation": "exec_error_to_terminal",
+          "sample": 4
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 678250,
+          "iterations": 100000,
+          "ns_per_transition": 6.7825,
+          "operation": "exec_error_to_terminal",
+          "sample": 5
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 680666,
+          "iterations": 100000,
+          "ns_per_transition": 6.80666,
+          "operation": "exec_error_to_terminal",
+          "sample": 6
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 681666,
+          "iterations": 100000,
+          "ns_per_transition": 6.81666,
+          "operation": "exec_error_to_terminal",
+          "sample": 7
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 687459,
+          "iterations": 100000,
+          "ns_per_transition": 6.87459,
+          "operation": "exec_error_to_terminal",
+          "sample": 8
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 699875,
+          "iterations": 100000,
+          "ns_per_transition": 6.99875,
+          "operation": "exec_error_to_terminal",
+          "sample": 9
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 695416,
+          "iterations": 100000,
+          "ns_per_transition": 6.95416,
+          "operation": "exec_error_to_terminal",
+          "sample": 10
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 681750,
+          "iterations": 100000,
+          "ns_per_transition": 6.8175,
+          "operation": "exec_error_to_terminal",
+          "sample": 11
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 682666,
+          "iterations": 100000,
+          "ns_per_transition": 6.82666,
+          "operation": "exec_error_to_terminal",
+          "sample": 12
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 681167,
+          "iterations": 100000,
+          "ns_per_transition": 6.81167,
+          "operation": "exec_error_to_terminal",
+          "sample": 13
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 678750,
+          "iterations": 100000,
+          "ns_per_transition": 6.7875,
+          "operation": "exec_error_to_terminal",
+          "sample": 14
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 679167,
+          "iterations": 100000,
+          "ns_per_transition": 6.79167,
+          "operation": "exec_error_to_terminal",
+          "sample": 15
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 682209,
+          "iterations": 100000,
+          "ns_per_transition": 6.82209,
+          "operation": "exec_error_to_terminal",
+          "sample": 16
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 682375,
+          "iterations": 100000,
+          "ns_per_transition": 6.82375,
+          "operation": "exec_error_to_terminal",
+          "sample": 17
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 679167,
+          "iterations": 100000,
+          "ns_per_transition": 6.79167,
+          "operation": "exec_error_to_terminal",
+          "sample": 18
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 679042,
+          "iterations": 100000,
+          "ns_per_transition": 6.79042,
+          "operation": "exec_error_to_terminal",
+          "sample": 19
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 678375,
+          "iterations": 100000,
+          "ns_per_transition": 6.78375,
+          "operation": "exec_error_to_terminal",
+          "sample": 20
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 685583,
+          "iterations": 100000,
+          "ns_per_transition": 6.85583,
+          "operation": "exec_error_to_terminal",
+          "sample": 21
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 692041,
+          "iterations": 100000,
+          "ns_per_transition": 6.92041,
+          "operation": "exec_error_to_terminal",
+          "sample": 22
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 692666,
+          "iterations": 100000,
+          "ns_per_transition": 6.92666,
+          "operation": "exec_error_to_terminal",
+          "sample": 23
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 691666,
+          "iterations": 100000,
+          "ns_per_transition": 6.91666,
+          "operation": "exec_error_to_terminal",
+          "sample": 24
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 681583,
+          "iterations": 100000,
+          "ns_per_transition": 6.81583,
+          "operation": "exec_error_to_terminal",
+          "sample": 25
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 681334,
+          "iterations": 100000,
+          "ns_per_transition": 6.81334,
+          "operation": "exec_error_to_terminal",
+          "sample": 26
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 684416,
+          "iterations": 100000,
+          "ns_per_transition": 6.84416,
+          "operation": "exec_error_to_terminal",
+          "sample": 27
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 680708,
+          "iterations": 100000,
+          "ns_per_transition": 6.80708,
+          "operation": "exec_error_to_terminal",
+          "sample": 28
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 678791,
+          "iterations": 100000,
+          "ns_per_transition": 6.78791,
+          "operation": "exec_error_to_terminal",
+          "sample": 29
+        }
+      ],
+      "source_commit": "4341c6b75c561d3d05a6854b38489ec3704c02f7",
+      "test_command": [
+        "/private/var/folders/8f/dl9bkkyn1zs5ycl864wv184h0000gn/T/carrick-atomic-handoff-juqxp5h3/source/target/release/deps/carrick_runtime-d84348e87b2d541e",
+        "vcpu_loop::tests::clone_admission_terminal_claim_cost_receipt",
+        "--ignored",
+        "--nocapture",
+        "--exact"
+      ],
+      "worktree": "/var/folders/8f/dl9bkkyn1zs5ycl864wv184h0000gn/T/carrick-atomic-handoff-juqxp5h3/source"
+    },
+    {
+      "aggregate": {
+        "exec_error_to_terminal": {
+          "median_ns_per_transition": 8.07021,
+          "p95_ns_per_transition": 8.43459
+        },
+        "generic_exit_claim": {
+          "median_ns_per_transition": 3.699165,
+          "p95_ns_per_transition": 3.89625
+        }
+      },
+      "build_command": [
+        "cargo",
+        "test",
+        "--release",
+        "-p",
+        "carrick-runtime",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "census": [
+        {
+          "matches": [],
+          "observations": 1,
+          "phase": "before_build"
+        },
+        {
+          "cleanup": {
+            "escalated": false,
+            "process_group_id": 66670,
+            "terminated": false
+          },
+          "matches": [],
+          "observations": 3,
+          "phase": "build"
+        },
+        {
+          "matches": [],
+          "observations": 1,
+          "phase": "before_reducer"
+        },
+        {
+          "cleanup": {
+            "escalated": false,
+            "process_group_id": 66677,
+            "terminated": false
+          },
+          "matches": [],
+          "observations": 5,
+          "phase": "reducer"
+        },
+        {
+          "matches": [],
+          "observations": 1,
+          "phase": "post_arm"
+        }
+      ],
+      "executable": {
+        "macho_uuid": "5C5DD823-08D0-33DD-A395-CCAD27DBF855",
+        "path": "/private/var/folders/8f/dl9bkkyn1zs5ycl864wv184h0000gn/T/carrick-atomic-handoff-mlreq27r/source/target/release/deps/carrick_runtime-d84348e87b2d541e",
+        "sha256": "bc56e20aa170c3474585ef515205eb57d9143699197d09875c8b865c5e2cc0b7"
+      },
+      "label": "A2",
+      "power_state_after": {
+        "cpu_power_status": "No CPU power status has been recorded",
+        "low_power_mode": "0",
+        "performance_warning": "No performance warning level has been recorded",
+        "power_source": "AC Power",
+        "thermal_warning": "No thermal warning level has been recorded"
+      },
+      "power_state_before": {
+        "cpu_power_status": "No CPU power status has been recorded",
+        "low_power_mode": "0",
+        "performance_warning": "No performance warning level has been recorded",
+        "power_source": "AC Power",
+        "thermal_warning": "No thermal warning level has been recorded"
+      },
+      "rows": [
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 366875,
+          "iterations": 100000,
+          "ns_per_transition": 3.66875,
+          "operation": "generic_exit_claim",
+          "sample": 0
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 367541,
+          "iterations": 100000,
+          "ns_per_transition": 3.67541,
+          "operation": "generic_exit_claim",
+          "sample": 1
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 366750,
+          "iterations": 100000,
+          "ns_per_transition": 3.6675,
+          "operation": "generic_exit_claim",
+          "sample": 2
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 368125,
+          "iterations": 100000,
+          "ns_per_transition": 3.68125,
+          "operation": "generic_exit_claim",
+          "sample": 3
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 367584,
+          "iterations": 100000,
+          "ns_per_transition": 3.67584,
+          "operation": "generic_exit_claim",
+          "sample": 4
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 367542,
+          "iterations": 100000,
+          "ns_per_transition": 3.67542,
+          "operation": "generic_exit_claim",
+          "sample": 5
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 368542,
+          "iterations": 100000,
+          "ns_per_transition": 3.68542,
+          "operation": "generic_exit_claim",
+          "sample": 6
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 367125,
+          "iterations": 100000,
+          "ns_per_transition": 3.67125,
+          "operation": "generic_exit_claim",
+          "sample": 7
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 368875,
+          "iterations": 100000,
+          "ns_per_transition": 3.68875,
+          "operation": "generic_exit_claim",
+          "sample": 8
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 369042,
+          "iterations": 100000,
+          "ns_per_transition": 3.69042,
+          "operation": "generic_exit_claim",
+          "sample": 9
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 367875,
+          "iterations": 100000,
+          "ns_per_transition": 3.67875,
+          "operation": "generic_exit_claim",
+          "sample": 10
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 369625,
+          "iterations": 100000,
+          "ns_per_transition": 3.69625,
+          "operation": "generic_exit_claim",
+          "sample": 11
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 369625,
+          "iterations": 100000,
+          "ns_per_transition": 3.69625,
+          "operation": "generic_exit_claim",
+          "sample": 12
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 369833,
+          "iterations": 100000,
+          "ns_per_transition": 3.69833,
+          "operation": "generic_exit_claim",
+          "sample": 13
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 370167,
+          "iterations": 100000,
+          "ns_per_transition": 3.70167,
+          "operation": "generic_exit_claim",
+          "sample": 14
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 371791,
+          "iterations": 100000,
+          "ns_per_transition": 3.71791,
+          "operation": "generic_exit_claim",
+          "sample": 15
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 368083,
+          "iterations": 100000,
+          "ns_per_transition": 3.68083,
+          "operation": "generic_exit_claim",
+          "sample": 16
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 373292,
+          "iterations": 100000,
+          "ns_per_transition": 3.73292,
+          "operation": "generic_exit_claim",
+          "sample": 17
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 372875,
+          "iterations": 100000,
+          "ns_per_transition": 3.72875,
+          "operation": "generic_exit_claim",
+          "sample": 18
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 384333,
+          "iterations": 100000,
+          "ns_per_transition": 3.84333,
+          "operation": "generic_exit_claim",
+          "sample": 19
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 389625,
+          "iterations": 100000,
+          "ns_per_transition": 3.89625,
+          "operation": "generic_exit_claim",
+          "sample": 20
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 387584,
+          "iterations": 100000,
+          "ns_per_transition": 3.87584,
+          "operation": "generic_exit_claim",
+          "sample": 21
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 387125,
+          "iterations": 100000,
+          "ns_per_transition": 3.87125,
+          "operation": "generic_exit_claim",
+          "sample": 22
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 396125,
+          "iterations": 100000,
+          "ns_per_transition": 3.96125,
+          "operation": "generic_exit_claim",
+          "sample": 23
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 386042,
+          "iterations": 100000,
+          "ns_per_transition": 3.86042,
+          "operation": "generic_exit_claim",
+          "sample": 24
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 371375,
+          "iterations": 100000,
+          "ns_per_transition": 3.71375,
+          "operation": "generic_exit_claim",
+          "sample": 25
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 370625,
+          "iterations": 100000,
+          "ns_per_transition": 3.70625,
+          "operation": "generic_exit_claim",
+          "sample": 26
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 371292,
+          "iterations": 100000,
+          "ns_per_transition": 3.71292,
+          "operation": "generic_exit_claim",
+          "sample": 27
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 373042,
+          "iterations": 100000,
+          "ns_per_transition": 3.73042,
+          "operation": "generic_exit_claim",
+          "sample": 28
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 370000,
+          "iterations": 100000,
+          "ns_per_transition": 3.7,
+          "operation": "generic_exit_claim",
+          "sample": 29
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 807542,
+          "iterations": 100000,
+          "ns_per_transition": 8.07542,
+          "operation": "exec_error_to_terminal",
+          "sample": 0
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 814125,
+          "iterations": 100000,
+          "ns_per_transition": 8.14125,
+          "operation": "exec_error_to_terminal",
+          "sample": 1
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 796375,
+          "iterations": 100000,
+          "ns_per_transition": 7.96375,
+          "operation": "exec_error_to_terminal",
+          "sample": 2
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 803042,
+          "iterations": 100000,
+          "ns_per_transition": 8.03042,
+          "operation": "exec_error_to_terminal",
+          "sample": 3
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 781250,
+          "iterations": 100000,
+          "ns_per_transition": 7.8125,
+          "operation": "exec_error_to_terminal",
+          "sample": 4
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 823417,
+          "iterations": 100000,
+          "ns_per_transition": 8.23417,
+          "operation": "exec_error_to_terminal",
+          "sample": 5
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 834084,
+          "iterations": 100000,
+          "ns_per_transition": 8.34084,
+          "operation": "exec_error_to_terminal",
+          "sample": 6
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 829667,
+          "iterations": 100000,
+          "ns_per_transition": 8.29667,
+          "operation": "exec_error_to_terminal",
+          "sample": 7
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 843459,
+          "iterations": 100000,
+          "ns_per_transition": 8.43459,
+          "operation": "exec_error_to_terminal",
+          "sample": 8
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 802834,
+          "iterations": 100000,
+          "ns_per_transition": 8.02834,
+          "operation": "exec_error_to_terminal",
+          "sample": 9
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 804958,
+          "iterations": 100000,
+          "ns_per_transition": 8.04958,
+          "operation": "exec_error_to_terminal",
+          "sample": 10
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 789708,
+          "iterations": 100000,
+          "ns_per_transition": 7.89708,
+          "operation": "exec_error_to_terminal",
+          "sample": 11
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 828083,
+          "iterations": 100000,
+          "ns_per_transition": 8.28083,
+          "operation": "exec_error_to_terminal",
+          "sample": 12
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 802959,
+          "iterations": 100000,
+          "ns_per_transition": 8.02959,
+          "operation": "exec_error_to_terminal",
+          "sample": 13
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 803750,
+          "iterations": 100000,
+          "ns_per_transition": 8.0375,
+          "operation": "exec_error_to_terminal",
+          "sample": 14
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 800667,
+          "iterations": 100000,
+          "ns_per_transition": 8.00667,
+          "operation": "exec_error_to_terminal",
+          "sample": 15
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 789166,
+          "iterations": 100000,
+          "ns_per_transition": 7.89166,
+          "operation": "exec_error_to_terminal",
+          "sample": 16
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 808750,
+          "iterations": 100000,
+          "ns_per_transition": 8.0875,
+          "operation": "exec_error_to_terminal",
+          "sample": 17
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 800917,
+          "iterations": 100000,
+          "ns_per_transition": 8.00917,
+          "operation": "exec_error_to_terminal",
+          "sample": 18
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 803042,
+          "iterations": 100000,
+          "ns_per_transition": 8.03042,
+          "operation": "exec_error_to_terminal",
+          "sample": 19
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 800333,
+          "iterations": 100000,
+          "ns_per_transition": 8.00333,
+          "operation": "exec_error_to_terminal",
+          "sample": 20
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 785541,
+          "iterations": 100000,
+          "ns_per_transition": 7.85541,
+          "operation": "exec_error_to_terminal",
+          "sample": 21
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 818041,
+          "iterations": 100000,
+          "ns_per_transition": 8.18041,
+          "operation": "exec_error_to_terminal",
+          "sample": 22
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 830250,
+          "iterations": 100000,
+          "ns_per_transition": 8.3025,
+          "operation": "exec_error_to_terminal",
+          "sample": 23
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 834875,
+          "iterations": 100000,
+          "ns_per_transition": 8.34875,
+          "operation": "exec_error_to_terminal",
+          "sample": 24
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 855041,
+          "iterations": 100000,
+          "ns_per_transition": 8.55041,
+          "operation": "exec_error_to_terminal",
+          "sample": 25
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 828083,
+          "iterations": 100000,
+          "ns_per_transition": 8.28083,
+          "operation": "exec_error_to_terminal",
+          "sample": 26
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 817500,
+          "iterations": 100000,
+          "ns_per_transition": 8.175,
+          "operation": "exec_error_to_terminal",
+          "sample": 27
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 817125,
+          "iterations": 100000,
+          "ns_per_transition": 8.17125,
+          "operation": "exec_error_to_terminal",
+          "sample": 28
+        },
+        {
+          "contender_admissions": 0,
+          "elapsed_ns": 806500,
+          "iterations": 100000,
+          "ns_per_transition": 8.065,
+          "operation": "exec_error_to_terminal",
+          "sample": 29
+        }
+      ],
+      "source_commit": "e3ac9b8db119df4b4a1a6c2358b18b952083728c",
+      "test_command": [
+        "/private/var/folders/8f/dl9bkkyn1zs5ycl864wv184h0000gn/T/carrick-atomic-handoff-mlreq27r/source/target/release/deps/carrick_runtime-d84348e87b2d541e",
+        "vcpu_loop::tests::clone_admission_terminal_claim_cost_receipt",
+        "--ignored",
+        "--nocapture",
+        "--exact"
+      ],
+      "worktree": "/var/folders/8f/dl9bkkyn1zs5ycl864wv184h0000gn/T/carrick-atomic-handoff-mlreq27r/source"
+    }
+  ],
+  "executable_identities": {
+    "4341c6b75c561d3d05a6854b38489ec3704c02f7": {
+      "macho_uuid": "5D0E88AA-C936-3D84-82B8-064F0985C2B9",
+      "path": "/private/var/folders/8f/dl9bkkyn1zs5ycl864wv184h0000gn/T/carrick-atomic-handoff-juqxp5h3/source/target/release/deps/carrick_runtime-d84348e87b2d541e",
+      "sha256": "6c5e946e64d0334a6606451d6e8fc870eebab9ff274d6be787c582bddf579f6a"
+    },
+    "e3ac9b8db119df4b4a1a6c2358b18b952083728c": {
+      "macho_uuid": "5C5DD823-08D0-33DD-A395-CCAD27DBF855",
+      "path": "/private/var/folders/8f/dl9bkkyn1zs5ycl864wv184h0000gn/T/carrick-atomic-handoff-mlreq27r/source/target/release/deps/carrick_runtime-d84348e87b2d541e",
+      "sha256": "bc56e20aa170c3474585ef515205eb57d9143699197d09875c8b865c5e2cc0b7"
+    }
+  },
+  "host": {
+    "cpu_model": "Apple M4",
+    "machine": "arm64",
+    "node": "Timothys-Air-2.localdomain",
+    "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+    "python": "3.14.6 (main, Jun 10 2026, 10:03:53) [Clang 21.0.0 (clang-2100.0.123.102)]",
+    "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)"
+  },
+  "mode": "paired",
+  "parameters": {
+    "iterations": 100000,
+    "samples": 30,
+    "warmups": 5
+  },
+  "ratios": {
+    "accepted": true,
+    "contender_admissions": 0,
+    "generic_median_ratio": 0.9001463843867468,
+    "generic_p95_ratio": 0.880130185067007
+  },
+  "schema": "carrick.atomic-exec-terminal-handoff-abba.v1"
+}

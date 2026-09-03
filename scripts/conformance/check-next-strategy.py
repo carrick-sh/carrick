@@ -2,6 +2,7 @@
 """Fail closed when probe wiring regresses to the legacy subprocess strategy."""
 
 from pathlib import Path
+import shlex
 import sys
 
 
@@ -26,12 +27,63 @@ def check_next_has_no_subprocesses() -> None:
 
 
 def check_ci_uses_public_gate() -> None:
-    workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    workflows = sorted((ROOT / ".github/workflows").glob("*.yml"))
     legacy = "cargo test -p carrick-cli --test conformance"
-    if legacy in workflow:
-        fail("CI invokes the legacy carrick-cli conformance target directly")
-    if "run: just conformance-probes" not in workflow:
-        fail("CI does not invoke the public just conformance-probes gate")
+    for workflow in workflows:
+        if legacy in workflow.read_text(encoding="utf-8"):
+            fail(
+                f"{workflow.relative_to(ROOT)} invokes the legacy carrick-cli "
+                "conformance target directly"
+            )
+    if not any(_uses_public_gate(workflow) for workflow in workflows):
+        fail("no workflow invokes the public just conformance-probes gate")
+
+
+def _uses_public_gate(workflow: Path) -> bool:
+    lines = workflow.read_text(encoding="utf-8").splitlines()
+    for index, raw in enumerate(lines):
+        command = _run_command(raw)
+        if command is None:
+            continue
+        if _command_uses_public_gate(command):
+            return True
+        if command.startswith(("|", ">")) and _block_uses_public_gate(lines, index):
+            return True
+    return False
+
+
+def _run_command(raw: str) -> str | None:
+    stripped = raw.lstrip()
+    for prefix in ("run:", "- run:"):
+        if stripped.startswith(prefix):
+            return stripped.removeprefix(prefix).strip()
+    return None
+
+
+def _block_uses_public_gate(lines: list[str], header_index: int) -> bool:
+    header = lines[header_index]
+    header_indent = len(header) - len(header.lstrip())
+    for raw in lines[header_index + 1 :]:
+        if raw.strip() and len(raw) - len(raw.lstrip()) <= header_indent:
+            return False
+        if _command_uses_public_gate(raw.strip()):
+            return True
+    return False
+
+
+def _command_uses_public_gate(command: str) -> bool:
+    try:
+        tokens = shlex.split(command, comments=False)
+    except ValueError:
+        return False
+    while tokens and _is_environment_assignment(tokens[0]):
+        tokens.pop(0)
+    return tokens[:2] == ["just", "conformance-probes"]
+
+
+def _is_environment_assignment(token: str) -> bool:
+    name, separator, _value = token.partition("=")
+    return separator == "=" and name.isidentifier()
 
 
 def check_public_gate_is_filtered() -> None:

@@ -1413,6 +1413,19 @@ where
                 crate::linux_abi::LINUX_EAGAIN.guest_retval(),
             )));
         }
+        // Reserve carrier job custody before any Kernel/backend child
+        // publication. Container close rejects a new reservation, while a
+        // reservation which won before close remains valid through the
+        // transaction and may activate its exact completion during the drain.
+        let process_job_reservation = match kernel.reserve_hvpatch_persistent_process_job() {
+            Ok(reservation) => reservation,
+            Err(RuntimeError::CarrierClosing | RuntimeError::CarrierClosed) => {
+                return Ok(PreparedInProcessFork::Complete(Some(
+                    crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+                )));
+            }
+            Err(error) => return Err(error),
+        };
         // Clone admission is closed and all previously enrolled clone
         // publications have drained before quiescence. Take the authoritative
         // task transaction only after every sibling has either parked or
@@ -1467,6 +1480,16 @@ where
                     },
                 });
             }
+            Err(error @ crate::kernel::KernelOperationError::ProcessLimitExceeded { .. }) => {
+                // Reaching RLIMIT_NPROC is an expected guest-visible resource
+                // result, not a degraded carrier condition.  Keep the detail
+                // available to opt-in diagnostics without leaking a host WARN
+                // into the guest's stderr stream.
+                tracing::debug!(%error, "hvpatch fork reached the guest process limit");
+                return Ok(PreparedInProcessFork::Complete(Some(
+                    crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+                )));
+            }
             Err(error) => {
                 tracing::warn!(%error, "hvpatch kernel child reservation failed; fork(2) = EAGAIN");
                 return Ok(PreparedInProcessFork::Complete(Some(
@@ -1476,6 +1499,7 @@ where
         };
         let shares_mm = clone_plan.mm() == crate::kernel::CloneObjectMode::Share;
         let child_id = reservation.child_id();
+        let guest_child_pid = reservation.visible_child_id();
         let child_pid = child_id.raw();
         let parent_task = parent_context.task().key();
         let prepared_mm = if shares_mm {
@@ -1904,39 +1928,9 @@ where
         let child_platform_futex = (self.platform_futex_factory)(Arc::clone(&child_futex));
         let child_threads = Arc::new(parking_lot::Mutex::new(Vec::new()));
 
-        // The pid the GUEST sees for this child is the kernel task id itself:
-        // the kernel graph's `IdRegistry` is the pid domain of the container's
-        // namespace (init is task 1), and every guest-visible rendering --
-        // `getpid`, `gettid`, the `/proc` listing, `/proc/<pid>/*`,
-        // `oom_score_adj` -- draws on that one number. A second, independently
-        // counted ns pid drifted from it whenever a fork retried after a
-        // dropped reservation (a `Topology` retry burns a task id but not a
-        // counter tick), leaving `getpid()` naming a task `/proc` did not
-        // list. The region keeps membership/parent/orphan bookkeeping only.
-        // The kernel publish that normally registers the child (`fork_task`'s
-        // commit) runs AFTER this copyout, so the registration is pulled
-        // forward here: `fork_task` finds the mapping already present and
-        // keeps it. Fork children always share the parent's region
-        // (CLONE_NEWPID is rejected at clone entry), and the three failpoint
-        // rollbacks below unregister again so a rolled-back reservation cannot
-        // leave a stale mapping behind for a recycled task id.
-        let ns_region = parent_context.task().pid_ns_region();
-        let mut child_ns_registered = false;
-        if let (Some(region), Ok(raw)) = (&ns_region, u32::try_from(child_pid)) {
-            if region.host_to_ns(raw).is_none() {
-                child_ns_registered = region
-                    .register(raw, raw, parent_task.id.raw() as u32)
-                    .is_some();
-            }
-        }
-        let guest_child_pid = child_pid;
-        let unregister_child_ns = |registered: bool| {
-            if registered {
-                if let (Some(region), Ok(raw)) = (&ns_region, u32::try_from(child_pid)) {
-                    region.unregister_reaped(raw);
-                }
-            }
-        };
+        // The kernel reservation owns the independently allocated namespace
+        // PID until commit. Copy out that captured visible identity while all
+        // backend keys continue to use the carrier-global TaskId.
         let parent_outputs_published = request.parent_tid_addr.is_none_or(|address| {
             memory
                 .write_bytes(address, &guest_child_pid.to_le_bytes())
@@ -1968,7 +1962,6 @@ where
                     std::process::abort();
                 });
             }
-            unregister_child_ns(child_ns_registered);
             if let Err(cleanup_error) =
                 ops.abort_and_rollback_prepared(prepared_backend, memory, !shares_mm)
             {
@@ -1991,7 +1984,6 @@ where
                     .write_bytes(address, bytes)
                     .unwrap_or_else(|_| std::process::abort());
             }
-            unregister_child_ns(child_ns_registered);
             if let Err(cleanup_error) =
                 ops.abort_and_rollback_prepared(prepared_backend, memory, !shares_mm)
             {
@@ -2013,7 +2005,6 @@ where
                     .write_bytes(address, bytes)
                     .unwrap_or_else(|_| std::process::abort());
             }
-            unregister_child_ns(child_ns_registered);
             if let Err(cleanup_error) =
                 ops.abort_and_rollback_prepared(prepared_backend, memory, !shares_mm)
             {
@@ -2157,9 +2148,8 @@ where
                 std::process::abort();
             });
 
-        type HvfEngine = carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Engine;
         let (execution_lease, injected_lease) = ExecutionLeaseCell::injected();
-        let mut child_state = ThreadRuntimeState::<HvfEngine>::new(
+        let mut child_state = ThreadRuntimeState::<E>::new(
             Arc::clone(&child_registry),
             Arc::clone(&child_futex),
             child_platform_futex,
@@ -2178,6 +2168,33 @@ where
         );
         child_state.execution_lease = execution_lease;
         child_state.service_kernel_context = Some(child_context.retain_exact());
+        if !is_external_exec {
+            let child_syscall = self
+                .syscall_completion
+                .guest("process child publication lost parent completion token")
+                .unwrap_or_else(|error| {
+                    tracing::error!(
+                        child_pid,
+                        %error,
+                        "process child publication lost parent completion token"
+                    );
+                    std::process::abort();
+                })
+                .syscall();
+            child_state.syscall_completion =
+                SyscallCompletionOwnership::Guest(SyscallCompletionToken::new(
+                    child_syscall,
+                    child_context.retain_exact(),
+                    child_kernel.dispatcher.observers().cloned(),
+                ));
+        } else {
+            child_state
+                .begin_internal_control_exec()
+                .unwrap_or_else(|error| {
+                    tracing::error!(child_pid, %error, "type external control exec ownership");
+                    std::process::abort();
+                });
+        }
         let mut logical = prepare_hvpatch_logical_job(HvpatchLogicalJobInput {
             kernel: Arc::clone(&child_kernel),
             state: child_state,
@@ -2186,12 +2203,17 @@ where
             cpu: task_state,
             generation,
             injected_lease,
-            bootstrap_process_child: Some((
-                shares_mm,
-                request
-                    .child_tid_addr
-                    .map(|address| (address, guest_child_pid)),
-            )),
+            bootstrap_process_child: Some(if is_external_exec {
+                ProcessChildBootstrap::ExternalControlExec { shares_mm }
+            } else {
+                ProcessChildBootstrap::GuestFork {
+                    shares_mm,
+                    child_settid: request
+                        .child_tid_addr
+                        .map(|address| (address, guest_child_pid)),
+                }
+            }),
+            bootstrap_thread_child: false,
         })
         .unwrap_or_else(|error| {
             tracing::error!(child_pid, %error, "prepare process child logical job");
@@ -2225,10 +2247,6 @@ where
             });
         child_kernel
             .register_hvpatch_runtime_endpoint(Arc::clone(&child_futex), Arc::clone(&child_kicker));
-        child_kernel.enroll_hvpatch_persistent_process_job(
-            logical.result.clone(),
-            logical.completion.clone(),
-        );
         if let Err(error) = child_kernel.admit_external_exec(child_context.task().key()) {
             return Err(ops.fail_stop(error));
         }
@@ -2282,6 +2300,10 @@ where
                 Arc::clone(child_context.thread()),
                 proof,
                 member_publication,
+                process_job_reservation,
+                logical.result.clone(),
+                logical.completion.clone(),
+                logical.process_retirement.clone(),
             ))
         } else {
             dormant
@@ -2291,6 +2313,11 @@ where
                     std::process::abort();
                 });
             member_publication.commit();
+            process_job_reservation.activate_with_process_retirement(
+                logical.result.clone(),
+                logical.completion.clone(),
+                logical.process_retirement.clone(),
+            )?;
             if let Err(error) = check_hvpatch_process_failpoint(HvpatchProcessFailpoint::Activation)
             {
                 return Err(ops.fail_stop(error));
@@ -2860,21 +2887,35 @@ mod pt_pause_tests {
         let reserve_at = prepare
             .find("let reservation = match reservation_result {")
             .expect("fork matches its kernel reservation result");
-        let arm = &prepare[reserve_at..reserve_at + 2_000];
+        let reservation_match = &prepare[reserve_at..];
+        let match_end = reservation_match
+            .find("\n        let shares_mm =")
+            .expect("kernel reservation match ends before MM preparation");
+        let arm = &reservation_match[..match_end];
         let busy_at = arm
             .find("Err(crate::kernel::KernelOperationError::TaskBusy(")
             .expect("TaskBusy is matched explicitly at the reservation");
-        let eagain_at = arm
-            .find("LINUX_EAGAIN")
-            .expect("other reservation failures still lower to EAGAIN");
+        let process_limit_at = arm
+            .find("KernelOperationError::ProcessLimitExceeded")
+            .expect("expected process-limit refusal is matched explicitly");
+        let fallback_at = arm
+            .find("\n            Err(error) => {")
+            .expect("unexpected reservation failures retain a fallback");
         assert!(
-            busy_at < eagain_at,
-            "TaskBusy is handled before the EAGAIN fallback"
+            busy_at < process_limit_at && process_limit_at < fallback_at,
+            "TaskBusy and expected process-limit refusal precede the fallback"
         );
         assert!(
-            arm[busy_at..eagain_at].contains("ProcessForkRetrySubscription::Reservation"),
+            arm[busy_at..process_limit_at].contains("ProcessForkRetrySubscription::Reservation"),
             "TaskBusy is a Retry on the reservation epoch"
         );
+        let process_limit_arm = &arm[process_limit_at..fallback_at];
+        assert!(process_limit_arm.contains("tracing::debug!"));
+        assert!(!process_limit_arm.contains("tracing::warn!"));
+        assert!(process_limit_arm.contains("LINUX_EAGAIN"));
+        let fallback_arm = &arm[fallback_at..];
+        assert!(fallback_arm.contains("tracing::warn!"));
+        assert!(fallback_arm.contains("LINUX_EAGAIN"));
         let epoch_at = prepare[..reserve_at]
             .rfind("kernel_graph().reservation_epoch()")
             .expect("the observed epoch is captured before the reservation");

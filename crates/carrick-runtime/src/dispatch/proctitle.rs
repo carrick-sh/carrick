@@ -47,49 +47,18 @@
 //! runs before any fork/thread, and the widened buffer is private per process
 //! after fork.
 //
-// The label machinery (`RUN_ID`, `run_id`, `proc_label`) and a few helpers are
-// only reachable on some platforms; they are exercised on every platform by the
-// unit tests, so allow dead_code module-wide rather than cfg-gating the still-
-// tested helpers.
+// The label machinery and a few helpers are only reachable on some platforms;
+// they are exercised on every platform by the unit tests, so allow dead_code
+// module-wide rather than cfg-gating the still-tested helpers.
 #![allow(dead_code)]
 
 use std::sync::OnceLock;
 
-/// Per-run id (from `CARRICK_RUN_ID`, inherited across guest forks via the
-/// environment), cached once. Lets cleanup scope to a single run instead of
-/// reaping every `carrick:` host process — the hazard that forces the
-/// conformance gate and the LTP sweeps to run serially. The CLI gives EVERY
-/// `carrick run` a sensible default for this (precedence: explicit
-/// `CARRICK_RUN_ID` → the container `--name` → an auto 12-hex short id from the
-/// `carrick ps` id space), so a run is scoped + reapable by default with no env
-/// var to set — see `crate::commands` (carrick-cli).
-static RUN_ID: OnceLock<Option<String>> = OnceLock::new();
-
-fn run_id() -> Option<&'static str> {
-    RUN_ID
-        .get_or_init(|| {
-            std::env::var("CARRICK_RUN_ID")
-                .ok()
-                .filter(|s| !s.is_empty())
-        })
-        .as_deref()
-}
-
-/// Build the host process title. With a run id this is `carrick:<id>: <name>`,
-/// which is greppable per-run — but the id MUST be matched with its trailing
-/// delimiter: `pkill -f "carrick:<id>:"` (note the final `:`), NOT a bare
-/// `carrick:<id>`. The `:` separates the id from the name, so a run id that is a
-/// PREFIX of another (e.g. `…-c1` vs `…-c10`) would over-match without it — the
-/// scoped reaper (`scripts/sudo/kill.sh`) anchors on `carrick:<id>:` as a literal
-/// for exactly this reason. The match survives `setpgid`/`setsid` escapes.
-/// Without a run id the title is the legacy `carrick: <name>`. Both keep the
-/// literal `carrick:` so the global recovery reaper still matches for manual
-/// cleanup.
-pub(crate) fn proc_label(name: &str, run_id: Option<&str>) -> String {
-    match run_id {
-        Some(id) if !id.is_empty() => format!("carrick:{id}: {}", name.trim()),
-        _ => format!("carrick: {}", name.trim()),
-    }
+/// The one process-level title for a carrier. The scope is immutable and is
+/// the exact token `scripts/sudo/kill.sh` matches; container lifecycle changes
+/// only the count suffix.
+pub(crate) fn carrier_proc_label(scope: &str, live_containers: usize) -> String {
+    format!("carrick:{scope}: {live_containers} containers")
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -152,30 +121,25 @@ pub fn init() {
 )))]
 pub fn init() {}
 
-/// Set the host thread/process name to `carrick: <comm>` so external
-/// tools (Activity Monitor, `ps -M`, `sample`, lldb) can tell which
-/// guest a carrick host process is running — invaluable when a forked
-/// child hangs. `comm` is the guest's NUL-padded task name.
+/// Set only the calling host thread's diagnostic name. Guest `prctl` and exec
+/// may call this freely; they must never overwrite the shared carrier's argv
+/// title, which is owned by [`set_carrier_process_title`].
 #[cfg(target_os = "macos")]
 pub fn set_host_process_name(comm: &[u8]) {
     let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
     let name = String::from_utf8_lossy(&comm[..end]);
-    let label = proc_label(&name, run_id());
-
-    // (1) Thread name — shows in lldb / Instruments / sample / crash
-    // reports. Capped at MAXTHREADNAMESIZE (64).
+    let label = format!("carrick: {}", name.trim());
     let thread_label: String = label.chars().take(63).collect();
     if let Ok(cstr) = std::ffi::CString::new(thread_label) {
         unsafe {
             libc::pthread_setname_np(cstr.as_ptr());
         }
     }
+}
 
-    // (2) argv buffer in-place overwrite — what `ps` reads. macOS's `ps`
-    // shows the argument vector. If `init()` widened the writable range
-    // by relocating environ, we get the full argv+envp byte span; otherwise
-    // we fall back to overwriting just `argv[0]` (legacy behaviour). NUL-pad
-    // the remainder so a shortened name doesn't leave stale trailing text.
+#[cfg(target_os = "macos")]
+pub fn set_carrier_process_title(scope: &str, live_containers: usize) {
+    let label = carrier_proc_label(scope, live_containers);
     unsafe {
         if let Some((buf, len)) = wide_buffer() {
             write_label_into(buf, len, label.as_bytes());
@@ -185,28 +149,25 @@ pub fn set_host_process_name(comm: &[u8]) {
     }
 }
 
-/// BSD `set_host_process_name`: build the same `proc_label` and hand it to
-/// `setproctitle(3)`. The `-` format prefix suppresses libc's default
-/// `progname: ` so `ps -o command` shows EXACTLY the label, e.g.
-/// `carrick:cr-test123: ls` — greppable per-run for the scoped reaper.
 #[cfg(any(
     target_os = "freebsd",
     target_os = "netbsd",
     target_os = "openbsd",
     target_os = "dragonfly"
 ))]
-pub fn set_host_process_name(comm: &[u8]) {
-    let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
-    let name = String::from_utf8_lossy(&comm[..end]);
-    let label = proc_label(&name, run_id());
+pub fn set_host_process_name(_comm: &[u8]) {}
 
-    // A NUL in the label would truncate the C string; `proc_label` only ever
-    // contains the run-id + the guest task name, but guard anyway.
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+pub fn set_carrier_process_title(scope: &str, live_containers: usize) {
+    let label = carrier_proc_label(scope, live_containers);
     let Ok(clabel) = std::ffi::CString::new(label) else {
         return;
     };
-    // Leading "-" in the format suppresses setproctitle's default
-    // "progname: " prefix, so the title is the label verbatim.
     const FMT: &[u8] = b"-%s\0";
     unsafe {
         libc::setproctitle(
@@ -216,33 +177,22 @@ pub fn set_host_process_name(comm: &[u8]) {
     }
 }
 
-/// Linux `set_host_process_name`: (a) overwrite the in-place argv/env byte
-/// window — what `/proc/PID/cmdline` and `ps` read — NUL-padding the remainder,
-/// and (b) `prctl(PR_SET_NAME)` to set `/proc/PID/comm` (15-char cap) for the
-/// short name. Mirrors the macOS argv-overwrite path; if `init()` declined to
-/// relocate we fall back to the `argv[0]`-only window.
 #[cfg(target_os = "linux")]
 pub fn set_host_process_name(comm: &[u8]) {
     let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
     let name = String::from_utf8_lossy(&comm[..end]);
-    let label = proc_label(&name, run_id());
+    let label = format!("carrick: {}", name.trim());
 
-    // (1) /proc/PID/comm via prctl(PR_SET_NAME) — the kernel caps this at 16
-    // bytes including the NUL (15 visible chars). Shows in `ps -o comm`, top,
-    // /proc/PID/comm, and as the thread name in gdb/perf. Use the run-id +
-    // name label truncated to fit; the full label lives in cmdline below.
     if let Ok(cstr) = std::ffi::CString::new(label.chars().take(15).collect::<String>()) {
         unsafe {
             libc::prctl(libc::PR_SET_NAME, cstr.as_ptr() as libc::c_ulong, 0, 0, 0);
         }
     }
+}
 
-    // (2) argv/env byte window in-place overwrite — what `/proc/PID/cmdline`
-    // and `ps -o command` read. If `init()` widened the window by relocating
-    // environ we get the full argv+envp byte span; otherwise fall back to
-    // `argv[0]`-only. NUL-pad the remainder so a shortened name doesn't leave
-    // stale trailing text (and so `/proc/PID/cmdline`'s NUL-separated parsing
-    // collapses to the single title arg).
+#[cfg(target_os = "linux")]
+pub fn set_carrier_process_title(scope: &str, live_containers: usize) {
+    let label = carrier_proc_label(scope, live_containers);
     unsafe {
         if let Some((buf, len)) = wide_buffer() {
             write_label_into(buf, len, label.as_bytes());
@@ -262,6 +212,16 @@ pub fn set_host_process_name(comm: &[u8]) {
     target_os = "dragonfly"
 )))]
 pub fn set_host_process_name(_comm: &[u8]) {}
+
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+)))]
+pub fn set_carrier_process_title(_scope: &str, _live_containers: usize) {}
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn wide_buffer() -> Option<(*mut u8, usize)> {
@@ -582,29 +542,21 @@ unsafe fn discover_and_relocate() -> Option<Buffer> {
 
 #[cfg(test)]
 mod tests {
-    use super::proc_label;
+    use super::carrier_proc_label;
 
     #[test]
-    fn label_with_run_id_is_scoped_per_run() {
-        // A scoped reaper greps "carrick:<id>" — this must contain exactly that
-        // token (colon then id, no space) so it can't match another run's title.
-        assert_eq!(proc_label("ls", Some("cr-42")), "carrick:cr-42: ls");
-    }
-
-    #[test]
-    fn label_without_run_id_is_legacy() {
-        assert_eq!(proc_label("ls", None), "carrick: ls");
-        assert_eq!(proc_label("ls", Some("")), "carrick: ls");
+    fn carrier_label_is_scoped_and_counts_live_containers() {
+        assert_eq!(
+            carrier_proc_label("cr-42", 2),
+            "carrick:cr-42: 2 containers"
+        );
     }
 
     #[test]
     fn scoped_label_is_not_matched_by_another_runs_grep() {
         // The whole point: run A's reaper (grep "carrick:cr-A") must NOT match
         // run B's title, nor the legacy title.
-        assert!(!proc_label("ls", Some("cr-B")).contains("carrick:cr-A"));
-        assert!(!proc_label("ls", None).contains("carrick:cr-A"));
-        // ...but the global recovery reaper (grep "carrick:") still matches both.
-        assert!(proc_label("ls", Some("cr-B")).contains("carrick:"));
-        assert!(proc_label("ls", None).contains("carrick:"));
+        assert!(!carrier_proc_label("cr-B", 2).contains("carrick:cr-A:"));
+        assert!(carrier_proc_label("cr-B", 2).contains("carrick:cr-B:"));
     }
 }

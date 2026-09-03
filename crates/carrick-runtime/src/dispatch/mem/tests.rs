@@ -309,6 +309,58 @@ impl GuestMemory for CountingMmapMemory {
 
 impl CurrentMmMemory for CountingMmapMemory {}
 
+struct Stage1MmapMemory {
+    inner: CountingMmapMemory,
+    page_tables: carrick_mem::page_table::PageTableManager,
+}
+
+impl Stage1MmapMemory {
+    fn new(base: u64, len: usize) -> Self {
+        Self {
+            inner: CountingMmapMemory::new(base, len),
+            page_tables: carrick_mem::page_table::PageTableManager::new(
+                carrick_mem::memory::stage1_hvpatch_page_tables(),
+                carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+            ),
+        }
+    }
+
+    fn terminal_descriptor(&self, address: u64) -> u64 {
+        carrick_mem::page_table::terminal_descriptor(self.page_tables.debug_walk(address))
+    }
+}
+
+impl GuestMemory for Stage1MmapMemory {
+    fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        self.inner.read_bytes_raw(address, length)
+    }
+
+    fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        self.inner.write_bytes_raw(address, bytes)
+    }
+
+    fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        self.inner.zero_backing(address, len)
+    }
+
+    fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
+        let flags = LinuxProtFlags::from_bits_retain(prot);
+        let executable = flags.contains(LinuxProtFlags::EXEC);
+        let changed = if flags.contains(LinuxProtFlags::WRITE) {
+            self.page_tables.set_rw(address, len, executable)
+        } else if flags.intersects(LinuxProtFlags::READ | LinuxProtFlags::EXEC) {
+            self.page_tables.set_readonly(address, len, executable)
+        } else {
+            self.page_tables.set_prot_none(address, len)
+        };
+        changed
+            .map(|_| ())
+            .map_err(|error| MemoryError::HostMap(format!("stage-1 protection: {error:?}")))
+    }
+}
+
+impl CurrentMmMemory for Stage1MmapMemory {}
+
 struct ConcurrentExecMemory(CountingMmapMemory);
 
 impl GuestMemory for ConcurrentExecMemory {
@@ -5149,6 +5201,63 @@ fn mprotect_over_armed_first_touch_page_keeps_the_leaf_invalid_with_new_prot() {
         log.last().copied(),
         Some((base, page as usize, 0)),
         "the armed page must be re-protected to an invalid leaf after the VMA edit: {log:?}"
+    );
+}
+
+/// `MADV_DONTNEED` turns a private-anonymous page back into a first-touch
+/// fault. The protection restored by that fault is the VMA's complete live
+/// R/W/X permission, not a reconstruction from only its writable bit. V8 uses
+/// this exact RWX reserve/discard/publish sequence for generated code.
+#[test]
+fn dontneed_first_touch_restores_an_executable_leaf() {
+    const SYS_MADVISE: u64 = 233;
+    let dispatcher = SyscallDispatcher::new();
+    let page = dispatcher.linux_page_size();
+    let base = LINUX_MMAP_BASE;
+    let rwx = LinuxProtFlags::READ | LinuxProtFlags::WRITE | LinuxProtFlags::EXEC;
+    dispatcher.record_dynamic_mapping(base, page, rwx, ProcMapSharing::Private, String::new());
+
+    let registry =
+        crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1174));
+    let reporter = CompatReporter::default();
+    let mut memory = Stage1MmapMemory::new(base, page as usize);
+    memory
+        .protect_range(base, page as usize, rwx.bits())
+        .expect("publish the live RWX VMA");
+
+    let outcome = threaded_memory_call(
+        &dispatcher,
+        &mut memory,
+        &registry,
+        &reporter,
+        SyscallRequest::new(
+            SYS_MADVISE,
+            SyscallArgs([base, page, carrick_abi::LINUX_MADV_DONTNEED, 0, 0, 0]),
+        ),
+    );
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+
+    let restored_prot = dispatcher
+        .with_resident_fault_plan_for_test(base + 16, |plan| {
+            let prot = plan.prot();
+            memory
+                .protect_range(plan.page(), page as usize, prot)
+                .expect("publish first-touch leaf");
+            prot
+        })
+        .expect("MADV_DONTNEED re-arms the discarded page");
+    let leaf = memory.terminal_descriptor(base);
+    assert_eq!(
+        restored_prot,
+        rwx.bits(),
+        "the pending edit preserves PROT_EXEC"
+    );
+    assert!(
+        carrick_mem::page_table::terminal_descriptor_permits_el0(
+            leaf,
+            carrick_mem::page_table::LeafAccess::Execute,
+        ),
+        "the exact first-touch leaf must remain executable: {leaf:#x}"
     );
 }
 

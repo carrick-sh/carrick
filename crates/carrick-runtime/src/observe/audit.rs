@@ -20,6 +20,7 @@ pub enum AuditEvent {
         syscall_number: u64,
         syscall_name: &'static str,
         args: [u64; 6],
+        original_args: Option<[u64; 6]>,
     },
     SyscallReturn {
         pid: i32,
@@ -134,6 +135,7 @@ impl SyscallObserver for AuditObserver {
             syscall_number: s.number(),
             syscall_name: s.name(),
             args: s.args(),
+            original_args: (s.original_args().0 != s.args()).then_some(s.original_args().0),
         });
         SyscallAction::Allow
     }

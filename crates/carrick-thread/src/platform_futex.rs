@@ -33,10 +33,9 @@ pub struct FutexTableFutex {
 }
 
 impl FutexTableFutex {
-    /// Wrap the process-private table (installed as the CURRENT table for
-    /// helper-thread signal wakes, exactly as before).
+    /// Wrap the process-private table. The runtime loop separately registers
+    /// it beside the exact container's thread registry for helper-thread wakes.
     pub fn new(table: Arc<FutexTable>) -> Self {
-        crate::thread::set_current_futex_table(&table);
         Self { table }
     }
 }
@@ -260,7 +259,6 @@ impl<S: NativeSharedFutex> FutexTableNativeFutex<S> {
     /// Runs [`NativeSharedFutex::init_shared_state`] here, at construction —
     /// the one point every lane reaches before its first guest `fork`.
     pub fn new(table: Arc<FutexTable>, shared: S) -> Self {
-        crate::thread::set_current_futex_table(&table);
         shared.init_shared_state();
         Self { table, shared }
     }
@@ -371,7 +369,6 @@ mod tests {
     /// releases it, with no host primitive involved.
     #[test]
     fn shared_futex_rendezvous_is_in_process() {
-        let _guard = crate::thread::current_futex_table_test_guard();
         let word = Box::leak(Box::new(std::sync::atomic::AtomicU32::new(7)));
         let addr = std::ptr::from_ref(word) as usize;
         let location = SharedFutexLocation::Direct {
@@ -406,7 +403,6 @@ mod tests {
 
     #[test]
     fn shared_wake_publishes_exact_carrier_generation_callback() {
-        let _guard = crate::thread::current_futex_table_test_guard();
         let word = Box::leak(Box::new(std::sync::atomic::AtomicU32::new(7)));
         let addr = std::ptr::from_ref(word) as usize;
         let key = addr ^ 0x5a5a;
@@ -436,7 +432,6 @@ mod tests {
     /// moved returns 0 without parking rather than sleeping to its deadline.
     #[test]
     fn shared_wait_returns_zero_when_the_word_already_moved() {
-        let _guard = crate::thread::current_futex_table_test_guard();
         let word = Box::leak(Box::new(std::sync::atomic::AtomicU32::new(9)));
         let addr = std::ptr::from_ref(word) as usize;
         let location = SharedFutexLocation::Direct {
@@ -453,7 +448,6 @@ mod tests {
 
     #[test]
     fn shared_wait_publishes_after_waiter_enrollment() {
-        let _guard = crate::thread::current_futex_table_test_guard();
         let state = Arc::new(AtomicUsize::new(0));
         let word = Box::leak(Box::new(std::sync::atomic::AtomicU32::new(9)));
         let addr = std::ptr::from_ref(word) as usize;
@@ -554,7 +548,6 @@ mod tests {
     /// between slices and hand a requeue continuation the wrong deadline.
     #[test]
     fn native_shared_wait_delegates_the_whole_wait_once() {
-        let _guard = crate::thread::current_futex_table_test_guard();
         let shared = RecordingNative::default();
         let waits = Arc::clone(&shared.waits);
         let futex = FutexTableNativeFutex::new(Arc::new(FutexTable::default()), shared);
@@ -590,7 +583,6 @@ mod tests {
     /// nothing to find.
     #[test]
     fn native_shared_wait_enrolls_before_parking() {
-        let _guard = crate::thread::current_futex_table_test_guard();
         let shared = RecordingNative::default();
         let enrollments = Arc::clone(&shared.enrollments);
         let enrolled_before_wait = Arc::clone(&shared.enrolled_before_wait);
@@ -619,7 +611,6 @@ mod tests {
     /// modules return `-EINTR` from it without touching the kernel).
     #[test]
     fn native_shared_wait_forwards_the_interrupt_predicate() {
-        let _guard = crate::thread::current_futex_table_test_guard();
         let futex =
             FutexTableNativeFutex::new(Arc::new(FutexTable::default()), RecordingNative::default());
         assert_eq!(
@@ -641,7 +632,6 @@ mod tests {
     /// (NetBSD uses it directly as `uaddr2`; FreeBSD as a side-table key).
     #[test]
     fn native_wake_and_requeue_forward_words_and_keys() {
-        let _guard = crate::thread::current_futex_table_test_guard();
         let shared = RecordingNative::default();
         let wakes = Arc::clone(&shared.wakes);
         let requeues = Arc::clone(&shared.requeues);
@@ -675,7 +665,6 @@ mod tests {
     /// pre-fork; construction is the one point every lane reaches first.
     #[test]
     fn native_futex_initializes_shared_state_at_construction() {
-        let _guard = crate::thread::current_futex_table_test_guard();
         let shared = RecordingNative::default();
         let inits = Arc::clone(&shared.inits);
         let futex = FutexTableNativeFutex::new(Arc::new(FutexTable::default()), shared);

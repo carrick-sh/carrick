@@ -414,6 +414,32 @@ fn instance_scoped_spec(spec: &NetworkNamespaceSpec) -> NetworkNamespaceSpec {
     spec
 }
 
+/// Resolve the immutable Linux-visible model for one namespace.
+///
+/// Host mode is the sole mode that needs host capability discovery. The
+/// optional snapshot exists for deterministic tests; production passes `None`
+/// and probes exactly once here. Bridge is wholly spec-defined and `none` must
+/// remain loopback-only regardless of the host wire.
+fn linux_model_for_spec(
+    spec: &NetworkNamespaceSpec,
+    host_wire: Option<&model::HostWireSnapshot>,
+) -> model::LinuxNetworkModel {
+    match spec.mode {
+        NetworkMode::Host => {
+            let probed;
+            let wire = match host_wire {
+                Some(wire) => wire,
+                None => {
+                    probed = model::HostWireSnapshot::probe();
+                    &probed
+                }
+            };
+            model::LinuxNetworkModel::host_mirror(wire)
+        }
+        NetworkMode::Bridge | NetworkMode::None => model::LinuxNetworkModel::from_spec(spec),
+    }
+}
+
 impl RuntimeNetwork {
     pub fn create(spec: &NetworkNamespaceSpec) -> Result<Self, String> {
         let spec = instance_scoped_spec(spec);
@@ -425,7 +451,7 @@ impl RuntimeNetwork {
                     .is_some_and(|id| id.as_str() != NetworkNamespaceId::LEGACY_SHARED),
             "a bridge namespace must carry an instance-unique id before the provider sees it"
         );
-        let model = model::LinuxNetworkModel::from_spec(&spec);
+        let model = linux_model_for_spec(&spec, None);
         let provider = select_provider(&spec);
         let lease = provider.create_namespace(&spec)?;
         for mapping in &spec.published_ports {
@@ -444,7 +470,7 @@ impl RuntimeNetwork {
 
     pub fn host_default() -> Self {
         let spec = NetworkNamespaceSpec::default();
-        let model = model::LinuxNetworkModel::from_spec(&spec);
+        let model = linux_model_for_spec(&spec, None);
         Self {
             spec,
             model,
@@ -482,6 +508,39 @@ impl Drop for RuntimeNetwork {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_mode_freezes_one_linux_shaped_host_wire_snapshot() {
+        let wire = model::HostWireSnapshot {
+            interfaces: vec![model::HostWireInterface {
+                name: "en0".to_string(),
+                flags: 0x41,
+                hw_addr: vec![0x02, 1, 2, 3, 4, 5],
+                v4_addresses: vec![("192.0.2.44".parse().unwrap(), 24)],
+                loopback: false,
+            }],
+            loopback_has_v6_localhost: true,
+        };
+
+        let host = linux_model_for_spec(&NetworkNamespaceSpec::default(), Some(&wire));
+        assert_eq!(
+            host.links
+                .iter()
+                .map(|link| link.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["lo", "eth0"]
+        );
+
+        let none = linux_model_for_spec(&NetworkNamespaceSpec::none(), Some(&wire));
+        assert_eq!(
+            none.links
+                .iter()
+                .map(|link| link.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["lo"],
+            "network none must remain isolated even when a host snapshot exists"
+        );
+    }
 
     #[test]
     fn host_provider_reports_host_capabilities() {

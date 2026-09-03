@@ -126,12 +126,6 @@ impl DebugEndpoint {
         })
     }
 
-    /// Resolve from the ambient `CARRICK_RUN_ID`, which every gated run sets.
-    pub fn for_current_run() -> Result<Self, EndpointError> {
-        let run_id = std::env::var("CARRICK_RUN_ID").unwrap_or_default();
-        Self::for_run_id(&run_id)
-    }
-
     pub fn socket_path(&self) -> &Path {
         &self.socket
     }

@@ -1060,7 +1060,7 @@ fn deliver_notify(
                 };
                 let info = crate::linux_abi::LinuxSiginfo::message_queue(
                     signo,
-                    context.task().key().id.raw(),
+                    crate::dispatch::signal::ns_visible_sender_pid(context),
                     context.resources().credentials().ruid().raw(),
                     value,
                 );
@@ -2339,6 +2339,16 @@ mod tests {
         let (process, _) = crate::hvpatch::process_context_for_tests(83_001);
         dispatcher.bind_hvpatch_process(process);
         let registrant = dispatcher.capture_one_task_context().unwrap();
+        let arena = Box::leak(Box::new(
+            carrick_kernel::arena::KernelArena::create().expect("mqueue pid namespace arena"),
+        ));
+        registrant
+            .container()
+            .install_pid_ns(
+                crate::namespace::pid::NsSharedRegion::allocate(arena)
+                    .expect("mqueue pid namespace"),
+            )
+            .expect("install mqueue pid namespace");
         let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x6000]);
         let mqd = open_test_queue(
             &dispatcher,
@@ -2399,9 +2409,17 @@ mod tests {
         let info_sender = info.si_addr as u32 as i32;
         let info_uid = (info.si_addr >> 32) as u32;
         let info_value = i64::from_le_bytes(info._pad[0..8].try_into().unwrap());
+        assert_ne!(
+            sender.task().key().id.raw(),
+            crate::dispatch::signal::ns_visible_sender_pid(&sender),
+            "the regression requires distinct carrier and namespace identities"
+        );
         assert_eq!(info_signo, signo);
         assert_eq!(info_code, crate::linux_abi::LINUX_SI_MESGQ);
-        assert_eq!(info_sender, sender.task().key().id.raw());
+        assert_eq!(
+            info_sender,
+            crate::dispatch::signal::ns_visible_sender_pid(&sender)
+        );
         assert_eq!(info_uid, 1_234);
         assert_eq!(info_value, value);
         assert!(

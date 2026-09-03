@@ -4,6 +4,42 @@
   "typed_error_debt_ceiling": 49,
   "rows": [
     {
+      "file": "crates/carrick-runtime/src/carrier.rs",
+      "function": "CarrierKernelActivation::commit_with_services",
+      "ordinal_in_function": 1,
+      "fingerprint": "edaf0b8f5769320ef6306c46af66bc5da62eb157841f085e88483eb4fd3dbc37",
+      "verdict": "carrier_fault",
+      "failure_domain": "carrier::kernel_activation",
+      "rationale": "The first-root activation claim no longer owns the carrier's provisional kernel slot; continuing could publish an unrelated or already-retired kernel graph as the carrier authority."
+    },
+    {
+      "file": "crates/carrick-runtime/src/carrier.rs",
+      "function": "CarrierKernelActivation::commit_with_services",
+      "ordinal_in_function": 2,
+      "fingerprint": "1766953c81ce553cf0e8ac6637dc882cc0e0142b51e54ac137fd5d356a7b1706",
+      "verdict": "carrier_fault",
+      "failure_domain": "carrier::kernel_activation",
+      "rationale": "The provisional root task, activation claim, or kernel allocation changed after validation; continuing would make carrier-wide services point at a different graph generation."
+    },
+    {
+      "file": "crates/carrick-runtime/src/carrier.rs",
+      "function": "CarrierLease::publish_retired",
+      "ordinal_in_function": 1,
+      "fingerprint": "63ae8e50e1b0f6299401965eccc83ecbcc1aee9ee6403c44ac59f4f87b2af1d2",
+      "verdict": "carrier_fault",
+      "failure_domain": "carrier::lease_ownership",
+      "rationale": "Retirement publication lost the exact running reservation after kernel and mount teardown; continuing could remove another container generation or report false-zero carrier state."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/creds.rs",
+      "function": "SyscallDispatcher::identity_pid",
+      "ordinal_in_function": 1,
+      "fingerprint": "653cd6af4637294b814ca28a0a57cc2c94aa13da90ec021d65bc9166727f9abf",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::pid_identity",
+      "rationale": "An HVPatch dispatcher retained an internal PID without the namespace-local identity captured from its exact live task binding; continuing would expose carrier-global identity through a container-scoped Linux PID surface."
+    },
+    {
       "file": "crates/carrick-runtime/src/dispatch/creds.rs",
       "function": "SyscallDispatcher::cred_snapshot",
       "ordinal_in_function": 1,
@@ -156,7 +192,7 @@
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
       "function": "SyscallDispatcher::write",
       "ordinal_in_function": 1,
-      "fingerprint": "3b69f2c5f161cb37efe56847fc45968daa5a99bdd0cd4913d02b4feba3e3ee52",
+      "fingerprint": "676711a4f56255092fdfdc61a3c2ad81f32c2136e47c2ed1c8a8559d8c8f4866",
       "verdict": "typed_error_debt",
       "failure_domain": "dispatch::fs_io",
       "rationale": "Missing captured slot authority during pipe write in SyscallDispatcher::write is a normal close observation and should lower to EBADF.",
@@ -166,7 +202,7 @@
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
       "function": "SyscallDispatcher::write",
       "ordinal_in_function": 2,
-      "fingerprint": "3b69f2c5f161cb37efe56847fc45968daa5a99bdd0cd4913d02b4feba3e3ee52",
+      "fingerprint": "676711a4f56255092fdfdc61a3c2ad81f32c2136e47c2ed1c8a8559d8c8f4866",
       "verdict": "typed_error_debt",
       "failure_domain": "dispatch::fs_io",
       "rationale": "Missing captured slot authority during host pipe write in SyscallDispatcher::write is a normal close observation and should lower to EBADF.",
@@ -176,7 +212,7 @@
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
       "function": "SyscallDispatcher::write",
       "ordinal_in_function": 3,
-      "fingerprint": "3b69f2c5f161cb37efe56847fc45968daa5a99bdd0cd4913d02b4feba3e3ee52",
+      "fingerprint": "676711a4f56255092fdfdc61a3c2ad81f32c2136e47c2ed1c8a8559d8c8f4866",
       "verdict": "typed_error_debt",
       "failure_domain": "dispatch::fs_io",
       "rationale": "Missing captured slot authority during host socket write in SyscallDispatcher::write is a normal close observation and should lower to EBADF.",
@@ -186,7 +222,7 @@
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
       "function": "SyscallDispatcher::write",
       "ordinal_in_function": 4,
-      "fingerprint": "3b69f2c5f161cb37efe56847fc45968daa5a99bdd0cd4913d02b4feba3e3ee52",
+      "fingerprint": "676711a4f56255092fdfdc61a3c2ad81f32c2136e47c2ed1c8a8559d8c8f4866",
       "verdict": "typed_error_debt",
       "failure_domain": "dispatch::fs_io",
       "rationale": "Missing captured slot authority during host file write in SyscallDispatcher::write is a normal close observation and should lower to EBADF.",
@@ -726,8 +762,8 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "SyscallDispatcher::bind_hvpatch_process",
-      "ordinal_in_function": 3,
+      "function": "SyscallDispatcher::bind_hvpatch_process_exact",
+      "ordinal_in_function": 1,
       "fingerprint": "31139df9317ab927fd6e22f2f85bc47b3e0693e63c92c37eb80993b84534ab7b",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::hvpatch_binding",
@@ -1087,7 +1123,7 @@
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
       "function": "ProcessContext::with_foreign_mm_endpoint",
       "ordinal_in_function": 1,
-      "fingerprint": "cf1c906e9cd309f400108da061c6f910d894281d73b3d14da8d399d6fede33b1",
+      "fingerprint": "294b05deb834f9b3e3b50f77993dbe4c4a450d5f89deb946e3fac6c69ae4bdcf",
       "verdict": "typed_error_debt",
       "failure_domain": "hvpatch::bootstrap",
       "rationale": "Foreign MM endpoint installation failure on root ProcessContext occurs during root bootstrap before guest execution and should return a typed RuntimeError instead of aborting.",
@@ -1308,6 +1344,15 @@
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::stage1_retirement",
       "rationale": "PreparedStage1MmRetirement missing ASID state during commit; indicates double-commit or corrupted ASID retirement state."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
+      "function": "PreparedStage1MmRetirement::commit",
+      "ordinal_in_function": 3,
+      "fingerprint": "7e5e1640631352f61645713dd49b284a14ef6e0154453d182b985aa0259171dc",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::stage1_retirement",
+      "rationale": "Stage-1 root retirement nonce overflow would reuse proof identity and permit an old backend retirement proof to authenticate a later root-slot generation."
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
@@ -1739,7 +1784,7 @@
       "file": "crates/carrick-runtime/src/runtime.rs",
       "function": "run_combined_syscall_loop_with_dispatcher",
       "ordinal_in_function": 1,
-      "fingerprint": "c0abbe0553d64478e5f88dc82306f3d2d58967fe3bb26933840e5982165b6710",
+      "fingerprint": "05c15722d40d8fbb372668de2b3a91daf870cb07ed961e59c3ccfe058dfc285b",
       "verdict": "carrier_fault",
       "failure_domain": "runtime::host_alias_mapping",
       "rationale": "runtime.map_host_alias backend failure during alias installation; leaves hardware page tables and stage-2 mappings in an unrecoverable split state."
@@ -1748,7 +1793,7 @@
       "file": "crates/carrick-runtime/src/runtime.rs",
       "function": "run_combined_syscall_loop_with_dispatcher",
       "ordinal_in_function": 2,
-      "fingerprint": "c0abbe0553d64478e5f88dc82306f3d2d58967fe3bb26933840e5982165b6710",
+      "fingerprint": "05c15722d40d8fbb372668de2b3a91daf870cb07ed961e59c3ccfe058dfc285b",
       "verdict": "carrier_fault",
       "failure_domain": "runtime::host_alias_mapping",
       "rationale": "Host alias mapping length overflowed usize after backend mapping was installed; cannot apply memory protection to live mapping."
@@ -1757,7 +1802,7 @@
       "file": "crates/carrick-runtime/src/runtime.rs",
       "function": "run_combined_syscall_loop_with_dispatcher",
       "ordinal_in_function": 3,
-      "fingerprint": "c0abbe0553d64478e5f88dc82306f3d2d58967fe3bb26933840e5982165b6710",
+      "fingerprint": "05c15722d40d8fbb372668de2b3a91daf870cb07ed961e59c3ccfe058dfc285b",
       "verdict": "carrier_fault",
       "failure_domain": "runtime::host_alias_mapping",
       "rationale": "runtime.protect_range failed to apply PROT_NONE to installed host alias mapping; continuing would leave inaccessible memory readable."
@@ -1766,7 +1811,7 @@
       "file": "crates/carrick-runtime/src/runtime.rs",
       "function": "run_combined_syscall_loop_with_dispatcher",
       "ordinal_in_function": 4,
-      "fingerprint": "c0abbe0553d64478e5f88dc82306f3d2d58967fe3bb26933840e5982165b6710",
+      "fingerprint": "05c15722d40d8fbb372668de2b3a91daf870cb07ed961e59c3ccfe058dfc285b",
       "verdict": "carrier_fault",
       "failure_domain": "runtime::host_alias_mapping",
       "rationale": "Host alias bus fault length overflowed usize after backend mapping was installed; cannot apply bus-fault guard protection."
@@ -1775,7 +1820,7 @@
       "file": "crates/carrick-runtime/src/runtime.rs",
       "function": "run_combined_syscall_loop_with_dispatcher",
       "ordinal_in_function": 5,
-      "fingerprint": "c0abbe0553d64478e5f88dc82306f3d2d58967fe3bb26933840e5982165b6710",
+      "fingerprint": "05c15722d40d8fbb372668de2b3a91daf870cb07ed961e59c3ccfe058dfc285b",
       "verdict": "carrier_fault",
       "failure_domain": "runtime::host_alias_mapping",
       "rationale": "runtime.protect_range failed to apply guard protection to bus fault range of host alias mapping; leaves invalid file region accessible."
@@ -1784,19 +1829,388 @@
       "file": "crates/carrick-runtime/src/runtime.rs",
       "function": "run_combined_syscall_loop_with_dispatcher",
       "ordinal_in_function": 6,
-      "fingerprint": "c0abbe0553d64478e5f88dc82306f3d2d58967fe3bb26933840e5982165b6710",
+      "fingerprint": "05c15722d40d8fbb372668de2b3a91daf870cb07ed961e59c3ccfe058dfc285b",
       "verdict": "carrier_fault",
       "failure_domain": "runtime::host_alias_mapping",
       "rationale": "dispatcher.commit_host_alias_install failed after backend host mapping was installed; leaves uncommitted alias mapping in guest address space."
     },
     {
       "file": "crates/carrick-runtime/src/threaded_loop.rs",
-      "function": "publish_initial_frame_inventory",
+      "function": "prepare_initial_frame_inventory",
       "ordinal_in_function": 1,
-      "fingerprint": "08301a005dd4cb2ab14b1b402353e2a73e8eebc53d6cd1abed604812ea3b823a",
+      "fingerprint": "bec45a7e313f5fba812c28e1fc63954a2fcd51c88fa05810dee1c0b3186f034b",
       "verdict": "carrier_fault",
       "failure_domain": "threaded_loop::initial_frame_inventory",
       "rationale": "Initial boot frame inventory publication failed after hypervisor mappings were already established in HVF; leaves hypervisor and kernel graph state diverging."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
+      "function": "MountRetirement::clear",
+      "ordinal_in_function": 1,
+      "fingerprint": "d0b524ccb1694f46852a77c809976706339b2ce8f16c1ecad14f780be5656529",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mount_retirement",
+      "rationale": "Mount destruction was requested without first proving sole ownership; continuing could publish a retired container while live dispatchers still use its mount table."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
+      "function": "MountRetirement::clear",
+      "ordinal_in_function": 2,
+      "fingerprint": "464f92a45a1a126ab184e1b81b432d922e8da1c9683fd3bf7013f1219c699bbe",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mount_retirement",
+      "rationale": "A prepared mount-retirement token lost its exact table before destruction; continuing would fabricate cleanup accounting for a table that was already removed."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
+      "function": "MountRetirement::clear",
+      "ordinal_in_function": 3,
+      "fingerprint": "8392fef40138b7ff4387400aa13b18683696617d7d8378927fcf7a8c916353f2",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mount_retirement",
+      "rationale": "A new mount-table owner appeared after sole ownership was proven; continuing could destroy storage still reachable by another container executor."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "function": "DispatchMmBinding::rebind_prepared_root",
+      "ordinal_in_function": 1,
+      "fingerprint": "c6abce235563aa121422a0a460e71035ff4ec9ceed5de177ad11f671bf5105eb",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mm_binding",
+      "rationale": "A newly prepared carrier root already had an exec MM staged while its bootstrap MM identity was being rebound; continuing would mix two MM generations in one dispatcher."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/signal.rs",
+      "function": "ns_visible_sender_pid",
+      "ordinal_in_function": 1,
+      "fingerprint": "e439d9187eda293b1be3c31f26c0980092218a9d5abede24df8c2341d3a1879f",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::signal_identity",
+      "rationale": "A live signal sender lacked an i32 namespace-visible PID; continuing would attribute a signal to no valid Linux process or to a different container identity."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
+      "function": "PreparedRootInitialization::process",
+      "ordinal_in_function": 1,
+      "fingerprint": "c50e8d08ba546e6a456544396cbbbddb173faf4e5358f403ea11fc70b31d5e22",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::root_initialization",
+      "rationale": "The prepared first-root transaction lost its process context before activation; continuing could commit inventory and lifecycle state without the root that owns them."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
+      "function": "ProcessContext::wait_result",
+      "ordinal_in_function": 1,
+      "fingerprint": "12ec014e0bcdf5297e0536b76b956abb36b8bab9ea992c2415f4f820df26a4b1",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::wait_identity",
+      "rationale": "An exited child carried a namespace PID outside the Linux wait ABI range; continuing would return a status for an unrepresentable or aliased child identity."
+    },
+    {
+      "file": "crates/carrick-runtime/src/interactive_supervisor.rs",
+      "function": "InteractiveSession::start",
+      "ordinal_in_function": 1,
+      "fingerprint": "8adab59c100fef60f52b3cd8822749182342c382196100f71dd6165e04ac285a",
+      "verdict": "carrier_fault",
+      "failure_domain": "interactive::session_ownership",
+      "rationale": "Interactive setup completed without the admission token that owns process stdio and SIGWINCH routing; continuing could let two containers overwrite the same host facilities."
+    },
+    {
+      "file": "crates/carrick-runtime/src/interactive_supervisor.rs",
+      "function": "<InteractiveSessionAdmission as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "e1bbb53d76f2380aa0c56e5c18b3673281b641bc05a1f85ee6df321ed5f0aef0",
+      "verdict": "carrier_fault",
+      "failure_domain": "interactive::session_ownership",
+      "rationale": "An interactive admission token released a singleton gate that was no longer held; continuing would hide double release and make terminal ownership unauthenticated."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "function": "DebugAuxProviderRegistry::reserve_id",
+      "ordinal_in_function": 1,
+      "fingerprint": "3c6436627bb8859954c0b5d9254510980d7063096f788c86188491eb7d1d136c",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::debug_provider_identity",
+      "rationale": "The carrier-wide debug provider generation exhausted u64; wrapping would let a stale auxiliary provider authenticate as a new one."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "function": "PreparedContainerRoot::commit",
+      "ordinal_in_function": 1,
+      "fingerprint": "73003166eb59270c3719c950b8cd42a0d7a0e4b188d2f39264e37f2ae9f77fd4",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::container_root_publication",
+      "rationale": "A root without a PID namespace had an internal task identity outside the Linux namespace-ID domain; publishing it would create an unaddressable container init."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "function": "PreparedContainerRoot::commit",
+      "ordinal_in_function": 2,
+      "fingerprint": "68c5b9e42e448e12973fe50731cfb950da9aac9dc2fd1e0f005338501c32f83d",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::container_root_publication",
+      "rationale": "Rollback after PID-root publication failure could not remove every exact staged graph edge; continuing would leave a partially published container root."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "function": "Kernel::bootstrap_root",
+      "ordinal_in_function": 1,
+      "fingerprint": "01809fdcb02b551f6eefc13c85f151663fcf2dd87148720f3cd2975dbd71f917",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::bootstrap_identity",
+      "rationale": "A bootstrap root without a PID namespace had an internal task identity outside the Linux namespace-ID domain; the kernel cannot publish a valid init identity."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "function": "Kernel::retire_container_root",
+      "ordinal_in_function": 1,
+      "fingerprint": "e90088ed7c644e475851c37f49e55dbff9da5ab4d4b2e507881de24d224f1037",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::container_retirement",
+      "rationale": "Live tasks or task reservations reappeared after container retirement closed admission and drained the tree; continuing would publish false terminal cleanup."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "function": "Kernel::retire_container_root",
+      "ordinal_in_function": 2,
+      "fingerprint": "e90088ed7c644e475851c37f49e55dbff9da5ab4d4b2e507881de24d224f1037",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::container_retirement",
+      "rationale": "An exact retiring task lost its zombie record after the retirement set was frozen; continuing would leak its identity claim while reporting it reaped."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "function": "Kernel::retire_container_root",
+      "ordinal_in_function": 3,
+      "fingerprint": "e90088ed7c644e475851c37f49e55dbff9da5ab4d4b2e507881de24d224f1037",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::container_retirement",
+      "rationale": "A removed zombie no longer matched the exact task generation and container selected for retirement; continuing could reap another container's task."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "function": "Kernel::retire_container_root",
+      "ordinal_in_function": 4,
+      "fingerprint": "e90088ed7c644e475851c37f49e55dbff9da5ab4d4b2e507881de24d224f1037",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::container_retirement",
+      "rationale": "The container-init index no longer named the root generation being retired; continuing would leave or remove the wrong namespace root."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "function": "Kernel::retire_container_root",
+      "ordinal_in_function": 5,
+      "fingerprint": "e90088ed7c644e475851c37f49e55dbff9da5ab4d4b2e507881de24d224f1037",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::container_retirement",
+      "rationale": "The container registry lost the exact entry selected for terminal retirement; continuing would publish cleanup without removing authoritative container state."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "function": "Kernel::retire_container_root",
+      "ordinal_in_function": 6,
+      "fingerprint": "e90088ed7c644e475851c37f49e55dbff9da5ab4d4b2e507881de24d224f1037",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::container_retirement",
+      "rationale": "The removed container Arc was not the exact object whose task tree and namespace had been drained; continuing could finalize a replacement generation."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "function": "RegistryState::publish_process_group",
+      "ordinal_in_function": 1,
+      "fingerprint": "1657b188134cb1e64db3171b5a6bf02e0bc1b473ca177340bf5676967d401ed6",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::process_group_index",
+      "rationale": "Process-group publication collided in either the internal or container namespace index; continuing would make the two authoritative identity maps disagree."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "function": "RegistryState::remove_process_group",
+      "ordinal_in_function": 1,
+      "fingerprint": "c4a5db7588f7b23897bbdd56e3af71da937366ec4316c0911d4cf41fd41102c1",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::process_group_index",
+      "rationale": "Removing an internal process-group record did not remove the matching container namespace index edge; continuing would leave a stale group alias."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "function": "RegistryState::publish_session",
+      "ordinal_in_function": 1,
+      "fingerprint": "fc24dad569a45da759fa551655983f95ff87a0c628d251e600e60a9423c06867",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::session_index",
+      "rationale": "Session publication collided in either the internal or container namespace index; continuing would make the two authoritative identity maps disagree."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "function": "RegistryState::remove_session",
+      "ordinal_in_function": 1,
+      "fingerprint": "b995289c6ea4edef9a3cad760be3610d3e3939e0708465570a927492b1a76bdb",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::session_index",
+      "rationale": "Removing an internal session record did not remove the matching container namespace index edge; continuing would leave a stale session alias."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "function": "ProcessGroup::new",
+      "ordinal_in_function": 1,
+      "fingerprint": "1501dfb0abc8790ccaf659b8822dd0670670789d12942885a17b7414a1a06e0e",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::process_group_generation",
+      "rationale": "The monotone process-group object generation exhausted u64; wrapping would let stale group authority authenticate as a new object."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "function": "Zombie::from_task",
+      "ordinal_in_function": 1,
+      "fingerprint": "bd29fe3dbd74bbde641f330de37b08478883924da6bb455e0e20cacc28a4895b",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::zombie_identity",
+      "rationale": "An exiting task's internal identity did not fit the PID namespace storage domain; continuing would create an unaddressable zombie."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "function": "Zombie::from_task",
+      "ordinal_in_function": 2,
+      "fingerprint": "6131debc9fa5b2643a7c3d2299aaa8ca9d0d11f0c8e20ac76bdd4fdf14ff816b",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::zombie_identity",
+      "rationale": "A live namespace member disappeared before its zombie captured the visible PID; continuing would make wait and signal identity disagree."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "function": "PreparedThreadClone::commit",
+      "ordinal_in_function": 1,
+      "fingerprint": "5f3afa81b717fb948923a836a274f61640cf7586e09cf055a8c9800db1abde12",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::thread_publication",
+      "rationale": "Thread publication failed after its namespace membership committed; returning an ordinary error would leave a ghost TID without a task-thread edge."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "function": "Kernel::initialize_launch_controlling_tty",
+      "ordinal_in_function": 1,
+      "fingerprint": "becaf649b27fd3005928cdc85a13f3c51254835b079a391e79a437ec0692d1ae",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::tty_identity",
+      "rationale": "A live root task's session was absent or belonged to another container during terminal-route activation; continuing could route signals across containers."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "function": "Kernel::initialize_launch_controlling_tty",
+      "ordinal_in_function": 2,
+      "fingerprint": "87b325d3016453c4e2fe22e6271e5885e2735a1012a388c57fcd306a34855784",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::tty_identity",
+      "rationale": "A live root task's process group was absent or belonged to another container during terminal-route activation; continuing could route signals across containers."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "function": "Kernel::exit_thread",
+      "ordinal_in_function": 1,
+      "fingerprint": "e5b06e0d0356de449a56cbdf38d7f62212a0df8fb585b4c1ff91fde9560be59b",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::thread_retirement",
+      "rationale": "A published secondary thread identity exceeded the namespace member domain during exact retirement; continuing would leak that TID membership."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "function": "Kernel::exit_thread",
+      "ordinal_in_function": 2,
+      "fingerprint": "e5b06e0d0356de449a56cbdf38d7f62212a0df8fb585b4c1ff91fde9560be59b",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::thread_retirement",
+      "rationale": "The PID namespace refused to remove the exact secondary thread already retired from the task graph; continuing would leave a stale TID alias."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "function": "Kernel::set_process_group",
+      "ordinal_in_function": 1,
+      "fingerprint": "02fed4406864ec4afb2550e559f71439596d24a379488ad95de7ecae91ed1f1a",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::process_group_identity",
+      "rationale": "The new-group branch lost the namespace identity it had already proven while holding the registry lock; continuing would publish an unnamed process group."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "function": "Kernel::commit_task_exit_notifying",
+      "ordinal_in_function": 1,
+      "fingerprint": "386861f5a76627d7c9989911b7fe38e79de196652b73ddc533bc99ec89411c2d",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::task_exit_identity",
+      "rationale": "A published secondary TID exceeded the namespace member domain after task-exit commit began; continuing would prevent exact namespace cleanup."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "function": "Kernel::commit_task_exit_notifying",
+      "ordinal_in_function": 2,
+      "fingerprint": "77e6de5968a0f849bce50f82a950d58404ccdba1c56a8e7393b3139f047a9555",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::task_exit_identity",
+      "rationale": "The PID namespace refused to remove a secondary TID already retired by the committed task-exit transaction; continuing would leave stale membership."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "function": "Kernel::wait_child_matching",
+      "ordinal_in_function": 1,
+      "fingerprint": "2211a3140732966e1cab25fe8883ef0317cbeeafab24bda63d5fac3fdd25822b",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::child_reaping",
+      "rationale": "A reaped child identity exceeded the PID namespace member domain after its zombie was consumed; continuing would be unable to retire the exact namespace slot."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "function": "Kernel::wait_child_matching",
+      "ordinal_in_function": 2,
+      "fingerprint": "2211a3140732966e1cab25fe8883ef0317cbeeafab24bda63d5fac3fdd25822b",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::child_reaping",
+      "rationale": "The PID namespace refused to remove the exact child just consumed by wait; continuing would permit stale PID reuse or double reaping."
+    },
+    {
+      "file": "crates/carrick-runtime/src/namespace/pid.rs",
+      "function": "mark_self_execed_for",
+      "ordinal_in_function": 1,
+      "fingerprint": "c40735c7aaad0f089a29f29f98434f9cfcb5094a3f7682b2f72f8ef6eadd4c37",
+      "verdict": "carrier_fault",
+      "failure_domain": "namespace::exec_identity",
+      "rationale": "A namespaced task crossed exec commit with an internal identity outside the PID member domain; continuing would lose the child-exec permission transition."
+    },
+    {
+      "file": "crates/carrick-runtime/src/namespace/pid.rs",
+      "function": "ns_self_pid_for",
+      "ordinal_in_function": 1,
+      "fingerprint": "3600b2ac4e9fab43feef82feafabdf9da9190088af36785da6781d39e242489a",
+      "verdict": "carrier_fault",
+      "failure_domain": "namespace::self_identity",
+      "rationale": "A live task was absent from its exact container PID region; returning zero or the carrier-global ID would violate Linux self-PID identity."
+    },
+    {
+      "file": "crates/carrick-runtime/src/threaded_loop.rs",
+      "function": "<PreparedInitialFrameInventory as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "2478fe37c512ffa15f13ca4176bd0d8b4ea1da673af4a569cc5fc0c9138e0519",
+      "verdict": "carrier_fault",
+      "failure_domain": "threaded_loop::initial_frame_inventory",
+      "rationale": "Rollback of an unpublished initial frame-inventory apply failed; continuing would leave hardware mappings and the kernel frame authority describing different ownership."
+    },
+    {
+      "file": "crates/carrick-runtime/src/threaded_loop.rs",
+      "function": "run_threaded_loop_inner",
+      "ordinal_in_function": 1,
+      "fingerprint": "967937f4c4876d8e6666e99cf86017247cc2e8d91263678e1fcb385b528f5fe4",
+      "verdict": "carrier_fault",
+      "failure_domain": "threaded_loop::root_activation",
+      "rationale": "The first-root activation callback lost the prepared publication bundle it exclusively owned; continuing would publish a ready kernel without its lifecycle and frame commitments."
+    },
+    {
+      "file": "crates/carrick-runtime/src/threaded_loop.rs",
+      "function": "run_threaded_loop_inner",
+      "ordinal_in_function": 2,
+      "fingerprint": "967937f4c4876d8e6666e99cf86017247cc2e8d91263678e1fcb385b528f5fe4",
+      "verdict": "carrier_fault",
+      "failure_domain": "threaded_loop::root_activation",
+      "rationale": "The activated root could not recapture its exact kernel context before terminal-route publication; continuing could bind carrier-wide TTY service to the wrong task generation."
     }
   ]
 }

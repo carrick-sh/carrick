@@ -65,11 +65,20 @@ pub(crate) fn with_optional_vdso_for_clock<A: carrick_hal::GuestArch>(
     image: AddressSpace,
     clock: &crate::kernel::container::ClockDomain,
 ) -> Result<AddressSpace, AddressSpaceError> {
+    with_optional_vdso_for_clock_with_visibility::<A>(image, clock, false)
+}
+
+pub(crate) fn with_optional_vdso_for_clock_with_visibility<A: carrick_hal::GuestArch>(
+    image: AddressSpace,
+    clock: &crate::kernel::container::ClockDomain,
+    requires_syscall_traps: bool,
+) -> Result<AddressSpace, AddressSpaceError> {
     with_optional_vdso_for_clock_at::<A>(
         image,
         clock,
         carrick_mem::vdso::LINUX_VVAR_BASE,
         carrick_mem::vdso::LINUX_VDSO_BASE,
+        requires_syscall_traps,
     )
 }
 
@@ -88,6 +97,7 @@ pub(crate) fn with_optional_vdso_at<A: carrick_hal::GuestArch>(
         &crate::kernel::container::ClockDomain::system(),
         vvar_base,
         vdso_base,
+        false,
     )
 }
 
@@ -101,23 +111,47 @@ pub(crate) fn with_optional_vdso_for_clock_at<A: carrick_hal::GuestArch>(
     clock: &crate::kernel::container::ClockDomain,
     vvar_base: u64,
     vdso_base: u64,
+    requires_syscall_traps: bool,
 ) -> Result<AddressSpace, AddressSpaceError> {
-    let mode = vdso_debug_mode();
+    with_optional_vdso_for_clock_at_with_mode::<A>(
+        image,
+        clock,
+        vvar_base,
+        vdso_base,
+        requires_syscall_traps,
+        vdso_debug_mode(),
+    )
+}
+
+pub(crate) fn with_optional_vdso_for_clock_at_with_mode<A: carrick_hal::GuestArch>(
+    image: AddressSpace,
+    clock: &crate::kernel::container::ClockDomain,
+    vvar_base: u64,
+    vdso_base: u64,
+    requires_syscall_traps: bool,
+    mode: VdsoDebugMode,
+) -> Result<AddressSpace, AddressSpaceError> {
     if mode == VdsoDebugMode::Disabled {
-        return Ok(image);
+        return Ok(image.with_vdso_auxv(false));
     }
-    let vdso_bytes = match mode {
-        VdsoDebugMode::NoGetrandom => carrick_mem::vdso::vdso_image_bytes_without_getrandom(),
-        VdsoDebugMode::NoFastpaths => carrick_mem::vdso::vdso_image_bytes_without_fastpaths(),
-        VdsoDebugMode::ClockSyscalls => carrick_mem::vdso::vdso_image_bytes_with_clock_syscalls(),
-        VdsoDebugMode::Full => {
-            if clock.is_scaled() || clock.is_deterministic() || clock.is_frozen() {
+    let vdso_bytes = if requires_syscall_traps {
+        carrick_mem::vdso::vdso_image_bytes_without_fastpaths()
+    } else {
+        match mode {
+            VdsoDebugMode::NoGetrandom => carrick_mem::vdso::vdso_image_bytes_without_getrandom(),
+            VdsoDebugMode::NoFastpaths => carrick_mem::vdso::vdso_image_bytes_without_fastpaths(),
+            VdsoDebugMode::ClockSyscalls => {
                 carrick_mem::vdso::vdso_image_bytes_with_clock_syscalls()
-            } else {
-                A::vdso_bytes()
             }
+            VdsoDebugMode::Full => {
+                if clock.is_scaled() || clock.is_deterministic() || clock.is_frozen() {
+                    carrick_mem::vdso::vdso_image_bytes_with_clock_syscalls()
+                } else {
+                    A::vdso_bytes()
+                }
+            }
+            VdsoDebugMode::Disabled => unreachable!(),
         }
-        VdsoDebugMode::Disabled => unreachable!(),
     };
     image.with_vdso_bytes_at(vdso_bytes, vvar_base, vdso_base)
 }
@@ -239,5 +273,27 @@ mod tests {
             &get_vdso(&space_det)[..syscall_bytes.len()],
             syscall_bytes.as_slice()
         );
+    }
+
+    #[test]
+    fn interceptor_requires_syscall_vdso() {
+        use crate::kernel::container::ClockDomain;
+        use carrick_hal::aarch64_arch::Aarch64GuestArch;
+
+        let space = with_optional_vdso_for_clock_with_visibility::<Aarch64GuestArch>(
+            AddressSpace::from_regions(0, Vec::new()).unwrap(),
+            &ClockDomain::system(),
+            true,
+        )
+        .unwrap();
+        let vdso = space
+            .regions()
+            .iter()
+            .find(|region| region.start == carrick_mem::vdso::LINUX_VDSO_BASE)
+            .expect("vDSO mapping")
+            .bytes();
+        let no_fastpaths = carrick_mem::vdso::vdso_image_bytes_without_fastpaths();
+
+        assert_eq!(&vdso[..no_fastpaths.len()], no_fastpaths.as_slice());
     }
 }

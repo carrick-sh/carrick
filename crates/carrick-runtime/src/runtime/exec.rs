@@ -22,9 +22,11 @@ fn finalize_hvf_exec_base(
     raw: AddressSpace,
     needs_at_base: bool,
     vdso_enabled: bool,
+    requires_syscall_traps: bool,
 ) -> Result<AddressSpace, LinuxErrno> {
     use crate::linux_abi::{LINUX_ENOENT, LINUX_ENOEXEC};
 
+    let requires_syscall_traps = requires_syscall_traps || dispatcher.requires_syscall_traps();
     let mut staged = raw.with_vdso_auxv(vdso_enabled);
     if needs_at_base {
         staged = staged.with_auxv_base(ROSETTA_AT_BASE_PLACEHOLDER);
@@ -36,9 +38,15 @@ fn finalize_hvf_exec_base(
     let container = dispatcher.container();
     staged
         .with_el0_trampoline_bytes(HvfArch::entry_trampoline_bytes())
-        .and_then(with_hvf_syscall_mailbox)
+        .and_then(|image| with_hvf_syscall_mailbox(image, requires_syscall_traps))
         .and_then(|address_space| address_space.with_hvpatch_stage1_page_tables())
-        .and_then(|image| with_optional_vdso_for_clock::<HvfArch>(image, container.clock()))
+        .and_then(|image| {
+            with_optional_vdso_for_clock_with_visibility::<HvfArch>(
+                image,
+                container.clock(),
+                requires_syscall_traps,
+            )
+        })
         .map_err(|_| LINUX_ENOENT)
 }
 
@@ -50,6 +58,7 @@ pub(crate) fn load_execve_image(
     // interpreters are pushed as their UTF-8 bytes.
     argv: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
+    requires_syscall_traps: bool,
 ) -> Result<AddressSpace, LinuxErrno> {
     use crate::linux_abi::{LINUX_ENOENT, LINUX_ENOEXEC};
     let argv = if argv.is_empty() {
@@ -101,13 +110,16 @@ pub(crate) fn load_execve_image(
         }
     };
     let vdso_enabled = vdso_enabled_for_debug();
+    let requires_syscall_traps = requires_syscall_traps || dispatcher.requires_syscall_traps();
     // The cache is deliberately limited to direct little-endian AArch64 ELFs.
     // Rosetta redirects rewrite argv and carry target-specific AT_BASE state;
     // mutable/foreign images stay on the uncached path below.
     let cache_key = dispatcher
         .read_exec_file_head(&path, 20)
         .filter(|head| is_aarch64_elf_head(head))
-        .and_then(|_| dispatcher.hvpatch_exec_cache_key(&path, vdso_enabled, false));
+        .and_then(|_| {
+            dispatcher.hvpatch_exec_cache_key(&path, vdso_enabled, requires_syscall_traps, false)
+        });
     let (base, argv) = if cache_key.is_some() {
         let base = dispatcher.with_hvpatch_exec_cache(cache_key, || {
             let raw_bytes = dispatcher
@@ -121,7 +133,7 @@ pub(crate) fn load_execve_image(
             })
             .map_err(|_| LINUX_ENOEXEC)?
             .with_main_file_path(path.clone());
-            finalize_hvf_exec_base(dispatcher, raw, false, vdso_enabled)
+            finalize_hvf_exec_base(dispatcher, raw, false, vdso_enabled, requires_syscall_traps)
         })?;
         (base, argv)
     } else {
@@ -149,7 +161,13 @@ pub(crate) fn load_execve_image(
         .map_err(|_| LINUX_ENOEXEC)?
         .with_main_file_path(path.clone());
         (
-            finalize_hvf_exec_base(dispatcher, raw, needs_at_base, vdso_enabled)?,
+            finalize_hvf_exec_base(
+                dispatcher,
+                raw,
+                needs_at_base,
+                vdso_enabled,
+                requires_syscall_traps,
+            )?,
             argv,
         )
     };
@@ -172,6 +190,93 @@ pub(crate) use crate::exec_helpers::{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "syscall-shim")]
+    struct ContinueInterceptor;
+
+    #[cfg(feature = "syscall-shim")]
+    impl crate::observe::SyscallInterceptor for ContinueInterceptor {
+        fn intercept(
+            &self,
+            _process: &crate::observe::ProcessInfo<'_>,
+            _call: &crate::observe::InterceptedSyscall<'_>,
+        ) -> crate::observe::InterceptAction {
+            crate::observe::InterceptAction::Continue
+        }
+    }
+
+    #[cfg(feature = "syscall-shim")]
+    fn synthetic_exec_image() -> AddressSpace {
+        let permissions = carrick_mem::elf::SegmentPerms {
+            read: true,
+            write: false,
+            execute: true,
+        };
+        AddressSpace::from_segments(
+            0x0040_0000,
+            [(
+                0x0040_0000,
+                permissions,
+                0xd503_201f_u32.to_le_bytes().to_vec(),
+                0x4000,
+            )],
+        )
+        .expect("synthetic exec image")
+    }
+
+    #[cfg(feature = "syscall-shim")]
+    fn image_region(image: &AddressSpace, start: u64) -> &[u8] {
+        image
+            .regions()
+            .iter()
+            .find(|region| region.start == start)
+            .expect("required exec image region")
+            .bytes()
+    }
+
+    #[cfg(feature = "syscall-shim")]
+    #[test]
+    fn interceptor_exec_image_preserves_closed_identity_page() {
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.install_interceptor(std::sync::Arc::new(ContinueInterceptor));
+
+        let mut image =
+            finalize_hvf_exec_base(&dispatcher, synthetic_exec_image(), false, true, false)
+                .expect("interceptor-bearing exec image");
+        let context = dispatcher
+            .capture_one_task_context()
+            .expect("exec task context");
+        crate::vcpu_loop::stamp_identity_page(&mut image, &dispatcher, &context)
+            .expect("closed exec identity page remains stampable");
+
+        let identity = image_region(&image, carrick_mem::memory::LINUX_IDENTITY_PAGE_BASE);
+        let gate = usize::try_from(carrick_mem::memory::IDENTITY_OFF_SHIM_ENABLED)
+            .expect("identity gate offset");
+        assert_eq!(&identity[gate..gate + 4], &0_u32.to_le_bytes());
+        let vdso = image_region(&image, carrick_mem::vdso::LINUX_VDSO_BASE);
+        let no_fastpaths = carrick_mem::vdso::vdso_image_bytes_without_fastpaths();
+        assert_eq!(&vdso[..no_fastpaths.len()], no_fastpaths.as_slice());
+    }
+
+    #[cfg(feature = "syscall-shim")]
+    #[test]
+    fn unrestricted_exec_image_preserves_fastpaths() {
+        use carrick_hal::GuestArch as _;
+
+        type HvfArch = <crate::trap::HvfTrapEngine as carrick_hal::ThreadedEngine>::Arch;
+        let image = finalize_hvf_exec_base(
+            &SyscallDispatcher::new(),
+            synthetic_exec_image(),
+            false,
+            true,
+            false,
+        )
+        .expect("unrestricted exec image");
+
+        image_region(&image, carrick_mem::memory::LINUX_IDENTITY_PAGE_BASE);
+        let vdso = image_region(&image, carrick_mem::vdso::LINUX_VDSO_BASE);
+        assert_eq!(&vdso[..HvfArch::vdso_bytes().len()], HvfArch::vdso_bytes());
+    }
 
     #[test]
     fn cache_classifier_accepts_only_little_endian_aarch64_elf() {
@@ -230,7 +335,7 @@ mod tests {
             )],
         )
         .expect("synthetic exec image");
-        let image = finalize_hvf_exec_base(&SyscallDispatcher::new(), raw, false, false)
+        let image = finalize_hvf_exec_base(&SyscallDispatcher::new(), raw, false, false, false)
             .expect("production HVPatch exec builder");
         let tables = image
             .regions()

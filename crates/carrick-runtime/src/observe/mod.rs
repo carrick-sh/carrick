@@ -3,6 +3,7 @@
 pub mod audit;
 pub mod budget;
 pub mod fault;
+pub mod intercept;
 pub mod policy;
 pub mod sandbox;
 
@@ -12,8 +13,11 @@ pub use fault::{
     FaultAction, FaultCondition, FaultInjector, FaultPredicate, FaultRule, FaultRuleBuilder,
     SyscallBitset,
 };
+pub use intercept::{InterceptAction, InterceptedSyscall, SyscallInterceptor};
 pub use policy::{ArgFilter, PolicyObserver, PolicyRule};
 pub use sandbox::{SandboxObserver, SandboxPreset};
+
+pub use carrick_observability::compat::{SyscallArgIndexError, SyscallArgs};
 
 use crate::dispatch::Signal;
 use carrick_abi::{CanonicalNr, LinuxErrno};
@@ -126,6 +130,14 @@ impl<'a> ProcessInfo<'a> {
         self.context.parent_at_capture()
     }
 
+    pub fn container_id(&self) -> crate::kernel::container::ContainerId {
+        self.context.task().container().id()
+    }
+
+    pub fn run_id(&self) -> crate::kernel::container::RunId {
+        self.context.task().container().run_id().clone()
+    }
+
     pub fn pgrp(&self) -> crate::kernel::ProcessGroupId {
         self.context.task().process_group()
     }
@@ -161,6 +173,7 @@ impl<'a> ProcessInfo<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct SyscallInfo<'a> {
     request: &'a crate::dispatch::SyscallRequest,
+    original_args: carrick_observability::compat::SyscallArgs,
 }
 
 impl<'a> SyscallInfo<'a> {
@@ -170,7 +183,20 @@ impl<'a> SyscallInfo<'a> {
     /// observer is installed, so it must not do the table binary search that
     /// only `name()`/`table_entry()` actually need.
     pub const fn new(request: &'a crate::dispatch::SyscallRequest) -> Self {
-        Self { request }
+        Self {
+            request,
+            original_args: request.args,
+        }
+    }
+
+    pub(crate) const fn new_effective(
+        request: &'a crate::dispatch::SyscallRequest,
+        original_args: carrick_observability::compat::SyscallArgs,
+    ) -> Self {
+        Self {
+            request,
+            original_args,
+        }
     }
 
     pub fn canonical_number(&self) -> carrick_abi::CanonicalNr {
@@ -199,6 +225,10 @@ impl<'a> SyscallInfo<'a> {
 
     pub fn raw_args(&self) -> carrick_observability::compat::SyscallArgs {
         self.request.args
+    }
+
+    pub fn original_args(&self) -> carrick_observability::compat::SyscallArgs {
+        self.original_args
     }
 
     pub fn guest_abi(&self) -> carrick_abi::LinuxGuestAbi {

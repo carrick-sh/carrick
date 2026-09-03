@@ -342,19 +342,25 @@ mod tests {
         server.shutdown();
     }
 
-    struct MockAuxProvider;
+    struct MockAuxProvider {
+        marker: usize,
+        scheduler: bool,
+    }
 
     impl KernelDebugAuxProvider for MockAuxProvider {
         fn scheduler_rows(&self) -> Vec<DebugSchedulerRow> {
-            vec![DebugSchedulerRow {
-                lifecycle: "open".to_owned(),
-                queued_len: 1,
-                claimed: 0,
-                waiters: 0,
-                control_epoch: 0,
-                need_resched: false,
-                snapshot_count: 0,
-            }]
+            self.scheduler
+                .then(|| DebugSchedulerRow {
+                    lifecycle: "open".to_owned(),
+                    queued_len: self.marker,
+                    claimed: 0,
+                    waiters: 0,
+                    control_epoch: 0,
+                    need_resched: false,
+                    snapshot_count: 0,
+                })
+                .into_iter()
+                .collect()
         }
 
         fn run_queue_rows(&self) -> Vec<DebugRunQueueRow> {
@@ -368,7 +374,7 @@ mod tests {
 
         fn executor_rows(&self) -> Vec<DebugExecutorRow> {
             vec![DebugExecutorRow {
-                id: 1,
+                id: self.marker as u32,
                 epoch: Some(1),
                 current_binding: Some(DebugExecutorBindingRow {
                     thread: dto::DebugThreadKey { tid: 1, serial: 1 },
@@ -411,8 +417,13 @@ mod tests {
     fn aux_provider_present_populates_aux_tables_and_marker() {
         let (_temp, endpoint) = scoped_endpoint("k1-debug-aux-present");
         let kernel = kernel_with_root();
-        let provider: Arc<dyn KernelDebugAuxProvider> = Arc::new(MockAuxProvider);
-        kernel.register_debug_aux_provider(&provider);
+        let provider: Arc<dyn KernelDebugAuxProvider> = Arc::new(MockAuxProvider {
+            marker: 1,
+            scheduler: true,
+        });
+        kernel
+            .register_debug_aux_provider(&provider)
+            .expect("register carrier provider");
         let mut server =
             KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone()).expect("server");
 
@@ -437,6 +448,81 @@ mod tests {
             Some(1)
         );
         server.shutdown();
+    }
+
+    #[test]
+    fn a_second_distinct_aux_provider_cannot_replace_the_carrier_owner() {
+        let (_temp, endpoint) = scoped_endpoint("k1-debug-aux-isolated");
+        let kernel = kernel_with_root();
+        let alpha: Arc<dyn KernelDebugAuxProvider> = Arc::new(MockAuxProvider {
+            marker: 11,
+            scheduler: true,
+        });
+        let beta: Arc<dyn KernelDebugAuxProvider> = Arc::new(MockAuxProvider {
+            marker: 22,
+            scheduler: true,
+        });
+        let alpha_registration = kernel
+            .register_debug_aux_provider(&alpha)
+            .expect("register carrier owner");
+        assert!(
+            kernel.register_debug_aux_provider(&beta).is_err(),
+            "a second allocation must fail closed",
+        );
+        let mut server =
+            KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone()).expect("server");
+
+        let snapshot = fetch_at(&endpoint, None).expect("unfiltered snapshot");
+        let ids = snapshot
+            .executors
+            .expect("executor table")
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![11]);
+        assert_eq!(
+            snapshot.scheduler.expect("scheduler table")[0].queued_len,
+            11,
+        );
+        assert!(kernel.unregister_debug_aux_provider(alpha_registration));
+        let beta_registration = kernel
+            .register_debug_aux_provider(&beta)
+            .expect("released carrier owner can be replaced");
+        assert!(kernel.unregister_debug_aux_provider(beta_registration));
+        server.shutdown();
+    }
+
+    #[test]
+    fn the_same_aux_provider_registered_twice_is_projected_once() {
+        let (_temp, endpoint) = scoped_endpoint("k1-debug-aux-deduplicated");
+        let kernel = kernel_with_root();
+        let provider: Arc<dyn KernelDebugAuxProvider> = Arc::new(MockAuxProvider {
+            marker: 23,
+            scheduler: false,
+        });
+        let first = kernel
+            .register_debug_aux_provider(&provider)
+            .expect("register provider");
+        let second = kernel
+            .register_debug_aux_provider(&provider)
+            .expect("idempotent registration");
+        assert_eq!(first, second, "same allocation must retain one exact token");
+        let mut server =
+            KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone()).expect("server");
+
+        let snapshot =
+            fetch_at(&endpoint, Some(vec![KernelDebugTable::Executor])).expect("fetch snapshot");
+        assert_eq!(
+            snapshot.executors.expect("executor table").len(),
+            1,
+            "one provider allocation must contribute one set of rows",
+        );
+        server.shutdown();
+        assert!(kernel.unregister_debug_aux_provider(first));
+        assert!(
+            !kernel.unregister_debug_aux_provider(second),
+            "the shared exact token must unregister the publication once",
+        );
     }
 
     #[test]

@@ -98,7 +98,8 @@ use carrick_guest_mem::{Gpa, GuestVa, HostVa};
 
 use crate::compat::CompatReporter;
 use crate::dispatch::{
-    CurrentMmMemory, DispatchOutcome, GuestMemory, MemoryError, SyscallDispatcher, SyscallRequest,
+    CurrentMmMemory, DispatchOutcome, GuestMemory, MemoryError, PreparedDispatch, PreparedSyscall,
+    SyscallCompletionToken, SyscallDispatcher, SyscallRequest,
 };
 use crate::linux_abi::LinuxErrno;
 use crate::memory::{AddressSpace, AddressSpaceError};
@@ -131,7 +132,7 @@ pub use crate::trap::SyscallTrap;
 // native backend resolves them on every host OS. Re-exported here so the
 // original `crate::runtime::…` paths are unchanged on this arm.
 pub(crate) use crate::vdso_policy::{
-    debug_env_flag_enabled, vdso_enabled_for_debug, with_optional_vdso_for_clock,
+    debug_env_flag_enabled, vdso_enabled_for_debug, with_optional_vdso_for_clock_with_visibility,
 };
 
 pub use crate::debug_state::{DebugRegionSnapshot, DebugStateSnapshot, maybe_dump_debug_state};
@@ -254,7 +255,14 @@ where
             env,
             crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
         )?;
-    finish_and_run_image(image, dispatcher, max_traps, debug_state_path)
+    let requires_syscall_traps = dispatcher.requires_syscall_traps();
+    finish_and_run_image(
+        image,
+        dispatcher,
+        requires_syscall_traps,
+        max_traps,
+        debug_state_path,
+    )
 }
 
 pub struct RunStaticElfBackendOptions<'a> {
@@ -305,7 +313,8 @@ pub fn run_static_elf_bytes_with_hvf_and_dispatcher(
     max_traps: usize,
 ) -> Result<RunResult, RuntimeError> {
     let image = AddressSpace::load_elf_bytes(bytes)?;
-    finish_and_run_image(image, dispatcher, max_traps, None)
+    let requires_syscall_traps = dispatcher.requires_syscall_traps();
+    finish_and_run_image(image, dispatcher, requires_syscall_traps, max_traps, None)
 }
 
 pub fn run_static_elf_bytes_with_hvf_args_and_dispatcher<A, E>(
@@ -335,7 +344,8 @@ where
             env,
             crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
         )?;
-    finish_and_run_image(image, dispatcher, max_traps, None)
+    let requires_syscall_traps = dispatcher.requires_syscall_traps();
+    finish_and_run_image(image, dispatcher, requires_syscall_traps, max_traps, None)
 }
 
 pub fn run_rootfs_elf_with_hvf_args_and_dispatcher<A, E>(
@@ -363,6 +373,62 @@ pub fn run_rootfs_elf_with_hvf_args_and_dispatcher_debug<A, E>(
     env: E,
     max_traps: usize,
     debug_state_path: Option<&PathBuf>,
+) -> Result<RunResult, RuntimeError>
+where
+    A: IntoIterator<Item = String>,
+    E: IntoIterator<Item = String>,
+{
+    run_rootfs_elf_with_hvf_args_and_dispatcher_debug_owned(
+        path,
+        rootfs,
+        dispatcher,
+        argv,
+        env,
+        max_traps,
+        debug_state_path,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "fs-memory")]
+pub(crate) fn run_rootfs_elf_with_hvf_args_and_dispatcher_debug_on<A, E>(
+    path: impl AsRef<Path>,
+    rootfs: &RootFs,
+    dispatcher: SyscallDispatcher,
+    argv: A,
+    env: E,
+    max_traps: usize,
+    debug_state_path: Option<&PathBuf>,
+    carrier: crate::carrier::CarrierRuntime,
+    lease: crate::carrier::CarrierLease,
+) -> Result<RunResult, RuntimeError>
+where
+    A: IntoIterator<Item = String>,
+    E: IntoIterator<Item = String>,
+{
+    run_rootfs_elf_with_hvf_args_and_dispatcher_debug_owned(
+        path,
+        rootfs,
+        dispatcher,
+        argv,
+        env,
+        max_traps,
+        debug_state_path,
+        Some((carrier, lease)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_rootfs_elf_with_hvf_args_and_dispatcher_debug_owned<A, E>(
+    path: impl AsRef<Path>,
+    rootfs: &RootFs,
+    dispatcher: SyscallDispatcher,
+    argv: A,
+    env: E,
+    max_traps: usize,
+    debug_state_path: Option<&PathBuf>,
+    ownership: Option<(crate::carrier::CarrierRuntime, crate::carrier::CarrierLease)>,
 ) -> Result<RunResult, RuntimeError>
 where
     A: IntoIterator<Item = String>,
@@ -413,7 +479,15 @@ where
         env,
         crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
     )?;
-    finish_and_run_image(image, dispatcher, max_traps, debug_state_path)
+    let requires_syscall_traps = dispatcher.requires_syscall_traps();
+    finish_and_run_image_owned(
+        image,
+        dispatcher,
+        requires_syscall_traps,
+        max_traps,
+        debug_state_path,
+        ownership,
+    )
 }
 
 // `resolve_entrypoint_path` / `resolve_entrypoint_program` (Docker `execvp` PATH
@@ -426,13 +500,43 @@ where
 /// PT_INTERP are loaded via `dispatcher.read_exec_file` — the same
 /// overlay-first reader used by the guest-runtime execve path — so no
 /// in-memory `RootFs` is required.
-pub(crate) fn run_elf_from_dispatcher_debug<A, E>(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_elf_from_dispatcher_debug_on<A, E>(
     path: &str,
     dispatcher: SyscallDispatcher,
     argv: A,
     env: E,
     max_traps: usize,
     debug_state_path: Option<&PathBuf>,
+    carrier: crate::carrier::CarrierRuntime,
+    lease: crate::carrier::CarrierLease,
+) -> Result<RunResult, RuntimeError>
+where
+    A: IntoIterator<Item = String>,
+    E: IntoIterator<Item = String>,
+{
+    run_elf_from_dispatcher_debug_owned(
+        path,
+        dispatcher,
+        argv,
+        env,
+        max_traps,
+        debug_state_path,
+        carrier,
+        lease,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_elf_from_dispatcher_debug_owned<A, E>(
+    path: &str,
+    dispatcher: SyscallDispatcher,
+    argv: A,
+    env: E,
+    max_traps: usize,
+    debug_state_path: Option<&PathBuf>,
+    carrier: crate::carrier::CarrierRuntime,
+    lease: crate::carrier::CarrierLease,
 ) -> Result<RunResult, RuntimeError>
 where
     A: IntoIterator<Item = String>,
@@ -513,7 +617,14 @@ where
     });
     drop(launch_context);
     let image = built?;
-    crate::hvpatch::finish_hvpatch_image(image, dispatcher, max_traps, debug_state_path)
+    crate::hvpatch::finish_hvpatch_image_on(
+        image,
+        dispatcher,
+        max_traps,
+        debug_state_path,
+        carrier,
+        lease,
+    )
 }
 
 pub fn run_rootfs_elf_with_hvf_args<A, E>(
@@ -590,6 +701,8 @@ fn run_address_space_with_hvf_and_dispatcher(
     image: AddressSpace,
     mut dispatcher: SyscallDispatcher,
     max_traps: usize,
+    carrier: crate::carrier::CarrierRuntime,
+    lease: crate::carrier::CarrierLease,
 ) -> Result<RunResult, RuntimeError> {
     let _ = crate::ulock::preinit_waiter_table();
     // The carrier owns the kernel arena; this container owns its pid region
@@ -597,11 +710,21 @@ fn run_address_space_with_hvf_and_dispatcher(
     // host namespace-supervisor process.
     let _ = carrick_kernel::arena::KernelArena::global();
     let container = dispatcher.container();
-    let admission = crate::carrier::admit_container(container.id());
+    if lease.launch().container_id != container.id() || !lease.belongs_to(&carrier) {
+        return Err(RuntimeError::CarrierFailed(
+            "runtime received a carrier lease for a different container or generation".to_owned(),
+        ));
+    }
+    lease.mark_running()?;
+    // All image/spec/embed mounts are installed before this entry point. The
+    // token seals that immutable routing table now and becomes its exclusive
+    // terminal owner after the run loop and optional archive endpoint drain.
+    let mount_retirement = dispatcher.prepare_mount_retirement();
+    lease.register_mounts(mount_retirement.mount_count())?;
     // Taken by the run terminal (inside `finalize_persistent_hvf_run`), or by
     // the boot-failure path below when the loop never ran.
-    let mut retire = Some((container, admission));
-    let container_id = std::env::var("CARRICK_CONTAINER_ID").ok();
+    let registry_id = container.launch().registry_id().map(str::to_owned);
+    let mut retire = Some((container, lease, mount_retirement));
     let mut exact_control_installed = false;
     let mut run = (|| -> Result<RunResult, RuntimeError> {
         // Build the engine (create VM + vCPU, map the address space, park at the EL0
@@ -620,19 +743,30 @@ fn run_address_space_with_hvf_and_dispatcher(
         })?;
         let _ = stamp_identity_page(&mut trap, &dispatcher, &boot_context);
         drop(boot_context);
-        let mut completion = run_threaded_hvf_loop(trap, dispatcher, max_traps);
+        let mut completion = run_threaded_hvf_loop(trap, dispatcher, max_traps, &carrier);
+        // The control server owns an archive authority over this container's
+        // mount table. Stop admission and join its synchronous worker before
+        // retirement proves exclusive terminal ownership. Terminal state is
+        // persisted only after teardown, so a cleanup failure still reports
+        // the fail-closed status 125.
+        if let Some(control) = completion.carrier_control.as_mut() {
+            exact_control_installed = true;
+            control.quiesce();
+        }
         // Container teardown: reap, drop mounts, release the pid region. The
         // VM, the arena and every other carrier facility persist for the next
         // container; `carrier::shutdown` retires them at carrier exit.
         let mut run = finalize_persistent_hvf_run(
             completion.run,
             || {
-                let (container, admission) = retire.take().ok_or_else(|| {
+                let (container, lease, mounts) = retire.as_mut().ok_or_else(|| {
                     RuntimeError::Configuration("container retired twice".to_owned())
                 })?;
-                crate::carrier::retire_container(container, admission).map(|_| ())
+                crate::carrier::retire_leased_container(Arc::clone(container), lease, mounts)?;
+                retire.take();
+                Ok(())
             },
-            crate::carrier::record_container_terminal,
+            |terminal| carrier.record_terminal(terminal),
             |_| Ok(()),
         );
         // Keep mutating control live through VM destruction, terminal receipt,
@@ -640,7 +774,6 @@ fn run_address_space_with_hvf_and_dispatcher(
         // exact externally visible status and release the endpoint.  Any error
         // after control installation is fail-closed as 125.
         if let Some(control) = completion.carrier_control.as_mut() {
-            exact_control_installed = true;
             let exit_code = run.as_ref().map_or(125, |result| result.exit_code);
             if let Err(error) = control.complete(exit_code)
                 && run.is_ok()
@@ -656,13 +789,16 @@ fn run_address_space_with_hvf_and_dispatcher(
     // identity): `finalize_persistent_hvf_run` never ran, so the container is
     // still admitted. Retire it here; the admission's RAII drop alone would
     // un-count it but leave its tasks/mounts/pid region behind.
-    if let Some((container, admission)) = retire.take()
-        && let Err(error) = crate::carrier::retire_container(container, admission)
-        && run.is_ok()
-    {
-        run = Err(error);
+    if let Some((container, lease, mounts)) = retire.as_mut() {
+        match crate::carrier::retire_leased_container(Arc::clone(container), lease, mounts) {
+            Ok(_) => {
+                retire.take();
+            }
+            Err(error) if run.is_ok() => run = Err(error),
+            Err(_) => {}
+        }
     }
-    if !exact_control_installed && let Some(id) = container_id.as_deref() {
+    if !exact_control_installed && let Some(id) = registry_id.as_deref() {
         let exit_code = run.as_ref().map_or(125, |result| result.exit_code);
         crate::container::mark_exited(id, exit_code);
     }
@@ -676,16 +812,51 @@ fn run_address_space_with_hvf_and_dispatcher(
 /// optimization inside the vector: disabling it does not return HVF to the
 /// register-scraping transport. Keeping this builder shared by boot and
 /// `execve` also makes the transport immutable across a container lifecycle.
-fn with_hvf_syscall_mailbox(image: AddressSpace) -> Result<AddressSpace, AddressSpaceError> {
+fn with_hvf_syscall_mailbox(
+    image: AddressSpace,
+    _requires_syscall_traps: bool,
+) -> Result<AddressSpace, AddressSpaceError> {
+    // EL1 vectors are carrier-wide immutable code. They cannot depend on one
+    // container's observer/interceptor policy: two siblings may legitimately
+    // require different visibility. Install the universal shim-capable page
+    // whenever the feature is compiled, and let each container's private
+    // identity-page gate decide whether matched calls return in EL1 or fall
+    // through to the host dispatcher.
     let identity_fast_path = crate::syscall_shim_enabled();
     let image = image.with_el1_vectors_mailbox(identity_fast_path)?;
-    let image = if identity_fast_path {
+    // The page is part of the compile-enabled transport shape even when its
+    // runtime gate is closed. Boot/fork/exec stampers still publish the task
+    // identity there; interceptor/observer visibility keeps the gate at zero
+    // so every identity call traps through ordinary dispatch.
+    let image = if crate::syscall_shim_enabled() {
         image.with_identity_page()?
     } else {
         image
     };
     let image = image.with_syscall_mailbox_arena()?;
     image.with_carrier_maintenance_root()
+}
+
+/// Construct the immutable HVPatch image boundary shared by initial boots and
+/// its unit-level construction proof. The live dispatcher restriction is
+/// sealed here so a stale caller snapshot can only make the image stricter.
+fn finalize_hvf_initial_image(
+    image: AddressSpace,
+    dispatcher: &SyscallDispatcher,
+    requires_syscall_traps: bool,
+) -> Result<AddressSpace, AddressSpaceError> {
+    use carrick_hal::GuestArch as _;
+
+    type HvfArch = <HvfTrapEngine as carrick_hal::ThreadedEngine>::Arch;
+    let requires_syscall_traps = requires_syscall_traps || dispatcher.requires_syscall_traps();
+    let image = image.with_el0_trampoline_bytes(HvfArch::entry_trampoline_bytes())?;
+    let image = with_hvf_syscall_mailbox(image, requires_syscall_traps)?;
+    let image = image.with_hvpatch_stage1_page_tables()?;
+    with_optional_vdso_for_clock_with_visibility::<HvfArch>(
+        image,
+        dispatcher.container().clock(),
+        requires_syscall_traps,
+    )
 }
 
 /// Finish a freshly-loaded image (its initial stack already set, if any) and
@@ -698,8 +869,46 @@ fn with_hvf_syscall_mailbox(image: AddressSpace) -> Result<AddressSpace, Address
 pub(crate) fn finish_and_run_image(
     image: AddressSpace,
     dispatcher: SyscallDispatcher,
+    requires_syscall_traps: bool,
     max_traps: usize,
     debug_state_path: Option<&PathBuf>,
+) -> Result<RunResult, RuntimeError> {
+    finish_and_run_image_owned(
+        image,
+        dispatcher,
+        requires_syscall_traps,
+        max_traps,
+        debug_state_path,
+        None,
+    )
+}
+
+pub(crate) fn finish_and_run_image_on(
+    image: AddressSpace,
+    dispatcher: SyscallDispatcher,
+    requires_syscall_traps: bool,
+    max_traps: usize,
+    debug_state_path: Option<&PathBuf>,
+    carrier: crate::carrier::CarrierRuntime,
+    lease: crate::carrier::CarrierLease,
+) -> Result<RunResult, RuntimeError> {
+    finish_and_run_image_owned(
+        image,
+        dispatcher,
+        requires_syscall_traps,
+        max_traps,
+        debug_state_path,
+        Some((carrier, lease)),
+    )
+}
+
+fn finish_and_run_image_owned(
+    image: AddressSpace,
+    dispatcher: SyscallDispatcher,
+    requires_syscall_traps: bool,
+    max_traps: usize,
+    debug_state_path: Option<&PathBuf>,
+    ownership: Option<(crate::carrier::CarrierRuntime, crate::carrier::CarrierLease)>,
 ) -> Result<RunResult, RuntimeError> {
     // Arm the one carrier's deadlock watchdog. Logical fork children advance
     // the same carrier-global counter; no host-child re-arm exists.
@@ -716,23 +925,23 @@ pub(crate) fn finish_and_run_image(
             .get(carrick_abi::LinuxResource::Nofile)
             .rlim_cur,
     );
-    // Per-ISA image bytes come from the engine's GuestArch (the x86_64 seam);
-    // this file is the macOS/HVF path, so the engine is `HvfTrapEngine`.
-    use carrick_hal::GuestArch as _;
-    type HvfArch = <HvfTrapEngine as carrick_hal::ThreadedEngine>::Arch;
-    let image = image.with_el0_trampoline_bytes(HvfArch::entry_trampoline_bytes())?;
     // macOS/HVF ordinary syscalls always publish through the EL1-only mailbox.
     // The feature-gated identity handlers remain a no-exit fast path within
     // that vector; native DSR and the non-macOS VMM lifecycle never enter this
     // builder.
-    let image = with_hvf_syscall_mailbox(image)?;
-    let image = image.with_hvpatch_stage1_page_tables()?;
-    let container = dispatcher.container();
-    let image = with_optional_vdso_for_clock::<HvfArch>(image, container.clock())?;
+    let image = finalize_hvf_initial_image(image, &dispatcher, requires_syscall_traps)?;
     if let Some(p) = maybe_dump_debug_state(&image, debug_state_path) {
         eprintln!("debug state written: {}", p.display());
     }
-    run_address_space_with_hvf_and_dispatcher(image, dispatcher, max_traps)
+    let (carrier, lease) = match ownership {
+        Some(ownership) => ownership,
+        None => {
+            let carrier = crate::carrier::process_carrier()?;
+            let lease = carrier.reserve(dispatcher.container().launch().clone())?;
+            (carrier, lease)
+        }
+    };
+    run_address_space_with_hvf_and_dispatcher(image, dispatcher, max_traps, carrier, lease)
 }
 
 // `apply_image_proc_state`, `stamp_identity_page`, and
@@ -856,14 +1065,31 @@ where
         let kernel_context = dispatcher.capture_one_task_context().map_err(|error| {
             RuntimeError::Configuration(format!("capture one-task syscall Kernel context: {error}"))
         })?;
-        let outcome = dispatch_single_threaded_syscall(
-            &mut dispatcher,
+        let prepared = dispatcher.prepare_syscall(
             &kernel_context,
             SyscallRequest::from_raw(frame),
-            runtime,
             &reporter,
-            &mut waiter,
         )?;
+        let (syscall, prepared_outcome) = match prepared {
+            PreparedDispatch::Invoke(syscall) => (syscall, None),
+            PreparedDispatch::Complete { syscall, outcome } => (syscall, Some(outcome)),
+        };
+        let mut completion = Some(SyscallCompletionToken::new(
+            syscall,
+            kernel_context.retain_exact(),
+            dispatcher.observers().cloned(),
+        ));
+        let outcome = match prepared_outcome {
+            Some(outcome) => outcome,
+            None => dispatch_single_threaded_syscall(
+                &mut dispatcher,
+                &kernel_context,
+                syscall,
+                runtime,
+                &reporter,
+                &mut waiter,
+            )?,
+        };
 
         let mut last_syscall_retval: Option<i64> = None;
         let mut signal_interrupted_pc: Option<u64> = None;
@@ -880,10 +1106,11 @@ where
             | DispatchOutcome::WaitOnSignals { .. }
             | DispatchOutcome::WaitOnSleep { .. } => {
                 let value = crate::linux_abi::LINUX_EINTR.guest_retval();
-                runtime.complete_syscall(value)?;
+                complete_single_threaded_syscall(runtime, &mut completion, &reporter, value)?;
                 last_syscall_retval = Some(value);
             }
             DispatchOutcome::Exit { code } => {
+                retire_single_threaded_syscall(&mut completion)?;
                 crate::probes::guest_exit(code);
                 dispatcher.cleanup_sysv_ipc_on_process_exit();
                 return Ok(RunResult {
@@ -898,6 +1125,7 @@ where
                 });
             }
             DispatchOutcome::SignalDeath { signum } => {
+                retire_single_threaded_syscall(&mut completion)?;
                 dispatcher.cleanup_sysv_ipc_on_process_exit();
                 return Ok(RunResult {
                     exit_code: 128 + signum,
@@ -911,17 +1139,17 @@ where
                 });
             }
             DispatchOutcome::Returned { value } => {
-                runtime.complete_syscall(value)?;
+                complete_single_threaded_syscall(runtime, &mut completion, &reporter, value)?;
                 last_syscall_retval = Some(value);
             }
             DispatchOutcome::SchedulerYield => {
                 std::thread::yield_now();
-                runtime.complete_syscall(0)?;
+                complete_single_threaded_syscall(runtime, &mut completion, &reporter, 0)?;
                 last_syscall_retval = Some(0);
             }
             DispatchOutcome::Errno { errno } => {
                 let value = errno.guest_retval();
-                runtime.complete_syscall(value)?;
+                complete_single_threaded_syscall(runtime, &mut completion, &reporter, value)?;
                 last_syscall_retval = Some(value);
             }
             DispatchOutcome::Fork { .. } => {
@@ -929,7 +1157,7 @@ where
                 // fixture. Product execution uses the unified kernel loop, where
                 // fork/vfork clone logical tasks and never create a host process.
                 let value = crate::linux_abi::LINUX_EOPNOTSUPP.guest_retval();
-                runtime.complete_syscall(value)?;
+                complete_single_threaded_syscall(runtime, &mut completion, &reporter, value)?;
                 last_syscall_retval = Some(value);
             }
             DispatchOutcome::Execve { path, argv, env } => {
@@ -947,7 +1175,13 @@ where
                 crate::dispatch::set_host_process_name(cmdline.as_bytes());
                 let proc_env = env.clone();
                 let loaded = dispatcher.with_kernel_credentials(&kernel_context, || {
-                    load_execve_image(&dispatcher, &path, argv, env)
+                    load_execve_image(
+                        &dispatcher,
+                        &path,
+                        argv,
+                        env,
+                        dispatcher.requires_syscall_traps(),
+                    )
                 });
                 match loaded {
                     Ok(new_image) => {
@@ -977,11 +1211,17 @@ where
                         // execve_into rebuilt a fresh (zeroed) identity page;
                         // exec retains the caller's captured credential values.
                         let _ = stamp_identity_page(runtime, &dispatcher, &exec_context);
+                        retire_single_threaded_syscall(&mut completion)?;
                         stop_after_traced_exec(&dispatcher);
                     }
                     Err(errno) => {
                         let value = errno.guest_retval();
-                        runtime.complete_syscall(value)?;
+                        complete_single_threaded_syscall(
+                            runtime,
+                            &mut completion,
+                            &reporter,
+                            value,
+                        )?;
                         last_syscall_retval = Some(value);
                     }
                 }
@@ -997,6 +1237,7 @@ where
                     this_tid,
                     carrick_abi::SigSet::from_raw(restored_sigmask),
                 );
+                retire_single_threaded_syscall(&mut completion)?;
                 // Deliver the NEXT pending signal (if any) before resuming the
                 // restored context — the kernel delivers all deliverable pending
                 // signals back-to-back before returning to userspace. The just-
@@ -1010,7 +1251,7 @@ where
                 // Rosetta requested hardware x86_64 TSO on this vCPU. Toggle
                 // ACTLR_EL1.EnTSO, then complete prctl with 0.
                 runtime.set_memory_model(hardware_tso_for_debug(tso))?;
-                runtime.complete_syscall(0)?;
+                complete_single_threaded_syscall(runtime, &mut completion, &reporter, 0)?;
                 last_syscall_retval = Some(0);
             }
             DispatchOutcome::MapHostAlias {
@@ -1086,7 +1327,7 @@ where
                         }
                     }
                 })?;
-                runtime.complete_syscall(retval)?;
+                complete_single_threaded_syscall(runtime, &mut completion, &reporter, retval)?;
                 last_syscall_retval = Some(retval);
             }
             DispatchOutcome::SharedFutexWait {
@@ -1110,7 +1351,7 @@ where
                 } else {
                     shared_futex_wait(location.wait_addr(), waiter_key, value, timeout, this_tid)
                 };
-                runtime.complete_syscall(retval)?;
+                complete_single_threaded_syscall(runtime, &mut completion, &reporter, retval)?;
                 last_syscall_retval = Some(retval);
             }
             DispatchOutcome::SharedFutexWaitv {
@@ -1129,7 +1370,7 @@ where
                     shared_futex_wait(location.wait_addr(), waiter_key, value, timeout, this_tid)
                 };
                 let retval = if retval == 0 { index } else { retval };
-                runtime.complete_syscall(retval)?;
+                complete_single_threaded_syscall(runtime, &mut completion, &reporter, retval)?;
                 last_syscall_retval = Some(retval);
             }
             DispatchOutcome::WaitOnSharedWord {
@@ -1147,7 +1388,7 @@ where
                     shared_futex_wait(location.wait_addr(), waiter_key, value, None, this_tid)
                 };
                 if retval != 0 {
-                    runtime.complete_syscall(retval)?;
+                    complete_single_threaded_syscall(runtime, &mut completion, &reporter, retval)?;
                     last_syscall_retval = Some(retval);
                     break;
                 }
@@ -1161,14 +1402,14 @@ where
                             ));
                         }
                     };
-                    runtime.complete_syscall(retval)?;
+                    complete_single_threaded_syscall(runtime, &mut completion, &reporter, retval)?;
                     last_syscall_retval = Some(retval);
                     break;
                 }
                 match dispatch_single_threaded_syscall(
                     &mut dispatcher,
                     &kernel_context,
-                    SyscallRequest::from_raw(frame),
+                    syscall,
                     runtime,
                     &reporter,
                     &mut waiter,
@@ -1187,13 +1428,23 @@ where
                         sysv = next_sysv;
                     }
                     DispatchOutcome::Returned { value } => {
-                        runtime.complete_syscall(value)?;
+                        complete_single_threaded_syscall(
+                            runtime,
+                            &mut completion,
+                            &reporter,
+                            value,
+                        )?;
                         last_syscall_retval = Some(value);
                         break;
                     }
                     DispatchOutcome::Errno { errno } => {
                         let value = errno.guest_retval();
-                        runtime.complete_syscall(value)?;
+                        complete_single_threaded_syscall(
+                            runtime,
+                            &mut completion,
+                            &reporter,
+                            value,
+                        )?;
                         last_syscall_retval = Some(value);
                         break;
                     }
@@ -1213,7 +1464,7 @@ where
                 // guest (LTP tst_checkpoint_wake). Same __ulock one-at-a-time +
                 // sched_yield as the threaded loop's PlatformFutex::shared_wake.
                 let retval = shared_futex_wake(location.wait_addr().raw(), waiter_key, count);
-                runtime.complete_syscall(retval)?;
+                complete_single_threaded_syscall(runtime, &mut completion, &reporter, retval)?;
                 last_syscall_retval = Some(retval);
             }
             DispatchOutcome::SharedFutexRequeue {
@@ -1235,7 +1486,7 @@ where
                 );
                 trace_shared_futex_requeue(1, from_key, to_key, wake, requeue, woken, requeued);
                 let retval = i64::from(woken + requeued);
-                runtime.complete_syscall(retval)?;
+                complete_single_threaded_syscall(runtime, &mut completion, &reporter, retval)?;
                 last_syscall_retval = Some(retval);
             }
             DispatchOutcome::CloneThread { .. }
@@ -1248,7 +1499,7 @@ where
                 // single-threaded loops here always pass `thread: None`, so
                 // the dispatcher never produces them.
                 let value = crate::linux_abi::LINUX_ENOSYS.guest_retval();
-                runtime.complete_syscall(value)?;
+                complete_single_threaded_syscall(runtime, &mut completion, &reporter, value)?;
                 last_syscall_retval = Some(value);
             }
         }
@@ -1314,14 +1565,69 @@ where
 // `partial_write_interrupt_outcome` were hoisted into `crate::vcpu_loop` (shared
 // with the threaded loop); imported above and called unchanged here.
 
+fn complete_single_threaded_syscall<R: SyscallTrap>(
+    runtime: &mut R,
+    completion: &mut Option<SyscallCompletionToken>,
+    reporter: &CompatReporter,
+    value: i64,
+) -> Result<(), RuntimeError> {
+    runtime.complete_syscall(value)?;
+    let token = completion.take().ok_or_else(|| {
+        RuntimeError::Configuration("single-threaded syscall completed twice".to_owned())
+    })?;
+    token.publish_return(reporter, value);
+    Ok(())
+}
+
+fn retire_single_threaded_syscall(
+    completion: &mut Option<SyscallCompletionToken>,
+) -> Result<(), RuntimeError> {
+    completion.take().ok_or_else(|| {
+        RuntimeError::Configuration("single-threaded syscall token retired twice".to_owned())
+    })?;
+    Ok(())
+}
+
 fn dispatch_single_threaded_syscall<M: CurrentMmMemory>(
     dispatcher: &mut SyscallDispatcher,
     kernel_context: &crate::kernel::KernelContext,
-    request: SyscallRequest,
+    syscall: PreparedSyscall,
     memory: &mut M,
     reporter: &CompatReporter,
     waiter: &mut crate::io_wait::ThreadWaiter,
 ) -> Result<DispatchOutcome, RuntimeError> {
+    dispatch_single_threaded_syscall_with(
+        dispatcher,
+        kernel_context,
+        syscall,
+        memory,
+        reporter,
+        waiter,
+        |dispatcher, kernel_context, syscall, memory, reporter| {
+            dispatcher.dispatch_prepared(kernel_context, syscall, memory, reporter)
+        },
+    )
+}
+
+fn dispatch_single_threaded_syscall_with<M, F>(
+    dispatcher: &mut SyscallDispatcher,
+    kernel_context: &crate::kernel::KernelContext,
+    syscall: PreparedSyscall,
+    memory: &mut M,
+    reporter: &CompatReporter,
+    waiter: &mut crate::io_wait::ThreadWaiter,
+    mut dispatch: F,
+) -> Result<DispatchOutcome, RuntimeError>
+where
+    M: CurrentMmMemory,
+    F: FnMut(
+        &mut SyscallDispatcher,
+        &crate::kernel::KernelContext,
+        PreparedSyscall,
+        &mut M,
+        &CompatReporter,
+    ) -> Result<DispatchOutcome, crate::dispatch::DispatchError>,
+{
     use crate::io_wait::WaitResult;
 
     // Service blocking I/O by waiting without re-entering the dispatcher's
@@ -1333,9 +1639,9 @@ fn dispatch_single_threaded_syscall<M: CurrentMmMemory>(
     let mut poll_deadline: Option<Instant> = None;
     loop {
         let outcome = dispatch_with_panic_backstop(
-            request.number.raw(),
+            syscall.request.number.raw(),
             ThreadId::main_from_host_pid(),
-            || dispatcher.dispatch(kernel_context, request, memory, reporter),
+            || dispatch(dispatcher, kernel_context, syscall, memory, reporter),
         )?;
         match outcome {
             DispatchOutcome::BlockingHostWrite(mut write) => {
@@ -1733,8 +2039,9 @@ fn run_threaded_hvf_loop(
     trap: HvfTrapEngine,
     dispatcher: SyscallDispatcher,
     max_traps: usize,
+    carrier: &crate::carrier::CarrierRuntime,
 ) -> crate::threaded_loop::ThreadedLoopCompletion {
-    crate::threaded_loop::run_threaded_loop(trap, dispatcher, HvfHostBackend, max_traps)
+    crate::threaded_loop::run_threaded_loop(trap, dispatcher, HvfHostBackend, max_traps, carrier)
 }
 
 // `run_vcpu_until_exit`, `assemble_run_result`, `PendingSignalAction`,
@@ -2249,6 +2556,494 @@ where
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct RetryCompletionTrap {
+        completed: Vec<i64>,
+        syscalls: std::collections::VecDeque<carrick_hal::RawSyscall>,
+        restored_sigframes: usize,
+        execve_calls: usize,
+        memory: std::collections::BTreeMap<u64, u8>,
+    }
+
+    impl carrick_guest_mem::GuestMemory for RetryCompletionTrap {
+        fn read_bytes_raw(
+            &self,
+            address: u64,
+            length: usize,
+        ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
+            Ok((0..length)
+                .map(|offset| {
+                    self.memory
+                        .get(&(address + offset as u64))
+                        .copied()
+                        .unwrap_or(0)
+                })
+                .collect())
+        }
+
+        fn write_bytes_raw(
+            &mut self,
+            address: u64,
+            bytes: &[u8],
+        ) -> Result<(), carrick_guest_mem::MemoryError> {
+            for (offset, byte) in bytes.iter().copied().enumerate() {
+                self.memory.insert(address + offset as u64, byte);
+            }
+            Ok(())
+        }
+    }
+
+    impl carrick_guest_mem::CurrentMmMemory for RetryCompletionTrap {}
+
+    impl SyscallTrap for RetryCompletionTrap {
+        fn next_syscall(&mut self) -> Result<Option<carrick_hal::RawSyscall>, TrapError> {
+            Ok(self.syscalls.pop_front())
+        }
+
+        fn current_pc(&self) -> Result<u64, TrapError> {
+            Ok(0)
+        }
+
+        fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError> {
+            self.completed.push(return_value);
+            Ok(())
+        }
+
+        fn execve_into(&mut self, _new_image: &AddressSpace) -> Result<(), TrapError> {
+            self.execve_calls += 1;
+            Ok(())
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn inject_signal(
+            &mut self,
+            _signum: i32,
+            _handler: u64,
+            _sa_restorer: u64,
+            _pending_syscall_retval: Option<i64>,
+            _interrupted_pc: Option<u64>,
+            _altstack: Option<(u64, u64)>,
+            _saved_sigmask: u64,
+            _fault_siginfo: Option<(i32, u64)>,
+            _queued_siginfo: Option<crate::linux_abi::LinuxSiginfo>,
+            _restart_syscall: bool,
+        ) -> Result<(), TrapError> {
+            Ok(())
+        }
+
+        fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
+            self.restored_sigframes += 1;
+            Ok(0)
+        }
+    }
+
+    fn scripted_syscall(number: u64, args: [u64; 6]) -> carrick_hal::RawSyscall {
+        carrick_hal::RawSyscall {
+            number: carrick_abi::CanonicalNr(number),
+            args,
+            guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+            native_number: carrick_abi::NativeNr(number),
+        }
+    }
+
+    fn synthetic_exec_elf() -> Vec<u8> {
+        const ET_EXEC: u16 = 2;
+        const PT_LOAD: u32 = 1;
+        let mut elf = vec![0_u8; 0x1000];
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[6] = 1;
+        elf[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
+        elf[18..20].copy_from_slice(&goblin::elf::header::EM_AARCH64.to_le_bytes());
+        elf[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        elf[24..32].copy_from_slice(&0x400000_u64.to_le_bytes());
+        elf[32..40].copy_from_slice(&64_u64.to_le_bytes());
+        elf[52..54].copy_from_slice(&64_u16.to_le_bytes());
+        elf[54..56].copy_from_slice(&56_u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&1_u16.to_le_bytes());
+        let ph = 64;
+        elf[ph..ph + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        elf[ph + 4..ph + 8].copy_from_slice(&5_u32.to_le_bytes());
+        elf[ph + 16..ph + 24].copy_from_slice(&0x400000_u64.to_le_bytes());
+        elf[ph + 24..ph + 32].copy_from_slice(&0x400000_u64.to_le_bytes());
+        let len = elf.len() as u64;
+        elf[ph + 32..ph + 40].copy_from_slice(&len.to_le_bytes());
+        elf[ph + 40..ph + 48].copy_from_slice(&len.to_le_bytes());
+        elf[ph + 48..ph + 56].copy_from_slice(&0x1000_u64.to_le_bytes());
+        elf
+    }
+
+    struct KillOnEntryObserver;
+
+    impl crate::observe::SyscallObserver for KillOnEntryObserver {
+        fn on_syscall(
+            &self,
+            _process: &crate::observe::ProcessInfo<'_>,
+            _call: &crate::observe::SyscallInfo<'_>,
+        ) -> crate::observe::SyscallAction {
+            crate::observe::SyscallAction::Kill(crate::dispatch::Signal(
+                crate::linux_abi::LINUX_SIGKILL,
+            ))
+        }
+    }
+
+    struct RedispatchCountingInterceptor(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl crate::observe::SyscallInterceptor for RedispatchCountingInterceptor {
+        fn intercept(
+            &self,
+            _process: &crate::observe::ProcessInfo<'_>,
+            _call: &crate::observe::InterceptedSyscall<'_>,
+        ) -> crate::observe::InterceptAction {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::observe::InterceptAction::Continue
+        }
+    }
+
+    #[test]
+    fn interception_redispatch_reuses_one_prepared_envelope_once_and_twice() {
+        for redispatches in [1, 2] {
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut dispatcher = SyscallDispatcher::new();
+            dispatcher.install_interceptor(std::sync::Arc::new(RedispatchCountingInterceptor(
+                std::sync::Arc::clone(&calls),
+            )));
+            let context = dispatcher.capture_one_task_context().unwrap();
+            let reporter = CompatReporter::default();
+            let prepared = dispatcher
+                .prepare_syscall(
+                    &context,
+                    SyscallRequest::new(92, crate::compat::SyscallArgs::from([0; 6])),
+                    &reporter,
+                )
+                .unwrap();
+            let PreparedDispatch::Invoke(syscall) = prepared else {
+                panic!("personality must invoke its handler")
+            };
+            let mut token = Some(SyscallCompletionToken::new(
+                syscall,
+                context.retain_exact(),
+                dispatcher.observers().cloned(),
+            ));
+            let mut memory = crate::dispatch::LinearMemory::new(0x4000_0000, vec![0; 4096]);
+            let mut waiter = crate::io_wait::ThreadWaiter::new(
+                crate::thread::ThreadId::synthetic_for_tests(72_410 + redispatches),
+            );
+            let mut handler_calls = 0;
+            let outcome = dispatch_single_threaded_syscall_with(
+                &mut dispatcher,
+                &context,
+                syscall,
+                &mut memory,
+                &reporter,
+                &mut waiter,
+                |_, _, received, _, _| {
+                    handler_calls += 1;
+                    assert_eq!(received.request.args, syscall.request.args);
+                    if handler_calls <= redispatches {
+                        Ok(DispatchOutcome::WaitOnHvpatchChild {
+                            target: None,
+                            sig_mask: carrick_abi::WaitSigMask::NONE,
+                        })
+                    } else {
+                        Ok(DispatchOutcome::Returned { value: 17 })
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(outcome, DispatchOutcome::Returned { value: 17 });
+            let mut trap = RetryCompletionTrap::default();
+            complete_single_threaded_syscall(&mut trap, &mut token, &reporter, 17).unwrap();
+
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "redispatch count {redispatches} reran interception"
+            );
+            assert_eq!(handler_calls, redispatches + 1);
+            assert_eq!(trap.completed, vec![17]);
+            assert!(token.is_none());
+            let report = reporter.snapshot();
+            assert_eq!(report.summary.syscall_invocations, 1);
+            assert_eq!(report.summary.syscall_returns_ok, 1);
+        }
+    }
+
+    #[test]
+    fn interception_blocking_write_partial_completion_publishes_actual_value_once() {
+        let dispatcher = &mut SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+        let prepared = dispatcher
+            .prepare_syscall(
+                &context,
+                SyscallRequest::new(92, crate::compat::SyscallArgs::from([0; 6])),
+                &reporter,
+            )
+            .unwrap();
+        let PreparedDispatch::Invoke(syscall) = prepared else {
+            panic!("partial completion fixture must invoke")
+        };
+        let mut completion = Some(SyscallCompletionToken::new(
+            syscall,
+            context.retain_exact(),
+            dispatcher.observers().cloned(),
+        ));
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let write = crate::dispatch::BlockingHostWrite::for_tests(
+            fds[1],
+            vec![1, 2, 3, 4],
+            2,
+            crate::thread::ThreadId::synthetic_for_tests(72_411),
+            true,
+        )
+        .unwrap();
+        assert_eq!(unsafe { libc::close(fds[0]) }, 0);
+        assert_eq!(unsafe { libc::close(fds[1]) }, 0);
+        let mut memory = crate::dispatch::LinearMemory::new(0x4000_0000, vec![0; 4096]);
+        let mut waiter =
+            crate::io_wait::ThreadWaiter::new(crate::thread::ThreadId::synthetic_for_tests(72_411));
+        let mut write = Some(write);
+
+        let outcome = dispatch_single_threaded_syscall_with(
+            dispatcher,
+            &context,
+            syscall,
+            &mut memory,
+            &reporter,
+            &mut waiter,
+            |_, _, _, _, _| {
+                Ok(DispatchOutcome::BlockingHostWrite(
+                    write.take().expect("handler runs once"),
+                ))
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 2 });
+        let mut trap = RetryCompletionTrap::default();
+        complete_single_threaded_syscall(&mut trap, &mut completion, &reporter, 2).unwrap();
+
+        assert_eq!(trap.completed, vec![2]);
+        assert!(completion.is_none());
+        assert_eq!(reporter.snapshot().summary.syscall_invocations, 1);
+        assert_eq!(reporter.snapshot().summary.syscall_returns_ok, 1);
+    }
+
+    #[test]
+    fn interception_nonreturning_rt_sigreturn_and_exit_retire_without_publication() {
+        let mut runtime = RetryCompletionTrap {
+            syscalls: std::collections::VecDeque::from([
+                scripted_syscall(139, [0; 6]),
+                scripted_syscall(94, [7, 0, 0, 0, 0, 0]),
+            ]),
+            ..Default::default()
+        };
+
+        let result =
+            run_combined_syscall_loop_with_dispatcher(&mut runtime, SyscallDispatcher::new(), 3)
+                .unwrap();
+
+        assert_eq!(result.exit_code, 7);
+        assert_eq!(runtime.restored_sigframes, 1);
+        assert!(runtime.completed.is_empty());
+        assert_eq!(result.report.summary.syscall_invocations, 2);
+        assert_eq!(result.report.summary.syscall_returns_ok, 0);
+        assert_eq!(result.report.summary.syscall_returns_errno, 0);
+    }
+
+    #[test]
+    fn interception_nonreturning_signal_death_retires_without_publication() {
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.install_observer(std::sync::Arc::new(KillOnEntryObserver));
+        let mut runtime = RetryCompletionTrap {
+            syscalls: std::collections::VecDeque::from([scripted_syscall(92, [0; 6])]),
+            ..Default::default()
+        };
+
+        let result =
+            run_combined_syscall_loop_with_dispatcher(&mut runtime, dispatcher, 2).unwrap();
+
+        assert_eq!(
+            result.terminating_signal,
+            Some(crate::linux_abi::LINUX_SIGKILL)
+        );
+        assert!(runtime.completed.is_empty());
+        assert_eq!(result.report.summary.syscall_invocations, 1);
+        assert_eq!(result.report.summary.syscall_returns_ok, 0);
+        assert_eq!(result.report.summary.syscall_returns_errno, 0);
+    }
+
+    #[test]
+    fn interception_nonreturning_successful_exec_retires_without_publication() {
+        let path = std::env::temp_dir().join(format!(
+            "carrick-task4-exec-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&path, synthetic_exec_elf()).unwrap();
+        let path = path.to_string_lossy().into_owned();
+        let path_address = 0x1000;
+        let argv_address = 0x2000;
+        let env_address = 0x3000;
+        let mut runtime = RetryCompletionTrap {
+            syscalls: std::collections::VecDeque::from([
+                scripted_syscall(221, [path_address, argv_address, env_address, 0, 0, 0]),
+                scripted_syscall(94, [9, 0, 0, 0, 0, 0]),
+            ]),
+            ..Default::default()
+        };
+        for (offset, byte) in path
+            .as_bytes()
+            .iter()
+            .copied()
+            .chain(std::iter::once(0))
+            .enumerate()
+        {
+            runtime.memory.insert(path_address + offset as u64, byte);
+        }
+        for (offset, byte) in path_address
+            .to_le_bytes()
+            .into_iter()
+            .chain(0_u64.to_le_bytes())
+            .enumerate()
+        {
+            runtime.memory.insert(argv_address + offset as u64, byte);
+        }
+        for (offset, byte) in 0_u64.to_le_bytes().into_iter().enumerate() {
+            runtime.memory.insert(env_address + offset as u64, byte);
+        }
+
+        let result =
+            run_combined_syscall_loop_with_dispatcher(&mut runtime, SyscallDispatcher::new(), 3);
+        let _ = std::fs::remove_file(&path);
+        let result = result.unwrap();
+
+        assert_eq!(result.exit_code, 9);
+        assert_eq!(runtime.execve_calls, 1);
+        assert!(runtime.completed.is_empty());
+        assert_eq!(result.report.summary.syscall_invocations, 2);
+        assert_eq!(result.report.summary.syscall_returns_ok, 0);
+        assert_eq!(result.report.summary.syscall_returns_errno, 0);
+    }
+
+    #[cfg(feature = "syscall-shim")]
+    struct ContinueInterceptor;
+
+    #[cfg(feature = "syscall-shim")]
+    impl crate::observe::SyscallInterceptor for ContinueInterceptor {
+        fn intercept(
+            &self,
+            _process: &crate::observe::ProcessInfo<'_>,
+            _call: &crate::observe::InterceptedSyscall<'_>,
+        ) -> crate::observe::InterceptAction {
+            crate::observe::InterceptAction::Continue
+        }
+    }
+
+    #[cfg(feature = "syscall-shim")]
+    struct RequiredObserver;
+
+    #[cfg(feature = "syscall-shim")]
+    impl crate::observe::SyscallObserver for RequiredObserver {
+        fn wants_fast_path_visibility(&self) -> crate::observe::FastPathVisibility {
+            crate::observe::FastPathVisibility::Required
+        }
+    }
+
+    #[cfg(feature = "syscall-shim")]
+    fn image_region(image: &AddressSpace, start: u64) -> &[u8] {
+        image
+            .regions()
+            .iter()
+            .find(|region| region.start == start)
+            .expect("required image region")
+            .bytes()
+    }
+
+    #[cfg(feature = "syscall-shim")]
+    #[test]
+    fn interceptor_initial_image_preserves_closed_identity_page() {
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.install_interceptor(std::sync::Arc::new(ContinueInterceptor));
+        let raw = AddressSpace::from_regions(0x4000, Vec::new()).expect("raw image");
+
+        let mut image = finalize_hvf_initial_image(raw, &dispatcher, false)
+            .expect("interceptor-bearing initial image");
+        let context = dispatcher
+            .capture_one_task_context()
+            .expect("initial task context");
+        stamp_identity_page(&mut image, &dispatcher, &context)
+            .expect("closed identity page remains stampable");
+
+        let identity = image_region(&image, carrick_mem::memory::LINUX_IDENTITY_PAGE_BASE);
+        let gate = usize::try_from(carrick_mem::memory::IDENTITY_OFF_SHIM_ENABLED)
+            .expect("identity gate offset");
+        assert_eq!(&identity[gate..gate + 4], &0_u32.to_le_bytes());
+
+        let vdso = image_region(&image, carrick_mem::vdso::LINUX_VDSO_BASE);
+        let no_fastpaths = carrick_mem::vdso::vdso_image_bytes_without_fastpaths();
+        assert_eq!(&vdso[..no_fastpaths.len()], no_fastpaths.as_slice());
+    }
+
+    #[cfg(feature = "syscall-shim")]
+    #[test]
+    fn observer_initial_image_preserves_closed_identity_page_without_interceptor() {
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.install_observer(std::sync::Arc::new(RequiredObserver));
+        assert!(dispatcher.interceptors().is_none());
+        let raw = AddressSpace::from_regions(0x4000, Vec::new()).expect("raw image");
+
+        let mut image = finalize_hvf_initial_image(raw, &dispatcher, false)
+            .expect("observer-visible initial image");
+        let context = dispatcher
+            .capture_one_task_context()
+            .expect("initial task context");
+        stamp_identity_page(&mut image, &dispatcher, &context)
+            .expect("closed observer identity page remains stampable");
+
+        let identity = image_region(&image, carrick_mem::memory::LINUX_IDENTITY_PAGE_BASE);
+        let gate = usize::try_from(carrick_mem::memory::IDENTITY_OFF_SHIM_ENABLED)
+            .expect("identity gate offset");
+        assert_eq!(&identity[gate..gate + 4], &0_u32.to_le_bytes());
+    }
+
+    #[cfg(feature = "syscall-shim")]
+    #[test]
+    fn carrier_vector_page_is_identical_across_fast_path_visibility_policies() {
+        let unrestricted = SyscallDispatcher::new();
+        let mut observed = SyscallDispatcher::new();
+        observed.install_observer(std::sync::Arc::new(RequiredObserver));
+        let raw = || AddressSpace::from_regions(0x4000, Vec::new()).expect("raw image");
+        let fast =
+            finalize_hvf_initial_image(raw(), &unrestricted, false).expect("unrestricted image");
+        let visible =
+            finalize_hvf_initial_image(raw(), &observed, true).expect("observer-visible image");
+
+        assert_eq!(
+            image_region(&fast, carrick_mem::memory::LINUX_EL1_VECTORS_BASE),
+            image_region(&visible, carrick_mem::memory::LINUX_EL1_VECTORS_BASE),
+            "carrier-wide vector code must not encode per-container visibility"
+        );
+    }
+
+    #[cfg(feature = "syscall-shim")]
+    #[test]
+    fn unrestricted_initial_image_preserves_fastpaths() {
+        use carrick_hal::GuestArch as _;
+
+        type HvfArch = <HvfTrapEngine as carrick_hal::ThreadedEngine>::Arch;
+        let dispatcher = SyscallDispatcher::new();
+        let raw = AddressSpace::from_regions(0x4000, Vec::new()).expect("raw image");
+        let image = finalize_hvf_initial_image(raw, &dispatcher, false)
+            .expect("unrestricted initial image");
+
+        image_region(&image, carrick_mem::memory::LINUX_IDENTITY_PAGE_BASE);
+        let vdso = image_region(&image, carrick_mem::vdso::LINUX_VDSO_BASE);
+        assert_eq!(&vdso[..HvfArch::vdso_bytes().len()], HvfArch::vdso_bytes());
+    }
+
     #[test]
     fn runtime_host_process_creation_inventory_is_exact_and_shrinking() {
         use std::collections::BTreeMap;
@@ -2285,6 +3080,10 @@ mod tests {
             ("kernel/mm_access.rs", [0, 0, 1]),
             ("network/socket_namespace.rs", [7, 0, 0]),
             ("run_state.rs", [1, 0, 0]),
+            // This unit test self-spawns to isolate a process-global abort
+            // boundary while proving pending exec error preservation. It is
+            // not production host-process-per-guest architecture.
+            ("vcpu_loop/mod.rs", [0, 0, 1]),
             // Both are unit tests that fork a child to BE the tracee, because
             // a ptrace stop needs a real host parent/child pair:
             // 1. `ptrace_signal_stop_queued_host_sigkill_remains_terminal`

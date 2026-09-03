@@ -1,5 +1,276 @@
 use super::*;
 
+fn two_namespaced_roots_for_async_owner() -> (
+    Arc<crate::kernel::Kernel>,
+    crate::kernel::KernelContext,
+    crate::kernel::KernelContext,
+) {
+    use carrick_kernel::arena::KernelArena;
+
+    use crate::kernel::{Container, LaunchContext, RootBootstrap, RunId};
+    use crate::namespace::pid::NsSharedRegion;
+
+    let arena = Box::leak(Box::new(KernelArena::create().expect("test kernel arena")));
+    let alpha = Arc::new(Container::new(LaunchContext::unmanaged(RunId::new(
+        "fasync-alpha",
+    ))));
+    alpha
+        .install_pid_ns(NsSharedRegion::allocate(arena).expect("alpha pid namespace"))
+        .expect("install alpha pid namespace");
+    let alpha_bootstrap = RootBootstrap::for_reference_model(
+        4_710,
+        carrick_hal::ThreadId::synthetic_for_tests(4_710),
+        "fasync-alpha-init".to_owned(),
+    )
+    .expect("alpha bootstrap")
+    .with_container(alpha);
+    let (kernel, alpha) =
+        crate::kernel::Kernel::bootstrap_root(alpha_bootstrap).expect("publish alpha root");
+
+    let beta = Arc::new(Container::new(LaunchContext::unmanaged(RunId::new(
+        "fasync-beta",
+    ))));
+    beta.install_pid_ns(NsSharedRegion::allocate(arena).expect("beta pid namespace"))
+        .expect("install beta pid namespace");
+    let beta = kernel
+        .prepare_container_root(
+            carrick_hal::ThreadId::synthetic_for_tests(4_720),
+            None,
+            "fasync-beta-init".to_owned(),
+            beta,
+            None,
+        )
+        .expect("prepare beta root")
+        .commit()
+        .expect("publish beta root");
+    (kernel, alpha, beta)
+}
+
+#[test]
+fn async_process_owner_is_bound_to_the_exact_container_generation() {
+    let (_kernel, alpha, beta) = two_namespaced_roots_for_async_owner();
+    let alpha_owner =
+        crate::kernel::objects::CapturedAsyncIoOwner::capture(&alpha, LINUX_F_OWNER_PID, 1);
+    let beta_owner =
+        crate::kernel::objects::CapturedAsyncIoOwner::capture(&beta, LINUX_F_OWNER_PID, 1);
+    assert_eq!(alpha_owner.visible.owner_pid, 1);
+    assert_eq!(beta_owner.visible.owner_pid, 1);
+    let signal =
+        crate::kernel::LinuxSignal::for_signal_number(LINUX_SIGIO).expect("valid async signal");
+    let info = carrick_abi::LinuxSiginfo::sigpoll(LINUX_SIGIO, carrick_abi::LINUX_POLL_MSG, 0, 7);
+
+    assert!(alpha_owner.post_kernel_signal(alpha.kernel(), signal, Some(info)));
+    assert!(
+        alpha
+            .shared()
+            .pending_signals()
+            .present()
+            .contains(LINUX_SIGIO)
+    );
+    assert!(
+        !beta
+            .shared()
+            .pending_signals()
+            .present()
+            .contains(LINUX_SIGIO),
+        "the other container's visible PID 1 must not receive alpha's event",
+    );
+
+    assert!(beta_owner.post_kernel_signal(beta.kernel(), signal, Some(info)));
+    assert!(
+        beta.shared()
+            .pending_signals()
+            .present()
+            .contains(LINUX_SIGIO)
+    );
+}
+
+#[test]
+fn async_thread_owner_is_bound_to_the_exact_container_generation() {
+    let (_kernel, alpha, beta) = two_namespaced_roots_for_async_owner();
+    let alpha_owner =
+        crate::kernel::objects::CapturedAsyncIoOwner::capture(&alpha, LINUX_F_OWNER_TID, 1);
+    let signal =
+        crate::kernel::LinuxSignal::for_signal_number(LINUX_SIGIO).expect("valid async signal");
+
+    assert!(alpha_owner.post_kernel_signal(alpha.kernel(), signal, None));
+    assert!(
+        alpha
+            .thread()
+            .signal_state()
+            .pending()
+            .contains(LINUX_SIGIO)
+    );
+    assert!(
+        !beta.thread().signal_state().pending().contains(LINUX_SIGIO),
+        "the other container's visible TID 1 must not receive alpha's event",
+    );
+    assert!(
+        !alpha
+            .shared()
+            .pending_signals()
+            .present()
+            .contains(LINUX_SIGIO),
+        "F_OWNER_TID must not degrade to process-directed delivery",
+    );
+}
+
+#[test]
+fn async_owner_never_follows_a_reused_internal_pid() {
+    let (kernel, alpha, _beta) = two_namespaced_roots_for_async_owner();
+    let root_binding = alpha.task_binding();
+    let root_tid = alpha.thread().key().tid;
+    let plan = crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty())
+        .expect("fork plan");
+    let child_a = kernel
+        .reserve_fork(&alpha, plan, "fasync-child-a".to_owned(), None)
+        .expect("reserve child A")
+        .prepare_reference(carrick_hal::ThreadId::synthetic_for_tests(4_731))
+        .expect("prepare child A")
+        .commit()
+        .expect("publish child A")
+        .into_parts()
+        .expect("start child A")
+        .0;
+    let child_a_key = child_a.task().key();
+    let owner = crate::kernel::objects::CapturedAsyncIoOwner::capture(&alpha, LINUX_F_OWNER_PID, 2);
+
+    kernel
+        .exit_task_key_eventually(
+            child_a_key,
+            crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
+        )
+        .expect("exit child A");
+    drop(child_a);
+    assert!(matches!(
+        kernel.wait_child(
+            alpha.task().key().id,
+            Some(child_a_key.id),
+            crate::kernel::WaitMode::Consume,
+        ),
+        Ok(crate::kernel::WaitOutcome::Exited(_))
+    ));
+    kernel.sweep_retired_threads();
+    kernel.ids().set_next_for_tests(child_a_key.id.raw());
+
+    let alpha = root_binding.capture(root_tid).expect("fresh root context");
+    let child_b = kernel
+        .reserve_fork(&alpha, plan, "fasync-child-b".to_owned(), None)
+        .expect("reserve child B")
+        .prepare_reference(carrick_hal::ThreadId::synthetic_for_tests(4_732))
+        .expect("prepare child B")
+        .commit()
+        .expect("publish child B")
+        .into_parts()
+        .expect("start child B")
+        .0;
+    assert_eq!(child_b.task().key().id, child_a_key.id);
+    assert_ne!(child_b.task().key(), child_a_key);
+
+    let signal =
+        crate::kernel::LinuxSignal::for_signal_number(LINUX_SIGIO).expect("valid async signal");
+    assert!(!owner.post_kernel_signal(&kernel, signal, None));
+    assert!(
+        !child_b
+            .shared()
+            .pending_signals()
+            .present()
+            .contains(LINUX_SIGIO),
+        "a late readiness event must not follow the recycled PID",
+    );
+}
+
+#[test]
+fn async_process_group_owner_is_bound_to_the_exact_container_generation() {
+    let (_kernel, alpha, beta) = two_namespaced_roots_for_async_owner();
+    let alpha_owner =
+        crate::kernel::objects::CapturedAsyncIoOwner::capture(&alpha, LINUX_F_OWNER_PGRP, 1);
+    let signal =
+        crate::kernel::LinuxSignal::for_signal_number(LINUX_SIGIO).expect("valid async signal");
+
+    assert!(alpha_owner.post_kernel_signal(alpha.kernel(), signal, None));
+    assert!(
+        alpha
+            .shared()
+            .pending_signals()
+            .present()
+            .contains(LINUX_SIGIO)
+    );
+    assert!(
+        !beta
+            .shared()
+            .pending_signals()
+            .present()
+            .contains(LINUX_SIGIO),
+        "the other container's visible PGID 1 must not receive alpha's event",
+    );
+}
+
+#[test]
+fn tiocspgrp_distinguishes_invalid_ids_from_absent_groups() {
+    let (kernel, alpha, beta) = two_namespaced_roots_for_async_owner();
+
+    assert_eq!(resolve_tiocspgrp(&alpha, -1), Err(LINUX_EINVAL));
+    assert_eq!(resolve_tiocspgrp(&alpha, 0), Err(LINUX_EINVAL));
+    assert_eq!(resolve_tiocspgrp(&alpha, 99), Err(LINUX_EPERM));
+    assert_eq!(
+        resolve_tiocspgrp(&alpha, 1),
+        Ok(alpha.task().process_group())
+    );
+    assert_eq!(
+        resolve_tiocspgrp(&beta, 1),
+        Ok(beta.task().process_group()),
+        "the same visible PGID resolves only in the caller's container",
+    );
+
+    let child = kernel
+        .reserve_fork(
+            &alpha,
+            crate::kernel::ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+            "tiocspgrp-foreign-session".to_owned(),
+            None,
+        )
+        .expect("reserve session leader")
+        .prepare_reference(carrick_hal::ThreadId::synthetic_for_tests(4_733))
+        .expect("prepare session leader")
+        .commit()
+        .expect("publish session leader")
+        .into_parts()
+        .expect("start session leader")
+        .0;
+    kernel
+        .create_session(child.task().key().id, None)
+        .expect("create foreign session");
+    let visible_group =
+        crate::namespace::pid::process_group_to_ns_for(&alpha, child.task().process_group())
+            .expect("foreign session group remains visible in the container");
+    assert_eq!(
+        resolve_tiocspgrp(
+            &alpha,
+            i32::try_from(visible_group).expect("visible PGID fits i32"),
+        ),
+        Err(LINUX_EPERM),
+        "a positive PGID outside the caller's session is a permission error",
+    );
+}
+
+#[test]
+fn foreign_numeric_proc_pid_never_aliases_the_callers_fd_table() {
+    assert_eq!(proc_self_fd_number("/proc/4242/fd/7", Some(1)), None);
+    assert_eq!(
+        proc_self_fdinfo_number("/proc/4242/fdinfo/7", Some(1)),
+        None
+    );
+    assert_eq!(proc_self_magic_link("/proc/4242/exe", Some(1)), None);
+
+    assert_eq!(proc_self_fd_number("/proc/1/fd/7", Some(1)), Some(7));
+    assert_eq!(
+        proc_self_fdinfo_number("/proc/1/fdinfo/7", Some(1)),
+        Some(7)
+    );
+    assert_eq!(proc_self_magic_link("/proc/1/exe", Some(1)), Some("exe"));
+}
+
 fn logical_lock_request(
     owner: (i32, u64),
     range: (u64, u64),
@@ -292,49 +563,343 @@ fn inet4_ioctl_view_uses_linux_interface_names() {
     assert_eq!(names, ["lo", "eth0"]);
     assert_eq!(ifaces[0].addr_be, [127, 0, 0, 1]);
     assert_eq!(ifaces[1].addr_be, spec.ipv4.octets());
-    assert_eq!(linux_if_nametoindex("lo"), Some(1));
-    assert_eq!(linux_if_indextoname(2), Some("eth0"));
+    assert_eq!(model.links[0].index, 1);
+    assert_eq!(model.links[1].index, 2);
+}
+
+fn network_surface_model(
+    name: &str,
+    address: std::net::Ipv4Addr,
+    flags: u32,
+    mtu: u32,
+) -> crate::network::model::LinuxNetworkModel {
+    let mut model = crate::network::model::LinuxNetworkModel::isolated();
+    let mut uplink = crate::network::model::LinuxNetworkLink::uplink(
+        2,
+        name.to_owned(),
+        [0x02, 0, 0, 0, 0, address.octets()[3]],
+    );
+    uplink.flags = flags;
+    uplink.mtu = mtu;
+    model.links.push(uplink);
+    model
+        .addresses
+        .push(crate::network::model::LinuxNetworkAddress::new(
+            std::net::IpAddr::V4(address),
+            24,
+            name.to_owned(),
+        ));
+    model
+}
+
+fn two_roots_for_guest_network_surfaces() -> (
+    Arc<crate::kernel::Kernel>,
+    crate::kernel::KernelContext,
+    crate::kernel::KernelContext,
+) {
+    use crate::kernel::{Container, LaunchContext, RootBootstrap, RunId};
+
+    let alpha_container = Arc::new(Container::new(LaunchContext::unmanaged(RunId::new(
+        "surface-alpha",
+    ))));
+    let alpha_bootstrap = RootBootstrap::for_reference_model(
+        4_810,
+        carrick_hal::ThreadId::synthetic_for_tests(4_810),
+        "surface-alpha-init".to_owned(),
+    )
+    .expect("alpha bootstrap")
+    .with_container(alpha_container);
+    let (kernel, alpha) =
+        crate::kernel::Kernel::bootstrap_root(alpha_bootstrap).expect("publish alpha root");
+
+    let beta_container = Arc::new(Container::new(LaunchContext::unmanaged(RunId::new(
+        "surface-beta",
+    ))));
+    let beta = kernel
+        .prepare_container_root(
+            carrick_hal::ThreadId::synthetic_for_tests(4_820),
+            None,
+            "surface-beta-init".to_owned(),
+            beta_container,
+            None,
+        )
+        .expect("prepare beta root")
+        .commit()
+        .expect("publish beta root");
+    (kernel, alpha, beta)
+}
+
+fn dispatch_uname_nodename(
+    dispatcher: &mut SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
+) -> String {
+    let reporter = CompatReporter::default();
+    let mut memory = LinearMemory::new(0x1000, vec![0; 0x1000]);
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                context,
+                SyscallRequest::new(160, SyscallArgs::from([0x1000, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .expect("dispatch uname"),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    let uts = memory.read_bytes(0x1000, 65 * 6).expect("read utsname");
+    let nodename = &uts[65..130];
+    let end = nodename
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(nodename.len());
+    String::from_utf8(nodename[..end].to_vec()).expect("UTF-8 nodename")
+}
+
+fn sysfs_link_view(context: &crate::kernel::KernelContext) -> (Vec<String>, String) {
+    use crate::vfs::Vfs;
+
+    let sys = crate::vfs::SysVfs::in_namespace(context.task().net_ns());
+    let names = sys
+        .readdir("/sys/class/net")
+        .expect("read sysfs link directory")
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect();
+    let own = context
+        .task()
+        .net_ns()
+        .view()
+        .links
+        .iter()
+        .find(|link| !link.loopback)
+        .expect("uplink")
+        .name
+        .clone();
+    let crate::vfs::VfsHandle::Bytes { contents, .. } = sys
+        .open(
+            &format!("/sys/class/net/{own}/mtu"),
+            crate::vfs::OpenFlags {
+                read: true,
+                ..crate::vfs::OpenFlags::default()
+            },
+            &crate::vfs::OpenContext::default(),
+        )
+        .expect("open sysfs MTU")
+    else {
+        panic!("sysfs MTU must be a byte-backed file");
+    };
+    (names, String::from_utf8(contents).expect("UTF-8 sysfs MTU"))
+}
+
+fn proc_net_dev(context: &crate::kernel::KernelContext) -> String {
+    use crate::vfs::Vfs;
+
+    let network = context.task().net_ns().view();
+    let open_context = crate::vfs::OpenContext {
+        network_model: Some(network.as_ref()),
+        ..crate::vfs::OpenContext::default()
+    };
+    let crate::vfs::VfsHandle::Bytes { contents, .. } = crate::vfs::ProcVfs::new()
+        .open(
+            "/proc/net/dev",
+            crate::vfs::OpenFlags {
+                read: true,
+                ..crate::vfs::OpenFlags::default()
+            },
+            &open_context,
+        )
+        .expect("open proc net dev")
+    else {
+        panic!("proc net dev must be a byte-backed file");
+    };
+    String::from_utf8(contents).expect("UTF-8 proc net dev")
+}
+
+fn dispatch_socket(
+    dispatcher: &mut SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
+    domain: i32,
+    socket_type: i32,
+) -> i32 {
+    let reporter = CompatReporter::default();
+    let mut memory = LinearMemory::new(0x1000, vec![0; 0x1000]);
+    let DispatchOutcome::Returned { value } = dispatcher
+        .dispatch(
+            context,
+            SyscallRequest::new(
+                198,
+                SyscallArgs::from([domain as u64, socket_type as u64, 0, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .expect("dispatch socket")
+    else {
+        panic!("socket must return an fd");
+    };
+    i32::try_from(value).expect("socket fd")
+}
+
+fn rtnetlink_link_dump(
+    dispatcher: &mut SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
+) -> Vec<u8> {
+    let fd = dispatch_socket(dispatcher, context, LINUX_AF_NETLINK, LINUX_SOCK_RAW);
+    let reporter = CompatReporter::default();
+    let mut memory = LinearMemory::new(0x1000, vec![0; 0x5000]);
+    let mut request = [0u8; 16];
+    request[0..4].copy_from_slice(&16u32.to_le_bytes());
+    request[4..6].copy_from_slice(&18u16.to_le_bytes()); // RTM_GETLINK
+    request[6..8].copy_from_slice(&0x301u16.to_le_bytes()); // REQUEST | DUMP
+    request[8..12].copy_from_slice(&1u32.to_le_bytes());
+    memory.write_bytes(0x1000, &request).expect("write request");
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                context,
+                SyscallRequest::new(206, SyscallArgs::from([fd as u64, 0x1000, 16, 0, 0, 0]),),
+                &mut memory,
+                &reporter,
+            )
+            .expect("send rtnetlink request"),
+        DispatchOutcome::Returned { value: 16 },
+    );
+    let DispatchOutcome::Returned { value } = dispatcher
+        .dispatch(
+            context,
+            SyscallRequest::new(207, SyscallArgs::from([fd as u64, 0x2000, 0x3000, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .expect("receive rtnetlink reply")
+    else {
+        panic!("rtnetlink reply must be immediately readable");
+    };
+    memory
+        .read_bytes(0x2000, usize::try_from(value).expect("reply length"))
+        .expect("read rtnetlink reply")
+}
+
+fn ioctl_link_flags_and_mtu(
+    dispatcher: &mut SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
+    name: &str,
+) -> (u16, i32) {
+    let fd = dispatch_socket(dispatcher, context, LINUX_AF_INET, LINUX_SOCK_DGRAM);
+    let reporter = CompatReporter::default();
+    let mut memory = LinearMemory::new(0x1000, vec![0; 0x2000]);
+    let mut ifreq = [0u8; 40];
+    ifreq[..name.len()].copy_from_slice(name.as_bytes());
+
+    memory.write_bytes(0x1000, &ifreq).expect("write ifreq");
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                context,
+                SyscallRequest::new(
+                    29,
+                    SyscallArgs::from([fd as u64, LINUX_SIOCGIFFLAGS, 0x1000, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("dispatch SIOCGIFFLAGS"),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    let flag_bytes = memory.read_bytes(0x1010, 2).expect("read flags");
+    let flags = u16::from_le_bytes([flag_bytes[0], flag_bytes[1]]);
+
+    memory.write_bytes(0x1000, &ifreq).expect("reset ifreq");
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                context,
+                SyscallRequest::new(
+                    29,
+                    SyscallArgs::from([fd as u64, LINUX_SIOCGIFMTU, 0x1000, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("dispatch SIOCGIFMTU"),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    let mtu_bytes = memory.read_bytes(0x1010, 4).expect("read MTU");
+    let mtu = i32::from_le_bytes([mtu_bytes[0], mtu_bytes[1], mtu_bytes[2], mtu_bytes[3]]);
+    (flags, mtu)
 }
 
 #[test]
-fn fasync_signal_target_drops_on_ns_translation_miss() {
-    // A translation MISS (no host mapping for the owner's ns id) must DROP the
-    // SIGIO — returning None — never fall back to the raw ns value reinterpreted
-    // as a host pid (which would signal an unrelated process). Matches the
-    // kill-path ESRCH intent.
-    assert_eq!(
-        SyscallDispatcher::fasync_signal_target(LINUX_F_OWNER_TID, None),
-        None,
-        "an owner whose ns-pid has no host mapping must not deliver to a bogus pid"
+fn two_live_containers_project_mutated_uts_and_netns_through_guest_surfaces() {
+    let (_kernel, alpha, beta) = two_roots_for_guest_network_surfaces();
+    let alpha_flags = carrick_abi::LINUX_IFF_UP
+        | carrick_abi::LINUX_IFF_POINTOPOINT
+        | carrick_abi::LINUX_IFF_NOARP;
+    let beta_flags = carrick_abi::LINUX_IFF_UP
+        | carrick_abi::LINUX_IFF_BROADCAST
+        | carrick_abi::LINUX_IFF_PROMISC;
+    let alpha_model = network_surface_model(
+        "alpha0",
+        std::net::Ipv4Addr::new(10, 81, 0, 2),
+        alpha_flags,
+        1401,
     );
-    assert_eq!(
-        SyscallDispatcher::fasync_signal_target(LINUX_F_OWNER_PGRP, None),
-        None
+    let beta_model = network_surface_model(
+        "beta0",
+        std::net::Ipv4Addr::new(10, 82, 0, 2),
+        beta_flags,
+        9001,
     );
-    assert_eq!(
-        SyscallDispatcher::fasync_signal_target(LINUX_F_OWNER_PID, None),
-        None
-    );
-}
 
-#[test]
-fn fasync_signal_target_resolves_by_owner_kind() {
-    use crate::dispatch::signal::SignalTarget;
-    // A successful translation routes by owner kind: PID (and the default)
-    // target that host pid; TID targets that host tid; PGRP targets the
-    // host process group (bootstrap_signal_send_as reconstructs the
-    // kill(2) negated-pgid encoding).
+    // Mutate after both roots exist: this catches a shared initial namespace,
+    // stale launch snapshot, or dispatcher-global projection.
+    alpha.task().uts_ns().set_nodename("alpha-mutated");
+    beta.task().uts_ns().set_nodename("beta-mutated");
+    alpha.task().net_ns().publish(alpha_model.clone());
+    beta.task().net_ns().publish(beta_model.clone());
+
+    let mut alpha_dispatcher = SyscallDispatcher::new();
+    alpha_dispatcher.set_container(alpha.container());
+    let mut beta_dispatcher = SyscallDispatcher::new();
+    beta_dispatcher.set_container(beta.container());
+
     assert_eq!(
-        SyscallDispatcher::fasync_signal_target(LINUX_F_OWNER_PID, Some(42)),
-        Some(SignalTarget::HostProcess(HostPid(42)))
+        dispatch_uname_nodename(&mut alpha_dispatcher, &alpha),
+        "alpha-mutated"
     );
     assert_eq!(
-        SyscallDispatcher::fasync_signal_target(LINUX_F_OWNER_TID, Some(42)),
-        Some(SignalTarget::HostThread(HostPid(42)))
+        dispatch_uname_nodename(&mut beta_dispatcher, &beta),
+        "beta-mutated"
+    );
+
+    assert_eq!(
+        sysfs_link_view(&alpha),
+        (vec!["lo".into(), "alpha0".into()], "1401\n".into())
     );
     assert_eq!(
-        SyscallDispatcher::fasync_signal_target(LINUX_F_OWNER_PGRP, Some(7)),
-        Some(SignalTarget::HostProcessGroup(HostPid(7)))
+        sysfs_link_view(&beta),
+        (vec!["lo".into(), "beta0".into()], "9001\n".into())
+    );
+
+    let alpha_proc = proc_net_dev(&alpha);
+    let beta_proc = proc_net_dev(&beta);
+    assert!(alpha_proc.contains("alpha0:") && !alpha_proc.contains("beta0:"));
+    assert!(beta_proc.contains("beta0:") && !beta_proc.contains("alpha0:"));
+
+    let alpha_netlink = rtnetlink_link_dump(&mut alpha_dispatcher, &alpha);
+    let beta_netlink = rtnetlink_link_dump(&mut beta_dispatcher, &beta);
+    assert!(alpha_netlink.windows(7).any(|bytes| bytes == b"alpha0\0"));
+    assert!(!alpha_netlink.windows(6).any(|bytes| bytes == b"beta0\0"));
+    assert!(beta_netlink.windows(6).any(|bytes| bytes == b"beta0\0"));
+    assert!(!beta_netlink.windows(7).any(|bytes| bytes == b"alpha0\0"));
+
+    assert_eq!(
+        ioctl_link_flags_and_mtu(&mut alpha_dispatcher, &alpha, "alpha0"),
+        (alpha_flags as u16, 1401),
+    );
+    assert_eq!(
+        ioctl_link_flags_and_mtu(&mut beta_dispatcher, &beta, "beta0"),
+        (beta_flags as u16, 9001),
     );
 }
 
@@ -1636,14 +2201,20 @@ fn sigpoll_fd(info: carrick_abi::LinuxSiginfo) -> i32 {
     i32::from_le_bytes(info._pad[0..4].try_into().unwrap())
 }
 
+fn take_process_sigpoll_fd(context: &crate::kernel::KernelContext, signum: i32) -> i32 {
+    let pending = context
+        .shared()
+        .pending_signals()
+        .take_lowest_in(carrick_abi::SigSet::EMPTY.with(signum))
+        .expect("process-directed dnotify signal");
+    sigpoll_fd(pending.siginfo.expect("dnotify siginfo"))
+}
+
 #[test]
 fn dnotify_child_attrib_queues_parent_before_child() {
     let dispatcher = SyscallDispatcher::new();
-    let tid = dispatcher
-        .capture_one_task_context()
-        .unwrap()
-        .thread()
-        .registry_id();
+    let context = dispatcher.exact_signal_context_for_test();
+    let tid = context.thread().registry_id();
     let signum = 34;
 
     let parent_fd = dispatcher
@@ -1667,6 +2238,7 @@ fn dnotify_child_attrib_queues_parent_before_child() {
 
     dispatcher
         .dnotify_register(
+            &context,
             parent_fd,
             LinuxDnotifyMask::ATTRIB | LinuxDnotifyMask::MULTISHOT,
             tid,
@@ -1674,6 +2246,7 @@ fn dnotify_child_attrib_queues_parent_before_child() {
         .unwrap();
     dispatcher
         .dnotify_register(
+            &context,
             child_fd,
             LinuxDnotifyMask::ATTRIB | LinuxDnotifyMask::MULTISHOT,
             tid,
@@ -1685,32 +2258,15 @@ fn dnotify_child_attrib_queues_parent_before_child() {
         "/watched/child",
     );
 
-    assert_eq!(
-        sigpoll_fd(
-            dispatcher
-                .take_pending_siginfo(&dispatcher.exact_signal_context_for_test(), tid, signum)
-                .unwrap()
-        ),
-        parent_fd
-    );
-    assert_eq!(
-        sigpoll_fd(
-            dispatcher
-                .take_pending_siginfo(&dispatcher.exact_signal_context_for_test(), tid, signum)
-                .unwrap()
-        ),
-        child_fd
-    );
+    assert_eq!(take_process_sigpoll_fd(&context, signum), parent_fd);
+    assert_eq!(take_process_sigpoll_fd(&context, signum), child_fd);
 }
 
 #[test]
 fn dnotify_child_attrib_matches_macos_private_tmp_alias() {
     let dispatcher = SyscallDispatcher::new();
-    let tid = dispatcher
-        .capture_one_task_context()
-        .unwrap()
-        .thread()
-        .registry_id();
+    let context = dispatcher.exact_signal_context_for_test();
+    let tid = context.thread().registry_id();
     let signum = 34;
 
     let parent_fd = dispatcher
@@ -1725,6 +2281,7 @@ fn dnotify_child_attrib_matches_macos_private_tmp_alias() {
 
     dispatcher
         .dnotify_register(
+            &context,
             parent_fd,
             LinuxDnotifyMask::ATTRIB | LinuxDnotifyMask::MULTISHOT,
             tid,
@@ -1736,14 +2293,7 @@ fn dnotify_child_attrib_matches_macos_private_tmp_alias() {
         "/tmp/watched/child",
     );
 
-    assert_eq!(
-        sigpoll_fd(
-            dispatcher
-                .take_pending_siginfo(&dispatcher.exact_signal_context_for_test(), tid, signum)
-                .unwrap()
-        ),
-        parent_fd
-    );
+    assert_eq!(take_process_sigpoll_fd(&context, signum), parent_fd);
 }
 
 #[test]
@@ -2216,6 +2766,55 @@ impl SpliceTestRig {
             DispatchOutcome::Returned { value: 0 },
         );
     }
+}
+
+#[test]
+fn final_pipe_description_close_disarms_fasync_registration() {
+    const SYS_DUP: u64 = 23;
+
+    carrick_signal_core::fasync::fasync_init();
+    let mut rig = SpliceTestRig::new(0x10000);
+    let (read_fd, write_fd) = rig.pipe2(0x4200);
+    let pipe_id = rig
+        .dispatcher
+        .host_pipe_pipe_id(read_fd as i32)
+        .expect("pipe id");
+    if let Some(owner) = carrick_signal_core::fasync::lookup(pipe_id) {
+        carrick_signal_core::fasync::disarm(pipe_id, owner.registration_id);
+    }
+
+    assert_eq!(
+        rig.run(
+            SpliceTestRig::SYS_FCNTL,
+            [read_fd, LINUX_F_SETOWN, 1, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    assert_eq!(
+        rig.run(
+            SpliceTestRig::SYS_FCNTL,
+            [read_fd, LINUX_F_SETFL, LINUX_O_ASYNC, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    assert!(carrick_signal_core::fasync::lookup(pipe_id).is_some());
+
+    let alias = match rig.run(SYS_DUP, [read_fd, 0, 0, 0, 0, 0]) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("dup read end failed: {other:?}"),
+    };
+    rig.close(read_fd);
+    assert!(
+        carrick_signal_core::fasync::lookup(pipe_id).is_some(),
+        "closing one dup must retain the description's registration",
+    );
+    rig.close(alias);
+    assert_eq!(
+        carrick_signal_core::fasync::lookup(pipe_id),
+        None,
+        "the final description close must reclaim its FASYNC slot",
+    );
+    rig.close(write_fd);
 }
 
 /// Splicing FROM readable synthetic character devices into a pipe write end:

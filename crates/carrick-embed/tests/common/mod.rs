@@ -8,7 +8,9 @@
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
-use carrick_embed::{ContainerResult, EmbedError};
+use carrick_abi::{NsGid, NsUid};
+use carrick_embed::{ContainerBuilder, ContainerResult, EmbedError, InMemoryFileVfs};
+use carrick_image::PullPolicy;
 
 /// The canonical smoke image: the arm64 probe lane's image
 /// (`crates/carrick-cli/tests/conformance.rs:209`, `ARM64.image`) and
@@ -33,6 +35,43 @@ pub fn repo_root() -> PathBuf {
         .and_then(|p| p.parent())
         .expect("carrick-embed lives under crates/carrick-embed")
         .to_path_buf()
+}
+
+/// A builder for the immutable, locally-built raw-syscall interceptor probe.
+/// The fixture bytes are mounted executable through Carrick's public VFS seam;
+/// no mutable image content participates in this proof.
+pub fn interceptor_probe_builder(mode: &str) -> ContainerBuilder {
+    ContainerBuilder::from_image(SMOKE_IMAGE)
+        .pull_policy(PullPolicy::Missing)
+        .command(["/opt/carrick/interceptor-probe", mode])
+        .vfs_mount("/opt/carrick", Box::new(interceptor_probe_vfs(None)))
+}
+
+pub fn interceptor_probe_vfs(marker: Option<&[u8]>) -> InMemoryFileVfs {
+    let fixture = repo_root().join("target/embed-fixtures/interceptor-probe-aarch64");
+    let bytes = std::fs::read(&fixture).unwrap_or_else(|error| {
+        panic!(
+            "read {}: {error}; scripts/test-signed.sh must build the fixture first",
+            fixture.display()
+        )
+    });
+    let vfs = InMemoryFileVfs::new();
+    vfs.add_file_with_metadata(
+        "/opt/carrick/interceptor-probe",
+        bytes,
+        0o755,
+        NsUid::ROOT,
+        NsGid::ROOT,
+        0,
+    )
+    .expect("install executable interceptor probe");
+    if let Some(marker) = marker {
+        // VfsMounts deliberately passes the canonical absolute guest path to
+        // mounted filesystems (proc/sys/dev use the same convention).
+        vfs.add_file("/opt/carrick/marker", marker)
+            .expect("install topology marker");
+    }
+    vfs
 }
 
 /// Unwrap a container run, turning `EmbedError::Entitlement` into a loud,

@@ -150,6 +150,7 @@ mod tests {
                 syscall_number: 172,
                 syscall_name: "getpid",
                 args: [0; 6],
+                original_args: None,
             },
             AuditEvent::SyscallReturn {
                 pid: 1,

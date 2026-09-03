@@ -58,42 +58,74 @@
       "rationale": "Carrier-wide host infrastructure static REGISTRATIONS in crates/carrick-runtime/src/binfmt.rs maintaining host process lifecycle or VM resources."
     },
     {
-      "kind": "static",
+      "kind": "env_var_os",
       "file": "crates/carrick-runtime/src/carrier.rs",
-      "symbol": "LAST_CONTAINER_TERMINAL",
-      "fingerprint": "96589efe21b783f63a220b6acae98efb784a8ebed0d1f1fd378fa90a60a112d6",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide host infrastructure static LAST_CONTAINER_TERMINAL in crates/carrick-runtime/src/carrier.rs maintaining host process lifecycle or VM resources."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/carrier.rs",
-      "symbol": "LIVE_CONTAINERS",
-      "fingerprint": "477d768a04cc804e225887f6d4a93e9df883c8b63d3aa77e100854a940dc2b81",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide host infrastructure static LIVE_CONTAINERS in crates/carrick-runtime/src/carrier.rs maintaining host process lifecycle or VM resources."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/carrier.rs",
-      "symbol": "SHUTDOWN_DONE",
-      "fingerprint": "106a32b37cdd7586ba96ad68e7524340475d4722318ad6c48a5193239cee9d31",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide host infrastructure static SHUTDOWN_DONE in crates/carrick-runtime/src/carrier.rs maintaining host process lifecycle or VM resources."
+      "symbol": "shutdown_with_destroy_and_hooks::crate::vm_lifecycle::VM_LIFECYCLE_ARTIFACT_PATH_ENV",
+      "fingerprint": "eb3706692052bb42ba87ae30c5ef15712e1923b63801aeefdbfab37ea965ecc9",
+      "classification": "config_debug",
+      "rationale": "Process diagnostic configuration selecting the optional no-clobber VM lifecycle artifact destination; the single carrier terminal claimant snapshots it once per shutdown operation and owns publication."
     },
     {
       "kind": "env_var_os",
       "file": "crates/carrick-runtime/src/carrier.rs",
-      "symbol": "shutdown::crate::vm_lifecycle::VM_LIFECYCLE_ARTIFACT_PATH_ENV",
+      "symbol": "shutdown_wait::crate::vm_lifecycle::VM_LIFECYCLE_ARTIFACT_PATH_ENV",
       "fingerprint": "eb3706692052bb42ba87ae30c5ef15712e1923b63801aeefdbfab37ea965ecc9",
       "classification": "config_debug",
-      "rationale": "Environment variable VM_LIFECYCLE_ARTIFACT_PATH_ENV read in shutdown::crate::vm_lifecycle::VM_LIFECYCLE_ARTIFACT_PATH_ENV (crates/carrick-runtime/src/carrier.rs) configuring carrier behavior or debug logging."
+      "rationale": "The explicit carrier finalizer reads the same optional lifecycle artifact destination only after closing admission and becoming the unique terminal claimant."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/carrier.rs",
+      "symbol": "tests::install::key",
+      "fingerprint": "ac8124cbc29687037b55a81ab069be0cf9a4462aadd314e5102b4014a46f0403",
+      "classification": "test_only",
+      "rationale": "The cfg(test) artifact environment guard snapshots each test-owned key so serial runtime tests can restore the process environment after exercising public shutdown publication."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/carrier.rs",
+      "symbol": "CARRIER_PROCESS_EPOCH",
+      "fingerprint": "bd4c728388c76da6b14e33b42e496c1248f7b41ff4cc91c12edd033d5b0ab285",
+      "classification": "carrier_infra",
+      "rationale": "Process epoch invalidates every inherited carrier and lease after fork before either can lock parent-owned state; the child advances it together with replacing carrier and lifecycle routing."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/carrier.rs",
+      "symbol": "NEXT_CARRIER_GENERATION",
+      "fingerprint": "2a37db36bfcf0a5a3242201a0dc758ab06c48d086f9ff398ce2be8ee0f670962",
+      "classification": "monotonic_allocator",
+      "rationale": "Process-wide checked allocator for never-reused carrier generation identities; mutable admission, container registries, and lifecycle evidence remain owned by the selected CarrierInner."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/carrier.rs",
+      "symbol": "independent_carrier_gate_slot::SLOT",
+      "fingerprint": "4c9d51d4df98ae543ef847379a7a864b1fcf92e510019d85237b1132f6b1153f",
+      "classification": "carrier_infra",
+      "rationale": "Process-exclusive weak owner gate enforcing at most one independent hardware carrier; fork-child reset pointer-replaces the slot without locking or freeing inherited mutex state."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/carrier.rs",
+      "symbol": "tests::TEST_LOCK",
+      "fingerprint": "b45f2e0792f4c7c840555bdf52882bf567b1f7f35998d77b3e2084e080d8479d",
+      "classification": "test_only",
+      "rationale": "The cfg(test) mutex serializes carrier-generation, lifecycle-window, fork-reset, and environment-restoration regressions that intentionally share process-scoped test authorities."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-embed/src/lib.rs",
+      "symbol": "CARRIER_TEST_LOCK",
+      "fingerprint": "86037a327730c39a17444d150fb83c62b8a9461aef204b955c50b6dc8161ed37",
+      "classification": "test_only",
+      "rationale": "The cfg(test) mutex serializes embed lifecycle tests that intentionally exercise the process-exclusive hardware-carrier owner gate."
     },
     {
       "kind": "static",
       "file": "crates/carrick-runtime/src/container.rs",
       "symbol": "lifecycle_lock_stripe::STRIPES",
-      "fingerprint": "84c0d46673aeddef669239b10b3ea8d8ee97ef0c1f41f49c76cc1fc965871597",
+      "fingerprint": "4b70d1b27757137a45c68b0a3ff3fb9ef0f6e6e589c961e8687ffe3f016fc895",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static lifecycle_lock_stripe::STRIPES in crates/carrick-runtime/src/container.rs maintaining host process lifecycle or VM resources."
     },
@@ -596,14 +628,6 @@
     {
       "kind": "static",
       "file": "crates/carrick-runtime/src/dispatch/proctitle.rs",
-      "symbol": "RUN_ID",
-      "fingerprint": "ce7c656de97db969ec3e68b9056b0bb8116a2439c5d520301fdd13047b012d57",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide host infrastructure static RUN_ID in crates/carrick-runtime/src/dispatch/proctitle.rs maintaining host process lifecycle or VM resources."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/proctitle.rs",
       "symbol": "environ",
       "fingerprint": "b3ff0bd36943e3de71e4fbea6443de7840503303e9f63e4745289585f78b0422",
       "classification": "carrier_infra",
@@ -632,14 +656,6 @@
       "fingerprint": "27cedbf80a52da333b79cf0aa46783a2ef28a8063d0c2abdd1e5a0f14910cec3",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static linux_capture::CAPTURE_CTOR in crates/carrick-runtime/src/dispatch/proctitle.rs maintaining host process lifecycle or VM resources."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/dispatch/proctitle.rs",
-      "symbol": "run_id::CARRICK_RUN_ID",
-      "fingerprint": "953114542a4126bc26109153a15da1a6aab9eace9d9e6bdcc2819659a277157a",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_RUN_ID read in run_id::CARRICK_RUN_ID (crates/carrick-runtime/src/dispatch/proctitle.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "static",
@@ -964,18 +980,18 @@
     {
       "kind": "static",
       "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
+      "symbol": "NEXT_ROOT_RETIREMENT_NONCE",
+      "fingerprint": "c73210fbc89a24fcfaa66dc2721fc4849d50029ea61803558ef70f4ea8f3c24e",
+      "classification": "monotonic_allocator",
+      "rationale": "Carrier-wide monotonic allocator for one-shot stage-1 root retirement proof nonces; it carries no current-container identity and aborts before wrap can permit proof replay."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
       "symbol": "carrier_stage1_mm_pool::CELL",
       "fingerprint": "13381776c2ba86f91d31228432a1c6fd0544e5b3b3efc92b2f1dcc5a3670b77b",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static carrier_stage1_mm_pool::CELL in crates/carrick-runtime/src/hvpatch/stage1_mm.rs maintaining host process lifecycle or VM resources."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/kernel/container.rs",
-      "symbol": "NEXT_CONTAINER_ID",
-      "fingerprint": "2425f0e62916d257472dd44f33bf9df8b86b4b613ebec6f8dbf4f8a89e843c3d",
-      "classification": "monotonic_allocator",
-      "rationale": "Carrier-wide monotonic allocator NEXT_CONTAINER_ID in crates/carrick-runtime/src/kernel/container.rs generating unique IDs across the host process."
     },
     {
       "kind": "env_var",
@@ -1042,14 +1058,6 @@
       "rationale": "Environment variable BASE_DIR_ENV read in base_directory::BASE_DIR_ENV (crates/carrick-runtime/src/kernel/debug/endpoint.rs) configuring carrier behavior or debug logging."
     },
     {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/kernel/debug/endpoint.rs",
-      "symbol": "for_current_run::CARRICK_RUN_ID",
-      "fingerprint": "953114542a4126bc26109153a15da1a6aab9eace9d9e6bdcc2819659a277157a",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_RUN_ID read in for_current_run::CARRICK_RUN_ID (crates/carrick-runtime/src/kernel/debug/endpoint.rs) configuring carrier behavior or debug logging."
-    },
-    {
       "kind": "static",
       "file": "crates/carrick-runtime/src/kernel/debug/server.rs",
       "symbol": "INSTALLED",
@@ -1080,24 +1088,6 @@
       "fingerprint": "db47b947bff4c3855c8dadde05cd337b2537f37926863719961a524d914ad7de",
       "classification": "test_only",
       "rationale": "Test-only subprocess sentinel isolates the one-vCPU full-occupancy handshake case and is absent from production builds."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/kernel/netns.rs",
-      "symbol": "root_net_ns::ROOT",
-      "fingerprint": "bd5168df1168a3dcc729e1465ca6cfc617a839b7ff4472b4b1e481157ab3e308",
-      "classification": "container_debt",
-      "rationale": "Initial network namespace ROOT static models initial container netns and must move to Container.net_ns.",
-      "destination": "Container.net_ns"
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/kernel/netns.rs",
-      "symbol": "root_uts_ns::ROOT",
-      "fingerprint": "311d88f987977849416ddcf865b1d27576e9348b0122c189e95a2ecb48c3aaf2",
-      "classification": "container_debt",
-      "rationale": "Initial UTS namespace ROOT static models initial container nodename/domainname and must move to Container.uts_ns.",
-      "destination": "Container.uts_ns"
     },
     {
       "kind": "static",
@@ -1229,14 +1219,6 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/prepare.rs",
-      "symbol": "prepare::CARRIER_INIT",
-      "fingerprint": "7a4bb66f8f253a90e7052ec2e92a241e6c5d2576aab61542c989a42daec748c3",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide host infrastructure static prepare::CARRIER_INIT in crates/carrick-runtime/src/prepare.rs maintaining host process lifecycle or VM resources."
-    },
-    {
-      "kind": "static",
       "file": "crates/carrick-runtime/src/pty_relay.rs",
       "symbol": "WINCH_PIPE_WRITE",
       "fingerprint": "0efde91efab0d3df7a93b1a0b6554a008420c9bc83e195109adfe32353429078",
@@ -1298,14 +1280,6 @@
       "fingerprint": "3c13ec3261cdbf3ca309bd9fd863023dabca93ee7c6addfd1401bc8a5fe7cd61",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static rosetta_license_blob::CACHE in crates/carrick-runtime/src/runtime.rs maintaining host process lifecycle or VM resources."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/runtime.rs",
-      "symbol": "run_address_space_with_hvf_and_dispatcher::CARRICK_CONTAINER_ID",
-      "fingerprint": "1b67e5b5b134ab1ff2cca6220975a5fca2164042ec673eeff0f92b11be2833b1",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_CONTAINER_ID read in run_address_space_with_hvf_and_dispatcher::CARRICK_CONTAINER_ID (crates/carrick-runtime/src/runtime.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "env_var",
@@ -1402,6 +1376,38 @@
       "fingerprint": "fbba5cbdfd1fe6923542b013fe8828c2b3a6774ecdf07765037c1b61e2c8a642",
       "classification": "test_only",
       "rationale": "Test-only fixture or lock VFORK_ACTIVATION_HOOK in crates/carrick-runtime/src/vcpu_loop/executor.rs scoped strictly to test harness execution."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "symbol": "tests::clone_admission_terminal_claim_cost_receipt::CARRICK_HANDOFF_PERF_ITERATIONS",
+      "fingerprint": "d8c13a13ecbc912d8eefc2783675658f04dbc51fedcbe50a5e580828ae136b35",
+      "classification": "test_only",
+      "rationale": "Test-only parameter owned by the ignored atomic exec-terminal release reducer and its Task 1 runner; it sizes prebuilt transition cases and is absent from production builds."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "symbol": "tests::clone_admission_terminal_claim_cost_receipt::CARRICK_HANDOFF_PERF_SAMPLES",
+      "fingerprint": "2344175e9c90df709feedc32257de58f569ac5546fb850762c7c8143d893aa45",
+      "classification": "test_only",
+      "rationale": "Test-only parameter owned by the ignored atomic exec-terminal release reducer and its Task 1 runner; it controls receipt cardinality and is absent from production builds."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "symbol": "tests::clone_admission_terminal_claim_cost_receipt::CARRICK_HANDOFF_PERF_WARMUPS",
+      "fingerprint": "64dadf48c6448d74008a80ff8c4b1187583cbac313db5f6762ef7a045db4eeef",
+      "classification": "test_only",
+      "rationale": "Test-only parameter owned by the ignored atomic exec-terminal release reducer and its Task 1 runner; it controls unreported warmups and is absent from production builds."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "symbol": "tests::pending_exec_completion_ownership_survives_control_context_failure_without_abort::CHILD",
+      "fingerprint": "aff99ea176e234e486ad57820720ef9f768be471aa94e729627b0f8b49a0cd9d",
+      "classification": "test_only",
+      "rationale": "Test-only child sentinel owned by the pending-exec regression's self-spawn; it selects the isolated child half because the tested abort is process-global, prevents recursive spawning, and is absent from production builds."
     },
     {
       "kind": "static",
@@ -1543,7 +1549,7 @@
       "kind": "env_var_os",
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "symbol": "macos_helper_stubs::execve_trace_filter::CARRICK_EXECVE_TRACE",
-      "fingerprint": "b829ed5ee882b3a9fe4e21b7229378adc7ff7b6f6e295a71af3510cb6d53254e",
+      "fingerprint": "b01adb77229238e6fb14b457a4e26ba56cf33fa62f73db20fbfab25b92f25607",
       "classification": "config_debug",
       "rationale": "Environment variable CARRICK_EXECVE_TRACE read in macos_helper_stubs::execve_trace_filter::CARRICK_EXECVE_TRACE (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
     },
@@ -1551,7 +1557,7 @@
       "kind": "static",
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "symbol": "macos_helper_stubs::execve_trace_filter::FILTER",
-      "fingerprint": "b923ff80052568fdb6c4792712f6be7a453c07ebf58f04f189ceb0dc88189d07",
+      "fingerprint": "8f561fa7f46f8336b60e37897fe253a69245320364c3abfb867389253efcdde7",
       "classification": "config_debug",
       "rationale": "Process-global configuration or failpoint cache macos_helper_stubs::execve_trace_filter::FILTER in crates/carrick-runtime/src/vcpu_loop/mod.rs initialized from environment flags."
     },
@@ -1559,7 +1565,7 @@
       "kind": "env_var_os",
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "symbol": "new::CARRICK_TRACE_TRAPS",
-      "fingerprint": "e790d772c83fe2d155d2d470c8e3b30b3ecedad7cc4fbd7ae9c5d8dea0f32deb",
+      "fingerprint": "32eac70bf993d040c3eacedbffa49fd74f7077a8bf566fe086a309d83c6fc598",
       "classification": "config_debug",
       "rationale": "Environment variable CARRICK_TRACE_TRAPS read in new::CARRICK_TRACE_TRAPS (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
     },
@@ -1662,10 +1668,10 @@
     {
       "kind": "env_var_os",
       "file": "crates/carrick-runtime/src/vcpu_loop/threads.rs",
-      "symbol": "publish_persistent_sibling_stop::CARRICK_SIG_DEBUG",
+      "symbol": "publish_persistent_sibling_stop_with::CARRICK_SIG_DEBUG",
       "fingerprint": "c3ebac26552821dc161b816d5870e2a482bba18de94aa6b15d568d126be9d8fe",
       "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_SIG_DEBUG read in publish_persistent_sibling_stop::CARRICK_SIG_DEBUG (crates/carrick-runtime/src/vcpu_loop/threads.rs) configuring carrier behavior or debug logging."
+      "rationale": "Environment variable CARRICK_SIG_DEBUG enables signal-lifecycle diagnostics only; it neither stores nor selects container-owned state."
     },
     {
       "kind": "env_var",
@@ -1908,6 +1914,14 @@
       "rationale": "Environment variable HVF_SYSCALL_TRANSPORT_ENV read in from_env::HVF_SYSCALL_TRANSPORT_ENV (crates/carrick-vmm-hvf/src/syscall_mailbox.rs) configuring carrier behavior or debug logging."
     },
     {
+      "kind": "env_var",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "cow_refusal_diagnostics_enabled::CARRICK_COW_REFUSAL_DIAGNOSTICS",
+      "fingerprint": "43db9f06606a9143f79288608f8feb422b011330838c585691d5a6942746afce",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_COW_REFUSAL_DIAGNOSTICS enables bounded COW and stage-2 diagnostic recording only; it cannot select or mutate guest authority."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "ALIAS_REMAP_COUNT",
@@ -1922,6 +1936,22 @@
       "fingerprint": "41bb64410f90ebaee726eb9a9e71e5bb46f2ec92855206b9c49efa1e3de63d3d",
       "classification": "carrier_infra",
       "rationale": "Host thread-local counter of rows visited by linear passes over the carrier-global alias/replay/version state, so an algorithmic-complexity regression is a TEST failure rather than a timing observation (retiring_one_owner_does_not_scan_foreign_alias_rows). Deliberately PER HOST THREAD and not process-global: a process-global counter is polluted by every other guest thread and by concurrently running tests, which made the same work report 1,539 rows under cargo test's default parallelism and 513 in isolation. It describes the measuring thread's own work and carries no Linux process semantics."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "cow_diagnostic_history::HISTORY",
+      "fingerprint": "7c3d0d63c3f8d0673e7ad155a4c750dba6532a1a9ca147be9d50fbbba3c139ae",
+      "classification": "config_debug",
+      "rationale": "Opt-in bounded carrier diagnostic history keyed by exact custody and MM identities; disabled by default and never consulted for kernel semantics."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "cow_refusal_diagnostics_enabled::ENABLED",
+      "fingerprint": "36833e7b8d81b0acafe43de2e53df551a8c2c019b1582a9dc718da51ee441c9b",
+      "classification": "config_debug",
+      "rationale": "Process-cached enable flag for opt-in COW refusal diagnostics; immutable after first read and carries no container identity."
     },
     {
       "kind": "static",
@@ -2394,6 +2424,254 @@
       "fingerprint": "ab0b08b97611e117782a41f621e4ace1ab4d3cc389433a60a25ff4abe830222f",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static park_for_slot::GATE_MUTEX in crates/carrick-vmm-hvf/src/trap/vcpu_gate.rs maintaining host process lifecycle or VM resources."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-observability/src/probes.rs",
+      "symbol": "real::parse_guest_mem_probe_usize_env::name",
+      "fingerprint": "2004d7f691adfb3fbda3dec7e993acd4b27c4a5c1c5b7bb8f5f552b4e44a8c50",
+      "classification": "config_debug",
+      "rationale": "Process diagnostic or tuning configuration; it changes instrumentation only and cannot select or overwrite container-owned state."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-observability/src/vm_lifecycle.rs",
+      "symbol": "write_completed_artifact::VM_LIFECYCLE_SOURCE_SHA256_ENV",
+      "fingerprint": "0d7ebc6dd3d0242fbea1ea41d7dfb208dade219b0e1bf1ac3238248498dffc8c",
+      "classification": "config_debug",
+      "rationale": "Process diagnostic or tuning configuration; it changes instrumentation only and cannot select or overwrite container-owned state."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/kernel/container.rs",
+      "symbol": "from_process_env_or_random::CARRICK_RUN_ID",
+      "fingerprint": "953114542a4126bc26109153a15da1a6aab9eace9d9e6bdcc2819659a277157a",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-scoped synchronized infrastructure; it is either immutable, keyed by exact container identity, or coordinates the one host carrier without storing current-container identity."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/kernel/container.rs",
+      "symbol": "unmanaged_from_process_run_id::CARRICK_RUN_ID",
+      "fingerprint": "953114542a4126bc26109153a15da1a6aab9eace9d9e6bdcc2819659a277157a",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-scoped synchronized infrastructure; it is either immutable, keyed by exact container identity, or coordinates the one host carrier without storing current-container identity."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-thread/src/thread.rs",
+      "symbol": "futex_halt_poll_ns::CARRICK_FUTEX_HALT_POLL_NS",
+      "fingerprint": "2da0f384eb915b5d0a255dd871cca978c7bf6da5e3847da9ed8c5581e8b1141b",
+      "classification": "config_debug",
+      "rationale": "Process diagnostic or tuning configuration; it changes instrumentation only and cannot select or overwrite container-owned state."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-thread/src/thread.rs",
+      "symbol": "tests::set::key",
+      "fingerprint": "ac8124cbc29687037b55a81ab069be0cf9a4462aadd314e5102b4014a46f0403",
+      "classification": "test_only",
+      "rationale": "Test-only fixture or synchronization guard, unreachable from production carrier execution."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-observability/src/compat.rs",
+      "symbol": "PROBE_HOOK",
+      "fingerprint": "dae463e6b056d73af1fa18438f2963435a5c8ed539ab75092998d7bf87ae2f54",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-scoped synchronized infrastructure; it is either immutable, keyed by exact container identity, or coordinates the one host carrier without storing current-container identity."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-observability/src/probes.rs",
+      "symbol": "real::guest_mem_subrange_config::CONFIG",
+      "fingerprint": "ff15b14b509bd302787dab97bc1662d88f64258e569f8c7a34a1232636d94d6b",
+      "classification": "config_debug",
+      "rationale": "Process diagnostic or tuning configuration; it changes instrumentation only and cannot select or overwrite container-owned state."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-observability/src/vm_lifecycle.rs",
+      "symbol": "PROCESS_COMMAND_SHA256",
+      "fingerprint": "467674f6d82f92f7b22c46da01b873c06c2c9990077b6de7af2d053aef40e971",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-scoped synchronized infrastructure; it is either immutable, keyed by exact container identity, or coordinates the one host carrier without storing current-container identity."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-observability/src/vm_lifecycle.rs",
+      "symbol": "PROCESS_WINDOW_EPOCH",
+      "fingerprint": "a1bb743c98458bbd38a0ffdc804a66d7f34314fda833791ba84f3204b9fa5c28",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-scoped synchronized infrastructure; it is either immutable, keyed by exact container identity, or coordinates the one host carrier without storing current-container identity."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-observability/src/vm_lifecycle.rs",
+      "symbol": "process_window_slot::SLOT",
+      "fingerprint": "64413bef13c89a770da88a5874238798f358dd41c1a659e1a448292ec54c2813",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-scoped synchronized infrastructure; it is either immutable, keyed by exact container identity, or coordinates the one host carrier without storing current-container identity."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/interactive_supervisor.rs",
+      "symbol": "INTERACTIVE_SESSION_ACTIVE",
+      "fingerprint": "76ede1925284ac43348519a8f3e77beb2a8f9b81c5f7c3a314565d0070282ec5",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-scoped synchronized infrastructure; it is either immutable, keyed by exact container identity, or coordinates the one host carrier without storing current-container identity."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "symbol": "NEXT_PROCESS_GROUP_GENERATION",
+      "fingerprint": "8d9ca8cc664c8e4e0cb71a22cd8e2af00b7b8113f10f5626038f92201b1fd5b8",
+      "classification": "monotonic_allocator",
+      "rationale": "Process-wide monotonic identity allocator; values are never interpreted as the current container and are not reused."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-thread/src/fork_quiesce.rs",
+      "symbol": "EXIT_CLEANUPS",
+      "fingerprint": "c4e9548b6e096dcd3d8ea2be4fbb002ddec03a2578219b23e7923168fa13366b",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-scoped synchronized infrastructure; it is either immutable, keyed by exact container identity, or coordinates the one host carrier without storing current-container identity."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-thread/src/fork_quiesce.rs",
+      "symbol": "NEXT_TOPOLOGY_LISTENER",
+      "fingerprint": "77f49234dba93458d974180c77f1df78a7bccfd9c6e027d7a2b069e3f6dcd70f",
+      "classification": "monotonic_allocator",
+      "rationale": "Process-wide monotonic identity allocator; values are never interpreted as the current container and are not reused."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-thread/src/fork_quiesce.rs",
+      "symbol": "barrier::B",
+      "fingerprint": "2e433e2c97a871b68c5900916150b5a265f41f80ec7d5b11c2c694e6e49cc9c7",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-scoped synchronized infrastructure; it is either immutable, keyed by exact container identity, or coordinates the one host carrier without storing current-container identity."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-thread/src/fork_quiesce.rs",
+      "symbol": "exec_owner::OWNER",
+      "fingerprint": "93aebe81dfd1262562e7cf4a225185dc3db69b65fecc2ed75b62f39ad939f0de",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-scoped synchronized infrastructure; it is either immutable, keyed by exact container identity, or coordinates the one host carrier without storing current-container identity."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-thread/src/fork_quiesce.rs",
+      "symbol": "pt_barrier::B",
+      "fingerprint": "e414462d3cf00c02b860620c1b47ce27b4595e25aaae726b072f272d6b2cb2d6",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-scoped synchronized infrastructure; it is either immutable, keyed by exact container identity, or coordinates the one host carrier without storing current-container identity."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-thread/src/fork_quiesce.rs",
+      "symbol": "topology_lock::L",
+      "fingerprint": "d5d31275524e8338b7af556763a70a16711eb1a2a91474fd13fa21fd4a15f26f",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-scoped synchronized infrastructure; it is either immutable, keyed by exact container identity, or coordinates the one host carrier without storing current-container identity."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-thread/src/fork_quiesce.rs",
+      "symbol": "topology_probe_tests::TOPOLOGY_TEST_LOCK",
+      "fingerprint": "29c1e1aae9c8164c23a54929fa89474de3cd73d0e531142f3487ef0c66a0036b",
+      "classification": "test_only",
+      "rationale": "Test-only fixture or synchronization guard, unreachable from production carrier execution."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-thread/src/fork_quiesce.rs",
+      "symbol": "topology_release_publication::PUBLICATION",
+      "fingerprint": "e60087495444491ef9f360b1093aec9517a20dcdd2ad059bd09030f4b0ee04d4",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-scoped synchronized infrastructure; it is either immutable, keyed by exact container identity, or coordinates the one host carrier without storing current-container identity."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-thread/src/platform_futex.rs",
+      "symbol": "carrier_shared_futex_table::TABLE",
+      "fingerprint": "37b1584fafd1a4678b218d1509460a70b31bb36914a9cf8b947c03ab62fe5246",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-scoped synchronized infrastructure; it is either immutable, keyed by exact container identity, or coordinates the one host carrier without storing current-container identity."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-thread/src/thread.rs",
+      "symbol": "FUTEX_HALT_POLL_NS",
+      "fingerprint": "4999d3235076fb9bf7d67eddbcb7fa835a18419891bcdc032cc9bdc66ea17974",
+      "classification": "config_debug",
+      "rationale": "Process diagnostic or tuning configuration; it changes instrumentation only and cannot select or overwrite container-owned state."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-thread/src/thread.rs",
+      "symbol": "NEXT_RUNTIME_ENDPOINT_GENERATION",
+      "fingerprint": "556e2b58600e50e98eb56cafbc9bdb3aa8a36a771ed307222ef6b3c97b7bd77e",
+      "classification": "monotonic_allocator",
+      "rationale": "Process-wide monotonic identity allocator; values are never interpreted as the current container and are not reused."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-thread/src/thread.rs",
+      "symbol": "RUNTIME_ENDPOINTS",
+      "fingerprint": "54a7714cab53c047542f69a66cabbf499fae67757f792e6c6c771028b9803b61",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-scoped synchronized infrastructure; it is either immutable, keyed by exact container identity, or coordinates the one host carrier without storing current-container identity."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-thread/src/thread.rs",
+      "symbol": "tests::FUTEX_HALT_POLL_ENV_LOCK",
+      "fingerprint": "86318b87f12470f75dbbcaa35b6119914e162a19053a312b9948b8751905a077",
+      "classification": "test_only",
+      "rationale": "Test-only fixture or synchronization guard, unreachable from production carrier execution."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-observability/src/probes.rs",
+      "symbol": "real::EPOLL_MASKED_PROBE",
+      "fingerprint": "5c7abbbb2eb95c2800e4edfb6aeb4c867031950de918cefcbfa564908e6bddb5",
+      "classification": "config_debug",
+      "rationale": "Process diagnostic or tuning configuration; it changes instrumentation only and cannot select or overwrite container-owned state."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-observability/src/probes.rs",
+      "symbol": "real::EPOLL_REBIND_PROBE",
+      "fingerprint": "be7528ebd0538573bfc40866bdd6b01d4b1abd07324ce577b322c0a0bc24b447",
+      "classification": "config_debug",
+      "rationale": "Process diagnostic or tuning configuration; it changes instrumentation only and cannot select or overwrite container-owned state."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-observability/src/probes.rs",
+      "symbol": "real::ULOCK_REQUEUE_PROBE",
+      "fingerprint": "010de993528a592dd7082d6906e8eb3e2163d1bdc15fd4e309d33551793cd1c0",
+      "classification": "config_debug",
+      "rationale": "Process diagnostic or tuning configuration; it changes instrumentation only and cannot select or overwrite container-owned state."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-thread/src/fork_quiesce.rs",
+      "symbol": "TOPOLOGY_DEPTH",
+      "fingerprint": "0c344a04adbf6aaaa1a832135428375187949a1306ca0f44b358afe0b79c59c2",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-scoped synchronized infrastructure; it is either immutable, keyed by exact container identity, or coordinates the one host carrier without storing current-container identity."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-thread/src/thread.rs",
+      "symbol": "FUTEX_PARK_VALIDATION_ACTIVE",
+      "fingerprint": "ddadcb4497b02732ade86258a4fcec32b53d682e75b57a2111920772af6347e8",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-scoped synchronized infrastructure; it is either immutable, keyed by exact container identity, or coordinates the one host carrier without storing current-container identity."
     }
   ]
 }

@@ -611,33 +611,25 @@ impl KernelDebugSnapshot {
             || want(KernelDebugTable::RunQueue)
             || want(KernelDebugTable::Executor)
             || want(KernelDebugTable::ExecutorReceipt);
-        let (
-            scheduler,
-            run_queue,
-            executors,
-            executor_receipts,
-            executor_receipt_summary,
-            provider_absent,
-        ) = match aux {
-            Some(provider) => (
-                want(KernelDebugTable::Scheduler).then(|| provider.scheduler_rows()),
-                want(KernelDebugTable::RunQueue).then(|| provider.run_queue_rows()),
-                want(KernelDebugTable::Executor).then(|| provider.executor_rows()),
-                want(KernelDebugTable::ExecutorReceipt).then(|| provider.executor_receipt_rows().0),
-                want(KernelDebugTable::ExecutorReceipt)
-                    .then(|| provider.executor_receipt_rows().1)
-                    .flatten(),
-                has_aux_table.then_some(false),
-            ),
-            None => (
-                want(KernelDebugTable::Scheduler).then(Vec::new),
-                want(KernelDebugTable::RunQueue).then(Vec::new),
-                want(KernelDebugTable::Executor).then(Vec::new),
-                want(KernelDebugTable::ExecutorReceipt).then(Vec::new),
-                None,
-                has_aux_table.then_some(true),
-            ),
-        };
+        let scheduler = want(KernelDebugTable::Scheduler)
+            .then(|| aux.map_or_else(Vec::new, KernelDebugAuxProvider::scheduler_rows));
+        let run_queue = want(KernelDebugTable::RunQueue)
+            .then(|| aux.map_or_else(Vec::new, KernelDebugAuxProvider::run_queue_rows));
+        let executors = want(KernelDebugTable::Executor)
+            .then(|| aux.map_or_else(Vec::new, KernelDebugAuxProvider::executor_rows));
+        let (executor_receipts, executor_receipt_summary) =
+            if want(KernelDebugTable::ExecutorReceipt) {
+                aux.map_or_else(
+                    || (Some(Vec::new()), None),
+                    |provider| {
+                        let (rows, summary) = provider.executor_receipt_rows();
+                        (Some(rows), summary)
+                    },
+                )
+            } else {
+                (None, None)
+            };
+        let provider_absent = has_aux_table.then_some(aux.is_none());
         Self {
             schema: KERNEL_DEBUG_RESPONSE_SCHEMA.to_owned(),
             snapshot_schema_version: snapshot.schema_version,

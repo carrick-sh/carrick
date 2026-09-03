@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use carrick_abi::{SigBlockMask, SigSet, WaitSigMask};
 use carrick_guest_mem::{GuestVa, SharedFutexLocation};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use crate::dispatch::{
     BlockingHostWrite, BlockingRecordLock, DispatchOutcome, SyscallRequest, WaitFdAuthority,
@@ -253,6 +253,18 @@ impl ContinuationAuthority {
 
     pub const fn task(&self) -> TaskKey {
         self.task
+    }
+
+    fn namespace_task_id(&self, task: TaskKey) -> Option<i64> {
+        let parent = self.task_ref.upgrade()?;
+        if parent.key() != self.task {
+            return None;
+        }
+        let raw = u32::try_from(task.id.raw()).ok()?;
+        match parent.pid_ns_region() {
+            Some(region) => region.host_to_ns(raw).map(i64::from),
+            None => Some(i64::from(raw)),
+        }
     }
 
     pub const fn task_revision(&self) -> TaskRevision {
@@ -1472,8 +1484,13 @@ impl BlockedContinuation {
                         ContinuationCompletion::RedispatchWithPartial(offset)
                     }
                     ContinuationFamily::VforkParent => {
-                        let child = self.vfork_child().map_or(0, |key| i64::from(key.id.raw()));
-                        ContinuationCompletion::Return(child)
+                        match self
+                            .vfork_child()
+                            .and_then(|key| self.authority().namespace_task_id(key))
+                        {
+                            Some(child) => ContinuationCompletion::Return(child),
+                            None => ContinuationCompletion::Errno(carrick_abi::LINUX_ESRCH),
+                        }
                     }
                     ContinuationFamily::WaitOnSharedWord => match &self.state().detail {
                         ContinuationDetail::SharedWord {
@@ -2578,6 +2595,8 @@ struct CarrierWaitServiceInner {
     control_write: OwnedFd,
     reactor_poll_calls: AtomicU64,
     #[cfg(test)]
+    fail_next_enroll: AtomicBool,
+    #[cfg(test)]
     /// Test observer for "a poll cycle completed", paired with the
     /// `reactor_poll_calls` value when it was installed so a cycle that had
     /// already counted before installation cannot satisfy it.
@@ -2998,6 +3017,8 @@ impl CarrierWaitService {
             control_write,
             reactor_poll_calls: AtomicU64::new(0),
             #[cfg(test)]
+            fail_next_enroll: AtomicBool::new(false),
+            #[cfg(test)]
             reactor_poll_observer: Mutex::new(None),
         });
         let weak = Arc::downgrade(&inner);
@@ -3063,6 +3084,10 @@ impl CarrierWaitService {
         &self,
         registration: &mut ContinuationRegistration,
     ) -> Result<(), WaitServiceError> {
+        #[cfg(test)]
+        if self.inner.fail_next_enroll.swap(false, Ordering::AcqRel) {
+            return Err(WaitServiceError::StaleRegistration);
+        }
         if registration.enrolled
             || !Weak::ptr_eq(&registration.service, &Arc::downgrade(&self.inner))
         {
@@ -3088,6 +3113,11 @@ impl CarrierWaitService {
         let _ = self.recheck_registration(registration)?;
         self.inner.nudge_reactor();
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_enroll_for_test(&self) {
+        self.inner.fail_next_enroll.store(true, Ordering::Release);
     }
 
     fn install_producer_subscriptions(
@@ -3466,6 +3496,12 @@ pub enum QuantumExit {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExecutorFailureSettlement {
+    PublishCurrent,
+    DeferredToProcessOwner,
+}
+
 /// Object-safe job state driven by the one authoritative Task 4 executor pool.
 /// Implementations own logical runtime/continuation state only; the executor
 /// argument owns the backend engine and physical vCPU for the duration of one
@@ -3478,6 +3514,11 @@ pub(crate) trait PersistentQuantumJob: Send + 'static {
     ) -> crate::vcpu_loop::executor::ExecutorExit;
 
     fn after_terminal_settlement(&mut self) {}
+
+    fn after_executor_failure_settlement(&mut self) -> ExecutorFailureSettlement {
+        self.after_terminal_settlement();
+        ExecutorFailureSettlement::PublishCurrent
+    }
 
     fn take_address_space_retirement(
         &mut self,
@@ -3507,6 +3548,7 @@ pub(crate) trait PersistentQuantumJob: Send + 'static {
 pub(crate) struct HvpatchTaskQuantum {
     job: Mutex<Box<dyn PersistentQuantumJob>>,
     completion: LogicalJobCompletion,
+    _physical_retirement: PhysicalJobRetirementPublisher,
 }
 
 impl HvpatchTaskQuantum {
@@ -3514,9 +3556,11 @@ impl HvpatchTaskQuantum {
         job: Box<dyn PersistentQuantumJob>,
         completion: LogicalJobCompletion,
     ) -> Self {
+        let physical_retirement = completion.physical_retirement_publisher();
         Self {
             job: Mutex::new(job),
             completion,
+            _physical_retirement: physical_retirement,
         }
     }
 
@@ -3531,6 +3575,14 @@ impl HvpatchTaskQuantum {
     pub(crate) fn after_terminal_settlement(&self) {
         self.job.lock().after_terminal_settlement();
         self.completion.publish();
+    }
+
+    pub(crate) fn after_executor_failure_settlement(&self) {
+        if self.job.lock().after_executor_failure_settlement()
+            == ExecutorFailureSettlement::PublishCurrent
+        {
+            self.completion.publish();
+        }
     }
 
     pub(crate) fn take_address_space_retirement(
@@ -3560,10 +3612,12 @@ impl HvpatchTaskQuantum {
 
 pub(crate) struct HvpatchTaskBinding {
     identity: crate::vcpu_loop::executor::TaskLoadIdentity,
-    quantum: Arc<HvpatchTaskQuantum>,
     backend: Mutex<Option<Box<dyn std::any::Any + Send>>>,
     stage1_mm: Option<Arc<crate::hvpatch::Stage1MmLease>>,
     terminal_generation: Mutex<HvpatchBindingTerminalGeneration>,
+    // Last by construction: the quantum's drop receipt may become visible
+    // only after every other final-binding authority has been released.
+    quantum: Arc<HvpatchTaskQuantum>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3776,6 +3830,26 @@ impl HvpatchTaskBinding {
         }
     }
 
+    pub(crate) fn after_executor_failure_settlement(&self) {
+        let publish_logical_result = {
+            let mut generation = self.terminal_generation.lock();
+            match *generation {
+                HvpatchBindingTerminalGeneration::Active => {
+                    *generation = HvpatchBindingTerminalGeneration::Settled;
+                    true
+                }
+                HvpatchBindingTerminalGeneration::ExecTransferred => {
+                    *generation = HvpatchBindingTerminalGeneration::Settled;
+                    false
+                }
+                HvpatchBindingTerminalGeneration::Settled => return,
+            }
+        };
+        if publish_logical_result {
+            self.quantum.after_executor_failure_settlement();
+        }
+    }
+
     pub(crate) fn mark_exec_transferred(&self) -> Result<(), crate::trap::TrapError> {
         let mut generation = self.terminal_generation.lock();
         if *generation != HvpatchBindingTerminalGeneration::Active {
@@ -3793,7 +3867,10 @@ impl HvpatchTaskBinding {
         self.quantum.take_address_space_retirement()
     }
 
-    pub(crate) fn retire_detached_address_space(&self) -> Result<(), crate::trap::TrapError> {
+    pub(crate) fn retire_detached_address_space(
+        &self,
+        root_ticket: Option<crate::hvpatch::Stage1RootRetirementTicket>,
+    ) -> Result<Option<crate::hvpatch::Stage1RootRetirementReceipt>, crate::trap::TrapError> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             let backend = self.backend.lock().take().ok_or_else(|| {
@@ -3816,6 +3893,7 @@ impl HvpatchTaskBinding {
             // (a published inventory must never leak), but for months it was
             // the only thing an operator saw.
             let retired = backend.retire_detached_address_space_with(
+                root_ticket,
                 |commit| {
                     self.quantum
                         .apply_detached_address_space_retirement_with_receipt(commit)
@@ -3829,9 +3907,9 @@ impl HvpatchTaskBinding {
                      this, not the cause): {error}"
                 );
             }
-            retired?;
+            let root_receipt = retired?;
             drop(backend);
-            Ok(())
+            Ok(root_receipt)
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         Err(crate::trap::TrapError::Hypervisor(
@@ -3876,7 +3954,10 @@ impl HvpatchTaskBinding {
         ))
     }
 
-    pub(crate) fn retire_detached_exec_predecessor(&self) -> Result<(), crate::trap::TrapError> {
+    pub(crate) fn retire_detached_exec_predecessor(
+        &self,
+        root_ticket: Option<crate::hvpatch::Stage1RootRetirementTicket>,
+    ) -> Result<Option<crate::hvpatch::Stage1RootRetirementReceipt>, crate::trap::TrapError> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             let mut slot = self.backend.lock();
@@ -3892,7 +3973,7 @@ impl HvpatchTaskBinding {
                         "detached exec cleanup backend type mismatch".to_owned(),
                     )
                 })?;
-            backend.retire_detached_exec_predecessor()
+            backend.retire_detached_exec_predecessor(root_ticket)
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         Err(crate::trap::TrapError::Hypervisor(
@@ -3956,6 +4037,8 @@ type JobCompletionCallback = Arc<dyn Fn(JobId) + Send + Sync + 'static>;
 
 struct JobCompletionState {
     done: AtomicBool,
+    physically_retired: Mutex<bool>,
+    physical_retirement_changed: Condvar,
     next_listener: AtomicU64,
     listeners: Mutex<BTreeMap<u64, JobCompletionCallback>>,
 }
@@ -3982,6 +4065,8 @@ impl LogicalJobCompletion {
             id: JobId(next_nonzero(&NEXT_RUNNER_JOB_ID)),
             state: Arc::new(JobCompletionState {
                 done: AtomicBool::new(false),
+                physically_retired: Mutex::new(false),
+                physical_retirement_changed: Condvar::new(),
                 next_listener: AtomicU64::new(1),
                 listeners: Mutex::new(BTreeMap::new()),
             }),
@@ -4008,6 +4093,49 @@ impl LogicalJobCompletion {
         }
     }
 
+    /// Wait until the executor has released the final binding that owned this
+    /// job's kernel graph. Logical result publication deliberately precedes
+    /// that release, so container teardown must observe this distinct phase.
+    pub(crate) fn wait_for_physical_retirement(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut retired = self.state.physically_retired.lock();
+        while !*retired {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            if self
+                .state
+                .physical_retirement_changed
+                .wait_for(&mut retired, remaining)
+                .timed_out()
+                && !*retired
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn physical_retirement_publisher(&self) -> PhysicalJobRetirementPublisher {
+        PhysicalJobRetirementPublisher {
+            completion: self.clone(),
+        }
+    }
+
+    fn publish_physical_retirement(&self) {
+        let mut retired = self.state.physically_retired.lock();
+        if *retired {
+            return;
+        }
+        *retired = true;
+        self.state.physical_retirement_changed.notify_all();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_physical_retirement_for_test(&self) {
+        self.publish_physical_retirement();
+    }
+
     fn subscribe(&self, callback: JobCompletionCallback) -> Option<JobCompletionSubscription> {
         let mut listeners = self.state.listeners.lock();
         if self.is_finished() {
@@ -4019,6 +4147,19 @@ impl LogicalJobCompletion {
             completion: self.clone(),
             listener,
         })
+    }
+}
+
+/// Drop-only publication guard placed after the quantum's job field. Rust
+/// drops struct fields in declaration order, so this receipt becomes visible
+/// only after the job (and its Kernel/VFS ownership) has been destroyed.
+struct PhysicalJobRetirementPublisher {
+    completion: LogicalJobCompletion,
+}
+
+impl Drop for PhysicalJobRetirementPublisher {
+    fn drop(&mut self) {
+        self.completion.publish_physical_retirement();
     }
 }
 
@@ -4467,7 +4608,7 @@ mod tests {
             );
         }
         let dispatch = loop_source
-            .split("fn service_threaded_syscall_for_executor")
+            .split("fn redispatch_threaded_syscall_for_executor")
             .nth(1)
             .and_then(|tail| tail.split("\n    fn ").next())
             .expect("dispatch service body");
@@ -4832,6 +4973,103 @@ mod tests {
     }
 
     #[test]
+    fn physical_retirement_waits_for_every_final_binding_field() {
+        struct ExitJob;
+        impl PersistentQuantumJob for ExitJob {
+            fn poll_quantum_with_engine(
+                &mut self,
+                _engine: &mut dyn std::any::Any,
+                _control: &mut crate::vcpu_loop::executor::HvpatchQuantumControl<'_, '_>,
+            ) -> crate::vcpu_loop::executor::ExecutorExit {
+                crate::vcpu_loop::executor::ExecutorExit::Exited
+            }
+        }
+        struct BlockingBackendDrop {
+            entered: std::sync::mpsc::SyncSender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl Drop for BlockingBackendDrop {
+            fn drop(&mut self) {
+                self.entered.send(()).expect("report backend drop");
+                self.release.recv().expect("release backend drop");
+            }
+        }
+
+        let (_kernel, context) = bootstrap(15_476);
+        let state = crate::vcpu_loop::executor::tests::task_state(&context, 476);
+        let completion = LogicalJobCompletion::pending();
+        let quantum = Arc::new(HvpatchTaskQuantum::new(
+            Box::new(ExitJob),
+            completion.clone(),
+        ));
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let binding = HvpatchTaskBinding::new(
+            crate::vcpu_loop::executor::TaskLoadIdentity {
+                abi: state.cpu.guest_abi(),
+                version: state.cpu.version(),
+                mm: state.mm,
+                asid_generation: state.asid_generation,
+            },
+            Arc::clone(&quantum),
+            Box::new(BlockingBackendDrop {
+                entered: entered_tx,
+                release: release_rx,
+            }),
+        );
+        drop(quantum);
+        completion.publish();
+        let dropper = std::thread::spawn(move || drop(binding));
+        entered_rx.recv().expect("backend drop entered");
+        assert!(
+            !completion.wait_for_physical_retirement(Duration::from_millis(20)),
+            "receipt must remain pending while another binding field is dropping"
+        );
+        release_tx.send(()).expect("release backend");
+        dropper.join().expect("binding dropper");
+        assert!(completion.wait_for_physical_retirement(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn exec_replacement_keeps_physical_retirement_pending() {
+        struct ExitJob;
+        impl PersistentQuantumJob for ExitJob {
+            fn poll_quantum_with_engine(
+                &mut self,
+                _engine: &mut dyn std::any::Any,
+                _control: &mut crate::vcpu_loop::executor::HvpatchQuantumControl<'_, '_>,
+            ) -> crate::vcpu_loop::executor::ExecutorExit {
+                crate::vcpu_loop::executor::ExecutorExit::Exited
+            }
+        }
+
+        let (_kernel, context) = bootstrap(15_477);
+        let state = crate::vcpu_loop::executor::tests::task_state(&context, 477);
+        let identity = crate::vcpu_loop::executor::TaskLoadIdentity {
+            abi: state.cpu.guest_abi(),
+            version: state.cpu.version(),
+            mm: state.mm,
+            asid_generation: state.asid_generation,
+        };
+        let completion = LogicalJobCompletion::pending();
+        let quantum = Arc::new(HvpatchTaskQuantum::new(
+            Box::new(ExitJob),
+            completion.clone(),
+        ));
+        let predecessor = HvpatchTaskBinding::new(identity, Arc::clone(&quantum), Box::new(()));
+        let successor = predecessor.replacement(identity);
+        drop(quantum);
+        completion.publish();
+        drop(predecessor);
+        assert!(
+            !completion.wait_for_physical_retirement(Duration::from_millis(20)),
+            "exec predecessor must not retire the successor's shared quantum"
+        );
+        drop(successor);
+        assert!(completion.wait_for_physical_retirement(Duration::from_secs(1)));
+    }
+
+    #[test]
     fn production_hvpatch_thread_clone_never_reaches_host_thread_or_vcpu_materialization() {
         let source = include_str!("mod.rs");
         let production = source
@@ -5032,13 +5270,13 @@ mod tests {
         assert!(exec_source.contains("pending_exec_replacement.replace"));
         assert!(exec_source.contains("std::process::abort"));
         let exec_resume = production
-            .split("let replaced = self.publish_exec_replacement(control)?")
-            .nth(1)
-            .and_then(|tail| {
-                tail.split("HvpatchProductionPhase::TerminalProcessDrain")
-                    .next()
-            })
-            .expect("post-exec worker boundary");
+            .split_once("fn finish_exec_suffix(")
+            .expect("post-exec suffix boundary")
+            .1
+            .split_once("fn service_outcome(")
+            .expect("post-exec worker boundary")
+            .0;
+        assert!(exec_resume.contains("self.publish_exec_replacement(control)"));
         assert!(exec_resume.contains("ExecutorExit::Preempted"));
         assert!(exec_resume.contains("HvpatchLoopSuspension::Preemption"));
         assert!(!terminal_finalizer.contains("retire_task_address_space"));

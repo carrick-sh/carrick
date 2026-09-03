@@ -2507,7 +2507,12 @@ impl SyscallDispatcher {
     /// Handle a netlink "send": parse the request and queue a synthetic
     /// rtnetlink dump reply (or a bare NLMSG_DONE for requests we don't
     /// specifically model). Returns the number of bytes "sent".
-    fn netlink_send(&self, fd: i32, request: &[u8]) -> DispatchOutcome {
+    fn netlink_send(
+        &self,
+        context: &crate::kernel::KernelContext,
+        fd: i32,
+        request: &[u8],
+    ) -> DispatchOutcome {
         let Some(open_file) = self.open_file(fd) else {
             return DispatchOutcome::errno(LINUX_EBADF);
         };
@@ -2525,7 +2530,7 @@ impl SyscallDispatcher {
             // walk for host — which is why the guest's own surfaces disagreed
             // with each other, and why the accurate encoder was the one the
             // conformance lane never exercised.
-            let net_ns = self.caller_net_ns();
+            let net_ns = self.caller_net_ns(context);
             build_netlink_reply_for_snapshot(request, dest_pid, &net_ns.view())
         };
         if let Some(mut open) = open_file.description.write() {
@@ -3032,6 +3037,7 @@ impl SyscallDispatcher {
     /// msg_len field with the bytes-sent on success.
     fn sendmmsg(
         &self,
+        context: &crate::kernel::KernelContext,
         fd: Fd,
         msgvec: GuestPtr,
         vlen: u64,
@@ -3052,7 +3058,7 @@ impl SyscallDispatcher {
                     return DispatchOutcome::errno(LINUX_EFAULT);
                 }
             };
-            let outcome = match self.sendmsg_inner(fd, entry, flags, &*memory) {
+            let outcome = match self.sendmsg_inner(context, fd, entry, flags, &*memory) {
                 Ok(o) => o,
                 // Surface the REAL errno the single-message path carries (a bad
                 // fd is EBADF, not the blanket EFAULT — sendmmsg02). The
@@ -8357,7 +8363,7 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                     }
                 };
-                return Ok(this.netlink_send(fd, &bytes));
+                return Ok(this.netlink_send(cx.kernel, fd, &bytes));
             }
             if let Some(open_file) = this.open_file(fd)
                 && let Some(open) = open_file.description.read()
@@ -9574,7 +9580,7 @@ impl SyscallDispatcher {
         }
 
         fn sendmsg(this, cx, fd: Fd, msg: GuestPtr, flags: u64) {
-            this.sendmsg_inner(fd.0, msg.0, flags as i32, &*cx.memory)
+            this.sendmsg_inner(cx.kernel, fd.0, msg.0, flags as i32, &*cx.memory)
         }
 
         fn recvmsg(this, cx, fd: Fd, msg: GuestPtr, flags: u64) {
@@ -9589,7 +9595,7 @@ impl SyscallDispatcher {
 
         fn sys_sendmmsg(this, cx, fd: Fd, mmsg: GuestPtr, vlen: u64, flags: u64) {
 
-            Ok(this.sendmmsg(fd, mmsg, vlen, flags, cx.memory))
+            Ok(this.sendmmsg(cx.kernel, fd, mmsg, vlen, flags, cx.memory))
 
         }
 
@@ -9599,6 +9605,7 @@ impl SyscallDispatcher {
 impl SyscallDispatcher {
     fn sendmsg_inner(
         &self,
+        context: &crate::kernel::KernelContext,
         fd: i32,
         msg_addr: u64,
         flags: i32,
@@ -9665,7 +9672,7 @@ impl SyscallDispatcher {
         // AF_NETLINK: parse the assembled request and queue a synthetic
         // dump reply, ignoring the destination sockaddr (always the kernel).
         if is_netlink {
-            return Ok(self.netlink_send(fd, &data));
+            return Ok(self.netlink_send(context, fd, &data));
         }
         let host_addr = if msg.name == 0 || msg.namelen == 0 {
             None

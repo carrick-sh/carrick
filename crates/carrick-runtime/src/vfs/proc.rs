@@ -204,6 +204,9 @@ pub struct SyntheticProcContext {
     pub open_fds: Vec<i32>,
     /// The active Linux-visible network namespace model.
     pub network: carrick_spec::NetworkNamespaceSpec,
+    /// Exact task/container namespace snapshot when opened by the dispatcher.
+    pub(crate) network_model: Option<crate::network::model::LinuxNetworkModel>,
+    pub(crate) runtime_endpoint_container: Option<carrick_hal::ContainerId>,
     /// The serialized ELF auxv byte image (type/value pairs through AT_NULL) the
     /// guest received on its stack, surfaced verbatim via `/proc/self/auxv`.
     pub auxv: Vec<u8>,
@@ -1141,8 +1144,8 @@ pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<V
             }
             // /proc/net/<f>, plus the namespace-correct /proc/self/net/<f> and
             // /proc/<pid>/net/<f> aliases, share one renderer (proc_net(5)).
-            if let Some(name) = proc_net_basename(path)
-                && let Some(v) = synthetic_proc_net_file(name, &ctx.network)
+            if let Some(name) = proc_net_basename(path, ctx)
+                && let Some(v) = synthetic_proc_net_file_for_context(name, ctx)
             {
                 return Some(v);
             }
@@ -1156,13 +1159,19 @@ pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<V
 /// The `<f>` of a `/proc/net/<f>`, `/proc/self/net/<f>`, `/proc/thread-self/net/<f>`
 /// or `/proc/<pid>/net/<f>` path — the namespace-correct net paths every tool
 /// reaches all resolve to the same per-file renderer. `None` otherwise.
-fn proc_net_basename(path: &str) -> Option<&str> {
+fn proc_net_basename<'a>(path: &'a str, ctx: &SyntheticProcContext) -> Option<&'a str> {
     if let Some(name) = path.strip_prefix("/proc/net/") {
         return (!name.contains('/')).then_some(name);
     }
     let rest = path.strip_prefix("/proc/")?;
     let (pid, tail) = rest.split_once('/')?;
     if pid != "self" && pid != "thread-self" && !pid.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    if pid.bytes().all(|byte| byte.is_ascii_digit())
+        && ctx.processes.is_some()
+        && !proc_pid_component_is_live(pid, ctx)
+    {
         return None;
     }
     let name = tail.strip_prefix("net/")?;
@@ -1216,6 +1225,10 @@ fn proc_net_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
     if !proc_net_is_dir(path) {
         return None;
     }
+    Some(proc_net_entries())
+}
+
+fn proc_net_entries() -> Vec<DirEnt> {
     let mut entries = vec![
         DirEnt {
             name: ".".to_string(),
@@ -1230,7 +1243,30 @@ fn proc_net_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
         name: (*f).to_string(),
         kind: EntryKind::File,
     }));
-    Some(entries)
+    entries
+}
+
+/// Graph-aware network-directory listing. HVPatch peers are logical tasks in
+/// one carrier process, so a numeric component is live only when the calling
+/// container's process snapshot names it. The host process table remains the
+/// fallback solely on lanes without a kernel graph.
+fn proc_net_dir_entries_with_context(
+    path: &str,
+    ctx: &SyntheticProcContext,
+) -> Option<Vec<DirEnt>> {
+    if path == "/proc/net" {
+        return Some(proc_net_entries());
+    }
+    let rest = path.strip_prefix("/proc/")?;
+    let component = rest.strip_suffix("/net")?;
+    if component.is_empty() || component.contains('/') {
+        return None;
+    }
+    if ctx.processes.is_some() {
+        proc_pid_component_is_live(component, ctx).then(proc_net_entries)
+    } else {
+        proc_net_dir_entries(path)
+    }
 }
 
 /// Classify the process component of a `/proc/<pid>/…` path: `Some((is_self,
@@ -1431,64 +1467,21 @@ fn proc_symlink_metadata(size: u64) -> Metadata {
 /// (index, name, has_ipv4, has_ipv6) for each interface Carrick advertises.
 /// Driven entirely by `LinuxNetworkModel`, so the guest's view is consistent and
 /// isolated from host network configuration.
-fn linux_interfaces(
-    network: &carrick_spec::NetworkNamespaceSpec,
+fn linux_interfaces_model(
+    model: &crate::network::model::LinuxNetworkModel,
 ) -> Vec<(u32, String, bool, bool)> {
-    if network.mode != carrick_spec::NetworkMode::Host {
-        let model = crate::network::model::LinuxNetworkModel::from_spec(network);
-        return model
-            .links
-            .iter()
-            .map(|link| {
-                // Whether a link carries a family is DERIVED from the address
-                // list rather than stored beside it, so `/proc/net/if_inet6`
-                // cannot claim a link has IPv6 while the same namespace hands
-                // out no IPv6 address for it — which is exactly how a
-                // fabricated `fe80::…:1` reached the guest.
-                (
-                    link.index,
-                    link.name.clone(),
-                    model.link_carries(&link.name, false),
-                    model.link_carries(&link.name, true),
-                )
-            })
-            .collect();
-    }
-    host_linux_interfaces()
-}
-
-fn host_linux_interfaces() -> Vec<(u32, String, bool, bool)> {
-    let mut out: Vec<(u32, String, bool, bool)> = Vec::new();
-    let mut have_eth = false;
-    for (_idx, name, v4, v6) in host_mc_interfaces() {
-        if name == "lo0" || name == "lo" {
-            if !out.iter().any(|(_, n, _, _)| n == "lo") {
-                // Loopback always carries both IPv4 (127.0.0.1) and IPv6 (::1).
-                out.push((1, "lo".to_owned(), true, true));
-            }
-        } else if name.starts_with("en") && !have_eth {
-            have_eth = true;
-            // NO IPv6 on the uplink, even in host mode, and for the same reason
-            // `LinuxNetworkModel` gives none: what would be emitted is not the
-            // host's real address but a FABRICATED `fe80::…:1`
-            // (`synthetic_proc_net_if_inet6`), and carrick cannot service an IPv6
-            // multicast join on it — libuv's `udp_multicast_join6` gets
-            // EADDRNOTAVAIL where the oracle skips.
-            //
-            // Inheriting the host's `v6` here made the fabrication guest-visible
-            // in host mode only, which is the mode the conformance surface runs
-            // in, so the model's fix never applied where it mattered. It is wrong
-            // in both directions: libuv's `can_ipv6_external()` and
-            // `tcp_connect6_link_local` both key off "does any enumerated
-            // interface carry an fe80:: address", and Linux answers no.
-            let _ = v6;
-            out.push((2, "eth0".to_owned(), v4, false));
-        }
-    }
-    if !out.iter().any(|(_, n, _, _)| n == "lo") {
-        out.insert(0, (1, "lo".to_owned(), true, true));
-    }
-    out
+    model
+        .links
+        .iter()
+        .map(|link| {
+            (
+                link.index,
+                link.name.clone(),
+                model.link_carries(&link.name, false),
+                model.link_carries(&link.name, true),
+            )
+        })
+        .collect()
 }
 
 /// Render `/proc/net/<name>` (and its `self/net` / `<pid>/net` aliases). carrick
@@ -1500,12 +1493,36 @@ fn synthetic_proc_net_file(
     name: &str,
     network: &carrick_spec::NetworkNamespaceSpec,
 ) -> Option<Vec<u8>> {
+    let model = if network.mode == carrick_spec::NetworkMode::Host {
+        crate::network::model::LinuxNetworkModel::host_mirror(
+            &crate::network::model::HostWireSnapshot::probe(),
+        )
+    } else {
+        crate::network::model::LinuxNetworkModel::from_spec(network)
+    };
+    synthetic_proc_net_file_from_model(name, &model)
+}
+
+fn synthetic_proc_net_file_for_context(
+    name: &str,
+    context: &SyntheticProcContext,
+) -> Option<Vec<u8>> {
+    context.network_model.as_ref().map_or_else(
+        || synthetic_proc_net_file(name, &context.network),
+        |model| synthetic_proc_net_file_from_model(name, model),
+    )
+}
+
+fn synthetic_proc_net_file_from_model(
+    name: &str,
+    network: &crate::network::model::LinuxNetworkModel,
+) -> Option<Vec<u8>> {
     let bytes: Vec<u8> = match name {
-        "dev" => return Some(synthetic_proc_net_dev(network)),
-        "igmp" => return Some(synthetic_proc_net_igmp(network)),
-        "igmp6" => return Some(synthetic_proc_net_igmp6(network)),
-        "dev_mcast" => return Some(synthetic_proc_net_dev_mcast(network)),
-        "if_inet6" => synthetic_proc_net_if_inet6(network),
+        "dev" => return Some(network.render_proc_net_dev()),
+        "igmp" => return Some(synthetic_proc_net_igmp_model(network)),
+        "igmp6" => return Some(synthetic_proc_net_igmp6_model(network)),
+        "dev_mcast" => return Some(synthetic_proc_net_dev_mcast_model(network)),
+        "if_inet6" => synthetic_proc_net_if_inet6_model(network),
         "tcp" => b"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n".to_vec(),
         "tcp6" => b"  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n".to_vec(),
         "udp" => b"   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n".to_vec(),
@@ -1515,7 +1532,7 @@ fn synthetic_proc_net_file(
         "unix" => b"Num       RefCount Protocol Flags    Type St Inode Path\n".to_vec(),
         "packet" => b"sk               RefCnt Type Proto  Iface R Rmem   User   Inode\n".to_vec(),
         "arp" => b"IP address       HW type     Flags       HW address            Mask     Device\n".to_vec(),
-        "route" => synthetic_proc_net_route(network),
+        "route" => network.render_proc_net_route(),
         "ipv6_route" => synthetic_proc_net_ipv6_route(),
         "snmp" => synthetic_proc_net_snmp(),
         "snmp6" => synthetic_proc_net_snmp6(),
@@ -1529,9 +1546,11 @@ fn synthetic_proc_net_file(
 
 /// `/proc/net/if_inet6`: one row per IPv6 interface (proc_net(5)). Loopback's
 /// `::1/128` plus a row per mapped uplink; glibc's `__check_pf` reads this.
-fn synthetic_proc_net_if_inet6(network: &carrick_spec::NetworkNamespaceSpec) -> Vec<u8> {
+fn synthetic_proc_net_if_inet6_model(
+    network: &crate::network::model::LinuxNetworkModel,
+) -> Vec<u8> {
     let mut s = String::new();
-    for (idx, name, _v4, v6) in linux_interfaces(network) {
+    for (idx, name, _v4, v6) in linux_interfaces_model(network) {
         if name == "lo" {
             s.push_str(&format!(
                 "00000000000000000000000000000001 {idx:02x} 80 10 80 {name:>9}\n"
@@ -1547,27 +1566,18 @@ fn synthetic_proc_net_if_inet6(network: &carrick_spec::NetworkNamespaceSpec) -> 
 
 /// `/proc/net/dev`: the two verbatim header lines (proc_net(5) quotes them
 /// exactly) then one all-zero-counter row per Linux-mapped interface.
+#[cfg(test)]
 fn synthetic_proc_net_dev(network: &carrick_spec::NetworkNamespaceSpec) -> Vec<u8> {
-    if network.mode != carrick_spec::NetworkMode::Host {
-        return crate::network::model::LinuxNetworkModel::from_spec(network).render_proc_net_dev();
-    }
-    let mut s = String::from(
-        "Inter-|   Receive                                                |  Transmit\n \
-face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n",
-    );
-    for (_idx, name, _v4, _v6) in linux_interfaces(network) {
-        s.push_str(&format!(
-            "{name:>6}: 0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0\n"
-        ));
-    }
-    s.into_bytes()
+    crate::network::model::LinuxNetworkModel::from_spec(network).render_proc_net_dev()
 }
 
 /// `/proc/net/dev_mcast`: the standard all-nodes multicast MAC memberships per
 /// interface (333300000001 = IPv6 all-nodes, 01005e000001 = IPv4 all-hosts).
-fn synthetic_proc_net_dev_mcast(network: &carrick_spec::NetworkNamespaceSpec) -> Vec<u8> {
+fn synthetic_proc_net_dev_mcast_model(
+    network: &crate::network::model::LinuxNetworkModel,
+) -> Vec<u8> {
     let mut s = String::new();
-    for (idx, name, v4, v6) in linux_interfaces(network) {
+    for (idx, name, v4, v6) in linux_interfaces_model(network) {
         if v6 {
             s.push_str(&format!("{idx:<4} {name:<15} 1     0     333300000001\n"));
         }
@@ -1580,25 +1590,9 @@ fn synthetic_proc_net_dev_mcast(network: &carrick_spec::NetworkNamespaceSpec) ->
 
 /// `/proc/net/route`: header + an on-link default route via the primary uplink
 /// and a loopback route. Addresses are little-endian hex (proc_net(5)).
+#[cfg(test)]
 fn synthetic_proc_net_route(network: &carrick_spec::NetworkNamespaceSpec) -> Vec<u8> {
-    let mut s = String::from(
-        "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n",
-    );
-    if network.mode != carrick_spec::NetworkMode::Host {
-        return crate::network::model::LinuxNetworkModel::from_spec(network)
-            .render_proc_net_route();
-    }
-    let eth = linux_interfaces(network)
-        .into_iter()
-        .find(|(_, n, _, _)| n == "eth0")
-        .map(|(_, n, _, _)| n);
-    if let Some(eth) = eth {
-        // Default route, on-link (gateway 0.0.0.0), mask 0.0.0.0.
-        s.push_str(&format!(
-            "{eth}\t00000000\t00000000\t0001\t0\t0\t0\t00000000\t0\t0\t0\n"
-        ));
-    }
-    s.into_bytes()
+    crate::network::model::LinuxNetworkModel::from_spec(network).render_proc_net_route()
 }
 
 /// `/proc/net/ipv6_route`: loopback rows in the fixed 32-hex-digit layout, no
@@ -1652,59 +1646,12 @@ IpExt: InNoRoutes InTruncatedPkts InMcastPkts OutMcastPkts InBcastPkts OutBcastP
 IpExt: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n".to_vec()
 }
 
-/// `(index, name, has_ipv4, has_ipv6)` for each host interface, via getifaddrs.
-/// Used to synthesize `/proc/net/igmp[6]` so a guest's `Interface.MulticastAddrs`
-/// reports the standard multicast groups every Linux interface joins.
-#[cfg(target_os = "macos")]
-fn host_mc_interfaces() -> Vec<(u32, String, bool, bool)> {
-    use std::collections::BTreeMap;
-    let mut map: BTreeMap<String, (u32, bool, bool)> = BTreeMap::new();
-    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
-    if unsafe { libc::getifaddrs(&mut head) } != 0 || head.is_null() {
-        return Vec::new();
-    }
-    let mut cur = head;
-    while !cur.is_null() {
-        let ifa = unsafe { &*cur };
-        cur = ifa.ifa_next;
-        if ifa.ifa_name.is_null() {
-            continue;
-        }
-        let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
-            .to_string_lossy()
-            .into_owned();
-        let idx = {
-            let c = std::ffi::CString::new(name.clone()).unwrap_or_default();
-            unsafe { libc::if_nametoindex(c.as_ptr()) }
-        };
-        let entry = map.entry(name).or_insert((idx, false, false));
-        if idx != 0 {
-            entry.0 = idx;
-        }
-        if !ifa.ifa_addr.is_null() {
-            match unsafe { (*ifa.ifa_addr).sa_family } as i32 {
-                libc::AF_INET => entry.1 = true,
-                libc::AF_INET6 => entry.2 = true,
-                _ => {}
-            }
-        }
-    }
-    unsafe { libc::freeifaddrs(head) };
-    map.into_iter()
-        .map(|(name, (idx, v4, v6))| (idx, name, v4, v6))
-        .collect()
-}
-#[cfg(not(target_os = "macos"))]
-fn host_mc_interfaces() -> Vec<(u32, String, bool, bool)> {
-    vec![(1, "lo".to_owned(), true, true)]
-}
-
 /// `/proc/net/igmp`: one block per IPv4 interface listing the all-hosts group
 /// (224.0.0.1), matching the format Go's `parseProcNetIGMP` reads (the group is
 /// the address in NATIVE/little-endian hex).
-fn synthetic_proc_net_igmp(network: &carrick_spec::NetworkNamespaceSpec) -> Vec<u8> {
+fn synthetic_proc_net_igmp_model(network: &crate::network::model::LinuxNetworkModel) -> Vec<u8> {
     let mut s = String::from("Idx\tDevice    : Count Querier\tGroup    Users Timer\tReporter\n");
-    for (idx, name, v4, _v6) in linux_interfaces(network) {
+    for (idx, name, v4, _v6) in linux_interfaces_model(network) {
         if !v4 {
             continue;
         }
@@ -1718,9 +1665,9 @@ fn synthetic_proc_net_igmp(network: &carrick_spec::NetworkNamespaceSpec) -> Vec<
 /// `/proc/net/igmp6`: the all-nodes link-local (ff02::1) and interface-local
 /// (ff01::1) groups per IPv6 interface — the address is straight network-order
 /// hex, as Go's `parseProcNetIGMP6` reads.
-fn synthetic_proc_net_igmp6(network: &carrick_spec::NetworkNamespaceSpec) -> Vec<u8> {
+fn synthetic_proc_net_igmp6_model(network: &crate::network::model::LinuxNetworkModel) -> Vec<u8> {
     let mut s = String::new();
-    for (idx, name, _v4, v6) in linux_interfaces(network) {
+    for (idx, name, _v4, v6) in linux_interfaces_model(network) {
         if !v6 {
             continue;
         }
@@ -1736,8 +1683,13 @@ fn synthetic_proc_net_igmp6(network: &carrick_spec::NetworkNamespaceSpec) -> Vec
 
 /// Directory entries (tid names) for `/proc/<pid>/task/`, or `None` if `pid`
 /// isn't a guest we expose.
-pub(crate) fn synthetic_task_dir(pid: u32) -> Option<Vec<String>> {
-    let own = crate::current_thread_states();
+pub(crate) fn synthetic_task_dir(
+    pid: u32,
+    container: Option<carrick_hal::ContainerId>,
+) -> Option<Vec<String>> {
+    let own = container
+        .map(crate::container_thread_states)
+        .unwrap_or_default();
     if own.iter().any(|(t, _)| t.raw() as u32 == pid) {
         let self_host_pid = std::process::id();
         let self_ns_pid = crate::namespace::pid::self_ns_pid();
@@ -1823,7 +1775,7 @@ pub(crate) fn proc_pid_dir_host_pid(path: &str) -> Option<u32> {
         let ns_pid = comp.parse().ok()?;
         (ns_pid_to_host(ns_pid)?, Some(ns_pid))
     };
-    if synthetic_task_dir(host_pid).is_none()
+    if synthetic_task_dir(host_pid, None).is_none()
         && !ns_pid.is_some_and(|pid| mapped_existing_ns_pid(pid, host_pid))
     {
         return None;
@@ -1850,11 +1802,14 @@ pub(crate) fn proc_pid_dir_linux_pid(path: &str) -> Option<u32> {
 /// `(., .., <tid>...)` entries for a `/proc/<pid>/task/` path. Accepts the
 /// `self`/`thread-self`/… aliases as well as a numeric pid (so `/proc/self/task`
 /// resolves — it is listed in the self dir's readdir, and must not ENOENT).
-fn proc_task_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
+fn proc_task_dir_entries(
+    path: &str,
+    container: Option<carrick_hal::ContainerId>,
+) -> Option<Vec<DirEnt>> {
     let p = path.strip_suffix('/').unwrap_or(path);
     let pid_comp = p.strip_prefix("/proc/")?.strip_suffix("/task")?;
     let (_is_self, host_pid) = proc_live_pid(pid_comp)?;
-    let tids = synthetic_task_dir(host_pid)?;
+    let tids = synthetic_task_dir(host_pid, container)?;
     Some(proc_task_dir_entries_from_tids(tids))
 }
 
@@ -2119,6 +2074,7 @@ fn proc_pid_dir_entries_with_context(
         Some(GraphProcess::Peer(_) | GraphProcess::Zombie) => {
             proc_pid_dir_entries_for_known_process(path, false)
         }
+        None if ctx.processes.is_some() => None,
         // No kernel graph on this lane: the host process table is still the
         // authority, one Linux process being one host process there.
         None => proc_pid_dir_entries(path),
@@ -2133,7 +2089,11 @@ fn proc_pid_dir_entries_with_context(
 /// predicate for the subtrees that only need "does this process exist" and not
 /// the process record itself.
 pub(crate) fn proc_pid_component_is_live(component: &str, ctx: &SyntheticProcContext) -> bool {
-    graph_process(component, ctx).is_some() || proc_live_pid(component).is_some()
+    if ctx.processes.is_some() {
+        graph_process(component, ctx).is_some()
+    } else {
+        graph_process(component, ctx).is_some() || proc_live_pid(component).is_some()
+    }
 }
 
 /// The `/proc/<pid>/ns` component pair of a path, if it has one.
@@ -2241,6 +2201,7 @@ pub(crate) fn synthetic_dir_entries(path: &str, ctx: &SyntheticProcContext) -> O
         .or_else(|| proc_task_tid_dir_entries_with_context(path, ctx))
         .or_else(|| proc_pid_dir_entries_with_context(path, ctx))
         .or_else(|| proc_ns_dir_entries_with_context(path, ctx))
+        .or_else(|| proc_net_dir_entries_with_context(path, ctx))
 }
 
 /// The `/proc` top-level listing: `.`/`..`, the self aliases, every synthetic
@@ -2393,6 +2354,8 @@ fn synthetic_proc_context_from_open(ctx: &OpenContext<'_>) -> SyntheticProcConte
         environ: ctx.environ.unwrap_or(&[]).to_vec(),
         open_fds: ctx.open_fds.unwrap_or(&[]).to_vec(),
         network: ctx.network.cloned().unwrap_or_default(),
+        network_model: ctx.network_model.cloned(),
+        runtime_endpoint_container: ctx.runtime_endpoint_container,
         auxv: ctx.auxv.unwrap_or(&[]).to_vec(),
         address_space_regions: ctx.address_space_regions.map(|regions| regions.to_vec()),
         locked_memory: ctx.locked_memory.unwrap_or(&[]).to_vec(),
@@ -2429,7 +2392,7 @@ impl Vfs for ProcVfs {
             || proc_ns_is_dir(path)
             || proc_fd_is_dir(path)
             || proc_fdinfo_is_dir(path)
-            || proc_task_dir_entries(path).is_some()
+            || proc_task_dir_entries(path, None).is_some()
             || proc_pid_dir_entries(path).is_some()
         {
             return Ok(Metadata {
@@ -2559,7 +2522,7 @@ impl Vfs for ProcVfs {
         if let Some(entries) = proc_ns_dir_entries(path) {
             return Ok(entries);
         }
-        if let Some(entries) = proc_task_dir_entries(path) {
+        if let Some(entries) = proc_task_dir_entries(path, None) {
             return Ok(entries);
         }
         if let Some(entries) = proc_pid_dir_entries(path) {
@@ -2638,7 +2601,12 @@ impl Vfs for ProcVfs {
             });
         }
         if let Some(entries) = sysctl_dir_entries(path)
-            .or_else(|| proc_net_dir_entries(path))
+            .or_else(|| {
+                proc_net_dir_entries_with_context(
+                    path,
+                    synth_ctx.get_or_init(|| synthetic_proc_context_from_open(ctx)),
+                )
+            })
             .or_else(|| proc_ns_dir_entries(path))
             .or_else(|| {
                 synthetic_dir_entries(
@@ -2646,7 +2614,7 @@ impl Vfs for ProcVfs {
                     synth_ctx.get_or_init(|| synthetic_proc_context_from_open(ctx)),
                 )
             })
-            .or_else(|| proc_task_dir_entries(path))
+            .or_else(|| proc_task_dir_entries(path, ctx.runtime_endpoint_container))
         {
             return Ok(VfsHandle::Directory {
                 path: path.to_string(),
@@ -3074,7 +3042,15 @@ fn synthetic_proc_self_status(ctx: &SyntheticProcContext) -> String {
     let nthreads = ctx
         .threads
         .as_ref()
-        .map_or_else(|| crate::current_thread_states().len(), Vec::len)
+        .map_or_else(
+            || {
+                ctx.runtime_endpoint_container
+                    .map(crate::container_thread_states)
+                    .unwrap_or_default()
+                    .len()
+            },
+            Vec::len,
+        )
         .max(1);
     let ncpu = crate::host_facts::logical_cpu_count();
     let cpus_hex = cpus_allowed_hex(ncpu);
@@ -3290,7 +3266,10 @@ fn synthetic_proc_self_stat(ctx: &SyntheticProcContext) -> String {
                 .map_or('R', |thread| thread.state),
         ),
         None => {
-            let thread_states = crate::current_thread_states();
+            let thread_states = ctx
+                .runtime_endpoint_container
+                .map(crate::container_thread_states)
+                .unwrap_or_default();
             (
                 thread_states.len().max(1),
                 proc_self_stat_state_from_threads(
@@ -3653,7 +3632,18 @@ Threads:\t{threads}\n",
         };
     }
 
-    let own_threads = crate::current_thread_states();
+    // A present process census is the complete PID authority. Reaching this
+    // point means the id was neither the reader, one of its threads, a live
+    // peer, nor a zombie; never reinterpret the same raw number through the
+    // carrier's host process/thread/run-state tables.
+    if ctx.processes.is_some() {
+        return None;
+    }
+
+    let own_threads = ctx
+        .runtime_endpoint_container
+        .map(crate::container_thread_states)
+        .unwrap_or_default();
     // Worker threads are addressed by their (untranslated) registry tid, but the
     // MAIN thread is addressed by its ns-pid (== tgid) under a PID namespace,
     // which the registry keys by the host id instead. Match either so a
@@ -3671,7 +3661,7 @@ Threads:\t{threads}\n",
         let me = std::process::id();
         // Per-thread name (prctl PR_SET_NAME / pthread_setname_np), falling back
         // to the process comm for a thread that never named itself.
-        let name = per_thread_comm(tid, self_comm);
+        let name = per_thread_comm(ctx.runtime_endpoint_container, tid, self_comm);
         match rest {
             "stat" => {
                 return Some(
@@ -4191,8 +4181,13 @@ fn process_short_name(executable_path: &str) -> String {
 
 /// The name to report in `/proc/<pid>/task/<tid>/comm`: the thread's own
 /// prctl/pthread-set name if it has one, else the process comm (`fallback`).
-fn per_thread_comm(tid: crate::thread::ThreadId, fallback: &str) -> String {
-    crate::thread::current_thread_name(tid)
+fn per_thread_comm(
+    container: Option<carrick_hal::ContainerId>,
+    tid: crate::thread::ThreadId,
+    fallback: &str,
+) -> String {
+    container
+        .and_then(|container| crate::thread::container_thread_name(container, tid))
         .map(|n| {
             let len = n.iter().position(|&b| b == 0).unwrap_or(n.len());
             String::from_utf8_lossy(&n[..len]).into_owned()
@@ -5739,6 +5734,45 @@ mod tests {
             synthetic_file("/proc/999999/stat", &ctx).is_none(),
             "a pid with no kernel-graph record must not render"
         );
+        assert!(
+            synthetic_file("/proc/999999/net/tcp", &ctx).is_none(),
+            "a numeric /proc/<pid>/net path must obey the same graph liveness gate"
+        );
+    }
+
+    /// Once a kernel task census is present it is the complete PID authority.
+    /// A raw number absent from that census must not become visible merely
+    /// because it collides with the carrier's host pid or run-state record.
+    #[test]
+    fn graph_backed_proc_rejects_carrier_pid_absent_from_graph() {
+        struct RunStateCleanup(i32);
+
+        impl Drop for RunStateCleanup {
+            fn drop(&mut self) {
+                crate::run_state::clear_guest_process(self.0);
+            }
+        }
+
+        let carrier_pid = i32::try_from(std::process::id()).expect("host pid fits i32");
+        crate::run_state::publish_task_thread(
+            carrier_pid,
+            carrier_pid,
+            crate::run_state::RunState::Running,
+        );
+        let _cleanup = RunStateCleanup(carrier_pid);
+        let ctx = peer_dir_ctx();
+        let component = carrier_pid.to_string();
+        let path = format!("/proc/{component}");
+
+        let leaked_directory = proc_pid_dir_entries_with_context(&path, &ctx).is_some();
+        let leaked_liveness = proc_pid_component_is_live(&component, &ctx);
+        let leaked_file =
+            synthetic_proc_pid_file(carrier_pid as u32, "stat", "carrier", &ctx).is_some();
+        assert_eq!(
+            (leaked_directory, leaked_liveness, leaked_file),
+            (false, false, false),
+            "a graph miss must not inherit host directory, liveness, or run-state rendering"
+        );
     }
 
     fn peer_dir_ctx() -> SyntheticProcContext {
@@ -5780,6 +5814,57 @@ mod tests {
         entries.iter().map(|e| e.name.as_str()).collect()
     }
 
+    #[test]
+    fn container_task_census_isolated() {
+        let render = |comm: &'static str| {
+            std::thread::spawn(move || {
+                let ctx = SyntheticProcContext {
+                    executable_path: format!("/{comm}"),
+                    task_comm: comm.to_owned(),
+                    identity: Some(SyntheticProcIdentity {
+                        pid: 1,
+                        tid: 1,
+                        ppid: 0,
+                        pgrp: 1,
+                        session: 1,
+                        user_cpu_us: 0,
+                        system_cpu_us: 0,
+                    }),
+                    processes: Some(vec![SyntheticProcProcess {
+                        pid: 1,
+                        ppid: 0,
+                        pgrp: 1,
+                        session: 1,
+                        state: 'R',
+                        tids: vec![1],
+                        comm: comm.to_owned(),
+                        user_cpu_us: 0,
+                        system_cpu_us: 0,
+                    }]),
+                    zombies: Some(Vec::new()),
+                    ..SyntheticProcContext::default()
+                };
+                let entries = synthetic_dir_entries("/proc", &ctx).expect("proc root");
+                let numeric = entries
+                    .into_iter()
+                    .filter_map(|entry| entry.name.parse::<u32>().ok())
+                    .collect::<Vec<_>>();
+                let stat = synthetic_file("/proc/1/stat", &ctx).expect("container init stat");
+                assert!(synthetic_file("/proc/77/stat", &ctx).is_none());
+                (numeric, String::from_utf8(stat).expect("utf8 stat"))
+            })
+        };
+
+        let alpha = render("alpha-init");
+        let beta = render("beta-init");
+        let (alpha_pids, alpha_stat) = alpha.join().expect("alpha proc tree");
+        let (beta_pids, beta_stat) = beta.join().expect("beta proc tree");
+        assert_eq!(alpha_pids, vec![1]);
+        assert_eq!(beta_pids, vec![1]);
+        assert!(alpha_stat.starts_with("1 (alpha-init) "), "{alpha_stat:?}");
+        assert!(beta_stat.starts_with("1 (beta-init) "), "{beta_stat:?}");
+    }
+
     /// `/proc/<peer>` must EXIST, not just render its files. The per-pid file
     /// renderers were routed through the kernel graph first, which left
     /// `cat /proc/<peer>/stat` working while `ls -d /proc/<peer>`,
@@ -5806,6 +5891,60 @@ mod tests {
             synthetic_dir_entries("/proc/999999", &ctx).is_none(),
             "a pid the graph never knew must stay ENOENT"
         );
+    }
+
+    #[test]
+    fn peer_net_directory_uses_the_container_graph_for_lookup_open_and_readdir() {
+        let ctx = peer_dir_ctx();
+        let entries = synthetic_dir_entries("/proc/7/net", &ctx)
+            .expect("a live peer's network directory must exist");
+        assert!(names(&entries).contains(&"tcp"));
+        assert!(
+            synthetic_dir_entries("/proc/999999/net", &ctx).is_none(),
+            "a raw pid absent from this container must not inherit host liveness"
+        );
+
+        let open_ctx = OpenContext {
+            identity: ctx.identity,
+            processes: ctx.processes.as_deref(),
+            zombies: ctx.zombies.as_deref(),
+            ..OpenContext::default()
+        };
+        let opened = ProcVfs::new()
+            .open(
+                "/proc/7/net",
+                OpenFlags {
+                    read: true,
+                    directory: true,
+                    ..OpenFlags::default()
+                },
+                &open_ctx,
+            )
+            .expect("open a live peer's network directory");
+        match opened {
+            VfsHandle::Directory { entries, .. } => {
+                assert!(names(&entries).contains(&"tcp"));
+            }
+            other => panic!("expected peer network directory, got {other:?}"),
+        }
+
+        let carrier_pid = std::process::id();
+        if carrier_pid != 7 {
+            assert!(
+                ProcVfs::new()
+                    .open(
+                        &format!("/proc/{carrier_pid}/net"),
+                        OpenFlags {
+                            read: true,
+                            directory: true,
+                            ..OpenFlags::default()
+                        },
+                        &open_ctx,
+                    )
+                    .is_err(),
+                "a host pid collision absent from this container must stay invisible"
+            );
+        }
     }
 
     /// `/proc/<peer>/task` lists the graph's own per-task thread claims. Asking

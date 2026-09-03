@@ -753,7 +753,7 @@ mod fs;
 pub(crate) use fs::RecordLockContentionFixture;
 pub use fs::StdioSink;
 mod keys;
-pub(crate) use fs::{LegacyAioContextId, SplicePushback};
+pub(crate) use fs::{LegacyAioContextId, MountRetirement, SplicePushback};
 #[macro_use]
 mod mem;
 #[macro_use]
@@ -782,7 +782,9 @@ pub use time::{
     HOST_FD_HEADROOM, guest_file_table_max, host_open_descriptor_count, raise_host_nofile_backing,
 };
 
-pub use proctitle::{init as proctitle_init, set_host_process_name};
+#[cfg(test)]
+pub(crate) use proctitle::carrier_proc_label;
+pub use proctitle::{init as proctitle_init, set_carrier_process_title, set_host_process_name};
 
 pub use crate::vfs::{ProcMapSharing, ProcMapsEntry};
 pub use abi_args::{Fd, GuestLen, GuestPtr, HostFd, HostPid, NsPid, Pid, Signal};
@@ -1097,6 +1099,100 @@ pub struct SyscallRequest {
     /// cheaply read it from the vCPU. Legacy/synthetic dispatch paths leave
     /// this absent.
     pub current_guest_sp: Option<u64>,
+}
+
+/// One immutable syscall identity plus the effective scalar arguments selected
+/// by the one-time preflight pipeline.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PreparedSyscall {
+    pub(crate) original_args: SyscallArgs,
+    pub(crate) request: SyscallRequest,
+}
+
+impl PreparedSyscall {
+    pub(crate) fn effective_info(&self) -> crate::observe::SyscallInfo<'_> {
+        crate::observe::SyscallInfo::new_effective(&self.request, self.original_args)
+    }
+}
+
+/// Result of the one-time interceptor and policy preflight.
+///
+/// Deliberately not `Clone`/`Copy`: terminal dispatch outcomes own continuation
+/// and descriptor state that must retain a single run-loop owner.
+pub(crate) enum PreparedDispatch {
+    Invoke(PreparedSyscall),
+    Complete {
+        syscall: PreparedSyscall,
+        outcome: DispatchOutcome,
+    },
+}
+
+/// Merge one policy-layer terminal result without letting a later layer weaken
+/// an earlier one. A signal death is stricter than an errno, which is stricter
+/// than seccomp's ABI-defined `ERRNO|0` successful return. Equal-strength
+/// outcomes preserve the earlier policy layer's deterministic decision.
+fn merge_policy_terminal(terminal: &mut Option<DispatchOutcome>, candidate: DispatchOutcome) {
+    fn restriction_rank(outcome: &DispatchOutcome) -> u8 {
+        match outcome {
+            DispatchOutcome::SignalDeath { .. } => 2,
+            DispatchOutcome::Errno { .. } => 1,
+            _ => 0,
+        }
+    }
+
+    let should_replace = match terminal.as_ref() {
+        Some(current) => restriction_rank(&candidate) > restriction_rank(current),
+        None => true,
+    };
+    if should_replace {
+        *terminal = Some(candidate);
+    }
+}
+
+/// Single owner for terminal syscall publication across deferred run-loop work.
+pub(crate) struct SyscallCompletionToken {
+    syscall: PreparedSyscall,
+    context: crate::kernel::KernelContext,
+    container_id: crate::kernel::container::ContainerId,
+    observers: Option<Arc<crate::observe::ObserverChain>>,
+}
+
+impl SyscallCompletionToken {
+    pub(crate) fn new(
+        syscall: PreparedSyscall,
+        context: crate::kernel::KernelContext,
+        observers: Option<Arc<crate::observe::ObserverChain>>,
+    ) -> Self {
+        let container_id = context.task().container().id();
+        Self {
+            syscall,
+            context,
+            container_id,
+            observers,
+        }
+    }
+
+    pub(crate) const fn syscall(&self) -> PreparedSyscall {
+        self.syscall
+    }
+
+    /// Publish a return only after the engine has accepted the actual guest
+    /// completion. Ownership of `self` makes duplicate publication impossible.
+    pub(crate) fn publish_return(self, reporter: &CompatReporter, value: i64) {
+        debug_assert_eq!(self.context.task().container().id(), self.container_id);
+        let info = self.syscall.effective_info();
+        let outcome = crate::observe::SyscallOutcome::from_retval(value);
+        reporter.record(CompatEvent::SyscallReturn {
+            number: info.number(),
+            name: ::std::borrow::Cow::Borrowed(info.name()),
+            retval: outcome.value,
+            errno: outcome.errno.map(LinuxErrno::get),
+        });
+        if let Some(observers) = self.observers {
+            let process = crate::observe::ProcessInfo::new(&self.context);
+            observers.on_syscall_return(&process, &info, &outcome);
+        }
+    }
 }
 
 /// Uniform context handed to every *normalized* syscall handler, so all
@@ -2043,44 +2139,6 @@ impl DispatchOutcome {
     pub fn errno(errno: LinuxErrno) -> Self {
         DispatchOutcome::Errno { errno }
     }
-
-    fn retval_errno(&self) -> (i64, Option<i32>) {
-        match self {
-            DispatchOutcome::Returned { value } => (*value, None),
-            DispatchOutcome::SchedulerYield => (0, None),
-            DispatchOutcome::Errno { errno } => (errno.guest_retval(), Some(errno.get())),
-            DispatchOutcome::Exit { code } => (*code as i64, None),
-            DispatchOutcome::SignalDeath { signum } => ((128 + *signum) as i64, None),
-            DispatchOutcome::Fork { .. } => (0, None),
-            DispatchOutcome::Execve { .. } => (0, None),
-            DispatchOutcome::SigReturn => (0, None),
-            DispatchOutcome::SetMemoryModel { .. } => (0, None),
-            DispatchOutcome::MapHostAlias { .. } => (0, None),
-            // CloneThread/ThreadExit/FutexWait are handled specially by the
-            // runtime and never flow through retval_errno — the runtime acts
-            // on them directly before any x0 write.
-            DispatchOutcome::CloneThread { .. } => (0, None),
-            DispatchOutcome::ThreadExit { .. } => (0, None),
-            DispatchOutcome::SignalThread { .. } => (0, None),
-            DispatchOutcome::FutexWait { .. } => (0, None),
-            DispatchOutcome::FutexWaitv { .. } => (0, None),
-            DispatchOutcome::SharedFutexWait { .. } => (0, None),
-            DispatchOutcome::SharedFutexWaitv { .. } => (0, None),
-            DispatchOutcome::SharedFutexWake { .. } => (0, None),
-            DispatchOutcome::SharedFutexRequeue { .. } => (0, None),
-            DispatchOutcome::WaitOnSharedWord { .. } => (0, None),
-            DispatchOutcome::WaitOnFds { .. } => (0, None),
-            DispatchOutcome::BlockingHostWrite(_) => (0, None),
-            DispatchOutcome::BlockingRecordLock(_) => (0, None),
-            DispatchOutcome::WaitOnFdsSelect { .. } => (0, None),
-            DispatchOutcome::WaitOnPollFds { .. } => (0, None),
-            DispatchOutcome::WaitOnProcExit { .. } => (0, None),
-            DispatchOutcome::WaitOnProcState { .. } => (0, None),
-            DispatchOutcome::WaitOnHvpatchChild { .. } => (0, None),
-            DispatchOutcome::WaitOnSignals { .. } => (0, None),
-            DispatchOutcome::WaitOnSleep { .. } => (0, None),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2146,6 +2204,10 @@ impl CurrentMmMemory for LinearMemory {}
 pub enum DispatchError {
     #[error("guest memory read length does not fit this host: {0}")]
     LengthTooLarge(u64),
+    #[error("syscall interceptor panicked in container {container_id:?}")]
+    InterceptorPanicked {
+        container_id: crate::kernel::ContainerId,
+    },
     /// A guest-visible errno. Unlike [`DispatchError::LengthTooLarge`] (which is
     /// a fatal, unrepresentable condition that aborts the run), this is lowered
     /// to a [`DispatchOutcome::Errno`] at the dispatch boundary
@@ -2432,6 +2494,28 @@ impl DispatchMmAuthority {
             mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
             guest_executors: Arc::new(crate::kernel::GuestExecutorCensus::default()),
             vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
+        }
+    }
+
+    /// Re-key the prepared root dispatcher onto the MM identity committed by
+    /// the carrier kernel graph.
+    ///
+    /// A dispatcher is assembled before carrier admission, so its mandatory
+    /// one-task reference binding has an MM id from a throwaway kernel. The
+    /// first carrier root happens to receive the same numeric id; later roots
+    /// do not. Preserve the prepared VMA state, but mint every coordination
+    /// object whose authority is defined by the exact committed MM.
+    fn rebind_prepared_root(&self, mm_id: crate::kernel::MmId) -> Self {
+        Self {
+            mm_id,
+            mem: Arc::clone(&self.mem),
+            host_alias_transactions: Arc::new(HostAliasTransactions::new()),
+            mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
+            guest_executors: Arc::new(crate::kernel::GuestExecutorCensus::default()),
+            vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(
+                self.vvar_realtime_epoch
+                    .load(std::sync::atomic::Ordering::Acquire),
+            ),
         }
     }
 
@@ -2970,6 +3054,19 @@ impl DispatchMmBinding {
         }
     }
 
+    fn rebind_prepared_root(&self, mm_id: crate::kernel::MmId) {
+        let staged = self.staged_exec.lock();
+        if staged.is_some() {
+            tracing::error!("cannot rebind a prepared root with a staged exec MM");
+            std::process::abort();
+        }
+        let current = self.current.load_full();
+        if current.mm_id != mm_id {
+            self.current
+                .store(Arc::new(current.rebind_prepared_root(mm_id)));
+        }
+    }
+
     fn begin_dispatch<'permit>(
         &self,
         permit: &'permit mm_mutation::HostAliasPermit<'_>,
@@ -3289,6 +3386,9 @@ pub struct SyscallDispatcher {
     /// Observer chain for syscall and lifecycle interception (container deny policy,
     /// compat reporting, audit, user observers). `None` when unconfined and no observers.
     observers: Option<Arc<crate::observe::ObserverChain>>,
+    /// Immutable trusted interceptor membership, sealed before guest boot and
+    /// inherited by exact `Arc` identity across logical process forks.
+    interceptors: Option<Arc<crate::observe::intercept::InterceptorChain>>,
     /// SysV IPC namespace shared by every logical process in this run.
     sysv: Arc<sysv::SysvIpcNamespace>,
     /// Per-process shmat/shmdt bookkeeping, inherited by value at fork.
@@ -3567,6 +3667,34 @@ impl Default for SyscallDispatcher {
 #[cfg(test)]
 mod core_publication_tests {
     use super::*;
+
+    #[test]
+    fn hvpatch_root_binding_rekeys_prepared_dispatch_mm_to_committed_kernel_mm() {
+        let dispatcher = SyscallDispatcher::new();
+        let prepared = dispatcher.mm_binding.current.load_full();
+        let prepared_mem = Arc::clone(&prepared.mem);
+        let (process, context) = crate::hvpatch::process_context_for_tests(41_201);
+        let committed_mm = context.shared().mm().id();
+        let wrong_raw = committed_mm.raw().checked_add(1).expect("test MM id");
+        let wrong_mm = crate::kernel::MmId::from_registry_allocation(
+            std::num::NonZeroU64::new(wrong_raw).expect("nonzero test MM id"),
+        );
+        dispatcher
+            .mm_binding
+            .current
+            .store(Arc::new(prepared.rebind_prepared_root(wrong_mm)));
+
+        dispatcher.bind_hvpatch_process_exact(process, &context, None);
+
+        let rebound = dispatcher.mm_binding.current.load_full();
+        assert_eq!(rebound.mm_id, committed_mm);
+        assert!(Arc::ptr_eq(&rebound.mem, &prepared_mem));
+        assert_eq!(rebound.mutation_coordinator.mm(), committed_mm);
+        let executor = dispatcher
+            .enter_mm_executor()
+            .expect("root executor admission");
+        assert_eq!(executor.mm_id(), committed_mm);
+    }
 
     struct FinalCleanupErrorBackend {
         inner: crate::fs_backend::MemoryBackend,
@@ -4613,12 +4741,28 @@ impl SyscallDispatcher {
                 tracing::error!(%error, "cannot capture HVPatch root filesystem context");
                 std::process::abort();
             });
+        self.bind_hvpatch_process_exact(process, &process_context, launch_fs_context);
+    }
+
+    /// Bind a newly prepared container root using the exact context returned
+    /// by its kernel transaction. This avoids recapturing through the registry
+    /// before a later root's atomic commit, while preserving every dispatcher
+    /// mount, interceptor, observer and filesystem setting already installed.
+    pub(crate) fn bind_hvpatch_process_exact(
+        &self,
+        process: crate::hvpatch::ProcessContext,
+        process_context: &crate::kernel::KernelContext,
+        launch_fs_context: Option<(String, Option<String>)>,
+    ) {
         if let Some((launch_cwd, launch_chroot_root)) = launch_fs_context {
             let process_fs_context = process_context.resources().fs_context();
             process_fs_context.set_cwd(launch_cwd);
             process_fs_context.set_chroot_root(launch_chroot_root);
         }
         HVPATCH_LANE.store(true, std::sync::atomic::Ordering::Release);
+        let namespace_pid = self.identity_snapshot(process_context).pid;
+        self.mm_binding
+            .rebind_prepared_root(process_context.shared().mm().id());
         process.bind_vma_source(self.vma_snapshot_source());
         let stage1 = process.stage1_mm_lease().unwrap_or_else(|error| {
             tracing::error!(%error, "cannot bind exact HVPatch stage-1 mutation authority");
@@ -4632,7 +4776,7 @@ impl SyscallDispatcher {
         // one-task adapter's host-PID credential projection is inapplicable.
         crate::cred_ipc::unpublish();
         let mut proc = self.proc.lock();
-        proc.virtual_pid = Some(process.pid() as u32);
+        proc.bind_hvpatch_identity(process.pid() as u32, namespace_pid);
         proc.hvpatch_process = Some(process);
     }
 
@@ -4867,17 +5011,13 @@ impl SyscallDispatcher {
 
     /// The network namespace the CALLING guest process belongs to.
     ///
-    /// Resolved through the kernel graph by exact task, because that is where
-    /// namespace membership lives; the root namespace is the answer only for
-    /// lanes with no task registry to ask (`run-elf`, the unit tests), where
-    /// there is exactly one guest process and it has never left the root.
-    pub(crate) fn caller_net_ns(&self) -> Arc<crate::kernel::NetNs> {
-        self.hvpatch_process()
-            .and_then(|process| process.kernel_graph().live_task(process.task_id()))
-            .map_or_else(
-                || Arc::clone(crate::kernel::root_net_ns()),
-                |task| task.net_ns(),
-            )
+    /// Resolved through the exact syscall context; no dispatcher-global root
+    /// exists for a second container to overwrite.
+    pub(crate) fn caller_net_ns(
+        &self,
+        context: &crate::kernel::KernelContext,
+    ) -> Arc<crate::kernel::NetNs> {
+        context.task().net_ns()
     }
 
     pub(crate) fn timer_delivery(&self) -> Option<Arc<dyn carrick_hal::TimerDelivery>> {
@@ -4950,26 +5090,40 @@ impl SyscallDispatcher {
         }
         let process = self.hvpatch_process()?;
         // ns-pid -> task id: the caller's number is the guest's namespace view.
-        let host = crate::namespace::pid::guest_pid_to_kernel(pid)?;
+        let namespace_id = u32::try_from(pid).ok()?;
+        let host = crate::namespace::pid::ns_to_kernel_for(context, namespace_id)?;
+        let host = i32::try_from(host).ok()?;
         let task = crate::kernel::TaskId::from_abi_positive(host).ok()?;
-        process.kernel_graph().live_task(task)
+        let task = process.kernel_graph().live_task(task)?;
+        (task.container().id() == context.container().id()).then_some(task)
     }
 
-    pub(crate) fn guest_process_target(&self, pid: i32) -> Option<GuestProcessTarget> {
+    pub(crate) fn guest_process_target(
+        &self,
+        context: &crate::kernel::KernelContext,
+        pid: i32,
+    ) -> Option<GuestProcessTarget> {
         let process = self.hvpatch_process()?;
-        // ns-pid -> task id, with a raw fallback so an unknown number still
-        // reports `Missing` rather than silently un-answering the question.
-        let pid = crate::namespace::pid::guest_pid_to_kernel(pid).unwrap_or(pid);
+        let namespace_id = u32::try_from(pid).ok()?;
+        let pid = crate::namespace::pid::ns_to_kernel_for(context, namespace_id)
+            .and_then(|pid| i32::try_from(pid).ok())?;
         let Ok(task) = crate::kernel::TaskId::from_abi_positive(pid) else {
             return None;
         };
         let kernel = process.kernel_graph();
-        if let Some(euid) = kernel.live_task_process_euid(task) {
-            return Some(GuestProcessTarget::Live { euid });
+        if let Some(target) = kernel.live_task(task) {
+            return (target.container().id() == context.container().id()).then(|| {
+                GuestProcessTarget::Live {
+                    euid: target.process_credentials().euid(),
+                }
+            });
         }
         Some(match kernel.registry().zombie(task) {
-            Some(zombie) => GuestProcessTarget::Zombie { euid: zombie.euid },
+            Some(zombie) if zombie.container == context.container().id() => {
+                GuestProcessTarget::Zombie { euid: zombie.euid }
+            }
             None => GuestProcessTarget::Missing,
+            Some(_) => GuestProcessTarget::Missing,
         })
     }
 
@@ -5119,6 +5273,7 @@ impl SyscallDispatcher {
             fs: self.fs.fork_clone(),
             seccomp: self.seccomp.fork_clone(),
             observers: self.observers.clone(),
+            interceptors: self.interceptors.clone(),
             sysv: Arc::clone(&self.sysv),
             sysv_process: Mutex::new(self.fork_sysv_process_attachments()),
             mqueue: Arc::clone(&self.mqueue),
@@ -5178,17 +5333,28 @@ impl SyscallDispatcher {
                 tracing::error!(?error, "dispatcher fork preparation failed");
                 std::process::abort()
             });
-        self.fork_clone_with_prepared_mm(
-            parent_mm_id,
-            child_mm_id,
-            parent_guest_pid,
-            child_guest_pid,
-            prepared_mm,
-        )
-        .unwrap_or_else(|_| {
-            tracing::error!("fork_clone_in_process_with_mm_mode stale revision");
-            std::process::abort()
-        })
+        let child = self
+            .fork_clone_with_prepared_mm(
+                parent_mm_id,
+                child_mm_id,
+                parent_guest_pid,
+                child_guest_pid,
+                prepared_mm,
+            )
+            .unwrap_or_else(|_| {
+                tracing::error!("fork_clone_in_process_with_mm_mode stale revision");
+                std::process::abort()
+            });
+        // This test-only helper does not publish the synthetic child through
+        // the kernel graph, where production binds the exact namespace-local
+        // identity before the child may execute. Its callers model the
+        // no-PID-namespace case, so complete that lifecycle step explicitly
+        // instead of weakening `identity_pid`'s fail-closed production check.
+        child
+            .proc
+            .lock()
+            .bind_hvpatch_identity(child_guest_pid, child_guest_pid);
+        child
     }
 
     #[cfg(test)]
@@ -5422,6 +5588,7 @@ impl SyscallDispatcher {
             seccomp: crate::seccomp::SeccompState::default(),
             // Unconfined until a frontend applies a policy or installs observers.
             observers: None,
+            interceptors: None,
             sysv: Arc::new(sysv::SysvIpcNamespace::new()),
             sysv_process: Mutex::new(sysv::SysvProcessAttachments::default()),
             mqueue: Arc::new(mqueue::MqueueRegistry::default()),
@@ -5824,20 +5991,15 @@ impl SyscallDispatcher {
         snapshot: Option<&crate::vfs::HostResolverSnapshot>,
     ) -> Self {
         let mut dispatcher = Self::new_with_host_resolver(snapshot);
-        // The run's own view replaces the boot-time host mirror in the ROOT
-        // network namespace, so every surface that renders from a namespace —
-        // `/sys/class/net`, the rtnetlink dumps — moves together. Previously the
-        // container modes RE-MOUNTED `/sys` with a private copy of the model
-        // and host mode did not, which left the default lane rendering
-        // `/sys/class/net` straight off `getifaddrs(3)`: the guest saw `en0`,
-        // `awdl0` and `utun0` there while rtnetlink advertised `lo` and `eth0`.
-        // Host mode is the exception, and deliberately: there the guest really
-        // does share the host's connectivity, so the view the root namespace
-        // seeded itself with — one mirror of the host wire, taken once — is the
-        // right answer and the spec has no addresses to offer.
-        if network.spec.mode != carrick_spec::NetworkMode::Host {
-            crate::kernel::publish_root_net_view(network.model.clone());
-        }
+        // Bare/reference-model callers do not subsequently install the
+        // product container that `Runtime::prepare` supplies. Give those
+        // callers one coherent namespace object now so `/sys`, rtnetlink,
+        // ioctls and `/proc/net` all render the exact supplied model. Build it
+        // from that model directly: probing a host mirror here and replacing
+        // it immediately is both wasted work and a transient wrong authority.
+        dispatcher.set_container(Arc::new(
+            crate::kernel::Container::for_reference_model_with_network(network.model.clone()),
+        ));
         if should_mount_network_resolv_conf(&network.model) {
             let contents = resolv_conf_contents_for_network(&network.model);
             dispatcher.fs.vfs_mounts_mut().mount(
@@ -5850,8 +6012,22 @@ impl SyscallDispatcher {
     }
 
     /// Install the container the root bootstrap boots into.
-    pub fn set_container(&self, container: Arc<crate::kernel::Container>) {
+    pub fn set_container(&mut self, container: Arc<crate::kernel::Container>) {
+        self.fs.vfs_mounts_mut().mount(
+            "/sys",
+            Box::new(crate::vfs::SysVfs::in_namespace(Arc::clone(
+                container.net_ns(),
+            ))),
+        );
         *self.container.write() = Some(container);
+    }
+
+    /// Seal this run's mount table for terminal retirement. Call only after
+    /// every image/spec/embed mount has been installed: holding the token is
+    /// intentionally an additional `Arc` owner, so later reconfiguration
+    /// would fail the dispatcher's pre-boot uniqueness invariant.
+    pub(crate) fn prepare_mount_retirement(&self) -> fs::MountRetirement {
+        fs::MountRetirement::new(self.container().id(), Arc::clone(&self.fs.vfs_mounts))
     }
 
     /// The container installed by `Runtime::execute`, if any. The HVPatch
@@ -5981,17 +6157,12 @@ impl SyscallDispatcher {
 
     /// Name the run's UTS namespace (`--hostname`, or the container name).
     ///
-    /// The name goes into the NAMESPACE, which is where a hostname lives on
-    /// Linux and what makes it shared: every task holds an `Arc` to the same
-    /// object, so a name set here is the name every guest process reads. The
-    /// per-dispatcher `ProcState.guest_hostname` copy this still writes is the
-    /// remaining fork-COPY, and the one place `uname(2)` reads; it is seeded
-    /// from the namespace and cannot yet diverge from it because `sethostname`
-    /// is EPERM, but it is the next thing to delete.
+    /// The name goes into this dispatcher's container namespace. Preparation
+    /// installs the final value before graph publication; this setter remains
+    /// for the one-task compatibility constructors.
     pub fn set_guest_hostname(&self, hostname: impl Into<String>) {
         let hostname = hostname.into();
-        crate::kernel::publish_root_nodename(&hostname);
-        self.proc.lock().guest_hostname = hostname;
+        self.container().uts_ns().set_nodename(&hostname);
     }
 
     pub(crate) fn request_signal_pump(&self) {
@@ -6115,6 +6286,36 @@ impl SyscallDispatcher {
             .kernel()
             .task_identity(context.task().key().id)
             .map_err(|error| CorePublicationError::KernelIdentity(error.to_string()))?;
+        let pid = u32::try_from(identity.task.id.raw())
+            .ok()
+            .and_then(|id| crate::namespace::pid::kernel_to_ns_for(context, id))
+            .and_then(|id| i32::try_from(id).ok())
+            .ok_or_else(|| {
+                CorePublicationError::KernelIdentity(
+                    "process is outside the caller's container namespace".to_owned(),
+                )
+            })?;
+        let ppid = identity.parent.map_or(0, |parent| {
+            u32::try_from(parent.id.raw())
+                .ok()
+                .and_then(|id| crate::namespace::pid::kernel_to_ns_for(context, id))
+                .and_then(|id| i32::try_from(id).ok())
+                .unwrap_or(0)
+        });
+        let pgrp = crate::namespace::pid::process_group_to_ns_for(context, identity.process_group)
+            .and_then(|id| i32::try_from(id).ok())
+            .ok_or_else(|| {
+                CorePublicationError::KernelIdentity(
+                    "process group is outside the caller's container namespace".to_owned(),
+                )
+            })?;
+        let session = crate::namespace::pid::session_to_ns_for(context, identity.session)
+            .and_then(|id| i32::try_from(id).ok())
+            .ok_or_else(|| {
+                CorePublicationError::KernelIdentity(
+                    "session is outside the caller's container namespace".to_owned(),
+                )
+            })?;
         let proc = self.proc.lock();
         let mem_authority_41 = self.mem();
         let mem = mem_authority_41.lock();
@@ -6149,10 +6350,10 @@ impl SyscallDispatcher {
             .rlim_cur;
         Ok(CoreProcessSnapshot {
             identity: crate::core_dump::ProcessIdentity {
-                pid: identity.task.id.raw(),
-                ppid: identity.parent.map_or(0, |parent| parent.id.raw()),
-                pgrp: identity.process_group.raw(),
-                session: identity.session.raw(),
+                pid,
+                ppid,
+                pgrp,
+                session,
                 comm: comm.clone(),
                 psargs,
             },
@@ -6646,13 +6847,14 @@ impl SyscallDispatcher {
         &self,
         path: &str,
         vdso: bool,
+        requires_syscall_traps: bool,
         needs_at_base: bool,
     ) -> Option<String> {
         use std::os::unix::fs::MetadataExt as _;
         let file = self.open_exec_host_file(path)?;
         let metadata = file.metadata().ok()?;
         Some(format!(
-            "{path}\0{}:{}:{}:{}:{}:{}:{}\0{}\0{}\0{}",
+            "{path}\0{}:{}:{}:{}:{}:{}:{}\0{}\0{}\0{}\0{}",
             metadata.dev(),
             metadata.ino(),
             metadata.size(),
@@ -6662,6 +6864,7 @@ impl SyscallDispatcher {
             metadata.ctime_nsec(),
             self.linux_page_size(),
             u8::from(vdso),
+            u8::from(requires_syscall_traps),
             u8::from(needs_at_base)
         ))
     }
@@ -6804,6 +7007,15 @@ impl SyscallDispatcher {
         // Only act when THIS is the last reference (the host fd is actually
         // closing) — a dup'd fd sharing the Arc keeps the writer/pty alive.
         let last_ref = open_file.description.fd_ref_count() == 1;
+        if last_ref
+            && carrick_signal_core::fasync::any_armed()
+            && let Some(pipe_id) = self.fasync_pipe_id_for_open_file(open_file)
+        {
+            // FASYNC is owned by the open file description, not by a numeric
+            // fd alias. Exact registration matching prevents the other end of
+            // a pipe (which shares the join key) from disarming this arm.
+            carrick_signal_core::fasync::disarm(pipe_id, open_file.description.id().raw());
+        }
         let mut pty_master_index = None;
         let mut fifo_writer_closed = false;
         let mut closing_inotify = None;
@@ -7111,15 +7323,10 @@ impl SyscallDispatcher {
             .set_controlling(host_slave_name, std::process::id())
     }
 
-    pub(crate) fn initialize_bound_controlling_tty(
-        &self,
-    ) -> Result<(), crate::kernel::KernelError> {
-        if self.fs.pty_table.lock().controlling().is_none() {
-            return Ok(());
+    pub(crate) fn initialize_controlling_tty_for(&self, context: &crate::kernel::KernelContext) {
+        if self.fs.pty_table.lock().controlling().is_some() {
+            context.kernel().initialize_launch_controlling_tty(context);
         }
-        let context = self.capture_one_task_context()?;
-        context.kernel().initialize_launch_controlling_tty(&context);
-        Ok(())
     }
 
     /// Single-threaded dispatch (legacy + unit tests + the fork-based runtime
@@ -7144,8 +7351,37 @@ impl SyscallDispatcher {
         reporter: &CompatReporter,
         lease: Option<&crate::kernel::objects::ThreadExecutionLease>,
     ) -> Result<DispatchOutcome, DispatchError> {
+        match self.prepare_syscall(kernel, request, reporter)? {
+            PreparedDispatch::Invoke(syscall) => {
+                self.dispatch_prepared_with_lease(kernel, syscall, memory, reporter, lease)
+            }
+            PreparedDispatch::Complete { outcome, .. } => Ok(outcome),
+        }
+    }
+
+    pub(crate) fn dispatch_prepared(
+        &mut self,
+        kernel: &crate::kernel::KernelContext,
+        syscall: PreparedSyscall,
+        memory: &mut impl CurrentMmMemory,
+        reporter: &CompatReporter,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        self.dispatch_prepared_with_lease(kernel, syscall, memory, reporter, None)
+    }
+
+    /// Handler-only single-threaded dispatch. Repeated readiness attempts reuse
+    /// the same prepared envelope and enter here without running preflight.
+    pub(crate) fn dispatch_prepared_with_lease(
+        &mut self,
+        kernel: &crate::kernel::KernelContext,
+        syscall: PreparedSyscall,
+        memory: &mut impl CurrentMmMemory,
+        reporter: &CompatReporter,
+        lease: Option<&crate::kernel::objects::ThreadExecutionLease>,
+    ) -> Result<DispatchOutcome, DispatchError> {
         // Tree-wide forward-progress beat for the deadlock watchdog.
         crate::deadlock_watchdog::tick();
+        let request = syscall.request;
         let mut executor = self
             .enter_mm_executor()
             .map_err(DispatchError::MmExecutorAdmission)?;
@@ -7272,6 +7508,25 @@ impl SyscallDispatcher {
         self.observers.as_ref()
     }
 
+    /// Append one trusted interceptor while the dispatcher is still being
+    /// prepared. Each registration replaces the stored immutable chain; no
+    /// execution-time mutation surface is exposed.
+    pub fn install_interceptor(
+        &mut self,
+        interceptor: Arc<dyn crate::observe::SyscallInterceptor>,
+    ) {
+        let chain = match self.interceptors.as_ref() {
+            Some(chain) => chain.with_appended(interceptor),
+            None => crate::observe::intercept::InterceptorChain::new(vec![interceptor]),
+        };
+        self.interceptors = Some(Arc::new(chain));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn interceptors(&self) -> Option<&Arc<crate::observe::intercept::InterceptorChain>> {
+        self.interceptors.as_ref()
+    }
+
     pub fn set_observers(&mut self, observers: Option<Arc<crate::observe::ObserverChain>>) {
         self.observers = observers;
     }
@@ -7335,11 +7590,148 @@ impl SyscallDispatcher {
         }
     }
 
+    /// Apply every one-time syscall transform and policy layer in the single
+    /// authoritative order, then publish the effective entry exactly once.
+    pub(crate) fn prepare_syscall(
+        &self,
+        kernel: &crate::kernel::KernelContext,
+        original: SyscallRequest,
+        reporter: &CompatReporter,
+    ) -> Result<PreparedDispatch, DispatchError> {
+        let original_args = original.args;
+        let process = crate::observe::ProcessInfo::new(kernel);
+        let interception = match self.interceptors.as_ref() {
+            Some(chain) => chain.apply(&process, &original)?,
+            None => crate::observe::intercept::Interception {
+                effective_args: original_args,
+                proposed: None,
+            },
+        };
+        let mut syscall = PreparedSyscall {
+            original_args,
+            request: SyscallRequest {
+                args: interception.effective_args,
+                ..original
+            },
+        };
+        let mut terminal = None;
+
+        // Launch policy is authoritative over a trusted interceptor proposal.
+        if let Some(chain) = self.observers.as_ref()
+            && let Some(action) = chain.check_policy(&process, &syscall.effective_info())
+        {
+            match action {
+                crate::observe::SyscallAction::Allow => {}
+                crate::observe::SyscallAction::Deny(errno) => {
+                    reporter.record(CompatEvent::partial_syscall(
+                        syscall.request.number.raw(),
+                        syscall.effective_info().name(),
+                        syscall.request.args,
+                        "denied by launch-time container syscall policy (Docker default-seccomp model)",
+                    ));
+                    merge_policy_terminal(&mut terminal, DispatchOutcome::Errno { errno });
+                }
+                crate::observe::SyscallAction::Kill(signal) => {
+                    merge_policy_terminal(
+                        &mut terminal,
+                        DispatchOutcome::SignalDeath { signum: signal.0 },
+                    );
+                }
+                crate::observe::SyscallAction::Short(count) => {
+                    if crate::observe::is_shortable_syscall(syscall.request.number) {
+                        syscall.request.args.0[2] =
+                            (syscall.request.args.0[2] as usize).min(count) as u64;
+                    }
+                }
+            }
+        }
+
+        // Guest seccomp validates the effective request and may veto a proposal.
+        if let Some(outcome) = self.seccomp_precheck(&syscall.request) {
+            merge_policy_terminal(&mut terminal, outcome);
+        }
+
+        // User observers see the same effective request the handler will receive.
+        if let Some(chain) = self.observers.as_ref()
+            && chain.has_user_observers()
+        {
+            match chain.on_user_syscall(&process, &syscall.effective_info()) {
+                crate::observe::SyscallAction::Allow => {}
+                crate::observe::SyscallAction::Deny(errno) => {
+                    merge_policy_terminal(&mut terminal, DispatchOutcome::Errno { errno });
+                }
+                crate::observe::SyscallAction::Kill(signal) => {
+                    merge_policy_terminal(
+                        &mut terminal,
+                        DispatchOutcome::SignalDeath { signum: signal.0 },
+                    );
+                }
+                crate::observe::SyscallAction::Short(count) => {
+                    if crate::observe::is_shortable_syscall(syscall.request.number) {
+                        syscall.request.args.0[2] =
+                            (syscall.request.args.0[2] as usize).min(count) as u64;
+                    }
+                }
+            }
+        }
+
+        // CPU/resource policy remains a one-time entry check and cannot be
+        // bypassed by a trusted terminal proposal.
+        if terminal.is_none()
+            && let Err(outcome) = time::check_cpu_limits(kernel)
+        {
+            terminal = Some(outcome);
+        }
+
+        let name = syscall.effective_info().name();
+        for (number, arg_index, mask) in SYSCALL_FLAG_VALIDATORS {
+            if *number == syscall.request.number.raw() {
+                check_syscall_flags(
+                    reporter,
+                    syscall.request.number.raw(),
+                    name,
+                    *arg_index,
+                    syscall.request.arg(*arg_index as usize),
+                    *mask,
+                );
+            }
+        }
+        reporter.record(CompatEvent::SyscallEntry {
+            number: syscall.request.number.raw(),
+            name: ::std::borrow::Cow::Borrowed(name),
+            args: syscall.request.args,
+        });
+        if syscall.original_args != syscall.request.args {
+            reporter.record(CompatEvent::SyscallRewrite {
+                number: syscall.request.number.raw(),
+                name: ::std::borrow::Cow::Borrowed(name),
+                original_args: syscall.original_args,
+                effective_args: syscall.request.args,
+            });
+        }
+
+        let proposed = interception.proposed.map(|outcome| match outcome.errno {
+            Some(errno) => DispatchOutcome::Errno { errno },
+            None => DispatchOutcome::Returned {
+                value: outcome.value,
+            },
+        });
+        match terminal.or(proposed) {
+            Some(outcome) => Ok(PreparedDispatch::Complete { syscall, outcome }),
+            None => Ok(PreparedDispatch::Invoke(syscall)),
+        }
+    }
+
     pub(crate) fn identity_fast_path_enabled(&self) -> bool {
         // The EL1 shim answers identity syscalls without a dispatch, so it must
         // be off whenever a guest filter is active OR an observer requests full visibility.
-        !self.seccomp.is_active()
-            && !self.observers.as_ref().is_some_and(|chain| {
+        !self.requires_syscall_traps()
+    }
+
+    pub(crate) fn requires_syscall_traps(&self) -> bool {
+        self.interceptors.is_some()
+            || self.seccomp.is_active()
+            || self.observers.as_ref().is_some_and(|chain| {
                 chain.wants_fast_path_visibility() == crate::observe::FastPathVisibility::Required
             })
     }
@@ -7349,9 +7741,11 @@ impl SyscallDispatcher {
     /// returned atomic word from 1 to 0 before publishing their filter.
     #[allow(dead_code)]
     pub(crate) fn identity_fast_path_word(&self) -> Option<&std::sync::atomic::AtomicU32> {
-        if self.observers.as_ref().is_some_and(|chain| {
-            chain.wants_fast_path_visibility() == crate::observe::FastPathVisibility::Required
-        }) {
+        if self.interceptors.is_some()
+            || self.observers.as_ref().is_some_and(|chain| {
+                chain.wants_fast_path_visibility() == crate::observe::FastPathVisibility::Required
+            })
+        {
             None
         } else {
             Some(self.seccomp.identity_fast_path_word())
@@ -7397,32 +7791,6 @@ impl SyscallDispatcher {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn dispatch_threaded_with_mm_executor_and_lease(
-        &self,
-        executor: &mut MmExecutorParticipation,
-        kernel: &crate::kernel::KernelContext,
-        request: SyscallRequest,
-        memory: &mut impl CurrentMmMemory,
-        reporter: &CompatReporter,
-        tid: crate::thread::ThreadId,
-        registry: &crate::thread::ThreadRegistry,
-        futex: &crate::thread::FutexTable,
-        lease: Option<&crate::kernel::objects::ThreadExecutionLease>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        self.dispatch_threaded_with_executor_and_lease(
-            kernel,
-            request,
-            memory,
-            reporter,
-            tid,
-            registry,
-            futex,
-            lease,
-            Some(executor),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
     fn dispatch_threaded_with_executor_and_lease(
         &self,
         kernel: &crate::kernel::KernelContext,
@@ -7435,9 +7803,65 @@ impl SyscallDispatcher {
         lease: Option<&crate::kernel::objects::ThreadExecutionLease>,
         mm_executor: Option<&mut MmExecutorParticipation>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        self.dispatch_threaded_with_route(
+        match self.prepare_syscall(kernel, request, reporter)? {
+            PreparedDispatch::Invoke(syscall) => self
+                .dispatch_threaded_prepared_with_executor_and_lease(
+                    kernel,
+                    syscall,
+                    memory,
+                    reporter,
+                    tid,
+                    registry,
+                    futex,
+                    lease,
+                    mm_executor,
+                ),
+            PreparedDispatch::Complete { outcome, .. } => Ok(outcome),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_threaded_prepared_with_mm_executor_and_lease(
+        &self,
+        executor: &mut MmExecutorParticipation,
+        kernel: &crate::kernel::KernelContext,
+        syscall: PreparedSyscall,
+        memory: &mut impl CurrentMmMemory,
+        reporter: &CompatReporter,
+        tid: crate::thread::ThreadId,
+        registry: &crate::thread::ThreadRegistry,
+        futex: &crate::thread::FutexTable,
+        lease: Option<&crate::kernel::objects::ThreadExecutionLease>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        self.dispatch_threaded_prepared_with_executor_and_lease(
             kernel,
-            request,
+            syscall,
+            memory,
+            reporter,
+            tid,
+            registry,
+            futex,
+            lease,
+            Some(executor),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_threaded_prepared_with_executor_and_lease(
+        &self,
+        kernel: &crate::kernel::KernelContext,
+        syscall: PreparedSyscall,
+        memory: &mut impl CurrentMmMemory,
+        reporter: &CompatReporter,
+        tid: crate::thread::ThreadId,
+        registry: &crate::thread::ThreadRegistry,
+        futex: &crate::thread::FutexTable,
+        lease: Option<&crate::kernel::objects::ThreadExecutionLease>,
+        mm_executor: Option<&mut MmExecutorParticipation>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        self.dispatch_threaded_prepared_with_route(
+            kernel,
+            syscall,
             memory,
             reporter,
             tid,
@@ -7467,20 +7891,30 @@ impl SyscallDispatcher {
         if !executor.authorizes(&authority) || executor.mm_id() != kernel.shared().mm().id() {
             return Err(DispatchError::MmMutationPeerExecutor);
         }
-        if syscall_requires_mm_mutation(request.number.raw(), request.args) {
-            let coordinator = executor.mutation_coordinator();
-            crate::vcpu_loop::with_sole_mm_stage1(executor, |outer| {
-                let mut guard =
-                    mm_mutation::from_sole_executor(outer, coordinator, kernel.shared().mm().id());
-                self.dispatch_threaded_mutation(
-                    kernel, request, memory, reporter, tid, registry, futex, &mut guard,
-                )
-            })
-            .ok_or(DispatchError::MmMutationPeerExecutor)?
-        } else {
-            self.dispatch_threaded_with_mm_executor_and_lease(
-                executor, kernel, request, memory, reporter, tid, registry, futex, None,
-            )
+        match self.prepare_syscall(kernel, request, reporter)? {
+            PreparedDispatch::Complete { outcome, .. } => Ok(outcome),
+            PreparedDispatch::Invoke(syscall) => {
+                if syscall_requires_mm_mutation(syscall.request.number.raw(), syscall.request.args)
+                {
+                    let coordinator = executor.mutation_coordinator();
+                    crate::vcpu_loop::with_sole_mm_stage1(executor, |outer| {
+                        let mut guard = mm_mutation::from_sole_executor(
+                            outer,
+                            coordinator,
+                            kernel.shared().mm().id(),
+                        );
+                        self.dispatch_threaded_prepared_mutation_with_lease(
+                            kernel, syscall, memory, reporter, tid, registry, futex, &mut guard,
+                            None,
+                        )
+                    })
+                    .ok_or(DispatchError::MmMutationPeerExecutor)?
+                } else {
+                    self.dispatch_threaded_prepared_with_mm_executor_and_lease(
+                        executor, kernel, syscall, memory, reporter, tid, registry, futex, None,
+                    )
+                }
+            }
         }
     }
 
@@ -7496,39 +7930,30 @@ impl SyscallDispatcher {
         registry: &crate::thread::ThreadRegistry,
         futex: &crate::thread::FutexTable,
     ) -> Result<DispatchOutcome, DispatchError> {
-        if syscall_requires_mm_mutation(request.number.raw(), request.args) {
-            mm_mutation::test_support::with_guard(self.mm_mutation_coordinator(), |guard| {
-                self.dispatch_threaded_mutation(
-                    kernel, request, memory, reporter, tid, registry, futex, guard,
-                )
-            })
-        } else {
-            self.dispatch_threaded(kernel, request, memory, reporter, tid, registry, futex)
+        match self.prepare_syscall(kernel, request, reporter)? {
+            PreparedDispatch::Complete { outcome, .. } => Ok(outcome),
+            PreparedDispatch::Invoke(syscall) => {
+                if syscall_requires_mm_mutation(syscall.request.number.raw(), syscall.request.args)
+                {
+                    mm_mutation::test_support::with_guard(self.mm_mutation_coordinator(), |guard| {
+                        self.dispatch_threaded_prepared_mutation_with_lease(
+                            kernel, syscall, memory, reporter, tid, registry, futex, guard, None,
+                        )
+                    })
+                } else {
+                    self.dispatch_threaded_prepared_with_executor_and_lease(
+                        kernel, syscall, memory, reporter, tid, registry, futex, None, None,
+                    )
+                }
+            }
         }
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn dispatch_threaded_mutation(
+    pub(crate) fn dispatch_threaded_prepared_mutation_with_lease(
         &self,
         kernel: &crate::kernel::KernelContext,
-        request: SyscallRequest,
-        memory: &mut impl CurrentMmMemory,
-        reporter: &CompatReporter,
-        tid: crate::thread::ThreadId,
-        registry: &crate::thread::ThreadRegistry,
-        futex: &crate::thread::FutexTable,
-        guard: &mut mm_mutation::MmMutationGuard<'_>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        self.dispatch_threaded_mutation_with_lease(
-            kernel, request, memory, reporter, tid, registry, futex, guard, None,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn dispatch_threaded_mutation_with_lease(
-        &self,
-        kernel: &crate::kernel::KernelContext,
-        request: SyscallRequest,
+        syscall: PreparedSyscall,
         memory: &mut impl CurrentMmMemory,
         reporter: &CompatReporter,
         tid: crate::thread::ThreadId,
@@ -7537,9 +7962,9 @@ impl SyscallDispatcher {
         guard: &mut mm_mutation::MmMutationGuard<'_>,
         lease: Option<&crate::kernel::objects::ThreadExecutionLease>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        self.dispatch_threaded_with_route(
+        self.dispatch_threaded_prepared_with_route(
             kernel,
-            request,
+            syscall,
             memory,
             reporter,
             tid,
@@ -7550,10 +7975,10 @@ impl SyscallDispatcher {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn dispatch_threaded_with_route<R: NormalizedDispatchRoute>(
+    fn dispatch_threaded_prepared_with_route<R: NormalizedDispatchRoute>(
         &self,
         kernel: &crate::kernel::KernelContext,
-        mut request: SyscallRequest,
+        syscall: PreparedSyscall,
         memory: &mut impl CurrentMmMemory,
         reporter: &CompatReporter,
         tid: crate::thread::ThreadId,
@@ -7561,72 +7986,7 @@ impl SyscallDispatcher {
         futex: &crate::thread::FutexTable,
         mut route: R,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let p = crate::observe::ProcessInfo::new(kernel);
-
-        // 1. Policy observer precheck (first built-in observer in the chain)
-        if let Some(ref chain) = self.observers {
-            let action = {
-                let s = crate::observe::SyscallInfo::new(&request);
-                chain.check_policy(&p, &s)
-            };
-            if let Some(action) = action {
-                match action {
-                    crate::observe::SyscallAction::Allow => {}
-                    crate::observe::SyscallAction::Deny(errno) => {
-                        let name = crate::observe::SyscallInfo::new(&request).name();
-                        reporter.record(CompatEvent::partial_syscall(
-                            request.number.raw(),
-                            name,
-                            request.args,
-                            "denied by launch-time container syscall policy (Docker default-seccomp model)",
-                        ));
-                        return Ok(DispatchOutcome::Errno { errno });
-                    }
-                    crate::observe::SyscallAction::Kill(sig) => {
-                        return Ok(DispatchOutcome::SignalDeath { signum: sig.0 });
-                    }
-                    crate::observe::SyscallAction::Short(n) => {
-                        if crate::observe::is_shortable_syscall(request.number) {
-                            request.args.0[2] = (request.args.0[2] as usize).min(n) as u64;
-                        }
-                    }
-                }
-            }
-        }
-
-        // 2. seccomp veto applies before user observers and handlers
-        if let Some(outcome) = self.seccomp_precheck(&request) {
-            return Ok(outcome);
-        }
-
-        // 3. User observers
-        if let Some(ref chain) = self.observers {
-            if chain.has_user_observers() {
-                let action = {
-                    let s = crate::observe::SyscallInfo::new(&request);
-                    chain.on_user_syscall(&p, &s)
-                };
-                match action {
-                    crate::observe::SyscallAction::Allow => {}
-                    crate::observe::SyscallAction::Deny(errno) => {
-                        return Ok(DispatchOutcome::Errno { errno });
-                    }
-                    crate::observe::SyscallAction::Kill(sig) => {
-                        return Ok(DispatchOutcome::SignalDeath { signum: sig.0 });
-                    }
-                    crate::observe::SyscallAction::Short(n) => {
-                        if crate::observe::is_shortable_syscall(request.number) {
-                            request.args.0[2] = (request.args.0[2] as usize).min(n) as u64;
-                        }
-                    }
-                }
-            }
-        }
-
-        // 4. CPU limits and budget check
-        if let Err(outcome) = time::check_cpu_limits(kernel) {
-            return Ok(outcome);
-        }
+        let request = syscall.request;
 
         // The calling MM's vDSO realtime word follows a guest `clock_settime`
         // made by any process (one atomic compare when nothing changed).
@@ -7668,32 +8028,14 @@ impl SyscallDispatcher {
 
         let syscall = lookup_aarch64(request.number.raw());
         let name = syscall.map_or("unknown", |syscall| syscall.name);
-        reporter.record(CompatEvent::SyscallEntry {
-            number: request.number.raw(),
-            name: ::std::borrow::Cow::Borrowed(name),
-            args: request.args,
-        });
-
-        let outcome = {
-            reporter.record(CompatEvent::unhandled_syscall(
-                request.number.raw(),
-                name,
-                request.args,
-            ));
-            DispatchOutcome::Errno {
-                errno: LINUX_ENOSYS,
-            }
-        };
-
-        let (retval, errno) = outcome.retval_errno();
-        reporter.record(CompatEvent::SyscallReturn {
-            number: request.number.raw(),
-            name: ::std::borrow::Cow::Borrowed(name),
-            retval,
-            errno,
-        });
-
-        Ok(outcome)
+        reporter.record(CompatEvent::unhandled_syscall(
+            request.number.raw(),
+            name,
+            request.args,
+        ));
+        Ok(DispatchOutcome::Errno {
+            errno: LINUX_ENOSYS,
+        })
     }
 
     /// Shared threaded dispatch path for subsystems already moved behind
@@ -7721,29 +8063,6 @@ impl SyscallDispatcher {
         if !Self::dispatch_normalized_known(request.number.raw()) {
             return None;
         }
-
-        let syscall = lookup_aarch64(request.number.raw());
-        let name = syscall.map_or("unknown", |syscall| syscall.name);
-
-        for (nr, arg_index, mask) in SYSCALL_FLAG_VALIDATORS {
-            if *nr == request.number.raw() {
-                let value = request.arg(*arg_index as usize);
-                check_syscall_flags(
-                    reporter,
-                    request.number.raw(),
-                    name,
-                    *arg_index,
-                    value,
-                    *mask,
-                );
-            }
-        }
-
-        reporter.record(CompatEvent::SyscallEntry {
-            number: request.number.raw(),
-            name: ::std::borrow::Cow::Borrowed(name),
-            args: request.args,
-        });
 
         #[cfg(feature = "watchpoint")]
         if let Some(addr) = watch_addr()
@@ -7778,14 +8097,6 @@ impl SyscallDispatcher {
         resources::with_captured_resources(kernel, || {
             self.epoll_rearm_after_io(&request, &outcome);
         });
-        let (retval, errno) = outcome.retval_errno();
-        reporter.record(CompatEvent::SyscallReturn {
-            number: request.number.raw(),
-            name: ::std::borrow::Cow::Borrowed(name),
-            retval,
-            errno,
-        });
-
         Some(Ok(outcome))
     }
 
@@ -7810,41 +8121,47 @@ impl SyscallDispatcher {
         match request.number.raw() {
             130 => {
                 let target =
-                    crate::thread::ThreadId::from_guest_supplied_tid(request.arg(0) as i32);
+                    crate::namespace::pid::guest_tid_to_kernel_for(kernel, request.arg(0) as i32)
+                        .map(crate::thread::ThreadId::from_guest_supplied_tid);
                 let signum = request.arg(1);
-                if signum <= LINUX_MAX_SIGNUM && (target == tid || !registry.is_live(target)) {
+                if signum <= LINUX_MAX_SIGNUM
+                    && target.is_none_or(|target| target == tid || !registry.is_live(target))
+                {
                     return None;
                 }
             }
             131 => {
                 let target =
-                    crate::thread::ThreadId::from_guest_supplied_tid(request.arg(1) as i32);
+                    crate::namespace::pid::guest_tid_to_kernel_for(kernel, request.arg(1) as i32)
+                        .map(crate::thread::ThreadId::from_guest_supplied_tid);
                 let signum = request.arg(2);
-                if signum <= LINUX_MAX_SIGNUM && (target == tid || !registry.is_live(target)) {
+                if signum <= LINUX_MAX_SIGNUM
+                    && target.is_none_or(|target| target == tid || !registry.is_live(target))
+                {
                     return None;
                 }
             }
             _ => {}
         }
 
-        let syscall = lookup_aarch64(request.number.raw());
-        let name = syscall.map_or("unknown", |syscall| syscall.name);
-        reporter.record(CompatEvent::SyscallEntry {
-            number: request.number.raw(),
-            name: ::std::borrow::Cow::Borrowed(name),
-            args: request.args,
-        });
-
         let outcome = match request.number.raw() {
             96 => {
                 let addr = request.arg(0);
                 registry.set_clear_child_tid(tid, addr);
-                // set_tid_address(2) returns the caller's TID from the kernel context.
-                let visible = i64::from(kernel.thread().key().tid.raw());
-                DispatchOutcome::Returned { value: visible }
+                let Some(visible) = u32::try_from(kernel.thread().key().tid.raw())
+                    .ok()
+                    .and_then(|tid| crate::namespace::pid::kernel_to_ns_for(kernel, tid))
+                else {
+                    return Some(Ok(DispatchOutcome::errno(LINUX_ESRCH)));
+                };
+                DispatchOutcome::Returned {
+                    value: i64::from(visible),
+                }
             }
             98 => {
-                let hvpatch_linux_tid = u32::try_from(kernel.thread().key().tid.raw()).ok();
+                let hvpatch_linux_tid = u32::try_from(kernel.thread().key().tid.raw())
+                    .ok()
+                    .and_then(|tid| crate::namespace::pid::kernel_to_ns_for(kernel, tid));
                 let clock = Arc::clone(kernel.task().container().clock());
                 dispatch_threaded_futex(
                     &clock,
@@ -7883,7 +8200,7 @@ impl SyscallDispatcher {
                         crate::linux_abi::LinuxSiginfo::kill(
                             signum as i32,
                             crate::linux_abi::LINUX_SI_TKILL,
-                            kernel.task().key().id.raw(),
+                            crate::dispatch::signal::ns_visible_sender_pid(kernel),
                             kernel.resources().credentials().ruid().raw(),
                         )
                     });
@@ -7900,7 +8217,7 @@ impl SyscallDispatcher {
                         crate::linux_abi::LinuxSiginfo::kill(
                             signum as i32,
                             crate::linux_abi::LINUX_SI_TKILL,
-                            kernel.task().key().id.raw(),
+                            crate::dispatch::signal::ns_visible_sender_pid(kernel),
                             kernel.resources().credentials().ruid().raw(),
                         )
                     });
@@ -7914,8 +8231,11 @@ impl SyscallDispatcher {
                     .unwrap_or_else(|| DispatchOutcome::errno(LINUX_ESRCH))
                 }
             }
-            178 => DispatchOutcome::Returned {
-                value: i64::from(crate::vcpu_loop::ns_visible_guest_tid(self, kernel)),
+            178 => match crate::vcpu_loop::ns_visible_guest_tid(self, kernel) {
+                Some(tid) => DispatchOutcome::Returned {
+                    value: i64::from(tid),
+                },
+                None => DispatchOutcome::errno(LINUX_ESRCH),
             },
             449 => {
                 let clock = Arc::clone(kernel.task().container().clock());
@@ -7935,21 +8255,13 @@ impl SyscallDispatcher {
             },
         };
 
-        let (retval, errno) = outcome.retval_errno();
-        reporter.record(CompatEvent::SyscallReturn {
-            number: request.number.raw(),
-            name: ::std::borrow::Cow::Borrowed(name),
-            retval,
-            errno,
-        });
-
         Some(Ok(outcome))
     }
 
     fn dispatch_inner<R: NormalizedDispatchRoute>(
         &mut self,
         kernel: &crate::kernel::KernelContext,
-        mut request: SyscallRequest,
+        request: SyscallRequest,
         memory: &mut impl CurrentMmMemory,
         reporter: &CompatReporter,
         thread: Option<ThreadCtx>,
@@ -7957,101 +8269,6 @@ impl SyscallDispatcher {
     ) -> Result<DispatchOutcome, DispatchError> {
         let syscall = lookup_aarch64(request.number.raw());
         let name = syscall.map_or("unknown", |syscall| syscall.name);
-
-        reporter.record(CompatEvent::SyscallEntry {
-            number: request.number.raw(),
-            name: ::std::borrow::Cow::Borrowed(name),
-            args: request.args,
-        });
-
-        let p = crate::observe::ProcessInfo::new(kernel);
-
-        // 1. Policy observer precheck (first built-in observer in the chain)
-        if let Some(ref chain) = self.observers {
-            let action = {
-                let s = crate::observe::SyscallInfo::new(&request);
-                chain.check_policy(&p, &s)
-            };
-            if let Some(action) = action {
-                match action {
-                    crate::observe::SyscallAction::Allow => {}
-                    crate::observe::SyscallAction::Deny(errno) => {
-                        let name = crate::observe::SyscallInfo::new(&request).name();
-                        reporter.record(CompatEvent::partial_syscall(
-                            request.number.raw(),
-                            name,
-                            request.args,
-                            "denied by launch-time container syscall policy (Docker default-seccomp model)",
-                        ));
-                        let (retval, errno_val) = (errno.guest_retval(), Some(errno.get()));
-                        reporter.record(CompatEvent::SyscallReturn {
-                            number: request.number.raw(),
-                            name: ::std::borrow::Cow::Borrowed(name),
-                            retval,
-                            errno: errno_val,
-                        });
-                        return Ok(DispatchOutcome::Errno { errno });
-                    }
-                    crate::observe::SyscallAction::Kill(sig) => {
-                        return Ok(DispatchOutcome::SignalDeath { signum: sig.0 });
-                    }
-                    crate::observe::SyscallAction::Short(n) => {
-                        if crate::observe::is_shortable_syscall(request.number) {
-                            request.args.0[2] = (request.args.0[2] as usize).min(n) as u64;
-                        }
-                    }
-                }
-            }
-        }
-
-        // 2. seccomp: installed cBPF filters get to veto the syscall before its
-        // handler runs (ERRNO / kill), mirroring the kernel's pre-syscall check.
-        if let Some(outcome) = self.seccomp_precheck(&request) {
-            let (retval, errno) = outcome.retval_errno();
-            reporter.record(CompatEvent::SyscallReturn {
-                number: request.number.raw(),
-                name: ::std::borrow::Cow::Borrowed(name),
-                retval,
-                errno,
-            });
-            return Ok(outcome);
-        }
-
-        // 3. User observers
-        if let Some(ref chain) = self.observers {
-            if chain.has_user_observers() {
-                let action = {
-                    let s = crate::observe::SyscallInfo::new(&request);
-                    chain.on_user_syscall(&p, &s)
-                };
-                match action {
-                    crate::observe::SyscallAction::Allow => {}
-                    crate::observe::SyscallAction::Deny(errno) => {
-                        let (retval, errno_val) = (errno.guest_retval(), Some(errno.get()));
-                        reporter.record(CompatEvent::SyscallReturn {
-                            number: request.number.raw(),
-                            name: ::std::borrow::Cow::Borrowed(name),
-                            retval,
-                            errno: errno_val,
-                        });
-                        return Ok(DispatchOutcome::Errno { errno });
-                    }
-                    crate::observe::SyscallAction::Kill(sig) => {
-                        return Ok(DispatchOutcome::SignalDeath { signum: sig.0 });
-                    }
-                    crate::observe::SyscallAction::Short(n) => {
-                        if crate::observe::is_shortable_syscall(request.number) {
-                            request.args.0[2] = (request.args.0[2] as usize).min(n) as u64;
-                        }
-                    }
-                }
-            }
-        }
-
-        // 4. CPU limits and budget check
-        if let Err(outcome) = time::check_cpu_limits(kernel) {
-            return Ok(outcome);
-        }
 
         // The calling MM's vDSO realtime word follows a guest `clock_settime`
         // made by any process (see `dispatch_threaded`).
@@ -8075,25 +8292,6 @@ impl SyscallDispatcher {
             crate::probes::mem_watch(request.number.raw(), addr, u64::from_le_bytes(le));
         }
 
-        // Systematic unknown-flag check. For each syscall whose flag
-        // argument has a well-defined supported mask, validate the
-        // bits BEFORE the handler runs. The handler still executes
-        // (it makes its own EINVAL decisions); this just guarantees
-        // a structured report entry whenever a bit drifts.
-        for (nr, arg_index, mask) in SYSCALL_FLAG_VALIDATORS {
-            if *nr == request.number.raw() {
-                let value = request.arg(*arg_index as usize);
-                check_syscall_flags(
-                    reporter,
-                    request.number.raw(),
-                    name,
-                    *arg_index,
-                    value,
-                    *mask,
-                );
-            }
-        }
-
         // Syscalls migrated to the normalized SyscallCtx handler contract are
         // dispatched here first; the borrow of memory/reporter is scoped to
         // the call, so the legacy match below can still use them for the rest.
@@ -8102,13 +8300,6 @@ impl SyscallDispatcher {
             // Consumption-based EPOLLET re-arm (see `epoll_rearm_after_io`).
             resources::with_captured_resources(kernel, || {
                 self.epoll_rearm_after_io(&request, &outcome);
-            });
-            let (retval, errno) = outcome.retval_errno();
-            reporter.record(CompatEvent::SyscallReturn {
-                number: request.number.raw(),
-                name: ::std::borrow::Cow::Borrowed(name),
-                retval,
-                errno,
             });
             return Ok(outcome);
         }
@@ -8123,19 +8314,9 @@ impl SyscallDispatcher {
             name,
             request.args,
         ));
-        let outcome = DispatchOutcome::Errno {
+        Ok(DispatchOutcome::Errno {
             errno: LINUX_ENOSYS,
-        };
-
-        let (retval, errno) = outcome.retval_errno();
-        reporter.record(CompatEvent::SyscallReturn {
-            number: request.number.raw(),
-            name: ::std::borrow::Cow::Borrowed(name),
-            retval,
-            errno,
-        });
-
-        Ok(outcome)
+        })
     }
 
     // ------------------------------------------------------------------
@@ -8153,6 +8334,27 @@ impl SyscallDispatcher {
     //   - sockaddr_in / sockaddr_un layout (BSD has sin_len)  (BSD-only)
     //   - many Linux-specific `SOL_*` levels                  (we ENOPROTOOPT)
     // ------------------------------------------------------------------
+}
+
+#[cfg(test)]
+mod mount_retirement_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_mount_retirement_waits_for_every_dispatch_and_archive_alias() {
+        let dispatcher = SyscallDispatcher::new();
+        let expected = dispatcher.fs.vfs_mounts.len();
+        let archive = dispatcher.archive_authority();
+        let mut retirement = dispatcher.prepare_mount_retirement();
+
+        assert!(retirement.prepare().is_err());
+        drop(dispatcher);
+        assert!(retirement.prepare().is_err());
+        drop(archive);
+
+        retirement.prepare().expect("terminal mount owner");
+        assert_eq!(retirement.clear(), expected);
+    }
 }
 
 /// Untyped guest-memory write. Prefer [`write_kernel_struct`] over this
@@ -9084,7 +9286,7 @@ fn is_stdio_fd(fd: i32) -> bool {
 /// a real TTY) instead of skip. Consulting the real host fd is the
 /// Darwin-native ground truth and also fixes the interactive `-t` pty case
 /// (the slave IS a tty) and the redirected case (a pipe/file is NOT).
-fn fd_is_tty(open_files: &HashMap<i32, OpenFile>, fd: i32) -> bool {
+fn fd_is_tty<S: std::hash::BuildHasher>(open_files: &HashMap<i32, OpenFile, S>, fd: i32) -> bool {
     if !is_stdio_fd(fd) {
         return false;
     }
@@ -9710,12 +9912,23 @@ impl SyscallDispatcher {
         Some(()).and_then(|()| {
             let task = context.task();
             let identity = context.kernel().task_identity(task.key().id).ok()?;
+            let to_ns = |raw: i32| {
+                u32::try_from(raw)
+                    .ok()
+                    .and_then(|raw| crate::namespace::pid::kernel_to_ns_for(context, raw))
+            };
             Some(crate::vfs::SyntheticProcIdentity {
-                pid: identity.task.id.raw() as u32,
-                tid: context.thread().key().tid.raw() as u32,
-                ppid: identity.parent.map_or(0, |parent| parent.id.raw() as u32),
-                pgrp: identity.process_group.raw() as u32,
-                session: identity.session.raw() as u32,
+                pid: to_ns(identity.task.id.raw())?,
+                tid: to_ns(context.thread().key().tid.raw())?,
+                ppid: identity
+                    .parent
+                    .and_then(|parent| to_ns(parent.id.raw()))
+                    .unwrap_or(0),
+                pgrp: crate::namespace::pid::process_group_to_ns_for(
+                    context,
+                    identity.process_group,
+                )?,
+                session: crate::namespace::pid::session_to_ns_for(context, identity.session)?,
                 user_cpu_us: task.self_cpu_us(),
                 system_cpu_us: task.self_system_cpu_us(),
             })
@@ -9730,15 +9943,22 @@ impl SyscallDispatcher {
     /// process-owned render field comes from one short mutex snapshot. The
     /// caller releases that mutex before entering MM snapshot authority.
     fn synthetic_proc_processes(
+        context: &crate::kernel::KernelContext,
         hvpatch_process: Option<&crate::hvpatch::ProcessContext>,
     ) -> Option<Vec<crate::vfs::SyntheticProcProcess>> {
         let registry = hvpatch_process?.kernel_graph().registry();
+        let container = context.container().id();
+        let init = context.kernel().container_init(container)?;
+        let to_ns = |raw: i32| {
+            u32::try_from(raw)
+                .ok()
+                .and_then(|raw| crate::namespace::pid::kernel_to_ns_for(context, raw))
+        };
         let mut processes: Vec<_> = registry
-            .live_processes()
+            .live_processes_for_container(container)
             .into_iter()
-            .map(|process| {
-                let pid = process.key.id.raw() as u32;
-                let init = carrick_abi::LINUX_BOOTSTRAP_PID as u32;
+            .filter_map(|process| {
+                let pid = to_ns(process.key.id.raw())?;
                 let task_ref = registry.task(process.key.id);
                 let (user_cpu_us, system_cpu_us, is_stopped) =
                     task_ref.as_ref().map_or((0, 0, false), |task| {
@@ -9748,18 +9968,20 @@ impl SyscallDispatcher {
                             task.is_job_control_stopped(),
                         )
                     });
-                crate::vfs::SyntheticProcProcess {
+                Some(crate::vfs::SyntheticProcProcess {
                     pid,
                     // A parentless task is an orphan reparented to init — except
                     // for init ITSELF, which Linux reports with ppid 0. Without
                     // that case `/proc/1/stat` claims pid 1 is its own parent.
                     ppid: process
                         .parent
-                        .map_or(if pid == init { 0 } else { init }, |parent| {
-                            parent.id.raw() as u32
-                        }),
-                    pgrp: process.process_group.raw() as u32,
-                    session: process.session.raw() as u32,
+                        .and_then(|parent| to_ns(parent.id.raw()))
+                        .unwrap_or(if process.key == init { 0 } else { 1 }),
+                    pgrp: crate::namespace::pid::process_group_to_ns_for(
+                        context,
+                        process.process_group,
+                    )?,
+                    session: crate::namespace::pid::session_to_ns_for(context, process.session)?,
                     // The run-state table is keyed by the LOGICAL task pid on
                     // this lane (`publish_task_thread`), so it is the one live
                     // per-Linux-process state carrick has. A task that has not
@@ -9771,9 +9993,16 @@ impl SyscallDispatcher {
                     state: if is_stopped {
                         'T'
                     } else {
-                        crate::run_state::published_stat_char(pid).unwrap_or('R')
+                        u32::try_from(process.key.id.raw())
+                            .ok()
+                            .and_then(crate::run_state::published_stat_char)
+                            .unwrap_or('R')
                     },
-                    tids: process.tids.iter().map(|tid| tid.raw() as u32).collect(),
+                    tids: process
+                        .tids
+                        .iter()
+                        .filter_map(|tid| to_ns(tid.raw()))
+                        .collect(),
                     // HONEST GAP: this is the registry's fork-time label, not
                     // the Linux `comm`. Linux's is the exec basename as later
                     // amended by `prctl(PR_SET_NAME)`, and carrick keeps that
@@ -9787,7 +10016,7 @@ impl SyscallDispatcher {
                     comm: process.diagnostic_name,
                     user_cpu_us,
                     system_cpu_us,
-                }
+                })
             })
             .collect();
         processes.sort_by_key(|process| process.pid);
@@ -9820,9 +10049,16 @@ impl SyscallDispatcher {
             .into_iter()
             .map(|thread| {
                 let registry_id = thread.registry_id();
+                let internal_tid = u32::try_from(thread.key().tid.raw()).ok()?;
+                let visible_tid = crate::namespace::pid::kernel_to_ns_for(context, internal_tid)?;
                 let comm = registry
                     .and_then(|r| r.thread_name(registry_id))
-                    .or_else(|| carrick_thread::thread::current_thread_name(registry_id))
+                    .or_else(|| {
+                        carrick_thread::thread::container_thread_name(
+                            context.container().id(),
+                            registry_id,
+                        )
+                    })
                     .map(|name| {
                         let len = name
                             .iter()
@@ -9834,15 +10070,15 @@ impl SyscallDispatcher {
                     .linux_run_state()
                     .or_else(|| states.as_ref().and_then(|m| m.get(&registry_id).copied()))
                     .unwrap_or('R');
-                crate::vfs::SyntheticProcThread {
-                    tid: thread.key().tid.raw() as u32,
+                Some(crate::vfs::SyntheticProcThread {
+                    tid: visible_tid,
                     state,
                     comm,
                     user_cpu_us: thread.cpu_us(),
                     system_cpu_us: thread.system_cpu_us(),
-                }
+                })
             })
-            .collect();
+            .collect::<Option<Vec<_>>>()?;
         threads.sort_by_key(|thread| thread.tid);
         Some(threads)
     }
@@ -9910,16 +10146,7 @@ impl SyscallDispatcher {
         // publication holds MM alias authority while cloning this same process
         // state, so retaining `proc` across `mem_snapshot()` would create the
         // exact cycle `proc -> MM snapshot` versus `MM alias -> proc`.
-        let (
-            hvpatch_process,
-            executable_path,
-            argv,
-            task_comm,
-            timerslack_ns,
-            guest_arch,
-            guest_hostname,
-            environ,
-        ) = {
+        let (hvpatch_process, executable_path, argv, task_comm, timerslack_ns, guest_arch, environ) = {
             let proc = self.proc.lock();
             (
                 proc.hvpatch_process.clone(),
@@ -9928,10 +10155,11 @@ impl SyscallDispatcher {
                 linux_task_name_to_string(&proc.task_name),
                 proc.timerslack,
                 proc.reported_arch(),
-                proc.guest_hostname().to_string(),
                 proc.env.clone(),
             )
         };
+        let guest_hostname = context.task().uts_ns().nodename();
+        let network_model = context.task().net_ns().view().as_ref().clone();
         after_proc_snapshot();
         let mem = self.mem_snapshot();
         let mut address_space_regions = mem.address_space_regions;
@@ -9949,33 +10177,50 @@ impl SyscallDispatcher {
         // map and the renderer falls back to its single-host-process cell.
         let oom_score_adj = hvpatch_process
             .as_ref()
-            .map(|process| process.kernel_graph().registry().oom_score_adj_by_pid())
+            .map(|process| {
+                process
+                    .kernel_graph()
+                    .registry()
+                    .oom_score_adj_by_pid_for_container(context.container().id())
+                    .into_iter()
+                    .filter_map(|(pid, value)| {
+                        crate::namespace::pid::kernel_to_ns_for(context, pid)
+                            .map(|pid| (pid, value))
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         // Capabilities and the user-namespace view are the CALLER's own, read
         // straight off its task: unlike `oom_score_adj` these render only for
         // `/proc/self`, so there is no by-pid map to assemble.
         let creds_ns = context.task().creds_ns();
-        let processes = Self::synthetic_proc_processes(hvpatch_process.as_ref());
+        let processes = Self::synthetic_proc_processes(context, hvpatch_process.as_ref());
         let zombies = hvpatch_process.map(|process| {
             process
                 .kernel_graph()
                 .registry()
-                .zombies()
+                .zombies_for_container(context.container().id())
                 .into_iter()
-                .map(|zombie| crate::vfs::SyntheticProcZombie {
-                    pid: zombie.key.id.raw() as u32,
-                    ppid: zombie
-                        .parent
-                        .map_or(carrick_abi::LINUX_BOOTSTRAP_PID as u32, |parent| {
-                            parent.id.raw() as u32
-                        }),
-                    pgrp: zombie.process_group.raw() as u32,
-                    session: zombie.session.raw() as u32,
-                    comm: zombie.diagnostic_name,
-                    user_cpu_us: u64::try_from(zombie.rusage.user_time.as_micros())
-                        .unwrap_or(u64::MAX),
-                    system_cpu_us: u64::try_from(zombie.rusage.system_time.as_micros())
-                        .unwrap_or(u64::MAX),
+                .filter_map(|zombie| {
+                    let to_ns = |raw: i32| {
+                        u32::try_from(raw)
+                            .ok()
+                            .and_then(|raw| crate::namespace::pid::kernel_to_ns_for(context, raw))
+                    };
+                    Some(crate::vfs::SyntheticProcZombie {
+                        pid: to_ns(zombie.key.id.raw())?,
+                        ppid: zombie
+                            .parent
+                            .and_then(|parent| to_ns(parent.id.raw()))
+                            .unwrap_or(1),
+                        pgrp: zombie.namespace_process_group,
+                        session: zombie.namespace_session,
+                        comm: zombie.diagnostic_name,
+                        user_cpu_us: u64::try_from(zombie.rusage.user_time.as_micros())
+                            .unwrap_or(u64::MAX),
+                        system_cpu_us: u64::try_from(zombie.rusage.system_time.as_micros())
+                            .unwrap_or(u64::MAX),
+                    })
                 })
                 .collect()
         });
@@ -9989,6 +10234,8 @@ impl SyscallDispatcher {
             environ,
             open_fds: self.open_fd_numbers(),
             network: self.network.spec.clone(),
+            network_model: Some(network_model),
+            runtime_endpoint_container: Some(context.container().id()),
             auxv: mem.linux_auxv_image,
             address_space_regions,
             locked_memory: mem.locked_ranges,

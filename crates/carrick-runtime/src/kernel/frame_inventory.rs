@@ -5,7 +5,7 @@
 //! or unmap advances it by exactly one. Frame retirement must share the final
 //! unmap generation in the same transaction. IDs and generations never restart.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroU64;
 use std::time::Instant;
 
@@ -292,6 +292,67 @@ impl FrameInventoryAuthority {
                 mappings,
             ),
         ))
+    }
+
+    /// Undo an apply that initialized an address space whose owning kernel
+    /// object never became visible. Mapping IDs are monotonic and the receipt
+    /// names the exact `(mapping, frame, mm)` set, so this removes no sibling
+    /// publication even if other address spaces advanced the global revision.
+    pub(crate) fn rollback_unpublished_apply(
+        &self,
+        receipt: &FrameInventoryApplyReceipt,
+    ) -> Result<(), FrameInventoryError> {
+        let mm = MmId::from_raw_u64(receipt.mm().get())
+            .ok_or(FrameInventoryError::RollbackReceiptMmInvalid)?;
+        let mut state = self.state.lock();
+        let next_revision = state
+            .revision
+            .checked_add(1)
+            .ok_or(FrameInventoryError::RevisionExhausted)?;
+        let mut unique = BTreeSet::new();
+        for &(mapping, frame) in receipt.mapping_set() {
+            if !unique.insert(mapping) {
+                return Err(FrameInventoryError::RollbackReceiptDuplicate(mapping));
+            }
+            let entry = state
+                .mappings
+                .get(&mapping)
+                .ok_or(FrameInventoryError::RollbackReceiptMismatch(mapping))?;
+            if entry.state != MappingState::Published || entry.mm != mm || entry.frame != frame {
+                return Err(FrameInventoryError::RollbackReceiptMismatch(mapping));
+            }
+            let frame_entry = state
+                .frames
+                .get(&frame)
+                .ok_or(FrameInventoryError::RollbackReceiptMismatch(mapping))?;
+            if frame_entry.mapping_count == 0 {
+                return Err(FrameInventoryError::MappingCountUnderflow(frame));
+            }
+        }
+
+        for &(mapping, frame) in receipt.mapping_set() {
+            let removed = state
+                .mappings
+                .remove(&mapping)
+                .ok_or(FrameInventoryError::RollbackReceiptMismatch(mapping))?;
+            decrement_mm_mapping_count(&mut state.mm_mapping_counts, removed.mm);
+            let retire_frame = {
+                let frame_entry = state
+                    .frames
+                    .get_mut(&frame)
+                    .ok_or(FrameInventoryError::RollbackReceiptMismatch(mapping))?;
+                frame_entry.mapping_count = frame_entry
+                    .mapping_count
+                    .checked_sub(1)
+                    .ok_or(FrameInventoryError::MappingCountUnderflow(frame))?;
+                frame_entry.mapping_count == 0
+            };
+            if retire_frame {
+                state.frames.remove(&frame);
+            }
+        }
+        state.revision = next_revision;
+        Ok(())
     }
 
     pub fn apply_retirement_with_receipt<T>(
@@ -937,6 +998,12 @@ pub enum FrameInventoryError {
     MappingCountUnderflow(FrameId),
     #[error("frame inventory revision space exhausted")]
     RevisionExhausted,
+    #[error("unpublished frame inventory rollback receipt has an invalid mm")]
+    RollbackReceiptMmInvalid,
+    #[error("unpublished frame inventory rollback receipt duplicates mapping {0:?}")]
+    RollbackReceiptDuplicate(MappingId),
+    #[error("unpublished frame inventory rollback receipt does not match mapping {0:?}")]
+    RollbackReceiptMismatch(MappingId),
     #[error("test failpoint before event {0}")]
     InjectedFailure(usize),
 }
@@ -1108,6 +1175,52 @@ mod tests {
             retirement_challenge
                 .authenticate_retirement(&retirement_receipt, nz(fixture.mm1.raw()))
         );
+    }
+
+    #[test]
+    fn unpublished_apply_receipt_rolls_back_only_its_exact_mm_mappings() {
+        let fixture = Fixture::new();
+        let mut first_pair = None;
+        let first = fixture.batch(2, |transaction, reservation| {
+            let frame = reservation.claim_frame().unwrap();
+            let mapping = reservation.claim_mapping().unwrap();
+            first_pair = Some((mapping, frame));
+            prepare_publish(reservation, transaction, frame, mapping, 0x4000, 0x4000);
+        });
+        let (_, first_receipt) = fixture
+            .authority
+            .apply_with_receipt(fixture.mm1, first)
+            .unwrap();
+
+        let mut sibling_pair = None;
+        let sibling = fixture.batch(2, |transaction, reservation| {
+            let frame = reservation.claim_frame().unwrap();
+            let mapping = reservation.claim_mapping().unwrap();
+            sibling_pair = Some((mapping, frame));
+            prepare_publish(reservation, transaction, frame, mapping, 0x8000, 0x4000);
+        });
+        fixture.authority.apply(fixture.mm2, sibling).unwrap();
+
+        fixture
+            .authority
+            .rollback_unpublished_apply(&first_receipt)
+            .expect("rollback exact unpublished apply");
+        let (first_mapping, first_frame) = first_pair.unwrap();
+        assert!(!fixture.authority.mapping_is_live_exact(
+            fixture.mm1,
+            first_mapping,
+            first_frame,
+            Gpa(0x4000),
+            length(0x4000),
+        ));
+        let (sibling_mapping, sibling_frame) = sibling_pair.unwrap();
+        assert!(fixture.authority.mapping_is_live_exact(
+            fixture.mm2,
+            sibling_mapping,
+            sibling_frame,
+            Gpa(0x8000),
+            length(0x4000),
+        ));
     }
 
     #[test]
