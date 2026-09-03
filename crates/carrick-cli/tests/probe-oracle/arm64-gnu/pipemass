@@ -1,0 +1,8 @@
+c0e8e3d731d2c6e7
+soft_nofile=200000
+pipes=99998 fds_opened=199996 highest_fd=199998 fail=EMFILE
+open_last_slot=ok fd_is_last=true
+last_writable poll=1 pollout=true
+last_roundtrip write=1 poll=1 pollin=true read=1 byte=z
+socket_in_freed_slot=ok fd_reuses_slot=true
+closed=99998

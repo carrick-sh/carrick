@@ -2,8 +2,8 @@ use carrick_abi::*;
 use carrick_guest_mem::CurrentMmMemory;
 use parking_lot::{Condvar, Mutex};
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use super::DispatchOutcome;
 use crate::dispatch::WaitFds;
@@ -28,13 +28,24 @@ pub(crate) struct PipeState {
     pub(crate) pipe_id: u64,
 }
 
+/// One in-memory guest pipe.
+///
+/// The two host readiness pipes (`read_pipe_ready`, `write_pipe_ready`) are the
+/// level-triggered signals a host `poll`/`kqueue` waits on when a guest blocks
+/// in `read`/`write` or registers the pipe with a readiness poller. They are
+/// created LAZILY on the first such wait: a plain `pipe()` + copy + `close`
+/// never needs them, and creating them eagerly cost every guest `pipe()` two
+/// host `pipe(2)`s, four `F_DUPFD_CLOEXEC` relocations and eight `fcntl`s —
+/// `ltp-pipe06` (524k pipes to `EMFILE`) ran ~29x Docker on that alone.
+/// Creation is serialised under `state`, so a thread that holds the state
+/// lock must use the `*_locked` accessors; the unlocked ones take the lock.
 #[derive(Debug)]
 pub(crate) struct PipeInner {
     pub(crate) state: Mutex<PipeState>,
     pub(crate) changed: Condvar,
     pub(crate) capacity_cell: Arc<AtomicI64>,
-    pub(crate) read_pipe_ready: Option<(HostFdRef, HostFdRef)>,
-    pub(crate) write_pipe_ready: Option<(HostFdRef, HostFdRef)>,
+    read_pipe_ready: OnceLock<Option<(HostFdRef, HostFdRef)>>,
+    write_pipe_ready: OnceLock<Option<(HostFdRef, HostFdRef)>>,
     read_notified: std::sync::atomic::AtomicBool,
     write_notified: std::sync::atomic::AtomicBool,
 }
@@ -48,11 +59,10 @@ pub(crate) fn pipe_writer_is_writable(state: &PipeState) -> bool {
 impl PipeInner {
     pub(crate) fn new(pipe_id: u64, capacity: usize) -> Self {
         let capacity = capacity.clamp(PIPE_BUF, MAX_PIPE_CAPACITY);
-        let read_pipe_ready = make_readiness_pipe();
-        let write_pipe_ready = make_readiness_pipe();
-        let inner = Self {
+        // The buffer grows on first write; a never-written pipe owns no heap.
+        Self {
             state: Mutex::new(PipeState {
-                buffer: VecDeque::with_capacity(capacity.min(65536)),
+                buffer: VecDeque::new(),
                 capacity,
                 readers: 0,
                 writers: 0,
@@ -60,13 +70,11 @@ impl PipeInner {
             }),
             changed: Condvar::new(),
             capacity_cell: Arc::new(AtomicI64::new(capacity as i64)),
-            read_pipe_ready,
-            write_pipe_ready,
+            read_pipe_ready: OnceLock::new(),
+            write_pipe_ready: OnceLock::new(),
             read_notified: std::sync::atomic::AtomicBool::new(false),
             write_notified: std::sync::atomic::AtomicBool::new(false),
-        };
-        inner.update_readiness_locked(&inner.state.lock());
-        inner
+        }
     }
 
     #[cfg(test)]
@@ -83,7 +91,7 @@ impl PipeInner {
 
     pub(crate) fn update_readiness_locked(&self, state: &PipeState) {
         let read_ready = !state.buffer.is_empty() || state.writers == 0;
-        if let Some((r, w)) = &self.read_pipe_ready {
+        if let Some((r, w)) = self.read_pipe_ready.get().and_then(Option::as_ref) {
             if read_ready {
                 if !self.read_notified.swap(true, Ordering::SeqCst) {
                     let _ = unsafe { libc::write(w.raw(), [1u8].as_ptr() as *const _, 1) };
@@ -95,7 +103,7 @@ impl PipeInner {
         }
 
         let write_ready = state.readers == 0 || pipe_writer_is_writable(state);
-        if let Some((r, w)) = &self.write_pipe_ready {
+        if let Some((r, w)) = self.write_pipe_ready.get().and_then(Option::as_ref) {
             if write_ready {
                 if !self.write_notified.swap(true, Ordering::SeqCst) {
                     let _ = unsafe { libc::write(w.raw(), [1u8].as_ptr() as *const _, 1) };
@@ -107,12 +115,53 @@ impl PipeInner {
         }
     }
 
+    /// The host fd a waiter polls (`POLLIN`) for "this pipe is readable",
+    /// creating the readiness pipe on first use. `None` only when the host
+    /// could not allocate the fds (the caller reports `EMFILE`).
     pub(crate) fn read_poll_fd(&self) -> Option<HostFdRef> {
-        self.read_pipe_ready.as_ref().map(|(r, _)| r.clone())
+        if let Some(ready) = self.read_pipe_ready.get() {
+            return ready.as_ref().map(|(r, _)| r.clone());
+        }
+        let state = self.state.lock();
+        self.read_poll_fd_locked(&state)
     }
 
+    /// [`Self::read_poll_fd`] for a caller that already holds `state`.
+    pub(crate) fn read_poll_fd_locked(&self, state: &PipeState) -> Option<HostFdRef> {
+        if self.read_pipe_ready.get().is_none() {
+            // Initialisation always runs under `state`, so a `get()` miss under
+            // the lock means this thread is the one that creates it; the level
+            // is primed from the current state before anyone can poll it.
+            self.read_pipe_ready.get_or_init(make_readiness_pipe);
+            self.update_readiness_locked(state);
+        }
+        self.read_pipe_ready
+            .get()
+            .and_then(Option::as_ref)
+            .map(|(r, _)| r.clone())
+    }
+
+    /// The host fd a waiter polls (`POLLIN`) for "this pipe is writable" —
+    /// the level protocol keeps one byte queued while the pipe has room —
+    /// creating the readiness pipe on first use.
     pub(crate) fn write_poll_fd(&self) -> Option<HostFdRef> {
-        self.write_pipe_ready.as_ref().map(|(r, _)| r.clone())
+        if let Some(ready) = self.write_pipe_ready.get() {
+            return ready.as_ref().map(|(r, _)| r.clone());
+        }
+        let state = self.state.lock();
+        self.write_poll_fd_locked(&state)
+    }
+
+    /// [`Self::write_poll_fd`] for a caller that already holds `state`.
+    pub(crate) fn write_poll_fd_locked(&self, state: &PipeState) -> Option<HostFdRef> {
+        if self.write_pipe_ready.get().is_none() {
+            self.write_pipe_ready.get_or_init(make_readiness_pipe);
+            self.update_readiness_locked(state);
+        }
+        self.write_pipe_ready
+            .get()
+            .and_then(Option::as_ref)
+            .map(|(r, _)| r.clone())
     }
 
     pub(crate) fn pipe_id(&self) -> u64 {
@@ -176,7 +225,7 @@ pub(crate) fn read_pipe<M: CurrentMmMemory>(
     }
     if nonblocking {
         DispatchOutcome::errno(LINUX_EAGAIN)
-    } else if let Some(host_fd) = pipe.read_poll_fd() {
+    } else if let Some(host_fd) = pipe.read_poll_fd_locked(&state) {
         DispatchOutcome::WaitOnFds {
             fds: WaitFds::authorized_raw_one(host_fd.raw(), libc::POLLIN, authority),
             timeout: None,
@@ -368,7 +417,7 @@ pub(crate) fn write_pipe(
             if nonblocking {
                 return DispatchOutcome::errno(LINUX_EAGAIN);
             }
-            let Some(host_fd) = pipe.write_poll_fd() else {
+            let Some(host_fd) = pipe.write_poll_fd_locked(&state) else {
                 return DispatchOutcome::errno(LINUX_EMFILE);
             };
             // The readiness protocol is a LEVEL signal: while the pipe is

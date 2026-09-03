@@ -1549,6 +1549,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "pipemass": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "pipeszcrossend": {
     "class": "conformance",
     "excluded": false,
