@@ -4,11 +4,11 @@
     "inspect_misc": 145,
     "create_install": 71,
     "read_attempt": 13,
-    "write_attempt": 21,
+    "write_attempt": 22,
     "slot_description_mutation": 18,
-    "lifecycle": 35,
+    "lifecycle": 37,
     "stream_transfer": 16,
-    "mapping_ring": 11,
+    "mapping_ring": 12,
     "epoll_wait": 33
   },
   "entries": [
@@ -2107,7 +2107,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 5961,
+      "line": 5979,
       "categories": [
         "table_guard"
       ],
@@ -2118,7 +2118,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 6773,
+      "line": 6791,
       "categories": [
         "description_guard"
       ],
@@ -2129,7 +2129,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 6795,
+      "line": 6813,
       "categories": [
         "description_guard"
       ],
@@ -2140,7 +2140,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 6868,
+      "line": 6886,
       "categories": [
         "description_guard"
       ],
@@ -3655,18 +3655,74 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/tests.rs",
-      "line": 4166,
+      "line": 4156,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "parent.captured_file_table().write_open_files().insert(",
+      "scope_kind": "test_or_definition",
+      "enclosing_function": "hvpatch_exiting_task_fds_retire_while_task_is_still_registered",
+      "migration_family": "lifecycle"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/tests.rs",
+      "line": 4173,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "parent.captured_file_table().write_open_files().insert(",
+      "scope_kind": "test_or_definition",
+      "enclosing_function": "hvpatch_exiting_task_fds_retire_while_task_is_still_registered",
+      "migration_family": "lifecycle"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/tests.rs",
+      "line": 4190,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "for open_file in parent.captured_file_table().read_open_files().values() {",
+      "scope_kind": "test_or_definition",
+      "enclosing_function": "hvpatch_exiting_task_fds_retire_while_task_is_still_registered",
+      "migration_family": "write_attempt"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/tests.rs",
+      "line": 4199,
       "categories": [
         "table_guard"
       ],
       "text": ".write_open_files()",
       "scope_kind": "test_or_definition",
-      "enclosing_function": "hvpatch_exit_notification_observes_retired_inherited_pipe_writer",
+      "enclosing_function": "hvpatch_exiting_task_fds_retire_while_task_is_still_registered",
       "migration_family": "mapping_ring"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/tests.rs",
-      "line": 4282,
+      "line": 4264,
+      "categories": [
+        "table_guard"
+      ],
+      "text": ".write_open_files()",
+      "scope_kind": "test_or_definition",
+      "enclosing_function": "hvpatch_inherited_fd_close_is_not_the_last_logical_reference",
+      "migration_family": "mapping_ring"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/tests.rs",
+      "line": 4380,
+      "categories": [
+        "description_guard",
+        "epoll"
+      ],
+      "text": "let epoll = epoll.description.read().expect(\"epoll open description\");",
+      "scope_kind": "test_or_definition",
+      "enclosing_function": "hvpatch_child_dup3_does_not_detach_parent_epoll_interest",
+      "migration_family": "epoll_wait"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/tests.rs",
+      "line": 4498,
       "categories": [
         "description_guard",
         "epoll"
@@ -3678,19 +3734,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/tests.rs",
-      "line": 4400,
-      "categories": [
-        "description_guard",
-        "epoll"
-      ],
-      "text": "let epoll = epoll.description.read().expect(\"epoll open description\");",
-      "scope_kind": "test_or_definition",
-      "enclosing_function": "hvpatch_child_dup3_does_not_detach_parent_epoll_interest",
-      "migration_family": "epoll_wait"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/tests.rs",
-      "line": 4428,
+      "line": 4526,
       "categories": [
         "description_guard",
         "epoll"
@@ -3702,7 +3746,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/tests.rs",
-      "line": 5719,
+      "line": 5817,
       "categories": [
         "description_guard"
       ],
@@ -3713,7 +3757,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/tests.rs",
-      "line": 5949,
+      "line": 6047,
       "categories": [
         "description_backing"
       ],
@@ -3988,7 +4032,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "line": 2671,
+      "line": 2699,
       "categories": [
         "table_guard"
       ],
@@ -3999,7 +4043,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "line": 5533,
+      "line": 5561,
       "categories": [
         "table_guard"
       ],
@@ -4010,7 +4054,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "line": 5564,
+      "line": 5592,
       "categories": [
         "table_guard"
       ],
