@@ -1028,9 +1028,11 @@ impl ProcessContext {
 
     /// Publish Linux lifecycle state before any irreversible backend teardown.
     /// The callback runs after the zombie is durable and the exiting task is no
-    /// longer live, but while the exit reservation still excludes waiters. The
-    /// runtime uses that window to retire the process file table before queueing
-    /// SIGCHLD: Linux closes every process fd before the parent can observe exit.
+    /// longer live, but while the exit reservation still excludes waiters; the
+    /// runtime queues SIGCHLD there. The process file table is already retired
+    /// by then — the terminal path closes every fd before it takes the
+    /// retirement topology lock (`retire_hvpatch_process_fds`), so Linux's
+    /// "every fd closed before the parent can observe exit" still holds.
     /// Root-slot/ASID retirement remains deliberately separate and follows output
     /// and fd finalization.
     /// `status` is the Linux `wait(2)` encoding, built by

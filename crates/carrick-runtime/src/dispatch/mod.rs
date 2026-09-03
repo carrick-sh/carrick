@@ -4712,6 +4712,19 @@ impl SyscallDispatcher {
             self.mqueue_rebind_exec_file_table(owner, files, successor);
         }
         kernel.retire_file_table_if_unreferenced(files);
+        self.drain_file_table_close_events(kernel, files, owner);
+    }
+
+    /// Consume the typed close events of a retired `files` generation and
+    /// close each description's logical fd reference. Split from
+    /// [`Self::close_draining_file_table`] so the process-terminal path can
+    /// retire the exiting task's table with the exiting-task census first.
+    fn drain_file_table_close_events(
+        &self,
+        kernel: &Arc<crate::kernel::Kernel>,
+        files: &Arc<crate::kernel::FileTable>,
+        owner: Option<crate::kernel::TaskKey>,
+    ) {
         let pid = self.event_ring_guest_pid();
         let events = kernel.take_file_close_events(files.id());
         resources::with_retiring_file_table(Arc::clone(files), || {
@@ -5190,12 +5203,17 @@ impl SyscallDispatcher {
     /// made this exact table generation draining, consume its typed close
     /// events without erasing the rows retained for coherent snapshots.
     pub(crate) fn retire_hvpatch_process_fds(&self, context: &crate::kernel::KernelContext) {
-        self.fs
-            .classic_record_locks
-            .release_owner(context.task().key());
+        let owner = context.task().key();
+        self.fs.classic_record_locks.release_owner(owner);
         let files = self.file_table_for_context(context);
-        self.mqueue_retire_task_owner(context.task().key(), &files);
-        self.close_draining_file_table(context.kernel(), &files, Some(context.task().key()), None);
+        self.mqueue_retire_task_owner(owner, &files);
+        // The exiting task is still registered when the terminal path calls
+        // this, ahead of the retirement topology lock; it must not hold its
+        // own table alive.
+        context
+            .kernel()
+            .retire_file_table_for_exiting_task(&files, owner);
+        self.drain_file_table_close_events(context.kernel(), &files, Some(owner));
     }
 
     fn event_ring_guest_pid(&self) -> i32 {

@@ -4138,6 +4138,104 @@ mod hvpatch_in_process_fork_tests {
         assert_ne!(pollfd.revents & libc::POLLHUP, 0);
     }
 
+    /// The process-terminal path closes the exiting task's fds BEFORE it
+    /// takes the retirement topology lock (Linux `exit_files` precedes
+    /// `exit_notify`), so the task is still registered when its table is
+    /// retired. The census must exclude the exiting task itself; a census
+    /// that counted it kept the table alive, deferred every close to the
+    /// topology-locked tail, and wedged `ltp-fork07` / `forkreadexitcow`
+    /// against a sibling's first copy-on-write fault inside `read(2)`.
+    #[test]
+    fn hvpatch_exiting_task_fds_retire_while_task_is_still_registered() {
+        let mut host_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(host_fds.as_mut_ptr()) }, 0);
+        let read_host_fd = host_fds[0];
+        let write_host_fd = host_fds[1];
+
+        let parent = SyscallDispatcher::new();
+        parent.captured_file_table().write_open_files().insert(
+            3,
+            OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(OpenDescription::HostPipe {
+                    host_fd: HostFdRef::new(read_host_fd),
+                    is_read_end: true,
+                    pipe_id: 1,
+                    base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
+                    pty: None,
+                    bidirectional: false,
+                    write_kind: HostWriteKind::PipeLike,
+                    stdio_stream: None,
+                })),
+                crate::linux_abi::LINUX_O_RDONLY,
+                0,
+            ),
+        );
+        parent.captured_file_table().write_open_files().insert(
+            4,
+            OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(OpenDescription::HostPipe {
+                    host_fd: HostFdRef::new(write_host_fd),
+                    is_read_end: false,
+                    pipe_id: 1,
+                    base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_WRONLY),
+                    pty: None,
+                    bidirectional: false,
+                    write_kind: HostWriteKind::PipeLike,
+                    stdio_stream: None,
+                })),
+                crate::linux_abi::LINUX_O_WRONLY,
+                0,
+            ),
+        );
+        for open_file in parent.captured_file_table().read_open_files().values() {
+            retain_open_file(&open_file.description);
+        }
+
+        let parent_tid = crate::thread::ThreadId::synthetic_for_tests(5110);
+        let child_tid = crate::thread::ThreadId::synthetic_for_tests(5111);
+        let (child, child_context) = fork_dispatcher(&parent, parent_tid, child_tid, 53, 54);
+        let parent_writer = parent
+            .captured_file_table()
+            .write_open_files()
+            .remove(&4)
+            .unwrap();
+        parent.close_open_file_and_free_pty(&parent_writer);
+        drop(parent_writer);
+
+        let mut pollfd = libc::pollfd {
+            fd: read_host_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 0) }, 0);
+
+        // The child is still a live, registered task: its own reference to
+        // the table must not defer the retirement.
+        assert!(
+            child_context
+                .kernel()
+                .task_is_live(child_context.task().key().id)
+        );
+        child.retire_hvpatch_process_fds(&child_context);
+        pollfd.revents = 0;
+        assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 0) }, 1);
+        assert_ne!(pollfd.revents & libc::POLLHUP, 0);
+
+        // Exit publication afterwards finds nothing left to close.
+        child_context
+            .kernel()
+            .exit_task_key_eventually_notifying(
+                child_context.task().key(),
+                crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                None,
+                |_| {},
+            )
+            .unwrap();
+        pollfd.revents = 0;
+        assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 0) }, 1);
+        assert_ne!(pollfd.revents & libc::POLLHUP, 0);
+    }
+
     #[test]
     fn hvpatch_inherited_fd_close_is_not_the_last_logical_reference() {
         let dispatcher = SyscallDispatcher::new();
