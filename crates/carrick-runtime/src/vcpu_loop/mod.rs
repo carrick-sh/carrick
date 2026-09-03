@@ -4103,6 +4103,19 @@ where
                 .continuation_services(terminal_context.kernel())
                 .0
         };
+        // Close the process's fds FIRST — before the owner-set hold and the
+        // retirement topology lock — matching Linux `exit_files` preceding
+        // `exit_notify`, and the fork path's lock order (subsystem
+        // authorities, then topology). Closing takes per-description locks;
+        // a sibling mid-`read(2)` holds one of those while its copy-in
+        // faults a copy-on-write page, which needs the topology lock. Taking
+        // the topology lock first and closing fds under it was an ABBA that
+        // wedged `ltp-fork07` at its ninth child (`forkreadexitcow`).
+        // Idempotent on a `TerminalRetireRetry` re-entry: the table
+        // generation is already drained and its close events consumed.
+        self.kernel
+            .dispatcher
+            .retire_hvpatch_process_fds(&terminal_context);
         // Retiring this process's MM edge is an owner-set edit on its
         // generation. A vfork sibling mid-exec has that generation reserved
         // and its owner set frozen; admit the edit against the reservation
@@ -4320,9 +4333,6 @@ where
         let status = crate::kernel::LinuxWaitStatus::from_wait_encoding(wait_encoding);
         let orphan_adopter = self.kernel.dispatcher.hvpatch_orphan_adopter();
         let publish_result = process.publish_exit_status(status, orphan_adopter, |parent| {
-            self.kernel
-                .dispatcher
-                .retire_hvpatch_process_fds(&terminal_context);
             if child {
                 self.kernel.notify_hvpatch_parent_exit(parent);
             }

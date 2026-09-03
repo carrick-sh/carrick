@@ -2606,16 +2606,29 @@ impl Kernel {
         }
     }
 
-    pub(crate) fn file_table_is_live_exact(&self, target: &Arc<FileTable>) -> bool {
+    /// Whether any registered thread outside `excluded` still holds `target`
+    /// as its file table. The exclusion lets a process-terminal path retire
+    /// its own table while its last thread is still registered — Linux
+    /// `exit_files` runs before `exit_notify` — so that fd teardown never
+    /// waits behind the exit publication or anything it serialises with.
+    fn file_table_is_live_excluding(
+        &self,
+        target: &Arc<FileTable>,
+        excluded: Option<TaskKey>,
+    ) -> bool {
         let state = self.registry().state.read();
-        state.tasks.values().any(|record| {
-            record.task.thread_keys().into_iter().any(|thread_key| {
-                record
-                    .task
-                    .thread(thread_key.tid)
-                    .is_some_and(|thread| Arc::ptr_eq(&thread.resources().files(), target))
+        state
+            .tasks
+            .values()
+            .filter(|record| excluded.is_none_or(|excluded| record.task.key() != excluded))
+            .any(|record| {
+                record.task.thread_keys().into_iter().any(|thread_key| {
+                    record
+                        .task
+                        .thread(thread_key.tid)
+                        .is_some_and(|thread| Arc::ptr_eq(&thread.resources().files(), target))
+                })
             })
-        })
     }
 
     /// Current FileTable generations of one exact live task. Exec/CLONE_FILES
@@ -2645,7 +2658,21 @@ impl Kernel {
     }
 
     pub(crate) fn retire_file_table_if_unreferenced(&self, target: &Arc<FileTable>) {
-        self.retire_file_table_generation(target, None);
+        self.retire_file_table_generation(target, None, None);
+    }
+
+    /// Retire `target` on behalf of `exiting`, whose last thread may still be
+    /// registered: the process-terminal path closes the process's fds BEFORE
+    /// it takes the retirement topology lock and publishes the exit, so the
+    /// exiting task itself must not count as a live holder. Every other task
+    /// sharing the table (`CLONE_FILES` without `CLONE_THREAD`) still keeps
+    /// it alive. Idempotent: a second call finds the generation drained.
+    pub(crate) fn retire_file_table_for_exiting_task(
+        &self,
+        target: &Arc<FileTable>,
+        exiting: TaskKey,
+    ) {
+        self.retire_file_table_generation(target, None, Some(exiting));
     }
 
     pub(super) fn retire_file_table_after_exec(
@@ -2653,15 +2680,16 @@ impl Kernel {
         target: &Arc<FileTable>,
         successor: &Arc<FileTable>,
     ) {
-        self.retire_file_table_generation(target, Some(successor));
+        self.retire_file_table_generation(target, Some(successor), None);
     }
 
     fn retire_file_table_generation(
         &self,
         target: &Arc<FileTable>,
         successor: Option<&Arc<FileTable>>,
+        exiting: Option<TaskKey>,
     ) {
-        if self.file_table_is_live_exact(target) {
+        if self.file_table_is_live_excluding(target, exiting) {
             return;
         }
         let events = target.drain_functional_refs();
@@ -3178,7 +3206,7 @@ impl Kernel {
             thread.replace_resources(Arc::clone(&resources));
             self.observe_thread_publication(&thread, &resources, revision);
             drop(state);
-            self.retire_file_table_generation(&old_files, Some(&files));
+            self.retire_file_table_generation(&old_files, Some(&files), None);
             return Ok(CloseRangeUnshare {
                 context: KernelContext::from_parts(
                     self.clone(),
