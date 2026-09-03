@@ -20,7 +20,7 @@ use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-const CACHED_SHARD_0_PROBE_COUNT: usize = 143;
+const CACHED_SHARD_0_PROBE_COUNT: usize = 140;
 
 /// Derive the shard 0 subset from a complete baseline set.
 pub fn expected_shard_gaps(baseline: &[&'static str]) -> BTreeSet<&'static str> {
@@ -224,8 +224,8 @@ fn test_shard_0_inventory() {
     selected_names.sort();
     assert_eq!(
         selected_names.len(),
-        448,
-        "expected exactly 448 conformance generic probes in inventory"
+        449,
+        "expected exactly 449 conformance generic probes in inventory"
     );
 
     let derived_shard_0: Vec<&str> = selected_names

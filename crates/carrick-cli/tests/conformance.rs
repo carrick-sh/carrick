@@ -2880,10 +2880,14 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// `read(2)` on an inherited descriptor, must not deadlock against a sibling's
 /// process retirement — the `ltp-fork07` shape) is `generic`, moving the
 /// denominator from 496 to 497.
-/// The authoritative inventory contains 497 probe sources: 471 conformance
-/// sources (448 generic, 23 dedicated), 25 performance sources, and one helper.
-/// Both libc lanes therefore gate 942 conformance rows.
-const PROBE_SOURCE_COUNT: usize = 497;
+/// `pipemass` (a process may hold as many pipes as `RLIMIT_NOFILE` allows and
+/// the last slot still serves a regular-file open, a poll and a byte round
+/// trip — the `ltp-pipe06` shape) is `generic`, moving the denominator from
+/// 497 to 498.
+/// The authoritative inventory contains 498 probe sources: 472 conformance
+/// sources (449 generic, 23 dedicated), 25 performance sources, and one helper.
+/// Both libc lanes therefore gate 944 conformance rows.
+const PROBE_SOURCE_COUNT: usize = 498;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
@@ -4633,9 +4637,9 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
     let generic = validate_closure_probe_rows(&inventory(), &sources)
         .expect("checked-in closure probe inventory must match the source denominator");
-    assert_eq!(generic.len(), 448);
-    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 471);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 942);
+    assert_eq!(generic.len(), 449);
+    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 472);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 944);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")
