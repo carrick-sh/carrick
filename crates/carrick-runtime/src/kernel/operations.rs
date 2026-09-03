@@ -243,6 +243,8 @@ pub struct ProcessIdentity {
     pub parent: Option<TaskId>,
     pub process_group: ProcessGroupId,
     pub session: SessionId,
+    pub namespace_process_group: u32,
+    pub namespace_session: u32,
     pub state: ProcessState,
 }
 
@@ -388,11 +390,16 @@ impl StartedFork {
 #[must_use = "a published child must be started or explicitly retired"]
 pub struct PublishedFork {
     started: Option<StartedFork>,
+    visible_child_id: i32,
     start_wait: Option<ChildStartWait>,
     start_release: ChildStartRelease,
 }
 
 impl PublishedFork {
+    pub const fn visible_child_id(&self) -> i32 {
+        self.visible_child_id
+    }
+
     pub fn context(&self) -> Option<&KernelContext> {
         self.started.as_ref().map(StartedFork::context)
     }
@@ -604,6 +611,7 @@ pub struct ForkReservation {
     child_id: TaskId,
     task_reservation: TaskReservation,
     leader_claim: ThreadClaim,
+    pid_identity: Option<crate::namespace::pid::PreparedNamespaceIdentity>,
     diagnostic_name: String,
     vfork_relationship: Option<(VforkParentWait, VforkChildRelease)>,
     failpoint: Option<KernelFailpoint>,
@@ -613,6 +621,12 @@ pub struct ForkReservation {
 impl ForkReservation {
     pub const fn child_id(&self) -> TaskId {
         self.child_id
+    }
+
+    pub fn visible_child_id(&self) -> i32 {
+        self.pid_identity
+            .as_ref()
+            .map_or(self.child_id.raw(), |identity| identity.visible_id() as i32)
     }
 
     pub fn prepare_with_mm_backend(
@@ -756,6 +770,10 @@ impl PreparedFork {
         self.reservation.child_id
     }
 
+    pub fn visible_child_id(&self) -> i32 {
+        self.reservation.visible_child_id()
+    }
+
     /// Exact address-space identity already selected by Kernel preparation.
     /// Runtime/backend publication must route child mappings to this ID rather
     /// than allocating or reconstructing one from backend process state.
@@ -855,12 +873,16 @@ impl PreparedFork {
             child_id,
             task_reservation,
             leader_claim,
+            pid_identity,
             diagnostic_name,
             vfork_relationship,
             failpoint,
             external_peer_root,
         } = reservation;
         let child_key = child.key();
+        let visible_child_id = pid_identity
+            .as_ref()
+            .map_or(child_id.raw(), |identity| identity.visible_id() as i32);
         let leader_tid = LinuxTid::for_task_leader(child_id);
         let (vfork_parent_wait, vfork_release) = match vfork_relationship {
             Some((parent_wait, child_release)) => (Some(parent_wait), Some(child_release)),
@@ -897,6 +919,10 @@ impl PreparedFork {
             }
             check_failpoint(failpoint, KernelFailpoint::BeforePublish)?;
 
+            if pid_identity.is_some_and(|identity| !identity.commit()) {
+                return Err(KernelOperationError::PidNamespaceMembership(child_id));
+            }
+
             let task_claim = task_reservation.commit();
             if !external_peer_root {
                 child_parent_task.add_child(child_key);
@@ -917,16 +943,6 @@ impl PreparedFork {
                     diagnostic_name,
                 },
             );
-            if let Some(region) = child.pid_ns_region() {
-                if let (Ok(child_pid), Ok(parent_pid)) = (
-                    u32::try_from(child_id.raw()),
-                    u32::try_from(child_parent_task.key().id.raw()),
-                ) {
-                    if region.host_to_ns(child_pid).is_none() {
-                        let _ = region.register(child_pid, child_pid, parent_pid);
-                    }
-                }
-            }
             kernel.observe_task_publication(
                 &child,
                 &leader,
@@ -968,6 +984,7 @@ impl PreparedFork {
                 ),
                 vfork_parent_wait,
             }),
+            visible_child_id,
             start_wait,
             start_release,
         })
@@ -995,11 +1012,16 @@ impl StartedThreadClone {
 #[must_use = "a published thread must be started or explicitly retired"]
 pub struct PublishedThreadClone {
     started: Option<StartedThreadClone>,
+    visible_tid: i32,
     start_wait: Option<ChildStartWait>,
     start_release: ChildStartRelease,
 }
 
 impl PublishedThreadClone {
+    pub const fn visible_tid(&self) -> i32 {
+        self.visible_tid
+    }
+
     pub fn context(&self) -> Option<&KernelContext> {
         self.started.as_ref().map(StartedThreadClone::context)
     }
@@ -1040,12 +1062,19 @@ pub struct ThreadCloneReservation {
     plan: ClonePlan,
     tid: LinuxTid,
     reservation: ThreadReservation,
+    pid_identity: Option<crate::namespace::pid::PreparedNamespaceIdentity>,
     failpoint: Option<KernelFailpoint>,
 }
 
 impl ThreadCloneReservation {
     pub const fn tid(&self) -> LinuxTid {
         self.tid
+    }
+
+    pub fn visible_tid(&self) -> i32 {
+        self.pid_identity
+            .as_ref()
+            .map_or(self.tid.raw(), |identity| identity.visible_id() as i32)
     }
 
     pub fn prepare(
@@ -1100,6 +1129,10 @@ impl PreparedThreadClone {
         self.reservation.tid
     }
 
+    pub fn visible_tid(&self) -> i32 {
+        self.reservation.visible_tid()
+    }
+
     pub(crate) fn prepared_execution_identity(
         &self,
     ) -> (
@@ -1140,6 +1173,9 @@ impl PreparedThreadClone {
             {
                 return Err(KernelOperationError::ParentExited);
             }
+            if !self.reservation.task.container().accepts_new_tasks() {
+                return Err(KernelOperationError::ParentExited);
+            }
             match TaskSetReservation::acquired(&kernel, &mut state, vec![task_id], transaction) {
                 Ok(publication) => {
                     drop(state);
@@ -1168,6 +1204,9 @@ impl PreparedThreadClone {
             .get(&task_id)
             .is_none_or(|record| record.task.key() != task)
         {
+            return Err(KernelOperationError::ParentExited);
+        }
+        if !self.reservation.task.container().accepts_new_tasks() {
             return Err(KernelOperationError::ParentExited);
         }
         match TaskSetReservation::acquired(&kernel, &mut state, vec![task_id], transaction) {
@@ -1202,8 +1241,12 @@ impl PreparedThreadClone {
             plan: _,
             tid,
             reservation,
+            pid_identity,
             failpoint,
         } = reservation;
+        let visible_tid = pid_identity
+            .as_ref()
+            .map_or(tid.raw(), |identity| identity.visible_id() as i32);
         let published_and_pending = {
             let mut state = kernel.registry().state.write();
             if let Some(publication) = publication.as_ref() {
@@ -1230,8 +1273,17 @@ impl PreparedThreadClone {
             }
             let published_revision = next_revision(record.revision)?;
             check_failpoint(failpoint, KernelFailpoint::BeforePublish)?;
+            if pid_identity.is_some_and(|identity| !identity.commit()) {
+                return Err(KernelOperationError::PidNamespaceMembership(task.key().id));
+            }
             let claim = reservation.commit();
-            task.publish_thread(Arc::clone(&thread))?;
+            // The task, key and unique numeric claim were validated while the
+            // registry write lock was held. Publication has no recoverable
+            // failure left after namespace membership commits; treating an
+            // invariant violation as an ordinary error would leave a ghost
+            // namespace member behind.
+            task.publish_thread(Arc::clone(&thread))
+                .unwrap_or_else(|_| std::process::abort());
             record.thread_claims.insert(tid, claim);
             record.revision = published_revision;
             kernel.observe_thread_publication(&thread, &resources, published_revision);
@@ -1256,6 +1308,7 @@ impl PreparedThreadClone {
                     published_revision,
                 ),
             }),
+            visible_tid,
             start_wait,
             start_release,
         })
@@ -1264,14 +1317,29 @@ impl PreparedThreadClone {
 
 impl Kernel {
     pub(crate) fn initialize_launch_controlling_tty(&self, caller: &KernelContext) {
-        {
-            let mut tty = self.controlling_tty.lock();
-            tty.get_or_insert(super::core::ControllingTtyState {
-                session: caller.task().session(),
-                foreground: caller.task().process_group(),
+        let container = caller.container().id();
+        let state = self.registry().state.read();
+        let session = state
+            .sessions
+            .get(&caller.task().session())
+            .filter(|record| record.container == container)
+            .map(|record| Arc::clone(&record.object))
+            .unwrap_or_else(|| std::process::abort());
+        let foreground = state
+            .process_groups
+            .get(&caller.task().process_group())
+            .filter(|record| record.container == container)
+            .map(|record| Arc::clone(&record.object))
+            .unwrap_or_else(|| std::process::abort());
+        let mut ttys = self.controlling_ttys.lock();
+        ttys.entry(container)
+            .or_insert(super::core::ControllingTtyState {
+                session,
+                foreground,
             });
-        }
-        super::tty::acknowledge_ready();
+        drop(ttys);
+        drop(state);
+        super::tty::acknowledge_ready(self, container);
     }
 
     pub(crate) fn tty_acquire(
@@ -1279,21 +1347,42 @@ impl Kernel {
         caller: &KernelContext,
         force: bool,
     ) -> Result<(), TtyControlError> {
+        let container = caller.container().id();
         let session = caller.task().session();
         if session.raw() != caller.task().key().id.raw() {
             return Err(TtyControlError::Permission);
         }
-        let mut tty = self.controlling_tty.lock();
-        match tty.as_ref() {
-            Some(current) if current.session == session => Ok(()),
+        let state = self.registry().state.read();
+        let Some(session_object) = state
+            .sessions
+            .get(&session)
+            .filter(|record| record.container == container)
+            .map(|record| Arc::clone(&record.object))
+        else {
+            return Err(TtyControlError::Permission);
+        };
+        let Some(foreground) = state
+            .process_groups
+            .get(&caller.task().process_group())
+            .filter(|record| record.container == container)
+            .map(|record| Arc::clone(&record.object))
+        else {
+            return Err(TtyControlError::Permission);
+        };
+        let mut ttys = self.controlling_ttys.lock();
+        match ttys.get(&container) {
+            Some(current) if current.session.id() == session => Ok(()),
             Some(_) if !force || !caller.resources().credentials().is_privileged() => {
                 Err(TtyControlError::Permission)
             }
             _ => {
-                *tty = Some(super::core::ControllingTtyState {
-                    session,
-                    foreground: caller.task().process_group(),
-                });
+                ttys.insert(
+                    container,
+                    super::core::ControllingTtyState {
+                        session: session_object,
+                        foreground,
+                    },
+                );
                 Ok(())
             }
         }
@@ -1303,21 +1392,25 @@ impl Kernel {
         &self,
         caller: &KernelContext,
     ) -> Result<ProcessGroupId, TtyControlError> {
-        let tty = self.controlling_tty.lock();
-        let tty = tty.as_ref().ok_or(TtyControlError::NotControlling)?;
-        if tty.session != caller.task().session() {
+        let ttys = self.controlling_ttys.lock();
+        let tty = ttys
+            .get(&caller.container().id())
+            .ok_or(TtyControlError::NotControlling)?;
+        if tty.session.id() != caller.task().session() {
             return Err(TtyControlError::NotControlling);
         }
-        Ok(tty.foreground)
+        Ok(tty.foreground.id())
     }
 
     pub(crate) fn tty_session(&self, caller: &KernelContext) -> Result<SessionId, TtyControlError> {
-        let tty = self.controlling_tty.lock();
-        let tty = tty.as_ref().ok_or(TtyControlError::NotControlling)?;
-        if tty.session != caller.task().session() {
+        let ttys = self.controlling_ttys.lock();
+        let tty = ttys
+            .get(&caller.container().id())
+            .ok_or(TtyControlError::NotControlling)?;
+        if tty.session.id() != caller.task().session() {
             return Err(TtyControlError::NotControlling);
         }
-        Ok(tty.session)
+        Ok(tty.session.id())
     }
 
     pub(crate) fn tty_set_foreground_process_group(
@@ -1325,17 +1418,20 @@ impl Kernel {
         caller: &KernelContext,
         foreground: ProcessGroupId,
     ) -> Result<(), TtyControlError> {
+        let container = caller.container().id();
         let state = self.registry().state.read();
         let Some(group) = state.process_groups.get(&foreground) else {
             return Err(TtyControlError::Permission);
         };
-        if group.object.session() != caller.task().session() {
+        if group.container != container || group.object.session() != caller.task().session() {
             return Err(TtyControlError::Permission);
         }
-        drop(state);
-        let mut tty = self.controlling_tty.lock();
-        let tty = tty.as_mut().ok_or(TtyControlError::NotControlling)?;
-        if tty.session != caller.task().session() {
+        let foreground = Arc::clone(&group.object);
+        let mut ttys = self.controlling_ttys.lock();
+        let tty = ttys
+            .get_mut(&container)
+            .ok_or(TtyControlError::NotControlling)?;
+        if tty.session.id() != caller.task().session() {
             return Err(TtyControlError::NotControlling);
         }
         tty.foreground = foreground;
@@ -1343,12 +1439,15 @@ impl Kernel {
     }
 
     pub(crate) fn tty_detach(&self, caller: &KernelContext) -> Result<(), TtyControlError> {
-        let mut tty = self.controlling_tty.lock();
-        let current = tty.as_ref().ok_or(TtyControlError::NotControlling)?;
-        if current.session != caller.task().session() {
+        let container = caller.container().id();
+        let mut ttys = self.controlling_ttys.lock();
+        let current = ttys
+            .get(&container)
+            .ok_or(TtyControlError::NotControlling)?;
+        if current.session.id() != caller.task().session() {
             return Err(TtyControlError::NotControlling);
         }
-        *tty = None;
+        ttys.remove(&container);
         Ok(())
     }
 
@@ -1357,16 +1456,38 @@ impl Kernel {
             .is_ok_and(|foreground| foreground != caller.task().process_group())
     }
 
-    pub(crate) fn post_signal_to_tty_foreground(&self, signal: LinuxSignal) -> usize {
+    pub(crate) fn post_signal_to_tty_foreground(
+        &self,
+        container: super::container::ContainerId,
+        signal: LinuxSignal,
+    ) -> usize {
         let Some(group) = self
-            .controlling_tty
+            .controlling_ttys
             .lock()
-            .as_ref()
-            .map(|tty| tty.foreground)
+            .get(&container)
+            .map(|tty| Arc::clone(&tty.foreground))
         else {
             return 0;
         };
-        self.task_keys_in_process_group(group)
+        let state = self.registry().state.read();
+        let mut tasks = state
+            .process_groups
+            .get(&group.id())
+            .filter(|record| record.container == container && Arc::ptr_eq(&record.object, &group))
+            .into_iter()
+            .flat_map(|record| record.members.iter())
+            .filter_map(|task| {
+                state.tasks.get(&task.id).and_then(|record| {
+                    (record.task.key() == *task
+                        && record.task.lifecycle() == TaskLifecycle::Live
+                        && record.task.container().id() == container)
+                        .then_some(*task)
+                })
+            })
+            .collect::<Vec<_>>();
+        drop(state);
+        tasks.sort_unstable();
+        tasks
             .into_iter()
             .filter(|task| self.post_signal_to_task_key(*task, signal, None))
             .count()
@@ -1405,11 +1526,26 @@ impl Kernel {
     pub(crate) fn process_identity(&self, task_id: TaskId) -> Option<ProcessIdentity> {
         let state = self.registry().state.read();
         if let Some(record) = state.tasks.get(&task_id) {
+            let container = record.task.container().id();
+            let process_group = record.task.process_group();
+            let session = record.task.session();
+            let namespace_process_group = state
+                .process_groups
+                .get(&process_group)
+                .filter(|group| group.container == container)
+                .map(|group| group.namespace_id)?;
+            let namespace_session = state
+                .sessions
+                .get(&session)
+                .filter(|session| session.container == container)
+                .map(|session| session.namespace_id)?;
             return Some(ProcessIdentity {
                 pid: task_id,
                 parent: record.task.parent().map(|parent| parent.id),
-                process_group: record.task.process_group(),
-                session: record.task.session(),
+                process_group,
+                session,
+                namespace_process_group,
+                namespace_session,
                 state: ProcessState::Live,
             });
         }
@@ -1418,6 +1554,8 @@ impl Kernel {
             parent: record.zombie.parent.map(|parent| parent.id),
             process_group: record.zombie.process_group,
             session: record.zombie.session,
+            namespace_process_group: record.zombie.namespace_process_group,
+            namespace_session: record.zombie.namespace_session,
             state: ProcessState::Zombie,
         })
     }
@@ -1442,29 +1580,12 @@ impl Kernel {
         self.registry().state.read().tasks.contains_key(&task_id)
     }
 
-    /// The effective uid a LIVE task runs as, read from its own retained
-    /// process credentials.
-    ///
-    /// This is the authority for every "does the caller own that process?"
-    /// check that crosses a Linux process boundary (`setpriority`,
-    /// `sched_setparam`, `sched_setaffinity`, `process_vm_*`). The host cannot
-    /// answer it under HVPatch: every logical process shares the carrier's
-    /// pid, so a host-pid-keyed credential publication describes the carrier
-    /// rather than the target.
-    pub(crate) fn live_task_process_euid(&self, task_id: TaskId) -> Option<carrick_abi::NsUid> {
-        let state = self.registry().state.read();
-        state.tasks.get(&task_id).and_then(|record| {
-            (record.task.lifecycle() == TaskLifecycle::Live)
-                .then(|| record.task.process_credentials().euid())
-        })
-    }
-
     /// Resolve a task id to the LIVE task itself, for the callers that must
     /// read or write another process's per-task state rather than just test a
     /// property of it.
     ///
-    /// `live_task_process_euid` answers "who owns it"; this answers "which task
-    /// is it", which is what `prlimit(pid, …)` needs — Linux lets one process
+    /// This answers "which task is it", which is what `prlimit(pid, …)` needs
+    /// — Linux lets one process
     /// write another's limits, so there has to be a path from the caller to the
     /// target's state. There was none: rlimits lived in the dispatcher's private
     /// `ProcState`, so the write landed on whoever called.
@@ -1572,6 +1693,9 @@ impl Kernel {
                 record.task.shared().sighand(),
             )
         };
+        if target.container().id() != caller.container().id() {
+            return ExactSignalTargetAuthorization::Missing;
+        }
         let caller_credentials = caller.resources().credentials();
         let caller_is_privileged = caller_credentials.is_privileged();
         let uid_match = [caller_credentials.ruid(), caller_credentials.euid()]
@@ -1586,8 +1710,7 @@ impl Kernel {
             return ExactSignalTargetAuthorization::Denied;
         }
 
-        let init = TaskId::from_abi_positive(carrick_abi::LINUX_BOOTSTRAP_PID as i32).ok();
-        if Some(target_task.id) == init
+        if target.container().pid_root() == Some(target_task)
             && signal.is_some_and(|signal| {
                 (crate::namespace::pid::is_init_protected_default_signal(signal.raw())
                     || matches!(
@@ -1975,6 +2098,67 @@ impl Kernel {
         keys
     }
 
+    /// Resolve one namespace-visible process group and capture authorization
+    /// tickets for its exact member generations.
+    ///
+    /// Name lookup and membership selection share one registry read lock. If
+    /// the group disappears and its internal number is reused afterward, the
+    /// captured `TaskKey`s still carry the old serials; authorization/posting
+    /// can therefore only fail, never redirect to the replacement group.
+    pub(crate) fn authorize_namespace_process_group_signal_targets_exact(
+        &self,
+        caller: &KernelContext,
+        namespace_id: u32,
+        signal: Option<LinuxSignal>,
+    ) -> Option<Vec<ExactSignalTargetAuthorization>> {
+        if !std::ptr::eq(self, caller.kernel().as_ref()) {
+            return None;
+        }
+        let targets = {
+            let state = self.registry().state.read();
+            let container = caller.container().id();
+            let group = *state
+                .process_group_by_namespace
+                .get(&(container, namespace_id))?;
+            exact_process_group_members(&state, container, group)?
+        };
+        Some(
+            targets
+                .into_iter()
+                .map(|target| self.authorize_signal_target_exact(caller, target, None, signal))
+                .collect(),
+        )
+    }
+
+    /// Capture the caller's current process-group members with the same exact
+    /// generation guarantee as namespace-name lookup.
+    pub(crate) fn authorize_current_process_group_signal_targets_exact(
+        &self,
+        caller: &KernelContext,
+        signal: Option<LinuxSignal>,
+    ) -> Option<Vec<ExactSignalTargetAuthorization>> {
+        if !std::ptr::eq(self, caller.kernel().as_ref()) {
+            return None;
+        }
+        let targets = {
+            let state = self.registry().state.read();
+            let caller_record = state.tasks.get(&caller.task().key().id)?;
+            if caller_record.task.key() != caller.task().key()
+                || caller_record.task.lifecycle() != TaskLifecycle::Live
+            {
+                return None;
+            }
+            let container = caller_record.task.container().id();
+            exact_process_group_members(&state, container, caller_record.task.process_group())?
+        };
+        Some(
+            targets
+                .into_iter()
+                .map(|target| self.authorize_signal_target_exact(caller, target, None, signal))
+                .collect(),
+        )
+    }
+
     /// Every LIVE task a broadcast `kill(-1, …)` may target: all of them except
     /// the caller and init, lowest id first.
     ///
@@ -1990,14 +2174,19 @@ impl Kernel {
     }
 
     pub(crate) fn task_keys_for_broadcast(&self, caller: TaskId) -> Vec<TaskKey> {
-        let init = TaskId::from_abi_positive(carrick_abi::LINUX_BOOTSTRAP_PID as i32).ok();
         let state = self.registry().state.read();
+        let Some(caller_record) = state.tasks.get(&caller) else {
+            return Vec::new();
+        };
+        let container_id = caller_record.task.container().id();
+        let init = state.container_inits.get(&container_id).copied();
         let mut keys: Vec<TaskKey> = state
             .tasks
             .iter()
             .filter(|(id, record)| {
                 **id != caller
-                    && Some(**id) != init
+                    && init.is_none_or(|init| init.id != **id)
+                    && record.task.container().id() == container_id
                     && record.task.lifecycle() == TaskLifecycle::Live
             })
             .map(|(_, record)| record.task.key())
@@ -2041,8 +2230,7 @@ impl Kernel {
             }
             Arc::clone(&record.task)
         };
-        let init = TaskId::from_abi_positive(carrick_abi::LINUX_BOOTSTRAP_PID as i32).ok();
-        if Some(target.id) == init
+        if task.container().pid_root() == Some(target)
             && crate::namespace::pid::is_init_protected_default_signal(signal.raw())
             && task.shared().sighand().disposition(signal)
                 == super::objects::SignalDisposition::Default
@@ -2293,6 +2481,39 @@ impl Kernel {
         true
     }
 
+    /// Cancel exactly one container generation for carrier shutdown. Every
+    /// live task in that container has its kernel-owned continuation cancelled
+    /// before SIGKILL is queued and its lane waker is fired. Sibling container
+    /// tasks are selected out while holding the topology read lock.
+    pub(crate) fn request_container_shutdown(&self, container: super::ContainerId) -> usize {
+        let tasks = {
+            let state = self.registry().state.read();
+            state
+                .tasks
+                .values()
+                .filter(|record| {
+                    record.task.container().id() == container
+                        && record.task.lifecycle() == TaskLifecycle::Live
+                })
+                .map(|record| Arc::clone(&record.task))
+                .collect::<Vec<_>>()
+        };
+        for task in &tasks {
+            for thread in task.threads() {
+                let _ = thread.cancel_kernel_owned_continuation(
+                    crate::vcpu_loop::continuation::CancellationCause::ServiceShutdown,
+                );
+            }
+        }
+        let Ok(sigkill) = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGKILL) else {
+            return 0;
+        };
+        tasks
+            .into_iter()
+            .filter(|task| self.post_signal_to_task_key(task.key(), sigkill, None))
+            .count()
+    }
+
     /// Publish one short kernel-owned event to an exact live task generation,
     /// then wake that same retained task after publication.
     ///
@@ -2530,28 +2751,30 @@ impl Kernel {
             .flatten()
     }
 
-    /// Post one thread-directed signal to an exact live `(tgid, tid)` pair.
+    /// Post one thread-directed signal to an exact live task/thread generation.
     /// The pending queue is published before the task wake, matching the
-    /// process-directed ordering in [`Self::post_signal_to_task`].
-    #[cfg(test)]
-    pub fn post_signal_to_thread(
+    /// process-directed ordering in [`Self::post_signal_to_task_key`].
+    pub(crate) fn post_signal_to_thread_key(
         &self,
-        target_task: TaskId,
-        target_tid: LinuxTid,
+        target_task: TaskKey,
+        target_thread: ThreadKey,
         signal: LinuxSignal,
         siginfo: Option<LinuxSiginfo>,
     ) -> bool {
         let (thread, task, parent) = {
             let state = self.registry().state.read();
-            let Some(record) = state.tasks.get(&target_task) else {
+            let Some(record) = state.tasks.get(&target_task.id) else {
                 return false;
             };
-            if record.task.lifecycle() != TaskLifecycle::Live {
+            if record.task.key() != target_task || record.task.lifecycle() != TaskLifecycle::Live {
                 return false;
             }
-            let Some(thread) = record.task.thread(target_tid) else {
+            let Some(thread) = record.task.thread(target_thread.tid) else {
                 return false;
             };
+            if thread.key() != target_thread {
+                return false;
+            }
             let parent = record
                 .task
                 .parent()
@@ -2563,7 +2786,7 @@ impl Kernel {
         let generation = task.lock_signal_generation();
         if task.lifecycle() != TaskLifecycle::Live
             || task
-                .thread(target_tid)
+                .thread(target_thread.tid)
                 .is_none_or(|current| !Arc::ptr_eq(&current, &thread))
         {
             return false;
@@ -2591,6 +2814,29 @@ impl Kernel {
             parent.wake();
         }
         true
+    }
+
+    #[cfg(test)]
+    pub fn post_signal_to_thread(
+        &self,
+        target_task: TaskId,
+        target_tid: LinuxTid,
+        signal: LinuxSignal,
+        siginfo: Option<LinuxSiginfo>,
+    ) -> bool {
+        let target = {
+            let state = self.registry().state.read();
+            let record = match state.tasks.get(&target_task) {
+                Some(record) => record,
+                None => return false,
+            };
+            let thread = match record.task.thread(target_tid) {
+                Some(thread) => thread,
+                None => return false,
+            };
+            (record.task.key(), thread.key())
+        };
+        self.post_signal_to_thread_key(target.0, target.1, signal, siginfo)
     }
 
     pub(super) fn retire_mm_io_state_if_unreferenced(&self, target: &Arc<Mm>) {
@@ -2793,6 +3039,9 @@ impl Kernel {
             if caller_record.task.key() != parent.task.key() {
                 return Err(KernelOperationError::ParentExited);
             }
+            if !caller_record.task.container().accepts_new_tasks() {
+                return Err(KernelOperationError::ParentExited);
+            }
             // Compare the PARENT ASSOCIATION, not the revision.
             //
             // A task's revision advances whenever any thread publishes a
@@ -2860,6 +3109,20 @@ impl Kernel {
         };
         let (child_id, task_reservation) = self.ids().reserve_task()?;
         let leader_claim = self.ids().claim_task_leader_thread(child_id)?;
+        let pid_identity = match parent.task().pid_ns_region() {
+            Some(region) => {
+                let child = u32::try_from(child_id.raw())
+                    .map_err(|_| KernelOperationError::PidNamespaceMembership(child_id))?;
+                let parent_id = u32::try_from(parent.task().key().id.raw())
+                    .map_err(|_| KernelOperationError::PidNamespaceMembership(child_id))?;
+                Some(
+                    region
+                        .reserve_identity(child, parent_id)
+                        .ok_or(KernelOperationError::PidNamespaceMembership(child_id))?,
+                )
+            }
+            None => None,
+        };
         check_failpoint(failpoint, KernelFailpoint::AfterReserve)?;
         let vfork_relationship =
             (plan.vfork() == VforkMode::SuspendParent).then(VforkChildRelease::pair);
@@ -2877,6 +3140,7 @@ impl Kernel {
             child_id,
             task_reservation,
             leader_claim,
+            pid_identity,
             diagnostic_name,
             vfork_relationship,
             failpoint,
@@ -2950,6 +3214,9 @@ impl Kernel {
             if record.task.key() != parent.task.key() {
                 return Err(KernelOperationError::ParentExited);
             }
+            if !record.task.container().accepts_new_tasks() {
+                return Err(KernelOperationError::ParentExited);
+            }
             let current_shared = record.task.shared();
             let current_caller = record
                 .task
@@ -2964,6 +3231,20 @@ impl Kernel {
             }
         }
         let (tid, reservation) = self.ids().reserve_thread()?;
+        let pid_identity = match parent.task().pid_ns_region() {
+            Some(region) => {
+                let internal = u32::try_from(tid.raw()).map_err(|_| {
+                    KernelOperationError::PidNamespaceMembership(parent.task().key().id)
+                })?;
+                let parent_id = u32::try_from(parent.task().key().id.raw()).map_err(|_| {
+                    KernelOperationError::PidNamespaceMembership(parent.task().key().id)
+                })?;
+                Some(region.reserve_identity(internal, parent_id).ok_or(
+                    KernelOperationError::PidNamespaceMembership(parent.task().key().id),
+                )?)
+            }
+            None => None,
+        };
         check_failpoint(failpoint, KernelFailpoint::AfterReserve)?;
         Ok(ThreadCloneReservation {
             kernel: self.clone(),
@@ -2974,6 +3255,7 @@ impl Kernel {
             plan,
             tid,
             reservation,
+            pid_identity,
             failpoint,
         })
     }
@@ -3092,6 +3374,14 @@ impl Kernel {
                 });
         }
         drop(state);
+        if tid != LinuxTid::for_task_leader(context.task.key().id)
+            && let Some(region) = context.task.pid_ns_region()
+        {
+            let internal = u32::try_from(tid.raw()).unwrap_or_else(|_| std::process::abort());
+            if !region.unregister_reaped(internal) {
+                std::process::abort();
+            }
+        }
         self.retire_file_table_if_unreferenced(&files);
         Ok(next)
     }
@@ -3526,9 +3816,17 @@ impl Kernel {
         if !group_exists && target_group != ProcessGroupId::from_leader(target_id) {
             return Err(KernelOperationError::IdentityPermission);
         }
+        let target_namespace_id = if group_exists {
+            None
+        } else {
+            Some(namespace_visible_task_id(&target)?)
+        };
 
         let published_revision = next_revision(target_revision)?;
         if !group_exists {
+            let Some(namespace_id) = target_namespace_id else {
+                std::process::abort();
+            };
             if !state.sessions.contains_key(&caller.session()) {
                 return Err(KernelOperationError::IdentityObjectMissing);
             }
@@ -3545,11 +3843,13 @@ impl Kernel {
                 .ok_or(KernelOperationError::IdentityObjectMissing)?
                 .process_groups
                 .insert(target_group);
-            state.process_groups.insert(
+            state.publish_process_group(
                 target_group,
                 ProcessGroupRecord {
                     object,
                     members: std::collections::BTreeSet::new(),
+                    container: target.container().id(),
+                    namespace_id,
                 },
             );
         }
@@ -3640,6 +3940,7 @@ impl Kernel {
         };
         let session = task.session();
         let group_id = ProcessGroupId::from_leader(task_id);
+        let namespace_id = namespace_visible_task_id(&task)?;
         let claim = self.ids().claim_process_group(group_id)?;
         check_failpoint(failpoint, KernelFailpoint::AfterReserve)?;
         let object = Arc::new(ProcessGroup::new(group_id, session, self.ids(), claim)?);
@@ -3674,11 +3975,13 @@ impl Kernel {
         check_failpoint(failpoint, KernelFailpoint::BeforePublish)?;
 
         let old_group = current.process_group();
-        state.process_groups.insert(
+        state.publish_process_group(
             group_id,
             ProcessGroupRecord {
                 object,
                 members: std::collections::BTreeSet::from([current.key()]),
+                container: current.container().id(),
+                namespace_id,
             },
         );
         if let Some(session_record) = state.sessions.get_mut(&session) {
@@ -3726,6 +4029,7 @@ impl Kernel {
         let old_session = task.session();
         let group_id = ProcessGroupId::from_leader(task_id);
         let session_id = SessionId::from_leader(task_id);
+        let namespace_id = namespace_visible_task_id(&task)?;
         if old_group == group_id {
             return Err(KernelOperationError::AlreadyProcessGroupLeader);
         }
@@ -3777,18 +4081,22 @@ impl Kernel {
         check_failpoint(failpoint, KernelFailpoint::BeforePublish)?;
 
         remove_group_member(&mut state, old_group, old_session, current.key());
-        state.process_groups.insert(
+        state.publish_process_group(
             group_id,
             ProcessGroupRecord {
                 object: group,
                 members: std::collections::BTreeSet::from([current.key()]),
+                container: current.container().id(),
+                namespace_id,
             },
         );
-        state.sessions.insert(
+        state.publish_session(
             session_id,
             SessionRecord {
                 object: session,
                 process_groups: std::collections::BTreeSet::from([group_id]),
+                container: current.container().id(),
+                namespace_id,
             },
         );
         current.replace_identity(group_id, session_id);
@@ -3914,18 +4222,13 @@ impl Kernel {
             }
             Some(adopter_key)
         } else {
-            (task_key != state.root)
-                .then(|| {
-                    state
-                        .tasks
-                        .get(&state.root.id)
-                        .filter(|record| {
-                            record.task.key() == state.root
-                                && record.task.lifecycle() == TaskLifecycle::Live
-                        })
-                        .map(|record| record.task.key())
+            let init = state.container_inits.get(&task.container().id()).copied();
+            init.filter(|init| *init != task_key).and_then(|init| {
+                state.tasks.get(&init.id).and_then(|record| {
+                    (record.task.key() == init && record.task.lifecycle() == TaskLifecycle::Live)
+                        .then(|| record.task.key())
                 })
-                .flatten()
+            })
         };
         let mut children = task.children();
         children.sort_by_key(|child| child.serial);
@@ -3980,7 +4283,25 @@ impl Kernel {
             None
         };
 
-        let registry_zombie = Zombie::from_task(&task, status, diagnostic_name);
+        let namespace_process_group = state
+            .process_groups
+            .get(&task.process_group())
+            .filter(|group| group.container == task.container().id())
+            .map(|group| group.namespace_id)
+            .ok_or(KernelOperationError::ExitTopologyChanged(task_id))?;
+        let namespace_session = state
+            .sessions
+            .get(&task.session())
+            .filter(|session| session.container == task.container().id())
+            .map(|session| session.namespace_id)
+            .ok_or(KernelOperationError::ExitTopologyChanged(task_id))?;
+        let registry_zombie = Zombie::from_task(
+            &task,
+            status,
+            diagnostic_name,
+            namespace_process_group,
+            namespace_session,
+        );
         let result_zombie = registry_zombie.clone();
         let task_ids: Vec<_> = reserved_ids.into_iter().collect();
         let reservation = TaskSetReservation::acquired(self, &mut state, task_ids, transaction)?;
@@ -4077,12 +4398,10 @@ impl Kernel {
         if let Some(tracer) = &own_tracer {
             tracer.remove_ptrace_tracee(prepared.task);
         }
+        let mut exiting_threads = Vec::new();
         let mut exiting_file_tables = Vec::new();
         for thread_key in exiting_record.task.thread_keys() {
             if let Some(thread) = exiting_record.task.thread(thread_key.tid) {
-                let _ = thread.cancel_kernel_owned_continuation(
-                    crate::vcpu_loop::continuation::CancellationCause::ProcessExit,
-                );
                 let files = thread.resources().files();
                 if !exiting_file_tables
                     .iter()
@@ -4090,6 +4409,7 @@ impl Kernel {
                 {
                     exiting_file_tables.push(files);
                 }
+                exiting_threads.push(thread);
             }
         }
 
@@ -4107,7 +4427,14 @@ impl Kernel {
             has_execed: _,
             diagnostic_name: _,
         } = record;
+        let leader_tid = LinuxTid::for_task_leader(task.key().id);
+        let pid_region = task.pid_ns_region();
+        let mut retired_secondary_namespace_tids = Vec::new();
         for (tid, claim) in thread_claims {
+            if tid != leader_tid {
+                retired_secondary_namespace_tids
+                    .push(u32::try_from(tid.raw()).unwrap_or_else(|_| std::process::abort()));
+            }
             if let Some(thread) = task.thread(tid) {
                 state
                     .retired_threads
@@ -4162,6 +4489,20 @@ impl Kernel {
         let pending_publication = prepared.reservation.commit(&mut state)?;
         drop(state);
         pending_publication.publish();
+        if let Some(region) = pid_region {
+            for tid in retired_secondary_namespace_tids {
+                if !region.unregister_reaped(tid) {
+                    std::process::abort();
+                }
+            }
+        }
+        // Cancellation can wake a host waiter, whose callback may re-enter the
+        // registry. Never invoke it while holding the topology write lock.
+        for thread in exiting_threads {
+            let _ = thread.cancel_kernel_owned_continuation(
+                crate::vcpu_loop::continuation::CancellationCause::ProcessExit,
+            );
+        }
         // Queue the parent's exit notification after the exit reservation is
         // committed. If notify_parent ran before commit, a parent that woke
         // immediately would see TaskBusy in wait_child_matching and park in
@@ -4393,13 +4734,16 @@ impl Kernel {
         if mode == WaitMode::Consume {
             ensure_task_unreserved(&state, parent_id)?;
         }
-        let Some((parent, children, tracees)) = state.tasks.get(&parent_id).map(|record| {
-            (
-                record.task.key(),
-                record.task.children(),
-                record.task.ptrace_tracees(),
-            )
-        }) else {
+        let Some((parent, parent_pid_region, children, tracees)) =
+            state.tasks.get(&parent_id).map(|record| {
+                (
+                    record.task.key(),
+                    record.task.pid_ns_region(),
+                    record.task.children(),
+                    record.task.ptrace_tracees(),
+                )
+            })
+        else {
             return Err(KernelOperationError::UnknownTask(parent_id));
         };
         // ptrace(2): a tracer waits for its tracees' ptrace stops whether or
@@ -4444,6 +4788,14 @@ impl Kernel {
                         .task
                         .charge_reaped_child(zombie.total_charge_to_reaper());
                     parent_record.revision = parent_revision;
+                }
+                drop(state);
+                if let Some(region) = parent_pid_region {
+                    let internal =
+                        u32::try_from(id.raw()).unwrap_or_else(|_| std::process::abort());
+                    if !region.unregister_reaped(internal) {
+                        std::process::abort();
+                    }
                 }
             }
             return Ok(WaitOutcome::Exited(zombie));
@@ -4547,6 +4899,31 @@ fn next_revision(revision: TaskRevision) -> Result<TaskRevision, KernelOperation
     revision
         .next()
         .ok_or(KernelOperationError::RevisionExhausted)
+}
+
+fn exact_process_group_members(
+    state: &RegistryState,
+    container: super::container::ContainerId,
+    group_id: ProcessGroupId,
+) -> Option<Vec<TaskKey>> {
+    let group = state.process_groups.get(&group_id)?;
+    if group.container != container {
+        return None;
+    }
+    Some(
+        group
+            .members
+            .iter()
+            .filter_map(|key| {
+                let record = state.tasks.get(&key.id)?;
+                (record.task.key() == *key
+                    && record.task.lifecycle() == TaskLifecycle::Live
+                    && record.task.container().id() == container
+                    && record.task.process_group() == group_id)
+                    .then_some(*key)
+            })
+            .collect(),
+    )
 }
 
 /// `RLIMIT_NPROC` at fork reservation — setrlimit(2): while the number of
@@ -4664,7 +5041,7 @@ fn remove_group_member(
     if !remove_group {
         return;
     }
-    state.process_groups.remove(&group_id);
+    state.remove_process_group(group_id);
     let remove_session = if let Some(session) = state.sessions.get_mut(&session_id) {
         session.process_groups.remove(&group_id);
         session.process_groups.is_empty()
@@ -4672,7 +5049,20 @@ fn remove_group_member(
         false
     };
     if remove_session {
-        state.sessions.remove(&session_id);
+        state.remove_session(session_id);
+    }
+}
+
+/// Namespace-visible pid for a live task, used when that task creates a
+/// process-group or session whose name must outlive the task's own PID slot.
+fn namespace_visible_task_id(task: &TaskRef) -> Result<u32, KernelOperationError> {
+    let internal = u32::try_from(task.key().id.raw())
+        .map_err(|_| KernelOperationError::PidNamespaceMembership(task.key().id))?;
+    match task.pid_ns_region() {
+        Some(region) => region
+            .host_to_ns(internal)
+            .ok_or(KernelOperationError::PidNamespaceMembership(task.key().id)),
+        None => Ok(internal),
     }
 }
 
@@ -4764,6 +5154,8 @@ pub enum KernelOperationError {
     RetiredThreadCapacity(usize),
     #[error("task's process-group or session object disappeared before commit")]
     IdentityObjectMissing,
+    #[error("kernel task {0:?} could not join its container PID namespace")]
+    PidNamespaceMembership(TaskId),
     #[error("kernel task {0:?} is not live")]
     UnknownTask(TaskId),
     #[error("kernel task {0:?} belongs to another generation")]
@@ -5508,6 +5900,89 @@ mod tests {
     }
 
     #[test]
+    fn authorized_group_selection_never_follows_a_reused_group_number() {
+        let (kernel, root) = bootstrap(79);
+        let root_binding = root.task_binding();
+        let root_tid = root.thread().key().tid;
+        let child_a = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(9_179),
+                "group-signal-child-a".to_owned(),
+                None,
+            )
+            .expect("child A");
+        let child_a_key = child_a.task().key();
+        let child_a_group = kernel
+            .create_process_group(child_a_key.id, None)
+            .expect("child A group");
+        let sigusr1 = LinuxSignal::for_signal_number(10).expect("SIGUSR1");
+        let selected = kernel
+            .authorize_namespace_process_group_signal_targets_exact(
+                &root,
+                child_a_group.raw() as u32,
+                Some(sigusr1),
+            )
+            .expect("child A group exists");
+        let ticket = selected
+            .into_iter()
+            .find_map(|authorization| match authorization {
+                ExactSignalTargetAuthorization::Allowed(ticket) => Some(ticket),
+                _ => None,
+            })
+            .expect("child A is authorized");
+
+        kernel
+            .exit_task_key_eventually(child_a_key, LinuxWaitStatus::from_wait_encoding(0))
+            .expect("exit child A");
+        drop(child_a);
+        assert!(matches!(
+            kernel.wait_child(
+                root.task().key().id,
+                Some(child_a_key.id),
+                WaitMode::Consume
+            ),
+            Ok(WaitOutcome::Exited(_))
+        ));
+        kernel.sweep_retired_threads();
+        kernel.ids().set_next_for_tests(child_a_key.id.raw());
+
+        let fresh_root = root_binding.capture(root_tid).expect("fresh root context");
+        let child_b = kernel
+            .fork_task(
+                &fresh_root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(9_180),
+                "group-signal-child-b".to_owned(),
+                None,
+            )
+            .expect("child B");
+        assert_eq!(child_b.task().key().id, child_a_key.id);
+        assert_ne!(child_b.task().key(), child_a_key);
+        assert_eq!(
+            kernel
+                .create_process_group(child_b.task().key().id, None)
+                .expect("child B group"),
+            child_a_group,
+        );
+
+        assert!(
+            !kernel.post_signal_to_authorized_target(&ticket, sigusr1, None),
+            "the exact old group member ticket must fail closed",
+        );
+        assert!(
+            !child_b
+                .task()
+                .shared()
+                .pending_signals()
+                .present()
+                .contains(sigusr1.raw()),
+            "the reused group number must not redirect delivery to child B",
+        );
+    }
+
+    #[test]
     fn carrier_control_honors_default_signal_protection_for_namespace_init() {
         let (kernel, root) = bootstrap(carrick_abi::LINUX_BOOTSTRAP_PID as i32);
         let sigterm = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGTERM).expect("SIGTERM");
@@ -5679,7 +6154,10 @@ mod tests {
         let (kernel, root) = bootstrap(carrick_abi::LINUX_BOOTSTRAP_PID as i32);
         kernel.initialize_launch_controlling_tty(&root);
         let winch = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGWINCH).expect("WINCH");
-        assert_eq!(kernel.post_signal_to_tty_foreground(winch), 1);
+        assert_eq!(
+            kernel.post_signal_to_tty_foreground(root.container().id(), winch),
+            1
+        );
         assert!(
             root.shared()
                 .pending_signals()
@@ -5726,10 +6204,99 @@ mod tests {
     }
 
     #[test]
+    fn two_containers_keep_independent_tty_state_and_relay_routes_exactly() {
+        use crate::kernel::{Container, LaunchContext, RunId};
+
+        let (kernel, alpha) = bootstrap(carrick_abi::LINUX_BOOTSTRAP_PID as i32);
+        let beta_container = Arc::new(Container::new(LaunchContext::unmanaged(RunId::new(
+            "tty-beta",
+        ))));
+        let beta = kernel
+            .prepare_container_root(
+                ThreadId::synthetic_for_tests(9_012),
+                None,
+                "tty-beta-init".to_owned(),
+                beta_container,
+                None,
+            )
+            .expect("prepare beta root")
+            .commit()
+            .expect("publish beta root");
+
+        crate::kernel::tty::prepare();
+        crate::kernel::tty::install(&kernel);
+        kernel.initialize_launch_controlling_tty(&alpha);
+        crate::kernel::tty::route_foreground_signal(carrick_abi::LINUX_SIGINT);
+
+        kernel.initialize_launch_controlling_tty(&beta);
+        crate::kernel::tty::route_foreground_signal(carrick_abi::LINUX_SIGWINCH);
+
+        assert_eq!(
+            kernel.tty_foreground_process_group(&alpha),
+            Ok(alpha.task().process_group()),
+        );
+        assert_eq!(kernel.tty_session(&alpha), Ok(alpha.task().session()));
+        assert_eq!(
+            kernel.tty_foreground_process_group(&beta),
+            Ok(beta.task().process_group()),
+        );
+        assert_eq!(kernel.tty_session(&beta), Ok(beta.task().session()));
+
+        let alpha_pending = alpha.shared().pending_signals().present();
+        let beta_pending = beta.shared().pending_signals().present();
+        assert!(alpha_pending.contains(carrick_abi::LINUX_SIGINT));
+        assert!(!alpha_pending.contains(carrick_abi::LINUX_SIGWINCH));
+        assert!(!beta_pending.contains(carrick_abi::LINUX_SIGINT));
+        assert!(beta_pending.contains(carrick_abi::LINUX_SIGWINCH));
+    }
+
+    #[test]
+    fn retiring_container_revokes_only_its_controlling_tty() {
+        use crate::kernel::{Container, LaunchContext, RunId};
+
+        let (kernel, alpha) = bootstrap(carrick_abi::LINUX_BOOTSTRAP_PID as i32);
+        let beta_container = Arc::new(Container::new(LaunchContext::unmanaged(RunId::new(
+            "retired-tty-beta",
+        ))));
+        let beta_id = beta_container.id();
+        let beta = kernel
+            .prepare_container_root(
+                ThreadId::synthetic_for_tests(9_013),
+                None,
+                "retired-tty-beta-init".to_owned(),
+                beta_container,
+                None,
+            )
+            .expect("prepare beta root")
+            .commit()
+            .expect("publish beta root");
+
+        kernel.initialize_launch_controlling_tty(&alpha);
+        kernel.initialize_launch_controlling_tty(&beta);
+        kernel
+            .retire_container_root(beta_id, None)
+            .expect("retire beta root");
+
+        assert_eq!(
+            kernel.tty_session(&beta),
+            Err(TtyControlError::NotControlling),
+        );
+        assert_eq!(kernel.tty_session(&alpha), Ok(alpha.task().session()));
+    }
+
+    #[test]
     fn exact_authorized_self_signals_preserve_process_and_thread_queue_ownership() {
         let (kernel, root) = bootstrap(80);
         let sigusr1 = LinuxSignal::for_signal_number(10).expect("SIGUSR1");
         let sigusr2 = LinuxSignal::for_signal_number(12).expect("SIGUSR2");
+        // Every container root is namespace init now, even when its carrier
+        // TaskId is not numerically 1. Linux permits init to receive these
+        // default-lethal signals only after it installs a handler; this test
+        // is about process-vs-thread queue ownership, not init immunity.
+        let mut caught = carrick_abi::LinuxSigaction::empty();
+        caught.sa_handler = 0x4000;
+        root.shared().sighand().install_action(sigusr1, caught);
+        root.shared().sighand().install_action(sigusr2, caught);
         let process_ticket = match kernel.authorize_signal_target_exact(
             &root,
             root.task().key(),

@@ -7,7 +7,7 @@ use parking_lot::{Condvar, Mutex};
 use super::asid::{AsidError, AsidGeneration, AsidLoad, AsidResidencyError};
 use super::stage1_mm::{
     PreparedStage1Mm, PreparedStage1MmAbort, Stage1MmBackend, Stage1MmError, Stage1MmLease,
-    Stage1MmPool, Stage1MmRetirement,
+    Stage1MmPool, Stage1MmRetirement, Stage1RootRetirementReceipt, Stage1RootRetirementTicket,
 };
 #[cfg(test)]
 use crate::kernel::ThreadKey;
@@ -466,9 +466,30 @@ impl RetiredStage1Mm {
         self.retirement.as_ref()
     }
 
-    pub(crate) fn complete(self) -> Result<(), MmResourcesError> {
+    pub(crate) fn take_root_retirement_ticket(
+        &mut self,
+    ) -> Result<Option<Stage1RootRetirementTicket>, MmResourcesError> {
+        match self.retirement.as_mut() {
+            Some(retirement) => retirement.take_root_retirement_ticket().map_err(Into::into),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn complete(
+        self,
+        root_receipt: Option<Stage1RootRetirementReceipt>,
+    ) -> Result<(), MmResourcesError> {
         match self.retirement {
-            Some(retirement) => retirement.complete().map_err(Into::into),
+            Some(retirement) => retirement.complete(root_receipt).map_err(Into::into),
+            None if root_receipt.is_none() => Ok(()),
+            None => Err(Stage1MmError::UnexpectedRootRetirementReceipt.into()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_for_test(self) -> Result<(), MmResourcesError> {
+        match self.retirement {
+            Some(retirement) => retirement.complete_for_test().map_err(Into::into),
             None => Ok(()),
         }
     }
@@ -492,6 +513,8 @@ pub(crate) enum MmResourcesError {
     RootSlotExhausted,
     #[error("hvpatch stage-1 mm retirement still awaits executor invalidation")]
     RetirementIncomplete,
+    #[error(transparent)]
+    RootRetirement(Stage1MmError),
     #[error(transparent)]
     ExecReservationConflict(#[from] ExecReservationConflict),
     #[error(
@@ -530,6 +553,11 @@ impl From<Stage1MmError> for MmResourcesError {
             Stage1MmError::RootSlotExhausted | Stage1MmError::Retired => Self::RootSlotExhausted,
             Stage1MmError::RetirementIncomplete => Self::RetirementIncomplete,
             Stage1MmError::Residency(error) => Self::Residency(error),
+            error @ (Stage1MmError::RootRetirementTicketAlreadyIssued
+            | Stage1MmError::RootRetirementTicketUnavailable
+            | Stage1MmError::RootRetirementReceiptMissing
+            | Stage1MmError::UnexpectedRootRetirementReceipt
+            | Stage1MmError::RootRetirementMismatch { .. }) => Self::RootRetirement(error),
         }
     }
 }
@@ -1405,7 +1433,7 @@ mod tests {
             resources.prepare_child(),
             Err(MmResourcesError::AsidExhausted)
         ));
-        retired.complete().expect("complete retirement");
+        retired.complete_for_test().expect("complete retirement");
         assert_eq!(
             resources.prepare_child().unwrap().binding().asid,
             binding.asid
@@ -1423,7 +1451,7 @@ mod tests {
         assert!(!resources.is_final_owner(parent).unwrap());
 
         let retired = resources.retire(child).unwrap();
-        retired.complete().expect("complete retirement");
+        retired.complete_for_test().expect("complete retirement");
         assert!(resources.is_final_owner(parent).unwrap());
         assert_eq!(backend.binding().stage1_root.gpa().raw(), 0x4000);
         assert!(resources.prepare_child().is_ok());
@@ -1472,7 +1500,7 @@ mod tests {
         RetiredStage1Mm {
             retirement: Some(retired.unwrap()),
         }
-        .complete()
+        .complete_for_test()
         .unwrap();
     }
 
@@ -1487,7 +1515,7 @@ mod tests {
             .unwrap();
         let old_binding = old_backend.binding();
         let retired = resources.retire(old).unwrap();
-        retired.complete().expect("complete retirement");
+        retired.complete_for_test().expect("complete retirement");
 
         let replacement_backend = resources
             .publish_child(replacement, resources.prepare_child().unwrap())
@@ -1496,7 +1524,9 @@ mod tests {
         assert_eq!(replacement_binding.asid, old_binding.asid);
 
         let duplicate = resources.retire(old).unwrap();
-        duplicate.complete().expect("complete duplicate retirement");
+        duplicate
+            .complete_for_test()
+            .expect("complete duplicate retirement");
         assert_eq!(replacement_backend.binding(), replacement_binding);
         assert!(matches!(
             resources.prepare_exec(old),
@@ -1644,7 +1674,11 @@ mod tests {
             resources.reserve_exec(first_child),
             Err(MmResourcesError::OwnerSetEditInFlight { .. })
         ));
-        resources.retire(second_child).unwrap().complete().unwrap();
+        resources
+            .retire(second_child)
+            .unwrap()
+            .complete_for_test()
+            .unwrap();
         drop(hold);
         assert_eq!(
             resources
@@ -1761,7 +1795,7 @@ mod tests {
         let ExecMmCommitReceipt::Retired { retirement, .. } = waiter_receipt else {
             panic!("final waiter did not retire its exact predecessor");
         };
-        retirement.complete().unwrap();
+        retirement.complete_for_test().unwrap();
         waiter_thread.join().unwrap();
     }
 
@@ -1925,7 +1959,7 @@ mod tests {
             predecessor.begin_asid_load(executor(13_502)),
             Err(AsidResidencyError::Retiring)
         ));
-        retirement.complete().unwrap();
+        retirement.complete_for_test().unwrap();
     }
 
     #[test]
@@ -1997,7 +2031,7 @@ mod tests {
             .mm_pool
             .retire(&predecessor)
             .unwrap()
-            .complete()
+            .complete_for_test()
             .unwrap();
 
         let final_task = task(132, 3);
@@ -2032,7 +2066,7 @@ mod tests {
             &final_resources.lease(committed_child).unwrap(),
             &replacement
         ));
-        retirement.complete().unwrap();
+        retirement.complete_for_test().unwrap();
     }
 
     #[test]
@@ -2071,7 +2105,7 @@ mod tests {
                 retained_retirement.asid_generation(),
             ))
             .unwrap();
-        retained_retirement.complete().unwrap();
+        retained_retirement.complete_for_test().unwrap();
         drop(retained_resources.reserve_exec(retained_child).unwrap());
 
         let final_task = task(142, 3);
@@ -2105,7 +2139,7 @@ mod tests {
                 final_retirement.asid_generation(),
             ))
             .unwrap();
-        final_retirement.complete().unwrap();
+        final_retirement.complete_for_test().unwrap();
         drop(final_resources.reserve_exec(final_task).unwrap());
     }
 
@@ -2134,12 +2168,12 @@ mod tests {
             worker_resources
                 .retire(unrelated_alias)
                 .unwrap()
-                .complete()
+                .complete_for_test()
                 .unwrap();
             worker_resources
                 .retire(unrelated_final)
                 .unwrap()
-                .complete()
+                .complete_for_test()
                 .unwrap();
             worker_resources
                 .reserve_exec(unrelated_owner)
@@ -2346,7 +2380,7 @@ mod tests {
         reserve_first_resources
             .retire(reserve_first_alias)
             .unwrap()
-            .complete()
+            .complete_for_test()
             .unwrap();
 
         let retire_first_root = task(182, 3);
@@ -2383,7 +2417,12 @@ mod tests {
             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
         ));
         retire_release.wait();
-        retire_owner.join().unwrap().unwrap().complete().unwrap();
+        retire_owner
+            .join()
+            .unwrap()
+            .unwrap()
+            .complete_for_test()
+            .unwrap();
         let retire_first = reserve_rx
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap()

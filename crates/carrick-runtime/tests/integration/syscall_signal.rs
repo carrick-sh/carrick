@@ -382,6 +382,9 @@ fn kill_tkill_tgkill_validate_logical_targets_and_queue_exact_thread_signals() {
     let context = dispatcher.capture_one_task_context().unwrap();
     let task_id = context.task().key().id.raw() as u64;
     let thread_id = context.thread().key().tid.raw() as u64;
+    // This fixture's root task is namespace init. Linux protects init from
+    // default-lethal signals, so install a handler before testing delivery.
+    install_guest_signal_handler(&context, 1);
 
     // kill(1, 0) -> existence check, success.
     assert_eq!(

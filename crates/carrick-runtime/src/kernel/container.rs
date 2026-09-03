@@ -23,30 +23,57 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use camino::Utf8PathBuf;
 use carrick_guest_mem::{CurrentMmMemory, MemoryError};
 
+use super::netns::{NetNs, UtsNs};
 use super::objects::TaskKey;
-use crate::namespace::process::{CapabilitySet, capability_mask_for_names};
+use crate::namespace::process::{CapabilitySet, alloc_ns_id, capability_mask_for_names};
+use crate::network::model::{HostWireSnapshot, LinuxNetworkModel};
 use crate::run_result::RuntimeError;
 
-/// Kernel-graph identity of one container.
-///
-/// Allocated from a carrier-wide monotonic counter — the same class as
-/// [`crate::namespace::process::alloc_ns_id`] — so two containers in one
-/// carrier can never share an id. Never derived from a host pid: the carrier
-/// pid names the host process, which may hold many of these.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[repr(transparent)]
-pub struct ContainerId(u64);
+pub use carrick_hal::ContainerId;
 
-static NEXT_CONTAINER_ID: AtomicU64 = AtomicU64::new(1);
+/// Immutable process-cleanup identity for one carrier. A shared carrier can
+/// host many container [`RunId`] values, but `scripts/sudo/kill.sh` must always
+/// have one stable token that names the host process itself.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct CarrierScopeId(String);
 
-impl ContainerId {
-    /// The next unused id in this carrier. Ids are never recycled.
-    pub fn allocate() -> Self {
-        Self(NEXT_CONTAINER_ID.fetch_add(1, Ordering::Relaxed))
+impl CarrierScopeId {
+    pub fn new(scope: impl Into<String>) -> Result<Self, RuntimeError> {
+        let scope = scope.into();
+        if scope.is_empty() {
+            return Err(RuntimeError::Configuration(
+                "carrier cleanup scope cannot be empty".to_owned(),
+            ));
+        }
+        Ok(Self(scope))
     }
 
-    pub const fn raw(self) -> u64 {
-        self.0
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Resolve the process-level cleanup identity at the launch boundary.
+    /// An operator-supplied id remains byte-for-byte compatible with the
+    /// scoped reaper; otherwise cryptographic host entropy prevents two
+    /// embedders from accidentally sharing a cleanup target.
+    pub(crate) fn from_process_env_or_random() -> Result<Self, RuntimeError> {
+        if let Some(scope) = std::env::var("CARRICK_RUN_ID")
+            .ok()
+            .filter(|scope| !scope.is_empty())
+        {
+            return Self::new(scope);
+        }
+        let mut entropy = [0_u8; 16];
+        getrandom::fill(&mut entropy).map_err(|error| {
+            RuntimeError::Configuration(format!(
+                "failed to generate carrier cleanup scope: {error}"
+            ))
+        })?;
+        let scope = entropy
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        Self::new(scope)
     }
 }
 
@@ -140,6 +167,9 @@ impl LaunchAuthorization {
 pub struct LaunchContext {
     /// Kernel-graph identity of the container this run becomes.
     pub container_id: ContainerId,
+    /// Host-process cleanup identity. Explicit carriers replace the
+    /// constructor default with their immutable scope when reserving a run.
+    pub carrier_scope_id: CarrierScopeId,
     /// The run stamp (`CARRICK_RUN_ID`).
     pub run_id: RunId,
     /// An existing overlay to ATTACH instead of extracting the image
@@ -159,13 +189,28 @@ impl LaunchContext {
     /// embedded `PreparedContainer`, and of every in-crate reference-model
     /// kernel. Allocates a fresh [`ContainerId`].
     pub fn unmanaged(run_id: RunId) -> Self {
+        let carrier_scope_id = CarrierScopeId(run_id.as_str().to_owned());
         Self {
             container_id: ContainerId::allocate(),
+            carrier_scope_id,
             run_id,
             exec_overlay: None,
             launch_authorization: None,
             registry_id: None,
         }
+    }
+
+    /// Build an unmanaged launch at the process-identity boundary, preserving
+    /// an explicit operator run id and otherwise using the caller's freshly
+    /// generated default. Keeping the environment read here prevents embed
+    /// preparation and execution code from rediscovering ambient identity.
+    pub fn unmanaged_from_process_run_id(default_run_id: RunId) -> Self {
+        let run_id = std::env::var("CARRICK_RUN_ID")
+            .ok()
+            .filter(|stamp| !stamp.is_empty())
+            .map(RunId::new)
+            .unwrap_or(default_run_id);
+        Self::unmanaged(run_id)
     }
 
     /// The lifecycle-registry id as a `&str`, for the callers that key the
@@ -217,6 +262,7 @@ impl LaunchContext {
             .map(LaunchAuthorization::new);
         Ok(Self {
             container_id: ContainerId::allocate(),
+            carrier_scope_id: CarrierScopeId(run_id.as_str().to_owned()),
             run_id,
             exec_overlay,
             launch_authorization,
@@ -797,11 +843,16 @@ impl ClockDomain {
 pub struct Container {
     id: ContainerId,
     launch: LaunchContext,
+    /// Initial network and UTS namespaces for this container. Each task's
+    /// `NsProxy` clones these exact Arcs at publication; a later container can
+    /// therefore never rename or republish an already-running sibling.
+    net_ns: Arc<NetNs>,
+    uts_ns: Arc<UtsNs>,
     /// The task that is this container's PID-namespace init. Published once,
     /// by the bootstrap that creates the root task. B2 adds the pid-namespace
     /// REGION (`pid_ns`) beside it; the two are different domains (a task key
     /// versus an arena slot) and both stay.
-    pid_root: OnceLock<TaskKey>,
+    pid_root: Mutex<Option<TaskKey>>,
     /// The PID namespace root's region (`None` = the container shares the
     /// host pid namespace, `PidMode::Host`). Installed once by
     /// `Runtime::execute` before the root task boots; every task reaches it
@@ -809,6 +860,7 @@ pub struct Container {
     /// the namespace's members and releases its arena slot through
     /// `NsSharedRegion::retire`; dropping the last `Arc` is the safety net.
     pid_ns: OnceLock<Arc<crate::namespace::pid::NsSharedRegion>>,
+    kernel: Mutex<Option<std::sync::Weak<super::Kernel>>>,
     clock: Arc<ClockDomain>,
     budget: Option<Arc<crate::observe::ResourceBudget>>,
     /// The capability set every process of this container starts from: the
@@ -817,6 +869,10 @@ pub struct Container {
     /// root task is bootstrapped, then read-only; forks copy it per task.
     granted_caps: CapabilitySet,
     generation: u64,
+    /// Admission closes before retirement starts driving task exits. This is
+    /// distinct from `retired`: a failed settlement remains closed and may be
+    /// retried, but must never admit a new fork into the retiring container.
+    retirement_started: AtomicBool,
     retired: Arc<AtomicBool>,
 }
 
@@ -825,17 +881,62 @@ impl Container {
     /// runtime's entry points (`execute.rs`, `hvpatch::initialize_root_process`,
     /// later `prepare.rs`) construct it; embedders go through `LaunchContext`.
     pub(crate) fn new(launch: LaunchContext) -> Self {
+        let hostname = carrick_host::host_facts::host_short_hostname()
+            .unwrap_or(crate::linux_abi::CARRICK_HOSTNAME);
+        Self::new_with_namespaces(
+            launch,
+            LinuxNetworkModel::host_mirror(&HostWireSnapshot::probe()),
+            hostname,
+        )
+    }
+
+    /// Build directly from already-resolved launch namespaces. Preparation
+    /// uses this path so a bridge/none container does not probe and allocate a
+    /// discarded host-mirror model before installing its final model.
+    pub(crate) fn new_with_namespaces(
+        launch: LaunchContext,
+        network: LinuxNetworkModel,
+        hostname: impl Into<String>,
+    ) -> Self {
         Self {
             id: launch.container_id,
             launch,
-            pid_root: OnceLock::new(),
+            net_ns: Arc::new(NetNs::from_model(alloc_ns_id(), network)),
+            uts_ns: Arc::new(UtsNs::new(alloc_ns_id(), hostname.into())),
+            pid_root: Mutex::new(None),
             pid_ns: OnceLock::new(),
+            kernel: Mutex::new(None),
             clock: Arc::new(ClockDomain::default()),
             budget: None,
             granted_caps: CapabilitySet::docker_default(),
             generation: 1,
+            retirement_started: AtomicBool::new(false),
             retired: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Replace this unpublished container's initial network view with the
+    /// final launch model. Builder-only so publication cannot change a live
+    /// task's namespace by swapping the container field underneath it.
+    #[cfg(test)]
+    pub(crate) fn with_network_model(mut self, model: LinuxNetworkModel) -> Self {
+        self.net_ns = Arc::new(NetNs::from_model(alloc_ns_id(), model));
+        self
+    }
+
+    /// Replace this unpublished container's initial UTS nodename.
+    #[cfg(test)]
+    pub(crate) fn with_hostname(mut self, hostname: impl Into<String>) -> Self {
+        self.uts_ns = Arc::new(UtsNs::new(alloc_ns_id(), hostname));
+        self
+    }
+
+    pub(crate) fn net_ns(&self) -> &Arc<NetNs> {
+        &self.net_ns
+    }
+
+    pub(crate) fn uts_ns(&self) -> &Arc<UtsNs> {
+        &self.uts_ns
     }
 
     /// Attach a resource budget quota and counter set to the container.
@@ -886,6 +987,19 @@ impl Container {
         Self::new(LaunchContext::unmanaged(RunId::new("reference-model")))
     }
 
+    /// Build the reference-model container around an already-resolved network
+    /// view. Unlike [`Self::for_reference_model`], this does not probe the host
+    /// network only to discard that model immediately.
+    pub(crate) fn for_reference_model_with_network(network: LinuxNetworkModel) -> Self {
+        let hostname = carrick_host::host_facts::host_short_hostname()
+            .unwrap_or(crate::linux_abi::CARRICK_HOSTNAME);
+        Self::new_with_namespaces(
+            LaunchContext::unmanaged(RunId::new("reference-model")),
+            network,
+            hostname,
+        )
+    }
+
     /// Install the container's PID namespace region. Exactly once, before any
     /// task of the container runs; a second install is refused and hands the
     /// region back so the caller cannot silently leak a claimed slot.
@@ -893,12 +1007,20 @@ impl Container {
         &self,
         region: Arc<crate::namespace::pid::NsSharedRegion>,
     ) -> Result<(), Arc<crate::namespace::pid::NsSharedRegion>> {
-        if let Some(key) = self.pid_root() {
-            if let Ok(pid) = u32::try_from(key.id.raw()) {
-                region.set_init(pid);
+        let root = self
+            .pid_root
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(key) = *root {
+            if let Ok(pid) = u32::try_from(key.id.raw())
+                && !region.set_kernel_init(pid)
+            {
+                return Err(region);
             }
         }
-        self.pid_ns.set(region)
+        let result = self.pid_ns.set(region);
+        drop(root);
+        result
     }
 
     /// The container's PID namespace region, `None` under `PidMode::Host`.
@@ -920,21 +1042,81 @@ impl Container {
 
     /// The container's init task, once bootstrapped.
     pub fn pid_root(&self) -> Option<TaskKey> {
-        self.pid_root.get().copied()
+        *self
+            .pid_root
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Reserve the namespace membership needed by a root publication while
+    /// the kernel graph remains unpublished. The prepared-root guard removes
+    /// this exact member on every abort path.
+    pub(super) fn prepare_pid_root(
+        &self,
+        key: TaskKey,
+    ) -> Result<Option<crate::namespace::pid::PreparedNamespaceIdentity>, super::KernelError> {
+        if self.pid_root().is_some() {
+            return Err(super::KernelError::ContainerRootAlreadyPublished(self.id));
+        }
+        let Some(region) = self.pid_region() else {
+            return Ok(None);
+        };
+        let pid = u32::try_from(key.id.raw())
+            .map_err(|_| super::KernelError::PidNamespaceMembership(self.id))?;
+        region
+            .reserve_init_identity(pid)
+            .map(Some)
+            .ok_or(super::KernelError::PidNamespaceMembership(self.id))
+    }
+
+    pub(super) fn rollback_prepared_pid_root(&self, key: TaskKey) {
+        if self.pid_root() != Some(key)
+            && let Some(region) = self.pid_region()
+            && let Ok(pid) = u32::try_from(key.id.raw())
+        {
+            region.rollback_kernel_init(pid);
+        }
     }
 
     /// Publish the init task. A container has exactly one; a second
     /// publication is a graph error, never a silent overwrite.
-    pub(super) fn publish_pid_root(&self, key: TaskKey) -> Result<(), super::KernelError> {
-        self.pid_root
-            .set(key)
-            .map_err(|_| super::KernelError::ContainerRootAlreadyPublished(self.id))?;
-        if let Some(region) = self.pid_region() {
-            if let Ok(pid) = u32::try_from(key.id.raw()) {
-                region.set_init(pid);
+    pub(super) fn publish_pid_root(
+        &self,
+        key: TaskKey,
+        prepared_identity: Option<crate::namespace::pid::PreparedNamespaceIdentity>,
+    ) -> Result<(), super::KernelError> {
+        let mut publication = self
+            .pid_root
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if publication.is_some() {
+            return Err(super::KernelError::ContainerRootAlreadyPublished(self.id));
+        }
+        if prepared_identity.is_some_and(|identity| !identity.commit()) {
+            return Err(super::KernelError::PidNamespaceMembership(self.id));
+        }
+        *publication = Some(key);
+        Ok(())
+    }
+
+    pub(crate) fn rollback_pid_root(&self, key: TaskKey) {
+        let mut root = self
+            .pid_root
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *root == Some(key) {
+            *root = None;
+            if let Some(region) = self.pid_region() {
+                let _ = region.retire();
             }
         }
-        Ok(())
+    }
+
+    pub(super) fn bind_kernel(&self, kernel: &Arc<super::Kernel>) {
+        *self
+            .kernel
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::downgrade(kernel));
     }
 
     pub fn clock(&self) -> &Arc<ClockDomain> {
@@ -951,6 +1133,21 @@ impl Container {
         self.retired.load(Ordering::Acquire)
     }
 
+    /// Whether task-creation admission remains open for this container.
+    pub(super) fn accepts_new_tasks(&self) -> bool {
+        !self.retirement_started.load(Ordering::Acquire)
+    }
+
+    /// Close task-creation admission. Idempotent so a partially settled
+    /// retirement can safely be retried without reopening the container.
+    pub(super) fn begin_retirement(&self) {
+        self.retirement_started.store(true, Ordering::Release);
+    }
+
+    pub(super) fn mark_retired(&self) {
+        self.retired.store(true, Ordering::Release);
+    }
+
     /// A shared token observing this container's retirement status.
     pub fn retirement_token(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.retired)
@@ -964,18 +1161,33 @@ impl Container {
     pub(crate) fn retire(
         self: std::sync::Arc<Self>,
     ) -> Result<crate::carrier::ContainerTeardown, crate::run_result::RuntimeError> {
-        self.retired.store(true, Ordering::Release);
-        let id = self.id();
-        let pid_region_released = self
-            .pid_region()
-            .map(|region| region.retire())
-            .unwrap_or(false);
-        Ok(crate::carrier::ContainerTeardown {
-            id,
-            tasks_reaped: 0,
-            mounts_dropped: 0,
-            pid_region_released,
-        })
+        let kernel = self
+            .kernel
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        match kernel {
+            Some(kernel) => kernel
+                .retire_container_root(self.id(), None)
+                .map_err(|error| crate::run_result::RuntimeError::Configuration(error.to_string())),
+            None => {
+                self.retired.store(true, Ordering::Release);
+                let id = self.id();
+                let pid_region_released = self
+                    .pid_region()
+                    .map(|region| region.retire())
+                    .unwrap_or(false);
+                Ok(crate::carrier::ContainerTeardown {
+                    id,
+                    carrier_scope_id: self.launch.carrier_scope_id.clone(),
+                    run_id: self.launch.run_id.clone(),
+                    tasks_reaped: 0,
+                    mounts_dropped: 0,
+                    pid_region_released,
+                })
+            }
+        }
     }
 }
 
@@ -1038,10 +1250,12 @@ mod tests {
                 .task_serial()
                 .expect("serial"),
         };
-        container.publish_pid_root(key).expect("first publication");
+        container
+            .publish_pid_root(key, None)
+            .expect("first publication");
         assert_eq!(container.pid_root(), Some(key));
         assert!(matches!(
-            container.publish_pid_root(key),
+            container.publish_pid_root(key, None),
             Err(super::super::KernelError::ContainerRootAlreadyPublished(id)) if id == container.id()
         ));
     }

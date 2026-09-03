@@ -107,6 +107,7 @@ enum RuntimePublishedExec {
 }
 
 pub(super) struct PreparedExecve {
+    origin: Option<super::AuthenticatedExecCompletionOrigin>,
     image: AddressSpace,
     path: String,
     proc_argv: Vec<String>,
@@ -114,10 +115,136 @@ pub(super) struct PreparedExecve {
     command_line: String,
     inventory_failure_injection: Option<HvpatchExecInventoryFailureInjection>,
     hvpatch_mm_reservation: Option<crate::hvpatch::ExecMmReservation>,
-    _clone_admission: ExecCloneAdmission,
+    /// Exact terminal context paired with `clone_admission`. The pair moves
+    /// together until the destructive suffix either commits a Kernel successor
+    /// or reaches the exec-specific terminal entry.
+    terminal_context: Option<crate::kernel::KernelContext>,
+    clone_admission: Option<ExecCloneAdmission>,
     runtime_region_count: u64,
     runtime_mapped_bytes: u64,
     sibling_drain_started: std::time::Instant,
+}
+
+impl PreparedExecve {
+    fn take_terminal_authority(
+        &mut self,
+    ) -> (crate::kernel::KernelContext, super::ExecTerminalHandoff) {
+        let context = self
+            .terminal_context
+            .take()
+            .unwrap_or_else(|| std::process::abort());
+        let clone_admission = self
+            .clone_admission
+            .take()
+            .unwrap_or_else(|| std::process::abort());
+        (context, super::ExecTerminalHandoff { clone_admission })
+    }
+
+    fn into_terminal_authority(
+        mut self,
+    ) -> (crate::kernel::KernelContext, super::ExecTerminalHandoff) {
+        self.take_terminal_authority()
+    }
+
+    fn take_origin(&mut self) -> Result<super::AuthenticatedExecCompletionOrigin, RuntimeError> {
+        self.origin.take().ok_or_else(|| {
+            RuntimeError::Configuration(
+                "prepared exec authenticated completion origin consumed twice".to_owned(),
+            )
+        })
+    }
+}
+
+/// A post-close failure paired with the exact, non-reconstructible admission
+/// token that must become terminal ownership before the original error can be
+/// published.
+pub(super) struct ExecTerminalFailure(Box<super::PendingExecTerminalError>);
+
+impl ExecTerminalFailure {
+    fn from_prepared(error: RuntimeError, prepared: PreparedExecve) -> Self {
+        let (context, handoff) = prepared.into_terminal_authority();
+        Self(Box::new(super::PendingExecTerminalError {
+            error,
+            pending: super::PendingExecTerminal { context, handoff },
+        }))
+    }
+
+    fn from_admission(
+        error: RuntimeError,
+        context: crate::kernel::KernelContext,
+        clone_admission: ExecCloneAdmission,
+    ) -> Self {
+        Self(Box::new(super::PendingExecTerminalError {
+            error,
+            pending: super::PendingExecTerminal {
+                context,
+                handoff: super::ExecTerminalHandoff { clone_admission },
+            },
+        }))
+    }
+
+    pub(super) fn into_pending(self) -> Box<super::PendingExecTerminalError> {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for ExecTerminalFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExecTerminalFailure")
+            .field("error", &self.0.error)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A completed destructive suffix still retains exec admission until its
+/// caller has either published the replacement or routed a terminal outcome.
+pub(super) struct FinishedPreparedExecve {
+    outcome: Option<VcpuLoopOutcome>,
+    context: crate::kernel::KernelContext,
+    handoff: super::ExecTerminalHandoff,
+}
+
+impl FinishedPreparedExecve {
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        Option<VcpuLoopOutcome>,
+        crate::kernel::KernelContext,
+        super::ExecTerminalHandoff,
+    ) {
+        (self.outcome, self.context, self.handoff)
+    }
+}
+
+/// The single non-copyable owner retained from sibling-drain admission through
+/// delayed drain completion and the destructive exec suffix.  Keeping the
+/// prepared image and transferred completion authority inside this envelope
+/// makes phase replacement, terminal drain/suffix errors, and unwind retire
+/// without publishing a fabricated guest return.
+pub(super) struct PreparedExecveDrain {
+    prepared: PreparedExecve,
+    drain: super::continuation::ProcessDrain,
+    completion_ownership: super::PendingExecCompletionOwnership,
+}
+
+impl PreparedExecveDrain {
+    pub(super) fn is_ready(&self) -> bool {
+        self.drain.is_ready()
+    }
+
+    pub(super) fn into_terminal_authority(
+        self,
+    ) -> (crate::kernel::KernelContext, super::ExecTerminalHandoff) {
+        let Self {
+            prepared,
+            drain,
+            completion_ownership,
+        } = self;
+        drop(drain);
+        drop(completion_ownership);
+        prepared.into_terminal_authority()
+    }
 }
 
 fn close_clone_admission_then<T>(
@@ -131,6 +258,7 @@ fn close_clone_admission_then<T>(
 pub(super) enum ExecvePreparation {
     Complete(Option<VcpuLoopOutcome>),
     Prepared(Box<PreparedExecve>),
+    TerminalFailure(ExecTerminalFailure),
 }
 
 impl RuntimePreparedExec {
@@ -238,6 +366,18 @@ enum HvpatchExecInventoryFailureInjection {
     ReplacementReservation,
     BeginInventory,
     IdentityPage,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ExecTerminalContextFailpoint {
+    BeforeKernelCommit,
+    TaskLoadPublication,
+    SnapshotPublication,
+    FrameCowBinding,
+    InventoryActivation,
+    IdentityPublication,
+    VvarPublication,
 }
 
 fn parse_hvpatch_exec_inventory_failure_injection(
@@ -878,13 +1018,24 @@ where
     /// Fail the `execve` syscall itself, leaving the caller running its old
     /// image. Only correct BEFORE the point of no return.
     fn exec_failed_with_errno(
+        &mut self,
+        kernel: &Kernel,
         engine: &mut E,
         errno: crate::linux_abi::LinuxErrno,
+        origin: super::AuthenticatedExecCompletionOrigin,
     ) -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
-        engine.complete_syscall(errno.guest_retval())?;
+        match origin.0 {
+            super::ExecCompletionOrigin::GuestSyscall => {
+                self.complete_errno(engine, &kernel.reporter, errno)?;
+            }
+            super::ExecCompletionOrigin::InternalControl => {
+                self.finish_internal_control_exec()?;
+            }
+        }
         Ok(None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn prepare_execve(
         &mut self,
         kernel: &Kernel,
@@ -893,7 +1044,9 @@ where
         path: String,
         argv: Vec<Vec<u8>>,
         env: Vec<Vec<u8>>,
+        origin: super::ExecCompletionOrigin,
     ) -> Result<ExecvePreparation, RuntimeError> {
+        let origin = self.authenticate_exec_completion_origin(origin)?;
         if let Some(process) = kernel.hvpatch_process.as_ref() {
             process.trace_lifecycle(
                 carrick_observability::probes::HvpatchGuestLifecyclePhase::ExecBegin,
@@ -915,11 +1068,18 @@ where
             match chain.on_exec(&p, path.as_bytes(), &argv_slices) {
                 crate::observe::SyscallAction::Allow => {}
                 crate::observe::SyscallAction::Deny(errno) => {
-                    return Self::exec_failed_with_errno(engine, errno)
+                    return self
+                        .exec_failed_with_errno(kernel, engine, errno, origin)
                         .map(ExecvePreparation::Complete);
                 }
                 crate::observe::SyscallAction::Kill(_sig) => {
-                    return Self::exec_failed_with_errno(engine, crate::linux_abi::LINUX_EACCES)
+                    return self
+                        .exec_failed_with_errno(
+                            kernel,
+                            engine,
+                            crate::linux_abi::LINUX_EACCES,
+                            origin,
+                        )
                         .map(ExecvePreparation::Complete);
                 }
                 crate::observe::SyscallAction::Short(_) => {}
@@ -931,8 +1091,9 @@ where
             .collect();
         let command_line = proc_argv.join(" ");
         let proc_env = env.clone();
+        let requires_syscall_traps = kernel.dispatcher.requires_syscall_traps();
         let image = match kernel.dispatcher.with_kernel_resources(kernel_context, || {
-            load_execve_image(&kernel.dispatcher, &path, argv, env)
+            load_execve_image(&kernel.dispatcher, &path, argv, env, requires_syscall_traps)
         }) {
             Ok(image) => image,
             Err(errno) => {
@@ -943,7 +1104,8 @@ where
                         errno.get()
                     );
                 }
-                return Self::exec_failed_with_errno(engine, errno)
+                return self
+                    .exec_failed_with_errno(kernel, engine, errno, origin)
                     .map(ExecvePreparation::Complete);
             }
         };
@@ -972,20 +1134,34 @@ where
         let (clone_admission, hvpatch_mm_reservation) = match admissions {
             Ok((admission, Some(Ok(reservation)))) => (admission, Some(reservation)),
             Ok((admission, None)) => (admission, None),
-            Ok((_admission, Some(Err(error)))) => {
+            Ok((admission, Some(Err(error)))) => {
                 tracing::error!(
                     %error,
                     "execve MM-generation admission failed before the point of no return"
                 );
-                return Self::exec_failed_with_errno(engine, crate::linux_abi::LINUX_EAGAIN)
-                    .map(ExecvePreparation::Complete);
+                return match self.exec_failed_with_errno(
+                    kernel,
+                    engine,
+                    crate::linux_abi::LINUX_EAGAIN,
+                    origin,
+                ) {
+                    Ok(outcome) => Ok(ExecvePreparation::Complete(outcome)),
+                    Err(completion_error) => Ok(ExecvePreparation::TerminalFailure(
+                        ExecTerminalFailure::from_admission(
+                            completion_error,
+                            kernel_context.retain_exact(),
+                            admission,
+                        ),
+                    )),
+                };
             }
             Err(error) => {
                 tracing::error!(
                     %error,
                     "execve clone-admission drain failed before the point of no return"
                 );
-                return Self::exec_failed_with_errno(engine, crate::linux_abi::LINUX_EAGAIN)
+                return self
+                    .exec_failed_with_errno(kernel, engine, crate::linux_abi::LINUX_EAGAIN, origin)
                     .map(ExecvePreparation::Complete);
             }
         };
@@ -1004,6 +1180,7 @@ where
         let runtime_region_count = image.regions().len() as u64;
         let runtime_mapped_bytes = image.regions().iter().map(|region| region.len()).sum();
         Ok(ExecvePreparation::Prepared(Box::new(PreparedExecve {
+            origin: Some(origin),
             image,
             path,
             proc_argv,
@@ -1011,7 +1188,8 @@ where
             command_line,
             inventory_failure_injection,
             hvpatch_mm_reservation,
-            _clone_admission: clone_admission,
+            terminal_context: Some(kernel_context.retain_exact()),
+            clone_admission: Some(clone_admission),
             runtime_region_count,
             runtime_mapped_bytes,
             sibling_drain_started: std::time::Instant::now(),
@@ -1024,11 +1202,12 @@ where
     async fn drive_execve(
         &mut self,
         kernel: &Kernel,
-        kernel_context: &crate::kernel::KernelContext,
+        kernel_context: &mut crate::kernel::KernelContext,
         engine: &mut E,
         prepared: PreparedExecve,
     ) -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
         let PreparedExecve {
+            origin: _,
             image: img,
             path,
             proc_argv,
@@ -1036,11 +1215,16 @@ where
             command_line: cmdline,
             inventory_failure_injection,
             mut hvpatch_mm_reservation,
-            _clone_admission,
+            terminal_context,
+            clone_admission,
             runtime_region_count,
             runtime_mapped_bytes,
             sibling_drain_started,
         } = prepared;
+        if terminal_context.is_some() || clone_admission.is_some() {
+            tracing::error!("prepared exec suffix retained duplicate terminal authority");
+            std::process::abort();
+        }
         let emit_runtime_stage =
             |phase: carrick_observability::probes::HvpatchExecRuntimeStagePhase,
              started: std::time::Instant| {
@@ -1489,6 +1673,8 @@ where
                 }
             }
         }
+        #[cfg(test)]
+        self.fail_exec_terminal_context_for_test(ExecTerminalContextFailpoint::BeforeKernelCommit)?;
         let committed = match (kernel.hvpatch_process.as_ref(), published_kernel_exec) {
             (Some(process), RuntimePublishedExec::Hvpatch(published)) => process
                 .complete_exec(published, prepared_dispatch_mm_exec.take())
@@ -1500,7 +1686,9 @@ where
                 {
                     prepared.commit();
                 }
-                committed.map(|context| (context, None))
+                committed
+                    .map(|context| (context, None))
+                    .map_err(crate::hvpatch::CompleteExecError::before_commit)
             }
             _ => {
                 tracing::error!("exec preparation/backend authority mismatch");
@@ -1510,6 +1698,10 @@ where
         let (committed_context, committed_transition) = match committed {
             Ok(committed) => committed,
             Err(error) => {
+                let (error, committed_context) = error.into_parts();
+                if let Some(committed_context) = committed_context {
+                    *kernel_context = committed_context;
+                }
                 // The engine now runs the replacement image. Returning a
                 // guest-visible exec failure or resuming the old Kernel
                 // graph would create split lifecycle authority.
@@ -1521,6 +1713,17 @@ where
                 .map(Some);
             }
         };
+        // This is the terminal-context authority boundary: every remaining
+        // edge is post-commit and must carry the Kernel successor, including
+        // errors before runtime state and replacement publication catch up.
+        *kernel_context = committed_context.retain_exact();
+        #[cfg(test)]
+        {
+            self.committed_exec_context_for_test = Some(committed_context.retain_exact());
+            self.fail_exec_terminal_context_for_test(
+                ExecTerminalContextFailpoint::TaskLoadPublication,
+            )?;
+        }
         // Linux detaches every SysV shared-memory mapping only after exec has
         // crossed its no-return boundary. Preparation failures above preserve
         // the old image and its attachment set; a committed replacement owns
@@ -1554,6 +1757,10 @@ where
             crate::hvpatch::ProcessContext::asid_generation,
         );
         engine.bind_task_snapshot_identity(committed_mm.raw(), committed_asid_generation);
+        #[cfg(test)]
+        self.fail_exec_terminal_context_for_test(
+            ExecTerminalContextFailpoint::SnapshotPublication,
+        )?;
         let replacement_cpu = match engine.snapshot_guest_state_for_publication() {
             Ok(state) => state,
             Err(error) => {
@@ -1604,6 +1811,10 @@ where
         // authority makes a structurally valid COW MappingId belong to
         // the retired mm and fail closed at replacement-mm teardown.
         if let Some(process) = kernel.hvpatch_process.as_ref() {
+            #[cfg(test)]
+            self.fail_exec_terminal_context_for_test(
+                ExecTerminalContextFailpoint::FrameCowBinding,
+            )?;
             let owner_inventory = engine.frame_cow_owner_inventory().ok_or_else(|| {
                 RuntimeError::Configuration(
                     "committed HVPatch exec has no carrier host-owner inventory".to_owned(),
@@ -1637,6 +1848,10 @@ where
                     asid: binding.asid.raw(),
                 },
             );
+            #[cfg(test)]
+            self.fail_exec_terminal_context_for_test(
+                ExecTerminalContextFailpoint::InventoryActivation,
+            )?;
             if let Err(error) = engine.activate_exec_inventory() {
                 return Self::exec_failed_past_no_return(
                     kernel,
@@ -1695,6 +1910,10 @@ where
         } else {
             crate::memory::LINUX_IDENTITY_PAGE_BASE
         };
+        #[cfg(test)]
+        self.fail_exec_terminal_context_for_test(
+            ExecTerminalContextFailpoint::IdentityPublication,
+        )?;
         if let Err(error) = super::stamp_identity_page_at(
             engine,
             &kernel.dispatcher,
@@ -1713,6 +1932,8 @@ where
         // first instruction, so a vDSO read before any syscall already agrees
         // with the syscall path (`sync_vvar_realtime_offset`; probe
         // clocksettimevdso, `date -s` followed by an exec'd `date`).
+        #[cfg(test)]
+        self.fail_exec_terminal_context_for_test(ExecTerminalContextFailpoint::VvarPublication)?;
         if let Err(error) = kernel
             .dispatcher
             .sync_vvar_realtime_offset(committed_context.task().container().clock(), engine)
@@ -1772,17 +1993,107 @@ where
     pub(super) fn finish_prepared_execve(
         &mut self,
         kernel: &Kernel,
-        kernel_context: &crate::kernel::KernelContext,
         engine: &mut E,
-        prepared: PreparedExecve,
-    ) -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
-        let mut future = Box::pin(self.drive_execve(kernel, kernel_context, engine, prepared));
+        mut prepared: PreparedExecve,
+    ) -> Result<FinishedPreparedExecve, ExecTerminalFailure> {
+        let (mut terminal_context, handoff) = prepared.take_terminal_authority();
+        let mut future =
+            Box::pin(self.drive_execve(kernel, &mut terminal_context, engine, prepared));
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-        match future.as_mut().poll(&mut context) {
+        let result = match future.as_mut().poll(&mut context) {
             std::task::Poll::Ready(result) => result,
             std::task::Poll::Pending => Err(RuntimeError::Configuration(
                 "prepared exec suffix attempted to suspend with an injected engine".to_owned(),
             )),
+        };
+        drop(future);
+        match result {
+            Ok(outcome) => Ok(FinishedPreparedExecve {
+                outcome,
+                context: terminal_context,
+                handoff,
+            }),
+            Err(error) => Err(ExecTerminalFailure(Box::new(
+                super::PendingExecTerminalError {
+                    error,
+                    pending: super::PendingExecTerminal {
+                        context: terminal_context,
+                        handoff,
+                    },
+                },
+            ))),
         }
+    }
+
+    pub(super) fn begin_prepared_execve_drain(
+        &mut self,
+        kernel: &Kernel,
+        current: super::continuation::JobId,
+        mut prepared: PreparedExecve,
+    ) -> Result<PreparedExecveDrain, ExecTerminalFailure> {
+        let origin = match prepared.take_origin() {
+            Ok(origin) => origin,
+            Err(error) => return Err(ExecTerminalFailure::from_prepared(error, prepared)),
+        };
+        let completion_ownership = match self.take_authenticated_exec_completion_ownership(origin) {
+            Ok(ownership) => ownership,
+            Err(error) => return Err(ExecTerminalFailure::from_prepared(error, prepared)),
+        };
+        let drain = match self.begin_persistent_exec_sibling_drain(kernel, current) {
+            Ok(drain) => drain,
+            Err(error) => {
+                drop(completion_ownership);
+                return Err(ExecTerminalFailure::from_prepared(error, prepared));
+            }
+        };
+        Ok(PreparedExecveDrain {
+            prepared,
+            drain,
+            completion_ownership,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn prepared_execve_drain_for_test(
+        &mut self,
+        mut prepared: PreparedExecve,
+        drain: super::continuation::ProcessDrain,
+    ) -> Result<PreparedExecveDrain, ExecTerminalFailure> {
+        let origin = match prepared.take_origin() {
+            Ok(origin) => origin,
+            Err(error) => return Err(ExecTerminalFailure::from_prepared(error, prepared)),
+        };
+        let completion_ownership = match self.take_authenticated_exec_completion_ownership(origin) {
+            Ok(ownership) => ownership,
+            Err(error) => return Err(ExecTerminalFailure::from_prepared(error, prepared)),
+        };
+        Ok(PreparedExecveDrain {
+            prepared,
+            drain,
+            completion_ownership,
+        })
+    }
+
+    pub(super) fn finish_prepared_execve_drain(
+        &mut self,
+        kernel: &Kernel,
+        engine: &mut E,
+        current: &super::continuation::LogicalJobCompletion,
+        owner: PreparedExecveDrain,
+    ) -> Result<FinishedPreparedExecve, ExecTerminalFailure> {
+        let PreparedExecveDrain {
+            prepared,
+            drain,
+            completion_ownership,
+        } = owner;
+        let drain_result = self.finish_persistent_sibling_drain(current);
+        drop(drain);
+        if let Err(error) = drain_result {
+            drop(completion_ownership);
+            return Err(ExecTerminalFailure::from_prepared(error, prepared));
+        }
+        let result = self.finish_prepared_execve(kernel, engine, prepared);
+        drop(completion_ownership);
+        result
     }
 }

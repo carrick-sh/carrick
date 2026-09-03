@@ -69,6 +69,7 @@ const WEXITED: libc::c_int = 4;
 const WNOWAIT: libc::c_int = 0x0100_0000;
 
 const CLD_EXITED: libc::c_int = 1;
+const LINUX_WALL: libc::c_int = 0x4000_0000;
 
 const DEFAULT_DEADLINE: Duration = Duration::from_millis(500);
 const CLEANUP_DEADLINE: Duration = Duration::from_millis(200);
@@ -98,6 +99,10 @@ unsafe fn raw_clone(flags: u64, ptid: *mut i32, ctid: *mut i32) -> i64 {
         core::ptr::null_mut::<libc::c_void>(),
         ctid,
     ) as i64
+}
+
+extern "C" fn clone_exit_zero(_arg: *mut libc::c_void) -> libc::c_int {
+    0
 }
 
 fn poll_readable(fd: i32, deadline: Instant) -> bool {
@@ -191,12 +196,20 @@ fn write_exact_bounded(fd: i32, bytes: &[u8], deadline: Instant) -> bool {
 }
 
 unsafe fn waitpid_bounded(pid: libc::pid_t, deadline: Instant) -> Option<i32> {
+    waitpid_bounded_with_options(pid, deadline, 0)
+}
+
+unsafe fn waitpid_bounded_with_options(
+    pid: libc::pid_t,
+    deadline: Instant,
+    options: libc::c_int,
+) -> Option<i32> {
     if pid <= 0 {
         return None;
     }
     let mut status = 0;
     loop {
-        let rc = libc::waitpid(pid, &mut status, libc::WNOHANG);
+        let rc = libc::waitpid(pid, &mut status, libc::WNOHANG | options);
         if rc == pid {
             return Some(status);
         }
@@ -270,19 +283,30 @@ unsafe fn test_clone_matrix() {
         cleanup_child_bounded(r2 as i32);
     }
 
-    // 1.3 Invalid exit signal in CSIGNAL mask -> EINVAL
-    let r4 = raw_clone(
-        CLONE_VM | 0xff,
+    // 1.3 Legacy clone accepts an out-of-range CSIGNAL byte. Use libc's clone
+    // trampoline and a dedicated stack: raw clone with CLONE_VM and a null
+    // child stack makes parent and child execute on the same writable stack,
+    // so the accepted call races and corrupts this probe's saved observations.
+    let mut r4_stack = vec![0u8; 1usize << 16];
+    let r4_stack_top =
+        (r4_stack.as_mut_ptr().add(r4_stack.len()) as usize & !0xf) as *mut libc::c_void;
+    let r4 = libc::clone(
+        clone_exit_zero,
+        r4_stack_top,
+        (CLONE_VM | 0xff) as libc::c_int,
         core::ptr::null_mut(),
-        core::ptr::null_mut(),
-    );
+    ) as i64;
     let r4_er = if r4 < 0 { errno() } else { 0 };
-    if r4 == 0 {
-        libc::_exit(0);
-    }
     if r4 > 0 {
-        let _ = waitpid_bounded(r4 as i32, deadline);
-        cleanup_child_bounded(r4 as i32);
+        // __WALL is required because the invalid signal is not SIGCHLD.
+        if waitpid_bounded_with_options(r4 as i32, deadline, LINUX_WALL).is_none() {
+            let _ = libc::kill(r4 as i32, libc::SIGKILL);
+            let _ = waitpid_bounded_with_options(
+                r4 as i32,
+                Instant::now() + CLEANUP_DEADLINE,
+                LINUX_WALL,
+            );
+        }
     }
 
     // 1.4 CLONE_FS with CLONE_NEWNS -> EINVAL

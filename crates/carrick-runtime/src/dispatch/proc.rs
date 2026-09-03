@@ -123,6 +123,19 @@ use crate::linux_abi::{
 /// caller's `len` to equal this exactly; get_robust_list reports it.
 const ROBUST_LIST_HEAD_SIZE: u64 = 24;
 
+/// Render the freshly-created session through the caller's PID namespace.
+/// `setsid(2)` returns a session id that is also its leader's pid.
+fn ns_visible_session(
+    context: &crate::kernel::KernelContext,
+    session: crate::kernel::SessionId,
+) -> i32 {
+    u32::try_from(session.raw())
+        .ok()
+        .and_then(|raw| crate::namespace::pid::kernel_to_ns_for(context, raw))
+        .and_then(|visible| i32::try_from(visible).ok())
+        .unwrap_or(0)
+}
+
 /// The Linux process a pid-taking identity syscall names: `0` is the caller,
 /// anything positive is a guest pid, anything negative is ESRCH.
 ///
@@ -131,20 +144,6 @@ const ROBUST_LIST_HEAD_SIZE: u64 = 24;
 /// of one carrier — so translating them through the pid-namespace region and
 /// handing the result to Darwin asked the host about a number that means
 /// something else in its own namespace.
-/// Render a session or process-group id in the caller's PID-namespace view.
-///
-/// A session/group id IS its leader's pid, so it belongs to the same domain
-/// `getpid` reports and must be translated the same way. Returning the raw
-/// `TaskId` made a forked child see `setsid() != getpid()`; the numbering
-/// domains coincide for the first process, which is why only a probe with a
-/// SECOND live process exposes it.
-fn ns_visible_identity_id(context: &crate::kernel::KernelContext, leader_pid: i32) -> i32 {
-    let Ok(raw) = u32::try_from(leader_pid) else {
-        return leader_pid;
-    };
-    i32::try_from(crate::namespace::pid::host_to_ns_or_self_for(context, raw)).unwrap_or(leader_pid)
-}
-
 /// Resolve a pid the GUEST supplied into carrick's task id.
 ///
 /// A guest names processes in its own pid namespace, and carrick's kernel graph
@@ -156,9 +155,12 @@ fn ns_visible_identity_id(context: &crate::kernel::KernelContext, leader_pid: i3
 ///
 /// Untranslatable ids stay untranslated rather than becoming zero, so a guest
 /// outside any namespace region is unaffected.
-fn guest_pid_to_task_id(pid: Pid) -> Result<crate::kernel::TaskId, LinuxErrno> {
+fn guest_pid_to_task_id(
+    context: &crate::kernel::KernelContext,
+    pid: Pid,
+) -> Result<crate::kernel::TaskId, LinuxErrno> {
     let raw = u32::try_from(pid.0).map_err(|_| LINUX_ESRCH)?;
-    let host = crate::namespace::pid::ns_to_host_or_self(raw).ok_or(LINUX_ESRCH)?;
+    let host = crate::namespace::pid::ns_to_kernel_for(context, raw).ok_or(LINUX_ESRCH)?;
     let host = i32::try_from(host).map_err(|_| LINUX_ESRCH)?;
     crate::kernel::TaskId::from_abi_positive(host).map_err(|_| LINUX_ESRCH)
 }
@@ -170,7 +172,7 @@ fn identity_target_task(
     if pid.0 == 0 {
         return Ok(context.task().key().id);
     }
-    guest_pid_to_task_id(pid)
+    guest_pid_to_task_id(context, pid)
 }
 
 /// Per-Linux-policy priority window for `sched_get_priority_{max,min}`. RT
@@ -237,14 +239,17 @@ fn sched_priority_for(policy: i32, max: bool) -> DispatchOutcome {
 /// guest-init alias used elsewhere); threaded dispatch also carries the current
 /// guest tid.
 pub(super) fn sched_pid_is_self<M: CurrentMmMemory>(cx: &SyscallCtx<'_, M>, pid: u64) -> bool {
-    // 0 and the caller's own thread tid are self for sched_*; the process-level
-    // self cases (host pid, bootstrap, ns-pid) are the canonical
-    // NsPid::names_self (which the old body lacked the ns-pid arm of).
-    pid == 0
-        || cx
-            .thread
-            .is_some_and(|thread| pid == thread.tid.raw() as u64)
-        || NsPid(pid as i32).names_self()
+    if pid == 0 || pid > i32::MAX as u64 {
+        return pid == 0;
+    }
+    let requested = pid as u32;
+    let own_pid = u32::try_from(cx.kernel.task().key().id.raw())
+        .ok()
+        .and_then(|id| crate::namespace::pid::kernel_to_ns_for(cx.kernel, id));
+    let own_tid = u32::try_from(cx.kernel.thread().key().tid.raw())
+        .ok()
+        .and_then(|id| crate::namespace::pid::kernel_to_ns_for(cx.kernel, id));
+    own_pid == Some(requested) || own_tid == Some(requested)
 }
 
 /// True when `pid` names a live sibling thread in this Carrick guest process.
@@ -255,10 +260,14 @@ pub(super) fn sched_pid_is_live_guest_thread<M: CurrentMmMemory>(
     if pid == 0 || pid > i32::MAX as u64 {
         return false;
     }
+    let Some(internal) = crate::namespace::pid::guest_tid_to_kernel_for(cx.kernel, pid as i32)
+    else {
+        return false;
+    };
     cx.thread.is_some_and(|thread| {
         thread
             .registry
-            .is_live(crate::thread::ThreadId::from_guest_supplied_tid(pid as i32))
+            .is_live(crate::thread::ThreadId::from_guest_supplied_tid(internal))
     })
 }
 
@@ -308,7 +317,7 @@ pub(super) fn resolve_sched_target<M: CurrentMmMemory>(
     if pid == 0 || pid > i32::MAX as u64 {
         return SchedTarget::NotFound;
     }
-    if let Some(target) = this.guest_process_target(pid as i32) {
+    if let Some(target) = this.guest_process_target(cx.kernel, pid as i32) {
         return match target.euid() {
             Some(euid) => SchedTarget::OtherGuest { euid },
             None => SchedTarget::NotFound,
@@ -620,9 +629,6 @@ pub(super) struct ProcState {
     /// would corrupt them (a class of bug carrick has hit before). Captured at
     /// exec; empty until then.
     pub env: Vec<Vec<u8>>,
-    /// Guest UTS hostname. This is per-dispatcher so container/network namespace
-    /// identity can diverge from the host-derived default.
-    pub guest_hostname: String,
     /// `personality(2)` execution-domain flags, recorded and echoed back.
     pub personality: u64,
     /// `prctl(PR_SET_NAME)` task comm name (16 bytes, NUL-padded).
@@ -676,6 +682,11 @@ pub(super) struct ProcState {
     /// process. `None` preserves the host-pid identity model of every other
     /// backend.
     pub virtual_pid: Option<u32>,
+    /// Namespace-local form of `virtual_pid`, captured while the exact task
+    /// binding is live. A consuming wait legitimately removes live namespace
+    /// membership before every runtime-owned suffix has released its
+    /// dispatcher, so those suffixes must not re-query the liveness index.
+    pub namespace_pid: Option<u32>,
     pub hvpatch_process: Option<crate::hvpatch::ProcessContext>,
     /// Interval-timer state for `[ITIMER_REAL, ITIMER_VIRTUAL, ITIMER_PROF]`,
     /// indexed by the `which` value. Anchored to the monotonic clock so
@@ -806,7 +817,6 @@ impl ProcState {
             binfmt_interpreted: false,
             native_x86_64: false,
             env: Vec::new(),
-            guest_hostname: crate::execute::guest_hostname().to_string(),
             personality: 0,
             task_name: linux_task_name_from_bytes(b"exe"),
             pdeathsig: 0,
@@ -820,6 +830,7 @@ impl ProcState {
             timerslack_default: LINUX_DEFAULT_TIMERSLACK_NS,
             bootstrap_host_pid: std::process::id(),
             virtual_pid: None,
+            namespace_pid: None,
             hvpatch_process: None,
             itimers: [None, None, None],
             affinity: default_affinity(crate::host_facts::logical_cpu_count()),
@@ -830,9 +841,18 @@ impl ProcState {
         }
     }
 
+    pub(super) fn bind_hvpatch_identity(&mut self, internal_pid: u32, namespace_pid: u32) {
+        self.virtual_pid = Some(internal_pid);
+        self.namespace_pid = Some(namespace_pid);
+    }
+
     pub(super) fn fork_clone(&self, parent_guest_pid: u32, child_guest_pid: u32) -> Self {
         let mut child = self.clone();
         child.virtual_pid = Some(child_guest_pid);
+        // The child's exact namespace identity becomes authoritative only at
+        // kernel publication; `bind_hvpatch_process_exact` caches it before
+        // the child can execute.
+        child.namespace_pid = None;
         child.pdeathsig = 0;
         child.subreaper_ancestor = if self.child_subreaper != 0 {
             parent_guest_pid
@@ -872,10 +892,6 @@ impl ProcState {
         } else {
             crate::vfs::GuestReportedArch::Aarch64
         }
-    }
-
-    pub(super) fn guest_hostname(&self) -> &str {
-        &self.guest_hostname
     }
 
     #[cfg(test)]
@@ -1171,7 +1187,7 @@ impl SyscallDispatcher {
     /// child is released. The native fork path retains exact thread exclusion,
     /// so this fd cannot have been observed, closed, or reused by guest code.
     pub fn remove_installed_child_pidfd(&self, fd: i32, child_pid: i32) -> bool {
-        if self.pidfd_target(fd) != Some(PidfdTarget::Host(child_pid)) {
+        if self.pidfd_target(None, fd) != Some(PidfdTarget::Host(child_pid)) {
             return false;
         }
         self.remove_pidfd(fd)
@@ -1187,7 +1203,7 @@ impl SyscallDispatcher {
         child: crate::kernel::TaskKey,
     ) -> bool {
         super::resources::with_captured_resources(context, || {
-            if self.pidfd_target(fd) != Some(PidfdTarget::Hvpatch(child)) {
+            if self.pidfd_target(None, fd) != Some(PidfdTarget::Hvpatch(child)) {
                 return false;
             }
             self.remove_pidfd(fd)
@@ -1207,18 +1223,26 @@ impl SyscallDispatcher {
     }
 
     /// Resolve a pidfd to its typed process target.
-    fn proc_directory_pidfd_target(&self, path: &str) -> Option<PidfdTarget> {
-        if let Some(process) = self.hvpatch_process()
-            && let Some(pid) = crate::vfs::proc::proc_pid_dir_linux_pid(path)
-            && let Ok(pid) = i32::try_from(pid)
-            && let Some(task) = process.live_process_key(pid)
-        {
-            return Some(PidfdTarget::Hvpatch(task));
+    fn proc_directory_pidfd_target(
+        &self,
+        context: Option<&crate::kernel::KernelContext>,
+        path: &str,
+    ) -> Option<PidfdTarget> {
+        if let Some(process) = self.hvpatch_process() {
+            let context = context?;
+            let visible = crate::vfs::proc::proc_pid_dir_linux_pid(path)?;
+            let internal = crate::namespace::pid::ns_to_kernel_for(context, visible)?;
+            let internal = i32::try_from(internal).ok()?;
+            return process.live_process_key(internal).map(PidfdTarget::Hvpatch);
         }
         crate::vfs::proc::proc_pid_dir_host_pid(path).map(|pid| PidfdTarget::Host(pid as i32))
     }
 
-    fn pidfd_target(&self, fd: i32) -> Option<PidfdTarget> {
+    fn pidfd_target(
+        &self,
+        context: Option<&crate::kernel::KernelContext>,
+        fd: i32,
+    ) -> Option<PidfdTarget> {
         let open = self.open_file(fd)?;
         let desc = open.description.read()?;
         match &*desc {
@@ -1227,7 +1251,9 @@ impl SyscallDispatcher {
             // `pidfd_send_signal`/`waitid(P_PIDFD)` accept one). Resolve its
             // backing host pid; any other directory (or non-numeric /proc path)
             // yields None → EBADF. (CPython test_pidfd_send_signal.)
-            OpenDescription::Directory { path, .. } => self.proc_directory_pidfd_target(path),
+            OpenDescription::Directory { path, .. } => {
+                self.proc_directory_pidfd_target(context, path)
+            }
             _ => None,
         }
     }
@@ -1236,14 +1262,18 @@ impl SyscallDispatcher {
     /// HvPatch pidfds and non-pidfd descriptors.
     #[cfg(test)]
     pub(super) fn pidfd_host_pid(&self, fd: i32) -> Option<i32> {
-        match self.pidfd_target(fd)? {
+        match self.pidfd_target(None, fd)? {
             PidfdTarget::Host(pid) => Some(pid),
             PidfdTarget::Hvpatch(_) => None,
         }
     }
 
-    fn pidfd_hvpatch_task(&self, fd: i32) -> Option<crate::kernel::TaskKey> {
-        match self.pidfd_target(fd)? {
+    fn pidfd_hvpatch_task(
+        &self,
+        context: &crate::kernel::KernelContext,
+        fd: i32,
+    ) -> Option<crate::kernel::TaskKey> {
+        match self.pidfd_target(Some(context), fd)? {
             PidfdTarget::Hvpatch(task) => Some(task),
             PidfdTarget::Host(_) => None,
         }
@@ -1767,12 +1797,14 @@ impl SyscallDispatcher {
             // thread — sigsuspendxthread's tgkill(SIGUSR1) landed on main
             // instead of the suspended sibling (handler ran, wrong thread,
             // sibling parked forever).
-            if let Some(tid) = hvpatch_reported_tid(cx.kernel.thread().key().tid.raw()) {
+            if let Some(tid) = hvpatch_reported_tid(cx.kernel.thread().key().tid.raw())
+                .and_then(|tid| crate::namespace::pid::kernel_to_ns_for(cx.kernel, tid))
+            {
                 return Ok(DispatchOutcome::Returned {
                     value: i64::from(tid),
                 });
             }
-            Ok(this.getpid())
+            Ok(DispatchOutcome::errno(LINUX_ESRCH))
         }
 
         fn set_tid_address(this, cx, addr: GuestPtr) {
@@ -1791,11 +1823,18 @@ impl SyscallDispatcher {
                 // host tid.
                 //
                 // LTP set_tid_address01 asserts the result == getpid(); that
-                // holds by construction here, because a leader's ThreadKey tid
-                // IS `LinuxTid::for_task_leader(task.id)` and getpid() reports
-                // the same TaskId.
+                // holds by construction here, because both the leader and
+                // secondary threads are translated through this task's exact
+                // namespace region. A missing mapping must not fall back to a
+                // carrier-global TID.
+                let Some(tid) = u32::try_from(cx.kernel.thread().key().tid.raw())
+                    .ok()
+                    .and_then(|tid| crate::namespace::pid::kernel_to_ns_for(cx.kernel, tid))
+                else {
+                    return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+                };
                 return Ok(DispatchOutcome::Returned {
-                    value: i64::from(cx.kernel.thread().key().tid.raw()),
+                    value: i64::from(tid),
                 });
             }
             Ok(this.getpid())
@@ -1893,7 +1932,7 @@ impl SyscallDispatcher {
                 // get_robust_list01 uses pid 1 for the EPERM case and an unused
                 // pid for ESRCH). Existence is zombie-inclusive because Linux
                 // keeps an unreaped process addressable.
-                let exists = guest_pid_to_task_id(pid)
+                let exists = guest_pid_to_task_id(cx.kernel, pid)
                     .is_ok_and(|task| cx.kernel.kernel().process_identity(task).is_some());
                 return Ok(DispatchOutcome::errno(if exists { LINUX_EPERM } else { LINUX_ESRCH }));
             }
@@ -2287,7 +2326,10 @@ impl SyscallDispatcher {
                 command,
                 LINUX_FUTEX_LOCK_PI | LINUX_FUTEX_TRYLOCK_PI | LINUX_FUTEX_UNLOCK_PI
             ) {
-                let Some(guest_tid) = u32::try_from(cx.kernel.thread().key().tid.raw()).ok() else {
+                let Some(guest_tid) = u32::try_from(cx.kernel.thread().key().tid.raw())
+                    .ok()
+                    .and_then(|tid| crate::namespace::pid::kernel_to_ns_for(cx.kernel, tid))
+                else {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 };
                 return Ok(dispatch_futex_pi(
@@ -2510,19 +2552,16 @@ impl SyscallDispatcher {
 
         fn uname(this, cx, address: GuestPtr) {
             let memory = &mut *cx.memory;
-            // nodename is the dispatcher-owned guest hostname: a requested
-            // container UTS identity when present, otherwise the host-derived
-            // fallback. Keep it in lockstep with /proc/sys/kernel/hostname and
-            // the /etc/hosts self-mapping.
+            // Nodename is the calling task's UTS namespace. Under HVPatch a
+            // dispatcher is not an identity boundary: two container tasks can
+            // share the carrier while answering this syscall differently.
             // A binfmt-interpreted guest (x86_64 under Rosetta) reports x86_64;
             // otherwise native aarch64. The flag — not executable_path — is the
             // signal, because a faithful binfmt redirect keeps the program's own
             // identity (executable_path stays the target, as on real Linux). Both
             // carry the resolved nodename.
-            let proc = this.proc.lock();
-            let nodename = proc.guest_hostname().to_string();
-            let arch = proc.reported_arch();
-            drop(proc);
+            let nodename = cx.kernel.task().uts_ns().nodename();
+            let arch = this.proc.lock().reported_arch();
             let uts = match arch {
                 crate::vfs::GuestReportedArch::X86_64 => {
                     LinuxUtsname::carrick_x86_64_with_nodename(&nodename)
@@ -2544,7 +2583,7 @@ impl SyscallDispatcher {
                 };
                 let kernel = process.kernel_graph();
                 let target = || {
-                    guest_pid_to_task_id(pid)
+                    guest_pid_to_task_id(cx.kernel, pid)
                         .ok()
                         .and_then(|target| kernel.live_task_key(target))
                 };
@@ -2611,7 +2650,7 @@ impl SyscallDispatcher {
                     }
                     17 => DispatchOutcome::errno(LINUX_EINVAL),
                     LINUX_PTRACE_ATTACH => {
-                        let Ok(target_task_id) = guest_pid_to_task_id(pid) else {
+                        let Ok(target_task_id) = guest_pid_to_task_id(cx.kernel, pid) else {
                             return Ok(DispatchOutcome::errno(LINUX_ESRCH));
                         };
                         match kernel.attach_task_for_ptrace(cx.kernel, target_task_id) {
@@ -2620,7 +2659,7 @@ impl SyscallDispatcher {
                         }
                     }
                     LINUX_PTRACE_PEEKTEXT | LINUX_PTRACE_PEEKDATA => {
-                        let Ok(target_task_id) = guest_pid_to_task_id(pid) else {
+                        let Ok(target_task_id) = guest_pid_to_task_id(cx.kernel, pid) else {
                             return Ok(DispatchOutcome::errno(LINUX_ESRCH));
                         };
                         let Some(target_task) = kernel.registry().task(target_task_id) else {
@@ -2701,7 +2740,7 @@ impl SyscallDispatcher {
                         }
                     }
                     LINUX_PTRACE_POKETEXT | LINUX_PTRACE_POKEDATA => {
-                        let Ok(target_task_id) = guest_pid_to_task_id(pid) else {
+                        let Ok(target_task_id) = guest_pid_to_task_id(cx.kernel, pid) else {
                             return Ok(DispatchOutcome::errno(LINUX_ESRCH));
                         };
                         let Some(target_task) = kernel.registry().task(target_task_id) else {
@@ -3008,25 +3047,37 @@ impl SyscallDispatcher {
             if pid.0 < 0 {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
-            let target = match (pid.0 != 0).then(|| guest_pid_to_task_id(pid)).transpose() {
+            let target = match (pid.0 != 0)
+                .then(|| guest_pid_to_task_id(cx.kernel, pid))
+                .transpose()
+            {
                 Ok(target) => target,
                 Err(_) => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
             };
-            // A pgid is a leader's pid, so the same ns translation applies. A
-            // number naming no member keeps its raw value: Linux lets setpgid
-            // name a NOT-YET-EXISTING group only when it equals the target's
-            // own pid (handled above by translation), and an unknown group
-            // must fall through to the kernel's own EPERM, not EINVAL here.
+            // Existing groups resolve through their own lifetime authority;
+            // the leader's PID entry may already have been consumed. The PID
+            // fallback is solely for Linux's create-a-new-group case, where
+            // pgid names the still-live target process itself.
             let group = match (pgid.0 != 0)
                 .then(|| {
-                    let host = crate::namespace::pid::guest_pid_to_kernel(pgid.0)
-                        .unwrap_or(pgid.0);
-                    crate::kernel::ProcessGroupId::from_abi_positive(host)
+                    let namespace_id = u32::try_from(pgid.0).map_err(|_| ())?;
+                    if let Some(group) =
+                        crate::namespace::pid::ns_to_process_group_for(cx.kernel, namespace_id)
+                    {
+                        return Ok(group);
+                    }
+                    let internal = crate::namespace::pid::ns_to_kernel_for(
+                        cx.kernel,
+                        namespace_id,
+                    )
+                    .and_then(|internal| i32::try_from(internal).ok())
+                    .ok_or(())?;
+                    crate::kernel::ProcessGroupId::from_abi_positive(internal).map_err(|_| ())
                 })
                 .transpose()
             {
                 Ok(group) => group,
-                Err(_) => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+                Err(()) => return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EPERM)),
             };
             match cx
                 .kernel
@@ -3053,10 +3104,7 @@ impl SyscallDispatcher {
             };
             match cx.kernel.kernel().process_identity(target) {
                 Some(identity) => Ok(DispatchOutcome::Returned {
-                    value: i64::from(ns_visible_identity_id(
-                        cx.kernel,
-                        identity.process_group.raw(),
-                    )),
+                    value: i64::from(identity.namespace_process_group),
                 }),
                 None => Ok(DispatchOutcome::errno(LINUX_ESRCH)),
             }
@@ -3071,7 +3119,7 @@ impl SyscallDispatcher {
             };
             match cx.kernel.kernel().process_identity(target) {
                 Some(identity) => Ok(DispatchOutcome::Returned {
-                    value: i64::from(ns_visible_identity_id(cx.kernel, identity.session.raw())),
+                    value: i64::from(identity.namespace_session),
                 }),
                 None => Ok(DispatchOutcome::errno(LINUX_ESRCH)),
             }
@@ -3092,7 +3140,7 @@ impl SyscallDispatcher {
                 // two numbering domains happen to coincide, which is why the
                 // single-process lane never caught it.
                 Ok(sid) => Ok(DispatchOutcome::Returned {
-                    value: i64::from(ns_visible_identity_id(cx.kernel, sid.raw())),
+                    value: i64::from(ns_visible_session(cx.kernel, sid)),
                 }),
                 Err(error) => Ok(DispatchOutcome::errno(
                     crate::hvpatch::identity_operation_errno(error),
@@ -3138,7 +3186,9 @@ impl SyscallDispatcher {
                     // number naming no member is ECHILD, same as the range
                     // check below.
                     LINUX_P_PID if id > 0 && id <= i32::MAX as u64 => {
-                        match crate::namespace::pid::guest_pid_to_kernel(id as i32) {
+                        match crate::namespace::pid::ns_to_kernel_for(cx.kernel, id as u32)
+                            .and_then(|host| i32::try_from(host).ok())
+                        {
                             Some(host) => Some(host),
                             None => {
                                 return Ok(DispatchOutcome::errno(
@@ -3160,10 +3210,11 @@ impl SyscallDispatcher {
                                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                             }
                         } else {
-                            // An ns-pgid; group ids are leader pids, so the
-                            // same pid translation applies. A miss is ECHILD.
-                            match crate::namespace::pid::guest_pid_to_kernel(id as i32) {
-                                Some(host) => host,
+                            match crate::namespace::pid::ns_to_process_group_for(
+                                cx.kernel,
+                                id as u32,
+                            ) {
+                                Some(group) => group.raw(),
                                 None => {
                                     return Ok(DispatchOutcome::errno(
                                         crate::linux_abi::LINUX_ECHILD,
@@ -3177,7 +3228,7 @@ impl SyscallDispatcher {
                     LINUX_P_PGID => {
                         return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD));
                     }
-                    LINUX_P_PIDFD => match this.pidfd_hvpatch_task(id as i32) {
+                    LINUX_P_PIDFD => match this.pidfd_hvpatch_task(cx.kernel, id as i32) {
                         Some(task) => {
                             pidfd_target = Some(task);
                             None
@@ -3638,7 +3689,11 @@ impl SyscallDispatcher {
                         include_continued,
                     ),
                     value if value > 0 => {
-                        match crate::namespace::pid::guest_pid_to_kernel(value) {
+                        match u32::try_from(value)
+                            .ok()
+                            .and_then(|value| crate::namespace::pid::ns_to_kernel_for(cx.kernel, value))
+                            .and_then(|host| i32::try_from(host).ok())
+                        {
                             Some(host) => {
                                 host_target = Some(host);
                                 process.wait_child_with_job_control(
@@ -3662,9 +3717,14 @@ impl SyscallDispatcher {
                         ),
                         Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                     },
-                    value => match value
-                        .checked_abs()
-                        .and_then(crate::namespace::pid::guest_pid_to_kernel)
+                    value => match value.checked_abs().and_then(|value| {
+                        u32::try_from(value)
+                            .ok()
+                            .and_then(|value| {
+                                crate::namespace::pid::ns_to_process_group_for(cx.kernel, value)
+                            })
+                            .map(crate::kernel::ProcessGroupId::raw)
+                    })
                     {
                         Some(group) => process.wait_child_in_process_group_with_job_control(
                             group,
@@ -3690,13 +3750,9 @@ impl SyscallDispatcher {
                             memory.write_bytes(rusage_addr.0, rusage.abi_bytes())?;
                         }
                         return Ok(DispatchOutcome::Returned {
-                            // The reaped child's pid in the CALLER's namespace
-                            // view — the probe loop `waitpid(rc) == fork_rc`
-                            // never terminated on the raw task id.
-                            value: i64::from(ns_visible_identity_id(
-                                cx.kernel,
-                                exit.pid().raw(),
-                            )),
+                            // The wait receipt retains the namespace pid because
+                            // consuming the zombie also releases its live map.
+                            value: i64::from(exit.visible_pid()),
                         });
                     }
                     crate::hvpatch::WaitResult::StillRunning => {
@@ -4387,7 +4443,11 @@ impl SyscallDispatcher {
                 // The guest names the target by ns-pid; the graph indexes by
                 // task id. A non-member is ESRCH (`pidfd_open(getpid())`
                 // failed exactly here once `getpid` reported ns pids).
-                let Some(host) = crate::namespace::pid::guest_pid_to_kernel(pid.0) else {
+                let Some(host) = u32::try_from(pid.0)
+                    .ok()
+                    .and_then(|pid| crate::namespace::pid::ns_to_kernel_for(cx.kernel, pid))
+                    .and_then(|host| i32::try_from(host).ok())
+                else {
                     return Ok(DispatchOutcome::errno(LINUX_ESRCH));
                 };
                 return Ok(this.open_hvpatch_pidfd(&process, host, flags));
@@ -4417,7 +4477,7 @@ impl SyscallDispatcher {
         }
 
         fn pidfd_send_signal(this, cx, fd: Fd, signum: u64, info: GuestPtr, flags: u64) {
-            let Some(target) = this.pidfd_target(fd.0) else {
+            let Some(target) = this.pidfd_target(Some(cx.kernel), fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
             if flags != 0 {
@@ -4456,7 +4516,7 @@ impl SyscallDispatcher {
                     Some(crate::linux_abi::LinuxSiginfo::kill(
                         signum as i32,
                         crate::linux_abi::LINUX_SI_USER,
-                        cx.kernel.task().key().id.raw(),
+                        crate::dispatch::signal::ns_visible_sender_pid(cx.kernel),
                         this.cred_snapshot().ruid.raw(),
                     ))
                 };
@@ -4760,7 +4820,7 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::errno(LINUX_ESRCH));
         }
 
-        let Ok(target_task_id) = guest_pid_to_task_id(pid) else {
+        let Ok(target_task_id) = guest_pid_to_task_id(cx.kernel, pid) else {
             return Ok(DispatchOutcome::errno(LINUX_ESRCH));
         };
         let Some(target_task) = cx.kernel.kernel().registry().task(target_task_id) else {
@@ -5444,15 +5504,7 @@ pub(crate) fn build_hvpatch_waitid_siginfo(
     exit: crate::hvpatch::ChildExit,
 ) -> [u8; crate::linux_abi::LINUX_SIGINFO_SIZE] {
     let (si_code, si_status) = hvpatch_waitid_exit_fields(exit.status());
-    // si_pid is read by the GUEST and must name the child as the guest's
-    // namespace does — the raw task id only coincides by counter alignment.
-    let si_pid = u32::try_from(exit.pid().raw())
-        .ok()
-        .map(crate::namespace::pid::host_to_ns_or_self)
-        .and_then(|ns| i32::try_from(ns).ok())
-        .filter(|ns| *ns != 0)
-        .unwrap_or_else(|| exit.pid().raw());
-    build_linux_sigchld_siginfo(si_pid, exit.ruid().raw(), si_code, si_status)
+    build_linux_sigchld_siginfo(exit.visible_pid(), exit.ruid().raw(), si_code, si_status)
 }
 
 /// Build a Linux `siginfo_t` (SIGCHLD layout) for `waitid` from the fields
@@ -6517,6 +6569,8 @@ mod kernel_process_dispatch_tests {
         // When dispatching without an active execution lease:
         // Ordinary syscalls (getpid, getppid, getuid, sched_yield) succeed normally
         // without attempting foreign MM access or failing due to missing lease authority.
+        // This fixture is the container's kernel-graph root, so Linux exposes no
+        // parent inside its PID namespace: getppid() is 0, not a synthetic pid 1.
         assert_eq!(
             dispatch(&mut dispatcher, &root, &mut memory, 172, [0, 0, 0, 0, 0, 0]),
             DispatchOutcome::Returned { value: 61_098 },
@@ -6524,7 +6578,7 @@ mod kernel_process_dispatch_tests {
         );
         assert_eq!(
             dispatch(&mut dispatcher, &root, &mut memory, 173, [0, 0, 0, 0, 0, 0]),
-            DispatchOutcome::Returned { value: 1 },
+            DispatchOutcome::Returned { value: 0 },
             "getppid must not require or consume execution lease authority",
         );
         assert_eq!(
@@ -8278,11 +8332,20 @@ mod process_identity_dispatch_tests {
         number: u64,
         arg: i64,
     ) -> DispatchOutcome {
+        call_args(dispatcher, caller, number, [arg as u64, 0, 0, 0, 0, 0])
+    }
+
+    fn call_args(
+        dispatcher: &mut SyscallDispatcher,
+        caller: &KernelContext,
+        number: u64,
+        args: [u64; 6],
+    ) -> DispatchOutcome {
         let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
         dispatcher
             .dispatch(
                 caller,
-                SyscallRequest::new(number, SyscallArgs::from([arg as u64, 0, 0, 0, 0, 0])),
+                SyscallRequest::new(number, SyscallArgs::from(args)),
                 &mut memory,
                 &CompatReporter::default(),
             )
@@ -8294,6 +8357,97 @@ mod process_identity_dispatch_tests {
             DispatchOutcome::Returned { value } => value,
             other => panic!("expected a value, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn container_pid_identity_isolated() {
+        use std::sync::Arc;
+
+        use carrick_kernel::arena::KernelArena;
+
+        use crate::kernel::{Container, Kernel, LaunchContext, RootBootstrap, RunId};
+        use crate::namespace::pid::NsSharedRegion;
+
+        let arena = Box::leak(Box::new(KernelArena::create().expect("test kernel arena")));
+        let alpha_container = Arc::new(Container::new(LaunchContext::unmanaged(RunId::new(
+            "identity-alpha",
+        ))));
+        alpha_container
+            .install_pid_ns(NsSharedRegion::allocate(arena).expect("alpha pid region"))
+            .expect("install alpha pid region");
+        let alpha_bootstrap = RootBootstrap::for_reference_model(
+            8_700,
+            ThreadId::synthetic_for_tests(8_700),
+            "identity-alpha-init".to_owned(),
+        )
+        .expect("alpha bootstrap")
+        .with_container(Arc::clone(&alpha_container));
+        let (kernel, alpha) = Kernel::bootstrap_root(alpha_bootstrap).expect("alpha root");
+
+        let beta_container = Arc::new(Container::new(LaunchContext::unmanaged(RunId::new(
+            "identity-beta",
+        ))));
+        beta_container
+            .install_pid_ns(NsSharedRegion::allocate(arena).expect("beta pid region"))
+            .expect("install beta pid region");
+        let beta = kernel
+            .prepare_container_root(
+                ThreadId::synthetic_for_tests(8_701),
+                None,
+                "identity-beta-init".to_owned(),
+                beta_container,
+                None,
+            )
+            .expect("prepare beta")
+            .commit()
+            .expect("commit beta");
+        let mut dispatcher = SyscallDispatcher::new();
+
+        for context in [&alpha, &beta] {
+            assert_eq!(returned(call(&mut dispatcher, context, 172, 0)), 1);
+            assert_eq!(returned(call(&mut dispatcher, context, 178, 0)), 1);
+            assert_eq!(returned(call(&mut dispatcher, context, SYS_GETPGID, 0)), 1);
+            assert_eq!(returned(call(&mut dispatcher, context, SYS_GETSID, 0)), 1);
+            let core = dispatcher
+                .core_process_snapshot(context)
+                .expect("namespace-visible core identity");
+            assert_eq!(core.identity.pid, 1);
+            assert_eq!(core.identity.ppid, 0);
+            assert_eq!(core.identity.pgrp, 1);
+            assert_eq!(core.identity.session, 1);
+        }
+        assert_eq!(
+            crate::namespace::pid::ns_to_process_group_for(&alpha, 1),
+            Some(alpha.task().process_group())
+        );
+        assert_eq!(
+            crate::namespace::pid::ns_to_process_group_for(&beta, 1),
+            Some(beta.task().process_group())
+        );
+        assert_eq!(
+            crate::namespace::pid::process_group_to_ns_for(&alpha, beta.task().process_group()),
+            None,
+            "another container's internal group key is invisible",
+        );
+        assert_eq!(
+            crate::namespace::pid::ns_to_session_for(&alpha, 1),
+            Some(alpha.task().session())
+        );
+        assert_eq!(
+            crate::namespace::pid::session_to_ns_for(&alpha, beta.task().session()),
+            None,
+            "another container's internal session key is invisible",
+        );
+
+        let beta_internal = i64::from(beta.task().key().id.raw());
+        assert!(matches!(
+            call(&mut dispatcher, &alpha, SYS_GETPGID, beta_internal),
+            DispatchOutcome::Errno { errno } if errno == LINUX_ESRCH
+        ));
+        assert!(matches!(
+            call(&mut dispatcher, &alpha, SYS_GETSID, beta_internal),
+            DispatchOutcome::Errno { errno } if errno == LINUX_ESRCH
+        ));
     }
 
     /// `getpgid`/`getsid`/`setpgid`/`setsid` must describe the process that
@@ -8399,6 +8553,137 @@ mod process_identity_dispatch_tests {
             call(&mut dispatcher, &root, SYS_GETPGID, first_pid),
             DispatchOutcome::errno(LINUX_ESRCH),
             "a reaped child is gone from the process table",
+        );
+    }
+
+    #[test]
+    fn live_groups_and_session_keep_their_namespace_ids_after_leader_reap() {
+        use std::sync::Arc;
+
+        use carrick_kernel::arena::KernelArena;
+
+        use crate::kernel::{Container, Kernel, LaunchContext, RootBootstrap, RunId};
+        use crate::namespace::pid::NsSharedRegion;
+
+        let arena = Box::leak(Box::new(KernelArena::create().expect("test kernel arena")));
+        let container = Arc::new(Container::new(LaunchContext::unmanaged(RunId::new(
+            "job-identity-lifetime",
+        ))));
+        let region = NsSharedRegion::allocate(arena).expect("pid region");
+        container
+            .install_pid_ns(Arc::clone(&region))
+            .expect("install pid region");
+        let bootstrap = RootBootstrap::for_reference_model(
+            8_800,
+            ThreadId::synthetic_for_tests(8_800),
+            "job-identity-init".to_owned(),
+        )
+        .expect("root bootstrap")
+        .with_container(container);
+        let (kernel, root) = Kernel::bootstrap_root(bootstrap).expect("root");
+        let mut dispatcher = SyscallDispatcher::new();
+
+        let leader = fork_child(&root, 8_801);
+        let leader_pid = returned(call(&mut dispatcher, &leader, 172, 0));
+        assert_eq!(leader_pid, 2);
+        assert_eq!(returned(call(&mut dispatcher, &leader, SYS_SETSID, 0)), 2);
+        let leader = refreshed(&leader);
+
+        let first_group_member = fork_child(&leader, 8_802);
+        let leader = refreshed(&leader);
+        let second_group_member = fork_child(&leader, 8_803);
+        assert_eq!(
+            returned(call(&mut dispatcher, &second_group_member, SYS_SETPGID, 0)),
+            0
+        );
+        let second_group_member = refreshed(&second_group_member);
+        assert_eq!(
+            returned(call(&mut dispatcher, &second_group_member, SYS_GETPGID, 0)),
+            4
+        );
+
+        kernel
+            .prepare_task_exit(
+                leader.task().key().id,
+                LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .expect("prepare leader exit")
+            .commit()
+            .expect("publish leader exit");
+        kernel
+            .wait_child(
+                root.task().key().id,
+                Some(leader.task().key().id),
+                WaitMode::Consume,
+            )
+            .expect("consume leader exit");
+        assert_eq!(region.ns_to_host(leader_pid as u32), None);
+
+        assert_eq!(
+            returned(call(&mut dispatcher, &first_group_member, SYS_GETPGID, 0)),
+            leader_pid,
+            "the surviving leader group keeps its namespace-visible pgid",
+        );
+        assert_eq!(
+            returned(call(&mut dispatcher, &second_group_member, SYS_GETSID, 0)),
+            leader_pid,
+            "a second live group keeps the reaped leader's session id",
+        );
+        assert_eq!(
+            call_args(
+                &mut dispatcher,
+                &second_group_member,
+                SYS_SETPGID,
+                [0, leader_pid as u64, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+            "setpgid can still name the existing leader group",
+        );
+        let second_group_member = refreshed(&second_group_member);
+        assert_eq!(
+            returned(call(&mut dispatcher, &second_group_member, SYS_GETPGID, 0)),
+            leader_pid,
+        );
+
+        kernel
+            .prepare_task_exit(
+                first_group_member.task().key().id,
+                LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .expect("prepare first member exit")
+            .commit()
+            .expect("publish first member exit");
+        kernel
+            .wait_child(
+                root.task().key().id,
+                Some(first_group_member.task().key().id),
+                WaitMode::Consume,
+            )
+            .expect("consume first member exit");
+
+        let second_pid = returned(call(&mut dispatcher, &second_group_member, 172, 0));
+        kernel
+            .prepare_task_exit(
+                second_group_member.task().key().id,
+                LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .expect("prepare last member exit")
+            .commit()
+            .expect("publish last member exit");
+
+        let root = refreshed(&root);
+        assert_eq!(
+            returned(call(&mut dispatcher, &root, SYS_GETPGID, second_pid)),
+            leader_pid,
+            "a zombie keeps the retired process group's namespace identity",
+        );
+        assert_eq!(
+            returned(call(&mut dispatcher, &root, SYS_GETSID, second_pid)),
+            leader_pid,
+            "a zombie keeps the retired session's namespace identity",
         );
     }
 }

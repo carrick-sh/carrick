@@ -29,7 +29,9 @@ fn process_identity_syscalls_return_bootstrap_ids() {
 
     for (number, expected) in [
         (172, pid),
-        (173, 1),
+        // The bootstrap task is this PID namespace's init, whose parent is
+        // outside the namespace. Linux exposes that boundary as PPid 0.
+        (173, 0),
         (174, 0),
         (175, 0),
         (176, 0),

@@ -6,7 +6,7 @@ This directory contains technical design documents, architectural overviews, HAL
 
 ## 🏛 Architecture & Foundations
 
-- **[`architecture-overview.md`](architecture-overview.md)** — High-level architecture of Carrick: execution lanes, kernel graph, VFS/rootfs, process models, and syscall translation.
+- **[`architecture-overview.md`](architecture-overview.md)** — Current carrier-kernel architecture: kernel graph, HVPatch memory domains, task/executor model, host capabilities, and platform HALs.
 - **[`hal.md`](hal.md)** — Hardware Abstraction Layer (HAL): platform-neutral contracts separating host/VMM backends (HVF, KVM, bhyve, NVMM).
 - **[`namespaces-design.md`](namespaces-design.md)** — Linux PID, mount, IPC, user, and network namespace emulation inside host Darwin/BSD environments.
 - **[`support-matrix.md`](support-matrix.md)** — Auto-rendered Linux syscall compatibility and conformance status matrix across architectures.
@@ -27,7 +27,7 @@ This directory contains technical design documents, architectural overviews, HAL
 
 ## 🔬 Testing, Conformance & Diagnostics
 
-- **[`conformance-testing.md`](conformance-testing.md)** — Differential conformance testing framework against native ARM64 Docker oracle.
+- **[`conformance-testing.md`](conformance-testing.md)** — Host-only checks, signed hardware gates, differential Docker oracles, strict closure, and the evidence limits of public GitHub-hosted runners.
 - **[`conformance-coverage.md`](conformance-coverage.md)** — Conformance coverage tiers, test harnesses (LTP, CPython, Node.js, Go), and regression tracking.
 - **[`diagnostics-and-debugging.md`](diagnostics-and-debugging.md)** — Guide to in-process USDT probes, `carrick trace` (DTrace), `carrick_lldb.py`, and the lock-free event ring.
 

@@ -1,8 +1,12 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use carrick_abi::{LinuxGuestAbi, NativeNr};
 use carrick_observability::compat::{CompatReporter, SyscallArgs};
 use carrick_spec::SeccompPolicy;
+use proptest::prelude::*;
 
+use super::intercept::InterceptorChain;
 use super::*;
 use crate::dispatch::{DispatchOutcome, LinearMemory, SyscallDispatcher, SyscallRequest};
 use crate::kernel::{
@@ -104,6 +108,297 @@ impl SyscallObserver for FastPathReqObserver {
     }
 }
 
+struct ContinueInterceptor;
+
+impl SyscallInterceptor for ContinueInterceptor {
+    fn intercept(
+        &self,
+        _process: &ProcessInfo<'_>,
+        _call: &InterceptedSyscall<'_>,
+    ) -> InterceptAction {
+        InterceptAction::Continue
+    }
+}
+
+fn assert_interceptor_bounds<T: SyscallInterceptor + Send + Sync>() {}
+
+#[test]
+fn syscall_args_are_immutable_six_words() {
+    let original = SyscallArgs::new([10, 11, 12, 13, 14, 15]);
+    let rewritten = original
+        .with_arg(0, 100)
+        .expect("first scalar argument is writable")
+        .with_arg(5, 500)
+        .expect("sixth scalar argument is writable");
+
+    assert_eq!(original.words(), [10, 11, 12, 13, 14, 15]);
+    assert_eq!(original.get(0), Some(10));
+    assert_eq!(original.get(5), Some(15));
+    assert_eq!(rewritten.words(), [100, 11, 12, 13, 14, 500]);
+    assert_eq!(rewritten.get(0), Some(100));
+    assert_eq!(rewritten.get(5), Some(500));
+    assert_eq!(
+        original.with_arg(6, 600),
+        Err(SyscallArgIndexError { index: 6 })
+    );
+}
+
+#[test]
+fn intercepted_syscall_preserves_request_identity_and_original_arguments() {
+    let original_args = SyscallArgs::new([1, 2, 3, 4, 5, 6]);
+    let request = SyscallRequest::new(64, original_args)
+        .with_guest_abi(LinuxGuestAbi::X86_64)
+        .with_current_guest_sp(Some(0xfeed_cafe));
+    let request = SyscallRequest {
+        native_number: NativeNr(1),
+        ..request
+    };
+    let effective_args = original_args
+        .with_arg(0, 9)
+        .expect("first scalar argument is writable");
+    let call = InterceptedSyscall::new(&request, effective_args);
+
+    assert_eq!(call.canonical_number(), request.number);
+    assert_eq!(call.native_number(), 1);
+    assert_eq!(call.guest_abi(), LinuxGuestAbi::X86_64);
+    assert_eq!(call.current_guest_sp(), Some(0xfeed_cafe));
+    assert_eq!(call.original_args(), original_args);
+    assert_eq!(call.effective_args(), SyscallArgs::new([9, 2, 3, 4, 5, 6]));
+}
+
+#[test]
+fn interceptor_contract_is_thread_safe() {
+    assert_interceptor_bounds::<ContinueInterceptor>();
+}
+
+struct RewriteInterceptor {
+    observed_args: Arc<Mutex<Vec<[u64; 6]>>>,
+    rewrite: SyscallArgs,
+}
+
+impl SyscallInterceptor for RewriteInterceptor {
+    fn intercept(
+        &self,
+        _process: &ProcessInfo<'_>,
+        call: &InterceptedSyscall<'_>,
+    ) -> InterceptAction {
+        self.observed_args
+            .lock()
+            .expect("recording mutex is not poisoned")
+            .push(call.effective_args().words());
+        InterceptAction::RewriteArgs(self.rewrite)
+    }
+}
+
+struct ActionInterceptor {
+    calls: Arc<AtomicUsize>,
+    action: InterceptAction,
+}
+
+impl SyscallInterceptor for ActionInterceptor {
+    fn intercept(
+        &self,
+        _process: &ProcessInfo<'_>,
+        _call: &InterceptedSyscall<'_>,
+    ) -> InterceptAction {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.action
+    }
+}
+
+struct PanicInterceptor;
+
+impl SyscallInterceptor for PanicInterceptor {
+    fn intercept(
+        &self,
+        _process: &ProcessInfo<'_>,
+        _call: &InterceptedSyscall<'_>,
+    ) -> InterceptAction {
+        panic!("interceptor panic must remain contained")
+    }
+}
+
+#[test]
+fn interceptor_chain_applies_cumulative_rewrites_without_mutating_original_request() {
+    let original = SyscallArgs::new([1, 2, 3, 4, 5, 6]);
+    let request = SyscallRequest::new(64, original);
+    let observed_args = Arc::new(Mutex::new(Vec::new()));
+    let chain = InterceptorChain::new(vec![
+        Arc::new(RewriteInterceptor {
+            observed_args: Arc::clone(&observed_args),
+            rewrite: SyscallArgs::new([10, 11, 12, 13, 14, 15]),
+        }),
+        Arc::new(RewriteInterceptor {
+            observed_args: Arc::clone(&observed_args),
+            rewrite: SyscallArgs::new([20, 21, 22, 23, 24, 25]),
+        }),
+    ]);
+    let context = test_kernel_context();
+
+    let result = chain
+        .apply(&ProcessInfo::new(&context), &request)
+        .expect("rewriting chain succeeds");
+
+    assert_eq!(
+        *observed_args
+            .lock()
+            .expect("recording mutex is not poisoned"),
+        vec![[1, 2, 3, 4, 5, 6], [10, 11, 12, 13, 14, 15]]
+    );
+    assert_eq!(result.effective_args.words(), [20, 21, 22, 23, 24, 25]);
+    assert_eq!(result.proposed, None);
+    assert_eq!(request.args.words(), [1, 2, 3, 4, 5, 6]);
+}
+
+#[test]
+fn interceptor_chain_return_stops_later_interceptors() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let chain = InterceptorChain::new(vec![
+        Arc::new(ActionInterceptor {
+            calls: Arc::clone(&calls),
+            action: InterceptAction::Return(42),
+        }),
+        Arc::new(ActionInterceptor {
+            calls: Arc::clone(&calls),
+            action: InterceptAction::Continue,
+        }),
+    ]);
+    let context = test_kernel_context();
+    let request = SyscallRequest::new(64, SyscallArgs::new([0; 6]));
+
+    let result = chain
+        .apply(&ProcessInfo::new(&context), &request)
+        .expect("returning chain succeeds");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(result.proposed, Some(SyscallOutcome::returned(42)));
+}
+
+#[test]
+fn interceptor_chain_errno_stops_later_interceptors() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let chain = InterceptorChain::new(vec![
+        Arc::new(ActionInterceptor {
+            calls: Arc::clone(&calls),
+            action: InterceptAction::Errno(LINUX_EACCES),
+        }),
+        Arc::new(ActionInterceptor {
+            calls: Arc::clone(&calls),
+            action: InterceptAction::Continue,
+        }),
+    ]);
+    let context = test_kernel_context();
+    let request = SyscallRequest::new(64, SyscallArgs::new([0; 6]));
+
+    let result = chain
+        .apply(&ProcessInfo::new(&context), &request)
+        .expect("errno chain succeeds");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(result.proposed, Some(SyscallOutcome::errno(LINUX_EACCES)));
+}
+
+#[test]
+fn interceptor_chain_empty_preserves_request_without_proposed_outcome() {
+    let request = SyscallRequest::new(64, SyscallArgs::new([1, 2, 3, 4, 5, 6]));
+    let context = test_kernel_context();
+
+    let result = InterceptorChain::default()
+        .apply(&ProcessInfo::new(&context), &request)
+        .expect("empty chain succeeds");
+
+    assert_eq!(result.effective_args, request.args);
+    assert_eq!(result.proposed, None);
+}
+
+#[test]
+fn interceptor_chain_lowers_callback_panic_to_calling_container_id() {
+    let context = test_kernel_context();
+    let process = ProcessInfo::new(&context);
+    let request = SyscallRequest::new(64, SyscallArgs::new([0; 6]));
+    let chain = InterceptorChain::new(vec![Arc::new(PanicInterceptor)]);
+
+    let error = chain
+        .apply(&process, &request)
+        .expect_err("panicking interceptor must fail through DispatchError");
+
+    assert!(matches!(
+        error,
+        crate::dispatch::DispatchError::InterceptorPanicked { container_id }
+            if container_id == context.container().id()
+    ));
+}
+
+proptest! {
+    #[test]
+    fn interceptor_rewrites_preserve_request_identity(
+        original in any::<[u64; 6]>(),
+        original_number in any::<u64>(),
+        original_native_number in any::<u64>(),
+        rewrites in prop::collection::vec(any::<[u64; 6]>(), 0..16),
+    ) {
+        let request = SyscallRequest {
+            native_number: NativeNr(original_native_number),
+            ..SyscallRequest::new(original_number, SyscallArgs::new(original))
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let interceptors = rewrites
+            .iter()
+            .copied()
+            .map(|rewrite| {
+                Arc::new(ActionInterceptor {
+                    calls: Arc::clone(&calls),
+                    action: InterceptAction::RewriteArgs(SyscallArgs::new(rewrite)),
+                }) as Arc<dyn SyscallInterceptor>
+            })
+            .collect();
+        let context = test_kernel_context();
+
+        let result = InterceptorChain::new(interceptors)
+            .apply(&ProcessInfo::new(&context), &request)
+            .expect("rewrite chain succeeds");
+        let expected_last = rewrites.last().copied().unwrap_or(original);
+
+        prop_assert_eq!(result.effective_args.words(), expected_last);
+        prop_assert_eq!(request.args.words(), original);
+        prop_assert_eq!(request.number.raw(), original_number);
+        prop_assert_eq!(request.native_number.raw(), original_native_number);
+    }
+
+    #[test]
+    fn interceptor_chain_terminal_action_stops_all_later_callbacks(
+        (rewrites, terminal_position) in prop::collection::vec(any::<[u64; 6]>(), 1..16)
+            .prop_flat_map(|rewrites| (Just(rewrites.clone()), 0..rewrites.len())),
+    ) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let interceptors = rewrites
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(position, rewrite)| {
+                let action = if position == terminal_position {
+                    InterceptAction::Return(42)
+                } else {
+                    InterceptAction::RewriteArgs(SyscallArgs::new(rewrite))
+                };
+                Arc::new(ActionInterceptor {
+                    calls: Arc::clone(&calls),
+                    action,
+                }) as Arc<dyn SyscallInterceptor>
+            })
+            .collect();
+        let context = test_kernel_context();
+        let request = SyscallRequest::new(64, SyscallArgs::new([0; 6]));
+
+        let result = InterceptorChain::new(interceptors)
+            .apply(&ProcessInfo::new(&context), &request)
+            .expect("terminal chain succeeds");
+
+        prop_assert_eq!(calls.load(Ordering::SeqCst), terminal_position + 1);
+        prop_assert_eq!(result.proposed, Some(SyscallOutcome::returned(42)));
+    }
+}
+
 fn test_kernel_context() -> KernelContext {
     let bootstrap = RootBootstrap::for_reference_model(
         1,
@@ -112,6 +407,18 @@ fn test_kernel_context() -> KernelContext {
     )
     .expect("root bootstrap");
     Kernel::bootstrap_root(bootstrap).expect("root kernel").1
+}
+
+#[test]
+fn process_info_exposes_container_identity() {
+    let context = test_kernel_context();
+    let process = ProcessInfo::new(&context);
+
+    assert_eq!(process.container_id(), context.task().container().id());
+    assert_eq!(
+        process.run_id(),
+        context.task().container().run_id().clone()
+    );
 }
 
 #[test]

@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::num::NonZeroU64;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -22,7 +23,7 @@ use crate::namespace::user::UserNs;
 
 use super::address::MmBackend;
 use super::clone_plan::{CloneObjectMode, ClonePlan, CloneTaskMode};
-use super::container::Container;
+use super::container::{Container, ContainerId};
 use super::crash_capture::{CrashCaptureGeneration, CrashRegisterVote};
 use super::ids::{
     ChildExitSignal, CredentialsId, FileDescriptionId, FileSlotNumber, FileTableId, FsContextId,
@@ -751,6 +752,168 @@ pub(crate) struct AsyncIoOwner {
     pub(crate) owner_pid: i32,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AsyncIoTarget {
+    pub(crate) container_id: u64,
+    pub(crate) target_id: i32,
+    pub(crate) target_generation: u64,
+    pub(crate) thread_id: i32,
+    pub(crate) thread_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CapturedAsyncIoOwner {
+    pub(crate) visible: AsyncIoOwner,
+    pub(crate) target: AsyncIoTarget,
+}
+
+impl CapturedAsyncIoOwner {
+    pub(crate) fn capture(
+        context: &crate::kernel::KernelContext,
+        owner_type: i32,
+        owner_pid: i32,
+    ) -> Self {
+        let visible = AsyncIoOwner {
+            owner_type,
+            owner_pid,
+        };
+        let Some(namespace_id) = u32::try_from(owner_pid).ok().filter(|id| *id != 0) else {
+            return Self {
+                visible,
+                target: AsyncIoTarget::default(),
+            };
+        };
+        let container_id = context.container().id().raw();
+        let target = match owner_type {
+            crate::linux_abi::LINUX_F_OWNER_PGRP => {
+                crate::namespace::pid::ns_to_process_group_for(context, namespace_id)
+                    .and_then(|id| context.kernel().registry().process_group(id))
+                    .map(|group| AsyncIoTarget {
+                        container_id,
+                        target_id: group.id().raw(),
+                        target_generation: group.generation(),
+                        thread_id: 0,
+                        thread_generation: 0,
+                    })
+            }
+            crate::linux_abi::LINUX_F_OWNER_TID => {
+                crate::namespace::pid::guest_tid_to_kernel_for(context, owner_pid)
+                    .and_then(|id| LinuxTid::from_abi_positive(id).ok())
+                    .and_then(|tid| context.kernel().live_keys_for_thread(None, tid))
+                    .and_then(|(task, thread)| {
+                        context
+                            .kernel()
+                            .registry()
+                            .task(task.id)
+                            .filter(|task| task.container().id().raw() == container_id)
+                            .map(|_| AsyncIoTarget {
+                                container_id,
+                                target_id: task.id.raw(),
+                                target_generation: task.serial.raw(),
+                                thread_id: thread.tid.raw(),
+                                thread_generation: thread.serial.raw(),
+                            })
+                    })
+            }
+            _ => crate::namespace::pid::ns_to_kernel_for(context, namespace_id)
+                .and_then(|id| i32::try_from(id).ok())
+                .and_then(|id| TaskId::from_abi_positive(id).ok())
+                .and_then(|id| context.kernel().registry().task(id))
+                .filter(|task| task.container().id().raw() == container_id)
+                .map(|task| AsyncIoTarget {
+                    container_id,
+                    target_id: task.key().id.raw(),
+                    target_generation: task.key().serial.raw(),
+                    thread_id: 0,
+                    thread_generation: 0,
+                }),
+        }
+        .unwrap_or_default();
+        Self { visible, target }
+    }
+
+    pub(crate) fn post_kernel_signal(
+        self,
+        kernel: &Arc<crate::kernel::Kernel>,
+        signal: LinuxSignal,
+        siginfo: Option<LinuxSiginfo>,
+    ) -> bool {
+        let Some(target_id) = TaskId::from_abi_positive(self.target.target_id).ok() else {
+            return false;
+        };
+        match self.visible.owner_type {
+            crate::linux_abi::LINUX_F_OWNER_PGRP => {
+                let Ok(group_id) = ProcessGroupId::from_abi_positive(self.target.target_id) else {
+                    return false;
+                };
+                if kernel
+                    .registry()
+                    .process_group(group_id)
+                    .is_none_or(|group| group.generation() != self.target.target_generation)
+                {
+                    return false;
+                }
+                let mut posted = false;
+                for task in kernel.task_keys_in_process_group(group_id) {
+                    let is_exact_target = kernel.registry().task(task.id).is_some_and(|current| {
+                        current.key() == task
+                            && current.container().id().raw() == self.target.container_id
+                    });
+                    if is_exact_target {
+                        // Do not short-circuit: a process-group owner delivers
+                        // to every live member, even after the first post.
+                        posted |= kernel.post_signal_to_task_key(task, signal, siginfo);
+                    }
+                }
+                posted
+            }
+            crate::linux_abi::LINUX_F_OWNER_TID => {
+                let Some(task_serial) = TaskSerial::from_raw_u64(self.target.target_generation)
+                else {
+                    return false;
+                };
+                let Ok(tid) = LinuxTid::from_abi_positive(self.target.thread_id) else {
+                    return false;
+                };
+                let Some(thread_serial) = ThreadSerial::from_raw_u64(self.target.thread_generation)
+                else {
+                    return false;
+                };
+                let task = TaskKey {
+                    id: target_id,
+                    serial: task_serial,
+                };
+                let thread = ThreadKey {
+                    tid,
+                    serial: thread_serial,
+                };
+                if kernel.registry().task(target_id).is_none_or(|current| {
+                    current.key() != task
+                        || current.container().id().raw() != self.target.container_id
+                }) {
+                    return false;
+                }
+                kernel.post_signal_to_thread_key(task, thread, signal, siginfo)
+            }
+            _ => {
+                let Some(serial) = TaskSerial::from_raw_u64(self.target.target_generation) else {
+                    return false;
+                };
+                let key = TaskKey {
+                    id: target_id,
+                    serial,
+                };
+                if kernel.registry().task(target_id).is_none_or(|task| {
+                    task.key() != key || task.container().id().raw() != self.target.container_id
+                }) {
+                    return false;
+                }
+                kernel.post_signal_to_task_key(key, signal, siginfo)
+            }
+        }
+    }
+}
+
 /// Open-file-description state that is generic across EVERY backing kind.
 ///
 /// Linux keeps these on the description, so a `dup`, a `fork`, or a
@@ -779,7 +942,7 @@ pub(crate) struct DescriptionCommon {
     async_sig: AtomicI32,
     /// True for a `memfd_secret(2)` description.
     secretmem: AtomicBool,
-    owner: Mutex<AsyncIoOwner>,
+    owner: Mutex<CapturedAsyncIoOwner>,
     /// `memfd_create(2)`/`F_ADD_SEALS` seal set. `None` = this description does
     /// not support sealing (`F_GET_SEALS`/`F_ADD_SEALS` → `EINVAL`).
     seals: Mutex<Option<u32>>,
@@ -793,7 +956,7 @@ impl DescriptionCommon {
             lease: AtomicI32::new(crate::linux_abi::LINUX_F_UNLCK),
             async_sig: AtomicI32::new(0),
             secretmem: AtomicBool::new(false),
-            owner: Mutex::new(AsyncIoOwner::default()),
+            owner: Mutex::new(CapturedAsyncIoOwner::default()),
             seals: Mutex::new(None),
         }
     }
@@ -852,10 +1015,22 @@ impl DescriptionCommon {
     }
 
     pub(crate) fn owner(&self) -> AsyncIoOwner {
+        self.owner.lock().visible
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_owner(&self, owner: AsyncIoOwner) {
+        *self.owner.lock() = CapturedAsyncIoOwner {
+            visible: owner,
+            target: AsyncIoTarget::default(),
+        };
+    }
+
+    pub(crate) fn captured_owner(&self) -> CapturedAsyncIoOwner {
         *self.owner.lock()
     }
 
-    pub(crate) fn set_owner(&self, owner: AsyncIoOwner) {
+    pub(crate) fn set_captured_owner(&self, owner: CapturedAsyncIoOwner) {
         *self.owner.lock() = owner;
     }
 
@@ -1299,7 +1474,7 @@ impl FileSlotSubscriptions {
     /// its slot. Only the slot numbers in `changed` can have moved, so the
     /// listeners on every other number are provably still current and are
     /// not re-examined.
-    fn publish_changes(&self, table: FileTableId, slots: &HashMap<i32, FileSlot>, changed: &[i32]) {
+    fn publish_changes(&self, table: FileTableId, slots: &FileSlotMap, changed: &[i32]) {
         let callbacks = {
             let mut listeners = self.listeners.lock();
             let stale = listeners
@@ -1489,10 +1664,39 @@ impl Drop for FileTableExecFreeze {
     }
 }
 
+/// Collision-free hashing for the signed 32-bit descriptor-number domain.
+///
+/// Guest code controls descriptor values, but each `i32` maps to a distinct
+/// `u64`, so this avoids both collision attacks and the SipHash work that
+/// otherwise dominated fd-fill workloads. Keep this private to the typed fd
+/// table; arbitrary byte keys must continue using a keyed hasher.
+#[derive(Default)]
+pub(crate) struct FileSlotHasher(u64);
+
+impl Hasher for FileSlotHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // `Hash for i32` calls `write_i32`; retain a deterministic fallback so
+        // the Hasher contract remains total if that implementation changes.
+        self.0 = bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    }
+
+    fn write_i32(&mut self, value: i32) {
+        self.0 = u64::from(value as u32);
+    }
+}
+
+pub(crate) type FileSlotMap = HashMap<i32, FileSlot, BuildHasherDefault<FileSlotHasher>>;
+
 #[derive(Debug)]
 pub struct FileTable {
     id: FileTableId,
-    open_files: RwLock<HashMap<i32, FileSlot>>,
+    open_files: RwLock<FileSlotMap>,
     next_fd: Mutex<i32>,
     stdio_cloexec: Mutex<[bool; 3]>,
     closed_stdio: Mutex<[bool; 3]>,
@@ -1510,7 +1714,7 @@ impl FileTable {
     pub fn new(id: FileTableId) -> Self {
         Self {
             id,
-            open_files: RwLock::new(HashMap::new()),
+            open_files: RwLock::new(FileSlotMap::default()),
             next_fd: Mutex::new(3),
             stdio_cloexec: Mutex::new([false; 3]),
             closed_stdio: Mutex::new([false; 3]),
@@ -1553,7 +1757,7 @@ impl FileTable {
     }
 
     fn for_exec(id: FileTableId, caller: &Self) -> Self {
-        let open_files: HashMap<_, _> = caller
+        let open_files: FileSlotMap = caller
             .open_files
             .read()
             .iter()
@@ -1663,7 +1867,7 @@ impl FileTable {
     }
 
     fn resolve_slot_from_guard(
-        open_files: &HashMap<i32, FileSlot>,
+        open_files: &FileSlotMap,
         authority: FileSlotAuthority,
     ) -> Option<Arc<FileDescription>> {
         let slot = open_files.get(&authority.number.raw())?;
@@ -1737,7 +1941,7 @@ impl FileTable {
         self.open_files.read().len()
     }
 
-    pub(crate) fn read_open_files(&self) -> RwLockReadGuard<'_, HashMap<i32, FileSlot>> {
+    pub(crate) fn read_open_files(&self) -> RwLockReadGuard<'_, FileSlotMap> {
         self.open_files.read()
     }
 
@@ -1926,7 +2130,7 @@ impl Drop for FileTable {
 /// and re-walked every slot on release to discover changes, which made an
 /// fd-fill loop quadratic — `dup` at 20k open fds cost ~1 ms, 6000x Linux.)
 pub(crate) struct FileTableWriteGuard<'a> {
-    guard: RwLockWriteGuard<'a, HashMap<i32, FileSlot>>,
+    guard: RwLockWriteGuard<'a, FileSlotMap>,
     _mutation: FileTableMutationLease,
     revision: &'a ObjectRevision,
     table: FileTableId,
@@ -1940,7 +2144,7 @@ pub(crate) struct FileTableWriteGuard<'a> {
 }
 
 impl Deref for FileTableWriteGuard<'_> {
-    type Target = HashMap<i32, FileSlot>;
+    type Target = FileSlotMap;
 
     fn deref(&self) -> &Self::Target {
         &self.guard
@@ -7769,10 +7973,13 @@ impl SignalAuthority {
     }
 }
 
+static NEXT_PROCESS_GROUP_GENERATION: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Debug)]
 pub struct ProcessGroup {
     id: ProcessGroupId,
     session: SessionId,
+    generation: u64,
     _claim: ProcessGroupClaim,
 }
 
@@ -7786,9 +7993,14 @@ impl ProcessGroup {
         if claim.raw() != id.raw() || !claim.belongs_to(registry) {
             return Err(ObjectGraphError::ProcessGroupClaimMismatch);
         }
+        let generation = NEXT_PROCESS_GROUP_GENERATION.fetch_add(1, Ordering::Relaxed);
+        if generation == 0 || generation == u64::MAX {
+            std::process::abort();
+        }
         Ok(Self {
             id,
             session,
+            generation,
             _claim: claim,
         })
     }
@@ -7799,6 +8011,12 @@ impl ProcessGroup {
 
     pub const fn session(&self) -> SessionId {
         self.session
+    }
+
+    /// Monotonic object generation. Unlike the numeric PGID, this never follows
+    /// a later process group that reuses the same id.
+    pub(crate) const fn generation(&self) -> u64 {
+        self.generation
     }
 }
 
@@ -7850,9 +8068,20 @@ pub struct TaskRusage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Zombie {
     pub key: TaskKey,
+    /// PID the parent saw in its container PID namespace at exit. The live
+    /// namespace membership is released by a consuming wait, so the receipt
+    /// must retain this value for wait4/waitid rendering after reap.
+    pub namespace_pid: u32,
+    pub container: ContainerId,
     pub parent: Option<TaskKey>,
     pub process_group: ProcessGroupId,
     pub session: SessionId,
+    /// Historical process-group id in this container's PID namespace. Unlike
+    /// the internal group key, this remains renderable after its leader PID
+    /// mapping and the final live group record have both disappeared.
+    pub namespace_process_group: u32,
+    /// Historical session id in this container's PID namespace.
+    pub namespace_session: u32,
     pub status: LinuxWaitStatus,
     /// The real uid this process held when it exited. Linux `waitid(2)` reports
     /// this value in `siginfo_t.si_uid`, so it must survive task teardown.
@@ -7879,14 +8108,32 @@ impl Zombie {
     /// and `children_rusage` is what the child had already accumulated from
     /// reaping its own children. Linux charges a reaper BOTH, which is how
     /// `tms_cutime` totals a whole process subtree.
-    pub fn from_task(task: &Task, status: LinuxWaitStatus, diagnostic_name: String) -> Self {
+    pub fn from_task(
+        task: &Task,
+        status: LinuxWaitStatus,
+        diagnostic_name: String,
+        namespace_process_group: u32,
+        namespace_session: u32,
+    ) -> Self {
         let (children_user_us, children_system_us) = task.children_cpu_us();
         let credentials = task.process_credentials();
+        let internal_pid =
+            u32::try_from(task.key().id.raw()).unwrap_or_else(|_| std::process::abort());
+        let namespace_pid = match task.pid_ns_region() {
+            Some(region) => region
+                .host_to_ns(internal_pid)
+                .unwrap_or_else(|| std::process::abort()),
+            None => internal_pid,
+        };
         Self {
             key: task.key(),
+            namespace_pid,
+            container: task.container().id(),
             parent: task.parent(),
             process_group: task.process_group(),
             session: task.session(),
+            namespace_process_group,
+            namespace_session,
             status,
             ruid: credentials.ruid(),
             euid: credentials.euid(),
@@ -7985,6 +8232,15 @@ mod tests {
     use carrick_abi::LinuxCloneFlags;
 
     use super::*;
+
+    #[test]
+    fn file_slot_hasher_preserves_the_i32_descriptor_domain() {
+        for value in [i32::MIN, -1, 0, 1, 2, 3, 65_535, i32::MAX] {
+            let mut hasher = FileSlotHasher::default();
+            std::hash::Hasher::write_i32(&mut hasher, value);
+            assert_eq!(hasher.finish(), u64::from(value as u32));
+        }
+    }
     use crate::kernel::container::{LaunchContext, RunId};
     use crate::kernel::{ClonePlan, IdRegistry};
 
@@ -8731,6 +8987,8 @@ mod tests {
             &fixture.task,
             LinuxWaitStatus::from_wait_encoding(0),
             "fixture".to_string(),
+            u32::try_from(fixture.task.process_group().raw()).expect("positive process group"),
+            u32::try_from(fixture.task.session().raw()).expect("positive session"),
         );
         drop(mm);
         drop(fixture);

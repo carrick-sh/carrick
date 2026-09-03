@@ -996,14 +996,28 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             };
             crate::runtime_util::emit_resolve_warnings(&resolved.warnings);
             let spec = resolved.spec;
-            let result = match carrick_runtime::Runtime::execute(&spec) {
+            let carrier = match carrick_runtime::CarrierRuntime::new_explicit() {
+                Ok(carrier) => carrier,
+                Err(e) => {
+                    eprintln!("carrick: {e:#}");
+                    std::process::exit(125);
+                }
+            };
+            let launch = match carrick_runtime::kernel::LaunchContext::from_process_env() {
+                Ok(launch) => launch,
+                Err(e) => {
+                    eprintln!("carrick: {e:#}");
+                    carrick_runtime::carrier::exit_explicit_carrier(&carrier, 125);
+                }
+            };
+            let result = match carrick_runtime::Runtime::execute_on(&carrier, &spec, launch) {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("carrick: {e:#}");
                     // The interactive PTY relay is a thread of this carrier
                     // (no host fork survives), so the carrier exit funnel is
                     // the right teardown on every lane.
-                    carrick_runtime::carrier::exit_carrier(125);
+                    carrick_runtime::carrier::exit_explicit_carrier(&carrier, 125);
                 }
             };
 
@@ -1029,7 +1043,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             // Interactive / tty: the guest's stdio already went straight to the
             // terminal; nothing to emit, just take the exit code.
             if tty || interactive {
-                carrick_runtime::carrier::exit_carrier(status);
+                carrick_runtime::carrier::exit_explicit_carrier(&carrier, status);
             }
 
             // `--json`: the compat-report envelope on stdout. The CLI runs the
@@ -1052,7 +1066,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         "report": result.report,
                     }))?
                 );
-                carrick_runtime::carrier::exit_carrier(status);
+                carrick_runtime::carrier::exit_explicit_carrier(&carrier, status);
             }
 
             // Default: behave like `docker run`. The guest's stdout/stderr
@@ -1066,7 +1080,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     result.traps
                 );
             }
-            carrick_runtime::carrier::exit_carrier(status);
+            carrick_runtime::carrier::exit_explicit_carrier(&carrier, status);
         }
         // `Shell` is normalised to `Run` (interactive /bin/sh) before this
         // match, so it is never reached here.
@@ -2786,8 +2800,15 @@ pub(crate) fn run_build(
     let engine = carrick_engine::Engine::new(store.clone());
     let resolved = block_on_oci(engine.resolve(request)).context("resolve kaniko build carrier")?;
     crate::runtime_util::emit_resolve_warnings(&resolved.warnings);
-    let result =
-        carrick_runtime::Runtime::execute(&resolved.spec).context("run kaniko build carrier")?;
+    let carrier =
+        carrick_runtime::CarrierRuntime::new_explicit().context("create kaniko build carrier")?;
+    let launch = carrick_runtime::kernel::LaunchContext::from_process_env()
+        .context("resolve kaniko launch identity")?;
+    let result = carrick_runtime::Runtime::execute_on(&carrier, &resolved.spec, launch)
+        .context("run kaniko build carrier")?;
+    carrier
+        .shutdown_wait()
+        .context("shutdown kaniko build carrier")?;
     emit_raw(&result);
     let status = if result.trap_limit_hit {
         1

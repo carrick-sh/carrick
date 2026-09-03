@@ -21,7 +21,10 @@ pub(super) fn clear_persistent_child_tid_and_wake<M: carrick_guest_mem::CurrentM
 }
 
 pub(super) enum CloneThreadSpawn {
-    Started(crate::kernel::LinuxTid),
+    Started {
+        internal: crate::kernel::LinuxTid,
+        visible: i32,
+    },
     Errno(crate::linux_abi::LinuxErrno),
 }
 
@@ -90,10 +93,10 @@ impl CloneTidOutputTransaction {
     pub(super) fn publish<E: CloneTidMemory>(
         &self,
         engine: &mut E,
-        linux_tid: crate::kernel::LinuxTid,
+        visible_tid: i32,
         backend_tid: ThreadId,
     ) -> bool {
-        let bytes = linux_tid.raw().to_le_bytes();
+        let bytes = visible_tid.to_le_bytes();
         self.publish_one(
             engine,
             backend_tid,
@@ -217,10 +220,7 @@ mod clone_tid_output_tests {
         memory.bytes.insert(child, 22_i32.to_le_bytes().to_vec());
         let transaction = CloneTidOutputTransaction::capture(&memory, parent, child).unwrap();
         memory.fail_write = Some(child);
-        let linux_tid = crate::kernel::LinuxTid::for_task_leader(
-            crate::kernel::TaskId::for_root_bootstrap(77).unwrap(),
-        );
-        assert!(!transaction.publish(&mut memory, linux_tid, ThreadId::synthetic_for_tests(77),));
+        assert!(!transaction.publish(&mut memory, 7, ThreadId::synthetic_for_tests(77),));
         memory.fail_write = None;
         transaction.rollback(&mut memory).unwrap();
         assert_eq!(memory.bytes[&parent], 11_i32.to_le_bytes());
@@ -249,6 +249,24 @@ impl<E: ThreadedEngine + 'static> ThreadRuntimeState<E>
 where
     E::SiblingSpec: 'static,
 {
+    pub(super) fn persistent_sibling_stop_authority(
+        &self,
+    ) -> Result<PersistentSiblingStopAuthority, RuntimeError> {
+        let context = self.service_kernel_context.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration(
+                "persistent sibling stop lost exact Kernel context".to_owned(),
+            )
+        })?;
+        Ok(PersistentSiblingStopAuthority {
+            registry: Arc::clone(&self.registry),
+            keeper: self.this_tid,
+            kicker: Arc::clone(&self.kicker),
+            futex: Arc::clone(&self.futex),
+            platform_futex: Arc::clone(&self.platform_futex),
+            context: context.retain_exact(),
+        })
+    }
+
     /// Attempt to publish this thread's live vCPU into the kicker: the fresh
     /// kick handle AND the thread's lifetime in-guest flag, in one entry.
     ///
@@ -319,38 +337,86 @@ where
         Ok(drain)
     }
 
-    fn publish_persistent_sibling_stop(&self, kernel: &Kernel) -> Result<(), RuntimeError> {
-        let removed = self.registry.remove_all_except(self.this_tid);
-        if std::env::var_os("CARRICK_SIG_DEBUG").is_some() {
-            eprintln!(
-                "SIGDBG sibling-stop registry={:p} keeper={:?} removed={:?}",
-                std::sync::Arc::as_ptr(&self.registry),
-                self.this_tid,
-                removed
-            );
-        }
-        self.kicker.kick_all_except(self.this_tid);
-        self.futex.notify_signal_pending();
-        self.platform_futex.notify_signal_pending();
-        kernel.signal_arrival.wake_all_waiters();
+    pub(super) fn publish_persistent_sibling_stop(
+        &self,
+        kernel: &Kernel,
+    ) -> Result<(), RuntimeError> {
         let context = self.service_kernel_context.as_ref().ok_or_else(|| {
             RuntimeError::Configuration(
                 "persistent sibling stop lost exact Kernel context".to_owned(),
             )
         })?;
-        let scheduler = kernel
-            .hvpatch_runtime
-            .as_ref()
-            .ok_or_else(|| {
-                RuntimeError::Configuration(
-                    "persistent sibling stop has no shared scheduler".to_owned(),
-                )
-            })?
-            .continuation_services(context.kernel())
-            .0;
-        wake_removed_persistent_sibling_threads(context, &scheduler, &removed)
+        publish_persistent_sibling_stop_with(
+            &self.registry,
+            self.this_tid,
+            self.kicker.as_ref(),
+            &self.futex,
+            self.platform_futex.as_ref(),
+            context,
+            kernel,
+        )
     }
+}
 
+pub(super) struct PersistentSiblingStopAuthority {
+    registry: Arc<ThreadRegistry>,
+    keeper: ThreadId,
+    kicker: Arc<dyn VcpuRegistry>,
+    futex: Arc<FutexTable>,
+    platform_futex: Arc<dyn PlatformFutex>,
+    context: crate::kernel::KernelContext,
+}
+
+impl PersistentSiblingStopAuthority {
+    pub(super) fn publish(&self, kernel: &Kernel) -> Result<(), RuntimeError> {
+        publish_persistent_sibling_stop_with(
+            &self.registry,
+            self.keeper,
+            self.kicker.as_ref(),
+            &self.futex,
+            self.platform_futex.as_ref(),
+            &self.context,
+            kernel,
+        )
+    }
+}
+
+fn publish_persistent_sibling_stop_with(
+    registry: &ThreadRegistry,
+    keeper: ThreadId,
+    kicker: &dyn VcpuRegistry,
+    futex: &FutexTable,
+    platform_futex: &dyn PlatformFutex,
+    context: &crate::kernel::KernelContext,
+    kernel: &Kernel,
+) -> Result<(), RuntimeError> {
+    let removed = registry.remove_all_except(keeper);
+    if std::env::var_os("CARRICK_SIG_DEBUG").is_some() {
+        eprintln!(
+            "SIGDBG sibling-stop registry={registry:p} keeper={keeper:?} removed={removed:?}"
+        );
+    }
+    kicker.kick_all_except(keeper);
+    futex.notify_signal_pending();
+    platform_futex.notify_signal_pending();
+    kernel.signal_arrival.wake_all_waiters();
+    let scheduler = kernel
+        .hvpatch_runtime
+        .as_ref()
+        .ok_or_else(|| {
+            RuntimeError::Configuration(
+                "persistent sibling stop has no shared scheduler".to_owned(),
+            )
+        })?
+        .continuation_services(context.kernel())
+        .0;
+    wake_removed_persistent_sibling_threads(context, &scheduler, &removed)
+}
+
+impl<E: ThreadedEngine + 'static> ThreadRuntimeState<E>
+where
+    E::SiblingSpec: 'static,
+{
     pub(super) fn begin_persistent_exec_sibling_drain(
         &self,
         kernel: &Kernel,
@@ -372,16 +438,16 @@ where
 
     pub(super) fn finish_persistent_sibling_drain(
         &self,
-        current: continuation::JobId,
-    ) -> Result<(), RuntimeError> {
-        let published = finish_persistent_process_handles(&self.threads, current)?;
+        current: &continuation::LogicalJobCompletion,
+    ) -> Result<Vec<continuation::LogicalJobCompletion>, RuntimeError> {
+        let (published, completions) = finish_persistent_process_handles(&self.threads, current)?;
         if published > 0 {
             self.trace_hvpatch_thread_terminal(
                 carrick_observability::probes::HvpatchThreadTerminalReason::MembersDrainedByOwner,
                 i32::try_from(published).unwrap_or(i32::MAX),
             );
         }
-        Ok(())
+        Ok(completions)
     }
 
     /// Logical HVPatch exit while the physical vCPU remains owned by the

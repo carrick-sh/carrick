@@ -382,7 +382,7 @@ where
     E::SiblingSpec: 'static,
 {
     pub(super) fn complete_signal_thread(
-        &self,
+        &mut self,
         kernel: &Kernel,
         engine: &mut E,
         target: ThreadId,
@@ -415,7 +415,7 @@ where
         } else {
             crate::linux_abi::LINUX_ESRCH.guest_retval()
         };
-        self.complete_returned(engine, retval)
+        self.complete_returned(engine, &kernel.reporter, retval)
     }
 }
 

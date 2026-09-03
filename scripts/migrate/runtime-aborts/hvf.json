@@ -187,7 +187,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "AliasPublicationReceipt::retire_exact",
       "ordinal_in_function": 1,
-      "fingerprint": "99bb3c622d6ab1a8ee59c6c33a81ac60db92f95746eae3db98ca892aaf0ddc48",
+      "fingerprint": "63eb2abd01e59faa3906852cc098dfc2f9b7d75bbf6f02d810c025833ecb3df1",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "Version ID discovered in alias version chain was unexpectedly missing when resolving its index during exact retirement, indicating corrupted version chain state. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited (alias state partitioned by ownership scope and indexed, page-table pre-images journalled instead of cloned), which is what moved the fingerprint."
@@ -196,7 +196,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "AliasPublicationReceipt::retire_exact",
       "ordinal_in_function": 2,
-      "fingerprint": "99bb3c622d6ab1a8ee59c6c33a81ac60db92f95746eae3db98ca892aaf0ddc48",
+      "fingerprint": "63eb2abd01e59faa3906852cc098dfc2f9b7d75bbf6f02d810c025833ecb3df1",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "Alias epoch counter overflow when retiring an alias publication version prevents safe invalidation and epoch advancement in the alias version registry. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited (alias state partitioned by ownership scope and indexed, page-table pre-images journalled instead of cloned), which is what moved the fingerprint."
@@ -205,7 +205,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "AliasPublicationReceipt::retire_exact",
       "ordinal_in_function": 3,
-      "fingerprint": "99bb3c622d6ab1a8ee59c6c33a81ac60db92f95746eae3db98ca892aaf0ddc48",
+      "fingerprint": "63eb2abd01e59faa3906852cc098dfc2f9b7d75bbf6f02d810c025833ecb3df1",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "Version ID discovered in replay chain was missing when indexing during exact retirement, indicating corrupted replay version chain state. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited (alias state partitioned by ownership scope and indexed, page-table pre-images journalled instead of cloned), which is what moved the fingerprint."
@@ -214,7 +214,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "AliasPublicationReceipt::retire_exact",
       "ordinal_in_function": 4,
-      "fingerprint": "99bb3c622d6ab1a8ee59c6c33a81ac60db92f95746eae3db98ca892aaf0ddc48",
+      "fingerprint": "63eb2abd01e59faa3906852cc098dfc2f9b7d75bbf6f02d810c025833ecb3df1",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "Replay epoch counter overflow when retiring a replay version prevents safe invalidation in the replay version registry. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited (alias state partitioned by ownership scope and indexed, page-table pre-images journalled instead of cloned), which is what moved the fingerprint."
@@ -223,7 +223,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "AliasPublicationReceipt::retire_exact",
       "ordinal_in_function": 5,
-      "fingerprint": "99bb3c622d6ab1a8ee59c6c33a81ac60db92f95746eae3db98ca892aaf0ddc48",
+      "fingerprint": "63eb2abd01e59faa3906852cc098dfc2f9b7d75bbf6f02d810c025833ecb3df1",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "The alias version chain named by a retiring version id was absent from the keyed chain map. retire_exact now finds a chain through alias_version_owner (an id -> key index) instead of scanning every chain's version list, so an id present in the index with no chain behind it is a torn alias-version registry, not a lookup miss. Aborting keeps the previous behaviour of the unwrap_or_else(abort) this replaced."
@@ -232,10 +232,64 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "AliasPublicationReceipt::retire_exact",
       "ordinal_in_function": 6,
-      "fingerprint": "99bb3c622d6ab1a8ee59c6c33a81ac60db92f95746eae3db98ca892aaf0ddc48",
+      "fingerprint": "63eb2abd01e59faa3906852cc098dfc2f9b7d75bbf6f02d810c025833ecb3df1",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "As #5 for the REPLAY half: a version id present in replay_version_owner whose ReplayVersionChain is missing means the replay version registry and its index disagree."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "AliasRegistry::bump_revision",
+      "ordinal_in_function": 1,
+      "fingerprint": "160b2915d388f87a742a74be7b573bcb4d725343c3a353b944156884504c3111",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::host_alias",
+      "rationale": "Exhausting the monotonic alias-registry revision makes coherent snapshot and delayed-retirement validation ambiguous across carrier tasks; continuing would permit stale alias state to authenticate as current."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "AliasRegistry::rebuild_scope_rows",
+      "ordinal_in_function": 1,
+      "fingerprint": "38acfa1106f41f91dd7088c10e3c12168bcadc2d55cfcc55f962594b8bd4d740",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::host_alias",
+      "rationale": "A scope bucket that was just found and emptied under exclusive registry access disappeared before replacement; this proves the registry's bucket transaction is internally inconsistent and its indexes cannot be trusted."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "AliasRegistry::replace_exact_keys_in_batch",
+      "ordinal_in_function": 1,
+      "fingerprint": "2ab4cf6e335a3b86c759f94f63cf5b2a1a00e5aefb1258803751d696ae41151e",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::host_alias",
+      "rationale": "A batch replacement value does not match the exact semantic key it is meant to restore, violating the authenticated alias preimage contract and risking retirement of the wrong carrier mapping."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "AliasRegistry::upsert_by_key",
+      "ordinal_in_function": 1,
+      "fingerprint": "886dcc303488dab2bb78e3a240bb0eb7ad59880f90f0191e8cb6051178959d5b",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::host_alias",
+      "rationale": "The exact-key index named a scope position that is absent from its authoritative bucket, proving index/bucket divergence before an alias mutation."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "AliasRegistry::upsert_by_key",
+      "ordinal_in_function": 2,
+      "fingerprint": "886dcc303488dab2bb78e3a240bb0eb7ad59880f90f0191e8cb6051178959d5b",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::host_alias",
+      "rationale": "The exact-key index's sequence or alias value disagreed with the authoritative scope bucket, so continuing the in-place update would corrupt ordering and exact-retirement identity."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "AliasRegistry::upsert_by_key",
+      "ordinal_in_function": 3,
+      "fingerprint": "886dcc303488dab2bb78e3a240bb0eb7ad59880f90f0191e8cb6051178959d5b",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::host_alias",
+      "rationale": "The exact-key index entry disappeared during an exclusive upsert after its bucket was already mutated, leaving carrier alias indexes irreconcilably inconsistent."
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
@@ -394,7 +448,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::execve_rebuild_inner",
       "ordinal_in_function": 1,
-      "fingerprint": "acb33cd56903a141c2223488b27be0984b23be66a43f478bc2b399679bfa7d3e",
+      "fingerprint": "2fd8860b7fdec58cdf722608008a41ad486beb781b7c1a57017a4527e90a1aaf",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::exec_commit",
       "rationale": "Pre-exec authority rollback verification failed after switch_exec_stage2_transaction error, leaving carrier stage-2 authority corrupted."
@@ -403,7 +457,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::execve_rebuild_inner",
       "ordinal_in_function": 2,
-      "fingerprint": "acb33cd56903a141c2223488b27be0984b23be66a43f478bc2b399679bfa7d3e",
+      "fingerprint": "2fd8860b7fdec58cdf722608008a41ad486beb781b7c1a57017a4527e90a1aaf",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Staging frame inventory retirement failed after stage-2 physical unmap was committed, desynchronizing stage-2 state from frame inventory."
@@ -412,7 +466,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::execve_rebuild_inner",
       "ordinal_in_function": 3,
-      "fingerprint": "bcf47e881cb3659c0252150c9f60fda6cdad64c0a9f5053e7ce2ce7132813c97",
+      "fingerprint": "548e6f33326b095c7ed420fc3dcb11eb0433c8f48b8f9811c3a6cef45a044e21",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::exec_commit",
       "rationale": "Overlapping detached exec predecessor cleanup on task state indicates concurrent exec or abandoned predecessor stage-2 retirement."
@@ -421,7 +475,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::execve_rebuild_inner",
       "ordinal_in_function": 4,
-      "fingerprint": "b013dfac9fc0532ae4574d089b99d89bb95ae0b96bc40e304c664b67576150bd",
+      "fingerprint": "2e58e296d7c8998e40a15800d1b9d23b19164f89b9280232f0beace45fc5a3f8",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Publishing global-frame host owner failed after stage-2 mappings were installed, desynchronizing global frame owner registry from carrier memory."
@@ -430,7 +484,16 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::execve_rebuild_inner",
       "ordinal_in_function": 5,
-      "fingerprint": "a9d290efb7148b6f6d1f3cd8f3830a802e6e08a4b6d942d1e33cec7586c6e76f",
+      "fingerprint": "2e58e296d7c8998e40a15800d1b9d23b19164f89b9280232f0beace45fc5a3f8",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::mm_authority",
+      "rationale": "Installing the replacement exec region's exact structural owner into the already-published MM authority failed; continuing would leave stage-1 root or structural mappings without authenticated stage-2 lifetime authority."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::execve_rebuild_inner",
+      "ordinal_in_function": 6,
+      "fingerprint": "94dc65f529d67f6369997ba8097deecfbee7237f16068492cc3e20ea0400c0bd",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Region in carrier mappings has invalid physical host offset when computing stage-2 owner identity during exec inventory staging."
@@ -438,8 +501,8 @@
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::execve_rebuild_inner",
-      "ordinal_in_function": 6,
-      "fingerprint": "a9d290efb7148b6f6d1f3cd8f3830a802e6e08a4b6d942d1e33cec7586c6e76f",
+      "ordinal_in_function": 7,
+      "fingerprint": "94dc65f529d67f6369997ba8097deecfbee7237f16068492cc3e20ea0400c0bd",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Staging replacement frame inventory failed after stage-2 mappings were installed, leaving physical stage-2 memory unrepresented in inventory ledger."
@@ -447,8 +510,8 @@
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::execve_rebuild_inner",
-      "ordinal_in_function": 7,
-      "fingerprint": "a9d290efb7148b6f6d1f3cd8f3830a802e6e08a4b6d942d1e33cec7586c6e76f",
+      "ordinal_in_function": 8,
+      "fingerprint": "94dc65f529d67f6369997ba8097deecfbee7237f16068492cc3e20ea0400c0bd",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Invalid physical host offset when collecting carrier stage-2 lease owner hosts during exec registration rebind."
@@ -456,8 +519,8 @@
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::execve_rebuild_inner",
-      "ordinal_in_function": 8,
-      "fingerprint": "a9d290efb7148b6f6d1f3cd8f3830a802e6e08a4b6d942d1e33cec7586c6e76f",
+      "ordinal_in_function": 9,
+      "fingerprint": "94dc65f529d67f6369997ba8097deecfbee7237f16068492cc3e20ea0400c0bd",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Collecting carrier stage-2 lease owners failed with conflicting or duplicate host owners during exec registration rebind."
@@ -465,8 +528,8 @@
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::execve_rebuild_inner",
-      "ordinal_in_function": 9,
-      "fingerprint": "a9d290efb7148b6f6d1f3cd8f3830a802e6e08a4b6d942d1e33cec7586c6e76f",
+      "ordinal_in_function": 10,
+      "fingerprint": "94dc65f529d67f6369997ba8097deecfbee7237f16068492cc3e20ea0400c0bd",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Registering carrier stage-2 leases in the carrier registry failed during exec rebind, leaving replacement stage-2 leases unmanaged."
@@ -474,8 +537,8 @@
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::execve_rebuild_inner",
-      "ordinal_in_function": 10,
-      "fingerprint": "a9d290efb7148b6f6d1f3cd8f3830a802e6e08a4b6d942d1e33cec7586c6e76f",
+      "ordinal_in_function": 11,
+      "fingerprint": "94dc65f529d67f6369997ba8097deecfbee7237f16068492cc3e20ea0400c0bd",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::task_backend_lifecycle",
       "rationale": "Missing task registration during HVPatch exec authority rebind leaves the replacement MM unbound from carrier task tracking."
@@ -483,8 +546,8 @@
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::execve_rebuild_inner",
-      "ordinal_in_function": 11,
-      "fingerprint": "a9d290efb7148b6f6d1f3cd8f3830a802e6e08a4b6d942d1e33cec7586c6e76f",
+      "ordinal_in_function": 12,
+      "fingerprint": "94dc65f529d67f6369997ba8097deecfbee7237f16068492cc3e20ea0400c0bd",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::task_backend_lifecycle",
       "rationale": "Rebinding exec MM authority into the carrier task registration failed, leaving the carrier task with stale or missing MM authority."
@@ -492,7 +555,7 @@
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::execve_rebuild_inner",
-      "ordinal_in_function": 12,
+      "ordinal_in_function": 13,
       "fingerprint": "a467ae545003d2c6af669aa61d24c721ee4d7f730172acc2f8674c84ca4d779c",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::exec_commit",
@@ -502,7 +565,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::from_process_spec",
       "ordinal_in_function": 1,
-      "fingerprint": "db6000c32f34f65748a028c4db6a0934fd32e9ac6cd23777df04f7f7f8ce8607",
+      "fingerprint": "e957c6e33eaa9c2a33231fb884e5f760e6d003f078b72bedc5caabfe36d69ec5",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Rollback of staged unpublished inventory mappings failed during process materialization from spec, leaving frame inventory in a corrupted state."
@@ -655,7 +718,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::prepare_task_only_plan",
       "ordinal_in_function": 1,
-      "fingerprint": "0dcadba1b7f3733db3a7a02a818cdf0e7770a7c009f92b7e71ab26c15596d873",
+      "fingerprint": "4058c21ae2e7fca91dd038c127ed1351bc353fc6b7322508aaade4b35e0e5362",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Rollback of staged unpublished inventory mappings failed during task-only child process preparation, leaving frame inventory in a corrupted state."
@@ -671,9 +734,9 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::retire_task_state_process_mappings",
+      "function": "HvfVmState::retire_task_state_process_mappings_inner",
       "ordinal_in_function": 1,
-      "fingerprint": "be06335dea59ce61abf5efd66d1670d7d71f8a69ea273540a5cbcd0aa2670e8f",
+      "fingerprint": "a8f1ff5732753749d832cbfaf5304fea9aa42788382ad96c46b0858ae8176245",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Validated retirement reservation disappeared from inventory ledger during process mapping retirement, indicating concurrent state mutation or broken transaction atomicity."
@@ -718,7 +781,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::unregister_process_alias",
       "ordinal_in_function": 2,
-      "fingerprint": "07d7e86979792d4f42a65210bac7a980927b24fba403cc18282dc0cf9250151e",
+      "fingerprint": "213b9edc67b2824b934b39d2b6436f93a87d47911713dec5cda6076c5231df41",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Applying alias retirement inventory commit to Kernel authority failed after unregistering aliases, desynchronizing alias state from Kernel frame inventory authority."
@@ -1058,9 +1121,63 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvpatchTaskRegistration::runtime_task_state",
+      "ordinal_in_function": 1,
+      "fingerprint": "e74763f15bf536ebf840916809f40d565dba9f9b9e69b1ad562313f00671238e",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::mm_authority",
+      "rationale": "Installing a consumed prepared root-stage-2 authority into the live task MM failed during activation; continuing would activate stage-1 without its authenticated structural lifetime owner."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvpatchTaskRegistration::runtime_task_state",
+      "ordinal_in_function": 2,
+      "fingerprint": "e74763f15bf536ebf840916809f40d565dba9f9b9e69b1ad562313f00671238e",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::mm_authority",
+      "rationale": "Installing a task mapping's authenticated structural owner into the live MM failed during activation, so stage-1 and structural stage-2 lifetime authority no longer form one coherent task state."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "MmAccessState::retire_mm_root_stage2_in",
+      "ordinal_in_function": 1,
+      "fingerprint": "321a7007ca3de542a69c57c477353e9b62b40f0c24beed34a1dbcdc277ae272f",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::mm_authority",
+      "rationale": "The exact root authority disappeared while its slot remained exclusively locked, after its structural record had already terminalized; this is an impossible authority-state transition, not a recoverable retirement refusal."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "fail_stop_partial_process_stage2_rollback",
+      "ordinal_in_function": 1,
+      "fingerprint": "8fb449bdb8654a1edcb4677fa26567a9d45d6ce179d9625398972f4922ec09d6",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::mm_authority",
+      "rationale": "Structural stage-2 rollback remained nonterminal before root-slot release, so unwinding would permit address-space reuse while stale carrier translations or owner records still exist."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "mutate_known_external_alias_state",
+      "ordinal_in_function": 1,
+      "fingerprint": "10857878c6c3b2e2826cb593e1e45f5d25f0d3358ecd77df8e48175001dec85f",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::host_alias",
+      "rationale": "Alias epoch exhaustion after a known external mutation prevents issuance of a distinct version for the new state, allowing stale receipts to authenticate against changed carrier aliases."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "mutate_known_external_alias_state",
+      "ordinal_in_function": 2,
+      "fingerprint": "597d7ffd5b4aac2e866f3c5d842d6e101041c96ffdbd9dbf4cabb736c62104b6",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::host_alias",
+      "rationale": "Replay epoch exhaustion after a known external mutation prevents distinct versioning of changed replay mappings, so delayed receipts can no longer be authenticated safely."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "retire_process_aliases_in",
       "ordinal_in_function": 1,
-      "fingerprint": "07395066e9c374d8607a1bd7ad74a0792c38a29df5891fb27aeb39c97f24440a",
+      "fingerprint": "f35e621b28af4885ffd4d4133ff52e525a5b8c11782fdaa685308c5792464919",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "Counter overflow when incrementing an alias version epoch during process-exit alias retirement risks alias version collision and stale readers. Same condition and verdict as the epoch aborts in mutate_external_alias_state; this path exists because process exit now removes its own scope bucket instead of diffing whole-registry snapshots."
@@ -1069,7 +1186,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "retire_process_aliases_in",
       "ordinal_in_function": 2,
-      "fingerprint": "47878bc6e81becbc5adca2399a4eaf308ee097c1065269cd8f61500dc78700ac",
+      "fingerprint": "57c84843f43b7bc92d75fe992262e3831dca0aeeb6a97762402072a5e8953198",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "Counter overflow when incrementing a replay version epoch during process-exit alias retirement. Replay-side counterpart of #1, same verdict and same reason for existing."

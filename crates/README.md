@@ -7,9 +7,11 @@ carrick-cli   -> carrick-engine -> { carrick-image, carrick-runtime } -> carrick
 carrick-embed -> { carrick-engine, carrick-runtime }                   -> carrick-spec
 ```
 
-`carrick-embed` is the library front door and takes the runtime directly (for
-`RuntimeExtensions`, the `Vfs` trait and, in later phases, observers); the CLI
-reaches the runtime only through the engine.
+`carrick-embed` is the library front door and takes the runtime directly. Its
+builder exposes syscall observers and policy presets, VFS mounts, resource
+budgets, time control, network interposition, and shared buffers; the CLI
+reaches the runtime only through the engine. Tty sessions and concurrent
+containers in one host process are not yet public embed features.
 
 Platform code is selected by Cargo features. The default feature is
 `platform-macos`; non-macOS builds use `--no-default-features` plus exactly one
@@ -23,7 +25,7 @@ Platform code is selected by Cargo features. The default feature is
 | `carrick-engine` | Docker-style request merge layer: image config + CLI flags -> `RunSpec`. |
 | `carrick-embed` | Library embedding surface: `ContainerBuilder` -> `RunRequest` -> `Engine::resolve` -> `Runtime::prepare`/`PreparedRun::execute`, with captured, inherited or piped stdio and the `testing` helpers (`TestContainer`, `run_in_container`, `ResultAssert`). The dog-food consumer for Carrick's own guest tests; guest-running tests need the signed `just test-embed` recipe. |
 | `carrick-image` | OCI reference parsing, pull/cache, config and layer resolution. |
-| `carrick-runtime` | Linux behavior core: ELF execution, syscall dispatch, VFS/rootfs, process model, namespaces, credentials, sockets, IPC, procfs/sysfs, and platform-selected execution loops. |
+| `carrick-runtime` | Carrick kernel implementation: ELF execution, syscall dispatch, VFS/rootfs, kernel-owned process and memory models, namespaces, credentials, sockets, IPC, procfs/sysfs, scheduling integration, and platform-selected execution loops. |
 | `carrick-spec` | Shared vocabulary types: `RunSpec`, `ContainerSpec`, `ImageConfig`, mounts, namespace config, platform requests. |
 
 ## ABI, Memory, and Neutral Core
@@ -32,7 +34,7 @@ Platform code is selected by Cargo features. The default feature is
 | --- | --- |
 | `carrick-abi` | Linux ABI constants and wire structs, with compile-time layout/constant assertions. |
 | `carrick-guest-mem` | Guest-memory trait, memory error type, and syscall-frame hub types shared by handlers and VMM engines. |
-| `carrick-kernel` | Kernel-graph shared memory structures: arenas, process/task identity, robust lock registries. |
+| `carrick-kernel` | Kernel-graph foundations: carrier/container objects, arenas, typed process/task/thread/mm identity, lifecycle transactions, and shared registries. |
 | `carrick-mem` | Guest address-space construction: ELF layout, page tables, trampolines, VDSO/vvar, region helpers. |
 | `carrick-hal` | OS/VMM-neutral traits and shared types: trap contract, hypervisor traits, guest-arch tables, event/futex/threaded-loop/signal/timer surfaces. |
 | `carrick-thread` | Thread registry, private-futex park table, and fork/page-table quiesce barriers. |
@@ -51,9 +53,13 @@ Platform code is selected by Cargo features. The default feature is
 
 ## VMM Backends and Guest ISA
 
+The VMM crates execute guest instructions and project Carrick's kernel state
+onto host virtualization APIs. They do not own Linux process identity or
+lifecycle semantics.
+
 | Crate | Role |
 | --- | --- |
-| `carrick-vmm-hvf` | macOS Hypervisor.framework backend; mature AArch64 trap loop, vCPU coordination, fork/exec VM management, probes. |
+| `carrick-vmm-hvf` | macOS Hypervisor.framework backend; mature AArch64 stage-1/stage-2 projection, vCPU execution and coordination, fault/syscall exits, and observability probes. |
 | `carrick-vmm-kvm` | Linux/KVM backend; AArch64 KVM support, x86_64 lane, KVM kick/futex/fork/timer/signal glue, standalone target-host runners. |
 | `carrick-vmm-bhyve` | FreeBSD/bhyve backend; x86_64 lane through the shared x86 engine plus bhyve-specific host/VMM glue. |
 | `carrick-vmm-nvmm` | NetBSD/NVMM backend; x86_64 lane through the shared x86 engine plus NVMM-specific host/VMM glue. |
@@ -74,7 +80,7 @@ Platform code is selected by Cargo features. The default feature is
 | Crate | Role |
 | --- | --- |
 | `carrick-conformance` | Differential conformance harness; shells out to built carrick binaries and Docker oracles, classifies baselines, renders support matrix. |
-| `carrick-conformance-next` | Self-hosted conformance framework using `carrick-embed` (Phase J): `TestContainer` + `AuditObserver` in-process `#[test]` ports of LTP/probe cases, semantic probe observers, fuzzing, and golden traces. `carrick-conformance` stays the verdict authority until the new framework reproduces every historical false-green rejection. |
+| `carrick-conformance-next` | In-process conformance framework using `carrick-embed` (Phase J): `TestContainer` + `AuditObserver` `#[test]` ports of LTP/probe cases, semantic probe observers, fuzzing, and golden traces. `carrick-conformance` stays the verdict authority until the new framework reproduces every historical false-green rejection. |
 | `carrick-test-support` | Shared integration/CLI test helpers, mainly synthetic rootfs tar/gzip assembly. |
 
 ## Feature Closure Rules

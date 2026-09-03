@@ -109,6 +109,7 @@ impl HvpatchTaskEngineBindingState {
     /// so its commit is applied directly.
     pub(super) fn retire_detached_address_space_with(
         &mut self,
+        root_ticket: Option<crate::hvpatch::Stage1RootRetirementTicket>,
         apply_with_receipt: impl FnOnce(
             carrick_hal::FrameInventoryCommit<()>,
         ) -> Result<
@@ -116,12 +117,30 @@ impl HvpatchTaskEngineBindingState {
             TrapError,
         >,
         apply_commit: impl FnOnce(carrick_hal::FrameInventoryCommit<()>) -> Result<(), TrapError>,
-    ) -> Result<(), TrapError> {
+    ) -> Result<Option<crate::hvpatch::Stage1RootRetirementReceipt>, TrapError> {
         match &mut self.payload {
             HvpatchTaskEngineBindingPayload::Resident(state) => {
-                let commit =
-                    carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_task_engine(state)?;
-                apply_commit(commit)
+                let (commit, root_receipt) = match root_ticket {
+                    Some(ticket) => {
+                        let (commit, proof) = carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_task_engine_with_root_proof(
+                            state,
+                            ticket.base(),
+                            ticket.size(),
+                        )?;
+                        let receipt = ticket.redeem_vmm(proof).map_err(|error| {
+                            TrapError::Hypervisor(format!(
+                                "authenticate detached resident root retirement: {error}"
+                            ))
+                        })?;
+                        (commit, Some(receipt))
+                    }
+                    None => (
+                        carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_task_engine(state)?,
+                        None,
+                    ),
+                };
+                apply_commit(commit)?;
+                Ok(root_receipt)
             }
             HvpatchTaskEngineBindingPayload::TaskOnly(state) => {
                 // A vfork/`CLONE_VM` task shares another process's kernel mm, so
@@ -146,12 +165,46 @@ impl HvpatchTaskEngineBindingState {
                         target: "carrick::exec",
                         "detached retirement skipped: task shares another process's inventory",
                     );
-                    return Ok(());
+                    return match root_ticket {
+                        Some(ticket) => {
+                            let proof = carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_task_only_shared_root_with_proof(
+                                state,
+                                ticket.base(),
+                                ticket.size(),
+                            )?;
+                            ticket.redeem_vmm(proof).map(Some).map_err(|error| {
+                                TrapError::Hypervisor(format!(
+                                    "authenticate detached shared-inventory root retirement: {error}"
+                                ))
+                            })
+                        }
+                        None => Ok(None),
+                    };
                 }
-                let commit =
-                    carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_task_only_engine(state)?;
+                let (commit, root_receipt) = match root_ticket {
+                    Some(ticket) => {
+                        let (commit, proof) = carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_task_only_engine_with_root_proof(
+                            state,
+                            ticket.base(),
+                            ticket.size(),
+                        )?;
+                        let receipt = ticket.redeem_vmm(proof).map_err(|error| {
+                            TrapError::Hypervisor(format!(
+                                "authenticate detached task-only root retirement: {error}"
+                            ))
+                        })?;
+                        (commit, Some(receipt))
+                    }
+                    None => (
+                        carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_task_only_engine(
+                            state,
+                        )?,
+                        None,
+                    ),
+                };
                 state.prepare_inventory_retirement(commit)?;
-                state.apply_inventory_retirement(apply_with_receipt)
+                state.apply_inventory_retirement(apply_with_receipt)?;
+                Ok(root_receipt)
             }
             #[cfg(test)]
             HvpatchTaskEngineBindingPayload::Test => Err(TrapError::Hypervisor(
@@ -160,16 +213,47 @@ impl HvpatchTaskEngineBindingState {
         }
     }
 
-    pub(super) fn retire_detached_exec_predecessor(&mut self) -> Result<(), TrapError> {
+    pub(super) fn retire_detached_exec_predecessor(
+        &mut self,
+        root_ticket: Option<crate::hvpatch::Stage1RootRetirementTicket>,
+    ) -> Result<Option<crate::hvpatch::Stage1RootRetirementReceipt>, TrapError> {
         match &mut self.payload {
-            HvpatchTaskEngineBindingPayload::Resident(state) => {
-                carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_exec_predecessor(state)
-            }
-            HvpatchTaskEngineBindingPayload::TaskOnly(state) => {
-                carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_task_only_exec_predecessor(
-                    state,
-                )
-            }
+            HvpatchTaskEngineBindingPayload::Resident(state) => match root_ticket {
+                Some(ticket) => {
+                    let proof = carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_exec_predecessor_with_root_proof(
+                            state,
+                            ticket.base(),
+                            ticket.size(),
+                        )?;
+                    ticket.redeem_vmm(proof).map(Some).map_err(|error| {
+                        TrapError::Hypervisor(format!(
+                            "authenticate resident exec predecessor root retirement: {error}"
+                        ))
+                    })
+                }
+                None => {
+                    carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_exec_predecessor(state)?;
+                    Ok(None)
+                }
+            },
+            HvpatchTaskEngineBindingPayload::TaskOnly(state) => match root_ticket {
+                Some(ticket) => {
+                    let proof = carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_task_only_exec_predecessor_with_root_proof(
+                            state,
+                            ticket.base(),
+                            ticket.size(),
+                        )?;
+                    ticket.redeem_vmm(proof).map(Some).map_err(|error| {
+                        TrapError::Hypervisor(format!(
+                            "authenticate task-only exec predecessor root retirement: {error}"
+                        ))
+                    })
+                }
+                None => {
+                    carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_task_only_exec_predecessor(state)?;
+                    Ok(None)
+                }
+            },
             #[cfg(test)]
             HvpatchTaskEngineBindingPayload::Test => Err(TrapError::Hypervisor(
                 "test-only backend has no exec predecessor cleanup".to_owned(),
@@ -714,6 +798,10 @@ pub trait PersistentTaskBinding {
 
     fn after_terminal_settlement(&self) {}
 
+    fn after_executor_failure_settlement(&self) {
+        self.after_terminal_settlement();
+    }
+
     /// Whether this binding's address space has stopped admitting loads.
     ///
     /// Asked only to classify a REJECTED load: `true` means another thread in
@@ -736,7 +824,10 @@ pub trait PersistentTaskBinding {
         None
     }
 
-    fn retire_detached_address_space(&self) -> Result<(), TrapError> {
+    fn retire_detached_address_space(
+        &self,
+        _root_ticket: Option<crate::hvpatch::Stage1RootRetirementTicket>,
+    ) -> Result<Option<crate::hvpatch::Stage1RootRetirementReceipt>, TrapError> {
         Err(TrapError::Hypervisor(
             "task binding has no detached address-space cleanup authority".to_owned(),
         ))
@@ -748,7 +839,10 @@ pub trait PersistentTaskBinding {
         ))
     }
 
-    fn retire_detached_exec_predecessor(&self) -> Result<(), TrapError> {
+    fn retire_detached_exec_predecessor(
+        &self,
+        _root_ticket: Option<crate::hvpatch::Stage1RootRetirementTicket>,
+    ) -> Result<Option<crate::hvpatch::Stage1RootRetirementReceipt>, TrapError> {
         Err(TrapError::Hypervisor(
             "task binding has no detached exec predecessor authority".to_owned(),
         ))
@@ -768,6 +862,10 @@ impl PersistentTaskBinding for crate::vcpu_loop::continuation::HvpatchTaskBindin
         crate::vcpu_loop::continuation::HvpatchTaskBinding::after_terminal_settlement(self);
     }
 
+    fn after_executor_failure_settlement(&self) {
+        crate::vcpu_loop::continuation::HvpatchTaskBinding::after_executor_failure_settlement(self);
+    }
+
     fn address_space_is_retiring(&self) -> bool {
         crate::vcpu_loop::continuation::HvpatchTaskBinding::address_space_is_retiring(self)
     }
@@ -782,16 +880,28 @@ impl PersistentTaskBinding for crate::vcpu_loop::continuation::HvpatchTaskBindin
         crate::vcpu_loop::continuation::HvpatchTaskBinding::take_address_space_retirement(self)
     }
 
-    fn retire_detached_address_space(&self) -> Result<(), TrapError> {
-        crate::vcpu_loop::continuation::HvpatchTaskBinding::retire_detached_address_space(self)
+    fn retire_detached_address_space(
+        &self,
+        root_ticket: Option<crate::hvpatch::Stage1RootRetirementTicket>,
+    ) -> Result<Option<crate::hvpatch::Stage1RootRetirementReceipt>, TrapError> {
+        crate::vcpu_loop::continuation::HvpatchTaskBinding::retire_detached_address_space(
+            self,
+            root_ticket,
+        )
     }
 
     fn retire_detached_shared_mm_edge(&self) -> Result<(), TrapError> {
         crate::vcpu_loop::continuation::HvpatchTaskBinding::retire_detached_shared_mm_edge(self)
     }
 
-    fn retire_detached_exec_predecessor(&self) -> Result<(), TrapError> {
-        crate::vcpu_loop::continuation::HvpatchTaskBinding::retire_detached_exec_predecessor(self)
+    fn retire_detached_exec_predecessor(
+        &self,
+        root_ticket: Option<crate::hvpatch::Stage1RootRetirementTicket>,
+    ) -> Result<Option<crate::hvpatch::Stage1RootRetirementReceipt>, TrapError> {
+        crate::vcpu_loop::continuation::HvpatchTaskBinding::retire_detached_exec_predecessor(
+            self,
+            root_ticket,
+        )
     }
 }
 
@@ -1396,15 +1506,27 @@ pub(crate) struct PreparedVforkChildActivation {
     child_thread: Arc<crate::kernel::Thread>,
     proof: HvpatchActivationProof,
     member_publication: super::PersistentProcessMemberPublication,
+    job_reservation: super::ContainerJobReservation,
+    job_result: super::HvpatchLoopResult,
+    job_completion: crate::vcpu_loop::continuation::LogicalJobCompletion,
+    process_retirement: super::ProcessPhysicalRetirement,
 }
 
 impl PreparedVforkChildActivation {
+    // This is the typed handoff boundary for one atomic activation. Keeping
+    // the independently owned guards as arguments makes omission visible at
+    // compile time; a loose builder would permit partially armed activation.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         dormant: PreparedHvpatchSubmission,
         scheduler: Arc<Scheduler>,
         child_thread: Arc<crate::kernel::Thread>,
         proof: HvpatchActivationProof,
         member_publication: super::PersistentProcessMemberPublication,
+        job_reservation: super::ContainerJobReservation,
+        job_result: super::HvpatchLoopResult,
+        job_completion: crate::vcpu_loop::continuation::LogicalJobCompletion,
+        process_retirement: super::ProcessPhysicalRetirement,
     ) -> Self {
         Self {
             dormant,
@@ -1412,6 +1534,10 @@ impl PreparedVforkChildActivation {
             child_thread,
             proof,
             member_publication,
+            job_reservation,
+            job_result,
+            job_completion,
+            process_retirement,
         }
     }
 
@@ -1422,6 +1548,10 @@ impl PreparedVforkChildActivation {
             child_thread,
             proof,
             member_publication,
+            job_reservation,
+            job_result,
+            job_completion,
+            process_retirement,
         } = self;
         let fail_unpublished_child = |error: TrapError| {
             scheduler
@@ -1449,6 +1579,10 @@ impl PreparedVforkChildActivation {
         dormant
             .activate(&scheduler, Arc::clone(&child_thread), proof)
             .map_err(fail_unpublished_child)?;
+
+        job_reservation
+            .activate_with_process_retirement(job_result, job_completion, process_retirement)
+            .map_err(|error| fail_unpublished_child(TrapError::Hypervisor(error.to_string())))?;
 
         #[cfg(test)]
         if let Some(hook) = VFORK_ACTIVATION_HOOK.lock().as_ref() {
@@ -2864,8 +2998,40 @@ where
     _factory: std::marker::PhantomData<F>,
     resolver: Arc<R>,
     _debug_aux_provider: Arc<dyn crate::kernel::debug::KernelDebugAuxProvider>,
+    debug_aux_registration: crate::kernel::core::DebugAuxProviderRegistration,
     #[cfg(test)]
     control: Arc<PoolControl>,
+}
+
+struct DebugAuxProviderPublication {
+    kernel: Arc<crate::kernel::Kernel>,
+    registration: Option<crate::kernel::core::DebugAuxProviderRegistration>,
+}
+
+impl DebugAuxProviderPublication {
+    fn new(
+        kernel: Arc<crate::kernel::Kernel>,
+        registration: crate::kernel::core::DebugAuxProviderRegistration,
+    ) -> Self {
+        Self {
+            kernel,
+            registration: Some(registration),
+        }
+    }
+
+    fn commit(mut self) -> crate::kernel::core::DebugAuxProviderRegistration {
+        self.registration
+            .take()
+            .unwrap_or_else(|| std::process::abort())
+    }
+}
+
+impl Drop for DebugAuxProviderPublication {
+    fn drop(&mut self) {
+        if let Some(registration) = self.registration.take() {
+            self.kernel.unregister_debug_aux_provider(registration);
+        }
+    }
 }
 
 impl<F, R> std::fmt::Debug for ExecutorPool<F, R>
@@ -2968,6 +3134,19 @@ where
                 message: format!("install combined task resolver: {error}"),
             })?;
         let receipts = Arc::new(ReceiptLog::default());
+        let debug_aux_provider: Arc<dyn crate::kernel::debug::KernelDebugAuxProvider> = Arc::new(
+            HvpatchKernelDebugAuxProvider::new(Arc::clone(&scheduler), Arc::clone(&receipts)),
+        );
+        let debug_aux_publication = DebugAuxProviderPublication::new(
+            Arc::clone(scheduler.kernel()),
+            scheduler
+                .kernel()
+                .register_debug_aux_provider(&debug_aux_provider)
+                .map_err(|error| ExecutorPoolStartError {
+                    configured_workers,
+                    message: format!("publish carrier debug provider: {error}"),
+                })?,
+        );
         let control = Arc::new(PoolControl::new(configured_workers, Arc::clone(&scheduler)));
         let (startup_tx, startup_rx) = mpsc::channel();
         let mut handles: Vec<WorkerHandle> = Vec::with_capacity(configured_workers);
@@ -3079,12 +3258,7 @@ where
         scheduler.install_discard_recorder(
             Arc::clone(&receipts) as Arc<dyn crate::kernel::scheduler::DiscardRecorder>
         );
-        let debug_aux_provider: Arc<dyn crate::kernel::debug::KernelDebugAuxProvider> = Arc::new(
-            HvpatchKernelDebugAuxProvider::new(Arc::clone(&scheduler), Arc::clone(&receipts)),
-        );
-        scheduler
-            .kernel()
-            .register_debug_aux_provider(&debug_aux_provider);
+        let debug_aux_registration = debug_aux_publication.commit();
 
         Ok(Self {
             scheduler,
@@ -3093,6 +3267,7 @@ where
             _factory: std::marker::PhantomData,
             resolver,
             _debug_aux_provider: debug_aux_provider,
+            debug_aux_registration,
             #[cfg(test)]
             control,
         })
@@ -3125,7 +3300,9 @@ where
     }
 
     pub fn shutdown(self) -> Result<ExecutorPoolReport, ExecutorPoolShutdownError> {
-        self.scheduler.kernel().unregister_debug_aux_provider();
+        self.scheduler
+            .kernel()
+            .unregister_debug_aux_provider(self.debug_aux_registration);
         self.scheduler.close();
         let mut failures = Vec::new();
         if let Err(error) = self
@@ -3901,7 +4078,7 @@ where
             std::process::abort();
         }
         let exec_cleanup_ran = pending_exec_retirement.is_some() || pending_exec_cleanup;
-        if let Some(retirement) = pending_exec_retirement.take() {
+        if let Some(mut retirement) = pending_exec_retirement.take() {
             match control.invalidate_after_exec(
                 &retirement,
                 executor_id,
@@ -3925,20 +4102,39 @@ where
                     ));
                 }
             }
-            if let Err(error) = binding.retire_detached_exec_predecessor() {
-                let settlement = fail_running_and_retire::<F::TaskBinding, _>(
-                    resolver.as_ref(),
-                    scheduler,
-                    running,
-                    ExecutionFailure::SnapshotRestoreFailed,
-                    receipts,
-                );
-                return Err(with_settlement_error(
-                    format!("exec detached predecessor cleanup failed: {error}"),
-                    settlement,
-                ));
-            }
-            if let Err(error) = retirement.complete() {
+            let root_ticket = match retirement.take_root_retirement_ticket() {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                        resolver.as_ref(),
+                        scheduler,
+                        running,
+                        ExecutionFailure::SnapshotRestoreFailed,
+                        receipts,
+                    );
+                    return Err(with_settlement_error(
+                        format!("exec predecessor root retirement ticket failed: {error}"),
+                        settlement,
+                    ));
+                }
+            };
+            let root_receipt = match binding.retire_detached_exec_predecessor(root_ticket) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                        resolver.as_ref(),
+                        scheduler,
+                        running,
+                        ExecutionFailure::SnapshotRestoreFailed,
+                        receipts,
+                    );
+                    return Err(with_settlement_error(
+                        format!("exec detached predecessor cleanup failed: {error}"),
+                        settlement,
+                    ));
+                }
+            };
+            if let Err(error) = retirement.complete(root_receipt) {
                 let settlement = fail_running_and_retire::<F::TaskBinding, _>(
                     resolver.as_ref(),
                     scheduler,
@@ -3954,18 +4150,22 @@ where
             pending_exec_cleanup = false;
         }
         if pending_exec_cleanup {
-            if let Err(error) = binding.retire_detached_exec_predecessor() {
-                let settlement = fail_running_and_retire::<F::TaskBinding, _>(
-                    resolver.as_ref(),
-                    scheduler,
-                    running,
-                    ExecutionFailure::SnapshotRestoreFailed,
-                    receipts,
-                );
-                return Err(with_settlement_error(
-                    format!("shared-MM exec detached predecessor cleanup failed: {error}"),
-                    settlement,
-                ));
+            match binding.retire_detached_exec_predecessor(None) {
+                Ok(None) => {}
+                Ok(Some(_)) => std::process::abort(),
+                Err(error) => {
+                    let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                        resolver.as_ref(),
+                        scheduler,
+                        running,
+                        ExecutionFailure::SnapshotRestoreFailed,
+                        receipts,
+                    );
+                    return Err(with_settlement_error(
+                        format!("shared-MM exec detached predecessor cleanup failed: {error}"),
+                        settlement,
+                    ));
+                }
             }
         }
         if exec_cleanup_ran {
@@ -3987,7 +4187,7 @@ where
                 ));
             }
         }
-        if let Some(retirement) = terminal_retirement {
+        if let Some(mut retirement) = terminal_retirement {
             if let Some(stage1) = retirement.retirement() {
                 match control.invalidate_after_exec(
                     stage1,
@@ -4038,26 +4238,46 @@ where
                 }
             };
             deferred_stop |= stop_seen;
-            let cleanup = if retirement.retirement().is_some() {
-                binding.retire_detached_address_space()
-            } else {
-                binding.retire_detached_shared_mm_edge()
+            let root_ticket = match retirement.take_root_retirement_ticket() {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    drop(_topology);
+                    let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                        resolver.as_ref(),
+                        scheduler,
+                        running,
+                        ExecutionFailure::SnapshotRestoreFailed,
+                        receipts,
+                    );
+                    return Err(with_settlement_error(
+                        format!("terminal root retirement ticket failed: {error}"),
+                        settlement,
+                    ));
+                }
             };
-            if let Err(error) = cleanup {
-                drop(_topology);
-                let settlement = fail_running_and_retire::<F::TaskBinding, _>(
-                    resolver.as_ref(),
-                    scheduler,
-                    running,
-                    ExecutionFailure::SnapshotRestoreFailed,
-                    receipts,
-                );
-                return Err(with_settlement_error(
-                    format!("terminal detached address-space cleanup failed: {error}"),
-                    settlement,
-                ));
-            }
-            if let Err(error) = retirement.complete() {
+            let cleanup = if retirement.retirement().is_some() {
+                binding.retire_detached_address_space(root_ticket)
+            } else {
+                binding.retire_detached_shared_mm_edge().map(|()| None)
+            };
+            let root_receipt = match cleanup {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    drop(_topology);
+                    let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                        resolver.as_ref(),
+                        scheduler,
+                        running,
+                        ExecutionFailure::SnapshotRestoreFailed,
+                        receipts,
+                    );
+                    return Err(with_settlement_error(
+                        format!("terminal detached address-space cleanup failed: {error}"),
+                        settlement,
+                    ));
+                }
+            };
+            if let Err(error) = retirement.complete(root_receipt) {
                 drop(_topology);
                 let settlement = fail_running_and_retire::<F::TaskBinding, _>(
                     resolver.as_ref(),
@@ -4371,9 +4591,23 @@ where
     let result = fail_running(scheduler, running, reason, receipts);
     resolver.retire(thread, generation);
     if let Some(binding) = binding {
-        binding.after_terminal_settlement();
+        binding.after_executor_failure_settlement();
     }
     result
+}
+
+#[cfg(test)]
+pub(super) fn fail_running_and_retire_for_test<B, R>(
+    resolver: &R,
+    scheduler: &Scheduler,
+    running: RunnableThread,
+    reason: ExecutionFailure,
+) -> Option<String>
+where
+    B: PersistentTaskBinding + Send + Sync + 'static,
+    R: TaskBindingResolver<B>,
+{
+    fail_running_and_retire::<B, R>(resolver, scheduler, running, reason, &ReceiptLog::default())
 }
 
 fn with_settlement_error(mut source: String, settlement: Option<String>) -> String {
@@ -4660,14 +4894,17 @@ pub(crate) mod tests {
             self.pending_address_space_retirement.lock().take()
         }
 
-        fn retire_detached_address_space(&self) -> Result<(), TrapError> {
+        fn retire_detached_address_space(
+            &self,
+            root_ticket: Option<crate::hvpatch::Stage1RootRetirementTicket>,
+        ) -> Result<Option<crate::hvpatch::Stage1RootRetirementReceipt>, TrapError> {
             if let Some(gate) = self.retire_detached_address_space_gate.lock().take() {
                 let _ = gate.send(());
             }
             if let Some(resume) = self.retire_detached_address_space_resume.lock().take() {
                 let _ = resume.recv_timeout(std::time::Duration::from_secs(5));
             }
-            Ok(())
+            Ok(root_ticket.map(|ticket| ticket.complete_for_test()))
         }
     }
 
@@ -5505,14 +5742,14 @@ pub(crate) mod tests {
             .find("invalidate_after_exec")
             .expect("post-save ASID invalidation");
         let release = worker_loop
-            .find("retirement.complete()")
+            .find("retirement.complete(root_receipt)")
             .expect("post-ack ASID/root release");
         assert!(save < invalidate && invalidate < release);
         let exec_retirement = worker_loop
-            .split("if let Some(retirement) = pending_exec_retirement.take()")
+            .split("if let Some(mut retirement) = pending_exec_retirement.take()")
             .nth(1)
             .and_then(|tail| {
-                tail.split("if let Some(retirement) = terminal_retirement")
+                tail.split("if let Some(mut retirement) = terminal_retirement")
                     .next()
             })
             .expect("exec retirement order");
@@ -5522,12 +5759,19 @@ pub(crate) mod tests {
         let exec_cleanup = exec_retirement
             .find("retire_detached_exec_predecessor")
             .expect("detached exec predecessor cleanup");
+        let exec_ticket = exec_retirement
+            .find("take_root_retirement_ticket")
+            .expect("exec root retirement ticket");
         let exec_release = exec_retirement
-            .find("retirement.complete()")
+            .find("retirement.complete(root_receipt)")
             .expect("exec ASID/root release");
-        assert!(exec_invalidate < exec_cleanup && exec_cleanup < exec_release);
+        assert!(
+            exec_invalidate < exec_ticket
+                && exec_ticket < exec_cleanup
+                && exec_cleanup < exec_release
+        );
         let terminal = worker_loop
-            .split("if let Some(retirement) = terminal_retirement")
+            .split("if let Some(mut retirement) = terminal_retirement")
             .nth(1)
             .and_then(|tail| tail.split("if let Some(authority)").next())
             .expect("terminal retirement order");
@@ -5540,12 +5784,16 @@ pub(crate) mod tests {
         let detached_cleanup = terminal
             .find("retire_detached_address_space")
             .expect("detached stage-2/inventory cleanup");
+        let terminal_ticket = terminal
+            .find("take_root_retirement_ticket")
+            .expect("terminal root retirement ticket");
         let terminal_release = terminal
-            .find("retirement.complete()")
+            .find("retirement.complete(root_receipt)")
             .expect("terminal ASID/root release");
         assert!(
             terminal_invalidate < topology_acquire
-                && topology_acquire < detached_cleanup
+                && topology_acquire < terminal_ticket
+                && terminal_ticket < detached_cleanup
                 && detached_cleanup < terminal_release
         );
         let pre_load = worker_loop
@@ -5780,6 +6028,20 @@ pub(crate) mod tests {
         state: &MigratableTaskState,
         marker: u64,
     ) -> Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding> {
+        hvpatch_test_binding_with_completion(
+            context,
+            state,
+            marker,
+            crate::vcpu_loop::continuation::LogicalJobCompletion::pending(),
+        )
+    }
+
+    fn hvpatch_test_binding_with_completion(
+        context: &KernelContext,
+        state: &MigratableTaskState,
+        marker: u64,
+        completion: crate::vcpu_loop::continuation::LogicalJobCompletion,
+    ) -> Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding> {
         struct ExitJob;
 
         impl crate::vcpu_loop::continuation::PersistentQuantumJob for ExitJob {
@@ -5802,7 +6064,7 @@ pub(crate) mod tests {
             },
             Arc::new(crate::vcpu_loop::continuation::HvpatchTaskQuantum::new(
                 Box::new(ExitJob),
-                crate::vcpu_loop::continuation::LogicalJobCompletion::pending(),
+                completion,
             )),
             Box::new(marker),
         ))
@@ -6891,6 +7153,31 @@ pub(crate) mod tests {
             ExecutorBoundaryAudit::production(),
         )
         .expect("start executor pool")
+    }
+
+    #[test]
+    fn a_second_pool_on_one_kernel_cannot_replace_the_debug_owner() {
+        let (kernel, _root) = bootstrap(14_005);
+        let first_scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+        let first_factory = Arc::new(FakeFactory::default());
+        let first_pool = start_pool(first_scheduler, first_factory, 1);
+
+        let second_scheduler = Arc::new(Scheduler::new(kernel));
+        let second_factory = Arc::new(FakeFactory::default());
+        let error = ExecutorPool::start(
+            config(1),
+            second_scheduler,
+            Arc::clone(&second_factory),
+            second_factory,
+            ExecutorBoundaryAudit::production(),
+        )
+        .expect_err("a carrier cannot publish a second executor debug owner");
+        assert!(
+            error.to_string().contains("already registered"),
+            "unexpected failure: {error}",
+        );
+
+        first_pool.shutdown().expect("first pool remains healthy");
     }
 
     #[test]
@@ -8365,7 +8652,7 @@ pub(crate) mod tests {
         assert_eq!(invalidations[0].executor, executor);
         assert_ne!(invalidations[0].host_thread, thread::current().id());
         retired
-            .complete()
+            .complete_for_test()
             .expect("release exact ASID/root only after all acks");
         pool.shutdown().expect("pool shutdown");
     }
@@ -8398,7 +8685,7 @@ pub(crate) mod tests {
         assert_eq!(retirement.pending(), vec![executor]);
         assert!(
             retired
-                .complete()
+                .complete_for_test()
                 .unwrap_err()
                 .to_string()
                 .contains("awaits executor invalidation")
@@ -8820,6 +9107,90 @@ pub(crate) mod tests {
         ));
     }
 
+    #[test]
+    fn pre_exit_executor_failure_publishes_an_error_instead_of_thread_done() {
+        struct MissingTerminalResult {
+            settlement: super::super::HvpatchExternalTerminalSettlement,
+        }
+
+        impl crate::vcpu_loop::continuation::PersistentQuantumJob for MissingTerminalResult {
+            fn poll_quantum_with_engine(
+                &mut self,
+                _engine: &mut dyn std::any::Any,
+                _control: &mut HvpatchQuantumControl<'_, '_>,
+            ) -> ExecutorExit {
+                unreachable!("executor failure settles this job without another poll")
+            }
+
+            fn after_terminal_settlement(&mut self) {
+                self.settlement.publish_terminal(None);
+            }
+        }
+
+        let (kernel, context) = bootstrap(14_601);
+        let generation = publish(&context, 161);
+        let scheduler = Scheduler::new(kernel);
+        let executor = scheduler
+            .register_executor(Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default()))))
+            .expect("register failure-settlement executor");
+        scheduler
+            .make_runnable(context.thread().key())
+            .expect("queue failure-settlement job");
+        let running = scheduler.take(&executor).expect("claim failing job");
+
+        let result = super::super::HvpatchLoopResult::pending();
+        let completion = crate::vcpu_loop::continuation::LogicalJobCompletion::pending();
+        let settlement = super::super::HvpatchExternalTerminalSettlement::new(
+            result.clone(),
+            completion.clone(),
+        );
+        let binding = Arc::new(crate::vcpu_loop::continuation::HvpatchTaskBinding::new(
+            TaskLoadIdentity {
+                abi: carrick_abi::LinuxGuestAbi::Aarch64,
+                version: 1,
+                mm: context.shared().mm().id(),
+                asid_generation: context.shared().mm().id().raw(),
+            },
+            Arc::new(crate::vcpu_loop::continuation::HvpatchTaskQuantum::new(
+                Box::new(MissingTerminalResult {
+                    settlement: settlement.clone(),
+                }),
+                completion.clone(),
+            )),
+            Box::new(161_u64),
+        ));
+        let directory = HvpatchTaskBindingDirectory::default();
+        directory
+            .publish(context.thread().key(), generation, binding)
+            .expect("publish exact failure-settlement binding");
+
+        assert!(
+            super::fail_running_and_retire::<
+                crate::vcpu_loop::continuation::HvpatchTaskBinding,
+                _,
+            >(
+                &directory,
+                &scheduler,
+                running,
+                ExecutionFailure::SnapshotRestoreFailed,
+                &ReceiptLog::default(),
+            )
+            .is_none(),
+            "exact failure settlement itself must succeed",
+        );
+        assert!(completion.is_finished());
+        assert!(matches!(
+            result.wait(),
+            Err(crate::runtime::RuntimeError::CarrierFailed(_))
+        ));
+
+        scheduler
+            .unregister_executor(&executor)
+            .expect("unregister failure-settlement executor");
+        scheduler.close();
+        scheduler.wait_closed();
+    }
+
     struct VforkTestFixture {
         kernel: Arc<Kernel>,
         parent: KernelContext,
@@ -8836,6 +9207,9 @@ pub(crate) mod tests {
         child_proof: HvpatchActivationProof,
         child_threads: Arc<parking_lot::Mutex<Vec<crate::vcpu_loop::VcpuThreadHandle>>>,
         terminal_settlement: super::super::HvpatchExternalTerminalSettlement,
+        runtime_directory: Arc<super::super::HvpatchRuntimeDirectory>,
+        job_result: super::super::HvpatchLoopResult,
+        job_completion: crate::vcpu_loop::continuation::LogicalJobCompletion,
     }
 
     impl VforkTestFixture {
@@ -8855,7 +9229,14 @@ pub(crate) mod tests {
                 .thread()
                 .publish_initial_task_state(child_state.clone())
                 .unwrap();
-            let hvpatch_child_binding = hvpatch_test_binding(&child_ref, &child_state, 20);
+            let job_result = crate::vcpu_loop::HvpatchLoopResult::pending();
+            let job_completion = crate::vcpu_loop::continuation::LogicalJobCompletion::pending();
+            let hvpatch_child_binding = hvpatch_test_binding_with_completion(
+                &child_ref,
+                &child_state,
+                20,
+                job_completion.clone(),
+            );
 
             let scheduler = Arc::new(Scheduler::new(kernel.clone()));
             let factory = Arc::new(FakeFactory::default());
@@ -8901,9 +9282,10 @@ pub(crate) mod tests {
 
             let child_threads = Arc::new(parking_lot::Mutex::new(Vec::new()));
             let terminal_settlement = super::super::HvpatchExternalTerminalSettlement::new(
-                crate::vcpu_loop::HvpatchLoopResult::pending(),
-                crate::vcpu_loop::continuation::LogicalJobCompletion::pending(),
+                job_result.clone(),
+                job_completion.clone(),
             );
+            let runtime_directory = Arc::new(super::super::HvpatchRuntimeDirectory::default());
 
             Self {
                 kernel,
@@ -8921,6 +9303,9 @@ pub(crate) mod tests {
                 child_proof,
                 child_threads,
                 terminal_settlement,
+                runtime_directory,
+                job_result,
+                job_completion,
             }
         }
 
@@ -8933,12 +9318,27 @@ pub(crate) mod tests {
                 &self.terminal_settlement,
             );
             let dormant = self.dormant.take().expect("dormant submission");
+            let job_reservation = self
+                .runtime_directory
+                .container_job_group(self.child.container().id())
+                .reserve()
+                .expect("reserve vfork child job");
             super::PreparedVforkChildActivation::new(
                 dormant,
                 Arc::clone(&self.scheduler),
                 Arc::clone(self.child.thread()),
                 proof.unwrap_or(self.child_proof),
                 member_pub,
+                job_reservation,
+                self.job_result.clone(),
+                self.job_completion.clone(),
+                {
+                    let retirement = super::super::ProcessPhysicalRetirement::default();
+                    retirement
+                        .publish(vec![self.job_completion.clone()])
+                        .expect("publish fixture process retirement");
+                    retirement
+                },
             )
         }
 
@@ -8958,6 +9358,20 @@ pub(crate) mod tests {
             )
             .unwrap()
         }
+    }
+
+    #[test]
+    fn dropped_vfork_activation_releases_unpublished_job_reservation() {
+        let mut fixture = VforkTestFixture::new(14_500, 24_500);
+        let activation = fixture.make_activation(None);
+        assert_eq!(fixture.runtime_directory.live_job_group_count(), 1);
+        assert_eq!(fixture.runtime_directory.live_process_job_count(), 0);
+
+        drop(activation);
+
+        assert_eq!(fixture.runtime_directory.live_job_group_count(), 0);
+        assert_eq!(fixture.runtime_directory.live_process_job_count(), 0);
+        assert!(fixture.child_threads.lock().is_empty());
     }
 
     #[test]
@@ -9013,10 +9427,56 @@ pub(crate) mod tests {
 
         pool.shutdown().expect("clean pool shutdown");
 
+        assert_eq!(fixture.runtime_directory.live_job_group_count(), 1);
+        assert_eq!(fixture.runtime_directory.live_process_job_count(), 1);
+        if !fixture.job_result.is_ready() {
+            fixture
+                .job_result
+                .publish(Ok(super::super::VcpuLoopOutcome::ThreadDone));
+            fixture.job_completion.publish();
+        }
+        assert_eq!(
+            fixture
+                .runtime_directory
+                .container_job_group(fixture.child.container().id())
+                .join()
+                .expect("join activated vfork child"),
+            1
+        );
+        assert_eq!(fixture.runtime_directory.live_job_group_count(), 0);
+
         assert!(
             save_observed_at_activation.load(Ordering::SeqCst),
             "Parent backend must be saved before child activation runs"
         );
+    }
+
+    #[test]
+    fn vfork_continuation_enrollment_failure_releases_job_reservation() {
+        let mut fixture = VforkTestFixture::new(14_505, 24_505);
+        let continuation = fixture.make_continuation();
+        let activation = fixture.make_activation(None);
+        fixture
+            .parent_binding
+            .block_with_vfork_continuation(continuation, activation);
+
+        let pool = start_pool(
+            Arc::clone(&fixture.scheduler),
+            Arc::clone(&fixture.factory),
+            1,
+        );
+        pool.control.wait_service.fail_next_enroll_for_test();
+        let parent_auth = fixture.parent_authority.take().unwrap();
+        parent_auth
+            .publish(&fixture.scheduler, Arc::clone(fixture.parent.thread()))
+            .unwrap();
+        drop(parent_auth);
+
+        let _ = pool.shutdown();
+
+        assert_eq!(fixture.runtime_directory.live_job_group_count(), 0);
+        assert_eq!(fixture.runtime_directory.live_process_job_count(), 0);
+        assert!(fixture.child_threads.lock().is_empty());
     }
 
     #[test]
@@ -9358,7 +9818,9 @@ pub(crate) mod tests {
             .invalidate_asid_retirement_timeout(retirement2, Duration::from_secs(5))
             .expect("executor must service InvalidateAsid while waiting for topology lock");
         assert!(retirement2.pending().is_empty());
-        retired2.complete().expect("complete second retirement");
+        retired2
+            .complete_for_test()
+            .expect("complete second retirement");
 
         // Release the topology lock so the executor can acquire it and finish
         drop(cleanup.held_topology.take());

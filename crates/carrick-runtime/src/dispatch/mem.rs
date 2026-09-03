@@ -2212,13 +2212,20 @@ fn mark_range_unmapped(memory: &mut impl CurrentMmMemory, address: u64, len: usi
 /// span.
 struct MadviseRangeMeta {
     fully_mapped: bool,
-    covered: Vec<(u64, u64)>,
+    covered: Vec<MadviseCoveredSegment>,
     writable: bool,
     shared: bool,
     all_private_anon: bool,
     any_special: bool,
     any_droppable: bool,
     locked: bool,
+}
+
+#[derive(Clone, Copy)]
+struct MadviseCoveredSegment {
+    start: u64,
+    end: u64,
+    prot: LinuxProtFlags,
 }
 
 /// Owns alias exclusion from grow-down fault lookup through backend protection
@@ -2471,7 +2478,7 @@ impl SyscallDispatcher {
         intervals.sort_by_key(|vma| vma.start);
 
         let mut covered_to = start;
-        let mut covered: Vec<(u64, u64)> = Vec::new();
+        let mut covered: Vec<MadviseCoveredSegment> = Vec::new();
         let mut fully_mapped = true;
         let mut writable = true;
         let mut shared = false;
@@ -2488,9 +2495,20 @@ impl SyscallDispatcher {
             }
             if vma.end > covered_to {
                 let segment_end = vma.end.min(end);
+                let prot = LinuxProtFlags::from_bits_retain(
+                    (u64::from(vma.read) * carrick_abi::LINUX_PROT_READ)
+                        | (u64::from(vma.write) * carrick_abi::LINUX_PROT_WRITE)
+                        | (u64::from(vma.execute) * carrick_abi::LINUX_PROT_EXEC),
+                );
                 match covered.last_mut() {
-                    Some((_, last_end)) if *last_end == covered_to => *last_end = segment_end,
-                    _ => covered.push((covered_to, segment_end)),
+                    Some(last) if last.end == covered_to && last.prot == prot => {
+                        last.end = segment_end;
+                    }
+                    _ => covered.push(MadviseCoveredSegment {
+                        start: covered_to,
+                        end: segment_end,
+                        prot,
+                    }),
                 }
                 if !vma.write {
                     writable = false;
@@ -7383,17 +7401,17 @@ impl SyscallDispatcher {
                     // The pages are dropped per mapped segment: the segments
                     // ahead of and past a hole are still discarded, and the
                     // hole itself is reported afterwards.
-                    for &(segment_start, segment_end) in &meta.covered {
-                        let Ok(segment_len) = usize::try_from(segment_end - segment_start) else {
+                    for segment in &meta.covered {
+                        let Ok(segment_len) = usize::try_from(segment.end - segment.start) else {
                             return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                         };
                         if meta.writable && !meta.shared {
-                            if cx.memory.zero_backing(segment_start, segment_len).is_err() {
+                            if cx.memory.zero_backing(segment.start, segment_len).is_err() {
                                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                             }
                         }
                         if meta.all_private_anon {
-                            this.mark_range_nonresident(segment_start, segment_len as u64);
+                            this.mark_range_nonresident(segment.start, segment_len as u64);
                             // Discarding the pages puts them back where a fresh
                             // anonymous mapping starts: not resident, and resident
                             // again on the NEXT touch. Re-arm the first-touch fault
@@ -7404,24 +7422,26 @@ impl SyscallDispatcher {
                             if std::env::var("CARRICK_MINCORE_EXACT").as_deref() != Ok("0")
                                 && cx
                                     .memory
-                                    .resident_pages(GuestVa(segment_start), 1, this.linux_page_size())
+                                    .resident_pages(GuestVa(segment.start), 1, this.linux_page_size())
                                     .is_none()
-                                && cx.memory.protect_range(segment_start, segment_len, 0).is_ok()
+                                && cx.memory.protect_range(segment.start, segment_len, 0).is_ok()
                             {
-                                // `MADV_DONTNEED` requires a readable mapping to
-                                // reach here, and `writable` is the only other axis
-                                // this range can carry.
-                                let prot = if meta.writable {
-                                    LinuxProtFlags::READ | LinuxProtFlags::WRITE
-                                } else {
-                                    LinuxProtFlags::READ
-                                };
-                                this.track_resident_fault_range(segment_start, segment_len as u64, prot);
+                                // This mapping stays readable; its next
+                                // first-touch publication must restore the
+                                // exact semantic VMA R/W/X permission.
+                                // Reconstructing only READ|WRITE drops EXEC from
+                                // V8's discarded code-cage pages and publishes
+                                // the generated-code leaf UXN.
+                                this.track_resident_fault_range(
+                                    segment.start,
+                                    segment_len as u64,
+                                    segment.prot,
+                                );
                                 cx.memory.set_mapping_protection(
-                                    segment_start,
+                                    segment.start,
                                     segment_len,
                                     false,
-                                    !meta.writable,
+                                    !segment.prot.contains(LinuxProtFlags::WRITE),
                                 );
                             }
                         }

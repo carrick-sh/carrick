@@ -499,11 +499,20 @@ pub struct ContainerLifecycleLock {
 }
 
 const LIFECYCLE_LOCK_STRIPES: usize = 64;
+const NAME_REGISTRY_LOCK_SLOT: usize = LIFECYCLE_LOCK_STRIPES;
+const LIFECYCLE_LOCK_SLOTS: usize = LIFECYCLE_LOCK_STRIPES + 1;
 
 fn lifecycle_lock_stripe(key: &str) -> &'static parking_lot::Mutex<()> {
-    static STRIPES: std::sync::OnceLock<[parking_lot::Mutex<()>; LIFECYCLE_LOCK_STRIPES]> =
+    static STRIPES: std::sync::OnceLock<[parking_lot::Mutex<()>; LIFECYCLE_LOCK_SLOTS]> =
         std::sync::OnceLock::new();
     let stripes = STRIPES.get_or_init(|| std::array::from_fn(|_| parking_lot::Mutex::new(())));
+    // Rename holds one per-container lifecycle lock before taking the global
+    // name-registry lock. Keep the latter outside the striped container set so
+    // a hash collision can never turn that intentional nesting into a
+    // same-thread, non-reentrant mutex deadlock.
+    if key == ".container-names" {
+        return &stripes[NAME_REGISTRY_LOCK_SLOT];
+    }
     let hash = key.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
     });
@@ -1205,6 +1214,18 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("creator acquires after release");
         contender.join().expect("creator thread");
+    }
+
+    #[test]
+    fn name_registry_lock_never_aliases_a_container_lifecycle_stripe() {
+        let registry = lifecycle_lock_stripe(".container-names");
+        for index in 0..(LIFECYCLE_LOCK_STRIPES * 4) {
+            let id = format!("container-lock-collision-check-{index}");
+            assert!(
+                !std::ptr::eq(registry, lifecycle_lock_stripe(&id)),
+                "global name lock aliased the lifecycle stripe for {id}"
+            );
+        }
     }
 
     #[test]

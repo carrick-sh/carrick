@@ -1,0 +1,10 @@
+[package]
+name = "carrick-embed-implicit-driver"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+carrick-embed = { path = "@CARRICK_EMBED_PATH@" }

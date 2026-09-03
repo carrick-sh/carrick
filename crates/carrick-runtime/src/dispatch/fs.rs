@@ -49,6 +49,27 @@
 use super::*;
 use crate::linux_abi::LINUX_ENOSPC;
 
+fn resolve_tiocspgrp(
+    context: &crate::kernel::KernelContext,
+    namespace_id: i32,
+) -> Result<crate::kernel::ProcessGroupId, LinuxErrno> {
+    let namespace_id = u32::try_from(namespace_id)
+        .ok()
+        .filter(|id| *id != 0)
+        .ok_or(LINUX_EINVAL)?;
+    let group_id =
+        crate::namespace::pid::ns_to_process_group_for(context, namespace_id).ok_or(LINUX_EPERM)?;
+    let group = context
+        .kernel()
+        .registry()
+        .process_group(group_id)
+        .ok_or(LINUX_EPERM)?;
+    if group.session() != context.task().session() {
+        return Err(LINUX_EPERM);
+    }
+    Ok(group_id)
+}
+
 syscall_table! {
     /// Per-module syscall routing for the `fs` subsystem (Task A1).
     ///
@@ -195,7 +216,7 @@ pub(crate) use pipe::*;
 pub use state::StdioSink;
 use state::*;
 pub(super) use state::{FsState, RuntimeIo, host_fd_offset};
-pub(crate) use state::{LegacyAioContextId, SplicePushback};
+pub(crate) use state::{LegacyAioContextId, MountRetirement, SplicePushback};
 
 fn get_last_error() -> i32 {
     carrick_portable::errno()
@@ -522,7 +543,7 @@ fn forward_record_lock<M: CurrentMmMemory>(
         };
         if matches!(linux_cmd, LINUX_F_GETLK | LINUX_F_OFD_GETLK) {
             let conflict = this.fs.classic_record_locks.conflict(&request);
-            return write_logical_record_lock_conflict(memory, arg, conflict, is_ofd);
+            return write_logical_record_lock_conflict(kernel, memory, arg, conflict, is_ofd);
         }
         match this.fs.classic_record_locks.try_set(request.clone()) {
             Ok(()) => DispatchOutcome::Returned { value: 0 },
@@ -630,10 +651,13 @@ pub(crate) enum LogicalRecordLockOwner {
 }
 
 impl LogicalRecordLockOwner {
-    pub(crate) fn pid(&self) -> i32 {
+    fn task_key(&self) -> Option<crate::kernel::TaskKey> {
         match self {
-            Self::Process { pid, .. } => *pid,
-            Self::Ofd(_) => -1,
+            Self::Process { pid, serial } => Some(crate::kernel::TaskKey {
+                id: crate::kernel::TaskId::from_abi_positive(*pid).ok()?,
+                serial: crate::kernel::TaskSerial::from_raw_u64(*serial)?,
+            }),
+            Self::Ofd(_) => None,
         }
     }
 
@@ -1236,6 +1260,7 @@ fn normalize_logical_record_lock_range(
 }
 
 fn write_logical_record_lock_conflict(
+    context: &crate::kernel::KernelContext,
     memory: &mut impl CurrentMmMemory,
     arg: u64,
     conflict: Option<LogicalRecordLock>,
@@ -1262,7 +1287,18 @@ fn write_logical_record_lock_conflict(
     } else {
         i64::try_from(conflict.range.end.saturating_sub(conflict.range.start)).unwrap_or(i64::MAX)
     };
-    let pid = if is_ofd { -1 } else { conflict.owner.pid() };
+    let pid = if is_ofd {
+        -1
+    } else {
+        conflict
+            .owner
+            .task_key()
+            .filter(|key| context.kernel().task_key_is_live(*key))
+            .and_then(|key| u32::try_from(key.id.raw()).ok())
+            .and_then(|pid| crate::namespace::pid::kernel_to_ns_for(context, pid))
+            .and_then(|pid| i32::try_from(pid).ok())
+            .unwrap_or(0)
+    };
     out[0..2].copy_from_slice(&lock_type.to_le_bytes());
     out[2..4].copy_from_slice(&(libc::SEEK_SET as i16).to_le_bytes());
     out[8..16].copy_from_slice(&(conflict.range.start as i64).to_le_bytes());
@@ -1314,18 +1350,25 @@ fn fd_open_path_inserts() -> usize {
 
 use super::fd_table::is_anon_overlay_path;
 
-fn proc_self_fd_number(path: &str) -> Option<i32> {
+fn proc_component_is_self(pid: &str, visible_self: Option<u32>) -> bool {
+    matches!(pid, "self" | "thread-self" | "curproc" | "this")
+        || pid
+            .parse::<u32>()
+            .ok()
+            .zip(visible_self)
+            .is_some_and(|(pid, visible_self)| pid == visible_self)
+}
+
+fn proc_self_fd_number(path: &str, visible_self: Option<u32>) -> Option<i32> {
     let rest = path
         .strip_prefix("/proc/self/fd/")
         .or_else(|| path.strip_prefix("/proc/thread-self/fd/"))
         .or_else(|| path.strip_prefix("/proc/curproc/fd/"))
         .or_else(|| path.strip_prefix("/proc/this/fd/"))
         .or_else(|| {
-            // /proc/<pid>/fd/N — carrick is one guest process, so any numeric
-            // pid component refers to "self".
             let after = path.strip_prefix("/proc/")?;
             let (pid, tail) = after.split_once('/')?;
-            if pid.chars().all(|c| c.is_ascii_digit()) && !pid.is_empty() {
+            if proc_component_is_self(pid, visible_self) {
                 tail.strip_prefix("fd/")
             } else {
                 None
@@ -1339,18 +1382,14 @@ fn proc_self_fd_number(path: &str) -> Option<i32> {
 /// (the executable path, the cwd, the root), so they are resolved here rather
 /// than in the pure `ProcVfs`. carrick is one guest process, so any numeric pid
 /// component refers to "self".
-fn proc_self_magic_link(path: &str) -> Option<&'static str> {
+fn proc_self_magic_link(path: &str, visible_self: Option<u32>) -> Option<&'static str> {
     let rest = path.strip_prefix("/proc/")?;
     let (pid, leaf) = rest.split_once('/')?;
     // ONLY this process resolves exe/cwd/root from the live dispatcher state.
     // A foreign guest pid must NOT masquerade as self (that would readlink
     // /proc/<other>/exe to OUR executable_path); for those, fall through so the
     // path resolves to ENOENT rather than leaking the inspector's identity.
-    let is_self = matches!(pid, "self" | "thread-self" | "curproc" | "this")
-        || pid
-            .parse::<u32>()
-            .is_ok_and(|n| n == std::process::id() || n == crate::namespace::pid::self_ns_pid());
-    if !is_self {
+    if !proc_component_is_self(pid, visible_self) {
         return None;
     }
     match leaf {
@@ -1395,17 +1434,19 @@ fn ns_type_clone_flag(ns_type: &str) -> Option<u64> {
 
 /// The fd number `N` of a `/proc/<self>/fdinfo/N` path, if it is one. Self only
 /// (the contents are this process's live fd state); a foreign pid falls through.
-fn proc_self_fdinfo_number(path: &str) -> Option<i32> {
+fn proc_self_fdinfo_number(path: &str, visible_self: Option<u32>) -> Option<i32> {
     let rest = path.strip_prefix("/proc/")?;
     let (pid, tail) = rest.split_once('/')?;
-    let is_self = matches!(pid, "self" | "thread-self" | "curproc" | "this")
-        || pid
-            .parse::<u32>()
-            .is_ok_and(|n| n == std::process::id() || n == crate::namespace::pid::self_ns_pid());
-    if !is_self {
+    if !proc_component_is_self(pid, visible_self) {
         return None;
     }
     tail.strip_prefix("fdinfo/")?.parse::<i32>().ok()
+}
+
+fn proc_visible_self(context: &crate::kernel::KernelContext) -> Option<u32> {
+    u32::try_from(context.task().key().id.raw())
+        .ok()
+        .and_then(|pid| crate::namespace::pid::try_ns_self_pid_for(context, pid))
 }
 
 /// The file STATUS flags reportable via `fcntl(F_GETFL)` and `/proc/<pid>/fdinfo`.
@@ -1424,12 +1465,13 @@ fn reportable_status_flags(raw: u64) -> u64 {
     raw & !CREATION_ONLY
 }
 
-/// One interface with an IPv4 address: `(name, flags_host, sin_addr_be)`
-/// where `flags_host` is the host's raw `ifa_flags` and `sin_addr_be` is the
-/// 4-byte network-order IPv4 address. Built from the runtime's LinuxNetworkModel.
+/// One Linux-visible interface with an IPv4 address. Flags and MTU stay in
+/// their Linux model domain; translating them through host constants would
+/// discard namespace state and can contradict rtnetlink and sysfs.
 struct HostInet4Iface {
     name: String,
-    flags_host: u32,
+    flags_linux: u16,
+    mtu: i32,
     addr_be: [u8; 4],
 }
 
@@ -1455,41 +1497,16 @@ fn inet4_interfaces_from_model(
             } else {
                 [0, 0, 0, 0]
             });
-        let flags_host = if link.loopback {
-            libc::IFF_LOOPBACK | libc::IFF_UP | libc::IFF_RUNNING
-        } else {
-            libc::IFF_UP | libc::IFF_RUNNING | libc::IFF_BROADCAST | libc::IFF_MULTICAST
-        } as u32;
         out.push(HostInet4Iface {
             name: link.name.clone(),
-            flags_host,
+            flags_linux: (link.flags & u32::from(u16::MAX)) as u16,
+            mtu: i32::try_from(link.mtu).unwrap_or(i32::MAX),
             addr_be,
         });
     }
     out
 }
 
-fn linux_if_indextoname(index: i32) -> Option<&'static str> {
-    match index {
-        1 => Some("lo"),
-        2 => Some("eth0"),
-        _ => None,
-    }
-}
-
-fn linux_if_nametoindex(name: &str) -> Option<i32> {
-    match name {
-        "lo" => Some(1),
-        "eth0" => Some(2),
-        _ => None,
-    }
-}
-
-/// Translate a host's BSD/Linux `ifa_flags` bitmask to the Linux `IFF_*` flag
-/// values a guest expects in `ifr_flags`. Most low bits (UP/BROADCAST/DEBUG/
-/// LOOPBACK/POINTOPOINT/RUNNING/NOARP/PROMISC) share values across BSD and
-/// Linux; MULTICAST differs (BSD 0x8000 vs Linux 0x1000) — translate by name
-/// via the host's `libc::IFF_*` so this is correct on every host.
 /// Whether the `--fs host` trusted-dirfd fast lane is armed. Default ON;
 /// `CARRICK_FS_TRUSTED_LANE=0` is the exact escape hatch (AGENTS.md: new work
 /// ships on, with one switch that restores the historical path for
@@ -1499,32 +1516,6 @@ fn trusted_fs_lane_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         std::env::var_os("CARRICK_FS_TRUSTED_LANE").as_deref() != Some(std::ffi::OsStr::new("0"))
     })
-}
-
-fn host_iff_to_linux(flags_host: u32) -> u16 {
-    // The Linux IFF_* consts are u32 in carrick-abi; `ifr_flags` is a u16
-    // field, and every translated bit (<= 0x1000) fits the narrow width.
-    use crate::linux_abi::{
-        LINUX_IFF_BROADCAST, LINUX_IFF_DEBUG, LINUX_IFF_LOOPBACK, LINUX_IFF_MULTICAST,
-        LINUX_IFF_NOARP, LINUX_IFF_POINTOPOINT, LINUX_IFF_PROMISC, LINUX_IFF_RUNNING, LINUX_IFF_UP,
-    };
-    let h = flags_host as i32;
-    let mut out: u16 = 0;
-    let set = |out: &mut u16, host_bit: i32, linux_bit: u32| {
-        if h & host_bit != 0 {
-            *out |= linux_bit as u16;
-        }
-    };
-    set(&mut out, libc::IFF_UP, LINUX_IFF_UP);
-    set(&mut out, libc::IFF_BROADCAST, LINUX_IFF_BROADCAST);
-    set(&mut out, libc::IFF_DEBUG, LINUX_IFF_DEBUG);
-    set(&mut out, libc::IFF_LOOPBACK, LINUX_IFF_LOOPBACK);
-    set(&mut out, libc::IFF_POINTOPOINT, LINUX_IFF_POINTOPOINT);
-    set(&mut out, libc::IFF_RUNNING, LINUX_IFF_RUNNING);
-    set(&mut out, libc::IFF_NOARP, LINUX_IFF_NOARP);
-    set(&mut out, libc::IFF_PROMISC, LINUX_IFF_PROMISC);
-    set(&mut out, libc::IFF_MULTICAST, LINUX_IFF_MULTICAST);
-    out
 }
 
 /// Build one Linux `struct ifreq` (40 bytes) carrying `name` and an
@@ -2351,7 +2342,8 @@ impl SyscallDispatcher {
         // get a fresh fd referring to the same open file. Rosetta opens its
         // main-binary fd this way. Serve it by duplicating N (works for host-fd
         // backed files, which carry no guest path to re-resolve).
-        if let Some(n) = proc_self_fd_number(&path) {
+        let visible_self = proc_visible_self(context);
+        if let Some(n) = proc_self_fd_number(&path, visible_self) {
             // O_TRUNC on the reopened magic symlink truncates the underlying
             // (shared) in-memory inode — memfd_create01 reopens /proc/self/fd/N
             // with O_TRUNC and expects size 0. Applied before the dup and gated
@@ -2403,7 +2395,7 @@ impl SyscallDispatcher {
         // live fd table — built here (it needs the fd table + a host lseek for
         // overlay files) and installed as a synthetic read-only file. ENOENT if
         // fd N isn't open.
-        if let Some(n) = proc_self_fdinfo_number(&path) {
+        if let Some(n) = proc_self_fdinfo_number(&path, visible_self) {
             return Ok(match self.fdinfo_bytes(n) {
                 Some(bytes) => self.install_proc_synthetic_bytes(&path, bytes, flags),
                 None => DispatchOutcome::errno(LINUX_ENOENT),
@@ -2449,7 +2441,7 @@ impl SyscallDispatcher {
         // for exe, the working dir for cwd, the root for root) — `cat`/`ls`/
         // `realpath` of /proc/self/{cwd,root} were failing because only exe was
         // mapped here (the VFS readlink can't see the cwd).
-        let mut path = match proc_self_magic_link(&path) {
+        let mut path = match proc_self_magic_link(&path, visible_self) {
             Some("exe") => {
                 let exe = self.proc.lock().executable_path.clone();
                 // Avoid the circular default (`executable_path` is itself
@@ -4127,8 +4119,10 @@ impl SyscallDispatcher {
         let timerslack_ns = proc.timerslack;
         let env = proc.env.clone();
         let guest_arch = proc.reported_arch();
-        let guest_hostname = proc.guest_hostname().to_string();
         drop(proc);
+        let guest_hostname = context.task().uts_ns().nodename();
+        let net_ns = context.task().net_ns();
+        let network_model = net_ns.view();
         let open_fds = self.open_fd_numbers();
         let mem = self.mem_snapshot();
         let mut address_space_regions = mem.address_space_regions.clone();
@@ -4149,33 +4143,48 @@ impl SyscallDispatcher {
         let proc_threads = self.synthetic_proc_threads(context, registry);
         // See `synthetic_proc_context`: the kernel graph is the only authority
         // that can distinguish two Linux processes sharing this Darwin process.
-        let proc_oom_score_adj = self
-            .hvpatch_process()
-            .map(|process| process.kernel_graph().registry().oom_score_adj_by_pid());
+        let proc_oom_score_adj = self.hvpatch_process().map(|process| {
+            process
+                .kernel_graph()
+                .registry()
+                .oom_score_adj_by_pid_for_container(context.container().id())
+                .into_iter()
+                .filter_map(|(pid, value)| {
+                    crate::namespace::pid::kernel_to_ns_for(context, pid).map(|pid| (pid, value))
+                })
+                .collect()
+        });
         // The caller's own capabilities and user-namespace view; `/proc/self`'s
         // `status`, `uid_map`, `gid_map` and `setgroups` render from this.
         let proc_creds_ns = context.task().creds_ns();
-        let proc_processes = Self::synthetic_proc_processes(self.hvpatch_process().as_ref());
+        let proc_processes =
+            Self::synthetic_proc_processes(context, self.hvpatch_process().as_ref());
         let proc_zombies = self.hvpatch_process().map(|process| {
             process
                 .kernel_graph()
                 .registry()
-                .zombies()
+                .zombies_for_container(context.container().id())
                 .into_iter()
-                .map(|zombie| crate::vfs::SyntheticProcZombie {
-                    pid: zombie.key.id.raw() as u32,
-                    ppid: zombie
-                        .parent
-                        .map_or(carrick_abi::LINUX_BOOTSTRAP_PID as u32, |parent| {
-                            parent.id.raw() as u32
-                        }),
-                    pgrp: zombie.process_group.raw() as u32,
-                    session: zombie.session.raw() as u32,
-                    comm: zombie.diagnostic_name,
-                    user_cpu_us: u64::try_from(zombie.rusage.user_time.as_micros())
-                        .unwrap_or(u64::MAX),
-                    system_cpu_us: u64::try_from(zombie.rusage.system_time.as_micros())
-                        .unwrap_or(u64::MAX),
+                .filter_map(|zombie| {
+                    let to_ns = |raw: i32| {
+                        u32::try_from(raw)
+                            .ok()
+                            .and_then(|raw| crate::namespace::pid::kernel_to_ns_for(context, raw))
+                    };
+                    Some(crate::vfs::SyntheticProcZombie {
+                        pid: to_ns(zombie.key.id.raw())?,
+                        ppid: zombie
+                            .parent
+                            .and_then(|parent| to_ns(parent.id.raw()))
+                            .unwrap_or(1),
+                        pgrp: zombie.namespace_process_group,
+                        session: zombie.namespace_session,
+                        comm: zombie.diagnostic_name,
+                        user_cpu_us: u64::try_from(zombie.rusage.user_time.as_micros())
+                            .unwrap_or(u64::MAX),
+                        system_cpu_us: u64::try_from(zombie.rusage.system_time.as_micros())
+                            .unwrap_or(u64::MAX),
+                    })
                 })
                 .collect::<Vec<_>>()
         });
@@ -4189,6 +4198,8 @@ impl SyscallDispatcher {
             environ: Some(env.as_slice()),
             open_fds: Some(open_fds.as_slice()),
             network: Some(&self.network.spec),
+            network_model: Some(&network_model),
+            runtime_endpoint_container: Some(context.container().id()),
             auxv: Some(mem.linux_auxv_image.as_slice()),
             address_space_regions: address_space_regions.as_deref(),
             locked_memory: Some(mem.locked_ranges.as_slice()),
@@ -4528,6 +4539,13 @@ impl SyscallDispatcher {
     /// socket fstat.
     fn host_pipe_pipe_id(&self, fd: i32) -> Option<u64> {
         let open_file = self.open_file(fd)?;
+        self.fasync_pipe_id_for_open_file(&open_file)
+    }
+
+    pub(in crate::dispatch) fn fasync_pipe_id_for_open_file(
+        &self,
+        open_file: &OpenFile,
+    ) -> Option<u64> {
         let open = open_file.description.read()?;
         let host_socket_fd = match &*open {
             OpenDescription::PipeReader { pipe, .. } | OpenDescription::PipeWriter { pipe, .. } => {
@@ -5107,11 +5125,12 @@ impl SyscallDispatcher {
         }
     }
 
-    /// Reconcile the fork-coherent FASYNC registry with `fd`'s current
+    /// Reconcile the carrier-coherent FASYNC registry with `fd`'s current
     /// description after an `O_ASYNC` / `F_SETOWN` / `F_SETSIG` change. If
     /// `O_ASYNC` is set on a host pipe/socket, arm `(dev, ino)` with the fd's
-    /// owner + signal so a writer in another guest process can deliver the I/O
-    /// signal on the readiness edge; if `O_ASYNC` is clear, disarm it. A no-op
+    /// exact owner generation + signal so a writer in another guest task can
+    /// deliver the I/O signal on the readiness edge; if `O_ASYNC` is clear,
+    /// disarm it. A no-op
     /// for non-pipe/socket fds (FASYNC delivery is only wired for the
     /// pipe/socket readiness edge carrick can observe).
     fn sync_fasync_registration(&self, fd: i32) {
@@ -5125,106 +5144,55 @@ impl SyscallDispatcher {
         let armed = LinuxOpenFlags::from_bits_truncate(common.status_flags())
             .contains(LinuxOpenFlags::ASYNC);
         if !armed {
-            carrick_signal_core::fasync::disarm(pipe_id);
+            carrick_signal_core::fasync::disarm(pipe_id, open_file.description.id().raw());
             return;
         }
-        let owner = common.owner();
-        let (owner_type, owner_pid) = (owner.owner_type, owner.owner_pid);
+        let owner = common.captured_owner();
+        let (owner_type, owner_pid) = (owner.visible.owner_type, owner.visible.owner_pid);
         let sig = common.async_sig();
         carrick_signal_core::fasync::arm(
             pipe_id,
             carrick_signal_core::fasync::FasyncOwner {
+                registration_id: open_file.description.id().raw(),
                 owner_pid,
                 owner_type,
                 sig,
+                container_id: owner.target.container_id,
+                target_id: owner.target.target_id,
+                target_generation: owner.target.target_generation,
+                thread_id: owner.target.thread_id,
+                thread_generation: owner.target.thread_generation,
             },
         );
-    }
-
-    /// Resolve the host signal target for an fasync (signal-driven I/O) owner from
-    /// the ns→host translation of its owner pid/pgid. Returns `None` — meaning DROP
-    /// the SIGIO, deliver nothing — when the owner's ns id has no host mapping
-    /// (`host_target == None`), matching the `kill(2)` path's ESRCH intent: a
-    /// translation MISS must NOT fall back to the raw ns value reinterpreted as a
-    /// host pid, which would signal an unrelated process. The `Some` target feeds
-    /// `bootstrap_signal_send_as`: `F_OWNER_PGRP` is a HOST process group,
-    /// `F_OWNER_TID` a HOST thread, anything else the owner's HOST pid.
-    fn fasync_signal_target(
-        owner_type: i32,
-        host_target: Option<u32>,
-    ) -> Option<crate::dispatch::signal::SignalTarget> {
-        use crate::dispatch::signal::SignalTarget;
-        let host = host_target?;
-        Some(match owner_type {
-            LINUX_F_OWNER_PGRP => SignalTarget::HostProcessGroup(HostPid(host)),
-            LINUX_F_OWNER_TID => SignalTarget::HostThread(HostPid(host)),
-            _ => SignalTarget::HostProcess(HostPid(host)),
-        })
-    }
-
-    fn queue_self_sigpoll(
-        &self,
-        context: &crate::kernel::KernelContext,
-        signum: i32,
-        fd: i32,
-        target_tid: Option<crate::thread::ThreadId>,
-    ) {
-        let info = carrick_abi::LinuxSiginfo::sigpoll(signum, carrick_abi::LINUX_POLL_MSG, 0, fd);
-        let Some(tid) = target_tid.filter(|tid| *tid != crate::thread::ThreadId::NONE) else {
-            self.mark_process_signal_pending_with_info(context, signum, Some(info));
-            return;
-        };
-        self.record_pending_siginfo(context, tid, signum, info);
-        if !self.signal_blocked(context, tid, signum)
-            && let Some(action) = self.registered_signal_handler(context, signum)
-        {
-            self.record_pending_signal_action(context, tid, signum, action);
-        }
-        self.mark_signal_pending(context, tid, signum);
     }
 
     fn send_async_owner_signal(
         &self,
         context: &crate::kernel::KernelContext,
-        owner_type: i32,
-        owner_pid: i32,
+        owner: crate::kernel::objects::CapturedAsyncIoOwner,
         sig: i32,
         fd: i32,
-        target_tid: Option<crate::thread::ThreadId>,
     ) {
-        if owner_pid == 0 {
+        if owner.visible.owner_pid == 0 {
             return;
         }
         let signum = if sig == 0 { LINUX_SIGIO } else { sig };
-        if owner_type != LINUX_F_OWNER_PGRP
-            && u32::try_from(owner_pid).ok() == Some(crate::namespace::pid::self_ns_pid())
-        {
-            self.queue_self_sigpoll(context, signum, fd, target_tid);
-            return;
-        }
-        let ns = owner_pid as u32;
-        let host_target = match owner_type {
-            LINUX_F_OWNER_PGRP => crate::namespace::pid::ns_to_host_pgid(ns),
-            _ => crate::namespace::pid::ns_to_host_or_self(ns),
-        };
-        let Some(target) = Self::fasync_signal_target(owner_type, host_target) else {
+        let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(signum) else {
             return;
         };
-        if matches!(target, crate::dispatch::signal::SignalTarget::HostProcess(pid) if pid.0 == std::process::id())
-            || matches!(target, crate::dispatch::signal::SignalTarget::HostThread(pid) if pid.0 == std::process::id())
-        {
-            self.queue_self_sigpoll(context, signum, fd, target_tid);
-            return;
-        }
-        // Kernel-internal SIGIO delivery is not gated by the writer's euid.
-        let _ = crate::dispatch::signal::bootstrap_signal_send_as(target, signum as u64, None);
+        let info = carrick_abi::LinuxSiginfo::sigpoll(signum, carrick_abi::LINUX_POLL_MSG, 0, fd);
+        // This is a kernel-owned readiness notification, not a guest kill(2):
+        // route it through the exact task/thread/group generation captured by
+        // F_SETOWN. The event-producing context may belong to another process
+        // or container and is deliberately not used as target authority.
+        let _ = owner.post_kernel_signal(context.kernel(), signal, Some(info));
     }
 
     /// Deliver the FASYNC (signal-driven I/O) signal after a guest write to a
     /// host pipe/socket made it readable. Looks up the pipe inode in the
-    /// fork-coherent registry; if armed, sends the owner's `F_SETSIG` signal
-    /// (default `SIGIO`) through the same cross-process kill path as a guest
-    /// `kill(2)`. This is the readiness EDGE the writer can observe: a write that
+    /// carrier-coherent registry; if armed, posts the owner's `F_SETSIG` signal
+    /// (default `SIGIO`) through Carrick's exact-generation signal authority.
+    /// This is the readiness EDGE the writer can observe: a write that
     /// added bytes transitions the reader's fd to readable, which is exactly when
     /// Linux raises the owner's I/O signal. (`written <= 0` — a short/blocked
     /// write that added nothing — is not an edge and delivers nothing.)
@@ -5248,21 +5216,26 @@ impl SyscallDispatcher {
         let Some(owner) = carrick_signal_core::fasync::lookup(pipe_id) else {
             return;
         };
-        // owner_pid is the F_SETOWN value as the guest set it (a PID-namespace id
-        // from the owner's getpid()); send_async_owner_signal translates it to a
-        // HOST-domain target exactly as the guest kill(2) path does.
-        self.send_async_owner_signal(
-            context,
-            owner.owner_type,
-            owner.owner_pid,
-            owner.sig,
-            fd,
-            None,
-        );
+        let sig = owner.sig;
+        let owner = crate::kernel::objects::CapturedAsyncIoOwner {
+            visible: crate::kernel::objects::AsyncIoOwner {
+                owner_pid: owner.owner_pid,
+                owner_type: owner.owner_type,
+            },
+            target: crate::kernel::objects::AsyncIoTarget {
+                container_id: owner.container_id,
+                target_id: owner.target_id,
+                target_generation: owner.target_generation,
+                thread_id: owner.thread_id,
+                thread_generation: owner.thread_generation,
+            },
+        };
+        self.send_async_owner_signal(context, owner, sig, fd);
     }
 
     fn dnotify_register(
         &self,
+        context: &crate::kernel::KernelContext,
         fd: i32,
         mask: LinuxDnotifyMask,
         tid: crate::thread::ThreadId,
@@ -5284,13 +5257,16 @@ impl SyscallDispatcher {
             return Ok(());
         }
         if open_file.description.common().owner().owner_pid == 0 {
-            open_file
-                .description
-                .common()
-                .set_owner(crate::kernel::objects::AsyncIoOwner {
-                    owner_type: LINUX_F_OWNER_PID,
-                    owner_pid: crate::namespace::pid::self_ns_pid() as i32,
-                });
+            let internal = u32::try_from(context.task().key().id.raw())
+                .map_err(|_| crate::linux_abi::LINUX_EOVERFLOW)?;
+            let visible = crate::namespace::pid::ns_self_pid_for(context, internal);
+            open_file.description.common().set_captured_owner(
+                crate::kernel::objects::CapturedAsyncIoOwner::capture(
+                    context,
+                    LINUX_F_OWNER_PID,
+                    i32::try_from(visible).map_err(|_| crate::linux_abi::LINUX_EOVERFLOW)?,
+                ),
+            );
         }
         let effective_mask = mask - LinuxDnotifyMask::MULTISHOT;
         if let Some(entry) = registry.iter_mut().find(|entry| entry.fd == fd) {
@@ -5417,7 +5393,7 @@ impl SyscallDispatcher {
         context: &crate::kernel::KernelContext,
         paths: &[String],
         mask: LinuxDnotifyMask,
-        target_tid: Option<crate::thread::ThreadId>,
+        _target_tid: Option<crate::thread::ThreadId>,
     ) {
         let registrations: Vec<_> = self
             .fs
@@ -5439,17 +5415,9 @@ impl SyscallDispatcher {
             }
             if let Some(open_file) = self.open_file(entry.fd) {
                 let common = open_file.description.common();
-                let owner = common.owner();
-                let (owner_type, owner_pid, sig) =
-                    (owner.owner_type, owner.owner_pid, common.async_sig());
-                self.send_async_owner_signal(
-                    context,
-                    owner_type,
-                    owner_pid,
-                    sig,
-                    entry.fd,
-                    target_tid.or(Some(entry.tid)),
-                );
+                let owner = common.captured_owner();
+                let sig = common.async_sig();
+                self.send_async_owner_signal(context, owner, sig, entry.fd);
             }
         }
     }
@@ -6541,6 +6509,7 @@ impl SyscallDispatcher {
 
     fn openat2_checked_path<'a>(
         &self,
+        context: &crate::kernel::KernelContext,
         dirfd: u64,
         path: &'a str,
         resolve: u64,
@@ -6579,7 +6548,7 @@ impl SyscallDispatcher {
         }
 
         if resolve & (RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS) != 0
-            && self.openat2_touches_magic_link(&anchor, effective_path.as_ref())
+            && self.openat2_touches_magic_link(context, &anchor, effective_path.as_ref())
         {
             return Err(crate::linux_abi::LINUX_ELOOP);
         }
@@ -6667,8 +6636,14 @@ impl SyscallDispatcher {
         false
     }
 
-    fn openat2_touches_magic_link(&self, anchor: &str, path: &str) -> bool {
+    fn openat2_touches_magic_link(
+        &self,
+        context: &crate::kernel::KernelContext,
+        anchor: &str,
+        path: &str,
+    ) -> bool {
         let abs = self.openat2_absolute_walk_path(anchor, path);
+        let visible_self = proc_visible_self(context);
         let mut prefix = String::new();
         for comp in abs.split('/').filter(|c| !c.is_empty() && *c != ".") {
             if comp == ".." {
@@ -6681,8 +6656,8 @@ impl SyscallDispatcher {
             }
             prefix.push('/');
             prefix.push_str(comp);
-            if proc_self_fd_number(&prefix).is_some()
-                || proc_self_magic_link(&prefix).is_some()
+            if proc_self_fd_number(&prefix, visible_self).is_some()
+                || proc_self_magic_link(&prefix, visible_self).is_some()
                 || proc_ns_link(&prefix).is_some()
             {
                 return true;
@@ -8007,7 +7982,7 @@ impl SyscallDispatcher {
                     let Some(mask) = LinuxDnotifyMask::from_bits(arg) else {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     };
-                    if let Err(errno) = this.dnotify_register(fd.0, mask, cx.tid()) {
+                    if let Err(errno) = this.dnotify_register(cx.kernel, fd.0, mask, cx.tid()) {
                         return Ok(DispatchOutcome::errno(errno));
                     }
                     DispatchOutcome::Returned { value: 0 }
@@ -8414,10 +8389,9 @@ impl SyscallDispatcher {
                 }
                 // Async-I/O owner + signal (F_SETOWN/F_GETOWN, F_SETOWN_EX/
                 // F_GETOWN_EX, F_SETSIG/F_GETSIG). The owner (SIGIO/SIGURG target)
-                // and signal are recorded on the open-file description (shared
-                // across dup), giving the exact round-trip LTP fcntl31/32 read
-                // back. Actual SIGIO delivery on fd readiness is a tracked
-                // follow-up (carrick has no async-I/O readiness signal path yet).
+                // and exact kernel target are recorded on the open-file
+                // description (shared across dup), while the original visible
+                // tuple remains the exact F_GETOWN/F_GETOWN_EX round trip.
                 LINUX_F_SETOWN => {
                     let Some(open_file) = this.open_file(fd.0) else {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
@@ -8430,13 +8404,13 @@ impl SyscallDispatcher {
                     } else {
                         (LINUX_F_OWNER_PID, a)
                     };
-                    open_file
-                        .description
-                        .common()
-                        .set_owner(crate::kernel::objects::AsyncIoOwner {
+                    open_file.description.common().set_captured_owner(
+                        crate::kernel::objects::CapturedAsyncIoOwner::capture(
+                            cx.kernel,
                             owner_type,
                             owner_pid,
-                        });
+                        ),
+                    );
                     // Refresh the FASYNC registry if O_ASYNC is already armed on
                     // this fd (the owner can be set after O_ASYNC — LTP fcntl31).
                     this.sync_fasync_registration(fd.0);
@@ -8449,7 +8423,7 @@ impl SyscallDispatcher {
                     let owner = open_file.description.common().owner();
                     // A process-group owner reads back as a negative id.
                     let val = if owner.owner_type == LINUX_F_OWNER_PGRP {
-                        -owner.owner_pid
+                        owner.owner_pid.wrapping_neg()
                     } else {
                         owner.owner_pid
                     };
@@ -8466,13 +8440,13 @@ impl SyscallDispatcher {
                     {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
-                    open_file
-                        .description
-                        .common()
-                        .set_owner(crate::kernel::objects::AsyncIoOwner {
-                            owner_type: owner.owner_type,
-                            owner_pid: owner.owner_pid,
-                        });
+                    open_file.description.common().set_captured_owner(
+                        crate::kernel::objects::CapturedAsyncIoOwner::capture(
+                            cx.kernel,
+                            owner.owner_type,
+                            owner.owner_pid,
+                        ),
+                    );
                     this.sync_fasync_registration(fd.0);
                     DispatchOutcome::Returned { value: 0 }
                 }
@@ -8728,7 +8702,15 @@ impl SyscallDispatcher {
                     }
                     LINUX_TIOCGPGRP => {
                         match cx.kernel.kernel().tty_foreground_process_group(cx.kernel) {
-                            Ok(group) => write_packed(&mut *cx.memory, arg, &group.raw().to_le_bytes()),
+                            Ok(group) => match crate::namespace::pid::process_group_to_ns_for(
+                                cx.kernel,
+                                group,
+                            )
+                                .and_then(|group| i32::try_from(group).ok())
+                            {
+                                Some(group) => write_packed(&mut *cx.memory, arg, &group.to_le_bytes()),
+                                None => DispatchOutcome::errno(LINUX_ESRCH),
+                            },
                             Err(_) => DispatchOutcome::errno(LINUX_ENOTTY),
                         }
                     }
@@ -8740,8 +8722,9 @@ impl SyscallDispatcher {
                                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                             }
                         }
-                        let Ok(group) = crate::kernel::ProcessGroupId::from_abi_positive(i32::from_le_bytes(buf)) else {
-                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        let group = match resolve_tiocspgrp(cx.kernel, i32::from_le_bytes(buf)) {
+                            Ok(group) => group,
+                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                         };
                         match cx.kernel.kernel().tty_set_foreground_process_group(cx.kernel, group) {
                             Ok(()) => DispatchOutcome::Returned { value: 0 },
@@ -8759,9 +8742,15 @@ impl SyscallDispatcher {
                     },
                     LINUX_TIOCGSID => {
                         match cx.kernel.kernel().tty_session(cx.kernel) {
-                            Ok(session) => {
-                                write_packed(&mut *cx.memory, arg, &session.raw().to_le_bytes())
-                            }
+                            Ok(session) => match crate::namespace::pid::session_to_ns_for(
+                                cx.kernel,
+                                session,
+                            )
+                                .and_then(|session| i32::try_from(session).ok())
+                            {
+                                Some(session) => write_packed(&mut *cx.memory, arg, &session.to_le_bytes()),
+                                None => DispatchOutcome::errno(LINUX_ESRCH),
+                            },
                             Err(_) => DispatchOutcome::errno(LINUX_ENOTTY),
                         }
                     }
@@ -9087,7 +9076,15 @@ impl SyscallDispatcher {
                 LINUX_TIOCGPGRP => match this.tty_ioctl_fd_kind(fd.0) {
                     Ok(TtyFdKind::Stdio) => {
                         match cx.kernel.kernel().tty_foreground_process_group(cx.kernel) {
-                            Ok(group) => write_packed(&mut *cx.memory, arg, &group.raw().to_le_bytes()),
+                            Ok(group) => match crate::namespace::pid::process_group_to_ns_for(
+                                cx.kernel,
+                                group,
+                            )
+                                .and_then(|group| i32::try_from(group).ok())
+                            {
+                                Some(group) => write_packed(&mut *cx.memory, arg, &group.to_le_bytes()),
+                                None => DispatchOutcome::errno(LINUX_ESRCH),
+                            },
                             Err(_) => DispatchOutcome::errno(LINUX_ENOTTY),
                         }
                     }
@@ -9103,8 +9100,9 @@ impl SyscallDispatcher {
                                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                             }
                         }
-                        let Ok(group) = crate::kernel::ProcessGroupId::from_abi_positive(i32::from_le_bytes(buf)) else {
-                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        let group = match resolve_tiocspgrp(cx.kernel, i32::from_le_bytes(buf)) {
+                            Ok(group) => group,
+                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                         };
                         match cx.kernel.kernel().tty_set_foreground_process_group(cx.kernel, group) {
                             Ok(()) => DispatchOutcome::Returned { value: 0 },
@@ -9207,7 +9205,16 @@ impl SyscallDispatcher {
                                 i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
                             if ifindex <= 0 {
                                 DispatchOutcome::errno(LINUX_ENODEV)
-                            } else if let Some(name) = linux_if_indextoname(ifindex) {
+                            } else if let Some(name) = cx
+                                .kernel
+                                .task()
+                                .net_ns()
+                                .view()
+                                .links
+                                .iter()
+                                .find(|link| link.index == ifindex as u32)
+                                .map(|link| link.name.clone())
+                            {
                                 let mut ifreq_name = [0u8; LINUX_IFNAMSIZ];
                                 let len = name.len().min(ifreq_name.len().saturating_sub(1));
                                 ifreq_name[..len].copy_from_slice(&name.as_bytes()[..len]);
@@ -9231,7 +9238,16 @@ impl SyscallDispatcher {
                                 DispatchOutcome::errno(LINUX_ENODEV)
                             } else {
                                 let name = String::from_utf8_lossy(&bytes[..end]);
-                                if let Some(ifindex) = linux_if_nametoindex(&name) {
+                                if let Some(ifindex) = cx
+                                    .kernel
+                                    .task()
+                                    .net_ns()
+                                    .view()
+                                    .links
+                                    .iter()
+                                    .find(|link| link.name == name)
+                                    .and_then(|link| i32::try_from(link.index).ok())
+                                {
                                     write_packed(
                                         &mut *cx.memory,
                                         arg + LINUX_IFNAMSIZ as u64,
@@ -9281,7 +9297,9 @@ impl SyscallDispatcher {
                         };
                         let ifc_len = conf.ifc_len.max(0) as usize;
                         let ifc_buf = conf.ifc_buf;
-                        let ifaces = inet4_interfaces_from_model(&this.network.model);
+                        let net_ns = cx.kernel.task().net_ns();
+                        let network = net_ns.view();
+                        let ifaces = inet4_interfaces_from_model(&network);
                         // Linux convention: a NULL ifc_buf is a size query that
                         // reports the bytes required without writing entries.
                         let cap = if ifc_buf == 0 {
@@ -9329,18 +9347,19 @@ impl SyscallDispatcher {
                             .position(|b| *b == 0)
                             .unwrap_or(name_bytes.len());
                         let name = String::from_utf8_lossy(&name_bytes[..end]).into_owned();
-                        let ifaces = inet4_interfaces_from_model(&this.network.model);
+                        let net_ns = cx.kernel.task().net_ns();
+                        let network = net_ns.view();
+                        let ifaces = inet4_interfaces_from_model(&network);
                         let Some(iface) = ifaces.iter().find(|i| i.name == name) else {
                             return Ok(DispatchOutcome::errno(LINUX_ENODEV));
                         };
                         match ioctl_request {
                             LINUX_SIOCGIFFLAGS => {
                                 // ifr_flags is a `short` at offset IFNAMSIZ.
-                                let flags = host_iff_to_linux(iface.flags_host);
                                 write_packed(
                                     &mut *cx.memory,
                                     arg + LINUX_IFNAMSIZ as u64,
-                                    &flags.to_le_bytes(),
+                                    &iface.flags_linux.to_le_bytes(),
                                 )
                             }
                             LINUX_SIOCGIFADDR | LINUX_SIOCGIFNETMASK | LINUX_SIOCGIFBRDADDR => {
@@ -9360,7 +9379,7 @@ impl SyscallDispatcher {
                             _ => write_packed(
                                 &mut *cx.memory,
                                 arg + LINUX_IFNAMSIZ as u64,
-                                &1500i32.to_le_bytes(),
+                                &iface.mtu.to_le_bytes(),
                             ),
                         }
                     }
@@ -9382,7 +9401,15 @@ impl SyscallDispatcher {
                 LINUX_TIOCGSID => match this.tty_ioctl_fd_kind(fd.0) {
                     Ok(TtyFdKind::Stdio) => {
                         match cx.kernel.kernel().tty_session(cx.kernel) {
-                            Ok(session) => write_packed(&mut *cx.memory, arg, &session.raw().to_le_bytes()),
+                            Ok(session) => match crate::namespace::pid::session_to_ns_for(
+                                cx.kernel,
+                                session,
+                            )
+                                .and_then(|session| i32::try_from(session).ok())
+                            {
+                                Some(session) => write_packed(&mut *cx.memory, arg, &session.to_le_bytes()),
+                                None => DispatchOutcome::errno(LINUX_ESRCH),
+                            },
                             Err(_) => DispatchOutcome::errno(LINUX_ENOTTY),
                         }
                     }
@@ -9831,7 +9858,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let path = read_guest_c_string(&*cx.memory, arg1)?;
-            let path = match this.openat2_checked_path(arg0, &path, resolve) {
+            let path = match this.openat2_checked_path(cx.kernel, arg0, &path, resolve) {
                 Ok(path) => path,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
@@ -13791,16 +13818,19 @@ impl SyscallDispatcher {
                                     pid,
                                     value,
                                 }) => {
-                                    let target = pid.unwrap_or_else(|| {
-                                        cx.kernel.task().key().id.raw() as u32
-                                    });
+                                    let target = match pid {
+                                        Some(pid) => crate::namespace::pid::ns_to_kernel_for(
+                                            cx.kernel, pid,
+                                        ),
+                                        None => u32::try_from(cx.kernel.task().key().id.raw()).ok(),
+                                    };
                                     match this.hvpatch_process() {
                                         Some(process) => {
-                                            if process
+                                            if target.is_some_and(|target| process
                                                 .kernel_graph()
                                                 .registry()
                                                 .set_oom_score_adj(target, value)
-                                            {
+                                            ) {
                                                 DispatchOutcome::Returned { value: written }
                                             } else {
                                                 // The process exited between
@@ -14372,9 +14402,10 @@ impl SyscallDispatcher {
                     )
                 })
                 .flatten();
+            let visible_self = proc_visible_self(cx.kernel);
             let target = if let Some(t) = peer_ns_target {
                 t
-            } else if let Some(kind) = proc_self_magic_link(&path) {
+            } else if let Some(kind) = proc_self_magic_link(&path, visible_self) {
                 match kind {
                     // /proc/self/exe is the REAL running binary. If the entrypoint
                     // was a symlink (e.g. /usr/bin/readlink -> /bin/busybox), resolve
@@ -14394,7 +14425,7 @@ impl SyscallDispatcher {
                 // `carrick run -t` controlling pty. This is what glibc `ttyname(3)`
                 // reads, so `tty(1)` and tty-name lookups resolve.
                 t
-            } else if let Some(t) = proc_self_fd_number(&path).and_then(|n| {
+            } else if let Some(t) = proc_self_fd_number(&path, visible_self).and_then(|n| {
                 this.lookup_recorded_fd_open_path(n).or_else(|| {
                     this.open_file(n)
                         .and_then(|f| f.description.read().and_then(|g| g.open_path().map(str::to_owned)))
@@ -14403,7 +14434,7 @@ impl SyscallDispatcher {
                 // /proc/self/fd/N → the path fd N was opened at. Rosetta readlinks
                 // its main-binary fd this way to recover the binary's path.
                 t
-            } else if let Some(t) = proc_self_fd_number(&path).and_then(|n| {
+            } else if let Some(t) = proc_self_fd_number(&path, visible_self).and_then(|n| {
                 this.open_file(n).and_then(|f| {
                     if f.description
                         .concrete_backing::<crate::dispatch::ioring::IoUringBacking>()
@@ -14969,7 +15000,7 @@ impl SyscallDispatcher {
             let anon_fd_candidate = if old.is_empty() {
                 Some(olddirfd as i32)
             } else if flags & LINUX_AT_SYMLINK_FOLLOW != 0 {
-                proc_self_fd_number(&old)
+                proc_self_fd_number(&old, proc_visible_self(cx.kernel))
             } else {
                 None
             };

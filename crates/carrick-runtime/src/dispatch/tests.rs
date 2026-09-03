@@ -3916,7 +3916,7 @@ mod hvpatch_in_process_fork_tests {
     }
 
     #[test]
-    fn dispatcher_fork_clone_splits_process_state_without_duping_descriptions() {
+    pub(super) fn dispatcher_fork_clone_splits_process_state_without_duping_descriptions() {
         let child_tid = crate::thread::ThreadId::synthetic_for_tests(4101);
         let parent = SyscallDispatcher::new();
         let parent_context = parent.capture_one_task_context().unwrap();
@@ -4540,6 +4540,477 @@ mod hvpatch_in_process_fork_tests {
             "child non-final close deleted the parent's host epoll registration"
         );
         assert_ne!(pollfd.revents & libc::POLLIN, 0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ContinueInterceptor;
+
+    impl crate::observe::SyscallInterceptor for ContinueInterceptor {
+        fn intercept(
+            &self,
+            _process: &crate::observe::ProcessInfo<'_>,
+            _call: &crate::observe::InterceptedSyscall<'_>,
+        ) -> crate::observe::InterceptAction {
+            crate::observe::InterceptAction::Continue
+        }
+    }
+
+    struct RecordingInterceptor {
+        position: usize,
+        calls: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl crate::observe::SyscallInterceptor for RecordingInterceptor {
+        fn intercept(
+            &self,
+            _process: &crate::observe::ProcessInfo<'_>,
+            _call: &crate::observe::InterceptedSyscall<'_>,
+        ) -> crate::observe::InterceptAction {
+            self.calls.lock().push(self.position);
+            crate::observe::InterceptAction::Continue
+        }
+    }
+
+    #[test]
+    fn interceptor_disables_identity_fast_path() {
+        let mut dispatcher = SyscallDispatcher::new();
+        assert!(dispatcher.identity_fast_path_enabled());
+        assert!(dispatcher.identity_fast_path_word().is_some());
+        assert!(!dispatcher.requires_syscall_traps());
+
+        dispatcher.install_interceptor(Arc::new(ContinueInterceptor));
+
+        assert!(!dispatcher.identity_fast_path_enabled());
+        assert!(dispatcher.identity_fast_path_word().is_none());
+        assert!(dispatcher.requires_syscall_traps());
+    }
+
+    #[test]
+    fn interceptor_chain_arc_is_inherited_by_fork() {
+        let mut parent = SyscallDispatcher::new();
+        parent.install_interceptor(Arc::new(ContinueInterceptor));
+        let parent_chain = Arc::clone(parent.interceptors().expect("installed chain"));
+        let child = parent.fork_clone_in_process(
+            crate::thread::ThreadId::synthetic_for_tests(7000),
+            crate::thread::ThreadId::synthetic_for_tests(7001),
+            7000,
+            7001,
+        );
+
+        assert!(Arc::ptr_eq(
+            &parent_chain,
+            child.interceptors().expect("inherited chain")
+        ));
+        assert!(child.requires_syscall_traps());
+    }
+
+    #[test]
+    fn interceptor_registration_preserves_order() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut dispatcher = SyscallDispatcher::new();
+        for position in [1, 2] {
+            dispatcher.install_interceptor(Arc::new(RecordingInterceptor {
+                position,
+                calls: Arc::clone(&calls),
+            }));
+        }
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let request = SyscallRequest::new(172, SyscallArgs::new([0; 6]));
+
+        dispatcher
+            .interceptors()
+            .expect("installed chain")
+            .apply(&crate::observe::ProcessInfo::new(&context), &request)
+            .expect("interceptor chain");
+
+        assert_eq!(*calls.lock(), vec![1, 2]);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum InterceptionEntryPoint {
+        Single,
+        Threaded,
+    }
+
+    #[derive(Clone, Copy)]
+    struct FixedInterceptor(crate::observe::InterceptAction);
+
+    impl crate::observe::SyscallInterceptor for FixedInterceptor {
+        fn intercept(
+            &self,
+            _process: &crate::observe::ProcessInfo<'_>,
+            _call: &crate::observe::InterceptedSyscall<'_>,
+        ) -> crate::observe::InterceptAction {
+            self.0
+        }
+    }
+
+    #[derive(Default)]
+    struct EffectiveArgsObserver {
+        args: Mutex<Vec<SyscallArgs>>,
+        action: Mutex<Option<crate::observe::SyscallAction>>,
+        returns: Mutex<Vec<(SyscallArgs, SyscallArgs, crate::observe::SyscallOutcome)>>,
+    }
+
+    impl EffectiveArgsObserver {
+        fn with_action(action: crate::observe::SyscallAction) -> Self {
+            Self {
+                args: Mutex::new(Vec::new()),
+                action: Mutex::new(Some(action)),
+                returns: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl crate::observe::SyscallObserver for EffectiveArgsObserver {
+        fn on_syscall(
+            &self,
+            _process: &crate::observe::ProcessInfo<'_>,
+            call: &crate::observe::SyscallInfo<'_>,
+        ) -> crate::observe::SyscallAction {
+            self.args.lock().push(call.raw_args());
+            self.action
+                .lock()
+                .as_ref()
+                .copied()
+                .unwrap_or(crate::observe::SyscallAction::Allow)
+        }
+
+        fn on_syscall_return(
+            &self,
+            _process: &crate::observe::ProcessInfo<'_>,
+            call: &crate::observe::SyscallInfo<'_>,
+            outcome: &crate::observe::SyscallOutcome,
+        ) {
+            self.returns
+                .lock()
+                .push((call.original_args(), call.raw_args(), *outcome));
+        }
+    }
+
+    fn run_interception_entry(
+        entry: InterceptionEntryPoint,
+        dispatcher: &mut SyscallDispatcher,
+        request: SyscallRequest,
+        reporter: &CompatReporter,
+    ) -> DispatchOutcome {
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = LinearMemory::new(0x4000_0000, vec![0u8; 4096]);
+        match entry {
+            InterceptionEntryPoint::Single => dispatcher
+                .dispatch(&context, request, &mut memory, reporter)
+                .expect("single dispatch"),
+            InterceptionEntryPoint::Threaded => {
+                let tid = crate::thread::ThreadId::synthetic_for_tests(7100);
+                let registry = crate::thread::ThreadRegistry::new(tid);
+                dispatcher
+                    .dispatch_threaded_for_test(
+                        &context,
+                        request,
+                        &mut memory,
+                        reporter,
+                        tid,
+                        &registry,
+                        &crate::thread::FutexTable::new(),
+                    )
+                    .expect("threaded dispatch")
+            }
+        }
+    }
+
+    #[test]
+    fn interception_order_applies_to_both_dispatch_entry_points() {
+        const SYS_PERSONALITY: u64 = 92;
+        const DENIED_PERSONALITY: u64 = 0x80_0000;
+        const REWRITTEN_PERSONALITY: u64 = 1;
+
+        for entry in [
+            InterceptionEntryPoint::Single,
+            InterceptionEntryPoint::Threaded,
+        ] {
+            let mut dispatcher = SyscallDispatcher::new();
+            dispatcher.apply_seccomp_policy(carrick_spec::SeccompPolicy::ContainerDefault);
+            dispatcher.install_interceptor(Arc::new(FixedInterceptor(
+                crate::observe::InterceptAction::RewriteArgs(SyscallArgs::from([
+                    DENIED_PERSONALITY,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ])),
+            )));
+            assert_eq!(
+                run_interception_entry(
+                    entry,
+                    &mut dispatcher,
+                    SyscallRequest::new(SYS_PERSONALITY, SyscallArgs::from([0; 6])),
+                    &CompatReporter::default(),
+                ),
+                DispatchOutcome::Errno { errno: LINUX_EPERM },
+                "rewrite must precede launch policy for {entry:?}"
+            );
+
+            let mut dispatcher = SyscallDispatcher::new();
+            dispatcher.apply_seccomp_policy(carrick_spec::SeccompPolicy::ContainerDefault);
+            dispatcher.install_interceptor(Arc::new(FixedInterceptor(
+                crate::observe::InterceptAction::Return(7),
+            )));
+            assert_eq!(
+                run_interception_entry(
+                    entry,
+                    &mut dispatcher,
+                    SyscallRequest::new(
+                        SYS_PERSONALITY,
+                        SyscallArgs::from([DENIED_PERSONALITY, 0, 0, 0, 0, 0]),
+                    ),
+                    &CompatReporter::default(),
+                ),
+                DispatchOutcome::Errno { errno: LINUX_EPERM },
+                "launch policy must veto proposed success for {entry:?}"
+            );
+
+            let mut dispatcher = SyscallDispatcher::new();
+            dispatcher.install_interceptor(Arc::new(FixedInterceptor(
+                crate::observe::InterceptAction::Return(7),
+            )));
+            dispatcher
+                .seccomp
+                .install(vec![crate::seccomp::SockFilter {
+                    code: 0x06,
+                    jt: 0,
+                    jf: 0,
+                    k: crate::seccomp::SECCOMP_RET_ERRNO | LINUX_EACCES.get() as u32,
+                }])
+                .expect("test seccomp filter");
+            assert_eq!(
+                run_interception_entry(
+                    entry,
+                    &mut dispatcher,
+                    SyscallRequest::new(SYS_PERSONALITY, SyscallArgs::from([0; 6])),
+                    &CompatReporter::default(),
+                ),
+                DispatchOutcome::Errno {
+                    errno: LINUX_EACCES
+                },
+                "guest seccomp must veto proposed success for {entry:?}"
+            );
+
+            let observer = Arc::new(EffectiveArgsObserver::default());
+            let mut dispatcher = SyscallDispatcher::new();
+            dispatcher.install_interceptor(Arc::new(FixedInterceptor(
+                crate::observe::InterceptAction::RewriteArgs(SyscallArgs::from([
+                    REWRITTEN_PERSONALITY,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ])),
+            )));
+            dispatcher.install_observer(observer.clone());
+            assert_eq!(
+                run_interception_entry(
+                    entry,
+                    &mut dispatcher,
+                    SyscallRequest::new(SYS_PERSONALITY, SyscallArgs::from([0; 6])),
+                    &CompatReporter::default(),
+                ),
+                DispatchOutcome::Returned { value: 0 }
+            );
+            assert_eq!(
+                observer.args.lock().as_slice(),
+                &[SyscallArgs::from([REWRITTEN_PERSONALITY, 0, 0, 0, 0, 0])]
+            );
+            assert_eq!(dispatcher.proc.lock().personality, REWRITTEN_PERSONALITY);
+
+            let observer = Arc::new(EffectiveArgsObserver::with_action(
+                crate::observe::SyscallAction::Deny(LINUX_EACCES),
+            ));
+            let mut dispatcher = SyscallDispatcher::new();
+            dispatcher.install_interceptor(Arc::new(FixedInterceptor(
+                crate::observe::InterceptAction::Errno(LINUX_EPERM),
+            )));
+            dispatcher.install_observer(observer);
+            assert_eq!(
+                run_interception_entry(
+                    entry,
+                    &mut dispatcher,
+                    SyscallRequest::new(
+                        SYS_PERSONALITY,
+                        SyscallArgs::from([REWRITTEN_PERSONALITY, 0, 0, 0, 0, 0]),
+                    ),
+                    &CompatReporter::default(),
+                ),
+                DispatchOutcome::Errno {
+                    errno: LINUX_EACCES
+                }
+            );
+            assert_eq!(dispatcher.proc.lock().personality, 0);
+
+            let observer = Arc::new(EffectiveArgsObserver::with_action(
+                crate::observe::SyscallAction::Short(1),
+            ));
+            let reporter = CompatReporter::default();
+            let mut dispatcher = SyscallDispatcher::new();
+            dispatcher.install_interceptor(Arc::new(FixedInterceptor(
+                crate::observe::InterceptAction::Return(7),
+            )));
+            dispatcher.install_observer(observer);
+            assert_eq!(
+                run_interception_entry(
+                    entry,
+                    &mut dispatcher,
+                    SyscallRequest::new(
+                        SYS_PERSONALITY,
+                        SyscallArgs::from([REWRITTEN_PERSONALITY, 0, 9, 0, 0, 0]),
+                    ),
+                    &reporter,
+                ),
+                DispatchOutcome::Returned { value: 7 }
+            );
+            assert_eq!(dispatcher.proc.lock().personality, 0);
+            let report = reporter.snapshot();
+            assert_eq!(report.summary.syscall_invocations, 1);
+            assert_eq!(report.summary.syscall_returns_ok, 0);
+            assert_eq!(report.summary.syscall_returns_errno, 0);
+
+            let observer = Arc::new(EffectiveArgsObserver::with_action(
+                crate::observe::SyscallAction::Short(4),
+            ));
+            let mut dispatcher = SyscallDispatcher::new();
+            dispatcher.install_observer(observer.clone());
+            let eventfd = OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(OpenDescription::EventFd {
+                    state: Arc::new(EventFdState::new(1)),
+                    semaphore: false,
+                    base: OpenDescriptionBase::new(0),
+                })),
+                crate::linux_abi::LINUX_O_RDWR,
+                0,
+            );
+            let fd = dispatcher
+                .install_fd_at_or_above(3, eventfd)
+                .expect("install eventfd for short-read handler proof");
+            assert_eq!(
+                run_interception_entry(
+                    entry,
+                    &mut dispatcher,
+                    SyscallRequest::new(
+                        63,
+                        SyscallArgs::from([fd as u64, 0x4000_0000, 8, 0, 0, 0]),
+                    ),
+                    &CompatReporter::default(),
+                ),
+                DispatchOutcome::Errno {
+                    errno: LINUX_EINVAL
+                },
+                "eventfd read must receive the shortened four-byte count for {entry:?}"
+            );
+            assert_eq!(
+                observer.args.lock().as_slice(),
+                &[SyscallArgs::from([
+                    fd as u64,
+                    0x4000_0000,
+                    8,
+                    0,
+                    0,
+                    0
+                ])]
+            );
+        }
+    }
+
+    #[test]
+    fn interception_policy_kill_cannot_be_downgraded_by_observer() {
+        const SYS_PERSONALITY: u64 = 92;
+
+        for entry in [
+            InterceptionEntryPoint::Single,
+            InterceptionEntryPoint::Threaded,
+        ] {
+            let observer = Arc::new(EffectiveArgsObserver::with_action(
+                crate::observe::SyscallAction::Deny(LINUX_EACCES),
+            ));
+            let mut dispatcher = SyscallDispatcher::new();
+            dispatcher
+                .seccomp
+                .install(vec![crate::seccomp::SockFilter {
+                    code: 0x06,
+                    jt: 0,
+                    jf: 0,
+                    k: crate::seccomp::SECCOMP_RET_KILL_PROCESS,
+                }])
+                .expect("test seccomp filter");
+            dispatcher.install_observer(observer);
+
+            assert_eq!(
+                run_interception_entry(
+                    entry,
+                    &mut dispatcher,
+                    SyscallRequest::new(SYS_PERSONALITY, SyscallArgs::from([0; 6])),
+                    &CompatReporter::default(),
+                ),
+                DispatchOutcome::SignalDeath {
+                    signum: crate::linux_abi::LINUX_SIGSYS,
+                },
+                "an observer denial must not downgrade seccomp's kill for {entry:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn interception_order_completion_reports_actual_return_once() {
+        let observer = Arc::new(EffectiveArgsObserver::default());
+        let reporter = CompatReporter::default();
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.install_interceptor(Arc::new(FixedInterceptor(
+            crate::observe::InterceptAction::RewriteArgs(SyscallArgs::from([1, 2, 3, 4, 5, 6])),
+        )));
+        dispatcher.install_observer(observer.clone());
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let original_args = SyscallArgs::from([9, 8, 7, 6, 5, 4]);
+        let prepared = dispatcher
+            .prepare_syscall(&context, SyscallRequest::new(92, original_args), &reporter)
+            .expect("prepare syscall");
+        let PreparedDispatch::Invoke(syscall) = prepared else {
+            panic!("rewrite-only interception must invoke the real handler");
+        };
+        let mut token = Some(SyscallCompletionToken::new(
+            syscall,
+            context.retain_exact(),
+            dispatcher.observers().cloned(),
+        ));
+
+        assert_eq!(reporter.snapshot().summary.syscall_invocations, 1);
+        assert_eq!(reporter.snapshot().summary.syscall_returns_ok, 0);
+        token
+            .take()
+            .expect("installed completion token")
+            .publish_return(&reporter, 17);
+
+        assert!(token.is_none(), "terminal publication consumes the token");
+        let report = reporter.snapshot();
+        assert_eq!(report.summary.syscall_invocations, 1);
+        assert_eq!(report.summary.syscall_returns_ok, 1);
+        assert_eq!(report.summary.syscall_returns_errno, 0);
+        assert_eq!(
+            observer.returns.lock().as_slice(),
+            &[(
+                original_args,
+                SyscallArgs::from([1, 2, 3, 4, 5, 6]),
+                crate::observe::SyscallOutcome::returned(17)
+            )]
+        );
+    }
+
+#[test]
+fn dispatcher_fork_clone_splits_process_state_without_duping_descriptions() {
+        super::hvpatch_in_process_fork_tests::dispatcher_fork_clone_splits_process_state_without_duping_descriptions();
     }
 }
 

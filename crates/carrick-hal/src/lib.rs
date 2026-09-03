@@ -6,6 +6,8 @@
 //! traits (`EventMultiplexer`, `CrossProcessFutex`),
 //! errno translation, and shared types (`OsError`, `MemPerms`, `Reg`, `SysReg`).
 //! Modules are added by the following tasks.
+pub mod container;
+pub use container::ContainerId;
 pub mod aarch64;
 pub use aarch64::{
     AARCH64_HVC_EXCEPTION_CLASS, AARCH64_SVC_EXCEPTION_CLASS, ExecLevel, aarch64_exception_class,

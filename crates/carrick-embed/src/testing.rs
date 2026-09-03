@@ -7,8 +7,17 @@ use std::sync::Arc;
 
 use crate::{
     AuditObserver, ContainerBuilder, ContainerResult, EmbedError, ImageStore, PullPolicy,
-    SyscallObserver,
+    SyscallInterceptor, SyscallObserver,
 };
+
+/// Read-only lifecycle telemetry for Carrick's own signed topology tests.
+/// This is not part of the stable embedding API.
+#[cfg(feature = "test-support")]
+pub fn carrier_snapshot(
+    carrier: &crate::Carrier,
+) -> Result<carrick_runtime::CarrierSnapshot, EmbedError> {
+    carrier.snapshot()
+}
 
 /// One image, many commands: each [`Self::run`] builds a fresh
 /// [`ContainerBuilder`] with captured stdio, so tests read the guest's bytes
@@ -27,6 +36,7 @@ pub struct TestContainer {
     store: Option<ImageStore>,
     pull: Option<PullPolicy>,
     observers: Vec<Arc<dyn SyscallObserver>>,
+    interceptors: Vec<Arc<dyn SyscallInterceptor>>,
 }
 
 impl std::fmt::Debug for TestContainer {
@@ -42,6 +52,7 @@ impl std::fmt::Debug for TestContainer {
             .field("store", &self.store)
             .field("pull", &self.pull)
             .field("observers_count", &self.observers.len())
+            .field("interceptors_count", &self.interceptors.len())
             .finish()
     }
 }
@@ -61,6 +72,7 @@ impl TestContainer {
             store: None,
             pull: None,
             observers: Vec::new(),
+            interceptors: Vec::new(),
         }
     }
 
@@ -124,6 +136,11 @@ impl TestContainer {
         self
     }
 
+    pub fn interceptor(mut self, interceptor: Arc<dyn SyscallInterceptor>) -> Self {
+        self.interceptors.push(interceptor);
+        self
+    }
+
     /// The builder one `run` would execute (exposed so request-level tests
     /// can check the lowering without a guest).
     pub fn builder<I, S>(&self, argv: I) -> ContainerBuilder
@@ -168,6 +185,9 @@ impl TestContainer {
         }
         for obs in &self.observers {
             builder = builder.observer(Arc::clone(obs));
+        }
+        for interceptor in &self.interceptors {
+            builder = builder.interceptor(Arc::clone(interceptor));
         }
         builder
     }
@@ -262,6 +282,18 @@ mod tests {
     use super::*;
     use crate::CompatReport;
 
+    struct ContinueInterceptor;
+
+    impl crate::SyscallInterceptor for ContinueInterceptor {
+        fn intercept(
+            &self,
+            _process: &crate::ProcessInfo<'_>,
+            _call: &crate::InterceptedSyscall<'_>,
+        ) -> crate::InterceptAction {
+            crate::InterceptAction::Continue
+        }
+    }
+
     fn result(exit_code: i32, stdout: &str, stderr: &str) -> ContainerResult {
         ContainerResult {
             exit_code,
@@ -311,5 +343,18 @@ mod tests {
         assert_eq!(request.cap_add, ["SYS_TIME"]);
         assert_eq!(request.max_traps, 9);
         assert_eq!(request.stdio, crate::StdioMode::Captured);
+    }
+
+    #[test]
+    fn test_container_preserves_interceptor_registration_order() {
+        let first: Arc<dyn crate::SyscallInterceptor> = Arc::new(ContinueInterceptor);
+        let second: Arc<dyn crate::SyscallInterceptor> = Arc::new(ContinueInterceptor);
+        let container = TestContainer::new("ubuntu:24.04")
+            .interceptor(Arc::clone(&first))
+            .interceptor(Arc::clone(&second));
+
+        assert_eq!(container.interceptors.len(), 2);
+        assert!(Arc::ptr_eq(&container.interceptors[0], &first));
+        assert!(Arc::ptr_eq(&container.interceptors[1], &second));
     }
 }

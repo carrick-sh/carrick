@@ -1,12 +1,11 @@
-name: CI
+name: Hosted CI
 
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
-  # Nightly: catches @stable toolchain drift and drives the dormant
-  # self-hosted guest-execution lane (kvm-smoke) once a runner is registered.
+  # Nightly catches moving @stable toolchain and hosted runner-image drift.
   schedule:
     - cron: "0 7 * * *"
 
@@ -20,11 +19,11 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Compile + lint + host tests. carrick-runtime links Hypervisor.framework, so
-  # this must run on macOS/arm64 — but these steps never launch a guest vCPU, so
-  # a GitHub-hosted runner (no hypervisor entitlement / no nested virt) is fine.
+  # Source, ABI, kernel-graph, and host-semantic validation on public hosted
+  # Apple Silicon. These steps never launch a guest vCPU; they do not prove
+  # HVPatch runtime or Linux behavioral conformance.
   check:
-    name: fmt · clippy · build · unit tests
+    name: hosted macOS · source + host-only tests
     runs-on: macos-14 # Apple Silicon
     steps:
       - uses: actions/checkout@v4
@@ -77,8 +76,8 @@ jobs:
 
       # `just test` is `--lib` only; the HVF-dependent integration binaries
       # (trap_hvf, runtime_loop, interactive_tty, …) need an entitled vCPU and
-      # run in the self-hosted job below. The pure-logic suites run via
-      # `just test-integration`.
+      # run only in the trusted hardware workflow. The pure-logic suites run
+      # here via `just test-integration`.
       #
       # GitHub-hosted macOS runners default RLIMIT_NOFILE to 256, but carrick
       # relocates its internal fds above 16384 to stay clear of the guest fd
@@ -100,14 +99,10 @@ jobs:
           just test-integration
 
 
-  # NOTE: there is deliberately NO guest-executing job on a GITHUB-HOSTED
-  # runner. A hosted macOS runner has neither the Hypervisor.framework access
-  # HVPatch needs nor the LOCAL registries the suites pull from
-  # (localhost:5050/ltp, localhost:5005/go|node are populated by hand on a dev
-  # box), so such a job can only ever fail. The predecessor job was viable only
-  # because the retired 1:1 native backend needed no hypervisor; that backend is
-  # gone. Guest execution is gated by `hvf-conformance` below, dormant behind a
-  # self-hosted runner, and by `just ci` + `just conformance` locally.
+  # Hosted runners intentionally stop at source, host-semantic, and target
+  # closure evidence. Real guest execution lives in kernel-runtime.yml on
+  # trusted, capability-labeled hardware; a skipped or unsupported nested-virt
+  # attempt is never represented as a kernel pass here.
 
   # L1 — cross-compile our OWNED crates for aarch64-linux + assert the
   # platform-linux dependency closure links NO macOS hypervisor (carrick-vmm-hvf /
@@ -115,8 +110,8 @@ jobs:
   # fix. Cheap on a hosted Linux runner; the full CLI is NOT cross-compiled
   # here (ring/oci-client need a C cross toolchain) — that real Linux build
   # happens natively in the local nested-KVM VM (see `just build-linux`).
-  # L2 (real KVM exec via `just kvm-smoke`) is LOCAL-ONLY on the M3-nested HVF
-  # lane; a CI KVM lane is deferred to a follow-on spec.
+  # Real KVM execution is a separate trusted-hardware job; it is not inferred
+  # from this cross-check.
   cross-check-linux:
     name: aarch64-linux cross-check · no-hvf closure
     runs-on: ubuntu-latest
@@ -230,36 +225,6 @@ jobs:
       - name: Cross-check carrick-vmm-nvmm for x86_64-netbsd
         run: just check-netbsd
 
-  # R1 — the ONLY CI lane that actually EXECUTES a guest vCPU. Runs the
-  # freestanding hello-aarch64 ELF under carrick-vmm-kvm on real /dev/kvm
-  # (`just kvm-smoke`, no Docker) so a broken syscall translation, a shared
-  # carrick-x86 / carrick-aarch64 engine fault, or a reclaim deadlock surfaces
-  # in CI instead of waiting for a manual gate. Requires a self-hosted Linux
-  # runner WITH /dev/kvm whose arch matches the fixture (aarch64 for
-  # hello-aarch64; nested virt is NOT guaranteed on GitHub-hosted Ubuntu).
-  # DORMANT until a runner is registered AND the repo var
-  # CARRICK_SELF_HOSTED_KVM=true is set — mirroring the hvf-conformance pattern.
-  # Scheduled (nightly) / manual only, so PRs are not blocked on the fleet.
-  kvm-smoke:
-    name: KVM guest smoke · real /dev/kvm
-    if: ${{ vars.CARRICK_SELF_HOSTED_KVM == 'true' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
-    runs-on: [self-hosted, linux, kvm]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install just
-        uses: taiki-e/install-action@v2
-        with:
-          tool: just
-
-      - name: KVM smoke — run-elf hello-aarch64 on /dev/kvm
-        run: just kvm-smoke
-
   # Dependency license / bans / sources gate. Enforces the deny.toml permissive
   # allowlist so a copyleft/unknown-license transitive dependency fails CI rather
   # than slipping in silently. Cheap; runs on a hosted Linux runner, no hypervisor.
@@ -279,32 +244,3 @@ jobs:
 
       - name: cargo-deny (licenses · bans · sources)
         run: just deny
-
-  # Full HVF runtime + differential conformance vs Docker. Requires a self-hosted
-  # Apple-Silicon runner that (a) holds the com.apple.security.hypervisor
-  # entitlement and (b) has Docker available. GitHub-hosted macOS runners can do
-  # neither, so this job is DORMANT until a runner exists: set the repo variable
-  # CARRICK_SELF_HOSTED=true (and register a runner with the matching labels) to
-  # enable it. Defined now so the pipeline is ready the moment a runner lands.
-  hvf-conformance:
-    name: HVF runtime · conformance
-    if: ${{ vars.CARRICK_SELF_HOSTED == 'true' }}
-    runs-on: [self-hosted, macos, arm64]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build + codesign
-        run: ./scripts/build-signed.sh
-
-      - name: Full test suite (incl. HVF integration)
-        run: cargo test --workspace
-
-      # The public probe gate uses conformance-next in-process with committed
-      # Docker oracles, plus only its reviewed legacy exceptions.
-      - name: Conformance probes
-        run: just conformance-probes

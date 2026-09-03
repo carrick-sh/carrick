@@ -444,6 +444,12 @@ pub struct OpenContext<'a> {
     pub open_fds: Option<&'a [i32]>,
     /// The active Linux-visible network namespace model, for `/proc/net/*`.
     pub network: Option<&'a carrick_spec::NetworkNamespaceSpec>,
+    /// Exact task/container namespace snapshot. Internal because embedders
+    /// supply namespace state through `Container`, not VFS open contexts.
+    pub(crate) network_model: Option<&'a crate::network::model::LinuxNetworkModel>,
+    /// Exact container owner for legacy thread-registry fallback rendering.
+    /// HVPatch normally supplies a complete `threads` snapshot instead.
+    pub(crate) runtime_endpoint_container: Option<carrick_hal::ContainerId>,
     /// The serialized ELF auxv byte image, for `/proc/self/auxv`.
     pub auxv: Option<&'a [u8]>,
     pub address_space_regions: Option<&'a [ProcMapsEntry]>,

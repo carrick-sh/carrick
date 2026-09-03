@@ -226,6 +226,12 @@ fn shared_dispatcher_routes_sibling_thread_signals() {
         .unwrap()
         .into_context();
     let context = dispatcher.capture_one_task_context().unwrap();
+    // The root task is namespace init and therefore ignores default-lethal
+    // signals until it installs a handler. Make delivery observable here.
+    let signal = carrick_runtime::kernel::LinuxSignal::for_signal_number(10).unwrap();
+    let mut action = carrick_runtime::linux_abi::LinuxSigaction::empty();
+    action.sa_handler = 0x4000;
+    context.shared().sighand().install_action(signal, action);
 
     let routed = dispatcher
         .dispatch_threaded(
@@ -248,6 +254,10 @@ fn shared_dispatcher_routes_sibling_thread_signals() {
             signum: 10,
             kernel_target: Some(sibling_context.thread().key()),
         }
+    );
+    assert_eq!(
+        dispatcher.take_deliverable_pending(&sibling_context, target),
+        Some(10)
     );
 }
 

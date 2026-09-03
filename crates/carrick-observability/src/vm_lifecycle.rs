@@ -10,14 +10,16 @@ use std::io::{Read as _, Write as _};
 use std::num::NonZeroU64;
 use std::path::Path;
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 const MAX_RECORDED_EVENTS: usize = 64;
 const MAX_RECORDED_VIOLATIONS: usize = 64;
+#[doc(hidden)]
+pub const MAX_RECORDED_EVENTS_FOR_TEST: usize = MAX_RECORDED_EVENTS;
 pub const VM_LIFECYCLE_ARTIFACT_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -115,6 +117,10 @@ pub enum VmLifecycleViolation {
     EventCapacityExceeded,
     #[error("VM lifecycle violation capacity was exceeded")]
     ViolationCapacityExceeded,
+    #[error("VM lifecycle operation {operation:?} occurred outside an active carrier window")]
+    OutOfWindowEvent { operation: VmLifecycleOperation },
+    #[error("VM run terminal occurred outside an active carrier window")]
+    OutOfWindowTerminal,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -161,6 +167,14 @@ impl Default for VmLifecycleState {
 }
 
 impl VmLifecycleState {
+    fn with_cursors(next_serial: u64, next_sequence: u64) -> Self {
+        Self {
+            next_serial,
+            next_sequence,
+            ..Self::default()
+        }
+    }
+
     fn allocate_serial(&mut self) -> Option<VmSerial> {
         let serial = NonZeroU64::new(self.next_serial).map(VmSerial);
         self.next_serial = self.next_serial.checked_add(1).unwrap_or(0);
@@ -298,6 +312,10 @@ impl VmLifecycleState {
             terminal: self.terminal,
         }
     }
+
+    fn cursors(&self) -> (u64, u64) {
+        (self.next_serial, self.next_sequence)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -378,6 +396,20 @@ pub struct VmLifecycleLedger {
 }
 
 impl VmLifecycleLedger {
+    fn with_cursors_and_violations(
+        next_serial: u64,
+        next_sequence: u64,
+        violations: &[VmLifecycleViolation],
+    ) -> Self {
+        let mut state = VmLifecycleState::with_cursors(next_serial, next_sequence);
+        for violation in violations {
+            state.record_violation(violation.clone());
+        }
+        Self {
+            state: Mutex::new(state),
+        }
+    }
+
     pub fn record_raw(&self, operation: u32, admission: i32) {
         self.state
             .lock()
@@ -398,18 +430,62 @@ impl VmLifecycleLedger {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .snapshot()
     }
+
+    fn cursors(&self) -> (u64, u64) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .cursors()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum VmLifecycleWindowError {
+    #[error("VM lifecycle window is already active for carrier generation {generation}")]
+    AlreadyActive { generation: u64 },
+    #[error("VM lifecycle window for carrier generation {generation} is no longer active")]
+    NotActive { generation: u64 },
+}
+
+#[derive(Debug)]
+struct ActiveProcessWindow {
+    generation: u64,
+    ledger: Arc<VmLifecycleLedger>,
+}
+
+#[derive(Debug)]
+struct ProcessWindowState {
+    active: Option<ActiveProcessWindow>,
+    most_recent: Option<VmLifecycleSnapshot>,
+    recent_summaries: std::collections::VecDeque<(u64, usize, usize)>,
+    next_serial: u64,
+    next_sequence: u64,
+    out_of_window_violations: Vec<VmLifecycleViolation>,
+}
+
+impl Default for ProcessWindowState {
+    fn default() -> Self {
+        Self {
+            active: None,
+            most_recent: None,
+            recent_summaries: std::collections::VecDeque::with_capacity(8),
+            next_serial: 1,
+            next_sequence: 1,
+            out_of_window_violations: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
-struct ProcessLedgerSlot {
-    current: AtomicPtr<VmLifecycleLedger>,
+struct ProcessWindowSlot {
+    current: AtomicPtr<Mutex<ProcessWindowState>>,
 }
 
-impl ProcessLedgerSlot {
-    fn get(&self) -> &'static VmLifecycleLedger {
+impl ProcessWindowSlot {
+    fn get(&self) -> &'static Mutex<ProcessWindowState> {
         let mut current = self.current.load(Ordering::Acquire);
         if current.is_null() {
-            let candidate = Box::into_raw(Box::new(VmLifecycleLedger::default()));
+            let candidate = Box::into_raw(Box::new(Mutex::new(ProcessWindowState::default())));
             match self.current.compare_exchange(
                 ptr::null_mut(),
                 candidate,
@@ -418,53 +494,267 @@ impl ProcessLedgerSlot {
             ) {
                 Ok(_) => current = candidate,
                 Err(installed) => {
-                    // SAFETY: this candidate was never published and remains
-                    // uniquely owned by this initialization attempt.
+                    // SAFETY: the losing candidate was never published.
                     drop(unsafe { Box::from_raw(candidate) });
                     current = installed;
                 }
             }
         }
-        // SAFETY: installed ledgers are intentionally process-lifetime objects.
-        // A fork child replaces (but never frees) the inherited pointer before
-        // it can publish new events, so outstanding references cannot dangle.
+        // SAFETY: installed process slots intentionally live until process
+        // exit; fork-child reset replaces and leaks the inherited allocation.
         unsafe { &*current }
     }
 
     fn reset_after_fork_child(&self) {
-        let replacement = Box::into_raw(Box::new(VmLifecycleLedger::default()));
-        // Do not lock or free the inherited ledger: another vanished host thread
-        // may have owned its mutex at fork. The child has one surviving thread,
-        // and leaking the inherited allocation in that new process is bounded.
+        let replacement = Box::into_raw(Box::new(Mutex::new(ProcessWindowState::default())));
         self.current.store(replacement, Ordering::Release);
     }
 }
 
-fn process_ledger_slot() -> &'static ProcessLedgerSlot {
-    static SLOT: ProcessLedgerSlot = ProcessLedgerSlot {
+fn process_window_slot() -> &'static ProcessWindowSlot {
+    static SLOT: ProcessWindowSlot = ProcessWindowSlot {
         current: AtomicPtr::new(ptr::null_mut()),
     };
     &SLOT
 }
 
-fn process_ledger() -> &'static VmLifecycleLedger {
-    process_ledger_slot().get()
+fn process_window_state() -> &'static Mutex<ProcessWindowState> {
+    process_window_slot().get()
+}
+
+static PROCESS_WINDOW_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+/// Exact, generation-scoped view of one carrier's VM lifecycle.
+///
+/// The process-wide probe shim routes into the active window. Finalization
+/// preserves globally monotonic raw identities while publishing a rebased v1
+/// one-VM snapshot through [`process_snapshot`].
+#[derive(Debug)]
+pub struct VmLifecycleWindow {
+    generation: u64,
+    process_epoch: u64,
+    ledger: Arc<VmLifecycleLedger>,
+    finalized: AtomicBool,
+}
+
+impl VmLifecycleWindow {
+    pub fn open(generation: u64) -> Result<Self, VmLifecycleWindowError> {
+        let mut windows = process_window_state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(active) = &windows.active {
+            return Err(VmLifecycleWindowError::AlreadyActive {
+                generation: active.generation,
+            });
+        }
+        let ledger = Arc::new(VmLifecycleLedger::with_cursors_and_violations(
+            windows.next_serial,
+            windows.next_sequence,
+            &windows.out_of_window_violations,
+        ));
+        windows.active = Some(ActiveProcessWindow {
+            generation,
+            ledger: Arc::clone(&ledger),
+        });
+        Ok(Self {
+            generation,
+            process_epoch: PROCESS_WINDOW_EPOCH.load(Ordering::Acquire),
+            ledger,
+            finalized: AtomicBool::new(false),
+        })
+    }
+
+    pub fn raw_snapshot(&self) -> VmLifecycleSnapshot {
+        if self.process_epoch != PROCESS_WINDOW_EPOCH.load(Ordering::Acquire) {
+            let mut snapshot = VmLifecycleState::default().snapshot();
+            snapshot
+                .violations
+                .push(VmLifecycleViolation::OutOfWindowTerminal);
+            return snapshot;
+        }
+        self.ledger.snapshot()
+    }
+
+    pub fn finalize(&self) -> Result<VmLifecycleSnapshot, VmLifecycleWindowError> {
+        if self.process_epoch != PROCESS_WINDOW_EPOCH.load(Ordering::Acquire) {
+            return Err(VmLifecycleWindowError::NotActive {
+                generation: self.generation,
+            });
+        }
+        if self.finalized.swap(true, Ordering::AcqRel) {
+            return Err(VmLifecycleWindowError::NotActive {
+                generation: self.generation,
+            });
+        }
+        let mut windows = process_window_state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(active) = windows.active.take() else {
+            return Err(VmLifecycleWindowError::NotActive {
+                generation: self.generation,
+            });
+        };
+        if active.generation != self.generation || !Arc::ptr_eq(&active.ledger, &self.ledger) {
+            windows.active = Some(active);
+            return Err(VmLifecycleWindowError::NotActive {
+                generation: self.generation,
+            });
+        }
+        let raw = self.ledger.snapshot();
+        let (next_serial, next_sequence) = self.ledger.cursors();
+        windows.next_serial = next_serial;
+        windows.next_sequence = next_sequence;
+        let completed = rebase_completed_window(&raw);
+        if windows.recent_summaries.len() == 8 {
+            let _ = windows.recent_summaries.pop_front();
+        }
+        windows.recent_summaries.push_back((
+            self.generation,
+            raw.events.len(),
+            raw.violations.len(),
+        ));
+        windows.most_recent = Some(completed.clone());
+        Ok(completed)
+    }
+}
+
+impl Drop for VmLifecycleWindow {
+    fn drop(&mut self) {
+        if !self.finalized.load(Ordering::Acquire) {
+            let _ = self.finalize();
+        }
+    }
+}
+
+fn rebase_completed_window(snapshot: &VmLifecycleSnapshot) -> VmLifecycleSnapshot {
+    let mut rebased = snapshot.clone();
+    for (index, event) in rebased.events.iter_mut().enumerate() {
+        event.sequence = VmLifecycleSequence(
+            NonZeroU64::new(u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1))
+                .unwrap_or(NonZeroU64::MAX),
+        );
+    }
+    if let Some(terminal) = rebased.terminal.as_mut() {
+        terminal.sequence = VmLifecycleSequence(
+            NonZeroU64::new(
+                u64::try_from(rebased.events.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(1),
+            )
+            .unwrap_or(NonZeroU64::MAX),
+        );
+    }
+    rebased
+}
+
+fn empty_snapshot() -> VmLifecycleSnapshot {
+    VmLifecycleState::default().snapshot()
+}
+
+fn append_bounded_unique_violation(
+    violations: &mut Vec<VmLifecycleViolation>,
+    violation: VmLifecycleViolation,
+) {
+    if violations.contains(&violation) {
+        return;
+    }
+    if violations.len() < MAX_RECORDED_VIOLATIONS.saturating_sub(1) {
+        violations.push(violation);
+    } else if violations.len() < MAX_RECORDED_VIOLATIONS
+        && !violations.contains(&VmLifecycleViolation::ViolationCapacityExceeded)
+    {
+        violations.push(VmLifecycleViolation::ViolationCapacityExceeded);
+    }
+}
+
+fn record_out_of_window_violation(
+    windows: &mut ProcessWindowState,
+    violation: VmLifecycleViolation,
+) {
+    append_bounded_unique_violation(&mut windows.out_of_window_violations, violation);
+    let out_of_window_violations = windows.out_of_window_violations.clone();
+    let snapshot = windows.most_recent.get_or_insert_with(empty_snapshot);
+    for violation in out_of_window_violations {
+        append_bounded_unique_violation(&mut snapshot.violations, violation);
+    }
+}
+
+fn advance_out_of_window_sequence(windows: &mut ProcessWindowState) {
+    if let Some(next) = windows.next_sequence.checked_add(1) {
+        windows.next_sequence = next;
+    } else {
+        windows.next_sequence = 0;
+        record_out_of_window_violation(windows, VmLifecycleViolation::SequenceExhausted);
+    }
 }
 
 pub fn record_raw(operation: u32, admission: i32) {
-    process_ledger().record_raw(operation, admission);
+    let mut windows = process_window_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(ledger) = windows
+        .active
+        .as_ref()
+        .map(|active| Arc::clone(&active.ledger))
+    {
+        ledger.record_raw(operation, admission);
+        (windows.next_serial, windows.next_sequence) = ledger.cursors();
+    } else {
+        let Some(operation) = VmLifecycleOperation::from_raw(operation) else {
+            advance_out_of_window_sequence(&mut windows);
+            record_out_of_window_violation(
+                &mut windows,
+                VmLifecycleViolation::UnknownOperation { operation },
+            );
+            return;
+        };
+        if operation == VmLifecycleOperation::LogicalCreateAttempt {
+            windows.next_serial = windows.next_serial.checked_add(1).unwrap_or(0);
+            if windows.next_serial == 0 {
+                record_out_of_window_violation(&mut windows, VmLifecycleViolation::SerialExhausted);
+            }
+        }
+        advance_out_of_window_sequence(&mut windows);
+        record_out_of_window_violation(
+            &mut windows,
+            VmLifecycleViolation::OutOfWindowEvent { operation },
+        );
+    }
 }
 
 pub fn record_process_terminal(outcome: VmRunTerminalOutcome) {
-    process_ledger().record_terminal(outcome);
+    let mut windows = process_window_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(ledger) = windows
+        .active
+        .as_ref()
+        .map(|active| Arc::clone(&active.ledger))
+    {
+        ledger.record_terminal(outcome);
+        (windows.next_serial, windows.next_sequence) = ledger.cursors();
+    } else {
+        advance_out_of_window_sequence(&mut windows);
+        record_out_of_window_violation(&mut windows, VmLifecycleViolation::OutOfWindowTerminal);
+    }
 }
 
 pub fn process_snapshot() -> VmLifecycleSnapshot {
-    process_ledger().snapshot()
+    let windows = process_window_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(active) = &windows.active {
+        active.ledger.snapshot()
+    } else if let Some(snapshot) = &windows.most_recent {
+        snapshot.clone()
+    } else {
+        empty_snapshot()
+    }
 }
 
 pub fn reset_after_fork_child() {
-    process_ledger_slot().reset_after_fork_child();
+    PROCESS_WINDOW_EPOCH.fetch_add(1, Ordering::AcqRel);
+    process_window_slot().reset_after_fork_child();
 }
 
 pub const VM_LIFECYCLE_ARTIFACT_SCHEMA: &str = "carrick.hvpatch-vm-lifecycle.v1";
@@ -964,13 +1254,18 @@ fn publish_artifact_bytes(path: &Path, bytes: &[u8]) -> Result<(), VmLifecycleAr
     Ok(())
 }
 
-pub fn write_completed_process_artifact(
+/// Publish one already-finalized carrier window with process provenance.
+///
+/// Callers that own a generation should pass that generation's immutable
+/// snapshot instead of re-reading the process-wide diagnostic view.
+pub fn write_completed_artifact(
     path: &Path,
+    snapshot: &VmLifecycleSnapshot,
+    carrier_scope: &[u8],
 ) -> Result<VmLifecycleArtifactSummary, VmLifecycleArtifactError> {
-    use std::os::unix::ffi::OsStrExt as _;
-
-    let run_id =
-        std::env::var_os("CARRICK_RUN_ID").ok_or(VmLifecycleArtifactError::MissingRunId)?;
+    if carrier_scope.is_empty() {
+        return Err(VmLifecycleArtifactError::MissingRunId);
+    }
     let source_sha256 = std::env::var(VM_LIFECYCLE_SOURCE_SHA256_ENV)
         .map_err(|_| VmLifecycleArtifactError::MissingSourceSha256)?;
     let executable = std::env::current_exe().map_err(|source| VmLifecycleArtifactError::Io {
@@ -983,14 +1278,21 @@ pub fn write_completed_process_artifact(
         .cloned()
         .ok_or(VmLifecycleArtifactError::MissingCommandSha256)?;
     let bytes = render_completed_artifact(
-        &process_snapshot(),
-        sha256_hex(run_id.as_os_str().as_bytes()),
+        snapshot,
+        sha256_hex(carrier_scope),
         source_sha256,
         binary_sha256,
         command_sha256,
     )?;
     publish_artifact_bytes(path, &bytes)?;
     validate_artifact(&bytes)
+}
+
+pub fn write_completed_process_artifact(
+    path: &Path,
+    carrier_scope: &[u8],
+) -> Result<VmLifecycleArtifactSummary, VmLifecycleArtifactError> {
+    write_completed_artifact(path, &process_snapshot(), carrier_scope)
 }
 
 #[cfg(test)]
@@ -1242,6 +1544,58 @@ mod tests {
     }
 
     #[test]
+    fn invalid_window_then_stray_preserves_both_and_advances_one_cursor_authority() {
+        let first = VmLifecycleWindow::open(10).expect("first window");
+        for operation in [0, 1, 2, 3] {
+            record_raw(operation, 4);
+        }
+        record_process_terminal(VmRunTerminalOutcome::RuntimeError);
+        record_process_terminal(VmRunTerminalOutcome::RuntimeError);
+        let first_raw = first.raw_snapshot();
+        let first_serial = first_raw.events[0].serial.get();
+        let first_terminal_sequence = first_raw.terminal.expect("terminal").sequence.get();
+        assert!(
+            first_raw
+                .violations
+                .contains(&VmLifecycleViolation::DuplicateRunTerminal)
+        );
+        first.finalize().expect("finalize first");
+
+        record_raw(0, 99);
+        let stray = process_snapshot();
+        assert!(
+            stray
+                .violations
+                .contains(&VmLifecycleViolation::DuplicateRunTerminal)
+        );
+        assert!(
+            stray
+                .violations
+                .contains(&VmLifecycleViolation::OutOfWindowEvent {
+                    operation: VmLifecycleOperation::LogicalCreateAttempt,
+                })
+        );
+
+        let second = VmLifecycleWindow::open(11).expect("second window");
+        record_raw(0, 5);
+        let second_raw = second.raw_snapshot();
+        assert!(second_raw.events[0].serial.get() > first_serial + 1);
+        assert!(second_raw.events[0].sequence.get() > first_terminal_sequence + 1);
+        assert!(
+            second_raw
+                .violations
+                .contains(&VmLifecycleViolation::OutOfWindowEvent {
+                    operation: VmLifecycleOperation::LogicalCreateAttempt,
+                })
+        );
+        for operation in [1, 2, 3] {
+            record_raw(operation, 5);
+        }
+        record_process_terminal(VmRunTerminalOutcome::RuntimeError);
+        second.finalize().expect("finalize second");
+    }
+
+    #[test]
     fn artifact_publication_is_private_durable_and_no_clobber() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -1260,18 +1614,5 @@ mod tests {
             publish_artifact_bytes(&insecure.join("ledger.json"), b"receipt\n"),
             Err(VmLifecycleArtifactError::InsecureParentDirectory)
         ));
-    }
-
-    #[test]
-    fn fork_child_reset_discards_inherited_history_and_restarts_identity() {
-        let slot = ProcessLedgerSlot::default();
-        slot.get().record_raw(0, 3);
-        slot.get().record_raw(1, 3);
-        slot.reset_after_fork_child();
-        assert!(slot.get().snapshot().events.is_empty());
-        slot.get().record_raw(0, 4);
-        let snapshot = slot.get().snapshot();
-        assert_eq!(snapshot.events[0].serial.get(), 1);
-        assert_eq!(snapshot.events[0].sequence.get(), 1);
     }
 }

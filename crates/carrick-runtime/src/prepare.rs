@@ -19,8 +19,8 @@
 //! container's `<registry>/<id>/scratch`) is never removed here — the
 //! registry owns it and `carrick rm` reaps it — and its `scratch_path`
 //! record is written only after the overlay exists, so a failed preparation
-//! publishes nothing. Carrier-scoped statics (`publish_root_net_view`,
-//! the host process title) are overwritten by the next `prepare`.
+//! publishes nothing. The host process title remains carrier-scoped; guest
+//! UTS and network state are already final on the unpublished `Container`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,7 +41,7 @@ use crate::interactive_supervisor::InteractiveSession;
 use crate::kernel::container::LaunchContext;
 use crate::network::RuntimeNetwork;
 #[cfg(feature = "platform-macos")]
-use crate::runtime::run_elf_from_dispatcher_debug;
+use crate::runtime::run_elf_from_dispatcher_debug_on;
 use crate::runtime::{RunResult, RuntimeError};
 use crate::vfs::{BindVfs, HostResolverSnapshot, Vfs};
 
@@ -103,6 +103,7 @@ pub struct RuntimeExtensions {
     vfs_mounts: Vec<(Utf8PathBuf, Box<dyn Vfs>)>,
     stdio: Option<StdioSink>,
     observers: Vec<Arc<dyn crate::observe::SyscallObserver>>,
+    interceptors: Vec<Arc<dyn crate::observe::SyscallInterceptor>>,
     time: Option<crate::kernel::container::TimeControl>,
     budget: Option<Arc<crate::observe::ResourceBudget>>,
     network_interposer: Option<crate::network::interposer::NetworkInterposer>,
@@ -137,6 +138,24 @@ impl RuntimeExtensions {
         I: IntoIterator<Item = Arc<dyn crate::observe::SyscallObserver>>,
     {
         self.observers.extend(observers);
+        self
+    }
+
+    /// Register a trusted syscall interceptor for this container.
+    ///
+    /// Interceptors run in registration order and may rewrite only the six
+    /// scalar argument words or propose a terminal return/errno.
+    pub fn interceptor(mut self, interceptor: Arc<dyn crate::observe::SyscallInterceptor>) -> Self {
+        self.interceptors.push(interceptor);
+        self
+    }
+
+    /// Register multiple trusted syscall interceptors in iterator order.
+    pub fn interceptors<I>(mut self, interceptors: I) -> Self
+    where
+        I: IntoIterator<Item = Arc<dyn crate::observe::SyscallInterceptor>>,
+    {
+        self.interceptors.extend(interceptors);
         self
     }
 
@@ -211,23 +230,22 @@ pub struct PreparedRun {
     root: RootBacking,
     dispatcher: SyscallDispatcher,
     interactive_session: Option<InteractiveSession>,
+    carrier: crate::carrier::CarrierRuntime,
+    carrier_lease: crate::carrier::CarrierLease,
 }
 
-/// The first two setters both fs backends apply, in the order `execute.rs`
-/// applied them: page geometry, then the UTS nodename.
-fn configure_page_and_hostname(
-    dispatcher: &mut SyscallDispatcher,
-    plan: &ExecutionPlan,
-    guest_hostname: &str,
-) {
+/// Install the resolved page geometry. The UTS nodename is already frozen in
+/// the prepared container and `set_container` binds that exact namespace to
+/// the dispatcher; resolving or rewriting it here would duplicate a host
+/// probe and create two launch-time authorities.
+fn configure_page_geometry(dispatcher: &mut SyscallDispatcher, plan: &ExecutionPlan) {
     dispatcher.set_page_geometry(plan.page.page_geometry);
-    dispatcher.set_guest_hostname(guest_hostname);
 }
 
 /// Initial cwd, credentials and the launch-time syscall policy, in the order
 /// `execute.rs` applied them. The host backend calls
 /// `sandbox_exec_to_container` + `set_executable_path` between this and
-/// [`configure_page_and_hostname`], exactly where `execute.rs` did.
+/// [`configure_page_geometry`], exactly where `execute.rs` did.
 fn configure_identity_and_policy(
     dispatcher: &mut SyscallDispatcher,
     spec: &RunSpec,
@@ -326,8 +344,8 @@ fn prepare_host_backend(
     if let HostRootLayout::CachedLower(rootfs) = root_layout {
         dispatcher.set_rootfs_layer(rootfs);
     }
-    let guest_hostname = effective_guest_hostname(spec);
-    configure_page_and_hostname(&mut dispatcher, plan, guest_hostname.as_ref());
+    let guest_hostname = container.uts_ns().nodename();
+    configure_page_geometry(&mut dispatcher, plan);
     // Sandboxed container fs: forbid the execve host-fs fallback so a target
     // absent from the container ENOENTs instead of escaping to the host.
     dispatcher.sandbox_exec_to_container();
@@ -344,7 +362,7 @@ fn prepare_host_backend(
         &spec.network,
         &hosts_entries,
         &spec.extra_hosts,
-        guest_hostname.as_ref(),
+        &guest_hostname,
     );
     install_spec_mounts(&mut dispatcher, spec);
     let _ = dispatcher.set_fs_backend(Box::new(host));
@@ -365,15 +383,13 @@ fn prepare_memory_backend(
     if let Some(snapshot) = plan.host_resolver.as_ref() {
         dispatcher.set_host_resolver_snapshot(snapshot);
     }
-    let guest_hostname = effective_guest_hostname(spec);
-    configure_page_and_hostname(&mut dispatcher, plan, guest_hostname.as_ref());
+    let guest_hostname = container.uts_ns().nodename();
+    configure_page_geometry(&mut dispatcher, plan);
     configure_identity_and_policy(&mut dispatcher, spec, container);
-    crate::execute::install_fs_backend(
-        &mut dispatcher,
-        FsBackendKind::Memory,
-        guest_hostname.as_ref(),
-    )
-    .map_err(|e| RuntimeError::FsBackend(anyhow::anyhow!("failed to install fs backend: {e}")))?;
+    crate::execute::install_fs_backend(&mut dispatcher, FsBackendKind::Memory, &guest_hostname)
+        .map_err(|e| {
+            RuntimeError::FsBackend(anyhow::anyhow!("failed to install fs backend: {e}"))
+        })?;
     install_spec_mounts(&mut dispatcher, spec);
     Ok((dispatcher, rootfs))
 }
@@ -387,128 +403,10 @@ impl Runtime {
         launch: LaunchContext,
         ext: RuntimeExtensions,
     ) -> Result<PreparedRun, RuntimeError> {
-        static CARRIER_INIT: std::sync::Once = std::sync::Once::new();
-        CARRIER_INIT.call_once(|| {
-            crate::memory::init_alias_ipa_allocator();
-            crate::fs_resolve_cache::init();
-        });
-
-        let RuntimeExtensions {
-            vfs_mounts,
-            stdio,
-            observers,
-            time,
-            budget,
-            network_interposer,
-        } = ext;
-        let sink = resolve_stdio(spec, stdio)?;
-        if spec.platform == Platform::Amd64 {
-            rosetta_license_notice();
-        }
-        let ExecutionPlan {
-            launch,
-            page,
-            host_resolver,
-            network,
-            env,
-        } = resolve_plan(spec, launch)?;
-        let network = if let Some(interposer) = network_interposer {
-            let net = match Arc::try_unwrap(network) {
-                Ok(net) => net.with_interposer(interposer),
-                Err(_) => {
-                    let net = RuntimeNetwork::create(&spec.network).map_err(|e| {
-                        RuntimeError::Unsupported(format!("network setup failed: {e}"))
-                    })?;
-                    net.with_interposer(interposer)
-                }
-            };
-            Arc::new(net)
-        } else {
-            network
-        };
-        let plan = ExecutionPlan {
-            launch,
-            page,
-            host_resolver,
-            network,
-            env,
-        };
-
-        let mut container = crate::kernel::Container::new(plan.launch.clone())
-            .with_launch_capabilities(&spec.cap_add);
-        if let Some(control) = time {
-            container = container.with_time_control(control);
-        }
-        if let Some(ref b) = budget {
-            container = container.with_resource_budget(Arc::clone(b));
-        }
-        let container = Arc::new(container);
-
-        match spec.pid {
-            PidMode::Host => {}
-            PidMode::Private => {
-                let region = crate::namespace::pid::NsSharedRegion::allocate(
-                    carrick_kernel::arena::KernelArena::global(),
-                )
-                .map_err(|e| {
-                    RuntimeError::Configuration(format!(
-                        "all 64 arena PID namespace slots are claimed: {e:?}"
-                    ))
-                })?;
-                container.install_pid_ns(region).map_err(|_| {
-                    RuntimeError::Configuration("pid namespace already installed".into())
-                })?;
-            }
-        }
-
-        let (mut dispatcher, root) = match spec.fs_backend {
-            FsBackendKind::Host => (
-                prepare_host_backend(spec, &plan, &container)?,
-                RootBacking::Host,
-            ),
-            #[cfg(feature = "fs-memory")]
-            FsBackendKind::Memory => {
-                let (dispatcher, rootfs) = prepare_memory_backend(spec, &plan, &container)?;
-                (dispatcher, RootBacking::Memory { rootfs })
-            }
-        };
-
-        // Extensions go in after the image, bind and rosetta mounts so an
-        // embedder's mount at the same point shadows them (re-mount replaces).
-        for (target, vfs) in vfs_mounts {
-            dispatcher.register_mount(PathBuf::from(target.as_std_path()), vfs);
-        }
-        if let Some(b) = budget {
-            dispatcher.install_observer(b);
-        }
-        for observer in observers {
-            dispatcher.install_observer(observer);
-        }
-        dispatcher.set_stdio_sink(sink);
-        let interactive_session = if spec.tty {
-            Some(InteractiveSession::start(&mut dispatcher).map_err(|e| {
-                RuntimeError::FsBackend(anyhow::anyhow!(
-                    "failed to create carrier-local interactive PTY: {e}"
-                ))
-            })?)
-        } else {
-            None
-        };
-
-        let ExecutionPlan { env, .. } = plan;
-        Ok(PreparedRun {
-            executable: spec.executable.clone(),
-            argv: spec.argv.clone(),
-            env,
-            max_traps: spec.max_traps,
-            debug_state_path: spec
-                .debug_state_path
-                .as_ref()
-                .map(|p| PathBuf::from(p.as_std_path())),
-            root,
-            dispatcher,
-            interactive_session,
-        })
+        let carrier = crate::carrier::process_carrier()?;
+        carrier.initialize_facilities();
+        let lease = carrier.reserve(launch)?;
+        prepare_on(&carrier, spec, lease, ext)
     }
 
     /// The CLI seam: prepare with the process-environment launch context and
@@ -521,6 +419,171 @@ impl Runtime {
         )?
         .execute()
     }
+
+    /// Execute through a caller-owned carrier rather than the implicit CLI
+    /// compatibility owner.
+    pub fn execute_on(
+        carrier: &crate::carrier::CarrierRuntime,
+        spec: &RunSpec,
+        launch: LaunchContext,
+    ) -> Result<RunResult, RuntimeError> {
+        let lease = carrier.reserve(launch)?;
+        prepare_on(carrier, spec, lease, RuntimeExtensions::default())?.execute()
+    }
+}
+
+/// Prepare one container against the exact carrier generation that admitted
+/// its launch. A failed preparation drops `lease`, removing only this
+/// container's `Prepared` reservation.
+pub fn prepare_on(
+    carrier: &crate::carrier::CarrierRuntime,
+    spec: &RunSpec,
+    lease: crate::carrier::CarrierLease,
+    ext: RuntimeExtensions,
+) -> Result<PreparedRun, RuntimeError> {
+    if !lease.belongs_to(carrier) {
+        return Err(RuntimeError::CarrierFailed(
+            "prepared lease belongs to a different carrier generation".to_owned(),
+        ));
+    }
+    carrier.initialize_facilities();
+    let launch = lease.launch().clone();
+    prepare_with_lease(spec, launch, ext, carrier.clone(), lease)
+}
+
+fn prepare_with_lease(
+    spec: &RunSpec,
+    launch: LaunchContext,
+    ext: RuntimeExtensions,
+    carrier: crate::carrier::CarrierRuntime,
+    carrier_lease: crate::carrier::CarrierLease,
+) -> Result<PreparedRun, RuntimeError> {
+    let RuntimeExtensions {
+        vfs_mounts,
+        stdio,
+        observers,
+        interceptors,
+        time,
+        budget,
+        network_interposer,
+    } = ext;
+    let sink = resolve_stdio(spec, stdio)?;
+    if spec.platform == Platform::Amd64 {
+        rosetta_license_notice();
+    }
+    let ExecutionPlan {
+        launch,
+        page,
+        host_resolver,
+        network,
+        env,
+    } = resolve_plan(spec, launch)?;
+    let network = if let Some(interposer) = network_interposer {
+        let net = match Arc::try_unwrap(network) {
+            Ok(net) => net.with_interposer(interposer),
+            Err(_) => {
+                let net = RuntimeNetwork::create(&spec.network)
+                    .map_err(|e| RuntimeError::Unsupported(format!("network setup failed: {e}")))?;
+                net.with_interposer(interposer)
+            }
+        };
+        Arc::new(net)
+    } else {
+        network
+    };
+    let plan = ExecutionPlan {
+        launch,
+        page,
+        host_resolver,
+        network,
+        env,
+    };
+
+    let guest_hostname = effective_guest_hostname(spec);
+    let mut container = crate::kernel::Container::new_with_namespaces(
+        plan.launch.clone(),
+        plan.network.model.clone(),
+        guest_hostname.as_ref(),
+    )
+    .with_launch_capabilities(&spec.cap_add);
+    if let Some(control) = time {
+        container = container.with_time_control(control);
+    }
+    if let Some(ref b) = budget {
+        container = container.with_resource_budget(Arc::clone(b));
+    }
+    let container = Arc::new(container);
+
+    match spec.pid {
+        PidMode::Host => {}
+        PidMode::Private => {
+            let region = crate::namespace::pid::NsSharedRegion::allocate(
+                carrick_kernel::arena::KernelArena::global(),
+            )
+            .map_err(|e| {
+                RuntimeError::Configuration(format!(
+                    "all 64 arena PID namespace slots are claimed: {e:?}"
+                ))
+            })?;
+            container.install_pid_ns(region).map_err(|_| {
+                RuntimeError::Configuration("pid namespace already installed".into())
+            })?;
+        }
+    }
+
+    let (mut dispatcher, root) = match spec.fs_backend {
+        FsBackendKind::Host => (
+            prepare_host_backend(spec, &plan, &container)?,
+            RootBacking::Host,
+        ),
+        #[cfg(feature = "fs-memory")]
+        FsBackendKind::Memory => {
+            let (dispatcher, rootfs) = prepare_memory_backend(spec, &plan, &container)?;
+            (dispatcher, RootBacking::Memory { rootfs })
+        }
+    };
+
+    // Extensions go in after the image, bind and rosetta mounts so an
+    // embedder's mount at the same point shadows them (re-mount replaces).
+    for (target, vfs) in vfs_mounts {
+        dispatcher.register_mount(PathBuf::from(target.as_std_path()), vfs);
+    }
+    for interceptor in interceptors {
+        dispatcher.install_interceptor(interceptor);
+    }
+    if let Some(b) = budget {
+        dispatcher.install_observer(b);
+    }
+    for observer in observers {
+        dispatcher.install_observer(observer);
+    }
+    dispatcher.set_stdio_sink(sink);
+    let interactive_session = if spec.tty {
+        Some(InteractiveSession::start(&mut dispatcher).map_err(|e| {
+            RuntimeError::FsBackend(anyhow::anyhow!(
+                "failed to create carrier-local interactive PTY: {e}"
+            ))
+        })?)
+    } else {
+        None
+    };
+
+    let ExecutionPlan { env, .. } = plan;
+    Ok(PreparedRun {
+        executable: spec.executable.clone(),
+        argv: spec.argv.clone(),
+        env,
+        max_traps: spec.max_traps,
+        debug_state_path: spec
+            .debug_state_path
+            .as_ref()
+            .map(|p| PathBuf::from(p.as_std_path())),
+        root,
+        dispatcher,
+        interactive_session,
+        carrier,
+        carrier_lease,
+    })
 }
 
 /// runc/shell exit conventions for a failed entrypoint load: 127 for "not
@@ -534,6 +597,11 @@ fn classify_run_outcome(
         Ok(result) => Ok(result),
         Err(e) if is_entrypoint_not_found(&e) => Ok(entrypoint_not_found_result()),
         Err(e) if is_entrypoint_not_executable(&e) => Ok(entrypoint_not_executable_result()),
+        Err(
+            e @ RuntimeError::Dispatch(crate::dispatch::DispatchError::InterceptorPanicked {
+                ..
+            }),
+        ) => Err(e),
         Err(e @ RuntimeError::Configuration(_)) => Err(e),
         Err(e) => Err(RuntimeError::FsBackend(anyhow::anyhow!("{label}: {e}"))),
     }
@@ -560,23 +628,27 @@ impl PreparedRun {
             root,
             dispatcher,
             interactive_session,
+            carrier,
+            carrier_lease,
         } = self;
         #[cfg(feature = "platform-macos")]
         let run = match root {
             RootBacking::Host => classify_run_outcome(
-                run_elf_from_dispatcher_debug(
+                run_elf_from_dispatcher_debug_on(
                     &executable,
                     dispatcher,
                     argv,
                     env,
                     max_traps,
                     debug_state_path.as_ref(),
+                    carrier,
+                    carrier_lease,
                 ),
                 "failed to run ELF from dispatcher",
             ),
             #[cfg(feature = "fs-memory")]
             RootBacking::Memory { rootfs } => classify_run_outcome(
-                crate::runtime::run_rootfs_elf_with_hvf_args_and_dispatcher_debug(
+                crate::runtime::run_rootfs_elf_with_hvf_args_and_dispatcher_debug_on(
                     &executable,
                     &rootfs,
                     dispatcher,
@@ -584,6 +656,8 @@ impl PreparedRun {
                     env,
                     max_traps,
                     debug_state_path.as_ref(),
+                    carrier,
+                    carrier_lease,
                 ),
                 "failed to run rootfs ELF",
             ),
@@ -606,6 +680,8 @@ impl PreparedRun {
                 debug_state_path,
                 root,
                 dispatcher,
+                carrier,
+                carrier_lease,
             );
             Err(RuntimeError::Unsupported(
                 "Pending port to hvpatch VM carrier model".to_string(),
@@ -625,6 +701,49 @@ mod tests {
         ExecBackendRequest, FsBackendKind, NetworkNamespaceSpec, PidMode, Platform, RunSpec,
         StdioMode,
     };
+
+    struct ContinueInterceptor;
+
+    impl crate::observe::SyscallInterceptor for ContinueInterceptor {
+        fn intercept(
+            &self,
+            _process: &crate::observe::ProcessInfo<'_>,
+            _call: &crate::observe::InterceptedSyscall<'_>,
+        ) -> crate::observe::InterceptAction {
+            crate::observe::InterceptAction::Continue
+        }
+    }
+
+    #[test]
+    fn runtime_extensions_preserve_interceptor_registration_order() {
+        let first: Arc<dyn crate::observe::SyscallInterceptor> = Arc::new(ContinueInterceptor);
+        let second: Arc<dyn crate::observe::SyscallInterceptor> = Arc::new(ContinueInterceptor);
+
+        let extensions = RuntimeExtensions::default()
+            .interceptor(Arc::clone(&first))
+            .interceptors([Arc::clone(&second)]);
+
+        assert_eq!(extensions.interceptors.len(), 2);
+        assert!(Arc::ptr_eq(&extensions.interceptors[0], &first));
+        assert!(Arc::ptr_eq(&extensions.interceptors[1], &second));
+    }
+
+    #[test]
+    fn run_outcome_preserves_typed_interceptor_panics() {
+        let expected = crate::kernel::container::ContainerId::allocate();
+        let panic = RuntimeError::Dispatch(crate::dispatch::DispatchError::InterceptorPanicked {
+            container_id: expected,
+        });
+
+        let error = classify_run_outcome(Err(panic), "test launch")
+            .expect_err("interceptor panic must remain an infrastructure error");
+        assert!(matches!(
+            error,
+            RuntimeError::Dispatch(crate::dispatch::DispatchError::InterceptorPanicked {
+                container_id,
+            }) if container_id == expected
+        ));
+    }
 
     fn hvpatch_run_spec() -> RunSpec {
         RunSpec {
@@ -727,6 +846,50 @@ mod tests {
             .err()
             .expect("a missing layer must fail preparation");
         assert!(matches!(err, RuntimeError::FsBackend(_)), "{err}");
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn prepare_on_holds_and_rolls_back_the_exact_carrier_lease() {
+        // Other compatibility-prepare tests may already have opened the CLI
+        // process carrier. Task 1 requires `Runtime::prepare` to share that
+        // exact owner until Task 5 rewires every caller.
+        let carrier = crate::carrier::process_carrier().expect("process carrier");
+        let launch = test_launch();
+        let lease = carrier.reserve(launch.clone()).expect("reserve");
+        let prepared = prepare_on(
+            &carrier,
+            &hvpatch_run_spec(),
+            lease,
+            RuntimeExtensions::default(),
+        )
+        .expect("empty rootfs prepares");
+        assert_eq!(
+            carrier.snapshot().expect("snapshot").registered_containers,
+            1
+        );
+        assert_eq!(carrier.snapshot().expect("snapshot").live_containers, 0);
+        drop(prepared);
+        assert_eq!(
+            carrier.snapshot().expect("snapshot").registered_containers,
+            0
+        );
+
+        let mut missing = hvpatch_run_spec();
+        missing.rootfs_layers = vec![Utf8PathBuf::from(
+            "/nonexistent/carrick-prepare-on-test/sha256-missing-layer",
+        )];
+        let lease = carrier
+            .reserve(test_launch())
+            .expect("reserve failure case");
+        let error = prepare_on(&carrier, &missing, lease, RuntimeExtensions::default())
+            .err()
+            .expect("missing layer must fail");
+        assert!(matches!(error, RuntimeError::FsBackend(_)), "{error}");
+        assert_eq!(
+            carrier.snapshot().expect("snapshot").registered_containers,
+            0
+        );
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

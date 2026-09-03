@@ -25,15 +25,15 @@
 //! change on either side is visible to both), and `unshare` replaces this task's
 //! pointer only (so one process moves and its relatives do not).
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use super::container::Container;
 
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 
-use crate::namespace::{INITIAL_NET_NS, INITIAL_UTS_NS, NsId};
-use crate::network::model::{HostWireSnapshot, LinuxNetworkModel};
+use crate::namespace::NsId;
+use crate::network::model::LinuxNetworkModel;
 
 /// A network namespace: an identity plus the interface/address/route/resolver
 /// view every guest-facing network surface renders from.
@@ -87,6 +87,7 @@ impl NetNs {
     }
 
     /// Publish a new view for every task in this namespace at once.
+    #[cfg(test)]
     pub(crate) fn publish(&self, model: LinuxNetworkModel) {
         self.view.store(Arc::new(model));
     }
@@ -156,17 +157,12 @@ pub(crate) struct NsProxy {
 }
 
 impl NsProxy {
-    /// The proxy a fresh task holds: the ROOT network and UTS namespaces (what
-    /// Linux gives everything descended from init) as a member of `container`.
-    ///
-    /// Phase B1 still takes the root net/UTS objects from the carrier-wide
-    /// cells below; B3 (Tasks 20–21) moves them onto the container
-    /// (`Container::{uts_ns, net_ns}`) and deletes the cells, so this becomes
-    /// a pure read of `container`.
+    /// The proxy a fresh task holds: this container's initial network and UTS
+    /// namespaces (what Linux gives everything descended from its init).
     pub(crate) fn for_container(container: Arc<Container>) -> Self {
         Self {
-            net: Arc::clone(root_net_ns()),
-            uts: Arc::clone(root_uts_ns()),
+            net: Arc::clone(container.net_ns()),
+            uts: Arc::clone(container.uts_ns()),
             container,
         }
     }
@@ -204,73 +200,12 @@ impl NsProxy {
     }
 }
 
-/// The carrier's initial network namespace.
-///
-/// Carrier-wide, for the same reason [`crate::namespace::process::alloc_ns_id`]
-/// is: the ROOT namespace is one identity that every task starts in, not a
-/// per-task value. Tasks that leave it hold their own `Arc` and are unaffected
-/// by anything published here.
-///
-/// It seeds itself by MIRRORING the host's wire, because carrick's default lane
-/// is `--net host`, where the guest genuinely shares the host's connectivity.
-/// That probe is the one legitimate SHAPE for `getifaddrs` — asking the host
-/// what the WIRE can do, ONCE, with the answer then living in the namespace and
-/// every guest-facing surface reading the namespace. (Two guest-facing
-/// `getifaddrs` view derivations remain, in `dispatch/fs.rs` for `SIOC*` and
-/// `vfs/proc.rs` for `/proc/net/*`; they move onto this probe next.) The
-/// distinction is not academic —
-/// re-deriving the view per guest call meant the guest's `eth0` address changed
-/// underneath a running daemon when the Mac renewed a DHCP lease or raised a
-/// VPN `utun`, so a process that cached its address and one that re-read it
-/// disagreed within one program.
-pub(crate) fn root_net_ns() -> &'static Arc<NetNs> {
-    static ROOT: OnceLock<Arc<NetNs>> = OnceLock::new();
-    ROOT.get_or_init(|| {
-        Arc::new(NetNs::from_model(
-            INITIAL_NET_NS,
-            LinuxNetworkModel::host_mirror(&HostWireSnapshot::probe()),
-        ))
-    })
-}
-
-/// The carrier's initial UTS namespace.
-///
-/// Seeded from the host's own short hostname because that is carrick's
-/// `--net host` contract — the guest shares the host's network identity — and
-/// then OVERWRITTEN by [`publish_root_nodename`] when the run names itself. The
-/// host is the authority for the seed and for nothing after it: every read goes
-/// to the namespace, so a guest's `sethostname` sticks and its children see it.
-pub(crate) fn root_uts_ns() -> &'static Arc<UtsNs> {
-    static ROOT: OnceLock<Arc<UtsNs>> = OnceLock::new();
-    ROOT.get_or_init(|| {
-        let seed = carrick_host::host_facts::host_short_hostname()
-            .unwrap_or(crate::linux_abi::CARRICK_HOSTNAME);
-        Arc::new(UtsNs::new(INITIAL_UTS_NS, seed))
-    })
-}
-
-/// Install the run's own network view into the root namespace, replacing the
-/// host mirror the root seeded itself with.
-///
-/// Called once at run setup for the container modes, where carrick assigns the
-/// addresses. Publication rather than construction because the root namespace
-/// object is shared: a task that already holds it sees the new view without
-/// having to be told.
-pub(crate) fn publish_root_net_view(model: LinuxNetworkModel) {
-    root_net_ns().publish(model);
-}
-
-/// Set the root namespace's nodename to the run's configured hostname
-/// (`--hostname`, or the container name), overriding the host-derived seed.
-pub(crate) fn publish_root_nodename(nodename: &str) {
-    root_uts_ns().set_nodename(nodename);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::{Container, Kernel, LaunchContext, RootBootstrap, RunId};
     use crate::namespace::process::alloc_ns_id;
-    use crate::network::model::{HostWireInterface, LinuxNetworkLink};
+    use crate::network::model::{HostWireInterface, HostWireSnapshot, LinuxNetworkLink};
     use carrick_abi::{LINUX_IFF_RUNNING, LINUX_IFF_UP};
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -282,6 +217,62 @@ mod tests {
             [0x02, 0, 0, 0, 0, 2],
         ));
         model
+    }
+
+    /// Booting a second container must not rename or replace the network view
+    /// of a task that was already published in the shared carrier graph.
+    ///
+    /// The production regression this catches is cloning both task nsproxies
+    /// from the carrier-global root cells: beta's launch publication then
+    /// changes alpha's already-live `uname`, `/sys`, rtnetlink and `/proc/net`
+    /// source objects in place.
+    #[test]
+    fn containers_do_not_share_root_uts_or_net() {
+        let alpha_container = Arc::new(
+            Container::new(LaunchContext::unmanaged(RunId::new("namespace-alpha")))
+                .with_hostname("alpha-host")
+                .with_network_model(with_uplink("alpha0")),
+        );
+        let alpha_bootstrap = RootBootstrap::for_reference_model(
+            7_810,
+            carrick_hal::ThreadId::synthetic_for_tests(7_810),
+            "namespace-alpha-init".to_owned(),
+        )
+        .expect("alpha bootstrap")
+        .with_container(alpha_container);
+        let (kernel, alpha) = Kernel::bootstrap_root(alpha_bootstrap).expect("alpha root");
+
+        let beta_container = Arc::new(
+            Container::new(LaunchContext::unmanaged(RunId::new("namespace-beta")))
+                .with_hostname("beta-host")
+                .with_network_model(with_uplink("beta0")),
+        );
+        let beta = kernel
+            .prepare_container_root(
+                carrick_hal::ThreadId::synthetic_for_tests(7_820),
+                None,
+                "namespace-beta-init".to_owned(),
+                beta_container,
+                None,
+            )
+            .expect("prepare beta root")
+            .commit()
+            .expect("publish beta root");
+
+        assert_eq!(alpha.task().uts_ns().nodename(), "alpha-host");
+        assert_eq!(beta.task().uts_ns().nodename(), "beta-host");
+        let link_names = |context: &crate::kernel::KernelContext| {
+            context
+                .task()
+                .net_ns()
+                .view()
+                .links
+                .iter()
+                .map(|link| link.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(link_names(&alpha), ["lo", "alpha0"]);
+        assert_eq!(link_names(&beta), ["lo", "beta0"]);
     }
 
     /// Two tasks in different network namespaces get different answers to the

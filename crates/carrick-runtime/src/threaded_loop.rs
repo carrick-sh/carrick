@@ -91,35 +91,68 @@ pub trait HostBackend: Send + Sync + 'static {
         &self,
         kicker: &std::sync::Arc<dyn carrick_hal::VcpuRegistry>,
         main_tid: crate::thread::ThreadId,
+        container: crate::kernel::ContainerId,
     ) {
         #[cfg(any(
             feature = "platform-linux",
             feature = "platform-freebsd",
             feature = "platform-netbsd"
         ))]
-        crate::timer_delivery::register(std::sync::Arc::clone(kicker), main_tid);
+        crate::timer_delivery::register(std::sync::Arc::clone(kicker), main_tid, container);
         #[cfg(feature = "platform-macos")]
         {
-            let _ = (kicker, main_tid);
+            let _ = (kicker, main_tid, container);
         }
     }
 }
 
-/// Publish the root mm's initial frame inventory as one reserve→commit
-/// transaction; a rejected publication aborts, because the HVF mappings
-/// already exist and running with two truths is not recoverable.
-fn publish_initial_frame_inventory<Inventory>(
+/// Applied initial mappings held provisional until the matching container root
+/// is visible. Dropping the guard removes only the exact receipt-bound mapping
+/// set; `commit` makes the publication durable.
+#[must_use = "initial frame inventory must commit with its container root"]
+#[derive(Debug)]
+pub(crate) struct PreparedInitialFrameInventory {
+    kernel: std::sync::Arc<crate::kernel::Kernel>,
+    receipt: Option<carrick_hal::FrameInventoryApplyReceipt>,
+}
+
+impl PreparedInitialFrameInventory {
+    pub(crate) fn commit(mut self) {
+        self.receipt = None;
+    }
+}
+
+impl Drop for PreparedInitialFrameInventory {
+    fn drop(&mut self) {
+        let Some(receipt) = self.receipt.take() else {
+            return;
+        };
+        if self
+            .kernel
+            .frame_inventory()
+            .rollback_unpublished_apply(&receipt)
+            .is_err()
+        {
+            std::process::abort();
+        }
+    }
+}
+
+/// Stage the root mm's initial frame inventory as one reserve→apply operation.
+/// The returned guard keeps the shared publication rollback-capable until the
+/// container-root transaction commits.
+pub(crate) fn prepare_initial_frame_inventory<Inventory>(
     context: Option<&crate::kernel::KernelContext>,
     extent_count: usize,
     inventory: Inventory,
-) -> Result<(), RuntimeError>
+) -> Result<Option<PreparedInitialFrameInventory>, RuntimeError>
 where
     Inventory: FnOnce(
         carrick_hal::FrameInventoryReservation,
     ) -> Result<carrick_hal::FrameInventoryCommit<()>, carrick_hal::TrapError>,
 {
     let Some(context) = context else {
-        return Ok(());
+        return Ok(None);
     };
     let event_count = extent_count
         .checked_mul(2)
@@ -141,15 +174,18 @@ where
     };
     // These mappings already exist in HVF. A missing/rejected authoritative
     // publication cannot be recovered without running with two truths.
-    if context
+    let receipt = match context
         .kernel()
         .frame_inventory()
-        .apply(context.shared().mm().id(), commit)
-        .is_err()
+        .apply_with_receipt(context.shared().mm().id(), commit)
     {
-        std::process::abort();
-    }
-    Ok(())
+        Ok(((), receipt)) => receipt,
+        Err(_) => std::process::abort(),
+    };
+    Ok(Some(PreparedInitialFrameInventory {
+        kernel: std::sync::Arc::clone(context.kernel()),
+        receipt: Some(receipt),
+    }))
 }
 
 fn resolve_hvpatch_setup<T, Retire>(
@@ -188,6 +224,7 @@ pub(crate) fn run_threaded_loop<E, H>(
     dispatcher: SyscallDispatcher,
     host: H,
     max_traps: usize,
+    carrier: &crate::carrier::CarrierRuntime,
 ) -> ThreadedLoopCompletion
 where
     E: carrick_hal::ThreadedEngine + 'static,
@@ -195,7 +232,14 @@ where
     H: HostBackend,
 {
     let mut carrier_control = None;
-    let run = run_threaded_loop_inner(engine, dispatcher, host, max_traps, &mut carrier_control);
+    let run = run_threaded_loop_inner(
+        engine,
+        dispatcher,
+        host,
+        max_traps,
+        carrier,
+        &mut carrier_control,
+    );
     ThreadedLoopCompletion {
         run,
         carrier_control,
@@ -204,9 +248,10 @@ where
 
 fn run_threaded_loop_inner<E, H>(
     mut engine: E,
-    dispatcher: SyscallDispatcher,
+    mut dispatcher: SyscallDispatcher,
     host: H,
     max_traps: usize,
+    carrier: &crate::carrier::CarrierRuntime,
     carrier_control: &mut Option<crate::kernel::control::ManagedCarrierControl>,
 ) -> Result<RunResult, RuntimeError>
 where
@@ -224,8 +269,6 @@ where
 
     let main_tid: ThreadId = main_registry_id();
     let registry = Arc::new(ThreadRegistry::new(main_tid));
-    // Publish for /proc/<tid>/stat + /proc/<pid>/task/ synthesis.
-    crate::thread::set_current_registry(Arc::clone(&registry));
     // Root guest pid (before any fork) so /proc/<pid>/ can tell a guest
     // descendant from a host process.
     crate::host_proc::set_root_guest_pid(std::process::id());
@@ -261,6 +304,14 @@ where
     // the factory rebuilds that pairing over a fresh table on the fork child
     // side.
     let futex = Arc::new(FutexTable::new());
+    // Publish one weak, exact-generation endpoint under the container's typed
+    // identity. The RAII token outlives every helper and removes only this
+    // generation when the loop returns.
+    let _runtime_endpoint = crate::thread::register_container_runtime_endpoint(
+        dispatcher.container().id(),
+        &registry,
+        &futex,
+    );
     let platform_futex: Arc<dyn carrick_hal::PlatformFutex> = host.make_futex(Arc::clone(&futex));
     let host_for_factory = std::sync::Arc::new(host);
     let factory_host = Arc::clone(&host_for_factory);
@@ -280,12 +331,28 @@ where
     // vCPU + nudge the futex; HVF supplies its kqueue-pump wake.
     let signal_arrival: Arc<dyn carrick_hal::SignalArrival> =
         host_for_factory.make_signal_arrival(&kicker, &platform_futex);
-    let setup = crate::hvpatch::initialize_root_process(&mut engine, &dispatcher);
-    let hvpatch_process = resolve_hvpatch_setup(setup, || {
+    let setup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::hvpatch::initialize_root_process(&mut engine, &mut dispatcher, carrier)
+    }));
+    let setup = match setup {
+        Ok(setup) => setup,
+        Err(payload) => {
+            carrier.rollback_pending_kernel_boot_for_current_thread();
+            std::panic::resume_unwind(payload);
+        }
+    };
+    let root_initialization = resolve_hvpatch_setup(setup, || {
         // The outer HVPatch owner destroys the VM and records the terminal.
         // Retire only this already-created vCPU so teardown has one owner.
         engine.destroy_vcpu_on_thread_exit();
     })?;
+    let (hvpatch_process, mut first_root_publications) = match root_initialization {
+        Some(initialization) => {
+            let (process, publications) = initialization.into_parts();
+            (Some(process), publications)
+        }
+        None => (None, None),
+    };
     if hvpatch_process.is_none() {
         // Container VMM runs construct the dispatcher before the namespace
         // supervisor fork. Rebind the one-task adapter to this guest-init host
@@ -322,28 +389,26 @@ where
         // a coincidence this must not depend on.
         dispatcher.root_leader_linux_tid()
     };
+    let kernel_activation = match hvpatch_process.as_ref() {
+        Some(process) => carrier.claim_kernel_activation(process.task_key())?,
+        None => None,
+    };
+    let shared_hvpatch_runtime = kernel_activation
+        .as_ref()
+        .map(|activation| Arc::clone(activation.runtime().directory()))
+        .or_else(|| {
+            carrier
+                .kernel_runtime()
+                .map(|runtime| Arc::clone(runtime.directory()))
+        });
     let kernel = Arc::new(KernelState::new(
         dispatcher,
         signal_pump,
         signal_arrival,
         hvpatch_process,
-        None,
+        shared_hvpatch_runtime,
         None,
     ));
-    if kernel.hvpatch_process.is_some() {
-        let context = kernel
-            .dispatcher
-            .capture_kernel_context(root_linux_tid)
-            .map_err(|error| {
-                RuntimeError::Configuration(format!(
-                    "capture initial HVPatch frame inventory context: {error}"
-                ))
-            })?;
-        let extent_count = engine.frame_inventory_extent_count();
-        publish_initial_frame_inventory(Some(&context), extent_count, |reservation| {
-            engine.inventory_initial_mappings(reservation)
-        })?;
-    }
     kernel.register_hvpatch_runtime_endpoint(Arc::clone(&futex), Arc::clone(&kicker));
     let mut control_exec = None;
     // Mutating carrier control is mandatory for a managed detached container.
@@ -404,10 +469,12 @@ where
         control_exec = Some(runtime);
         *carrier_control = Some(guard);
     }
-    debug_assert!(kernel.hvpatch_process.as_ref().is_none_or(|process| {
-        process.pid() == carrick_abi::LINUX_BOOTSTRAP_PID as i32
-            && process.live_process_count() == 1
-    }));
+    debug_assert!(
+        kernel
+            .hvpatch_process
+            .as_ref()
+            .is_none_or(|process| { process.has_namespace_root_identity() })
+    );
     // Track spawned sibling threads so the process doesn't tear down while a
     // worker is mid-flight; joined after the main thread finishes.
     let threads: Arc<parking_lot::Mutex<Vec<crate::vcpu_loop::VcpuThreadHandle>>> =
@@ -424,7 +491,11 @@ where
     // Wire wall-clock timer signals (setitimer/alarm/timer_settime): the
     // firing thread publishes the timer signal then kicks through this registry.
     // (No-op on HVF, which uses a kqueue EVFILT_TIMER.)
-    host_for_factory.register_process_timer_kicker(&kicker, main_tid);
+    host_for_factory.register_process_timer_kicker(
+        &kicker,
+        main_tid,
+        kernel.dispatcher.container().id(),
+    );
     // Install the backend `TimerDelivery` the dispatch arm reaches through the
     // process-global (`dispatch/time.rs` has no KernelState ref).
     crate::timer_delivery::register_delivery(
@@ -454,7 +525,42 @@ where
         carrick_hal::InGuestFlag::for_guest_thread(),
         max_traps,
     );
-    let (outcome, pool_shutdown) = launch.wait_deferring_pool_shutdown();
+    if launch.is_persistent()
+        && let Some(activation) = kernel_activation
+    {
+        activation.commit_with_services(|runtime| {
+            first_root_publications
+                .take()
+                .unwrap_or_else(|| std::process::abort())
+                .commit_publications();
+            // The relay route and debug endpoint must never point at a root
+            // that the carrier still reports as provisional. TTY authority
+            // is initialized only after the route exists so its ready
+            // acknowledgement cannot be lost.
+            crate::kernel::tty::install(runtime.kernel());
+            kernel
+                .dispatcher
+                .initialize_controlling_tty_for(
+                    &kernel
+                        .dispatcher
+                        .capture_kernel_context(root_linux_tid)
+                        .unwrap_or_else(|error| {
+                            tracing::error!(%error, "cannot capture activated HVPatch root tty context");
+                            std::process::abort();
+                        }),
+                );
+            crate::kernel::KernelDebugServer::install(
+                Arc::clone(runtime.kernel()),
+                kernel
+                    .dispatcher
+                    .container()
+                    .launch()
+                    .carrier_scope_id
+                    .as_str(),
+            );
+        });
+    }
+    let outcome = launch.wait();
     // Process children are not Linux thread-group siblings of their creator.
     // The outer root run, which owns the shared HVPatch VM lifetime, joins the
     // global process topology after its own terminal loop even when that loop
@@ -468,10 +574,6 @@ where
     // "HVPatch terminal owner did not complete teardown" on every fork-storm
     // exit (reducer: `forkstackstorm`).
     let terminal = kernel.take_process_terminal();
-    let pool_shutdown = match pool_shutdown {
-        Some(shutdown) => shutdown.shutdown(),
-        None => Ok(()),
-    };
     // All logical processes and persistent executors are now joined. Retire
     // the shared SysV namespace before any earlier terminal error can return;
     // a root process may have exited before descendants, so per-process exit
@@ -509,8 +611,6 @@ where
             }
         },
     };
-    pool_shutdown?;
-
     Ok(result)
 }
 
@@ -579,21 +679,24 @@ mod tests {
     #[test]
     fn initial_inventory_is_hvpatch_only_and_publishes_once_to_exact_mm() {
         let mature_called = Cell::new(false);
-        publish_initial_frame_inventory(None, 1, |reservation| {
+        let mature = prepare_initial_frame_inventory(None, 1, |reservation| {
             mature_called.set(true);
             Ok(one_mapping_commit(reservation))
         })
         .expect("non-HVPatch no-op");
+        assert!(mature.is_none());
         assert!(!mature_called.get());
 
         let context = root_context(67_101);
         let exact_mm = context.shared().mm().id();
         let calls = Cell::new(0);
-        publish_initial_frame_inventory(Some(&context), 1, |reservation| {
+        let prepared = prepare_initial_frame_inventory(Some(&context), 1, |reservation| {
             calls.set(calls.get() + 1);
             Ok(one_mapping_commit(reservation))
         })
-        .expect("initial publication");
+        .expect("initial publication")
+        .expect("HVPatch inventory guard");
+        prepared.commit();
 
         assert_eq!(calls.get(), 1);
         let snapshot = context.kernel().frame_inventory().snapshot_for_mm(exact_mm);
@@ -606,7 +709,7 @@ mod tests {
     fn initial_inventory_abandons_reservation_when_backend_staging_fails() {
         let context = root_context(67_102);
         let transaction = RefCell::new(None);
-        let error = publish_initial_frame_inventory(Some(&context), 1, |reservation| {
+        let error = prepare_initial_frame_inventory(Some(&context), 1, |reservation| {
             transaction.replace(Some(reservation.transaction()));
             Err(carrick_hal::TrapError::Hypervisor(
                 "mock initial inventory failure".to_owned(),
@@ -619,6 +722,35 @@ mod tests {
                 .kernel()
                 .frame_inventory()
                 .abandon(transaction.into_inner().expect("captured transaction"))
+        );
+    }
+
+    #[test]
+    fn dropped_initial_inventory_guard_removes_the_uncommitted_publication() {
+        let context = root_context(67_103);
+        let exact_mm = context.shared().mm().id();
+        let prepared = prepare_initial_frame_inventory(Some(&context), 1, |reservation| {
+            Ok(one_mapping_commit(reservation))
+        })
+        .expect("initial publication")
+        .expect("HVPatch inventory guard");
+        assert_eq!(
+            context
+                .kernel()
+                .frame_inventory()
+                .snapshot_for_mm(exact_mm)
+                .mappings
+                .len(),
+            1
+        );
+        drop(prepared);
+        assert!(
+            context
+                .kernel()
+                .frame_inventory()
+                .snapshot_for_mm(exact_mm)
+                .mappings
+                .is_empty()
         );
     }
 

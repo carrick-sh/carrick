@@ -15,10 +15,18 @@ from typing import Any
 
 
 LIBCS = ("gnu", "musl")
-DEDICATED_SOURCE_COUNT = 22
-DEDICATED_RUNNER_COUNT = 16
+DEDICATED_SOURCE_COUNT = 23
+DEDICATED_RUNNER_COUNT = 17
+SIGNED_SCENARIO_RUNNERS = {
+    "production_rx_poketext_executes_warm_patched_instruction": (
+        "carrick-conformance-next",
+        "ptrace_poketext_signed",
+    ),
+}
 Source = namedtuple("Source", "name runner")
-RunnerCommand = namedtuple("RunnerCommand", "runner test_target sources")
+RunnerCommand = namedtuple(
+    "RunnerCommand", "runner package test_target transport sources"
+)
 Plan = namedtuple("Plan", "sources commands")
 CompletedRow = namedtuple("CompletedRow", "libc source runner")
 CommandResult = namedtuple("CommandResult", "status output detail")
@@ -50,14 +58,23 @@ def build_plan(inventory: dict[str, Any]) -> Plan:
     grouped: dict[str, list[str]] = {}
     for source in sources:
         grouped.setdefault(source.runner, []).append(source.name)
-    commands = [
-        RunnerCommand(
-            runner,
-            "conformance",
-            tuple(names),
+    commands = []
+    for runner, names in sorted(grouped.items()):
+        signed_route = SIGNED_SCENARIO_RUNNERS.get(runner)
+        if signed_route is None:
+            package, test_target, transport = "carrick-cli", "conformance", "cargo"
+        else:
+            package, test_target = signed_route
+            transport = "test-signed"
+        commands.append(
+            RunnerCommand(
+                runner,
+                package,
+                test_target,
+                transport,
+                tuple(names),
+            )
         )
-        for runner, names in sorted(grouped.items())
-    ]
     if len(commands) != DEDICATED_RUNNER_COUNT:
         raise ScenarioError(
             f"dedicated runner denominator is {len(commands)}; expected {DEDICATED_RUNNER_COUNT}"
@@ -98,18 +115,28 @@ def _run_command(root: Path, command: RunnerCommand, libc: str) -> CommandResult
             "CARRICK_PROBE_SCENARIO_LIBC": libc,
         }
     )
-    args = [
-        "cargo",
-        "test",
-        "-p",
-        "carrick-cli",
-        "--test",
-        command.test_target,
-        command.runner,
-        "--",
-        "--exact",
-        "--nocapture",
-    ]
+    if command.transport == "test-signed":
+        args = [
+            "scripts/test-signed.sh",
+            command.package,
+            command.runner,
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ]
+    else:
+        args = [
+            "cargo",
+            "test",
+            "-p",
+            command.package,
+            "--test",
+            command.test_target,
+            command.runner,
+            "--",
+            "--exact",
+            "--nocapture",
+        ]
     try:
         process = subprocess.run(
             args,
@@ -128,14 +155,19 @@ def _run_command(root: Path, command: RunnerCommand, libc: str) -> CommandResult
     ran_once = output.count("running 1 test") == 1
     passed = output.count(f"test {command.runner} ... ok") == 1
     failed = output.count(f"test {command.runner} ... FAILED") == 1
-    if process.returncode == 0 and ran_once and passed:
+    transport_completed = (
+        output.count(f"test-signed: OK ({command.package}:") == 1
+        if command.transport == "test-signed"
+        else ran_once
+    )
+    if process.returncode == 0 and transport_completed and passed:
         return CommandResult("PASS", output, "")
-    if process.returncode != 0 and ran_once and failed:
+    if process.returncode != 0 and transport_completed and failed:
         return CommandResult("FAIL", output, f"cargo test exited {process.returncode}")
     return CommandResult(
         "ERROR",
         output,
-        f"cargo test exited {process.returncode} without exactly one terminal test result",
+        f"scenario command exited {process.returncode} without exact test and transport receipts",
     )
 
 

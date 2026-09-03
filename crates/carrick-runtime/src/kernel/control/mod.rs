@@ -392,6 +392,17 @@ impl ManagedCarrierControl {
         Ok(())
     }
 
+    /// Stop admission, join the synchronous control worker, and drop every
+    /// installed exec/archive authority without publishing terminal state.
+    /// Container teardown uses this after guest executors join and before its
+    /// mount table is destroyed; [`Self::complete`] records the exact outcome
+    /// once teardown itself has succeeded or failed.
+    pub(crate) fn quiesce(&mut self) {
+        if let Some(mut server) = self.server.take() {
+            server.shutdown();
+        }
+    }
+
     /// Install the live HVPatch scheduler bridge after the persistent executor
     /// directory is ready. Until installation, authenticated exec requests are
     /// refused by name and cannot fall back to another runtime or process.
@@ -1367,6 +1378,47 @@ mod tests {
             .expect("managed control");
             guard.complete(42).expect("complete");
         }
+        let exited = crate::container::ContainerState::load(&id).expect("terminal state");
+        assert_eq!(exited.status, crate::container::ContainerStatus::Exited);
+        assert_eq!(exited.exit_code, Some(42));
+        assert!(exited.control.is_none());
+        let _ = crate::container::ContainerState::remove(&id);
+    }
+
+    #[test]
+    fn managed_guard_quiesces_before_publishing_the_terminal_outcome() {
+        let id = format!("control-guard-quiesce-{}", std::process::id());
+        let _ = crate::container::ContainerState::remove(&id);
+        managed_state(id.clone()).create().expect("created state");
+        let (kernel, init) = kernel_with_init();
+        let mut guard =
+            ManagedCarrierControl::start(kernel, init.task().key(), &id, "launch-authorization:77")
+                .expect("managed control");
+        let dispatcher = crate::dispatch::SyscallDispatcher::new();
+        let mut mounts = dispatcher.prepare_mount_retirement();
+        let expected_mounts = mounts.mount_count();
+        guard
+            .archive_admission_slot()
+            .expect("archive slot")
+            .install(Arc::new(ArchiveRuntime::new(
+                dispatcher.archive_authority(),
+                1,
+            )))
+            .expect("install archive authority");
+        drop(dispatcher);
+        assert!(
+            mounts.prepare().is_err(),
+            "the live control server must retain its archive mount authority"
+        );
+
+        guard.quiesce();
+        mounts.prepare().expect("quiesce releases archive owner");
+        assert_eq!(mounts.clear(), expected_mounts);
+        let draining = crate::container::ContainerState::load(&id).expect("draining state");
+        assert_eq!(draining.status, crate::container::ContainerStatus::Running);
+        assert_eq!(draining.exit_code, None);
+
+        guard.complete(42).expect("complete after quiesce");
         let exited = crate::container::ContainerState::load(&id).expect("terminal state");
         assert_eq!(exited.status, crate::container::ContainerStatus::Exited);
         assert_eq!(exited.exit_code, Some(42));

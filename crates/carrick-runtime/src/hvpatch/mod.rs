@@ -41,7 +41,7 @@ pub(crate) use mm_resources::{
 pub(crate) use stage1_mm::Stage1MmPool;
 pub(crate) use stage1_mm::{
     CowInvalidationError, CowInvalidationObserver, CowInvalidationTicket, PreparedStage1Mm,
-    Stage1MmLease, Stage1MmRetirement,
+    Stage1MmLease, Stage1MmRetirement, Stage1RootRetirementReceipt, Stage1RootRetirementTicket,
 };
 
 /// Installation permission kept private to the HVPatch bootstrap/lifecycle
@@ -60,9 +60,62 @@ impl ForeignMmInstallPermit {
 pub(crate) struct ProcessContext {
     resources: std::sync::Arc<MmResources>,
     binding: crate::kernel::KernelTaskBinding,
+    /// Immutable container ownership retained independently of task liveness.
+    /// Terminal join/cleanup runs after the leader has left the task graph and
+    /// must never recapture this identity through a dead task.
+    container_id: crate::kernel::ContainerId,
     mm_backend: std::sync::Arc<parking_lot::RwLock<std::sync::Arc<stage1_mm::Stage1MmBackend>>>,
     mm_access: Option<crate::kernel::MmAccessAuthority>,
     foreign_mm_endpoint: Option<carrick_hal::ForeignMmEndpoint>,
+}
+
+struct PreparedRootLifecycle {
+    lifecycle: carrick_observability::probes::HvpatchGuestLifecycle,
+    address_space: Option<carrick_observability::probes::HvpatchGuestAddressSpace>,
+}
+
+impl PreparedRootLifecycle {
+    fn commit(self) {
+        crate::probes::hvpatch_guest_lifecycle(self.lifecycle);
+        if let Some(address_space) = self.address_space {
+            crate::probes::hvpatch_guest_address_space(address_space);
+        }
+    }
+}
+
+pub(crate) struct PreparedRootInitialization {
+    process: Option<ProcessContext>,
+    inventory: Option<crate::threaded_loop::PreparedInitialFrameInventory>,
+    lifecycle: Option<PreparedRootLifecycle>,
+}
+
+impl PreparedRootInitialization {
+    fn process(&self) -> ProcessContext {
+        self.process
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| std::process::abort())
+    }
+
+    pub(crate) fn commit_publications(mut self) {
+        if let Some(inventory) = self.inventory.take() {
+            inventory.commit();
+        }
+        if let Some(lifecycle) = self.lifecycle.take() {
+            lifecycle.commit();
+        }
+    }
+}
+
+pub(crate) struct RootProcessInitialization {
+    process: ProcessContext,
+    first_root_publications: Option<PreparedRootInitialization>,
+}
+
+impl RootProcessInitialization {
+    pub(crate) fn into_parts(self) -> (ProcessContext, Option<PreparedRootInitialization>) {
+        (self.process, self.first_root_publications)
+    }
 }
 
 /// Build a real HVPatch process binding for cross-subsystem unit tests. This
@@ -89,7 +142,12 @@ pub(crate) fn process_context_for_tests(
         .publish_root(root.task().key())
         .expect("publish test HVPatch root");
     (
-        ProcessContext::new(resources, root.task_binding(), backend),
+        ProcessContext::new(
+            resources,
+            root.task_binding(),
+            root.container().id(),
+            backend,
+        ),
         root,
     )
 }
@@ -395,6 +453,43 @@ pub(crate) struct CommittedProcessExec {
     retired_mm: Option<Stage1MmRetirement>,
 }
 
+/// A failed exec commit together with the context that owns terminal cleanup.
+///
+/// Before `Kernel::commit_exec_transition` succeeds, the caller's predecessor
+/// remains authoritative. After it succeeds, even a later MM/ASID publication
+/// error must carry the committed successor so terminal handling cannot retire
+/// the predecessor generation.
+pub(crate) struct CompleteExecError {
+    error: String,
+    committed_context: Option<crate::kernel::KernelContext>,
+}
+
+impl CompleteExecError {
+    pub(crate) fn before_commit(error: impl ToString) -> Self {
+        Self {
+            error: error.to_string(),
+            committed_context: None,
+        }
+    }
+
+    fn after_commit(error: impl ToString, context: crate::kernel::KernelContext) -> Self {
+        Self {
+            error: error.to_string(),
+            committed_context: Some(context),
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (String, Option<crate::kernel::KernelContext>) {
+        (self.error, self.committed_context)
+    }
+}
+
+impl std::fmt::Display for CompleteExecError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.error)
+    }
+}
+
 impl CommittedProcessExec {
     pub(crate) fn context(&self) -> &crate::kernel::KernelContext {
         self.transition.context()
@@ -424,13 +519,19 @@ impl CommittedProcessExec {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ChildExit {
     pid: crate::kernel::TaskId,
+    visible_pid: i32,
     ruid: carrick_abi::NsUid,
     status: i32,
 }
 
 impl ChildExit {
+    #[cfg(test)]
     pub(crate) const fn pid(self) -> crate::kernel::TaskId {
         self.pid
+    }
+
+    pub(crate) const fn visible_pid(self) -> i32 {
+        self.visible_pid
     }
 
     pub(crate) const fn status(self) -> i32 {
@@ -470,8 +571,33 @@ impl PendingAddressSpaceRetirement {
         self.tid
     }
 
-    pub(crate) fn complete(self) -> Result<(), String> {
-        self.retired.complete().map_err(|error| error.to_string())?;
+    pub(crate) fn take_root_retirement_ticket(
+        &mut self,
+    ) -> Result<Option<Stage1RootRetirementTicket>, String> {
+        self.retired
+            .take_root_retirement_ticket()
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn complete(
+        self,
+        root_receipt: Option<Stage1RootRetirementReceipt>,
+    ) -> Result<(), String> {
+        self.retired
+            .complete(root_receipt)
+            .map_err(|error| error.to_string())?;
+        crate::event_ring::rec_hvpatch_process_exit_end(self.pid, self.tid.raw(), self.exit_code);
+        if let Some(event) = self.lifecycle_event {
+            crate::probes::hvpatch_guest_lifecycle(event);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_for_test(self) -> Result<(), String> {
+        self.retired
+            .complete_for_test()
+            .map_err(|error| error.to_string())?;
         crate::event_ring::rec_hvpatch_process_exit_end(self.pid, self.tid.raw(), self.exit_code);
         if let Some(event) = self.lifecycle_event {
             crate::probes::hvpatch_guest_lifecycle(event);
@@ -530,11 +656,13 @@ impl ProcessContext {
     fn new(
         resources: std::sync::Arc<MmResources>,
         binding: crate::kernel::KernelTaskBinding,
+        container_id: crate::kernel::ContainerId,
         mm_backend: std::sync::Arc<stage1_mm::Stage1MmBackend>,
     ) -> Self {
         Self {
             resources,
             binding,
+            container_id,
             mm_backend: std::sync::Arc::new(parking_lot::RwLock::new(mm_backend)),
             mm_access: None,
             foreign_mm_endpoint: None,
@@ -542,10 +670,18 @@ impl ProcessContext {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn with_foreign_mm_endpoint(mut self, endpoint: carrick_hal::ForeignMmEndpoint) -> Self {
-        self.binding
-            .install_foreign_mm_endpoint(endpoint.clone(), &ForeignMmInstallPermit::new())
-            .unwrap_or_else(|_| std::process::abort());
+    fn with_foreign_mm_endpoint(
+        mut self,
+        endpoint: carrick_hal::ForeignMmEndpoint,
+        context: &crate::kernel::KernelContext,
+    ) -> Self {
+        if context.task().key() != self.binding.task_key() {
+            std::process::abort();
+        }
+        context
+            .shared()
+            .mm()
+            .install_foreign_mm_endpoint(endpoint.clone(), &ForeignMmInstallPermit::new());
         self.foreign_mm_endpoint = Some(endpoint);
         self.mm_access = Some(crate::kernel::MmAccessAuthority::new());
         self
@@ -569,6 +705,26 @@ impl ProcessContext {
 
     pub(crate) fn task_binding(&self) -> crate::kernel::KernelTaskBinding {
         self.binding.clone()
+    }
+
+    /// Root validation keeps the scheduler's carrier-wide TaskId distinct
+    /// from the PID namespace identity presented to Linux.
+    pub(crate) fn has_namespace_root_identity(&self) -> bool {
+        let internal = self.task_id();
+        let Ok(internal_u32) = u32::try_from(internal.raw()) else {
+            return false;
+        };
+        self.binding
+            .capture(crate::kernel::LinuxTid::for_task_leader(internal))
+            .is_ok_and(|context| {
+                context.task().key() == self.task_key()
+                    && crate::namespace::pid::try_ns_self_pid_for(&context, internal_u32)
+                        == Some(crate::namespace::pid::NS_INIT_PID)
+            })
+    }
+
+    pub(crate) fn container_id(&self) -> crate::kernel::ContainerId {
+        self.container_id
     }
 
     pub(crate) fn process_timer_delivery(&self) -> std::sync::Arc<dyn carrick_hal::TimerDelivery> {
@@ -635,6 +791,7 @@ impl ProcessContext {
         let mut child = Self::new(
             std::sync::Arc::clone(&self.resources),
             context.task_binding(),
+            context.container().id(),
             mm_backend,
         );
         child.mm_access.clone_from(&self.mm_access);
@@ -662,6 +819,7 @@ impl ProcessContext {
             .install_foreign_mm_mutation_authority(authority, &ForeignMmInstallPermit::new());
     }
 
+    #[cfg(test)]
     pub(crate) fn live_process_count(&self) -> usize {
         self.kernel_graph().registry().task_count()
     }
@@ -750,6 +908,59 @@ impl ProcessContext {
                 None
             }
         }
+    }
+
+    fn prepare_root_lifecycle(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+    ) -> Result<PreparedRootLifecycle, RuntimeError> {
+        if context.task().key() != self.task_key() {
+            return Err(RuntimeError::Configuration(
+                "HVPatch root lifecycle context does not match process binding".to_owned(),
+            ));
+        }
+        let binding = self.mm_binding().ok_or_else(|| {
+            RuntimeError::Configuration("hvpatch root mm backend disappeared".to_owned())
+        })?;
+        let task = context.task().key();
+        let parent = context.parent_at_capture();
+        let lifecycle = carrick_observability::probes::HvpatchGuestLifecycle::new(
+            carrick_observability::probes::HvpatchGuestLifecyclePhase::Root,
+            task.id.raw(),
+            parent.map_or(0, |parent| parent.id.raw()),
+            tid.raw(),
+            u32::from(binding.asid.raw()),
+            task.serial.raw(),
+            parent.map_or(0, |parent| parent.serial.raw()),
+            context.shared().mm().id().raw(),
+            0,
+        )
+        .map_err(|error| {
+            RuntimeError::Configuration(format!("prepare HVPatch root lifecycle: {error}"))
+        })?;
+        let address_space = self
+            .resources
+            .root_slot(self.task_key())
+            .map(|root_slot| {
+                carrick_observability::probes::HvpatchGuestAddressSpace::new(
+                    self.pid(),
+                    u32::from(binding.asid.raw()),
+                    root_slot.base(),
+                    root_slot.size(),
+                    binding.ttbr0.raw(),
+                )
+                .map_err(|error| {
+                    RuntimeError::Configuration(format!(
+                        "prepare HVPatch root address-space lifecycle: {error}"
+                    ))
+                })
+            })
+            .transpose()?;
+        Ok(PreparedRootLifecycle {
+            lifecycle,
+            address_space,
+        })
     }
 
     pub(crate) fn trace_lifecycle(
@@ -970,13 +1181,14 @@ impl ProcessContext {
         &self,
         published: PublishedProcessExec,
         dispatch_mm: Option<crate::dispatch::PreparedDispatchMmExec>,
-    ) -> Result<CommittedProcessExec, String> {
+    ) -> Result<CommittedProcessExec, CompleteExecError> {
         let PublishedProcessExec { kernel, receipt } = published;
         let replacement_mm = kernel.replacement_mm_id();
         let transition = self
             .kernel_graph()
             .commit_exec_transition(kernel, None)
-            .map_err(|error| error.to_string())?;
+            .map_err(CompleteExecError::before_commit)?;
+        let committed_context = transition.context().retain_exact();
         let (replacement_lease, retired_mm) = match receipt {
             mm_resources::ExecMmCommitReceipt::Retained { replacement, .. } => (replacement, None),
             mm_resources::ExecMmCommitReceipt::Retired {
@@ -989,7 +1201,7 @@ impl ProcessContext {
                 replacement_mm,
                 replacement_lease.asid_generation().generation(),
             )
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| CompleteExecError::after_commit(error, committed_context))?;
         if let Some(dispatch_mm) = dispatch_mm {
             dispatch_mm.commit();
         }
@@ -1010,6 +1222,7 @@ impl ProcessContext {
     ) -> Result<CommittedProcessExec, String> {
         let published = self.publish_exec_mm(prepared, vma_source)?;
         self.complete_exec(published, dispatch_mm)
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn record_process_exit_begin(
@@ -1208,25 +1421,39 @@ impl ProcessContext {
         outcome: Result<crate::kernel::WaitOutcome, crate::kernel::KernelOperationError>,
     ) -> WaitResult {
         match outcome {
-            Ok(crate::kernel::WaitOutcome::Exited(zombie)) => WaitResult::Exited(ChildExit {
-                pid: zombie.key.id,
-                ruid: zombie.ruid,
-                status: zombie.status.raw(),
-            }),
+            Ok(crate::kernel::WaitOutcome::Exited(zombie)) => {
+                let Ok(visible_pid) = i32::try_from(zombie.namespace_pid) else {
+                    std::process::abort();
+                };
+                WaitResult::Exited(ChildExit {
+                    pid: zombie.key.id,
+                    visible_pid,
+                    ruid: zombie.ruid,
+                    status: zombie.status.raw(),
+                })
+            }
             // A P_PIDFD wait runs in Consume mode too, so reporting a
             // job-control event as "still running" DISCARDS it. Render the
             // wait-status encoding and let the caller decide whether it asked
             // for it.
             Ok(crate::kernel::WaitOutcome::Stopped { task, signal, ruid }) => {
+                let Some(visible_pid) = self.visible_task_id(task) else {
+                    return WaitResult::NoChild;
+                };
                 WaitResult::StateChanged(ChildExit {
                     pid: task,
+                    visible_pid,
                     ruid,
                     status: (signal.raw() << 8) | 0x7f,
                 })
             }
             Ok(crate::kernel::WaitOutcome::Continued { task, ruid }) => {
+                let Some(visible_pid) = self.visible_task_id(task) else {
+                    return WaitResult::NoChild;
+                };
                 WaitResult::StateChanged(ChildExit {
                     pid: task,
+                    visible_pid,
                     ruid,
                     status: 0xffff,
                 })
@@ -1253,6 +1480,13 @@ impl ProcessContext {
                 WaitResult::NoChild
             }
         }
+    }
+
+    fn visible_task_id(&self, task: crate::kernel::TaskId) -> Option<i32> {
+        let observer = self.binding.capture_signal_snapshot().ok()?;
+        let internal = u32::try_from(task.raw()).ok()?;
+        crate::namespace::pid::kernel_to_ns_for(observer.context(), internal)
+            .and_then(|visible| i32::try_from(visible).ok())
     }
 
     /// This process's OWN process group. A peer's group is a different
@@ -1315,8 +1549,9 @@ fn root_bootstrap_identity(_host_pid: u32) -> Result<RootBootstrapIdentity, Runt
 /// Install the root in-process guest's nonzero ASID before its first entry.
 pub(crate) fn initialize_root_process<E: ThreadedEngine>(
     engine: &mut E,
-    dispatcher: &SyscallDispatcher,
-) -> Result<Option<ProcessContext>, RuntimeError> {
+    dispatcher: &mut SyscallDispatcher,
+    carrier: &crate::carrier::CarrierRuntime,
+) -> Result<Option<RootProcessInitialization>, RuntimeError> {
     const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
     let stage1_root = engine.get_sys_reg(SysReg::Ttbr0).map_err(|error| {
         RuntimeError::Trap(crate::trap::TrapError::Hypervisor(error.to_string()))
@@ -1350,59 +1585,87 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
     )
     .map_err(|error| RuntimeError::Configuration(error.to_string()))?
     .with_container(container);
-    let (kernel, root) = crate::kernel::Kernel::bootstrap_root(bootstrap)
+    let launch_fs_context = dispatcher
+        .launch_fs_context_for_hvpatch_bind()
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-    crate::kernel::tty::install(&kernel);
-    mm_backend.bind_inventory(&kernel, root.shared().mm().id());
-    // Publish the live kernel debug endpoint for this run. Default ON;
-    // `CARRICK_KERNEL_DEBUG=0` opts out. The socket is how `carrick debug
-    // hvpatch-kernel` reads a coherent snapshot of the object graph while the
-    // guest is running.
-    crate::kernel::KernelDebugServer::install(std::sync::Arc::clone(&kernel));
-    table
-        .publish_root(root.task().key())
-        .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-    let context = ProcessContext::new(table, root.task_binding(), mm_backend);
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let context = match engine.foreign_mm_endpoint() {
-        Some(endpoint) => context.with_foreign_mm_endpoint(endpoint),
-        None => context,
+    let (root, initialization) =
+        carrier.boot_kernel_root_prepared(bootstrap, |kernel, _, root_context| {
+            mm_backend.bind_inventory(kernel, root_context.shared().mm().id());
+            table
+                .publish_root(root_context.task().key())
+                .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+            let prepared = ProcessContext::new(
+                Arc::clone(&table),
+                root_context.task_binding(),
+                root_context.container().id(),
+                Arc::clone(&mm_backend),
+            );
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let prepared = match engine.foreign_mm_endpoint() {
+                Some(endpoint) => prepared.with_foreign_mm_endpoint(endpoint, root_context),
+                None => prepared,
+            };
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            debug_assert!(prepared.mm_access_authority().is_some());
+            let binding = prepared.mm_binding().ok_or_else(|| {
+                RuntimeError::Configuration("hvpatch root mm backend disappeared".to_owned())
+            })?;
+            engine.configure_process_asid(binding.asid.raw())?;
+            debug_assert_eq!(
+                binding.ttbr0.raw(),
+                engine.get_sys_reg(SysReg::Ttbr0).unwrap_or(0)
+            );
+            crate::vcpu_loop::stamp_identity_page(engine, dispatcher, root_context).map_err(
+                |error| {
+                    RuntimeError::Configuration(format!(
+                        "stamp HVPatch root identity page: {error}"
+                    ))
+                },
+            )?;
+            let lifecycle = prepared.prepare_root_lifecycle(
+                root_context,
+                crate::thread::ThreadId::from_guest_supplied_tid(
+                    root_context.thread().key().tid.raw(),
+                ),
+            )?;
+            let extent_count = engine.frame_inventory_extent_count();
+            let inventory = crate::threaded_loop::prepare_initial_frame_inventory(
+                Some(root_context),
+                extent_count,
+                |reservation| engine.inventory_initial_mappings(reservation),
+            )?;
+            Ok(PreparedRootInitialization {
+                process: Some(prepared),
+                inventory,
+                lifecycle: Some(lifecycle),
+            })
+        })?;
+
+    // FileAuthority launch is the last fallible dispatcher operation. If it
+    // fails after a later root crossed its graph commit, retire that exact
+    // root before returning; the first root remains provisional and simply
+    // rolls its carrier boot slot back.
+    if let Err(error) = dispatcher.activate_file_authority(root.context().resources().files()) {
+        drop(initialization);
+        root.rollback_failed_initialization()?;
+        return Err(RuntimeError::Configuration(format!(
+            "activate per-run FileAuthority: {error}"
+        )));
+    }
+
+    let process = initialization.process();
+    dispatcher.bind_hvpatch_process_exact(process.clone(), root.context(), launch_fs_context);
+    let first_root_publications = if root.is_first_boot() {
+        Some(initialization)
+    } else {
+        dispatcher.initialize_controlling_tty_for(root.context());
+        initialization.commit_publications();
+        None
     };
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    debug_assert!(context.mm_access_authority().is_some());
-    let binding = context.mm_binding().ok_or_else(|| {
-        RuntimeError::Configuration("hvpatch root mm backend disappeared".to_owned())
-    })?;
-    engine.configure_process_asid(binding.asid.raw())?;
-    debug_assert_eq!(
-        binding.ttbr0.raw(),
-        engine.get_sys_reg(SysReg::Ttbr0).unwrap_or(0)
-    );
-    context.trace_lifecycle(
-        carrick_observability::probes::HvpatchGuestLifecyclePhase::Root,
-        root_tid,
-        0,
-    );
-    dispatcher.bind_hvpatch_process(context.clone());
-    let root_context = dispatcher.capture_one_task_context().map_err(|error| {
-        RuntimeError::Configuration(format!(
-            "capture HVPatch root identity Kernel context: {error}"
-        ))
-    })?;
-    dispatcher
-        .activate_file_authority(root_context.resources().files())
-        .map_err(|error| {
-            RuntimeError::Configuration(format!("activate per-run FileAuthority: {error}"))
-        })?;
-    dispatcher
-        .initialize_bound_controlling_tty()
-        .map_err(|error| {
-            RuntimeError::Configuration(format!("initialize controlling tty authority: {error}"))
-        })?;
-    crate::vcpu_loop::stamp_identity_page(engine, dispatcher, &root_context).map_err(|error| {
-        RuntimeError::Configuration(format!("stamp HVPatch root identity page: {error}"))
-    })?;
-    Ok(Some(context))
+    Ok(Some(RootProcessInitialization {
+        process,
+        first_root_publications,
+    }))
 }
 
 const PAGE_SIZE: u64 = 4096;
@@ -1612,6 +1875,43 @@ pub(crate) fn finish_hvpatch_image(
     max_traps: usize,
     debug_state_path: Option<&PathBuf>,
 ) -> Result<RunResult, RuntimeError> {
+    finish_hvpatch_image_owned(image, dispatcher, max_traps, debug_state_path, None)
+}
+
+#[cfg(all(
+    feature = "platform-macos",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+pub(crate) fn finish_hvpatch_image_on(
+    image: AddressSpace,
+    dispatcher: SyscallDispatcher,
+    max_traps: usize,
+    debug_state_path: Option<&PathBuf>,
+    carrier: crate::carrier::CarrierRuntime,
+    lease: crate::carrier::CarrierLease,
+) -> Result<RunResult, RuntimeError> {
+    finish_hvpatch_image_owned(
+        image,
+        dispatcher,
+        max_traps,
+        debug_state_path,
+        Some((carrier, lease)),
+    )
+}
+
+#[cfg(all(
+    feature = "platform-macos",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+fn finish_hvpatch_image_owned(
+    image: AddressSpace,
+    dispatcher: SyscallDispatcher,
+    max_traps: usize,
+    debug_state_path: Option<&PathBuf>,
+    ownership: Option<(crate::carrier::CarrierRuntime, crate::carrier::CarrierLease)>,
+) -> Result<RunResult, RuntimeError> {
     // Offline stack attribution needs the exact Carrick Mach-O identity on
     // every file/rootfs/raw-image path before any syscall-service probe can
     // fire. All dyld queries remain inside the USDT closure, so an untraced
@@ -1621,12 +1921,25 @@ pub(crate) fn finish_hvpatch_image(
         RuntimeError::Unsupported(format!("hvpatch image preparation failed: {error}"))
     })?;
     let _patch_summary = (prepared.manifest.len(), prepared.island_bases.len());
-    let outcome = crate::runtime::finish_and_run_image(
-        prepared.image,
-        dispatcher,
-        max_traps,
-        debug_state_path,
-    );
+    let requires_syscall_traps = dispatcher.requires_syscall_traps();
+    let outcome = match ownership {
+        Some((carrier, lease)) => crate::runtime::finish_and_run_image_on(
+            prepared.image,
+            dispatcher,
+            requires_syscall_traps,
+            max_traps,
+            debug_state_path,
+            carrier,
+            lease,
+        ),
+        None => crate::runtime::finish_and_run_image(
+            prepared.image,
+            dispatcher,
+            requires_syscall_traps,
+            max_traps,
+            debug_state_path,
+        ),
+    };
     // vCPU reclaim census for the whole run. The M:N executor design deletes
     // the destroy/recreate reclaim path, and the rule is that the win is
     // measured before the path is removed. One line at the end of a run is not
@@ -1731,6 +2044,22 @@ mod tests {
         assert_eq!(identity.tid.raw(), carrick_abi::LINUX_BOOTSTRAP_PID as i32);
     }
 
+    #[test]
+    fn process_context_retains_container_identity_after_task_retirement() {
+        let (process, context) = process_context_for_tests(67_001);
+        let container = context.container().id();
+        context
+            .kernel()
+            .exit_task(
+                process.task_id(),
+                crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .expect("retire root task");
+        assert!(!context.kernel().task_is_live(process.task_id()));
+        assert_eq!(process.container_id(), container);
+    }
+
     fn text(words: &[u32]) -> Vec<u8> {
         words.iter().flat_map(|word| word.to_le_bytes()).collect()
     }
@@ -1822,7 +2151,7 @@ mod tests {
         let table = std::sync::Arc::new(table);
         table.publish_root(root.task().key()).unwrap();
         (
-            ProcessContext::new(table, root.task_binding(), backend),
+            ProcessContext::new(table, root.task_binding(), root.container().id(), backend),
             root,
         )
     }
@@ -1844,7 +2173,7 @@ mod tests {
                 .retirement()
                 .is_none_or(|r| r.pending().is_empty())
         );
-        retirement.complete().unwrap();
+        retirement.complete_for_test().unwrap();
     }
 
     fn production_shared_child(
@@ -3732,6 +4061,19 @@ mod tests {
         assert_eq!(siginfo_i32(&siginfo, 8), libc::CLD_EXITED);
         assert_eq!(siginfo_i32(&siginfo, 24), 23);
         assert_eq!(parent.live_process_count(), 1);
+    }
+
+    #[test]
+    fn waitid_siginfo_uses_the_visible_pid_retained_by_the_wait_receipt() {
+        let exit = ChildExit {
+            pid: crate::kernel::TaskId::from_abi_positive(42).expect("internal pid"),
+            visible_pid: 7,
+            ruid: carrick_abi::NsUid::new(1_000),
+            status: 9 << 8,
+        };
+
+        let siginfo = crate::dispatch::build_hvpatch_waitid_siginfo(exit);
+        assert_eq!(siginfo_i32(&siginfo, 16), 7);
     }
 
     #[test]

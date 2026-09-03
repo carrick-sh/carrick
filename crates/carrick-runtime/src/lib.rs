@@ -238,19 +238,21 @@ pub use carrick_mem::shared_aperture;
 // thread (ThreadRegistry/FutexTable) + fork_quiesce barriers are
 // hypervisor-agnostic; both backends use the real carrick-thread impls.
 pub use carrick_thread::{fork_quiesce, thread};
-// `current_thread_states` queries the kernel for per-thread run-state via the
+// `container_thread_states` queries the kernel for per-thread run-state via the
 // Mach port recorded by each vCPU thread. On macOS the real implementation
 // (in carrick-vmm-hvf::thread) issues `thread_info`; on Linux there are no Mach
 // ports, so we return every registered thread with state 'R' (running).
 #[cfg(feature = "platform-macos")]
-pub use carrick_vmm_hvf::thread::current_thread_states;
+pub use carrick_vmm_hvf::thread::container_thread_states;
 #[cfg(any(
     feature = "platform-linux",
     feature = "platform-freebsd",
     feature = "platform-netbsd"
 ))]
-pub fn current_thread_states() -> Vec<(thread::ThreadId, char)> {
-    thread::current_thread_state_chars()
+pub fn container_thread_states(
+    container: carrick_hal::ContainerId,
+) -> Vec<(thread::ThreadId, char)> {
+    thread::container_thread_state_chars(container)
 }
 
 // Under platform-linux there is no carrick-vmm-hvf to re-export `trap` from; the
@@ -314,6 +316,9 @@ pub mod kernel;
 pub mod run_result;
 
 pub mod carrier;
+pub use carrier::{
+    CarrierAdmissionState, CarrierLease, CarrierRuntime, CarrierSnapshot, ContainerInitSnapshot,
+};
 pub(crate) mod container_policy;
 pub mod threaded_loop;
 pub mod vcpu_loop;
@@ -334,7 +339,7 @@ pub(crate) mod seccomp;
 pub(crate) mod vdso_policy;
 pub mod vfs;
 pub use prepare::{
-    ExecutionPlan, PreparedRun, Runtime, RuntimeExtensions, StdioSink, resolve_plan,
+    ExecutionPlan, PreparedRun, Runtime, RuntimeExtensions, StdioSink, prepare_on, resolve_plan,
 };
 
 /// Absolute host path to Apple's Rosetta 2 Linux interpreter that carrick probes
@@ -398,11 +403,12 @@ pub fn rosetta_available() -> bool {
     feature = "platform-netbsd"
 ))]
 pub mod execute {
-    // Shared on the non-macOS lane (used by /proc + uname on every backend).
-    // The root UTS namespace is the authority here too — the backends differ in
-    // how they run a guest, not in where the guest's hostname lives.
+    // Construction-time default only. Guest-facing reads resolve the calling
+    // task's container-owned UTS namespace on every backend.
     pub fn guest_hostname() -> String {
-        crate::kernel::root_uts_ns().nodename()
+        carrick_host::host_facts::host_short_hostname()
+            .unwrap_or(crate::linux_abi::CARRICK_HOSTNAME)
+            .to_owned()
     }
 }
 
@@ -1584,6 +1590,7 @@ pub mod timer_delivery {
 
     struct Delivery {
         kicker: Arc<dyn carrick_hal::VcpuRegistry>,
+        container: carrick_hal::ContainerId,
         // Wall-clock interval/POSIX timer signals (SIGALRM/SIGVTALRM/SIGPROF) are
         // PROCESS-directed: Linux delivers them to the thread group, runnable by
         // any thread that does not block the signal. `main_tid` is retained only
@@ -1657,8 +1664,16 @@ pub mod timer_delivery {
     }
 
     /// Install the kicker + target tid. Called once at run-loop startup.
-    pub fn register(kicker: Arc<dyn carrick_hal::VcpuRegistry>, main_tid: ThreadId) {
-        *lock() = Some(Delivery { kicker, main_tid });
+    pub fn register(
+        kicker: Arc<dyn carrick_hal::VcpuRegistry>,
+        main_tid: ThreadId,
+        container: carrick_hal::ContainerId,
+    ) {
+        *lock() = Some(Delivery {
+            kicker,
+            container,
+            main_tid,
+        });
     }
 
     /// Publish a PROCESS-directed timer `signum` into the shared process-directed
@@ -1670,7 +1685,7 @@ pub mod timer_delivery {
         if let Some(d) = lock().as_ref() {
             carrick_signal_core::publish_process_signal(signum);
             d.kicker.kick_all();
-            crate::thread::notify_current_futex_signal_pending();
+            crate::thread::notify_container_futex_signal_pending(d.container);
         }
     }
 

@@ -24,9 +24,9 @@ pub use carrick_runtime::linux_abi::{
     LINUX_S_IFREG, LINUX_S_IFSOCK, LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM, LINUX_TIOCGPTN,
     LINUX_TIOCSPTLCK, LinuxCapabilityData, LinuxCapabilityHeader, LinuxDirent64Header,
     LinuxEpollEvent, LinuxErrno, LinuxEventfdValue, LinuxFdPair, LinuxIovec, LinuxItimerspec,
-    LinuxItimerval, LinuxPollFd, LinuxRlimit, LinuxRusage, LinuxSigaltstack, LinuxStat,
-    LinuxStatfs, LinuxStatx, LinuxTermios, LinuxTimerfdExpirations, LinuxTimespec, LinuxTimeval,
-    LinuxTimezone, LinuxTms, LinuxUtsname, LinuxWinsize, LinuxX8664Stat,
+    LinuxItimerval, LinuxPollFd, LinuxRlimit, LinuxRusage, LinuxSigaction, LinuxSigaltstack,
+    LinuxStat, LinuxStatfs, LinuxStatx, LinuxTermios, LinuxTimerfdExpirations, LinuxTimespec,
+    LinuxTimeval, LinuxTimezone, LinuxTms, LinuxUtsname, LinuxWinsize, LinuxX8664Stat,
 };
 pub use carrick_runtime::memory::{
     AddressSpace, LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE,
@@ -38,6 +38,16 @@ pub use carrick_runtime::thread::ThreadId;
 /// discipline; production code never fabricates keys).
 pub fn test_tid(raw: i32) -> ThreadId {
     ThreadId::synthetic_for_tests(raw)
+}
+
+/// Install a caught disposition so namespace-init signal protection does not
+/// swallow a delivery test before it reaches the exact thread queue.
+pub fn install_guest_signal_handler(context: &carrick_runtime::kernel::KernelContext, signal: i32) {
+    let signal =
+        carrick_runtime::kernel::LinuxSignal::for_signal_number(signal).expect("valid test signal");
+    let mut action = LinuxSigaction::empty();
+    action.sa_handler = 0x4000;
+    context.shared().sighand().install_action(signal, action);
 }
 pub use carrick_test_support::{gzip_tar, gzip_tar_with_links, gzip_tar_with_modes};
 pub use zerocopy::{FromBytes, IntoBytes};

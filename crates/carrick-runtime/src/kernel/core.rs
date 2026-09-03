@@ -18,7 +18,7 @@ use super::objects::{
     Sighand, Task, TaskIdentity, TaskKey, TaskLifecycle, TaskRef, TaskShared, Thread, ThreadKey,
     ThreadRef, ThreadResources, Zombie,
 };
-use super::registry::{IdError, IdRegistry, TaskClaim, ThreadClaim};
+use super::registry::{IdError, IdRegistry, TaskClaim, TaskReservation, ThreadClaim};
 
 /// Complete syscall identity snapshot. Each context keeps the exact shared
 /// associations observed at entry, so exec/resource publication cannot tear a
@@ -31,6 +31,11 @@ pub struct KernelContext {
     pub(super) shared: Arc<TaskShared>,
     pub(super) resources: Arc<ThreadResources>,
     pub(super) revision: TaskRevision,
+    /// Namespace-local identity reserved for a not-yet-published container
+    /// root. This is visible only through this exact prepared context, so
+    /// initialization can stamp PID 1 without publishing namespace membership
+    /// ahead of the root transaction.
+    provisional_namespace_pid: Option<crate::namespace::pid::PreparedNamespaceIdentityView>,
     /// Parent association observed at capture.
     ///
     /// A task's `revision` advances for any observable change, including
@@ -125,6 +130,7 @@ impl KernelContext {
             shared: Arc::clone(&self.shared),
             resources: Arc::clone(&self.resources),
             revision: self.revision,
+            provisional_namespace_pid: self.provisional_namespace_pid.clone(),
             parent_at_capture: self.parent_at_capture,
         }
     }
@@ -142,6 +148,12 @@ impl KernelContext {
             kernel: Arc::clone(&self.kernel),
             task: self.task.key(),
         }
+    }
+
+    pub(crate) fn provisional_namespace_pid_for(&self, internal_id: u32) -> Option<u32> {
+        self.provisional_namespace_pid
+            .as_ref()
+            .and_then(|identity| identity.visible_for(internal_id))
     }
 
     fn capture(
@@ -171,6 +183,7 @@ impl KernelContext {
             shared,
             resources,
             revision,
+            provisional_namespace_pid: None,
             parent_at_capture,
         }
     }
@@ -224,27 +237,6 @@ impl KernelTaskBinding {
             return Err(KernelError::StaleTaskBinding(self.task.id));
         }
         Ok(context)
-    }
-
-    pub(crate) fn install_foreign_mm_endpoint(
-        &self,
-        endpoint: carrick_hal::ForeignMmEndpoint,
-        permit: &crate::hvpatch::ForeignMmInstallPermit,
-    ) -> Result<(), KernelError> {
-        let state = self.kernel.registry.state.read();
-        let record = state
-            .tasks
-            .get(&self.task.id)
-            .ok_or(KernelError::UnknownTask(self.task.id))?;
-        if record.task.key() != self.task {
-            return Err(KernelError::StaleTaskBinding(self.task.id));
-        }
-        record
-            .task
-            .shared()
-            .mm()
-            .install_foreign_mm_endpoint(endpoint, permit);
-        Ok(())
     }
 
     /// Capture current signal authority for this exact task generation.
@@ -352,6 +344,74 @@ impl RootBootstrap {
         self.container = container;
         self
     }
+
+    pub(crate) fn into_container_root_parts(
+        self,
+    ) -> (ThreadId, Option<Arc<dyn MmBackend>>, String, Arc<Container>) {
+        (
+            self.registry_id,
+            self.mm_backend,
+            self.diagnostic_name,
+            self.container,
+        )
+    }
+}
+
+/// Exact authority to unregister one auxiliary debug provider publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DebugAuxProviderRegistration {
+    id: u64,
+}
+
+/// The shared carrier already has a distinct auxiliary debug provider.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("the carrier auxiliary debug provider is already registered")]
+pub struct DebugAuxProviderRegistrationError;
+
+struct DebugAuxProviderEntry {
+    id: u64,
+    provider: Weak<dyn super::debug::KernelDebugAuxProvider>,
+}
+
+#[derive(Default)]
+struct DebugAuxProviderRegistry {
+    next_id: u64,
+    carrier: Option<DebugAuxProviderEntry>,
+}
+
+impl std::fmt::Debug for DebugAuxProviderRegistry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DebugAuxProviderRegistry")
+            .field("carrier", &self.carrier.is_some())
+            .finish()
+    }
+}
+
+impl DebugAuxProviderRegistry {
+    fn reserve_id(&mut self) -> u64 {
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .unwrap_or_else(|| std::process::abort());
+        self.next_id
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ContainerRootPublicationBarriers {
+    barriers: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for ContainerRootPublicationBarriers {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ContainerRootPublicationBarriers")
+            .field("installed", &self.barriers.lock().is_some())
+            .finish()
+    }
 }
 
 /// One backend-neutral Linux kernel instance.
@@ -378,21 +438,218 @@ pub struct Kernel {
     /// would merge every guest's keys together. Key SERIALS are only meaningful
     /// because this allocator is VM-wide.
     keyrings: crate::keyring::KeyringService,
-    pub(super) debug_aux_provider: Mutex<Option<Weak<dyn super::debug::KernelDebugAuxProvider>>>,
-    pub(super) controlling_tty: Mutex<Option<ControllingTtyState>>,
+    debug_aux_providers: Mutex<DebugAuxProviderRegistry>,
+    /// Controlling-terminal authority is isolated by container even though all
+    /// tasks share this kernel. Each value retains the exact session/group
+    /// objects, keeping their numeric claims from being reused under a relay.
+    pub(super) controlling_ttys: Mutex<BTreeMap<ContainerId, ControllingTtyState>>,
     /// Every live container on this kernel, by id. The root task's container
     /// is registered by `bootstrap_root`; later ones by `create_container`.
     containers: Mutex<BTreeMap<ContainerId, Arc<Container>>>,
-    /// The container the root task was booted into.
-    root_container: Arc<Container>,
+    pending_container_roots: Mutex<BTreeSet<ContainerId>>,
+    #[cfg(test)]
+    container_root_publication_barriers: ContainerRootPublicationBarriers,
     /// `RLIMIT_CPU` watchdog; see [`super::cpu_limit`].
     cpu_limit_watch: CpuLimitWatch,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// A fully constructed container-init graph that is still invisible to the
+/// shared kernel. Dropping it releases every numeric/object claim; `commit`
+/// is the only publication point.
+#[must_use = "dropping a prepared container root rolls back every identity claim"]
+pub struct PreparedContainerRoot {
+    kernel: Arc<Kernel>,
+    container: Arc<Container>,
+    task_reservation: TaskReservation,
+    leader_claim: ThreadClaim,
+    task: TaskRef,
+    leader: ThreadRef,
+    shared: Arc<TaskShared>,
+    resources: Arc<ThreadResources>,
+    process_group: Arc<ProcessGroup>,
+    session: Arc<Session>,
+    diagnostic_name: String,
+    pid_identity: Option<crate::namespace::pid::PreparedNamespaceIdentity>,
+    container_reservation: ContainerRootReservation,
+}
+
+struct ContainerRootReservation {
+    kernel: Weak<Kernel>,
+    container: Arc<Container>,
+    prepared_task: Option<TaskKey>,
+    armed: bool,
+}
+
+impl ContainerRootReservation {
+    fn record_prepared_task(&mut self, task: TaskKey) {
+        self.prepared_task = Some(task);
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+        if let Some(kernel) = self.kernel.upgrade() {
+            kernel
+                .pending_container_roots
+                .lock()
+                .remove(&self.container.id());
+        }
+    }
+}
+
+impl Drop for ContainerRootReservation {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(task) = self.prepared_task {
+            self.container.rollback_prepared_pid_root(task);
+        }
+        if let Some(kernel) = self.kernel.upgrade() {
+            kernel
+                .pending_container_roots
+                .lock()
+                .remove(&self.container.id());
+        }
+    }
+}
+
+impl std::fmt::Debug for PreparedContainerRoot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedContainerRoot")
+            .field("container", &self.container.id())
+            .field("task", &self.task.key())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedContainerRoot {
+    pub(crate) fn context(&self) -> KernelContext {
+        let mut context = KernelContext::capture(
+            Arc::clone(&self.kernel),
+            Arc::clone(&self.task),
+            Arc::clone(&self.leader),
+            TaskRevision::INITIAL,
+        );
+        context.provisional_namespace_pid = self
+            .pid_identity
+            .as_ref()
+            .and_then(crate::namespace::pid::PreparedNamespaceIdentity::view);
+        context
+    }
+
+    /// Atomically publish every root edge after all fallible construction.
+    pub fn commit(self) -> Result<KernelContext, KernelError> {
+        let Self {
+            kernel,
+            container,
+            task_reservation,
+            leader_claim,
+            task,
+            leader,
+            shared,
+            resources,
+            process_group,
+            session,
+            diagnostic_name,
+            pid_identity,
+            container_reservation,
+        } = self;
+        let task_key = task.key();
+        let task_id = task_key.id;
+        let leader_tid = leader.key().tid;
+        let process_group_id = task.process_group();
+        let session_id = task.session();
+        let namespace_id = pid_identity.as_ref().map_or_else(
+            || u32::try_from(task_id.raw()).unwrap_or_else(|_| std::process::abort()),
+            crate::namespace::pid::PreparedNamespaceIdentity::visible_id,
+        );
+
+        let mut state = kernel.registry.state.write_unpublished();
+        let mut containers = kernel.containers.lock();
+        if containers.contains_key(&container.id()) {
+            return Err(KernelError::DuplicateContainer(container.id()));
+        }
+        if state.tasks.contains_key(&task_id) || state.container_inits.contains_key(&container.id())
+        {
+            return Err(KernelError::DuplicateContainer(container.id()));
+        }
+        let task_claim = task_reservation.commit();
+        state.tasks.insert(
+            task_id,
+            TaskRecord {
+                task: Arc::clone(&task),
+                revision: TaskRevision::INITIAL,
+                task_claim,
+                thread_claims: BTreeMap::from([(leader_tid, leader_claim)]),
+                dead_leader: None,
+                vfork_release: None,
+                has_execed: false,
+                diagnostic_name,
+            },
+        );
+        state.publish_process_group(
+            process_group_id,
+            ProcessGroupRecord {
+                object: process_group,
+                members: BTreeSet::from([task_key]),
+                container: container.id(),
+                namespace_id,
+            },
+        );
+        state.publish_session(
+            session_id,
+            SessionRecord {
+                object: session,
+                process_groups: BTreeSet::from([process_group_id]),
+                container: container.id(),
+                namespace_id,
+            },
+        );
+        state.container_inits.insert(container.id(), task_key);
+        containers.insert(container.id(), Arc::clone(&container));
+
+        // Stage every carrier-kernel edge while both graph authorities remain
+        // write-locked, then publish PID membership and the container's root
+        // together as the final fallible edge. A graph reader cannot return
+        // the staged root until namespace identity is live, and a namespace
+        // reader cannot observe membership before the complete graph exists.
+        // These are commit-path locks only; steady-state PID translation and
+        // graph lookup gain no additional lock or atomic operation.
+        #[cfg(test)]
+        kernel.pause_container_root_publication();
+        if let Err(error) = container.publish_pid_root(task_key, pid_identity) {
+            if containers
+                .remove(&container.id())
+                .is_none_or(|removed| !Arc::ptr_eq(&removed, &container))
+                || state.container_inits.remove(&container.id()) != Some(task_key)
+                || state.remove_session(session_id).is_none()
+                || state.remove_process_group(process_group_id).is_none()
+                || state.tasks.remove(&task_id).is_none()
+            {
+                std::process::abort();
+            }
+            return Err(error);
+        }
+        container.bind_kernel(&kernel);
+        kernel.observe_task_publication(&task, &leader, &shared, &resources, TaskRevision::INITIAL);
+        state.publish_epoch();
+        drop(containers);
+        drop(state);
+        container_reservation.disarm();
+        Ok(KernelContext::capture(
+            kernel,
+            task,
+            leader,
+            TaskRevision::INITIAL,
+        ))
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(super) struct ControllingTtyState {
-    pub(super) session: SessionId,
-    pub(super) foreground: ProcessGroupId,
+    pub(super) session: Arc<Session>,
+    pub(super) foreground: Arc<ProcessGroup>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -527,6 +784,69 @@ impl ObservationInventory {
         self.thread_resources
             .retain(|_, objects| retain_live_weak(objects));
         before - observation_count(self)
+    }
+
+    /// Revoke every observation edge owned by an exact retiring task set.
+    ///
+    /// Weak observations normally remain useful while stale external handles
+    /// drain. Container retirement is stronger: once its final topology edge
+    /// disappears, no snapshot may rediscover that container through a retained
+    /// `KernelContext`. Shared leaf rows are removed only when no surviving
+    /// task-shared observation still names them.
+    fn retire_tasks(&mut self, tasks: &BTreeSet<TaskKey>) -> usize {
+        let before = observation_count(self);
+        self.tasks.retain(|task, _| !tasks.contains(task));
+
+        let mut retired_threads = BTreeSet::new();
+        self.threads.retain(|thread, observations| {
+            observations.retain(|(task, _)| !tasks.contains(task));
+            if observations.is_empty() {
+                retired_threads.insert(*thread);
+                false
+            } else {
+                true
+            }
+        });
+        self.thread_resources
+            .retain(|key, _| !retired_threads.contains(&key.thread));
+
+        self.task_shared.retain(|key, _| !tasks.contains(&key.task));
+        let live_mms = self
+            .task_shared
+            .keys()
+            .map(|key| key.mm)
+            .collect::<BTreeSet<_>>();
+        let live_sighands = self
+            .task_shared
+            .keys()
+            .map(|key| key.sighand)
+            .collect::<BTreeSet<_>>();
+        self.mms.retain(|id, _| live_mms.contains(id));
+        self.sighands.retain(|id, _| live_sighands.contains(id));
+        self.sweep();
+        before - observation_count(self)
+    }
+
+    /// Revoke every historical observation edge belonging to `container`.
+    ///
+    /// The live registry and zombie table are lifecycle authorities, not an
+    /// observation history: a task can already have been reaped while a stale
+    /// external [`KernelContext`] still keeps its weak observation upgradeable.
+    /// Start from the task observations themselves so final container
+    /// retirement cannot rediscover such a task through that retained handle.
+    fn retire_container(&mut self, container: ContainerId) -> usize {
+        let tasks = self
+            .tasks
+            .iter()
+            .filter(|(_, observations)| {
+                observations.iter().any(|task| {
+                    task.upgrade()
+                        .is_some_and(|task| task.container().id() == container)
+                })
+            })
+            .map(|(task, _)| *task)
+            .collect::<BTreeSet<_>>();
+        self.retire_tasks(&tasks)
     }
 }
 
@@ -874,7 +1194,6 @@ impl Kernel {
             serial: object_ids.task_serial()?,
         };
         let container = bootstrap.container;
-        container.publish_pid_root(task_key)?;
         let task = Arc::new(Task::new(
             task_key,
             None,
@@ -906,6 +1225,12 @@ impl Kernel {
             process_group_claim,
         )?);
         let session = Arc::new(Session::new(session_id, &ids, session_claim)?);
+        let pid_identity = container.prepare_pid_root(task_key)?;
+        let namespace_id = pid_identity.as_ref().map_or_else(
+            || u32::try_from(task_key.id.raw()).unwrap_or_else(|_| std::process::abort()),
+            crate::namespace::pid::PreparedNamespaceIdentity::visible_id,
+        );
+        container.publish_pid_root(task_key, pid_identity)?;
 
         let task_record = TaskRecord {
             task: Arc::clone(&task),
@@ -920,7 +1245,7 @@ impl Kernel {
         let registry = Registry {
             state: RegistryLock::new(RegistryState {
                 epoch: 1,
-                root: task_key,
+                container_inits: BTreeMap::from([(container.id(), task_key)]),
                 tasks: BTreeMap::from([(bootstrap.task_id, task_record)]),
                 zombies: BTreeMap::new(),
                 process_groups: BTreeMap::from([(
@@ -928,7 +1253,13 @@ impl Kernel {
                     ProcessGroupRecord {
                         object: process_group,
                         members: BTreeSet::from([task_key]),
+                        container: container.id(),
+                        namespace_id,
                     },
+                )]),
+                process_group_by_namespace: BTreeMap::from([(
+                    (container.id(), namespace_id),
+                    process_group_id,
                 )]),
                 reservations: BTreeMap::new(),
                 retired_threads: Vec::new(),
@@ -937,7 +1268,13 @@ impl Kernel {
                     SessionRecord {
                         object: session,
                         process_groups: BTreeSet::from([process_group_id]),
+                        container: container.id(),
+                        namespace_id,
                     },
+                )]),
+                session_by_namespace: BTreeMap::from([(
+                    (container.id(), namespace_id),
+                    session_id,
                 )]),
             }),
         };
@@ -964,19 +1301,17 @@ impl Kernel {
             pending_file_closes: Mutex::new(Vec::new()),
             reservation_gate: ReservationGate::default(),
             keyrings: crate::keyring::KeyringService::new(),
-            debug_aux_provider: Mutex::new(None),
-            controlling_tty: Mutex::new(None),
+            debug_aux_providers: Mutex::new(DebugAuxProviderRegistry::default()),
+            controlling_ttys: Mutex::new(BTreeMap::new()),
             containers: Mutex::new(BTreeMap::from([(container.id(), Arc::clone(&container))])),
-            root_container: container,
+            pending_container_roots: Mutex::new(BTreeSet::new()),
+            #[cfg(test)]
+            container_root_publication_barriers: ContainerRootPublicationBarriers::default(),
             cpu_limit_watch: CpuLimitWatch::default(),
         });
+        container.bind_kernel(&kernel);
         let context = KernelContext::capture(kernel.clone(), task, leader, TaskRevision::INITIAL);
         Ok((kernel, context))
-    }
-
-    /// The container the root task was booted into.
-    pub fn root_container(&self) -> &Arc<Container> {
-        &self.root_container
     }
 
     /// The kernel's `RLIMIT_CPU` watchdog.
@@ -992,36 +1327,377 @@ impl Kernel {
         self.containers.lock().len()
     }
 
-    /// Register another container on this kernel. The caller built the
-    /// `Arc` (so the same allocation is what its dispatcher, pid region and
-    /// root bootstrap hold). Phase B1 records identity; B2 hands it a pid
-    /// region and B3 its namespaces and granted caps, at which point a second
-    /// `PreparedRun` boots its init here.
-    pub fn create_container(&self, container: Arc<Container>) -> Result<(), KernelError> {
-        let mut containers = self.containers.lock();
-        if containers.contains_key(&container.id()) {
-            return Err(KernelError::DuplicateContainer(container.id()));
+    #[cfg(test)]
+    pub(super) fn install_container_root_publication_barriers(
+        &self,
+        staged: Arc<std::sync::Barrier>,
+        publish: Arc<std::sync::Barrier>,
+    ) {
+        let previous = self
+            .container_root_publication_barriers
+            .barriers
+            .lock()
+            .replace((staged, publish));
+        assert!(previous.is_none(), "publication barriers already installed");
+    }
+
+    #[cfg(test)]
+    fn pause_container_root_publication(&self) {
+        let barriers = self
+            .container_root_publication_barriers
+            .barriers
+            .lock()
+            .take();
+        if let Some((staged, publish)) = barriers {
+            staged.wait();
+            publish.wait();
         }
-        containers.insert(container.id(), container);
-        Ok(())
+    }
+
+    pub(crate) fn container_ids(&self) -> Vec<ContainerId> {
+        self.containers.lock().keys().copied().collect()
+    }
+
+    /// Exact init generation for one container, never a carrier-global pid 1.
+    pub fn container_init(&self, id: ContainerId) -> Option<TaskKey> {
+        self.registry.state.read().container_inits.get(&id).copied()
+    }
+
+    /// Prepare a later container root without publishing any graph edge.
+    pub fn prepare_container_root(
+        self: &Arc<Self>,
+        registry_id: ThreadId,
+        mm_backend: Option<Arc<dyn MmBackend>>,
+        diagnostic_name: String,
+        container: Arc<Container>,
+        failpoint: Option<super::operations::KernelFailpoint>,
+    ) -> Result<PreparedContainerRoot, KernelError> {
+        {
+            let containers = self.containers.lock();
+            let mut pending = self.pending_container_roots.lock();
+            if containers.contains_key(&container.id())
+                || pending.contains(&container.id())
+                || container.pid_root().is_some()
+            {
+                return Err(KernelError::DuplicateContainer(container.id()));
+            }
+            pending.insert(container.id());
+        }
+        let mut container_reservation = ContainerRootReservation {
+            kernel: Arc::downgrade(self),
+            container: Arc::clone(&container),
+            prepared_task: None,
+            armed: true,
+        };
+        let (task_id, task_reservation) = self.ids.reserve_task()?;
+        fail_container_root(failpoint, super::operations::KernelFailpoint::AfterReserve)?;
+        let leader_claim = self.ids.claim_task_leader_thread(task_id)?;
+        let process_group_id = ProcessGroupId::from_leader(task_id);
+        let session_id = SessionId::from_leader(task_id);
+        let process_group_claim = self.ids.claim_process_group(process_group_id)?;
+        let session_claim = self.ids.claim_session(session_id)?;
+        let mm_id = self.object_ids.mm_id()?;
+        let mm = match mm_backend {
+            Some(backend) => Arc::new(Mm::with_backend(mm_id, backend)),
+            None => Arc::new(Mm::new_reference(mm_id)),
+        };
+        let shared = Arc::new(TaskShared::new(
+            mm,
+            Arc::new(Sighand::new(self.object_ids.sighand_id()?)),
+        ));
+        let resources = Arc::new(ThreadResources::new(
+            Arc::new(FileTable::new(self.object_ids.file_table_id()?)),
+            Arc::new(FsContext::new(self.object_ids.fs_context_id()?)),
+            Arc::new(Credentials::root(self.object_ids.credentials_id()?)),
+        ));
+        let task_key = TaskKey {
+            id: task_id,
+            serial: self.object_ids.task_serial()?,
+        };
+        let task = Arc::new(Task::new(
+            task_key,
+            None,
+            TaskIdentity {
+                process_group: process_group_id,
+                session: session_id,
+            },
+            Arc::clone(&shared),
+            resources.credentials(),
+            Arc::clone(&container),
+            ChildExitSignal::SIGCHLD,
+        ));
+        task.with_caps(|caps| *caps = container.granted_caps());
+        let leader_tid = LinuxTid::for_task_leader(task_id);
+        let leader_key = ThreadKey {
+            tid: leader_tid,
+            serial: self.object_ids.thread_serial()?,
+        };
+        let leader = task.attach_thread(leader_key, registry_id, Arc::clone(&resources))?;
+        let pid_identity = container.prepare_pid_root(task_key)?;
+        container_reservation.record_prepared_task(task_key);
+        let process_group = Arc::new(ProcessGroup::new(
+            process_group_id,
+            session_id,
+            &self.ids,
+            process_group_claim,
+        )?);
+        let session = Arc::new(Session::new(session_id, &self.ids, session_claim)?);
+        fail_container_root(failpoint, super::operations::KernelFailpoint::AfterObjects)?;
+        fail_container_root(
+            failpoint,
+            super::operations::KernelFailpoint::AfterBackendPrepare,
+        )?;
+        fail_container_root(failpoint, super::operations::KernelFailpoint::BeforePublish)?;
+        Ok(PreparedContainerRoot {
+            kernel: Arc::clone(self),
+            container,
+            task_reservation,
+            leader_claim,
+            task,
+            leader,
+            shared,
+            resources,
+            process_group,
+            session,
+            diagnostic_name,
+            pid_identity,
+            container_reservation,
+        })
+    }
+
+    /// Settle and reap exactly one container's task tree.
+    ///
+    /// Validation and injected failures happen before admission closes, so a
+    /// rejected retirement publishes neither topology nor an epoch. Once
+    /// closed, every live task is driven through the ordinary exact exit path:
+    /// thread claims, reparenting, vfork release, file-table retirement and
+    /// exit subscribers therefore have the same semantics as a guest exit.
+    /// The final transaction removes all exact-container zombies (including
+    /// already-orphaned ones) and the container edges.
+    pub fn retire_container_root(
+        self: &Arc<Self>,
+        container_id: ContainerId,
+        failpoint: Option<super::operations::KernelFailpoint>,
+    ) -> Result<crate::carrier::ContainerTeardown, KernelError> {
+        fail_container_root(failpoint, super::operations::KernelFailpoint::AfterReserve)?;
+        let (container, init, mut live_tasks) = {
+            let state = self.registry.state.write_unpublished();
+            let containers = self.containers.lock();
+            let container = containers
+                .get(&container_id)
+                .map(Arc::clone)
+                .ok_or(KernelError::UnknownContainer(container_id))?;
+            let init = state
+                .container_inits
+                .get(&container_id)
+                .copied()
+                .ok_or(KernelError::UnknownContainer(container_id))?;
+            let selected: BTreeSet<TaskId> = state
+                .tasks
+                .iter()
+                .filter(|(_, record)| record.task.container().id() == container_id)
+                .map(|(id, _)| *id)
+                .collect();
+            if (!selected.contains(&init.id)
+                && state
+                    .zombies
+                    .get(&init.id)
+                    .is_none_or(|record| record.zombie.key != init))
+                || selected
+                    .iter()
+                    .any(|id| state.reservations.contains_key(id))
+            {
+                return Err(KernelError::ContainerBusy(container_id));
+            }
+            if selected.iter().any(|id| {
+                state.tasks.get(id).is_none_or(|record| {
+                    record.task.children().iter().any(|child| {
+                        !selected.contains(&child.id)
+                            && state
+                                .zombies
+                                .get(&child.id)
+                                .is_none_or(|zombie| zombie.zombie.container != container_id)
+                    })
+                })
+            }) {
+                return Err(KernelError::ContainerTopology(container_id));
+            }
+            fail_container_root(failpoint, super::operations::KernelFailpoint::AfterObjects)?;
+            fail_container_root(
+                failpoint,
+                super::operations::KernelFailpoint::AfterBackendPrepare,
+            )?;
+            fail_container_root(failpoint, super::operations::KernelFailpoint::BeforePublish)?;
+
+            // This store occurs under the same registry write lock consulted
+            // by fork/thread-clone admission, closing the validation race.
+            container.begin_retirement();
+            let live_tasks = selected
+                .into_iter()
+                .filter_map(|id| state.tasks.get(&id).map(|record| record.task.key()))
+                .collect::<Vec<_>>();
+            (container, init, live_tasks)
+        };
+
+        // Non-init tasks first. Their ordinary exit transaction reparents any
+        // children to the still-live init; init then orphans all remaining
+        // live/zombie children exactly as normal Linux task exit does.
+        live_tasks.sort_by_key(|task| task.id == init.id);
+        for task in live_tasks {
+            self.exit_task_key_eventually(
+                task,
+                super::objects::LinuxWaitStatus::from_wait_encoding(0),
+            )
+            .map_err(|_| KernelError::ContainerTopology(container_id))?;
+        }
+
+        let retiring_tasks = {
+            let state = self.registry.state.read();
+            let containers = self.containers.lock();
+            if containers
+                .get(&container_id)
+                .is_none_or(|current| !Arc::ptr_eq(current, &container))
+            {
+                return Err(KernelError::UnknownContainer(container_id));
+            }
+            if state
+                .tasks
+                .values()
+                .any(|record| record.task.container().id() == container_id)
+                || state.reservations.keys().any(|task| {
+                    state
+                        .tasks
+                        .get(task)
+                        .is_some_and(|record| record.task.container().id() == container_id)
+                })
+            {
+                return Err(KernelError::ContainerBusy(container_id));
+            }
+            state
+                .zombies
+                .iter()
+                .filter(|(_, record)| record.zombie.container == container_id)
+                .map(|(_, record)| record.zombie.key)
+                .collect::<BTreeSet<_>>()
+        };
+
+        // Namespace and observation authority disappear before the container's
+        // final table edge. Admission is already closed and every task is a
+        // zombie, so no new observation can be published for this container.
+        let pid_region_released = match container.pid_region() {
+            Some(region) => {
+                if !region.retire() {
+                    return Err(KernelError::PidNamespaceRetirement(container_id));
+                }
+                true
+            }
+            None => false,
+        };
+        self.observations.lock().retire_container(container_id);
+        container.mark_retired();
+
+        let tasks_reaped = {
+            let mut state = self.registry.state.write_unpublished();
+            let mut containers = self.containers.lock();
+            if state
+                .tasks
+                .values()
+                .any(|record| record.task.container().id() == container_id)
+                || state.reservations.keys().any(|task| {
+                    state
+                        .tasks
+                        .get(task)
+                        .is_some_and(|record| record.task.container().id() == container_id)
+                })
+            {
+                std::process::abort();
+            }
+            let tasks_reaped = retiring_tasks
+                .iter()
+                .map(|key| {
+                    let record = state
+                        .zombies
+                        .remove(&key.id)
+                        .unwrap_or_else(|| std::process::abort());
+                    if record.zombie.key != *key || record.zombie.container != container_id {
+                        std::process::abort();
+                    }
+                    record
+                })
+                .count();
+            self.controlling_ttys.lock().remove(&container_id);
+            if state.container_inits.remove(&container_id) != Some(init) {
+                std::process::abort();
+            }
+            let removed = containers
+                .remove(&container_id)
+                .unwrap_or_else(|| std::process::abort());
+            if !Arc::ptr_eq(&removed, &container) {
+                std::process::abort();
+            }
+            state.publish_epoch();
+            tasks_reaped
+        };
+        Ok(crate::carrier::ContainerTeardown {
+            id: container_id,
+            carrier_scope_id: container.launch().carrier_scope_id.clone(),
+            run_id: container.run_id().clone(),
+            tasks_reaped,
+            mounts_dropped: 0,
+            pid_region_released,
+        })
     }
 
     pub fn register_debug_aux_provider(
         &self,
         provider: &Arc<dyn super::debug::KernelDebugAuxProvider>,
-    ) {
-        *self.debug_aux_provider.lock() = Some(Arc::downgrade(provider));
+    ) -> Result<DebugAuxProviderRegistration, DebugAuxProviderRegistrationError> {
+        let mut providers = self.debug_aux_providers.lock();
+        if let Some(entry) = providers.carrier.as_ref()
+            && let Some(current) = entry.provider.upgrade()
+        {
+            return if Arc::ptr_eq(&current, provider) {
+                Ok(DebugAuxProviderRegistration { id: entry.id })
+            } else {
+                Err(DebugAuxProviderRegistrationError)
+            };
+        }
+        providers.carrier = None;
+        let id = providers.reserve_id();
+        providers.carrier = Some(DebugAuxProviderEntry {
+            id,
+            provider: Arc::downgrade(provider),
+        });
+        Ok(DebugAuxProviderRegistration { id })
     }
 
-    pub fn unregister_debug_aux_provider(&self) {
-        *self.debug_aux_provider.lock() = None;
-    }
-
-    pub fn debug_aux_provider(&self) -> Option<Arc<dyn super::debug::KernelDebugAuxProvider>> {
-        self.debug_aux_provider
-            .lock()
+    pub fn unregister_debug_aux_provider(
+        &self,
+        registration: DebugAuxProviderRegistration,
+    ) -> bool {
+        let mut providers = self.debug_aux_providers.lock();
+        if providers
+            .carrier
             .as_ref()
-            .and_then(Weak::upgrade)
+            .is_none_or(|entry| entry.id != registration.id)
+        {
+            return false;
+        }
+        providers.carrier = None;
+        true
+    }
+
+    /// Select the shared carrier's provider for its unscoped auxiliary tables.
+    pub fn debug_aux_provider(&self) -> Option<Arc<dyn super::debug::KernelDebugAuxProvider>> {
+        let mut providers = self.debug_aux_providers.lock();
+        let provider = providers
+            .carrier
+            .as_ref()
+            .and_then(|entry| entry.provider.upgrade());
+        if provider.is_none() {
+            providers.carrier = None;
+        }
+        provider
     }
 
     /// The VM-wide keyring store. See the field docs for why it lives here.
@@ -1205,7 +1881,12 @@ impl Kernel {
 
     pub fn validate_invariants(&self) -> Result<(), RegistryInvariantError> {
         let state = self.registry.state.read();
-        if !state.tasks.contains_key(&state.root.id) {
+        if state.container_inits.values().any(|root| {
+            state
+                .tasks
+                .get(&root.id)
+                .is_none_or(|record| record.task.key() != *root)
+        }) {
             return Err(RegistryInvariantError::RootNotLive);
         }
         if state.reservations.keys().any(|task_id| {
@@ -1223,13 +1904,18 @@ impl Kernel {
             let Some(group) = state.process_groups.get(&group_id) else {
                 return Err(RegistryInvariantError::MissingProcessGroup);
             };
-            if group.object.session() != session_id || !group.members.contains(&key) {
+            if group.object.session() != session_id
+                || group.container != record.task.container().id()
+                || !group.members.contains(&key)
+            {
                 return Err(RegistryInvariantError::ProcessGroupBacklink);
             }
             let Some(session) = state.sessions.get(&session_id) else {
                 return Err(RegistryInvariantError::MissingSession);
             };
-            if !session.process_groups.contains(&group_id) {
+            if session.container != record.task.container().id()
+                || !session.process_groups.contains(&group_id)
+            {
                 return Err(RegistryInvariantError::SessionBacklink);
             }
             let thread_keys = record.task.thread_keys();
@@ -1257,28 +1943,59 @@ impl Kernel {
                 }
             }
         }
+        if state.process_group_by_namespace.len() != state.process_groups.len() {
+            return Err(RegistryInvariantError::ProcessGroupBacklink);
+        }
+        let mut process_group_names = BTreeSet::new();
         for (group_id, group) in &state.process_groups {
             if !self.ids.is_reserved_number(group_id.raw()) {
                 return Err(RegistryInvariantError::ProcessGroupClaim);
+            }
+            if !process_group_names.insert((group.container, group.namespace_id)) {
+                return Err(RegistryInvariantError::ProcessGroupBacklink);
+            }
+            if state
+                .process_group_by_namespace
+                .get(&(group.container, group.namespace_id))
+                != Some(group_id)
+            {
+                return Err(RegistryInvariantError::ProcessGroupBacklink);
             }
             for member in &group.members {
                 let Some(task) = state.tasks.get(&member.id) else {
                     return Err(RegistryInvariantError::MissingGroupMember);
                 };
-                if task.task.key() != *member || task.task.process_group() != *group_id {
+                if task.task.key() != *member
+                    || task.task.process_group() != *group_id
+                    || task.task.container().id() != group.container
+                {
                     return Err(RegistryInvariantError::ProcessGroupBacklink);
                 }
             }
         }
+        if state.session_by_namespace.len() != state.sessions.len() {
+            return Err(RegistryInvariantError::SessionBacklink);
+        }
+        let mut session_names = BTreeSet::new();
         for (session_id, session) in &state.sessions {
             if !self.ids.is_reserved_number(session_id.raw()) {
                 return Err(RegistryInvariantError::SessionClaim);
+            }
+            if !session_names.insert((session.container, session.namespace_id)) {
+                return Err(RegistryInvariantError::SessionBacklink);
+            }
+            if state
+                .session_by_namespace
+                .get(&(session.container, session.namespace_id))
+                != Some(session_id)
+            {
+                return Err(RegistryInvariantError::SessionBacklink);
             }
             for group_id in &session.process_groups {
                 let Some(group) = state.process_groups.get(group_id) else {
                     return Err(RegistryInvariantError::MissingProcessGroup);
                 };
-                if group.object.session() != *session_id {
+                if group.object.session() != *session_id || group.container != session.container {
                     return Err(RegistryInvariantError::SessionBacklink);
                 }
             }
@@ -1376,6 +2093,7 @@ impl RegistryLock {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LiveProcess {
     pub key: TaskKey,
+    pub container: ContainerId,
     pub parent: Option<TaskKey>,
     pub process_group: ProcessGroupId,
     pub session: SessionId,
@@ -1406,17 +2124,18 @@ impl Registry {
             .map(|record| record.zombie.clone())
     }
 
-    pub(crate) fn zombies(&self) -> Vec<Zombie> {
+    pub(crate) fn zombies_for_container(&self, container: ContainerId) -> Vec<Zombie> {
         self.state
             .read()
             .zombies
             .values()
+            .filter(|record| record.zombie.container == container)
             .map(|record| record.zombie.clone())
             .collect()
     }
 
     /// Every LIVE process's Linux identity, for the `/proc/<pid>/{stat,status,
-    /// comm,cmdline}` renderers. The sibling of [`Registry::zombies`]: that one
+    /// comm,cmdline}` renderers. The sibling of [`Registry::zombies_for_container`]: that one
     /// describes the exited-but-unreaped interval, this one the interval before
     /// it, and together they are the whole set of processes a guest can name.
     ///
@@ -1433,6 +2152,7 @@ impl Registry {
             .values()
             .map(|record| LiveProcess {
                 key: record.task.key(),
+                container: record.task.container().id(),
                 parent: record.task.parent(),
                 process_group: record.task.process_group(),
                 session: record.task.session(),
@@ -1443,21 +2163,29 @@ impl Registry {
             .collect()
     }
 
+    pub(crate) fn live_processes_for_container(&self, container: ContainerId) -> Vec<LiveProcess> {
+        self.live_processes()
+            .into_iter()
+            .filter(|process| process.container == container)
+            .collect()
+    }
+
     /// Every live process's `oom_score_adj`, keyed by its Linux pid, for the
     /// `/proc/<pid>/oom_score_adj` renderer. A snapshot rather than a per-read
     /// lookup because the synthetic-`/proc` context is assembled before the
     /// requested pid is known; the live-task count is small.
-    pub(crate) fn oom_score_adj_by_pid(&self) -> BTreeMap<u32, i32> {
-        // LIVE tasks only. The `/proc` renderer's contract is "a pid absent
-        // from this map has no live process behind it" — that absence is what
-        // makes `/proc/<dead-pid>/oom_score_adj` ENOENT. Including a lingering
-        // zombie/dead record fabricated the file for a reaped pid (probe
-        // `oomscoreadj`, `dead_pid_file_absent=false`).
+    pub(crate) fn oom_score_adj_by_pid_for_container(
+        &self,
+        container: ContainerId,
+    ) -> BTreeMap<u32, i32> {
         self.state
             .read()
             .tasks
             .iter()
-            .filter(|(_, record)| record.task.lifecycle() == TaskLifecycle::Live)
+            .filter(|(_, record)| {
+                record.task.lifecycle() == TaskLifecycle::Live
+                    && record.task.container().id() == container
+            })
             .map(|(id, record)| (id.raw() as u32, record.task.oom_score_adj()))
             .collect()
     }
@@ -1533,6 +2261,7 @@ impl Registry {
     /// means no such group (or none of its members are live) — ESRCH.
     pub(crate) fn process_group_prio_targets(
         &self,
+        container: ContainerId,
         pgid: ProcessGroupId,
     ) -> Vec<(Arc<Task>, carrick_abi::NsUid)> {
         let state = self.state.read();
@@ -1544,7 +2273,10 @@ impl Registry {
             .iter()
             .filter_map(|member| {
                 let record = state.tasks.get(&member.id)?;
-                if record.task.key() == *member && record.task.lifecycle() == TaskLifecycle::Live {
+                if record.task.key() == *member
+                    && record.task.container().id() == container
+                    && record.task.lifecycle() == TaskLifecycle::Live
+                {
                     Some((
                         Arc::clone(&record.task),
                         record.task.process_credentials().euid(),
@@ -1565,6 +2297,7 @@ impl Registry {
     /// joining every credential transition.
     pub(crate) fn user_prio_targets(
         &self,
+        container: ContainerId,
         uid: carrick_abi::NsUid,
     ) -> Vec<(Arc<Task>, carrick_abi::NsUid)> {
         self.state
@@ -1573,6 +2306,7 @@ impl Registry {
             .values()
             .filter(|record| {
                 record.task.lifecycle() == TaskLifecycle::Live
+                    && record.task.container().id() == container
                     && record.task.process_credentials().euid() == uid
             })
             .map(|record| {
@@ -1592,12 +2326,69 @@ impl Registry {
             .map(|record| Arc::clone(&record.object))
     }
 
+    /// Resolve a namespace-visible process-group id inside one container.
+    ///
+    /// This is deliberately backed by the process-group record rather than by
+    /// the leader's task/PID entry: Linux keeps the group name live while any
+    /// member remains, even after the leader has exited and been reaped.
+    pub(crate) fn process_group_from_namespace(
+        &self,
+        container: ContainerId,
+        namespace_id: u32,
+    ) -> Option<ProcessGroupId> {
+        let state = self.state.read();
+        let id = *state
+            .process_group_by_namespace
+            .get(&(container, namespace_id))?;
+        state.process_groups.contains_key(&id).then_some(id)
+    }
+
+    /// Render a live process-group id in exactly one container's namespace.
+    pub(crate) fn process_group_to_namespace(
+        &self,
+        container: ContainerId,
+        id: ProcessGroupId,
+    ) -> Option<u32> {
+        self.state
+            .read()
+            .process_groups
+            .get(&id)
+            .filter(|record| record.container == container)
+            .map(|record| record.namespace_id)
+    }
+
     pub fn session(&self, id: SessionId) -> Option<Arc<Session>> {
         self.state
             .read()
             .sessions
             .get(&id)
             .map(|record| Arc::clone(&record.object))
+    }
+
+    /// Resolve a namespace-visible session id inside one container. Session
+    /// identity follows the session record, not its (possibly reaped) leader.
+    pub(crate) fn session_from_namespace(
+        &self,
+        container: ContainerId,
+        namespace_id: u32,
+    ) -> Option<SessionId> {
+        let state = self.state.read();
+        let id = *state.session_by_namespace.get(&(container, namespace_id))?;
+        state.sessions.contains_key(&id).then_some(id)
+    }
+
+    /// Render a live session id in exactly one container's namespace.
+    pub(crate) fn session_to_namespace(
+        &self,
+        container: ContainerId,
+        id: SessionId,
+    ) -> Option<u32> {
+        self.state
+            .read()
+            .sessions
+            .get(&id)
+            .filter(|record| record.container == container)
+            .map(|record| record.namespace_id)
     }
 
     pub fn process_group_members(&self, id: ProcessGroupId) -> Vec<TaskKey> {
@@ -1650,13 +2441,26 @@ impl Registry {
 #[derive(Debug)]
 pub(super) struct RegistryState {
     pub(super) epoch: u64,
-    pub(super) root: TaskKey,
+    pub(super) container_inits: BTreeMap<ContainerId, TaskKey>,
     pub(super) tasks: BTreeMap<TaskId, TaskRecord>,
     pub(super) zombies: BTreeMap<TaskId, ZombieRecord>,
     pub(super) process_groups: BTreeMap<ProcessGroupId, ProcessGroupRecord>,
+    pub(super) process_group_by_namespace: BTreeMap<(ContainerId, u32), ProcessGroupId>,
     pub(super) reservations: BTreeMap<TaskId, carrick_hal::KernelTransactionId>,
     pub(super) retired_threads: Vec<RetiredThreadRecord>,
     pub(super) sessions: BTreeMap<SessionId, SessionRecord>,
+    pub(super) session_by_namespace: BTreeMap<(ContainerId, u32), SessionId>,
+}
+
+fn fail_container_root(
+    selected: Option<super::operations::KernelFailpoint>,
+    boundary: super::operations::KernelFailpoint,
+) -> Result<(), KernelError> {
+    if selected == Some(boundary) {
+        Err(KernelError::InjectedContainerRootFailure(boundary))
+    } else {
+        Ok(())
+    }
 }
 
 impl RegistryState {
@@ -1665,6 +2469,54 @@ impl RegistryState {
             std::process::abort();
         };
         self.epoch = next;
+    }
+
+    pub(super) fn publish_process_group(&mut self, id: ProcessGroupId, record: ProcessGroupRecord) {
+        let namespace_key = (record.container, record.namespace_id);
+        if self.process_groups.contains_key(&id)
+            || self.process_group_by_namespace.contains_key(&namespace_key)
+        {
+            std::process::abort();
+        }
+        self.process_group_by_namespace.insert(namespace_key, id);
+        self.process_groups.insert(id, record);
+    }
+
+    pub(super) fn remove_process_group(
+        &mut self,
+        id: ProcessGroupId,
+    ) -> Option<ProcessGroupRecord> {
+        let record = self.process_groups.remove(&id)?;
+        if self
+            .process_group_by_namespace
+            .remove(&(record.container, record.namespace_id))
+            != Some(id)
+        {
+            std::process::abort();
+        }
+        Some(record)
+    }
+
+    pub(super) fn publish_session(&mut self, id: SessionId, record: SessionRecord) {
+        let namespace_key = (record.container, record.namespace_id);
+        if self.sessions.contains_key(&id) || self.session_by_namespace.contains_key(&namespace_key)
+        {
+            std::process::abort();
+        }
+        self.session_by_namespace.insert(namespace_key, id);
+        self.sessions.insert(id, record);
+    }
+
+    pub(super) fn remove_session(&mut self, id: SessionId) -> Option<SessionRecord> {
+        let record = self.sessions.remove(&id)?;
+        if self
+            .session_by_namespace
+            .remove(&(record.container, record.namespace_id))
+            != Some(id)
+        {
+            std::process::abort();
+        }
+        Some(record)
     }
 }
 
@@ -1698,12 +2550,20 @@ pub(super) struct RetiredThreadRecord {
 pub(super) struct ProcessGroupRecord {
     pub(super) object: Arc<ProcessGroup>,
     pub(super) members: BTreeSet<TaskKey>,
+    /// Namespace that owns this group name. Internal `ProcessGroupId` remains
+    /// the scheduler/kernel key; this pair is the guest-facing authority.
+    pub(super) container: ContainerId,
+    pub(super) namespace_id: u32,
 }
 
 #[derive(Debug)]
 pub(super) struct SessionRecord {
     pub(super) object: Arc<Session>,
     pub(super) process_groups: BTreeSet<ProcessGroupId>,
+    /// Namespace that owns this session name. Its lifetime is exactly this
+    /// record's lifetime, independent of the leader's task slot.
+    pub(super) container: ContainerId,
+    pub(super) namespace_id: u32,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1726,6 +2586,18 @@ pub enum KernelError {
     DuplicateContainer(ContainerId),
     #[error("container {0:?} already has an init task")]
     ContainerRootAlreadyPublished(ContainerId),
+    #[error("container root failed at injected boundary {0:?}")]
+    InjectedContainerRootFailure(super::operations::KernelFailpoint),
+    #[error("container {0:?} has no live init task")]
+    UnknownContainer(ContainerId),
+    #[error("container {0:?} init could not join its PID namespace")]
+    PidNamespaceMembership(ContainerId),
+    #[error("container {0:?} PID namespace could not be retired")]
+    PidNamespaceRetirement(ContainerId),
+    #[error("container {0:?} still has an in-flight kernel transaction")]
+    ContainerBusy(ContainerId),
+    #[error("container {0:?} task tree crosses a container boundary")]
+    ContainerTopology(ContainerId),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -2022,14 +2894,19 @@ mod tests {
         let child4 = fork(5004, "child-4");
         assert!(child4.task.begin_exit());
 
-        let root_targets = kernel.registry().process_group_prio_targets(pgid_root);
+        let container = root.task.container().id();
+        let root_targets = kernel
+            .registry()
+            .process_group_prio_targets(container, pgid_root);
         let root_target_ids: Vec<TaskId> = root_targets.iter().map(|(t, _)| t.key().id).collect();
         assert_eq!(
             root_target_ids,
             vec![root.task.key().id, child1.task.key().id]
         );
 
-        let child2_targets = kernel.registry().process_group_prio_targets(pgid_child2);
+        let child2_targets = kernel
+            .registry()
+            .process_group_prio_targets(container, pgid_child2);
         let child2_target_ids: Vec<TaskId> =
             child2_targets.iter().map(|(t, _)| t.key().id).collect();
         assert_eq!(child2_target_ids, vec![child2.task.key().id]);
@@ -2038,7 +2915,7 @@ mod tests {
         assert!(
             kernel
                 .registry()
-                .process_group_prio_targets(unknown_pgid)
+                .process_group_prio_targets(container, unknown_pgid)
                 .is_empty()
         );
     }
@@ -2048,7 +2925,7 @@ mod tests {
     /// makes `ContainerId` a real domain.
     #[test]
     fn containers_in_one_kernel_have_distinct_ids() {
-        let (kernel, _context) = bootstrap(4400);
+        let (kernel, context) = bootstrap(4400);
         let first = Arc::new(Container::new(LaunchContext::unmanaged(RunId::new(
             "first",
         ))));
@@ -2056,22 +2933,44 @@ mod tests {
             "second",
         ))));
         kernel
-            .create_container(Arc::clone(&first))
-            .expect("first container");
+            .prepare_container_root(
+                ThreadId::synthetic_for_tests(4401),
+                None,
+                "first-root".to_string(),
+                Arc::clone(&first),
+                None,
+            )
+            .expect("prepare first container")
+            .commit()
+            .expect("publish first container root");
         kernel
-            .create_container(Arc::clone(&second))
-            .expect("second container");
+            .prepare_container_root(
+                ThreadId::synthetic_for_tests(4402),
+                None,
+                "second-root".to_string(),
+                Arc::clone(&second),
+                None,
+            )
+            .expect("prepare second container")
+            .commit()
+            .expect("publish second container root");
 
         assert_ne!(first.id(), second.id());
-        assert_ne!(first.id(), kernel.root_container().id());
-        assert_ne!(second.id(), kernel.root_container().id());
+        assert_ne!(first.id(), context.container().id());
+        assert_ne!(second.id(), context.container().id());
         assert_eq!(kernel.container_count(), 3);
         assert!(Arc::ptr_eq(
             &kernel.container(first.id()).expect("registered"),
             &first
         ));
         assert!(matches!(
-            kernel.create_container(Arc::clone(&first)),
+            kernel.prepare_container_root(
+                ThreadId::synthetic_for_tests(4403),
+                None,
+                "duplicate-first-root".to_string(),
+                Arc::clone(&first),
+                None,
+            ),
             Err(KernelError::DuplicateContainer(id)) if id == first.id()
         ));
     }
@@ -2093,8 +2992,11 @@ mod tests {
         let (kernel, context) = Kernel::bootstrap_root(bootstrap).expect("root kernel");
 
         let resolved = context.container();
-        assert!(Arc::ptr_eq(&resolved, kernel.root_container()));
         assert!(Arc::ptr_eq(&resolved, &container));
+        assert_eq!(
+            kernel.container_init(container.id()),
+            Some(context.task().key())
+        );
         assert_eq!(resolved.run_id().as_str(), "root-run");
         assert_eq!(resolved.pid_root(), Some(context.task().key()));
         assert_eq!(kernel.container_count(), 1);

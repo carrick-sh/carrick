@@ -10,12 +10,13 @@ commands for different reasons:
   no Docker, no signed binary.
 * **Runtime conformance** — observable behavior is pinned by differential tests
   that run an identical workload under carrick and under a real Linux container
-  (the Docker oracle) and diff the output. A LANE selects only *where* the
-  carrick side runs, never which execution backend it uses — carrick has one
-  (HVPatch) and defaults to it, so no lane passes `--exec-backend`. The default
-  lane is `hvf`: the local signed binary on this mac, `linux/arm64`. The local
-  x86_64 bring-up lanes use `linux/amd64`. The macOS lane needs a signed release
-  binary and a reachable Docker daemon unless the oracle verdict is cached.
+  (the Docker oracle) and diff the output. Carrick has one shipped HVPatch
+  kernel execution model, projected through platform VMMs. A LANE selects the
+  target host/VMM and guest architecture, not a different source of Linux
+  process semantics. The default lane is `hvf`: the local signed binary on this
+  Mac, `linux/arm64`. The local x86_64 bring-up lanes use `linux/amd64`. The
+  macOS lane needs a signed release binary and a reachable Docker daemon unless
+  the oracle verdict is cached.
 
 Compile-time checks pin *what the bytes are*; runtime probes pin *what the
 syscall does*. Both are gates: a green build plus a green probe suite is the
@@ -27,6 +28,30 @@ how-to-run-and-interpret companion.
 
 ---
 
+## CI evidence boundary
+
+Public pull requests run source, ABI, host-only kernel-semantic, and target
+feature-closure checks on GitHub-hosted machines. They do not execute a guest
+and must not be cited as HVPatch/KVM runtime proof. GitHub documents nested
+virtualization as
+[unsupported on hosted macOS Arm64](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#limitations-for-arm64-macos-runners)
+and [experimental rather than guaranteed on hosted runners generally](https://docs.github.com/en/actions/concepts/runners/github-hosted-runners#preinstalled-software-for-github-owned-images).
+
+Real guest execution is isolated in `.github/workflows/kernel-runtime.yml` on
+trusted, capability-labeled self-hosted hardware. The focused HVF job proves
+signed embed/probe execution; the KVM job proves its named smoke fixture; only
+the strict baseline-free closure invocation accounts for the frozen 2,127
+suites. These claims are intentionally not interchangeable.
+
+| CI surface | Trigger | Evidence |
+| --- | --- | --- |
+| Hosted CI | Pull request, main, manual, nightly | Source, ABI, host semantics, target feature closure; no guest |
+| Focused HVF | Trusted main/manual/nightly | Signed embed execution and cached probe gate |
+| HVF closure | Trusted manual/nightly | Strict, unfiltered 2,127-suite MATCH accounting |
+| KVM smoke | Trusted manual/nightly | Named fixture on usable `/dev/kvm` |
+
+---
+
 ## Host unit/integration tests
 
 The fast inner loop. Pure-Rust library tests across the workspace — VFS logic,
@@ -34,14 +59,14 @@ ABI encoders, sockaddr translation, the in-memory rootfs merge — with **no HVF
 vCPU and no Docker**:
 
 ```sh
-just test                      # == cargo test --workspace --lib
-cargo test --workspace --lib   # the same thing, directly
+just test  # repository-safe host test recipe
 ```
 
-`--lib` deliberately scopes to the in-crate `#[cfg(test)]` modules and skips the
-integration-test binaries under `crates/carrick-cli/tests/` (which need the
-signed binary and Docker — see below). Because these tests never spawn a guest,
-they run from a plain `cargo build` artifact and stay green on any machine.
+The recipe runs ordinary crates in parallel, then runs the fork-sensitive
+`carrick-runtime`, `carrick-host`, and `carrick-native-darwin` crates alone with
+`RUST_TEST_THREADS=1`. Child reaping is process-wide, so a bare parallel
+`cargo test --workspace --lib` can deadlock even when individual modules use
+locks. Because these tests never spawn a guest, they use unsigned artifacts.
 
 > [!NOTE]
 > The crate-wide no-panic gate (`unwrap`/`expect`/`panic!`/`todo!`/
@@ -61,6 +86,7 @@ The primary runtime gate is `carrick-conformance`, driven through `just`:
 just conformance                 # full tier, local macOS (`hvf`) lane
 just conformance smoke           # smoke tier
 just conformance full --bless    # refresh baseline/oracle outputs when intended
+just conformance full --closure --force  # strict, baseline-free 2,127-suite gate
 just matrix                      # re-render docs/support-matrix.md from results
 ```
 
@@ -82,19 +108,29 @@ Lane-specific expected gaps belong in that lane's overlay
 (`scripts/conformance/baseline.<key>.jsonl`), not in the shared `hvf` baseline —
 `hvf` carries no overlay because it IS the shared ground truth.
 
-## Legacy differential probe suite vs Docker
+Strict closure requires the exact unfiltered HVF full selection. It refuses
+baseline excuses, skips, flake retries, blessing, missing oracle rows, and
+partial report inventories, and requires exactly 2,127 unique `MATCH` reports.
+`just conformance-probes` remains the public focused probe gate; its narrower
+surface is not suite closure.
 
-The older line-exact ABI probe gate still lives in
-`crates/carrick-cli/tests/conformance.rs` and runs deliberately:
+## Retained subprocess differential probes
+
+New generic probe coverage runs in-process through
+`carrick-conformance-next`. Subprocess execution remains only for the reviewed
+entries in `scripts/conformance/retained-generic-probes.txt`, dedicated runners
+whose topology is not yet available through the public embed API, and the
+explicit CLI process-boundary contract. Run the combined public gate with:
 
 ```sh
-just conformance                                              # builds+signs, then runs
-cargo test -p carrick-cli --test conformance -- --nocapture   # if already built+signed
+just conformance-probes
 ```
 
 `just conformance-probes` depends on `build`, so it always re-signs the release
 binary first ([`scripts/build-signed.sh`](../scripts/build-signed.sh)).
-`--nocapture` surfaces the per-case `PASS`/`FAIL`/`XFAIL` lines as they run.
+The retained subprocess runner surfaces per-case `PASS`/`FAIL`/`XFAIL` lines as
+it runs; the generic shards use signed in-process test executables and committed
+source-hash-validated Docker oracles.
 
 ### What a case is
 
@@ -122,7 +158,7 @@ carrick-vs-Docker diff engine:
 The same two-sided run also drives `conformance_go_fixture` (a Go hello-world
 ELF built by `scripts/build-go-fixtures.sh`).
 
-### Self-skip semantics
+### Developer convenience skips are not hardware evidence
 
 Every `#[test]` here **passes by skipping** when its prerequisites are absent, so
 `cargo test` stays green on a machine without HVF entitlement or Docker:
@@ -134,6 +170,14 @@ Every `#[test]` here **passes by skipping** when its prerequisites are absent, s
   static-musl probes only run on the `arm64` lane.
 
 A genuine ABI divergence is the only thing that turns a non-skipped case red.
+
+Those skips keep an ordinary developer test command usable, but a skipped case
+proves nothing. The focused hardware job uses the signed embed recipe so a
+missing entitlement or HVF capability fails; its retained subprocess exceptions
+still require row-level review for skips. Only strict closure makes every
+missing binary, image, oracle, capability, skip, and report row a gate failure.
+Never cite a green skip-capable invocation as a complete guest-execution
+receipt.
 
 ### Two-phase, parallel, never carrick||docker
 

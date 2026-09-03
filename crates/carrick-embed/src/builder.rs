@@ -12,6 +12,8 @@ use carrick_runtime::runtime::DEFAULT_MAX_TRAPS;
 use carrick_runtime::vfs::Vfs;
 use carrick_spec::{Mount, Platform, StdioMode};
 
+use crate::carrier::CarrierBinding;
+use crate::prepared::PreparedCarrierOwnership;
 use crate::result::{CaptureBuffer, CapturedStreams};
 use crate::{ContainerResult, EmbedError, PreparedContainer};
 
@@ -105,6 +107,7 @@ fn piped_writer(
 /// only rejects what the engine could never honour (a named user, a relative
 /// mount path, a malformed env key).
 pub struct ContainerBuilder {
+    carrier: CarrierBinding,
     image: String,
     platform: Option<Platform>,
     pull: PullPolicy,
@@ -125,6 +128,7 @@ pub struct ContainerBuilder {
     budget: Option<carrick_runtime::observe::ResourceBudget>,
     max_traps: usize,
     observers: Vec<std::sync::Arc<dyn carrick_runtime::observe::SyscallObserver>>,
+    interceptors: Vec<std::sync::Arc<dyn carrick_runtime::observe::SyscallInterceptor>>,
     network_interposer: Option<carrick_runtime::network::interposer::NetworkInterposer>,
     shared_buffers: Vec<(String, crate::SharedBuffer)>,
 }
@@ -132,7 +136,19 @@ pub struct ContainerBuilder {
 impl ContainerBuilder {
     /// Start from an image reference (`ubuntu:24.04`, `ghcr.io/org/app@sha256:…`).
     pub fn from_image(image: impl Into<String>) -> Self {
+        Self::new(image, CarrierBinding::ImplicitSingleUse)
+    }
+
+    pub(crate) fn from_carrier(
+        image: impl Into<String>,
+        carrier: carrick_runtime::CarrierRuntime,
+    ) -> Self {
+        Self::new(image, CarrierBinding::Explicit(carrier))
+    }
+
+    fn new(image: impl Into<String>, carrier: CarrierBinding) -> Self {
         Self {
+            carrier,
             image: image.into(),
             platform: None,
             pull: PullPolicy::Missing,
@@ -153,6 +169,7 @@ impl ContainerBuilder {
             budget: None,
             max_traps: DEFAULT_MAX_TRAPS,
             observers: Vec::new(),
+            interceptors: Vec::new(),
             network_interposer: None,
             shared_buffers: Vec::new(),
         }
@@ -290,6 +307,19 @@ impl ContainerBuilder {
         self
     }
 
+    /// Register a trusted syscall interceptor for this container.
+    ///
+    /// Repeated calls append in deterministic order. The interceptor receives
+    /// opaque scalar words only; it cannot change the syscall number or access
+    /// guest memory through this interface.
+    pub fn interceptor(
+        mut self,
+        interceptor: std::sync::Arc<dyn carrick_runtime::observe::SyscallInterceptor>,
+    ) -> Self {
+        self.interceptors.push(interceptor);
+        self
+    }
+
     /// Attach a fault injector to simulate syscall and I/O failures.
     pub fn fault_injector(self, injector: carrick_runtime::observe::FaultInjector) -> Self {
         self.observer(std::sync::Arc::new(injector))
@@ -392,6 +422,9 @@ impl ContainerBuilder {
     /// Resolve the image (async) and freeze the run. No guest work happens here.
     pub async fn prepare(self) -> Result<PreparedContainer, EmbedError> {
         let request = self.to_run_request()?;
+        // Reserve identity before image I/O. If resolution fails, the exact
+        // prepared lease drops here and removes only this reservation.
+        let (carrier, carrier_lease, implicit_carrier) = self.carrier.reserve()?;
         let store = self
             .store
             .clone()
@@ -424,6 +457,9 @@ impl ContainerBuilder {
         for observer in self.observers {
             extensions = extensions.observer(observer);
         }
+        for interceptor in self.interceptors {
+            extensions = extensions.interceptor(interceptor);
+        }
         for (target, vfs) in vfs_mounts {
             extensions = extensions.vfs_mount(target, vfs);
         }
@@ -442,6 +478,11 @@ impl ContainerBuilder {
             extensions,
             plan.captured,
             self.shared_buffers,
+            PreparedCarrierOwnership {
+                runtime: carrier,
+                lease: carrier_lease,
+                implicit: implicit_carrier,
+            },
         ))
     }
 
@@ -504,6 +545,34 @@ mod tests {
     use carrick_engine::{request_platform, resolve_run_spec};
     use carrick_image::ResolvedImage;
     use carrick_spec::ImageConfig;
+
+    struct ContinueInterceptor;
+
+    impl carrick_runtime::observe::SyscallInterceptor for ContinueInterceptor {
+        fn intercept(
+            &self,
+            _process: &carrick_runtime::observe::ProcessInfo<'_>,
+            _call: &carrick_runtime::observe::InterceptedSyscall<'_>,
+        ) -> carrick_runtime::observe::InterceptAction {
+            carrick_runtime::observe::InterceptAction::Continue
+        }
+    }
+
+    #[test]
+    fn builder_preserves_interceptor_registration_order() {
+        let first: std::sync::Arc<dyn carrick_runtime::observe::SyscallInterceptor> =
+            std::sync::Arc::new(ContinueInterceptor);
+        let second: std::sync::Arc<dyn carrick_runtime::observe::SyscallInterceptor> =
+            std::sync::Arc::new(ContinueInterceptor);
+
+        let builder = ContainerBuilder::from_image("alpine")
+            .interceptor(std::sync::Arc::clone(&first))
+            .interceptor(std::sync::Arc::clone(&second));
+
+        assert_eq!(builder.interceptors.len(), 2);
+        assert!(std::sync::Arc::ptr_eq(&builder.interceptors[0], &first));
+        assert!(std::sync::Arc::ptr_eq(&builder.interceptors[1], &second));
+    }
 
     fn strings(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
@@ -839,6 +908,7 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_resolves_a_local_image_without_pulling() {
+        let _serial = crate::CARRIER_TEST_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let store = ImageStore::new(tmp.path());
         seed_local_image(
@@ -866,6 +936,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_absent_image_with_pull_never_is_an_image_error() {
+        let _serial = crate::CARRIER_TEST_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         // `PreparedContainer` has no `Debug` (it owns a `RuntimeExtensions`), so
         // `unwrap_err()` cannot be used on this Result; destructure instead.
@@ -893,6 +964,7 @@ mod tests {
 
     #[tokio::test]
     async fn vfs_mount_wires_into_prepared_container() {
+        let _serial = crate::CARRIER_TEST_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let store = ImageStore::new(tmp.path());
         seed_local_image(
@@ -916,6 +988,7 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_wires_time_control() {
+        let _serial = crate::CARRIER_TEST_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let store = ImageStore::new(tmp.path());
         seed_local_image(
@@ -938,6 +1011,7 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_wires_network_interposer() {
+        let _serial = crate::CARRIER_TEST_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let store = ImageStore::new(tmp.path());
         seed_local_image(
@@ -963,6 +1037,7 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_wires_shared_buffer() {
+        let _serial = crate::CARRIER_TEST_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let store = ImageStore::new(tmp.path());
         seed_local_image(

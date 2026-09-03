@@ -52,6 +52,7 @@ use crate::trap::{
 };
 pub use crate::trap::{
     HvpatchCarrierTaskIdentity, HvpatchCarrierTaskStateDirectory, HvpatchChildKernelBinding,
+    HvpatchMmRootRetirementProof,
 };
 
 /// The public engine type: the HVF aarch64 lane IS `Aarch64EngineCore<HvfAarch64Vmm>`.
@@ -921,6 +922,41 @@ pub fn retire_detached_task_engine(
     })
 }
 
+pub fn retire_detached_task_engine_with_root_proof(
+    state: &mut HvpatchTaskEngineState,
+    expected_root_base: u64,
+    expected_root_size: u64,
+) -> Result<
+    (
+        carrick_hal::FrameInventoryCommit<()>,
+        HvpatchMmRootRetirementProof,
+    ),
+    TrapError,
+> {
+    let backend = state.backend_mut();
+    let proof = HvfVmState::retire_task_state_process_mappings_with_root_proof(
+        &mut backend.state.task,
+        (expected_root_base, expected_root_size),
+    )?;
+    let inventory = backend.state.take_retirement_inventory().ok_or_else(|| {
+        TrapError::Hypervisor(
+            "detached HVPatch task retirement produced no inventory commit".to_owned(),
+        )
+    })?;
+    Ok((inventory, proof))
+}
+
+pub fn retire_detached_task_shared_root_with_proof(
+    state: &mut HvpatchTaskEngineState,
+    expected_root_base: u64,
+    expected_root_size: u64,
+) -> Result<HvpatchMmRootRetirementProof, TrapError> {
+    HvfVmState::retire_task_state_mm_root_only(
+        &mut state.backend_mut().state.task,
+        (expected_root_base, expected_root_size),
+    )
+}
+
 pub fn retire_detached_task_only_engine(
     state: &HvpatchTaskOnlyEngineState,
 ) -> Result<carrick_hal::FrameInventoryCommit<()>, TrapError> {
@@ -936,10 +972,64 @@ pub fn retire_detached_task_only_engine(
     })
 }
 
+pub fn retire_detached_task_only_engine_with_root_proof(
+    state: &HvpatchTaskOnlyEngineState,
+    expected_root_base: u64,
+    expected_root_size: u64,
+) -> Result<
+    (
+        carrick_hal::FrameInventoryCommit<()>,
+        HvpatchMmRootRetirementProof,
+    ),
+    TrapError,
+> {
+    let mut parked = state.parked_task.lock();
+    let task = parked.as_mut().ok_or_else(|| {
+        TrapError::Hypervisor("detached task-only retirement has no parked task state".to_owned())
+    })?;
+    let proof = HvfVmState::retire_task_state_process_mappings_with_root_proof(
+        task,
+        (expected_root_base, expected_root_size),
+    )?;
+    let inventory = HvfVmState::take_task_state_retirement_inventory(task).ok_or_else(|| {
+        TrapError::Hypervisor(
+            "detached task-only retirement produced no inventory commit".to_owned(),
+        )
+    })?;
+    Ok((inventory, proof))
+}
+
+/// Retire only the exact structural page-table backing for a final task whose
+/// user-frame inventory is shared with another process. The shared ledger is
+/// untouched; successful return proves the reusable stage-1 slot is no longer
+/// occupied in the carrier's stage-2 map.
+pub fn retire_detached_task_only_shared_root_with_proof(
+    state: &HvpatchTaskOnlyEngineState,
+    expected_root_base: u64,
+    expected_root_size: u64,
+) -> Result<HvpatchMmRootRetirementProof, TrapError> {
+    let mut parked = state.parked_task.lock();
+    let task = parked.as_mut().ok_or_else(|| {
+        TrapError::Hypervisor("detached task-only retirement has no parked task state".to_owned())
+    })?;
+    HvfVmState::retire_task_state_mm_root_only(task, (expected_root_base, expected_root_size))
+}
+
 pub fn retire_detached_exec_predecessor(
     state: &mut HvpatchTaskEngineState,
 ) -> Result<(), TrapError> {
     HvfVmState::retire_task_state_exec_predecessor(&mut state.backend_mut().state.task)
+}
+
+pub fn retire_detached_exec_predecessor_with_root_proof(
+    state: &mut HvpatchTaskEngineState,
+    expected_root_base: u64,
+    expected_root_size: u64,
+) -> Result<HvpatchMmRootRetirementProof, TrapError> {
+    HvfVmState::retire_task_state_exec_predecessor_with_root_proof(
+        &mut state.backend_mut().state.task,
+        (expected_root_base, expected_root_size),
+    )
 }
 
 pub fn retire_detached_task_only_exec_predecessor(
@@ -950,6 +1040,21 @@ pub fn retire_detached_task_only_exec_predecessor(
         TrapError::Hypervisor("detached exec cleanup has no parked task state".to_owned())
     })?;
     HvfVmState::retire_task_state_exec_predecessor(task)
+}
+
+pub fn retire_detached_task_only_exec_predecessor_with_root_proof(
+    state: &HvpatchTaskOnlyEngineState,
+    expected_root_base: u64,
+    expected_root_size: u64,
+) -> Result<HvpatchMmRootRetirementProof, TrapError> {
+    let mut parked = state.parked_task.lock();
+    let task = parked.as_mut().ok_or_else(|| {
+        TrapError::Hypervisor("detached exec cleanup has no parked task state".to_owned())
+    })?;
+    HvfVmState::retire_task_state_exec_predecessor_with_root_proof(
+        task,
+        (expected_root_base, expected_root_size),
+    )
 }
 
 pub fn cancel_dormant_task_engine(state: &mut HvpatchTaskEngineState) -> Result<(), TrapError> {
@@ -1849,6 +1954,46 @@ mod task_only_materializer_tests {
             ),
             process_asid: Some(asid),
         }
+    }
+
+    #[test]
+    fn task_only_runtime_projection_clones_the_exact_mm_authorities() {
+        let root = 0x9a_0000_0000;
+        let projection = runtime_projection(root, 2);
+        let expected_page_tables = std::sync::Arc::clone(&projection.page_tables);
+        let expected_protections = std::sync::Arc::clone(&projection.protections);
+        let slot = super::TaskOnlyRuntimeProjectionSlot::new(projection);
+
+        let (first_page_tables, first_protections) = slot
+            .clone_authorities()
+            .expect("clone first runtime authorities");
+        let (second_page_tables, second_protections) = slot
+            .clone_authorities()
+            .expect("clone second runtime authorities");
+
+        assert!(std::sync::Arc::ptr_eq(
+            &expected_page_tables,
+            &first_page_tables
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &first_page_tables,
+            &second_page_tables
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &expected_protections,
+            &first_protections
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &first_protections,
+            &second_protections
+        ));
+        assert_eq!(
+            second_page_tables
+                .lock()
+                .as_ref()
+                .map(|manager| manager.base()),
+            Some(root),
+        );
     }
 
     #[test]

@@ -29,6 +29,18 @@ pub enum TerminalReason {
 /// the HVF loops and the KVM single-threaded loop.
 #[derive(Debug, Error)]
 pub enum RuntimeError {
+    #[error("an independent carrier is already active in this host process")]
+    CarrierAlreadyActive,
+    #[error(
+        "an explicit carrier is active; bind this container to that carrier instead of using the implicit compatibility path"
+    )]
+    ExplicitCarrierBindingRequired,
+    #[error("carrier admission is closing")]
+    CarrierClosing,
+    #[error("carrier is closed")]
+    CarrierClosed,
+    #[error("carrier failed: {0}")]
+    CarrierFailed(String),
     #[error("failed to load ELF image: {0}")]
     AddressSpace(#[from] AddressSpaceError),
     // Reading a rootfs-backed ELF (main binary / PT_INTERP) lives at the runtime

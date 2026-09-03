@@ -5,12 +5,31 @@ mod common;
 
 use carrick_conformance_next::{PullPolicy, TestContainer};
 
+fn selected_probe_target() -> &'static str {
+    let closure_mode = std::env::var("CARRICK_PROBE_MODE").as_deref() == Ok("closure");
+    let libc = std::env::var("CARRICK_PROBE_SCENARIO_LIBC").ok();
+    if !closure_mode {
+        return "aarch64-unknown-linux-musl";
+    }
+    match libc.as_deref() {
+        Some("musl") => "aarch64-unknown-linux-musl",
+        Some("gnu") => "aarch64-unknown-linux-gnu",
+        Some(value) => {
+            panic!("invalid CARRICK_PROBE_SCENARIO_LIBC={value:?}; expected musl or gnu")
+        }
+        None => panic!("closure ptrace scenario requires CARRICK_PROBE_SCENARIO_LIBC"),
+    }
+}
+
 #[test]
-#[ignore = "requires a signed HVF test executable and prebuilt aarch64-musl probes"]
+#[ignore = "requires a signed HVF test executable and prebuilt aarch64 probes"]
 fn production_rx_poketext_executes_warm_patched_instruction() {
     let _guard = common::guest_lock();
     let root = common::repo_root();
-    let probe_dir = root.join("conformance-probes/target/aarch64-unknown-linux-musl/release");
+    let probe_dir = root
+        .join("conformance-probes/target")
+        .join(selected_probe_target())
+        .join("release");
     let probe = probe_dir.join("ptracepoketext");
     assert!(probe.is_file(), "build probes first: {}", probe.display());
 

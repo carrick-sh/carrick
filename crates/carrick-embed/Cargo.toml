@@ -8,6 +8,14 @@ license.workspace = true
 name = "carrick_embed"
 path = "src/lib.rs"
 
+[[example]]
+name = "intercept_getuid"
+path = "examples/intercept_getuid.rs"
+
+[[example]]
+name = "advanced_embed"
+path = "examples/advanced_embed.rs"
+
 [lints]
 workspace = true
 
@@ -26,6 +34,9 @@ platform-freebsd = ["carrick-runtime/platform-freebsd", "carrick-engine/platform
 platform-netbsd = ["carrick-runtime/platform-netbsd", "carrick-engine/platform-netbsd"]
 # In-memory fs backend selection (default OFF; same control-point rule as the CLI).
 fs-memory = ["carrick-spec/fs-memory", "carrick-engine/fs-memory", "carrick-runtime/fs-memory"]
+# Read-only internal lifecycle telemetry used by signed Carrick conformance
+# tests. Not enabled for ordinary embedding consumers.
+test-support = []
 
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }

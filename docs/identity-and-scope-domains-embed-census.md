@@ -1,9 +1,12 @@
-# Embed census: per-container state held in carrier-wide statics
+# Embed concurrency census
 
 Companion to [`identity-and-scope-domains.md`](identity-and-scope-domains.md)
 ("Scope: a `static` is just a `static`") for the `carrick-embed` program
 ([`superpowers/specs/2026-08-25-carrick-embed-program-design.md`](superpowers/specs/2026-08-25-carrick-embed-program-design.md),
-Phase B). Taken at `3dc6cc72` on 2026-08-25 with
+Phase B). The original census was taken at `3dc6cc72` on 2026-08-25. The
+executable ledger now scans runtime, kernel, HVF, thread, embed, and
+observability sources and is enforced with
+`--require-concurrent-embed-clean`.
 
 ```sh
 rg -n 'static [A-Z_]+:|OnceLock|std::env::var' crates/carrick-runtime/src crates/carrick-kernel/src \
@@ -24,14 +27,17 @@ row was read at its line, not inferred from the grep. Two verdicts:
   state; where its VALUE is per-run today (the run id in the process title) the
   source moves to `LaunchContext` and the static keeps its carrier scope.
 
-The phase column names the plan cluster that moves the row: **B1** (this
+The historical phase column names the plan cluster that moved the row: **B1** (this
 census + `Container` identity, Task 15), **B2** (pid region, the arena
 singleton, run identity, the SysV IPC scope; Tasks 16–19), **B3** (the
 `ClockDomain` realtime offset + epoch, granted caps, UTS/net namespaces;
 Tasks 20–21). Adjacent-crate rows the survey named are listed last for
 completeness.
 
-## Container-state (must move into `Container`)
+## Resolved container-state migrations
+
+Every row in this section has moved to its typed owner. There are no remaining
+`container_debt` rows in the executable ledger.
 
 | file:line | static / env read | what it models | Phase-B destination |
 |---|---|---|---|
@@ -50,7 +56,7 @@ completeness.
 | `crates/carrick-runtime/src/runtime.rs:693,719-720` | `ARENA_PATH_ENV` presence; `CARRICK_RUN_ID` / `CARRICK_CONTAINER_ID` (`kernel_arena_run_scope`) | the per-run arena directory name | deleted by **B2**: the arena becomes the lazy `KernelArena::global()` singleton over an unlinked temp file, so there is no scope path to name; the `pid-<pid>` run-id fallback survives only in `LaunchContext::from_process_env` (B1 Task 15) |
 | `crates/carrick-runtime/src/threaded_loop.rs:351-352` | `CARRICK_CONTAINER_ID`, `CARRICK_LAUNCH_AUTHORIZATION` → `ManagedCarrierControl::start` | which registry entry this carrier is authorized to become | `LaunchContext.registry_id` / `.launch_authorization` — **B2** |
 | `crates/carrick-runtime/src/dispatch/sysv.rs:867,884-885` | `static SYSV_FALLBACK_ROOT_PID`; `CARRICK_RUN_ID` / `CARRICK_CONTAINER_ID` (`sysv_run_scope`) | the SysV IPC namespace's on-disk scope | **B2** Task 16 replaces `sysv_run_scope` with `task.container().run_id().scope_component()` (the sanitizer lifted into `RunId::scope_component` by B1 Task 15) |
-| `crates/carrick-runtime/src/kernel/debug/endpoint.rs:131` | `CARRICK_RUN_ID` (`DebugEndpoint::for_current_run`) | the run this debug endpoint rendezvouses for | `RunId` from the root container's `LaunchContext` — **B2** (the server at `kernel/debug/server.rs:42` stays carrier-infra: one kernel per carrier) |
+| `crates/carrick-runtime/src/kernel/debug/endpoint.rs` | former ambient `CARRICK_RUN_ID` (`DebugEndpoint::for_current_run`) | the carrier this debug endpoint rendezvouses for | deleted; `KernelDebugServer::install` receives the immutable `CarrierScopeId` explicitly |
 
 ## Carrier-infra (stays process-scoped)
 
@@ -58,7 +64,7 @@ completeness.
 
 | file:line | static / env read | note |
 |---|---|---|
-| `crates/carrick-runtime/src/dispatch/proctitle.rs:66,71` | `static RUN_ID: OnceLock<Option<String>>` seeded from `CARRICK_RUN_ID` | the host process TITLE is a carrier fact (`ps` sees one process); the id it embeds comes from the first container's `LaunchContext` after **B2**. Not a container object. |
+| `crates/carrick-runtime/src/dispatch/proctitle.rs` | argv/environ buffer only; the former cached `RUN_ID` was removed | `CarrierInner` owns an immutable `CarrierScopeId`; the visible title is `carrick:<scope>: <live-count> containers` and guest name changes update only their host thread |
 | `crates/carrick-kernel/src/arena.rs:25,370` | `static GLOBAL: OnceLock<KernelArena>`; `ARENA_PATH_ENV` in `create_or_attach_from_env` | the arena is a carrier singleton by design (spec Phase B); **B2** makes `KernelArena::global()` its sole constructor (lazy, over an unlinked temp file) and deletes `init_global`/`create_or_attach_from_env`/`ARENA_PATH_ENV` and the `set_var` at `runtime.rs:713`. `arena.rs:24 ARENA_FILE_COUNTER` is its id allocator. |
 | `crates/carrick-runtime/src/dispatch/pty_registry.rs:32` | `static MASTERS: LazyLock<Mutex<HashMap<u32, (i32, FileDescriptionId)>>>` | pts index → master. carrier-infra, unchanged in Phase B: the pts index space is the host devpts the carrier opened `/dev/ptmx` on, keyed by a host fd; a per-container devpts INSTANCE is a mount-table concern (Phase E), not a Phase-B move. No B-cluster gate depends on it. |
 
@@ -123,6 +129,24 @@ All stay host-process configuration. Those marked † are candidates for a `Cont
 
 Per host thread, never container state: `dispatch/resources.rs:59-63`, `dispatch/lock_order.rs:36`, `fanotify.rs:66`, `dispatch/fs/pathres.rs:20`, `fs_backend.rs:130`, `dispatch/sysv.rs:1395`, `vcpu_loop/signal.rs:357` (each is the cell inside a `thread_local!` that opens one to three lines earlier). `cfg(test)` only: `dispatch/fs.rs:1192,1195`, `vcpu_loop/executor.rs:1284`, `vcpu_loop/mod.rs:2837,2840`, `dispatch/fs/fd_helpers.rs:811`, and the test locks at `host_tty.rs:1232`, `network/socket_namespace.rs:2552`, `dispatch/signal.rs:3612`, `dispatch/time.rs:1356`, `vcpu_loop/signal.rs:702`.
 
+## Concurrent-path disposition
+
+| State family | Owner and routing proof |
+|---|---|
+| Initial UTS and network namespaces | `Container::{uts_ns,net_ns}`; every task reaches them through its `NsProxy`. `/proc`, `/sys`, uname, ioctl, and rtnetlink tests exercise two live containers after independent mutation. |
+| Thread registry and private futex table | `RUNTIME_ENDPOINTS` is keyed by typed `ContainerId`, holds weak handles, and uses exact-generation RAII removal. Syscalls derive the id from `KernelContext`; async delivery captures it at registration. Hot vCPU run-state publication uses its direct registry handle and does not lock the endpoint directory. |
+| Timer and signal delivery | Timer delivery stores `ContainerId`; cross-process signal liveness and wakeups resolve only that container's endpoint. The carrier-wide shared-futex table is intentionally also nudged because shared guest futexes span process-private tables. |
+| Kernel debug server and process title | One server and one title per carrier. Both receive immutable `CarrierScopeId`; neither reads a current-container environment value. Container `RunId` values are separate and guest `prctl`/exec changes only the calling host thread name. |
+| PTY registries, FIFO beacons, socket error/reuseport/SCTP registries | Retained as host-kernel-object tables keyed by host fd, inode, socket, or carrier-local endpoint. They contain no mutable current-container selector. |
+| Filesystem caches and FileAuthority | Carrier services keyed by exact mount/file-description/path authority; per-container mount roots and retirement live on `Container`/`MountRetirement`. Cache generations invalidate data but do not identify a container. |
+| vCPU permits, frame/IPA allocators, event ring, lifecycle ledger | One synchronized authority per hardware carrier. Identifiers are monotonic; the event ring and lifecycle window describe the carrier. Lifecycle artifact publication receives the exact carrier scope rather than rediscovering it from the environment. |
+| Observability hooks and probe TLS | Diagnostic-only process or host-thread state. They neither select a `ContainerId` nor alter guest-visible state when enabled. |
+
+The checker additionally rejects no-argument current-registry/current-futex
+accessors, ambient run/container statics, and `CARRICK_RUN_ID` reads below the
+launch-context boundary. Standalone probe binaries are outside the concurrent
+embed call graph and retain their explicit evidence-run environment contract.
+
 ## Adjacent crates the survey named (outside this grep's scope)
 
 | file:line | item | verdict |
@@ -133,21 +157,23 @@ Per host thread, never container state: `dispatch/resources.rs:59-63`, `dispatch
 | `crates/carrick-vmm-hvf/src/host_signal.rs:1113` | `INSTALLED: AtomicU8` host signal dispositions | carrier-infra (spec) |
 | `crates/carrick-hal/src/signal_pump.rs:68` (`:83` installs) | `SIGCHLD_INSTALLED` and the pump's dispositions | carrier-infra (spec) |
 | `crates/carrick-signal-core/src/host_glue.rs:87` | routed per-signal `sigaction` installs | carrier-infra (spec) |
-| `crates/carrick-runtime/src/dispatch/proctitle.rs:160,170,198,225` | `set_host_process_name` (host argv buffer + `pthread_setname_np` at `:170`) | carrier-infra: names the carrier |
+| `crates/carrick-runtime/src/dispatch/proctitle.rs` | argv/environ buffer and host thread naming | carrier-infra: `set_carrier_process_title` alone writes the carrier argv title; `set_host_process_name` names only the calling thread |
 
 ---
 
 ## Checked executable ledger — `scripts/migrate/runtime-global-state.json`
 
 Monotone process-global state gate enforced by `scripts/migrate/check-runtime-global-state.py`.
-Current verified census across `crates/carrick-runtime/src`, `crates/carrick-kernel/src`, and `crates/carrick-vmm-hvf/src`:
+Current verified census across `carrick-runtime`, `carrick-kernel`,
+`carrick-vmm-hvf`, `carrick-thread`, `carrick-embed`, and
+`carrick-observability`:
 
 | Classification | Count | Description |
 |---|---|---|
-| `carrier_infra` | 107 | Host execution infrastructure, thread-locals, VM lifecycle |
-| `config_debug` | 120 | Host-process configuration or diagnostic debug hatches read from environment |
-| `container_debt` | 2 | Per-container state remaining on root namespace statics (`kernel/netns.rs`) |
-| `host_kernel_object` | 8 | Tables keyed by host file descriptor or filesystem path |
-| `monotonic_allocator` | 30 | Monotonic identifier and generation allocators |
-| `test_only` | 18 | Test fixtures, probe tools, or synchronization locks |
-| **Total** | **285** | Exact source-fingerprinted rows |
+| `carrier_infra` | 120 | Host execution infrastructure, thread-locals, VM lifecycle |
+| `config_debug` | 128 | Host-process configuration or diagnostic debug hatches read from environment |
+| `container_debt` | 0 | Concurrent embed mode fails closed if this becomes nonzero |
+| `host_kernel_object` | 10 | Tables keyed by host file descriptor or filesystem path |
+| `monotonic_allocator` | 35 | Monotonic identifier and generation allocators |
+| `test_only` | 36 | Test fixtures, probe tools, or synchronization locks |
+| **Total** | **329** | Exact source-fingerprinted rows |
