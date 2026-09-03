@@ -13099,18 +13099,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/fs.rs:1252 in `proc_self_magic_link`, the host result from `std::process::id` determines the guest /proc/self magic-link result used by `proc_self_magic_link`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/fs.rs:1352 in `proc_self_magic_link`, the host result from `std::process::id` determines the guest /proc/self magic-link result used by `proc_self_magic_link`.",
     "review_id": "HA-000490",
     "source": {
-      "byte_end": 44812,
-      "byte_start": 44796,
+      "byte_end": 48699,
+      "byte_start": 48683,
       "column": 33,
       "column_end": 49,
       "column_start": 33,
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1252,
-      "line_end": 1252,
-      "line_start": 1252
+      "line": 1352,
+      "line_end": 1352,
+      "line_start": 1352
     }
   },
   {
@@ -13126,18 +13126,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/fs.rs:1304 in `proc_self_fdinfo_number`, the host result from `std::process::id` determines the guest /proc/self magic-link result used by `proc_self_fdinfo_number`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/fs.rs:1404 in `proc_self_fdinfo_number`, the host result from `std::process::id` determines the guest /proc/self magic-link result used by `proc_self_fdinfo_number`.",
     "review_id": "HA-000491",
     "source": {
-      "byte_end": 47013,
-      "byte_start": 46997,
+      "byte_end": 50900,
+      "byte_start": 50884,
       "column": 33,
       "column_end": 49,
       "column_start": 33,
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1304,
-      "line_end": 1304,
-      "line_start": 1304
+      "line": 1404,
+      "line_end": 1404,
+      "line_start": 1404
     }
   },
   {
@@ -13153,18 +13153,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/fs.rs:5113 in `send_async_owner_signal`, the host result from `std::process::id` determines the guest self-thread signal-target decision used by `send_async_owner_signal`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/fs.rs:5213 in `send_async_owner_signal`, the host result from `std::process::id` determines the guest self-thread signal-target decision used by `send_async_owner_signal`.",
     "review_id": "HA-000492",
     "source": {
-      "byte_end": 226045,
-      "byte_start": 226029,
+      "byte_end": 229932,
+      "byte_start": 229916,
       "column": 97,
       "column_end": 113,
       "column_start": 97,
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5113,
-      "line_end": 5113,
-      "line_start": 5113
+      "line": 5213,
+      "line_end": 5213,
+      "line_start": 5213
     }
   },
   {
@@ -13180,18 +13180,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/fs.rs:5114 in `send_async_owner_signal`, the host result from `std::process::id` determines the guest self-process signal-target decision used by `send_async_owner_signal`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/fs.rs:5214 in `send_async_owner_signal`, the host result from `std::process::id` determines the guest self-process signal-target decision used by `send_async_owner_signal`.",
     "review_id": "HA-000493",
     "source": {
-      "byte_end": 226164,
-      "byte_start": 226148,
+      "byte_end": 230051,
+      "byte_start": 230035,
       "column": 100,
       "column_end": 116,
       "column_start": 100,
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5114,
-      "line_end": 5114,
-      "line_start": 5114
+      "line": 5214,
+      "line_end": 5214,
+      "line_start": 5214
     }
   },
   {
