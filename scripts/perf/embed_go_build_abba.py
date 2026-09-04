@@ -26,7 +26,7 @@ import paired_stats
 
 
 ARM_SCHEMA = "carrick.embed-implicit-perf-arm.v1"
-CAMPAIGN_SCHEMA = "carrick.embed-implicit-go-build-abba.v1"
+CAMPAIGN_SCHEMA = "carrick.embed-implicit-go-build-abba.v2"
 ARM_ROLES = frozenset(("control", "candidate"))
 DRIVER_INPUTS = (
     pathlib.Path("scripts/perf/embed_implicit_driver/Cargo.toml.in"),
@@ -1088,12 +1088,15 @@ def _no_regression_decision(
     complete: bool,
     artifacts_authenticated: bool,
     preflights_passed: bool,
+    evidence_class: str = "official",
 ) -> dict[str, object]:
     if any(
         type(value) is not bool
         for value in (complete, artifacts_authenticated, preflights_passed)
     ):
         raise ValueError("decision eligibility inputs must be booleans")
+    if evidence_class not in {"official", "directional-pilot"}:
+        raise ValueError(f"invalid evidence class: {evidence_class!r}")
     quad_count = statistics_payload.get("quad_count")
     if type(quad_count) is not int or quad_count < 0:
         raise ValueError("quad_count must be a nonnegative integer")
@@ -1160,18 +1163,28 @@ def _no_regression_decision(
         "complete": complete,
         "quad_count": quad_count,
         "minimum_quads": MINIMUM_QUADS,
+        "evidence_class": evidence_class,
         "artifacts_authenticated": artifacts_authenticated,
         "preflights_passed": preflights_passed,
     }
     eligible = (
-        complete
+        evidence_class == "official"
+        and complete
         and quad_count >= MINIMUM_QUADS
         and artifacts_authenticated
         and preflights_passed
     )
     supported_fail = eligible and (primary_supported or secondary_supported)
     no_regression_pass = eligible and all(value <= THRESHOLD for value in medians)
-    status = "fail" if supported_fail else "pass" if no_regression_pass else "unresolved"
+    status = (
+        "directional"
+        if evidence_class == "directional-pilot" and complete
+        else "fail"
+        if supported_fail
+        else "pass"
+        if no_regression_pass
+        else "unresolved"
+    )
     return {
         "status": status,
         "threshold": THRESHOLD,
@@ -1188,10 +1201,19 @@ def _record_decision(
     artifact: dict[str, object], decision: dict[str, object]
 ) -> None:
     status = decision.get("status")
-    if status not in {"pass", "fail", "unresolved"}:
+    if status not in {"pass", "fail", "unresolved", "directional"}:
         raise ValueError(f"invalid no-regression decision status: {status!r}")
+    evidence_class = artifact.get("evidence_class", "official")
+    if (status == "directional") != (evidence_class == "directional-pilot"):
+        raise ValueError(
+            "directional decisions require directional-pilot evidence and vice versa"
+        )
     artifact["decision"] = decision
-    artifact["accepted"] = artifact.get("complete") is True and status == "pass"
+    artifact["accepted"] = (
+        artifact.get("complete") is True
+        and evidence_class == "official"
+        and status == "pass"
+    )
 
 
 def _decision_exit_code(artifact: dict[str, object]) -> int:
@@ -1207,6 +1229,12 @@ def _decision_exit_code(artifact: dict[str, object]) -> int:
         return 2
     if status == "unresolved":
         return 3
+    if (
+        status == "directional"
+        and artifact.get("evidence_class") == "directional-pilot"
+        and artifact.get("accepted") is False
+    ):
+        return 0
     return 1
 
 
@@ -1338,6 +1366,19 @@ def _campaign_preflight(
     }
 
 
+def _validate_campaign_quads(quads: int, *, pilot: bool) -> str:
+    if type(pilot) is not bool:
+        raise ValueError("pilot selection must be boolean")
+    if type(quads) is int:
+        if pilot and 1 <= quads < MINIMUM_QUADS:
+            return "directional-pilot"
+        if not pilot and MINIMUM_QUADS <= quads <= 127:
+            return "official"
+    mode = "pilot" if pilot else "official"
+    expected = "1 through 7" if pilot else "8 through 127"
+    raise ValueError(f"{mode} campaigns require {expected} quads")
+
+
 def run_campaign(
     harness_repo: pathlib.Path,
     control: ArmSpec,
@@ -1349,9 +1390,9 @@ def run_campaign(
     timeout_seconds: int = 900,
     image_ref: str = native_go_build.DEFAULT_IMAGE,
     allow_battery: bool = False,
+    pilot: bool = False,
 ) -> dict[str, object]:
-    if type(quads) is not int or not MINIMUM_QUADS <= quads <= 127:
-        raise ValueError("official campaigns require between 8 and 127 quads")
+    evidence_class = _validate_campaign_quads(quads, pilot=pilot)
     if timeout_seconds <= 0 or cooldown_seconds < 0:
         raise ValueError("timeout must be positive and cooldown nonnegative")
     mode = validate_arm_mode(control, candidate)
@@ -1365,6 +1406,7 @@ def run_campaign(
     artifact: dict[str, object] = {
         "schema": CAMPAIGN_SCHEMA,
         "campaign_id": campaign_id,
+        "evidence_class": evidence_class,
         "complete": False,
         "accepted": False,
         "mode": mode,
@@ -1469,6 +1511,7 @@ def run_campaign(
             complete=True,
             artifacts_authenticated=artifacts_authenticated,
             preflights_passed=preflights_passed,
+            evidence_class=evidence_class,
         )
         _record_decision(artifact, decision)
         native_go_build.write_json_atomic(output, artifact)
@@ -1502,6 +1545,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     run.add_argument("--control-overlay", required=True, type=pathlib.Path)
     run.add_argument("--candidate-overlay", required=True, type=pathlib.Path)
     run.add_argument("--quads", type=int, default=MINIMUM_QUADS)
+    run.add_argument(
+        "--pilot",
+        action="store_true",
+        help="run 1-7 directional quads that can never become accepted evidence",
+    )
     run.add_argument("--cooldown-seconds", type=float, default=2.0)
     run.add_argument("--timeout-seconds", type=int, default=900)
     run.add_argument("--image", default=native_go_build.DEFAULT_IMAGE)
@@ -1546,6 +1594,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             timeout_seconds=args.timeout_seconds,
             image_ref=args.image,
             allow_battery=args.allow_battery,
+            pilot=args.pilot,
         )
     except CampaignEvidenceError as error:
         print(json.dumps(error.artifact, indent=2, sort_keys=True), file=sys.stderr)

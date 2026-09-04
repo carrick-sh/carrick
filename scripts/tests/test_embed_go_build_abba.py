@@ -353,6 +353,140 @@ class ExecutionContractTest(unittest.TestCase):
             binary_sha256=("8" if role == "control" else "9") * 64,
         )
 
+    def campaign_receipt(
+        self,
+        root: pathlib.Path,
+        role: str,
+        *,
+        harness: pathlib.Path,
+    ):
+        receipt = self.arm_receipt(root, role, harness=harness)
+        receipt.driver_main_path = root / role / "driver-src/src/main.rs"
+        receipt.driver_main_sha256 = "6" * 64
+        receipt.cdhash = ("a" if role == "control" else "b") * 40
+        receipt.macho_uuid = ("A" if role == "control" else "B") * 36
+        receipt.entitlement_sha256 = "7" * 64
+        receipt.image_ref = native_go_build.DEFAULT_IMAGE
+        receipt.image_id = "sha256:" + "c" * 64
+        receipt.image_repo_digests = ("repo@sha256:" + "d" * 64,)
+        return receipt
+
+    def test_campaign_quad_evidence_classes_are_disjoint(self):
+        self.assertEqual(
+            embed_go_build_abba._validate_campaign_quads(1, pilot=True),
+            "directional-pilot",
+        )
+        self.assertEqual(
+            embed_go_build_abba._validate_campaign_quads(7, pilot=True),
+            "directional-pilot",
+        )
+        self.assertEqual(
+            embed_go_build_abba._validate_campaign_quads(8, pilot=False),
+            "official",
+        )
+        self.assertEqual(
+            embed_go_build_abba._validate_campaign_quads(127, pilot=False),
+            "official",
+        )
+        for quads, pilot in ((0, True), (8, True), (7, False), (128, False)):
+            with self.subTest(quads=quads, pilot=pilot):
+                with self.assertRaises(ValueError):
+                    embed_go_build_abba._validate_campaign_quads(
+                        quads, pilot=pilot
+                    )
+
+    def test_completed_pilot_is_directional_success_but_never_accepted(self):
+        root = pathlib.Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        harness = root / "harness"
+        harness.mkdir()
+        control = embed_go_build_abba.ArmSpec(
+            "control",
+            self.campaign_receipt(root, "control", harness=harness),
+            self.neutral_environment(),
+        )
+        candidate = embed_go_build_abba.ArmSpec(
+            "candidate",
+            self.campaign_receipt(root, "candidate", harness=harness),
+            self.neutral_environment(),
+        )
+        harness_identity = {
+            "harness_repo": str(harness),
+            "harness_commit": "2" * 40,
+            "driver_source_sha256": "3" * 64,
+            "harness_status": [],
+        }
+        preflight = {
+            "status": "passed",
+            "source_artifacts_authenticated": True,
+            "harness": harness_identity,
+            "executed_image_ref": "repo@sha256:" + "d" * 64,
+        }
+        output = root / "pilot.json"
+
+        with mock.patch.object(
+            embed_go_build_abba,
+            "_campaign_harness_identity",
+            return_value=harness_identity,
+        ), mock.patch.object(
+            embed_go_build_abba, "_campaign_preflight", return_value=preflight
+        ), mock.patch.object(
+            embed_go_build_abba,
+            "run_sample",
+            side_effect=lambda *_args, **_kwargs: {
+                "provenance": {"authenticated": True}
+            },
+        ), mock.patch.object(
+            embed_go_build_abba,
+            "_samples_authenticated",
+            return_value=True,
+        ), mock.patch.object(
+            embed_go_build_abba,
+            "_summarize_quads",
+            return_value=statistics_payload(
+                primary_median=1.05,
+                primary_lower=1.01,
+                sign_numerator=1,
+                sign_denominator=2,
+                quads=1,
+            ),
+        ), mock.patch.object(embed_go_build_abba.time, "sleep"):
+            artifact = embed_go_build_abba.run_campaign(
+                harness,
+                control,
+                candidate,
+                output,
+                quads=1,
+                cooldown_seconds=0,
+                pilot=True,
+            )
+
+        self.assertEqual(artifact["evidence_class"], "directional-pilot")
+        self.assertEqual(artifact["decision"]["status"], "directional")
+        self.assertFalse(artifact["decision"]["eligible"])
+        self.assertFalse(artifact["accepted"])
+        self.assertEqual(embed_go_build_abba._decision_exit_code(artifact), 0)
+
+    def test_cli_requires_explicit_pilot_selection(self):
+        common = [
+            "run",
+            "--harness-repo",
+            "/harness",
+            "--control-receipt",
+            "/arms/control.json",
+            "--candidate-receipt",
+            "/arms/candidate.json",
+            "--control-overlay",
+            "/arms/control.env",
+            "--candidate-overlay",
+            "/arms/candidate.env",
+            "--output",
+            "/tmp/output.json",
+        ]
+
+        self.assertFalse(embed_go_build_abba.parse_args(common).pilot)
+        self.assertTrue(embed_go_build_abba.parse_args([*common, "--pilot"]).pilot)
+
     def test_driver_argv_is_implicit_embed_and_never_cli_run(self):
         argv = embed_go_build_abba.build_driver_command(
             pathlib.Path("/arms/control/embed-driver"),
@@ -846,6 +980,7 @@ class NoRegressionDecisionTest(unittest.TestCase):
                 "complete": True,
                 "quad_count": 8,
                 "minimum_quads": 8,
+                "evidence_class": "official",
                 "artifacts_authenticated": True,
                 "preflights_passed": True,
             },
