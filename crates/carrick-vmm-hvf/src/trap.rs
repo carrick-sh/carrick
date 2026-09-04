@@ -6182,6 +6182,463 @@ mod foreign_mm_tests {
     }
 
     #[test]
+    fn semantic_lookup_rejects_foreign_va_alias_at_same_live_ipa() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let _external_alias_restore = ExternalAliasStateRestore::capture();
+        let _stage2_stub = ScopedStage2MapTestStub::enable();
+        let va = 0x6001_020000_u64;
+        let (task, custody, key, generation) =
+            inventoried_cow_source_fixture(CowSourceInventoryFixture::Absent);
+        let (host_addr, _) =
+            global_frame_host_owner_identity_in(&custody, key.0, key.1).expect("current owner");
+        let root = task.mm_root_slot.expect("fixture MM");
+        let own = AliasBacking {
+            start: va,
+            ipa: key.0,
+            host_addr,
+            size: OWNER_LEN,
+            physical_ipa: key.0,
+            physical_host_addr: host_addr,
+            physical_size: OWNER_LEN,
+            perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+            guest_writable: true,
+            sharing: GuestMappingSharing::Private,
+            ownership_scope: AliasOwnershipScope::MmRootSlot {
+                base: root.0,
+                size: root.1,
+            },
+            inventory_backing: InventoryBackingIdentity::Private(9_608),
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: generation,
+        };
+        let foreign = AliasBacking {
+            start: 0x4000_2f8000,
+            ownership_scope: AliasOwnershipScope::MmRootSlot {
+                base: root.0 + root.1,
+                size: root.1,
+            },
+            ..own
+        };
+        alias_registry().lock().extend([own, foreign]);
+        let mut tables = crate::page_table::PageTableManager::new(
+            carrick_mem::memory::stage1_hvpatch_page_tables(),
+            crate::memory::LINUX_PAGE_TABLES_BASE,
+        );
+        tables
+            .map_aliased(va, key.0, key.1, false)
+            .expect("stage-1 mapping");
+        *task.page_tables_authority().lock() = Some(tables);
+        let selected = task
+            .mapping_for_range_in(&custody, va + 0x1000, 16)
+            .expect("own live mapping");
+        // Retire the fixture even when the assertion below detects the old bug.
+        assert!(
+            retire_global_frame_host_owner_if_generation_in(&custody, key.0, key.1, generation,)
+                .is_retired()
+        );
+        assert_eq!(
+            selected.start, va,
+            "an IPA-sharing peer must not replace the requested semantic VA"
+        );
+        assert_eq!(selected.end, va + OWNER_LEN as u64);
+    }
+
+    #[test]
+    fn semantic_lookup_isolates_same_va_in_different_mm() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let _external_alias_restore = ExternalAliasStateRestore::capture();
+        let _stage2_stub = ScopedStage2MapTestStub::enable();
+        let va = 0x6001_020000_u64;
+        let (task_a, custody, key_a, gen_a) =
+            inventoried_cow_source_fixture(CowSourceInventoryFixture::Absent);
+        let (host_addr_a, _) =
+            global_frame_host_owner_identity_in(&custody, key_a.0, key_a.1).expect("owner a");
+        let root_a = task_a.mm_root_slot.expect("task a MM");
+
+        let mut lease_b = GlobalFrameStage2Lease::reserve(OWNER_LEN as u64, OWNER_LEN as u64)
+            .expect("reserve lease b");
+        let key_b = lease_b.key();
+        let host_b = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            OWNER_LEN,
+            crate::host_mapping::HostMappingKind::FrameCow,
+        )
+        .expect("allocate host backing b");
+        let host_addr_b = host_b.as_ptr() as usize;
+        assert_eq!(
+            unsafe { inventory_hv_vm_map(host_b.as_ptr().cast(), key_b.0, OWNER_LEN, 3) },
+            0,
+        );
+        lease_b.mark_mapped();
+        let gen_b = register_global_frame_host_owner_in(&custody, lease_b, host_b, 3)
+            .expect("register owner b");
+
+        let root_b = (root_a.0 + root_a.1, root_a.1);
+        let mut task_b = HvfTaskState::neutral();
+        task_b.persistent_vm_lifecycle = true;
+        task_b.mm_root_slot = Some(root_b);
+        task_b.container_root = task_a.container_root;
+
+        let alias_a = AliasBacking {
+            start: va,
+            ipa: key_a.0,
+            host_addr: host_addr_a,
+            size: OWNER_LEN,
+            physical_ipa: key_a.0,
+            physical_host_addr: host_addr_a,
+            physical_size: OWNER_LEN,
+            perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+            guest_writable: true,
+            sharing: GuestMappingSharing::Private,
+            ownership_scope: AliasOwnershipScope::MmRootSlot {
+                base: root_a.0,
+                size: root_a.1,
+            },
+            inventory_backing: InventoryBackingIdentity::Private(9_608),
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: gen_a,
+        };
+        let alias_b = AliasBacking {
+            start: va,
+            ipa: key_b.0,
+            host_addr: host_addr_b,
+            physical_ipa: key_b.0,
+            physical_host_addr: host_addr_b,
+            ownership_scope: AliasOwnershipScope::MmRootSlot {
+                base: root_b.0,
+                size: root_b.1,
+            },
+            owner_generation: gen_b,
+            ..alias_a
+        };
+        alias_registry().lock().extend([alias_a, alias_b]);
+
+        let mut tables_a = crate::page_table::PageTableManager::new(
+            carrick_mem::memory::stage1_hvpatch_page_tables(),
+            crate::memory::LINUX_PAGE_TABLES_BASE,
+        );
+        tables_a
+            .map_aliased(va, key_a.0, key_a.1, false)
+            .expect("stage-1 mapping a");
+        *task_a.page_tables_authority().lock() = Some(tables_a);
+
+        let mut tables_b = crate::page_table::PageTableManager::new(
+            carrick_mem::memory::stage1_hvpatch_page_tables(),
+            crate::memory::LINUX_PAGE_TABLES_BASE,
+        );
+        tables_b
+            .map_aliased(va, key_b.0, key_b.1, false)
+            .expect("stage-1 mapping b");
+        *task_b.page_tables_authority().lock() = Some(tables_b);
+
+        let sel_a = task_a
+            .mapping_for_range_in(&custody, va + 0x1000, 16)
+            .expect("task a mapping");
+        assert_eq!(sel_a.ipa, key_a.0);
+        assert_eq!(sel_a.host_addr, host_addr_a as *mut u8);
+
+        let sel_b = task_b
+            .mapping_for_range_in(&custody, va + 0x1000, 16)
+            .expect("task b mapping");
+        assert_eq!(sel_b.ipa, key_b.0);
+        assert_eq!(sel_b.host_addr, host_addr_b as *mut u8);
+
+        let mut task_c = HvfTaskState::neutral();
+        task_c.persistent_vm_lifecycle = true;
+        task_c.mm_root_slot = Some((root_b.0 + root_b.1, root_b.1));
+        task_c.container_root = task_a.container_root;
+        assert!(
+            task_c.mapping_for_range_in(&custody, va, 16).is_none(),
+            "unrelated task must not see foreign MM mapping at same VA"
+        );
+
+        assert!(
+            retire_global_frame_host_owner_if_generation_in(&custody, key_a.0, key_a.1, gen_a)
+                .is_retired()
+        );
+        assert!(
+            retire_global_frame_host_owner_if_generation_in(&custody, key_b.0, key_b.1, gen_b)
+                .is_retired()
+        );
+    }
+
+    #[test]
+    fn semantic_lookup_rejects_overlapping_row_with_wrong_va_to_ipa_offset() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let _external_alias_restore = ExternalAliasStateRestore::capture();
+        let _stage2_stub = ScopedStage2MapTestStub::enable();
+        let va = 0x6001_020000_u64;
+        let (task, custody, key, generation) =
+            inventoried_cow_source_fixture(CowSourceInventoryFixture::Absent);
+        let (host_addr, _) =
+            global_frame_host_owner_identity_in(&custody, key.0, key.1).expect("current owner");
+        let root = task.mm_root_slot.expect("fixture MM");
+
+        let alias = AliasBacking {
+            start: va,
+            ipa: key.0,
+            host_addr,
+            size: OWNER_LEN,
+            physical_ipa: key.0,
+            physical_host_addr: host_addr,
+            physical_size: OWNER_LEN,
+            perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+            guest_writable: true,
+            sharing: GuestMappingSharing::Private,
+            ownership_scope: AliasOwnershipScope::MmRootSlot {
+                base: root.0,
+                size: root.1,
+            },
+            inventory_backing: InventoryBackingIdentity::Private(9_608),
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: generation,
+        };
+        alias_registry().lock().extend([alias]);
+
+        let mut tables = crate::page_table::PageTableManager::new(
+            carrick_mem::memory::stage1_hvpatch_page_tables(),
+            crate::memory::LINUX_PAGE_TABLES_BASE,
+        );
+        tables
+            .map_aliased(va, key.0 + 0x2000, key.1.saturating_sub(0x2000), false)
+            .expect("stage-1 mapping with offset mismatch");
+        *task.page_tables_authority().lock() = Some(tables);
+
+        assert!(
+            task.mapping_for_range_in(&custody, va, 16).is_none(),
+            "stage-1 IPA mismatch must reject the alias and not fall through to stale mapping"
+        );
+
+        assert!(
+            retire_global_frame_host_owner_if_generation_in(&custody, key.0, key.1, generation)
+                .is_retired()
+        );
+    }
+
+    #[test]
+    fn semantic_lookup_rejects_stale_owner_generation_and_accepts_current() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let _external_alias_restore = ExternalAliasStateRestore::capture();
+        let _stage2_stub = ScopedStage2MapTestStub::enable();
+        let va = 0x6001_020000_u64;
+        let (task, custody, key, generation) =
+            inventoried_cow_source_fixture(CowSourceInventoryFixture::Absent);
+        let (host_addr, _) =
+            global_frame_host_owner_identity_in(&custody, key.0, key.1).expect("current owner");
+        let root = task.mm_root_slot.expect("fixture MM");
+
+        let stale_gen = generation.wrapping_add(100);
+        let stale_alias = AliasBacking {
+            start: va,
+            ipa: key.0,
+            host_addr,
+            size: OWNER_LEN,
+            physical_ipa: key.0,
+            physical_host_addr: host_addr,
+            physical_size: OWNER_LEN,
+            perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+            guest_writable: true,
+            sharing: GuestMappingSharing::Private,
+            ownership_scope: AliasOwnershipScope::MmRootSlot {
+                base: root.0,
+                size: root.1,
+            },
+            inventory_backing: InventoryBackingIdentity::Private(9_608),
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: stale_gen,
+        };
+        alias_registry().lock().extend([stale_alias]);
+
+        let mut tables = crate::page_table::PageTableManager::new(
+            carrick_mem::memory::stage1_hvpatch_page_tables(),
+            crate::memory::LINUX_PAGE_TABLES_BASE,
+        );
+        tables
+            .map_aliased(va, key.0, key.1, false)
+            .expect("stage-1 mapping");
+        *task.page_tables_authority().lock() = Some(tables);
+
+        assert!(
+            task.mapping_for_range_in(&custody, va, 16).is_none(),
+            "stale owner generation must be rejected by mapping_for_range_in"
+        );
+
+        let current_alias = AliasBacking {
+            owner_generation: generation,
+            ..stale_alias
+        };
+        alias_registry().lock().replace_all([current_alias]);
+        assert!(
+            task.mapping_for_range_in(&custody, va, 16).is_some(),
+            "current owner generation must be accepted by mapping_for_range_in"
+        );
+
+        assert!(
+            retire_global_frame_host_owner_if_generation_in(&custody, key.0, key.1, generation)
+                .is_retired()
+        );
+        assert!(
+            task.mapping_for_range_in(&custody, va, 16).is_none(),
+            "retired global frame owner must be rejected"
+        );
+    }
+
+    #[test]
+    fn semantic_lookup_enforces_exact_boundary_length_and_overflow_protection() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let _external_alias_restore = ExternalAliasStateRestore::capture();
+        let _stage2_stub = ScopedStage2MapTestStub::enable();
+        let va = 0x6001_020000_u64;
+        let size = OWNER_LEN;
+        let (task, custody, key, generation) =
+            inventoried_cow_source_fixture(CowSourceInventoryFixture::Absent);
+        let (host_addr, _) =
+            global_frame_host_owner_identity_in(&custody, key.0, key.1).expect("current owner");
+        let root = task.mm_root_slot.expect("fixture MM");
+
+        let alias = AliasBacking {
+            start: va,
+            ipa: key.0,
+            host_addr,
+            size,
+            physical_ipa: key.0,
+            physical_host_addr: host_addr,
+            physical_size: size,
+            perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+            guest_writable: true,
+            sharing: GuestMappingSharing::Private,
+            ownership_scope: AliasOwnershipScope::MmRootSlot {
+                base: root.0,
+                size: root.1,
+            },
+            inventory_backing: InventoryBackingIdentity::Private(9_608),
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: generation,
+        };
+        alias_registry().lock().extend([alias]);
+
+        let mut tables = crate::page_table::PageTableManager::new(
+            carrick_mem::memory::stage1_hvpatch_page_tables(),
+            crate::memory::LINUX_PAGE_TABLES_BASE,
+        );
+        tables
+            .map_aliased(va, key.0, key.1, false)
+            .expect("stage-1 mapping");
+        *task.page_tables_authority().lock() = Some(tables);
+
+        assert!(task.mapping_for_range_in(&custody, va, size).is_some());
+        assert!(task.mapping_for_range_in(&custody, va, 1).is_some());
+        assert!(
+            task.mapping_for_range_in(&custody, va + size as u64 - 1, 1)
+                .is_some()
+        );
+        assert!(
+            task.mapping_for_range_in(&custody, va + size as u64, 1)
+                .is_none()
+        );
+        assert!(
+            task.mapping_for_range_in(&custody, va + size as u64 - 1, 2)
+                .is_none()
+        );
+        assert!(task.mapping_for_range_in(&custody, va - 1, 1).is_none());
+        assert!(task.mapping_for_range_in(&custody, va, 0).is_some());
+        assert!(
+            task.mapping_for_range_in(&custody, va + 0x1000, 0)
+                .is_some()
+        );
+        assert!(
+            task.mapping_for_range_in(&custody, va, usize::MAX)
+                .is_none()
+        );
+        assert!(
+            task.mapping_for_range_in(&custody, u64::MAX - 8, 16)
+                .is_none()
+        );
+
+        for offset in [0, 0x100, 0x1000, 0x2000, 0x3f00] {
+            let max_valid_len = size - offset;
+            assert!(
+                task.mapping_for_range_in(&custody, va + offset as u64, max_valid_len)
+                    .is_some(),
+                "offset {offset:#x} with max valid len {max_valid_len:#x} must succeed"
+            );
+            assert!(
+                task.mapping_for_range_in(&custody, va + offset as u64, max_valid_len + 1)
+                    .is_none(),
+                "offset {offset:#x} exceeding len by 1 must fail"
+            );
+        }
+
+        assert!(
+            retire_global_frame_host_owner_if_generation_in(&custody, key.0, key.1, generation)
+                .is_retired()
+        );
+    }
+
+    #[test]
+    fn semantic_lookup_preserves_map_shared_and_maintenance_fallback() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let _external_alias_restore = ExternalAliasStateRestore::capture();
+        let _stage2_stub = ScopedStage2MapTestStub::enable();
+        let va = 0x6001_020000_u64;
+        let (task, custody, key, generation) =
+            inventoried_cow_source_fixture(CowSourceInventoryFixture::Absent);
+        let (host_addr, _) =
+            global_frame_host_owner_identity_in(&custody, key.0, key.1).expect("current owner");
+
+        let shared_alias = AliasBacking {
+            start: va,
+            ipa: key.0,
+            host_addr,
+            size: OWNER_LEN,
+            physical_ipa: key.0,
+            physical_host_addr: host_addr,
+            physical_size: OWNER_LEN,
+            perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+            guest_writable: true,
+            sharing: GuestMappingSharing::GlobalShared,
+            ownership_scope: AliasOwnershipScope::Global,
+            inventory_backing: InventoryBackingIdentity::Private(9_608),
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: generation,
+        };
+        alias_registry().lock().extend([shared_alias]);
+
+        assert!(task.translate_va_for_cow(va).is_none());
+
+        let selected = task
+            .mapping_for_range_in(&custody, va + 0x1000, 16)
+            .expect("maintenance fallback finds global shared mapping");
+        assert_eq!(selected.start, va);
+        assert_eq!(selected.sharing, GuestMappingSharing::GlobalShared);
+
+        let mut tables = crate::page_table::PageTableManager::new(
+            carrick_mem::memory::stage1_hvpatch_page_tables(),
+            crate::memory::LINUX_PAGE_TABLES_BASE,
+        );
+        tables
+            .map_aliased(va, key.0, key.1, false)
+            .expect("stage-1 mapping");
+        *task.page_tables_authority().lock() = Some(tables);
+
+        let selected_stage1 = task
+            .mapping_for_range_in(&custody, va + 0x1000, 16)
+            .expect("stage-1 path finds global shared mapping");
+        assert_eq!(selected_stage1.start, va);
+        assert_eq!(selected_stage1.sharing, GuestMappingSharing::GlobalShared);
+
+        assert!(
+            retire_global_frame_host_owner_if_generation_in(&custody, key.0, key.1, generation)
+                .is_retired()
+        );
+    }
+
+    #[test]
     fn cow_source_falls_back_to_offset_logical_inventory_with_current_physical_owner() {
         let _guard = FOREIGN_MM_TEST_LOCK.lock();
         let _external_alias_restore = ExternalAliasStateRestore::capture();
@@ -25618,17 +26075,35 @@ impl HvfTaskState {
                 ipa >= mapping.ipa
                     && ipa < mapping.ipa.saturating_add(mapping.size as u64)
                     && mapping.contains_range(address, length)
+                    && mapping.ipa.checked_add(address - mapping.start) == Some(ipa)
                     && region_is_live(mapping)
             }) {
                 return Some(mapping.view());
             }
             if let Some(alias) = alias_registry().lock().newest_containing_ipa(ipa, |alias| {
-                ipa >= alias.ipa
+                // A fork peer can retain the same physical frame at a
+                // different VA. Its live IPA is not a semantic mapping for
+                // this MM: copy offsets and sparse-materialization bounds
+                // must come from the requested VA's exact translation.
+                alias_matches_process_scope(
+                    alias.ownership_scope,
+                    self.mm_root_slot,
+                    self.container_root,
+                ) && address >= alias.start
+                    && address.checked_add(length as u64).is_some_and(|end| {
+                        alias
+                            .start
+                            .checked_add(alias.size as u64)
+                            .is_some_and(|limit| end <= limit)
+                    })
+                    && alias.ipa.checked_add(address - alias.start) == Some(ipa)
+                    && ipa >= alias.ipa
                     && ipa < alias.ipa.saturating_add(alias.size as u64)
                     && alias_is_live(alias)
             }) {
                 return Some(MappingView::from_alias(&alias));
             }
+            return None;
         }
         if let Some(mapping) = self
             .mappings
@@ -25639,7 +26114,6 @@ impl HvfTaskState {
             return Some(mapping.view());
         }
         if !self.protections.range_no_access(address, length) {
-            let end = address.saturating_add(length as u64);
             if let Some(alias) = alias_registry().lock().newest_matching_for_process(
                 self.mm_root_slot,
                 self.container_root,
@@ -25649,7 +26123,12 @@ impl HvfTaskState {
                         self.mm_root_slot,
                         self.container_root,
                     ) && address >= alias.start
-                        && end <= alias.start.saturating_add(alias.size as u64)
+                        && address.checked_add(length as u64).is_some_and(|end| {
+                            alias
+                                .start
+                                .checked_add(alias.size as u64)
+                                .is_some_and(|limit| end <= limit)
+                        })
                         && alias_is_live(alias)
                 },
             ) {
@@ -34924,7 +35403,12 @@ impl HvfVmState {
                 let next = mapping.end.min(end);
                 if next <= current {
                     return Err(TrapError::Hypervisor(format!(
-                        "sparse mmap live mapping made no progress at VA 0x{current:x}"
+                        "sparse mmap live mapping made no progress at VA 0x{current:x}: view VA 0x{:x}..0x{:x}, view IPA 0x{:x}, live IPA {:?}, mm root {:?}",
+                        mapping.start,
+                        mapping.end,
+                        mapping.ipa,
+                        self.translate_va(current),
+                        self.mm_root_slot,
                     )));
                 }
                 current = next;

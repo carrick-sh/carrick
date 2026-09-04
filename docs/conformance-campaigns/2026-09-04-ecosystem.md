@@ -110,3 +110,51 @@ pickle-bounds,pickle-fixed,pickle-fault,core-warn,va-red,va-green,network,
 pickle-oracle}.log`. Signed wrappers run the unsigned negative control and
 verify run-scoped cleanup. The initial sandbox-only run failed before any guest
 execution; its cleanup could not enumerate processes and is not a valid receipt.
+
+## Reviewed candidate checkpoint
+
+- The expanded `streamdestmatrix` oracle contains 92 deterministic lines per
+  libc, source hash `e87404e6ac445679`; two native-arm64 Docker runs per libc
+  agreed. The pre-fix runtime fails zero/short TCP address lengths, oversized
+  addresses, and zero-length UNIX destinations. The reviewed fix passes both
+  cached libc rows. SCTP retains its prior parse/provider/connected-send path.
+- MM review additionally rejects a live stage-1 mismatch instead of falling
+  through to a stale VA-only row. Six production-path host regressions pass;
+  the adjacent foreign-MM module reports 63 passed and one existing ignored
+  test. The combined signed socket/fork/mmap selection executes 22 cached rows
+  successfully, with the entitlement negative control and scoped cleanup.
+- The CPython reducer passes twice after this stronger lookup correction.
+  Restoring only the stale VA-only fallback reproduces the extension-import
+  SIGSEGV (3.64-second failing run); restoring the correction passes again.
+  This closes the focused reproduction, not the full
+  `cpython-concurrent_futures` suite.
+- Formatting, strategy enforcement and runtime/HVF library Clippy pass.
+  Sandbox Clippy initially failed because DTrace could not generate USDT
+  providers; the same check passed with host authority.
+- `carrick trace` core-lifecycle diagnostics record two successful core
+  publications, despite an empty host bind mount. Static inspection finds
+  publication and rollback directly targeting the root overlay rather than
+  mount routing. The trace profile expects exactly one core, so it rejects
+  this two-core capture; its summary is diagnostic, not profile acceptance.
+  Isolated Antigravity `core-publication`, conversation
+  `929e4131-e022-4de3-9619-5a44b9ed8ccd`, now owns that bounded repair and host
+  failure-path regressions. It is not yet integrated.
+
+Additional logs use `/tmp/carrick-ecosystem-sep04-` with suffixes
+`network-expanded-red.log`, `network-expanded-green.log`,
+`mm-reviewed.log`, `mm-adjacent.log`, `mm-net-adjacent.log`,
+`runtime-clippy-host.log`, `pickle-reviewed.log`, and `core-trace.log`.
+Candidate signed artifact inventories are copied under
+`target/conformance/ecosystem-sep04-receipts/`. These are dirty-source focused
+receipts; the final clean-artifact, unfiltered, full-suite and performance gates
+remain open.
+
+The socket correction and cached matrix are committed as `d63a89de8`. Additional
+MM attribution logs are `pickle-repeat.log`, `pickle-fallback-red.log`, and
+`pickle-restored.log` under the same `/tmp/carrick-ecosystem-sep04-` prefix.
+The current arm64 full-module cache contains 239 assertion IDs, but 205 are
+classified `other` (20 `ok`, 14 `skipped`), including its `closure-v1` row.
+That cache cannot establish final assertion closure. Antigravity
+`ecosystem-reducers` (`45ec01b2-8a36-4c46-be40-398fa317cedd`) is adding a bounded
+full-module embed test with transcript retention; actual assertion parsing and
+oracle requalification remain Codex acceptance work.
