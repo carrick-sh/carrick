@@ -49,6 +49,10 @@ impl PtyTable {
         n
     }
 
+    pub fn set_controlling_index(&mut self, index: Option<u32>) {
+        self.controlling_index = index;
+    }
+
     /// The controlling-terminal pts index, if interactive (`-t`).
     pub fn controlling(&self) -> Option<u32> {
         self.controlling_index

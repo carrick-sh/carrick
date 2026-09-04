@@ -1854,16 +1854,42 @@ impl FileTable {
         })
     }
 
+    pub fn capture_slot_or_stdio_authority(
+        &self,
+        number: FileSlotNumber,
+    ) -> Option<FileSlotAuthority> {
+        if let Some(authority) = self.capture_slot_authority(number) {
+            return Some(authority);
+        }
+        let raw = number.raw();
+        if (0..3).contains(&raw) && !self.closed_stdio.lock()[raw as usize] {
+            let description = FileDescriptionId::from_raw_u64(u64::MAX - raw as u64)?;
+            return Some(FileSlotAuthority {
+                table: self.id,
+                number,
+                slot_generation: 0,
+                description,
+            });
+        }
+        None
+    }
+
     pub fn validate_slot_authority(&self, authority: FileSlotAuthority) -> bool {
-        authority.table == self.id
-            && self
-                .open_files
-                .read()
-                .get(&authority.number.raw())
-                .is_some_and(|slot| {
-                    slot.generation == authority.slot_generation
-                        && slot.description.id() == authority.description
-                })
+        if authority.table != self.id {
+            return false;
+        }
+        if let Some(slot) = self.open_files.read().get(&authority.number.raw()) {
+            return slot.generation == authority.slot_generation
+                && slot.description.id() == authority.description;
+        }
+        let raw = authority.number.raw();
+        if (0..3).contains(&raw) && !self.closed_stdio.lock()[raw as usize] {
+            let Some(expected_desc) = FileDescriptionId::from_raw_u64(u64::MAX - raw as u64) else {
+                return false;
+            };
+            return authority.slot_generation == 0 && authority.description == expected_desc;
+        }
+        false
     }
 
     fn resolve_slot_from_guard(
