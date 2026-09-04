@@ -308,3 +308,36 @@ The independently compiled FIFO open matrix produced identical 16-line stdout
 on two serial native-arm64 Docker runs per libc, all exit zero and empty stderr.
 Raw outputs are in `target/conformance/ecosystem-sep04-fifo-oracle/`. Cached
 fixture/wiring review and the signed Carrick red run remain pending.
+
+## Fork COW execute permission closed (be541e9a6)
+
+The core-qualified heap-protection abort had a wider cause than the mprotect
+re-downgrade alone: `fork_cow_ranges` derived each range's execute flag from
+the HOST mapping's perms (RWX for the anonymous arena), and `ForkReadOnly`
+wrote that flag into UXN, so every inherited private page became executable in
+both parent and child. New probe `forkprotectexec` (Docker oracle blessed
+twice per libc) was red on the previous binary on three of eight lines,
+including `parent_rw_control_faults=false`, and MATCHes after the fix on both
+libcs. `ForkReadOnly` now preserves the leaf's own UXN and `protect_range`
+applies the requested `PROT_EXEC` to armed COW spans. Sixteen adjacent
+fork/mprotect/ptrace probes MATCH under the signed embed gate with the
+unentitled negative control passing. Receipts:
+`target/conformance/ecosystem-sep04-receipts/{fifo-forkexec-red,cow-exec-green,cow-exec-unit}.log`.
+
+## FIFO open matrix (red, branch `agy/fifo-open-sep04`)
+
+`fifoopenmatrix` is wired and blessed on that branch and red on six lines: a
+blocking `O_RDONLY` open never blocks, a blocking `O_WRONLY` open gives up with
+ENXIO after the dispatcher's 500x2 ms sleep loop, and no blocking open is
+signal-interruptible (EINTR / SA_RESTART). Antigravity `fifo-open`
+(`ecc3e9af-3421-486d-b2f9-47e0c9c86bcd`, run `ecosystem-sep04b`) owns the
+runtime fix under a brief that requires kernel-pollable per-FIFO presence
+pipes and `WaitOnFds` parking; Codex runs the signed gate and accepts.
+
+## Authority inventories (branch `agy/authority-sep04b`)
+
+The five raw lock additions and the K1 category drift from `05316a669` are
+delegated to Antigravity `authority` (`602cb1f4-09f0-4ee4-8b79-db6c8cbac057`)
+for encapsulation or trusted-boundary classification; ceilings stay where they
+are. The three `libc::getpid` host-authority rows moved by the COW fix were
+rebound as a positional reconcile (`7c7193512`).
