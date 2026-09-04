@@ -775,8 +775,25 @@ impl SyscallDispatcher {
             // Real host pipe write end: the kernel enforces EPIPE itself on
             // write, so we just accept the destination here.
             OpenDescription::HostPipe {
-                is_read_end: false, ..
+                is_read_end: false,
+                pty: None,
+                bidirectional: false,
+                ..
             } => None,
+            // A PTY or bidirectional pipe is a valid splice destination if opened
+            // for writing (status_flags & O_ACCMODE != O_RDONLY).
+            OpenDescription::HostPipe { pty: Some(_), .. }
+            | OpenDescription::HostPipe {
+                bidirectional: true,
+                ..
+            } => {
+                let flags = open_file.description.common().status_flags();
+                if flags & LINUX_O_ACCMODE == LINUX_O_RDONLY {
+                    Some(LINUX_EBADF)
+                } else {
+                    None
+                }
+            }
             // A host socket is a valid splice destination (pipe->socket, the
             // io.Copy(conn, pipe) direction); the host send enforces its own
             // errors. Without this the `_` arm below rejected it with EINVAL.

@@ -261,11 +261,10 @@ impl Vfs for DevptsVfs {
             let (master_fd, slave_name) =
                 open_master(flags.nonblock).map_err(crate::host_to_linux_errno)?;
             let index = table.insert(slave_name, std::process::id());
-            let status_flags = if flags.nonblock {
-                crate::linux_abi::LINUX_O_NONBLOCK as u32
-            } else {
-                0
-            };
+            let mut status_flags = crate::linux_abi::LINUX_O_RDWR as u32;
+            if flags.nonblock {
+                status_flags |= crate::linux_abi::LINUX_O_NONBLOCK as u32;
+            }
             return Ok(VfsHandle::Pty {
                 host_fd: master_fd,
                 pts_index: index,
@@ -300,11 +299,17 @@ impl Vfs for DevptsVfs {
                 }
             }
         }
-        let status_flags = if flags.nonblock {
-            crate::linux_abi::LINUX_O_NONBLOCK as u32
+        let acc_mode = if flags.read && flags.write {
+            crate::linux_abi::LINUX_O_RDWR as u32
+        } else if flags.write {
+            crate::linux_abi::LINUX_O_WRONLY as u32
         } else {
-            0
+            crate::linux_abi::LINUX_O_RDONLY as u32
         };
+        let mut status_flags = acc_mode;
+        if flags.nonblock {
+            status_flags |= crate::linux_abi::LINUX_O_NONBLOCK as u32;
+        }
         Ok(VfsHandle::Pty {
             host_fd,
             pts_index: n,

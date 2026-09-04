@@ -2315,7 +2315,7 @@ impl SyscallDispatcher {
         if let Some(outcome) = self.try_trusted_dirfd_openat(dirfd, path, flags) {
             return Ok(outcome);
         }
-        // A trailing slash forces directory semantics on the final component.
+        // A trailing slash or "/." forces directory semantics on the final component.
         // Linux's open(2): `O_CREAT` of a path that ends in `/` can NEVER
         // create a regular file there (a directory name is implied) and fails
         // EISDIR — whether the path exists as a dir, exists as a file, or
@@ -2323,12 +2323,41 @@ impl SyscallDispatcher {
         // path normalization strips the trailing slash, so a guest
         // `open(".../does_not_exist/", O_WRONLY|O_CREAT)` wrongly SUCCEEDED in
         // creating a file. shutil.copyfile relies on that EISDIR
-        // (test_copyfile_nonexistent_dir). Note the raw guest bytes, before
-        // resolution collapses the slash.
+        // (test_copyfile_nonexistent_dir).
+        // Similarly, any open of "file/." (O_CREAT or O_RDONLY) requires directory
+        // semantics and must fail with ENOTDIR on regular files.
+        let ends_with_dot = path == "."
+            || path.ends_with("/.")
+            || path.trim_end_matches('/').ends_with("/.")
+            || path.trim_end_matches('/') == "."
+            || path == ".."
+            || path.ends_with("/..")
+            || path.trim_end_matches('/').ends_with("/..")
+            || path.trim_end_matches('/') == "..";
         let had_trailing_slash = path.len() > 1 && path.ends_with('/');
-        let path = self.resolve_at_path(dirfd, path)?;
-        if want_create && had_trailing_slash {
-            return Ok(DispatchOutcome::errno(LINUX_EISDIR));
+        let mut path = self.resolve_at_path(dirfd, path)?;
+        if ends_with_dot || had_trailing_slash {
+            let followed = self
+                .canonicalize_following(&path)
+                .unwrap_or_else(|_| path.clone());
+            match self.layered_metadata(&followed) {
+                Ok(md) => {
+                    if md.kind == RootFsEntryKind::Directory {
+                        if want_create {
+                            return Ok(DispatchOutcome::errno(LINUX_EISDIR));
+                        }
+                        path = followed;
+                    } else {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
+                    }
+                }
+                Err(_) => {
+                    if want_create && had_trailing_slash {
+                        return Ok(DispatchOutcome::errno(LINUX_EISDIR));
+                    }
+                    return Ok(DispatchOutcome::errno(LINUX_ENOENT));
+                }
+            }
         }
 
         // Trace every open attempt. The per-backend `path_open` calls further
@@ -2712,12 +2741,27 @@ impl SyscallDispatcher {
             }
             // Linux O_ACCMODE is 0=RDONLY, 1=WRONLY, 2=RDWR.
             let access_idx = (access & LINUX_O_ACCMODE) as u32;
-            match self
+            let mut host_fd_opt = self
                 .fs
                 .rootfs_vfs
                 .overlay
-                .open_fifo_nonblock(&path, access_idx)
-            {
+                .open_fifo_nonblock(&path, access_idx);
+            if host_fd_opt.is_none() && !open_flags.contains(LinuxOpenFlags::NONBLOCK) {
+                // A blocking open (most commonly O_WRONLY waiting for a reader).
+                // Wait briefly in a retry loop until the reader appears or timeout.
+                for _ in 0..500 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    host_fd_opt = self
+                        .fs
+                        .rootfs_vfs
+                        .overlay
+                        .open_fifo_nonblock(&path, access_idx);
+                    if host_fd_opt.is_some() {
+                        break;
+                    }
+                }
+            }
+            match host_fd_opt {
                 Some(host_fd) => {
                     // Track this FIFO end for kernel-backed writer-close EOF
                     // readiness (macOS won't report it — see dispatch::fifo_beacon).
@@ -2750,9 +2794,7 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::Returned { value: fd as i64 });
                 }
                 // The non-blocking open failed — most commonly O_WRONLY with no
-                // reader (ENXIO, the correct O_NONBLOCK errno). A blocking
-                // O_WRONLY open that should wait for a reader is a known
-                // unimplemented case (it would block the dispatcher).
+                // reader (ENXIO, the correct O_NONBLOCK errno).
                 None => return Ok(DispatchOutcome::errno(linux_errno::ENXIO)),
             }
         }
@@ -6425,6 +6467,70 @@ impl SyscallDispatcher {
                 {
                     let rest = &cwd[resolved_old.len() + 1..];
                     self.set_cwd(&format!("{resolved_new}/{rest}"));
+                }
+                let file_table = self.captured_file_table();
+                for (_, open_file) in file_table.read_open_files().iter() {
+                    if let Some(mut desc) = open_file.description.write() {
+                        match &mut *desc {
+                            OpenDescription::Directory {
+                                path,
+                                metadata,
+                                listing,
+                                ..
+                            } => {
+                                if *path == resolved_old {
+                                    *path = resolved_new.clone();
+                                    metadata.path = Path::new(&resolved_new).to_path_buf();
+                                    *listing = DirListing::Pending;
+                                } else if path.starts_with(&resolved_old)
+                                    && path.as_bytes().get(resolved_old.len()) == Some(&b'/')
+                                {
+                                    let rest = &path[resolved_old.len() + 1..];
+                                    let updated = format!("{resolved_new}/{rest}");
+                                    *path = updated.clone();
+                                    metadata.path = Path::new(&updated).to_path_buf();
+                                    *listing = DirListing::Pending;
+                                }
+                            }
+                            OpenDescription::File { path, metadata, .. } => {
+                                if *path == resolved_old {
+                                    *path = resolved_new.clone();
+                                    metadata.path = Path::new(&resolved_new).to_path_buf();
+                                } else if path.starts_with(&resolved_old)
+                                    && path.as_bytes().get(resolved_old.len()) == Some(&b'/')
+                                {
+                                    let rest = &path[resolved_old.len() + 1..];
+                                    let updated = format!("{resolved_new}/{rest}");
+                                    *path = updated.clone();
+                                    metadata.path = Path::new(&updated).to_path_buf();
+                                }
+                            }
+                            OpenDescription::HostFile { metadata, .. } => {
+                                let path_str = metadata.path.to_string_lossy().into_owned();
+                                if path_str == resolved_old {
+                                    metadata.path = Path::new(&resolved_new).to_path_buf();
+                                } else if path_str.starts_with(&resolved_old)
+                                    && path_str.as_bytes().get(resolved_old.len()) == Some(&b'/')
+                                {
+                                    let rest = &path_str[resolved_old.len() + 1..];
+                                    metadata.path =
+                                        Path::new(&format!("{resolved_new}/{rest}")).to_path_buf();
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                let mut fd_open_paths = file_table.write_fd_open_paths();
+                for (_, open_path) in fd_open_paths.iter_mut() {
+                    if *open_path == resolved_old {
+                        *open_path = resolved_new.clone();
+                    } else if open_path.starts_with(&resolved_old)
+                        && open_path.as_bytes().get(resolved_old.len()) == Some(&b'/')
+                    {
+                        let rest = &open_path[resolved_old.len() + 1..];
+                        *open_path = format!("{resolved_new}/{rest}");
+                    }
                 }
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
@@ -14371,6 +14477,22 @@ impl SyscallDispatcher {
             }
 
             let path = read_guest_c_string(&*cx.memory, pathname)?;
+            if path.len() > 1 && path.ends_with('/') {
+                let resolved = this.resolve_at_path(dirfd, &path)?;
+                let canonical = this
+                    .canonicalize_following(&resolved)
+                    .unwrap_or_else(|_| resolved.clone());
+                return match this.layered_metadata(&canonical) {
+                    Ok(md) => {
+                        if md.kind == RootFsEntryKind::Directory {
+                            Ok(DispatchOutcome::errno(LINUX_EINVAL))
+                        } else {
+                            Ok(DispatchOutcome::errno(LINUX_ENOTDIR))
+                        }
+                    }
+                    Err(e) => Ok(DispatchOutcome::errno(e)),
+                };
+            }
             // An empty pathname with an O_PATH|O_NOFOLLOW dirfd naming a SYMLINK
             // reads that link — readlinkat implicitly treats "" as AT_EMPTY_PATH
             // for such an fd (readlinkat(2) since 2.6.39; readlinkat01 case 6).
@@ -14662,7 +14784,34 @@ impl SyscallDispatcher {
             if path.is_empty() {
                 return Ok(DispatchOutcome::errno(LINUX_ENOENT));
             }
+            let ends_with_dot = path == "."
+                || path.ends_with("/.")
+                || path.trim_end_matches('/').ends_with("/.")
+                || path.trim_end_matches('/') == "."
+                || path == ".."
+                || path.ends_with("/..")
+                || path.trim_end_matches('/').ends_with("/..")
+                || path.trim_end_matches('/') == "..";
+            let had_trailing_slash = path.len() > 1 && path.ends_with('/');
             let resolved = this.resolve_at_path(dirfd, &path)?;
+            if ends_with_dot || had_trailing_slash {
+                let followed = this
+                    .canonicalize_following(&resolved)
+                    .unwrap_or_else(|_| resolved.clone());
+                match this.layered_metadata(&followed) {
+                    Ok(md) => {
+                        if md.kind == RootFsEntryKind::Directory {
+                            if ends_with_dot {
+                                return Ok(DispatchOutcome::errno(LINUX_EEXIST));
+                            }
+                        } else {
+                            return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
+                        }
+                    }
+                    Err(_) if ends_with_dot => return Ok(DispatchOutcome::errno(LINUX_ENOENT)),
+                    _ => {}
+                }
+            }
             if this.is_synthetic_virtual_path(cx.kernel, &resolved) {
                 return Ok(DispatchOutcome::errno(LINUX_EEXIST));
             }
@@ -15415,8 +15564,48 @@ impl SyscallDispatcher {
             if path.is_empty() {
                 return Ok(DispatchOutcome::errno(LINUX_ENOENT));
             }
-            let resolved = this.resolve_at_path(dirfd, &path)?;
             let remove_dir = at_flags.contains(carrick_abi::LinuxAtFlags::REMOVEDIR);
+            let ends_with_dot = path == "."
+                || path.ends_with("/.")
+                || path.trim_end_matches('/').ends_with("/.")
+                || path.trim_end_matches('/') == "."
+                || path == ".."
+                || path.ends_with("/..")
+                || path.trim_end_matches('/').ends_with("/..")
+                || path.trim_end_matches('/') == "..";
+            let had_trailing_slash = path.len() > 1 && path.ends_with('/');
+            let resolved = this.resolve_at_path(dirfd, &path)?;
+            if ends_with_dot {
+                let followed = this
+                    .canonicalize_following(&resolved)
+                    .unwrap_or_else(|_| resolved.clone());
+                match this.layered_metadata(&followed) {
+                    Ok(md) => {
+                        if md.kind != RootFsEntryKind::Directory {
+                            return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
+                        } else if remove_dir {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        } else {
+                            return Ok(DispatchOutcome::errno(LINUX_EISDIR));
+                        }
+                    }
+                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_ENOENT)),
+                }
+            }
+            if had_trailing_slash {
+                if let Ok(lmd) = this.layered_lstat(&resolved) {
+                    if lmd.kind == RootFsEntryKind::Symlink {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
+                    }
+                }
+                if let Ok(md) = this.layered_metadata(&resolved) {
+                    if md.kind != RootFsEntryKind::Directory {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
+                    } else if !remove_dir {
+                        return Ok(DispatchOutcome::errno(LINUX_EISDIR));
+                    }
+                }
+            }
             // Synthetic /proc /sys paths can't be unlinked.
             if this.is_synthetic_virtual_path(cx.kernel, &resolved) {
                 return Ok(DispatchOutcome::errno(LINUX_EROFS));
