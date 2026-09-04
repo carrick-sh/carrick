@@ -414,8 +414,7 @@ fn epoll_wait_sample_needs_host_rebind(
     // after a delivered event. A masked event whose readiness snapshot did not
     // change is different: re-adding the filter can immediately reproduce the
     // same event when NOTE_LOWAT cannot express `last_read_avail + 1` (for
-    // example, a stream socket already at its receive-buffer ceiling). Leave
-    // that filter disabled until guest I/O advances the latch; the
+    // example, a stream socket already at its receive-buffer ceiling, or a
     // consumption path rebinds it through `epoll_rearm_after_io`. Listening
     // sockets are different: EVFILT_READ `data` is the pending-connection
     // count, and the filter must stay armed so NOTE_LOWAT can observe a later
@@ -495,6 +494,7 @@ mod epoll_edge_sample_tests {
             true,
             true,
         ));
+
         assert!(epoll_wait_sample_needs_host_rebind(
             LINUX_EPOLLIN,
             LINUX_EPOLLIN,
@@ -2466,6 +2466,25 @@ impl SyscallDispatcher {
                 protocol,
                 ..
             } => Some((*sock_type, *protocol)),
+            _ => None,
+        }
+    }
+
+    fn socket_guest_domain_type_and_protocol(&self, fd: i32) -> Option<(i32, i32, i32)> {
+        let open_file = self.open_file(fd)?;
+        let open = open_file.description.read()?;
+        match &*open {
+            OpenDescription::HostSocket {
+                family,
+                type_,
+                protocol,
+                ..
+            } => Some((*family, *type_, *protocol)),
+            OpenDescription::Netlink {
+                sock_type,
+                protocol,
+                ..
+            } => Some((LINUX_AF_NETLINK, *sock_type, *protocol)),
             _ => None,
         }
     }
@@ -6715,7 +6734,9 @@ impl SyscallDispatcher {
                         if sec < 0 || !(0..1_000_000).contains(&usec) {
                             return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                         }
-                        let ms = sec.saturating_mul(1000).saturating_add(usec / 1000);
+                        let ms = sec
+                            .saturating_mul(1000)
+                            .saturating_add(usec.saturating_add(999) / 1000);
                         if ms <= 0 {
                             0
                         } else if ms > i32::MAX as i64 {
@@ -6740,7 +6761,9 @@ impl SyscallDispatcher {
                         if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
                             return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                         }
-                        let ms = sec.saturating_mul(1000).saturating_add(nsec / 1_000_000);
+                        let ms = sec
+                            .saturating_mul(1000)
+                            .saturating_add(nsec.saturating_add(999_999) / 1_000_000);
                         if ms <= 0 {
                             0
                         } else {
@@ -7000,7 +7023,7 @@ impl SyscallDispatcher {
                 // LTP select01) counts as 2, not 1. Count each set-bit, not the
                 // fd once.
                 if (req_mask & 0x01) != 0
-                    && (revs & (libc::POLLIN | libc::POLLHUP)) != 0
+                    && (revs & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0
                     && let Some(ref mut set) = new_read
                 {
                     fd_set_set(set, fd_usize);
@@ -7085,7 +7108,9 @@ impl SyscallDispatcher {
                         }
                         let sec = timespec.tv_sec;
                         let nsec = timespec.tv_nsec;
-                        let ms = sec.saturating_mul(1000).saturating_add(nsec / 1_000_000);
+                        let ms = sec
+                            .saturating_mul(1000)
+                            .saturating_add(nsec.saturating_add(999_999) / 1_000_000);
                         if ms <= 0 {
                             0
                         } else {
@@ -8301,6 +8326,13 @@ impl SyscallDispatcher {
             let rc =
                 unsafe { libc::getpeername(host_fd.get(), sa.as_mut_ptr() as *mut _, &mut sa_len as *mut _) };
             if let Err(errno) = rc.host_syscall_errno() {
+                // On Darwin, getpeername returns EINVAL when the peer has closed or
+                // reset the connection. On Linux, getpeername returns ENOTCONN.
+                let errno = if errno == LINUX_EINVAL {
+                    LINUX_ENOTCONN
+                } else {
+                    errno
+                };
                 return Ok(DispatchOutcome::errno(errno));
             }
             // Connected (the host call succeeded): a NULL addr/addrlen → EFAULT
@@ -8487,15 +8519,24 @@ impl SyscallDispatcher {
             // (tcp_sendmsg with no peer), but macOS returns ENOTCONN. Remap only
             // for stream sockets so datagram ENOTCONN (a real Linux errno) is
             // untouched. (sendto01 "not connected TCP")
-            let (guest_type, guest_protocol) = match this.socket_guest_type_and_protocol(fd) {
-                Some(pair) => (Some(pair.0), Some(pair.1)),
-                None => (None, None),
+            let (guest_domain, guest_type, guest_protocol) = match this.socket_guest_domain_type_and_protocol(fd) {
+                Some(triple) => (Some(triple.0), Some(triple.1), Some(triple.2)),
+                None => (None, None, None),
             };
             let is_stream = guest_type == Some(libc::SOCK_STREAM);
             let is_sctp_stream = is_stream && guest_protocol == Some(LINUX_IPPROTO_SCTP);
-            if is_stream && dest_addr != 0 && host_socket_is_connected(host_fd.get()) {
+            let is_unix_stream = is_stream && guest_domain == Some(libc::AF_UNIX);
+            if is_unix_stream && dest_addr != 0 && host_socket_is_connected(host_fd.get()) {
                 return Ok(DispatchOutcome::errno(LINUX_EISCONN));
             }
+            // On connected TCP / non-UNIX stream sockets, Linux ignores dest_addr,
+            // while Darwin sendto with an address would fail with EISCONN.
+            // Clear host_addr when connected so Darwin sends implicitly.
+            let host_addr = if is_stream && !is_unix_stream && host_socket_is_connected(host_fd.get()) {
+                None
+            } else {
+                host_addr
+            };
             let nonblocking = this.io_is_nonblocking(fd, flags);
             let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;
             let connected_send = dest_addr == 0;
@@ -9732,7 +9773,17 @@ impl SyscallDispatcher {
         // A guest SCTP stream is backed by TCP, which carries no message
         // boundaries; record where each message ends so the receiver can report
         // MSG_EOR the way Linux does.
-        let is_sctp_stream = self.socket_guest_protocol(fd) == Some(LINUX_IPPROTO_SCTP);
+        let (guest_domain, guest_type, guest_protocol) =
+            match self.socket_guest_domain_type_and_protocol(fd) {
+                Some(triple) => (Some(triple.0), Some(triple.1), Some(triple.2)),
+                None => (None, None, None),
+            };
+        let is_stream = guest_type == Some(libc::SOCK_STREAM);
+        let is_sctp_stream = is_stream && guest_protocol == Some(LINUX_IPPROTO_SCTP);
+        let is_unix_stream = is_stream && guest_domain == Some(libc::AF_UNIX);
+        if is_unix_stream && host_addr.is_some() && host_socket_is_connected(host_fd.get()) {
+            return Ok(DispatchOutcome::errno(LINUX_EISCONN));
+        }
         let payload_len = data.len();
         let send_to = self
             .open_file(fd)
@@ -9765,8 +9816,11 @@ impl SyscallDispatcher {
                 // The shadow is already CONNECTED to this destination, and Darwin
                 // answers EISCONN for a send that names an address on a connected
                 // socket — so address it implicitly there.
+                // Similarly, connected TCP/stream sockets ignore dest_addr on Linux,
+                // while Darwin answers EISCONN if named.
                 if let Some(a) = &host_addr
                     && recverr_send_fd.is_none()
+                    && !(is_stream && !is_unix_stream && host_socket_is_connected(host_fd.get()))
                 {
                     hmsg.msg_name = a.as_ptr() as *mut libc::c_void;
                     hmsg.msg_namelen = a.len() as libc::socklen_t;
