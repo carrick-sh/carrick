@@ -2094,8 +2094,27 @@ impl WorkerBoundaryAudit {
         if !super::signal_progress_is_zero_for_executor_boundary() {
             return Err(boundary_error("signal-progress"));
         }
-        if current_signal_mask()? != self.baseline_signal_mask {
-            return Err(boundary_error("host-signal-mask"));
+        let current_signal_mask = current_signal_mask()?;
+        if current_signal_mask != self.baseline_signal_mask {
+            let added: Vec<_> = current_signal_mask
+                .iter()
+                .zip(&self.baseline_signal_mask)
+                .enumerate()
+                .filter_map(|(index, (current, baseline))| {
+                    (*current && !*baseline).then_some(index + 1)
+                })
+                .collect();
+            let removed: Vec<_> = current_signal_mask
+                .iter()
+                .zip(&self.baseline_signal_mask)
+                .enumerate()
+                .filter_map(|(index, (current, baseline))| {
+                    (!*current && *baseline).then_some(index + 1)
+                })
+                .collect();
+            return Err(TrapError::Hypervisor(format!(
+                "persistent executor boundary audit failed: host-signal-mask: added={added:?}, removed={removed:?}"
+            )));
         }
         Ok(())
     }
@@ -8940,6 +8959,43 @@ pub(crate) mod tests {
         ] {
             assert!(report.events().iter().any(|event| event.event == expected));
         }
+    }
+
+    #[test]
+    fn host_signal_mask_boundary_error_names_the_changed_signal() {
+        struct RestoreSignalMask(libc::sigset_t);
+        impl Drop for RestoreSignalMask {
+            fn drop(&mut self) {
+                let result = unsafe {
+                    libc::pthread_sigmask(libc::SIG_SETMASK, &self.0, std::ptr::null_mut())
+                };
+                assert_eq!(result, 0);
+            }
+        }
+
+        let boundary = WorkerBoundaryAudit::capture().expect("capture host signal mask baseline");
+        let mut blocked = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+        let mut previous = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+        assert_eq!(unsafe { libc::sigemptyset(&mut blocked) }, 0);
+        assert_eq!(unsafe { libc::sigaddset(&mut blocked, libc::SIGUSR1) }, 0);
+        assert_eq!(
+            unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut previous) },
+            0
+        );
+        let restore = RestoreSignalMask(previous);
+
+        let error = boundary
+            .audit_runtime_owned()
+            .expect_err("changed host signal mask must fail closed")
+            .to_string();
+        assert_eq!(
+            error,
+            format!(
+                "hypervisor operation failed: persistent executor boundary audit failed: host-signal-mask: added=[{}], removed=[]",
+                libc::SIGUSR1
+            )
+        );
+        drop(restore);
     }
 
     #[test]
