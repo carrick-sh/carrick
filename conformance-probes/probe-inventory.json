@@ -574,6 +574,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "fifoopenmatrix": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "fileaccessmode": {
     "class": "conformance",
     "excluded": false,

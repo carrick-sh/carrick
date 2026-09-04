@@ -1,0 +1,17 @@
+81b3336fba24c7eb
+nonblock_reader_without_writer_ok=true
+nonblock_writer_without_reader_enxio=true
+rdwr_immediate_success=true
+creat_excl_existing_fifo_eexist=true
+flags_o_nonblock_retained=true
+flags_o_cloexec_retained=true
+rdwr_cloexec_retained=true
+reader_blocked_without_writer=true
+reader_unblocked_after_writer=true
+writer_blocked_without_reader=true
+writer_unblocked_after_reader=true
+delayed_peer_writer_succeeded=true
+delayed_peer_writer_enxio=false
+interrupted_open_eintr=true
+sa_restart_stayed_blocked=true
+sa_restart_open_resumed_and_succeeded=true
