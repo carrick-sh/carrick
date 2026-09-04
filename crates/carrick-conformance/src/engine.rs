@@ -500,7 +500,7 @@ fn run_one(
                             .map(|n| n.get())
                             .unwrap_or(0),
                     });
-                    kill_scoped(pid, run_id, engine, cleanup.as_ref());
+                    let _ = kill_scoped(pid, run_id, engine, cleanup.as_ref());
                     // Reap whatever is left.
                     let _ = child.wait();
                     break -1;
@@ -520,7 +520,7 @@ fn run_one(
     // 160+). The pkill is scoped to this run's unique `--name` and is a no-op
     // when nothing escaped, so always running it after the wait is safe.
     if matches!(engine, Engine::Carrick) {
-        kill_scoped(pid, run_id, engine, cleanup.as_ref());
+        kill_scoped(pid, run_id, engine, cleanup.as_ref())?;
         if (128..=159).contains(&exit_code) {
             maybe_append_crash_core_summary(&stderr_path, pid, &argv);
         }
@@ -590,8 +590,134 @@ fn elapsed_ms(duration: Duration) -> u64 {
     }
 }
 
+fn parse_remaining_processes(stdout: &[u8]) -> anyhow::Result<usize> {
+    let text = String::from_utf8_lossy(stdout);
+    let mut remaining = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.starts_with("remaining carrick procs (") {
+            continue;
+        }
+        let Some((_description, value)) = line.rsplit_once('=') else {
+            anyhow::bail!("scoped cleanup receipt has no remaining-process count");
+        };
+        let value = value
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| anyhow::anyhow!("scoped cleanup receipt count is not an integer"))?;
+        if remaining.replace(value).is_some() {
+            anyhow::bail!("scoped cleanup emitted more than one remaining-process receipt");
+        }
+    }
+    remaining.ok_or_else(|| anyhow::anyhow!("scoped cleanup emitted no remaining-process receipt"))
+}
+
+fn validate_cleanup_helper(path: &Path) -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if !path.is_absolute() {
+        anyhow::bail!("scoped cleanup helper must be an absolute path");
+    }
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot inspect scoped cleanup helper {}: {error}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "scoped cleanup helper must not be a symlink: {}",
+            path.display()
+        );
+    }
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "scoped cleanup helper is not a regular file: {}",
+            path.display()
+        );
+    }
+    if metadata.permissions().mode() & 0o111 == 0 {
+        anyhow::bail!(
+            "scoped cleanup helper is not executable: {}",
+            path.display()
+        );
+    }
+    path.canonicalize().map_err(|error| {
+        anyhow::anyhow!(
+            "cannot resolve scoped cleanup helper {}: {error}",
+            path.display()
+        )
+    })
+}
+
+fn scoped_cleanup_helper() -> anyhow::Result<PathBuf> {
+    let configured = std::env::var_os("CARRICK_SCOPED_CLEANUP_HELPER").map(PathBuf::from);
+    let path = configured.unwrap_or_else(|| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/sudo/kill.sh")
+    });
+    validate_cleanup_helper(&path)
+}
+
+fn hvf_cleanup_command(helper: &Path, run_id: &str, privileged: bool) -> Command {
+    let mut command = if privileged {
+        let mut command = Command::new("sudo");
+        command.arg("-n").arg(helper);
+        command
+    } else {
+        Command::new(helper)
+    };
+    command.arg(run_id);
+    command
+}
+
+fn run_hvf_cleanup_with<F>(helper: &Path, run_id: &str, mut run: F) -> anyhow::Result<()>
+where
+    F: FnMut(&mut Command) -> std::io::Result<std::process::Output>,
+{
+    if run_id.is_empty() || run_id == "--all" {
+        anyhow::bail!("scoped cleanup requires a non-global run id");
+    }
+    let mut failures = Vec::new();
+    for privileged in [false, true] {
+        let mut command = hvf_cleanup_command(helper, run_id, privileged);
+        let attempt = if privileged { "sudo -n" } else { "direct" };
+        match run(&mut command) {
+            Ok(output) => match parse_remaining_processes(&output.stdout) {
+                Ok(0) if output.status.success() => return Ok(()),
+                Ok(remaining) => failures.push(format!(
+                    "{attempt} status={} remaining={remaining}: {}{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )),
+                Err(error) => failures.push(format!(
+                    "{attempt} status={}: {error}: {}{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )),
+            },
+            Err(error) => failures.push(format!("{attempt} could not run: {error}")),
+        }
+    }
+    anyhow::bail!(
+        "scoped carrick cleanup did not prove zero residue for {run_id}: {}",
+        failures.join("; ")
+    )
+}
+
+fn run_hvf_cleanup(run_id: &str) -> anyhow::Result<()> {
+    let helper = scoped_cleanup_helper()?;
+    run_hvf_cleanup_with(&helper, run_id, |command| command.output())
+}
+
 /// Kill exactly this run — never an unscoped reap.
-fn kill_scoped(pid: i32, run_id: &str, engine: Engine, cleanup: Option<&CarrickCleanup>) {
+fn kill_scoped(
+    pid: i32,
+    run_id: &str,
+    engine: Engine,
+    cleanup: Option<&CarrickCleanup>,
+) -> anyhow::Result<()> {
     // Group kill of the direct child tree (cheap, scoped to our spawned pid).
     unsafe {
         libc::kill(-pid, libc::SIGKILL);
@@ -646,20 +772,11 @@ fn kill_scoped(pid: i32, run_id: &str, engine: Engine, cleanup: Option<&CarrickC
         }
         (Engine::Carrick, Some(CarrickCleanup::Hvf) | None) => {
             // Belt for a guest that escaped its group (setpgid/setsid): the
-            // SCOPED kill.sh, which matches only `carrick:<run-id>` and refuses
-            // a global reap. Best-effort (needs the sudoers entry).
-            let cleanup = Command::new("sudo")
-                .args(["-n", "scripts/sudo/kill.sh", run_id])
-                .output();
-            if let Ok(output) = cleanup
-                && !output.status.success()
-            {
-                eprintln!(
-                    "warning: scoped carrick cleanup failed for {run_id}: {}{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
+            // SCOPED kill.sh matches only `carrick:<run-id>` and refuses a
+            // global reap. Direct execution handles ordinary same-user guests;
+            // sudo -n is a fallback for hosts with privileged wrappers. The
+            // helper's exact zero-residue receipt is required either way.
+            run_hvf_cleanup(run_id)?;
         }
         (Engine::Docker, _) => {
             let container = run_id.to_string();
@@ -670,6 +787,7 @@ fn kill_scoped(pid: i32, run_id: &str, engine: Engine, cleanup: Option<&CarrickC
                 .status();
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -750,6 +868,72 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn scoped_cleanup_parser_requires_an_exact_successful_zero_receipt() {
+        assert_eq!(
+            parse_remaining_processes(
+                b"pass 1: killing 1 procs (run-id exact)\n\
+                  remaining carrick procs (run-id exact) = 0\n"
+            )
+            .unwrap(),
+            0
+        );
+        assert!(parse_remaining_processes(b"permission denied\n").is_err());
+        assert!(
+            parse_remaining_processes(
+                b"remaining carrick procs (run-id exact) = 0\n\
+                  remaining carrick procs (run-id exact) = 1\n"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn scoped_cleanup_helper_rejects_relative_nonexecutables_and_symlinks() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        assert!(validate_cleanup_helper(Path::new("relative/kill.sh")).is_err());
+        let directory = std::env::temp_dir().join(format!(
+            "carrick-conformance-cleanup-helper-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let helper = directory.join("kill.sh");
+        std::fs::write(&helper, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(validate_cleanup_helper(&helper).is_err());
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            validate_cleanup_helper(&helper).unwrap(),
+            helper.canonicalize().unwrap()
+        );
+        let linked = directory.join("linked-kill.sh");
+        symlink(&helper, &linked).unwrap();
+        assert!(validate_cleanup_helper(&linked).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn scoped_cleanup_retries_privileged_only_after_direct_failure() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let helper = Path::new("/validated/kill.sh");
+        let mut privileged_attempts = Vec::new();
+        run_hvf_cleanup_with(helper, "conf-exact", |command| {
+            let privileged = command.get_program() == std::ffi::OsStr::new("sudo");
+            privileged_attempts.push(privileged);
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(if privileged { 0 } else { 256 }),
+                stdout: b"remaining carrick procs (run-id conf-exact) = 0\n".to_vec(),
+                stderr: Vec::new(),
+            })
+        })
+        .unwrap();
+
+        assert_eq!(privileged_attempts, vec![false, true]);
+    }
 
     #[test]
     fn carrick_timeout_is_fast_unless_the_oracle_proves_the_case_is_slow() {
