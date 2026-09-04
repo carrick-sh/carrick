@@ -248,3 +248,24 @@ performance result. Evidence:
 `/tmp/carrick-ecosystem-sep04-streaming-host.log`,
 `/tmp/carrick-ecosystem-sep04-streaming-smoke.log`, and
 `target/conformance/ecosystem-sep04-streaming-smoke/`.
+
+
+## Reviewed macOS authority inventory
+
+A fresh compiler capture of clean source `27fe93d69` found 638 macOS call sites:
+588 unchanged, 48 moved, two new. Codex verified all moved operation spans
+against the prior captured source; 46 also retained identical surrounding
+context. The changed bind-open flag and PTY status contexts preserve their
+recorded authority roles. The two new rows name bind-path no-follow metadata
+and fixed carrier FIFO retry sleep, with specific backing/carrier resources.
+The FIFO classification does not establish correct blocking-open timeout or
+executor-lease behavior; those semantics remain a focused-probe opportunity.
+
+Only the reviewed macOS slice and its existing-format compiler capture were
+updated. All six non-macOS profiles remain pending. The full modern candidate
+with clean-source provenance is retained at
+`target/conformance/ecosystem-sep04-receipts/authority-candidate.json`; it remains
+explicitly partial and non-authoritative for the full matrix. The checked legacy
+macOS receipt is an exact projection of its matching fields, not a new full-matrix
+claim. Independent static validation and diff whitespace checks passed; the
+fresh compiler comparison and full local CI gate still need to run after commit.
