@@ -2189,6 +2189,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "streamdestmatrix": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "symlinkfollow": {
     "class": "conformance",
     "excluded": false,
