@@ -10999,15 +10999,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 8789,
-        "byte_start": 8773,
+        "byte_end": 9039,
+        "byte_start": 9023,
         "column": 50,
         "column_end": 66,
         "column_start": 50,
         "file": "crates/carrick-runtime/src/vfs/devpts.rs",
-        "line": 267,
-        "line_end": 267,
-        "line_start": 267
+        "line": 275,
+        "line_end": 275,
+        "line_start": 275
       }
     },
     {
@@ -12758,9 +12758,9 @@
       }
     }
   ],
-  "rows_sha256": "b3f46da3a30c3c54a88c51641ffad1de8c48b43b17b06fd97108bdce3e6dd170",
+  "rows_sha256": "68e36a49a588b68e0b62d01a40ad24f07a6e4b2152ff7f7d51d6a689648f724d",
   "schema": 1,
-  "source_head": "be541e9a64ab41fbdc0938302841c8622eba27e1",
+  "source_head": "ff3b7037c56409c25271c7bb2658dc19a9f2621c",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",

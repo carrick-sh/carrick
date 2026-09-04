@@ -14773,18 +14773,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vfs/devpts.rs:267 in `open`, the host result from `std::process::id` determines the guest PTY entry ownership assigned from the host-process PID.",
+    "rationale": "At crates/carrick-runtime/src/vfs/devpts.rs:275 in `open`, the host result from `std::process::id` determines the guest PTY entry ownership assigned from the host-process PID.",
     "review_id": "HA-000557",
     "source": {
-      "byte_end": 8789,
-      "byte_start": 8773,
+      "byte_end": 9039,
+      "byte_start": 9023,
       "column": 50,
       "column_end": 66,
       "column_start": 50,
       "file": "crates/carrick-runtime/src/vfs/devpts.rs",
-      "line": 267,
-      "line_end": 267,
-      "line_start": 267
+      "line": 275,
+      "line_end": 275,
+      "line_start": 275
     }
   },
   {

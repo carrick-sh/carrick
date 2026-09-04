@@ -115,6 +115,14 @@ impl PtyTable {
     }
 }
 
+/// Helper to update the controlling pts index on an encapsulated PtyTable.
+pub fn set_controlling_index(
+    pty_table: &std::sync::Arc<parking_lot::Mutex<PtyTable>>,
+    index: Option<u32>,
+) {
+    pty_table.lock().set_controlling_index(index);
+}
+
 impl Default for PtyTable {
     fn default() -> Self {
         Self::new()
