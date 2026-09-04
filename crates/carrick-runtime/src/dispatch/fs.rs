@@ -8839,19 +8839,18 @@ impl SyscallDispatcher {
                         if cx.kernel.task().session().raw() != cx.kernel.task().key().id.raw() {
                             return Ok(DispatchOutcome::errno(LINUX_EPERM));
                         }
+                        // Note: controlling index is set regardless of whether tty_acquire succeeds or fails.
+                        crate::vfs::devpts::set_controlling_index(
+                            this.pty_table(),
+                            Some(role.index),
+                        );
                         match cx
                             .kernel
                             .kernel()
                             .tty_acquire(cx.kernel, arg != 0)
                         {
-                            Ok(()) => {
-                                this.pty_table().lock().set_controlling_index(Some(role.index));
-                                DispatchOutcome::Returned { value: 0 }
-                            }
-                            Err(_) => {
-                                this.pty_table().lock().set_controlling_index(Some(role.index));
-                                DispatchOutcome::Returned { value: 0 }
-                            }
+                            Ok(()) => DispatchOutcome::Returned { value: 0 },
+                            Err(_) => DispatchOutcome::Returned { value: 0 },
                         }
                     }
                     LINUX_TIOCGSID => {
@@ -8869,7 +8868,7 @@ impl SyscallDispatcher {
                         }
                     }
                     LINUX_TIOCNOTTY => {
-                        this.pty_table().lock().set_controlling_index(None);
+                        crate::vfs::devpts::set_controlling_index(this.pty_table(), None);
                         match cx.kernel.kernel().tty_detach(cx.kernel) {
                             Ok(()) => DispatchOutcome::Returned { value: 0 },
                             Err(_) => DispatchOutcome::Returned { value: 0 },

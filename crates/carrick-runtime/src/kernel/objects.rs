@@ -1854,6 +1854,10 @@ impl FileTable {
         })
     }
 
+    pub fn is_bare_stdio_open(&self, raw: i32) -> bool {
+        (0..3).contains(&raw) && !self.lock_closed_stdio()[raw as usize]
+    }
+
     pub fn capture_slot_or_stdio_authority(
         &self,
         number: FileSlotNumber,
@@ -1862,7 +1866,7 @@ impl FileTable {
             return Some(authority);
         }
         let raw = number.raw();
-        if (0..3).contains(&raw) && !self.closed_stdio.lock()[raw as usize] {
+        if self.is_bare_stdio_open(raw) {
             let description = FileDescriptionId::from_raw_u64(u64::MAX - raw as u64)?;
             return Some(FileSlotAuthority {
                 table: self.id,
@@ -1883,7 +1887,7 @@ impl FileTable {
                 && slot.description.id() == authority.description;
         }
         let raw = authority.number.raw();
-        if (0..3).contains(&raw) && !self.closed_stdio.lock()[raw as usize] {
+        if self.is_bare_stdio_open(raw) {
             let Some(expected_desc) = FileDescriptionId::from_raw_u64(u64::MAX - raw as u64) else {
                 return false;
             };
@@ -9266,6 +9270,34 @@ mod tests {
 
         // Resolving on table2 with table1's token returns None.
         assert!(table2.resolve_slot_authority(token1).is_none());
+    }
+
+    #[test]
+    fn capture_slot_or_stdio_authority_authorizes_bare_stdio_slots() {
+        let ids = ObjectIdRegistry::new();
+        let table = Arc::new(FileTable::new(ids.file_table_id().expect("table")));
+        let stdin_slot = FileSlotNumber::for_open_fd(0).expect("stdin");
+        let stdout_slot = FileSlotNumber::for_open_fd(1).expect("stdout");
+
+        // Open bare stdio slot captures authority and validates.
+        assert!(table.is_bare_stdio_open(0));
+        let token = table
+            .capture_slot_or_stdio_authority(stdin_slot)
+            .expect("token for stdin");
+        assert!(table.validate_slot_authority(token));
+
+        // When stdio slot is marked closed, authority capture returns None.
+        table.lock_closed_stdio()[0] = true;
+        assert!(!table.is_bare_stdio_open(0));
+        assert!(table.capture_slot_or_stdio_authority(stdin_slot).is_none());
+        assert!(!table.validate_slot_authority(token));
+
+        // Other stdio slot remains open and capturable.
+        assert!(table.is_bare_stdio_open(1));
+        let token_out = table
+            .capture_slot_or_stdio_authority(stdout_slot)
+            .expect("token for stdout");
+        assert!(table.validate_slot_authority(token_out));
     }
 
     /// A write guard settles exactly the slots it mutated: an untouched slot
