@@ -229,3 +229,22 @@ Evidence: `/tmp/carrick-ecosystem-sep04-core-mount-{red,green}.log`,
 `target/conformance/ecosystem-sep04-receipts/core-mount-green-artifacts.jsonl`.
 This closes mounted core visibility for the reducer; it does not fix the
 separate host executor-boundary abort or qualify the full ecosystem gate.
+
+
+## Durable ecosystem transcripts
+
+The full-module and focused CPython reducers now stream configured stdout and
+stderr artifact files through the public embed writer API before guest execution.
+Unbuffered Python output survives a host abort. Permanent capture errors fail
+the host check even if the guest ignores its stdio errno; interrupted writes
+retain standard retry semantics. The existing captured mode remains available
+when no artifact directory is requested.
+
+Independent checks passed 16 aggregate transcript cases, five writer failure
+cases and Clippy. The signed focused forkserver reducer passed with streamed
+artifacts in 2.56 seconds, including negative entitlement control and scoped
+cleanup. This is diagnostic validation under concurrent host work, not a
+performance result. Evidence:
+`/tmp/carrick-ecosystem-sep04-streaming-host.log`,
+`/tmp/carrick-ecosystem-sep04-streaming-smoke.log`, and
+`target/conformance/ecosystem-sep04-streaming-smoke/`.
