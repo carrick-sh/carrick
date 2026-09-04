@@ -1,0 +1,9 @@
+542c76f9705acd6e
+parent_rwx_control_exec=true
+parent_rw_control_faults=true
+child_cow_drop_exec_faults=true
+child_cow_add_exec_allowed=true
+neighbor_dropped_page_faults=true
+neighbor_retained_page_allowed=true
+parent_rwx_post_child_exec=true
+parent_rw_post_child_faults=true

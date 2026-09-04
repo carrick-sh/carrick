@@ -124,8 +124,12 @@ enum PtOp {
     /// Valid, AP=read-only. `exec` clears UXN (PROT_EXEC); else UXN set (NX).
     ReadOnly { exec: bool },
     /// Fork-COW read-only plus nG. Unlike an ordinary protection edit this must
-    /// not treat an already-RO global descriptor as satisfied.
-    ForkReadOnly { exec: bool },
+    /// not treat an already-RO global descriptor as satisfied. Arming is a
+    /// WRITE restriction only: the leaf's execute permission (UXN) is the
+    /// guest's `PROT_EXEC` state and is preserved verbatim. Deriving it from
+    /// the host mapping's perms made every private page in an RWX-backed
+    /// arena executable in both parent and child after fork (`forkprotectexec`).
+    ForkReadOnly,
     /// Valid, AP=read-write. `exec` clears UXN (PROT_EXEC); else UXN set (NX).
     ReadWrite { exec: bool },
     /// Valid, EL1 read-only and inaccessible to EL0 (AP=10).  Fork COW uses
@@ -1186,11 +1190,12 @@ impl PageTableManager {
             PtOp::Retire => base | (flags & !VALID) | scope | SW_RETIRED,
             PtOp::ReadWrite { exec } => base | flags | uxn(exec) | scope,
             PtOp::ReadOnly { exec } => base | (flags & !AP_MASK) | AP_RO | uxn(exec) | scope,
-            PtOp::ForkReadOnly { exec } => {
+            PtOp::ForkReadOnly => {
                 // Fork arming is a permission restriction, not a remap: a
                 // PROT_NONE descriptor must remain invalid while gaining nG so
-                // a later mprotect-to-write still inherits ASID scoping.
-                base | (flags & !VALID & !AP_MASK) | AP_RO | NON_GLOBAL | uxn(exec)
+                // a later mprotect-to-write still inherits ASID scoping. An
+                // absent leaf has no execute state to preserve; arm it NX.
+                base | (flags & !VALID & !AP_MASK) | AP_RO | NON_GLOBAL | UXN
             }
             PtOp::KernelReadOnly { exec } => {
                 base | (flags & !AP_MASK) | AP_PRIV_RO | uxn(exec) | scope
@@ -1215,7 +1220,7 @@ impl PageTableManager {
             PtOp::Retire => !valid && scoped && retired,
             PtOp::ReadWrite { exec } => valid && ap == AP_RW && uxn_set != exec && scoped,
             PtOp::ReadOnly { exec } => valid && ap == AP_RO && uxn_set != exec && scoped,
-            PtOp::ForkReadOnly { exec } => ap == AP_RO && uxn_set != exec && non_global,
+            PtOp::ForkReadOnly => ap == AP_RO && non_global,
             PtOp::KernelReadOnly { exec } => valid && ap == AP_PRIV_RO && uxn_set != exec && scoped,
         }
     }
@@ -1291,25 +1296,39 @@ impl PageTableManager {
                         };
                         (desc & !VALID) | scope | retired
                     }
-                    PtOp::ReadOnly { exec }
-                    | PtOp::ForkReadOnly { exec }
-                    | PtOp::ReadWrite { exec }
-                    | PtOp::KernelReadOnly { exec }
+                    PtOp::ReadOnly { .. }
+                    | PtOp::ForkReadOnly
+                    | PtOp::ReadWrite { .. }
+                    | PtOp::KernelReadOnly { .. }
                         if !empty =>
                     {
                         let ap = match op {
-                            PtOp::ReadOnly { .. } | PtOp::ForkReadOnly { .. } => AP_RO,
+                            PtOp::ReadOnly { .. } | PtOp::ForkReadOnly => AP_RO,
                             PtOp::KernelReadOnly { .. } => AP_PRIV_RO,
                             _ => AP_RW,
                         };
-                        let uxn = if exec { 0 } else { UXN };
+                        // Fork arming keeps the leaf's own execute permission;
+                        // every other edit sets it from the requested prot.
+                        let uxn = match op {
+                            PtOp::ForkReadOnly => desc & UXN,
+                            PtOp::ReadOnly { exec }
+                            | PtOp::ReadWrite { exec }
+                            | PtOp::KernelReadOnly { exec } => {
+                                if exec {
+                                    0
+                                } else {
+                                    UXN
+                                }
+                            }
+                            PtOp::Invalidate | PtOp::Retire => unreachable!(),
+                        };
                         let non_global =
-                            if self.asid_scoped_leaves || matches!(op, PtOp::ForkReadOnly { .. }) {
+                            if self.asid_scoped_leaves || matches!(op, PtOp::ForkReadOnly) {
                                 NON_GLOBAL
                             } else {
                                 0
                             };
-                        let validity = if matches!(op, PtOp::ForkReadOnly { .. }) {
+                        let validity = if matches!(op, PtOp::ForkReadOnly) {
                             desc & VALID
                         } else {
                             VALID
@@ -1326,7 +1345,7 @@ impl PageTableManager {
                             | retired
                     }
                     PtOp::ReadOnly { .. }
-                    | PtOp::ForkReadOnly { .. }
+                    | PtOp::ForkReadOnly
                     | PtOp::ReadWrite { .. }
                     | PtOp::KernelReadOnly { .. } => self.desc_for(op, block_start, level),
                 };
@@ -1563,13 +1582,8 @@ impl PageTableManager {
     /// Arm a private fork range read-only and make the descriptor ASID-scoped.
     /// The output address and all unrelated attributes are preserved, including
     /// for non-identity aliases and already-read-only mappings.
-    pub fn set_fork_readonly(
-        &mut self,
-        va: u64,
-        len: usize,
-        exec: bool,
-    ) -> Result<bool, PageTableError> {
-        self.apply(va, len, PtOp::ForkReadOnly { exec })
+    pub fn set_fork_readonly(&mut self, va: u64, len: usize) -> Result<bool, PageTableError> {
+        self.apply(va, len, PtOp::ForkReadOnly)
     }
 
     /// Mark a Carrick-owned EL1 range read-only without granting EL0 access.
@@ -2263,12 +2277,45 @@ mod tests {
         let va = LINUX_MMAP_BASE + 0x24_0000;
         assert_eq!(mgr.debug_walk(va)[3] & (1 << 11), 0);
 
-        mgr.set_fork_readonly(va, 0x1000, false)
-            .expect("arm fork COW");
+        mgr.set_fork_readonly(va, 0x1000).expect("arm fork COW");
 
         let leaf = mgr.debug_walk(va)[3];
         assert_eq!(leaf & AP_MASK, AP_RO);
         assert_ne!(leaf & (1 << 11), 0, "per-mm fork leaf must use its ASID");
+    }
+
+    #[test]
+    fn fork_readonly_preserves_each_leaf_execute_permission() {
+        let mut mgr = manager();
+        let nx = LINUX_MMAP_BASE + 0x2c_0000;
+        let x = LINUX_MMAP_BASE + 0x2c_1000;
+        mgr.set_rw(nx, 0x1000, false).expect("rw nx");
+        mgr.set_rw(x, 0x1000, true).expect("rw exec");
+        assert_ne!(mgr.debug_walk(nx)[3] & UXN, 0);
+        assert_eq!(mgr.debug_walk(x)[3] & UXN, 0);
+
+        mgr.set_fork_readonly(nx, 0x2000).expect("arm fork COW");
+
+        for va in [nx, x] {
+            let leaf = mgr.debug_walk(va)[3];
+            assert_eq!(leaf & AP_MASK, AP_RO, "fork arm must remove write");
+            assert_ne!(leaf & NON_GLOBAL, 0);
+        }
+        assert_ne!(
+            mgr.debug_walk(nx)[3] & UXN,
+            0,
+            "fork arm must not grant execute to an NX leaf"
+        );
+        assert_eq!(
+            mgr.debug_walk(x)[3] & UXN,
+            0,
+            "fork arm must not revoke execute from an executable leaf"
+        );
+        // Re-arming an already-armed range is satisfied regardless of UXN.
+        assert!(
+            !mgr.set_fork_readonly(nx, 0x2000).expect("re-arm"),
+            "an armed leaf is satisfied whatever its execute bit"
+        );
     }
 
     #[test]
@@ -2278,7 +2325,7 @@ mod tests {
         mgr.set_prot_none(va, 0x1000).expect("PROT_NONE");
         assert!(!mgr.is_valid(va));
 
-        mgr.set_fork_readonly(va, 0x1000, false)
+        mgr.set_fork_readonly(va, 0x1000)
             .expect("arm invalid fork leaf");
         assert!(!mgr.is_valid(va), "fork arming must not grant access");
         assert_ne!(mgr.debug_walk(va)[3] & NON_GLOBAL, 0);

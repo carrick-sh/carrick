@@ -629,6 +629,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "forkprotectexec": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "forkreadexitcow": {
     "class": "conformance",
     "excluded": false,

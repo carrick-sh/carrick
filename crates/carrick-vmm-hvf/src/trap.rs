@@ -23997,8 +23997,10 @@ fn perform_foreign_cow_transaction(
                     .set_writable_preserving_attributes(page_va, 0x1000)
                     .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
             } else if executable_authorized {
+                // The repointed leaf keeps the source VMA's execute bit; the
+                // fork arm only withdraws write.
                 tables
-                    .set_fork_readonly(page_va, 0x1000, true)
+                    .set_fork_readonly(page_va, 0x1000)
                     .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
             }
             page_va = page_va.saturating_add(0x1000);
@@ -36341,7 +36343,7 @@ impl HvfVmState {
             // Normalize the unpublished leaves to fork-RO/nG now; a later RW
             // protect changes AP while preserving the exact fresh IPA.
             manager
-                .set_fork_readonly(page_va, span_len, false)
+                .set_fork_readonly(page_va, span_len)
                 .map_err(|error| {
                     TrapError::Hypervisor(format!(
                         "restrict HVPatch retained reuse leaves: {error:?}"
