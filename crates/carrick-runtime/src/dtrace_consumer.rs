@@ -161,8 +161,7 @@ struct DtraceRecDesc {
     user_argument: u64,
 }
 
-// Prefix of libdtrace's `dtrace_eprobedesc_t`; `size` is the total raw ECB
-// record length and is all the consumer needs to authenticate a record slice.
+// Prefix of libdtrace's `dtrace_eprobedesc_t`.
 #[repr(C)]
 struct DtraceEnabledProbeDesc {
     _enabled_probe_id: u32,
@@ -172,8 +171,9 @@ struct DtraceEnabledProbeDesc {
 }
 
 // libdtrace's `dtrace_probedata_t`. The consumer callback receives this as its
-// first argument; `data` points to the raw ECB record described by
-// `DtraceRecDesc::offset` and `DtraceRecDesc::size`.
+// first argument; Apple libdtrace positions `data` at the current record's
+// payload before calling the record callback. `DtraceRecDesc::offset` remains
+// relative to the enclosing ECB and must not be applied to `data` again.
 #[repr(C)]
 struct DtraceProbeData {
     _handle: *mut DtraceHdl,
@@ -268,12 +268,7 @@ fn dtrace_exit_status(data: *const c_void, rec: &DtraceRecDesc) -> Option<u8> {
     if probe.enabled_probe.is_null() || probe.data.is_null() {
         return None;
     }
-    let enabled_probe = unsafe { &*probe.enabled_probe };
-    if rec.offset.checked_add(rec.size)? > enabled_probe.size {
-        return None;
-    }
-    let offset = usize::try_from(rec.offset).ok()?;
-    let raw = unsafe { std::ptr::read_unaligned(probe.data.add(offset).cast::<[u8; 4]>()) };
+    let raw = unsafe { std::ptr::read_unaligned(probe.data.cast::<[u8; 4]>()) };
     u8::try_from(i32::from_ne_bytes(raw)).ok()
 }
 
@@ -1338,8 +1333,9 @@ mod tests {
             report
         }
 
-        let mut payload = [0u8; 16];
+        let mut payload = [0u8; 20];
         payload[8..12].copy_from_slice(&1_i32.to_ne_bytes());
+        payload[16..20].copy_from_slice(&2_i32.to_ne_bytes());
         let exit = DtraceRecDesc {
             action: DTRACEACT_EXIT,
             size: std::mem::size_of::<i32>() as u32,
@@ -1356,38 +1352,20 @@ mod tests {
             _user_argument: 0,
             size: payload.len() as u32,
         };
-        let report = exit_report(&exit, &enabled_probe, payload.as_ptr());
+        // Apple libdtrace positions dtpda_data at the current record payload;
+        // dtrd_offset is relative to the enclosing ECB and must not be applied
+        // again by the record callback. The sentinel at payload + 16 catches a
+        // decoder that double-applies this record's offset of eight bytes.
+        let report = exit_report(&exit, &enabled_probe, unsafe { payload.as_ptr().add(8) });
         assert!(report.dtrace_exit_observed);
         assert_eq!(report.exit_status, 1);
 
-        let mut boundary_payload = payload;
-        boundary_payload[12..16].copy_from_slice(&42_i32.to_ne_bytes());
-        let boundary = DtraceRecDesc { offset: 12, ..exit };
-        let boundary_report = exit_report(&boundary, &enabled_probe, boundary_payload.as_ptr());
-        assert!(boundary_report.dtrace_exit_observed);
-        assert_eq!(boundary_report.exit_status, 42);
-
         for malformed in [
-            exit_report(&exit, std::ptr::null(), payload.as_ptr()),
+            exit_report(&exit, std::ptr::null(), unsafe { payload.as_ptr().add(8) }),
             exit_report(&exit, &enabled_probe, std::ptr::null()),
-            exit_report(
-                &DtraceRecDesc { size: 8, ..exit },
-                &enabled_probe,
-                payload.as_ptr(),
-            ),
-            exit_report(
-                &DtraceRecDesc { offset: 13, ..exit },
-                &enabled_probe,
-                payload.as_ptr(),
-            ),
-            exit_report(
-                &DtraceRecDesc {
-                    offset: u32::MAX,
-                    ..exit
-                },
-                &enabled_probe,
-                payload.as_ptr(),
-            ),
+            exit_report(&DtraceRecDesc { size: 8, ..exit }, &enabled_probe, unsafe {
+                payload.as_ptr().add(8)
+            }),
         ] {
             assert!(
                 !malformed.dtrace_exit_observed,
@@ -1398,13 +1376,15 @@ mod tests {
         let mut negative = payload;
         negative[8..12].copy_from_slice(&(-1_i32).to_ne_bytes());
         assert!(
-            !exit_report(&exit, &enabled_probe, negative.as_ptr()).dtrace_exit_observed,
+            !exit_report(&exit, &enabled_probe, unsafe { negative.as_ptr().add(8) })
+                .dtrace_exit_observed,
             "negative exit status must leave the receipt absent"
         );
         let mut oversized = payload;
         oversized[8..12].copy_from_slice(&256_i32.to_ne_bytes());
         assert!(
-            !exit_report(&exit, &enabled_probe, oversized.as_ptr()).dtrace_exit_observed,
+            !exit_report(&exit, &enabled_probe, unsafe { oversized.as_ptr().add(8) })
+                .dtrace_exit_observed,
             "out-of-range exit status must leave the receipt absent"
         );
 
