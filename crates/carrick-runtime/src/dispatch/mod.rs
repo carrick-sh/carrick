@@ -3476,6 +3476,47 @@ pub(crate) enum CorePublicationError {
     },
 }
 
+struct AutoCloseFd(i32);
+
+impl AutoCloseFd {
+    fn new(fd: i32) -> Self {
+        Self(fd)
+    }
+
+    fn as_raw_fd(&self) -> i32 {
+        self.0
+    }
+}
+
+impl Drop for AutoCloseFd {
+    fn drop(&mut self) {
+        if self.0 >= 0 {
+            unsafe {
+                libc::close(self.0);
+            }
+        }
+    }
+}
+
+fn write_all_host_fd(fd: i32, mut bytes: &[u8]) -> Result<(), crate::linux_abi::LinuxErrno> {
+    while !bytes.is_empty() {
+        let rc = unsafe { libc::write(fd, bytes.as_ptr().cast::<libc::c_void>(), bytes.len()) };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            let raw_errno = err.raw_os_error().unwrap_or(libc::EIO);
+            return Err(crate::host_to_linux_errno(raw_errno));
+        }
+        if rc == 0 {
+            return Err(crate::linux_abi::LINUX_EIO);
+        }
+        bytes = &bytes[rc as usize..];
+    }
+    Ok(())
+}
+
 /// Owns an epoll instance's kqueue and keeps it in the in-memory-wake registry
 /// for its lifetime (deregistered on drop). Derefs to the inner `Kqueue` so the
 /// epoll handlers use it transparently.
@@ -3808,6 +3849,359 @@ mod core_publication_tests {
             rlimit_core: 4096,
             dumpable: true,
         }
+    }
+
+    #[test]
+    fn core_publication_routes_to_bind_mount_on_host() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let host_path = temp_dir.path().to_path_buf();
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.fs.vfs_mounts_mut().mount(
+            "/evidence",
+            Box::new(crate::vfs::BindVfs::new("/evidence", &host_path, false)),
+        );
+        let mut snapshot = snapshot();
+        snapshot.cwd = "/evidence".to_owned();
+
+        let publication = dispatcher
+            .publish_core_atomic_with_failpoint(&snapshot, 15, b"bind-mount-core".to_vec(), None)
+            .expect("publish to bind mount");
+
+        assert_eq!(publication.path, "/evidence/core");
+        assert_eq!(publication.bytes, 15);
+
+        let host_core_file = host_path.join("core");
+        assert!(host_core_file.exists(), "host core file must exist");
+        let contents = std::fs::read(&host_core_file).expect("read host core");
+        assert_eq!(contents, b"bind-mount-core");
+
+        assert!(
+            dispatcher
+                .fs
+                .rootfs_vfs
+                .overlay
+                .file_contents("/evidence/core")
+                .is_none(),
+            "rootfs overlay must not contain the core"
+        );
+    }
+
+    #[test]
+    fn core_publication_rejects_read_only_bind_mount() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let host_path = temp_dir.path().to_path_buf();
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.fs.vfs_mounts_mut().mount(
+            "/evidence_ro",
+            Box::new(crate::vfs::BindVfs::new("/evidence_ro", &host_path, true)),
+        );
+        let mut snapshot = snapshot();
+        snapshot.cwd = "/evidence_ro".to_owned();
+
+        let err = dispatcher
+            .publish_core_atomic_with_failpoint(&snapshot, 16, b"must-not-write".to_vec(), None)
+            .expect_err("read-only bind mount must refuse publication");
+
+        assert!(
+            matches!(
+                &err,
+                CorePublicationError::Backend {
+                    operation: "create",
+                    error: crate::fs_backend::BackendError::Host(errno),
+                    ..
+                } if *errno == crate::linux_abi::LINUX_EROFS
+            ),
+            "unexpected error: {err:?}"
+        );
+
+        assert!(
+            !host_path.join("core").exists(),
+            "host core file must not exist"
+        );
+        assert!(
+            dispatcher
+                .fs
+                .rootfs_vfs
+                .overlay
+                .file_contents("/evidence_ro/core")
+                .is_none(),
+            "rootfs overlay must not contain the core"
+        );
+    }
+
+    #[test]
+    fn core_publication_on_bind_mount_failpoints_leave_no_artifacts() {
+        for failpoint in [
+            "before-create",
+            "unwritable-path",
+            "short-write",
+            "fsync",
+            "rename",
+            "post-publication",
+        ] {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let host_path = temp_dir.path().to_path_buf();
+            let mut dispatcher = SyscallDispatcher::new();
+            dispatcher.fs.vfs_mounts_mut().mount(
+                "/evidence",
+                Box::new(crate::vfs::BindVfs::new("/evidence", &host_path, false)),
+            );
+            let mut snapshot = snapshot();
+            snapshot.cwd = "/evidence".to_owned();
+
+            dispatcher
+                .publish_core_atomic_with_failpoint(
+                    &snapshot,
+                    17,
+                    b"failpoint-data".to_vec(),
+                    Some(failpoint),
+                )
+                .expect_err(failpoint);
+
+            assert!(
+                !host_path.join("core").exists(),
+                "final host core after {failpoint}"
+            );
+            assert!(
+                !host_path.join("core.carrick-tmp-91-17").exists(),
+                "temporary host file after {failpoint}"
+            );
+            assert!(
+                dispatcher
+                    .fs
+                    .rootfs_vfs
+                    .overlay
+                    .file_contents("/evidence/core")
+                    .is_none(),
+                "final overlay core after {failpoint}"
+            );
+            assert!(
+                dispatcher
+                    .fs
+                    .rootfs_vfs
+                    .overlay
+                    .file_contents("/evidence/core.carrick-tmp-91-17")
+                    .is_none(),
+                "temporary overlay core after {failpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn core_publication_on_bind_mount_rollback_removes_host_artifact() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let host_path = temp_dir.path().to_path_buf();
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.fs.vfs_mounts_mut().mount(
+            "/evidence",
+            Box::new(crate::vfs::BindVfs::new("/evidence", &host_path, false)),
+        );
+        let mut snapshot = snapshot();
+        snapshot.cwd = "/evidence".to_owned();
+
+        let publication = dispatcher
+            .publish_core_atomic_with_failpoint(&snapshot, 18, b"rollback-bind-core".to_vec(), None)
+            .expect("publish before rollback");
+
+        assert!(
+            host_path.join("core").exists(),
+            "host core exists after publish"
+        );
+        dispatcher
+            .rollback_core_publication(&publication)
+            .expect("rollback");
+
+        assert!(
+            !host_path.join("core").exists(),
+            "host core must be removed after rollback"
+        );
+        assert!(
+            !host_path.join("core.carrick-tmp-91-18").exists(),
+            "temporary host file must not exist"
+        );
+        assert!(
+            dispatcher
+                .fs
+                .rootfs_vfs
+                .overlay
+                .file_contents(&publication.path)
+                .is_none(),
+            "overlay must remain clean"
+        );
+    }
+
+    #[test]
+    fn core_publication_follows_symlink_cwd_to_bind_mount() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let host_path = temp_dir.path().to_path_buf();
+        let real_dir = host_path.join("real_dir");
+        std::fs::create_dir(&real_dir).expect("create real_dir");
+        std::os::unix::fs::symlink("real_dir", host_path.join("link_dir")).expect("create symlink");
+
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.fs.vfs_mounts_mut().mount(
+            "/evidence",
+            Box::new(crate::vfs::BindVfs::new("/evidence", &host_path, false)),
+        );
+
+        let mut snapshot = snapshot();
+        snapshot.cwd = "/evidence/link_dir".to_owned();
+
+        let publication = dispatcher
+            .publish_core_atomic_with_failpoint(&snapshot, 19, b"symlink-core".to_vec(), None)
+            .expect("publish via symlink cwd");
+
+        assert_eq!(publication.path, "/evidence/real_dir/core");
+        let host_core = real_dir.join("core");
+        assert!(
+            host_core.exists(),
+            "host core file must exist at resolved target"
+        );
+        let contents = std::fs::read(host_core).expect("read core");
+        assert_eq!(contents, b"symlink-core");
+    }
+
+    #[test]
+    fn core_publication_rejects_symlink_at_temp_path_without_truncating_target() {
+        use std::path::PathBuf;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct SymlinkInjectingVfs {
+            inner: crate::vfs::BindVfs,
+            host_mount_dir: PathBuf,
+            inject_temp_name: String,
+            victim_file: PathBuf,
+            injected: Arc<AtomicBool>,
+        }
+
+        impl crate::vfs::Vfs for SymlinkInjectingVfs {
+            fn lookup(&self, path: &str) -> Result<crate::vfs::Metadata, crate::vfs::VfsError> {
+                self.inner.lookup(path)
+            }
+
+            fn lookup_nofollow(
+                &self,
+                path: &str,
+            ) -> Result<crate::vfs::Metadata, crate::vfs::VfsError> {
+                self.inner.lookup_nofollow(path)
+            }
+
+            fn open(
+                &self,
+                path: &str,
+                flags: crate::vfs::OpenFlags,
+                ctx: &crate::vfs::OpenContext<'_>,
+            ) -> Result<crate::vfs::VfsHandle, crate::vfs::VfsError> {
+                if path.ends_with(&self.inject_temp_name) {
+                    let host_link = self.host_mount_dir.join(&self.inject_temp_name);
+                    let _ = std::os::unix::fs::symlink(&self.victim_file, &host_link);
+                    self.injected.store(true, Ordering::SeqCst);
+                }
+                self.inner.open(path, flags, ctx)
+            }
+
+            fn unlink(&self, path: &str) -> Result<(), crate::vfs::VfsError> {
+                self.inner.unlink(path)
+            }
+
+            fn rename(&self, from: &str, to: &str) -> Result<(), crate::vfs::VfsError> {
+                self.inner.rename(from, to)
+            }
+        }
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let host_mount = temp_dir.path().join("mount");
+        std::fs::create_dir(&host_mount).expect("create mount dir");
+        let victim_file = temp_dir.path().join("sensitive_target.txt");
+        let victim_bytes = b"CRITICAL_HOST_TARGET_DO_NOT_TRUNCATE";
+        std::fs::write(&victim_file, victim_bytes).expect("write victim");
+
+        let injected_flag = Arc::new(AtomicBool::new(false));
+        let temp_name = "core.carrick-tmp-91-20".to_string();
+
+        let injecting_vfs = SymlinkInjectingVfs {
+            inner: crate::vfs::BindVfs::new("/evidence", &host_mount, false),
+            host_mount_dir: host_mount.clone(),
+            inject_temp_name: temp_name.clone(),
+            victim_file: victim_file.clone(),
+            injected: Arc::clone(&injected_flag),
+        };
+
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher
+            .fs
+            .vfs_mounts_mut()
+            .mount("/evidence", Box::new(injecting_vfs));
+
+        let mut snapshot = snapshot();
+        snapshot.cwd = "/evidence".to_owned();
+
+        let err = dispatcher
+            .publish_core_atomic_with_failpoint(&snapshot, 20, b"malicious-payload".to_vec(), None)
+            .expect_err("exclusive create must fail when symlink is injected at temp path");
+
+        assert!(
+            injected_flag.load(Ordering::SeqCst),
+            "symlink must have been injected during open"
+        );
+        assert!(
+            matches!(
+                &err,
+                CorePublicationError::Backend {
+                    operation: "create",
+                    error: crate::fs_backend::BackendError::Host(errno),
+                    ..
+                } if *errno == crate::linux_abi::LINUX_EEXIST
+            ),
+            "unexpected error: {err:?}"
+        );
+
+        let surviving_bytes = std::fs::read(&victim_file).expect("read victim file");
+        assert_eq!(
+            surviving_bytes, victim_bytes,
+            "victim file must not be truncated or overwritten"
+        );
+    }
+
+    #[test]
+    fn core_publication_cleanup_does_not_truncate_symlink_target_on_unlink_failure() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let host_mount = temp_dir.path().join("mount_ro");
+        std::fs::create_dir(&host_mount).expect("create mount dir");
+        let victim_file = temp_dir.path().join("sensitive_ro_target.txt");
+        let victim_bytes = b"CRITICAL_HOST_TARGET_DO_NOT_TRUNCATE_RO";
+        std::fs::write(&victim_file, victim_bytes).expect("write victim");
+
+        let symlink_path = host_mount.join("stale_symlink");
+        std::os::unix::fs::symlink(&victim_file, &symlink_path).expect("create symlink");
+
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.fs.vfs_mounts_mut().mount(
+            "/evidence_ro",
+            Box::new(crate::vfs::BindVfs::new("/evidence_ro", &host_mount, true)),
+        );
+
+        let err = dispatcher
+            .cleanup_core_artifact("/evidence_ro/stale_symlink")
+            .expect_err("cleanup on read-only mount must fail without invalidating symlink target");
+
+        assert!(
+            matches!(
+                &err,
+                CorePublicationError::Cleanup {
+                    artifact_invalidated: false,
+                    ..
+                }
+            ),
+            "cleanup must fail closed with artifact_invalidated=false: {err:?}"
+        );
+
+        let surviving_bytes = std::fs::read(&victim_file).expect("read victim file");
+        assert_eq!(
+            surviving_bytes, victim_bytes,
+            "victim file must survive intact without truncation"
+        );
     }
 
     #[test]
@@ -6391,93 +6785,226 @@ impl SyscallDispatcher {
         bytes: Vec<u8>,
         failpoint: Option<&str>,
     ) -> Result<CorePublication, CorePublicationError> {
-        let final_path = if snapshot.cwd == "/" {
+        let resolved_cwd = self
+            .canonicalize_following(&snapshot.cwd)
+            .unwrap_or_else(|_| snapshot.cwd.clone());
+        let final_path = if resolved_cwd == "/" {
             "/core".to_owned()
         } else {
-            format!("{}/core", snapshot.cwd.trim_end_matches('/'))
+            format!("{}/core", resolved_cwd.trim_end_matches('/'))
         };
         let temp_path = format!(
             "{}.carrick-tmp-{}-{generation}",
             final_path, snapshot.identity.pid
         );
-        let backend = &self.fs.rootfs_vfs.overlay;
-        self.cleanup_core_artifact(&temp_path)?;
-        if failpoint == Some("before-create") {
-            return Err(CorePublicationError::Failpoint("before-create"));
-        }
-        if failpoint == Some("unwritable-path") {
-            return Err(CorePublicationError::Failpoint("unwritable-path"));
-        }
-        backend
-            .create_file(&temp_path)
-            .map_err(|error| CorePublicationError::Backend {
-                operation: "create",
-                path: temp_path.clone(),
-                error,
-            })?;
-        let publication = (|| {
-            if failpoint == Some("short-write") {
-                return Err(CorePublicationError::Failpoint("short-write"));
-            }
-            let bytes_written = bytes.len();
-            backend
-                .set_file_contents(&temp_path, bytes)
-                .map_err(|error| CorePublicationError::Backend {
-                    operation: "write",
-                    path: temp_path.clone(),
-                    error,
-                })?;
-            if failpoint == Some("fsync") {
-                return Err(CorePublicationError::Failpoint("fsync"));
-            }
-            if let Some(fd) = backend.reopen_for_durability(&temp_path).map_err(|error| {
-                CorePublicationError::Backend {
-                    operation: "reopen-for-fsync",
-                    path: temp_path.clone(),
-                    error,
-                }
-            })? {
-                let result = unsafe { libc::fsync(fd) };
-                let errno = (result < 0)
-                    .then(|| std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
-                unsafe { libc::close(fd) };
-                if let Some(errno) = errno {
-                    return Err(CorePublicationError::Fsync {
-                        path: temp_path.clone(),
-                        errno,
+
+        let m_temp = self.fs.vfs_mounts.resolve(&temp_path);
+        let m_final = self.fs.vfs_mounts.resolve(&final_path);
+
+        match (m_temp, m_final) {
+            (Some(m_temp), Some(m_final)) => {
+                if m_temp.point != m_final.point {
+                    return Err(CorePublicationError::Backend {
+                        operation: "rename",
+                        path: final_path,
+                        error: crate::fs_backend::BackendError::Host(crate::linux_abi::LINUX_EXDEV),
                     });
                 }
+                let vfs = m_temp.vfs;
+                let temp_vfs_path = m_temp.full_path.clone();
+                let final_vfs_path = m_final.full_path.clone();
+
+                self.cleanup_core_artifact(&temp_path)?;
+                if failpoint == Some("before-create") {
+                    return Err(CorePublicationError::Failpoint("before-create"));
+                }
+                if failpoint == Some("unwritable-path") {
+                    return Err(CorePublicationError::Failpoint("unwritable-path"));
+                }
+
+                let open_flags = crate::vfs::OpenFlags {
+                    write: true,
+                    create: true,
+                    excl: true,
+                    nofollow: true,
+                    cloexec: true,
+                    mode: 0o600,
+                    ..Default::default()
+                };
+                let ctx = crate::vfs::OpenContext::default();
+                let handle = vfs
+                    .open(&temp_vfs_path, open_flags, &ctx)
+                    .map_err(|errno| CorePublicationError::Backend {
+                        operation: "create",
+                        path: temp_path.clone(),
+                        error: crate::fs_backend::BackendError::Host(errno),
+                    })?;
+
+                let bytes_len = bytes.len();
+                let publication = (|| {
+                    match handle {
+                        crate::vfs::VfsHandle::HostFd { host_fd, .. } => {
+                            let scoped_fd = AutoCloseFd::new(host_fd);
+                            if failpoint == Some("short-write") {
+                                return Err(CorePublicationError::Failpoint("short-write"));
+                            }
+                            write_all_host_fd(scoped_fd.as_raw_fd(), &bytes).map_err(|errno| {
+                                CorePublicationError::Backend {
+                                    operation: "write",
+                                    path: temp_path.clone(),
+                                    error: crate::fs_backend::BackendError::Host(errno),
+                                }
+                            })?;
+                            if failpoint == Some("fsync") {
+                                return Err(CorePublicationError::Failpoint("fsync"));
+                            }
+                            let fsync_res = unsafe { libc::fsync(scoped_fd.as_raw_fd()) };
+                            if fsync_res < 0 {
+                                let errno =
+                                    std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                                return Err(CorePublicationError::Fsync {
+                                    path: temp_path.clone(),
+                                    errno,
+                                });
+                            }
+                            drop(scoped_fd);
+                        }
+                        crate::vfs::VfsHandle::InMemoryFile {
+                            contents,
+                            writable: true,
+                            ..
+                        } => {
+                            if failpoint == Some("short-write") {
+                                return Err(CorePublicationError::Failpoint("short-write"));
+                            }
+                            contents.write().clone_from(&bytes);
+                            if failpoint == Some("fsync") {
+                                return Err(CorePublicationError::Failpoint("fsync"));
+                            }
+                        }
+                        _ => {
+                            return Err(CorePublicationError::Backend {
+                                operation: "create",
+                                path: temp_path.clone(),
+                                error: crate::fs_backend::BackendError::Host(
+                                    crate::linux_abi::LINUX_EROFS,
+                                ),
+                            });
+                        }
+                    }
+
+                    if failpoint == Some("rename") {
+                        return Err(CorePublicationError::Failpoint("rename"));
+                    }
+                    vfs.rename(&temp_vfs_path, &final_vfs_path)
+                        .map_err(|errno| CorePublicationError::Backend {
+                            operation: "rename",
+                            path: final_path.clone(),
+                            error: crate::fs_backend::BackendError::Host(errno),
+                        })?;
+                    if failpoint == Some("post-publication") {
+                        self.cleanup_core_artifact(&final_path)?;
+                        return Err(CorePublicationError::Failpoint("post-publication"));
+                    }
+                    Ok(CorePublication {
+                        path: final_path.clone(),
+                        bytes: bytes_len,
+                        generation,
+                    })
+                })();
+                if publication.is_err() {
+                    self.cleanup_core_artifact(&temp_path)?;
+                }
+                publication
             }
-            if failpoint == Some("rename") {
-                return Err(CorePublicationError::Failpoint("rename"));
+            (None, None) => {
+                let backend = &self.fs.rootfs_vfs.overlay;
+                self.cleanup_core_artifact(&temp_path)?;
+                if failpoint == Some("before-create") {
+                    return Err(CorePublicationError::Failpoint("before-create"));
+                }
+                if failpoint == Some("unwritable-path") {
+                    return Err(CorePublicationError::Failpoint("unwritable-path"));
+                }
+                backend
+                    .create_file(&temp_path)
+                    .map_err(|error| CorePublicationError::Backend {
+                        operation: "create",
+                        path: temp_path.clone(),
+                        error,
+                    })?;
+                let bytes_len = bytes.len();
+                let publication = (|| {
+                    if failpoint == Some("short-write") {
+                        return Err(CorePublicationError::Failpoint("short-write"));
+                    }
+                    backend
+                        .set_file_contents(&temp_path, bytes)
+                        .map_err(|error| CorePublicationError::Backend {
+                            operation: "write",
+                            path: temp_path.clone(),
+                            error,
+                        })?;
+                    if failpoint == Some("fsync") {
+                        return Err(CorePublicationError::Failpoint("fsync"));
+                    }
+                    if let Some(fd) =
+                        backend.reopen_for_durability(&temp_path).map_err(|error| {
+                            CorePublicationError::Backend {
+                                operation: "reopen-for-fsync",
+                                path: temp_path.clone(),
+                                error,
+                            }
+                        })?
+                    {
+                        let scoped_fd = AutoCloseFd::new(fd);
+                        let result = unsafe { libc::fsync(scoped_fd.as_raw_fd()) };
+                        if result < 0 {
+                            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                            return Err(CorePublicationError::Fsync {
+                                path: temp_path.clone(),
+                                errno,
+                            });
+                        }
+                        drop(scoped_fd);
+                    }
+                    if failpoint == Some("rename") {
+                        return Err(CorePublicationError::Failpoint("rename"));
+                    }
+                    let renamed = backend
+                        .rename_overlay_entry(&temp_path, &final_path)
+                        .map_err(|error| CorePublicationError::Backend {
+                            operation: "rename",
+                            path: final_path.clone(),
+                            error,
+                        })?;
+                    if !renamed {
+                        return Err(CorePublicationError::RenameMissing {
+                            from: temp_path.clone(),
+                            to: final_path.clone(),
+                        });
+                    }
+                    if failpoint == Some("post-publication") {
+                        self.cleanup_core_artifact(&final_path)?;
+                        return Err(CorePublicationError::Failpoint("post-publication"));
+                    }
+                    Ok(CorePublication {
+                        path: final_path.clone(),
+                        bytes: bytes_len,
+                        generation,
+                    })
+                })();
+                if publication.is_err() {
+                    self.cleanup_core_artifact(&temp_path)?;
+                }
+                publication
             }
-            let renamed = backend
-                .rename_overlay_entry(&temp_path, &final_path)
-                .map_err(|error| CorePublicationError::Backend {
-                    operation: "rename",
-                    path: final_path.clone(),
-                    error,
-                })?;
-            if !renamed {
-                return Err(CorePublicationError::RenameMissing {
-                    from: temp_path.clone(),
-                    to: final_path.clone(),
-                });
-            }
-            if failpoint == Some("post-publication") {
-                self.cleanup_core_artifact(&final_path)?;
-                return Err(CorePublicationError::Failpoint("post-publication"));
-            }
-            Ok(CorePublication {
-                path: final_path.clone(),
-                bytes: bytes_written,
-                generation,
-            })
-        })();
-        if publication.is_err() {
-            self.cleanup_core_artifact(&temp_path)?;
+            _ => Err(CorePublicationError::Backend {
+                operation: "rename",
+                path: final_path,
+                error: crate::fs_backend::BackendError::Host(crate::linux_abi::LINUX_EXDEV),
+            }),
         }
-        publication
     }
 
     /// Remove a core publication artifact transactionally. If a durable
@@ -6485,19 +7012,76 @@ impl SyscallDispatcher {
     /// retry. A persistent failure remains explicit, while a path that survives
     /// cleanup cannot masquerade as a valid published core.
     fn cleanup_core_artifact(&self, path: &str) -> Result<(), CorePublicationError> {
-        let backend = &self.fs.rootfs_vfs.overlay;
-        match backend.remove_entry_checked(path) {
-            Ok(_) => Ok(()),
-            Err(remove_error) => {
-                let artifact_invalidated = backend.set_file_contents(path, Vec::new()).is_ok();
-                if artifact_invalidated && backend.remove_entry_checked(path).is_ok() {
-                    return Ok(());
+        if let Some(m) = self.fs.vfs_mounts.resolve(path) {
+            let is_regular_file = match m.vfs.lookup_nofollow(&m.full_path) {
+                Ok(meta) => meta.kind == crate::vfs::EntryKind::File,
+                Err(e) if e == crate::linux_abi::LINUX_ENOENT => return Ok(()),
+                Err(_) => false,
+            };
+            match m.vfs.unlink(&m.full_path) {
+                Ok(()) => Ok(()),
+                Err(errno) if errno == crate::linux_abi::LINUX_ENOENT => Ok(()),
+                Err(remove_errno) => {
+                    let artifact_invalidated = if is_regular_file {
+                        let open_flags = crate::vfs::OpenFlags {
+                            write: true,
+                            trunc: true,
+                            nofollow: true,
+                            cloexec: true,
+                            ..Default::default()
+                        };
+                        let ctx = crate::vfs::OpenContext::default();
+                        match m.vfs.open(&m.full_path, open_flags, &ctx) {
+                            Ok(crate::vfs::VfsHandle::HostFd { host_fd, .. }) => {
+                                let _scoped = AutoCloseFd::new(host_fd);
+                                true
+                            }
+                            Ok(crate::vfs::VfsHandle::InMemoryFile {
+                                contents,
+                                writable: true,
+                                ..
+                            }) => {
+                                contents.write().clear();
+                                true
+                            }
+                            _ => false,
+                        }
+                    } else {
+                        false
+                    };
+                    if artifact_invalidated && m.vfs.unlink(&m.full_path).is_ok() {
+                        return Ok(());
+                    }
+                    Err(CorePublicationError::Cleanup {
+                        path: path.to_owned(),
+                        remove_error: crate::fs_backend::BackendError::Host(remove_errno),
+                        artifact_invalidated,
+                    })
                 }
-                Err(CorePublicationError::Cleanup {
-                    path: path.to_owned(),
-                    remove_error,
-                    artifact_invalidated,
-                })
+            }
+        } else {
+            let backend = &self.fs.rootfs_vfs.overlay;
+            let is_regular_file = backend
+                .metadata(path)
+                .map(|m| m.kind == crate::rootfs::RootFsEntryKind::File)
+                .unwrap_or(false);
+            match backend.remove_entry_checked(path) {
+                Ok(_) => Ok(()),
+                Err(remove_error) => {
+                    let artifact_invalidated = if is_regular_file {
+                        backend.set_file_contents(path, Vec::new()).is_ok()
+                    } else {
+                        false
+                    };
+                    if artifact_invalidated && backend.remove_entry_checked(path).is_ok() {
+                        return Ok(());
+                    }
+                    Err(CorePublicationError::Cleanup {
+                        path: path.to_owned(),
+                        remove_error,
+                        artifact_invalidated,
+                    })
+                }
             }
         }
     }
