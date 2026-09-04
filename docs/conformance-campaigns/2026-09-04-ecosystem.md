@@ -158,3 +158,41 @@ That cache cannot establish final assertion closure. Antigravity
 `ecosystem-reducers` (`45ec01b2-8a36-4c46-be40-398fa317cedd`) is adding a bounded
 full-module embed test with transcript retention; actual assertion parsing and
 oracle requalification remain Codex acceptance work.
+
+## Broader probe gate and oracle accounting
+
+At `f82349e98`, the unfiltered cached generic embed gate executed 836 distinct
+rows (418 musl and 418 GNU), with zero diffs. The unsigned negative control and
+run-scoped cleanup passed. Receipt:
+`target/conformance/ecosystem-sep04-receipts/cached-all-artifacts.jsonl`; log:
+`/tmp/carrick-ecosystem-sep04-cached-all.log`. This excludes retained live-oracle
+and process-boundary lanes and does not close ecosystem conformance.
+
+The full local host gate passed formatting, workspace Clippy, strategy/shard
+checks and preceding domain audits, then stopped at host-authority inventory
+drift. Recorded compiler call-site locations need reviewed reconciliation;
+cross-platform profiles must remain explicitly pending. Log:
+`/tmp/carrick-ecosystem-sep04-ci.log`.
+
+CPython emits elapsed times before outcomes and occasionally before the next
+test name, plus two-line docstring descriptions. The old parser both classified
+valid outcomes as `other` and omitted whole identities. The reviewed parser
+now accounts for all 255 tests in the earlier failing transcript: 232 pass,
+18 skip, four errors and one failure. Both regression and closure modes retain
+the complete identities; incomplete descriptions remain `other`.
+
+A fresh, separate native-arm64 Docker phase on the recorded CPython image
+completed the exact declared `test_concurrent_futures` command with exit 0:
+237 pass, 18 skip, all 255 identities classified. Only that suite's two arm64
+oracle entries (regression and closure) were refreshed. The 80,405 ms elapsed
+time is diagnostic because host builds were active; it is not controlled
+performance evidence. Raw transcripts, image/argv/hash receipt and parsed maps
+are `target/conformance/ecosystem-sep04-cpython-oracle.{stdout,stderr,json}` and
+`target/conformance/ecosystem-sep04-oracle-{regression,closure}.json`.
+
+Independent host checks passed all 192 conformance-package tests and 16 embed
+transcript tests. The full-module embed wrapper requires completed unittest
+blocks and a terminal regrtest success, retains transcripts before assertions,
+and rejects empty, skipped-only, expected-failures-only and malformed results.
+It is aggregate completion evidence; exact assertion parity is checked
+separately. The full-module guest run is in progress, not yet accepted.
