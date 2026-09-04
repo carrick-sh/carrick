@@ -8445,25 +8445,63 @@ impl SyscallDispatcher {
                 (None, Some(b)) => b.as_ptr(),
                 (None, None) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
             };
+            let (guest_domain, guest_type, guest_protocol) =
+                match this.socket_guest_domain_type_and_protocol(fd) {
+                    Some(triple) => (Some(triple.0), Some(triple.1), Some(triple.2)),
+                    None => (None, None, None),
+                };
+            let is_stream = guest_type == Some(libc::SOCK_STREAM);
+            let is_sctp_stream = is_stream && guest_protocol == Some(LINUX_IPPROTO_SCTP);
+            let is_unix_stream = is_stream && guest_domain == Some(libc::AF_UNIX);
+            let is_connected_stream = is_stream
+                && !is_unix_stream
+                && !is_sctp_stream
+                && host_socket_is_connected(host_fd.get());
+
+            // Linux move_addr_to_kernel bound: sizeof(struct sockaddr_storage) = 128
+            const LINUX_SOCKADDR_STORAGE_MAX: usize = 128;
+
             // Read the destination sockaddr (if any) from guest memory up front,
             // then send with MSG_DONTWAIT through blocking_io: a full socket buffer
             // (EAGAIN) on a blocking fd waits for POLLOUT losslessly.
             let mut host_addr = if dest_addr == 0 {
                 None
             } else {
-                // Linux's move_addr_to_kernel rejects a negative addrlen with
-                // EINVAL before touching the buffer (sendto01 "invalid to buffer
-                // length", tolen = -1). read_linux_sockaddr reads addrlen as u32
-                // and would instead fault on the huge length (EFAULT) — guard here.
-                if (dest_len as i32) < 0 {
+                // Linux's move_addr_to_kernel rejects a negative addrlen or
+                // addrlen > sizeof(sockaddr_storage) (128) with EINVAL before
+                // touching the buffer (sendto01 "invalid to buffer length",
+                // tolen = -1).
+                if (dest_len as i32) < 0 || dest_len as usize > LINUX_SOCKADDR_STORAGE_MAX {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
-                match read_linux_sockaddr(memory, dest_addr, dest_len, family) {
-                    Ok(b) => Some(b),
-                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                if is_connected_stream {
+                    // On connected TCP / non-UNIX stream sockets, Linux ignores
+                    // dest_addr after move_addr_to_kernel validation, while Darwin
+                    // sendto with an address would fail with EISCONN. Send implicitly.
+                    if dest_len > 0 && memory.read_bytes(dest_addr, dest_len as usize).is_err() {
+                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                    }
+                    None
+                } else if is_unix_stream && host_socket_is_connected(host_fd.get()) {
+                    // Connected AF_UNIX stream returns EISCONN if dest_len > 0.
+                    // A zero length means no effective destination.
+                    if dest_len > 0 {
+                        if memory.read_bytes(dest_addr, dest_len as usize).is_err() {
+                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                        }
+                        return Ok(DispatchOutcome::errno(LINUX_EISCONN));
+                    }
+                    None
+                } else {
+                    // UDP, unconnected sockets, etc. parse destination sockaddr.
+                    match read_linux_sockaddr(memory, dest_addr, dest_len, family) {
+                        Ok(b) => Some(b),
+                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    }
                 }
             };
-            if family == LINUX_AF_INET
+            if !is_connected_stream
+                && family == LINUX_AF_INET
                 && let Some(protocol) = this.socket_port_protocol(fd)
                 && let Some(requested) = host_addr
                     .as_deref()
@@ -8510,29 +8548,16 @@ impl SyscallDispatcher {
                         }
                         return Ok(DispatchOutcome::Returned { value: len as i64 });
                     }
-                    Ok(ConnectTarget::Intercept(_)) => return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ECONNREFUSED)),
+                    Ok(ConnectTarget::Intercept(_)) => {
+                        return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ECONNREFUSED))
+                    }
                     Ok(ConnectTarget::Denied(errno)) => return Ok(DispatchOutcome::errno(errno)),
                     Err(_) => return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ECONNREFUSED)),
                 }
             }
-            // A send on an unconnected STREAM socket: Linux returns EPIPE
-            // (tcp_sendmsg with no peer), but macOS returns ENOTCONN. Remap only
-            // for stream sockets so datagram ENOTCONN (a real Linux errno) is
-            // untouched. (sendto01 "not connected TCP")
-            let (guest_domain, guest_type, guest_protocol) = match this.socket_guest_domain_type_and_protocol(fd) {
-                Some(triple) => (Some(triple.0), Some(triple.1), Some(triple.2)),
-                None => (None, None, None),
-            };
-            let is_stream = guest_type == Some(libc::SOCK_STREAM);
-            let is_sctp_stream = is_stream && guest_protocol == Some(LINUX_IPPROTO_SCTP);
-            let is_unix_stream = is_stream && guest_domain == Some(libc::AF_UNIX);
-            if is_unix_stream && dest_addr != 0 && host_socket_is_connected(host_fd.get()) {
-                return Ok(DispatchOutcome::errno(LINUX_EISCONN));
-            }
-            // On connected TCP / non-UNIX stream sockets, Linux ignores dest_addr,
-            // while Darwin sendto with an address would fail with EISCONN.
-            // Clear host_addr when connected so Darwin sends implicitly.
-            let host_addr = if is_stream && !is_unix_stream && host_socket_is_connected(host_fd.get()) {
+            // On connected SCTP stream sockets (backed by host TCP), clear host_addr
+            // after address validation / provider routing so Darwin sends implicitly.
+            let host_addr = if is_sctp_stream && host_socket_is_connected(host_fd.get()) {
                 None
             } else {
                 host_addr
