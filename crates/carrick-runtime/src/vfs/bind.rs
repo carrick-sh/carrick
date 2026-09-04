@@ -474,6 +474,18 @@ impl Vfs for BindVfs {
         if is_socket_marker(&host, flags.nofollow) {
             return Err(LINUX_ENXIO);
         }
+        let is_symlink = std::fs::symlink_metadata(&host)
+            .map(|m| m.is_symlink())
+            .unwrap_or(false);
+
+        if is_symlink {
+            if flags.create && flags.excl {
+                return Err(crate::linux_abi::LINUX_EEXIST);
+            }
+            if flags.nofollow {
+                return Err(crate::linux_abi::LINUX_ELOOP);
+            }
+        }
         if host.is_dir() {
             let entries = self.readdir(path)?;
             return Ok(VfsHandle::Directory {
@@ -508,6 +520,12 @@ impl Vfs for BindVfs {
         }
         if flags.trunc {
             host_flags |= libc::O_TRUNC;
+        }
+        if flags.nofollow {
+            host_flags |= libc::O_NOFOLLOW;
+        }
+        if flags.cloexec {
+            host_flags |= libc::O_CLOEXEC;
         }
 
         let existed_before_create = flags.create && std::fs::symlink_metadata(&host).is_ok();
@@ -904,6 +922,139 @@ mod tests {
             .collect();
 
         assert_eq!(names, vec!["visible"]);
+        let _ = std::fs::remove_dir_all(&src);
+    }
+
+    #[test]
+    fn bind_open_symlink_to_file_nofollow_returns_eloop() {
+        let src = std::env::temp_dir().join(format!("carrick-bind-symfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).expect("create src");
+        std::fs::write(src.join("target.txt"), b"hello").expect("write target");
+        std::os::unix::fs::symlink("target.txt", src.join("link_to_file")).expect("symlink");
+
+        let vfs = BindVfs::new("/workspace", src.clone(), false);
+        let ctx = OpenContext::default();
+        let flags = OpenFlags {
+            read: true,
+            nofollow: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            vfs.open("/workspace/link_to_file", flags, &ctx),
+            Err(crate::linux_abi::LINUX_ELOOP)
+        );
+        let _ = std::fs::remove_dir_all(&src);
+    }
+
+    #[test]
+    fn bind_open_symlink_to_directory_nofollow_returns_eloop() {
+        let src = std::env::temp_dir().join(format!("carrick-bind-symdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(src.join("subdir")).expect("create subdir");
+        std::os::unix::fs::symlink("subdir", src.join("link_to_dir")).expect("symlink");
+
+        let vfs = BindVfs::new("/workspace", src.clone(), false);
+        let ctx = OpenContext::default();
+        let flags = OpenFlags {
+            read: true,
+            nofollow: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            vfs.open("/workspace/link_to_dir", flags, &ctx),
+            Err(crate::linux_abi::LINUX_ELOOP)
+        );
+        let _ = std::fs::remove_dir_all(&src);
+    }
+
+    #[test]
+    fn bind_open_exclusive_create_on_symlink_returns_eexist() {
+        let src = std::env::temp_dir().join(format!("carrick-bind-symexcl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).expect("create src");
+        std::fs::write(src.join("target.txt"), b"hello").expect("write target");
+        std::os::unix::fs::symlink("target.txt", src.join("link_to_file")).expect("symlink");
+        std::os::unix::fs::symlink("nonexistent", src.join("dangling_link")).expect("symlink");
+
+        let vfs = BindVfs::new("/workspace", src.clone(), false);
+        let ctx = OpenContext::default();
+
+        let flags_excl_nofollow = OpenFlags {
+            write: true,
+            create: true,
+            excl: true,
+            nofollow: true,
+            mode: 0o600,
+            ..Default::default()
+        };
+        assert_eq!(
+            vfs.open("/workspace/link_to_file", flags_excl_nofollow, &ctx),
+            Err(crate::linux_abi::LINUX_EEXIST)
+        );
+
+        let flags_excl = OpenFlags {
+            write: true,
+            create: true,
+            excl: true,
+            mode: 0o600,
+            ..Default::default()
+        };
+        assert_eq!(
+            vfs.open("/workspace/link_to_file", flags_excl, &ctx),
+            Err(crate::linux_abi::LINUX_EEXIST)
+        );
+
+        assert_eq!(
+            vfs.open("/workspace/dangling_link", flags_excl_nofollow, &ctx),
+            Err(crate::linux_abi::LINUX_EEXIST)
+        );
+        assert_eq!(
+            vfs.open("/workspace/dangling_link", flags_excl, &ctx),
+            Err(crate::linux_abi::LINUX_EEXIST)
+        );
+
+        let _ = std::fs::remove_dir_all(&src);
+    }
+
+    #[test]
+    fn bind_open_follows_symlink_when_nofollow_not_set() {
+        let src =
+            std::env::temp_dir().join(format!("carrick-bind-symfollow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(src.join("subdir")).expect("create subdir");
+        std::fs::write(src.join("target.txt"), b"follow-me").expect("write target");
+        std::os::unix::fs::symlink("target.txt", src.join("link_to_file")).expect("symlink file");
+        std::os::unix::fs::symlink("subdir", src.join("link_to_dir")).expect("symlink dir");
+
+        let vfs = BindVfs::new("/workspace", src.clone(), false);
+        let ctx = OpenContext::default();
+
+        let file_flags = OpenFlags {
+            read: true,
+            nofollow: false,
+            ..Default::default()
+        };
+        let handle = vfs
+            .open("/workspace/link_to_file", file_flags, &ctx)
+            .expect("open file via symlink");
+        match handle {
+            VfsHandle::HostFd { host_fd, .. } => {
+                let _ = unsafe { libc::close(host_fd) };
+            }
+            other => panic!("expected HostFd, got {other:?}"),
+        }
+
+        let dir_flags = OpenFlags {
+            read: true,
+            nofollow: false,
+            ..Default::default()
+        };
+        let handle = vfs
+            .open("/workspace/link_to_dir", dir_flags, &ctx)
+            .expect("open dir via symlink");
+        assert!(matches!(handle, VfsHandle::Directory { .. }));
+
         let _ = std::fs::remove_dir_all(&src);
     }
 }

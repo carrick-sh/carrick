@@ -195,4 +195,37 @@ transcript tests. The full-module embed wrapper requires completed unittest
 blocks and a terminal regrtest success, retains transcripts before assertions,
 and rejects empty, skipped-only, expected-failures-only and malformed results.
 It is aggregate completion evidence; exact assertion parity is checked
-separately. The full-module guest run is in progress, not yet accepted.
+separately. The first full-module guest run aborted after 648 seconds; it is not accepted.
+The macOS crash report identifies two executor workers dropping active MM
+inventories from failure settlement. Offline LLDB lookup against the matching
+executable UUID `D3F1BF92-C27E-3FAB-9DD8-E4417C8A0CB0` places both callers at
+`executor.rs:3735`, the initial runtime boundary-audit failure path. The
+triggering audit error is still unknown. Buffered guest output was lost with
+the host abort; durable streaming is the next diagnostic correction.
+Logs: `/tmp/carrick-ecosystem-sep04-cpython-full.log` and
+`/tmp/carrick-ecosystem-sep04-cpython-crash-location.txt`.
+
+
+## Mounted core publication
+
+Core publication now resolves the guest cwd and mount before creating, writing,
+fsyncing and atomically renaming the temporary core. Overlay publication remains
+supported. Bind opens enforce NOFOLLOW/CLOEXEC and reject exclusive-create
+symlink targets. Cleanup uses the same mount and does not truncate symlink
+targets. Independent host tests passed 17 core-publication cases and eight bind
+VFS cases, including rollback and injected write failures.
+
+The new signed `core_publication_visible_on_bind_mount` embed test uses the
+existing source-hash-validated `coredumpfile` oracle. It failed against the
+pre-fix runtime and passed with the mount-aware candidate for both musl and GNU.
+Each run uses a fresh directory, requires exact host path `core`, rejects
+leftover temporary cores, and compares all guest output to the cached oracle.
+`carrick debug core` independently validated both ELF files and all three thread
+records. No Docker phase was needed. The negative entitlement control and scoped
+cleanup passed. Final test-only error-reporting adjustment passed Clippy.
+
+Evidence: `/tmp/carrick-ecosystem-sep04-core-mount-{red,green}.log`,
+`target/conformance/ecosystem-sep04-mounted-core-green/`, and
+`target/conformance/ecosystem-sep04-receipts/core-mount-green-artifacts.jsonl`.
+This closes mounted core visibility for the reducer; it does not fix the
+separate host executor-boundary abort or qualify the full ecosystem gate.
