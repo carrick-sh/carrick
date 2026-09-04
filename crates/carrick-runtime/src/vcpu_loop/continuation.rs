@@ -2708,6 +2708,32 @@ impl CarrierWaitServiceInner {
         Ok(())
     }
 
+    fn publish_signal_for_thread(&self, thread: ThreadKey) -> bool {
+        let candidates: Vec<(ContinuationWakeToken, SignalReadinessProbe)> = {
+            let state = self.state.lock();
+            state
+                .entries
+                .values()
+                .filter(|entry| {
+                    entry.token.thread == thread
+                        && matches!(
+                            entry.state,
+                            RegistrationState::Prepared | RegistrationState::Enrolled
+                        )
+                })
+                .map(|entry| (entry.token, entry.signal_readiness.clone()))
+                .collect()
+        };
+        let mut published = false;
+        for (token, probe) in candidates {
+            if let Some(event) = probe.event_after_task_wake() {
+                self.publish_event(token, event);
+                published = true;
+            }
+        }
+        published
+    }
+
     fn publish_event(
         &self,
         token: ContinuationWakeToken,
@@ -3163,20 +3189,26 @@ impl CarrierWaitService {
         }
         if let Some(task) = signal.task_ref.upgrade() {
             let callback_weak = weak.clone();
-            match task.subscribe_wake(
-                signal.observed_task_wake,
-                Arc::new(move |_| {
-                    if let Some(inner) = callback_weak.upgrade() {
-                        inner.publish_task_wake(token);
+            let mut observed = signal.observed_task_wake;
+            loop {
+                let callback = Arc::new({
+                    let callback_weak = callback_weak.clone();
+                    move |_| {
+                        if let Some(inner) = callback_weak.upgrade() {
+                            inner.publish_task_wake(token);
+                        }
                     }
-                }),
-            ) {
-                crate::kernel::objects::TaskWakeEnrollment::Ready(_) => {
-                    self.inner.publish_task_wake(token);
-                }
-                crate::kernel::objects::TaskWakeEnrollment::Subscribed(subscription) => {
-                    self.inner
-                        .attach_subscription(token, ProducerSubscription::Task(subscription));
+                });
+                match task.subscribe_wake(observed, callback) {
+                    crate::kernel::objects::TaskWakeEnrollment::Ready(current) => {
+                        self.inner.publish_task_wake(token);
+                        observed = current;
+                    }
+                    crate::kernel::objects::TaskWakeEnrollment::Subscribed(subscription) => {
+                        self.inner
+                            .attach_subscription(token, ProducerSubscription::Task(subscription));
+                        break;
+                    }
                 }
             }
         }
@@ -3309,6 +3341,10 @@ impl CarrierWaitService {
         } else {
             Err(WaitServiceError::StaleRegistration)
         }
+    }
+
+    pub fn publish_signal_for_thread(&self, thread: ThreadKey) -> bool {
+        self.inner.publish_signal_for_thread(thread)
     }
 
     pub fn event(&self, token: ContinuationWakeToken) -> ContinuationEventFuture {
