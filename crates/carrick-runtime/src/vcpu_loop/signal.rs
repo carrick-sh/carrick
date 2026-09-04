@@ -405,7 +405,8 @@ where
                     "Kernel-native thread signal has no runtime directory".to_owned(),
                 )
             })?;
-            let (scheduler, _service) = directory.continuation_services(context.kernel());
+            let (scheduler, service) = directory.continuation_services(context.kernel());
+            let _ = service.publish_signal_for_thread(exact);
             let _ = scheduler.wake(exact);
             0
         } else if self.registry.is_live(target) {

@@ -2353,11 +2353,7 @@ impl Kernel {
                 target.thread.as_ref().map(|_| "tid-directed")
             );
         }
-        if enforce_thread_rt_limit {
-            task.publish_wake_subscriptions();
-        } else {
-            task.wake();
-        }
+        task.wake();
         if let Some(parent) = parent {
             parent.wake();
         }
