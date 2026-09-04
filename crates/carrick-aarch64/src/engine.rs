@@ -1728,7 +1728,6 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     /// are mapped executable at boot and never edited here.)
     fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
         use carrick_abi::{LINUX_PROT_EXEC, LINUX_PROT_READ, LINUX_PROT_WRITE};
-        let exec = prot & LINUX_PROT_EXEC != 0;
         if prot & (LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) != 0 {
             self.ensure_sparse_mmap_backing(address, len)?;
         }
@@ -1741,17 +1740,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // RELRO RW→RO), so the stale stage-1 TLB entry must be invalidated for the
         // new protection to take effect.
         self.pt_edit_and_flush(|mgr| {
-            let mut changed = if prot & LINUX_PROT_WRITE != 0 {
-                mgr.set_rw(address, len, exec)?
-            } else if prot & (LINUX_PROT_READ | LINUX_PROT_EXEC) != 0 {
-                mgr.set_readonly(address, len, exec)?
-            } else {
-                mgr.set_prot_none(address, len)?
-            };
-            for range in &armed_cow {
-                changed |= mgr.set_readonly(range.va, range.len, range.executable)?;
-            }
-            Ok(changed)
+            apply_stage1_protection_edit(mgr, address, len, prot, &armed_cow)
         })?;
         self.vm
             .observe_frame_cow_protection(address, len, prot)
@@ -1888,6 +1877,28 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
                 )))
             })
     }
+}
+
+fn apply_stage1_protection_edit(
+    mgr: &mut PageTableManager,
+    address: u64,
+    len: usize,
+    prot: u64,
+    armed_cow: &[crate::vmm::ForkCowRange],
+) -> Result<bool, PageTableError> {
+    use carrick_abi::{LINUX_PROT_EXEC, LINUX_PROT_READ, LINUX_PROT_WRITE};
+    let exec = prot & LINUX_PROT_EXEC != 0;
+    let mut changed = if prot & LINUX_PROT_WRITE != 0 {
+        mgr.set_rw(address, len, exec)?
+    } else if prot & (LINUX_PROT_READ | LINUX_PROT_EXEC) != 0 {
+        mgr.set_readonly(address, len, exec)?
+    } else {
+        mgr.set_prot_none(address, len)?
+    };
+    for range in armed_cow {
+        changed |= mgr.set_readonly(range.va, range.len, exec)?;
+    }
+    Ok(changed)
 }
 
 impl<V: Aarch64Vmm> CurrentMmMemory for Aarch64EngineCore<V> {}
@@ -2973,7 +2984,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                     })?;
             } else {
                 page_tables
-                    .set_fork_readonly(range.va, range.len, range.executable)
+                    .set_fork_readonly(range.va, range.len)
                     .map_err(|error| {
                         TrapError::Hypervisor(format!(
                             "prepare hvpatch child private fork leaves read-only: {error:?}"
@@ -3053,7 +3064,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                         changed |= if range.kernel_only {
                             manager.set_kernel_readonly(range.va, range.len, range.executable)?
                         } else {
-                            manager.set_fork_readonly(range.va, range.len, range.executable)?
+                            manager.set_fork_readonly(range.va, range.len)?
                         };
                     }
                     Ok(changed)
@@ -4155,6 +4166,215 @@ mod tests {
         assert!(
             exec_protections.range_unmapped(LINUX_HEAP_BASE + LINUX_HEAP_SIZE - 0x1000, 0x1000),
             "execve must seed full heap as unmapped"
+        );
+    }
+
+    #[test]
+    fn stage1_protection_edit_fork_cow_downgrade_preserves_requested_exec_not_stale_arm() {
+        use carrick_abi::{LINUX_PROT_EXEC, LINUX_PROT_READ, LINUX_PROT_WRITE};
+        use carrick_mem::page_table::{
+            LeafAccess, terminal_descriptor, terminal_descriptor_permits_el0,
+        };
+
+        const PAGE_SIZE: u64 = 0x1000;
+        const NON_GLOBAL: u64 = 1 << 11;
+        const UXN: u64 = 1 << 54;
+        const AP_MASK: u64 = 0b11 << 6;
+        const AP_USER_RW: u64 = 0b01 << 6;
+        const AP_USER_RO: u64 = 0b11 << 6;
+        const PA_MASK_PAGE: u64 = 0x0000_FFFF_FFFF_F000;
+
+        let leaf =
+            |mgr: &PageTableManager, va: u64| -> u64 { terminal_descriptor(mgr.debug_walk(va)) };
+
+        // --------------------------------------------------------------------
+        // Case 1: Stale arm executable=true -> Requested RW (non-exec)
+        // Must remove execution permission (UXN set) while keeping write trap armed (RO).
+        // --------------------------------------------------------------------
+        let bytes = carrick_mem::memory::stage1_hvpatch_page_tables();
+        let mut mgr = PageTableManager::new(bytes, carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
+
+        // Non-identity VA and IPA
+        let base_va: u64 = 0x40_0088_c000;
+        let base_ipa: u64 = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x20_0000;
+        let edit_len: usize = 4 * PAGE_SIZE as usize; // 4 pages in edit: [0..4)
+        let total_mapped_len: u64 = 5 * PAGE_SIZE; // 5th page is neighbor [4..5)
+
+        mgr.map_private_aliased(base_va, base_ipa, total_mapped_len, true)
+            .expect("map initial non-identity pages");
+
+        let cow_range_stale_exec = crate::vmm::ForkCowRange {
+            va: base_va + PAGE_SIZE,
+            len: 2 * PAGE_SIZE as usize, // pages 1 and 2
+            executable: true,            // Stale historical fork-arm property
+            kernel_only: false,
+            granule: crate::vmm::CowGranule::Page,
+        };
+
+        let neighbor_va = base_va + 4 * PAGE_SIZE;
+        let neighbor_before = leaf(&mgr, neighbor_va);
+        assert_ne!(neighbor_before, 0);
+
+        let changed = apply_stage1_protection_edit(
+            &mut mgr,
+            base_va,
+            edit_len,
+            LINUX_PROT_READ | LINUX_PROT_WRITE,
+            &[cow_range_stale_exec],
+        )
+        .expect("apply RW protection edit");
+        assert!(changed, "protection edit must report changes");
+
+        // Page 0 (un-armed in range): RW, NX, IPA preserved, non-global preserved
+        let d0 = leaf(&mgr, base_va);
+        assert_eq!(d0 & PA_MASK_PAGE, base_ipa);
+        assert_ne!(d0 & NON_GLOBAL, 0, "page 0 must be non-global");
+        assert_eq!(d0 & AP_MASK, AP_USER_RW, "page 0 must be RW");
+        assert_ne!(d0 & UXN, 0, "page 0 must have UXN set (non-exec)");
+        assert!(terminal_descriptor_permits_el0(d0, LeafAccess::Read));
+        assert!(terminal_descriptor_permits_el0(d0, LeafAccess::Write));
+        assert!(!terminal_descriptor_permits_el0(d0, LeafAccess::Execute));
+
+        // Pages 1 & 2 (armed COW): must be RO, NX (exec removed despite stale arm executable=true),
+        // non-identity IPA preserved, non-global preserved.
+        for page_idx in 1..=2 {
+            let va = base_va + page_idx * PAGE_SIZE;
+            let expected_ipa = base_ipa + page_idx * PAGE_SIZE;
+            let d = leaf(&mgr, va);
+
+            assert_eq!(
+                d & PA_MASK_PAGE,
+                expected_ipa,
+                "page {page_idx} IPA must be preserved"
+            );
+            assert_ne!(d & NON_GLOBAL, 0, "page {page_idx} must remain non-global");
+            assert_eq!(
+                d & AP_MASK,
+                AP_USER_RO,
+                "page {page_idx} must stay read-only (write trap armed)"
+            );
+            assert_ne!(
+                d & UXN,
+                0,
+                "page {page_idx} must have UXN set (requested RW removes execution despite stale range.executable=true)"
+            );
+            assert!(terminal_descriptor_permits_el0(d, LeafAccess::Read));
+            assert!(
+                !terminal_descriptor_permits_el0(d, LeafAccess::Write),
+                "COW page {page_idx} must not be writable"
+            );
+            assert!(
+                !terminal_descriptor_permits_el0(d, LeafAccess::Execute),
+                "COW page {page_idx} must not be executable under requested RW"
+            );
+        }
+
+        // Page 3 (un-armed in range): RW, NX, IPA preserved, non-global preserved
+        let d3 = leaf(&mgr, base_va + 3 * PAGE_SIZE);
+        assert_eq!(d3 & PA_MASK_PAGE, base_ipa + 3 * PAGE_SIZE);
+        assert_ne!(d3 & NON_GLOBAL, 0, "page 3 must be non-global");
+        assert_eq!(d3 & AP_MASK, AP_USER_RW, "page 3 must be RW");
+        assert_ne!(d3 & UXN, 0, "page 3 must have UXN set (non-exec)");
+        assert!(terminal_descriptor_permits_el0(d3, LeafAccess::Read));
+        assert!(terminal_descriptor_permits_el0(d3, LeafAccess::Write));
+        assert!(!terminal_descriptor_permits_el0(d3, LeafAccess::Execute));
+
+        // Neighbor page 4 (outside clipped/edited range): completely unchanged
+        let neighbor_after = leaf(&mgr, neighbor_va);
+        assert_eq!(
+            neighbor_before, neighbor_after,
+            "neighbor page outside edit range must be unchanged"
+        );
+
+        // --------------------------------------------------------------------
+        // Case 2: Stale arm executable=false -> Requested RWX
+        // Must grant execution permission (UXN clear) while keeping write trap armed (RO).
+        // --------------------------------------------------------------------
+        let bytes = carrick_mem::memory::stage1_hvpatch_page_tables();
+        let mut mgr = PageTableManager::new(bytes, carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
+
+        mgr.map_private_aliased(base_va, base_ipa, total_mapped_len, true)
+            .expect("map initial non-identity pages");
+
+        let cow_range_stale_nonexec = crate::vmm::ForkCowRange {
+            va: base_va + PAGE_SIZE,
+            len: 2 * PAGE_SIZE as usize, // pages 1 and 2
+            executable: false,           // Stale historical fork-arm property
+            kernel_only: false,
+            granule: crate::vmm::CowGranule::Page,
+        };
+
+        let neighbor_before = leaf(&mgr, neighbor_va);
+
+        let changed = apply_stage1_protection_edit(
+            &mut mgr,
+            base_va,
+            edit_len,
+            LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC,
+            &[cow_range_stale_nonexec],
+        )
+        .expect("apply RWX protection edit");
+        assert!(changed, "protection edit must report changes");
+
+        // Page 0 (un-armed in range): RW, Executable, IPA preserved, non-global preserved
+        let d0 = leaf(&mgr, base_va);
+        assert_eq!(d0 & PA_MASK_PAGE, base_ipa);
+        assert_ne!(d0 & NON_GLOBAL, 0, "page 0 must be non-global");
+        assert_eq!(d0 & AP_MASK, AP_USER_RW, "page 0 must be RW");
+        assert_eq!(d0 & UXN, 0, "page 0 must have UXN clear (executable)");
+        assert!(terminal_descriptor_permits_el0(d0, LeafAccess::Read));
+        assert!(terminal_descriptor_permits_el0(d0, LeafAccess::Write));
+        assert!(terminal_descriptor_permits_el0(d0, LeafAccess::Execute));
+
+        // Pages 1 & 2 (armed COW): must be RO, Executable (exec granted despite stale arm executable=false),
+        // non-identity IPA preserved, non-global preserved.
+        for page_idx in 1..=2 {
+            let va = base_va + page_idx * PAGE_SIZE;
+            let expected_ipa = base_ipa + page_idx * PAGE_SIZE;
+            let d = leaf(&mgr, va);
+
+            assert_eq!(
+                d & PA_MASK_PAGE,
+                expected_ipa,
+                "page {page_idx} IPA must be preserved"
+            );
+            assert_ne!(d & NON_GLOBAL, 0, "page {page_idx} must remain non-global");
+            assert_eq!(
+                d & AP_MASK,
+                AP_USER_RO,
+                "page {page_idx} must stay read-only (write trap armed)"
+            );
+            assert_eq!(
+                d & UXN,
+                0,
+                "page {page_idx} must have UXN clear (requested RWX grants execution despite stale range.executable=false)"
+            );
+            assert!(terminal_descriptor_permits_el0(d, LeafAccess::Read));
+            assert!(
+                !terminal_descriptor_permits_el0(d, LeafAccess::Write),
+                "COW page {page_idx} must not be writable"
+            );
+            assert!(
+                terminal_descriptor_permits_el0(d, LeafAccess::Execute),
+                "COW page {page_idx} must be executable under requested RWX"
+            );
+        }
+
+        // Page 3 (un-armed in range): RW, Executable, IPA preserved, non-global preserved
+        let d3 = leaf(&mgr, base_va + 3 * PAGE_SIZE);
+        assert_eq!(d3 & PA_MASK_PAGE, base_ipa + 3 * PAGE_SIZE);
+        assert_ne!(d3 & NON_GLOBAL, 0, "page 3 must be non-global");
+        assert_eq!(d3 & AP_MASK, AP_USER_RW, "page 3 must be RW");
+        assert_eq!(d3 & UXN, 0, "page 3 must have UXN clear (executable)");
+        assert!(terminal_descriptor_permits_el0(d3, LeafAccess::Read));
+        assert!(terminal_descriptor_permits_el0(d3, LeafAccess::Write));
+        assert!(terminal_descriptor_permits_el0(d3, LeafAccess::Execute));
+
+        // Neighbor page 4 (outside clipped/edited range): completely unchanged
+        let neighbor_after = leaf(&mgr, neighbor_va);
+        assert_eq!(
+            neighbor_before, neighbor_after,
+            "neighbor page outside edit range must be unchanged"
         );
     }
 }
