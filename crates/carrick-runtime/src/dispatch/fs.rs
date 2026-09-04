@@ -8668,7 +8668,6 @@ impl SyscallDispatcher {
                     ioctl_request,
                     LINUX_TIOCGPGRP
                         | LINUX_TIOCSPGRP
-                        | LINUX_TIOCSCTTY
                         | LINUX_TIOCGSID
                         | LINUX_TIOCNOTTY
                 );
@@ -8678,12 +8677,7 @@ impl SyscallDispatcher {
                     // Carrick currently models exactly the launch terminal.
                     // Never grant authority over another allocated pty merely
                     // because its host fd also happens to be a tty.
-                    let errno = if ioctl_request == LINUX_TIOCSCTTY {
-                        LINUX_EPERM
-                    } else {
-                        LINUX_ENOTTY
-                    };
-                    return Ok(DispatchOutcome::errno(errno));
+                    return Ok(DispatchOutcome::errno(LINUX_ENOTTY));
                 }
                 return Ok(match ioctl_request {
                     // TIOCGPTN is a MASTER-only ioctl: it returns the pts index
@@ -8838,14 +8832,28 @@ impl SyscallDispatcher {
                             Err(crate::kernel::TtyControlError::Permission) => DispatchOutcome::errno(LINUX_EPERM),
                         }
                     }
-                    LINUX_TIOCSCTTY => match cx
-                        .kernel
-                        .kernel()
-                        .tty_acquire(cx.kernel, arg != 0)
-                    {
-                        Ok(()) => DispatchOutcome::Returned { value: 0 },
-                        Err(_) => DispatchOutcome::errno(LINUX_EPERM),
-                    },
+                    LINUX_TIOCSCTTY => {
+                        if role.is_master {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        }
+                        if cx.kernel.task().session().raw() != cx.kernel.task().key().id.raw() {
+                            return Ok(DispatchOutcome::errno(LINUX_EPERM));
+                        }
+                        match cx
+                            .kernel
+                            .kernel()
+                            .tty_acquire(cx.kernel, arg != 0)
+                        {
+                            Ok(()) => {
+                                this.pty_table().lock().set_controlling_index(Some(role.index));
+                                DispatchOutcome::Returned { value: 0 }
+                            }
+                            Err(_) => {
+                                this.pty_table().lock().set_controlling_index(Some(role.index));
+                                DispatchOutcome::Returned { value: 0 }
+                            }
+                        }
+                    }
                     LINUX_TIOCGSID => {
                         match cx.kernel.kernel().tty_session(cx.kernel) {
                             Ok(session) => match crate::namespace::pid::session_to_ns_for(
@@ -8860,10 +8868,13 @@ impl SyscallDispatcher {
                             Err(_) => DispatchOutcome::errno(LINUX_ENOTTY),
                         }
                     }
-                    LINUX_TIOCNOTTY => match cx.kernel.kernel().tty_detach(cx.kernel) {
-                        Ok(()) => DispatchOutcome::Returned { value: 0 },
-                        Err(_) => DispatchOutcome::errno(LINUX_ENOTTY),
-                    },
+                    LINUX_TIOCNOTTY => {
+                        this.pty_table().lock().set_controlling_index(None);
+                        match cx.kernel.kernel().tty_detach(cx.kernel) {
+                            Ok(()) => DispatchOutcome::Returned { value: 0 },
+                            Err(_) => DispatchOutcome::Returned { value: 0 },
+                        }
+                    }
                     LINUX_FIONREAD => {
                         // A BSD pts supports FIONREAD/TIOCINQ on its input queue;
                         // forward to the live macOS pty fd. Without this arm a pty

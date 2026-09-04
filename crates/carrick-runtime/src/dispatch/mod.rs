@@ -959,7 +959,9 @@ impl WaitFds {
             .map(|fd| {
                 let number =
                     crate::kernel::FileSlotNumber::for_open_fd(fd).map_err(|_| LINUX_EBADF)?;
-                files.capture_slot_authority(number).ok_or(LINUX_EBADF)
+                files
+                    .capture_slot_or_stdio_authority(number)
+                    .ok_or(LINUX_EBADF)
             })
             .collect::<Result<Vec<_>, _>>()?;
         if slot_authorities.is_empty() && !self.fds.is_empty() {
@@ -988,7 +990,9 @@ impl WaitFds {
                 .map(|fd| {
                     let number =
                         crate::kernel::FileSlotNumber::for_open_fd(fd).map_err(|_| LINUX_EBADF)?;
-                    files.capture_slot_authority(number).ok_or(LINUX_EBADF)
+                    files
+                        .capture_slot_or_stdio_authority(number)
+                        .ok_or(LINUX_EBADF)
                 })
                 .collect::<Result<Vec<_>, _>>()
         };
@@ -996,7 +1000,7 @@ impl WaitFds {
         let watched = watched_fds
             .into_iter()
             .filter_map(|fd| crate::kernel::FileSlotNumber::for_open_fd(fd).ok())
-            .filter_map(|number| files.capture_slot_authority(number))
+            .filter_map(|number| files.capture_slot_or_stdio_authority(number))
             .collect();
         if strict.is_empty() {
             return Err(LINUX_EBADF);
