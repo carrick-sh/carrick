@@ -242,6 +242,57 @@ fn ecosystem_cpython_concurrent_futures_module() {
     assert_regrtest_completion(&result);
 }
 
+/// Reusable diagnostic single CPython unittest runner.
+///
+/// Executes any single fully qualified test method provided via `CARRICK_CPYTHON_UNITTEST_CASE`
+/// (e.g. `test.test_concurrent_futures.test_deadlock.ProcessPoolForkserverExecutorDeadlockTest.test_error_during_result_pickle_on_worker`).
+///
+/// NOTE on scope & oracle limitations:
+/// This wrapper is a targeted triage and reduction tool for isolating individual test methods
+/// from full-module runs. It asserts successful guest process exit and exact single unittest
+/// completion with plain `OK` (rejecting skipped or expected-failure runs), but does NOT claim
+/// cached Docker oracle parity or generic test-suite coverage expansion.
+///
+/// Usage:
+///   CARRICK_CPYTHON_UNITTEST_CASE="test.test_concurrent_futures.test_deadlock.ProcessPoolForkserverExecutorDeadlockTest.test_error_during_result_pickle_on_worker" \
+///   ./scripts/test-signed.sh carrick-conformance-next ecosystem_cpython_unittest_case --ignored --nocapture
+#[test]
+#[ignore = "diagnostic single test runner; run explicitly via CARRICK_CPYTHON_UNITTEST_CASE=\"<method>\" ./scripts/test-signed.sh carrick-conformance-next ecosystem_cpython_unittest_case --ignored --nocapture"]
+fn ecosystem_cpython_unittest_case() {
+    let test_case = match std::env::var("CARRICK_CPYTHON_UNITTEST_CASE") {
+        Ok(val) if !val.trim().is_empty() => val.trim().to_string(),
+        _ => panic!(
+            "missing or empty CARRICK_CPYTHON_UNITTEST_CASE environment variable.\n\
+             Usage:\n  \
+             CARRICK_CPYTHON_UNITTEST_CASE=\"test.test_module.TestCase.test_method\" \\\n  \
+             ./scripts/test-signed.sh carrick-conformance-next ecosystem_cpython_unittest_case --ignored --nocapture"
+        ),
+    };
+
+    let _guard = common::guest_lock();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_ansi(false)
+        .with_writer(std::io::stderr)
+        .try_init();
+    let mut container = TestContainer::new("localhost:5050/cpython-test:3.12.13")
+        .pull_policy(PullPolicy::Never)
+        .env("PYTHONFAULTHANDLER", "1")
+        .env("PYTHONUNBUFFERED", "1");
+    if let Some(path) = std::env::var_os("CARRICK_REDUCER_ARTIFACT_DIR") {
+        std::fs::create_dir_all(&path).expect("create reducer artifact directory");
+        container = container
+            .mount(path.to_string_lossy(), "/evidence")
+            .workdir("/evidence");
+    }
+    let result = common::run_or_fail(run_reducer_container(
+        "ecosystem_cpython_unittest_case",
+        container,
+        ["/usr/local/bin/python3", "-m", "unittest", "-v", &test_case],
+    ));
+    assert_single_unittest_success(&result);
+}
+
 /// Summary of aggregated unittest outcomes and terminal regrtest status.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegrtestCompletionSummary {
@@ -519,6 +570,103 @@ fn assert_regrtest_completion(result: &ContainerResult) {
                 stdout, stderr
             );
         }
+    }
+}
+
+/// Validate a single CPython unittest transcript host-side without spawning guests.
+///
+/// Fails closed on:
+/// - Empty stdout and stderr
+/// - Any unittest failure or error marker (`FAILED`, `FAIL:`, `ERROR:`, `Result: FAILURE`, etc.)
+/// - Excluded tests (`OK (skipped=...)`, `OK (expected failures=...)`)
+/// - Test counts other than exactly 1 (`Ran 1 test in <T>s`)
+/// - Missing or malformed summary blocks or missing plain `OK` completion line
+pub fn parse_and_validate_single_unittest_transcript(
+    stdout: &str,
+    stderr: &str,
+) -> Result<(), String> {
+    if stdout.trim().is_empty() && stderr.trim().is_empty() {
+        return Err("empty transcript: neither stdout nor stderr contained output".to_string());
+    }
+
+    let mut ran_count: Option<usize> = None;
+    let mut saw_plain_ok = false;
+    let mut failure_reasons = Vec::new();
+
+    for line in stdout.lines().chain(stderr.lines()) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if trimmed.starts_with("FAILED")
+            || trimmed.starts_with("FAIL:")
+            || trimmed.starts_with("ERROR:")
+            || trimmed == "Result: FAILURE"
+            || trimmed == "== Tests result: FAILURE =="
+        {
+            failure_reasons.push(trimmed.to_string());
+        }
+
+        if let Some(count) = parse_ran_line(trimmed) {
+            if ran_count.is_some() {
+                return Err(
+                    "multiple unittest summary blocks found in single test transcript".to_string(),
+                );
+            }
+            ran_count = Some(count);
+        } else if trimmed == "OK" {
+            if ran_count.is_some() && !saw_plain_ok {
+                saw_plain_ok = true;
+            }
+        } else if trimmed.starts_with("OK (") {
+            return Err(format!(
+                "expected plain OK, but found excluded test summary: '{trimmed}'"
+            ));
+        }
+    }
+
+    if !failure_reasons.is_empty() {
+        return Err(format!(
+            "transcript rejected due to failures: {}",
+            failure_reasons.join("; ")
+        ));
+    }
+
+    match ran_count {
+        None => Err("transcript missing unittest summary block ('Ran 1 test in <T>s')".to_string()),
+        Some(0) => Err("0 tests ran in single unittest execution".to_string()),
+        Some(n) if n != 1 => Err(format!("expected exactly 1 test ran, but parsed {n} tests")),
+        Some(1) => {
+            if saw_plain_ok {
+                Ok(())
+            } else {
+                Err("unittest summary block missing plain 'OK' completion line".to_string())
+            }
+        }
+        Some(_) => unreachable!(),
+    }
+}
+
+/// Assert that a container run finished cleanly with exit 0 and that its single unittest transcript
+/// completed with exactly one executed test and plain OK (not skipped, expected-failure, or errored).
+fn assert_single_unittest_success(result: &ContainerResult) {
+    let stdout = result.stdout_utf8();
+    let stderr = result.stderr_utf8();
+    assert!(
+        result.success(),
+        "expected successful container execution (exit 0, no signal), got exit_code={} signal={:?} trap_limit_hit={}\n\n=== STDOUT ===\n{}\n\n=== STDERR ===\n{}\n",
+        result.exit_code,
+        result.signal,
+        result.trap_limit_hit,
+        stdout,
+        stderr
+    );
+    if let Err(err) = parse_and_validate_single_unittest_transcript(&stdout, &stderr) {
+        panic!(
+            "single unittest transcript validation failed: {err}\n\n=== STDOUT ===\n{}\n\n=== STDERR ===\n{}\n",
+            stdout, stderr
+        );
     }
 }
 
@@ -873,6 +1021,101 @@ OK
     assert_eq!(summary.total_expected_failures, 0);
     assert_eq!(summary.total_passed, 2);
     assert!(summary.regrtest_success);
+}
+
+#[test]
+fn single_unittest_accepts_plain_ok_single_test() {
+    let stderr = "\
+test_sample (test.test_mod.TestCase.test_sample) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 0.042s
+
+OK
+";
+    parse_and_validate_single_unittest_transcript("", stderr)
+        .expect("valid single unittest with plain OK should pass");
+}
+
+#[test]
+fn single_unittest_rejects_skipped_and_expected_failures() {
+    let stderr_skip = "\
+test_sample (test.test_mod.TestCase.test_sample) ... skipped 'not supported'
+
+----------------------------------------------------------------------
+Ran 1 test in 0.001s
+
+OK (skipped=1)
+";
+    let err_skip = parse_and_validate_single_unittest_transcript("", stderr_skip).unwrap_err();
+    assert!(
+        err_skip.contains("expected plain OK, but found excluded test summary"),
+        "{err_skip}"
+    );
+
+    let stderr_xfail = "\
+test_sample (test.test_mod.TestCase.test_sample) ... expected failure
+
+----------------------------------------------------------------------
+Ran 1 test in 0.001s
+
+OK (expected failures=1)
+";
+    let err_xfail = parse_and_validate_single_unittest_transcript("", stderr_xfail).unwrap_err();
+    assert!(
+        err_xfail.contains("expected plain OK, but found excluded test summary"),
+        "{err_xfail}"
+    );
+}
+
+#[test]
+fn single_unittest_rejects_zero_or_multiple_tests() {
+    let stderr_zero = "\
+----------------------------------------------------------------------
+Ran 0 tests in 0.000s
+
+OK
+";
+    let err_zero = parse_and_validate_single_unittest_transcript("", stderr_zero).unwrap_err();
+    assert!(err_zero.contains("0 tests ran"), "{err_zero}");
+
+    let stderr_multi = "\
+----------------------------------------------------------------------
+Ran 2 tests in 0.100s
+
+OK
+";
+    let err_multi = parse_and_validate_single_unittest_transcript("", stderr_multi).unwrap_err();
+    assert!(
+        err_multi.contains("expected exactly 1 test ran, but parsed 2 tests"),
+        "{err_multi}"
+    );
+}
+
+#[test]
+fn single_unittest_rejects_failure_and_incomplete() {
+    let stderr_fail = "\
+======================================================================
+FAIL: test_sample (test.test_mod.TestCase.test_sample)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  AssertionError: False is not true
+----------------------------------------------------------------------
+Ran 1 test in 0.010s
+
+FAILED (failures=1)
+";
+    let err_fail = parse_and_validate_single_unittest_transcript("", stderr_fail).unwrap_err();
+    assert!(err_fail.contains("rejected due to failures"), "{err_fail}");
+
+    let stderr_incomplete = "\
+test_sample (test.test_mod.TestCase.test_sample) ...
+";
+    let err_inc = parse_and_validate_single_unittest_transcript("", stderr_incomplete).unwrap_err();
+    assert!(
+        err_inc.contains("missing unittest summary block"),
+        "{err_inc}"
+    );
 }
 
 #[test]

@@ -268,4 +268,43 @@ with clean-source provenance is retained at
 explicitly partial and non-authoritative for the full matrix. The checked legacy
 macOS receipt is an exact projection of its matching fields, not a new full-matrix
 claim. Independent static validation and diff whitespace checks passed; the
-fresh compiler comparison and full local CI gate still need to run after commit.
+fresh compiler comparison passed after commit. Full local CI then stopped at
+dispatch-lock authority: 109 raw sites exceed the 107 ceiling, including five
+unclassified acquisitions and 39 positional mismatches. K1 operation inventory
+also contains real additions. These require semantic review and remediation;
+raising ceilings or treating additions as positional drift is not acceptance.
+
+## Core-qualified heap protection failure and single-case tooling
+
+The streamed full CPython module reached
+`ProcessPoolForkserverExecutorDeadlockTest.test_crash_big_data` and aborted in
+`brk` while growing `0x400088c000..0x4000c8c000` (4 MiB). The host core is
+`target/conformance/ecosystem-sep04-cpython-stream-debug/host.core`; its exact
+debug executable is `/tmp/carrick-ecosystem-sep04-stream-debug-executable`.
+Offline LLDB selected thread 12, frame 5 at `dispatch/mem.rs:3662`.
+
+The core retains a deferred-COW authentication error at VA `0x4000948000`:
+leaf `0x20009c09d80fc3`, translated and expected IPA `0x9c09d80000`, expected
+AP `0xc0`. The leaf is executable despite the requested RW protection.
+Offline inspection of the active engine's arm vector confirms covering arms
+with `executable=true`. The generic AArch64 protection path first applies the
+requested permissions, then re-downgrades COW spans using their historical
+execute flag. A narrow correction and production-path page-table regressions
+are under isolated Antigravity review; no runtime fix is accepted yet.
+This core does not explain the separate earlier executor-boundary abort.
+
+The new ignored `ecosystem_cpython_unittest_case` embed diagnostic requires
+`CARRICK_CPYTHON_UNITTEST_CASE`, uses the local image without pulling, preserves
+streamed evidence, and requires exactly one completed test with plain `OK`.
+Independent host validation passed 30 transcript/writer cases. The signed
+isolated `test_crash_big_data` passed in 7.70 seconds, with the negative
+entitlement control and scoped cleanup passing. Thus the full-module failure
+may depend on accumulated state; this single pass is not full-module acceptance
+or controlled performance evidence. Logs use
+`/tmp/carrick-ecosystem-sep04-{single-host,crash-big-data}.log`; the signed receipt
+is `target/conformance/ecosystem-sep04-receipts/single-case-artifacts.jsonl`.
+
+The independently compiled FIFO open matrix produced identical 16-line stdout
+on two serial native-arm64 Docker runs per libc, all exit zero and empty stderr.
+Raw outputs are in `target/conformance/ecosystem-sep04-fifo-oracle/`. Cached
+fixture/wiring review and the signed Carrick red run remain pending.
