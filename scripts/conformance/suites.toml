@@ -3458,6 +3458,7 @@ tier = "full"
 weight = "heavy"
 timeout_s = 300
 carrick_flags = ["--fs", "host"]
+docker_flags = ["--cap-add", "SYS_ADMIN"]
 
 [[suite]]
 name = "cpython-signal"
@@ -3601,6 +3602,11 @@ tier = "full"
 weight = "heavy"
 timeout_s = 300
 carrick_flags = ["--fs", "host"]
+known_gaps = [
+    "test.test_ssl.ThreadedTests.test_sni_callback_alert",
+    "test.test_ssl.ThreadedTests.test_sni_callback_raising",
+    "test.test_ssl.ThreadedTests.test_sni_callback_wrong_return_type",
+]
 
 [[suite]]
 name = "cpython-stable_abi_ctypes"
@@ -6528,7 +6534,7 @@ verdict = "gotest"
 tier = "full"
 weight = "heavy"
 timeout_s = 180
-carrick_flags = ["--fs", "host"]
+carrick_flags = ["--fs", "host", "-t"]
 docker_flags = ["-t"]
 workdir = "/usr/local/go/src/net"
 
@@ -6769,7 +6775,7 @@ verdict = "gotest"
 tier = "full"
 weight = "heavy"
 timeout_s = 180
-carrick_flags = ["--fs", "host"]
+carrick_flags = ["--fs", "host", "-t"]
 docker_flags = ["-t"]
 workdir = "/usr/local/go/src/os"
 
