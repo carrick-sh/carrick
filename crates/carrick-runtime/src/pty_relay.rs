@@ -276,10 +276,15 @@ impl PtyRelay {
         real_out: RawFd,
         winsize_r: RawFd,
     ) -> io::Result<Self> {
-        if let Err(error) = crate::host_tty::make_raw(real_in) {
-            close_pair(&pair);
-            return Err(error);
-        }
+        let raw_active = if crate::host_tty::host_isatty(real_in) {
+            if let Err(error) = crate::host_tty::make_raw(real_in) {
+                close_pair(&pair);
+                return Err(error);
+            }
+            true
+        } else {
+            false
+        };
 
         // ── SIGWINCH self-pipe ───────────────────────────────────────────────
         // Create a non-blocking pipe: handler writes, relay loop reads.
@@ -287,7 +292,9 @@ impl PtyRelay {
         // SAFETY: wp is a 2-int array for pipe(2).
         if unsafe { libc::pipe(wp.as_mut_ptr()) } != 0 {
             let error = io::Error::last_os_error();
-            crate::host_tty::restore_stdin_termios();
+            if raw_active {
+                crate::host_tty::restore_stdin_termios();
+            }
             close_pair(&pair);
             return Err(error);
         }
@@ -324,7 +331,9 @@ impl PtyRelay {
                 let e = io::Error::last_os_error();
                 libc::close(winch_r);
                 libc::close(winch_w);
-                crate::host_tty::restore_stdin_termios();
+                if raw_active {
+                    crate::host_tty::restore_stdin_termios();
+                }
                 close_pair(&pair);
                 return Err(e); // nothing published yet; clean
             }
@@ -352,11 +361,13 @@ impl PtyRelay {
         let mut relay = match Self::start_inner(pair, real_in, real_out, winch_r, winsize_r) {
             Ok(relay) => relay,
             Err(error) => {
-                crate::host_tty::restore_stdin_termios();
+                if raw_active {
+                    crate::host_tty::restore_stdin_termios();
+                }
                 return Err(error);
             }
         };
-        relay.raw_active = true;
+        relay.raw_active = raw_active;
         relay.winch_r = winch_r;
         relay.winch_w = winch_w;
         relay.old_sigwinch = Some(guard.old);
