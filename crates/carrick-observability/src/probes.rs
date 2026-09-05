@@ -7259,11 +7259,29 @@ mod real {
         carrick_usdt::vcpu__fault__regs!(|| (esr, elr, far, insn, rn, xrn));
     }
 
+    /// [`vcpu_fault_regs`] with the arguments produced lazily: `args` runs
+    /// only when a consumer is attached. The vCPU loop fires this on EVERY
+    /// data abort, and decoding the faulting instruction costs a guest read
+    /// (two heap allocations) plus a register fetch; paying that on the
+    /// happy path with no D script listening was ~1% of the arena-churn
+    /// profile. The eager form stays for callers whose values are free.
+    #[allow(clippy::redundant_closure)] // the usdt macro requires a closure literal
+    pub fn vcpu_fault_regs_with(args: impl FnOnce() -> (u64, u64, u64, u64, u32, u64)) {
+        carrick_usdt::vcpu__fault__regs!(|| args());
+    }
+
     /// Guest x0..x5 paired with [`vcpu_fault_regs`] on the same host thread.
     /// This is a separate probe because the USDT backend supports six scalar
     /// arguments. It is fault-only and therefore adds no happy-path overhead.
     pub fn vcpu_fault_gprs(x0: u64, x1: u64, x2: u64, x3: u64, x4: u64, x5: u64) {
         carrick_usdt::vcpu__fault__gprs!(|| (x0, x1, x2, x3, x4, x5));
+    }
+
+    /// [`vcpu_fault_gprs`] with the six register reads deferred until a
+    /// consumer is attached (see [`vcpu_fault_regs_with`]).
+    #[allow(clippy::redundant_closure)] // the usdt macro requires a closure literal
+    pub fn vcpu_fault_gprs_with(args: impl FnOnce() -> (u64, u64, u64, u64, u64, u64)) {
+        carrick_usdt::vcpu__fault__gprs!(|| args());
     }
 
     #[allow(clippy::too_many_arguments)]
