@@ -28540,6 +28540,25 @@ struct PendingFrameCowPublication {
     expected_ipa: u64,
 }
 
+/// Name the stage-1 pool's own numbers on a sparse-mmap planning failure.
+/// A bare `OutOfTables` cannot distinguish a legitimately huge address
+/// space from a pool that was refused permission to sweep its reclaimable
+/// tables (`cpython-compile` reported fifteen bare refusals at 1 MiB anonymous
+/// maps); the child-clone and syscall edit paths already report this census.
+fn sparse_mmap_stage1_error(
+    manager: &carrick_mem::page_table::PageTableManager,
+    span: &str,
+    error: carrick_mem::page_table::PageTableError,
+) -> TrapError {
+    let (in_use, free, capacity) = manager.pool_stats();
+    let (multi_vcpu, exclusive, reclaim_pending) = manager.coalesce_policy();
+    TrapError::Hypervisor(format!(
+        "plan sparse HVPatch mmap {span} stage-1 output: {error:?} \
+         (in_use={in_use} free={free} capacity={capacity} multi_vcpu={multi_vcpu} \
+         exclusive={exclusive} reclaim_pending={reclaim_pending})"
+    ))
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn deferred_cow_leaf_authenticates(
     leaf: u64,
@@ -35845,11 +35864,7 @@ impl HvfVmState {
             if start < aligned_start {
                 manager
                     .map_private_aliased(start, semantic_ipa, aligned_start - start, false)
-                    .map_err(|error| {
-                        TrapError::Hypervisor(format!(
-                            "plan sparse HVPatch mmap leading stage-1 output: {error:?}"
-                        ))
-                    })?;
+                    .map_err(|error| sparse_mmap_stage1_error(manager, "leading", error))?;
             }
             let aligned_len = (end - aligned_start) / TWO_MIB * TWO_MIB;
             if aligned_len != 0 {
@@ -35860,11 +35875,7 @@ impl HvfVmState {
                         aligned_len,
                         false,
                     )
-                    .map_err(|error| {
-                        TrapError::Hypervisor(format!(
-                            "plan sparse HVPatch mmap bulk stage-1 output: {error:?}"
-                        ))
-                    })?;
+                    .map_err(|error| sparse_mmap_stage1_error(manager, "bulk", error))?;
             }
             let tail_start = aligned_start + aligned_len;
             if tail_start < end {
@@ -35875,11 +35886,7 @@ impl HvfVmState {
                         end - tail_start,
                         false,
                     )
-                    .map_err(|error| {
-                        TrapError::Hypervisor(format!(
-                            "plan sparse HVPatch mmap trailing stage-1 output: {error:?}"
-                        ))
-                    })?;
+                    .map_err(|error| sparse_mmap_stage1_error(manager, "trailing", error))?;
             }
             manager
                 .set_prot_none(start, semantic_len)
