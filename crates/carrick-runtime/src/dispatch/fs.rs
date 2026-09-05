@@ -47,10 +47,10 @@
 //! the Darwin `copyfile`/`fclonefileat` fast path), `access` (DAC checks),
 //! and `xattr`.
 use super::*;
-use crate::linux_abi::{LINUX_ENOSPC, LINUX_ENXIO, LINUX_SEEK_DATA, LINUX_SEEK_HOLE};
+use crate::linux_abi::{
+    LINUX_ENOSPC, LINUX_ENXIO, LINUX_SEEK_DATA, LINUX_SEEK_HOLE, LINUX_TIOCSIG,
+};
 use crate::vfs::PtyRole;
-
-const LINUX_TIOCSIG: u64 = 0x40045436;
 
 fn resolve_tiocspgrp(
     context: &crate::kernel::KernelContext,
