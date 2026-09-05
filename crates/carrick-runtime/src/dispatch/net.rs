@@ -2297,9 +2297,6 @@ impl SyscallDispatcher {
     }
 
     fn set_socket_error_after_send(&self, fd: i32, errno: carrick_abi::LinuxErrno) {
-        if std::env::var_os("CARRICK_NET_DEBUG").is_some() {
-            eprintln!("NETDBG set_error_after_send fd={fd} errno={}", errno.get());
-        }
         if let Some(open_file) = self.open_file(fd)
             && let Some(mut open) = open_file.description.write()
             && let OpenDescription::HostSocket { base, .. } = &mut *open
@@ -2358,9 +2355,6 @@ impl SyscallDispatcher {
     }
 
     fn queue_socket_error_after_send(&self, fd: i32) {
-        if std::env::var_os("CARRICK_NET_DEBUG").is_some() {
-            eprintln!("NETDBG queue_error_after_send fd={fd}");
-        }
         if let Some(open_file) = self.open_file(fd)
             && let Some(mut open) = open_file.description.write()
             && let OpenDescription::HostSocket { base, .. } = &mut *open
@@ -8050,14 +8044,8 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
                     Ok(ConnectTarget::Unchanged) => {
-                        if std::env::var_os("CARRICK_NET_DEBUG").is_some() {
-                            eprintln!("NETDBG connect resolve UNCHANGED fd={fd} req={requested:?} proto={protocol:?}");
-                        }
                     }
                     Ok(ConnectTarget::Denied(errno)) => {
-                        if std::env::var_os("CARRICK_NET_DEBUG").is_some() {
-                            eprintln!("NETDBG connect resolve DENIED fd={fd} errno={} proto={protocol:?} gt={:?}", errno.get(), this.socket_guest_type(fd));
-                        }
                         if errno == carrick_abi::LINUX_ECONNREFUSED
                             && protocol == PortProtocol::Tcp
                             && this.socket_guest_type(fd) == Some(LINUX_SOCK_STREAM)
@@ -8460,16 +8448,6 @@ impl SyscallDispatcher {
 
         fn sendto(this, cx, fd: Fd, buf: GuestPtr, len: u64, flags: u64, dest_addr: GuestPtr, addrlen: u64) {
 
-            if std::env::var_os("CARRICK_NET_DEBUG").is_some() {
-                let kind = this
-                    .open_file(fd.0)
-                    .and_then(|of| of.description.read().map(|g| g.reexec_kind_name().to_string()))
-                    .unwrap_or_else(|| "<none>".to_string());
-                eprintln!(
-                    "NETDBG sendto enter pid={} fd={} len={} dest_addr={:#x} kind={kind}",
-                    std::process::id(), fd.0, len, dest_addr.0
-                );
-            }
             let memory = &*cx.memory;
             let fd = fd.0;
             let buf_addr = buf.0;
@@ -8731,9 +8709,6 @@ impl SyscallDispatcher {
             let send_to = this
                 .open_file(fd)
                 .and_then(|f| f.description.read()?.send_timeout());
-            if std::env::var_os("CARRICK_NET_DEBUG").is_some() {
-                eprintln!("NETDBG sendto pre-io fd={fd} nonblocking={nonblocking}");
-            }
             let outcome = this.blocking_io(fd, host_fd.get(), IoDir::Write, nonblocking, send_to, || {
                 // Re-stated locally (idempotent) so the non-blocking guarantee
                 // is visible at every send site below: both the real socket and
@@ -8801,20 +8776,16 @@ impl SyscallDispatcher {
                 }
                 result
             });
-            if std::env::var_os("CARRICK_NET_DEBUG").is_some() {
-                eprintln!("NETDBG sendto outcome fd={fd} connected_send={connected_send} outcome={outcome:?}");
-            }
             if connected_send && matches!(outcome, DispatchOutcome::Returned { value } if value >= 0) {
                 this.queue_socket_error_after_send(fd);
             }
-            let outcome = match outcome {
-                DispatchOutcome::Returned { value } if value >= 0 => DispatchOutcome::Returned {
-                    value: current_payload_len as i64,
-                },
-                other => other,
-            };
-            Ok(outcome)
-
+            Ok(this.settle_cork_send(
+                fd,
+                outcome,
+                combined_buf.as_deref(),
+                len - current_payload_len,
+                nonblocking,
+            ))
         }
 
         fn recvfrom(this, cx, fd: Fd, buf: GuestPtr, len: u64, flags: u64, src_addr: GuestPtr, addrlen: GuestPtr) {
@@ -10162,13 +10133,84 @@ impl SyscallDispatcher {
         } else {
             rights.abort();
         }
-        let outcome = match outcome {
-            DispatchOutcome::Returned { value } if value >= 0 => DispatchOutcome::Returned {
-                value: current_payload_len as i64,
-            },
-            other => other,
+        Ok(self.settle_cork_send(
+            fd,
+            outcome,
+            Some(&data),
+            data.len() - current_payload_len,
+            nonblocking,
+        ))
+    }
+
+    /// Translate the host's accepted byte count into the guest's `send`
+    /// result when the host call carried `cork_len` previously corked bytes
+    /// ahead of this call's payload.
+    ///
+    /// The host is the send-queue authority: it reports how many bytes it
+    /// actually queued, and a stream socket with a small `SO_SNDBUF` accepts
+    /// a partial write routinely. Reporting the full payload length in that
+    /// case told the guest bytes were queued that never were — asyncio's
+    /// sendfile fallback (`cpython-asyncio` `test_sendfile_*`) lost 4 KiB
+    /// slices of a 1 MiB transfer that way. Linux semantics: the corked bytes
+    /// belong to the kernel queue already, so this call's count is whatever
+    /// the host accepted beyond them; if the host accepted none of this
+    /// payload, the call did not make progress and a non-blocking sender
+    /// sees `EAGAIN`. Unsent corked bytes go back to the front of the cork
+    /// buffer so the next send or the close-time flush still delivers them
+    /// in order.
+    fn settle_cork_send(
+        &self,
+        fd: i32,
+        outcome: DispatchOutcome,
+        combined: Option<&[u8]>,
+        cork_len: usize,
+        nonblocking: bool,
+    ) -> DispatchOutcome {
+        let DispatchOutcome::Returned { value } = outcome else {
+            if cork_len > 0
+                && let Some(combined) = combined
+            {
+                self.restore_cork_prefix(fd, &combined[..cork_len]);
+            }
+            return outcome;
         };
-        Ok(outcome)
+        if value < 0 || cork_len == 0 {
+            return outcome;
+        }
+        let sent = value as usize;
+        if sent < cork_len {
+            if let Some(combined) = combined {
+                self.restore_cork_prefix(fd, &combined[sent..cork_len]);
+            }
+            return if nonblocking {
+                DispatchOutcome::errno(LINUX_EAGAIN)
+            } else {
+                DispatchOutcome::Returned { value: 0 }
+            };
+        }
+        let payload_sent = sent - cork_len;
+        if payload_sent == 0 && nonblocking {
+            return DispatchOutcome::errno(LINUX_EAGAIN);
+        }
+        DispatchOutcome::Returned {
+            value: payload_sent as i64,
+        }
+    }
+
+    /// Put not-yet-accepted corked bytes back ahead of anything corked since.
+    fn restore_cork_prefix(&self, fd: i32, unsent: &[u8]) {
+        if unsent.is_empty() {
+            return;
+        }
+        if let Some(open_file) = self.open_file(fd)
+            && let Some(mut open) = open_file.description.write()
+            && let OpenDescription::HostSocket { cork_buffer, .. } = &mut *open
+        {
+            let mut restored = Vec::with_capacity(unsent.len() + cork_buffer.len());
+            restored.extend_from_slice(unsent);
+            restored.append(cork_buffer);
+            *cork_buffer = restored;
+        }
     }
 
     /// Serve one `recvmsg(MSG_ERRQUEUE)` from this socket's modelled Linux
