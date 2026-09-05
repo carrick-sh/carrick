@@ -2616,6 +2616,46 @@
       "fingerprint": "ddadcb4497b02732ade86258a4fcec32b53d682e75b57a2111920772af6347e8",
       "classification": "carrier_infra",
       "rationale": "Carrier-scoped synchronized infrastructure; it is either immutable, keyed by exact container identity, or coordinates the one host carrier without storing current-container identity."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "tag_strip_tests::scrub_run_remap_and_fallback::CARRICK_DSR_ZERO_REMAP",
+      "fingerprint": "f08312718d4b80e85b738b71fc9d1113f65e6c70726568d978022d6cd6af058b",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_DSR_ZERO_REMAP read in tag_strip_tests::scrub_run_remap_and_fallback::CARRICK_DSR_ZERO_REMAP (crates/carrick-vmm-hvf/src/trap.rs): the exact =0 escape hatch for the reused-anonymous zero-remap lever (default ON), carrier-wide configuration, not Linux process state."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "zero_anonymous_remap_enabled::CARRICK_DSR_ZERO_REMAP",
+      "fingerprint": "71305498cda28a62a37368e8985d314746d4eb66e989ed11a3142a11e5e54b18",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_DSR_ZERO_REMAP read in zero_anonymous_remap_enabled::CARRICK_DSR_ZERO_REMAP (crates/carrick-vmm-hvf/src/trap.rs): the exact =0 escape hatch for the reused-anonymous zero-remap lever (default ON), carrier-wide configuration, not Linux process state."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "zero_anonymous_remap_enabled::CARRICK_DSR_ZERO_REMAP#2",
+      "fingerprint": "71305498cda28a62a37368e8985d314746d4eb66e989ed11a3142a11e5e54b18",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_DSR_ZERO_REMAP read in zero_anonymous_remap_enabled::CARRICK_DSR_ZERO_REMAP#2 (crates/carrick-vmm-hvf/src/trap.rs): the exact =0 escape hatch for the reused-anonymous zero-remap lever (default ON), carrier-wide configuration, not Linux process state."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "tag_strip_tests::scrub_run_remap_and_fallback::ZERO_REMAP_ENV_LOCK",
+      "fingerprint": "d0b0a0fd491ea9e06b4b19efeec9173852e3c57c5c2ae1d2e5e8af2418137bf7",
+      "classification": "test_only",
+      "rationale": "Test-only mutex serialising the CARRICK_DSR_ZERO_REMAP environment toggle across the scrub_run tests (crates/carrick-vmm-hvf/src/trap.rs)."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "zero_anonymous_remap_enabled::ENABLED",
+      "fingerprint": "36833e7b8d81b0acafe43de2e53df551a8c2c019b1582a9dc718da51ee441c9b",
+      "classification": "config_debug",
+      "rationale": "OnceLock cache of the CARRICK_DSR_ZERO_REMAP hatch in zero_anonymous_remap_enabled::ENABLED (crates/carrick-vmm-hvf/src/trap.rs); carrier-wide configuration read once, describes the carrier and no Linux process."
     }
   ]
 }
