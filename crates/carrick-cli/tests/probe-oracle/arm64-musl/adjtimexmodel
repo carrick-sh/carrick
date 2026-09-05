@@ -1,4 +1,4 @@
-c8cf77865d7bb868
+a32169db23410f1e
 clock_adjtime_read_ok=true
 adjtimex_read_ok=true
 adj_offset_ok=true
@@ -14,6 +14,6 @@ oversized_freq_accepted=true
 bad_tick_einval=true
 unknown_status_bits_accepted=true
 bad_setoffset_usec_einval=true
-micro_nano_exclusive_einval=false
-tai_timeconst_exclusive_einval=false
+micro_nano_together_accepted=true
+tai_timeconst_together_accepted=true
 singleshot_flag_without_offset_einval=true
