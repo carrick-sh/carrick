@@ -4773,8 +4773,8 @@ fn pipe_end_direction_matrix_and_fd_lifecycle_closure() {
             [w_fd, BUF_ADDR, 1, 0, 0, 0],
             &mut memory
         ),
-        DispatchOutcome::errno(LINUX_EBADF),
-        "pread64 on pipe write end must return EBADF"
+        DispatchOutcome::errno(LINUX_ESPIPE),
+        "pread64 on pipe write end must return ESPIPE"
     );
     assert_eq!(
         dispatch_call(
@@ -4783,11 +4783,12 @@ fn pipe_end_direction_matrix_and_fd_lifecycle_closure() {
             [w_fd, IOV_ADDR, 1, 0, 0, 0],
             &mut memory
         ),
-        DispatchOutcome::errno(LINUX_EBADF),
-        "preadv on pipe write end must return EBADF"
+        DispatchOutcome::errno(LINUX_ESPIPE),
+        "preadv on pipe write end must return ESPIPE"
     );
 
-    // 2. Write-family operations on PipeReader return EBADF
+    // 2. Write-family operations on PipeReader:
+    // non-positional write/writev return EBADF; positional pwrite64/pwritev return ESPIPE
     let r_fd = pair.in_read_fd as u64;
     assert_eq!(
         dispatch_call(
@@ -4816,8 +4817,8 @@ fn pipe_end_direction_matrix_and_fd_lifecycle_closure() {
             [r_fd, BUF_ADDR, 1, 0, 0, 0],
             &mut memory
         ),
-        DispatchOutcome::errno(LINUX_EBADF),
-        "pwrite64 on pipe read end must return EBADF"
+        DispatchOutcome::errno(LINUX_ESPIPE),
+        "pwrite64 on pipe read end must return ESPIPE"
     );
     assert_eq!(
         dispatch_call(
@@ -4826,8 +4827,8 @@ fn pipe_end_direction_matrix_and_fd_lifecycle_closure() {
             [r_fd, IOV_ADDR, 1, 0, 0, 0],
             &mut memory
         ),
-        DispatchOutcome::errno(LINUX_EBADF),
-        "pwritev on pipe read end must return EBADF"
+        DispatchOutcome::errno(LINUX_ESPIPE),
+        "pwritev on pipe read end must return ESPIPE"
     );
 
     // 3. Correct directions succeed

@@ -2891,7 +2891,7 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// The authoritative inventory contains 502 probe sources: 476 conformance
 /// sources (453 generic, 23 dedicated), 25 performance sources, and one helper.
 /// Both libc lanes therefore gate 952 conformance rows.
-const PROBE_SOURCE_COUNT: usize = 505;
+const PROBE_SOURCE_COUNT: usize = 506;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
@@ -3143,10 +3143,16 @@ fn probe_needs_unconfined(name: &str) -> bool {
 /// `carrick run` and `docker run` so the probe exercises the syscall rather
 /// than getting rejected at capability validation on either side.
 const SYS_TIME_PROBES: &[&str] = &["clocksettimevdso"];
+/// `fanotify_init(2)` needs `CAP_SYS_ADMIN`; Docker's default cap set drops
+/// it, so an unprivileged oracle fails the group creation and the probe's
+/// fanotify lines would be vacuous on both sides.
+const SYS_ADMIN_PROBES: &[&str] = &["pipeblockedge"];
 
 fn probe_capabilities(name: &str) -> &'static [&'static str] {
     if SYS_TIME_PROBES.contains(&name) {
         &["SYS_TIME"]
+    } else if SYS_ADMIN_PROBES.contains(&name) {
+        &["SYS_ADMIN"]
     } else {
         &[]
     }
@@ -4641,9 +4647,9 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
     let generic = validate_closure_probe_rows(&inventory(), &sources)
         .expect("checked-in closure probe inventory must match the source denominator");
-    assert_eq!(generic.len(), 455);
-    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 478);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 956);
+    assert_eq!(generic.len(), 456);
+    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 479);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 958);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")
@@ -4759,6 +4765,7 @@ fn clone_files_probes_run_without_container_seccomp() {
 #[test]
 fn clock_settime_probe_is_granted_cap_sys_time_on_both_sides() {
     assert_eq!(probe_capabilities("clocksettimevdso"), ["SYS_TIME"]);
+    assert_eq!(probe_capabilities("pipeblockedge"), ["SYS_ADMIN"]);
     assert!(probe_capabilities("futexrealtime").is_empty());
     assert!(probe_capabilities("clonefileshare").is_empty());
 }

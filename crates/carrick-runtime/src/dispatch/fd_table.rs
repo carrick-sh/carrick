@@ -2079,14 +2079,18 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
     ) -> Result<i64, crate::kernel::objects::PipeCapacityMutationError> {
         let mut open = self.write();
         match &mut *open {
-            OpenDescription::PipeReader { pipe, .. } | OpenDescription::PipeWriter { pipe, .. } => {
+            OpenDescription::PipeReader { base, pipe }
+            | OpenDescription::PipeWriter { base, pipe } => {
                 if accounting != crate::kernel::objects::PipeCapacityAccounting::InMemory {
                     return Err(
                         crate::kernel::objects::PipeCapacityMutationError::AccountingMismatch,
                     );
                 }
                 match pipe.set_capacity(capacity as usize) {
-                    Ok(new_cap) => Ok(new_cap as i64),
+                    Ok(new_cap) => {
+                        base.set_pipe_capacity(new_cap as i64);
+                        Ok(new_cap as i64)
+                    }
                     Err(errno) => Err(crate::kernel::objects::PipeCapacityMutationError::Semantic(
                         errno,
                     )),

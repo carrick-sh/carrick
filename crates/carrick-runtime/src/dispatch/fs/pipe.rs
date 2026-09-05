@@ -409,11 +409,17 @@ pub(crate) fn write_pipe(
             return DispatchOutcome::errno(LINUX_EPIPE);
         }
 
+        if is_interrupted() {
+            break;
+        }
+
         let capacity = state.capacity;
         let available = capacity.saturating_sub(state.buffer.len());
 
-        // For writes <= PIPE_BUF (4096), write must be atomic: all or wait.
-        if written == 0 && length <= PIPE_BUF && available < length {
+        // Writes <= PIPE_BUF (4096) must be atomic: all or wait.
+        // Writes > PIPE_BUF with no room at all (available == 0) must also wait
+        // for readiness before writing anything, rather than spinning in the vCPU.
+        if written == 0 && (available == 0 || (length <= PIPE_BUF && available < length)) {
             if nonblocking {
                 return DispatchOutcome::errno(LINUX_EAGAIN);
             }
@@ -464,8 +470,12 @@ pub(crate) fn write_pipe(
     pipe.update_readiness_locked(&state);
     drop(state);
     pipe.changed.notify_all();
-    DispatchOutcome::Returned {
-        value: written as i64,
+    if written == 0 {
+        DispatchOutcome::errno(LINUX_EINTR)
+    } else {
+        DispatchOutcome::Returned {
+            value: written as i64,
+        }
     }
 }
 
@@ -636,6 +646,56 @@ mod tests {
                 || false,
             ),
             DispatchOutcome::errno(LINUX_EAGAIN)
+        );
+    }
+
+    #[test]
+    fn in_memory_pipe_blocking_write_to_full_parks_on_readiness() {
+        let pipe = Arc::new(PipeInner::new_connected(10, 65536));
+        let authority = WaitFdAuthority::internal(InternalWaitKind::CarrierControl);
+        let fill = vec![0x33; 65536];
+        assert_eq!(
+            write_pipe(&fill, &pipe, 0, 4, authority.clone(), || false),
+            DispatchOutcome::Returned { value: 65536 }
+        );
+
+        // Pipe is now completely full (65536 bytes). A blocking write of 65536 bytes
+        // must park via WaitOnFds rather than spinning or returning 0.
+        let out = write_pipe(&fill, &pipe, 0, 4, authority.clone(), || false);
+        let host_fd = pipe.write_poll_fd().expect("write poll fd");
+        assert_eq!(
+            out,
+            DispatchOutcome::WaitOnFds {
+                fds: WaitFds::authorized_raw_one(host_fd.raw(), libc::POLLIN, authority),
+                timeout: None,
+                on_timeout: LINUX_EAGAIN.guest_retval(),
+                sig_mask: carrick_abi::WaitSigMask::NONE,
+            }
+        );
+    }
+
+    #[test]
+    fn in_memory_pipe_interrupted_write_returns_eintr_when_unwritten() {
+        let pipe = Arc::new(PipeInner::new_connected(11, 4096));
+        let authority = WaitFdAuthority::internal(InternalWaitKind::CarrierControl);
+        let fill = vec![0x44; 4096];
+        assert_eq!(
+            write_pipe(&fill, &pipe, 0, 4, authority.clone(), || false),
+            DispatchOutcome::Returned { value: 4096 }
+        );
+
+        // Pipe is full; write interrupted immediately must return EINTR, not 0.
+        let out = write_pipe(b"blocked", &pipe, 0, 4, authority, || true);
+        assert_eq!(out, DispatchOutcome::errno(LINUX_EINTR));
+    }
+
+    #[test]
+    fn in_memory_pipe_zero_length_write_returns_zero() {
+        let pipe = Arc::new(PipeInner::new_connected(12, 4096));
+        let authority = WaitFdAuthority::internal(InternalWaitKind::CarrierControl);
+        assert_eq!(
+            write_pipe(&[], &pipe, 0, 4, authority, || false),
+            DispatchOutcome::Returned { value: 0 }
         );
     }
 }
