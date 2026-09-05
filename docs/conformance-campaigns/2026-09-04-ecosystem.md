@@ -651,3 +651,24 @@ citable. Briefed for the next worker round
 (`scratchpad/brief-mmap-cost-2.md`): O(affected rows) munmap planning with
 an undo journal, an HVF stage-2 test deciding lever 2's fate, and the
 per-fault `Rc`.
+
+## Private-overlay owner fix landed (7d5ab8e23); page-table growth in review
+
+`overlay-owner` found the root cause: on exec rebuild
+`publish_exec_region_host_owner_in` provisioned structural owners only for
+the mm root slot, so the 2 GiB private overlay region had none; a later
+`MAP_FIXED|MAP_PRIVATE` repoint read a zero owner generation, and the
+first fork failed closed on the borrowed row. Non-reusable global-frame
+extents are now structural at exec publication, the carrier root install
+gets the same authority, and the repoint propagates the owner generation.
+`mapfixedfork` MATCHes on the in-memory rootfs in both lanes. `mmapcluster`
+now reaches the next defect on that lane, an underflow in the guest-read
+chunk loop (`chunk_address - mapping_start` with a non-containing
+mapping), handed back to the same worker as a which-mapping domain error.
+
+`pt-pool` delivered a multi-arena `PageTableManager` (`TableArenaSource`,
+per-arena `HostArenaResolver`, extension slots returned on retirement) but
+attached the source only in a unit test: no production manager grows, so
+the mechanism was default-off. Sent back to wire every HVPatch manager
+(root, exec, fork child with its own slots) before it can be gated with
+`cpython-compile`.
