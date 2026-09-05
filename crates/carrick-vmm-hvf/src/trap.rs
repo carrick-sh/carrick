@@ -15993,7 +15993,7 @@ fn unregister_alias_entries(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn retained_private_reuse_alias_fragment_in(
     custody: &CarrierVmCustody,
-    registry: &[AliasBacking],
+    registry: &AliasRegistry,
     va: u64,
     ipa: u64,
     len: usize,
@@ -16007,36 +16007,49 @@ fn retained_private_reuse_alias_fragment_in(
     let ipa_end = ipa.checked_add(len as u64)?;
     // An existing semantic fragment is already an exact lifetime owner. Do not
     // replace a wider entry with this one-page reuse observation.
-    if registry.iter().any(|entry| {
-        alias_matches_process_scope(entry.ownership_scope, mm_root_slot, container_root)
-            && va >= entry.start
-            && end <= entry.start.saturating_add(entry.size as u64)
-            && entry.ipa.checked_add(va.saturating_sub(entry.start)) == Some(ipa)
-    }) {
+    // Query `by_va_start` bounded to [va - widest_va, va] to locate any
+    // overlapping candidate without scanning unrelated processes or rows.
+    let has_existing = registry
+        .by_va_start
+        .range(va.saturating_sub(registry.widest_va)..=va)
+        .flat_map(|(_, rows)| rows)
+        .any(|(_, entry)| {
+            alias_matches_process_scope(entry.ownership_scope, mm_root_slot, container_root)
+                && va >= entry.start
+                && end <= entry.start.saturating_add(entry.size as u64)
+                && entry.ipa.checked_add(va.saturating_sub(entry.start)) == Some(ipa)
+        });
+    if has_existing {
         return None;
     }
 
-    let source = registry.iter().rev().find(|entry| {
-        entry.sharing == GuestMappingSharing::Private
-            && alias_matches_process_scope(entry.ownership_scope, mm_root_slot, container_root)
-            && ipa >= entry.physical_ipa
-            && ipa_end
-                <= entry
-                    .physical_ipa
-                    .saturating_add(entry.physical_size as u64)
-            && match global_frame_host_owner_identity_in(
-                custody,
-                entry.physical_ipa,
-                entry.physical_size as u64,
-            ) {
-                Some((host_addr, generation)) => {
-                    entry.owner_generation != 0
-                        && host_addr == entry.physical_host_addr
-                        && generation == entry.owner_generation
+    // Query `by_scope` for the process's owned scope, traversing rows newest-first.
+    let owned_scope = AliasRegistry::owned_scope(mm_root_slot, container_root);
+    let source = registry
+        .scope_rows(owned_scope)
+        .iter()
+        .rev()
+        .map(|(_, alias)| alias)
+        .find(|entry| {
+            entry.sharing == GuestMappingSharing::Private
+                && ipa >= entry.physical_ipa
+                && ipa_end
+                    <= entry
+                        .physical_ipa
+                        .saturating_add(entry.physical_size as u64)
+                && match global_frame_host_owner_identity_in(
+                    custody,
+                    entry.physical_ipa,
+                    entry.physical_size as u64,
+                ) {
+                    Some((host_addr, generation)) => {
+                        entry.owner_generation != 0
+                            && host_addr == entry.physical_host_addr
+                            && generation == entry.owner_generation
+                    }
+                    None => entry.owner_generation == 0,
                 }
-                None => entry.owner_generation == 0,
-            }
-    })?;
+        })?;
     let physical_offset = usize::try_from(ipa.checked_sub(source.physical_ipa)?).ok()?;
     Some(AliasBacking {
         start: va,
@@ -16063,7 +16076,7 @@ fn retained_private_reuse_alias_fragment_in(
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 fn retained_private_reuse_alias_fragment(
-    registry: &[AliasBacking],
+    registry: &AliasRegistry,
     va: u64,
     ipa: u64,
     len: usize,
@@ -38927,9 +38940,7 @@ impl HvfVmState {
             let retained_fragment = retained_ipa.and_then(|ipa| {
                 retained_private_reuse_alias_fragment_in(
                     &self.carrier_foreign_mm_transport.custody,
-                    &alias_registry()
-                        .lock()
-                        .process_visible_ordered(self.mm_root_slot, self.container_root),
+                    &alias_registry().lock(),
                     chunk_va,
                     ipa,
                     chunk_len,
@@ -48217,9 +48228,11 @@ mod frame_inventory_backend_tests {
             shared_key_offset: 0,
             owner_generation: generation.saturating_sub(1),
         };
+        let mut stale_registry = AliasRegistry::default();
+        stale_registry.push(source);
         assert!(
             retained_private_reuse_alias_fragment(
-                &[source],
+                &stale_registry,
                 source.start + 0x1000,
                 key.0 + 0x1000,
                 0x1000,
@@ -48234,8 +48247,10 @@ mod frame_inventory_backend_tests {
             owner_generation: generation,
             ..source
         };
+        let mut exact_registry = AliasRegistry::default();
+        exact_registry.push(exact);
         let reused = retained_private_reuse_alias_fragment(
-            &[exact],
+            &exact_registry,
             exact.start + 0x1000,
             key.0 + 0x1000,
             0x1000,
@@ -52801,7 +52816,7 @@ mod tag_strip_tests {
         registry.extend([prefix]);
 
         let reused = retained_private_reuse_alias_fragment(
-            &registry.ordered(),
+            &registry,
             va + 0x1000,
             physical_ipa + 0x1000,
             0x1000,
