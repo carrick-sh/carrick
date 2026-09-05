@@ -384,6 +384,43 @@ pub fn vvar_realtime_word(base_realtime_ns: u64, offset_ns: i64) -> u64 {
     base_realtime_ns.wrapping_add(offset_ns as u64)
 }
 
+/// Time discipline state modeled for this clock domain per `struct timex`.
+///
+/// Deliberate approximations:
+/// - Frequency adjustments (`freq`, `tick`) are recorded and reported faithfully
+///   through `adjtimex` and `clock_adjtime`, but do not alter the virtual clock rate.
+/// - `maxerror` remains static between calls unless explicitly updated via `ADJ_MAXERROR`.
+/// - `ADJ_OFFSET_SINGLESHOT` is modeled as an immediate step applied to the domain's
+///   virtual realtime offset rather than an ongoing linear slew or PLL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdjtimexState {
+    pub offset: i64,
+    pub freq: i64,
+    pub maxerror: i64,
+    pub esterror: i64,
+    pub status: i32,
+    pub constant: i64,
+    pub tick: i64,
+    pub tai: i32,
+    pub singleshot_offset: i64,
+}
+
+impl Default for AdjtimexState {
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            freq: 0,
+            maxerror: 16_000_000,
+            esterror: 16_000_000,
+            status: 0,
+            constant: 2,
+            tick: 10_000,
+            tai: 0,
+            singleshot_offset: 0,
+        }
+    }
+}
+
 /// The container's time authority. Supports standard system time tracking
 /// plus embedder-controlled modes (`Offset`, `Frozen`, `Scaled`, and
 /// `Deterministic`).
@@ -400,6 +437,7 @@ pub struct ClockDomain {
     start_host_instant: Instant,
     virtual_monotonic_ns: AtomicU64,
     waiters: Mutex<DeterministicWaiters>,
+    adjtimex: Mutex<AdjtimexState>,
 }
 
 impl Default for ClockDomain {
@@ -422,6 +460,7 @@ impl ClockDomain {
             start_host_instant: Instant::now(),
             virtual_monotonic_ns: AtomicU64::new(0),
             waiters: Mutex::new(DeterministicWaiters::default()),
+            adjtimex: Mutex::new(AdjtimexState::default()),
         }
     }
 
@@ -503,6 +542,43 @@ impl ClockDomain {
 
     pub fn set_realtime_offset_ns(&self, delta_ns: i64) {
         let _ = self.try_set_realtime_offset_ns(delta_ns);
+    }
+
+    /// Step the guest realtime offset by `step_ns`.
+    /// Returns `EPERM` if embedder time control is active.
+    pub fn try_step_realtime_offset_ns(&self, step_ns: i64) -> Result<(), carrick_abi::LinuxErrno> {
+        if self.is_controlled() {
+            return Err(carrick_abi::LINUX_EPERM);
+        }
+        let mut curr = self.realtime_offset_ns.load(Ordering::SeqCst);
+        loop {
+            let next = curr.saturating_add(step_ns);
+            match self.realtime_offset_ns.compare_exchange_weak(
+                curr,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(actual) => curr = actual,
+            }
+        }
+        self.epoch.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
+    /// The current `adjtimex(2)` discipline state for this domain.
+    pub fn adjtimex_state(&self) -> AdjtimexState {
+        self.adjtimex
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Mutate the `adjtimex(2)` discipline state under the domain's lock.
+    pub fn with_adjtimex_mut<R>(&self, f: impl FnOnce(&mut AdjtimexState) -> R) -> R {
+        let mut guard = self.adjtimex.lock().unwrap_or_else(|p| p.into_inner());
+        f(&mut guard)
     }
 
     /// CLOCK_REALTIME before this domain's offset: `uptime + vvar base` when
@@ -1689,6 +1765,58 @@ mod clock_domain_tests {
         assert_eq!(
             scaled_clock.scale_timeout(Duration::from_secs(10)),
             Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn adjtimex_state_defaults_and_mutation() {
+        let clock = ClockDomain::system();
+        let state = clock.adjtimex_state();
+        assert_eq!(state.offset, 0);
+        assert_eq!(state.freq, 0);
+        assert_eq!(state.maxerror, 16_000_000);
+        assert_eq!(state.esterror, 16_000_000);
+        assert_eq!(state.status, 0);
+        assert_eq!(state.constant, 2);
+        assert_eq!(state.tick, 10_000);
+        assert_eq!(state.tai, 0);
+        assert_eq!(state.singleshot_offset, 0);
+
+        clock.with_adjtimex_mut(|s| {
+            s.freq = 12345;
+            s.status = carrick_abi::LINUX_STA_PLL;
+            s.constant = 5;
+            s.tai = 37;
+        });
+        let modified = clock.adjtimex_state();
+        assert_eq!(modified.freq, 12345);
+        assert_eq!(modified.status, carrick_abi::LINUX_STA_PLL);
+        assert_eq!(modified.constant, 5);
+        assert_eq!(modified.tai, 37);
+    }
+
+    #[test]
+    fn step_realtime_offset_ns_advances_clock_and_bumps_epoch() {
+        let clock = ClockDomain::system();
+        assert_eq!(clock.realtime_offset_ns(), 0);
+        assert_eq!(clock.epoch(), 0);
+
+        assert!(clock.try_step_realtime_offset_ns(5_000_000_000).is_ok());
+        assert_eq!(clock.realtime_offset_ns(), 5_000_000_000);
+        assert_eq!(clock.epoch(), 1);
+
+        assert!(clock.try_step_realtime_offset_ns(-2_000_000_000).is_ok());
+        assert_eq!(clock.realtime_offset_ns(), 3_000_000_000);
+        assert_eq!(clock.epoch(), 2);
+    }
+
+    #[test]
+    fn controlled_domain_refuses_realtime_step() {
+        let delta = SignedDuration::from_secs(3600);
+        let clock = ClockDomain::offset(delta);
+        assert_eq!(
+            clock.try_step_realtime_offset_ns(1_000_000_000),
+            Err(carrick_abi::LINUX_EPERM)
         );
     }
 }
