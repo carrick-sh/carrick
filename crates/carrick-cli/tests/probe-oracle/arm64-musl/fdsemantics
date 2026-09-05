@@ -1,0 +1,15 @@
+542f05c940168355
+getfl_nonblock_set=true
+getfl_default_clear=true
+waitid_nonblock_eagain_while_alive=true
+waitid_after_exit_ok=true
+unknown_flag_einval=true
+noseal_get_seals_is_seal_seal=true
+noseal_add_seals_eperm=true
+allowseal_get_seals_zero=true
+allowseal_add_write_ok=true
+allowseal_add_after_seal_seal_eperm=true
+reopen_rdonly_get_seals_shared=true
+reopen_rdonly_add_seals_eperm=true
+reopen_rdonly_write_ebadf=true
+reopen_rdwr_add_seals_ok=true
