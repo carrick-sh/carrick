@@ -47,6 +47,7 @@ pub use carrick_observability::probes;
 pub mod darwin_kqueue;
 pub mod fork_coord;
 pub mod fork_quiesce;
+pub mod frame_pool;
 pub mod host_signal;
 pub mod io_wait;
 pub mod itimer;
