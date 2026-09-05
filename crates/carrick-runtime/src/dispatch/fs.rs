@@ -4673,7 +4673,7 @@ impl SyscallDispatcher {
                     crate::dispatch::pty_registry::register_master(
                         pts_index,
                         host_fd,
-                        open_file.description.id(),
+                        &open_file.description,
                     );
                 }
                 let new_fd = match self.install_fd_at_or_above(0, open_file) {
@@ -5376,44 +5376,6 @@ impl SyscallDispatcher {
         0
     }
 
-    pub(crate) fn find_file_description(
-        &self,
-        target_id: crate::kernel::FileDescriptionId,
-    ) -> Option<Arc<crate::kernel::FileDescription>> {
-        let find_in_table = |files: &crate::kernel::FileTable| {
-            for slot in files.read_open_files().values() {
-                if slot.description.id() == target_id {
-                    return Some(Arc::clone(&slot.description));
-                }
-            }
-            None
-        };
-        if let Some(files) = resources::files() {
-            if let Some(desc) = find_in_table(&files) {
-                return Some(desc);
-            }
-        }
-        let kernel = Arc::clone(self.kernel_binding.read().kernel());
-        for task_id in kernel.registry().task_ids() {
-            if let Some(task) = kernel.registry().task(task_id) {
-                for thread in task.threads() {
-                    if let Ok(context) = kernel.context(task_id, thread.key().tid) {
-                        if let Some(desc) = find_in_table(&context.resources().files()) {
-                            return Some(desc);
-                        }
-                    }
-                }
-            }
-        }
-        #[cfg(test)]
-        {
-            if let Some(desc) = find_in_table(&self.captured_file_table()) {
-                return Some(desc);
-            }
-        }
-        None
-    }
-
     pub(super) fn staged_splice_pipe_bytes(&self, guest_fd: i32) -> usize {
         self.open_file(guest_fd).map_or(0, |file| {
             file.description.common().splice_pushback().lock().len()
@@ -5424,8 +5386,13 @@ impl SyscallDispatcher {
         &self,
         description: crate::kernel::FileDescriptionId,
     ) -> usize {
-        self.find_file_description(description)
-            .map_or(0, |desc| desc.common().splice_pushback().lock().len())
+        let files = resources::files().unwrap_or_else(|| self.captured_file_table());
+        for slot in files.read_open_files().values() {
+            if slot.description.id() == description {
+                return slot.description.common().splice_pushback().lock().len();
+            }
+        }
+        0
     }
 
     pub(in crate::dispatch) fn discard_splice_pushback_if_final(&self, guest_fd: i32) {
@@ -6084,24 +6051,22 @@ impl SyscallDispatcher {
         Ok(bytes)
     }
 
-    /// Stage `bytes` on an open description named by ID rather than by guest
-    /// fd, for callers that must not touch the file table (see
-    /// `dispatch::pty_registry`).
+    /// Stage `bytes` on an open description directly, for callers that must not
+    /// touch the file table (see `dispatch::pty_registry`).
     pub(super) fn stage_splice_bytes_for_description(
         &self,
-        description: crate::kernel::FileDescriptionId,
+        description: &crate::kernel::FileDescription,
         bytes: Vec<u8>,
     ) {
         if bytes.is_empty() {
             return;
         }
-        if let Some(desc) = self.find_file_description(description) {
-            desc.common()
-                .splice_pushback()
-                .lock()
-                .push_back_owned(bytes);
-            self.notify_inmem_epoll();
-        }
+        description
+            .common()
+            .splice_pushback()
+            .lock()
+            .push_back_owned(bytes);
+        self.notify_inmem_epoll();
     }
 
     pub(super) fn stage_splice_pipe_bytes_owned(&self, guest_fd: i32, bytes: Vec<u8>) {

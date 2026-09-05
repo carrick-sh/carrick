@@ -24,21 +24,23 @@
 //! are removed when the master closes, because a stale one would name a host fd
 //! the kernel has since handed to something else.
 
-use crate::kernel::FileDescriptionId;
+use crate::kernel::FileDescription;
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
-/// pts index -> (master host fd, master open-description id).
-static MASTERS: LazyLock<Mutex<HashMap<u32, (i32, FileDescriptionId)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+type MasterEntry = (i32, Weak<FileDescription>);
+type MasterMap = HashMap<u32, MasterEntry>;
 
-fn lock() -> std::sync::MutexGuard<'static, HashMap<u32, (i32, FileDescriptionId)>> {
+/// pts index -> (master host fd, weak reference to master open-description).
+static MASTERS: LazyLock<Mutex<MasterMap>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn lock() -> std::sync::MutexGuard<'static, MasterMap> {
     MASTERS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Record a pty master as it is opened.
-pub(crate) fn register_master(index: u32, host_fd: i32, description: FileDescriptionId) {
-    lock().insert(index, (host_fd, description));
+pub(crate) fn register_master(index: u32, host_fd: i32, description: &Arc<FileDescription>) {
+    lock().insert(index, (host_fd, Arc::downgrade(description)));
 }
 
 /// Forget a pty master as it closes. A stale entry would name a host fd the
@@ -48,8 +50,10 @@ pub(crate) fn unregister_master(index: u32) {
 }
 
 /// The master end of pty `index`, if one is open.
-pub(crate) fn master(index: u32) -> Option<(i32, FileDescriptionId)> {
-    lock().get(&index).copied()
+pub(crate) fn master(index: u32) -> Option<(i32, Arc<FileDescription>)> {
+    lock()
+        .get(&index)
+        .and_then(|(host_fd, weak)| weak.upgrade().map(|desc| (*host_fd, desc)))
 }
 
 #[cfg(test)]
@@ -64,10 +68,24 @@ mod tests {
         let id = crate::kernel::ObjectIdRegistry::default()
             .file_description_id()
             .expect("a description id");
+        let desc = Arc::new(FileDescription::regular(id));
         assert!(master(4242).is_none());
-        register_master(4242, 31, id);
-        assert_eq!(master(4242), Some((31, id)));
+        register_master(4242, 31, &desc);
+        assert_eq!(master(4242).map(|(fd, d)| (fd, d.id())), Some((31, id)));
         unregister_master(4242);
         assert!(master(4242).is_none());
+    }
+
+    #[test]
+    fn a_dropped_master_description_is_not_findable() {
+        let id = crate::kernel::ObjectIdRegistry::default()
+            .file_description_id()
+            .expect("a description id");
+        let desc = Arc::new(FileDescription::regular(id));
+        register_master(4243, 31, &desc);
+        assert!(master(4243).is_some());
+        drop(desc);
+        assert!(master(4243).is_none());
+        unregister_master(4243);
     }
 }

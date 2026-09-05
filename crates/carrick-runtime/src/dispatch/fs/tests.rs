@@ -2452,7 +2452,7 @@ fn staged_splice_bytes_on_shared_description_survives_draining_table() {
         .install_fd_pair_at_or_above(3, read_open, write_open)
         .expect("install host pipe pair");
 
-    let desc_id = dispatcher.open_file(read_fd).unwrap().description.id();
+    let desc = dispatcher.open_file(read_fd).unwrap().description;
 
     let ids = crate::kernel::ObjectIdRegistry::new();
     let child_table = Arc::new(crate::kernel::FileTable::new(
@@ -2469,7 +2469,7 @@ fn staged_splice_bytes_on_shared_description_survives_draining_table() {
     crate::dispatch::resources::with_dirty_retiring_resources_for_executor_test(
         Arc::clone(&child_table),
         || {
-            dispatcher.stage_splice_bytes_for_description(desc_id, b"rescued".to_vec());
+            dispatcher.stage_splice_bytes_for_description(&desc, b"rescued".to_vec());
         },
     );
 
