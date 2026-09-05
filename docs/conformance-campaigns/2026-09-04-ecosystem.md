@@ -782,3 +782,20 @@ handing already-translated (IPA) addresses to the read path that now
 insists on semantic VAs; the fix belongs with whoever next touches the
 core writer. Main keeps the pre-existing in-memory-lane `mmapcluster`
 underflow until then; `--fs host` (the shard gate's lane) is unaffected.
+
+## Shared-file fixed mremap landed (2357a08c6)
+
+Seven commits from two worker conversations. The final cause, found by a
+fresh conversation in one turn after the long one had died eight times:
+the dispatcher hands the repoint the mm's SEMANTIC alias IPA token
+(`LINUX_ALIAS_IPA_BASE`, 0x1800000000), while under the persistent VM
+lifecycle the shared file's live backing is a global-frame GPA at a
+different address, so the owner lookup could never match. The source leaf
+is now authenticated through the live stage-1 translation (the rule from
+`identity-and-scope-domains.md`: never feed one address domain into a
+lookup for another). `mremapfixedshared` MATCHes both lanes, LTP mremap06
+goes 3/3 (was TBROK), and the neighbouring memory probes and the full
+shard gate stay green. `processvmsparse` is registered as the tracked gap
+it is until its fix lands (worker `processvm` dispatched); the page-table
+growth branch has the deferred-install fix (director-written) under its
+hardware gate.
