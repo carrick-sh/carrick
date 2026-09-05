@@ -38344,6 +38344,10 @@ impl HvfTaskState {
             let page_tables_authority = self.page_tables_authority();
             let page_tables = page_tables_authority.lock();
             let manager = page_tables.as_ref().ok_or_else(|| {
+                carrick_observability::probes::stage1_arena_absent(
+                    1,
+                    std::sync::Arc::as_ptr(&page_tables_authority) as u64,
+                );
                 TrapError::Hypervisor("HVPatch COW page-table manager is absent".to_owned())
             })?;
             cow_source_has_retained_projection(
@@ -38552,6 +38556,10 @@ impl HvfTaskState {
             let page_tables_authority = self.page_tables_authority();
             let mut page_tables = page_tables_authority.lock();
             let manager = page_tables.as_mut().ok_or_else(|| {
+                carrick_observability::probes::stage1_arena_absent(
+                    2,
+                    std::sync::Arc::as_ptr(&page_tables_authority) as u64,
+                );
                 TrapError::Hypervisor("HVPatch COW page-table manager is absent".to_owned())
             })?;
             // The transaction can fail after one or more descriptors were
