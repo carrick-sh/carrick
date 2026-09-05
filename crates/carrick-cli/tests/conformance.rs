@@ -2891,7 +2891,7 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// The authoritative inventory contains 502 probe sources: 476 conformance
 /// sources (453 generic, 23 dedicated), 25 performance sources, and one helper.
 /// Both libc lanes therefore gate 952 conformance rows.
-const PROBE_SOURCE_COUNT: usize = 503;
+const PROBE_SOURCE_COUNT: usize = 504;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
