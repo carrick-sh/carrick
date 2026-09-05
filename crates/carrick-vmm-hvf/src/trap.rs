@@ -13300,14 +13300,18 @@ impl AliasRegistry {
                 }
             }
         }
+        // Rows are identified by (sequence, semantic start): the fragments of
+        // one split row keep the row's sequence, and dedup on sequence alone
+        // dropped the sibling fragment from the plan (`mincoreedge`, a
+        // middle-page unmap followed by the head's).
         let mut planned = Self::default();
-        let mut seen_seqs = std::collections::BTreeSet::new();
+        let mut seen_rows = std::collections::BTreeSet::new();
         for (seq, alias) in overlapping {
-            seen_seqs.insert(seq);
+            seen_rows.insert((seq, alias.start));
             planned.insert_indexed_row(seq, alias);
         }
         for (seq, alias) in co_holders {
-            if seen_seqs.insert(seq) {
+            if seen_rows.insert((seq, alias.start)) {
                 planned.insert_indexed_row(seq, alias);
             }
         }
@@ -55922,6 +55926,63 @@ mod tag_strip_tests {
                 "resulting registry ordered rows mismatch for case: {desc}"
             );
         }
+    }
+
+    #[test]
+    fn planned_unmap_matches_actual_across_split_fragments() {
+        // `mincoreedge`: a three-page private mapping whose middle page is
+        // unmapped first, then the head, then the tail. Both fragments of the
+        // split keep the original row's sequence number, so a co-holder scan
+        // that dedups on sequence alone drops the tail while planning the
+        // head's unmap and plans a lease the live registry still holds.
+        let root_slot = Some((0x5000_0000, 0x4000));
+        let owned_scope = AliasOwnershipScope::MmRootSlot {
+            base: 0x5000_0000,
+            size: 0x4000,
+        };
+        let mut registry = AliasRegistry::default();
+        registry.push(make_test_alias(
+            0x1000_0000,
+            0x3000,
+            0x8000_0000,
+            0x8000,
+            owned_scope,
+        ));
+        let released: std::collections::BTreeSet<(u64, u64)> =
+            [(0x8000_0000u64, 0x8000u64)].into_iter().collect();
+        let steps = [
+            (
+                "middle",
+                0x1000_1000u64,
+                0x1000usize,
+                std::collections::BTreeSet::new(),
+            ),
+            (
+                "head",
+                0x1000_0000,
+                0x1000,
+                std::collections::BTreeSet::new(),
+            ),
+            ("tail", 0x1000_2000, 0x1000, released),
+        ];
+        for (desc, va, len, expected) in steps {
+            let (planned, _) = registry.plan_unregister_process_alias(
+                va,
+                len,
+                root_slot,
+                ContainerRootToken::ROOT,
+            );
+            let actual = unregister_alias_entries(
+                &mut registry,
+                va,
+                len,
+                root_slot,
+                ContainerRootToken::ROOT,
+            );
+            assert_eq!(planned, actual, "planned vs actual leases at {desc}");
+            assert_eq!(actual, expected, "released leases at {desc}");
+        }
+        assert_eq!(registry.len(), 0);
     }
 
     #[test]
