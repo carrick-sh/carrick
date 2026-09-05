@@ -945,7 +945,7 @@ pub(crate) struct DescriptionCommon {
     owner: Mutex<CapturedAsyncIoOwner>,
     /// `memfd_create(2)`/`F_ADD_SEALS` seal set. `None` = this description does
     /// not support sealing (`F_GET_SEALS`/`F_ADD_SEALS` → `EINVAL`).
-    seals: Mutex<Option<u32>>,
+    seals: Arc<Mutex<Option<u32>>>,
 }
 
 impl DescriptionCommon {
@@ -957,8 +957,24 @@ impl DescriptionCommon {
             async_sig: AtomicI32::new(0),
             secretmem: AtomicBool::new(false),
             owner: Mutex::new(CapturedAsyncIoOwner::default()),
-            seals: Mutex::new(None),
+            seals: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub(crate) fn new_with_seals(status_flags: u64, seals: Arc<Mutex<Option<u32>>>) -> Self {
+        Self {
+            status_flags: AtomicU64::new(status_flags),
+            fd_refs: AtomicUsize::new(0),
+            lease: AtomicI32::new(crate::linux_abi::LINUX_F_UNLCK),
+            async_sig: AtomicI32::new(0),
+            secretmem: AtomicBool::new(false),
+            owner: Mutex::new(CapturedAsyncIoOwner::default()),
+            seals,
+        }
+    }
+
+    pub(crate) fn shared_seals(&self) -> Arc<Mutex<Option<u32>>> {
+        Arc::clone(&self.seals)
     }
 
     pub(crate) fn status_flags(&self) -> u64 {

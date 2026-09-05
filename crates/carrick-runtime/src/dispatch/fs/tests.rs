@@ -5678,3 +5678,135 @@ fn trusted_dirfd_lane_serves_nofollow_directory_probe_enotdir() {
             .is_none()
     );
 }
+
+#[test]
+fn memfd_proc_self_fd_reopen_access_mode_and_seals() {
+    let mut dispatcher = SyscallDispatcher::new();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+    let reporter = CompatReporter::default();
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            &d.capture_one_task_context().unwrap(),
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    #[cfg(target_arch = "aarch64")]
+    const SYS_MEMFD_CREATE: u64 = 279;
+    #[cfg(target_arch = "x86_64")]
+    const SYS_MEMFD_CREATE: u64 = 319;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    const SYS_MEMFD_CREATE: u64 = 279;
+
+    memory.write_bytes(0x4000, b"test_memfd\0").unwrap();
+    let outcome = run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_MEMFD_CREATE,
+        [0x4000, 2, 0, 0, 0, 0],
+    );
+    let orig_fd = match outcome {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("memfd_create failed: {other:?}"),
+    };
+    assert!(orig_fd >= 0);
+
+    const F_ADD_SEALS: u64 = 1033;
+    const F_GET_SEALS: u64 = 1034;
+    const F_SEAL_GROW: u64 = 4;
+    const F_SEAL_WRITE: u64 = 8;
+    const SYS_FCNTL: u64 = 25;
+
+    let outcome = run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_FCNTL,
+        [orig_fd as u64, F_ADD_SEALS, F_SEAL_GROW, 0, 0, 0],
+    );
+    assert!(matches!(outcome, DispatchOutcome::Returned { value: 0 }));
+
+    const SYS_OPENAT: u64 = 56;
+    let ro_path = format!("/proc/self/fd/{orig_fd}\0");
+    memory.write_bytes(0x4100, ro_path.as_bytes()).unwrap();
+    let outcome = run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_OPENAT,
+        [(-100_i64) as u64, 0x4100, LINUX_O_RDONLY, 0, 0, 0],
+    );
+    let ro_fd = match outcome {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("openat O_RDONLY failed: {other:?}"),
+    };
+    assert!(ro_fd >= 0);
+    assert_ne!(ro_fd, orig_fd);
+
+    let outcome = run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_FCNTL,
+        [ro_fd as u64, F_GET_SEALS, 0, 0, 0, 0],
+    );
+    assert_eq!(
+        outcome,
+        DispatchOutcome::Returned {
+            value: F_SEAL_GROW as i64
+        }
+    );
+
+    let outcome = run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_FCNTL,
+        [ro_fd as u64, F_ADD_SEALS, F_SEAL_WRITE, 0, 0, 0],
+    );
+    assert_eq!(outcome, DispatchOutcome::errno(LINUX_EPERM));
+
+    const SYS_WRITE: u64 = 64;
+    memory.write_bytes(0x4200, b"data").unwrap();
+    let outcome = run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_WRITE,
+        [ro_fd as u64, 0x4200, 4, 0, 0, 0],
+    );
+    assert_eq!(outcome, DispatchOutcome::errno(LINUX_EBADF));
+
+    let rw_path = format!("/proc/self/fd/{ro_fd}\0");
+    memory.write_bytes(0x4300, rw_path.as_bytes()).unwrap();
+    let outcome = run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_OPENAT,
+        [(-100_i64) as u64, 0x4300, LINUX_O_RDWR, 0, 0, 0],
+    );
+    let rw_fd = match outcome {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("openat O_RDWR failed: {other:?}"),
+    };
+    assert!(rw_fd >= 0);
+
+    let outcome = run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_FCNTL,
+        [rw_fd as u64, F_ADD_SEALS, F_SEAL_WRITE, 0, 0, 0],
+    );
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+
+    let outcome = run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_FCNTL,
+        [ro_fd as u64, F_GET_SEALS, 0, 0, 0, 0],
+    );
+    assert_eq!(
+        outcome,
+        DispatchOutcome::Returned {
+            value: (F_SEAL_GROW | F_SEAL_WRITE) as i64
+        }
+    );
+}
