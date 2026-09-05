@@ -920,6 +920,11 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     "stage-1 page-table manager has no arena source".to_owned(),
                 ));
             }
+            Err(PageTableError::ConflictingArenaSource) => {
+                return Err(MemoryError::HostMap(
+                    "stage-1 page-table manager conflicting arena source".to_owned(),
+                ));
+            }
         };
         if outcome.changed {
             // SAFETY: `host` backs the live page-table region for the whole process
@@ -2600,12 +2605,9 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         let manager = page_tables.as_mut().ok_or_else(|| {
             TrapError::Hypervisor("no stage-1 manager bound on engine".to_owned())
         })?;
-        if manager.arena_source().is_some() {
-            return Err(TrapError::Hypervisor(
-                "stage-1 table arena source is already installed".to_owned(),
-            ));
-        }
-        manager.set_arena_source(source);
+        manager.set_arena_source(source).map_err(|error| {
+            TrapError::Hypervisor(format!("set stage-1 table arena source: {error:?}"))
+        })?;
         Ok(())
     }
 
@@ -3075,7 +3077,9 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
 
         let stage_started = std::time::Instant::now();
         if let Some(source) = request.table_arena_source.take() {
-            page_tables.set_arena_source(source);
+            page_tables.set_arena_source(source).map_err(|error| {
+                TrapError::Hypervisor(format!("set child arena source: {error:?}"))
+            })?;
         }
         let child_root = request.child_ttbr0 & ((1_u64 << 48) - 1);
         page_tables.rebase(child_root).map_err(|error| {

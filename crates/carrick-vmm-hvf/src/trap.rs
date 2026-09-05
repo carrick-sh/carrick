@@ -3096,11 +3096,15 @@ mod foreign_mm_tests {
 
     #[derive(Debug)]
     struct TestArenaSource {
+        id: carrick_mem::page_table::TableArenaSourceId,
         available: std::sync::Arc<std::sync::Mutex<Vec<carrick_guest_mem::Gpa>>>,
         returned: std::sync::Arc<std::sync::Mutex<Vec<carrick_guest_mem::Gpa>>>,
     }
 
     impl carrick_mem::page_table::TableArenaSource for TestArenaSource {
+        fn id(&self) -> carrick_mem::page_table::TableArenaSourceId {
+            self.id
+        }
         fn take_arena(&mut self) -> Option<carrick_guest_mem::Gpa> {
             self.available.lock().unwrap().pop()
         }
@@ -3214,10 +3218,11 @@ mod foreign_mm_tests {
         let available = std::sync::Arc::new(std::sync::Mutex::new(vec![ext_base]));
         let returned = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let source = TestArenaSource {
+            id: carrick_mem::page_table::TableArenaSourceId(stage1_root),
             available: std::sync::Arc::clone(&available),
             returned: std::sync::Arc::clone(&returned),
         };
-        manager.set_arena_source(Box::new(source));
+        manager.set_arena_source(Box::new(source)).unwrap();
         assert_eq!(manager.pool_stats().3, 1, "starts with 1 primary arena");
 
         let runtime_page_tables = Arc::new(parking_lot::Mutex::new(Some(manager)));
@@ -3353,10 +3358,11 @@ mod foreign_mm_tests {
         let available = std::sync::Arc::new(std::sync::Mutex::new(vec![ext_base]));
         let returned = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let source = TestArenaSource {
+            id: carrick_mem::page_table::TableArenaSourceId(stage1_root),
             available: std::sync::Arc::clone(&available),
             returned: std::sync::Arc::clone(&returned),
         };
-        manager.set_arena_source(Box::new(source));
+        manager.set_arena_source(Box::new(source)).unwrap();
 
         let runtime_page_tables = Arc::new(parking_lot::Mutex::new(Some(manager)));
         let mut runtime = registration

@@ -186,6 +186,8 @@ pub enum PageTableError {
     BadAddress,
     /// Extension arenas exist but no `TableArenaSource` is installed.
     MissingArenaSource,
+    /// A conflicting `TableArenaSource` bound to another lease is already installed.
+    ConflictingArenaSource,
 }
 
 /// Per-level table index for `va` (4 KiB granule, 40-bit IPA).
@@ -349,8 +351,29 @@ impl TableLocation {
     }
 }
 
+/// Typed identifier for a `TableArenaSource`, uniquely identified by its stage-1 root slot base.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub struct TableArenaSourceId(pub carrick_guest_mem::Gpa);
+
+impl TableArenaSourceId {
+    #[inline]
+    #[must_use]
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(carrick_guest_mem::Gpa(raw))
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn raw(self) -> u64 {
+        self.0.0
+    }
+}
+
 /// Provider of additional 2 MiB root slots when the primary stage-1 arena is exhausted.
 pub trait TableArenaSource: std::fmt::Debug + Send {
+    /// Return the typed identity of this arena source.
+    fn id(&self) -> TableArenaSourceId;
+
     /// Allocate an additional 2 MiB root slot.
     fn take_arena(&mut self) -> Option<carrick_guest_mem::Gpa>;
 
@@ -581,8 +604,18 @@ impl PageTableManager {
         self.arenas[0].base
     }
 
-    pub fn set_arena_source(&mut self, source: Box<dyn TableArenaSource>) {
+    pub fn set_arena_source(
+        &mut self,
+        source: Box<dyn TableArenaSource>,
+    ) -> Result<(), PageTableError> {
+        if let Some(existing) = self.arena_source.as_ref() {
+            if existing.id() == source.id() {
+                return Ok(());
+            }
+            return Err(PageTableError::ConflictingArenaSource);
+        }
         self.arena_source = Some(source);
+        Ok(())
     }
 
     pub fn arena_source(&self) -> Option<&(dyn TableArenaSource + 'static)> {
@@ -3811,11 +3844,15 @@ mod tests {
 
     #[derive(Debug)]
     struct TestArenaSource {
+        id: TableArenaSourceId,
         available: std::sync::Arc<std::sync::Mutex<Vec<carrick_guest_mem::Gpa>>>,
         returned: std::sync::Arc<std::sync::Mutex<Vec<carrick_guest_mem::Gpa>>>,
     }
 
     impl TableArenaSource for TestArenaSource {
+        fn id(&self) -> TableArenaSourceId {
+            self.id
+        }
         fn take_arena(&mut self) -> Option<carrick_guest_mem::Gpa> {
             self.available.lock().unwrap().pop()
         }
@@ -3844,10 +3881,11 @@ mod tests {
         let available = Arc::new(Mutex::new(vec![ext_base]));
         let returned = Arc::new(Mutex::new(Vec::new()));
         let source = TestArenaSource {
+            id: TableArenaSourceId(ext_base),
             available: Arc::clone(&available),
             returned: Arc::clone(&returned),
         };
-        mgr.set_arena_source(Box::new(source));
+        mgr.set_arena_source(Box::new(source)).unwrap();
 
         // Start an undo transaction to verify rollback returns the arena.
         mgr.begin_undo();
@@ -3915,10 +3953,11 @@ mod tests {
         let parent_available = Arc::new(Mutex::new(vec![ext2_base, ext1_base]));
         let parent_returned = Arc::new(Mutex::new(Vec::new()));
         let parent_source = TestArenaSource {
+            id: TableArenaSourceId(ext1_base),
             available: Arc::clone(&parent_available),
             returned: Arc::clone(&parent_returned),
         };
-        parent.set_arena_source(Box::new(parent_source));
+        parent.set_arena_source(Box::new(parent_source)).unwrap();
 
         // Grow parent to 2 arenas (1 extension arena)
         let va1 = LINUX_MMAP_BASE + 600 * TWO_MIB + 0x1000;
@@ -3962,10 +4001,11 @@ mod tests {
         let child_available = Arc::new(Mutex::new(vec![child_ext2, child_ext1]));
         let child_returned = Arc::new(Mutex::new(Vec::new()));
         let child_source = TestArenaSource {
+            id: TableArenaSourceId(child_ext1),
             available: Arc::clone(&child_available),
             returned: Arc::clone(&child_returned),
         };
-        child.set_arena_source(Box::new(child_source));
+        child.set_arena_source(Box::new(child_source)).unwrap();
 
         let parent_avail_count_before = parent_available.lock().unwrap().len();
 
@@ -3990,5 +4030,49 @@ mod tests {
         assert_eq!(child.base(), child_root, "child rebased root");
         assert_eq!(child.arenas[1].base, child_ext1.0, "child rebased arena 1");
         assert_eq!(child.arenas[2].base, child_ext2.0, "child rebased arena 2");
+    }
+
+    #[test]
+    fn installing_source_bound_to_another_lease_errors() {
+        use carrick_guest_mem::Gpa;
+        use std::sync::{Arc, Mutex};
+
+        let mut mgr = hvpatch_manager();
+        let ext_a = Gpa(0xb0_0000_0000);
+        let ext_b = Gpa(0xc0_0000_0000);
+        let available_a = Arc::new(Mutex::new(vec![ext_a]));
+        let returned_a = Arc::new(Mutex::new(Vec::new()));
+        let source_a1 = TestArenaSource {
+            id: TableArenaSourceId(ext_a),
+            available: Arc::clone(&available_a),
+            returned: Arc::clone(&returned_a),
+        };
+        let source_a2 = TestArenaSource {
+            id: TableArenaSourceId(ext_a),
+            available: Arc::clone(&available_a),
+            returned: Arc::clone(&returned_a),
+        };
+        let available_b = Arc::new(Mutex::new(vec![ext_b]));
+        let returned_b = Arc::new(Mutex::new(Vec::new()));
+        let source_b = TestArenaSource {
+            id: TableArenaSourceId(ext_b),
+            available: available_b,
+            returned: returned_b,
+        };
+
+        // First install succeeds.
+        mgr.set_arena_source(Box::new(source_a1))
+            .expect("first install succeeds");
+
+        // Re-installing a source with the SAME identity is a no-op (Ok(())).
+        mgr.set_arena_source(Box::new(source_a2))
+            .expect("re-installing source with same identity is a no-op");
+
+        // Installing a source with a DIFFERENT identity returns ConflictingArenaSource.
+        assert_eq!(
+            mgr.set_arena_source(Box::new(source_b)).unwrap_err(),
+            PageTableError::ConflictingArenaSource,
+            "installing conflicting source returns ConflictingArenaSource"
+        );
     }
 }

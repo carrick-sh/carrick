@@ -1002,6 +1002,21 @@ impl MmResources {
             .ok_or(MmResourcesError::UnknownTask(task))
     }
 
+    pub(crate) fn table_arena_source(
+        &self,
+        task: TaskKey,
+    ) -> Result<Box<dyn carrick_mem::page_table::TableArenaSource>, MmResourcesError> {
+        let lease = self.lease(task)?;
+        Ok(lease.table_arena_source(self.pool()))
+    }
+
+    pub(crate) fn table_arena_source_for_lease(
+        &self,
+        lease: &Arc<Stage1MmLease>,
+    ) -> Box<dyn carrick_mem::page_table::TableArenaSource> {
+        lease.table_arena_source(self.pool())
+    }
+
     pub(crate) fn is_final_owner(&self, task: TaskKey) -> Result<bool, MmResourcesError> {
         let state = self.state.lock();
         let lease = state
