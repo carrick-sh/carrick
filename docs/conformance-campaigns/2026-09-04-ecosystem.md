@@ -1327,3 +1327,20 @@ physical size is smaller than the query length; guard to land on main.
   all three shards, the dedicated runners and the CLI suite. The alias
   reversed-range panic the worker reported is fixed (`ed304a27b`, red-first
   test `containing_physical_query_wider_than_any_recorded_row_does_not_panic`).
+
+## 2026-09-06 early: dentry cache landed (worker dentry-cache, three rounds)
+
+`d7c4e1f31` + `a249f8acb`: a hierarchical dentry cache over the host-backed
+rootfs, names → inode identity, stat fields in an inode record keyed by
+(dev, ino) that every descriptor-based mutation invalidates. Director
+receipts on the branch binary, `python:3.12-slim`: stat 23.2 → 2.9 µs,
+stat ENOENT 46.9 → 2.9 µs, open+close 33.1 → 15.7 µs (the residual is the
+host `openat`; cap-std retirement's target), `listdir` of 201 entries
+1544 → 840 µs (per-entry stats still there; next round). The 16-row
+coherence script (fd writes, ftruncate, link, O_APPEND, rename, symlink,
+child-process mutations) matches Docker line for line; the `dentrycache`
+probe (49 rows) is Docker-blessed on both lanes after the stale gnu probe
+binary was rebuilt (the first bless captured a 33-row build). Landing
+mechanics lesson repeated: `git merge --ff-only` typed inside a worktree
+merges into the worktree's own branch and reports "Already up to date";
+fast-forward from the main tree only.
