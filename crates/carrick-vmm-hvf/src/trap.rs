@@ -25206,7 +25206,7 @@ fn perform_foreign_cow_transaction(
         ) {
             Ok(publication) => publication,
             Err(_error) => {
-                let rollback = lease
+                let mut rollback = lease
                     .state
                     .cow_rollback_scratch
                     .lock()
@@ -25214,6 +25214,9 @@ fn perform_foreign_cow_transaction(
                     .unwrap_or_else(|| std::process::abort());
                 let recycled_manager = {
                     let mut tables = page_tables_authority.lock();
+                    if let Some(live) = tables.as_mut() {
+                        rollback.adopt_live_extension_state(live);
+                    }
                     unsafe { rollback.restore_quiesced_snapshot_to_host(resolve_page_table_host) };
                     tables.replace(rollback)
                 };
@@ -35159,6 +35162,17 @@ impl HvfVmState {
             parking_lot::Mutex<Option<crate::page_table::PageTableManager>>,
         >,
     ) {
+        {
+            let guard = page_tables.lock();
+            tracing::debug!(
+                target: "carrick::stage1_arena",
+                authority = std::sync::Arc::as_ptr(&page_tables) as usize,
+                present = guard.is_some(),
+                has_source = guard.as_ref().is_some_and(|m| m.has_arena_source()),
+                arenas = guard.as_ref().map_or(0, |m| m.pool_stats().3),
+                "bind stage-1 page tables"
+            );
+        }
         self.mm_access.bind_page_tables_authority(page_tables);
     }
 
