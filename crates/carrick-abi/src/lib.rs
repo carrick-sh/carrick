@@ -4391,6 +4391,7 @@ pub const LINUX_FIONREAD: u64 = 0x541B;
 pub const LINUX_FIONBIO: u64 = 0x5421;
 pub const LINUX_TIOCNOTTY: u64 = 0x5422;
 pub const LINUX_TIOCGSID: u64 = 0x5429;
+pub const LINUX_TIOCSIG: u64 = 0x4004_5436;
 pub const LINUX_SIOCGIFNAME: u64 = 0x8910;
 pub const LINUX_SIOCGIFINDEX: u64 = 0x8933;
 /// `SIOCATMARK` — is the read pointer at the out-of-band mark? (`<asm-generic/sockios.h>`)
