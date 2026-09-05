@@ -380,3 +380,37 @@ run loop refuses a `Missing` wait authority). The signed gate then went
 from 6 red lines to 1: `reader_unblocked_after_writer`, whose probe-side
 non-blocking writer open raced the child's park on a loaded host; the
 probe now retries that open for up to 2 s and is being re-blessed.
+
+## Full ledger on the FIFO-landed artifact (ee40fc454, SHA e0f1b31c…)
+
+Exhaustive run (`--force`, cached oracles required, declared budgets, four
+workers on the 4P+6E host, two Antigravity cargo builds sharing the host, so
+every ratio is a hypothesis). Artifact identity:
+`target/conformance/ecosystem-sep04-receipts/ledger-ee40fc454-artifact.txt`;
+rows `ledger-ee40fc454.jsonl`.
+
+| ecosystem | match | regression | crash | timeout | other |
+|---|---|---|---|---|---|
+| CPython | 428/438 | 4 | 4 | 2 | |
+| Go | 190/194 | 2 | 0 | 2 | |
+| LTP | 1443/1492 | 28 | 0 | 4 | 10 known diff, 7 unbaselined |
+| Node | 2/3 | 1 | | | |
+
+2,063 of 2,127 match (97.0%); 47 gating rows. Go was 178 crashes in the
+August ledger. The four CPython crashes are host carrier aborts with
+distinct signatures: `cpython-asyncio` "vfork parent resumed without
+release completion" then FATAL MM-authority drop during
+`test_kill_issue43884`; `cpython-builtin` "persistent executor boundary
+audit failed: host-signal-mask added=[…]" in `PtyTests.test_input_no_stdout_fileno`;
+`cpython-readline` "mutation reached a draining FileTable generation" in
+`test_auto_history_enabled`; `cpython-compile` is a guest fatal in
+`test_compiler_recursion_limit`. The two CPython timeouts
+(`concurrent_futures`, `multiprocessing_fork`) are the process-pool
+performance gap. Matched-row ratios (hypothesis): LTP median 0.46x, Go
+1.38x, CPython 2.32x; 125/428 CPython and 158/190 Go rows inside 2x.
+
+Delegated after the ledger (run `ltp-sep04`): `ltp-fd` (pidfd
+PIDFD_NONBLOCK accepted; memfd re-open through `/proc/self/fd` must yield a
+new read-only description, returned for round 2), `ltp-net` (SO_PEERCRED
+guest identity, MSG_MORE coalescing), `ltp-pipe` (full-pipe blocking
+write, pwritev2 ESPIPE on pipes, blocking inotify/fanotify reads).
