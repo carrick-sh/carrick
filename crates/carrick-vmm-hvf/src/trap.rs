@@ -25104,7 +25104,14 @@ fn perform_foreign_cow_transaction(
             let recycled_manager = {
                 let mut tables = page_tables_authority.lock();
                 if let Some(live) = tables.as_mut() {
+                    let source_before = u32::from(live.has_arena_source());
                     snapshot.adopt_live_extension_state(live);
+                    carrick_observability::probes::stage1_arena_replace(
+                        8,
+                        source_before,
+                        u32::from(snapshot.has_arena_source()),
+                        0,
+                    );
                 }
                 unsafe { snapshot.restore_quiesced_snapshot_to_host(resolve_page_table_host) };
                 tables.replace(snapshot)
@@ -25126,7 +25133,14 @@ fn perform_foreign_cow_transaction(
         let recycled_manager = {
             let mut tables = page_tables_authority.lock();
             if let Some(live) = tables.as_mut() {
+                let source_before = u32::from(live.has_arena_source());
                 rollback.adopt_live_extension_state(live);
+                carrick_observability::probes::stage1_arena_replace(
+                    9,
+                    source_before,
+                    u32::from(rollback.has_arena_source()),
+                    0,
+                );
             }
             unsafe { rollback.restore_quiesced_snapshot_to_host(resolve_page_table_host) };
             tables.replace(rollback)
@@ -25144,7 +25158,14 @@ fn perform_foreign_cow_transaction(
         let recycled_manager = {
             let mut tables = page_tables_authority.lock();
             if let Some(live) = tables.as_mut() {
+                let source_before = u32::from(live.has_arena_source());
                 rollback.adopt_live_extension_state(live);
+                carrick_observability::probes::stage1_arena_replace(
+                    10,
+                    source_before,
+                    u32::from(rollback.has_arena_source()),
+                    0,
+                );
             }
             unsafe { rollback.restore_quiesced_snapshot_to_host(resolve_page_table_host) };
             tables.replace(rollback)
@@ -25215,7 +25236,14 @@ fn perform_foreign_cow_transaction(
                 let recycled_manager = {
                     let mut tables = page_tables_authority.lock();
                     if let Some(live) = tables.as_mut() {
+                        let source_before = u32::from(live.has_arena_source());
                         rollback.adopt_live_extension_state(live);
+                        carrick_observability::probes::stage1_arena_replace(
+                            11,
+                            source_before,
+                            u32::from(rollback.has_arena_source()),
+                            0,
+                        );
                     }
                     unsafe { rollback.restore_quiesced_snapshot_to_host(resolve_page_table_host) };
                     tables.replace(rollback)
