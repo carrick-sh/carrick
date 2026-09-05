@@ -1226,3 +1226,27 @@ being re-materialized zero on first touch. Every exec of a dynamic binary
 maps its libraries this way; this is most of the 3.7 ms spawn fixed cost.
 Brief: `scratchpad/brief-mmap-lazy.md` (dispatch after the stage-1 authority
 lands; same files).
+
+## 2026-09-05 evening: Stage1Authority landed; lazy /proc context measured; cap-std to go
+
+- **Stage1Authority landed** (`9a315bc22`, worker stage1-authority, three
+  review rounds). The page-table manager, its arena source and the
+  vfork share state live in one type; every stage-1 mutator takes the
+  source explicitly (`Option<&mut dyn TableArenaSource>` is the contract);
+  `Stage1Editor` has no `DerefMut` and the authority hands out no raw
+  `&mut PageTableManager`. Round 1 caught two regressions the first draft
+  would have shipped: the three COW rollback sites called a source-less
+  `rollback_undo` (arena leak on every rollback) and the fork child rebased
+  before its source was installed (fork of a grown process failed). Live
+  receipt: 300,000-deep recursion then fork, both sides complete;
+  `pagetablegrow`, `mincoreedge`, `forkstackstorm` MATCH.
+- **Lazy `OpenContext`** (worker lazy-proc, landing): `/proc/self/fd` listing
+  300 → 64 µs, `/proc/self/status` 382 → 82 µs, `/proc/self/maps` 414 → 52 µs
+  (Docker: 3.6 µs for the listing). Round 2 will profile the residual.
+- **Owner direction**: retire cap-std. With one kernel owning every guest
+  fs syscall, carrick's namei (dentry cache → contained parent fd + leaf,
+  one `*at` host call with `O_NOFOLLOW`) is the resolver; cap-std's
+  per-component re-walk is redundant containment. Brief:
+  `scratchpad/brief-retire-capstd.md`, queued as the dentry-cache worker's
+  round 2. Workers `mmap-lazy` and `fork-table-copy` dispatched from the
+  post-Stage1Authority main.
