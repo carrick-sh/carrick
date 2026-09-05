@@ -2445,6 +2445,17 @@ impl<M: CurrentMmMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
     ) -> Result<(), carrick_guest_mem::RepointPrivateError> {
         self.mem.repoint_private(va, overlay_ipa, len, content)
     }
+    fn repoint_shared_leaf(
+        &mut self,
+        va: u64,
+        target_ipa: u64,
+        len: usize,
+    ) -> Result<(), MemoryError> {
+        self.mem.repoint_shared_leaf(va, target_ipa, len)
+    }
+    fn translate_va(&self, va: u64) -> Option<u64> {
+        self.mem.translate_va(va)
+    }
     fn resident_pages(
         &self,
         start: carrick_guest_mem::GuestVa,

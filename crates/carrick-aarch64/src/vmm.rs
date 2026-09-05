@@ -721,6 +721,18 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         Ok(())
     }
 
+    /// Publish semantic VA ownership after `MREMAP_FIXED` repoints a live
+    /// stage-1 leaf into an existing shared extent. The stage-2 extent
+    /// already exists; HVPatch records the alias and mapped region edge.
+    fn publish_shared_repoint(
+        &mut self,
+        _va: u64,
+        _target_ipa: u64,
+        _len: usize,
+    ) -> Result<(), TrapError> {
+        Ok(())
+    }
+
     /// Backing READ of `[va, va+len)` whose stage-1 translation is `ipa`. The
     /// engine already ran the PROT_NONE gate (on `va`); this does the IPA-translated
     /// single-region backing copy. NULL-guard + single-window bounds live in the

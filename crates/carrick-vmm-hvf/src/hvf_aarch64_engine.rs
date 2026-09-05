@@ -1517,6 +1517,15 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.publish_private_repoint(va, overlay_ipa, len)
     }
 
+    fn publish_shared_repoint(
+        &mut self,
+        va: u64,
+        target_ipa: u64,
+        len: usize,
+    ) -> Result<(), TrapError> {
+        self.state.publish_shared_repoint(va, target_ipa, len)
+    }
+
     fn translated_read(&self, va: u64, _ipa: u64, len: usize) -> Result<Vec<u8>, MemoryError> {
         // HVF re-derives the region via its own per-thread mapping walk (with the
         // stage-1-IPA disambiguation + cross-thread alias fallback), so it ignores
