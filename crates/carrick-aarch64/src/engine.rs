@@ -844,6 +844,35 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     /// [`Self::pt_edit_and_flush`], which runs [`Self::run_el1_maintenance`]
     /// afterwards so a cached invalid walk or stale leaf cannot survive the
     /// publication.
+    /// Build a stage-1 manager from the live guest tables at the current
+    /// TTBR0 root — the same construction `pt_edit_locked` performs lazily on
+    /// the first edit. Fails (rather than guessing) when the root or its
+    /// backing is not readable yet.
+    fn build_page_tables_manager_from_live(&mut self) -> Result<PageTableManager, MemoryError> {
+        const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
+        let pt_base = self
+            .vcpu
+            .get_sys_reg(SysReg::Ttbr0)
+            .map_err(|error| MemoryError::HostMap(format!("read TTBR0_EL1: {error}")))?
+            & TTBR_ROOT_MASK;
+        if pt_base == 0 {
+            return Err(MemoryError::HostMap(
+                "stage-1 root not programmed".to_string(),
+            ));
+        }
+        let size = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize;
+        let bytes = self
+            .vm
+            .read_gpa(pt_base, size)
+            .map_err(|_| MemoryError::HostMap("read live page tables".to_string()))?;
+        use carrick_hal::PageTableCodec as _;
+        Ok(
+            <<Self as ThreadedEngine>::Arch as carrick_hal::GuestArch>::Mmu::new_manager(
+                bytes, pt_base,
+            ),
+        )
+    }
+
     fn pt_edit_locked(
         &mut self,
         edit: impl FnOnce(&mut PageTableManager) -> Result<PageTableApplyOutcome, PageTableError>,
@@ -2660,18 +2689,36 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         &mut self,
         source: Box<dyn carrick_mem::page_table::TableArenaSource>,
     ) -> Result<(), TrapError> {
-        let mut page_tables = self.page_tables.lock();
+        let page_tables = Arc::clone(&self.page_tables);
+        let mut page_tables = page_tables.lock();
         match page_tables.as_mut() {
             Some(manager) => manager.set_arena_source(source).map_err(|error| {
                 TrapError::Hypervisor(format!("set stage-1 table arena source: {error:?}"))
             }),
-            // No manager yet: it is built lazily on the first edit, or arrives
-            // with an exec rebuild. Keep the source and apply it then, so the
-            // install never depends on bring-up order.
-            None => {
-                self.pending_arena_source = Some(source);
-                Ok(())
-            }
+            // No manager yet. When the live tables are already readable (an
+            // exec rebuild, or a root whose boot tables are in place) build the
+            // manager NOW and attach the source to it: the slot is shared with
+            // the VMM state and with any successor engine over the same mm, and
+            // whichever of them builds the manager first would otherwise do so
+            // without this engine's deferred source (pagetablegrow through
+            // `/bin/sh -c` died at 87 mappings with `source=false`). Only when
+            // the tables are not readable yet (bring-up order) is the source
+            // kept for the lazy build.
+            None => match self.build_page_tables_manager_from_live() {
+                Ok(mut manager) => {
+                    manager.set_arena_source(source).map_err(|error| {
+                        TrapError::Hypervisor(format!(
+                            "set stage-1 table arena source on eager build: {error:?}"
+                        ))
+                    })?;
+                    *page_tables = Some(manager);
+                    Ok(())
+                }
+                Err(_) => {
+                    self.pending_arena_source = Some(source);
+                    Ok(())
+                }
+            },
         }
     }
 

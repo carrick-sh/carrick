@@ -1576,6 +1576,7 @@ where
             (kernel.hvpatch_process.as_ref(), &published_kernel_exec)
         {
             let source = process.table_arena_source_for_lease(published.replacement_lease());
+            tracing::debug!(target: "carrick::stage1_arena", "install replacement-lease arena source after execve_into");
             if let Err(error) = engine.install_stage1_table_arena_source(source) {
                 return Self::exec_failed_past_no_return(
                     kernel,
@@ -1853,6 +1854,7 @@ where
                         "committed HVPatch exec has no replacement table arena lease: {error}"
                     ))
                 })?;
+            tracing::debug!(target: "carrick::stage1_arena", "install committed-task arena source at exec commit");
             engine
                 .install_stage1_table_arena_source(arena_source)
                 .map_err(|error| {
