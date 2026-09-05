@@ -1037,7 +1037,7 @@
       "kind": "static",
       "file": "crates/carrick-runtime/src/kernel/tty.rs",
       "symbol": "slot::SLOT",
-      "fingerprint": "0f404b3565d84abd025cdb96ea28a068e75268aad767b2194a6a41cf02d2fc1b",
+      "fingerprint": "ce379d8b235f81fdcbcc1cdfefa4db0c7d455b43c56b04886cc8265673c26e7c",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static slot::SLOT in crates/carrick-runtime/src/kernel/tty.rs maintaining host process lifecycle or VM resources."
     },
