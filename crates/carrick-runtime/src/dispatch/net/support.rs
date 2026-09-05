@@ -1286,7 +1286,12 @@ pub(super) fn linux_to_host_sockopt(level: i32, optname: i32) -> Option<(i32, i3
             };
             Some((libc::IPPROTO_TCP, host_opt))
         }
-        LINUX_SOL_UDP => Some((libc::IPPROTO_UDP, optname)),
+        LINUX_SOL_UDP => {
+            if optname == crate::linux_abi::LINUX_UDP_CORK {
+                return None;
+            }
+            Some((libc::IPPROTO_UDP, optname))
+        }
         // IPPROTO_IPV6 options: same story (macOS <netinet6/in6.h>). The
         // macOS-literal arm is preserved verbatim (validated by the macOS probe
         // gate); macOS gates the RFC 3542 values behind __APPLE_USE_RFC_3542 and
@@ -1478,6 +1483,102 @@ pub(super) fn autobind_unix_host_path() -> std::path::PathBuf {
 /// so it is hidden from the guest's listxattr (is_internal_carrick_xattr) and
 /// valid on Linux hosts too; fork-coherent because it lives on the on-disk node.
 const CARRICK_UNIX_PATH_XATTR: &[u8] = b"user.carrick.unix_path\0";
+
+use crate::dispatch::fd_table::SocketPeerCred;
+
+fn encode_peer_cred(cred: SocketPeerCred) -> [u8; 12] {
+    let mut buf = [0u8; 12];
+    buf[0..4].copy_from_slice(&(cred.pid.0 as u32).to_ne_bytes());
+    buf[4..8].copy_from_slice(&cred.uid.raw().to_ne_bytes());
+    buf[8..12].copy_from_slice(&cred.gid.raw().to_ne_bytes());
+    buf
+}
+
+fn decode_peer_cred(bytes: &[u8]) -> Option<SocketPeerCred> {
+    if bytes.len() < 12 {
+        return None;
+    }
+    let pid = i32::from_ne_bytes(bytes[0..4].try_into().ok()?);
+    let uid = u32::from_ne_bytes(bytes[4..8].try_into().ok()?);
+    let gid = u32::from_ne_bytes(bytes[8..12].try_into().ok()?);
+    Some(SocketPeerCred {
+        pid: crate::dispatch::abi_args::NsPid(pid),
+        uid: carrick_abi::NsUid::new(uid),
+        gid: carrick_abi::NsGid::new(gid),
+    })
+}
+
+fn nul_trimmed_slice(path: &[u8]) -> &[u8] {
+    let nul = path.iter().position(|&b| b == 0).unwrap_or(path.len());
+    &path[..nul]
+}
+
+pub(super) fn register_unix_listener(host_path: &[u8], host_fd: i32, cred: SocketPeerCred) {
+    let path = nul_trimmed_slice(host_path);
+    use std::os::unix::ffi::OsStrExt;
+    let path_str = std::ffi::OsStr::from_bytes(path).to_string_lossy();
+    if let Ok(mut reg) = unix_path_registry().lock() {
+        let mut val = Vec::with_capacity(16);
+        val.extend_from_slice(&host_fd.to_ne_bytes());
+        val.extend_from_slice(&encode_peer_cred(cred));
+        reg.insert(
+            std::path::PathBuf::from(format!("@listener:{path_str}")),
+            val,
+        );
+        reg.insert(
+            std::path::PathBuf::from(format!("@listener_fd:{host_fd}")),
+            path.to_vec(),
+        );
+        reg.insert(
+            std::path::PathBuf::from(format!("@pending:{host_fd}")),
+            Vec::new(),
+        );
+    }
+}
+
+pub(crate) fn unregister_unix_listener(host_fd: i32) {
+    if let Ok(mut reg) = unix_path_registry().lock() {
+        if let Some(path) = reg.remove(&std::path::PathBuf::from(format!("@listener_fd:{host_fd}")))
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let path_str = std::ffi::OsStr::from_bytes(&path).to_string_lossy();
+            reg.remove(&std::path::PathBuf::from(format!("@listener:{path_str}")));
+        }
+        reg.remove(&std::path::PathBuf::from(format!("@pending:{host_fd}")));
+    }
+}
+
+pub(super) fn lookup_and_queue_unix_connect(
+    host_path: &[u8],
+    client_cred: SocketPeerCred,
+) -> Option<SocketPeerCred> {
+    let path = nul_trimmed_slice(host_path);
+    use std::os::unix::ffi::OsStrExt;
+    let path_str = std::ffi::OsStr::from_bytes(path).to_string_lossy();
+    let mut reg = unix_path_registry().lock().ok()?;
+    let val = reg.get(&std::path::PathBuf::from(format!("@listener:{path_str}")))?;
+    if val.len() < 16 {
+        return None;
+    }
+    let listener_fd = i32::from_ne_bytes(val[0..4].try_into().ok()?);
+    let server_cred = decode_peer_cred(&val[4..16])?;
+    let pending_key = std::path::PathBuf::from(format!("@pending:{listener_fd}"));
+    let pending = reg.entry(pending_key).or_default();
+    pending.extend_from_slice(&encode_peer_cred(client_cred));
+    Some(server_cred)
+}
+
+pub(super) fn pop_pending_unix_client(listener_host_fd: i32) -> Option<SocketPeerCred> {
+    let mut reg = unix_path_registry().lock().ok()?;
+    let pending_key = std::path::PathBuf::from(format!("@pending:{listener_host_fd}"));
+    let pending = reg.get_mut(&pending_key)?;
+    if pending.len() < 12 {
+        return None;
+    }
+    let cred = decode_peer_cred(&pending[0..12])?;
+    pending.drain(0..12);
+    Some(cred)
+}
 
 /// Process-global host-socket-path → original-guest-`sun_path` map, populated by
 /// `unix_socket_host_path` at every bind/connect/sendto translation and consumed

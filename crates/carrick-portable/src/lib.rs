@@ -1334,20 +1334,6 @@ pub fn peer_credentials(host_fd: i32) -> std::io::Result<PeerCredentials> {
     }
 }
 
-/// Peer credentials `(pid, uid, gid)` for guest `SO_PEERCRED` synthesis.
-///
-/// This preserves the guest ABI's historical best-effort zeros. Host control
-/// planes must call [`peer_credentials`] directly and reject errors.
-pub fn peer_ucred(host_fd: i32) -> (u32, u32, u32) {
-    peer_credentials(host_fd).map_or((0, 0, 0), |credentials| {
-        (
-            credentials.pid.unwrap_or(0),
-            credentials.uid,
-            credentials.gid,
-        )
-    })
-}
-
 /// Re-export a constant that has a real (possibly differently-named) equivalent
 /// on every platform. Two-way form: `port_alias!(NAME => bsd_name, linux_name)`
 /// uses `bsd_name` on the BSD family (macOS, FreeBSD, NetBSD — for constants all

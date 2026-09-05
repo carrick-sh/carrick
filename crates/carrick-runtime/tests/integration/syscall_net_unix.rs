@@ -749,11 +749,12 @@ fn getsockopt_so_peercred_returns_linux_ucred_from_local_peercred() {
     let uid = u32::from_ne_bytes([cred[4], cred[5], cred[6], cred[7]]);
     let gid = u32::from_ne_bytes([cred[8], cred[9], cred[10], cred[11]]);
 
-    assert_eq!(uid, unsafe { libc::geteuid() }, "peer uid is our euid");
-    assert_eq!(gid, unsafe { libc::getegid() }, "peer gid is our egid");
-    // LOCAL_PEERPID is best-effort: our pid when supported, else 0.
-    let me = unsafe { libc::getpid() } as u32;
-    assert!(pid == me || pid == 0, "peer pid {pid} should be {me} or 0");
+    let guest_pid = ret(&mut dispatcher, &mut memory, 172, [0; 6]) as u32;
+    let guest_uid = ret(&mut dispatcher, &mut memory, 174, [0; 6]) as u32;
+    let guest_gid = ret(&mut dispatcher, &mut memory, 176, [0; 6]) as u32;
+    assert_eq!(uid, guest_uid, "peer uid is guest uid");
+    assert_eq!(gid, guest_gid, "peer gid is guest gid");
+    assert_eq!(pid, guest_pid, "peer pid is guest pid");
 
     // A short optlen must clamp, not overflow the guest buffer.
     memory.write_bytes(0x4010, &4u32.to_ne_bytes()).unwrap();
@@ -850,4 +851,175 @@ fn so_passcred_set_get_round_trips() {
         1,
         "SO_PASSCRED must round-trip"
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn so_peercred_unrecorded_peer_returns_fallback_zeros_and_all_ones() {
+    const LINUX_AF_UNIX: u64 = 1;
+    const LINUX_SOCK_STREAM: u64 = 1;
+    const LINUX_SOL_SOCKET: u64 = 1;
+    const LINUX_SO_PEERCRED: u64 = 17;
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    let call = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            &d.capture_one_task_context().unwrap(),
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    // socket(AF_UNIX, SOCK_STREAM) -> single unconnected socket
+    let fd = match call(
+        &mut dispatcher,
+        &mut memory,
+        198,
+        [LINUX_AF_UNIX, LINUX_SOCK_STREAM, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("socket failed: {other:?}"),
+    };
+
+    // getsockopt(SO_PEERCRED) on unconnected socket -> fallback zeros and 0xFFFFFFFF
+    memory.write_bytes(0x4010, &12u32.to_ne_bytes()).unwrap();
+    assert_eq!(
+        call(
+            &mut dispatcher,
+            &mut memory,
+            209,
+            [fd, LINUX_SOL_SOCKET, LINUX_SO_PEERCRED, 0x4020, 0x4010, 0]
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let cred = memory.read_bytes(0x4020, 12).unwrap();
+    let pid = u32::from_ne_bytes([cred[0], cred[1], cred[2], cred[3]]);
+    let uid = u32::from_ne_bytes([cred[4], cred[5], cred[6], cred[7]]);
+    let gid = u32::from_ne_bytes([cred[8], cred[9], cred[10], cred[11]]);
+    assert_eq!(pid, 0, "unrecorded peercred pid must be 0");
+    assert_eq!(
+        uid, 0xFFFF_FFFF,
+        "unrecorded peercred uid must be 0xFFFFFFFF"
+    );
+    assert_eq!(
+        gid, 0xFFFF_FFFF,
+        "unrecorded peercred gid must be 0xFFFFFFFF"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn msg_more_and_cork_coalescing() {
+    const LINUX_AF_UNIX: u64 = 1;
+    const LINUX_SOCK_DGRAM: u64 = 2;
+    const LINUX_MSG_MORE: u64 = 0x8000;
+    const LINUX_MSG_DONTWAIT: u64 = 0x40;
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    let call = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            &d.capture_one_task_context().unwrap(),
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    // socketpair(AF_UNIX, SOCK_DGRAM)
+    assert_eq!(
+        call(
+            &mut dispatcher,
+            &mut memory,
+            199,
+            [LINUX_AF_UNIX, LINUX_SOCK_DGRAM, 0, 0x4000, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let pair = memory.read_bytes(0x4000, 8).unwrap();
+    let fd_a = i32::from_le_bytes([pair[0], pair[1], pair[2], pair[3]]) as u64;
+    let fd_b = i32::from_le_bytes([pair[4], pair[5], pair[6], pair[7]]) as u64;
+
+    // Send "hello " with MSG_MORE on fd_a
+    memory.write_bytes(0x4100, b"hello ").unwrap();
+    assert_eq!(
+        call(
+            &mut dispatcher,
+            &mut memory,
+            206, // sendto
+            [fd_a, 0x4100, 6, LINUX_MSG_MORE, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 6 }
+    );
+
+    // Non-blocking recv on fd_b should see EAGAIN (no datagram emitted yet)
+    assert_eq!(
+        call(
+            &mut dispatcher,
+            &mut memory,
+            207, // recvfrom
+            [fd_b, 0x4200, 100, LINUX_MSG_DONTWAIT, 0, 0]
+        ),
+        DispatchOutcome::errno(carrick_abi::LINUX_EAGAIN)
+    );
+
+    // Send "world" without MSG_MORE on fd_a -> emits the coalesced datagram
+    memory.write_bytes(0x4110, b"world").unwrap();
+    assert_eq!(
+        call(
+            &mut dispatcher,
+            &mut memory,
+            206, // sendto
+            [fd_a, 0x4110, 5, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 5 }
+    );
+
+    // Now recv on fd_b should receive the combined 11 bytes "hello world"
+    assert_eq!(
+        call(
+            &mut dispatcher,
+            &mut memory,
+            207, // recvfrom
+            [fd_b, 0x4200, 100, LINUX_MSG_DONTWAIT, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 11 }
+    );
+    let recv_data = memory.read_bytes(0x4200, 11).unwrap();
+    assert_eq!(&recv_data, b"hello world");
+
+    // Test close flush: send "flushme" with MSG_MORE, then close(fd_a)
+    memory.write_bytes(0x4120, b"flushme").unwrap();
+    assert_eq!(
+        call(
+            &mut dispatcher,
+            &mut memory,
+            206,
+            [fd_a, 0x4120, 7, LINUX_MSG_MORE, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 7 }
+    );
+    // close(fd_a)
+    assert_eq!(
+        call(&mut dispatcher, &mut memory, 57, [fd_a, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    // fd_b receives the flushed 7 bytes
+    assert_eq!(
+        call(
+            &mut dispatcher,
+            &mut memory,
+            207,
+            [fd_b, 0x4300, 100, LINUX_MSG_DONTWAIT, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 7 }
+    );
+    let flushed = memory.read_bytes(0x4300, 7).unwrap();
+    assert_eq!(&flushed, b"flushme");
 }

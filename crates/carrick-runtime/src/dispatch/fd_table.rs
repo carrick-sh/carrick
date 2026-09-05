@@ -56,7 +56,17 @@ use crate::linux_abi::{
 };
 use crate::rootfs::{RootFsDirEntry, RootFsEntryKind, RootFsMetadata};
 
+use super::abi_args::NsPid;
 use super::{EpollKqueue, Fd, GuestPtr, HostFd, inode_for_path, linux_mode};
+use carrick_abi::{NsGid, NsUid};
+
+/// Peer credentials recorded at connect/accept/socketpair time for an AF_UNIX socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SocketPeerCred {
+    pub(crate) pid: NsPid,
+    pub(crate) uid: NsUid,
+    pub(crate) gid: NsGid,
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct EpollInterest {
@@ -1183,6 +1193,10 @@ pub(super) enum OpenDescription {
         /// empty because Linux does not copy listener memberships across accept.
         mcast_memberships: Vec<SocketMulticastMembership>,
         synthetic_recv: VecDeque<(Vec<u8>, Vec<u8>)>,
+        peer_cred: Option<SocketPeerCred>,
+        cork_buffer: Vec<u8>,
+        cork_dest_addr: Option<Vec<u8>>,
+        cork_enabled: bool,
     },
     /// A regular file backed by a REAL macOS file descriptor into the
     /// `--fs host` overlay scratch. Unlike `File` (which caches bytes
@@ -1257,6 +1271,39 @@ pub(super) enum OpenDescription {
         base: OpenDescriptionBase,
         socket: Arc<crate::dispatch::net::unix_pure::PureSocketInner>,
     },
+}
+
+impl Drop for OpenDescription {
+    fn drop(&mut self) {
+        if let Self::HostSocket {
+            host_fd,
+            cork_buffer,
+            cork_dest_addr,
+            ..
+        } = self
+        {
+            if !cork_buffer.is_empty() {
+                let dest_ptr = cork_dest_addr
+                    .as_ref()
+                    .map_or(core::ptr::null(), |a| a.as_ptr().cast());
+                let dest_len = cork_dest_addr
+                    .as_ref()
+                    .map_or(0, |a| a.len() as libc::socklen_t);
+                unsafe {
+                    libc::sendto(
+                        host_fd.raw(),
+                        cork_buffer.as_ptr().cast(),
+                        cork_buffer.len(),
+                        libc::MSG_DONTWAIT,
+                        dest_ptr,
+                        dest_len,
+                    );
+                }
+                cork_buffer.clear();
+            }
+            crate::dispatch::net::support::unregister_unix_listener(host_fd.raw());
+        }
+    }
 }
 
 #[derive(Debug)]
