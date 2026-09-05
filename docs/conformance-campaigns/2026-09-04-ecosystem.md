@@ -341,3 +341,42 @@ delegated to Antigravity `authority` (`602cb1f4-09f0-4ee4-8b79-db6c8cbac057`)
 for encapsulation or trusted-boundary classification; ceilings stay where they
 are. The three `libc::getpid` host-authority rows moved by the COW fix were
 rebound as a positional reconcile (`7c7193512`).
+
+## Targeted re-measurement on the fork COW fix (signed 4871fc81…, source 9168071e0)
+
+With declared budgets (`--carrick-timeout-cap-s 0`, single worker, host
+shared with two worker cargo builds so no ratio below is a measurement):
+`go-build` MATCH with zero diffs (it was a CRASH in the August ledger);
+`cpython-subprocess` reported 21 "regressions" that are a cache artifact,
+see below; `cpython-concurrent_futures` hit its 600 s budget at test 193.
+The single-case and `test_init` module reducers pass in isolation, and the
+streamed full-module embed reducer then passed end to end: 255 assertions,
+0 failures, 9 skips, 2615 s wall under load (`test_wait` 8 min 52 s,
+`test_shutdown` 9 min). The suite is CORRECT on this runtime and roughly
+30x its 80 s oracle; the "timeout" rows are the harness enforcing the 2x
+cached-oracle budget, and a pathological ratio on a fork/process-pool
+suite is the next correctness-shaped performance target, not a hang.
+Evidence: `target/conformance/ecosystem-sep04-cf-module/` (streamed
+transcript) and `ecosystem-sep04-receipts/{targeted-cap0-9168071e0,cf-module-reducer3}.log`.
+
+## Oracle cache keyed by parser fingerprint (025e4298b)
+
+The 21 `cpython-subprocess` diffs were ids the old regrtest parser never
+recognised (two-line docstring assertions), so the committed oracle rows
+carried them as `absent`. `OracleKey` now includes
+`regrtest::PARSER_FINGERPRINT`; every regrtest row misses until a
+deliberate serial `--oracle-fill --oracle-fill-profile regression
+--ecosystem cpython` refresh (about 0.26 h of Docker for the 440 arm64
+regression rows; the amd64 rows can only be re-blessed on the fleet).
+
+## FIFO open handshake (branch `agy/fifo-open-sep04`, two review rounds)
+
+Round 1 was returned for hooking a global mutex into every `HostFdOwner`
+drop (fork-safety and close-path cost) and for learning FIFO identity by
+opening a transient reader. Round 2 owns the parked opener through a
+`WaitFdGuard::ParkedOpener` token and stats the path via
+`FsBackend::fifo_identity`. Codex added `InternalWaitKind::FifoOpen` (the
+run loop refuses a `Missing` wait authority). The signed gate then went
+from 6 red lines to 1: `reader_unblocked_after_writer`, whose probe-side
+non-blocking writer open raced the child's park on a loaded host; the
+probe now retries that open for up to 2 s and is being re-blessed.
