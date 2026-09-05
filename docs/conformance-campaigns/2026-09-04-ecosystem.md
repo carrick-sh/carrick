@@ -414,3 +414,30 @@ PIDFD_NONBLOCK accepted; memfd re-open through `/proc/self/fd` must yield a
 new read-only description, returned for round 2), `ltp-net` (SO_PEERCRED
 guest identity, MSG_MORE coalescing), `ltp-pipe` (full-pipe blocking
 write, pwritev2 ESPIPE on pipes, blocking inotify/fanotify reads).
+
+## Crash attribution from batch-lldb backtraces (no live attach)
+
+- `cpython-builtin` (`PtyTests.test_input_no_stdout_fileno`) reproduces in
+  isolation: exit-time `retire_hvpatch_process_fds` → `close_open_file_and_free_pty`
+  → `rescue_pty_master_before_slave_close` → `stage_splice_bytes_for_description`
+  → `FileTable::lock_splice_pushback` → the mutation gate of the exiting task's
+  already-drained table aborts the carrier (`builtin-lldb2.log`). The splice
+  pushback queue is per-table state for what is per-description state; the
+  pty master lives in the parent's table. Delegated as `pty-rescue`
+  (queue moves into `DescriptionCommon`, red-first host test, probe
+  `ptyexitrescue`).
+- `cpython-compile` (`test_compiler_recursion_limit`): fifteen 1 MiB anonymous
+  maps refused with `OutOfTables (in_use=438 free=0 capacity=440
+  multi_vcpu=true exclusive=true reclaim_pending=false)` after `7f9c29866`
+  attached the census to the sparse-mmap planner, i.e. genuine exhaustion of
+  the fixed 1.75 MiB per-process stage-1 pool, not refused reclaim. The pool
+  is bounded by the 2 MiB kernel region. Linux has no such limit; the design
+  answer is a multi-pool `PageTableManager` that grows by mapping further
+  kernel-only IPA pools on demand (tables are reached by the MMU through
+  stage-2, so an overflow pool needs no stage-1 mapping at all), with fork
+  cloning only the used watermark of each pool. Not yet delegated.
+- `cpython-asyncio` (`test_kill_issue43884`) and `cpython-readline`
+  (`test_auto_history_enabled`) pass in isolation; their aborts depend on
+  accumulated module state and will be re-run under the full-module reducer
+  after the pty-rescue fix lands, since the readline signature is the same
+  draining-table abort.
