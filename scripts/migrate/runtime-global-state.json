@@ -2536,6 +2536,30 @@
       "fingerprint": "41b96aede58f03f548e9e8c79858298de1322c6f615ee07f8e5ea1dae5227f3e",
       "classification": "config_debug",
       "rationale": "OnceLock cache of the CARRICK_MAX_WALL_MS trap-watchdog wall window in trap_watchdog_wall_window (crates/carrick-runtime/src/vcpu_loop/mod.rs); carrier-wide configuration read once."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+      "symbol": "kernel_process_dispatch_tests::FOREIGN_LEASE_RETAINS",
+      "fingerprint": "8f9eb03301b6181a71e99f07687c2b5fd6b115baf6b2551dee05ec108b7d2eec",
+      "classification": "test_only",
+      "rationale": "#[cfg(test)] thread-local in the process_vm dispatch tests (counts lease retains issued by the test transport); dispatch is synchronous so the test thread owns it."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+      "symbol": "kernel_process_dispatch_tests::FOREIGN_LEASE_STALE_ONCE",
+      "fingerprint": "0192f2ae90a62594483083d1913a3d84bc7f172440fc763fed9969e6af8ffa19",
+      "classification": "test_only",
+      "rationale": "#[cfg(test)] thread-local in the process_vm dispatch tests (fault injection: next lease read reports LeaseStale once); dispatch is synchronous so the test thread owns it."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+      "symbol": "kernel_process_dispatch_tests::FOREIGN_READ_TRANSACTIONS",
+      "fingerprint": "2970ae56f4ef338840e3ef5e66539c1f48a069445e395341fed602bbc565e4ff",
+      "classification": "test_only",
+      "rationale": "#[cfg(test)] thread-local in the process_vm dispatch tests (counts foreign-read transactions issued by the test transport); dispatch is synchronous so the test thread owns it."
     }
   ]
 }
