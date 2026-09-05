@@ -4815,7 +4815,7 @@ mod real {
         fn stage1__arena__install(_: u32, _: u32, _: u32, _: u64) {}
         /// The live stage-1 manager was overwritten wholesale (a rollback
         /// image or clone). Args: site (6 = rolled-back fork, 7 = parent
-        /// fork-COW rollback, 8..=11 = foreign-COW rollback sites), manager
+        /// fork-COW rollback, 8..=11 = foreign-COW rollback sites, 12 = authority rebind), manager
         /// had a source before, has one after, authority pointer.
         fn stage1__arena__replace(_: u32, _: u32, _: u32, _: u64) {}
         /// A path that requires a live stage-1 manager found the shared slot
