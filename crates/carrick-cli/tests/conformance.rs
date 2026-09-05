@@ -2888,10 +2888,10 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// `forkprotectexec` adds child `mprotect` execute-permission changes over
 /// inherited COW pages; `fifoopenmatrix` adds the FIFO open
 /// handshake/EINTR/SA_RESTART matrix.
-/// The authoritative inventory contains 507 probe sources: 480 conformance
-/// sources (457 generic, 23 dedicated), 26 performance sources, and one helper.
-/// Both libc lanes therefore gate 960 conformance rows.
-const PROBE_SOURCE_COUNT: usize = 507;
+/// The authoritative inventory contains 508 probe sources: 481 conformance
+/// sources (458 generic, 23 dedicated), 26 performance sources, and one helper.
+/// Both libc lanes therefore gate 962 conformance rows.
+const PROBE_SOURCE_COUNT: usize = 508;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
@@ -3146,7 +3146,7 @@ const SYS_TIME_PROBES: &[&str] = &["clocksettimevdso"];
 /// `fanotify_init(2)` needs `CAP_SYS_ADMIN`; Docker's default cap set drops
 /// it, so an unprivileged oracle fails the group creation and the probe's
 /// fanotify lines would be vacuous on both sides.
-const SYS_ADMIN_PROBES: &[&str] = &["pipeblockedge"];
+const SYS_ADMIN_PROBES: &[&str] = &["fanotifyondir", "pipeblockedge"];
 
 fn probe_capabilities(name: &str) -> &'static [&'static str] {
     if SYS_TIME_PROBES.contains(&name) {
@@ -4647,9 +4647,9 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
     let generic = validate_closure_probe_rows(&inventory(), &sources)
         .expect("checked-in closure probe inventory must match the source denominator");
-    assert_eq!(generic.len(), 457);
-    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 480);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 960);
+    assert_eq!(generic.len(), 458);
+    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 481);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 962);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")
@@ -4766,6 +4766,7 @@ fn clone_files_probes_run_without_container_seccomp() {
 fn clock_settime_probe_is_granted_cap_sys_time_on_both_sides() {
     assert_eq!(probe_capabilities("clocksettimevdso"), ["SYS_TIME"]);
     assert_eq!(probe_capabilities("pipeblockedge"), ["SYS_ADMIN"]);
+    assert_eq!(probe_capabilities("fanotifyondir"), ["SYS_ADMIN"]);
     assert!(probe_capabilities("futexrealtime").is_empty());
     assert!(probe_capabilities("clonefileshare").is_empty());
 }

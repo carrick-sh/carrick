@@ -489,6 +489,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "fanotifyondir": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "faultaddr": {
     "class": "conformance",
     "excluded": false,
