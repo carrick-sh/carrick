@@ -493,3 +493,22 @@ datagram on close. `pipeblockedge` needed `CAP_SYS_ADMIN` in both lanes
 (fanotify_init) to stop its fanotify lines being vacuous; under that
 privilege the pipe branch's runtime loses the whole probe output (a
 fanotify blocking-read park that never wakes), still open.
+
+## Pipe readiness branch landed (b31077560)
+
+The open fanotify item above was the runtime, not the probe: `install_fd`
+dropped the description's status flags, so a `fanotify_init(FAN_NONBLOCK)`
+group blocked in `read` and the harness's SIGALRM ended the probe before it
+flushed a line (`carrick trace` showed the `FAN_NONBLOCK` init followed by an
+EINTR'd read). `install_fd_with_status_flags` keeps them; the same fix had
+already closed pidfd `PIDFD_NONBLOCK`. The branch also parks full-pipe writes
+and inotify/fanotify reads on readiness instead of spinning. `pipeblockedge`
+is all-true against its `CAP_SYS_ADMIN` oracle in both libc lanes. Landed as
+`8dc06bae2..b31077560`; main's K1 burndown red (`read_attempt`,
+`slot_description_mutation`, `stream_transfer`) predates the branch and is the
+`socket-state` worker's item.
+
+The growable per-mm page-table backing (cpython `test_compile` exhaustion,
+`in_use=438 capacity=440`) is briefed as chained 2 MiB root slots behind a
+typed arena source on the manager; it waits on the `mmap-cost` worker, which
+holds `page_table.rs`.
