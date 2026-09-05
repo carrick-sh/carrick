@@ -1,0 +1,9 @@
+18ea86755f245668
+vintr_delivered_sigint=true
+vsusp_delivered_sigtstp=true
+vquit_delivered_sigquit=true
+normal_data_passed=true
+vlnext_quoted_signal=true
+disabled_isig_passed_data=true
+tiocsig_delivered_sigint=false
+child_clean_exit=true
