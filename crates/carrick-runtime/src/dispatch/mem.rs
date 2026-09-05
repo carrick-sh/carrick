@@ -118,6 +118,27 @@ enum MmapRefusal {
     Internal(&'static str),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SharedFileFixedMremapError {
+    #[error("shared file alias entry missing for range 0x{old_address:x}..0x{old_end:x}")]
+    MissingAliasEntry { old_address: u64, old_end: u64 },
+    #[error("new length {new_size} exceeds usize")]
+    NewLengthOverflow { new_size: u64 },
+    #[error("old length {old_size} exceeds usize")]
+    OldLengthOverflow { old_size: u64 },
+    #[error("destination address grant refused for 0x{va:x}..0x{end:x}")]
+    DestinationGrantRefused { va: u64, end: u64 },
+    #[error("repoint shared leaf failed: {source}")]
+    RepointSharedLeaf {
+        #[source]
+        source: carrick_guest_mem::MemoryError,
+    },
+    #[error("destination guest memory range invalid for 0x{va:x}..0x{end:x}")]
+    InvalidDestinationRange { va: u64, end: u64 },
+    #[error("failed to project fork semantics onto destination 0x{va:x}..0x{end:x}")]
+    ForkSemanticsProjectFailed { va: u64, end: u64 },
+}
+
 /// The guest's `mmap` arguments exactly as they arrived, captured before any
 /// normalization so a refusal reports what the guest asked for rather than
 /// what carrick rewrote it to.
@@ -6157,18 +6178,46 @@ impl SyscallDispatcher {
                     }
                 };
             if is_shared_file_fixed {
+                let va = new_address.0;
+                let fail = |error: SharedFileFixedMremapError,
+                            extent_base: Option<carrick_guest_mem::Gpa>,
+                            offset: Option<u64>| {
+                    tracing::error!(
+                        va = format_args!("{va:#x}"),
+                        len = format_args!("{new_size:#x}"),
+                        extent_base = format_args!("{:#x}", extent_base.map_or(0, |b| b.raw())),
+                        offset = format_args!("{:#x}", offset.unwrap_or(0)),
+                        %error,
+                        "HVPatch shared-file fixed mremap lowering failed; guest mremap lowered to ENOMEM"
+                    );
+                    Ok(DispatchOutcome::errno(LINUX_ENOMEM))
+                };
                 let Some(alias_entry) =
                     this.shared_file_alias_entry(old_address.0, old_size)
                 else {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    return fail(
+                        SharedFileFixedMremapError::MissingAliasEntry {
+                            old_address: old_address.0,
+                            old_end: old_address.0.saturating_add(old_size),
+                        },
+                        None,
+                        None,
+                    );
                 };
                 let Ok(new_len) = usize::try_from(new_size) else {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    return fail(
+                        SharedFileFixedMremapError::NewLengthOverflow { new_size },
+                        Some(alias_entry.extent_base),
+                        None,
+                    );
                 };
                 let Ok(old_len) = usize::try_from(old_size) else {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    return fail(
+                        SharedFileFixedMremapError::OldLengthOverflow { old_size },
+                        Some(alias_entry.extent_base),
+                        None,
+                    );
                 };
-                let va = new_address.0;
                 let delta = old_address.0.saturating_sub(alias_entry.range.start().raw());
                 let source_file_offset = alias_entry.row_file_offset.saturating_add(delta);
                 let destination_leaf_ipa = alias_entry
@@ -6215,15 +6264,25 @@ impl SyscallDispatcher {
                     )
                     .is_none()
                 {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    return fail(
+                        SharedFileFixedMremapError::DestinationGrantRefused {
+                            va,
+                            end: va.saturating_add(new_size),
+                        },
+                        Some(alias_entry.extent_base),
+                        Some(source_file_offset),
+                    );
                 }
 
                 // Repoint destination stage-1 leaf to the existing shared extent.
-                if memory
+                if let Err(err) = memory
                     .repoint_shared_leaf(va, destination_leaf_ipa, new_len)
-                    .is_err()
                 {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    return fail(
+                        SharedFileFixedMremapError::RepointSharedLeaf { source: err },
+                        Some(alias_entry.extent_base),
+                        Some(source_file_offset),
+                    );
                 }
 
                 // Reclaim the source range.
@@ -6270,7 +6329,14 @@ impl SyscallDispatcher {
                     GuestVa(va),
                     GuestVa(va.saturating_add(new_size)),
                 ) else {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    return fail(
+                        SharedFileFixedMremapError::InvalidDestinationRange {
+                            va,
+                            end: va.saturating_add(new_size),
+                        },
+                        Some(alias_entry.extent_base),
+                        Some(source_file_offset),
+                    );
                 };
                 let new_alias_entry = SharedFileAliasEntry {
                     range: dest_range,
@@ -6284,7 +6350,14 @@ impl SyscallDispatcher {
                 let Some(semantic_vmas) =
                     source_metadata.fork_semantics.project(va, new_size)
                 else {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    return fail(
+                        SharedFileFixedMremapError::ForkSemanticsProjectFailed {
+                            va,
+                            end: va.saturating_add(new_size),
+                        },
+                        Some(alias_entry.extent_base),
+                        Some(source_file_offset),
+                    );
                 };
 
                 this.record_dynamic_mapping_with_file_offset(

@@ -391,6 +391,7 @@ struct ProtectionTrackingMemory {
     repoint_observed_shared: Vec<bool>,
     restored_shared_identity: Vec<(u64, usize)>,
     repointed_shared_leaves: Vec<(u64, u64, usize)>,
+    active_aliases: Vec<(u64, u64, usize)>,
     unmapped_alias_ranges: Vec<(u64, usize)>,
     fail_repoint: bool,
     fail_repoint_indeterminate: bool,
@@ -541,11 +542,21 @@ impl ProtectionTrackingMemory {
             repoint_observed_shared: Vec::new(),
             restored_shared_identity: Vec::new(),
             repointed_shared_leaves: Vec::new(),
+            active_aliases: Vec::new(),
             unmapped_alias_ranges: Vec::new(),
             fail_repoint: false,
             fail_repoint_indeterminate: false,
             fail_protect: false,
         }
+    }
+
+    fn translate(&self, address: u64) -> u64 {
+        self.active_aliases
+            .iter()
+            .rev()
+            .find(|(va, _, l)| address >= *va && address < *va + *l as u64)
+            .map(|(va, target_ipa, _)| target_ipa + (address - va))
+            .unwrap_or(address)
     }
 }
 
@@ -559,11 +570,13 @@ impl GuestMemory for ProtectionTrackingMemory {
     }
 
     fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
-        self.inner.read_bytes_raw(address, length)
+        let translated = self.translate(address);
+        self.inner.read_bytes_raw(translated, length)
     }
 
     fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
-        self.inner.write_bytes_raw(address, bytes)
+        let translated = self.translate(address);
+        self.inner.write_bytes_raw(translated, bytes)
     }
 
     fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
@@ -577,6 +590,11 @@ impl GuestMemory for ProtectionTrackingMemory {
 
     fn unmap_alias_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
         self.unmapped_alias_ranges.push((address, len));
+        let unmap_end = address.saturating_add(len as u64);
+        self.active_aliases.retain(|(va, _, l)| {
+            let end = va.saturating_add(*l as u64);
+            end <= address || *va >= unmap_end
+        });
         Ok(())
     }
 
@@ -587,6 +605,12 @@ impl GuestMemory for ProtectionTrackingMemory {
         len: usize,
     ) -> Result<(), MemoryError> {
         self.repointed_shared_leaves.push((va, target_ipa, len));
+        if self.fail_repoint {
+            return Err(MemoryError::HostMap(
+                "injected repoint shared leaf failure".into(),
+            ));
+        }
+        self.active_aliases.push((va, target_ipa, len));
         Ok(())
     }
 
@@ -8272,9 +8296,28 @@ fn shared_file_fixed_mremap_moves_page_and_preserves_file_offset() {
     let reporter = CompatReporter::default();
     let mut memory = ProtectionTrackingMemory::new(base, (4 * PAGE) as usize);
 
-    use std::os::fd::IntoRawFd;
+    use std::os::fd::{AsRawFd, IntoRawFd};
 
     let host_file = tempfile::tempfile().expect("create tempfile");
+    let raw_fd = host_file.as_raw_fd();
+    unsafe {
+        assert_eq!(libc::ftruncate(raw_fd, (4 * PAGE) as libc::off_t), 0);
+        for i in 0..4 {
+            let page_data = vec![0x10 + i as u8; PAGE as usize];
+            assert_eq!(
+                libc::pwrite(
+                    raw_fd,
+                    page_data.as_ptr().cast(),
+                    PAGE as usize,
+                    (i * PAGE) as libc::off_t,
+                ),
+                PAGE as isize,
+            );
+        }
+    }
+    for i in 0..4 {
+        memory.inner.bytes[(i * PAGE as usize)..((i + 1) * PAGE as usize)].fill(0x10 + i as u8);
+    }
     let metadata = RootFsMetadata {
         path: std::path::PathBuf::from("/tmp/test_shared_fixed.dat"),
         kind: RootFsEntryKind::File,
@@ -8342,6 +8385,39 @@ fn shared_file_fixed_mremap_moves_page_and_preserves_file_offset() {
         "source range must be unmapped via unmap_alias_range"
     );
 
+    // Verify reading dst sees page 1's content.
+    assert_eq!(memory.read_bytes(dst, 1).unwrap(), vec![0x11]);
+
+    // Write through dst and verify writeback to file at page 1's offset.
+    memory.write_bytes(dst, &[0x77]).unwrap();
+    {
+        let mem_authority = dispatcher.mem();
+        let mem = mem_authority.lock();
+        let alias = mem
+            .shared_file_alias_maps
+            .iter()
+            .find(|entry| entry.range.start().raw() == dst)
+            .expect("dst shared file alias map entry");
+        assert_eq!(alias.row_file_offset, PAGE);
+        assert_eq!(alias.extent_base, carrick_guest_mem::Gpa(base));
+    }
+    let dirty = memory.read_bytes(dst, 1).unwrap();
+    assert_eq!(dirty[0], 0x77);
+    unsafe {
+        assert_eq!(
+            libc::pwrite(raw_fd, dirty.as_ptr().cast(), 1, PAGE as libc::off_t),
+            1
+        );
+    }
+    let mut b = [0u8; 1];
+    unsafe {
+        assert_eq!(
+            libc::pread(raw_fd, b.as_mut_ptr().cast(), 1, PAGE as libc::off_t),
+            1
+        );
+    }
+    assert_eq!(b[0], 0x77);
+
     // Verify metadata after move:
     // Destination dst has file_page_offset == Some(1).
     // Source src is unmapped.
@@ -8397,6 +8473,9 @@ fn shared_file_fixed_mremap_moves_page_and_preserves_file_offset() {
         "destination range must be unmapped via unmap_alias_range on reverse move"
     );
 
+    // Verify reading src after reverse move sees 0x77.
+    assert_eq!(memory.read_bytes(src, 1).unwrap(), vec![0x77]);
+
     {
         let mem_authority = dispatcher.mem();
         let mem = mem_authority.lock();
@@ -8407,6 +8486,83 @@ fn shared_file_fixed_mremap_moves_page_and_preserves_file_offset() {
             .expect("src core file entry");
         assert_eq!(src_mapping.file_page_offset, 1);
     }
+}
+
+#[test]
+fn shared_file_fixed_mremap_repoint_failure_lowers_to_enomem() {
+    const SYS_MREMAP: u64 = 216;
+    const MREMAP_MAYMOVE: u64 = 0x01;
+    const MREMAP_FIXED: u64 = 0x02;
+    const PAGE: u64 = LINUX_PAGE_SIZE;
+    let base = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+
+    let dispatcher = SyscallDispatcher::new();
+    let registry =
+        crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1082));
+    let reporter = CompatReporter::default();
+    let mut memory = ProtectionTrackingMemory::new(base, (4 * PAGE) as usize);
+    memory.fail_repoint = true;
+
+    use std::os::fd::IntoRawFd;
+
+    let host_file = tempfile::tempfile().expect("create tempfile");
+    let metadata = RootFsMetadata {
+        path: std::path::PathBuf::from("/tmp/test_shared_fixed_fail.dat"),
+        kind: RootFsEntryKind::File,
+        mode: 0o644,
+        size: (4 * PAGE) as usize,
+    };
+    let open_desc = std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::HostFile {
+        base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
+        host_fd: HostFdRef::new(host_file.into_raw_fd()),
+        metadata,
+        writable: true,
+    }));
+    let description = OpenFile::from_open_description_with_status_flags(
+        open_desc,
+        crate::linux_abi::LINUX_O_RDWR,
+        0,
+    )
+    .description();
+
+    dispatcher.commit_host_alias_mmap(HostAliasMmapCommit {
+        start: base,
+        len: 4 * PAGE,
+        prot: LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+        sharing: ProcMapSharing::Shared,
+        path: "/tmp/test_shared_fixed_fail.dat".into(),
+        file_page_offset: Some(0),
+        droppable: false,
+        semantic_vmas: None,
+        locked: None,
+        resident: true,
+        bus_fault: None,
+        write_sealed_shared: false,
+        read_only_shared_file: false,
+        secretmem: false,
+        writable_memfd: None,
+        shared_file_alias: Some(SharedFileAliasCommit {
+            description: Arc::clone(&description),
+            extent_base: carrick_guest_mem::Gpa(base),
+            row_file_offset: 0,
+        }),
+    });
+
+    let src = base + PAGE;
+    let dst = base + 3 * PAGE;
+
+    let outcome = threaded_memory_call(
+        &dispatcher,
+        &mut memory,
+        &registry,
+        &reporter,
+        SyscallRequest::new(
+            SYS_MREMAP,
+            SyscallArgs([src, PAGE, PAGE, MREMAP_MAYMOVE | MREMAP_FIXED, dst, 0]),
+        ),
+    );
+
+    assert_eq!(outcome, DispatchOutcome::errno(LINUX_ENOMEM));
 }
 
 #[test]

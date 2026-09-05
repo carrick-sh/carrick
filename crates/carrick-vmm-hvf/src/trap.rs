@@ -35608,19 +35608,34 @@ impl HvfVmState {
             .ok_or_else(|| {
                 TrapError::Hypervisor("shared repoint semantic host overflow".to_owned())
             })?;
-        let inventory_backing = self
-            .frame_inventory
-            .lock()
-            .extents
-            .get(&(physical_ipa, physical_size as u64))
-            .map(|extent| extent.backing)
-            .or_else(|| (!self.persistent_vm_lifecycle).then(Self::private_backing_identity))
-            .ok_or_else(|| {
-                TrapError::Hypervisor(format!(
-                    "shared repoint physical IPA 0x{:x} size {} lacks frame inventory",
-                    physical_ipa, physical_size
-                ))
-            })?;
+        let inventory_backing = {
+            let registry = alias_registry().lock();
+            registry
+                .physical_start_rows(physical_ipa)
+                .iter()
+                .find(|(_, alias)| alias.physical_size == physical_size)
+                .map(|(_, alias)| alias.inventory_backing)
+                .or_else(|| {
+                    registry
+                        .physical_start_rows(physical_ipa)
+                        .first()
+                        .map(|(_, alias)| alias.inventory_backing)
+                })
+        }
+        .or_else(|| {
+            self.frame_inventory
+                .lock()
+                .extents
+                .get(&(physical_ipa, physical_size as u64))
+                .map(|extent| extent.backing)
+        })
+        .or_else(|| (!self.persistent_vm_lifecycle).then(Self::private_backing_identity))
+        .ok_or_else(|| {
+            TrapError::Hypervisor(format!(
+                "shared repoint physical IPA 0x{:x} size {} lacks frame inventory",
+                physical_ipa, physical_size
+            ))
+        })?;
         let owner_generation =
             if is_reusable_global_frame_extent(physical_ipa, physical_size as u64) {
                 global_frame_host_owner_generation_in(
@@ -35631,6 +35646,7 @@ impl HvfVmState {
             } else {
                 mapping_owner_generation
             };
+        let shared_key_offset = mapping_shared_key_offset.saturating_add(semantic_offset);
         let sharing = GuestMappingSharing::GlobalShared;
         register_shared_alias(AliasBacking {
             start: va,
@@ -35646,7 +35662,7 @@ impl HvfVmState {
             ownership_scope: alias_ownership_scope(sharing, self.mm_root_slot, self.container_root),
             inventory_backing,
             shared_key_base: mapping_shared_key_base,
-            shared_key_offset: mapping_shared_key_offset,
+            shared_key_offset,
             owner_generation,
         });
         self.mappings.push(HvfMappedRegion {
@@ -35666,7 +35682,7 @@ impl HvfVmState {
             sharing,
             guest_writable: true,
             shared_key_base: mapping_shared_key_base,
-            shared_key_offset: mapping_shared_key_offset,
+            shared_key_offset,
             owner_generation,
         });
         Ok(())
