@@ -5076,6 +5076,13 @@ impl SyscallDispatcher {
         }
     }
 
+    /// Whether `index` is the guest's controlling pty. One lock site for the
+    /// six ioctl arms that asked the table directly (the dispatch-lock
+    /// burndown caps `pty_table` sites; the ISIG landing had added five).
+    fn pty_is_controlling(&self, index: u32) -> bool {
+        self.pty_table().lock().controlling() == Some(index)
+    }
+
     fn splice_source_not_readable(&self, fd: i32) -> bool {
         if self.fd_is_o_path(fd) {
             return true;
@@ -9006,7 +9013,7 @@ impl SyscallDispatcher {
                             session,
                         )
                         .or_else(|_| {
-                            if this.pty_table().lock().controlling() == Some(role.index) {
+                            if this.pty_is_controlling(role.index) {
                                 cx.kernel.kernel().tty_foreground_process_group(cx.kernel).map_err(|_| LINUX_ENOTTY)
                             } else {
                                 Err(LINUX_ENOTTY)
@@ -9043,13 +9050,13 @@ impl SyscallDispatcher {
                             session,
                             group,
                         );
-                        if this.pty_table().lock().controlling() == Some(role.index) {
+                        if this.pty_is_controlling(role.index) {
                             let _ = cx.kernel.kernel().tty_set_foreground_process_group(cx.kernel, group);
                         }
                         match res {
                             Ok(()) => DispatchOutcome::Returned { value: 0 },
                             Err(errno) => {
-                                if this.pty_table().lock().controlling() == Some(role.index) {
+                                if this.pty_is_controlling(role.index) {
                                     match cx.kernel.kernel().tty_set_foreground_process_group(cx.kernel, group) {
                                         Ok(()) => DispatchOutcome::Returned { value: 0 },
                                         Err(crate::kernel::TtyControlError::NotControlling) => DispatchOutcome::errno(LINUX_ENOTTY),
@@ -9094,7 +9101,7 @@ impl SyscallDispatcher {
                         let session_res = crate::kernel::tty::session(crate::kernel::tty::TtyKey::Pty(role.index))
                             .ok_or(LINUX_ENOTTY)
                             .or_else(|_| {
-                                if this.pty_table().lock().controlling() == Some(role.index) {
+                                if this.pty_is_controlling(role.index) {
                                     cx.kernel.kernel().tty_session(cx.kernel).map_err(|_| LINUX_ENOTTY)
                                 } else {
                                     Err(LINUX_ENOTTY)
@@ -9114,7 +9121,7 @@ impl SyscallDispatcher {
                         }
                     }
                     LINUX_TIOCNOTTY => {
-                        if this.pty_table().lock().controlling() == Some(role.index) {
+                        if this.pty_is_controlling(role.index) {
                             crate::vfs::devpts::set_controlling_index(this.pty_table(), None);
                             let _ = cx.kernel.kernel().tty_detach(cx.kernel);
                         }
@@ -9150,7 +9157,7 @@ impl SyscallDispatcher {
                                 DispatchOutcome::Returned { value: 0 }
                             }
                             _ => {
-                                if this.pty_table().lock().controlling() == Some(role.index)
+                                if this.pty_is_controlling(role.index)
                                     && cx.kernel.kernel().tty_session(cx.kernel).is_ok_and(|s| s == session)
                                 {
                                     crate::kernel::tty::route_foreground_signal_to_tty(
