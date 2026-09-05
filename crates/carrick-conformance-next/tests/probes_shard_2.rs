@@ -155,8 +155,8 @@ fn test_shard_2_inventory_definition() {
     generic_conformance_probes.dedup();
     assert_eq!(
         generic_conformance_probes.len(),
-        462,
-        "expected exactly 462 generic conformance probes across all shards"
+        463,
+        "expected exactly 463 generic conformance probes across all shards"
     );
 
     let derived_shard_2: Vec<&str> = generic_conformance_probes
