@@ -625,3 +625,29 @@ suite; the harness numbers were load. Quiet-host ledger refresh still owed.
 `cpython-compile` still crashes on page-table exhaustion (pt-pool worker in
 flight); `concurrent_futures` completed 232/237 with five timing-sensitive
 failures under that load.
+
+## Carrier allocation churn on the fault path (0492887cd)
+
+A dtrace `pid$target::__bzero:entry` census on perf_arena_churn (lever
+binary) found 3.5 million small zeroed allocations per run: two per data
+abort for the instruction fetch feeding the `vcpu__fault__regs` USDT probe
+(computed eagerly with no consumer attached), one `Rc` per fault in
+`acquire_mm_stage1_authority`, one per fault in `remove_fault_range`, a Vec
+growth per munmap in `unregister_alias`, and 624k `BTreeMap` node
+allocations from `unregister_process_alias` cloning the whole
+process-visible alias registry (snapshot, ordered, clone) on every munmap.
+It also showed `MAP_FIXED` fired once in the whole run against 6,000
+256 KiB memsets: lever 2's remap is inert because every HVPatch anonymous
+mapping is a reusable global-frame extent, which its eligibility excludes.
+
+Landed now: the fault probes take their arguments lazily (`1b3f2a5f2`),
+and the env-gated `SIGDBG`/`FAULTDBG`/`RUNSTATE` eprintln blocks on the
+per-quantum, per-fault and per-signal paths are deleted with the watchdog
+window cached (`0492887cd`); `__findenv_locked` had been 4.9% of carrier
+user CPU. Interleaved A/B against the pre-lever build under a loaded host
+(two worker compiles running) suggests about 2x on the touched arena cases
+and parity on the untouched case; absolute figures from that run are not
+citable. Briefed for the next worker round
+(`scratchpad/brief-mmap-cost-2.md`): O(affected rows) munmap planning with
+an undo journal, an HVF stage-2 test deciding lever 2's fate, and the
+per-fault `Rc`.
